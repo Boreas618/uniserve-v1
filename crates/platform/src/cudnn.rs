@@ -61,7 +61,7 @@ use std::sync::{Arc, OnceLock};
 use libloading::Library;
 
 use crate::driver::Handle;
-use crate::{DataType, Device, DeviceId, Error, Result, Stream};
+use crate::{DataType, Device, DeviceId, DeviceRange, Error, Result, Stream};
 
 const LIBCUDNN: &str = "libcudnn.so.9";
 
@@ -957,6 +957,7 @@ pub struct ConvolutionPlan {
     plan: Descriptor,
     engine: Engine,
     workspace_bytes: usize,
+    bytes: ConvolutionBytes,
     device: DeviceId,
     // Held only for their lifetime: the plan refers to the engine
     // configuration it was built from, which the heuristic's operation graph
@@ -977,24 +978,53 @@ impl ConvolutionPlan {
         self.workspace_bytes
     }
 
+    /// The bytes each of the convolution's three tensors spans, which is what
+    /// [`Cudnn::run`] checks its ranges against.
+    pub fn bytes(&self) -> ConvolutionBytes {
+        self.bytes
+    }
+
     /// The device the plan was built for.
     pub fn device(&self) -> DeviceId {
         self.device
     }
 }
 
-/// The device pointers of one execution of a convolution.
+/// The device storage one execution of a convolution reads and writes: the
+/// input, the filter, the output and the plan's workspace.
 ///
-/// Every pointer addresses device storage the caller keeps alive until the
-/// stream work completes, and that stays at its address for a captured
-/// graph's life.
+/// Each range states the bytes the caller has for that tensor; [`Cudnn::run`]
+/// checks them against what the convolution needs before the driver sees the
+/// call, so a short range fails with the size it needed. The ranges own
+/// nothing: the storage must outlive the stream work, and must stay at its
+/// address for a captured graph's life, which the arenas give.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConvolutionArgs {
-    pub x: u64,
-    pub w: u64,
-    pub y: u64,
-    /// The workspace's address; at least [`ConvolutionPlan::workspace_bytes`].
-    pub workspace: u64,
+    /// The layer's input, `N × C × …`.
+    pub x: DeviceRange,
+    /// The filter, `K × C × …` for a forward convolution and the layer's
+    /// `C × K × …` weight for a transposed one.
+    pub w: DeviceRange,
+    /// The layer's output, `N × K × …`; the convolution writes it.
+    pub y: DeviceRange,
+    /// The workspace, at least [`ConvolutionPlan::workspace_bytes`].
+    pub workspace: DeviceRange,
+}
+
+impl ConvolutionArgs {
+    /// The ranges of four buffers, for a caller that allocates whole blocks.
+    pub fn new(x: DeviceRange, w: DeviceRange, y: DeviceRange, workspace: DeviceRange) -> Self {
+        Self { x, w, y, workspace }
+    }
+}
+
+/// Whether two device ranges share a byte.
+fn overlaps(left: DeviceRange, right: DeviceRange) -> bool {
+    let start = left.ptr().address();
+    let end = start.saturating_add(left.bytes() as u64);
+    let other_start = right.ptr().address();
+    let other_end = other_start.saturating_add(right.bytes() as u64);
+    start < other_end && other_start < end
 }
 
 /// A cuDNN handle for one device's primary context.
@@ -1136,6 +1166,7 @@ impl Cudnn {
             plan,
             engine: recorded,
             workspace_bytes: workspace_bytes as usize,
+            bytes: convolution.bytes(),
             device: self.device,
             _config: chosen,
             _operation: operation,
@@ -1147,12 +1178,12 @@ impl Cudnn {
     /// The call issues device work and returns without waiting for it; on a
     /// capturing stream it is captured into the graph.
     ///
-    /// # Safety
-    ///
-    /// `args` must address device storage that outlives every execution of
-    /// the convolution: each tensor at least [`Convolution::bytes`] long and
-    /// the workspace at least [`ConvolutionPlan::workspace_bytes`].
-    pub unsafe fn run(
+    /// Each range is checked against what the convolution needs before any
+    /// driver call: the input, filter and output at least their tensors'
+    /// bytes, the workspace at least the plan's, and the output must not
+    /// overlap the input or the filter. The storage itself must outlive the
+    /// stream work, as any device storage a stream touches must.
+    pub fn run(
         &self,
         plan: &ConvolutionPlan,
         args: ConvolutionArgs,
@@ -1164,16 +1195,44 @@ impl Cudnn {
                 plan.device, self.device
             )));
         }
-        if args.x == 0 || args.w == 0 || args.y == 0 {
-            return Err(Error::invalid(
-                "a convolution needs the addresses of its input, filter and output",
-            ));
+        let bytes = plan.bytes;
+        for (name, range, needed) in [
+            ("input", args.x, bytes.x),
+            ("filter", args.w, bytes.w),
+            ("output", args.y, bytes.y),
+        ] {
+            if range.ptr().address() == 0 {
+                return Err(Error::invalid(format!(
+                    "the convolution's {name} has no address"
+                )));
+            }
+            if (range.bytes() as u64) < needed {
+                return Err(Error::invalid(format!(
+                    "the convolution's {name} spans {} bytes, its tensor needs {needed}",
+                    range.bytes()
+                )));
+            }
         }
-        if plan.workspace_bytes > 0 && args.workspace == 0 {
+        if args.workspace.ptr().address() == 0 && plan.workspace_bytes > 0 {
             return Err(Error::invalid(format!(
                 "the plan needs {} bytes of workspace, no address was given",
                 plan.workspace_bytes
             )));
+        }
+        if args.workspace.bytes() < plan.workspace_bytes {
+            return Err(Error::invalid(format!(
+                "the plan needs {} bytes of workspace, the range holds {}",
+                plan.workspace_bytes,
+                args.workspace.bytes()
+            )));
+        }
+        // The output is written while the input and the filter are read.
+        for (name, read) in [("input", args.x), ("filter", args.w)] {
+            if overlaps(args.y, read) {
+                return Err(Error::invalid(format!(
+                    "the convolution's output overlaps its {name}"
+                )));
+            }
         }
         let device = Device::new(self.device)?;
         let _context = device.enter()?;
@@ -1186,12 +1245,12 @@ impl Cudnn {
         // replay resends them through the captured node.
         let variant = Descriptor::create(self.api, DESCRIPTOR_VARIANT_PACK)?;
         let pointers: [*mut c_void; 3] = [
-            args.x as *mut c_void,
-            args.w as *mut c_void,
-            args.y as *mut c_void,
+            args.x.ptr().address() as *mut c_void,
+            args.w.ptr().address() as *mut c_void,
+            args.y.ptr().address() as *mut c_void,
         ];
         let uids: [i64; 3] = [UID_X, UID_W, UID_Y];
-        let workspace = args.workspace as *mut c_void;
+        let workspace = args.workspace.ptr().address() as *mut c_void;
         let call = "cudnnBackendSetAttribute";
         self.api.set(
             &variant,
