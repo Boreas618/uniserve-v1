@@ -26,9 +26,11 @@
 //! ## Precision
 //!
 //! With the design's `dtype = "auto"` nothing is converted at load: each weight keeps the
-//! representation the checkpoint stores it in - BF16 for the DiT partitions and the text encoder,
-//! FP16 for the video VAE decoder - and each layer declares the precision it computes in
-//! (specs/worker.md 1, 9).
+//! representation the checkpoint stores it in, and each layer declares the precision it computes in
+//! (specs/worker.md 1, 9). That representation is a fact about the export, not a preset: the
+//! released checkpoint is BF16 everywhere but its video VAE decoder, while an export of the same
+//! model can store FP32 throughout, and `auto` must follow each of them. [`stored_dtype`] is the one
+//! place that reads it.
 
 use nn::{Block, BlockName};
 use std::sync::Arc;
@@ -177,6 +179,54 @@ fn require(
     )))
 }
 
+/// The one floating-point type a component's weights are stored in.
+///
+/// `dtype = "auto"` converts nothing at load, so this is the element type a block built from that
+/// component keeps and computes in. It is read from the checkpoint - the tensors' own headers, which
+/// `nn::Checkpoint` has without mapping a byte - because the export need not declare it: a diffusers
+/// sidecar that omits `torch_dtype` states nothing, and a preset in this crate would be a second
+/// statement of a number the files already hold.
+///
+/// A component holding two floating-point types has no single representation, and this answers with
+/// a refusal that names both and an example of each rather than picking one: a block has one weight
+/// type, so an export that mixes them must say which it means, and the report is what decides the
+/// question instead of a guess. Integer tensors - a table, an index - are not weights and do not
+/// count.
+pub fn stored_dtype(checkpoint: &nn::Checkpoint, component: &str) -> Result<nn::DType> {
+    let source = checkpoint.component(component)?;
+    // The element types present, with one tensor that carries each, so a refusal is answerable.
+    let mut found: Vec<(nn::DType, String)> = Vec::new();
+    for name in source.names() {
+        let Some(location) = source.tensor(name) else {
+            continue;
+        };
+        if !location.dtype.is_float() {
+            continue;
+        }
+        if !found.iter().any(|(dtype, _)| *dtype == location.dtype) {
+            found.push((location.dtype, name.to_owned()));
+        }
+    }
+    match found.len() {
+        1 => Ok(found[0].0),
+        0 => Err(Error::checkpoint(format!(
+            "the checkpoint's `{component}` component holds no floating-point tensor, so there is \
+             no representation to load its weights in"
+        ))),
+        _ => Err(Error::checkpoint(format!(
+            "the checkpoint's `{component}` component stores {} floating-point types ({}), so \
+             `dtype = \"auto\"` has no single representation to keep; the export must state which \
+             one a deployment loads",
+            found.len(),
+            found
+                .iter()
+                .map(|(dtype, example)| format!("{dtype} (such as `{example}`)"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
 /// Load the deployment this rank places.
 ///
 /// The place and the blocks are the `partition`'s: it names the degrees and the rank's position in
@@ -184,9 +234,11 @@ fn require(
 /// checkpoint is one file set per pipeline: an export that continues a base release is opened by
 /// the engine as one checkpoint spanning both, so this function never learns about bases.
 ///
-/// Nothing is converted at load unless the checkpoint says so: with the design's `dtype = "auto"`
-/// each block keeps the representation its weights are stored in (BF16 DiT and text encoder, FP16
-/// video VAE decoder), and each layer declares the precision it computes in (specs/worker.md 1).
+/// Nothing is converted at load unless the deployment says so: with the design's `dtype = "auto"`
+/// each block keeps the representation its weights are stored in ([`stored_dtype`]), and each layer
+/// declares the precision it computes in (specs/worker.md 1). The representation is a fact about the
+/// export - BF16 throughout a released checkpoint, FP32 throughout another export of the same model
+/// - so no component's type is decided here.
 ///
 /// A block this build cannot construct is refused with [`Error::Unsupported`], naming it, rather
 /// than omitted: a deployment that places one must fail at load, not on the device.
@@ -264,7 +316,10 @@ pub fn load(
                     "vision tower",
                     "text_encoder",
                 )?;
-                let dtype = component.activation();
+                // The text encoder's representation is the checkpoint's, like every other block's:
+                // `TextEncoder::load` converts to whatever it is handed, so a constant here would
+                // be the one conversion in the load that no file states.
+                let dtype = stored_dtype(checkpoint, component.directories()[0])?;
                 let mut shards = loader.reborrow(source)?;
                 let encoder = Arc::new(TextEncoder::load(
                     &mut shards,
@@ -346,8 +401,10 @@ pub fn load(
             }
             Component::VideoPostprocessor => {
                 // Weightless: the splice's only constants are the reference's ImageNet means and standard
-                // deviations, uploaded once as the two `[3]` weights the byte step reads.
-                let dtype = Component::VideoDecoder.activation();
+                // deviations, uploaded once as the two `[3]` weights the byte step reads. It reads and
+                // writes the video decoder's rasters, so it holds their element type - the decoder's,
+                // which is the checkpoint's, not a constant here.
+                let dtype = stored_dtype(checkpoint, Component::VideoDecoder.directories()[0])?;
                 let bytes = |values: [f32; 3]| -> Vec<u8> {
                     values
                         .iter()
