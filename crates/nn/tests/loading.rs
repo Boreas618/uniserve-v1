@@ -37,16 +37,25 @@ fn shard(dir: &Path, name: &str, tensors: &[(&str, Vec<u64>, Vec<u8>)]) -> std::
     path
 }
 
-/// Write one shard whose tensors are byte buffers, and answer the path.
-fn shard_u8(dir: &Path, name: &str, tensors: &[(&str, Vec<u64>, Vec<u8>)]) -> std::path::PathBuf {
+/// Write one shard whose tensors are byte buffers of a stated type, and answer the path.
+///
+/// The dtype is stated per tensor because an encoded expert's fields are not all bytes: its packed
+/// FP4 values and its swizzled scales are `U8`, and its per-expert global scale is an FP32 scalar
+/// stored as four bytes. A shape and a byte count that disagree are a bug in the test's fixture, so
+/// the view refuses them here rather than in the loader.
+fn shard_typed(
+    dir: &Path,
+    name: &str,
+    tensors: &[(&str, Dtype, Vec<u64>, Vec<u8>)],
+) -> std::path::PathBuf {
     let path = dir.join(name);
     let views: Vec<(String, TensorView<'_>)> = tensors
         .iter()
-        .map(|(tensor, shape, bytes)| {
+        .map(|(tensor, dtype, shape, bytes)| {
             let shape: Vec<usize> = shape.iter().map(|&extent| extent as usize).collect();
             (
                 (*tensor).to_owned(),
-                TensorView::new(Dtype::U8, shape, bytes).unwrap(),
+                TensorView::new(*dtype, shape, bytes).unwrap(),
             )
         })
         .collect();
@@ -408,12 +417,12 @@ fn a_calibrated_nvfp4_matrix_is_loaded_as_its_three_fields() {
     // `[4, 64]` encoded: 32 bytes a row of packed pairs, four block scales a row.
     let values: Vec<u8> = (0..128).map(|byte| byte as u8).collect();
     let scales: Vec<u8> = (0..16).map(|byte| 0x30 + byte).collect();
-    shard_u8(
+    shard_typed(
         directory,
         "model.safetensors",
         &[
-            ("w", vec![4, 32], values.clone()),
-            ("w_scale", vec![4, 4], scales.clone()),
+            ("w", Dtype::U8, vec![4, 32], values.clone()),
+            ("w_scale", Dtype::U8, vec![4, 4], scales.clone()),
         ],
     );
 
@@ -453,10 +462,13 @@ fn the_block_scales_must_have_the_layout_s_shape() {
     let directory = directory.path();
     let values: Vec<u8> = vec![0; 128];
     let scales: Vec<u8> = vec![0x38; 16];
-    shard_u8(
+    shard_typed(
         directory,
         "model.safetensors",
-        &[("w", vec![4, 32], values), ("w_scale", vec![4, 4], scales)],
+        &[
+            ("w", Dtype::U8, vec![4, 32], values),
+            ("w_scale", Dtype::U8, vec![4, 4], scales),
+        ],
     );
 
     let checkpoint = Checkpoint::open(directory).unwrap();
@@ -482,7 +494,7 @@ fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection
     let directory = tempfile::tempdir().unwrap();
     let directory = directory.path();
     // Two experts, `[2, 64]` packed (32 bytes a row), two projections each, four block scales a row.
-    let mut tensors: Vec<(String, Vec<u64>, Vec<u8>)> = Vec::new();
+    let mut tensors: Vec<(String, Dtype, Vec<u64>, Vec<u8>)> = Vec::new();
     let mut expected = Vec::new();
     for expert in 0..2u8 {
         for (index, projection) in ["up", "gate"].iter().enumerate() {
@@ -494,20 +506,26 @@ fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection
                 .map(|byte| 0x20 + byte as u8 + expert * 8 + index as u8)
                 .collect();
             expected.extend_from_slice(&values);
-            tensors.push((format!("{stem}.weight"), vec![2, 32], values));
-            tensors.push((format!("{stem}.weight_scale"), vec![2, 4], scales.clone()));
+            tensors.push((format!("{stem}.weight"), Dtype::U8, vec![2, 32], values));
+            tensors.push((
+                format!("{stem}.weight_scale"),
+                Dtype::U8,
+                vec![2, 4],
+                scales.clone(),
+            ));
             tensors.push((
                 format!("{stem}.weight_scale_2"),
+                Dtype::F32,
                 vec![1],
                 (0.5f32 * (expert + 1) as f32).to_le_bytes().to_vec(),
             ));
         }
     }
-    let views: Vec<(&str, Vec<u64>, Vec<u8>)> = tensors
+    let views: Vec<(&str, Dtype, Vec<u64>, Vec<u8>)> = tensors
         .iter()
-        .map(|(name, shape, bytes)| (name.as_str(), shape.clone(), bytes.clone()))
+        .map(|(name, dtype, shape, bytes)| (name.as_str(), *dtype, shape.clone(), bytes.clone()))
         .collect();
-    shard_u8(directory, "model.safetensors", &views);
+    shard_typed(directory, "model.safetensors", &views);
 
     let checkpoint = Checkpoint::open(directory).unwrap();
     let mut store = Recording::default();
@@ -566,16 +584,41 @@ fn a_stack_needs_every_expert_to_agree_on_its_geometry() {
     let directory = tempfile::tempdir().unwrap();
     let directory = directory.path();
     let byte = |values: usize| vec![0u8; values];
-    shard_u8(
+    shard_typed(
         directory,
         "model.safetensors",
         &[
-            ("experts.0.up_proj.weight", vec![2, 32], byte(64)),
-            ("experts.0.up_proj.weight_scale", vec![2, 4], byte(8)),
-            ("experts.0.up_proj.weight_scale_2", vec![1], byte(4)),
-            ("experts.1.up_proj.weight", vec![4, 32], byte(128)),
-            ("experts.1.up_proj.weight_scale", vec![4, 4], byte(16)),
-            ("experts.1.up_proj.weight_scale_2", vec![1], byte(4)),
+            ("experts.0.up_proj.weight", Dtype::U8, vec![2, 32], byte(64)),
+            (
+                "experts.0.up_proj.weight_scale",
+                Dtype::U8,
+                vec![2, 4],
+                byte(8),
+            ),
+            (
+                "experts.0.up_proj.weight_scale_2",
+                Dtype::F32,
+                vec![1],
+                byte(4),
+            ),
+            (
+                "experts.1.up_proj.weight",
+                Dtype::U8,
+                vec![4, 32],
+                byte(128),
+            ),
+            (
+                "experts.1.up_proj.weight_scale",
+                Dtype::U8,
+                vec![4, 4],
+                byte(16),
+            ),
+            (
+                "experts.1.up_proj.weight_scale_2",
+                Dtype::F32,
+                vec![1],
+                byte(4),
+            ),
         ],
     );
     let checkpoint = Checkpoint::open(directory).unwrap();
