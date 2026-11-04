@@ -41,6 +41,7 @@
 //! its failures are for naming the operator and the key that produced them.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -49,8 +50,8 @@ use nn::{
     Arena, Backing, CausalLm, Checkpoint, DType, DevicePtr, Forward, PhaseKind, RetainedWeights,
     Sampler, SamplerState, Samples, Shape, TensorView, WeightKey, WeightLoader,
 };
-use ops::{Generation, KernelEntry};
-use qwen3_moe::{Config, LoadOptions, Partition, Plan, Run, Substage};
+use ops::{Generation, KernelEntry, ScaleLayout};
+use qwen3_moe::{Config, LoadOptions, Partition, Plan, Representation, Run, Substage};
 
 /// The checkpoint the reference was captured from, when `--checkpoint` does not name another.
 const DEFAULT_CHECKPOINT: &str = "/opt/uv/models/Qwen3-30B-A3B";
@@ -149,6 +150,58 @@ struct Args {
     /// The reference's greedy continuation, as JSON with an `ids` list: the run compares as it goes
     /// and stops at the first step that differs, which is the step the defect is in.
     expect: Option<PathBuf>,
+    /// The deployment's cache precision. It is a deployment fact and not a per-run switch: the
+    /// weights' precision comes from the checkpoint and cannot be overridden here.
+    kv_pages: KvPages,
+}
+
+fn load_declared<R: RetainedWeights>(
+    root: &Path,
+    checkpoint: &Checkpoint,
+    store: &mut R,
+) -> Result<(qwen3_moe::Qwen3Moe, Representation)> {
+    // The declaration is the crate's to read: the absence of one is a statement that nothing was
+    // quantized, and a declaration this tree cannot serve is refused there by name.
+    let declared = Representation::read(root)?;
+    let mut loader = WeightLoader::new(checkpoint, store, None, None);
+    let model = match &declared {
+        Representation::Dense => qwen3_moe::load(
+            root,
+            Partition::single(),
+            &mut loader,
+            LoadOptions::default(),
+        )?,
+        // The encoded entry point states the encoding once, so `LoadOptions` follows from the call
+        // rather than from a second statement a caller could get wrong. The scale layout is the one
+        // the compiled NVFP4 programs read - `swizzled_128x4` in their key - and a checkpoint
+        // written in the other layout would dequantize with the wrong block's scale.
+        Representation::Nvfp4 { .. } => qwen3_moe::load::load_encoded(
+            root,
+            Partition::single(),
+            &mut loader,
+            LoadOptions::default(),
+            ScaleLayout::Swizzled128X4,
+        )?,
+    };
+    Ok((model, declared))
+}
+
+/// The element type of the paged cache's pages: the deployment's choice, stated by the run.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KvPages {
+    /// BF16 pages, the vertical slice's cache.
+    Bf16,
+    /// FP8 E4M3 pages with one scale per page.
+    Fp8,
+}
+
+impl fmt::Display for KvPages {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Bf16 => "bf16",
+            Self::Fp8 => "fp8",
+        })
+    }
 }
 
 /// Where a generated token id comes from.
@@ -189,6 +242,7 @@ impl Args {
         let mut generate = None;
         let mut greedy = Greedy::Sampler;
         let mut expect = None;
+        let mut kv_pages = KvPages::Bf16;
         let mut words = std::env::args().skip(1);
         while let Some(word) = words.next() {
             let mut value = |name: &str| -> Result<String> {
@@ -243,6 +297,19 @@ impl Args {
                     })?);
                 }
                 "--expect" => expect = Some(PathBuf::from(value("--expect")?)),
+                "--kv-pages" => {
+                    let name = value("--kv-pages")?;
+                    kv_pages = match name.as_str() {
+                        "bf16" => KvPages::Bf16,
+                        "fp8" => KvPages::Fp8,
+                        other => {
+                            return Err(Failure::message(format!(
+                                "--kv-pages {other:?} names no page type; the page types are bf16 \
+                                 and fp8"
+                            )));
+                        }
+                    };
+                }
                 "--greedy" => {
                     let name = value("--greedy")?;
                     greedy = match name.as_str() {
@@ -276,14 +343,14 @@ impl Args {
                         "qwen3_moe_slice --stage weights|embedding|block|decode \
                          [--checkpoint PATH] [--store PATH] [--device N] [--layer N] \
                          [--tokens ID,ID,...] [--dump DIR] [--reference DIR] \
-                         [--substage normalized|attended|mlp_out] [--from NN] [--routing] [--generate N] [--greedy sampler|host] [--expect FILE]",
+                         [--substage normalized|attended|mlp_out] [--from NN] [--routing] [--generate N] [--greedy sampler|host] [--expect FILE] [--kv-pages bf16|fp8]",
                     ));
                 }
                 other => {
                     return Err(Failure::message(format!(
                         "unknown argument `{other}`; expected --stage, --checkpoint, --store, \
                          --device, --layer, --tokens, --from, --substage, --routing, --scores, \
-                         --generate, --greedy, --expect, --dump or --reference"
+                         --generate, --greedy, --expect, --kv-pages, --dump or --reference"
                     )));
                 }
             }
@@ -353,6 +420,7 @@ impl Args {
             generate,
             greedy,
             expect,
+            kv_pages,
         })
     }
 }
@@ -484,13 +552,7 @@ fn stage_weights(args: &Args) -> Result<()> {
     let config = Config::read(&args.checkpoint)?;
     let mut store = HostWeights::default();
     {
-        let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
-        let model = qwen3_moe::load(
-            &args.checkpoint,
-            Partition::single(),
-            &mut loader,
-            LoadOptions::default(),
-        )?;
+        let (model, _) = load_declared(&args.checkpoint, &checkpoint, &mut store)?;
         println!(
             "loaded: {} layers, hidden {}, {} experts of {} at top {}, {} parameters",
             config.num_hidden_layers,
@@ -549,20 +611,13 @@ fn stage_embedding(args: &Args) -> Result<()> {
     //    missing package is reported as coverage rather than as the first operator to launch.
     // Only the operator this stage launches is required: a key the stage never calls must be
     // reported, not fatal, or a missing sampler program would read as a broken embedding.
-    let needed = needed_keys(&store_root, Stage::Embedding, false)?;
+    let needed = needed_keys(&store_root, Stage::Embedding, false, args.kv_pages)?;
     let generation = load_generation(&device, &store_root, &needed)?;
 
-    // 3. Weights on the device, through the loader's own boundary.
+    // 3. Weights on the device, through the loader's own boundary, as the checkpoint declares
+    // itself: the declaration chooses the entry point, and the loader refuses a mismatch.
     let mut weights = DeviceWeights::new(&device, args.resident)?;
-    let model = {
-        let mut loader = WeightLoader::new(&checkpoint, &mut weights, None, None);
-        qwen3_moe::load(
-            &args.checkpoint,
-            Partition::single(),
-            &mut loader,
-            LoadOptions::default(),
-        )?
-    };
+    let (model, _) = load_declared(&args.checkpoint, &checkpoint, &mut weights)?;
 
     // 4. The arena: the plan's own sizes for one token, rounded up, plus the embedding's output.
     let plan = model.plan(DEFAULT_TOKENS)?;
@@ -646,16 +701,29 @@ fn decode_arena_bytes(
     page_size: u64,
     pages: u64,
     sampling: bool,
+    kv_pages: KvPages,
 ) -> qwen3_moe::Result<u64> {
     let layers = u64::try_from(config.num_hidden_layers).unwrap_or(0);
     let kv_heads = u64::try_from(config.num_key_value_heads).unwrap_or(0);
     let head_dim = u64::try_from(config.head_dim).unwrap_or(0);
-    // BF16 planes: one key and one value per layer, over the pages this batch touches.
+    // One key and one value per layer, over the pages this batch touches: two bytes a value in a
+    // BF16 page and one in an FP8 page, and an FP8 page carries an f32 scale of its own.
+    let element = match kv_pages {
+        KvPages::Bf16 => 2,
+        KvPages::Fp8 => 1,
+    };
     let plane = pages
         .saturating_mul(page_size)
         .saturating_mul(kv_heads)
         .saturating_mul(head_dim)
-        .saturating_mul(2);
+        .saturating_mul(element);
+    let scale_plane = match kv_pages {
+        KvPages::Bf16 => 0,
+        KvPages::Fp8 => layers
+            .saturating_mul(2)
+            .saturating_mul(pages)
+            .saturating_mul(4),
+    };
     let planes = layers.saturating_mul(2).saturating_mul(plane);
     let flags = layers
         .saturating_mul(2)
@@ -689,6 +757,7 @@ fn decode_arena_bytes(
     let mut total = 0_u64;
     for bytes in [
         planes,
+        scale_plane,
         flags,
         rows,
         metadata,
@@ -705,6 +774,15 @@ fn decode_arena_bytes(
 /// The stack over one prompt: `last = Some(layer)` stops after that layer and digests its output,
 /// `None` finishes the model and prints the last row's top-10.
 fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
+    // A run measures a pair - the checkpoint's representation and the deployment's cache precision -
+    // and a number that does not say which pair it measured cannot enter a table. The pair is the
+    // run's first line, read from the checkpoint and stated by the deployment, never overridden.
+    let declared = Representation::read(&args.checkpoint)?;
+    println!(
+        "combination: checkpoint {} declares {declared:?}; kv pages {}",
+        args.checkpoint.display(),
+        args.kv_pages,
+    );
     let store_root = args.store.clone().ok_or_else(|| {
         Failure::message(
             "stage `decode` needs a program store: pass --store <path> or set UNISERVE_STORE",
@@ -743,19 +821,22 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     let _guard = device.enter()?;
     let stream = device.stream()?;
 
-    let needed = needed_keys(&store_root, Stage::Decode, args.generate.is_some())?;
+    let needed = needed_keys(
+        &store_root,
+        Stage::Decode,
+        args.generate.is_some(),
+        args.kv_pages,
+    )?;
     let generation = load_generation(&device, &store_root, &needed)?;
 
     let mut weights = DeviceWeights::new(&device, args.resident)?;
-    let model = {
-        let mut loader = WeightLoader::new(&checkpoint, &mut weights, None, None);
-        qwen3_moe::load(
-            &args.checkpoint,
-            Partition::single(),
-            &mut loader,
-            LoadOptions::default(),
-        )?
-    };
+    let (model, loaded) = load_declared(&args.checkpoint, &checkpoint, &mut weights)?;
+    if loaded != declared {
+        return Err(Failure::message(format!(
+            "the checkpoint declared {declared:?} before the load and {loaded:?} during it: a \
+             declaration that changes between two reads is one this run cannot attribute"
+        )));
+    }
 
     // The arena, from the plan and the config's own cache geometry.
     let plan = model.plan(count)?;
@@ -768,6 +849,7 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
         page_size,
         pages,
         args.generate.is_some(),
+        args.kv_pages,
     )?;
     let allocator = weights.allocator();
     let reserve = usize::try_from(bytes).unwrap_or(usize::MAX);
@@ -827,21 +909,36 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     let head_dim = u64::try_from(config.head_dim).unwrap_or(0);
     let plane = Shape::new(&[pages, page_size, kv_heads, head_dim]);
     let flag = Shape::new(&[pages, 1, 1, 1]);
+    // The page type is the deployment's, and it decides both the planes' element type and whether
+    // they carry a scale. An FP8 page's scale is one f32 per page and the writer maintains it - it
+    // is read for the growth rule and written back - so a plane that starts at zero has no page
+    // whose scale a reader could mistake for a settled one.
+    let page_dtype = match args.kv_pages {
+        KvPages::Bf16 => DType::BF16,
+        KvPages::Fp8 => DType::F8E4M3,
+    };
     let mut planes = Vec::with_capacity(config.num_hidden_layers);
     for _ in 0..config.num_hidden_layers {
+        let (key_scale, value_scale) = match args.kv_pages {
+            KvPages::Bf16 => (None, None),
+            KvPages::Fp8 => (
+                Some(zeroed_f32(&stream, &arena, flag)?),
+                Some(zeroed_f32(&stream, &arena, flag)?),
+            ),
+        };
         planes.push(KvPlanes {
-            key: arena.tensor(DType::BF16, plane)?,
-            value: arena.tensor(DType::BF16, plane)?,
+            key: arena.tensor(page_dtype, plane)?,
+            value: arena.tensor(page_dtype, plane)?,
             key_initialized: zeroed_i32(&stream, &arena, flag)?,
             value_initialized: zeroed_i32(&stream, &arena, flag)?,
-            key_scale: None,
-            value_scale: None,
+            key_scale,
+            value_scale,
         });
     }
     let groups = [KvGroup {
         block_tables,
         page_size: u32::try_from(page_size).unwrap_or(64),
-        dtype: DType::BF16,
+        dtype: page_dtype,
         layers: &planes,
     }];
     let cache = KvView { groups: &groups };
@@ -2207,6 +2304,23 @@ fn zeroed_i32(stream: &platform::Stream, arena: &Arena, shape: Shape) -> Result<
     Ok(view)
 }
 
+/// A plane of `shape` f32 zeros.
+fn zeroed_f32(stream: &platform::Stream, arena: &Arena, shape: Shape) -> Result<TensorView> {
+    let view = arena.tensor(DType::F32, shape)?;
+    let zeros = vec![0_f32; usize::try_from(shape.numel()).unwrap_or(0)];
+    // SAFETY: `zeros` outlives the copy, which completes before the wait below.
+    unsafe {
+        platform::memcpy_async(
+            view.ptr.address(),
+            zeros.as_ptr() as u64,
+            std::mem::size_of_val(zeros.as_slice()),
+            stream,
+        )?;
+    }
+    stream.synchronize()?;
+    Ok(view)
+}
+
 /// Download `elements` f32 values.
 fn download_f32(stream: &platform::Stream, view: TensorView, elements: usize) -> Result<Vec<f32>> {
     let mut values = vec![0_f32; elements];
@@ -2233,7 +2347,12 @@ fn arena_bytes(plan: &qwen3_moe::Plan) -> u64 {
 }
 
 /// The (operator, key) pairs the fixture names for the slice, which is what the store must hold.
-fn needed_keys(store_root: &Path, stage: Stage, sampling: bool) -> Result<Vec<(String, String)>> {
+fn needed_keys(
+    store_root: &Path,
+    stage: Stage,
+    sampling: bool,
+    kv_pages: KvPages,
+) -> Result<Vec<(String, String)>> {
     let fixture =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../notes/programs/qwen3-moe-keys.txt");
     let text = std::fs::read_to_string(&fixture).map_err(|error| {
@@ -2253,6 +2372,15 @@ fn needed_keys(store_root: &Path, stage: Stage, sampling: bool) -> Result<Vec<(S
         let (Some(operator), Some(descriptor)) = (fields.next(), fields.next()) else {
             continue;
         };
+        // A cache this deployment does not select is not a missing program: the `kv_f8e4m3` rows
+        // belong to an fp8 deployment and the bf16 rows to a bf16 one, and a run must not be blocked
+        // by the other's gap.
+        let scaled = operator == "kv_write_scaled"
+            || descriptor.contains("kv_f8e4m3")
+            || descriptor.contains("kv_f8e5m2");
+        if scaled != (kv_pages == KvPages::Fp8) {
+            continue;
+        }
         if !required(stage, operator, sampling) {
             continue;
         }
@@ -2275,6 +2403,9 @@ fn required(stage: Stage, operator: &str, sampling: bool) -> bool {
         Stage::Block | Stage::Decode => {
             MODEL_OPERATORS.contains(&operator)
                 || (sampling && SAMPLER_OPERATORS.contains(&operator))
+                // The scale-deriving write is an fp8 deployment's, and the filter above has already
+                // kept only the rows that deployment selects.
+                || operator == "kv_write_scaled"
         }
     }
 }
