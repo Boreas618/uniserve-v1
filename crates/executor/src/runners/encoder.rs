@@ -415,6 +415,10 @@ impl<M: Encoder + Send + Sync> Runner for EncoderRunner<M> {
         self.capture_order()
     }
 
+    fn capture_plan(&self) -> Vec<Bucket> {
+        self.capture_order()
+    }
+
     fn cache(&self) -> Option<Arc<Mutex<crate::memory::prefix_cache::PrefixCache>>> {
         // An encoder holds no paged cache: what it reads is the rows it was handed.
         None

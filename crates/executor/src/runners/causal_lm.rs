@@ -1264,6 +1264,10 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         Ok(Jobs::new(jobs))
     }
 
+    fn capture_plan(&self) -> Vec<Bucket> {
+        self.buckets.capture_order().copied().collect()
+    }
+
     fn warmup(&mut self) -> Result<Jobs> {
         let generation = self.lifecycle.generation.number();
         let mut jobs = Vec::new();

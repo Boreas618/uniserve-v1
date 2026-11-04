@@ -53,6 +53,16 @@ pub trait Runner: Send {
         Vec::new()
     }
 
+    /// The buckets the next generation captures, in capture order, as this runner sees them.
+    ///
+    /// The first generation of an epoch has nothing to compare against, so every operator of every
+    /// bucket is new and one capture per bucket records them all: this list is that work stated
+    /// before it begins, which is the only way a run can see the number before paying for it. It is
+    /// the same set `warmup` walks, in the same order.
+    fn capture_plan(&self) -> Vec<crate::plan::Bucket> {
+        Vec::new()
+    }
+
     /// The resident cache this runner reads, when it reads one: what a sleep gives back and a wake
     /// maps again (2.5).
     ///
