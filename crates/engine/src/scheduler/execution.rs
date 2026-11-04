@@ -708,6 +708,12 @@ impl Scheduler {
         // what changed: the policy was handed the same table in its snapshot.
         self.pages = views::page_index(self);
         self.pages_seeded = true;
+        // The instance was instantiated on a snapshot and has never been
+        // observed. Seeding the recorder from that same snapshot is what keeps
+        // the next step's events proportional to what changed after it, rather
+        // than one `Updated` per live request to a policy that already knows.
+        let snapshot = policy.instantiated_on().clone();
+        self.recorder = mechanism::Recorder::from_snapshot(&snapshot);
         self.policy = Some(policy);
     }
 
