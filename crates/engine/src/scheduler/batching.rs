@@ -65,21 +65,13 @@ impl Scheduler {
         let mut work: Vec<(RequestId, PhaseId, Option<u32>)> = plan
             .work
             .iter()
-            .map(|work| {
-                (
-                    RequestId(work.request.0),
-                    work.phase,
-                    Some(work.tokens),
-                )
-            })
+            .map(|work| (RequestId(work.request.0), work.phase, Some(work.tokens)))
             .collect();
-        work.extend(plan.refill.iter().map(|request| {
-            (
-                RequestId(request.0),
-                refill,
-                None,
-            )
-        }));
+        work.extend(
+            plan.refill
+                .iter()
+                .map(|request| (RequestId(request.0), refill, None)),
+        );
         self.assemble_batch(&work)
     }
 

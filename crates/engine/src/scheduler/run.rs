@@ -233,6 +233,7 @@ impl Scheduler {
             policy: None,
             policy_report: None,
             recorder: mechanism::Recorder::default(),
+            watchdog: mechanism::Watchdog::default(),
             step: 0,
             config,
             fatal: false,

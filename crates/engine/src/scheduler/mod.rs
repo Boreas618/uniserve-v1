@@ -44,9 +44,10 @@ pub use config::{
 pub(crate) use execution::generation_consuming_calls;
 use ipc::{ForwardMode, MediaCall, TransferMode};
 pub use policy::{
-    BatchCapacity, Candidate, PREFETCH_FLOOR_TOKENS, PolicyBytes, PolicyPorts, PolicyProgram,
-    PolicyReverted, PolicySlot, PolicySource, PolicyStore, RouteFeed, RoutePolicy, Stage,
-    TrialState, Validators, backend_name, ceilings_of, parameters_of, program_of,
+    Arrival, BatchCapacity, Candidate, PREFETCH_FLOOR_TOKENS, PolicyBytes, PolicyPorts,
+    PolicyProgram, PolicyReverted, PolicySlot, PolicySource, PolicyStore, RouteFeed, RoutePolicy,
+    Stage, TrialState, Validators, arrival_view, backend_name, ceilings_of, parameters_of,
+    program_of,
 };
 pub(crate) use run::{MAX_GUIDANCE_PREFIX_ROWS, guidance_prefix_rows};
 pub use stats::{
@@ -476,6 +477,9 @@ pub struct Scheduler {
     policy_report: Option<policy::PolicyReverted>,
     /// The events and transitions a policy is told about (§4.4).
     recorder: mechanism::Recorder,
+    /// The starvation watchdog: a resident request that does not advance
+    /// within the policy's `timeout` is the policy's failure (§4.4).
+    watchdog: mechanism::Watchdog,
     /// The step number this scheduler is at.
     step: u64,
     /// Maximum number of transfer calls holding a reservation at once
