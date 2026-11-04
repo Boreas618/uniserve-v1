@@ -454,13 +454,36 @@ impl ClipDecoder {
                 view.shape.dim(3)
             )));
         }
+        // A blend reads its neighbour's **last** `extent` positions along the axis and writes the
+        // current tile's first `extent`. The predecessor's last positions are the seam itself, which
+        // still holds the predecessor's pixels in the raster, so the neighbour's view starts one
+        // tile-extent minus one overlap before the tile - not one overlap before it, which would read
+        // the tile's own pixels from a band further down.
+        let (tile_rows, tile_columns) = (
+            u64::from(tile.canvas.height) * ratio,
+            u64::from(tile.canvas.width) * ratio,
+        );
         if tile.above != 0 {
-            let previous = self.placement(decoded, tile, first_row, first_column, tile.above, 0)?;
+            let previous = self.placement(
+                decoded,
+                tile,
+                first_row,
+                first_column,
+                u32::try_from(tile_rows).unwrap_or(u32::MAX) - tile.above,
+                0,
+            )?;
             self.blend(tile.above, 2)?
                 .forward(f, Some(previous), view, view)?;
         }
         if tile.left != 0 {
-            let previous = self.placement(decoded, tile, first_row, first_column, 0, tile.left)?;
+            let previous = self.placement(
+                decoded,
+                tile,
+                first_row,
+                first_column,
+                0,
+                u32::try_from(tile_columns).unwrap_or(u32::MAX) - tile.left,
+            )?;
             self.blend(tile.left, 3)?
                 .forward(f, Some(previous), view, view)?;
         }
@@ -911,24 +934,37 @@ mod tests {
             let origin = (first_row * u64::from(WIDTH) + first_column) * 2;
             assert_eq!(view.ptr.address(), 0x1000 + origin);
             if tile.above != 0 {
+                // The neighbour is the predecessor's own block: its last `above` rows are the seam,
+                // which sits where this tile starts, so the block begins `256 - above` rows above it.
+                let up = 256 - tile.above;
                 let previous = clip
-                    .placement(dest, tile, first_row, first_column, tile.above, 0)
+                    .placement(dest, tile, first_row, first_column, up, 0)
                     .expect("the row neighbour");
                 assert_eq!(
                     previous.ptr.address(),
-                    0x1000 + origin - u64::from(tile.above) * u64::from(WIDTH) * 2
+                    0x1000 + origin - u64::from(up) * u64::from(WIDTH) * 2
+                );
+                // Its last `above` rows are this tile's first `above` rows - the seam itself.
+                assert_eq!(
+                    previous.ptr.address() + u64::from(256 - tile.above) * u64::from(WIDTH) * 2,
+                    0x1000 + origin
                 );
                 assert!(clip.blend(tile.above, 2).is_ok());
                 above_widths.push(tile.above);
                 above_seams += 1;
             }
             if tile.left != 0 {
+                let left = 256 - tile.left;
                 let previous = clip
-                    .placement(dest, tile, first_row, first_column, 0, tile.left)
+                    .placement(dest, tile, first_row, first_column, 0, left)
                     .expect("the column neighbour");
                 assert_eq!(
                     previous.ptr.address(),
-                    0x1000 + origin - u64::from(tile.left) * 2
+                    0x1000 + origin - u64::from(left) * 2
+                );
+                assert_eq!(
+                    previous.ptr.address() + u64::from(256 - tile.left) * 2,
+                    0x1000 + origin
                 );
                 assert!(clip.blend(tile.left, 3).is_ok());
                 left_widths.push(tile.left);
