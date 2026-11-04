@@ -181,7 +181,12 @@ const CROSS_CORRELATION: i32 = 1;
 /// (often one configuration).
 const HEURISTIC_MODE_B: i32 = 1;
 
-/// The most engine configurations one heuristic query is asked to return.
+/// The most engine configurations a query keeps after reading them all.
+///
+/// The array handed to the library always holds one created descriptor per
+/// configuration the heuristic reported, never fewer: it is the *requested*
+/// count, and asking for part of a list is not how the library is written to
+/// work. This cap is applied to what is kept.
 const MAX_ENGINE_CONFIGS: usize = 32;
 
 /// The unique ids that tie the three tensors of the operation graph to the
@@ -1674,10 +1679,20 @@ impl Cudnn {
             ));
             return steps;
         }
-        let config = stage!(
-            "engine heuristic: read the first configuration",
-            Self::first_config(self.api, &heuristic, available)
+        let shortlist = stage!(
+            "engine heuristic: mode A, read every configuration it lists",
+            self.configs(&graph, MAX_ENGINE_CONFIGS, HEURISTIC_MODE_A, false)
         );
+        let Some(config) = shortlist.kept.into_iter().next() else {
+            steps.push((
+                format!(
+                    "engine heuristic: mode A listed {} configuration(s) and the library filled none",
+                    shortlist.returned
+                ),
+                Some(String::from("nothing filled")),
+            ));
+            return steps;
+        };
         let notes_a = stage!(
             "engine heuristic: mode A's first configuration's numerical notes",
             self.numerical_notes(&config)
@@ -1744,29 +1759,6 @@ impl Cudnn {
         Ok(heuristic)
     }
 
-    /// The first configuration the heuristic proposed.
-    fn first_config(
-        api: &'static Api,
-        heuristic: &Descriptor,
-        available: usize,
-    ) -> Result<Descriptor> {
-        let config = Descriptor::create(api, DESCRIPTOR_ENGINE_CONFIG)?;
-        let mut handles = [config.raw];
-        let written = api.get(
-            heuristic,
-            ATTR_ENGINEHEUR_RESULTS,
-            TYPE_BACKEND_DESCRIPTOR,
-            &mut handles,
-            "cudnnBackendGetAttribute",
-        )?;
-        if written == 0 || handles[0].is_null() {
-            return Err(Error::invalid(format!(
-                "cuDNN proposed {available} engine configurations and filled none"
-            )));
-        }
-        Ok(config)
-    }
-
     /// The engine configurations cuDNN's heuristic proposes for `operation` in
     /// `mode`, best first: descriptors this module created for the library to
     /// fill, so it owns and destroys them.
@@ -1788,9 +1780,13 @@ impl Cudnn {
             kept: Vec::new(),
             dropped: Vec::new(),
         };
-        let wanted = returned.min(limit.clamp(1, MAX_ENGINE_CONFIGS));
-        let mut configs = Vec::with_capacity(wanted);
-        for _ in 0..wanted {
+        // One created engine-configuration descriptor per configuration the
+        // heuristic reported: the library fills the descriptors it is handed,
+        // and an array shorter than the list is a request it answers with
+        // nothing (`cudnn_frontend` reads the count first and asks for exactly
+        // that many, never fewer).
+        let mut configs = Vec::with_capacity(returned);
+        for _ in 0..returned {
             configs.push(Descriptor::create(self.api, DESCRIPTOR_ENGINE_CONFIG)?);
         }
         if configs.is_empty() {
@@ -1825,6 +1821,7 @@ impl Cudnn {
             }
             proposal.kept.push(config);
         }
+        proposal.kept.truncate(limit.clamp(1, MAX_ENGINE_CONFIGS));
         Ok(proposal)
     }
 
