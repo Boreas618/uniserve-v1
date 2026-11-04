@@ -1316,6 +1316,22 @@ impl nn::capability::Denoiser for Denoiser {
         Ok(())
     }
 
+    fn prepare_conditioning(
+        &self,
+        f: &Forward,
+        cond: nn::capability::Conditioning<'_>,
+    ) -> nn::Result<()> {
+        // The refiner's rows are the denoiser's conditioning (`denoiser.py:510-532`): every task's
+        // text passes through it once, in place over the runner's `text` buffer, and the encoder's
+        // own features arrive in `source`. A request with no source has no conditioning to refine -
+        // and no text either, since the encoder always writes what the refiner reads.
+        let Some(source) = cond.source else {
+            return Ok(());
+        };
+        self.refine_conditioning(f, source, cond.text, cond.state, None)
+            .map_err(flattened)
+    }
+
     fn denoise<'a>(
         &self,
         f: &Forward,

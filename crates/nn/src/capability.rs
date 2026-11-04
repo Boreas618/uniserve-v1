@@ -463,6 +463,13 @@ pub struct Latents {
 pub struct Conditioning<'a> {
     /// `[rows, width]` encoded text.
     pub text: TensorView,
+    /// `[rows, width]` the text encoder's own features, when the model has a conditioner between the
+    /// encoder and the denoiser: [`Denoiser::prepare_conditioning`] folds this into `text`.
+    ///
+    /// Both buffers are the runner's, sized to the request's text capacity, and the conditioner runs
+    /// in place over `text`. `None` when the model has no conditioner, or for a task whose
+    /// conditioning is nothing but the encoder's features.
+    pub source: Option<TensorView>,
     /// `[rows, …]` encoded reference media, when the task has references.
     pub images: Option<TensorView>,
     /// `[rows, …]` encoded reference audio, when the task has audio references.
@@ -549,6 +556,21 @@ pub trait Denoiser {
 
     /// Fold `cond` into the latents the schedule starts from.
     fn prepare_latents<'a>(&self, f: &Forward, cond: Conditioning<'a>, out: Latents) -> Result<()>;
+
+    /// Fold the conditioner's output into `cond.text`, before the request's first evaluation.
+    ///
+    /// The executor calls this once per request, before it captures anything and outside a captured
+    /// replay: the launches are captured with everything else, so the forward must be capture-safe -
+    /// no host read, no synchronization, no allocation. `cond.source` is the buffer the conditioner
+    /// reads; `cond.text` is written in place over its own rows.
+    ///
+    /// The default does nothing: a model whose text encoder's features are everything its denoiser
+    /// reads has no conditioner. A model that has one overrides this, and leaves
+    /// [`Self::denoise`] reading `cond.text` alone.
+    fn prepare_conditioning(&self, f: &Forward, cond: Conditioning<'_>) -> Result<()> {
+        let _ = (f, cond);
+        Ok(())
+    }
 
     /// One denoising step: update `latents` in place with the model's velocity.
     fn denoise<'a>(
