@@ -17,7 +17,7 @@
 //! The checkpoint is read through its headers and converted on the host, so the run needs the
 //! shards' bytes but no CUDA context; a checkpoint whose shards are missing cannot be loaded this way.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use nn::{Checkpoint, DType, HostStore, WeightLoader};
@@ -54,10 +54,10 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(root: &PathBuf, cache: DType) -> Result<(), String> {
+fn run(root: &Path, cache: DType) -> Result<(), String> {
     // The configuration is read on its own so a metadata defect names itself before the load.
     let _ = Config::read(root).map_err(|error| format!("{}: {error}", root.display()))?;
-    let file = Checkpoint::open_roots(&[root.as_path()])
+    let file = Checkpoint::open_roots(&[root])
         .map_err(|error| format!("opening {}: {error}", root.display()))?;
     let mut store = HostStore::new();
     let model = {
