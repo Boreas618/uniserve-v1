@@ -1,0 +1,36 @@
+# The weighted_rms_norm operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
+# driver the Program Server runs for one descriptor and target).
+#
+# The descriptor is the normalization's own: the element type, the row width, the
+# lane tile that covers it, and whether each program publishes its row's largest
+# magnitude. The key is the one `WeightedRmsNormDescriptor`'s `Display` prints,
+# e.g. `dtype_bf16_columns_3072_tile_4096_absmax_false`.
+
+op = "weighted_rms_norm"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/weighted_rms_norm.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+[kernel.descriptors]
+dimensions = { dtype = ["bf16", "fp16", "f32"], columns = ["768", "1024", "1536", "2048", "3072", "4096", "5120", "6144", "7168", "8192", "12288", "16384"], tile = ["1024", "2048", "4096", "8192", "16384"], absmax = ["true", "false"] }
+
+[parameters]
