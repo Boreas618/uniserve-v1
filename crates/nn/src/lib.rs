@@ -60,7 +60,7 @@ pub use exchange::ExchangeViews;
 pub use forward::{Arena, Forward};
 pub use group::Group;
 pub use layers::{
-    AdaptivePool, Attention, AttentionBackend, Candidates, Conv1d, Conv3d, ConvGeometry,
+    AdaptivePool, Attention, AttentionBackend, BiasAdd, Candidates, Conv1d, Conv3d, ConvGeometry,
     ConvTranspose1d, Embedding, FrameMoments, FrameNormPad, FramePad, GatedActivation, Gelu,
     LayerNorm, Linear, ModulatedRmsNorm, Moe, Noise, PackedSwiGlu, ParallelLMHead, RmsNorm, Rotary,
     Rotation, Sampler, SamplerState, Samples, ScaledResidual, ScaledResidualLayerNorm,

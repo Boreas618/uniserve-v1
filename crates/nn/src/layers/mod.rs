@@ -20,6 +20,7 @@
 
 mod activation;
 mod attention;
+mod bias;
 mod conv;
 mod embedding;
 mod exchange;
@@ -38,6 +39,7 @@ mod segments;
 
 pub use activation::{GatedActivation, Gelu, PackedSwiGlu, Snake, SwiGlu};
 pub use attention::{Attention, AttentionBackend, TRTLLM_WORKSPACE_BYTES};
+pub use bias::BiasAdd;
 pub use conv::{Conv1d, Conv3d, ConvGeometry, ConvTranspose1d};
 pub use embedding::Embedding;
 pub use exchange::UlyssesExchange;
