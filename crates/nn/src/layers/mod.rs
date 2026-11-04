@@ -31,6 +31,7 @@ mod moe;
 mod noise;
 mod norm;
 mod pool;
+mod position;
 mod residual;
 mod rope;
 mod rows;
@@ -51,6 +52,7 @@ pub use noise::{Key as NoiseKey, Noise};
 pub use norm::{LayerNorm, RmsNorm};
 pub use ops::rope::Rotation;
 pub use pool::AdaptivePool;
+pub use position::PositionInterpolate;
 pub use residual::{
     ScaledResidual, ScaledResidualLayerNorm, ScaledResidualRmsNorm, WeightedRmsNorm,
 };
