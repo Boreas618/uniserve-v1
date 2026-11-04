@@ -664,6 +664,9 @@ impl MainProcess {
         let mut reported = Instant::now();
         loop {
             if self.stopping {
+                // The report is stated once more on the way out: an epoch's counters are additive
+                // and a frontend that only saw the passes would lose the last second of them.
+                self.send_metrics();
                 return Ok(None);
             }
             let deadline = self.watchdog.deadline(oldest(&running));
