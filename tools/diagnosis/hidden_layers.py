@@ -515,6 +515,22 @@ def main():
         sums = ""
         if path.stem.endswith("_router_weights") and expected.ndim == 2:
             sums = renormalization_note(actual, expected)
+        # A stage that is right up to one factor is a different fault from one that is wrong: the
+        # least-squares factor and what remains after removing it say which, and a factor near a power
+        # of two names its own cause.
+        ours_flat = actual.astype(np.float64).ravel()
+        theirs_flat = expected.astype(np.float64).ravel()
+        denominator = float(np.dot(theirs_flat, theirs_flat))
+        if denominator > 0.0:
+            factor = float(np.dot(ours_flat, theirs_flat)) / denominator
+            if abs(factor - 1.0) > 0.01:
+                residual = float(np.linalg.norm(ours_flat - factor * theirs_flat))
+                residual /= float(np.linalg.norm(theirs_flat))
+                sums += (
+                    f"  one factor fits: ours = {factor:.4e} x the reference's, and the residual after"
+                    f" removing it is {residual:.3e}"
+                    + (" (1/2048 is 4.8828e-04)" if 0.9 < factor * 2048.0 < 1.1 else "")
+                )
         lines.append(
             f"{path.name:<16} {str(expected.shape):<12} {rel:10.3e} {rms:10.3e} {absolute:10.3e}"
             f" {increment:10.3e}  {worst} ({rows[worst]:.3e}){flag}{prefix_text}{sums}"
