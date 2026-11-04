@@ -280,6 +280,12 @@ impl Attention {
     /// reading a table at a null address. A batch that packs several sequences always passes both,
     /// and one table without the other is refused by the operator.
     ///
+    /// `max_kv_len` is the bucket's own key bound: the longest reduction *this* launch makes, which
+    /// is what the tolerance bound is written against, and it is a launch-time value because a
+    /// deployment's buckets differ by tens of thousands of rows. It must cover the keys this call
+    /// passes and stay within the deployment's declared ceiling ([`Self::paged`]'s `max_kv_len`),
+    /// which is the bound the operator was accepted for.
+    ///
     /// Serves both the `Dense` and the `Fp32` backend; the element types the views carry decide the
     /// descriptor, and the package behind it decides the tile and split heuristics.
     #[allow(
@@ -294,6 +300,7 @@ impl Attention {
         value: TensorView,
         cu_seq_lens_q: Option<TensorView>,
         cu_seq_lens_k: Option<TensorView>,
+        max_kv_len: u32,
         out: TensorView,
     ) -> Result<()> {
         if !matches!(
@@ -304,6 +311,22 @@ impl Attention {
                 "Attention::attend_dense: the {:?} backend is not a dense attention",
                 self.backend
             )));
+        }
+        let kv_tokens = key.shape.dim(0);
+        if u64::from(max_kv_len) < kv_tokens {
+            return Err(Error::shape(
+                "Attention::attend_dense",
+                format!("a {max_kv_len}-key bound for a launch of {kv_tokens} keys"),
+            ));
+        }
+        if max_kv_len > self.max_kv_len {
+            return Err(Error::shape(
+                "Attention::attend_dense",
+                format!(
+                    "a {max_kv_len}-key bound beyond the {} this module was accepted for",
+                    self.max_kv_len
+                ),
+            ));
         }
         let descriptor = DenseDescriptor {
             query: query.dtype,
@@ -318,7 +341,7 @@ impl Attention {
                 Mask::Dense
             },
             windowed: self.window.is_some(),
-            max_kv_len: self.max_kv_len,
+            max_kv_len,
             // Which of the two programs this call launches, not what this launch reads.
             cu_seq_lens: cu_seq_lens_q.is_some(),
         };

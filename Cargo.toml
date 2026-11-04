@@ -8,6 +8,7 @@ members = [
     "crates/platform",
     "crates/daemon",
     "crates/engine",
+    "crates/executor",
     "crates/frontend",
     "crates/ipc",
     "crates/manager",
@@ -41,6 +42,13 @@ anyhow.workspace = true
 clap.workspace = true
 daemon.workspace = true
 engine.workspace = true
+executor.workspace = true
+ipc.workspace = true
+nn.workspace = true
+ops.workspace = true
+platform.workspace = true
+proto.workspace = true
+qwen3-moe.workspace = true
 libc.workspace = true
 libloading.workspace = true
 mimalloc.workspace = true
@@ -72,6 +80,7 @@ readme = "README.md"
 platform = { path = "crates/platform" }
 daemon = { path = "crates/daemon" }
 engine = { path = "crates/engine" }
+executor = { path = "crates/executor" }
 frontend = { path = "crates/frontend" }
 ipc = { path = "crates/ipc" }
 media = { path = "crates/media" }

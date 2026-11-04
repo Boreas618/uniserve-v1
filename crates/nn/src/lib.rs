@@ -50,9 +50,10 @@ pub mod tensor;
 pub mod weights;
 
 pub use capability::{
-    BatchRow, BatchRows, CausalLm, Conditioning, DecodedMedia, Decoder, Denoiser, Encoder,
-    EncoderInputs, EncoderOutputs, ImageInput, KvGroup, KvPlanes, KvView, Latents, Layout, RowKind,
-    Seed, StateTable, Step, TokenBatch, VideoRequest, VideoTask,
+    BatchRow, BatchRows, CausalLm, ConditionRole, ConditionShape, Conditioning, DecodedMedia,
+    Decoder, Denoiser, Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, EncoderPrompt,
+    ImageInput, ImageShape, KvGroup, KvPlanes, KvView, Latents, Layout, RowKind, Seed, StateTable,
+    Step, TokenBatch, VideoRequest, VideoTask,
 };
 pub use checkpoint::{Checkpoint, CheckpointFile, FileIdentity, TensorLocation};
 pub use error::{Error, Result};
@@ -60,16 +61,19 @@ pub use exchange::ExchangeViews;
 pub use forward::{Arena, Forward};
 pub use group::Group;
 pub use layers::{
-    AdaptivePool, Attention, AttentionBackend, Candidates, Conv1d, Conv3d, ConvGeometry,
-    ConvTranspose1d, Embedding, FrameMoments, FrameNormPad, FramePad, GatedActivation,
-    GatedResidual, Gelu, LayerNorm, Linear, ModulatedRmsNorm, Moe, Noise, NoiseKey, PackedSwiGlu,
-    ParallelLMHead, Patch, PatchMode, RmsNorm, Rotary, Rotate, Rotation, Sampler, SamplerState,
-    Samples, ScaledAdd, ScaledResidual, ScaledResidualLayerNorm, ScaledResidualRmsNorm, Sections,
-    Silu, Snake, SwiGlu, TRTLLM_WORKSPACE_BYTES, UlyssesExchange, VsaTiles, WeightedRmsNorm,
-    gather_rows,
+    Activation, AdaptivePool, Attention, AttentionBackend, Candidates, Conv1d, Conv3d,
+    ConvGeometry, ConvTranspose1d, Embedding, FrameMoments, FrameNormPad, FramePad,
+    GatedActivation, GatedResidual, Gelu, LayerNorm, Linear, ModulatedRmsNorm, Moe, Noise,
+    NoiseKey, PackedSwiGlu, ParallelLMHead, Patch, PatchMode, RmsNorm, Rotary, Rotate, Rotation,
+    Sampler, SamplerState, Samples, ScaledAdd, ScaledResidual, ScaledResidualLayerNorm,
+    ScaledResidualRmsNorm, Sections, SegmentAttention, SegmentTables, Silu, Snake, SwiGlu,
+    TRTLLM_WORKSPACE_BYTES, UlyssesExchange, VsaTiles, WeightedRmsNorm, gather_rows,
 };
 pub use model::{Block, BlockName, Model, PhaseId};
 pub use ops::PhaseKind;
 pub use ops::{DType, DevicePtr, MAX_RANK, Shape, Strides, TensorView};
 pub use tensor::Backing;
-pub use weights::{Quantization, RetainedWeights, Weight, WeightKey, WeightLayout, WeightLoader};
+pub use weights::{
+    Quantization, QuantizedStack, QuantizedWeight, RetainedWeights, Weight, WeightKey, WeightLayout,
+    WeightLoader,
+};
