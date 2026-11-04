@@ -767,18 +767,11 @@ impl<'a> WeightLoader<'a> {
                         ));
                     }
                 };
-                for (seen, here, what) in [
-                    (rows, rows_here, "rows"),
-                    (columns, columns_here, "columns"),
-                ] {
-                    match seen {
-                        None => {
-                            if what == "rows" {
-                                rows = Some(here);
-                            } else {
-                                columns = Some(here);
-                            }
-                        }
+                // The stack's geometry is the first expert's; every other projection must agree,
+                // because one set of views serves them all.
+                let agreed = |seen: &mut Option<u64>, here: u64, what: &str| -> Result<()> {
+                    match *seen {
+                        None => *seen = Some(here),
                         Some(agreed) if agreed != here => {
                             return Err(Error::weight(
                                 &values_name,
@@ -787,7 +780,10 @@ impl<'a> WeightLoader<'a> {
                         }
                         Some(_) => {}
                     }
-                }
+                    Ok(())
+                };
+                agreed(&mut rows, rows_here, "rows")?;
+                agreed(&mut columns, columns_here, "columns")?;
 
                 let scales = self.checkpoint.read(&scales_name)?;
                 if scales.dtype != DType::U8 {
