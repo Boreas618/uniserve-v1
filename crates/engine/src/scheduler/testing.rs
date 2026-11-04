@@ -261,7 +261,7 @@ fn build_packaged_module() -> Vec<u8> {
     let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)
-        .expect("crates/engine lives two levels below the workspace root")
+        .unwrap_or_else(|| panic!("crates/engine lives two levels below the workspace root"))
         .to_path_buf();
     let target_dir = workspace.join("target").join("it-policy");
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
