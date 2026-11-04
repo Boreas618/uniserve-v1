@@ -351,6 +351,40 @@ mod tests {
     }
 
     #[test]
+    fn a_band_writes_every_row_it_keeps_and_no_row_it_drops() {
+        // The band property at the plan's own level: shifted back by the run's origin, the rows the
+        // band's tiles write must be exactly the rows the caller keeps. A band one row short loses a
+        // latent row silently, which is why this is asserted row by row rather than as a count.
+        let encoder = canvas();
+        for (start, stop) in [
+            (0, 48),
+            (0, 1),
+            (4, 12),
+            (10, 11),
+            (11, 21),
+            (20, 40),
+            (21, 22),
+            (32, 33),
+            (47, 48),
+        ] {
+            let band = encoder.band(start, stop).expect("a band");
+            let origin = band.origin;
+            let mut written = vec![false; (stop - start) as usize];
+            for tile in &band.tiles {
+                let first = tile.rows.0.max(start) - origin;
+                let last = (tile.rows.0 + tile.rows.1).min(stop) - origin;
+                for row in first..last {
+                    written[row as usize] = true;
+                }
+            }
+            assert!(
+                written.iter().all(|row| *row),
+                "band [{start}, {stop}) from origin {origin} leaves a row unwritten"
+            );
+        }
+    }
+
+    #[test]
     fn the_bands_of_a_raster_cover_its_rows_without_gap_or_overlap() {
         let encoder = canvas();
         let mut next = 0;
