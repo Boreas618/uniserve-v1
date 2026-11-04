@@ -90,6 +90,24 @@ pub struct PoolMetrics {
     pub budget: u64,
 }
 
+/// What the device's one allocator has mapped, per pool kind (4.1, item 5's invariant).
+///
+/// One allocator per device owns all three pools, so these figures are one booking's totals and
+/// not the sum of two owners' books: the graph range the captured graphs address, the scratch the
+/// shadow pair's region and the paired forward's pages come from, and the resident pools another
+/// owner carves. `budget` is the allowance they are all booked against.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeviceMemory {
+    /// Bytes mapped for captured graphs and their arena plans.
+    pub graph: u64,
+    /// Bytes mapped for scratch: the shadow pair's region and the paired forward's pages.
+    pub scratch: u64,
+    /// Bytes mapped for resident storage by its owner, when the executor shares the allocator.
+    pub resident: u64,
+    /// The device budget every mapping is booked against.
+    pub budget: u64,
+}
+
 /// The books of a runner's graph pools: the reservation per stream, each bucket's planned extent,
 /// and how much of each pool is mapped.
 ///
@@ -272,6 +290,16 @@ impl Pools {
     /// How many streams share the range.
     pub fn streams(&self) -> usize {
         self.streams
+    }
+
+    /// The device's mapped bytes per pool kind, from the one allocator that books them all.
+    pub fn memory(&self) -> DeviceMemory {
+        DeviceMemory {
+            graph: self.allocator.mapped_bytes(PoolKind::Graph) as u64,
+            scratch: self.allocator.mapped_bytes(PoolKind::Scratch) as u64,
+            resident: self.allocator.mapped_bytes(PoolKind::Resident) as u64,
+            budget: self.ledger.budget,
+        }
     }
 
     /// What the device's graph pools hold and what they may hold (4.1, item 5's invariant).
