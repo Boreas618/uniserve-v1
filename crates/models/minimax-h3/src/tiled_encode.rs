@@ -163,7 +163,8 @@ impl ClipEncoder {
     /// The plan of the tile rows `first..=last`, cropping `[start, stop)`.
     fn plan_of(&self, start: u32, stop: u32, (first, last): (usize, usize)) -> Plan {
         let owned = self.grid.owned(self.latent.0);
-        let blends = Grid::blends(&self.grid.rows);
+        let rows_blend = Grid::blends(&self.grid.rows);
+        let columns_blend = Grid::blends(&self.grid.columns);
         let mut tiles = Vec::with_capacity((last + 1 - first) * self.grid.columns.len());
         for row in first..=last {
             for column in 0..self.grid.columns.len() {
@@ -180,8 +181,15 @@ impl ClipEncoder {
                     // The fade reads the row above, which only the first row of the run lacks: a
                     // band that starts inside a seam reads the row above it through
                     // `Grid::band`, so that row is in the run.
-                    above: if row > first { blends[row - 1] } else { 0 },
-                    left: if column > 0 { blends[column] } else { 0 },
+                    // A tile fades over the seam it shares with the neighbour *before* it: the row
+                    // above and the column to its left, each seam its own width
+                    // (`uniserve/nn/vae/tiled.py:63-73`).
+                    above: if row > first { rows_blend[row - 1] } else { 0 },
+                    left: if column > 0 {
+                        columns_blend[column - 1]
+                    } else {
+                        0
+                    },
                 });
             }
         }
@@ -301,6 +309,10 @@ mod tests {
         assert_eq!(plan.tiles[7].above, 6);
         assert_eq!(plan.tiles[8].above, 6);
         assert_eq!(plan.tiles[8].left, 5);
+        // The last column's fade is its own seam, not the rows': the two axes have different
+        // widths, and reading one for the other is a defect this assertion is here to catch.
+        assert_eq!(plan.tiles[6].left, 4);
+        assert_eq!(plan.tiles[6].above, 0);
     }
 
     #[test]
