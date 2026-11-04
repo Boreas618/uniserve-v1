@@ -1863,6 +1863,32 @@ impl Cudnn {
             ),
             None,
         ));
+        // 8: a zero request with a real array. If the library reads
+        // `requestedElementCount = 0` as "everything you have", this fills
+        // where every non-zero request did not.
+        let line = match self.fill_once(heuristic, 0, listed.max(1), -1, false) {
+            Ok(line) => line,
+            Err(error) => format!("refused: {error}"),
+        };
+        steps.push((
+            format!("engine heuristic fill 8 requestedElementCount 0 with a real array: {line}"),
+            None,
+        ));
+        // 9: the counted descriptor, finalized again, then filled. If the
+        // count query leaves the descriptor unable to fill, a second finalize
+        // puts that back and this fills where 1 and 2 did not.
+        let line = match self
+            .api
+            .finalize(heuristic, "cudnnBackendFinalize")
+            .and_then(|()| self.fill_once(heuristic, listed as i64, listed.max(1), -1, false))
+        {
+            Ok(line) => line,
+            Err(error) => format!("refused: {error}"),
+        };
+        steps.push((
+            format!("engine heuristic fill 9 finalized again before the fill: {line}"),
+            None,
+        ));
         steps
     }
 
