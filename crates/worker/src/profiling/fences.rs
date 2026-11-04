@@ -51,7 +51,10 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use platform::{DeviceAllocation, DeviceId, Function, Module, PinnedBuffer, Stream};
+use platform::{
+    Capture, CaptureMode, Device, DeviceAllocation, DeviceId, Function, LaunchConfig, Library,
+    PinnedBuffer, Stream,
+};
 use ipc::FenceHistogram;
 
 use crate::{Error, Result, lock};
@@ -252,7 +255,9 @@ struct OpenStep {
 /// step cells and the double buffer, and the reader's position in it.
 struct DeviceFences {
     device: DeviceId,
-    _module: Module,
+    /// The library holding the probe kernels; it outlives every launch of
+    /// them and every graph that captured one.
+    _library: Library,
     fence: Function,
     clock: Function,
     /// `u32[1 + components]`.
@@ -657,9 +662,9 @@ pub(crate) fn matches(pattern: &str, name: &str) -> bool {
 
 impl DeviceFences {
     fn new(device: DeviceId, components: usize) -> Result<Self> {
-        let module = Module::load_ptx(device, PTX)?;
-        let fence = module.function("uniserve_fence")?;
-        let clock = module.function("uniserve_clock")?;
+        let library = Library::load(&Device::new(device)?, PTX.as_bytes())?;
+        let fence = library.kernel("uniserve_fence")?;
+        let clock = library.kernel("uniserve_clock")?;
         let control = Stream::with_priority(device, -5)?;
         let switches = DeviceAllocation::linear(device, 4 * (1 + components))?;
         let counters = DeviceAllocation::linear(device, 16)?;
@@ -683,7 +688,7 @@ impl DeviceFences {
         control.synchronize()?;
         Ok(Self {
             device,
-            _module: module,
+            _library: library,
             fence,
             clock,
             switches,
@@ -732,10 +737,11 @@ impl DeviceFences {
             (&raw mut filled).cast(),
             (&raw mut shift).cast(),
         ];
-        // SAFETY: the parameters are the kernel's, and every buffer they
-        // address lives with the process's fences, past every replay of a
-        // graph that captured the launch.
-        unsafe { self.fence.launch(stream, 1, 1, &mut parameters) }?;
+        // The parameters are the kernel's, and every buffer they address
+        // lives with the process's fences, past every replay of a graph that
+        // captured the launch.
+        self.fence
+            .launch_ex(stream, &LaunchConfig::new([1, 1, 1], [1, 1, 1]), &mut parameters)?;
         Ok(())
     }
 
@@ -841,7 +847,8 @@ impl DeviceFences {
         let before = (realtime(), platform::cupti::timestamp().unwrap_or(0));
         let started = Instant::now();
         // SAFETY: the parameter is the kernel's; the word outlives it.
-        unsafe { self.clock.launch(&self.control, 1, 1, &mut parameters)? };
+        self.clock
+            .launch_ex(&self.control, &LaunchConfig::new([1, 1, 1], [1, 1, 1]), &mut parameters)?;
         let gpu = loop {
             // SAFETY: as above; the device writes the word whole.
             let value = unsafe { std::ptr::read_volatile(self.clock_out.as_ptr().cast::<u64>()) };
@@ -1125,39 +1132,14 @@ mod device_tests {
         Ok(())
     }
 
-    /// The graph of what `issue` launches on `stream` while the stream
-    /// captures in `CU_STREAM_CAPTURE_MODE_GLOBAL`, the mode of
-    /// `torch.cuda.graph`; fails when the capture was invalidated.
+    /// The graph of what `issue` launches on `stream`, captured in
+    /// [`CaptureMode::Global`], the mode of `torch.cuda.graph`.
     fn capture_globally(
         stream: &Stream,
         issue: impl FnOnce(&Stream) -> Result<()>,
     ) -> Result<platform::GraphExec> {
-        type Capture = unsafe extern "C" fn(*mut c_void, i32) -> i32;
-        type Captured = unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> i32;
-        type Destroy = unsafe extern "C" fn(*mut c_void) -> i32;
-        // SAFETY: loading the driver runs only its initializers; each type is
-        // its symbol's C prototype.
-        let (begin, end, destroy) = unsafe {
-            let driver = Box::leak(Box::new(libloading::Library::new("libcuda.so.1").unwrap()));
-            (
-                *driver.get::<Capture>(b"cuStreamBeginCapture_v2").unwrap(),
-                *driver.get::<Captured>(b"cuStreamEndCapture").unwrap(),
-                *driver.get::<Destroy>(b"cuGraphDestroy").unwrap(),
-            )
-        };
-        let context = platform::PrimaryContext::retain(stream.device())?;
-        let _current = context.enter()?;
-        let handle = stream.raw() as *mut c_void;
-        let mut graph = std::ptr::null_mut();
-        // SAFETY: the stream is live; the driver writes the captured graph,
-        // which is destroyed once instantiated.
-        unsafe {
-            assert_eq!(begin(handle, 0), 0);
-            issue(stream)?;
-            assert_eq!(end(handle, &mut graph), 0, "the capture was invalidated");
-            let graph_exec = platform::GraphExec::instantiate(stream.device(), graph as usize);
-            assert_eq!(destroy(graph), 0);
-            Ok(graph_exec?)
-        }
+        let mut capture = Capture::begin(stream, CaptureMode::Global)?;
+        issue(stream)?;
+        capture.end()?.instantiate()
     }
 }
