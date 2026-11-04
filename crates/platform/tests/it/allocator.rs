@@ -464,3 +464,103 @@ fn a_pool_keeps_addresses_and_contents_across_a_suspension() {
         "giving out a freed block books nothing new"
     );
 }
+
+/// The device's ledger behind several allocators of the same pool: it counts
+/// what they hold together, adding what each reports and releasing what each
+/// gives up.
+struct SharedLedger {
+    total: AtomicU64,
+    limit: u64,
+}
+
+impl SharedLedger {
+    fn new(limit: u64) -> Arc<Self> {
+        Arc::new(Self {
+            total: AtomicU64::new(0),
+            limit,
+        })
+    }
+
+    fn total(&self) -> u64 {
+        self.total.load(Ordering::Relaxed)
+    }
+
+    fn add(&self, bytes: u64) -> platform::Result<()> {
+        let held = self.total() + bytes;
+        if held > self.limit {
+            return Err(Error::InvalidArgument(format!(
+                "the device's ledger refuses {held} bytes of a {}-byte allowance",
+                self.limit
+            )));
+        }
+        self.total.fetch_add(bytes, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+/// One allocator's place in a [`SharedLedger`]: a booking carries that
+/// allocator's own pool total, so the adapter keeps the total it last reported
+/// and passes the difference on — the shape a device with several allocators of
+/// one pool needs (a rank's graph pools are several).
+struct Adapter {
+    ledger: Arc<SharedLedger>,
+    last: Mutex<u64>,
+}
+
+impl Budget for Adapter {
+    fn book(&self, _device: DeviceId, _pool: PoolKind, bytes: u64) -> platform::Result<()> {
+        let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
+        if bytes >= *last {
+            self.ledger.add(bytes - *last)?;
+        } else {
+            self.ledger
+                .total
+                .fetch_sub(*last - bytes, Ordering::Relaxed);
+        }
+        // The ledger moved before this adapter's total does, so a refusal leaves
+        // both as they were.
+        *last = bytes;
+        Ok(())
+    }
+}
+
+fn with_adapter(device: &platform::Device, ledger: &Arc<SharedLedger>) -> Allocator {
+    let adapter = Arc::new(Adapter {
+        ledger: Arc::clone(ledger),
+        last: Mutex::new(0),
+    });
+    let booking: Arc<dyn Budget> = adapter;
+    Allocator::new(device, booking).unwrap()
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn several_allocators_of_one_pool_book_one_ledger_through_an_adapter() {
+    let _driver = exclusive_driver();
+    let device = platform::Device::new(DEVICE).unwrap();
+    let ledger = SharedLedger::new(32 << 20);
+    let mut first = with_adapter(&device, &ledger);
+    let mut second = with_adapter(&device, &ledger);
+    first.reserve(PoolKind::Graph, 8 << 20).unwrap();
+    second.reserve(PoolKind::Graph, 8 << 20).unwrap();
+
+    // A booking carries the allocator's own pool total, not a device-wide one,
+    // which is what lets an adapter tell the two apart.
+    let one = first.allocate(PoolKind::Graph, 4096).unwrap();
+    assert_eq!(first.mapped_bytes(PoolKind::Graph), one.len());
+    assert_eq!(ledger.total(), one.len() as u64);
+    let two = second.allocate(PoolKind::Graph, 4096).unwrap();
+    assert_eq!(second.mapped_bytes(PoolKind::Graph), two.len());
+    assert_eq!(
+        ledger.total(),
+        one.len() as u64 + two.len() as u64,
+        "the ledger counts what both allocators hold"
+    );
+
+    // A suspension reports the pool down to nothing, and the ledger releases
+    // exactly that allocator's share; the restore puts it back.
+    first.suspend().unwrap();
+    assert_eq!(ledger.total(), two.len() as u64);
+    first.restore().unwrap();
+    assert_eq!(ledger.total(), one.len() as u64 + two.len() as u64);
+}
