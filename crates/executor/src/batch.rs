@@ -532,6 +532,22 @@ pub trait Batches: Send + Sync {
     /// update's, which the main process reports as `PrecopyFailed`.
     fn shadow(&self, batch: Batch) -> Result<Submission>;
 
+    /// The bucket this executor would serve `computation` in, or `None` when it serves no such
+    /// computation (2.4's stated capability).
+    ///
+    /// The mechanism asks before it forms a media batch: a media call is served only where a
+    /// runner's plan states the computation, and the answer is the bucket that plan planned it
+    /// into, so the refusal the mechanism makes names a capability the executor does not state
+    /// rather than a check that was deleted. A missing phase is its own refusal: a batch cannot be
+    /// sent to a device that does not exist.
+    fn media(
+        &self,
+        _phase: ipc::PhaseId,
+        _computation: &crate::plan::Computation,
+    ) -> Result<Option<crate::plan::Bucket>> {
+        Ok(None)
+    }
+
     /// The pools this executor serves (4.2, 7.3): what the mechanism schedules against.
     ///
     /// The mechanism builds its `ExecutorInfo` from this and nothing else, so a pool whose ranks,
@@ -661,6 +677,14 @@ impl Executors {
 impl Batches for Executors {
     fn inventory(&self) -> &[Inventory] {
         &self.inventory
+    }
+
+    fn media(
+        &self,
+        phase: ipc::PhaseId,
+        computation: &crate::plan::Computation,
+    ) -> Result<Option<crate::plan::Bucket>> {
+        Ok(self.route(phase)?.media(computation))
     }
 
     fn submit(&self, batch: Batch) -> Result<Submission> {

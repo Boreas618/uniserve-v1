@@ -724,6 +724,7 @@ mod tests {
             variant: Variant::DecodeGreedy,
             rows,
             tokens: 1,
+            extent: crate::plan::Extent::None,
         }
     }
 
