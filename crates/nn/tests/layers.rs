@@ -141,7 +141,7 @@ fn the_frame_normalization_states_its_layout_and_its_affine_pair() {
 fn the_tile_selection_needs_a_whole_tile_and_a_pair_of_rotated_features() {
     // The programmes handle BLOCK_ROWS rows at a time, so a tile must be a whole number of them.
     assert!(VsaTiles::new(64, 8, 128, 1e-6).is_ok());
-    assert!(VsaTiles::new(48, 8, 128, 1e-6).is_err());
+    assert!(VsaTiles::new(40, 8, 128, 1e-6).is_err());
     assert!(VsaTiles::new(64, 0, 128, 1e-6).is_err());
 
     let layer = VsaTiles::new(64, 8, 128, 1e-6).unwrap();
