@@ -631,12 +631,12 @@ async fn commit(State(state): State<AdminState>) -> Response {
         // main processes', and the epoch keeps no previous generation
         // afterwards (§7.3 steps 5-6). Only when no program-layer update is in
         // flight does the configuration's own commit run.
-        let number = admin.running_number();
+        // The update the probation belongs to is the one this operation ends,
+        // numbered when it was applied — not this operation's own number.
         let epochs = leader.epochs();
-        let probation = epochs
-            .program_update()
-            .filter(|program| program.update.number == number);
+        let probation = epochs.program_update();
         if let Some(program) = probation {
+            let number = program.update.number;
             match leader.commit_programs(number).await {
                 Ok(true) => {
                     program_phase(&admin, &epochs, Phase::Committed, program.epoch, &program.update);
@@ -744,12 +744,12 @@ async fn rollback(State(state): State<AdminState>, body: axum::body::Bytes) -> R
         // A program-layer probation returns to the generation before it first,
         // with the reason the operator gave (§7.3 step 5); the configuration's
         // own rollback runs only when no program-layer update is in flight.
-        let number = admin.running_number();
+        // The update the probation belongs to is the one this operation ends,
+        // numbered when it was applied — not this operation's own number.
         let epochs = leader.epochs();
-        let probation = epochs
-            .program_update()
-            .filter(|program| program.update.number == number);
+        let probation = epochs.program_update();
         if let Some(program) = probation {
+            let number = program.update.number;
             match leader.rollback_programs(number, &reason).await {
                 Ok(true) => {
                     program_phase(&admin, &epochs, Phase::Reverted, program.epoch, &program.update);
