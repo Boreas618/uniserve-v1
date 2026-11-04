@@ -726,6 +726,7 @@ impl Scheduler {
         let mut inputs = Vec::with_capacity(batch.requests.len());
         let mut sampling = Vec::with_capacity(batch.requests.len());
         let mut draws = Vec::with_capacity(batch.requests.len());
+        let mut tables = Vec::with_capacity(batch.requests.len());
         for (call, placed) in &batch.requests {
             let Some(state) = self.running.get(&call.request_key.request_id) else {
                 tracing::debug!(
@@ -751,15 +752,45 @@ impl Scheduler {
             inputs.push(tokens);
             sampling.push(&state.req.sampling);
             draws.push(state.sampling_position);
+            // The layout addresses the request's current cache tables. A call
+            // declares a table on the wire only when it changed, so the
+            // declaration is a delta and not the layout: a decode whose pages
+            // did not move declares none, and the batch it travels in still
+            // needs the table it writes through.
+            let declared = placed.block_tables.clone();
+            tables.push(if declared.is_empty() {
+                let Some(pool) = state.request_pool_idx() else {
+                    tracing::debug!("a batch is dropped: a request holds no pool row");
+                    return;
+                };
+                match state.block_tables() {
+                    Some(tables) => tables
+                        .iter()
+                        .map(|table| IpcBlockTable {
+                            request_pool_idx: pool,
+                            group_id: u32::try_from(table.group_id()).unwrap_or(u32::MAX),
+                            start_page: u32::try_from(table.start_page()).unwrap_or(u32::MAX),
+                            unit_ids: table.unit_ids(),
+                            allocated_tokens: u32::try_from(table.capacity_tokens())
+                                .unwrap_or(u32::MAX),
+                        })
+                        .collect(),
+                    None => Vec::new(),
+                }
+            } else {
+                declared
+            });
         }
         batch.columns = columns::columns(
             &batch.requests,
+            &tables,
             &inputs,
             &sampling,
             &draws,
             page,
             max_kv_len,
         );
+
         if batch.columns.is_none() {
             let tokens = batch
                 .requests
