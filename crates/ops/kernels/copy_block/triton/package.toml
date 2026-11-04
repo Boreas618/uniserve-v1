@@ -18,6 +18,7 @@ packages = []
 
 [module]
 form = "cubin"
+metadata = "metadata.json"
 
 [source]
 kind = "triton"
@@ -26,7 +27,7 @@ script = "src/build.py"
 
 [kernel]
 target = "arch"
-architectures = ["sm_100a", "sm_90a"]
+architectures = ["sm_100a", "sm_90a", "sm_100f"]
 
 # `source_bf16_out_bf16`.
 [kernel.descriptors]
