@@ -187,10 +187,14 @@ def text_calls(text: dict, dtype: str) -> list[Call]:
                     "head_dim": str(head_dim),
                     "q_heads": str(heads // degree),
                     "kv_heads": str(kv_heads // degree),
-                    "mask": "dense",
+                    # The reference hands the language stack
+                    # `VarlenInput(lengths, lengths, (True,) * len(counts))`
+                    # (`uniserve/models/encoder.py:482`), so the key is the causal form; the tower's
+                    # is `(False,)` (`qwen3_vl/vision.py:281`). One stage reads both.
+                    "mask": "causal",
                     "window": "false",
                 },
-                f"attention.rs: the text stack's dense attention, {heads}/{kv_heads} heads {why}",
+                f"attention.rs: the text stack's causal attention, {heads}/{kv_heads} heads {why}",
             )
         )
         calls.append(
