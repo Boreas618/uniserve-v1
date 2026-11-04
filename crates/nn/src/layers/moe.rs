@@ -41,6 +41,15 @@ use crate::forward::Forward;
 use crate::layers::Linear;
 use crate::weights::{QuantizedStack, Weight};
 
+/// Scratch the encoded expert products are handed.
+///
+/// The size the trtllm-gen batched-GEMM tactic actually needs is the artifact's, so this is a *floor*
+/// rather than a promise: the entry computes its own requirement from the call and allocates a larger
+/// buffer when this one is short, which costs one allocation instead of a wrong result. Sizing it for
+/// the largest Qwen3-MoE case we serve (128 experts, 8 routes, 7168 hidden) keeps the launch path
+/// allocation-free, which is what a captured graph needs.
+const MOE_WORKSPACE_BYTES: u64 = 16 << 20;
+
 /// The tile geometry the grouped products' packages are compiled for.
 ///
 /// Like the row tile of a normalization this is program content (specs/worker.md 5.2, 5.4); the
@@ -741,6 +750,13 @@ impl Moe {
         // 1-3. The same prefix the dense block runs.
         let routes = self.route(f, hidden)?;
 
+        // The two encoded products take scratch the program uses for its own bookkeeping. The size is
+        // the artifact's, not ours: both keys are trtllm-gen modules, and their entry computes what its
+        // tactic needs and grows this buffer itself when it is short. What a caller buys by sizing it
+        // is that no launch allocates. One buffer serves both products because they run one after the
+        // other on this stream and neither keeps a view past its launch.
+        let workspace = arena.tensor(DType::U8, Shape::new(&[MOE_WORKSPACE_BYTES]))?;
+
         // 4. FC1 over the packed up/gate stack: the gated product of each permuted row.
         let gated = arena.tensor(hidden.dtype, Shape::new(&[routes.rows, intermediate]))?;
         let first =
@@ -756,6 +772,7 @@ impl Moe {
             permuted_to_expanded: routes.permuted_to_expanded,
             num_non_exiting_tiles: routes.num_non_exiting_tiles,
             out: gated,
+            workspace,
         };
 
         f.operate::<GatherGemmNvfp4>(&first, args)?;
@@ -774,6 +791,7 @@ impl Moe {
             permuted_to_expanded: routes.permuted_to_expanded,
             num_non_exiting_tiles: routes.num_non_exiting_tiles,
             out: products,
+            workspace,
         };
 
         f.operate::<RouteGemmNvfp4>(&second, args)?;
