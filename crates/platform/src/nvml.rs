@@ -16,12 +16,25 @@ const LIBNVML: &str = "libnvidia-ml.so.1";
 type NvmlReturn = i32;
 type NvmlDevice = *mut c_void;
 
+/// `nvmlReturn_t.NVML_SUCCESS`, compared with the header by
+/// [`tests::the_nvml_constants_are_the_headers`].
 const NVML_SUCCESS: NvmlReturn = 0;
+/// `nvmlReturn_t.NVML_ERROR_INSUFFICIENT_SIZE`, the status a process query
+/// answers when the caller's array is too short.
 const NVML_ERROR_INSUFFICIENT_SIZE: NvmlReturn = 7;
-/// `usedGpuMemory` when the driver cannot attribute storage to the process.
+/// `NVML_VALUE_NOT_AVAILABLE`: `usedGpuMemory` when the driver cannot attribute
+/// storage to the process.
+///
+/// The header spells it `#define NVML_VALUE_NOT_AVAILABLE (-1)`, a macro rather
+/// than an enumerator, and the field it fills is unsigned, so the crate keeps it
+/// as `u64::MAX` — the same bits. The header check does not table it: the reader
+/// takes a `#define`'s value only when it starts with a digit or a minus, and
+/// this one starts with a parenthesis.
 const NVML_VALUE_NOT_AVAILABLE: u64 = u64::MAX;
 
-/// `nvmlProcessInfo_t` (v2), returned by the `_v3` process queries.
+/// `nvmlProcessInfo_t` (v2), returned by the `_v3` process queries; its layout
+/// is compared with `nvml.h` by
+/// [`tests::the_nvml_structures_are_sized_by_the_headers`].
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct ProcessInfo {
@@ -31,7 +44,8 @@ struct ProcessInfo {
     compute_instance_id: u32,
 }
 
-/// `nvmlMemory_v2_t`.
+/// `nvmlMemory_v2_t`, whose layout is compared with `nvml.h` by
+/// [`tests::the_nvml_structures_are_sized_by_the_headers`].
 #[repr(C)]
 #[derive(Default)]
 struct RawMemory {
@@ -44,6 +58,11 @@ struct RawMemory {
 
 /// `NVML_STRUCT_VERSION(Memory, 2)`: the struct size with the version in the
 /// top byte.
+///
+/// This is the encoding `nvml.h` defines as a macro over `sizeof`, not an
+/// enumerator and not a number a header can state, so the header check cannot
+/// compare it; it is checked by the shape of [`RawMemory`] instead, which is
+/// what the size is computed from.
 const NVML_MEMORY_V2: u32 = size_of::<RawMemory>() as u32 | (2 << 24);
 
 /// The signature of NVML's `_v3` process queries.
@@ -276,5 +295,76 @@ impl Drop for Nvml {
     fn drop(&mut self) {
         // SAFETY: balances the nvmlInit of this session.
         let _ = unsafe { (self.api.shutdown)() };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The two structures this crate mirrors are laid out as `nvml.h` lays
+    /// them out: a field in the wrong place would return a plausible but wrong
+    /// byte count rather than an error, which no test reading a number can tell
+    /// from a real one.
+    #[test]
+    fn the_nvml_structures_are_sized_by_the_headers() {
+        use crate::header::struct_size;
+        for (name, size) in [
+            ("nvmlMemory_v2_t", std::mem::size_of::<super::RawMemory>()),
+            (
+                "nvmlProcessInfo_t",
+                std::mem::size_of::<super::ProcessInfo>(),
+            ),
+        ] {
+            match struct_size("nvml.h", name) {
+                Some(header) => assert_eq!(
+                    header, size,
+                    "{name}: nvml.h lays it out in {header} bytes, this crate in {size}"
+                ),
+                None => eprintln!(
+                    "skipped: nvml.h does not let {name} be laid out here, so the crate's {size} \
+                     bytes for it went uncompared"
+                ),
+            }
+        }
+    }
+
+    /// Every entry point this crate binds is declared by `nvml.h`, with the
+    /// version suffix it binds: a wrong suffix is a load failure at start-up,
+    /// and this says which name is wrong before a machine does.
+    #[test]
+    fn every_nvml_entry_point_is_declared_by_the_header() {
+        for name in [
+            "nvmlInit_v2",
+            "nvmlShutdown",
+            "nvmlErrorString",
+            "nvmlDeviceGetHandleByUUID",
+            "nvmlDeviceGetComputeRunningProcesses_v3",
+            "nvmlDeviceGetGraphicsRunningProcesses_v3",
+            "nvmlDeviceGetMemoryInfo_v2",
+        ] {
+            match crate::header::declares("nvml.h", name) {
+                Some(true) => {}
+                Some(false) => panic!("nvml.h does not declare {name}, which this crate binds"),
+                None => {
+                    eprintln!(
+                        "skipped: nvml.h is not provisioned here, so its entry points were not compared"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_nvml_constants_are_the_headers() {
+        crate::header::assert_constants(
+            "nvml.h",
+            &[
+                ("NVML_SUCCESS", super::NVML_SUCCESS as i64),
+                (
+                    "NVML_ERROR_INSUFFICIENT_SIZE",
+                    super::NVML_ERROR_INSUFFICIENT_SIZE as i64,
+                ),
+            ],
+        );
     }
 }

@@ -184,6 +184,7 @@ def compile_one(package, target, key, out, spec):
                 "-o",
                 str(entry_unit.with_suffix(".o")),
                 str(entry_unit),
+                *(f"-D{one}" for one in described.get("defines", [])),
                 f"-I{staging}",
                 f"-I{cuda_home() / 'include'}",
             ],

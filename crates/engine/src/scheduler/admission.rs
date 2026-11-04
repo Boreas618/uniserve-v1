@@ -18,8 +18,9 @@
 //! its route.
 
 use super::*;
-use crate::kv_cache::PrefixScope;
+use crate::kv_cache::{KvOffloadManager, PrefixScope};
 use ipc::ForwardMode;
+use scheduling::guest::Plan;
 
 /// One product a video request reserves: its declared name, the component
 /// output it is reserved under, and its request-sized shape.
@@ -91,6 +92,7 @@ impl Scheduler {
     /// waiting bound is reached. A rejection is sent on `event_tx` and its
     /// send result is ignored.
     pub(super) fn enqueue(&mut self, mut req: GenerationRequest, event_tx: EventTx) {
+        let id = req.request_id;
         let max_cache_tokens = match self.validate_submission(&req) {
             Ok(tokens) => tokens,
             Err(message) => {
@@ -142,17 +144,19 @@ impl Scheduler {
         }
         let st = self.request_state(req, event_tx, max_cache_tokens, continuation);
 
-        // Admission examines only the queue head, so the insertion position
-        // fixes the admission order. Under `Priority` a request goes after
-        // every queued request with a lower priority value, or an equal one
-        // and an earlier or equal arrival, so ties stay FIFO.
-        let position = match self.config.policy {
-            SchedulingPolicy::Fcfs => self.waiting.len(),
-            SchedulingPolicy::Priority => self.waiting.partition_point(|queued| {
-                (queued.req.priority, queued.queued_at) <= (st.req.priority, st.queued_at)
-            }),
-        };
-        self.waiting.insert(position, st);
+        // The queue keeps no order of its own: which queued request runs next
+        // is the policy's `Plan::admit`, and the mechanism admits in the plan's
+        // order (§4.4).
+        self.waiting.push_back(st);
+
+        // The policy sees the request as it arrived: nothing has happened to it
+        // yet, so every feature but the submitted ones is empty.
+        if let Some(view) = views::requests(self, self.recorder.recorded())
+            .into_iter()
+            .find(|view| view.id.0 == id.0)
+        {
+            self.recorder.record(views::arrived(view));
+        }
     }
 
     /// Checks a token-generation request against the loaded workers and
@@ -806,12 +810,11 @@ impl Scheduler {
     /// Admission stops at the first request that cannot be routed or
     /// reserved, leaving it at the queue head. A broken scheduler invariant
     /// also requeues the request, latches engine-fatal, and stops.
-    pub(super) fn admit_media(&mut self) {
-        // A closing scheduler admits nothing more, nor does one that sleeps.
-        if self.closing || self.admission_sleeps() {
-            return;
-        }
-        while self.running_request_count() < self.config.max_running_requests {
+    fn admit_media(&mut self, named: usize) {
+        for _ in 0..named {
+            if self.running_request_count() >= self.config.max_running_requests {
+                break;
+            }
             let Some(submission) = self.waiting_media.pop_front() else {
                 break;
             };
@@ -1313,12 +1316,83 @@ impl Scheduler {
     /// when the queue is empty, `max_running_requests` is reached, no request row is
     /// free, the head does not fit yet or finds no ready prefill worker, or a
     /// scheduler invariant breaks.
-    pub(super) fn admit(&mut self) {
+    /// Executes the plan's admission decisions (§4.4): the requests it
+    /// rejects are refused, and the ones it admits are tried in its order, the
+    /// mechanism stopping at the first the hard limits refuse so that a later
+    /// request never bypasses one the policy put first.
+    ///
+    /// The queues are ordered by the plan and bounded by it: a queued request
+    /// the plan does not name waits for a later step's plan, which is what makes
+    /// a policy's admission order its own rather than the arrival order.
+    pub(super) fn admit_plan(&mut self, plan: &Plan) {
         // A closing scheduler admits nothing more, nor does one that sleeps.
         if self.closing || self.admission_sleeps() {
             return;
         }
-        loop {
+        for id in &plan.reject {
+            self.reject_queued(ipc::RequestId(id.0));
+        }
+        let named: Vec<ipc::RequestId> = plan.admit.iter().map(|id| ipc::RequestId(id.0)).collect();
+        self.order_queues_by(&named);
+        let tokens_named = self
+            .waiting
+            .iter()
+            .filter(|state| named.contains(&state.req.request_id))
+            .count();
+        let media_named = self
+            .waiting_media
+            .iter()
+            .filter(|pending| named.contains(&pending.request.request_id))
+            .count();
+        self.admit_tokens(tokens_named);
+        self.admit_media(media_named);
+    }
+
+    /// Refuses one queued request the plan rejected, whether it waits as a
+    /// token request or as a media one.
+    fn reject_queued(&mut self, id: ipc::RequestId) {
+        if let Some(position) = self
+            .waiting
+            .iter()
+            .position(|state| state.req.request_id == id)
+            && let Some(state) = self.waiting.remove(position)
+        {
+            let _ = state.output.events.event_tx.send(Event::Rejected {
+                kind: RejectionKind::Overloaded,
+                message: "the scheduling policy rejected the request as over capacity".into(),
+            });
+        }
+        if let Some(position) = self
+            .waiting_media
+            .iter()
+            .position(|pending| pending.request.request_id == id)
+            && let Some(pending) = self.waiting_media.remove(position)
+        {
+            let _ = pending.event_tx.send(Event::Rejected {
+                    kind: RejectionKind::Overloaded,
+                    message: "the scheduling policy rejected the request as over capacity".into(),
+                });
+        }
+    }
+
+    /// Orders both queues by the plan's admission order: the requests it names
+    /// first and in its order, then the rest in the order they arrived, which is
+    /// the order a later plan's own naming or the mechanism's fallback sees.
+    fn order_queues_by(&mut self, order: &[ipc::RequestId]) {
+        let rank = |id: ipc::RequestId| order.iter().position(|named| *named == id);
+        self.waiting
+            .make_contiguous()
+            .sort_by_key(|state| rank(state.req.request_id).unwrap_or(usize::MAX));
+        self.waiting_media
+            .make_contiguous()
+            .sort_by_key(|pending| rank(pending.request.request_id).unwrap_or(usize::MAX));
+    }
+
+    /// The token half of the plan's admission: at most `named` requests, the
+    /// ones the plan named, and never one behind a request the hard limits
+    /// refused.
+    fn admit_tokens(&mut self, named: usize) {
+        for _ in 0..named {
             if self.running_request_count() >= self.config.max_running_requests
                 || self.storage.request_pool.is_empty()
             {
@@ -1399,33 +1473,25 @@ impl Scheduler {
                 // continuing another world's state reads none: the host's
                 // pages are keyed by the world that serves.
                 let mut host_tokens = 0;
-                if let Some(kv_offload) = self.kv_offload.as_mut()
-                    && let Some(step) = kv_offload.step(&target.0)
-                    && head.req.cache.read
-                    && head.req.cache.state_seeds.is_empty()
-                    && !head.has_context_images()
-                {
-                    // Reusable pages leave one prompt token to compute, as
-                    // in the device cache.
-                    let limit = n.saturating_sub(1) / step * step;
-                    if limit > cached_tokens {
-                        let keys = kv_offload.page_keys(
-                            &target.0,
-                            &head.req.prompt_token_ids,
-                            head.req.cache.isolation_key,
-                            limit,
-                        );
-                        match kv_offload.admission(
-                            head.req.request_id,
-                            &target.0,
-                            &keys,
-                            cached_tokens,
-                            limit,
-                        ) {
-                            Some(boundary) => host_tokens = boundary - cached_tokens,
-                            None => break,
-                        }
-                    }
+                match host_prefix(&mut self.kv_offload, head, &target, cached_tokens, n, 0) {
+                    HostHit::Serving(boundary) => host_tokens = boundary - cached_tokens,
+                    // The host is looking up this request's pages: the head
+                    // waits for the pins.
+                    HostHit::Pending => break,
+                    HostHit::Nothing => {}
+                }
+                // The two facts of the hit that no view can compute, recorded
+                // where admission measured them.
+                self.recorder.prefix_hit(
+                    scheduling::guest::RequestId(head.req.request_id.0),
+                    u32::try_from(cached_tokens).unwrap_or(u32::MAX),
+                    u32::try_from(host_tokens).unwrap_or(u32::MAX),
+                );
+                // One `Hit` per page the mechanism re-uses: a policy's LRU
+                // orders evictions by these, so a page that was hit must move.
+                for head_unit in &prefix_hit.matched_pages {
+                    self.recorder
+                        .hit(scheduling::guest::PageId(u64::from(*head_unit)));
                 }
                 let prefix_tokens = cached_tokens + host_tokens;
                 let first_chunk = n.saturating_sub(prefix_tokens).min(chunk_limit).max(1);
@@ -1491,7 +1557,7 @@ impl Scheduler {
     /// endpoint (prefix-cache residency is keyed by endpoint). The hit is an
     /// estimate; `acquire_cached_prefix` takes the actual prefix. Returns
     /// `None` when the runtime has no prefix cache or no prefill worker is ready.
-    fn prefill_target(
+    pub(super) fn prefill_target(
         &self,
         state: &RequestState,
     ) -> Option<((crate::WorkerGroupId, String), crate::kv_cache::PrefixHit)> {
@@ -1593,6 +1659,13 @@ impl Scheduler {
         reservation: AdmissionReservation,
     ) {
         let id = st.req.request_id;
+        // The policy sees every admission as it happens: the request becomes
+        // resident, and the watchdog's deadline starts with it.
+        let admitted_at =
+            scheduling::guest::Nanos(crate::clock::now_monotonic_us().saturating_mul(1_000));
+        let request = scheduling::guest::RequestId(id.0);
+        self.recorder.admitted(request, admitted_at);
+        self.watchdog.admitted(request, admitted_at);
         let request_key = RequestKey::new(self.engine_id, id, st.request_epoch);
         let AdmissionReservation {
             source,
@@ -1748,6 +1821,67 @@ pub(super) struct AdmissionReservation {
     source: ipc::WorkerEndpoint,
     request_slot: RequestSlot,
     prefix_cache: CacheAllocation,
+}
+
+/// What the host KV cache says about a request's prompt beyond its device hit.
+pub(super) enum HostHit {
+    /// Nothing to look for: no host cache serves that worker, the request
+    /// reads another world's pages or continues context images, or its prompt
+    /// is on the device already.
+    Nothing,
+    /// The host serves the prompt up to this token boundary.
+    Serving(usize),
+    /// The host is looking the pages up, and the request waits for the pins.
+    Pending,
+}
+
+/// Starts the host KV cache looking for the pages a request can reuse beyond
+/// the device hit it already has, up to `limit` tokens of its prompt.
+///
+/// Admission asks for the boundary it needs; a plan's `prefetch` asks again
+/// later, and the answer grows as host pages arrive. Reusable pages leave one
+/// prompt token to compute, as in the device cache.
+pub(super) fn host_prefix(
+    kv_offload: &mut Option<KvOffloadManager>,
+    state: &RequestState,
+    target: &(crate::WorkerGroupId, String),
+    device_hit: usize,
+    limit: usize,
+    min_deepening: usize,
+) -> HostHit {
+    let Some(kv_offload) = kv_offload.as_mut() else {
+        return HostHit::Nothing;
+    };
+    let Some(step) = kv_offload.step(&target.0) else {
+        return HostHit::Nothing;
+    };
+    if !state.req.cache.read
+        || !state.req.cache.state_seeds.is_empty()
+        || state.has_context_images()
+    {
+        return HostHit::Nothing;
+    }
+    let limit = limit.min(state.req.prompt_token_ids.len().saturating_sub(1)) / step * step;
+    if limit <= device_hit {
+        return HostHit::Nothing;
+    }
+    let keys = kv_offload.page_keys(
+        &target.0,
+        &state.req.prompt_token_ids,
+        state.req.cache.isolation_key,
+        limit,
+    );
+    match kv_offload.admission(
+        state.req.request_id,
+        &target.0,
+        &keys,
+        device_hit,
+        limit,
+        min_deepening,
+    ) {
+        Some(boundary) => HostHit::Serving(boundary),
+        None => HostHit::Pending,
+    }
 }
 
 /// Acquires the longest prefix every cache group can reuse and records cache

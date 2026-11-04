@@ -80,6 +80,12 @@ impl PoolKind {
 /// `platform` never talks to the Storage Server itself.
 pub trait Budget: Send + Sync {
     /// Books `bytes` as the total of `pool` on `device`, failing with no room.
+    ///
+    /// One call carries one pool's total, never the total over the device: the
+    /// allocator books each of its pools separately, so a budget that enforces
+    /// a device-wide or deployment-wide limit adds the kinds up itself. A
+    /// refused booking must leave the allocator nothing to undo — the booking
+    /// comes before the storage is created, and a refusal maps nothing.
     fn book(&self, device: DeviceId, pool: PoolKind, bytes: u64) -> Result<()>;
 }
 
