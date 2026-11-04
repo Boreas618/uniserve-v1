@@ -89,11 +89,14 @@ __global__ void sort_metadata_kernel(uniserve_moe_sort_call call) {
     const int64_t count = counts[expert];
     const int64_t tiles = tiles_of(count, call.tile_tokens);
     for (int64_t tile = 0; tile < tiles; ++tile) {
-      const int64_t first = (tile_offset + tile) * call.tile_tokens;
-      const int64_t live = count - tile * call.tile_tokens;
+      // The limit is the row the tile's live rows end at, counted from the
+      // first permuted row of the whole routing — TensorRT-LLM's `mnLimit`, and
+      // the GEMMs compute a tile's rows as `limit − tile · tile_tokens`.
+      const int64_t end_of_tile = (tile_offset + tile + 1) * call.tile_tokens;
+      const int64_t end_of_rows = tile_offset * call.tile_tokens + count;
       call.tile_to_expert[tile_offset + tile] = static_cast<int32_t>(expert);
       call.tile_to_limit[tile_offset + tile] =
-          static_cast<int32_t>(live < call.tile_tokens ? live : call.tile_tokens);
+          static_cast<int32_t>(end_of_tile < end_of_rows ? end_of_tile : end_of_rows);
     }
     tile_offset += tiles;
   }

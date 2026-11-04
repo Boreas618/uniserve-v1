@@ -22,7 +22,9 @@
 // vocabulary), `scales` is [tokens, top] route weights in `scales_dtype` —
 // accepted and not read by the sort, which writes indices alone. The outputs
 // are the tile metadata the grouped GEMMs read and the two permutation maps:
-// `tile_to_expert`/`tile_to_limit` [max_tiles], `expanded_to_permuted`
+// `tile_to_expert`/`tile_to_limit` [max_tiles] — the expert of a tile and the
+// permuted row its live rows end at, counted from the routing's first permuted
+// row (TensorRT-LLM's `mPtrCtaIdxXyToMnLimit`), `expanded_to_permuted`
 // [tokens, top] (-1 for a route this rank does not hold),
 // `permuted_to_expanded` [max_permuted_rows], and the two scalars
 // `total_padded_tokens` (padded permuted rows) and `num_non_exiting_tiles`
