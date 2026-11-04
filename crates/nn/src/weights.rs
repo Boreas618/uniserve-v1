@@ -502,6 +502,41 @@ pub struct QuantizedWeight {
     pub input_scale: Option<Weight>,
 }
 
+/// One packed table per projection: the axis order the batched-GEMM entry reads and the shape a
+/// checkpoint carries a tensor for.
+struct Projections {
+    /// Projections per expert: two for a fused up/gate stack, one for a down stack.
+    per: usize,
+    /// Experts in the stack.
+    experts: usize,
+}
+
+impl Projections {
+    /// The order over `per` projections of `experts` experts, both as published extents.
+    fn new(per: u64, experts: u64) -> Self {
+        Self {
+            per: usize::try_from(per).unwrap_or(0),
+            experts: usize::try_from(experts).unwrap_or(0),
+        }
+    }
+
+    /// How many scales the table holds.
+    fn len(&self) -> usize {
+        self.per * self.experts
+    }
+
+    /// `scales`, collected expert-major, as the table's little-endian f32 bytes.
+    fn bytes(&self, scales: &[f32]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(self.len() * 4);
+        for projection in 0..self.per {
+            for expert in 0..self.experts {
+                bytes.extend_from_slice(&scales[expert * self.per + projection].to_le_bytes());
+            }
+        }
+        bytes
+    }
+}
+
 /// A calibrated NVFP4 **stack of experts**, as `gather_gemm_nvfp4` and `route_gemm_nvfp4` read it.
 ///
 /// A model's expert block multiplies whole stacks: its weights are `[experts, rows, columns/2]` U8,
@@ -509,8 +544,9 @@ pub struct QuantizedWeight {
 /// projection** — so the scalar [`QuantizedWeight::global_scale`] cannot serve it, and a model may
 /// not build the table itself (constructing a weight is the loader's, not a model's). The loader
 /// publishes all three from the checkpoint's per-expert, per-projection tensors: the encoded values
-/// and scales concatenated in the operator's reading order, and the reciprocals as an
-/// `[experts, projections]` f32 weight.
+/// and scales concatenated in the operator's reading order, and the reciprocals as a
+/// `[projections, experts]` f32 weight — one packed table per projection, which is the shape the
+/// batched-GEMM entry reads and the shape the checkpoint itself carries a tensor per.
 ///
 /// The stack fused from an expert's `up_proj` and `gate_proj` is why the second axis exists: each of
 /// those has its own `weight_scale_2` in the checkpoint, so one scalar per expert would dequantize
@@ -524,12 +560,17 @@ pub struct QuantizedStack {
     /// Every expert of a stack agrees on it, and it is published unchanged: a model puts
     /// [`Self::scales`]`.dtype()` in the product's descriptor and nothing converts.
     pub scales: Weight,
-    /// `[experts, projections]` f32, row-major, in the stack's own projection order: the reciprocal
+    /// `[projections, experts]` f32, row-major, in the stack's own projection order: the reciprocal
     /// of each expert's **per-projection** checkpoint tensor scale.
+    ///
+    /// One packed table per projection rather than one row per expert, because that is what the
+    /// batched-GEMM entry takes: it reads each projection's table as `experts` consecutive floats. A
+    /// `[experts, projections]` table handed over as two rows would walk column 0 for even experts and
+    /// column 1 for odd ones, which is a wrong dequantization with nothing to show for it.
     pub global_scale: Weight,
     /// The layout the block scales are stored in.
     pub layout: ScaleLayout,
-    /// `[experts, projections]` f32, row-major, in the same order: the reciprocal of each expert's
+    /// `[projections, experts]` f32, row-major, in the same order: the reciprocal of each expert's
     /// **per-projection** activation tensor scale, when the caller asked for it.
     ///
     /// A ModelOpt MoE export calibrates each expert's projections separately, so one activation
@@ -1205,10 +1246,21 @@ impl<'a> WeightLoader<'a> {
 
         let values_shape = Shape::new(&[count, rows, columns / 2]);
         let scales_shape = Shape::new(&[count, per_expert_scales.dim(0), per_expert_scales.dim(1)]);
-        let scale_bytes: Vec<u8> = reciprocals
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect();
+        // `reciprocals` was collected expert-major, in the checkpoint's own reading order; the
+        // published table is projection-major, one packed row per projection.
+        let projections_shape = Shape::new(&[per, count]);
+        let strides = Projections::new(per, count);
+        if reciprocals.len() != strides.len() {
+            return Err(Error::weight(
+                name,
+                format!(
+                    "{per} projections of {count} experts are {} scales, and the checkpoint gave {}",
+                    strides.len(),
+                    reciprocals.len()
+                ),
+            ));
+        }
+        let scale_bytes: Vec<u8> = strides.bytes(&reciprocals);
         let files = self.identities(&fields)?;
 
         let values = self.publish_computed(
@@ -1261,19 +1313,16 @@ impl<'a> WeightLoader<'a> {
                         .chain(fields.iter().cloned())
                         .collect(),
                     start: 0,
-                    shape: Shape::new(&[count, per]),
+                    shape: projections_shape,
                     stride: None,
                 },
             },
-            Shape::new(&[count, per]),
+            projections_shape,
             &scale_bytes,
         )?;
         let input_scale = if input_scale {
-            let bytes: Vec<u8> = activation_reciprocals
-                .iter()
-                .flat_map(|value| value.to_le_bytes())
-                .collect();
-            let shape = Shape::new(&[count, per]);
+            let bytes = strides.bytes(&activation_reciprocals);
+            let shape = projections_shape;
             let files = self.identities(
                 &fields
                     .iter()

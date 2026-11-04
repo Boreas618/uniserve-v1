@@ -304,19 +304,20 @@ impl Moe {
                     }
                 }
                 // The tensor scales are the checkpoint's per expert and per projection: the fused
-                // up/gate stack carries two scalars per expert and the down stack one. A table of
-                // another shape would dequantize one projection with another's scale, which is a
-                // wrong product with nothing to show for it, so it is refused here.
+                // up/gate stack carries two scalars per expert and the down stack one. They are
+                // published one packed table per projection, which is what the product reads, and a
+                // table of another shape would dequantize one projection with another's scale, which
+                // is a wrong product with nothing to show for it, so it is refused here.
                 for (name, stack, projections) in [
                     ("up/gate", &up_gate.global_scale, 2),
                     ("down", &down.global_scale, 1),
                 ] {
-                    if stack.shape().dims() != [u64::from(local), projections] {
+                    if stack.shape().dims() != [projections, u64::from(local)] {
                         return Err(Error::shape(
                             "Moe",
                             format!(
-                                "the {name} tensor scales are {:?}, [{local}, {projections}] \
-                                 expected: one per expert and projection",
+                                "the {name} tensor scales are {:?}, [{projections}, {local}] \
+                                 expected: one packed table per projection",
                                 stack.shape().dims()
                             ),
                         ));
@@ -780,11 +781,19 @@ impl Moe {
         // 5. FC2 over the packed down stack: one hidden row per route.
         let products = arena.tensor(hidden.dtype, Shape::new(&[routes.rows, hidden_width]))?;
         let second = self.route_nvfp4_descriptor(hidden.dtype, down.scales.dtype(), down.layout);
+        // The down stack has one projection, so its one packed row *is* the product's `[experts]`
+        // table; the row is contiguous, so the view is the same address with one axis.
+        let down_scales = down.global_scale.view();
+        let down_scales = TensorView::new(
+            down_scales.ptr,
+            DType::F32,
+            Shape::new(&[down_scales.shape.dim(1)]),
+        );
         let args = RouteGemmNvfp4Args {
             hidden: gated,
             weights: down.values.view(),
             scales: down.scales.view(),
-            global_scale: down.global_scale.view(),
+            global_scale: down_scales,
             ids: routes.local_ids,
             tile_to_expert: routes.tile_to_expert,
             tile_to_limit: routes.tile_to_limit,
@@ -1172,7 +1181,7 @@ pub(super) mod tests {
         let stack = |rows: u64, columns: u64, projections: u64| QuantizedStack {
             values: weight(DType::U8, &[u64::from(experts), rows, columns / 2]),
             scales: weight(DType::U8, &[u64::from(experts), rows, columns / 16]),
-            global_scale: weight(DType::F32, &[u64::from(experts), projections]),
+            global_scale: weight(DType::F32, &[projections, u64::from(experts)]),
             layout: ops::fp4::ScaleLayout::Linear,
             input_scale: None,
         };
@@ -1217,7 +1226,7 @@ pub(super) mod tests {
         let stack = |rows: u64, columns: u64, projections: u64| QuantizedStack {
             values: weight(DType::U8, &[u64::from(experts), rows, columns / 2]),
             scales: weight(DType::U8, &[u64::from(experts), rows, columns / 16]),
-            global_scale: weight(DType::F32, &[u64::from(experts), projections]),
+            global_scale: weight(DType::F32, &[projections, u64::from(experts)]),
             layout: ops::fp4::ScaleLayout::Linear,
             input_scale: None,
         };
