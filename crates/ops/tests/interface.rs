@@ -249,7 +249,11 @@ fn element_types_keep_their_abi_numbering_and_round_off() {
     }
     assert_eq!(DType::from_i64(9), None);
     assert_eq!(DType::I16.bytes(), Some(2));
-    assert_eq!(DType::I16.unit_roundoff(), 0.0, "an integer has no rounding");
+    assert_eq!(
+        DType::I16.unit_roundoff(),
+        0.0,
+        "an integer has no rounding"
+    );
     assert!(!DType::I16.is_float());
 
     assert_eq!(DType::BF16.bytes(), Some(2));
