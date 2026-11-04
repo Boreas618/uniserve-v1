@@ -323,6 +323,9 @@ fn main() {
         "vocab_unpad".to_owned(),
         key(&ops::logits::UnpadDescriptor {
             dtype,
+            // The sampler's candidate buffer is FP32 (the row below says the same for
+            // `logits_shape`), so the head's product is widened here.
+            output: DType::F32,
             vocabulary: VOCABULARY,
             padded: VOCABULARY,
             block: 1024,
