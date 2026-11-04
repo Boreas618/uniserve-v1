@@ -425,6 +425,8 @@ pub(crate) fn serve_leader(
             nodes,
             engines: HashMap::new(),
             next_engine: 1,
+            clients: HashMap::new(),
+            next_client: 1,
             stops: HashMap::new(),
             commands,
             reports,
@@ -452,6 +454,12 @@ pub(crate) struct LeaderService {
     nodes: Vec<Node>,
     engines: HashMap<u64, EngineConnection>,
     next_engine: u64,
+    /// Peers of the process socket that are not processes of the deployment -
+    /// the daemon's own client, and the clients a main process's workers open.
+    /// They are served and never numbered, so no command can be addressed to
+    /// one of them (§2.3).
+    clients: HashMap<u64, EngineConnection>,
+    next_client: u64,
     /// Stops of an engine, by its request id, awaiting the members'
     /// answers.
     stops: HashMap<(u64, u64), PendingStop>,
@@ -500,6 +508,8 @@ pub(crate) fn run_leader(
         mut nodes,
         mut engines,
         mut next_engine,
+        mut clients,
+        mut next_client,
         mut stops,
         commands,
         reports,
@@ -527,6 +537,8 @@ pub(crate) fn run_leader(
                 nodes,
                 engines,
                 next_engine,
+                clients,
+                next_client,
                 stops,
                 commands,
                 reports,
@@ -618,6 +630,11 @@ pub(crate) fn run_leader(
         // The main processes that stated an engine number this round, by the
         // number their arrival gave them: applied once their hellos are read.
         let mut renumbered: Vec<(u64, u64)> = Vec::new();
+        // Peers that stated no engine number and hold none: the daemon's own
+        // client of this socket, and the clients a main process's workers open.
+        // Nothing addresses them, so they are kept out of the numbered registry
+        // and served for what they ask (§2.3).
+        let mut unkeyed: Vec<u64> = Vec::new();
         // Engines: their hellos and requests; a closed engine takes its
         // processes on every node with it.
         for (&engine, peer) in &mut engines {
@@ -662,16 +679,27 @@ pub(crate) fn run_leader(
                             if frontend && let Some(frontend_greetings) = &frontend_greetings {
                                 let _ = frontend_greetings.send(engine);
                             }
+                            // A peer that is not a main process and holds no
+                            // number is not a process of this deployment: it is
+                            // served (a device or storage query) and never
+                            // numbered, because the number a launch named is
+                            // the main process's and a client must not take it.
+                            if !frontend && stated.is_none() {
+                                unkeyed.push(engine);
+                            }
                             // The epoch layer binds this connection to the
                             // launch it started when the peer's first report
-                            // names the launch generation (§2.5).
-                            let _ = greetings.send((
-                                stated.unwrap_or(engine),
-                                Greeting {
-                                    build: hello.build.clone(),
-                                    frontend,
-                                },
-                            ));
+                            // names the launch generation (§2.5). A client
+                            // sends no report, and takes no greeting.
+                            if frontend || stated.is_some() {
+                                let _ = greetings.send((
+                                    stated.unwrap_or(engine),
+                                    Greeting {
+                                        build: hello.build.clone(),
+                                        frontend,
+                                    },
+                                ));
+                            }
                             if let Some(number) = stated
                                 && number != engine
                             {
@@ -723,6 +751,44 @@ pub(crate) fn run_leader(
                 }
             }
         }
+        // Clients of the process socket: the daemon's own, and the ones a main
+        // process's workers open. They ask (a device inventory, a storage
+        // ledger) and are answered; they are never commanded, and a client
+        // that goes takes nothing with it.
+        let mut gone = Vec::new();
+        for (&client, peer) in &mut clients {
+            loop {
+                match peer.connection.try_recv::<Upstream>() {
+                    Ok(Some(Upstream {
+                        kind: Some(upstream::Kind::Request(request)),
+                    })) => {
+                        if let Some(reply) = route(
+                            EPOCH_ENGINE,
+                            &request,
+                            host,
+                            &mut local,
+                            &mut members,
+                            &nodes,
+                            &mut stops,
+                        ) && peer.connection.send(&downstream_reply(reply)).is_err()
+                        {
+                            gone.push(client);
+                            break;
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(_) => {
+                        gone.push(client);
+                        break;
+                    }
+                }
+            }
+        }
+        for client in gone {
+            clients.remove(&client);
+        }
+
         for engine in closed {
             engines.remove(&engine);
             stops.retain(|&(owner, _), _| owner != engine);
@@ -810,6 +876,22 @@ pub(crate) fn run_leader(
             }
         }
 
+        // The clients leave the numbered registry before any command is read:
+        // a command names a launch's engine, and a client that happened to
+        // arrive first must not be the connection it names.
+        for arrived in unkeyed.drain(..) {
+            if let Some(peer) = engines.remove(&arrived) {
+                let client = next_client;
+                next_client += 1;
+                tracing::info!(
+                    client,
+                    engine = arrived,
+                    "a client of the process socket is not a process of the deployment"
+                );
+                clients.insert(client, peer);
+            }
+        }
+
         // The numbers main processes stated take effect before this round's
         // commands go down, so a command the epoch layer sends right after a
         // process reported itself ready already reaches that process.
@@ -851,6 +933,7 @@ pub(crate) fn run_leader(
         let mut descriptors = vec![listener.descriptor(), stop.wake.as_raw_fd()];
         descriptors.extend(joins.iter().flat_map(Joins::descriptors));
         descriptors.extend(engines.values().map(|peer| peer.connection.descriptor()));
+        descriptors.extend(clients.values().map(|peer| peer.connection.descriptor()));
         descriptors.extend(members.iter().map(|member| member.connection.descriptor()));
         wait(&descriptors, EXIT_POLL_INTERVAL);
         stop.drain();
@@ -1113,6 +1196,11 @@ impl LeaderService {
             nodes,
             engines,
             next_engine,
+            // A client of the process socket is a query in flight, not state:
+            // the successor serves its own, and a predecessor's client is
+            // closed with the predecessor's process.
+            clients: _,
+            next_client: _,
             stops,
             // The command channel is the daemon's, not the service's: the
             // successor makes its own ends when it resumes (`ProcessCommands`).
@@ -1266,6 +1354,8 @@ pub(crate) fn resume(
                     nodes,
                     engines: adopted_engines,
                     next_engine,
+                    clients: HashMap::new(),
+                    next_client: 1,
                     stops,
                     commands,
                     reports,
