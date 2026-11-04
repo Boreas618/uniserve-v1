@@ -63,8 +63,10 @@ def test_degenerate_samples_only_accept_an_equal_accuracy() -> None:
     assert interval.standard_error == 0.0
     assert interval.half_width == 0.0
     assert interval.accepted
+    # Both samples are at a bound, so the interval is still zero-width and
+    # only an equal accuracy is accepted.
     assert not difference_interval(
-        Proportion(0, 10), Proportion(1, 10)
+        Proportion(0, 10), Proportion(10, 10)
     ).accepted
 
 
@@ -312,7 +314,7 @@ def _run_compare(argv: list[str]) -> int:
         try:
             main()
         except SystemExit as exit_info:
-            return int(exit_info.value.code or 0)
+            return int(exit_info.code or 0)
     finally:
         sys.argv = previous
     return 0

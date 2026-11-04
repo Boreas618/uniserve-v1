@@ -302,13 +302,44 @@ def test_a_row_without_an_answer_is_rejected(tmp_path: Path) -> None:
         ("#### 1/2", None),
         ("#### 1,25", None),
         ("#### 18 because 2+3", None),
+        (r"\boxed{18}", Decimal("18")),
+        (r"so $\boxed{18}$", Decimal("18")),
+        (r"$$\boxed{ 1,250 }$$", Decimal("1250")),
+        (r"\boxed{-18.5}", Decimal("-18.5")),
+        (r"#### 5 and then \boxed{7}", Decimal("7")),
+        (r"\boxed{7} and then #### 15", Decimal("15")),
+        (r"\boxed{18", None),
+        (r"\boxed{\frac{1}{2}}", None),
+        (r"\boxed{18 apples}", None),
+        (r"#### 5 then \boxed{five too}", None),
+        (r"\boxed{2:00 pm}", None),
     ],
 )
 def test_the_marker_and_value_rule_decides_parsing(
     text: str, expected: Decimal | None
 ) -> None:
-    """The last ``#### `` marker's value parses; anything else is no answer."""
+    """The later of the two answer forms decides; anything else is no answer."""
     assert extract_answer(text) == expected
+
+
+def test_each_answer_form_is_counted_and_only_the_last_one_decides() -> None:
+    """A form's rows are counted, and a malformed last form never falls back."""
+    records = [
+        _record(0, "#### 18"),
+        _record(1, r"so $\boxed{18}$"),
+        _record(2, r"#### 5 then \boxed{five too}"),
+        _record(3, "no final answer"),
+        _record(4, r"\boxed{19}", success=False),
+    ]
+
+    score = score_records(records)
+    assert (score.correct, score.total, score.unparseable) == (2, 5, 2)
+    assert (score.by_marker, score.by_boxed, score.without_form) == (1, 2, 1)
+
+    validation = GSM8KTask(_point(None, num_prompts=5)).validate(records)
+    assert validation.statistics["decided_by_marker"] == 1
+    assert validation.statistics["decided_by_boxed"] == 2
+    assert validation.statistics["without_answer_form"] == 1
 
 
 def test_the_request_is_one_system_and_one_user_message() -> None:
