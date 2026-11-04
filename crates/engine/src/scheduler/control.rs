@@ -343,60 +343,44 @@ impl Scheduler {
     /// Asks the serving slot for `stage` and applies it here, which is a batch
     /// boundary: commands are drained between steps, with no batch in flight.
     ///
-    /// A stage that cannot be applied is the epoch's end when it leaves no
-    /// policy to serve under; the report names the policy that failed.
+    /// A stage that cannot be applied leaves no policy to serve under, so the
+    /// epoch ends; the report names the policy that failed and why.
     fn apply_stage(&mut self, stage: Stage, candidate: Option<Candidate>) -> Result<(), String> {
         let state = views::trial_state(self, self.step, self.recorder.recorded());
-        let ceilings = ceilings_of(BatchCapacity::of(&self.info));
-        match (&mut self.policy, candidate) {
-            (Some(policy), Some(candidate)) => policy.adopt(candidate),
-            (Some(policy), None) => {
-                policy.request(stage);
-                match policy.boundary(&state) {
-                    Ok(None) => {}
-                    Ok(Some(report)) => self.policy_report = Some(report),
-                    Err(error) => {
-                        self.policy_report = Some(policy::PolicyReverted {
-                            scheduler: None,
-                            program: policy.program().clone(),
-                            reason: error.to_string(),
-                            fatal: true,
-                        });
-                        return Err(error.to_string());
-                    }
-                }
-                return Ok(());
-            }
-            (None, Some(candidate)) => {
-                // An epoch's first switchover: no policy served before, so the
-                // candidate's precopy is the only instance this policy has.
-                let engine = policy::process_engine().map_err(|error| error.to_string())?;
-                self.adopt(PolicySlot::from_candidate(engine, ceilings, candidate));
-                return Ok(());
-            }
-            (None, None) => return Ok(()),
-        }
-        // A candidate is adopted above; the switchover applies at this boundary.
         let Some(policy) = self.policy.as_mut() else {
+            // An epoch's first switchover: no policy served before, so the
+            // candidate's precopy prepared the only instance this policy has.
+            let Some(candidate) = candidate else {
+                return Ok(());
+            };
+            let engine = policy::process_engine().map_err(|error| error.to_string())?;
+            let ceilings = ceilings_of(BatchCapacity::of(&self.info));
+            self.adopt(PolicySlot::from_candidate(engine, ceilings, candidate));
             return Ok(());
         };
+        if let Some(candidate) = candidate {
+            policy.adopt(candidate);
+        }
         policy.request(stage);
-        match policy.boundary(&state) {
-            Ok(None) => Ok(()),
-            Ok(Some(report)) => {
-                self.policy_report = Some(report);
-                Ok(())
-            }
+        let outcome = policy.boundary(&state);
+        let program = policy.program().clone();
+        let report = match outcome {
+            Ok(report) => report,
             Err(error) => {
+                let reason = error.to_string();
                 self.policy_report = Some(policy::PolicyReverted {
                     scheduler: None,
-                    program: policy.program().clone(),
-                    reason: error.to_string(),
+                    program,
+                    reason: reason.clone(),
                     fatal: true,
                 });
-                Err(error.to_string())
+                return Err(reason);
             }
+        };
+        if let Some(report) = report {
+            self.policy_report = Some(report);
         }
+        Ok(())
     }
 
     /// Selects commands with available destinations without bypassing an older
