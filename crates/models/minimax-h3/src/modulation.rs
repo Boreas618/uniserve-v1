@@ -391,11 +391,7 @@ impl Projections {
             Shape::new(&[groups, u64::from(self.time_dim)]),
         )?;
         let linear = |weights: &(Weight, Weight)| {
-            nn::layers::Linear::new(
-                weights.0,
-                Some(weights.1),
-                nn::layers::WeightOrder::NxK,
-            )
+            nn::layers::Linear::new(weights.0, Some(weights.1), nn::layers::WeightOrder::NxK)
         };
         linear(&self.first)?.forward(f, embedding, hidden)?;
         nn::layers::Silu.forward(f, hidden, activated)?;
