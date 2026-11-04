@@ -392,7 +392,7 @@ impl MainProcess {
         // measures, so the plan sees a device with the model already in it - the figure it computes
         // is what is left, not what was there before the load. Pools sized first and weights after
         // would over-commit the device by exactly the model's size.
-        let mut memory = plan.open_memory()?;
+        let mut memory = plan.open_memory(&model, &mut &*client)?;
         let blocking = ThreadPool::new(plan.blocking_limits());
         let modules = blocking.lane::<Install>(BlockingKind::ModuleLoad)?;
         let programs = Arc::new(Mutex::new(Client::connect(plan.program_server())?));
@@ -413,7 +413,11 @@ impl MainProcess {
         // memory and handed to the executor thread, so every owner and every runner books against
         // the same allowance.
         let pools = memory.pools();
-        let scratch = plan.graph(memory.device())?.scratch;
+        let device = *plan
+            .devices()
+            .first()
+            .context("this rank serves no device")?;
+        let scratch = plan.graph(device)?.scratch;
         for device in plan.devices() {
             let generation = Arc::new(Generation::new(epoch.generation, std::iter::empty()));
             let runners = plan.runners(*device, Arc::clone(&model), &mut memory, &generation)?;
