@@ -37,10 +37,22 @@ from PIL import Image, ImageOps
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 WORKSPACE = os.path.abspath(os.path.join(ROOT, "..", "..", "..", "..", ".."))
-FFMPEG = os.environ.get(
-    "UNISERVE_FFMPEG",
-    os.path.join(WORKSPACE, "artifacts", "native", "prefix", "bin", "ffmpeg"),
-)
+def _ffmpeg() -> str:
+    """The provisioned 8.1.2 build, or the image's own 8.1.2 build."""
+    named = os.environ.get("UNISERVE_FFMPEG")
+    if named:
+        return named
+    candidates = (
+        os.path.join(WORKSPACE, "artifacts", "native", "prefix", "bin", "ffmpeg"),
+        "/opt/uv/ffmpeg-8.1.2/bin/ffmpeg",
+    )
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return "ffmpeg"
+
+
+FFMPEG = _ffmpeg()
 # The provisioned FFmpeg links the shared runtime beside it.
 ENVIRONMENT = dict(os.environ)
 _LIBRARY = os.path.join(WORKSPACE, "artifacts", "native", "prefix", "lib")
