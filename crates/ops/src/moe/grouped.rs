@@ -434,6 +434,19 @@ impl Op for RouteGemm {
             ));
         }
         args.out.require_row(Self::NAME, descriptor.dtype, hidden)?;
+        // The product writes one row per **permuted** row — the height of `rows`, not the count of
+        // live expanded routes — because the combine indexes this buffer in the permuted row space.
+        // A buffer shorter than that is an overflow into whatever the arena placed next, and the
+        // entry cannot see it: it knows the height it was given and writes the map's rows.
+        if args.out.rows() < rows {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the output holds {} rows and this launch writes {rows} permuted rows",
+                    args.out.rows()
+                ),
+            ));
+        }
 
         let mut call = RouteCall {
             rows: address(args.rows.ptr) as usize as *const c_void,
