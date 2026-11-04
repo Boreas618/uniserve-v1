@@ -30,10 +30,11 @@ use std::time::Duration;
 use crate::supervision::DaemonOptions;
 use anyhow::Context as _;
 use models::video::plan::{MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS};
+pub use proto::request::StandbyStorage;
 use proto::request::wire;
 use proto::request::{
     ExpertExchange, FlashInferBackend, GraphPolicy, LoadFormat, ModelDtype, PrefixCacheDtype,
-    SchedulingPolicy, StandbyStorage,
+    SchedulingPolicy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
