@@ -72,7 +72,17 @@ fn every_kernel_package_in_the_tree_is_a_package_the_server_can_install() {
 /// qwen3_moe_keys` writes `.local/qwen3-moe-keys.txt`), so the test reports
 /// how to produce it when it is absent.
 fn slice_keys() -> Option<Vec<(String, String)>> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.local/qwen3-moe-keys.txt");
+    // The committed copy first, so a clean checkout checks both fixtures; the
+    // generated one beside it is what the model's example writes, and a host
+    // that regenerated the keys today should be checking today's.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let committed = root.join("notes/programs/qwen3-moe-keys.txt");
+    let generated = root.join(".local/qwen3-moe-keys.txt");
+    let path = if committed.is_file() {
+        committed
+    } else {
+        generated
+    };
     let Ok(text) = std::fs::read_to_string(&path) else {
         eprintln!(
             "SKIPPED (fixture): no {}; write it with `cargo run -p ops --example qwen3_moe_keys`",
@@ -325,17 +335,36 @@ fn every_fixture_key_parses_to_the_fields_its_operator_s_packages_declare() {
                 })
             });
             if !covering {
-                let fields: Vec<String> = declared
+                // Name what is wrong rather than that something is: a key whose
+                // values a package does not declare and a key whose field names
+                // are different are both "not covered", and the fix for each is
+                // different work by a different actor.
+                let why: Vec<String> = declared
                     .iter()
-                    .map(|(package, dimensions)| {
-                        let names: Vec<&str> = dimensions.keys().map(String::as_str).collect();
-                        format!("{package} declares [{}]", names.join(", "))
+                    .map(|(package, dimensions)| match parse_key(dimensions, key.as_str()) {
+                        None => {
+                            let names: Vec<&str> = dimensions.keys().map(String::as_str).collect();
+                            format!("{package} names the fields [{}]", names.join(", "))
+                        }
+                        Some(fields) => {
+                            let missing: Vec<String> = fields
+                                .iter()
+                                .filter(|(name, value)| {
+                                    !dimensions
+                                        .get(name)
+                                        .is_some_and(|allowed| allowed.iter().any(|one| one == value))
+                                })
+                                .map(|(name, value)| format!("{name}_{value}"))
+                                .collect();
+                            if missing.is_empty() {
+                                format!("{package} declares every value")
+                            } else {
+                                format!("{package} does not declare {}", missing.join(", "))
+                            }
+                        }
                     })
                     .collect();
-                failures.push(format!(
-                    "{operator}\t{key}: no package declares this key's fields exactly; {}",
-                    fields.join("; ")
-                ));
+                failures.push(format!("{operator}\t{key}: no package covers it; {}", why.join("; ")));
             }
         }
     }
@@ -476,4 +505,37 @@ fn every_package_names_an_operator_the_ops_crate_declares() {
         "a package under a name no operator carries is a program nothing can request:\n{}",
         failures.join("\n")
     );
+}
+
+/// The three convolution packages are one source in three places, and the store builds
+/// each package from its own copy of its root, so a source shared by path is not
+/// available to them. Identity in bytes is the invariant that keeps them one program:
+/// the entry differs only by the package's `[kernel.entry]`, and the element types only
+/// by the build script's defines. A divergence would make one backend compute what the
+/// other two do not, which no per-package check could see.
+#[test]
+fn the_convolutions_are_one_source_in_three_packages() {
+    const CONVOLUTIONS: [&str; 3] = ["conv1d", "conv3d", "conv_transpose1d"];
+    const SHARED: [&str; 4] = [
+        "src/conv.cu",
+        "include/uniserve_conv.h",
+        "test/conv_check.py",
+        "test/refusal_check.py",
+    ];
+    for shared in SHARED {
+        let sources = CONVOLUTIONS.map(|op| {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../ops/kernels")
+                .join(op)
+                .join("cudnn")
+                .join(shared);
+            std::fs::read(&path).unwrap_or_else(|error| {
+                panic!("{shared} of {op} is not readable at {}: {error}", path.display())
+            })
+        });
+        assert!(
+            sources[0] == sources[1] && sources[1] == sources[2],
+            "{shared} differs between the three convolution packages"
+        );
+    }
 }

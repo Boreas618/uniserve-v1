@@ -1,0 +1,37 @@
+# The candidate_order operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py`.
+#
+# The program puts each row's candidates in ascending token id order — the step
+# that makes an inverse-CDF draw independent of the order a top-k program
+# produced. It is a permutation, so nothing is computed and nothing is rounded,
+# and its tolerance is `exact`. The row count and the candidate count are launch
+# words: a request's selection depth must not recompile the sampler.
+
+op = "candidate_order"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/candidate_order.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+# `values_f32_ids_i32_pdl_false`.
+[kernel.descriptors]
+dimensions = { values = ["f32", "bf16"], ids = ["i32", "i64"], pdl = ["true", "false"] }
+
+[parameters]

@@ -87,12 +87,16 @@ fn serve_defaults_to_the_standard_socket_and_the_bundled_python() {
         panic!("a serve command");
     };
     // A CUDA toolkit is found on the host; the Python environment is the
-    // Program Server's own, beside the crate (design section 6.2).
+    // Program Server's own, beside the crate (design section 6.2), and every
+    // toolchain path is absolute by the time a build sees it: a relative one
+    // would be resolved against the copy a build runs in, not against the
+    // server's own directory.
     assert!(serve.toolchains.nvcc.is_none());
     assert_eq!(
         serve.toolchains.python,
-        PathBuf::from("python/.venv/bin/python")
+        std::path::absolute("python/.venv/bin/python").expect("an absolute path")
     );
+    assert!(serve.toolchains.python.is_absolute());
     assert!(serve.toolchains.wasm.is_none());
     assert!(
         serve.devices.is_empty(),

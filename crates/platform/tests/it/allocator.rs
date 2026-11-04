@@ -9,7 +9,10 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use platform::{Allocator, Budget, DeviceId, Error, PoolKind};
+use platform::{
+    Allocator, Budget, Capture, CaptureMode, DeviceId, Error, PinnedBuffer, PoolKind, memcpy_async,
+    memset_d8,
+};
 
 use crate::gpu::{DEVICE, exclusive_driver, read};
 
@@ -31,6 +34,14 @@ impl RecordingBudget {
 
     fn set_limit(&self, limit: u64) {
         self.limit.store(limit, Ordering::Relaxed);
+    }
+
+    /// How many bookings the budget was asked for, whatever their pool.
+    fn bookings(&self) -> usize {
+        self.totals
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
     }
 
     /// The last total booked for `pool`, if the budget booked one.
@@ -357,4 +368,92 @@ fn a_restore_a_shrunk_budget_refuses_parks_every_pool_again() {
     unsafe { platform::memcpy_async(host.address(), graph.address(), 16, &stream) }.unwrap();
     stream.synchronize().unwrap();
     assert_eq!(read(&host), vec![0x33; 16]);
+}
+
+/// A pool's storage keeps its addresses and contents across a suspension, and
+/// a graph captured over it before runs correctly after the restore; a freed
+/// block is given out again at its address.
+///
+/// The bookings are part of the behaviour: mapping a block books the pool's
+/// total before the storage exists, and neither a suspend/restore pair nor the
+/// reuse of a freed block books anything new. (That a refused booking leaves
+/// nothing mapped is
+/// [`an_allocation_over_the_device_budget_fails_before_it_maps_anything`].)
+#[test]
+#[ignore = "requires a CUDA device"]
+fn a_pool_keeps_addresses_and_contents_across_a_suspension() {
+    let _driver = exclusive_driver();
+    let device = platform::Device::new(DEVICE).unwrap();
+    let budget = RecordingBudget::new(64 << 20);
+    let mut allocator = with_budget(&device, &budget);
+    allocator.reserve(PoolKind::Graph, 64 << 20).unwrap();
+
+    let first = allocator.allocate(PoolKind::Graph, 1 << 20).unwrap();
+    let second = allocator.allocate(PoolKind::Graph, 1 << 20).unwrap();
+    assert_ne!(first.address(), second.address());
+    let mapped = allocator.mapped_bytes(PoolKind::Graph);
+    assert_eq!(mapped, first.len() + second.len());
+    assert_eq!(
+        budget.booked(PoolKind::Graph),
+        Some(mapped as u64),
+        "the pool books the storage it maps, and the booking carries the pool's total"
+    );
+    let bookings = budget.bookings();
+
+    let stream = device.stream().unwrap();
+    let host = PinnedBuffer::new(DEVICE, 256).unwrap();
+
+    // The first block holds 5s written before the suspension; a graph captured
+    // now fills the second with 9s at every launch.
+    // SAFETY: the ranges lie inside the allocator's blocks.
+    unsafe { memset_d8(first.address(), 5, 256, &stream) }.unwrap();
+    stream.synchronize().unwrap();
+    let capture = Capture::begin(&stream, CaptureMode::Relaxed).unwrap();
+    // SAFETY: the range lies inside the block.
+    unsafe { memset_d8(second.address(), 9, 256, &stream) }.unwrap();
+    let fill = capture.end().unwrap().instantiate().unwrap();
+
+    allocator.suspend().unwrap();
+    assert_eq!(
+        allocator.mapped_bytes(PoolKind::Graph),
+        0,
+        "a suspended pool maps nothing"
+    );
+    assert!(
+        allocator.allocate(PoolKind::Graph, 1 << 20).is_err(),
+        "a suspended allocator gives out nothing"
+    );
+    allocator.restore().unwrap();
+    assert_eq!(allocator.mapped_bytes(PoolKind::Graph), mapped);
+    assert_eq!(
+        budget.bookings(),
+        bookings,
+        "a suspend/restore pair books nothing new: the storage comes back over the booking"
+    );
+
+    // SAFETY: the ranges lie inside the restored blocks, at their addresses.
+    unsafe { memcpy_async(host.address(), first.address(), 256, &stream) }.unwrap();
+    stream.synchronize().unwrap();
+    assert_eq!(read(&host), vec![5; 256]);
+    fill.launch(&stream).unwrap();
+    // SAFETY: as above.
+    unsafe { memcpy_async(host.address(), second.address(), 256, &stream) }.unwrap();
+    stream.synchronize().unwrap();
+    assert_eq!(read(&host), vec![9; 256]);
+
+    drop(fill);
+    let address = second.address();
+    allocator.free(second);
+    let again = allocator.allocate(PoolKind::Graph, 1 << 20).unwrap();
+    assert_eq!(
+        again.address(),
+        address,
+        "a freed block comes back at its address, so a captured graph stays valid"
+    );
+    assert_eq!(allocator.mapped_bytes(PoolKind::Graph), mapped);
+    assert_eq!(
+        budget.bookings(),
+        bookings,
+        "giving out a freed block books nothing new"
+    );
 }
