@@ -14,7 +14,6 @@ mod peer;
 pub(crate) mod pool;
 
 pub(crate) use grants::DescriptorGrants;
-pub(crate) use peer::PeerStorage;
 
 use std::collections::HashMap;
 use std::ops::Range;
