@@ -203,7 +203,7 @@ impl TryFrom<ElementType> for ipc::DType {
 /// Storage a view can borrow: a device buffer, a host allocation or a segment
 /// of either. Implementors keep the bytes valid and unmoved for as long as the
 /// value is alive.
-
+///
 /// Where a storage lives: the host, page-locked host storage, or a device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MemoryKind {
