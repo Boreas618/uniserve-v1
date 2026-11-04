@@ -16,6 +16,12 @@ module loads with undefined ``cuda*`` symbols.
 
 The descriptor dimensions and their values come from the package manifest, so
 the keys this script accepts are exactly the range the manifest declares.
+
+The module this script writes is a **shared library with an entry symbol**, not a cubin `ops`
+launches: the call's parameters are the `Call` struct `entry.h` declares, and its layout is fixed
+there by a `static_assert` that fails the build if it drifts. So this package states no launch
+signature in `metadata.json` — there is no packed parameter list for `ops` to compare, because
+`ops` hands the entry one struct and the entry reads its own fields.
 """
 
 import json
