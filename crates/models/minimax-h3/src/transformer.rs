@@ -19,6 +19,7 @@
 //! through the borrow it is handed, never through state of its own.
 
 use crate::attention::{self, Factors, Visible};
+use crate::attention_sparse::Segments;
 use crate::config::{AttentionKind, TransformerConfig};
 use crate::modulation::AdaLnCache;
 use crate::partition::Partition;
@@ -38,17 +39,17 @@ pub const ROTATED_AXES: [u32; 3] = [32, 32, 32];
 pub struct Layer {
     norm1: Weight,
     norm2: Weight,
-    attention: attention::Dense,
+    attention: attention::Layer,
     gate_up: Linear,
     down: Linear,
     swiglu: PackedSwiGlu,
-    intermediate_size: u32,
     eps: f32,
 }
 
 impl Layer {
     /// Read layer `index` of a partition.
     fn load(
+        kind: AttentionKind,
         index: u32,
         config: &TransformerConfig,
         rows: u32,
@@ -61,7 +62,8 @@ impl Layer {
         Ok(Self {
             norm1: gain(loader, &format!("{prefix}.norm1.weight"), hidden)?,
             norm2: gain(loader, &format!("{prefix}.norm2.weight"), hidden)?,
-            attention: attention::Dense::load(
+            attention: attention::Layer::load(
+                kind,
                 index,
                 config,
                 rows,
@@ -78,7 +80,6 @@ impl Layer {
             )?,
             down: projection(loader, &format!("{prefix}.ff.net.2.weight"), hidden, ffn)?,
             swiglu: PackedSwiGlu::new(None)?,
-            intermediate_size: config.intermediate_size,
             eps: config.norm_eps,
         })
     }
@@ -97,32 +98,32 @@ impl Layer {
         modulation: TensorView,
         rows: TensorView,
         factors: Factors,
-        visible: &Visible,
-        total_rows: u32,
+        visible: Option<&Visible>,
+        segments: Option<&Segments>,
+        scratch: &Scratch,
     ) -> Result<()> {
         let width = hidden.shape.last();
         let (shift_attention, scale_attention, gate_attention) = chunks(modulation, width, 0)?;
         let (shift_mlp, scale_mlp, gate_mlp) = chunks(modulation, width, 3)?;
-        let arena = f.arena();
-        let dtype = hidden.dtype;
-        let tokens = hidden.shape.dim(0);
-        let normalized = arena.tensor(dtype, Shape::new(&[tokens, width]))?;
-        let update = arena.tensor(dtype, Shape::new(&[tokens, width]))?;
+        let normalized = scratch.normalized;
+        let update = scratch.update;
 
         // Attention: normalize, attend, and fold the gated update into `out` while normalizing the
         // feed-forward's input.
-        let attention_norm = ModulatedRmsNorm::new(
-            self.norm1.clone(),
-            shift_attention,
-            scale_attention,
-            None,
-            self.eps,
-        )?;
+        let attention_norm =
+            ModulatedRmsNorm::new(self.norm1, shift_attention, scale_attention, None, self.eps)?;
         attention_norm.forward(f, hidden, None, rows, normalized, None, None)?;
-        self.attention
-            .forward(f, normalized, factors, visible, total_rows, update)?;
+        self.attention.forward(
+            f,
+            normalized,
+            factors,
+            visible,
+            segments,
+            &scratch.attention,
+            update,
+        )?;
         let mlp_norm = ModulatedRmsNorm::new(
-            self.norm2.clone(),
+            self.norm2,
             shift_mlp,
             scale_mlp,
             Some(gate_attention),
@@ -132,9 +133,8 @@ impl Layer {
 
         // Feed-forward: the packed value and gate halves, the gated activation, the down
         // projection, and the second gated residual into the retained residual.
-        let ffn = u64::from(self.intermediate_size);
-        let packed = arena.tensor(dtype, Shape::new(&[tokens, 2 * ffn]))?;
-        let mlp = arena.tensor(dtype, Shape::new(&[tokens, ffn]))?;
+        let packed = scratch.packed;
+        let mlp = scratch.mlp;
         self.gate_up.forward(f, normalized, packed)?;
         self.swiglu.forward(f, packed, mlp, None)?;
         self.down.forward(f, mlp, update)?;
@@ -164,7 +164,7 @@ impl Transformer {
         let layer = self.layers.first().ok_or_else(|| {
             Error::Unsupported("an H3 partition with no layers has no rotary".to_owned())
         })?;
-        Ok(layer.attention.factors(f, positions, cosine, sine)?)
+        layer.attention.factors(f, positions, cosine, sine)
     }
 
     /// The final normalization and one modality's output projection: `hidden` in, velocity out.
@@ -253,7 +253,7 @@ fn chunks(table: TensorView, width: u64, first: u64) -> Result<(Weight, Weight, 
             Shape::new(&[rows, width]),
             nn::Strides::new(&[stride, 1]),
         );
-        Ok(borrowed(view)?)
+        borrowed(view)
     };
     Ok((chunk(0)?, chunk(1)?, chunk(2)?))
 }
@@ -301,18 +301,11 @@ impl Transformer {
                 config.output_heads
             )));
         }
-        if kind != AttentionKind::DENSE {
-            return Err(Error::Unsupported(
-                "the H3 partition's sparse attention is composed from nn::layers::SegmentAttention \
-                 and nn::layers::VsaTiles; this build composes the dense kind only"
-                    .to_owned(),
-            ));
-        }
         let hidden = u64::from(config.hidden_size);
         let video_in = u64::from(config.video_channels) * 4;
         let audio_in = u64::from(config.audio_channels);
         let layers = (0..config.num_hidden_layers)
-            .map(|index| Layer::load(index, config, rows, partition, loader))
+            .map(|index| Layer::load(kind, index, config, rows, partition, loader))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             proj_in: projection_with_bias(loader, "proj_in", hidden, video_in)?,
@@ -334,7 +327,7 @@ impl Transformer {
                 audio_in,
                 hidden,
             )?),
-            config: config.clone(),
+            config: *config,
         })
     }
 
@@ -366,7 +359,8 @@ impl Transformer {
         hidden: TensorView,
         rows: TensorView,
         factors: Factors,
-        visible: &Visible,
+        visible: Option<&Visible>,
+        segments: Option<&Segments>,
         total_rows: u32,
     ) -> Result<()> {
         let groups = adaln.groups();
@@ -380,11 +374,12 @@ impl Transformer {
             Shape::new(&[u64::from(groups.count()) * 3, 6 * width]),
         )?;
         let mut alternate = arena.tensor(hidden.dtype, Shape::new(&[tokens, width]))?;
+        let scratch = Scratch::reserve(self, f, hidden, total_rows)?;
         let mut current = hidden;
         for (index, layer) in self.layers.iter().enumerate() {
             adaln.layer(f, index, entries, modulation)?;
             layer.forward(
-                f, current, alternate, modulation, rows, factors, visible, total_rows,
+                f, current, alternate, modulation, rows, factors, visible, segments, &scratch,
             )?;
             std::mem::swap(&mut current, &mut alternate);
         }
@@ -399,6 +394,45 @@ impl Transformer {
     }
 }
 
+/// Every temporary view the stack reads, reserved once for the whole forward.
+///
+/// The executor's arena is a bump allocator reset once per forward, so scratch that does not depend
+/// on the layer is reserved once: reserving it per layer would multiply the arena by the layer
+/// count, which a 50-layer stack cannot afford at a served canvas.
+pub struct Scratch {
+    normalized: TensorView,
+    update: TensorView,
+    packed: TensorView,
+    mlp: TensorView,
+    attention: attention::LayerScratch,
+}
+
+impl Scratch {
+    /// Reserve the stack's scratch for `hidden` `[tokens, width]` with a key set of `total_rows`.
+    pub fn reserve(
+        transformer: &Transformer,
+        f: &Forward,
+        hidden: TensorView,
+        total_rows: u32,
+    ) -> Result<Self> {
+        let arena = f.arena();
+        let dtype = hidden.dtype;
+        let tokens = hidden.shape.dim(0);
+        let width = hidden.shape.last();
+        let ffn = u64::from(transformer.config.intermediate_size);
+        let layer = transformer.layers.first().ok_or_else(|| {
+            Error::Unsupported("a stack with no layers has no scratch".to_owned())
+        })?;
+        Ok(Self {
+            normalized: arena.tensor(dtype, Shape::new(&[tokens, width]))?,
+            update: arena.tensor(dtype, Shape::new(&[tokens, width]))?,
+            packed: arena.tensor(dtype, Shape::new(&[tokens, 2 * ffn]))?,
+            mlp: arena.tensor(dtype, Shape::new(&[tokens, ffn]))?,
+            attention: layer.attention.reserve(f, hidden, total_rows)?,
+        })
+    }
+}
+
 /// A `[out, in]` projection of the checkpoint, without bias.
 fn projection(
     loader: &mut WeightLoader<'_>,
@@ -407,7 +441,7 @@ fn projection(
     columns: u64,
 ) -> Result<Linear> {
     let weight = loader.load(&WeightRequest::region(
-        &format!("{name}.weight"),
+        format!("{name}.weight"),
         0,
         Shape::new(&[rows, columns]),
     ))?;
@@ -422,7 +456,7 @@ fn projection_with_bias(
     columns: u64,
 ) -> Result<Linear> {
     let weight = loader.load(&WeightRequest::region(
-        &format!("{name}.weight"),
+        format!("{name}.weight"),
         0,
         Shape::new(&[rows, columns]),
     ))?;
