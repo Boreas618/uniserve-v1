@@ -1542,6 +1542,9 @@ mod tests {
     struct TestSession {
         frames: mpsc::UnboundedReceiver<Bytes>,
         ended: bool,
+        /// Whether this response can be handed over; `false` models a
+        /// response whose state cannot be frozen.
+        freezable: bool,
     }
 
     impl Session for TestSession {
@@ -1564,7 +1567,8 @@ mod tests {
         }
 
         fn freeze(&mut self) -> Option<stream::Application> {
-            Some(stream::Application::ChatStream(Default::default()))
+            self.freezable
+                .then(|| stream::Application::ChatStream(Default::default()))
         }
 
         fn abort(&mut self) {}
@@ -1599,6 +1603,18 @@ mod tests {
         request_id: &str,
         pair: fn() -> (Io, UnixStream),
     ) -> (TestClient, mpsc::UnboundedSender<Bytes>) {
+        serve_handed_freezable(registry, registration, request_id, pair, true)
+    }
+
+    /// The same, for a response that cannot be handed over when `freezable`
+    /// is false.
+    fn serve_handed_freezable(
+        registry: Handoff,
+        registration: Arc<Registration>,
+        request_id: &str,
+        pair: fn() -> (Io, UnixStream),
+        freezable: bool,
+    ) -> (TestClient, mpsc::UnboundedSender<Bytes>) {
         let request_id = request_id.to_owned();
         let (frames, produced) = mpsc::unbounded_channel();
         let produced = Arc::new(std::sync::Mutex::new(Some(produced)));
@@ -1619,6 +1635,7 @@ mod tests {
                         Box::new(TestSession {
                             frames,
                             ended: false,
+                            freezable,
                         }),
                         registration,
                         &request_id,
@@ -1641,6 +1658,7 @@ mod tests {
             Box::new(TestSession {
                 frames: produced,
                 ended: false,
+                freezable: true,
             }),
             false,
         );
@@ -1694,6 +1712,7 @@ mod tests {
             Box::new(TestSession {
                 frames: produced,
                 ended: false,
+                freezable: true,
             }),
             false,
         );
@@ -1834,6 +1853,7 @@ mod tests {
             Box::new(TestSession {
                 frames: produced,
                 ended: false,
+                freezable: true,
             }),
             false,
         );
@@ -1883,6 +1903,54 @@ mod tests {
             .await
             .expect("the adopting task")
             .expect("an adopted connection ends quietly");
+    }
+
+    /// A response whose state cannot be frozen does not stay here: it is
+    /// reported as not handed over, and its connection ends at the boundary
+    /// rather than keeping the process that is leaving.
+    #[tokio::test]
+    async fn a_response_that_cannot_be_frozen_ends_its_connection() {
+        let registry = Handoff::new();
+        let registration = registry.register();
+        let (mut client, frames) = serve_handed_freezable(
+            registry.clone(),
+            Arc::clone(&registration),
+            "handoff-stream-4",
+            pair,
+            false,
+        );
+        client
+            .send(head("GET /stream HTTP/1.1", "").as_bytes())
+            .await;
+        frames.send(Bytes::from_static(b"data: a\n\n")).unwrap();
+        // Pause only once the frame reached the socket: what this process
+        // wrote before the boundary stays written.
+        while !client
+            .buffered
+            .windows(7)
+            .any(|window| window == b"data: a")
+        {
+            client.fill().await;
+        }
+
+        let frozen = tokio::time::timeout(std::time::Duration::from_secs(5), registry.pause())
+            .await
+            .expect("the pause is answered");
+        assert!(
+            frozen.is_empty(),
+            "a response that cannot be frozen is not handed over"
+        );
+
+        // What this process wrote stays written; nothing follows it, and the
+        // connection is closed rather than kept for a successor.
+        let raw = client.read_to_end().await;
+        assert!(raw.starts_with("HTTP/1.1 200"), "{raw}");
+        assert!(raw.contains("data: a"), "{raw}");
+        assert!(
+            !raw.ends_with("0\r\n\r\n"),
+            "the body was not terminated: {raw}"
+        );
+        drop(frames);
     }
 
     /// A pause reaches the connection while the kernel refuses the response:

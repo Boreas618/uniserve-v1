@@ -8,12 +8,12 @@
 //! `middleware`.
 
 pub(crate) mod admin;
+pub(crate) mod conn;
 pub(crate) mod handoff;
 pub(crate) mod listener;
-pub(crate) mod conn;
-pub(crate) mod stream;
 mod middleware;
 mod node;
+pub(crate) mod stream;
 
 pub use node::node;
 
@@ -129,8 +129,17 @@ pub async fn serve(config: ServeConfig, stated: Stated, shutdown: CancellationTo
     };
     Daemon::advance_epochs(Arc::clone(&updates), awake)
         .context("starting the epoch layer's thread")?;
+    // The daemon's channel down to the main processes, which the epoch's
+    // first program switch commands through.
+    let commands = daemon
+        .lock()
+        .map_err(|_| anyhow::anyhow!("the daemon's lock is poisoned"))?
+        .as_ref()
+        .and_then(Daemon::commands);
     let engine = tokio::select! {
-        engine = Leader::start(&config, &stated, address, updates) => engine.map(Arc::new),
+        engine = Leader::start(&config, &stated, address, commands.as_ref(), updates) => {
+            engine.map(Arc::new)
+        }
         () = shutdown.cancelled() => return stop_daemon(daemon).await,
     };
     let engine = match engine {
@@ -340,7 +349,9 @@ async fn serve_on(
         tokio::spawn(async move {
             crate::restart::streams::adopted(std::slice::from_ref(&stream));
             let request_id = stream.request_id.clone();
-            let error = conn::adopt(stream.descriptor, stream.http, stream.body, app).await.err();
+            let error = conn::adopt(stream.descriptor, stream.http, stream.body, app)
+                .await
+                .err();
             if let Some(error) = error {
                 tracing::warn!(%request_id, %error, "a handed-over connection ended");
             }

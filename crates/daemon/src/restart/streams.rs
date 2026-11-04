@@ -44,10 +44,10 @@
 //! removes their routes from the covered set, and until then a response they
 //! write ends at the boundary.
 //!
-//! A video artifact's body is not covered yet: it would take a session that
-//! streams the retained media from the byte the predecessor reached, which
-//! does not exist. Such a response is left with the predecessor, which
-//! finishes it, and the successor is not told it was taken over.
+//! A video artifact's body is covered too: its state names the job and the
+//! byte the predecessor reached, and the successor streams the job's retained
+//! media from there. The media is the one the successor adopted with the job,
+//! so a response whose media did not come over stays with the predecessor.
 
 use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex};
@@ -61,6 +61,7 @@ use tracing::{info, warn};
 use crate::http::handoff::{Decision, FrozenStream};
 use crate::http::stream::ResponseStream;
 use crate::leader::Leader;
+use crate::openai::video_jobs::VideoJobs;
 
 /// One response the predecessor froze, as it travels to the successor.
 ///
@@ -263,12 +264,13 @@ pub(crate) struct Adoption {
 pub(crate) fn adopt(
     leader: &Arc<Leader>,
     records: Vec<StreamHandoff>,
+    jobs: &Arc<VideoJobs>,
     next: &mut impl FnMut() -> anyhow::Result<OwnedFd>,
 ) -> Adoption {
     let mut taken = Vec::new();
     let mut streams = Vec::new();
     for record in records {
-        match take_over(leader, &record, next) {
+        match take_over(leader, jobs, &record, next) {
             Ok(response) => {
                 streams.push(Taken {
                     request_id: response.request_id.clone(),
@@ -294,6 +296,7 @@ pub(crate) fn adopt(
 /// from the state, then its connection.
 fn take_over(
     leader: &Arc<Leader>,
+    jobs: &Arc<VideoJobs>,
     record: &StreamHandoff,
     next: &mut impl FnMut() -> anyhow::Result<OwnedFd>,
 ) -> anyhow::Result<Adopted> {
@@ -353,14 +356,25 @@ fn take_over(
             // One JSON body: no server-sent events, so no keep-alive comment.
             ResponseStream::start(Box::new(run), false)
         }
-        // A video artifact's body has no session a successor resumes yet: the
-        // response stays with the predecessor, which finishes it, and is not
-        // named among the adopted ones.
-        handoff::stream::Application::VideoContent(content) => anyhow::bail!(
-            "a handed-over video response of job {} at byte {} has no session here yet",
-            content.job_id,
-            content.offset
-        ),
+        handoff::stream::Application::VideoContent(content) => {
+            // The artifact is the successor's own retained media: the job was
+            // adopted from the predecessor before its responses are, so a job
+            // that is not here is one whose media did not come over.
+            let media = jobs.content(&content.job_id).with_context(|| {
+                format!(
+                    "the retained media of the handed-over job {} is not here",
+                    content.job_id
+                )
+            })?;
+            let run = crate::output::run::VideoContentRun::new(
+                content.job_id.clone(),
+                content.content_type.clone(),
+                media,
+            )
+            .from_offset(usize::try_from(content.offset).unwrap_or(usize::MAX));
+            // Artifact bytes, not events: no server-sent keep-alive.
+            ResponseStream::start(Box::new(run), false)
+        }
     };
     info!(
         request_id = %record.request_id,
@@ -415,4 +429,108 @@ pub(crate) fn finished(request_id: &str) {
             "at_ns": crate::http::handoff::now_ns(),
         })
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use engine::{EngineConfig, SimEngine};
+    use proto::handoff::stream::Application;
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::model::ModelParameters;
+    use crate::options::VideoJobOptions;
+    use crate::test_support::{configured_tokenizer, leader_over, sim_client, sim_core, sim_model};
+
+    /// A response the successor cannot read is not taken over: it stays the
+    /// predecessor's, it is reported as taken over by nobody, and the
+    /// successor does not take its socket out of the handover — it does not
+    /// own the connection, so nothing about it moves.
+    #[tokio::test]
+    async fn a_response_that_cannot_be_read_stays_with_the_predecessor() {
+        // The queue of taken-over responses is this process's, so the test
+        // starts from what earlier tests left there.
+        let _ = take_adopted();
+        let core = sim_core(EngineConfig::sim("refused-handoff"), SimEngine::new());
+        let client = std::sync::Arc::new(sim_client(vec![core]));
+        let leader = std::sync::Arc::new(leader_over(
+            sim_model(ModelParameters::Qwen3),
+            configured_tokenizer(),
+            "refused-handoff".into(),
+            vec![client],
+            None,
+        ));
+        let jobs = std::sync::Arc::new(VideoJobs::new(
+            VideoJobOptions::default(),
+            CancellationToken::new(),
+        ));
+
+        // Bytes that are not a `uniserve.handoff.Stream`.
+        let record = StreamHandoff {
+            request_id: "refused-handoff-request".to_owned(),
+            frozen_at_ns: 1,
+            state: b"not a handed-over stream".to_vec(),
+        };
+        let mut socket_taken = false;
+        let adoption = adopt(&leader, vec![record], &jobs, &mut || {
+            socket_taken = true;
+            anyhow::bail!("a refused response must not take a descriptor")
+        });
+
+        assert!(
+            adoption.streams.is_empty(),
+            "a response that cannot be read is taken over by nobody"
+        );
+        assert!(
+            take_adopted().is_empty(),
+            "nothing is reported as adopted"
+        );
+        assert!(
+            !socket_taken,
+            "the successor takes no socket of a response it did not take over"
+        );
+    }
+
+    /// The same refusal when the state is readable but names no application:
+    /// the record is complete enough to decode and still cannot be resumed.
+    #[tokio::test]
+    async fn a_response_that_names_no_application_stays_with_the_predecessor() {
+        let _ = take_adopted();
+        let core = sim_core(EngineConfig::sim("refused-handoff-2"), SimEngine::new());
+        let client = std::sync::Arc::new(sim_client(vec![core]));
+        let leader = std::sync::Arc::new(leader_over(
+            sim_model(ModelParameters::Qwen3),
+            configured_tokenizer(),
+            "refused-handoff-2".into(),
+            vec![client],
+            None,
+        ));
+        let jobs = std::sync::Arc::new(VideoJobs::new(
+            VideoJobOptions::default(),
+            CancellationToken::new(),
+        ));
+        let state = StreamHandoff {
+            request_id: "nameless-application".to_owned(),
+            frozen_at_ns: 1,
+            state: Vec::new(),
+        };
+        // A decoded stream with no application and no framing.
+        let mut record = state;
+        record.state = handoff::Stream {
+            request_id: "nameless-application".to_owned(),
+            http: None,
+            application: None::<Application>,
+        }
+        .encode_to_vec();
+
+        let mut socket_taken = false;
+        let adoption = adopt(&leader, vec![record], &jobs, &mut || {
+            socket_taken = true;
+            anyhow::bail!("a refused response must not take a descriptor")
+        });
+
+        assert!(adoption.streams.is_empty());
+        assert!(take_adopted().is_empty());
+        assert!(!socket_taken, "a response without framing does not move");
+    }
 }

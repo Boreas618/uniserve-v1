@@ -1895,7 +1895,11 @@ fn clamp_logprob(logprob: f32) -> f32 {
 mod tests {
     use futures::{StreamExt as _, stream};
 
+    use super::super::protocol::ChatCompletionStreamResponse;
+    use super::ChatCollector;
     use super::ChatResponseContext;
+    use super::ChatStreamEmitter;
+    use super::chat_response;
     use super::chat_completion_chunk_stream;
     use crate::output::chat::{AssistantBlockKind, AssistantContentBlock};
     use crate::output::text::{DecodedLogprobs, DecodedPositionLogprobs, DecodedTokenLogprob};
@@ -2004,5 +2008,156 @@ mod tests {
     #[tokio::test]
     async fn hidden_reasoning_streams_no_metadata_of_reasoning_updates() {
         assert_eq!(streamed_metadata(false).await, (Vec::new(), 0));
+    }
+
+    /// The chunk as the client receives it, for comparing two runs.
+    fn chunks_of(chunks: &[ChatCompletionStreamResponse]) -> Vec<serde_json::Value> {
+        chunks
+            .iter()
+            .map(|chunk| serde_json::to_value(chunk).expect("a chunk serializes"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_handed_over_chunk_stage_writes_the_same_chunks() {
+        let context = ChatResponseContext {
+            request_id: "r".to_string(),
+            response_model: "m".to_string(),
+            include_usage: true,
+            requested_logprobs: true,
+            include_prompt_logprobs: false,
+            include_reasoning: true,
+            return_token_ids: true,
+            return_tokens_as_token_ids: false,
+        };
+        let outputs: Vec<RequestOutput> = thinking_response()
+            .into_iter()
+            .map(|output| output.expect("a served event"))
+            .collect();
+
+        // The same response written in one process: the reference sequence.
+        let mut uninterrupted = ChatStreamEmitter::new(&context, 7);
+        let mut expected = Vec::new();
+        for output in &outputs {
+            expected.extend(uninterrupted.push(output).expect("a chunk"));
+        }
+        let expected = chunks_of(&expected);
+
+        // The same response handed over at every position: where the stage can
+        // state itself, the successor writes exactly the rest of the same
+        // chunks; where it cannot, it says so instead of losing one.
+        let mut handable = 0;
+        for split in 1..outputs.len() {
+            let mut first = ChatStreamEmitter::new(&context, 7);
+            let mut chunks = Vec::new();
+            for output in &outputs[..split] {
+                chunks.extend(first.push(output).expect("a chunk"));
+            }
+            let state = first.state();
+            let Some(state) = state else {
+                // Only a buffered update keeps the stage from being stated.
+                continue;
+            };
+            handable += 1;
+            let mut second = ChatStreamEmitter::new(&context, 7);
+            second.resume(&state);
+            for output in &outputs[split..] {
+                chunks.extend(second.push(output).expect("a chunk"));
+            }
+            assert_eq!(
+                chunks_of(&chunks),
+                expected,
+                "a handoff after {split} outputs writes different chunks"
+            );
+        }
+        assert!(handable > 0, "no position in the response can be handed over");
+    }
+
+    /// The collected one-body response continues where a handoff left it: a
+    /// collector handed over mid-response collects exactly the response the
+    /// uninterrupted one does.
+    #[tokio::test]
+    async fn a_handed_over_collector_writes_the_same_response() {
+        let context = ChatResponseContext {
+            request_id: "r".to_string(),
+            response_model: "m".to_string(),
+            include_usage: false,
+            requested_logprobs: true,
+            include_prompt_logprobs: false,
+            include_reasoning: true,
+            return_token_ids: true,
+            return_tokens_as_token_ids: false,
+        };
+        let outputs: Vec<RequestOutput> = thinking_response()
+            .into_iter()
+            .map(|output| output.expect("a served event"))
+            .collect();
+
+        let mut uninterrupted = ChatCollector::new();
+        for output in &outputs {
+            uninterrupted.push(output).expect("a collected output");
+        }
+        let expected = serde_json::to_value(
+            chat_response(uninterrupted.collected().expect("the response"), &context, 7)
+                .expect("a response"),
+        )
+        .expect("the response serializes");
+
+        for split in 1..outputs.len() {
+            let mut first = ChatCollector::new();
+            for output in &outputs[..split] {
+                first.push(output).expect("a collected output");
+            }
+            // The blocks, token ids and images travel; the request's terminal
+            // output arrives after the handoff.
+            let mut second = ChatCollector::new();
+            second.resume(&first.state());
+            for output in &outputs[split..] {
+                second.push(output).expect("a collected output");
+            }
+            let response = serde_json::to_value(
+                chat_response(second.collected().expect("the response"), &context, 7)
+                    .expect("a response"),
+            )
+            .expect("the response serializes");
+            assert_eq!(response, expected, "a handoff after {split} outputs differs");
+        }
+    }
+
+    /// A stage holding a buffered chunk reports that it cannot be handed over,
+    /// rather than handing over a state that would drop it.
+    #[tokio::test]
+    async fn a_buffered_chunk_cannot_be_handed_over() {
+        let context = ChatResponseContext {
+            request_id: "r".to_string(),
+            response_model: "m".to_string(),
+            include_usage: false,
+            requested_logprobs: true,
+            include_prompt_logprobs: false,
+            include_reasoning: true,
+            return_token_ids: true,
+            return_tokens_as_token_ids: false,
+        };
+        // The deltas of one update are buffered until its metadata arrives.
+        let mut emitter = ChatStreamEmitter::new(&context, 7);
+        emitter
+            .push(&RequestOutput::TextDelta {
+                text: "Hi".to_string(),
+            })
+            .expect("a buffered delta");
+        assert!(
+            emitter.state().is_none(),
+            "a buffered chunk is never stated as handed over"
+        );
+        emitter
+            .push(&RequestOutput::TokenDelta {
+                token_ids: vec![11],
+                logprobs: logprobs(11),
+            })
+            .expect("the update's metadata");
+        assert!(
+            emitter.state().is_some(),
+            "after the update's metadata the stage can be handed over again"
+        );
     }
 }

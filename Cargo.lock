@@ -3354,7 +3354,6 @@ version = "2.0.0"
 dependencies = [
  "nn",
  "ops",
- "safetensors",
  "serde",
  "serde_json",
  "tempfile",
@@ -4728,6 +4727,7 @@ dependencies = [
  "daemon",
  "engine",
  "executor",
+ "frontend",
  "ipc",
  "libc",
  "libloading",
