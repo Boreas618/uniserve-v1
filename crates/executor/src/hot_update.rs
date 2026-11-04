@@ -271,18 +271,16 @@ impl HotUpdate {
             Phase::Precopied {
                 generation: expected,
             } if expected == generation => {
-                // Reverting before the switchover changes nothing serving, but
-                // the prepared generation has graphs and kernels on the
-                // executors: it is recorded for a purge like a reverted one.
+                // Reverting before the switchover changes nothing that serves, and the prepared
+                // generation is **discarded**, not purged: it never served a batch, so there is no
+                // last batch for a purge to follow, and `previous` is the generation a purge
+                // releases - it still names whatever the last switchover replaced. Recording this
+                // one as pending would leave the purge slot occupied by a generation no purge can
+                // name (`request_purge` refuses a number that is not `previous`), and every later
+                // purge would be refused for the rest of the epoch.
                 self.failure = Some(failure);
                 self.failed_generation = Some(generation);
                 self.phase = Phase::Serving;
-                // An earlier purge may still be pending; the daemon's purge of
-                // this generation follows its last batch, and there is none to
-                // wait for because it never served.
-                if self.purging.is_none() {
-                    self.purging = Some(generation);
-                }
                 Ok(())
             }
             phase => Err(unexpected(phase)),
@@ -539,6 +537,28 @@ mod tests {
         assert_eq!(update.purge_due(), Some(7));
         update.purged(7).expect("purged");
         assert!(update.request_purge(7).is_err());
+    }
+
+    /// A revert before the switchover discards the prepared generation and leaves the purge slot
+    /// free: the generation never served, so nothing about it can be purged, and a later update's
+    /// purge must still be able to run.
+    #[test]
+    fn a_revert_before_switchover_leaves_the_purge_slot_free() {
+        let mut update = update();
+        update.begin_precopy(8).expect("a fresh update");
+        update.precopied(8).expect("precopy finished");
+        update.revert(8, stall()).expect("revert before switchover");
+        assert_eq!(update.current(), 7, "nothing was switched over");
+        assert_eq!(update.previous(), None, "no generation was replaced");
+        assert_eq!(update.purge_due(), None, "a discarded generation is not purged");
+
+        // The next update's purge still runs.
+        update.begin_precopy(9).expect("a second update");
+        update.precopied(9).expect("precopy finished");
+        update.switchover(9, Instant::now()).expect("switchover");
+        update
+            .request_purge(7)
+            .expect("the generation the switchover replaced is purged");
     }
 
     #[test]
