@@ -24,6 +24,7 @@
 use std::fmt;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::pool::VirtualPool;
 use crate::vmm::{HandleType, ShareableHandle};
@@ -103,7 +104,13 @@ pub trait Budget: Send + Sync {
 /// A block outlives the buffers that describe it inside its pool, which keeps
 /// it mapped and gives it out again after it is freed.
 pub(crate) struct Block {
-    raw: u64,
+    /// The driver's handle of the storage mapped here, or 0 while the pool has
+    /// released it (a suspended pool). A buffer held across a suspension and a
+    /// restore keeps this block, so the handle is the block's own state rather
+    /// than a value copied when the buffer was handed out: exporting a buffer
+    /// after a restore exports the storage the restore created, and exporting
+    /// one while suspended is refused instead of naming a released handle.
+    handle: AtomicU64,
     bytes: usize,
     handle_type: HandleType,
     context: PrimaryContext,
@@ -117,15 +124,32 @@ impl Block {
         context: PrimaryContext,
     ) -> Self {
         Self {
-            raw,
+            handle: AtomicU64::new(raw),
             bytes,
             handle_type,
             context,
         }
     }
 
+    /// The handle of the storage mapped here now; 0 while the pool released it.
     pub(crate) fn raw(&self) -> u64 {
-        self.raw
+        self.handle.load(Ordering::Acquire)
+    }
+
+    /// Whether the pool maps this block's storage now.
+    pub(crate) fn is_mapped(&self) -> bool {
+        self.raw() != 0
+    }
+
+    /// The pool mapped new storage at the block's address: this is its handle.
+    pub(crate) fn remap(&self, raw: u64) {
+        self.handle.store(raw, Ordering::Release);
+    }
+
+    /// The pool released the block's storage; its address and contents stay
+    /// with the pool until the restore.
+    pub(crate) fn unmap(&self) {
+        self.handle.store(0, Ordering::Release);
     }
 
     /// The storage this block maps, rounded up to the allocation granularity.
@@ -136,7 +160,13 @@ impl Block {
     /// Exports one reference to the block as a POSIX file descriptor, which a
     /// Unix socket passes to the Storage Server or to another process.
     pub(crate) fn export(&self) -> Result<OwnedFd> {
-        match ShareableHandle::export(self.raw, self.handle_type)? {
+        if !self.is_mapped() {
+            return Err(Error::invalid(format!(
+                "the block of {} has no storage to export while its pool is suspended",
+                self.context.device()
+            )));
+        }
+        match ShareableHandle::export(self.raw(), self.handle_type)? {
             ShareableHandle::Descriptor(descriptor) => Ok(descriptor),
             ShareableHandle::Fabric(_) => Err(Error::invalid(format!(
                 "{}'s allocator maps POSIX descriptor handles, not fabric handles",
