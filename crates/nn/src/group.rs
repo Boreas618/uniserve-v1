@@ -13,10 +13,16 @@
 
 use std::cell::RefCell;
 
+use ops::platform::{DeviceRange, PlatformDevicePtr};
 use ops::{CollectiveType, Communicator, ReduceOp, Stream};
 
 use crate::error::{Error, Result};
 use crate::tensor::TensorView;
+
+/// The bytes `view` addresses, as the collective's range type wants them.
+fn range(view: TensorView, bytes: usize) -> DeviceRange {
+    DeviceRange::new(PlatformDevicePtr::from_address(view.ptr.address()), bytes)
+}
 
 /// A rank's NCCL communicator, borrowed by forwards.
 pub struct Group {
@@ -59,21 +65,18 @@ impl Group {
         stream: &Stream,
     ) -> Result<()> {
         let (count, dtype) = self.collective(send, recv, "all_reduce")?;
-        let mut communicator = self.communicator.borrow_mut();
-        // SAFETY: both views address `count` elements of `dtype` on the communicator's device and
-        // stay alive until the collective completes; the caller owns them for that long.
-        unsafe {
-            communicator
-                .all_reduce(
-                    send.ptr.address(),
-                    recv.ptr.address(),
-                    count,
-                    dtype,
-                    op,
-                    stream,
-                )
-                .map_err(Error::Platform)
-        }
+        let bytes = dtype.bytes() * count;
+        self.communicator
+            .borrow_mut()
+            .all_reduce(
+                stream,
+                range(send, bytes),
+                range(recv, bytes),
+                count,
+                dtype,
+                op,
+            )
+            .map_err(Error::Platform)
     }
 
     /// Gather `send` from every rank into `recv`, rank-major.
@@ -95,27 +98,27 @@ impl Group {
                 ),
             ));
         }
-        let mut communicator = self.communicator.borrow_mut();
-        // SAFETY: `send` holds `count` elements and `recv` holds `ranks × count` of the same dtype
-        // on the communicator's device, and both stay alive until the collective completes.
-        unsafe {
-            communicator
-                .all_gather(send.ptr.address(), recv.ptr.address(), count, dtype, stream)
-                .map_err(Error::Platform)
-        }
+        let bytes = dtype.bytes();
+        self.communicator
+            .borrow_mut()
+            .all_gather(
+                stream,
+                range(send, bytes * count),
+                range(recv, bytes * expected),
+                count,
+                dtype,
+            )
+            .map_err(Error::Platform)
     }
 
     /// Exchange equal blocks with every rank: block `j` goes to rank `j`, rank `j`'s comes back.
     pub fn all_to_all(&self, send: TensorView, recv: TensorView, stream: &Stream) -> Result<()> {
         let (count, dtype) = self.collective(send, recv, "all_to_all")?;
-        let mut communicator = self.communicator.borrow_mut();
-        // SAFETY: both views hold `ranks × count` elements of `dtype` on the communicator's device
-        // and stay alive until the collective completes.
-        unsafe {
-            communicator
-                .all_to_all(send.ptr.address(), recv.ptr.address(), count, dtype, stream)
-                .map_err(Error::Platform)
-        }
+        let bytes = dtype.bytes() * count * usize::try_from(self.ranks).unwrap_or(usize::MAX);
+        self.communicator
+            .borrow_mut()
+            .all_to_all(stream, range(send, bytes), range(recv, bytes), count, dtype)
+            .map_err(Error::Platform)
     }
 
     /// Run `call` with the underlying communicator, for an operator whose collective is not one of
