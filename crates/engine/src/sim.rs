@@ -41,6 +41,16 @@ const DEFAULT_TEXT_LEN: usize = 8;
 /// simulated requests.
 const FAKE_EOS_TOKEN: u32 = 151_645;
 const SYNTH_VOCAB_SIZE: usize = FAKE_EOS_TOKEN as usize + 1;
+/// The longest sequence the simulated pool was launched for: the model's
+/// context length, which a real rank reads from its launch arguments'
+/// `max_model_len` and which the attention descriptor bounds every row by.
+///
+/// A world states it as the pool's own launch fact, so the mechanism shapes a
+/// KV view from a number the pool declares and not from a guess: batches are
+/// refused when it is zero, exactly as a deployment that never states its
+/// model's length is refused.
+const SIM_MAX_MODEL_LEN: u32 = 32_768;
+
 const DEFAULT_DENOISE_STEPS: u16 = 50;
 const DEFAULT_IMAGE_HW: (u32, u32) = (512, 512);
 
@@ -115,6 +125,7 @@ impl SimExecutor {
     pub fn new(mut engine: SimEngine) -> Self {
         let info = engine.info().clone();
         let placement = engine.placement.clone();
+        let max_model_len = engine.max_model_len;
         let latent_pools = engine.latent_pools.clone();
         let encoder_pools = engine.encoder_pools.clone();
         let results_on_wait = engine.results_on_wait;
@@ -158,6 +169,10 @@ impl SimExecutor {
                 ExecutorInfo {
                     workers: vec![(id.clone(), info.clone())],
                     placements: BTreeMap::from([(id.clone(), placement)]),
+                    // The pool's own launch fact, as `WorkerExecutor` reads it
+                    // from the ranks' launch arguments: the mechanism shapes a
+                    // KV view to it, and refuses to shape one without it.
+                    max_model_len,
                     rank_latents: if latent_pools.is_empty() {
                         BTreeMap::new()
                     } else {
@@ -910,6 +925,14 @@ pub struct SimEngine {
     /// components' placement, which `SimExecutor` states to the scheduler as
     /// the engine's own launch, as `WorkerExecutor` does.
     placement: PoolPlacement,
+    /// The longest sequence the simulated pool was launched for: the model's
+    /// context length, which a real rank reads from its launch arguments
+    /// (`WorkerProcessArgs::max_model_len`) and `SimExecutor` states to the
+    /// scheduler as `ExecutorInfo::max_model_len`.
+    ///
+    /// The mechanism bounds every attention row by it, so a pool that states
+    /// none is refused rather than shaped to a bound nobody gave.
+    max_model_len: u32,
     /// Synthetic tokens sampled before `fake_eos` dominates.
     text_len: usize,
     fake_eos: u32,
@@ -1087,6 +1110,7 @@ impl SimEngine {
                 ranks: 1,
                 components: BTreeMap::new(),
             },
+            max_model_len: SIM_MAX_MODEL_LEN,
             text_len: DEFAULT_TEXT_LEN,
             fake_eos: FAKE_EOS_TOKEN,
             vocab: SYNTH_VOCAB_SIZE,
@@ -1103,6 +1127,19 @@ impl SimEngine {
             encoder_pools: Vec::new(),
             context: ContextLog::default(),
         }
+    }
+
+    /// The longest sequence this simulated pool was launched for: the number
+    /// `SimExecutor` states as `ExecutorInfo::max_model_len`.
+    pub const fn max_model_len(&self) -> u32 {
+        self.max_model_len
+    }
+
+    /// States the longest sequence this pool is launched for, as a launch file
+    /// states a real rank's: a world built for another model length says so
+    /// here rather than inheriting the simulator's default.
+    pub const fn set_max_model_len(&mut self, tokens: u32) {
+        self.max_model_len = tokens;
     }
 
     /// Produces deterministic logits for one simulated autoregressive position.
@@ -2368,6 +2405,31 @@ mod tests {
     use ipc::{
         Bounds, CallId, DType, ForwardBatch, GenerationParams, RequestKey, ShapeBound, TensorRef,
     };
+
+    /// The pool states the longest sequence it was launched for, and
+    /// `SimExecutor` hands that number to the mechanism: a batch is shaped to
+    /// a bound the pool declared, and a pool that declares none hands over a
+    /// zero the mechanism refuses rather than a guessed bound.
+    #[test]
+    fn a_simulated_pool_states_the_model_length_it_was_launched_for() {
+        let launched = SimEngine::new().max_model_len();
+        assert!(launched > 0, "a launched pool states its model's length");
+        let executor = SimExecutor::new(SimEngine::new());
+        assert_eq!(executor.info().max_model_len, launched);
+
+        let mut silent = SimEngine::new();
+        silent.set_max_model_len(0);
+        let executor = SimExecutor::new(silent);
+        assert_eq!(
+            executor.info().max_model_len,
+            0,
+            "a world that states none states none: the mechanism, not the simulator, refuses it"
+        );
+
+        let mut longer = SimEngine::new();
+        longer.set_max_model_len(65_536);
+        assert_eq!(SimExecutor::new(longer).info().max_model_len, 65_536);
+    }
 
     fn request_key() -> RequestKey {
         RequestKey::new(0, RequestId(9), 1)

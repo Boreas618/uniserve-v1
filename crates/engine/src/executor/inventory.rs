@@ -448,6 +448,46 @@ mod tests {
         assert_eq!(info.rank_count(&id), 2);
     }
 
+    /// The attention descriptor's bound is the pool's own launch fact: a pool
+    /// that states none is refused by name, rather than shaped to a bound
+    /// nobody gave, and two pools of one deployment must agree on it.
+    #[test]
+    fn a_pools_longest_sequence_must_be_stated_and_agreed() {
+        let silent = pool(
+            "text",
+            vec![rank("gpu-a", 128, None)],
+            1,
+            components(&[("text", &[0])]),
+            0,
+        );
+        let error = ExecutorInfo::from_inventory(&[silent]).expect_err("a pool that states none");
+        assert!(
+            format!("{error:#}").contains("pool text states no longest sequence"),
+            "{error:#}"
+        );
+
+        let narrow = pool(
+            "text",
+            vec![rank("gpu-a", 128, None)],
+            1,
+            components(&[("text", &[0])]),
+            4096,
+        );
+        let wide = pool(
+            "media",
+            vec![rank("gpu-b", 64, None)],
+            1,
+            components(&[("text", &[0])]),
+            8192,
+        );
+        let error =
+            ExecutorInfo::from_inventory(&[narrow, wide]).expect_err("two pools disagree");
+        assert!(
+            format!("{error:#}").contains("states"),
+            "the disagreement names both pools: {error:#}"
+        );
+    }
+
     #[test]
     fn a_pools_report_is_rank_zeros_with_what_its_ranks_state_jointly() {
         let mut narrow = rank("gpu-a", 128, None);
