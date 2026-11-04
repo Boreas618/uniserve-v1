@@ -143,6 +143,10 @@ const ATTR_OPERATION_CONVOLUTION_BWD_DATA_DX: i32 = 710;
 const ATTR_OPERATION_CONVOLUTION_BWD_DATA_DY: i32 = 711;
 const ATTR_OPERATIONGRAPH_HANDLE: i32 = 800;
 const ATTR_OPERATIONGRAPH_OPS: i32 = 801;
+/// How many engines the library holds for a graph at all, whatever a mode's
+/// search returned. It is read only as a cross-check: a graph that names no
+/// device can still say how many engines exist for its ops.
+const ATTR_OPERATIONGRAPH_ENGINE_GLOBAL_COUNT: i32 = 802;
 const ATTR_TENSOR_BYTE_ALIGNMENT: i32 = 900;
 const ATTR_TENSOR_DATA_TYPE: i32 = 901;
 const ATTR_TENSOR_DIMENSIONS: i32 = 902;
@@ -1700,6 +1704,31 @@ impl Cudnn {
             self.api
                 .count(&mode_b, ATTR_ENGINEHEUR_RESULTS, TYPE_BACKEND_DESCRIPTOR)
         );
+        // The graph's own count of the engines it has at all. Read beside the
+        // heuristic's counts because the two modes answered the same number on
+        // both shapes tried, which a mode-specific search should not do: a
+        // number that matches this one in every mode would say the two
+        // readings are not coming from different places.
+        for (label, descriptor) in [
+            ("the graph that names no device", &graph),
+            ("the graph that names the device", &named),
+        ] {
+            let mut global = 0i64;
+            let line = match self.api.get(
+                descriptor,
+                ATTR_OPERATIONGRAPH_ENGINE_GLOBAL_COUNT,
+                TYPE_INT64,
+                std::slice::from_mut(&mut global),
+                "cudnnBackendGetAttribute",
+            ) {
+                Ok(_) => format!("{global}"),
+                Err(error) => format!("refused: {error}"),
+            };
+            steps.push((
+                format!("operation graph: {label}, engine global count: {line}"),
+                None,
+            ));
+        }
         for (label, descriptor) in [("mode A", &heuristic), ("mode B", &mode_b)] {
             let line = match self.mode_of(descriptor) {
                 Ok(mode) => format!(
@@ -2613,6 +2642,10 @@ mod tests {
                 (
                     "CUDNN_ATTR_OPERATIONGRAPH_OPS",
                     ATTR_OPERATIONGRAPH_OPS as i64,
+                ),
+                (
+                    "CUDNN_ATTR_OPERATIONGRAPH_ENGINE_GLOBAL_COUNT",
+                    ATTR_OPERATIONGRAPH_ENGINE_GLOBAL_COUNT as i64,
                 ),
                 (
                     "CUDNN_ATTR_TENSOR_BYTE_ALIGNMENT",
