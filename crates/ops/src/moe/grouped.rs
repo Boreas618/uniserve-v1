@@ -280,6 +280,22 @@ impl Op for GatherGemm {
             .require_shape(Self::NAME, Shape::new(&[experts, 2 * intermediate, hidden]))?;
         args.weights
             .require_row(Self::NAME, descriptor.dtype, hidden)?;
+        // `ids` states the expanded route count and `expanded_to_permuted` is that same
+        // `(token, route)` space as the consumer sees it: the sort writes both, and a map of another
+        // shape is one a layer looks routes up in past its end. The hidden states name `tokens`, so
+        // all three agree on the route count or the launch refuses.
+        for (what, view) in [
+            ("route ids", &args.ids),
+            ("the route map", &args.expanded_to_permuted),
+        ] {
+            view.require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
+            if view.dtype != DType::I32 {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!("expected i32 {what}, found {}", view.dtype),
+                ));
+            }
+        }
         for view in [
             &args.tile_to_expert,
             &args.tile_to_limit,
@@ -434,6 +450,19 @@ impl Op for RouteGemm {
             ));
         }
         args.out.require_row(Self::NAME, descriptor.dtype, hidden)?;
+        // The product writes one row per **permuted** row — the height of `rows`, not the count of
+        // live expanded routes — because the combine indexes this buffer in the permuted row space.
+        // A buffer shorter than that is an overflow into whatever the arena placed next, and the
+        // entry cannot see it: it knows the height it was given and writes the map's rows.
+        if args.out.rows() < rows {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the output holds {} rows and this launch writes {rows} permuted rows",
+                    args.out.rows()
+                ),
+            ));
+        }
 
         let mut call = RouteCall {
             rows: address(args.rows.ptr) as usize as *const c_void,
@@ -497,7 +526,9 @@ pub struct RouteGemmArgs {
     pub permuted_to_expanded: TensorView,
     /// `[1]` i32 live tiles.
     pub num_non_exiting_tiles: TensorView,
-    /// `[tokens · top, hidden]` every route's expert product, written unweighted.
+    /// `[max_permuted_rows, hidden]` every permuted row's expert product, written unweighted: row
+    /// `p` of `out` is the product of the sort's permuted row `p`, which is also `out`'s row count
+    /// here and the height the launch checks.
     pub out: TensorView,
 }
 
@@ -1620,6 +1651,10 @@ mod nvfp4_launch_tests {
         odd.hidden = 2047;
         let mut odd_args = fc1_args();
         odd_args.weights = table(DType::U8, &[128, 1536, 1023]);
+        // The packed activations shrink with the contraction (`hidden / 2`), so the descriptor's odd
+        // width and the operand it is refused for agree; otherwise the shape check fires first and
+        // the test would be green about the wrong rule.
+        odd_args.hidden = table(DType::U8, &[3, 1023]);
         let error = GatherGemmNvfp4::validate(&odd, &odd_args).unwrap_err();
         assert!(format!("{error}").contains("odd"), "{error}");
 
@@ -1627,6 +1662,10 @@ mod nvfp4_launch_tests {
         partial.hidden = 2040;
         let mut partial_args = fc1_args();
         partial_args.weights = table(DType::U8, &[128, 1536, 1020]);
+        // The same rule as the odd case: the packed activations shrink with the contraction, so a
+        // stale width here would be refused by the shape check instead of by the block rule, and the
+        // test would be green about the wrong refusal.
+        partial_args.hidden = table(DType::U8, &[3, 1020]);
         let error = GatherGemmNvfp4::validate(&partial, &partial_args).unwrap_err();
         assert!(format!("{error}").contains("scale blocks"), "{error}");
     }

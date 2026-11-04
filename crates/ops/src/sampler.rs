@@ -208,38 +208,46 @@ pub struct TopKDescriptor {
     /// (`do_not_specialize = ["rows", "vocabulary", "width"]`), so it does not enter the key - a
     /// key that named it would demand a module per vocabulary the deployment happens to serve.
     pub vocabulary: u32,
-    /// How many candidates a row keeps: the live count, a **launch** value.
+    /// How many candidates a row keeps: a **launch** value, and the buffers' row stride.
     ///
-    /// The buffers are this many lanes wide per row and every emitted lane past it is masked, so
-    /// the live count does not enter the key. What enters it is its **padded** width - the next
-    /// power of two - because the emission ends in a bitonic sort, and a sort needs a power-of-two
-    /// network. A deployment's candidate count is a vocabulary (151936, which is `2^6 · 2371`), so
-    /// the network is widened and the buffers are not.
+    /// Nothing of the kept count is compiled in. The program walks the row in `tile`-lane chunks
+    /// and orders the kept pairs with radix passes over its scratch, so one module serves any kept
+    /// count up to the row's width - which is why the key names none of it.
     pub width: u32,
+    /// The lanes one pass reads, and the only size the key names.
+    ///
+    /// A pass's buffers and its nibble ranks are `tile` lanes wide, so the chunk is program content
+    /// the way a normalization's row block is: one module per chunk, whatever the vocabulary and
+    /// whatever the candidate count.
+    pub tile: u32,
     /// Element type of the emitted vocabulary ids.
     pub ids: DType,
     /// Launch with programmatic dependent launch.
     pub pdl: bool,
 }
 
-/// The bitonic network a candidate count is compiled to: the next power of two at or above it.
+/// The bins of one ordering pass of `top_k`: a nibble of the order-preserving key.
+pub const TOP_K_BINS: u32 = 16;
+
+/// The scratch one `top_k` launch of `rows` rows keeps: for every row two key planes, two id
+/// planes, and then two `TOP_K_BINS`-element tables - the descending base of each nibble and the
+/// count of it the pass has already placed.
 ///
-/// One function on purpose. It is the only place the padding is derived, so the key a store builds
-/// (`TopKDescriptor`'s display) and the width a program is compiled to (`src/build.py` reading the
-/// key) cannot disagree - and a caller that needs the number, such as a plan sizing a store, gets it
-/// from here rather than rounding for itself.
-pub fn network_width(width: u32) -> u32 {
-    width.next_power_of_two()
+/// The planes are the kept count wide, not the vocabulary's: the ordering works on the compacted
+/// candidates. It is one tensor per launch rather than five because a launch's operands are its
+/// arguments, and the program addresses the planes by offset from its own row.
+pub fn top_k_workspace(rows: u64, width: u64) -> Shape {
+    Shape::new(&[rows, 4 * width + 2 * u64::from(TOP_K_BINS)])
 }
 
 impl fmt::Display for TopKDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // `vocabulary` and the live `width` are absent on purpose: the program takes both as runtime
-        // scalars, so one module serves every vocabulary and every candidate count up to its
-        // network. What the key names is the network: the live count padded to a power of two.
+        // `vocabulary` and the kept count are absent on purpose: the program takes both as runtime
+        // scalars. What the key names is what a program can be compiled to disagree about, which is
+        // the element types and the chunk one pass reads.
         Key::new()
             .field("dtype", self.dtype)
-            .field("width", network_width(self.width))
+            .field("tile", self.tile)
             .field("ids", self.ids)
             .field("pdl", self.pdl)
             .finish(formatter)
@@ -255,6 +263,9 @@ pub struct TopKArgs {
     pub values: TensorView,
     /// `[rows, width]` the vocabulary ids of the kept logits.
     pub ids: TensorView,
+    /// The ordering's scratch, [`top_k_workspace`]'s shape: `[rows, 4 · width + 2 · TOP_K_BINS]`
+    /// i32. The plan reserves it; the program never grows one.
+    pub workspace: TensorView,
 }
 
 /// The `width` largest logits of every row, sorted.
@@ -281,12 +292,42 @@ impl Op for TopK {
             ));
         }
         let rows = args.logits.rows();
+        if descriptor.tile == 0 || !descriptor.tile.is_power_of_two() {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "a tile of {} is not a power of two: one pass reads a whole number of lanes",
+                    descriptor.tile
+                ),
+            ));
+        }
         args.logits
             .require_row(Self::NAME, descriptor.dtype, vocabulary)?;
         args.values
             .require_shape(Self::NAME, Shape::new(&[rows, width]))?;
+        if args.values.dtype != DType::F32 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "expected the kept logits as f32, found {}: the program recovers them from its \
+                     ordered keys as f32, and a narrower buffer would round them a second time",
+                    args.values.dtype
+                ),
+            ));
+        }
         args.ids
             .require_shape(Self::NAME, Shape::new(&[rows, width]))?;
+        args.workspace
+            .require_shape(Self::NAME, top_k_workspace(rows, width))?;
+        if args.workspace.dtype != DType::I32 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "expected the ordering's scratch as i32, found {}",
+                    args.workspace.dtype
+                ),
+            ));
+        }
         if args.ids.dtype != descriptor.ids {
             return Err(Error::argument(
                 Self::NAME,
@@ -299,6 +340,7 @@ impl Op for TopK {
             .view(args.logits)
             .view(args.values)
             .view(args.ids)
+            .view(args.workspace)
             .u64(rows)
             .u32(descriptor.vocabulary)
             .u32(descriptor.width);
