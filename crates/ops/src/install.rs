@@ -87,6 +87,7 @@ const OPERATORS: &[&str] = &[
     <crate::sampler::LogitsShape as Op>::NAME,
     <crate::sampler::TopK as Op>::NAME,
     <crate::sampler::FilterCandidates as Op>::NAME,
+    <crate::sampler::CandidateOrder as Op>::NAME,
     <crate::sampler::InverseCdf as Op>::NAME,
     <crate::sampler::ArgMax as Op>::NAME,
     <crate::sampler::LogSoftmax as Op>::NAME,
