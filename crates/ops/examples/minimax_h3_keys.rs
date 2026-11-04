@@ -698,6 +698,41 @@ fn main() {
         );
     }
 
+    // Its attention and its residual add, at the tower's own geometry: 16 heads of 72, a dense mask
+    // with no window, and **one sequence per time step** — `vision.rs` calls `attend_dense` with the
+    // offsets the grid's time steps give it, so the key carries no `cu_seq_lens` suffix (that name is
+    // written only for the form without offsets).
+    push(
+        "dense_attention",
+        ops::attention::DenseDescriptor {
+            query: DType::BF16,
+            key_value: DType::BF16,
+            output: DType::BF16,
+            head_dim: 72,
+            q_heads: 16,
+            kv_heads: 16,
+            mask: ops::attention::Mask::Dense,
+            windowed: false,
+            // A declared bound outside the key, sized for the tower's longest sequence: its learned
+            // position table is `num_position_embeddings 2304`, and no attention sequence is longer
+            // than the patches that table covers.
+            max_kv_len: 2304,
+            cu_seq_lens: true,
+        }
+        .to_string(),
+    );
+    // The tower's residual stream is `[patches, 1152]` with a plain scale and no bias update.
+    push(
+        "scaled_residual",
+        ops::residual::ScaledResidualDescriptor {
+            dtype: DType::BF16,
+            columns: 1152,
+            block: ELEMENTWISE_BLOCK,
+            update_bias: false,
+        }
+        .to_string(),
+    );
+
     // ---- The audio decoder's and encoder's convolutions, in FP32 with TF32 declared on.
     //
     // The decoder's seven upsamplers are `ConvTranspose1d` with `kernel = decoder_kernel_sizes`,
