@@ -442,26 +442,7 @@ impl ClipDecoder {
         decoded: TensorView,
         blended: TensorView,
     ) -> Result<()> {
-        if latents.len() != tiles.len() || positions.len() != tiles.len() {
-            return Err(Error::config(format!(
-                "{} tiles need {} latent views and {} position tables, found {} and {}",
-                tiles.len(),
-                tiles.len(),
-                tiles.len(),
-                latents.len(),
-                positions.len()
-            )));
-        }
-        let rows: u64 = tiles
-            .iter()
-            .map(|tile| crate::video_vae::Canvas::rows(&tile.canvas))
-            .sum();
-        if tokens.shape.rank() != 2 || tokens.shape.dim(0) != rows {
-            return Err(Error::config(format!(
-                "the clip's token buffer is {:?}, {rows} rows expected",
-                tokens.shape.dims()
-            )));
-        }
+        check_clip(tiles, latents.len(), positions.len(), tokens.shape)?;
         let mut start = 0_u64;
         for (index, tile) in tiles.iter().enumerate() {
             let tile_rows = crate::video_vae::Canvas::rows(&tile.canvas);
@@ -494,6 +475,32 @@ impl ClipDecoder {
             .to_owned(),
     ))
     }
+}
+
+/// Check one clip's arguments before any launch, and answer the token rows it needs.
+///
+/// A clip decodes one tile per entry of its grid: one latent view and one position table each, and one
+/// token buffer whose rows are the tiles' rows in the same order.
+fn check_clip(tiles: &[Tile], latents: usize, positions: usize, tokens: Shape) -> Result<u64> {
+    if latents != tiles.len() || positions != tiles.len() {
+        return Err(Error::config(format!(
+            "{} tiles need {} latent views and {} position tables, found {latents} and {positions}",
+            tiles.len(),
+            tiles.len(),
+            tiles.len()
+        )));
+    }
+    let rows: u64 = tiles
+        .iter()
+        .map(|tile| crate::video_vae::Canvas::rows(&tile.canvas))
+        .sum();
+    if tokens.rank() != 2 || tokens.dim(0) != rows {
+        return Err(Error::config(format!(
+            "the clip's token buffer is {:?}, {rows} rows expected",
+            tokens.dims()
+        )));
+    }
+    Ok(rows)
 }
 
 #[cfg(test)]
@@ -706,5 +713,32 @@ mod tests {
         // Every tile but the first row blends upwards, every tile but the first column blends left.
         assert_eq!(above_seams, 28 - 4);
         assert_eq!(left_seams, 28 - 7);
+    }
+
+    #[test]
+    fn a_clip_needs_one_latent_view_and_one_position_table_per_tile() {
+        let config = crate::video_vae::tests::video_config();
+        let canvas = Canvas::clip(&config, 48, 80);
+        let tiles = Tiles::of(&config, &canvas)
+            .expect("the grid")
+            .tiles(&config, &canvas);
+        // 28 tiles of a seven-frame canvas: 7 x 256 voxel rows plus five register and tail rows.
+        let rows: u64 = tiles
+            .iter()
+            .map(|tile| crate::video_vae::Canvas::rows(&tile.canvas))
+            .sum();
+        assert_eq!(rows, 28 * (7 * 256 + 5));
+        let tokens = Shape::new(&[rows, 3072]);
+        assert_eq!(
+            check_clip(&tiles, 28, 28, tokens).expect("a whole clip"),
+            rows
+        );
+        // A missing view or table is refused before any launch.
+        assert!(check_clip(&tiles, 27, 28, tokens).is_err());
+        assert!(check_clip(&tiles, 28, 27, tokens).is_err());
+        // So is a token buffer that is not one row per token of the clip.
+        assert!(check_clip(&tiles, 28, 28, Shape::new(&[rows - 1, 3072])).is_err());
+        assert!(check_clip(&tiles, 28, 28, Shape::new(&[rows, 2048])).is_ok());
+        assert!(check_clip(&tiles, 28, 28, Shape::new(&[rows])).is_err());
     }
 }
