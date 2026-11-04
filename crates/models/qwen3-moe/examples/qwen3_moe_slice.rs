@@ -861,18 +861,28 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     // What the model holds, by representation, beside what the index declares: a loader that fell
     // back to a full-precision path for a packed tensor still prints the declaration and still reads
     // as "NVFP4 ran", so the pair is the measurement and a mismatch is a refusal.
+    // The counts are in two units and saying so is part of the measurement: the index counts tensors
+    // and the loader publishes stacks, because an encoded expert block fuses everything the router
+    // names into one publish per projection pair. So the equivalence is stated by the model and not
+    // inferred here - what this line can refuse is a load that brought *nothing* through the
+    // representation, which is the fallback that would otherwise read as NVFP4 having run.
     println!(
-        "loaded: the index declares {packed} packed and {kept} kept in their own dtype; the model \
-         holds {} packed and {} full precision",
-        weights.packed, weights.dense,
+        "loaded: the index declares {packed} packed tensors and {kept} kept in their own dtype; the \
+         loader published {} packed weight(s) ({} bytes of E2M1) and {} full precision",
+        weights.packed, weights.packed_bytes, weights.dense,
     );
-    if weights.packed != packed {
+    if packed > 0 && weights.packed == 0 {
         return Err(Failure::message(format!(
-            "the index declares {packed} tensors as packed E2M1 and the model holds {}: the loader \
-             did not bring {} of them through the representation the checkpoint declares, and a run \
-             at that model would measure a fallback and call it NVFP4",
-            weights.packed,
-            packed.saturating_sub(weights.packed)
+            "the checkpoint declares {packed} packed E2M1 tensor(s) and the loader published none: \
+             every one of them arrived in a full-precision path, and a run at that model would \
+             measure a fallback and call it NVFP4"
+        )));
+    }
+    if packed == 0 && weights.packed > 0 {
+        return Err(Failure::message(format!(
+            "the checkpoint declares nothing packed and the loader published {} packed weight(s): \
+             the model holds a representation the checkpoint did not state",
+            weights.packed
         )));
     }
     if loaded != declared {
@@ -2794,6 +2804,9 @@ struct DeviceWeights {
     packed: usize,
     /// Weights published in a full-precision element type.
     dense: usize,
+    /// Bytes published as packed E2M1: the measure that survives the loader fusing 128 experts into
+    /// one stack, because a fused stack is one publish of many tensors' bytes.
+    packed_bytes: u64,
 }
 
 impl DeviceWeights {
@@ -2835,6 +2848,7 @@ impl DeviceWeights {
             bytes: 0,
             packed: 0,
             dense: 0,
+            packed_bytes: 0,
         })
     }
 
@@ -2896,7 +2910,10 @@ impl RetainedWeights for DeviceWeights {
         // that fell back would show up here as a packed tensor that never arrived packed, which is
         // the one thing the checkpoint's own index cannot tell a run.
         match dtype {
-            DType::U8 => self.packed += 1,
+            DType::U8 => {
+                self.packed += 1;
+                self.packed_bytes += bytes.len() as u64;
+            }
             DType::BF16 | DType::F16 | DType::F32 => self.dense += 1,
             _ => {}
         }
