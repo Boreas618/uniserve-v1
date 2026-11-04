@@ -22,12 +22,17 @@
 //! BF16 and the video VAE decoder is FP16, and each layer declares the precision it computes in
 //! (specs/worker.md 1, 9). An explicit choice converts every weight once, here, and never again.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use nn::DType;
 use nn::weights::Quantization;
+use nn::{Block, BlockName};
 
-use crate::{Error, Result};
+use crate::checkpoint::{Dit, Layout, Sidecars};
+use crate::config::Config;
+use crate::denoiser::{Arrangement, Denoiser};
+use crate::text_encoder::TextEncoder;
+use crate::{Error, Partition, Result};
 
 /// One block a deployment places, by the name its deployment file gives it.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -111,6 +116,69 @@ impl Component {
     }
 }
 
+/// The largest request a deployment admits, as the counts that size its DiT.
+///
+/// The attention's scratch and the per-layer buffers of a DiT are allocated once at load, for the
+/// largest layout the deployment will serve, so these are capacities and not the request's own
+/// numbers: a request larger than them is refused rather than overrunning a table
+/// (specs/worker.md 9, `uniserve/models/minimax_h3/denoiser.py`). They belong to the loading
+/// boundary because serving capacity is the caller's decision, not the architecture's
+/// (`AGENTS.md`, Model Library Boundary).
+///
+/// `text_rows` and `condition_rows` are counted in the attention kind's capacity unit: 64 rows
+/// under dense attention, one VSA tile under sparse attention. The released checkpoint's
+/// deployment is text 2 units (128 rows) and conditions 3 units (192 rows): nine images, three
+/// videos and two keyframes at one unit each.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Capacity {
+    /// Text rows every layout of this deployment holds, in capacity units.
+    pub text_rows: u32,
+    /// Condition rows it holds, in capacity units.
+    pub condition_rows: u32,
+    /// The largest frame count it serves.
+    ///
+    /// A layout's row count grows with the frames, so this is the frame count that sizes the
+    /// buffers; it is not aligned here, because `align_num_frames` lowers it to the legal
+    /// timeline the checkpoint serves.
+    pub frames: u32,
+}
+
+impl Capacity {
+    /// The padded row count of the largest layout this capacity can reach.
+    ///
+    /// Every canvas the DiT offers is packed at [`Capacity::frames`] and the largest padded row
+    /// count wins; that is the row bound the attention and the modulation tables are allocated
+    /// for. The packing's own rules refuse a canvas or a frame count they cannot serve, so a
+    /// capacity the checkpoint cannot reach is reported here rather than on the device.
+    pub fn rows(&self, config: &crate::config::DenoiserConfig) -> Result<u32> {
+        let unit = config.attention.capacity_rows();
+        let text = self.text_rows.checked_mul(unit).ok_or_else(|| {
+            Error::config(format!(
+                "a text capacity of {} units overflows at {unit} rows a unit",
+                self.text_rows
+            ))
+        })?;
+        let condition = self.condition_rows.checked_mul(unit).ok_or_else(|| {
+            Error::config(format!(
+                "a condition capacity of {} units overflows at {unit} rows a unit",
+                self.condition_rows
+            ))
+        })?;
+        let frames = crate::packing::align_num_frames(self.frames);
+        let mut largest = 0;
+        for canvas in config.offered_canvases() {
+            let packing = crate::packing::dense_packing(frames, canvas, text, condition, unit)?;
+            largest = largest.max(packing.padded_tokens);
+        }
+        if largest == 0 {
+            return Err(Error::config(
+                "the DiT offers no canvas, so no layout can be sized".to_owned(),
+            ));
+        }
+        Ok(largest)
+    }
+}
+
 /// The choices a load takes besides the checkpoint and the partition.
 pub struct LoadOptions {
     /// The components this rank places, in deployment order.
@@ -123,6 +191,8 @@ pub struct LoadOptions {
     pub dtype: Option<DType>,
     /// An explicit quantization, or `None` to keep the checkpoint's own representation.
     pub quantization: Option<Quantization>,
+    /// The capacity a DiT is sized for, or `None` for a deployment that places no DiT.
+    pub capacity: Option<Capacity>,
     /// The base pipeline of an export that holds only the components it changed.
     ///
     /// `FastVideo-FastH3-Omni-8-Step-V1` states a hub revision of the base release and carries
@@ -136,10 +206,17 @@ impl LoadOptions {
     pub fn new(blocks: Vec<Component>) -> Self {
         Self {
             blocks,
+            capacity: None,
             dtype: None,
             quantization: None,
             base: None,
         }
+    }
+
+    /// The same options, with the capacity a DiT is sized for.
+    pub fn with_capacity(mut self, capacity: Capacity) -> Self {
+        self.capacity = Some(capacity);
+        self
     }
 
     /// The activation element type of `component`, the deployment's choice or the design's.
@@ -178,6 +255,107 @@ impl LoadOptions {
     }
 }
 
+/// Load the deployment this rank places.
+///
+/// `root` is a pipeline directory, `partition` this rank's place in it, and `options` the components
+/// the rank places and their capacities. The configuration is read once, here, from the
+/// checkpoint's own sidecars, and each block is then built from its directories' shards with the
+/// representation `options` states: with `dtype` unset nothing is converted, so the DiT and the text
+/// encoder stay BF16 and the video VAE decoder FP16 (specs/worker.md 1).
+///
+/// A block whose construction has not landed is refused with [`Error::Unsupported`], naming it,
+/// rather than omitted: a deployment whose file places a block this build cannot construct must
+/// fail at load, not on the device.
+pub fn load(
+    root: &Path,
+    partition: Partition,
+    loader: &mut nn::weights::WeightLoader<'_>,
+    options: LoadOptions,
+) -> Result<nn::Model> {
+    // The checkpoint learns the pipeline root, so a directory of shards that states it is found
+    // from the root the caller names.
+    let checkpoint = nn::Checkpoint::open(root)?;
+    let base = match &options.base {
+        Some(path) => Some(nn::Checkpoint::open(path)?),
+        None => None,
+    };
+    let base_root = base.as_ref().map(nn::Checkpoint::root);
+
+    let layout = Layout::detect(checkpoint.root())?;
+    let sidecars = Sidecars::read(checkpoint.root(), base_root, &layout)?;
+    // A normalized configuration is checked against itself and the timeline as it is built.
+    let config = Config::normalize(&layout, &sidecars)?;
+    partition.validate(&config)?;
+
+    let shard = u32::try_from(partition.ulysses_degree).map_err(|_| {
+        Error::config(format!(
+            "a Ulysses degree of {} rows does not fit a row count",
+            partition.ulysses_degree
+        ))
+    })?;
+
+    let mut blocks = Vec::with_capacity(options.blocks.len());
+    for &component in &options.blocks {
+        let block = match component {
+            Component::TextEncoder => {
+                let source = options.source(&checkpoint, base.as_ref(), "text_encoder")?;
+                let dtype = options.activation(component);
+                let mut shards = loader.reborrow(source)?;
+                let encoder =
+                    TextEncoder::load(&mut shards, &config.text_encoder, &partition, dtype)?;
+                Block::Encoder(Box::new(encoder))
+            }
+            Component::Transformer | Component::TransformerRef => {
+                let dit = match component {
+                    Component::Transformer => Dit::Base,
+                    _ => Dit::Reference,
+                };
+                let denoiser = config.denoisers.get(&dit).ok_or_else(|| {
+                    Error::checkpoint(format!(
+                        "the checkpoint states no {} DiT, so the {} block cannot be placed (it                          states {})",
+                        dit.directory(),
+                        component.name(),
+                        config
+                            .denoisers
+                            .keys()
+                            .map(|dit| dit.directory())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                })?;
+                let capacity = options.capacity.ok_or_else(|| {
+                    Error::config(format!(
+                        "a deployment that places {} is sized for the largest request it serves:                          its text rows, condition rows and layout rows are owed, and none were                          stated",
+                        component.name()
+                    ))
+                })?;
+                let arrangement =
+                    Arrangement::new(denoiser, capacity.text_rows, capacity.condition_rows, shard)?;
+                // The attention's scratch is allocated for the largest layout this capacity can
+                // reach, so the row bound is computed from the canvases the DiT offers.
+                let rows = capacity.rows(denoiser)?;
+                let source = options.source(&checkpoint, base.as_ref(), dit.directory())?;
+                let mut shards = loader.reborrow(source)?;
+                let denoiser =
+                    Denoiser::load(denoiser.clone(), arrangement, rows, &partition, &mut shards)?;
+                Block::Denoiser(Box::new(denoiser))
+            }
+            Component::VideoDecoder | Component::AudioDecoder | Component::LatentEncoder => {
+                // The decoders and the condition encoders become capability blocks as their
+                // layers land; until then a deployment that places one is refused here rather
+                // than served by a half-built block.
+                return Err(Error::Unsupported(format!(
+                    "the {} block has no construction yet, so it cannot be placed",
+                    component.name()
+                )));
+            }
+        };
+        blocks.push((BlockName::new(component.name()), block));
+    }
+
+    Ok(nn::Model::new(blocks))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,6 +391,51 @@ mod tests {
             std::fs::write(path.join("model.safetensors"), bytes).expect("write");
         }
         root
+    }
+
+    #[test]
+    fn the_row_bound_is_the_largest_layout_the_deployments_capacity_reaches() {
+        use crate::config::tests_support::released_config;
+        let config = released_config();
+        let (_, denoiser) = config
+            .only_denoiser()
+            .expect("the released checkpoint's DiT");
+        let unit = denoiser.attention.capacity_rows();
+        let capacity = Capacity {
+            text_rows: 2,
+            condition_rows: 3,
+            frames: 124,
+        };
+
+        // The 5 s 16:9 layout needs 6913 rows; the bound is that or more, in whole units.
+        let rows = capacity.rows(denoiser).expect("a row bound");
+        assert!(rows >= 6913, "{rows}");
+        assert_eq!(
+            rows % unit,
+            0,
+            "{rows} is not a whole number of {unit}-row units"
+        );
+
+        // The bound grows with the frames served, so a longer admission is a larger allocation.
+        let longer = Capacity {
+            frames: 362,
+            ..capacity
+        }
+        .rows(denoiser)
+        .expect("a row bound");
+        assert!(longer > rows, "{longer} is not larger than {rows}");
+    }
+
+    #[test]
+    fn a_capacity_sizes_a_dit_and_is_owed_by_a_deployment_that_places_one() {
+        let options = LoadOptions::new(vec![Component::Transformer]);
+        assert!(options.capacity.is_none());
+        let sized = LoadOptions::new(vec![Component::Transformer]).with_capacity(Capacity {
+            text_rows: 2,
+            condition_rows: 3,
+            frames: 124,
+        });
+        assert!(sized.capacity.is_some());
     }
 
     #[test]
