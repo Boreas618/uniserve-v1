@@ -44,7 +44,7 @@ use crate::memory::allocation::Backing;
 use crate::memory::allocation::ElementType;
 use crate::memory::allocation::{Storage, StorageView};
 use crate::memory::retained::{
-    ExclusiveSpec, ExclusiveStorage, Retained, SegmentPart, SegmentedSpec,
+    Exclusive, ExclusiveSpec, ExclusiveStorage, Retained, SegmentPart, SegmentedSpec,
 };
 use crate::stream::{Issue, RowFill};
 use crate::{Error, Result};
@@ -331,6 +331,11 @@ pub struct CachePlanes {
     /// The value planes' segments, on a device whose pool splits into them.
     segmenting: Option<Segmenting>,
     values: [Arc<Storage>; 2],
+    /// The state group's checkpoint planes, one storage per field run of a page
+    /// (`CachePlan::state_fields`). They are separate from the K/V planes on
+    /// purpose: every group of the pool indexes the same units, so a state plane
+    /// and a K/V plane at one (column, unit) are different bytes of the page.
+    state: Vec<Arc<Storage>>,
     scales: Option<[Arc<Storage>; 2]>,
     initialized: [Arc<Storage>; 2],
     /// Each field's whole view, keyed as the numerical library reads it.
@@ -455,7 +460,10 @@ impl CachePlanes {
         // Segments created beside ones a predecessor left: their units are
         // reset alone.
         let mut fresh_segments: Vec<u32> = Vec::new();
-        let (values, initialized, scales) = match device {
+        // Whether the state storages are new: stale bytes of another pool would
+        // otherwise read as a checkpoint of this one.
+        let mut state_created = false;
+        let (values, initialized, scales, state) = match device {
             Some(device) => {
                 let peers = Storage::peers(device)?;
                 let spec = |name, bytes| ExclusiveSpec {
@@ -464,6 +472,7 @@ impl CachePlanes {
                     bytes,
                     access: &peers,
                 };
+                let state_fields = plan.state_fields();
                 let mut specs = Vec::new();
                 if layout.is_none() {
                     specs.push(spec("prefix_cache.key.values", plane_bytes));
@@ -474,6 +483,14 @@ impl CachePlanes {
                 if plan.quantized {
                     specs.push(spec("prefix_cache.key.scale", cells * 4));
                     specs.push(spec("prefix_cache.value.scale", cells * 4));
+                }
+                // A state page's checkpoints get storages of their own, at the end
+                // so the K/V storages keep the order the rest of the pool reads.
+                let state_names: Vec<String> = (0..state_fields)
+                    .map(|field| format!("prefix_cache.state.{field}.values"))
+                    .collect();
+                for name in &state_names {
+                    specs.push(spec(name, plane_bytes));
                 }
                 let taken = owner.exclusive(&specs)?;
                 let mut taken = taken.into_iter();
@@ -572,13 +589,21 @@ impl CachePlanes {
                 } else {
                     None
                 };
-                (values, initialized, scales)
+                let state_taken: Vec<Exclusive> =
+                    (0..state_fields).map(|_| next()).collect::<Result<_>>()?;
+                state_created = state_taken.iter().any(|taken| taken.created);
+                let state: Vec<Arc<Storage>> =
+                    state_taken.into_iter().map(|taken| taken.storage).collect();
+                (values, initialized, scales, state)
             }
             None => (
                 [Storage::host(plane_bytes), Storage::host(plane_bytes)],
                 [Storage::host(cells), Storage::host(cells)],
                 plan.quantized
                     .then(|| [Storage::host(cells * 4), Storage::host(cells * 4)]),
+                (0..plan.state_fields())
+                    .map(|_| Storage::host(plane_bytes))
+                    .collect(),
             ),
         };
         let mut planes = Self {
@@ -587,6 +612,7 @@ impl CachePlanes {
             num_units,
             segmenting,
             values,
+            state,
             scales,
             initialized,
             fields: Vec::new(),
@@ -617,6 +643,15 @@ impl CachePlanes {
                     && scales_created
                 {
                     stream.memset_2d(whole(scales[field].address(), UNIT_SCALE, 4, cells))?;
+                }
+            }
+        }
+        if state_created && let Some(stream) = stream {
+            for storage in &planes.state {
+                // SAFETY: the storage spans exactly the filled bytes and is owned
+                // by `planes`; the stream is drained below.
+                unsafe {
+                    stream.memset_2d(whole(storage.address(), 0, 1, plane_bytes))?;
                 }
             }
         }
@@ -1003,6 +1038,18 @@ impl CachePlanes {
         self.values
             .get(field)
             .ok_or_else(|| Error::Invalid(format!("a cache pool holds no field {field}")))
+    }
+
+    /// One field run of a state page's checkpoint planes. A state page's planes
+    /// live in their own storages, `CachePlan::state_fields` of them, so a state
+    /// plane never takes a K/V cell.
+    pub(crate) fn state_storage(&self, field: usize) -> Result<&Arc<Storage>> {
+        self.state.get(field).ok_or_else(|| {
+            Error::Invalid(format!(
+                "a cache pool holds {} state field runs, not {field}",
+                self.state.len()
+            ))
+        })
     }
 
     /// The device the planes live on, or `None` for a host pool.
@@ -1492,10 +1539,24 @@ impl CachePlanes {
         for &(from, to) in copies {
             self.require_unit(from.0)?;
             self.require_unit(to.0)?;
-            if from.0 == 0 || to.0 == 0 || from == to || inherited.contains(&to.0) {
-                return Err(Error::Invalid(
-                    "cache unit copies require a writable new destination".into(),
-                ));
+            // A refusal names the pair: the scheduler's allocation is what a caller has to look
+            // at, and "unit 0" or "already the source" is what tells them which entry is wrong.
+            let reason = if from.0 == 0 {
+                Some("the source is unit 0, the block tables' sentinel")
+            } else if to.0 == 0 {
+                Some("the destination is unit 0, the block tables' sentinel")
+            } else if from == to {
+                Some("the destination is the source")
+            } else if inherited.contains(&to.0) {
+                Some("the destination is an inherited read-only unit of the predecessor world")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                return Err(Error::Invalid(format!(
+                    "cache unit copy {} -> {} is refused: {reason}",
+                    from.0, to.0
+                )));
             }
             for column in 0..self.plan.columns {
                 for field in 0..2 {
@@ -1679,15 +1740,9 @@ mod layer_view_tests {
         num_units: u32,
         quantized: bool,
     ) -> CachePlanes {
-        let cells = usize::try_from(u64::from(columns) * u64::from(num_units)).unwrap();
-        // A field holds `cells` planes of the plan's `plane_bytes`, the flags one byte per cell
-        // and the scales four: a view reads the last cell, so a storage of `cells` bytes would
-        // address past its end.
-        let plane_bytes = 16;
-        let [key, value] = [0, 1].map(|_| Storage::host(cells.max(1) * plane_bytes));
-        let flags = || Storage::host(cells.max(1));
-        CachePlanes {
-            plan: Arc::new(CachePlan {
+        let checkpoints = Vec::new();
+        planes_of(
+            CachePlan {
                 columns,
                 plane_bytes: 16,
                 quantized,
@@ -1695,18 +1750,37 @@ mod layer_view_tests {
                 dtype: ipc::PrefixCacheDtype::BFloat16,
                 groups,
                 states: Vec::new(),
-                checkpoints: Vec::new(),
-            }),
+                checkpoints,
+            },
+            num_units,
+        )
+    }
+
+    /// The host pool `plan` describes, with a field storage per plane the plan's
+    /// figures need: a view reads the last cell, so a storage of `cells` bytes
+    /// would address past its end.
+    fn planes_of(plan: CachePlan, num_units: u32) -> CachePlanes {
+        let cells = usize::try_from(u64::from(plan.columns) * u64::from(num_units)).unwrap();
+        let plane_bytes = 16;
+        let [key, value] = [0, 1].map(|_| Storage::host(cells.max(1) * plane_bytes));
+        let flags = || Storage::host(cells.max(1));
+        let state = (0..plan.state_fields())
+            .map(|_| Storage::host(cells.max(1) * plane_bytes))
+            .collect();
+        let scales = plan.quantized.then(|| {
+            [
+                Storage::host(cells.max(1) * 4),
+                Storage::host(cells.max(1) * 4),
+            ]
+        });
+        CachePlanes {
+            plan: Arc::new(plan),
             device: None,
             num_units,
             segmenting: None,
+            state,
             values: [Arc::clone(&key), Arc::clone(&value)],
-            scales: quantized.then(|| {
-                [
-                    Storage::host(cells.max(1) * 4),
-                    Storage::host(cells.max(1) * 4),
-                ]
-            }),
+            scales,
             initialized: [flags(), flags()],
             fields: Vec::new(),
         }
@@ -1789,6 +1863,105 @@ mod layer_view_tests {
             .released_from
             .store(1, Ordering::Release);
         assert_eq!(pool.mapped_bytes(), full - 2 * 128);
+        Ok(())
+    }
+
+    /// A refused copy names the pair and the reason: the deployment's reader has the scheduler's
+    /// allocation to look at, and "1 -> 0, the block tables' sentinel" is what tells them which
+    /// entry of it is wrong.
+    #[test]
+    fn a_refused_unit_copy_names_the_pair_and_the_reason() {
+        let pool = pool(vec![group(2, 1)], 2, 4, false);
+        let batch = crate::stream::recorded::Batch::new(None, crate::stream::EventPool::new());
+        let refused = |copies: &[(ipc::UnitId, ipc::UnitId)]| {
+            pool.copy_units(copies, batch.on().host())
+                .expect_err("this copy is refused")
+                .to_string()
+        };
+        let sentinel = refused(&[(ipc::UnitId(1), ipc::UnitId(0))]);
+        assert!(
+            sentinel.contains("1 -> 0"),
+            "the pair is not named: {sentinel}"
+        );
+        assert!(
+            sentinel.contains("sentinel"),
+            "the reason is not named: {sentinel}"
+        );
+        let same = refused(&[(ipc::UnitId(2), ipc::UnitId(2))]);
+        assert!(same.contains("the destination is the source"), "{same}");
+    }
+
+    /// A unit copy moves a page's bytes into the units a batch was newly given: after it, the
+    /// destination's plane of each column holds what the source's held.
+    ///
+    /// This is the whole of what a cache-unit allocation asks of the pool - the source's bytes on
+    /// the destination's cells - so a run that reuses a cached prefix reads the destination and
+    /// finds the source's tokens.
+    #[test]
+    fn a_unit_copy_moves_a_pages_bytes_into_its_destination() -> Result<()> {
+        let pool = pool(vec![group(2, 1)], 2, 4, false);
+        let plane_bytes = pool.plan.plane_bytes as usize;
+        let cells = 2 * 4;
+        let address = pool.value_storage(0)?.address();
+        // SAFETY: the storage holds `cells` planes of `plane_bytes` bytes and is owned by `pool`;
+        // the test holds the only handle to it.
+        unsafe {
+            let bytes = std::slice::from_raw_parts_mut(address as *mut u8, cells * plane_bytes);
+            for (index, byte) in bytes.iter_mut().enumerate() {
+                *byte = u8::try_from(index % 251).expect("a byte");
+            }
+        }
+        let events = crate::stream::EventPool::new();
+        let batch = crate::stream::recorded::Batch::new(None, events);
+        pool.copy_units(&[(ipc::UnitId(1), ipc::UnitId(2))], batch.on().host())?;
+        batch.perform()?;
+        // Cell `column * num_units + unit`: unit 1 and unit 2 of column 0.
+        let expected: Vec<u8> = (plane_bytes..2 * plane_bytes)
+            .map(|index| u8::try_from(index % 251).expect("a byte"))
+            .collect();
+        let read = |cell: usize| {
+            // SAFETY: the same storage, still owned by `pool`, still `cells * plane_bytes` long.
+            unsafe {
+                std::slice::from_raw_parts(address as *const u8, cells * plane_bytes)
+                    [cell * plane_bytes..(cell + 1) * plane_bytes]
+                    .to_vec()
+            }
+        };
+        assert_eq!(
+            read(2),
+            expected,
+            "the destination did not take the source's bytes"
+        );
+        Ok(())
+    }
+
+    /// A state page's checkpoints live in field storages of their own, one per field run of the
+    /// page - never in a K/V plane's storage, because every group indexes the same units.
+    #[test]
+    fn a_state_page_holds_its_checkpoints_in_its_own_storages() -> Result<()> {
+        let mut with_state = group(2, 1);
+        with_state.state = true;
+        let plan = CachePlan {
+            columns: 2,
+            plane_bytes: 16,
+            quantized: false,
+            unit_bytes: 64,
+            dtype: ipc::PrefixCacheDtype::BFloat16,
+            groups: vec![with_state],
+            states: Vec::new(),
+            // Four checkpoint planes over two columns and one unit per page: two field runs.
+            checkpoints: vec![super::super::plan::Checkpoint {
+                first_plane: 0,
+                planes: 4,
+                fields: Vec::new(),
+            }],
+        };
+        let pool = planes_of(plan, 8);
+        let value = pool.value_storage(0)?.address();
+        for field in 0..2 {
+            assert_ne!(pool.state_storage(field)?.address(), value);
+        }
+        assert!(pool.state_storage(2).is_err());
         Ok(())
     }
 

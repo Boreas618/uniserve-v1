@@ -61,21 +61,43 @@ fn served_key(
     best
 }
 
-/// The entries a purge of `generation` releases, over the table's keys alone.
+/// The entries a purge of `generation` releases, over the table's keys and the generation the
+/// runner serves.
 ///
-/// A capture of `generation` is released only when a **newer** capture of the same bucket exists:
-/// the newer one is what serves from then on, so the older one is what a commit retires. A capture
-/// with no newer sibling is the program its bucket still serves (`served_key` takes the newest at or
-/// below the serving generation), so releasing it would leave the bucket with nothing to answer.
-fn released(keys: &[(Bucket, u64)], generation: u64) -> Vec<(Bucket, u64)> {
-    let serving: Vec<Bucket> = keys
+/// Which captures an ending generation leaves behind depends on which side of the serving generation
+/// it ended on, and the two cases are opposite:
+///
+/// 1. **A commit retired it** (`generation < serving`): release a capture of `generation` only when
+///    a **newer** capture of the same bucket exists, because that newer one is what serves from then
+///    on. A capture with no newer sibling is the program its bucket still serves (`served_key` takes
+///    the newest at or below the serving generation), so releasing it would leave the bucket with
+///    nothing to answer.
+/// 2. **A revert failed it** (`generation > serving`): release **every** capture of `generation`.
+///    Nothing serves from it - a bucket it shares with the serving generation keeps that
+///    generation's capture, and a bucket only it captured is one nobody serves any more - and the
+///    whole capture set is what the failed update leaves: executables, kernels and their arena
+///    regions. Keeping it leaks a capture set per reverted update.
+///
+/// `generation == serving` releases nothing: a purge never names what serves.
+fn released(keys: &[(Bucket, u64)], generation: u64, serving: u64) -> Vec<(Bucket, u64)> {
+    if generation == serving {
+        return Vec::new();
+    }
+    if generation > serving {
+        return keys
+            .iter()
+            .filter(|(_, captured_generation)| *captured_generation == generation)
+            .copied()
+            .collect();
+    }
+    let above: Vec<Bucket> = keys
         .iter()
         .filter(|(_, captured_generation)| *captured_generation > generation)
         .map(|(bucket, _)| *bucket)
         .collect();
     keys.iter()
         .filter(|(bucket, captured_generation)| {
-            *captured_generation == generation && serving.contains(bucket)
+            *captured_generation == generation && above.contains(bucket)
         })
         .copied()
         .collect()
@@ -194,7 +216,10 @@ impl Graphs {
         generations
     }
 
-    /// Drops exactly `generation`'s graphs, in bucket order, and answers the buckets it dropped.
+    /// Drops what an ending `generation` leaves behind, in bucket order, and answers the buckets it
+    /// dropped. `serving` is the generation the runner serves at the moment of the purge: it decides
+    /// which of the two lifetimes applies (commit: what a newer capture replaced; revert: the whole
+    /// abandoned set), and a purge naming it releases nothing.
     ///
     /// This is purge's last step (7.3): a dropped graph releases its executable and its nodes,
     /// and with them the last references that kept that generation's kernels loaded. It runs only
@@ -213,14 +238,12 @@ impl Graphs {
     /// The buckets come back so the caller can give each one's arena region to its graph pool:
     /// `Captured` guarantees that the executable goes first, so the regions are released only
     /// after the graphs that addressed them are gone.
-    pub fn purge(&mut self, generation: u64) -> Vec<Bucket> {
-        // An entry of this generation that **no newer capture supersedes** still serves: a bucket
-        // the update did not prepare keeps answering from it, because `served_key` takes the newest
-        // capture at or below the serving generation. Releasing it would leave that bucket with
-        // nothing to answer a batch - a Commit would fail every request in a bucket nobody changed.
-        // So a purge releases what a newer generation has replaced, and keeps what still serves.
+    pub fn purge(&mut self, generation: u64, serving: u64) -> Vec<Bucket> {
+        // Which captures go depends on which side of `serving` this generation ended on: a commit
+        // releases what a newer capture replaced and keeps what still serves, a revert releases the
+        // whole abandoned set. `released` states both, and releases nothing for the serving one.
         let keys: Vec<(Bucket, u64)> = self.captured.keys().copied().collect();
-        let stale = released(&keys, generation);
+        let stale = released(&keys, generation, serving);
         let mut buckets: Vec<Bucket> = stale.iter().map(|(bucket, _)| *bucket).collect();
         buckets.sort_unstable();
         buckets.dedup();
@@ -329,7 +352,7 @@ mod tests {
         assert!(graphs.buckets(1).is_empty());
         assert!(graphs.using("rms_norm", 1).is_empty());
         assert!(graphs.generations().is_empty());
-        assert!(graphs.purge(1).is_empty());
+        assert!(graphs.purge(1, 1).is_empty());
     }
 
     /// What a commit releases, over keys only: the captures a newer generation has replaced, and
@@ -343,12 +366,32 @@ mod tests {
         let keys = [(prepared, 1), (prepared, 2), (untouched, 1)];
 
         // Generation 2 replaced the prepared bucket's generation-1 capture: that one is released.
-        assert_eq!(released(&keys, 1), vec![(prepared, 1)]);
+        assert_eq!(released(&keys, 1, 2), vec![(prepared, 1)]);
         // The untouched bucket's only capture is generation 1's, and it still serves: kept.
-        assert!(!released(&keys, 1).contains(&(untouched, 1)));
+        assert!(!released(&keys, 1, 2).contains(&(untouched, 1)));
         // Purging the generation that serves releases nothing.
-        assert!(released(&keys, 2).is_empty());
+        assert!(released(&keys, 2, 2).is_empty());
         // A bucket prepared for the first time in generation 2 has no older capture to release.
-        assert!(released(&[(prepared, 2)], 1).is_empty());
+        assert!(released(&[(prepared, 2)], 1, 2).is_empty());
+    }
+
+    /// A reverted update is the other lifetime: the failed generation sits **above** the serving
+    /// one, so nothing "newer" supersedes it and a rule written for a commit would never release it.
+    /// The whole capture set goes - every bucket, whether or not the serving generation also holds
+    /// that bucket - because nothing serves from it and keeping it leaks a capture set per revert.
+    #[test]
+    fn a_purge_releases_the_whole_set_of_a_failed_generation() {
+        let shared = Bucket::decode(4, Variant::DecodeGreedy);
+        let only_the_failed = Bucket::decode(8, Variant::DecodeGreedy);
+        let keys = [(shared, 1), (shared, 2), (only_the_failed, 2)];
+
+        // Served generation 1, reverted from 2: both captures of generation 2 are released, and the
+        // shared bucket keeps the one generation 1 captured.
+        assert_eq!(
+            released(&keys, 2, 1),
+            vec![(shared, 2), (only_the_failed, 2)]
+        );
+        // And nothing of the serving generation is ever named.
+        assert!(released(&keys, 1, 1).is_empty());
     }
 }
