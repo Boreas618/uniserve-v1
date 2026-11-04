@@ -1,8 +1,12 @@
-# The gather_gemm operator's cute_dsl backend: design 5.2's program package.
+# The gather_gemm operator's CuTe DSL backend: design 5.2's program package.
 #
 # One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the
-# compile driver the Program Server runs for one descriptor and target).
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
+# driver the Program Server runs for one descriptor and target).
+#
+# One native module per descriptor: the compiled CuTe DSL specialization, its
+# cubin and the exported host launcher, behind the C entry `entry.h` declares for
+# the operator's `moe::grouped::GatherCall`.
 
 op = "gather_gemm"
 backend = "cute_dsl"
@@ -10,13 +14,11 @@ backend = "cute_dsl"
 [toolchain]
 kind = "cute_dsl"
 version = "4.6.2"
-packages = [{ name = "cutlass-dsl", version = "4.6.2" }, { name = "flashinfer-python", version = "0.6.18" }]
+packages = []
 
 [module]
 form = "native"
-
-[module.entries]
-launch = "uniserve_gather_gemm"
+entries = { launch = "uniserve_gather_gemm" }
 
 [source]
 kind = "cute_dsl"
@@ -27,10 +29,13 @@ script = "src/build.py"
 target = "arch"
 architectures = ["sm_100a"]
 
+# `hidden_2048_intermediate_1536_experts_128_top_8_activation_silu_dtype_bf16_tile_128x128_cluster_1x1`.
 [kernel.descriptors]
-dimensions = { tactic = ["m128n128", "m256n128", "m128n256", "m256n256"], topk = ["8"], activation = ["silu", "gelu_tanh"], k = ["2048"], n = ["1536"], experts = ["128"] }
+dimensions = { hidden = ["2048", "7168", "4096"], intermediate = ["1536", "768", "512"], experts = ["128", "256", "64"], top = ["8", "4", "2"], activation = ["silu", "gelu_tanh"], dtype = ["bf16"], tile = ["128x128", "256x128", "128x256", "256x256"], cluster = ["1x1", "2x1", "1x2", "2x2"] }
 
 [parameters]
+# The representative problem the compile describes: the metadata and the output
+# rows are runtime sizes, and the kernel's grids derive from the tile count.
 tokens = 4096
-rows = 32768
+permuted_rows = 32768
 max_active_clusters = 1

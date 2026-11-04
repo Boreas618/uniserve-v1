@@ -922,7 +922,9 @@ dependencies = [
  "minijinja",
  "minijinja-contrib",
  "models",
+ "ops",
  "platform",
+ "program-server",
  "prometheus-client",
  "prost",
  "proto",
@@ -2752,7 +2754,6 @@ name = "ops"
 version = "2.0.0"
 dependencies = [
  "platform",
- "serde",
  "thiserror",
 ]
 
@@ -3043,6 +3044,7 @@ version = "2.0.0"
 dependencies = [
  "clap",
  "libc",
+ "ops",
  "prost",
  "prost-build",
  "protox",

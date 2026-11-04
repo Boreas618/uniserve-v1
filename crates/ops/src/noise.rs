@@ -21,6 +21,13 @@
 //! yields; the normal's arithmetic is single precision, and the result rounds once into the output's
 //! type.
 //!
+//! The key is the request's, and it arrives in one of two forms. **Rows** gives one i64 key per row,
+//! so a batch draws one independent stream per request. **Scalar** gives one `u64` key for the whole
+//! draw and addresses the buffer flattened: `pair = flat element index / 2`, so a value is a pure
+//! function of `(key, element)` with no dependence on the program's id or its position in the grid.
+//! The second form is what a diffusion denoiser needs, because its seed is one host value and every
+//! element of the latent — of any shape the request happens to have — must redraw from it.
+//!
 //! A request may also need a **uniform** draw instead of a normal one — the diffusion schedule's
 //! noise keeps the same stream so a redraw is reproducible — and that is the same addressing with
 //! one word: `out[i] = (words[0] >> 8) / 2^24` in `[0, 1)` for every element, one sample per element
@@ -31,10 +38,10 @@ use std::fmt;
 
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
+use crate::platform::{self, Stream};
 use crate::tensor::{DType, Shape, TensorView};
 use crate::tolerance::Tolerance;
-use crate::{Error, Op, Result, Twins};
+use crate::{DevicePtr, Error, Op, Result, Twins};
 
 /// The elements one program draws.
 pub const NOISE_BLOCK: u32 = 1024;
@@ -57,6 +64,25 @@ impl fmt::Display for NoiseKind {
     }
 }
 
+/// Where a draw's Philox key comes from.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum KeySource {
+    /// One i64 key per row of `out`, read from the `keys` view: one stream per row.
+    #[default]
+    Rows,
+    /// One `u64` key for the whole draw, a launch scalar: one stream over the flattened buffer.
+    Scalar,
+}
+
+impl fmt::Display for KeySource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Rows => "rows",
+            Self::Scalar => "scalar",
+        })
+    }
+}
+
 /// One compilation of `philox_noise`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct NoiseDescriptor {
@@ -66,15 +92,22 @@ pub struct NoiseDescriptor {
     pub block: u32,
     /// Whether the draw is normal or uniform.
     pub kind: NoiseKind,
+    /// Where the draw's key comes from: a view of per-row keys, or one launch scalar.
+    pub source: KeySource,
 }
 
 impl fmt::Display for NoiseDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        Key::new()
+        let key = Key::new()
             .field("dtype", self.dtype)
             .field("block", self.block)
-            .field("kind", self.kind)
-            .finish(formatter)
+            .field("kind", self.kind);
+        // The per-row form is the default, so its key is the one it always had: `source` appears
+        // only for the scalar form, which addresses the buffer differently and is another program.
+        match self.source {
+            KeySource::Rows => key.finish(formatter),
+            KeySource::Scalar => key.field("source", self.source).finish(formatter),
+        }
     }
 }
 
@@ -84,8 +117,11 @@ pub struct NoiseArgs {
     /// `[rows, elements]`, contiguous: receives one standard normal sample per row.
     pub out: TensorView,
     /// `[rows]` i64: each row's sampling key as its bit pattern, from `ipc`'s
-    /// `request_sampling_key`.
-    pub keys: TensorView,
+    /// `request_sampling_key`. Present under `KeySource::Rows` and `None` under
+    /// `KeySource::Scalar`, where `key` replaces it; a mismatch of the two is refused.
+    pub keys: Option<TensorView>,
+    /// The whole draw's key as its bit pattern, read under `KeySource::Scalar` only.
+    pub key: u64,
     /// The processor stage the draw belongs to.
     pub stage: u32,
     /// The draw index within the token and stage.
@@ -138,32 +174,18 @@ impl Op for PhiloxNoise {
                 "the noise buffer is not contiguous".to_owned(),
             ));
         }
-        let rows = args.out.shape.dim(0);
-        let elements = args.out.shape.dim(1);
-        args.keys.require_shape(Self::NAME, Shape::new(&[rows]))?;
-        args.keys.require_row(Self::NAME, DType::I64, rows)?;
-        if args.keys.dtype != DType::I64 {
-            return Err(Error::argument(
-                Self::NAME,
-                format!(
-                    "the sampling keys are {}, not i64 holding the key's bits",
-                    args.keys.dtype
-                ),
-            ));
-        }
+        let plan = plan(descriptor, args)?;
 
         let mut arguments = Arguments::new();
         arguments
             .view(args.out)
-            .view(args.keys)
-            .u64(elements)
+            .pointer(DevicePtr::new(plan.keys))
+            .u64(plan.elements)
             .u32(args.stage)
-            .u32(args.draw);
-        kernel.launch(
-            LaunchGrid::new([rows, elements.div_ceil(u64::from(descriptor.block)), 1])?,
-            &mut arguments,
-            stream,
-        )
+            .u32(args.draw)
+            // Last, so the per-row form's leading arguments are the ones it always had.
+            .u64(args.key);
+        kernel.launch(plan.grid, &mut arguments, stream)
     }
 
     fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
@@ -183,5 +205,164 @@ impl Op for PhiloxNoise {
             // A 24-bit value scaled by 2^-24 is exact in FP32 and rounds once into a narrower output.
             NoiseKind::Uniform => Tolerance::exact(),
         }
+    }
+}
+
+/// How one launch addresses the draw: where the keys are, how many elements it covers and the grid.
+struct Plan {
+    /// The `keys` view's address under [`KeySource::Rows`], zero under [`KeySource::Scalar`].
+    keys: u64,
+    /// The row length under [`KeySource::Rows`], the flattened element count under
+    /// [`KeySource::Scalar`]: the number of consecutive elements a program indexes.
+    elements: u64,
+    /// `[rows, ceil(elements / block), 1]` under [`KeySource::Rows`],
+    /// `[ceil(elements / block), 1, 1]` under [`KeySource::Scalar`].
+    grid: LaunchGrid,
+}
+
+/// The addressing of one draw, checked against the form its descriptor names.
+fn plan(descriptor: &NoiseDescriptor, args: NoiseArgs) -> Result<Plan> {
+    let rows = args.out.shape.dim(0);
+    let row_elements = args.out.shape.dim(1);
+
+    // The two key forms address the draw differently, so the view and the grid follow the
+    // descriptor and a call that hands the wrong one is refused rather than read.
+    match (descriptor.source, args.keys) {
+        (KeySource::Rows, Some(keys)) => {
+            keys.require_shape(PhiloxNoise::NAME, Shape::new(&[rows]))?;
+            keys.require_row(PhiloxNoise::NAME, DType::I64, rows)?;
+            if args.key != 0 {
+                return Err(Error::argument(
+                    PhiloxNoise::NAME,
+                    format!(
+                        "the per-row form draws from the keys view; key {} is read in the scalar \
+                         form only",
+                        args.key
+                    ),
+                ));
+            }
+            Ok(Plan {
+                keys: platform::address(keys.ptr),
+                elements: row_elements,
+                // One row per program column, the whole row in the other.
+                grid: LaunchGrid::new([
+                    rows,
+                    row_elements.div_ceil(u64::from(descriptor.block)),
+                    1,
+                ])?,
+            })
+        }
+        (KeySource::Scalar, None) => {
+            // One grid over the flattened buffer: the element index is the flat index, so a value
+            // depends on the key and its own position and on nothing about the launch.
+            let elements = rows * row_elements;
+            Ok(Plan {
+                keys: 0,
+                elements,
+                grid: LaunchGrid::new([elements.div_ceil(u64::from(descriptor.block)), 1, 1])?,
+            })
+        }
+        (KeySource::Rows, None) => Err(Error::argument(
+            PhiloxNoise::NAME,
+            "the per-row form needs its keys view".to_owned(),
+        )),
+        (KeySource::Scalar, Some(_)) => Err(Error::argument(
+            PhiloxNoise::NAME,
+            "the scalar form draws from one key and takes no keys view".to_owned(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn out(rows: u64, elements: u64) -> TensorView {
+        TensorView::new(
+            DevicePtr::new(0x1000),
+            DType::BF16,
+            Shape::new(&[rows, elements]),
+        )
+    }
+
+    fn keys(rows: u64) -> TensorView {
+        TensorView::new(DevicePtr::new(0x2000), DType::I64, Shape::new(&[rows]))
+    }
+
+    fn descriptor(source: KeySource) -> NoiseDescriptor {
+        NoiseDescriptor {
+            dtype: DType::BF16,
+            block: NOISE_BLOCK,
+            kind: NoiseKind::Normal,
+            source,
+        }
+    }
+
+    fn args(out: TensorView, keys: Option<TensorView>, key: u64) -> NoiseArgs {
+        NoiseArgs {
+            out,
+            keys,
+            key,
+            stage: 0,
+            draw: 0,
+        }
+    }
+
+    #[test]
+    fn the_scalar_form_is_the_only_one_that_renames_the_key() {
+        // The per-row form's key is the one every published fixture carries; the scalar form
+        // addresses the buffer differently and must not share a module with it.
+        assert_eq!(
+            descriptor(KeySource::Rows).to_string(),
+            "dtype_bf16_block_1024_kind_normal"
+        );
+        assert_eq!(
+            descriptor(KeySource::Scalar).to_string(),
+            "dtype_bf16_block_1024_kind_normal_source_scalar"
+        );
+    }
+
+    #[test]
+    fn the_scalar_form_covers_the_buffer_flattened_in_one_dimension() {
+        // 4 rows of 4096 elements at a block of 1024: the per-row form is a 4 x 4 grid (one column
+        // per row) and the scalar form is one row of 16 blocks, so an element's program does not
+        // depend on which row it is in.
+        let rows_form = plan(
+            &descriptor(KeySource::Rows),
+            args(out(4, 4096), Some(keys(4)), 0),
+        )
+        .expect("the per-row form with its keys view");
+        assert_eq!(rows_form.grid.blocks, [4, 4, 1]);
+        assert_eq!(rows_form.elements, 4096);
+
+        let scalar_form = plan(&descriptor(KeySource::Scalar), args(out(4, 4096), None, 7))
+            .expect("the scalar form with its key");
+        assert_eq!(scalar_form.grid.blocks, [16, 1, 1]);
+        assert_eq!(scalar_form.elements, 4 * 4096);
+        assert_eq!(scalar_form.keys, 0);
+    }
+
+    #[test]
+    fn a_call_that_hands_the_wrong_key_form_is_refused_both_ways() {
+        let view = keys(4);
+        assert!(
+            plan(&descriptor(KeySource::Rows), args(out(4, 16), None, 0)).is_err(),
+            "the per-row form read a draw with no keys"
+        );
+        assert!(
+            plan(
+                &descriptor(KeySource::Scalar),
+                args(out(4, 16), Some(view), 7)
+            )
+            .is_err(),
+            "the scalar form read a keys view it does not address"
+        );
+        assert!(
+            plan(
+                &descriptor(KeySource::Rows),
+                args(out(4, 16), Some(view), 7)
+            )
+            .is_err(),
+            "the per-row form read a key it does not use"
+        );
     }
 }

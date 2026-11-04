@@ -1,0 +1,62 @@
+# The conv_transpose1d operator's cudnn backend: design 5.2's program package.
+#
+# One native module per descriptor. The module is the convolution itself, through
+# cuDNN 9's backend API: an engine per shape, chosen once (`tuning/engines.json`
+# when a tuning pass has run, cuDNN's first proposal until then) and executed on
+# the caller's stream, workspace from the stream's pool so a captured graph
+# records it.
+#
+# The audio decoder's upsampling layers are transposed convolutions, which cuDNN
+# runs as the backward-data pass of the convolution each layer transposes: the
+# layer's weight is `[c, k/groups, t]` in memory and is read by the pass as
+# `[k, c, t]` through the filter descriptor's strides, without copying it. The
+# layer's output padding is zero in `ops`, so both paddings are the layer's own.
+# A grouped transposed convolution is not described by that pass in this layout
+# and the module refuses it.
+#
+# The key is the operator crate's, all three axes printed as the geometry carries
+# them: `input_bf16_weight_bf16_output_bf16_geometry_kernel_4x1x1_stride_2x1x1_`
+# `padding_1x1x1_dilation_1x1x1_groups_1_bias_false_tf32_false_rank_1_`
+# `transposed_true`.
+#
+# `tf32` is a permission, not a setting: it says whether the engine *may* use TF32
+# tensor cores for an FP32 convolution, which is what design 9 asks the video VAE
+# to keep. cuDNN 9's backend API chooses the engine's arithmetic itself and exposes
+# no math-type knob (`cudnnSetConvolutionMathType` is the legacy path, and the
+# heuristic's numerical notes no longer carry a TF32 note), so this module cannot
+# turn TF32 on inside an engine that would not use it and cannot turn it off. It
+# does the part that matters: `tf32` is validated against the input type — true for
+# FP32, false otherwise — and a descriptor that disagrees is refused at launch
+# instead of run. Do not go looking for a setting in this package; there is none.
+
+op = "conv_transpose1d"
+backend = "cudnn"
+
+[toolchain]
+kind = "nvcc"
+version = "13.0.48"
+packages = []
+
+[module]
+form = "native"
+
+[module.entries]
+launch = "uniserve_conv_transpose1d"
+
+[source]
+kind = "cuda"
+files = [
+    "include/uniserve_conv.h",
+    "src/conv.cu",
+    "src/build.py",
+]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_100f"]
+
+[kernel.descriptors]
+dimensions = { input = ["bf16", "f32"], weight = ["bf16", "f32"], output = ["bf16", "f32"], geometry_kernel = ["4x1x1", "2x1x1", "8x1x1"], stride = ["2x1x1", "1x1x1"], padding = ["1x1x1", "0x0x0"], dilation = ["1x1x1"], groups = ["1"], bias = ["false"], tf32 = ["true", "false"], rank = ["1"], transposed = ["true"] }
+
+[parameters]
