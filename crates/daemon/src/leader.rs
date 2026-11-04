@@ -71,13 +71,14 @@ pub struct Leader {
     images: MediaConnector,
     /// The System One readout encoder of a model that serves the readout.
     readout: Option<Arc<ReadoutEncoder>>,
+    /// The epoch layer: the epoch records, the switch in flight and the
+    /// adapter that commands the deployment's main processes (§7.4). It
+    /// shares the records with the admin's `GET /admin/config`.
+    pub(crate) updates: Arc<crate::updates::driver::Driver>,
     /// Whether every request logs a summary line when it ends.
     log_requests: bool,
     /// Periodic throughput logging, stopped with the engine.
     _stats_logger: Option<StatsLogger>,
-    /// The epochs this node keeps and the program-layer update in flight
-    /// (§7.3): the daemon's record, which the admin API reads and reports.
-    epochs: Arc<crate::epoch::Epochs>,
 }
 
 /// The serving replica set and its sequential rollout. Replicas keep a
@@ -471,6 +472,7 @@ impl Leader {
         stated: &Stated,
         daemon: String,
         commands: Option<&crate::supervision::ProcessCommands>,
+        updates: Arc<crate::updates::driver::Driver>,
     ) -> anyhow::Result<Self> {
         let prepared = Self::prepare(config, stated).await?;
         info!(placement = ?prepared.spec.placement, "starting the engine process");
@@ -482,14 +484,17 @@ impl Leader {
             config.program_server.clone(),
         )?);
         let specs = engine::EngineConfig::replica_specs(&prepared.spec)?;
+        // The epoch's build config: every main process of it reads these bytes.
+        let build = crate::epoch::BuildConfig::of(config);
         let clients =
             futures::future::join_all(specs.into_iter().enumerate().map(|(index, mut spec)| {
                 let model = config.model().to_owned();
                 let starting = Arc::clone(&control);
+                let build = build.clone();
                 tokio::task::spawn_blocking(move || {
                     let observer = Arc::new(crate::worlds::Observer::default());
                     let sink = stats_sink(model, Arc::clone(&observer), index);
-                    let client = starting.start(spec.clone(), sink)?;
+                    let client = starting.start(spec.clone(), &build, sink)?;
                     spec.world = client.world();
                     Ok::<_, anyhow::Error>((client, spec, observer))
                 })
@@ -517,6 +522,7 @@ impl Leader {
             client,
             served,
             observer,
+            updates,
         )?;
         for (index, (client, served, observer)) in clients.enumerate() {
             let replica = Replica::new(
@@ -539,7 +545,7 @@ impl Leader {
             // The epoch's record commands the same main processes the
             // daemon's channel reaches, for every later program-layer
             // update (§2.3, §7.3).
-            leader.epochs.supervise(commands.clone());
+            leader.epochs().supervise(commands.clone());
             leader
                 .install_programs(commands, config, engines, world)
                 .await
@@ -634,7 +640,7 @@ impl Leader {
         // them (`EpochRecord::generation`), which `GET /admin/config`
         // reports and a later update is routed against (§7.2, §7.4).
         // The first epoch of a daemon is epoch 0 (§7.4).
-        let epoch = self.epochs.install(0, &deployment, world, &generations);
+        let epoch = self.epochs().install(0, &deployment, world, &generations);
         tracing::info!(
             epoch,
             world,
@@ -760,6 +766,7 @@ impl Leader {
         client: EngineClient,
         served: wire::EngineSpec,
         observer: Arc<crate::worlds::Observer>,
+        updates: Arc<crate::updates::driver::Driver>,
     ) -> anyhow::Result<Self> {
         let Prepared {
             model_config,
@@ -863,6 +870,7 @@ impl Leader {
             readout,
             config,
             observer,
+            updates,
         );
         let replica = Arc::clone(&engine.replicas.serving.borrow()[0]);
         let _ = replica.control.set(control);
@@ -886,6 +894,7 @@ impl Leader {
         images: MediaConnector,
         readout: Option<ReadoutEncoder>,
         options: &ServeConfig,
+        updates: Arc<crate::updates::driver::Driver>,
     ) -> Self {
         Self::observed(
             served_model_name,
@@ -896,6 +905,7 @@ impl Leader {
             readout,
             options,
             Arc::default(),
+            updates,
         )
     }
 
@@ -914,6 +924,7 @@ impl Leader {
         readout: Option<ReadoutEncoder>,
         options: &ServeConfig,
         observer: Arc<crate::worlds::Observer>,
+        updates: Arc<crate::updates::driver::Driver>,
     ) -> Self {
         let logging = &options.logging_config;
         let mut info = clients[0].info().clone();
@@ -965,9 +976,9 @@ impl Leader {
             replicas,
             images,
             readout: readout.map(Arc::new),
+            updates,
             log_requests: logging.log_requests,
             _stats_logger: stats_logger,
-            epochs: Arc::new(crate::epoch::Epochs::new()),
         }
     }
 
@@ -1280,7 +1291,9 @@ impl Leader {
     /// The epochs this node keeps: the record the admin API reports and a
     /// program-layer update lives in (§7.2, §7.3).
     pub(crate) fn epochs(&self) -> Arc<crate::epoch::Epochs> {
-        Arc::clone(&self.epochs)
+        // One record for the daemon: the epoch layer's driver owns it, the
+        // program layer and the admin API read it (§7.2, §7.3, §7.4).
+        Arc::clone(self.updates.epochs())
     }
 
     /// The configuration the deployment serves now: what a change is
@@ -1345,7 +1358,7 @@ impl Leader {
         }
         let mut update = update;
         update.number = number;
-        let epochs = Arc::clone(&self.epochs);
+        let epochs = Arc::clone(&self.epochs());
         let processes = self.main_processes();
         let recorded = update.clone();
         tokio::task::spawn_blocking(move || epochs.apply_programs(update, processes))
@@ -1375,16 +1388,18 @@ impl Leader {
     /// probation, or when a main process does not answer the commit.
     pub(crate) async fn commit_programs(&self, number: u64) -> Result<bool, UpdateError> {
         let program = self
-            .epochs
+            .epochs()
             .program_update()
             .filter(|program| program.update.number == number);
         if program.is_none() {
             return Ok(false);
         }
-        let epochs = Arc::clone(&self.epochs);
+        let epochs = Arc::clone(&self.epochs());
         tokio::task::spawn_blocking(move || epochs.commit_programs())
             .await
-            .map_err(|error| UpdateError::Failed(anyhow::anyhow!("committing the update: {error}")))?
+            .map_err(|error| {
+                UpdateError::Failed(anyhow::anyhow!("committing the update: {error}"))
+            })?
             .map_err(UpdateError::Failed)
     }
 
@@ -1404,13 +1419,13 @@ impl Leader {
         reason: &str,
     ) -> Result<bool, UpdateError> {
         let program = self
-            .epochs
+            .epochs()
             .program_update()
             .filter(|program| program.update.number == number);
         if program.is_none() {
             return Ok(false);
         }
-        let epochs = Arc::clone(&self.epochs);
+        let epochs = Arc::clone(&self.epochs());
         let reason = reason.to_owned();
         tokio::task::spawn_blocking(move || epochs.revert_programs(&reason))
             .await
@@ -1498,10 +1513,7 @@ impl Leader {
     /// Server's default socket on that host (§5.1, §6.3). The targets are the
     /// Program Server's own: the daemon does not query the devices of another
     /// host to name them.
-    fn program_servers(
-        &self,
-        config: &ServeConfig,
-    ) -> Vec<crate::engine::control::ProgramServer> {
+    fn program_servers(&self, config: &ServeConfig) -> Vec<crate::engine::control::ProgramServer> {
         let socket = config
             .program_server
             .clone()
@@ -1541,9 +1553,12 @@ impl Leader {
             .clone()
             .or_else(|| servers.first().map(|server| server.host.clone()))
             .or_else(|| {
-                self.replicas()
-                    .first()
-                    .and_then(|replica| replica.control.get().map(|control| control.host().to_owned()))
+                self.replicas().first().and_then(|replica| {
+                    replica
+                        .control
+                        .get()
+                        .map(|control| control.host().to_owned())
+                })
             })
             .unwrap_or_default()
     }
@@ -1831,8 +1846,10 @@ impl Replica {
             Arc::clone(&self.observer),
             self.ordinal,
         );
-        let client =
-            Arc::new(tokio::task::spawn_blocking(move || control.start(spec, sink)).await??);
+        let build = crate::epoch::BuildConfig::of(&locked(&self.config));
+        let client = Arc::new(
+            tokio::task::spawn_blocking(move || control.start(spec, &build, sink)).await??,
+        );
         reload_adapters(self, &client).await;
         self.hold.serve(Arc::clone(&client));
         info!("the relaunched engine serves");
