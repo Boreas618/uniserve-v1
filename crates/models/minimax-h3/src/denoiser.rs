@@ -279,8 +279,28 @@ impl Layouts {
             // prompt is all text and every row takes the text clock.
             &[],
         )?;
-        let mut written = 0;
+        let rows = tables.groups.len();
+        let video_rows = packing.video_rows as usize;
+        let audio_rows = packing.audio_rows as usize;
+        // The layout places the video rows first and the audio rows after them, so each modality's
+        // scatter indices are its own contiguous range.
+        let mut video_indices = Vec::with_capacity(video_rows);
+        let mut audio_indices = Vec::with_capacity(audio_rows);
+        for index in 0..video_rows {
+            video_indices.push(index as i32);
+        }
+        for index in 0..audio_rows {
+            audio_indices.push((video_rows + index) as i32);
+        }
+        // One sequence: every query row sees the used key rows and no query sees a padding row.
+        let queries = [0, rows as i32];
+        let keys = [0, tables.used as i32];
+        let specs = self.state_tables(layout)?;
         for (name, bytes) in [
+            ("audio_indices", integers(&audio_indices)),
+            ("video_indices", integers(&video_indices)),
+            ("cu_seq_lens_k", integers(&keys)),
+            ("cu_seq_lens_q", integers(&queries)),
             ("groups", integers(&tables.groups)),
             (
                 "modulation_indices",
@@ -290,7 +310,11 @@ impl Layouts {
             ("prefix_index", integers(&tables.prefix_index)),
             ("token_tags", integers(&tables.token_tags)),
         ] {
-            let Some(buffer) = out.get_mut(written) else {
+            let position = specs
+                .iter()
+                .position(|table| table.name == name)
+                .ok_or_else(|| Error::config(format!("{name} is not a table of this layout")))?;
+            let Some(buffer) = out.get_mut(position) else {
                 return Err(Error::config(format!(
                     "the executor holds no buffer for {name}"
                 )));
@@ -303,15 +327,19 @@ impl Layouts {
                 )));
             }
             buffer.copy_from_slice(&bytes);
-            written += 1;
         }
-        // The step is the executor's to write: it is the one table a replay changes.
-        if let Some(buffer) = out.get_mut(written)
+        // The step is the executor's to write through `prepare_evaluation`: one i32 a replay
+        // changes.
+        let position = specs
+            .iter()
+            .position(|table| table.name == "step")
+            .ok_or_else(|| Error::config("the step table is missing".to_owned()))?;
+        if let Some(buffer) = out.get_mut(position)
             && !buffer.is_empty()
-            && buffer.len() != 8
+            && buffer.len() != 4
         {
             return Err(Error::config(format!(
-                "the step table is {} bytes, not one i64",
+                "the step table is {} bytes, not one i32",
                 buffer.len()
             )));
         }
@@ -743,12 +771,16 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "audio_indices",
+                "cu_seq_lens_k",
+                "cu_seq_lens_q",
                 "groups",
                 "modulation_indices",
                 "position_ids",
                 "prefix_index",
                 "step",
-                "token_tags"
+                "token_tags",
+                "video_indices"
             ]
         );
         // Every table but the step covers one row per packed row.
@@ -761,7 +793,7 @@ mod tests {
             assert_eq!(table.shape.dim(0), rows, "{}", table.name);
         }
         // Axis-major: the rotation reads `[axis, token]`, so the axes are the leading extent.
-        assert_eq!(tables[2].shape.dims(), &[3, rows]);
+        assert_eq!(tables[5].shape.dims(), &[3, rows]);
     }
 
     #[test]
@@ -779,7 +811,7 @@ mod tests {
         rule.prepare_state(&request, 12, &layout, &mut out).unwrap();
         // A prompt of 12 rows is text, so every write index points into the text rows and every
         // generated row takes the prefix's zero row.
-        let prefix: Vec<i32> = decode_i32(&out[3]);
+        let prefix: Vec<i32> = decode_i32(&out[6]);
         assert_eq!(prefix.len(), tables[3].shape.dim(0) as usize);
         assert!(
             prefix[..12]
@@ -788,7 +820,7 @@ mod tests {
                 .all(|(row, column)| *column == row as i32)
         );
         // The modulation index of the first text row is `3 * video_group + text`.
-        let indices = decode_i32(&out[1]);
+        let indices = decode_i32(&out[4]);
         assert_eq!(indices[0], 1);
     }
 
