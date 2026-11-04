@@ -532,7 +532,9 @@ pub(crate) struct MainProcess {
     /// The admitted requests' event streams, by the daemon's request identity: the scheduler
     /// answers a submission with the stream of what the request produced, and this process is what
     /// carries those events back to the daemon (§2.3). A stream leaves when its request ends.
-    streams: Vec<(u64, engine::EventRx)>,
+    /// Each admitted request's scheduler rank beside its stream: a command for the request has to
+    /// reach the scheduler that serves it, and the command names the request, not the rank.
+    streams: Vec<(u64, usize, engine::EventRx)>,
     /// Whether this process admits and executes: a drain parks every scheduler, and only the
     /// `Serve` that names the epoch again resumes it in place (§2.3, §7.4 step 2).
     serving: bool,
@@ -978,7 +980,7 @@ impl MainProcess {
                     };
                     match scheduler.submit(request) {
                         Ok(stream) => {
-                            self.streams.push((id, stream));
+                            self.streams.push((id, rank, stream));
                             self.send_event(
                                 proto::request::wire::from_engine::Kind::Accepted(
                                     proto::request::wire::Accepted {
@@ -1817,18 +1819,33 @@ impl MainProcess {
     /// daemon addresses commands to the main process, and the mechanism keeps
     /// the rank of every request it accepted.
     fn request_command(&mut self, command: proto::request::wire::Command) -> Result<()> {
-        match self.schedulers.as_slice() {
-            [scheduler] => answer(
-                scheduler.request_command(command),
-                self.watchdog.stall_bound(),
-                "a request command",
-            ),
-            [] => bail!("a request command arrived at a node that holds no scheduler"),
-            schedulers => bail!(
-                "a request command needs the rank the request was routed to, among {} schedulers",
-                schedulers.len()
-            ),
-        }
+        // A command names its request, not the scheduler serving it, so the rank is read from the
+        // stream the submission answered with. A request that is not in flight here has already
+        // ended: a cancel or a stop for it is a no-op, not a fault, and ending an epoch because a
+        // client disconnected a moment too late would be the daemon's most common message.
+        let Some((_, rank, _)) = self
+            .streams
+            .iter()
+            .find(|(id, _, _)| *id == command.request)
+        else {
+            tracing::debug!(
+                request = command.request,
+                "a request command names a request this epoch no longer serves"
+            );
+            return Ok(());
+        };
+        let Some(scheduler) = self.schedulers.get(*rank) else {
+            tracing::debug!(
+                request = command.request,
+                rank, "a request command names a rank this node does not hold"
+            );
+            return Ok(());
+        };
+        answer(
+            scheduler.request_command(command),
+            self.watchdog.stall_bound(),
+            "a request command",
+        )
     }
 
     /// A command to the whole main process: shutdown, drain, park or promote,
@@ -2104,7 +2121,7 @@ impl MainProcess {
         // small, and the survivors go back before the pass returns.
         let streams = std::mem::take(&mut self.streams);
         let mut running = Vec::with_capacity(streams.len());
-        for (id, mut stream) in streams {
+        for (id, rank, mut stream) in streams {
             loop {
                 match stream.try_recv() {
                     Ok(event) => {
@@ -2132,7 +2149,7 @@ impl MainProcess {
                     }
                     // A request that produced nothing yet keeps its stream.
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                        running.push((id, stream));
+                        running.push((id, rank, stream));
                         break;
                     }
                     // The scheduler that served the request is gone, which ends it.
@@ -2158,7 +2175,7 @@ impl MainProcess {
         // §2.3: a shutdown finishes every request in flight as aborted, and the daemon learns that
         // from the request's own event - a connection that closes under it says only that the
         // process ended, not which request was lost with it.
-        for (request, _) in std::mem::take(&mut self.streams) {
+        for (request, _, _) in std::mem::take(&mut self.streams) {
             let event = proto::request::wire::Event {
                 request,
                 kind: Some(proto::request::wire::event::Kind::Error(
