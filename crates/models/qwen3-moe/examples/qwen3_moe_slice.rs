@@ -695,6 +695,15 @@ fn load_generation(
     root: &Path,
     needed: &[(String, String)],
 ) -> Result<Generation> {
+    if !root.is_dir() {
+        return Err(Failure::message(format!(
+            "the store root {} is not a directory: nothing is installed there, so no stage past \
+             `weights` can launch. The caller prepares the store (Program Server `prepare`, or the \
+             same `op/backend/revision/target/descriptor` directories assembled by hand); this \
+             harness only reads it.",
+            root.display()
+        )));
+    }
     let mut entries = Vec::new();
     let mut missing = Vec::new();
     for (operator, descriptor) in needed {
