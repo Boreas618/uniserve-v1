@@ -1,0 +1,55 @@
+# The dense_attention operator's fa4 backend: design 5.2's program package.
+#
+# One native module per descriptor: FlashAttention 4's Blackwell dense forward pass
+# over packed sequences, compiled through the vendor's own selection
+# (`flash_attn.cute.interface`) at build time and exported to C. The entry is the
+# operator's `attention::dense::Call`.
+#
+# No cache and no page table: each sequence's rows are a contiguous run of the packed
+# tensors, named by the two offset tables. A geometry FA4 cannot serve at this shape is
+# a cell this manifest does not declare: no window (FA4 reads a window size as a
+# distance, and the operator's window is a left bound the module is not compiled for),
+# and one element type for query, key, value and output.
+
+op = "dense_attention"
+backend = "fa4"
+
+[toolchain]
+kind = "cute_dsl"
+version = "4.5.0"
+packages = [
+    { name = "flash-attn", version = "4.0.0" },
+    { name = "torch", version = "2.9.1" },
+]
+
+[module]
+form = "native"
+entries = { launch = "uniserve_dense_attention" }
+
+[source]
+kind = "cute_dsl"
+files = ["src/fa4.py", "src/build.py", "src/_compile.py", "src/entry.cpp", "src/entry.h"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_100f"]
+
+# `dtype_bf16_kv_bf16_out_bf16_head_dim_128_q_heads_32_kv_heads_4_mask_causal_window_false`.
+#
+# The offsets path only: `cu_seq_lens = true` is what the descriptor prints for a packed
+# launch and prints nothing for it, so a package that serves packed sequences names no such
+# field. `max_kv_len` is a bound the caller supplies, deliberately absent from the key, so it
+# is a build parameter here and not a dimension.
+[kernel.descriptors]
+dimensions = { dtype = ["bf16", "f16"], kv = ["bf16", "f16"], out = ["bf16", "f16"], head_dim = ["128", "64"], q_heads = ["56", "32", "24", "16"], kv_heads = ["56", "4", "8", "2"], mask = ["causal", "dense"], window = ["false"] }
+
+[parameters]
+# The representative problem the vendor's configuration is chosen for: the batch and
+# query length of one launch. A call of a very different shape runs a configuration
+# chosen for this one.
+batch = 8
+query_len = 512
+# The longest key extent the module claims to serve, which the vendor's selection is told
+# about and a launch longer than is refused.
+max_kv_len = 40960

@@ -1,0 +1,46 @@
+# The sparse_attention operator's SM100 backend: design 5.2's program package.
+#
+# One native module per descriptor: H3's Video Sparse Attention, attention over the key
+# blocks a caller selected (`ops::attention::sparse::SparseCall`, 704 bytes). The kernel
+# is FastVideo's block-sparse SM100 forward pass, carried verbatim in this package's
+# sources under the license beside it; this package owns the operator's side — the call
+# structure, the geometry checks a TMA tensor map needs, and the normalizer's base.
+#
+# The block size is a compile-time choice of the vendor's kernel, so the descriptor's
+# `block` picks it and the two blocks are two revisions of the same program.
+
+op = "sparse_attention"
+backend = "sm100"
+
+[toolchain]
+kind = "nvcc"
+version = "13.0.48"
+packages = []
+
+[module]
+form = "native"
+
+[module.entries]
+launch = "uniserve_sparse_attention"
+
+[source]
+kind = "cuda"
+files = [
+    "LICENSE",
+    "include/uniserve_sparse_attention.h",
+    "src/primitives.cuh",
+    "src/block_sparse_kernel_sm100a.cuh",
+    "src/block_sparse_launch_sm100a.cuh",
+    "src/attention.cu",
+    "src/build.py",
+]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a"]
+
+[kernel.descriptors]
+dimensions = { block = ["64", "128"], dtype = ["bf16"], output = ["bf16"], head_dim = ["128"], lse = ["true", "false"] }
+
+[parameters]

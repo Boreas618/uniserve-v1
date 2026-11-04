@@ -1,0 +1,31 @@
+# The scaled_add operator's Triton backend: design 5.2's program package.
+#
+# One cubin per descriptor: a diffusion solver's Euler step, `target ← β · target + α ·
+# source`, in place on the target. The two operands keep their own element types — a BF16
+# accumulator stepped by an FP32 source — so the descriptor names both and each pair is a
+# compilation. The coefficients are launch scalars.
+
+op = "scaled_add"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+
+[source]
+kind = "triton"
+files = ["src/scaled_add.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+[kernel.descriptors]
+dimensions = { target = ["bf16", "f16", "f32"], source = ["bf16", "f16", "f32"], columns = ["5376"], block = ["1024"] }
+
+[parameters]

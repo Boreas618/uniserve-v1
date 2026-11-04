@@ -79,6 +79,16 @@ pub enum Error {
     /// The peer answered something this build does not expect.
     #[error("the program server answered out of protocol: {0}")]
     Protocol(String),
+    /// The Program Server was away for the whole of the wait (design section
+    /// 7.5): the client reconnected `attempts` times without a server
+    /// answering, so preparation is told a restart outlasted it.
+    #[error("the program server at {socket} was away for the whole {waited:?} wait")]
+    Restarted {
+        /// The socket that stayed unanswered.
+        socket: String,
+        /// How long the client waited before it gave up.
+        waited: std::time::Duration,
+    },
     /// No such program was installed.
     #[error("no {op} program of backend {backend} at revision {revision}")]
     UnknownRevision {
@@ -117,3 +127,28 @@ pub enum Error {
 
 /// What an operation of the Program Server answers.
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl Error {
+    /// Whether this error says the Program Server was away: the transport
+    /// ended or nothing was listening, which is a restart rather than a
+    /// decision (design section 7.5).
+    ///
+    /// Only the transport's own failures count. Everything the server decided
+    /// — a refusal, a build failure, an unknown revision — is the server
+    /// having answered, and retrying it would repeat the decision.
+    pub fn away(&self) -> bool {
+        matches!(
+            self,
+            Error::Io(source)
+                if matches!(
+                    source.kind(),
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::NotConnected
+                )
+        )
+    }
+}

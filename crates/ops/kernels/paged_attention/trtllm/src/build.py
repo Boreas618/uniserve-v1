@@ -12,7 +12,17 @@ Steps:
    the element types, `head_dim`, `page`, the mask and the phase, on the
    architecture families the target runs;
 3. fetch those cubins and publish them beside the module, under `cubins/`;
-4. compile the entry unit against the staged header and link `module.so`.
+4. compile the entry unit and the vendor's reduction unit against the staged
+   header, and link `module.so`.
+
+The module needs two things besides the runtime: the CUDA driver (`libcuda`),
+because trtllm-gen's launcher calls `cuModuleLoadData`, `cuModuleGetFunction` and
+`cuLaunchKernelEx` directly, and the vendor's own `runFmhaReduction`, whose
+definition ships in the same data tree as the headers (`csrc/fmhaReduction.cu`)
+and is compiled beside the entry. The driver is a *link-time stub* and a
+*run-time host library*: the toolkit's `libcuda.so` contributes the symbols and
+the soname `libcuda.so.1`, which the host's driver satisfies when the module is
+loaded — the module carries no driver of its own.
 
 A descriptor is the operator's: phase, dtype, kv, out, head_dim, page, q_heads,
 kv_heads, mask, window, len.
@@ -161,6 +171,8 @@ def matching_kernels(header, fields, target):
     page size, mask, phase and architecture family, so the filter is the
     descriptor's values, not a guess.
     """
+    if fields["window"] != "false":
+        raise SystemExit("the trtllm package is compiled without an attention window")
     families = FAMILIES.get(target)
     if families is None:
         raise SystemExit(f"{target} names no trtllm-gen architecture family")
@@ -170,8 +182,13 @@ def matching_kernels(header, fields, target):
     prefix = f"Q{query}Kv{key_value}O{out_type}" if query != key_value else f"Qkv{query}O{out_type}"
     head = f"H{fields['head_dim']}"
     page = f"P{fields['page']}"
-    mask = "Causal" if fields["mask"] == "causal" else "Dense"
     decode = fields["phase"] == "decode"
+    # The artifact's generation kernels are named causally whatever mask a call
+    # asks for: with one query token per request, a dense and a causal mask
+    # cover the same keys, which is why the vendor's own launcher hands its
+    # generation kernels a causal mask either way. The prefill's mask does pick
+    # the name, since its tiles see whole queries.
+    mask = "Causal" if decode or fields["mask"] == "causal" else "Dense"
     kept = []
     for line in header.splitlines():
         if not line.startswith("{ DATA_TYPE_"):
@@ -194,7 +211,9 @@ def matching_kernels(header, fields, target):
         # sliding-window ones only serve a window the descriptor does not have.
         if "SkipsSoftmax" in name:
             continue
-        if "SlidingOrChunked" in name and fields["window"] == "false":
+        # A window is its own trade: the sliding kernels read a window size the
+        # operator's call states, and this package does not serve one.
+        if "SlidingOrChunked" in name:
             continue
         kept.append(name)
     if not kept:
@@ -320,6 +339,52 @@ def build(package, descriptor, fields, target, out, data, artifact):
             f"{compiler} ({version}):\n{' '.join(command)}\n{compiled.stderr[-6000:]}"
         )
 
+    # trtllm-gen's launcher calls the CUDA driver API directly
+    # (`cuModuleLoadData`, `cuModuleGetFunction`, `cuLaunchKernelEx`), so the
+    # module links against `libcuda` as well as the runtime. The toolkit's stub
+    # `libcuda.so` is a link-time input only: the module carries no dependency
+    # of that name, and the host's own driver satisfies the symbols when the
+    # module is loaded.
+    stub = pathlib.Path("/usr/local/cuda/lib64/stubs")
+    if (stub / "libcuda.so").is_file():
+        driver = [f"-L{stub}", "-lcuda"]
+    elif any(
+        path.is_file()
+        for directory in ("/usr/local/cuda/lib64", "/usr/lib/x86_64-linux-gnu")
+        for path in (
+            pathlib.Path(directory) / "libcuda.so",
+            pathlib.Path(directory) / "libcuda.so.1",
+        )
+    ):
+        driver = ["-lcuda"]
+    else:
+        raise SystemExit(
+            "no libcuda to link against: the CUDA toolkit's stub is missing from "
+            f"{stub} and the host has no libcuda; a module whose driver symbols "
+            "stay undefined cannot be loaded"
+        )
+
+    # trtllm-gen's launcher also calls the vendor's own reduction
+    # (`tensorrt_llm::kernels::runFmhaReduction`), whose definition ships in the
+    # same data tree as the headers: it is compiled beside the entry, with the
+    # entry's own flags, and linked into the module.
+    reduction = out / "fmhaReduction.o"
+    reduction_command = [
+        *command[:-3],
+        "-o",
+        str(reduction),
+        str(data / "csrc/fmhaReduction.cu"),
+    ]
+    compiled = subprocess.run(
+        reduction_command, capture_output=True, text=True, check=False
+    )
+    if compiled.returncode != 0:
+        raise SystemExit(
+            "compiling the vendor's reduction unit failed with "
+            f"{compiler} ({version}):\n{' '.join(reduction_command)}\n"
+            f"{compiled.stderr[-6000:]}"
+        )
+
     module = out / "module.so"
     linked = subprocess.run(
         [
@@ -327,7 +392,9 @@ def build(package, descriptor, fields, target, out, data, artifact):
             "-shared",
             f"-arch={target}",
             str(unit),
+            str(reduction),
             "-L/usr/local/cuda/lib64",
+            *driver,
             "-lcudart",
             "-o",
             str(module),
@@ -339,6 +406,7 @@ def build(package, descriptor, fields, target, out, data, artifact):
     if linked.returncode != 0:
         raise SystemExit(f"linking module.so failed:\n{linked.stderr[-4000:]}")
     unit.unlink()
+    reduction.unlink()
 
     exported = subprocess.run(
         ["nm", "-D", "--defined-only", str(module)], capture_output=True, text=True, check=True
