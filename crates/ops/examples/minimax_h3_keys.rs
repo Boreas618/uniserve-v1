@@ -317,24 +317,19 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
         }
     }
 
-    // The sampler's input projection: the activation and the output are FP32 - the reference casts
-    // the sample up and narrows the projection's result afterwards - while the weight stays the
-    // checkpoint's own BF16 (`Linear::descriptor` writes the weight's type, never the activation's).
-    // So this is the one cell whose three element types are not all the same, and the one the
-    // trajectory crosses per evaluation in both directions.
-    push(
-        "gemm",
-        ops::gemm::Descriptor {
-            input: DType::F32,
-            weight: deployment,
-            accumulate: DType::F32,
-            output: DType::F32,
-            order: ops::gemm::WeightOrder::NxK,
-            epilogue: ops::gemm::Epilogue::Bias,
-            k: HIDDEN,
-        }
-        .to_string(),
-    );
+    // The sampler's input projection at a stated FP32 is the diagonal below (`k = HIDDEN`, all
+    // three types FP32). At `dtype = "auto"` it asks for an FP32 activation over a BF16 weight, and
+    // that cell has no row: no program can compute it. cuBLASLt takes one type per operand and a
+    // mixed pair is not among its legal combinations, so the cell built (this backend's manifest
+    // declares `input` and `weight` as independent lists and its build script never compiles the
+    // element type) and would be refused by `cublasLtMatmulAlgoGetHeuristic` before any pointer was
+    // read. `ops::gemm::Descriptor` lets the two types differ, which is why the row existed.
+    //
+    // The deployment's crossings are a named gap, not a row: `auto`'s sample is FP32 and its stack
+    // BF16, so a sampler run at `auto` needs an element-type crossing at `patch` and at
+    // `unpatchify_video` (one doc in `notes/h3/kernel-cells-audit.md` §5), and until those carry an
+    // input and an output type, `auto` stops at the first crossing by name. A stated FP32 deployment
+    // is complete.
 
     // The audio encoder is FP32 throughout (`Model.forward` casts, and the whole autoencoder runs in
     // FP32): its pre-block contracts at the latent width for the fused q/k/v and the shortcut, at
