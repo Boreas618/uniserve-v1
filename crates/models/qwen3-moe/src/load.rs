@@ -173,7 +173,9 @@ fn load_with(
     // there and states the slice's choice rather than inventing one per checkpoint.
     let layout = match quantization {
         Quantization::Nvfp4(layout) => layout,
-        Quantization::Bf16 => ops::fp4::ScaleLayout::Swizzled128X4,
+        // A dense deployment builds no packed projection, so the value is unreachable there; it is
+        // the checkpoint's own arrangement, which is what every loader call takes.
+        Quantization::Bf16 => ops::fp4::ScaleLayout::Linear,
     };
     let config = Config::read(root)?;
     partition.validate(&config)?;
@@ -582,6 +584,9 @@ fn encoded(
         0,
         Shape::new(&[1]),
     );
+    // `layout` here is the **checkpoint's** arrangement — linear, one scale per sixteen elements —
+    // and not the product's: the loader builds the table the programs read and states it back in
+    // `QuantizedWeight::layout`, so the two cannot be confused for one another.
     let quantized = loader.nvfp4(
         &values,
         &scales,
@@ -596,7 +601,7 @@ fn encoded(
         Shape::new(&[1]),
         &quantized.global_scale.to_le_bytes(),
     )?;
-    let linear = Nvfp4Linear::new(&quantized, None, layout, DType::BF16, ENCODE_CHUNK)?;
+    let linear = Nvfp4Linear::new(&quantized, None, quantized.layout, DType::BF16, ENCODE_CHUNK)?;
     Ok(Projection::Encoded {
         linear: Box::new(linear),
         alpha,
