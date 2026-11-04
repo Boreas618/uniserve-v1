@@ -152,32 +152,34 @@ pub fn compare_buffers(
     }
     for index in 0..numel as usize {
         let offset = index * width;
+        // Each arm reads the element through `element`, which names the offset a buffer too short
+        // for the dtype would have failed at: the check above makes that unreachable, and a panic
+        // would hide the cause if it ever stopped being true.
         let (reference, candidate) = match dtype {
             DType::F32 => (
-                f32::from_ne_bytes(real[offset..offset + 4].try_into().unwrap()) as f64,
-                f32::from_ne_bytes(shadow[offset..offset + 4].try_into().unwrap()) as f64,
+                f32::from_ne_bytes(element::<4>(real, offset)?) as f64,
+                f32::from_ne_bytes(element::<4>(shadow, offset)?) as f64,
             ),
             DType::BF16 => (
-                bf16_to_f32(&real[offset..offset + 2]) as f64,
-                bf16_to_f32(&shadow[offset..offset + 2]) as f64,
+                bf16_to_f32(&element::<2>(real, offset)?) as f64,
+                bf16_to_f32(&element::<2>(shadow, offset)?) as f64,
             ),
             DType::F16 => (
-                f16_to_f32(u16::from_ne_bytes(
-                    real[offset..offset + 2].try_into().unwrap(),
-                )) as f64,
-                f16_to_f32(u16::from_ne_bytes(
-                    shadow[offset..offset + 2].try_into().unwrap(),
-                )) as f64,
+                f16_to_f32(u16::from_ne_bytes(element::<2>(real, offset)?)) as f64,
+                f16_to_f32(u16::from_ne_bytes(element::<2>(shadow, offset)?)) as f64,
             ),
             DType::I32 => (
-                i32::from_ne_bytes(real[offset..offset + 4].try_into().unwrap()) as f64,
-                i32::from_ne_bytes(shadow[offset..offset + 4].try_into().unwrap()) as f64,
+                i32::from_ne_bytes(element::<4>(real, offset)?) as f64,
+                i32::from_ne_bytes(element::<4>(shadow, offset)?) as f64,
             ),
             DType::I64 => (
-                i64::from_ne_bytes(real[offset..offset + 8].try_into().unwrap()) as f64,
-                i64::from_ne_bytes(shadow[offset..offset + 8].try_into().unwrap()) as f64,
+                i64::from_ne_bytes(element::<8>(real, offset)?) as f64,
+                i64::from_ne_bytes(element::<8>(shadow, offset)?) as f64,
             ),
-            DType::U8 => (real[offset] as f64, shadow[offset] as f64),
+            DType::U8 => (
+                *real.get(offset).ok_or_else(|| missing(offset, 1))? as f64,
+                *shadow.get(offset).ok_or_else(|| missing(offset, 1))? as f64,
+            ),
             other => {
                 return Err(Error::Invariant(format!(
                     "shadow comparison of {other:?} is not supported"
@@ -201,6 +203,22 @@ pub fn compare_buffers(
     }
     Ok(numel)
 }
+
+/// One element of `N` bytes at `offset`, or the error naming the offset.
+fn element<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N]> {
+    bytes
+        .get(offset..offset + N)
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or_else(|| missing(offset, N))
+}
+
+/// A buffer that holds no element of `width` bytes at `offset`.
+fn missing(offset: usize, width: usize) -> Error {
+    Error::Invariant(format!(
+        "a twin buffer has no element of {width} bytes at offset {offset}"
+    ))
+}
+
 
 fn bf16_to_f32(bytes: &[u8]) -> f32 {
     f32::from_bits((u16::from_ne_bytes([bytes[0], bytes[1]]) as u32) << 16)
