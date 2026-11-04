@@ -45,12 +45,15 @@ const STAGES: &[Stage] = &[
     Stage { deployment: "t2va + DMD student", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "t2va + DMD student", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
     Stage { deployment: "t2va dense, Ulysses 2", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
-    Stage { deployment: "t2va dense, Ulysses 2", stage: "denoiser (base DiT + refiner)", weights: 21299, constants: 1946, arena: 11169, tables: 12 },
+    // The DiT's weights are not sliced by the Ulysses degree: every rank reads the whole 638-name
+    // set at the global head width (`Attention::load` projects `heads * head_dim`, and `projection`
+    // takes no rank), so this row is the one-rank row plus the four exchange entries' arena.
+    Stage { deployment: "t2va dense, Ulysses 2", stage: "denoiser (base DiT + refiner)", weights: 41953, constants: 1946, arena: 11169, tables: 12 },
     Stage { deployment: "t2va dense, Ulysses 2", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
     Stage { deployment: "t2va dense, Ulysses 2", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "t2va dense, Ulysses 2", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
     Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "text_encoder", weights: 25129, constants: 0, arena: 1, tables: 7 },
-    Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "denoiser (base DiT + refiner)", weights: 21299, constants: 1946, arena: 11169, tables: 12 },
+    Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "denoiser (base DiT + refiner)", weights: 41953, constants: 1946, arena: 11169, tables: 12 },
     Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
     Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
