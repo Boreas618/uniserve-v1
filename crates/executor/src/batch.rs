@@ -41,6 +41,26 @@ pub struct BatchId(pub u64);
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct CallId(pub u64);
 
+/// One sampled token, as a serving step produces it (4.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SampledToken {
+    /// The call the token was sampled for.
+    pub call: CallId,
+    /// The token id the bucket's sampler wrote for that call.
+    pub token: u32,
+}
+
+/// What one serving step produced: the tokens its sampling rows sampled (4.4).
+///
+/// The mechanism learns them from the batch's [`Submission`], builds the next step's input ids from
+/// them, and counts the tokens it emits. A step that samples nothing (a chunk of a prefill that
+/// samples no token, a warmup, a program-layer command) completes with an empty output.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BatchOutput {
+    /// One entry per sampling row, in the order the batch's calls and rows name them.
+    pub tokens: Vec<SampledToken>,
+}
+
 /// One batch: one phase of one step, as the mechanism assembles it.
 ///
 /// `shape` is what the runner pads to. It is the mechanism's statement of the batch's size — the
@@ -396,23 +416,25 @@ impl JobKind {
 
 /// What the caller of a submission holds until its jobs ended.
 ///
-/// A submission completes once the device executor has issued every job's work and the work
+/// A submission completes once the device executor has performed every job's work and the work
 /// completed on the device (the executor thread waits on its own stream's work before reporting a
-/// job, and with it the submission). The scheduler thread waits on the submission of a step at the
-/// next step's hand-off, never on the device itself.
+/// job, and with it the submission). A serving submission completes with the step's
+/// [`BatchOutput`] — the tokens its sampling rows sampled; every other submission completes with an
+/// empty one. The scheduler thread waits on the submission of a step at the next step's hand-off,
+/// never on the device itself.
 pub struct Submission {
     id: SubmissionId,
     state: Arc<SubmissionState>,
 }
 
 pub(crate) struct SubmissionState {
-    outcome: Mutex<Option<Outcome>>,
+    outcome: Mutex<Option<Outcome<BatchOutput>>>,
     ready: Condvar,
 }
 
 impl Submission {
     /// A submission that has already completed with `outcome`.
-    pub fn completed(id: SubmissionId, outcome: Outcome) -> Self {
+    pub fn completed(id: SubmissionId, outcome: Outcome<BatchOutput>) -> Self {
         let state = Arc::new(SubmissionState {
             outcome: Mutex::new(Some(outcome)),
             ready: Condvar::new(),
@@ -446,12 +468,12 @@ impl Submission {
     }
 
     /// Completes this submission with `outcome`, if something else did not already.
-    pub(crate) fn complete(&self, outcome: Outcome) {
+    pub(crate) fn complete(&self, outcome: Outcome<BatchOutput>) {
         Arc::clone(&self.state).finish(outcome);
     }
 
     /// Waits until the submission completed and answers its outcome.
-    pub fn wait(&self) -> Outcome {
+    pub fn wait(&self) -> Outcome<BatchOutput> {
         let mut outcome = lock(&self.state.outcome);
         while outcome.is_none() {
             outcome = match self.state.ready.wait(outcome) {
@@ -460,15 +482,13 @@ impl Submission {
                 Err(poisoned) => poisoned.into_inner(),
             };
         }
-        outcome
-            .clone()
-            .unwrap_or(Outcome::Failed(Arc::new(Error::State(
-                "a submission completed without an outcome",
-            ))))
+        outcome.clone().unwrap_or(Outcome::Failed(Arc::new(Error::State(
+            "a submission completed without an outcome",
+        ))))
     }
 
     /// Waits at most `timeout` for the submission's completion.
-    pub fn wait_timeout(&self, timeout: Duration) -> Option<Outcome> {
+    pub fn wait_timeout(&self, timeout: Duration) -> Option<Outcome<BatchOutput>> {
         let deadline = Instant::now() + timeout;
         let mut outcome = lock(&self.state.outcome);
         while outcome.is_none() {
@@ -485,14 +505,14 @@ impl Submission {
     }
 
     /// The submission's outcome, when it completed.
-    pub fn outcome(&self) -> Option<Outcome> {
+    pub fn outcome(&self) -> Option<Outcome<BatchOutput>> {
         lock(&self.state.outcome).clone()
     }
 }
 
 impl SubmissionState {
     /// Completes the submission with `outcome`; the first completion wins.
-    pub(crate) fn finish(self: Arc<Self>, outcome: Outcome) {
+    pub(crate) fn finish(self: Arc<Self>, outcome: Outcome<BatchOutput>) {
         let mut slot = lock(&self.outcome);
         if slot.is_none() {
             *slot = Some(outcome);

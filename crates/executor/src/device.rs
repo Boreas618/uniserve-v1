@@ -18,7 +18,7 @@ use std::time::Duration;
 use nn::Generation;
 use platform::DeviceId;
 
-use crate::batch::{Batch, Job, JobKind, Submission, SubmissionId};
+use crate::batch::{Batch, BatchOutput, Job, JobKind, Submission, SubmissionId};
 use crate::completion::Outcome;
 use crate::job::{Command, JobQueue, jobs_of, kind_of, phase_of};
 use crate::runner::{NamedRunner, RunnerId};
@@ -278,7 +278,10 @@ impl Device {
 
     /// Performs one command and waits for its device work before returning (2.4: the executor
     /// blocks only on the current command's device work).
-    fn serve(&mut self, command: Command) -> Result<()> {
+    ///
+    /// A command that serves a batch answers with that step's output; every other command answers
+    /// with an empty one.
+    fn serve(&mut self, command: Command) -> Result<BatchOutput> {
         match command {
             Command::Batch(batch) => {
                 let runner = self.runner_of(phase_of(&batch))?;
@@ -303,17 +306,20 @@ impl Device {
                 for named in &mut self.runners {
                     named.runner.switchover(generation);
                 }
-                self.streams.synchronize()
+                self.streams.synchronize()?;
+                Ok(BatchOutput::default())
             }
             Command::Purge(generation) => {
                 for named in &mut self.runners {
                     named.runner.purge(generation);
                 }
-                self.streams.synchronize()
+                self.streams.synchronize()?;
+                Ok(BatchOutput::default())
             }
             Command::Issue(work) => {
                 work.perform()?;
-                self.streams.synchronize()
+                self.streams.synchronize()?;
+                Ok(BatchOutput::default())
             }
             Command::After(events) => {
                 // The command establishes that the work deferred on these events may run: wait
@@ -322,21 +328,33 @@ impl Device {
                 for event in &events {
                     drain_event(event, deadline)?;
                 }
-                Ok(())
+                Ok(BatchOutput::default())
             }
         }
     }
 
     /// Performs a runner's jobs in order, each on the runner that returned it.
-    fn perform(&mut self, jobs: Vec<Job>) -> Result<()> {
+    ///
+    /// The answer is the output of the jobs that produced one; a job list with no output (every
+    /// program-layer command) answers empty.
+    fn perform(&mut self, jobs: Vec<Job>) -> Result<BatchOutput> {
+        let mut output = BatchOutput::default();
         for job in jobs {
             let runner = job
                 .runner()
                 .ok_or_else(|| Error::Invariant("a serving job names no runner".into()))?;
-            self.runner_mut(runner)?.serve(&job)?;
+            let produced = self.runner_mut(runner)?.serve(&job)?;
             self.streams.synchronize()?;
+            if !produced.tokens.is_empty() {
+                if !output.tokens.is_empty() {
+                    return Err(Error::Invariant(
+                        "two jobs of one command produced tokens".into(),
+                    ));
+                }
+                output = produced;
+            }
         }
-        Ok(())
+        Ok(output)
     }
 
     /// The runner that serves `phase`.
@@ -365,9 +383,9 @@ pub(crate) fn kind(command: &Command) -> JobKind {
 }
 
 /// The outcome of a submission that ended with `result`.
-pub(crate) fn outcome(result: Result<()>) -> Outcome {
+pub(crate) fn outcome(result: Result<BatchOutput>) -> Outcome<BatchOutput> {
     match result {
-        Ok(()) => Outcome::Success(()),
+        Ok(output) => Outcome::Success(output),
         Err(error) => Outcome::Failed(Arc::new(error)),
     }
 }
