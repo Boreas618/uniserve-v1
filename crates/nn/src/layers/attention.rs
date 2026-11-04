@@ -797,7 +797,11 @@ mod tests {
         let audio = Attention::fp32(64, 8, 8, 4_096, true, 0.125).unwrap();
         assert_eq!(audio.backend(), AttentionBackend::Fp32);
         assert!(audio.causal());
-        assert!(!Attention::fp32(64, 8, 8, 4_096, false, 0.125).unwrap().causal());
+        assert!(
+            !Attention::fp32(64, 8, 8, 4_096, false, 0.125)
+                .unwrap()
+                .causal()
+        );
         // A history window reads the causal mask only.
         assert!(Attention::dense(128, 32, 4, 8_192, false, Some(1_024), 0.088).is_err());
         assert!(Attention::dense(0, 32, 4, 8_192, true, None, 0.088).is_err());
