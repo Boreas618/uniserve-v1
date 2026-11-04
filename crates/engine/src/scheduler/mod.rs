@@ -167,6 +167,11 @@ enum BatchKind {
 /// with wake integration also returns early on commands and consumer reads;
 /// the timeout is only a liveness deadline.
 const IDLE_LIVENESS_POLL: Duration = Duration::from_millis(500);
+/// Longest a drain (`Scheduler::drain_batches`) may go without a batch or a
+/// submission leaving the pending set before it calls what it still holds
+/// abandoned. It bounds silence, not the drain: every completion restarts it,
+/// so a scheduler that keeps receiving results is never cut off under load.
+const DRAIN_SILENCE: Duration = Duration::from_secs(300);
 /// Timeout of a park while the host KV cache's answers are awaited: the
 /// Storage Server answers a local connection within this.
 const KV_OFFLOAD_POLL: Duration = Duration::from_millis(1);
