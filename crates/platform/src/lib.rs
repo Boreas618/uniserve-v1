@@ -64,7 +64,7 @@ pub use copy::{
 };
 pub use cublas::{
     Algorithm, ComputeType, Epilogue, Matmul, MatmulArgs, MatmulBytes, MatmulDescriptor,
-    MatrixLayout,
+    MatrixLayout, Order,
 };
 pub use cudnn::{
     Convolution, ConvolutionArgs, ConvolutionBytes, ConvolutionKind, ConvolutionPlan, Cudnn,

@@ -32,6 +32,7 @@ fn run() -> Result<(), platform::Error> {
     let (m, n, k) = (4u64, 6, 3);
     let column = MatmulDescriptor {
         compute: ComputeType::F32,
+        order: platform::Order::ColumnMajor,
         a: MatrixLayout::column_major(m, k, DataType::F32),
         b: MatrixLayout::column_major(k, n, DataType::F32),
         c: MatrixLayout::column_major(m, n, DataType::F32),

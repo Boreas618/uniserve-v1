@@ -136,12 +136,27 @@ impl Epilogue {
     }
 }
 
+/// The order the caller stores the operands in.
+///
+/// cuBLASLt only multiplies column-major matrices: a row-major `D = A · B` is
+/// the column-major `Dᵀ = Bᵀ · Aᵀ`, so the library is handed the operands
+/// swapped, and `m` and `n` with them. The descriptor keeps the caller's
+/// names — `a` is the caller's left operand — and this order says which way
+/// round the library is given them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Order {
+    ColumnMajor,
+    RowMajor,
+}
+
 /// One matrix multiplication: element and compute types, the four matrix
 /// layouts, the transpose flags, and the epilogue. It is the key under which
 /// a GEMM program records its tuning data (§5.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MatmulDescriptor {
     pub compute: ComputeType,
+    /// The order `a`, `b`, `c` and `d` are stored in.
+    pub order: Order,
     pub a: MatrixLayout,
     pub b: MatrixLayout,
     pub c: MatrixLayout,
@@ -157,12 +172,15 @@ impl MatmulDescriptor {
     pub fn row_major(m: u64, n: u64, k: u64, dtype: DataType, compute: ComputeType) -> Self {
         Self {
             compute,
+            order: Order::RowMajor,
             a: MatrixLayout::row_major(m, k, dtype),
             b: MatrixLayout::row_major(k, n, dtype),
             c: MatrixLayout::row_major(m, n, dtype),
             d: MatrixLayout::row_major(m, n, dtype),
-            transpose_a: true,
-            transpose_b: true,
+            // The row-major form swaps the operands rather than transposing
+            // them: `op(A)` is `Bᵀ` there, which is `b` as stored.
+            transpose_a: false,
+            transpose_b: false,
             epilogue: Epilogue::Default,
         }
     }
@@ -180,6 +198,12 @@ impl MatmulDescriptor {
     }
 
     fn check(&self) -> Result<()> {
+        if self.order == Order::RowMajor && (self.transpose_a || self.transpose_b) {
+            return Err(Error::invalid(
+                "a row-major multiplication reaches the library by swapping its operands, \
+                 so it cannot also transpose them: leave transpose_a and transpose_b false",
+            ));
+        }
         for (name, layout) in [("A", self.a), ("B", self.b), ("C", self.c), ("D", self.d)] {
             if layout.rows == 0 || layout.cols == 0 || layout.batch == 0 {
                 return Err(Error::invalid(format!(
@@ -589,6 +613,12 @@ impl Matmul {
             descriptions.set_bias(self.api, args.bias.ptr().address(), descriptor.bias_type())?;
         }
         let (alpha, beta) = (args.alpha, args.beta);
+        // The row-major form reaches the library with its operands swapped,
+        // so the pointers go where their layouts went.
+        let (left, right) = match descriptor.order {
+            Order::ColumnMajor => (args.a, args.b),
+            Order::RowMajor => (args.b, args.a),
+        };
         // SAFETY: forwarded from the caller; every pointer is device storage
         // live for the launch, every descriptor is live, the stream is live.
         self.api.check(
@@ -597,9 +627,9 @@ impl Matmul {
                     self.handle,
                     descriptions.matmul,
                     std::ptr::from_ref(&alpha).cast(),
-                    args.a.ptr().address() as *const c_void,
+                    left.ptr().address() as *const c_void,
                     descriptions.a,
-                    args.b.ptr().address() as *const c_void,
+                    right.ptr().address() as *const c_void,
                     descriptions.b,
                     std::ptr::from_ref(&beta).cast(),
                     args.c.ptr().address() as *const c_void,
@@ -658,9 +688,15 @@ impl Descriptions {
             c: std::ptr::null_mut(),
             d: std::ptr::null_mut(),
         };
+        // The library's "A" is the caller's left operand in column-major
+        // order, and its right one in row-major order: `Dᵀ = Bᵀ · Aᵀ`.
+        let (left, right) = match descriptor.order {
+            Order::ColumnMajor => (&descriptor.a, &descriptor.b),
+            Order::RowMajor => (&descriptor.b, &descriptor.a),
+        };
         for (slot, layout) in [
-            (&mut descriptions.a, &descriptor.a),
-            (&mut descriptions.b, &descriptor.b),
+            (&mut descriptions.a, left),
+            (&mut descriptions.b, right),
             (&mut descriptions.c, &descriptor.c),
             (&mut descriptions.d, &descriptor.d),
         ] {
@@ -899,7 +935,9 @@ mod tests {
             }
         );
         assert_eq!((descriptor.b.rows, descriptor.b.cols), (6, 3));
-        assert!(descriptor.transpose_a && descriptor.transpose_b);
+        // The row-major form reaches the library swapped, not transposed.
+        assert_eq!(descriptor.order, Order::RowMajor);
+        assert!(!descriptor.transpose_a && !descriptor.transpose_b);
         assert_eq!(
             descriptor.bytes(),
             MatmulBytes {
