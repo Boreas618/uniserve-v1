@@ -502,10 +502,15 @@ fn validate_work_entry(
             ));
         }
         PhaseKind::Prefill => {
+            // The mechanism states the charge of the call it will plan: a
+            // prompt chunk is sized by the policy against what is left, and a
+            // structural write (a close cache, a feedback state, a block's
+            // commit) is one position with nothing left to size.
             let remaining = request
                 .prefill_tokens
                 .max(request.prompt_tokens)
-                .saturating_sub(request.prefilled_tokens);
+                .saturating_sub(request.prefilled_tokens)
+                .max(request.next_tokens);
             if work.tokens > remaining {
                 return Err(invalid(
                     Call::Dispatch,

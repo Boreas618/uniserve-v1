@@ -650,6 +650,21 @@ impl Scheduler {
                     if let Some(&tok) = record.committed_tokens.last() {
                         self.emit_control(id, tok);
                     }
+                    // The branch's close write needs the token it writes at the
+                    // context's end. A context that sampled its last token
+                    // writes that one; one that sampled nothing (it ends with a
+                    // latent or generated-image block) starts from BOS, as the
+                    // understanding decode after such a context does. Leaving
+                    // `next_token` at its admission value plans the close write
+                    // from a token the request never computed.
+                    let pending = record
+                        .committed_tokens
+                        .last()
+                        .copied()
+                        .unwrap_or(self.special_tokens.bos);
+                    if let Some(st) = self.running.get_mut(&id) {
+                        st.next_token = pending;
+                    }
                     self.begin_image(id);
                     return;
                 }
