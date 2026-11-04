@@ -145,7 +145,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (
             "audio_vae",
             "audio encoder",
-            &["encoder.block.", "encoder.conv_in.", "encoder.conv_out."],
+            &["encoder.block.", "pre_block.", "mean_proj."],
         ),
         (
             "audio_vae",
@@ -164,6 +164,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &[
                 "model.language_model.layers.",
                 "model.language_model.embed_tokens.",
+                "model.visual.blocks.",
             ],
         ),
         (
