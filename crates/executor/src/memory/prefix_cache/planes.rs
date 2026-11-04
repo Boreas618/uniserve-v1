@@ -1407,7 +1407,7 @@ impl CachePlanes {
         }
         let dtype = plan.dtype;
         let element = dtype.bytes() as u64;
-        if element == 0 || plan.row_bytes() == 0 || self.plan.plane_bytes % element != 0 {
+        if element == 0 || plan.row_bytes() == 0 || !self.plan.plane_bytes.is_multiple_of(element) {
             return Err(Error::Invariant(format!(
                 "cache group {group} holds {} bytes of a page unit in {element}-byte elements",
                 self.plan.plane_bytes

@@ -207,6 +207,121 @@ pub(crate) fn page_cells(
     Ok(by_field)
 }
 
+/// The cells of one storage field, in row order.
+pub(crate) type Runs = Vec<(usize, Vec<i64>)>;
+
+/// The blocks of `pages` pages of `table` from `first_page`, per storage field, in the page's own
+/// order.
+///
+/// This is the layout of a state page in either direction: an export gathers these cells into its
+/// rows, an import scatters the same rows back into them, and the block copy of one page is the
+/// same list. `table` is the slot's block table of the state group, so the units are the
+/// destination's own; `num_units` is the pool's, which the cell indices are strided by.
+///
+/// # Errors
+///
+/// [`Error::Invalid`] when a page is past the table, and whatever [`page_cells`] refuses.
+pub(crate) fn page_runs(
+    plan: &crate::memory::CachePlan,
+    group: &CacheGroupPlan,
+    table: &crate::memory::prefix_cache::block_tables::GroupTable,
+    num_units: u32,
+    first_page: u32,
+    pages: u32,
+) -> Result<(u32, Runs)> {
+    let rows = table.units.len() / table.shape.units_per_page as usize;
+    runs_of(plan, group, num_units, pages, |index| {
+        let page = first_page.saturating_add(index as u32);
+        let position = usize::try_from(page.saturating_sub(table.start_page))
+            .map_err(|_| Error::Invalid("a state page is past its block table".to_owned()))?;
+        if position >= rows {
+            return Err(Error::Invalid(format!(
+                "a state page of {pages} pages from {first_page} is past its block table"
+            )));
+        }
+        Ok(table.row(position))
+    })
+}
+
+/// The same runs, for a caller that holds the units themselves rather than a table: `units` are
+/// page-major, `units_per_page` of them for each of `pages` pages, as the mechanism states a slot's
+/// pages in its `BlockTable`.
+///
+/// # Errors
+///
+/// [`Error::Invalid`] when `units` does not hold whole pages for `pages`, and whatever
+/// [`page_cells`] refuses.
+pub(crate) fn page_runs_of(
+    plan: &crate::memory::CachePlan,
+    group: &CacheGroupPlan,
+    units: &[ipc::UnitId],
+    units_per_page: u32,
+    num_units: u32,
+    pages: u32,
+) -> Result<(u32, Runs)> {
+    let per_page = units_per_page as usize;
+    let wanted = per_page
+        .checked_mul(pages as usize)
+        .ok_or_else(|| Error::Invalid("a state page names too many units".to_owned()))?;
+    if per_page == 0 || units.len() < wanted {
+        return Err(Error::Invalid(format!(
+            "a state page of {pages} pages of {per_page} units needs {wanted} units, and {} were \
+             named",
+            units.len()
+        )));
+    }
+    runs_of(plan, group, num_units, pages, |index| {
+        let start = index * per_page;
+        Ok(units[start..start + per_page]
+            .iter()
+            .map(|unit| unit.0)
+            .collect())
+    })
+}
+
+/// The runs of `pages` pages, each page's units read from `page_units` in page order.
+fn runs_of(
+    plan: &crate::memory::CachePlan,
+    group: &CacheGroupPlan,
+    num_units: u32,
+    pages: u32,
+    mut page_units: impl FnMut(usize) -> Result<Vec<u32>>,
+) -> Result<(u32, Runs)> {
+    let mut runs: Runs = Vec::new();
+    let mut rows = 0u32;
+    for index in 0..pages as usize {
+        let units = page_units(index)?;
+        for checkpoint in &plan.checkpoints {
+            for (field, cells) in page_cells(group, plan.columns, num_units, checkpoint, &units)? {
+                rows = rows.checked_add(cells.len() as u32).ok_or_else(|| {
+                    Error::Invalid("a state page holds too many blocks".to_owned())
+                })?;
+                match runs.last_mut() {
+                    Some((held, run)) if *held == field => run.extend(cells),
+                    _ => runs.push((field, cells)),
+                }
+            }
+        }
+    }
+    Ok((rows, runs))
+}
+
+/// A page's blocks as a destination writes them: the rows a transfer states and the cells of this
+/// rank's own units they land in.
+///
+/// It is what both directions of an import compare: the transfer states `rows` and `width`, this
+/// states the same two figures from the destination's own units of the same pages, and the
+/// scatter writes the rows into `runs` once they agree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatePage {
+    /// Blocks the page holds.
+    pub rows: u32,
+    /// Bytes one block holds.
+    pub width: u64,
+    /// The cells of the destination's units, per storage field, in row order.
+    pub runs: Vec<(usize, Vec<i64>)>,
+}
+
 /// The two copies' arguments, in one place so a caller states them once.
 pub(crate) fn snapshot_args(
     field: TensorView,
@@ -276,6 +391,84 @@ mod tests {
         let group = group(2, 1, 2);
         let cells = page_cells(&group, 2, 8, &checkpoint(0, 4), &[5])?;
         assert_eq!(cells, vec![(0, vec![5, 8 + 5]), (1, vec![5, 8 + 5]),]);
+        Ok(())
+    }
+
+    /// A page's blocks are the same list in both directions of a transfer: the export gathers
+    /// these cells into its rows, and the destination scatters the same rows back into its own
+    /// cells. So pages are read in page order, and a page past the table is refused rather than
+    /// wrapped onto another request's units.
+    #[test]
+    fn a_page_runs_its_blocks_in_page_order_and_refuses_a_page_past_its_table() -> Result<()> {
+        use crate::memory::prefix_cache::block_tables::{GroupShape, GroupTable};
+
+        let state = group(2, 1, 2);
+        let plan = crate::memory::prefix_cache::plan::CachePlan {
+            columns: 2,
+            plane_bytes: 16,
+            quantized: false,
+            unit_bytes: 64,
+            dtype: ipc::PrefixCacheDtype::BFloat16,
+            groups: vec![state.clone()],
+            states: Vec::new(),
+            checkpoints: vec![checkpoint(0, 4)],
+        };
+        // Two pages of one unit each, starting at page 3, with the units 5 and 6.
+        let table = GroupTable {
+            shape: GroupShape::new(64, 1, None)?,
+            start_page: 3,
+            units: vec![ipc::UnitId(5), ipc::UnitId(6)],
+            allocated_tokens: 128,
+        };
+        let (rows, runs) = page_runs(&plan, &state, &table, 8, 3, 2)?;
+        // Four planes a page over two fields, twice.
+        assert_eq!(rows, 8);
+        assert_eq!(
+            runs,
+            vec![(0, vec![5, 8 + 5, 6, 8 + 6]), (1, vec![5, 8 + 5, 6, 8 + 6]),]
+        );
+        // A page the table does not hold is a mistake in the caller, not a page of zeros.
+        let past = page_runs(&plan, &state, &table, 8, 5, 1).expect_err("a page past the table");
+        assert!(
+            past.to_string().contains("past its block table"),
+            "the refusal names the table: {past}"
+        );
+        Ok(())
+    }
+
+    /// The mechanism states a slot's pages as units, page-major, and the cache must read them
+    /// without rebuilding a table it already holds: the same pages give the same cells either
+    /// way, and a units list that does not hold whole pages is refused rather than read short.
+    #[test]
+    fn a_page_runs_the_units_the_mechanism_states_as_it_runs_a_table() -> Result<()> {
+        use crate::memory::prefix_cache::block_tables::{GroupShape, GroupTable};
+
+        let state = group(2, 1, 2);
+        let plan = crate::memory::prefix_cache::plan::CachePlan {
+            columns: 2,
+            plane_bytes: 16,
+            quantized: false,
+            unit_bytes: 64,
+            dtype: ipc::PrefixCacheDtype::BFloat16,
+            groups: vec![state.clone()],
+            states: Vec::new(),
+            checkpoints: vec![checkpoint(0, 4)],
+        };
+        let table = GroupTable {
+            shape: GroupShape::new(64, 1, None)?,
+            start_page: 3,
+            units: vec![ipc::UnitId(5), ipc::UnitId(6)],
+            allocated_tokens: 128,
+        };
+        let from_table = page_runs(&plan, &state, &table, 8, 3, 2)?;
+        let from_units = page_runs_of(&plan, &state, &table.units, 1, 8, 2)?;
+        assert_eq!(from_table, from_units);
+        let short = page_runs_of(&plan, &state, &[ipc::UnitId(5)], 1, 8, 2)
+            .expect_err("one unit for two pages");
+        assert!(
+            short.to_string().contains("were named"),
+            "the refusal says how many units a page needs: {short}"
+        );
         Ok(())
     }
 
@@ -394,18 +587,27 @@ mod tests {
 
         // Block `k` holds `k * 10 + j` at byte `j`, so a swap is visible byte by byte.
         let mut fill = PinnedBuffer::new(DEVICE, blocks).expect("staging");
+        // SAFETY: the pinned buffer is the only writer of these bytes and holds
+        // `blocks` of them, which is the whole field.
         for (index, byte) in unsafe { fill.as_mut_slice() }.iter_mut().enumerate() {
             *byte = u8::try_from(index / WIDTH * 10 + index % WIDTH).expect("a byte");
         }
+        // SAFETY: both ranges are the same `blocks` bytes, in buffers of their
+        // own, and the copy is ordered on `stream`.
         unsafe { memcpy_async(field.address(), fill.address(), blocks, &stream) }
             .expect("fill the field");
         // Page A reads blocks 3 and 4; page B writes block 4 and then block 3.
         for (buffer, cells) in [(&read, [3i64, 4]), (&write, [4i64, 3])] {
             let mut stage = PinnedBuffer::new(DEVICE, 16).expect("staging");
+            // SAFETY: the staging buffer holds 16 bytes and the two cells below
+            // fill exactly them.
             let bytes = unsafe { stage.as_mut_slice() };
             for (index, cell) in cells.iter().enumerate() {
                 bytes[index * 8..index * 8 + 8].copy_from_slice(&cell.to_ne_bytes());
             }
+            // SAFETY: the cell buffer holds these two `i64` indices and the
+            // staging buffer holds their 16 bytes; the copy is ordered on
+            // `stream`, so the launch below reads them after it.
             unsafe { memcpy_async(buffer.address(), stage.address(), 16, &stream) }
                 .expect("write the cells");
         }
@@ -415,9 +617,9 @@ mod tests {
             let mut rows = 2i32;
             let mut width = WIDTH as i32;
             let mut arguments: [*mut std::ffi::c_void; 5] = [
-                (destination as u64 as *mut std::ffi::c_void),
-                (cells as u64 as *mut std::ffi::c_void),
-                (source as u64 as *mut std::ffi::c_void),
+                (destination as *mut std::ffi::c_void),
+                (cells as *mut std::ffi::c_void),
+                (source as *mut std::ffi::c_void),
                 (&raw mut rows).cast(),
                 (&raw mut width).cast(),
             ];
@@ -445,10 +647,15 @@ mod tests {
         );
         stream.synchronize().expect("order the copies");
 
-        let mut back = PinnedBuffer::new(DEVICE, blocks).expect("staging");
+        let back = PinnedBuffer::new(DEVICE, blocks).expect("staging");
+        // SAFETY: the read-back buffer holds `blocks` bytes and the field holds
+        // the same, on one device; the copy is ordered on `stream` after both
+        // launches.
         unsafe { memcpy_async(back.address(), field.address(), blocks, &stream) }
             .expect("read the field back");
         stream.synchronize().expect("synchronize");
+        // SAFETY: the staging copy above has completed (`synchronize` below the
+        // launches) and nothing writes these bytes while they are read.
         let bytes = unsafe { back.as_slice() };
         let block = |index: usize| bytes[index * WIDTH..(index + 1) * WIDTH].to_vec();
         let pattern = |index: usize| -> Vec<u8> {

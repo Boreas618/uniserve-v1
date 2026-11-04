@@ -20,16 +20,16 @@
 
 pub(crate) mod continuation;
 
-use crate::scheduler::completion::CallCompletion;
 use super::{EncoderCachePin, GuidancePrefixState, Phase, RequestAllocations, TerminalIntent};
 use crate::kv_cache::{BlockTable, CacheAllocation};
+use crate::scheduler::completion::CallCompletion;
 
 use ipc::{ForwardMode, MediaCall, TransferMode};
 
 use crate::{GenerationRequest, ImageEncoderInput, ImageInput};
 use ipc::{
-    Bounds, BufferId, Call, CallId, CallKind, CallStatus, CanvasStep, DType, DimBound,
-    Readout, RequestKey, SamplingState, ShapeBound, TensorRef, VisionInput,
+    Bounds, BufferId, Call, CallId, CallKind, CallStatus, CanvasStep, DType, DimBound, Readout,
+    RequestKey, SamplingState, ShapeBound, TensorRef, VisionInput,
 };
 use ipc::{CanvasSampling, RequestId, SamplingParams};
 

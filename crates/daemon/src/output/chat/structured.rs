@@ -75,17 +75,23 @@ impl StructuredEventState {
     pub(crate) fn state(&self) -> handoff::Assembly {
         handoff::Assembly {
             completed_blocks: self.num_completed_blocks as u64,
-            text_block: self.open_text_block.as_ref().map(|block| handoff::OpenTextBlock {
-                index: block.index as u64,
-                reasoning: block.kind == AssistantBlockKind::Reasoning,
-                text: block.text.clone(),
-            }),
-            tool_call: self.open_tool_call.as_ref().map(|call| handoff::OpenToolCall {
-                index: call.index as u64,
-                id: call.id.clone(),
-                name: call.name.clone(),
-                arguments: call.arguments.clone(),
-            }),
+            text_block: self
+                .open_text_block
+                .as_ref()
+                .map(|block| handoff::OpenTextBlock {
+                    index: block.index as u64,
+                    reasoning: block.kind == AssistantBlockKind::Reasoning,
+                    text: block.text.clone(),
+                }),
+            tool_call: self
+                .open_tool_call
+                .as_ref()
+                .map(|call| handoff::OpenToolCall {
+                    index: call.index as u64,
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                }),
             next_tool_call_index: self.next_tool_call_index as u64,
             ..Default::default()
         }

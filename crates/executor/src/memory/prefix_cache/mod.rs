@@ -31,7 +31,7 @@ pub mod state;
 mod transfers;
 
 use self::state::{ScatterOp, SnapshotOp};
-pub use self::state::{Snapshot, StatePlanes};
+pub use self::state::{Snapshot, StatePage, StatePlanes};
 pub(crate) use access::UnitAccesses;
 pub use conversion::Unimported;
 use imports::Imports;
@@ -764,13 +764,7 @@ impl PrefixCache {
         let plan = self.plan();
         let group = &plan.groups[group_index];
         let columns = plan.columns;
-        let width = plan.plane_bytes;
         let units_held = self.planes.units();
-        if self.planes.device_of().is_none() {
-            return Err(Error::Invalid(
-                "a state page's block copy runs on a device pool".to_owned(),
-            ));
-        }
         // Every layer's planes in order, one run per field: the whole index vector is written
         // once, so each launch only names its own rows of it.
         let mut runs: Vec<(usize, Vec<i64>)> = Vec::new();
@@ -778,6 +772,204 @@ impl PrefixCache {
             runs.extend(state::page_cells(
                 group, columns, units_held, checkpoint, units,
             )?);
+        }
+        tracing::debug!(page, "copying a state page's checkpoints");
+        self.copy_runs(generation, &runs, snapshot, stream, snapshot_direction)
+    }
+
+    /// Publishes a slot's state page under the key the deployment derives (design 4.5, 8): the
+    /// blocks of `pages` pages from `first_page`, gathered from this rank's own units into a
+    /// retained device block the Storage Server names, so a later world maps those bytes by handle
+    /// instead of copying them.
+    ///
+    /// This runs between steps - at a precopy, before the generation is published as serving -
+    /// and never inside one: nothing here may allocate or talk to the server during a replay.
+    pub fn store_state_page(
+        &self,
+        retained: &crate::memory::retained::Retained,
+        slot: u32,
+        units: &[ipc::UnitId],
+        first_page: u32,
+        pages: u32,
+        state: crate::transfer::StateIdentity<'_>,
+    ) -> Result<[u8; 32]> {
+        let plan = self.planes.plan();
+        let group_index = self.state_group()?;
+        let group = &plan.groups[group_index];
+        let device = self.planes.device_of().ok_or_else(|| {
+            Error::Invalid("a state page is retained from a device pool".to_owned())
+        })?;
+        // The units are the mechanism's own statement of the slot's pages, page-major, so the
+        // cache never rebuilds a table it already holds to read them.
+        let (rows, runs) = state::page_runs_of(
+            plan,
+            group,
+            units,
+            group.units_per_page,
+            self.planes.units(),
+            pages,
+        )
+        .map_err(|error| {
+            Error::Invalid(format!(
+                "the state page of slot {slot} from page {first_page}: {error}"
+            ))
+        })?;
+        if rows == 0 {
+            return Err(Error::Invalid("a state page holds no block".into()));
+        }
+        let width = plan.plane_bytes;
+        let layers = u64::from(group.axis.offset)
+            ..u64::from(group.axis.offset) + group.layer_ids.len() as u64;
+        let key = crate::keys::state_key(
+            state.prefix,
+            &state.representation,
+            state.split,
+            &crate::keys::Region::new([layers]),
+        );
+        retained.store_state(device, &key.0, rows, width, |staging, stream| {
+            let mut batch = platform::CopyBatch::new(platform::SourceOrder::Stream);
+            let mut offset = 0_u64;
+            for (field, cells) in &runs {
+                let field_storage = self.planes.state_storage(*field)?;
+                let base = crate::memory::allocation::Backing::address(field_storage.as_ref());
+                for cell in cells {
+                    let cell = u64::try_from(*cell)
+                        .map_err(|_| Error::Invariant("a state cell index is negative".into()))?;
+                    batch.push(
+                        crate::memory::allocation::Backing::address(staging.as_ref()) + offset,
+                        base + cell * width,
+                        width as usize,
+                    );
+                    offset += width;
+                }
+            }
+            // SAFETY: the retained block holds `rows * width` bytes and every source is one block
+            // of the field's own checkpoint storage; the copy is ordered on the stream the
+            // publisher synchronizes before it records the key.
+            unsafe { stream.copy(&batch) }
+        })?;
+        Ok(key.0)
+    }
+
+    /// Reads a transfer's state page back under its key and scatters it into this rank's own
+    /// units: the import's half of the pair.
+    ///
+    /// The bytes are mapped by handle from the storage the publisher retained, so nothing is
+    /// copied but the page itself; `page` is the destination's own page, already checked against
+    /// the transfer's stated shape, and the scatter refuses a snapshot that does not fit it.
+    pub fn load_state_page(
+        &self,
+        retained: &crate::memory::retained::Retained,
+        entry: &ipc::StateTransfer,
+        page: &StatePage,
+        snapshot: Option<&mut Snapshot>,
+        generation: &ops::Generation,
+        stream: &Stream,
+    ) -> Result<()> {
+        // A runner binds one snapshot per state group before its first capture, because a step
+        // allocates nothing (4.5). A transfer that carries state reaching a runner with none is a
+        // model change, and it is refused rather than scattered into nothing.
+        let snapshot = snapshot.ok_or_else(|| {
+            Error::Invariant(
+                "this runner holds no state snapshot: a model with a state group binds one before \
+                 its first capture"
+                    .into(),
+            )
+        })?;
+        let device = self
+            .planes
+            .device_of()
+            .ok_or_else(|| Error::Invalid("a state page is mapped by a device pool".to_owned()))?;
+        let key: [u8; 32] = entry
+            .key
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::Invalid("a state page's key is not 32 bytes".into()))?;
+        let Some(storage) = retained.state_page(device, &key, page.rows, page.width)? else {
+            return Err(Error::Invalid(format!(
+                "no state page is retained under {} for rank {}: the transfer names a snapshot \
+                 this scope does not hold",
+                hex(&key),
+                entry.rank
+            )));
+        };
+        let bytes = u64::from(page.rows) * page.width;
+        if bytes > snapshot.bytes() {
+            return Err(Error::Invalid(format!(
+                "a state page of {bytes} bytes does not fit the snapshot's {} bytes",
+                snapshot.bytes()
+            )));
+        }
+        let bytes_usize = usize::try_from(bytes)
+            .map_err(|_| Error::Invalid("a state page is larger than this host can copy".into()))?;
+        // SAFETY: the retained block holds at least `bytes` and the snapshot holds `bytes`; the
+        // copy is ordered on the caller's stream, and the scatter below runs after it on the same
+        // stream, so the rows are complete before they are written.
+        unsafe {
+            platform::memcpy_async(
+                snapshot.address(),
+                crate::memory::allocation::Backing::address(storage.as_ref()),
+                bytes_usize,
+                stream,
+            )?;
+        }
+        self.scatter_state_page(page, snapshot, generation, stream)
+    }
+
+    /// Writes a checked state page into this rank's own units: the last step of an import, once
+    /// the page's rows are in `snapshot`.
+    ///
+    /// `page` comes from [`Self::state_page`], which refused a key or a shape this rank does not
+    /// hold, so what is left is the copy itself: the same runs the export gathered, written into
+    /// the destination's cells by the scatter program. A snapshot whose rows or width disagree
+    /// with the page is refused before the launch, so a page is written whole or not at all.
+    pub fn scatter_state_page(
+        &self,
+        page: &StatePage,
+        snapshot: &mut Snapshot,
+        generation: &ops::Generation,
+        stream: &Stream,
+    ) -> Result<()> {
+        if page.rows > snapshot.rows() {
+            return Err(Error::Invalid(format!(
+                "a state page of {} rows does not fit the snapshot's {} rows",
+                page.rows,
+                snapshot.rows()
+            )));
+        }
+        if page.width != snapshot.width() {
+            return Err(Error::Invalid(format!(
+                "a state page of {}-byte blocks does not fit a snapshot of {}-byte rows",
+                page.width,
+                snapshot.width()
+            )));
+        }
+        self.copy_runs(generation, &page.runs, snapshot, stream, false)
+    }
+
+    /// Runs the block copy of one page's `runs` between the checkpoints and `snapshot`: the
+    /// snapshot program fills the snapshot's rows from the fields, the scatter program writes them
+    /// into the fields.
+    ///
+    /// This is the copy both directions of a page end in - a batch copying a request's state, and
+    /// an import scattering the rows a snapshot carried - so the order of the runs, and the index
+    /// vector they are selected by, are stated once.
+    pub fn copy_runs(
+        &self,
+        generation: &ops::Generation,
+        runs: &[(usize, Vec<i64>)],
+        snapshot: &mut Snapshot,
+        stream: &Stream,
+        snapshot_direction: bool,
+    ) -> Result<()> {
+        let plan = self.plan();
+        let columns = plan.columns;
+        let width = plan.plane_bytes;
+        let units_held = self.planes.units();
+        if self.planes.device_of().is_none() {
+            return Err(Error::Invalid(
+                "a state page's block copy runs on a device pool".to_owned(),
+            ));
         }
         let total: u32 = runs.iter().map(|(_, cells)| cells.len() as u32).sum();
         if total == 0 {
@@ -787,6 +979,12 @@ impl PrefixCache {
             return Err(Error::Invalid(format!(
                 "a state page of {total} blocks does not fit the snapshot's {} rows",
                 snapshot.rows()
+            )));
+        }
+        if snapshot.width() != width {
+            return Err(Error::Invalid(format!(
+                "a state page of {width}-byte blocks does not fit a snapshot of {}-byte rows",
+                snapshot.width()
             )));
         }
         let cells: Vec<i64> = runs
@@ -804,7 +1002,7 @@ impl PrefixCache {
             width,
         );
         let mut row = 0u32;
-        for (field, blocks) in &runs {
+        for (field, blocks) in runs {
             let count = blocks.len() as u32;
             let storage = self.planes.state_storage(*field)?;
             let field_view = ops::TensorView::new(
@@ -835,7 +1033,7 @@ impl PrefixCache {
             }
             row += count;
         }
-        tracing::debug!(page, blocks = total, "copied a state page's checkpoints");
+        tracing::debug!(blocks = total, "copied a state page's checkpoints");
         Ok(())
     }
 
@@ -875,6 +1073,102 @@ impl PrefixCache {
         self.release_prefixes(request, &slots, stream)
     }
 
+    /// The state page a transfer carries into a slot, checked against this rank's own units of
+    /// the same pages before any byte is written (design 4.5).
+    ///
+    /// The transfer states, per publishing rank, the retained key its rows are stored under, how
+    /// many rows they are and how wide; this derives the same key from the deployment's own
+    /// identity and computes the same figures from the destination's units. A disagreement is a
+    /// named refusal carrying the key, the two shapes and the figures - never a partial scatter,
+    /// because a half-written state group is silently wrong output rather than a slow import.
+    ///
+    /// `None` answers for a deployment whose model keeps no state per unit; the caller then
+    /// scatters nothing.
+    pub fn state_page(
+        &self,
+        export: &CacheTransfer,
+        tables: &[Arc<GroupTable>],
+        state: Option<crate::transfer::StateIdentity<'_>>,
+    ) -> Result<Option<StatePage>> {
+        let plan = self.planes.plan();
+        let group_index = match plan.groups.iter().position(|group| group.state) {
+            Some(index) => index,
+            None => {
+                if !export.state.is_empty() {
+                    return Err(Error::Invalid(
+                        "a cache transfer states a state page this deployment does not keep".into(),
+                    ));
+                }
+                return Ok(None);
+            }
+        };
+        if export.state.is_empty() {
+            return Err(Error::Invalid(
+                "a cache transfer of a model that keeps state per unit carries no state page"
+                    .into(),
+            ));
+        }
+        let identity = state.ok_or_else(|| {
+            Error::Invalid(
+                "a cache import of a model that keeps state per unit needs the request's token \
+                 prefix, the epoch's representation and the rank's split to key its state page"
+                    .into(),
+            )
+        })?;
+        let table = tables.get(group_index).ok_or_else(|| {
+            Error::Invalid(format!(
+                "no destination table for the state group {group_index}"
+            ))
+        })?;
+        let group = &plan.groups[group_index];
+
+        // The destination's own page: the same pages the transfer names, read in this rank's
+        // units, which is what the rows land in.
+        let block = u64::from(table.shape.block_size);
+        let first_page = u32::try_from(u64::from(export.base_extent) / block)
+            .map_err(|_| Error::Invalid("a state page is past the page index range".into()))?;
+        let carried = u32::try_from(u64::from(export.exported_extent).div_ceil(block))
+            .map_err(|_| Error::Invalid("a state page is past the page index range".into()))?
+            .saturating_sub(first_page);
+        let (rows, runs) =
+            state::page_runs(plan, group, table, self.planes.units(), first_page, carried)?;
+        let width = plan.plane_bytes;
+
+        let layers = u64::from(group.axis.offset)
+            ..u64::from(group.axis.offset) + group.layer_ids.len() as u64;
+        let key = crate::keys::state_key(
+            identity.prefix,
+            &identity.representation,
+            identity.split,
+            &crate::keys::Region::new([layers]),
+        );
+        for entry in &export.state {
+            if entry.key != key.0 {
+                return Err(Error::Invalid(format!(
+                    "the state page of rank {} is retained under another key than this \
+                     deployment derives for the pages [{first_page}, {}): its key is {}, this \
+                     rank's {}",
+                    entry.rank,
+                    first_page + carried,
+                    hex(&entry.key),
+                    hex(&key.0)
+                )));
+            }
+            if entry.rows != rows || entry.width != width {
+                return Err(Error::Invalid(format!(
+                    "the state page of rank {} is {} rows of {} bytes, and rank {}'s own units of \
+                     pages [{first_page}, {}) hold {rows} rows of {width} bytes",
+                    entry.rank,
+                    entry.rows,
+                    entry.width,
+                    0,
+                    first_page + carried
+                )));
+            }
+        }
+        Ok(Some(StatePage { rows, width, runs }))
+    }
+
     /// Export a slot's visible cache extent (see `cache_export::export`). Its
     /// transfer and locations exist once the issuer's work was performed
     /// ([`Self::locate_export`]).
@@ -887,6 +1181,7 @@ impl PrefixCache {
         buffer: BufferId,
         transports: &Transports,
         consumers: &[usize],
+        state: Option<cache_export::StateIdentity<'_>>,
         stream: impl Issue,
     ) -> Result<CacheExport> {
         cache_export::export(
@@ -900,6 +1195,7 @@ impl PrefixCache {
             buffer,
             transports,
             consumers,
+            state,
             stream,
         )
     }
@@ -1276,6 +1572,11 @@ mod fixed_bytes_tests {
     }
 }
 
+/// The bytes of a key as hex, for a refusal that names both keys.
+fn hex(key: &[u8]) -> String {
+    key.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1316,6 +1617,63 @@ mod tests {
             })
             .expect("a dense plan of two layers"),
         )
+    }
+
+    /// A transfer and a deployment must agree about whether a state page exists at all: a model
+    /// that keeps state per unit cannot be imported without one, and a deployment that keeps none
+    /// cannot be given one. Both are refusals by name, and neither writes a byte.
+    #[test]
+    fn a_state_page_is_refused_where_the_two_worlds_disagree() -> Result<()> {
+        let cache = PrefixCache::new(
+            plan(),
+            /* units */ 8,
+            None,
+            /* request_pool_size */ 2,
+            /* width */ 4,
+            /* import_capacity */ 1,
+            None,
+            None,
+            &mut LocalStorage,
+            Arc::new(conversion::Unimported),
+        )?;
+        let transfer = |state: Vec<ipc::StateTransfer>| ipc::CacheTransfer {
+            source: ipc::BufferId {
+                owner: ipc::RequestKey::new(1, ipc::RequestId(7), 1),
+                producer_call_id: ipc::CallId::new(2, 0),
+                output_index: 0,
+                generation: 2,
+            },
+            destination: "target".into(),
+            base: None,
+            base_extent: 0,
+            exported_extent: 8,
+            compute_dtype: "bfloat16".into(),
+            groups: Vec::new(),
+            state,
+        };
+        // This deployment keeps no state per unit, so a page offered to it is a mistake one of
+        // the two worlds made, and the import says which.
+        let offered = transfer(vec![ipc::StateTransfer {
+            rank: 0,
+            first_row: 0,
+            rows: 4,
+            width: 128,
+            key: vec![7; 32],
+        }]);
+        let error = cache
+            .state_page(&offered, &[], None)
+            .expect_err("a state page the deployment does not keep");
+        assert!(
+            error.to_string().contains("does not keep"),
+            "the refusal names the disagreement: {error}"
+        );
+        // And a transfer that carries none is not silently a model without state.
+        assert!(
+            cache
+                .state_page(&transfer(Vec::new()), &[], None)?
+                .is_none()
+        );
+        Ok(())
     }
 
     /// The row a batch's gather reads is the units the allocation named - not zeros, and not

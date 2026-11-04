@@ -18,14 +18,16 @@
 
 use std::sync::Arc;
 
-use ipc::{BufferId, CacheGroupTransfer, CacheTransfer, TensorTransfer};
+use ipc::{BufferId, CacheGroupTransfer, CacheTransfer, StateTransfer, TensorTransfer};
 use platform::{CopyBatch, SourceOrder};
 
 use super::exports::{self, Exports, Location};
 use super::{Spans, Transports, copy_planner};
+use crate::keys::{self, Representation, Split, TokenPrefix};
 use crate::memory::allocation::Backing;
 use crate::memory::allocation::ElementType;
 use crate::memory::allocation::{Storage, StorageView};
+use crate::memory::prefix_cache::state;
 use crate::memory::{CachePlanes, GroupTable, TransferBases, UnitAccesses};
 use crate::stream::Issue;
 use crate::{Error, Result};
@@ -80,6 +82,19 @@ fn freeze(
     Ok(target)
 }
 
+/// What names the state page an export carries (design 4.5): the request's token
+/// prefix, the epoch's representation of its pages, and the rank's split.
+///
+/// The cache derives the retained key from them (`keys::state_key`); a caller
+/// never computes a key. A deployment whose model keeps state per unit states
+/// this with every export, and one whose model does not leaves it out.
+#[derive(Clone, Copy, Debug)]
+pub struct StateIdentity<'a> {
+    pub prefix: TokenPrefix,
+    pub representation: Representation<'a>,
+    pub split: Split,
+}
+
 /// One group's export inputs.
 struct GroupExport<'a> {
     index: usize,
@@ -95,10 +110,13 @@ pub struct CacheExport {
     transfer: CacheTransfer,
     /// The exports of each tensor of each group, in the transfer's order.
     exports: Vec<Vec<Vec<Exports>>>,
-    /// The staging FP8 views were frozen into. The issuer's work copies
-    /// into it and, for a mechanism that carries the bytes (shared memory,
-    /// the rank channel), out of it; a job performs those copies later, and
-    /// such an export does not retain the staging. The staging is released
+    /// The state page's gathered staging, when the model keeps one: the state
+    /// belongs to whoever retains it under the record's key.
+    state: Option<Arc<Storage>>,
+    /// The staging FP8 views and the state page were frozen into. The issuer's
+    /// work copies into it and, for a mechanism that carries the bytes (shared
+    /// memory, the rank channel), out of it; a job performs those copies later,
+    /// and such an export does not retain the staging. The staging is released
     /// with this value, once that work was performed.
     staging: Vec<Arc<Storage>>,
 }
@@ -120,6 +138,7 @@ impl CacheExport {
             buffer,
             mut transfer,
             exports,
+            state: _,
             staging,
         } = self;
         let mut locations: Vec<Location> = Vec::new();
@@ -197,6 +216,7 @@ pub(crate) fn export(
     buffer: BufferId,
     transports: &Transports,
     consumers: &[usize],
+    state: Option<StateIdentity<'_>>,
     stream: impl Issue,
 ) -> Result<CacheExport> {
     let (base, base_extent) = bases
@@ -210,13 +230,6 @@ pub(crate) fn export(
     if visible < base_extent {
         return Err(Error::Invalid(
             "cache export destination is ahead of its source".into(),
-        ));
-    }
-    // A request's state kept per request slot lives in its slot, which an
-    // export of its pages does not carry.
-    if planes.plan().states() {
-        return Err(Error::Invalid(
-            "a cache export does not carry the state a model keeps per request slot".into(),
         ));
     }
     // The draft cache is optional state of the rank that speculates: an
@@ -257,6 +270,7 @@ pub(crate) fn export(
         exported_extent: visible,
         compute_dtype: planes.plan().compute_dtype().name().to_owned(),
         groups,
+        state: Vec::new(),
     };
 
     // A transport can accept an export before a later group fails: keep
@@ -265,6 +279,7 @@ pub(crate) fn export(
     // failure address storage their revocation gives back.
     let mut exports = Vec::new();
     let mut staging = Vec::new();
+    let mut state_storage: Option<Arc<Storage>> = None;
     let result = stream.attempt(|| -> Result<()> {
         for (index, (group, table)) in transfer.groups.iter_mut().zip(&selected).enumerate() {
             let export = GroupExport {
@@ -286,12 +301,28 @@ pub(crate) fn export(
                 &mut staging,
             )?;
         }
+        // The state a model keeps per unit travels beside the pages it belongs
+        // to, as the rows its blocks hold (design 4.5): the destination scatters
+        // them into its own units of the same pages.
+        if let Some((page, storage)) = state_export(
+            planes,
+            &selected[0],
+            base_extent,
+            visible,
+            state,
+            stream,
+            &mut staging,
+        )? {
+            transfer.state = vec![page];
+            state_storage = Some(storage);
+        }
         Ok(())
     });
     let export = CacheExport {
         buffer,
         transfer,
         exports,
+        state: state_storage,
         staging,
     };
     if let Err(error) = result {
@@ -299,6 +330,109 @@ pub(crate) fn export(
         return Err(error);
     }
     Ok(export)
+}
+
+/// The state page an export carries (design 4.5): the checkpoint blocks of every
+/// unit of every carried page, gathered into one contiguous, exportable staging
+/// tensor of `[rows, width]`, and the key they are retained under.
+///
+/// The rows are the blocks a destination scatters into its own units of the same
+/// pages, in the order the plan lays its checkpoints out - the page's layout, not
+/// the export's token interval: every unit of every carried page contributes its
+/// blocks, so a partial page carries the whole state of the units it names.
+///
+/// The bytes are the caller's to retain: it publishes the staging under `key`
+/// (`Retained::store`), and a reader fetches them by that key and verifies the
+/// shape this states against its own page. The staging is returned with the
+/// record, and stays alive until the record's issuer performed its work.
+fn state_export(
+    planes: &CachePlanes,
+    table: &GroupTable,
+    base_extent: u32,
+    visible: u32,
+    state: Option<StateIdentity<'_>>,
+    stream: impl Issue,
+    frozen: &mut Vec<Arc<Storage>>,
+) -> Result<Option<(StateTransfer, Arc<Storage>)>> {
+    let plan = planes.plan();
+    let Some(group) = plan.groups.iter().find(|group| group.state) else {
+        return Ok(None);
+    };
+    if visible <= base_extent {
+        return Ok(None);
+    }
+    let identity = state.ok_or_else(|| {
+        Error::Invalid(
+            "a cache export of a model that keeps state per unit needs the request's token \
+             prefix, the epoch's representation and the rank's split to key its state page"
+                .into(),
+        )
+    })?;
+    let width = plan.plane_bytes;
+    let units_held = planes.units();
+
+    // The blocks of every unit of every carried page, in the page's own order:
+    // the same runs the destination recomputes from its own units of those
+    // pages, so the rows mean one thing on both sides.
+    let block = u64::from(table.shape.block_size);
+    let first_page = u32::try_from(u64::from(base_extent) / block)
+        .map_err(|_| Error::Invalid("a state page is past the page index range".into()))?;
+    let carried = u32::try_from(u64::from(visible).div_ceil(block))
+        .map_err(|_| Error::Invalid("a state page is past the page index range".into()))?
+        .saturating_sub(first_page);
+    let (total, runs) = state::page_runs(plan, group, table, units_held, first_page, carried)?;
+    if total == 0 {
+        return Ok(None);
+    }
+
+    let storage = staging(planes, (u64::from(total) * width) as usize)?;
+    frozen.push(Arc::clone(&storage));
+    let mut batch = CopyBatch::new(SourceOrder::Stream);
+    let mut offset = 0_u64;
+    for (field, cells) in &runs {
+        let field_storage = planes.state_storage(*field)?;
+        let base = <Storage as Backing>::address(field_storage.as_ref());
+        for cell in cells {
+            let cell = u64::try_from(*cell)
+                .map_err(|_| Error::Invariant("a state cell index is negative".into()))?;
+            batch.push(
+                storage.address() + offset,
+                base + cell * width,
+                width as usize,
+            );
+            offset += width;
+        }
+    }
+    // SAFETY: the staging holds `total` blocks of `width` bytes and every source
+    // is one block of the field's own checkpoint storage, which the export's
+    // reservation protects; the copy is ordered on `stream`, and the staging is
+    // kept until the record's issuer performed its work.
+    unsafe { stream.copy(&batch) }?;
+
+    // The key names the bytes by prefix, representation, split and the layers
+    // these checkpoints belong to, which is what keeps a state page from
+    // colliding with a KV page of the same prefix.
+    let layers =
+        u64::from(group.axis.offset)..u64::from(group.axis.offset) + group.layer_ids.len() as u64;
+    let region = keys::Region::new([layers]);
+    let key = keys::state_key(
+        identity.prefix,
+        &identity.representation,
+        identity.split,
+        &region,
+    )
+    .0
+    .to_vec();
+    Ok(Some((
+        StateTransfer {
+            rank: 0,
+            first_row: 0,
+            rows: total,
+            width,
+            key,
+        },
+        storage,
+    )))
 }
 
 #[expect(
@@ -623,6 +757,7 @@ mod tests {
             buffer,
             &transports,
             &[1],
+            None,
             Option::<&platform::Stream>::None,
         )?;
         let (transfer, _) = recorded.locate(&mut accesses)?;
@@ -773,6 +908,7 @@ mod tests {
                 buffer,
                 &transports,
                 &[1],
+                None,
                 Some(&stream),
             )?;
             let (transfer, locations) = exported.locate(&mut accesses)?;
