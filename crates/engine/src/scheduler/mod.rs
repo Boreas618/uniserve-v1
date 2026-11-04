@@ -69,12 +69,14 @@ pub(crate) mod graph;
 pub(crate) mod image_artifact;
 mod inflight;
 mod ledger;
+mod mechanism;
 pub(crate) mod output;
 mod placement;
 mod policy;
 mod preemption;
 mod run;
 mod speculation;
+pub(crate) mod views;
 mod warming;
 mod world;
 
