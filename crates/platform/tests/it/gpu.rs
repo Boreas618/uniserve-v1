@@ -791,6 +791,10 @@ fn a_created_segment_is_counted_as_created_until_it_is_released() {
     let granularity = HandleType::Descriptor.granularity(DEVICE).unwrap();
     let bytes = (1_usize << 30).div_ceil(granularity) * granularity;
     let mut segmented = SegmentedMapping::reserve(DEVICE, &[bytes], &[]).unwrap();
+    // Both NVML readings are taken with every queued release made, so what
+    // separates them is this test's own segment and not an earlier test's
+    // storage still waiting for the reclaimer.
+    reclaim::flush().unwrap();
     let before = match nvml.process_storage(DEVICE) {
         Ok(before) => before,
         // NVML lists host PIDs; a container without the host PID namespace
@@ -814,6 +818,9 @@ fn a_created_segment_is_counted_as_created_until_it_is_released() {
 
     segmented.release(0).unwrap();
     assert_eq!(platform::created_bytes(DEVICE), created_before);
+    // `release` unmaps the segment at once but hands the creating handle to
+    // the reclaimer, so the storage is freed when the queue has been made.
+    reclaim::flush().unwrap();
     let released = nvml.process_storage(DEVICE).unwrap();
     assert!(
         released < before + bytes as u64 / 2,
@@ -1838,20 +1845,27 @@ fn convolve(
     let mut host_filter = PinnedBuffer::new(DEVICE, w.len() * 4).unwrap();
     let host_output = PinnedBuffer::new(DEVICE, y_len * 4).unwrap();
 
-    // SAFETY: each host slice is filled whole, and every copy below lies
-    // inside the buffers it names.
+    // SAFETY: each copy lies inside the buffers it names, and every one of
+    // them outlives the synchronization below.
     unsafe {
         host_input.as_mut_slice().copy_from_slice(float_bytes(x));
         host_filter.as_mut_slice().copy_from_slice(float_bytes(w));
         memcpy_async(input.address(), host_input.address(), x.len() * 4, stream).unwrap();
         memcpy_async(filter.address(), host_filter.address(), w.len() * 4, stream).unwrap();
-        let args = ConvolutionArgs {
-            x: input.address(),
-            w: filter.address(),
-            y: output.address(),
-            workspace: workspace.address(),
-        };
-        cudnn.run(&plan, args, stream).unwrap();
+    }
+    let args = ConvolutionArgs::new(
+        DeviceRange::new(DevicePtr::from_address(input.address()), x.len() * 4),
+        DeviceRange::new(DevicePtr::from_address(filter.address()), w.len() * 4),
+        DeviceRange::new(DevicePtr::from_address(output.address()), y_len * 4),
+        DeviceRange::new(
+            DevicePtr::from_address(workspace.address()),
+            workspace.len(),
+        ),
+    );
+    cudnn.run(&plan, args, stream).unwrap();
+    // SAFETY: the copy reads the output allocation into a pinned buffer of
+    // its size.
+    unsafe {
         memcpy_async(host_output.address(), output.address(), y_len * 4, stream).unwrap();
     }
     stream.synchronize().unwrap();
@@ -1921,6 +1935,29 @@ fn a_convolution_matches_the_definition_of_a_conv1d() {
         plan.engine(),
         "the recorded engine is the one the heuristic proposes"
     );
+
+    // A range shorter than its tensor is named before the driver sees it.
+    let bytes = plan.bytes();
+    let input = DeviceAllocation::linear(DEVICE, bytes.x as usize).unwrap();
+    let filter = DeviceAllocation::linear(DEVICE, bytes.w as usize).unwrap();
+    let output = DeviceAllocation::linear(DEVICE, bytes.y as usize).unwrap();
+    let workspace = DeviceAllocation::linear(DEVICE, plan.workspace_bytes().max(4)).unwrap();
+    let short = ConvolutionArgs::new(
+        DeviceRange::new(DevicePtr::from_address(input.address()), bytes.x as usize),
+        DeviceRange::new(DevicePtr::from_address(filter.address()), bytes.w as usize),
+        DeviceRange::new(
+            DevicePtr::from_address(output.address()),
+            bytes.y as usize - 4,
+        ),
+        DeviceRange::new(
+            DevicePtr::from_address(workspace.address()),
+            workspace.len(),
+        ),
+    );
+    let error = cudnn
+        .run(&plan, short, &stream)
+        .expect_err("an output range one element short");
+    assert!(error.to_string().contains("its tensor needs"), "{error}");
 }
 
 /// cuDNN's backward data pass computes the definition of a `ConvTranspose1d`,
