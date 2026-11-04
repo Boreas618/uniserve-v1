@@ -151,35 +151,38 @@ impl SwiGlu {
         self.width
     }
 
-    /// `out[r, c] = (value + bias)[r, c] · silu((gate + bias)[r, c])`; all three views are
+    /// `out[r, c] = silu((gate + gate_bias)[r, c]) · (value + value_bias)[r, c]`; the three views are
     /// `[rows, width]`.
+    ///
+    /// The gate comes first, as in [`GatedActivation`], so the two gated activations cannot be read
+    /// one for the other: `gate` is the branch the activation is applied to.
     pub fn forward(
         &self,
         f: &Forward,
-        value: TensorView,
         gate: TensorView,
+        value: TensorView,
         out: TensorView,
     ) -> Result<()> {
-        self.run(f, value, gate, out, None)
+        self.run(f, gate, value, out, None)
     }
 
     /// The same activation, recording each program's largest magnitude into `partials`.
     pub fn forward_absmax(
         &self,
         f: &Forward,
-        value: TensorView,
         gate: TensorView,
+        value: TensorView,
         out: TensorView,
         partials: TensorView,
     ) -> Result<()> {
-        self.run(f, value, gate, out, Some(partials))
+        self.run(f, gate, value, out, Some(partials))
     }
 
     fn run(
         &self,
         f: &Forward,
-        value: TensorView,
         gate: TensorView,
+        value: TensorView,
         out: TensorView,
         partials: Option<TensorView>,
     ) -> Result<()> {
@@ -224,7 +227,8 @@ impl SwiGlu {
     }
 }
 
-/// `out = value · silu(gate)` over one packed `[value, gate]` projection.
+/// `out = silu(gate) · value` over one packed `[value, gate]` projection: the gate half is the one
+/// the activation applies to, as in [`GatedActivation`] and [`SwiGlu`].
 pub struct PackedSwiGlu {
     bias: Option<Weight>,
     absmax: bool,
@@ -297,5 +301,147 @@ impl PackedSwiGlu {
             partials,
         };
         f.operate::<activation::ValueFirstSwiglu>(&descriptor, args)
+    }
+}
+
+/// GELU over a row-major `[rows, columns]` activation.
+///
+/// H3's audio VAE and its diffusion transformer take PyTorch's tanh form
+/// (`gelu_pytorch_tanh`); a checkpoint whose config says plain `gelu` takes the exact one. They are
+/// separate compilations, so the layer states which it is (specs/worker.md 9, "GELU";
+/// `ops::gelu`).
+pub struct Gelu {
+    approximation: ops::gelu::Approximation,
+}
+
+impl Gelu {
+    /// PyTorch's `gelu_pytorch_tanh`: `x·sigmoid(√(8/π)(x + 0.044715x³))`.
+    pub const fn tanh() -> Self {
+        Self {
+            approximation: ops::gelu::Approximation::Tanh,
+        }
+    }
+
+    /// PyTorch's `gelu`: `0.5x(1 + erf(x/√2))`.
+    pub const fn exact() -> Self {
+        Self {
+            approximation: ops::gelu::Approximation::Exact,
+        }
+    }
+
+    /// Which formula this layer evaluates.
+    pub const fn approximation(&self) -> ops::gelu::Approximation {
+        self.approximation
+    }
+
+    /// `out = gelu(x)` over the rows.
+    pub fn forward(&self, f: &Forward, x: TensorView, out: TensorView) -> Result<()> {
+        if x.shape.rank() != 2 || x.shape != out.shape {
+            return Err(Error::shape(
+                "Gelu",
+                format!("{:?} into {:?}", x.shape.dims(), out.shape.dims()),
+            ));
+        }
+        let columns = u32::try_from(x.shape.last())
+            .map_err(|_| Error::shape("Gelu", "more columns than a descriptor holds".to_owned()))?;
+        let descriptor = ops::gelu::Descriptor {
+            dtype: x.dtype,
+            columns,
+            block: BLOCK,
+            approximate: self.approximation,
+            pdl: PDL,
+        };
+        f.operate::<ops::gelu::Gelu>(&descriptor, ops::gelu::Args { x, out })
+    }
+}
+
+/// The audio VAE's periodic activation, `x + sin²(α·x)/(α + 1e-9)`, one frequency per channel.
+///
+/// The encoder's blocks apply it and the decoder's alias-free activation composes it; `α` is the
+/// checkpoint's raw per-channel parameter, not a log-space pair (specs/worker.md 9, "Snake";
+/// `ops::snake`).
+pub struct Snake {
+    channels: u64,
+}
+
+impl Snake {
+    /// The activation of `channels` audio channels: the length of every `α`.
+    pub fn new(channels: u64) -> Result<Self> {
+        if channels == 0 {
+            return Err(Error::shape(
+                "Snake",
+                "an audio activation has channels".to_owned(),
+            ));
+        }
+        Ok(Self { channels })
+    }
+
+    /// `out = snake(x, alpha)` over `[rows, channels, width]`.
+    ///
+    /// `alpha` is `[channels]` in the activation's element type; the signal is row-major in and out.
+    pub fn forward(
+        &self,
+        f: &Forward,
+        x: TensorView,
+        alpha: TensorView,
+        out: TensorView,
+    ) -> Result<()> {
+        if x.shape.rank() != 3 || x.shape.dim(1) != self.channels {
+            return Err(Error::shape(
+                "Snake",
+                format!(
+                    "{:?} is not [rows, {}, width]",
+                    x.shape.dims(),
+                    self.channels
+                ),
+            ));
+        }
+        if alpha.shape.numel() != self.channels {
+            return Err(Error::shape(
+                "Snake",
+                format!(
+                    "{} frequencies for {} channels",
+                    alpha.shape.numel(),
+                    self.channels
+                ),
+            ));
+        }
+        let descriptor = ops::snake::Descriptor {
+            dtype: x.dtype,
+            channels: u32::try_from(self.channels).map_err(|_| {
+                Error::shape("Snake", "more channels than a descriptor holds".to_owned())
+            })?,
+            block: BLOCK,
+            pdl: PDL,
+        };
+        f.operate::<ops::snake::Snake>(&descriptor, ops::snake::Args { x, alpha, out })
+    }
+}
+
+/// The sigmoid linear unit on one buffer, `out = x / (1 + exp(−x))`.
+///
+/// A plain activation, not a gate: the timestep embedding is `Linear → SiLU → Linear` over one
+/// buffer, and folding it into a doubled gate buffer would compute a product nobody asks for
+/// (specs/worker.md 9, 门控残差; `ops::activation::Silu`).
+pub struct Silu;
+
+impl Silu {
+    /// `out = silu(x)` over the rows.
+    pub fn forward(&self, f: &Forward, x: TensorView, out: TensorView) -> Result<()> {
+        if x.shape.rank() != 2 || x.shape != out.shape {
+            return Err(Error::shape(
+                "Silu",
+                format!("{:?} into {:?}", x.shape.dims(), out.shape.dims()),
+            ));
+        }
+        let columns = u32::try_from(x.shape.last())
+            .map_err(|_| Error::shape("Silu", "more columns than a descriptor holds".to_owned()))?;
+        let descriptor = ops::activation::SiluDescriptor {
+            dtype: x.dtype,
+            columns,
+            block: BLOCK,
+            pdl: PDL,
+        };
+        f.operate::<ops::activation::Silu>(&descriptor, ops::activation::SiluArgs { x, out })
     }
 }

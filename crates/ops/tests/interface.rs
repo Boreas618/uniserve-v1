@@ -242,10 +242,19 @@ fn element_types_keep_their_abi_numbering_and_round_off() {
     assert_eq!(DType::F32.as_i64(), 5);
     assert_eq!(DType::F8E4M3.as_i64(), 6);
     assert_eq!(DType::F4E2M1.as_i64(), 7);
-    for number in 0..8 {
+    // Appended for the audio decoders' PCM output; the seven numbers before it never move.
+    assert_eq!(DType::I16.as_i64(), 8);
+    for number in 0..9 {
         assert_eq!(DType::from_i64(number).map(DType::as_i64), Some(number));
     }
-    assert_eq!(DType::from_i64(8), None);
+    assert_eq!(DType::from_i64(9), None);
+    assert_eq!(DType::I16.bytes(), Some(2));
+    assert_eq!(
+        DType::I16.unit_roundoff(),
+        0.0,
+        "an integer has no rounding"
+    );
+    assert!(!DType::I16.is_float());
 
     assert_eq!(DType::BF16.bytes(), Some(2));
     assert_eq!(DType::F4E2M1.bytes(), None, "two values share one byte");
@@ -448,6 +457,7 @@ fn a_sectioned_rotation_names_its_axes_in_its_key() {
         pdl: false,
         axes: 1,
         sections: [0; ops::rope::MAX_AXES],
+        interleaved: false,
     };
     let key = ops::descriptor::key(&plain);
     assert!(
@@ -461,6 +471,7 @@ fn a_sectioned_rotation_names_its_axes_in_its_key() {
     let three = ops::rope::FactorsDescriptor {
         axes: 3,
         sections: [16, 24, 24, 0],
+        interleaved: false,
         columns: 64,
         ..plain
     };

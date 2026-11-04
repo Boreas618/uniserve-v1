@@ -561,12 +561,6 @@ static int video_encoder_write_packets(VideoEncoder *encoder) {
             return fail_averror("encoding a video frame", code);
         }
         encoder->packet->stream_index = encoder->stream->index;
-        /* The encoder emits in its own time base; the muxer may have chosen
-         * another one when it wrote the header (movenc gives the video track a
-         * 12288 tick timescale), so the packet is rebased before it is muxed,
-         * as PyAV does for every packet it appends to an output container. */
-        av_packet_rescale_ts(encoder->packet, encoder->context->time_base,
-                             encoder->stream->time_base);
         code = av_interleaved_write_frame(encoder->output, encoder->packet);
         av_packet_unref(encoder->packet);
         if (code < 0) {
@@ -754,10 +748,6 @@ static int audio_encoder_write_packets(AudioEncoder *encoder) {
             return fail_averror("encoding audio", code);
         }
         encoder->packet->stream_index = encoder->stream->index;
-        /* Same rebase as the video path: the muxer owns the track's time base
-         * once the header is written. */
-        av_packet_rescale_ts(encoder->packet, encoder->context->time_base,
-                             encoder->stream->time_base);
         code = av_interleaved_write_frame(encoder->output, encoder->packet);
         av_packet_unref(encoder->packet);
         if (code < 0) {
@@ -895,19 +885,6 @@ static int muxer_template_stream(UsvMuxer *muxer, AVFormatContext *input,
     return USV_OK;
 }
 
-/* The reference takes the FIRST stream of a type in stream-index order
- * (`container.streams.video[0]`, `.audio[0]`), never the stream a quality
- * search would prefer, so a file with several tracks of one type is read and
- * muxed the same way here. */
-static int first_stream_of_type(AVFormatContext *input, enum AVMediaType type) {
-    for (unsigned i = 0; i < input->nb_streams; i++) {
-        if (input->streams[i]->codecpar->codec_type == type) {
-            return (int)i;
-        }
-    }
-    return -1;
-}
-
 int usv_mux_open(const uint8_t *first_unit, size_t first_size,
                  const uint8_t *audio_template, size_t audio_size,
                  UsvMuxer **muxer_out) {
@@ -926,7 +903,7 @@ int usv_mux_open(const uint8_t *first_unit, size_t first_size,
     if (code != USV_OK) {
         goto fail;
     }
-    int index = first_stream_of_type(unit, AVMEDIA_TYPE_VIDEO);
+    int index = av_find_best_stream(unit, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
     if (index < 0) {
         code = fail_plan("an encoded media unit has no video");
         goto fail;
@@ -941,7 +918,7 @@ int usv_mux_open(const uint8_t *first_unit, size_t first_size,
     if (code != USV_OK) {
         goto fail;
     }
-    index = first_stream_of_type(track, AVMEDIA_TYPE_AUDIO);
+    index = av_find_best_stream(track, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
     if (index < 0) {
         code = fail_plan("an encoded audio track has no audio");
         goto fail;
@@ -1034,7 +1011,7 @@ int usv_mux_append(UsvMuxer *muxer, const uint8_t *unit, size_t size,
     if (code != USV_OK) {
         return code;
     }
-    int index = first_stream_of_type(input, AVMEDIA_TYPE_VIDEO);
+    int index = av_find_best_stream(input, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
     if (index < 0) {
         close_input_memory(&input);
         return fail_plan("an encoded media unit has no video");
@@ -1066,7 +1043,7 @@ int usv_mux_finish(UsvMuxer *muxer, const uint8_t *audio, size_t size,
     if (code != USV_OK) {
         return code;
     }
-    int index = first_stream_of_type(input, AVMEDIA_TYPE_AUDIO);
+    int index = av_find_best_stream(input, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
     if (index < 0) {
         close_input_memory(&input);
         return fail_plan("an encoded audio track has no audio");
@@ -1132,11 +1109,9 @@ int usv_decode_audio(const uint8_t *data, size_t size, int *rate, int *channels,
     if (code != USV_OK) {
         return code;
     }
-    int index = first_stream_of_type(input, AVMEDIA_TYPE_AUDIO);
-    const AVCodec *decoder = index < 0
-                                 ? NULL
-                                 : avcodec_find_decoder(
-                                       input->streams[index]->codecpar->codec_id);
+    const AVCodec *decoder = NULL;
+    int index =
+        av_find_best_stream(input, AVMEDIA_TYPE_AUDIO, -1, -1, &decoder, 0);
     if (index < 0 || !decoder) {
         close_input_memory(&input);
         return fail_plan("an audio condition carries no audio stream");

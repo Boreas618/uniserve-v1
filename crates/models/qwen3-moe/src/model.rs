@@ -461,8 +461,8 @@ impl AttentionLayer {
                 f,
                 query,
                 key,
-                self.q_norm.view(),
-                self.k_norm.view(),
+                Some(self.q_norm.view()),
+                Some(self.k_norm.view()),
                 cosine,
                 sine,
                 query_rotated,
@@ -506,7 +506,9 @@ impl DenseMlp {
         out: TensorView,
     ) -> Result<()> {
         let dense = buffers.dense.as_ref().ok_or_else(|| {
-            Error::Config("a dense block runs in a forward planned without dense buffers".to_owned())
+            Error::Config(
+                "a dense block runs in a forward planned without dense buffers".to_owned(),
+            )
         })?;
         self.gate_proj
             .forward(f, normalized, dense.gate)
@@ -514,8 +516,10 @@ impl DenseMlp {
         self.up_proj
             .forward(f, normalized, dense.up)
             .map_err(Error::from)?;
+        // `SwiGLU(x · W_up, x · W_gate) = silu(gate) · up`: the gate is the branch the activation
+        // applies to, and the result lands in the gate buffer.
         self.activation
-            .forward(f, dense.up, dense.gate, dense.gate)
+            .forward(f, dense.gate, dense.up, dense.gate)
             .map_err(Error::from)?;
         self.down_proj
             .forward(f, dense.gate, out)

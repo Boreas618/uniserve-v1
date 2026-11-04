@@ -922,7 +922,9 @@ dependencies = [
  "minijinja",
  "minijinja-contrib",
  "models",
+ "ops",
  "platform",
+ "program-server",
  "prometheus-client",
  "prost",
  "proto",
@@ -1227,6 +1229,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d817e038c30374a4bcb22f94d0a8a0e216958d4c3dcde369b1439fec4bdda6e6"
 dependencies = [
  "cc",
+]
+
+[[package]]
+name = "executor"
+version = "2.0.0"
+dependencies = [
+ "bytemuck",
+ "indexmap 2.14.0",
+ "ipc",
+ "libc",
+ "libloading",
+ "nn",
+ "nvtx",
+ "ops",
+ "platform",
+ "proto",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "storage",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2030,6 +2058,8 @@ name = "ipc"
 version = "2.0.0"
 dependencies = [
  "libc",
+ "program-server",
+ "prost",
  "proto",
  "rmp-serde",
  "serde",
@@ -2038,6 +2068,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
+ "toml",
 ]
 
 [[package]]
@@ -4682,10 +4713,17 @@ dependencies = [
  "clap",
  "daemon",
  "engine",
+ "executor",
+ "ipc",
  "libc",
  "libloading",
  "mimalloc",
+ "nn",
+ "ops",
+ "platform",
  "program-server",
+ "proto",
+ "qwen3-moe",
  "rustix",
  "storage",
  "storage-server",

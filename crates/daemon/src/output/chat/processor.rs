@@ -56,6 +56,9 @@ pub enum AssistantEvent {
 pub struct ChatOutputProcessor {
     reasoning: Option<Box<dyn ReasoningParser>>,
     tools: Option<ToolStage>,
+    /// The parser set the request's model family chose, which a successor
+    /// rebuilds the same processors from (design §7.5.1 step 3).
+    parser: handoff::Parser,
 }
 
 impl ChatOutputProcessor {
@@ -67,7 +70,13 @@ impl ChatOutputProcessor {
         Self {
             reasoning,
             tools: tools.map(ToolStage::new),
+            parser: handoff::Parser::default(),
         }
+    }
+
+    /// The parser set this processor was built for.
+    pub fn parser(&self) -> &handoff::Parser {
+        &self.parser
     }
 
     /// The parsers' state, for the process that goes on writing the response
@@ -122,11 +131,18 @@ impl ChatOutputProcessor {
                 name: "qwen3".to_string(),
                 error: Box::new(error),
             })?;
+        let parse_tools = tools.is_some();
         let tools = tools.map(Qwen25ToolParser::new);
-        Ok(Self::new(
+        let mut processor = Self::new(
             reasoning.map(|parser| Box::new(parser) as Box<dyn ReasoningParser>),
             tools.map(|parser| Box::new(parser) as Box<dyn ToolParser>),
-        ))
+        );
+        processor.parser = handoff::Parser {
+            kind: handoff::parser::Kind::ParserKindQwen3 as i32,
+            parse_reasoning,
+            parse_tools,
+        };
+        Ok(processor)
     }
 
     /// The Gemma-4 processor of a request: thought channels when
@@ -164,10 +180,16 @@ impl ChatOutputProcessor {
                 error: Box::new(error),
             })?;
         let tools = parse_tools.then(Gemma4ToolParser::new);
-        Ok(Self::new(
+        let mut processor = Self::new(
             reasoning.map(|parser| Box::new(parser) as Box<dyn ReasoningParser>),
             tools.map(|parser| Box::new(parser) as Box<dyn ToolParser>),
-        ))
+        );
+        processor.parser = handoff::Parser {
+            kind: handoff::parser::Kind::ParserKindGemma4 as i32,
+            parse_reasoning,
+            parse_tools,
+        };
+        Ok(processor)
     }
 
     /// Chooses the region generation starts in from the prompt.
