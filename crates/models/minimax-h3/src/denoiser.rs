@@ -97,6 +97,30 @@ impl Layouts {
         })
     }
 
+    /// The elements the request's condition draws occupy, in request order.
+    ///
+    /// A condition's noise is drawn at latent resolution - patched afterwards, so its packed rows
+    /// overcount by four - and its audio rows are already channel-major elements.
+    pub fn condition_elements(&self, conditions: &[packing::Condition], canvas: &Canvas) -> u32 {
+        let Ok(segments) = packing::condition_segments(conditions, canvas) else {
+            return 0;
+        };
+        let channels = u64::from(self.config.transformer.video_channels);
+        let elements: u64 = segments
+            .iter()
+            .map(|segment| {
+                let visual = segment.visual.map_or(0, |visual| {
+                    u64::from(visual.frames)
+                        * u64::from(visual.raster.height)
+                        * u64::from(visual.raster.width)
+                        * channels
+                });
+                visual + u64::from(segment.audio_rows())
+            })
+            .sum();
+        elements as u32
+    }
+
     /// The layout a request is laid out in, without packing it.
     ///
     /// The capability asks for a layout and cannot refuse one, so this snaps the request the way
@@ -111,7 +135,13 @@ impl Layouts {
             width: 1344,
             height: 768,
         });
-        let raster = packing::latent_raster(&canvas).expect("a snapped canvas has a latent raster");
+        let raster = packing::latent_raster(&canvas).unwrap_or(packing::LatentRaster {
+            // A snapped canvas is a whole number of 16-pixel latent cells, so this is the raster the
+            // packing states; the fallback only keeps the capability's infallible call free of a
+            // panic when a caller passes a raster the checkpoint never served.
+            height: canvas.height / 16,
+            width: canvas.width / 16,
+        });
         Layout {
             video: LatentShape {
                 channels: self.config.transformer.video_channels,
@@ -127,6 +157,7 @@ impl Layouts {
             }),
             text_rows: self.arrangement.text_rows,
             condition_rows: self.arrangement.condition_rows,
+            condition_elements: self.condition_elements(&conditions_of(request), &canvas),
         }
     }
 
@@ -149,12 +180,18 @@ impl Layouts {
             self.arrangement.condition_rows,
             self.arrangement.shard,
         )?;
-        let layout = self.layout_of(&packing, &canvas)?;
+        let elements = self.condition_elements(&conditions_of(request), &canvas);
+        let layout = self.layout_of(&packing, &canvas, elements)?;
         Ok((layout, packing))
     }
 
-    /// The layout of a packing and the canvas it packs.
-    pub fn layout_of(&self, packing: &DensePacking, canvas: &Canvas) -> Result<Layout> {
+    /// The layout of a packing, the canvas it packs, and the condition elements it holds.
+    pub fn layout_of(
+        &self,
+        packing: &DensePacking,
+        canvas: &Canvas,
+        condition_elements: u32,
+    ) -> Result<Layout> {
         let raster = packing::latent_raster(canvas)?;
         let frames = packing::video_latent_frames(packing.video_rows / raster.patch_rows())?;
         Ok(Layout {
@@ -172,6 +209,7 @@ impl Layouts {
             }),
             text_rows: packing.text_rows,
             condition_rows: packing.condition_rows,
+            condition_elements,
         })
     }
 
@@ -190,12 +228,13 @@ impl Layouts {
             layout.condition_rows,
             self.arrangement.shard,
         )?;
-        let rebuilt = self.layout_of(&packing, &canvas)?;
+        let rebuilt = self.layout_of(&packing, &canvas, layout.condition_elements)?;
         if rebuilt.video.frames != layout.video.frames
             || rebuilt.video.height != layout.video.height
             || rebuilt.video.width != layout.video.width
             || rebuilt.text_rows != layout.text_rows
             || rebuilt.condition_rows != layout.condition_rows
+            || rebuilt.condition_elements != layout.condition_elements
         {
             return Err(Error::config(format!(
                 "the layout's {:?} latent extents are not a frame count and canvas this model packs",
@@ -445,6 +484,14 @@ pub fn frames_of(request: &VideoRequest) -> u32 {
     packing::align_num_frames(request.frames)
 }
 
+/// The audio rows a layout holds: one element per channel and latent step.
+fn audio_rows(layout: Layout) -> Result<u64> {
+    let audio = layout
+        .audio
+        .ok_or_else(|| Error::config("a layout without audio has no audio stream".to_owned()))?;
+    Ok(u64::from(audio.channels) * u64::from(audio.frames))
+}
+
 /// The canvas a request renders, on the checkpoint's 32-pixel grid.
 fn canvas_of(request: &VideoRequest) -> Result<Canvas> {
     let width = round_up(request.width, crate::CANVAS_MULTIPLE);
@@ -568,6 +615,9 @@ pub struct Denoiser {
     /// The schedule's entry times as their sinusoidal embedding, `[entries, frequency_dim]` FP32.
     frequencies: Weight,
     evaluations: u32,
+    /// This rank's position in the sequence shard and the shard's degree.
+    rank: u32,
+    shard: u32,
 }
 
 /// A model error as the capability's.
@@ -594,25 +644,23 @@ impl nn::capability::Denoiser for Denoiser {
         layout: Layout,
         out: nn::capability::Latents,
     ) -> nn::Result<()> {
-        // One stream per request, addressed by element: conditions first, then video, then audio.
-        // The video's first element is the number of elements the conditions' own draws occupy, and
-        // `nn::Layout` does not state it yet: a row capacity cannot stand in for it, because rows
-        // and elements differ by modality. Refusing is the only correct answer until it does.
-        let _ = (layout, seed);
-        return Err(flattened(Error::Unsupported(
-            "the initial noise cannot be addressed without Layout::condition_elements: the \
-             request's condition draws occupy elements before the video's first one, and a row \
-             capacity cannot produce that count"
-                .to_owned(),
-        )));
-        #[allow(unreachable_code)]
+        // One stream per request, addressed by element: the conditions' own draws first, then the
+        // video latents, then the audio latents. A shard's first row is not element zero, so each
+        // modality's offset carries the rank's global first row.
         let channels = u64::from(layout.video.channels);
-        let video_elements = u64::from(layout.video.frames)
-            * u64::from(layout.video.height)
-            * u64::from(layout.video.width)
-            * channels;
-        let video_offset = 0_u64;
-        let audio_offset = video_offset + video_elements;
+        // One packed row is a 2x2 patch of one latent frame, so it covers four voxels' channels.
+        let row_elements = channels * 4;
+        let video_rows = u64::from(layout.video.frames)
+            * u64::from(layout.video.height / 2)
+            * u64::from(layout.video.width / 2);
+        let condition = u64::from(layout.condition_elements);
+        let video_offset =
+            condition + self.first_row(video_rows).map_err(flattened)? * row_elements;
+        let audio_offset = condition
+            + video_rows * row_elements
+            + self
+                .first_row(audio_rows(layout).map_err(flattened)?)
+                .map_err(flattened)?;
         let noise = nn::Noise::new();
         noise.draw(
             f,
@@ -986,6 +1034,8 @@ impl Denoiser {
             adaln_output,
             frequencies,
             evaluations,
+            rank: partition.tensor_rank as u32,
+            shard: partition.ulysses_degree as u32,
         })
     }
 
@@ -1012,6 +1062,20 @@ impl Denoiser {
     /// How many solver evaluations one request makes.
     pub const fn evaluations(&self) -> u32 {
         self.evaluations
+    }
+
+    /// The first row of this rank's shard, in the layout's global row order.
+    ///
+    /// A shard is a contiguous block of rows, so a rank's elements begin at its first row's.
+    fn first_row(&self, rows: u64) -> Result<u64> {
+        let shard = u64::from(self.shard.max(1));
+        let rank = u64::from(self.rank);
+        if rank >= shard {
+            return Err(Error::config(format!(
+                "rank {rank} is outside a shard of {shard}"
+            )));
+        }
+        Ok(rank * rows / shard)
     }
 
     /// The tables the runner fills after loading.
@@ -1259,9 +1323,10 @@ mod tests {
     }
 
     fn decode_i32(bytes: &[u8]) -> Vec<i32> {
-        bytes
-            .chunks_exact(4)
-            .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        let (chunks, _) = bytes.as_chunks::<4>();
+        chunks
+            .iter()
+            .map(|chunk| i32::from_le_bytes(*chunk))
             .collect()
     }
 }
