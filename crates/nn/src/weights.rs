@@ -527,15 +527,17 @@ impl ValueLayout {
         };
         let mut arranged = bytes.to_vec();
         let stride = row_bytes as usize;
+        let lanes = block / 8;
         for expert in 0..experts {
             let base = expert * rows * row_bytes;
             for row in 0..rows {
-                // The reference's maps in closed form: a source row `r` of a block moves to
-                // `(r % (block / 8)) * 8 + r / (block / 8)`, which is the interleave of eight-row
-                // groups the artifact's `srcToDstBlk16RowMap` and `srcToDstBlk32RowMap` list.
-                let lanes = block / 8;
-                let destination = (row % lanes) * 8 + row / lanes;
-                let destination = (row / block) * block + destination;
+                // The reference's maps in closed form: within its block, a source row `r` moves to
+                // `(r % lanes) * 8 + r / lanes`, the interleave of `lanes` eight-row groups that the
+                // artifact's `srcToDstBlk16RowMap` and `srcToDstBlk32RowMap` list. The block is
+                // taken first: a row's offset inside its own block decides where it goes, and its
+                // block decides where that block starts.
+                let within = row % block;
+                let destination = (row / block) * block + (within % lanes) * 8 + within / lanes;
                 let source = (base + row * row_bytes) as usize;
                 let target = (base + destination * row_bytes) as usize;
                 arranged[target..target + stride].copy_from_slice(&bytes[source..source + stride]);
