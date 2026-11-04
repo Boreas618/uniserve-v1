@@ -138,12 +138,19 @@ struct Routing {
 #[derive(Debug, Default)]
 struct Generations {
     /// The generations successfully precopied, which is also the number the
-    /// next one gets.
+    /// next one gets: the engine numbers a generation, and the daemon echoes
+    /// the number back in `Switchover` (§7.3).
     prepared: u64,
     /// The generation the epoch serves.
     switched: u64,
     /// The generation no batch uses anything older than.
     purged: u64,
+    /// The generation each precopied program was given, by backend and
+    /// revision: a `Precopy` of a program this engine already prepared is
+    /// answered with that generation and prepares nothing again. A purge
+    /// forgets the entry, so a program prepared again after its modules were
+    /// dropped gets a generation of its own.
+    programs: std::collections::BTreeMap<(String, u32), u64>,
 }
 
 /// The control thread's policy state: its route instance, the candidate a
@@ -347,16 +354,42 @@ impl Routing {
         }
     }
 
+    /// The epoch's counters for the daemons' `/metrics` (`wire::Metrics`),
+    /// additive per epoch as the message promises (§2.3).
+    ///
+    /// `steps` is the epoch's steps — the ranks step together, so it is the
+    /// largest count any rank reached — and `batches` counts every batch every
+    /// rank finalized, which is larger because a step submits a batch per
+    /// (phase, component). `tokens` sums the tokens the workers' forwards
+    /// carried, `queue` is each rank's waiting depth, and `policy_fuel` and
+    /// `policy_calls` come from the policy instances (§12). The device's
+    /// counters and the allocators' figures are not this thread's: they come
+    /// with the executor's `counters()` and the allocators' reports.
+    fn metrics(&self) -> wire::Metrics {
+        let mut metrics = wire::Metrics::default();
+        for (index, slot) in self.slots.iter().enumerate() {
+            let stats = slot.handle.stats();
+            let finalized = stats.general.steps.load(Ordering::Relaxed);
+            metrics.steps = metrics.steps.max(finalized);
+            metrics.batches += finalized;
+            let tokens: u64 = crate::lock(&stats.worker.forward_mode_tokens)
+                .values()
+                .sum();
+            metrics.tokens += tokens;
+            metrics.queue.push(wire::QueueDepth {
+                rank: index as u32,
+                depth: u32::try_from(stats.general.pending.load(Ordering::Relaxed))
+                    .unwrap_or(u32::MAX),
+            });
+        }
+        let usage = self.policy_usage();
+        metrics.policy_fuel = usage.fuel;
+        metrics.policy_calls = usage.calls;
+        metrics
+    }
+
     /// §12's cost counters for the epoch's policy: every scheduler's, and the
     /// control thread's own route instance.
-    ///
-    /// [`PolicyUsage`] is what `Metrics.policy_fuel`/`policy_calls` carry; the
-    /// frame states the world's other counters and is not this thread's to
-    /// send yet.
-    #[expect(
-        dead_code,
-        reason = "the Metrics frame that carries these counters is not sent yet"
-    )]
     fn policy_usage(&self) -> PolicyUsage {
         let mut usage = PolicyUsage::default();
         for slot in &self.slots {
@@ -1987,7 +2020,14 @@ fn forward_events(
                         let routing = Arc::clone(routing);
                         tasks.spawn(async move { forward(stream, &routing).await });
                     }
-                    None => break,
+                    None => {
+                        // The last counters, before the epoch drains away
+                        // (§2.3: once more when it drains).
+                        let metrics = routing.metrics();
+                        routing
+                            .broadcast(|| Frame::plain(from_engine::Kind::Metrics(metrics.clone())));
+                        break;
+                    }
                 },
                 _ = interval.tick() => {
                     // A policy that failed after the commit reverted and
@@ -2062,6 +2102,10 @@ fn forward_events(
                             })));
                         }
                     }
+                    // The epoch's counters, once a second beside the
+                    // statistics (design §2.3's `/metrics`).
+                    let metrics = routing.metrics();
+                    routing.broadcast(|| Frame::plain(from_engine::Kind::Metrics(metrics.clone())));
                 }
                 Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
             }
@@ -2612,13 +2656,27 @@ fn apply_process_command(
                     program.backend, program.revision
                 )));
             };
+            // A repeated precopy of a program this engine already prepared is
+            // answered with its generation, not prepared again: the epoch
+            // updates at most once per program, and the daemon's echo of the
+            // number is what its switchover names.
+            let key = (program.backend.clone(), program.revision);
+            if let Some(&generation) = crate::lock(generations).programs.get(&key) {
+                return Some(proto::process::Report {
+                    kind: Some(report::Kind::Precopied(proto::process::Precopied {
+                        generation,
+                    })),
+                });
+            }
             match policy.precopy(policies, &program) {
                 Ok(()) => {
                     let mut generations = crate::lock(generations);
                     generations.prepared += 1;
+                    let generation = generations.prepared;
+                    generations.programs.insert(key, generation);
                     Some(proto::process::Report {
                         kind: Some(report::Kind::Precopied(proto::process::Precopied {
-                            generation: generations.prepared,
+                            generation,
                         })),
                     })
                 }
@@ -2685,7 +2743,11 @@ fn apply_process_command(
             }
             match policy.purge() {
                 Ok(()) => {
-                    crate::lock(generations).purged = generation;
+                    let mut generations = crate::lock(generations);
+                    generations.purged = generation;
+                    generations
+                        .programs
+                        .retain(|_, prepared| *prepared != generation);
                     Some(proto::process::Report {
                         kind: Some(report::Kind::Purged(proto::process::Purged { generation })),
                     })

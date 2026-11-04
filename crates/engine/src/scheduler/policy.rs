@@ -54,6 +54,10 @@ pub struct PolicyProgram {
     pub revision: u32,
     /// The policy's arguments, from the deployment configuration (§7.7).
     pub arguments: Parameters,
+    /// The arguments as the daemon stated them, one TOML value each, which is
+    /// what the Program Server resolves the module with: the server fills the
+    /// package's defaults for the ones the deployment leaves out.
+    pub stated: std::collections::BTreeMap<String, String>,
 }
 
 impl PolicyProgram {
@@ -104,6 +108,21 @@ impl PolicyProgram {
             backend,
             revision,
             arguments: parameters,
+            stated: arguments.clone(),
+        })
+    }
+
+    /// The program as the Program Server names it (§5.1): the backend, the
+    /// revision, and the stated arguments as TOML.
+    pub fn to_server_program(&self) -> Result<program_server::Program, PolicyError> {
+        let mut arguments = toml::Table::new();
+        for (name, value) in &self.stated {
+            arguments.insert(name.clone(), argument::<toml::Value>(value, name)?);
+        }
+        Ok(program_server::Program {
+            backend: self.backend.clone(),
+            revision: self.revision,
+            arguments,
         })
     }
 
@@ -203,11 +222,6 @@ pub(crate) fn process_engine() -> Result<&'static Engine, PolicyError> {
 /// it but not below it (`scheduling`'s check of the policy's limits).
 pub const PREFETCH_FLOOR_TOKENS: u32 = 256;
 
-/// `tokens` as the interface's token field, saturating instead of wrapping.
-fn token_count(tokens: usize) -> u32 {
-    u32::try_from(tokens).unwrap_or(u32::MAX)
-}
-
 /// Where the switch resolves a policy program's module (§5.1, §5.3).
 ///
 /// The daemon's commands and the epoch record name a program by backend,
@@ -219,58 +233,124 @@ pub trait PolicySource: Send + Sync {
     fn bytes(&self, program: &PolicyProgram) -> Result<Vec<u8>, PolicyError>;
 }
 
-/// The Program Server's module store, read by path (§5.3).
+/// The Program Server's client, as the source of a policy's module (§5.3,
+/// §7.3 step 2).
 ///
-/// A policy's module path is
-/// `scheduling/<backend>/<revision>/<target>/<descriptor>` below the store's
-/// root, the layout every program's modules use. Open point: `<target>` names
-/// the host the Program Server precompiled the module for (§5.1), not the source
-/// format, and `<descriptor>` is a policy package's single module rather than a
-/// kernel's per-descriptor set; the spelling below follows the design's order
-/// and shrinks to the Program Server's published layout once it is posted.
-#[derive(Clone, Debug)]
-pub struct PolicyStore {
-    root: PathBuf,
+/// The daemon names a program by backend, revision and arguments, never by
+/// content: this asks the host's Program Server to `resolve` it — the store's
+/// copy, or a build of it when the store misses it — for the baseline target
+/// this engine pinned at start, under the `scheduling` operator's single
+/// descriptor ([`program_server::manifest::POLICY_DESCRIPTOR`]).
+///
+/// One connection is kept and reused: a precopy is the only caller, and it
+/// runs on a thread of its own, so the lock is never held across a step.
+#[derive(Debug)]
+pub struct ProgramSource {
+    socket: PathBuf,
+    target: program_server::Target,
+    client: std::sync::Mutex<Option<program_server::Client>>,
 }
 
-impl PolicyStore {
-    /// A store rooted at `root`, the directory the Program Server shares.
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
-    }
+/// The operator a scheduling policy's program fills (§5.2).
+const POLICY_OP: &str = "scheduling";
 
-    /// The store's root directory.
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
-    /// The path of the module `program` resolves to.
+impl ProgramSource {
+    /// A source that resolves programs through the Program Server listening on
+    /// `socket`, for the target this host's engine precompiles for.
     ///
-    /// A policy package compiles to one module per revision rather than one per
-    /// descriptor, so the descriptor segment is the package's single `default`
-    /// one.
-    pub fn module_path(&self, program: &PolicyProgram) -> PathBuf {
-        self.root
-            .join("scheduling")
-            .join(&program.backend)
-            .join(program.revision.to_string())
-            .join("wasm32")
-            .join("default")
-            .join("module.wasm")
+    /// A host without a baseline target has no Program Server artifacts to
+    /// load, which is a precopy failure like any other.
+    pub fn connect(socket: impl Into<PathBuf>) -> Result<Self, PolicyError> {
+        let name = Engine::target().ok_or_else(|| PolicyError::Load {
+            message: format!(
+                "no baseline wasm target for this host (architecture {}): its Program Server \
+                 precompiles none",
+                std::env::consts::ARCH
+            ),
+        })?;
+        Ok(Self {
+            socket: socket.into(),
+            target: program_server::Target::new(name),
+            client: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// The socket the source asks.
+    pub fn socket(&self) -> &Path {
+        &self.socket
+    }
+
+    /// With `self`'s connection open, for the caller to resolve through.
+    fn with_client<T>(
+        &self,
+        ask: impl FnOnce(&mut program_server::Client) -> Result<T, PolicyError>,
+    ) -> Result<T, PolicyError> {
+        let mut client = crate::lock(&self.client);
+        if client.is_none() {
+            *client = Some(
+                program_server::Client::connect(&self.socket).map_err(|error| {
+                    PolicyError::Load {
+                        message: format!(
+                            "cannot reach the Program Server at {}: {error}",
+                            self.socket.display()
+                        ),
+                    }
+                })?,
+            );
+        }
+        let client = client.as_mut().ok_or_else(|| PolicyError::Load {
+            message: "the Program Server connection was closed".to_owned(),
+        })?;
+        let answer = ask(client);
+        if answer.is_err() {
+            // A failed exchange may leave the stream out of step; the next
+            // precopy opens a new one.
+            *crate::lock(&self.client) = None;
+        }
+        answer
     }
 }
 
-impl PolicySource for PolicyStore {
+impl PolicySource for ProgramSource {
     fn bytes(&self, program: &PolicyProgram) -> Result<Vec<u8>, PolicyError> {
-        let path = self.module_path(program);
-        std::fs::read(&path).map_err(|error| PolicyError::Load {
+        let server_program = program.to_server_program()?;
+        let module = self.with_client(|client| {
+            client
+                .resolve(
+                    POLICY_OP,
+                    &server_program,
+                    &self.target,
+                    program_server::manifest::POLICY_DESCRIPTOR,
+                    &mut |_| {},
+                )
+                .map_err(|error| PolicyError::Load {
+                    message: format!(
+                        "the Program Server did not resolve the {}/{} policy for {}: {error}",
+                        program.backend, program.revision, self.target
+                    ),
+                })
+        })?;
+        let mut file = module
+            .files
+            .into_iter()
+            .find(|file| file.name == program_server::source::MODULE_WASM)
+            .ok_or_else(|| PolicyError::Load {
+                message: format!(
+                    "the {}/{} policy's module carries no {}",
+                    program.backend,
+                    program.revision,
+                    program_server::source::MODULE_WASM
+                ),
+            })?
+            .file;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|error| PolicyError::Load {
             message: format!(
-                "cannot read the {}/{} policy module at {}: {error}",
-                program.backend,
-                program.revision,
-                path.display()
+                "cannot read the {}/{} policy module: {error}",
+                program.backend, program.revision
             ),
-        })
+        })?;
+        Ok(bytes)
     }
 }
 
@@ -1192,7 +1272,6 @@ mod tests {
     use serde::Serialize;
 
     use scheduling::guest::decision::{Plan, Shortage, Storage, Victim};
-    use scheduling::guest::event::{End, Event};
     use scheduling::guest::ids::{PageId, RequestId};
     use scheduling::guest::time::Nanos;
     use scheduling::guest::view::{ExpertLoad, ExpertOrder, RankView, RequestClass, RequestState};
@@ -1337,6 +1416,7 @@ mod tests {
             backend: backend.to_owned(),
             revision,
             arguments: Parameters::default(),
+            stated: Default::default(),
         }
     }
 
@@ -1898,12 +1978,34 @@ mod tests {
     }
 
     #[test]
-    fn the_store_names_a_policy_module_by_backend_revision_target_and_descriptor() {
-        let store = PolicyStore::new("/programs");
-        let path = store.module_path(&program("fcfs", 7));
-        assert_eq!(
-            path,
-            std::path::Path::new("/programs/scheduling/fcfs/7/wasm32/default/module.wasm")
-        );
+    fn a_program_resolves_with_the_arguments_the_deployment_stated() {
+        // The Program Server resolves a program by backend, revision and the
+        // arguments that were stated; it fills the package's defaults for the
+        // rest, so the source carries exactly what the daemon named.
+        let arguments = std::collections::BTreeMap::from([
+            ("max_batch".to_owned(), "16".to_owned()),
+            ("timeout".to_owned(), "\"5s\"".to_owned()),
+        ]);
+        let built = PolicyProgram::from_arguments("fcfs", 7, &arguments)
+            .expect("the arguments are the policy's");
+        let server = built
+            .to_server_program()
+            .expect("the arguments are TOML values");
+        assert_eq!(server.backend, "fcfs");
+        assert_eq!(server.revision, 7);
+        assert_eq!(server.arguments["max_batch"].as_integer(), Some(16));
+        assert_eq!(server.arguments["timeout"].as_str(), Some("5s"));
+        assert_eq!(server.arguments.len(), 2);
+    }
+
+    #[test]
+    fn a_host_without_a_baseline_target_has_no_program_server_artifacts() {
+        // `ProgramSource::connect` names the target the engine precompiles for;
+        // a host that has none cannot resolve a policy at all, and says so
+        // instead of loading the module for another host.
+        match ProgramSource::connect("/tmp/none.sock") {
+            Ok(source) => assert_eq!(source.socket(), std::path::Path::new("/tmp/none.sock")),
+            Err(error) => assert!(error.to_string().contains("architecture"), "{error}"),
+        }
     }
 }

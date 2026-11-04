@@ -163,6 +163,7 @@ impl World {
             backend: backend.to_owned(),
             revision,
             arguments: Default::default(),
+            stated: Default::default(),
         };
         let source: Arc<dyn PolicySource + Send + Sync> = Arc::new(PolicyBytes::new(wasm));
         answer(self.handle.precopy_policy(program, source))
