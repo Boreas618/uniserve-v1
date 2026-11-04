@@ -11,10 +11,10 @@ use std::time::Duration;
 
 use platform::nccl::{Communicator, DataType, ReduceOp, UniqueId};
 use platform::{
-    CaptureStatus, CopyBatch, DeviceAllocation, DeviceAttribute, DeviceGuard, DeviceId, Error,
-    Event, EventFlags, GraphExec, HandleType, Nvml, PeerMapping, PinnedBuffer, PrimaryContext,
-    Protection, SegmentedMapping, ShareableHandle, SourceOrder, Stream, Strided, StridedCopy,
-    VirtualPool, memcpy_async, memset_2d_d8, memset_d8, memset_d32, reclaim,
+    Capture, CaptureStatus, CopyBatch, DeviceAllocation, DeviceAttribute, DeviceId, Error, Event,
+    EventFlags, HandleType, Nvml, PeerMapping, PinnedBuffer, PrimaryContext, Protection,
+    SegmentedMapping, ShareableHandle, SourceOrder, Stream, Strided, StridedCopy, VirtualPool,
+    memcpy_async, memset_2d_d8, memset_d8, memset_d32, reclaim,
 };
 
 const DEVICE: DeviceId = DeviceId(0);
@@ -525,32 +525,11 @@ fn linear_cannot_export() -> bool {
 #[ignore = "requires a CUDA device"]
 fn capturing_streams_report_capture_and_reject_storage_operations() {
     let _driver = exclusive_driver();
-    type BeginCapture = unsafe extern "C" fn(*mut std::ffi::c_void, i32) -> i32;
-    type EndCapture =
-        unsafe extern "C" fn(*mut std::ffi::c_void, *mut *mut std::ffi::c_void) -> i32;
-    type DestroyGraph = unsafe extern "C" fn(*mut std::ffi::c_void) -> i32;
-
-    // SAFETY: loading libcuda runs only the driver's own initializers.
-    let library = unsafe { libloading::Library::new("libcuda.so.1") }.unwrap();
-    // SAFETY: the signatures match cuda.h, and `library` stays loaded while the
-    // copied function pointers are used; relaxed mode (2) keeps the capture
-    // from interacting with other test threads.
-    let (begin, end, destroy) = unsafe {
-        (
-            *library
-                .get::<BeginCapture>(b"cuStreamBeginCapture_v2")
-                .unwrap(),
-            *library.get::<EndCapture>(b"cuStreamEndCapture").unwrap(),
-            *library.get::<DestroyGraph>(b"cuGraphDestroy").unwrap(),
-        )
-    };
-
     let stream = Stream::new(DEVICE).unwrap();
     let device = DeviceAllocation::linear(DEVICE, 256).unwrap();
     assert_eq!(stream.capture_status().unwrap(), CaptureStatus::None);
 
-    // SAFETY: the stream is live and owned by this test.
-    assert_eq!(unsafe { begin(stream.raw() as *mut _, 2) }, 0);
+    let capture = Capture::begin(&stream).unwrap();
     assert_eq!(stream.capture_status().unwrap(), CaptureStatus::Active);
 
     let mut batch = CopyBatch::new(SourceOrder::Stream);
@@ -568,12 +547,9 @@ fn capturing_streams_report_capture_and_reject_storage_operations() {
     // SAFETY: the range lies inside the allocation.
     unsafe { memset_d8(device.address(), 0, 256, &stream).unwrap() };
 
-    let mut graph = std::ptr::null_mut();
-    // SAFETY: ends the capture begun above and destroys the resulting graph.
-    unsafe {
-        assert_eq!(end(stream.raw() as *mut _, &mut graph), 0);
-        assert_eq!(destroy(graph), 0);
-    }
+    // Ending the capture leaves the stream usable; the work this test only
+    // checks is accepted is discarded with the graph.
+    drop(capture);
     assert_eq!(stream.capture_status().unwrap(), CaptureStatus::None);
 }
 
@@ -583,27 +559,15 @@ fn capturing_streams_report_capture_and_reject_storage_operations() {
 #[ignore = "requires a CUDA device"]
 fn graph_executables_launch_on_another_stream() {
     let _driver = exclusive_driver();
-    let (begin, end, destroy_graph) = capture_functions();
-
-    let capture = Stream::new(DEVICE).unwrap();
+    let source = Stream::new(DEVICE).unwrap();
     let device = DeviceAllocation::linear(DEVICE, 256).unwrap();
     let host = PinnedBuffer::new(DEVICE, 256).unwrap();
 
-    // The captured work fills the allocation with 7; relaxed mode (2) keeps
-    // the capture from interacting with other threads.
-    let mut graph = std::ptr::null_mut();
-    // SAFETY: the stream is live and owned by this test; the fill lies inside
-    // the allocation; the graph ended by this capture is instantiated once
-    // and destroyed after.
-    let launched = unsafe {
-        assert_eq!(begin(capture.raw() as RawHandle, 2), 0);
-        memset_d8(device.address(), 7, 256, &capture).unwrap();
-        assert_eq!(end(capture.raw() as RawHandle, &mut graph), 0);
-        let launched = GraphExec::instantiate(DEVICE, graph as usize).unwrap();
-        let _context = DeviceGuard::new(DEVICE).unwrap();
-        assert_eq!(destroy_graph(graph), 0);
-        launched
-    };
+    // The captured work fills the allocation with 7.
+    let capture = Capture::begin(&source).unwrap();
+    // SAFETY: the fill lies inside the allocation.
+    unsafe { memset_d8(device.address(), 7, 256, &source) }.unwrap();
+    let launched = capture.end().unwrap().instantiate().unwrap();
 
     let stream = Stream::new(DEVICE).unwrap();
     // SAFETY: the ranges lie inside the allocation and the pinned buffer; the
@@ -617,31 +581,6 @@ fn graph_executables_launch_on_another_stream() {
     assert_eq!(read(&host), vec![7; 256]);
 }
 
-type RawHandle = *mut std::ffi::c_void;
-type BeginCapture = unsafe extern "C" fn(RawHandle, i32) -> i32;
-type EndCapture = unsafe extern "C" fn(RawHandle, *mut RawHandle) -> i32;
-type DestroyGraph = unsafe extern "C" fn(RawHandle) -> i32;
-
-/// The driver's stream capture entry points, which the crate leaves to the
-/// libraries that capture.
-fn capture_functions() -> (BeginCapture, EndCapture, DestroyGraph) {
-    // SAFETY: loading libcuda runs only the driver's own initializers; the
-    // library stays loaded for the process, as the driver is.
-    let library = Box::leak(Box::new(
-        unsafe { libloading::Library::new("libcuda.so.1") }.unwrap(),
-    ));
-    // SAFETY: the signatures match cuda.h.
-    unsafe {
-        (
-            *library
-                .get::<BeginCapture>(b"cuStreamBeginCapture_v2")
-                .unwrap(),
-            *library.get::<EndCapture>(b"cuStreamEndCapture").unwrap(),
-            *library.get::<DestroyGraph>(b"cuGraphDestroy").unwrap(),
-        )
-    }
-}
-
 /// A pool's storage keeps its addresses and contents across a suspension,
 /// and a graph captured over it before runs correctly after the restore; a
 /// freed chunk is given out again at its address.
@@ -649,7 +588,6 @@ fn capture_functions() -> (BeginCapture, EndCapture, DestroyGraph) {
 #[ignore = "requires a CUDA device"]
 fn a_pool_keeps_addresses_and_contents_across_a_suspension() {
     let _driver = exclusive_driver();
-    let (begin, end, destroy_graph) = capture_functions();
     let mut pool = VirtualPool::reserve(DEVICE, 64 << 20).unwrap();
     let first = pool.allocate(1 << 20).unwrap();
     let second = pool.allocate(1 << 20).unwrap();
@@ -660,20 +598,13 @@ fn a_pool_keeps_addresses_and_contents_across_a_suspension() {
 
     // The first chunk holds 5s written before the suspension; a graph
     // captured now fills the second with 9s at every launch.
-    let mut graph = std::ptr::null_mut();
-    // SAFETY: the ranges lie inside the pool's chunks; the stream is owned
-    // by this test and the graph is instantiated once and destroyed after.
-    let fill = unsafe {
-        memset_d8(first, 5, 256, &stream).unwrap();
-        stream.synchronize().unwrap();
-        assert_eq!(begin(stream.raw() as RawHandle, 2), 0);
-        memset_d8(second, 9, 256, &stream).unwrap();
-        assert_eq!(end(stream.raw() as RawHandle, &mut graph), 0);
-        let fill = GraphExec::instantiate(DEVICE, graph as usize).unwrap();
-        let _context = DeviceGuard::new(DEVICE).unwrap();
-        assert_eq!(destroy_graph(graph), 0);
-        fill
-    };
+    // SAFETY: the ranges lie inside the pool's chunks.
+    unsafe { memset_d8(first, 5, 256, &stream) }.unwrap();
+    stream.synchronize().unwrap();
+    let capture = Capture::begin(&stream).unwrap();
+    // SAFETY: the range lies inside the pool's chunk.
+    unsafe { memset_d8(second, 9, 256, &stream) }.unwrap();
+    let fill = capture.end().unwrap().instantiate().unwrap();
 
     let mapped = pool.mapped_bytes();
     pool.suspend().unwrap();
@@ -864,7 +795,10 @@ fn a_created_segment_is_counted_as_created_until_it_is_released() {
     };
     let created_before = platform::created_bytes(DEVICE);
     let _descriptor = segmented.create(0).unwrap();
-    assert_eq!(platform::created_bytes(DEVICE), created_before + bytes as u64);
+    assert_eq!(
+        platform::created_bytes(DEVICE),
+        created_before + bytes as u64
+    );
     let held = nvml.process_storage(DEVICE).unwrap();
     assert!(
         held >= before + bytes as u64 / 2,
@@ -1002,7 +936,6 @@ fn a_released_segment_is_mapped_again_at_its_address() {
 #[ignore = "requires a CUDA device"]
 fn a_captured_graph_reads_remapped_storage_without_changing_shared_bytes() {
     let _driver = exclusive_driver();
-    let (begin, end, destroy_graph) = capture_functions();
     let granularity = HandleType::Descriptor.granularity(DEVICE).unwrap();
     let bytes = 2 * granularity;
     let mut active = SegmentedMapping::reserve(DEVICE, &[bytes], &[]).unwrap();
@@ -1030,17 +963,10 @@ fn a_captured_graph_reads_remapped_storage_without_changing_shared_bytes() {
     }
     stream.synchronize().unwrap();
     source.protect(Protection::ReadOnly).unwrap();
-    let mut graph = std::ptr::null_mut();
-    // SAFETY: captured copies borrow allocations that outlive the executable.
-    let read_back = unsafe {
-        assert_eq!(begin(stream.raw() as RawHandle, 2), 0);
-        memcpy_async(host.address(), active.address(), bytes, &stream).unwrap();
-        assert_eq!(end(stream.raw() as RawHandle, &mut graph), 0);
-        let executable = GraphExec::instantiate(DEVICE, graph as usize).unwrap();
-        let _context = DeviceGuard::new(DEVICE).unwrap();
-        assert_eq!(destroy_graph(graph), 0);
-        executable
-    };
+    let capture = Capture::begin(&stream).unwrap();
+    // SAFETY: the copy borrows allocations that outlive the executable.
+    unsafe { memcpy_async(host.address(), active.address(), bytes, &stream) }.unwrap();
+    let read_back = capture.end().unwrap().instantiate().unwrap();
     read_back.launch(&stream).unwrap();
     stream.synchronize().unwrap();
     assert_eq!(read(&host), vec![7; bytes]);

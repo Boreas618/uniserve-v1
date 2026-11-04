@@ -112,6 +112,81 @@ pub(crate) struct Memcpy3DBatchOp {
     pub(crate) flags: u32,
 }
 
+/// `CUlaunchAttribute`: an attribute of one launch (`cuLaunchKernelEx`) or of
+/// one graph kernel node. The C struct pads the 4-byte id to 8 bytes, then
+/// carries the 64-byte value union.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct LaunchAttribute {
+    pub(crate) id: i32,
+    pub(crate) pad: [u8; 4],
+    pub(crate) value: LaunchAttributeValue,
+}
+
+/// `CUlaunchAttributeValue`: the driver reads the member named by the
+/// attribute's id. The union's C alignment is 8, from the pointers it holds.
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+pub(crate) union LaunchAttributeValue {
+    pub(crate) pad: [u8; 64],
+    pub(crate) cooperative: i32,
+    pub(crate) cluster: ClusterDim,
+    pub(crate) cluster_scheduling: i32,
+    pub(crate) programmatic_stream_serialization: i32,
+}
+
+/// The `clusterDim` member of [`LaunchAttributeValue`]: blocks per cluster.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ClusterDim {
+    pub(crate) x: u32,
+    pub(crate) y: u32,
+    pub(crate) z: u32,
+}
+
+/// `CUlaunchAttributeID`, of the values this crate sets.
+pub(crate) const CU_LAUNCH_ATTRIBUTE_COOPERATIVE: i32 = 2;
+pub(crate) const CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION: i32 = 4;
+pub(crate) const CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE: i32 = 5;
+pub(crate) const CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION: i32 = 6;
+
+/// `CUlaunchConfig`: the full configuration of one `cuLaunchKernelEx`.
+#[repr(C)]
+pub(crate) struct LaunchConfig {
+    pub(crate) grid_dim: [u32; 3],
+    pub(crate) block_dim: [u32; 3],
+    pub(crate) shared_mem_bytes: u32,
+    pub(crate) stream: Handle,
+    pub(crate) attrs: *mut LaunchAttribute,
+    pub(crate) num_attrs: u32,
+}
+
+/// `CUDA_KERNEL_NODE_PARAMS`: the parameters of a graph kernel node, as
+/// `cuGraphExecKernelNodeSetParams` replaces them.
+///
+/// The struct has no field for launch attributes: which cluster, programmatic
+/// dependency and cooperative launch a node uses is fixed when the graph is
+/// captured, and changing any of them is a recapture.
+#[repr(C)]
+pub(crate) struct KernelNodeParams {
+    pub(crate) func: Handle,
+    pub(crate) grid_dim: [u32; 3],
+    pub(crate) block_dim: [u32; 3],
+    pub(crate) shared_mem_bytes: u32,
+    pub(crate) kernel_params: *mut *mut c_void,
+    pub(crate) extra: *mut *mut c_void,
+    pub(crate) kern: Handle,
+    pub(crate) ctx: Handle,
+}
+
+/// `CUtensorMap`: the 128-byte tensor descriptor a TMA kernel reads, which
+/// `cuTensorMapEncodeTiled` fills. It must be 64-byte aligned.
+#[repr(C, align(64))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TensorMap {
+    pub(crate) opaque: [u64; 16],
+}
+
 /// Declares the driver table: one typed field per entry point.
 macro_rules! driver_table {
     (
@@ -211,10 +286,39 @@ driver_table! {
         memset_d2d8_async = "cuMemsetD2D8Async": fn(u64, usize, u8, usize, usize, Handle);
         memset_d2d32_async = "cuMemsetD2D32Async": fn(u64, usize, u32, usize, usize, Handle);
 
-        module_load_data = "cuModuleLoadData": fn(*mut Handle, *const c_void);
-        module_get_function = "cuModuleGetFunction": fn(*mut Handle, Handle, *const c_char);
-        launch_kernel = "cuLaunchKernel": fn(
-            Handle, u32, u32, u32, u32, u32, u32, u32, Handle, *mut *mut c_void, *mut *mut c_void,
+        library_load_data = "cuLibraryLoadData": fn(
+            *mut Handle, *const c_void, *mut i32, *mut *mut c_void, u32, *mut i32,
+            *mut *mut c_void, u32,
+        );
+        library_get_kernel = "cuLibraryGetKernel": fn(*mut Handle, Handle, *const c_char);
+        kernel_get_function = "cuKernelGetFunction": fn(*mut Handle, Handle);
+        library_unload = "cuLibraryUnload": fn(Handle);
+
+        launch_kernel_ex = "cuLaunchKernelEx": fn(
+            *const LaunchConfig, Handle, *mut *mut c_void, *mut *mut c_void,
+        );
+        func_set_attribute = "cuFuncSetAttribute": fn(Handle, i32, i32);
+
+        stream_begin_capture = "cuStreamBeginCapture_v2": fn(Handle, i32);
+        stream_end_capture = "cuStreamEndCapture": fn(Handle, *mut Handle);
+        stream_get_capture_info = "cuStreamGetCaptureInfo_v3": fn(
+            Handle, *mut i32, *mut u64, *mut Handle, *mut *const Handle, *mut *const c_void,
+            *mut usize,
+        );
+        graph_destroy = "cuGraphDestroy": fn(Handle);
+        graph_get_nodes = "cuGraphGetNodes": fn(Handle, *mut Handle, *mut usize);
+        graph_get_root_nodes = "cuGraphGetRootNodes": fn(Handle, *mut Handle, *mut usize);
+        graph_node_get_dependent_nodes = "cuGraphNodeGetDependentNodes_v2": fn(
+            Handle, *mut Handle, *mut c_void, *mut usize,
+        );
+        graph_node_get_type = "cuGraphNodeGetType": fn(Handle, *mut i32);
+        graph_exec_kernel_node_set_params = "cuGraphExecKernelNodeSetParams_v2": fn(
+            Handle, Handle, *const KernelNodeParams,
+        );
+
+        tensor_map_encode_tiled = "cuTensorMapEncodeTiled": fn(
+            *mut TensorMap, i32, u32, *mut c_void, *const u64, *const u64, *const u32,
+            *const u32, i32, i32, i32, i32,
         );
     }
     lazy {

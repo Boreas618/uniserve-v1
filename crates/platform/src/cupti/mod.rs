@@ -333,7 +333,9 @@ pub(crate) mod tests {
     use std::ffi::c_void;
     use std::sync::Mutex;
 
-    use crate::{DeviceAllocation, Function, Module, Result, Stream};
+    use crate::{
+        Capture, DeviceAllocation, Function, Graph, LaunchConfig, Library, Result, Stream,
+    };
 
     /// CUPTI is process-wide: its device tests run one at a time.
     pub(crate) static SERIAL: Mutex<()> = Mutex::new(());
@@ -349,17 +351,17 @@ pub(crate) mod tests {
 
     /// The spin kernel of `stream`'s device, and the word it stores into.
     pub(crate) struct Spin {
-        _module: Module,
+        _library: Library,
         function: Function,
         out: DeviceAllocation,
     }
 
     impl Spin {
         pub(crate) fn load(stream: &Stream) -> Result<Self> {
-            let module = Module::load_ptx(stream.device(), SPIN)?;
-            let function = module.function("spin")?;
+            let library = Library::load(stream.device(), SPIN.as_bytes())?;
+            let function = library.kernel("spin")?;
             Ok(Self {
-                _module: module,
+                _library: library,
                 function,
                 out: DeviceAllocation::linear(stream.device(), 4)?,
             })
@@ -370,9 +372,10 @@ pub(crate) mod tests {
         pub(crate) fn launch(&self, stream: &Stream, blocks: u32, mut count: u32) -> Result<()> {
             let mut out = self.out.address();
             let mut parameters: [*mut c_void; 2] = [(&raw mut out).cast(), (&raw mut count).cast()];
-            // SAFETY: the parameters are the kernel's; the word outlives the
+            let config = LaunchConfig::new([blocks, 1, 1], [128, 1, 1]);
+            // The parameters are the kernel's, and the word outlives the
             // launch, which the tests synchronize.
-            unsafe { self.function.launch(stream, blocks, 128, &mut parameters) }
+            self.function.launch_ex(stream, &config, &mut parameters)
         }
     }
 
@@ -381,33 +384,10 @@ pub(crate) mod tests {
     pub(crate) fn with_captured_graph<T>(
         stream: &Stream,
         issue: impl FnOnce(&Stream) -> Result<()>,
-        record: impl FnOnce(usize) -> Result<T>,
+        record: impl FnOnce(Graph) -> Result<T>,
     ) -> Result<T> {
-        type Capture = unsafe extern "C" fn(*mut c_void, i32) -> i32;
-        type Captured = unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> i32;
-        type Destroy = unsafe extern "C" fn(*mut c_void) -> i32;
-        // SAFETY: loading the driver runs only its initializers; each type is
-        // its symbol's C prototype.
-        let (begin, end, destroy) = unsafe {
-            let driver = Box::leak(Box::new(libloading::Library::new("libcuda.so.1").unwrap()));
-            (
-                *driver.get::<Capture>(b"cuStreamBeginCapture_v2").unwrap(),
-                *driver.get::<Captured>(b"cuStreamEndCapture").unwrap(),
-                *driver.get::<Destroy>(b"cuGraphDestroy").unwrap(),
-            )
-        };
-        let _context = stream.enter()?;
-        let mut graph = std::ptr::null_mut();
-        // SAFETY: the stream is live; `CU_STREAM_CAPTURE_MODE_THREAD_LOCAL`
-        // confines the capture to this thread, and the driver writes the
-        // captured graph, which remains live through `record`.
-        unsafe {
-            assert_eq!(begin(stream.handle(), 1), 0);
-            issue(stream)?;
-            assert_eq!(end(stream.handle(), &mut graph), 0);
-            let result = record(graph as usize);
-            assert_eq!(destroy(graph), 0);
-            result
-        }
+        let capture = Capture::begin(stream)?;
+        issue(stream)?;
+        record(capture.end()?)
     }
 }
