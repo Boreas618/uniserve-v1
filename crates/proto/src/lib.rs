@@ -35,6 +35,13 @@ pub mod process {
     include!(concat!(env!("OUT_DIR"), "/uniserve.process.rs"));
 }
 
+/// The state a hot restart hands its successor for the responses in flight
+/// (`handoff.proto`, specs/worker.md §7.5.1).
+#[allow(clippy::all, reason = "code generated from the schema")]
+pub mod handoff {
+    include!(concat!(env!("OUT_DIR"), "/uniserve.handoff.rs"));
+}
+
 /// The interfaces' major version: peers of different majors refuse each
 /// other. It changes only when a field is removed or changes meaning, which
 /// takes a planned restart of every daemon.
