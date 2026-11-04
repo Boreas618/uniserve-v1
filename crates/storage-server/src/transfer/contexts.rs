@@ -26,7 +26,7 @@
 //!   storage, and the lanes' streams and events.
 //! - When the last hold of a GPU ends, its session closes ([`Slot::release`]):
 //!   the registrations, then the mappings, then the context are released,
-//!   the process waits for the driver calls it deferred (`cuda::reclaim`),
+//!   the process waits for the driver calls it deferred (`platform::reclaim`),
 //!   so that the driver destroyed the context and NVML lists the process on
 //!   the GPU no more, and then the booking ends. The next hold that uses the
 //!   GPU starts a new session.
@@ -44,7 +44,7 @@ use std::os::fd::OwnedFd;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, mpsc};
 use std::time::Instant;
 
-use cuda::{DeviceId, HostRegistration, PeerMapping, PrimaryContext, Protection};
+use platform::{DeviceId, HostRegistration, PeerMapping, PrimaryContext, Protection};
 
 use super::storage::{HostMap, Mapped};
 
@@ -257,7 +257,7 @@ impl Slot {
     fn release(&self, session: &Session) {
         let started = Instant::now();
         session.close();
-        if let Err(error) = cuda::reclaim::flush() {
+        if let Err(error) = platform::reclaim::flush() {
             tracing::warn!(%error, gpu = %self.name(), "releasing a GPU's mappings failed");
         }
         self.unbook();
@@ -279,7 +279,7 @@ impl Slot {
     }
 
     fn name(&self) -> String {
-        cuda::DeviceUuid(self.gpu.uuid).to_string()
+        platform::DeviceUuid(self.gpu.uuid).to_string()
     }
 }
 

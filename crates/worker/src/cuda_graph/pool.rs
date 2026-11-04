@@ -1,6 +1,6 @@
 //! Shared device budgets and allocation pools for captured numerical calls.
 
-use cuda::DeviceId;
+use platform::DeviceId;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 

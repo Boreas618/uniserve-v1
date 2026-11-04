@@ -40,7 +40,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ::storage::manifest::{Encoding, Field, Logical, Segment, Span, StorageLayout};
-use cuda::{CopyBatch, DeviceId, Event, EventFlags, SourceOrder, Stream};
+use platform::{CopyBatch, DeviceId, Event, EventFlags, SourceOrder, Stream};
 use ipc::{
     BufferId, Call, CallKind, ImageParams, LatentOffload, LatentParams, LatentRestore, MediaCall,
     RequestKey,

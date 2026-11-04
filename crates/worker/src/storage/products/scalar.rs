@@ -5,7 +5,7 @@ use crate::ffi::{DType, MemoryKind};
 use crate::storage::allocation::StorageView;
 use crate::stream::{Fill, Issue};
 use crate::{Error, Result};
-use cuda::{CopyBatch, SourceOrder};
+use platform::{CopyBatch, SourceOrder};
 use std::collections::HashSet;
 use std::sync::Arc;
 

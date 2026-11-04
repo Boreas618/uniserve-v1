@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use cuda::DeviceId;
+use platform::DeviceId;
 use proto::profile::{Collector, SessionStart};
 
 use crate::job::{Completion, Job, JobId, JobQueue};
@@ -204,7 +204,7 @@ impl Session {
                 .push_back(if taken { Action::Arm } else { Action::Disarm });
             self.intended = taken;
         }
-        let now = cuda::cupti::timestamp().unwrap_or(0);
+        let now = platform::cupti::timestamp().unwrap_or(0);
         self.open.insert(step, (stage.to_owned(), taken, now));
     }
 
@@ -219,7 +219,7 @@ impl Session {
             stage,
             selected: taken,
             begin,
-            end: cuda::cupti::timestamp().ok(),
+            end: platform::cupti::timestamp().ok(),
         }));
         if !taken {
             return;
@@ -383,10 +383,10 @@ fn metadata(
         ("build".to_owned(), proto::BUILD.to_owned()),
         (
             "cupti_library".to_owned(),
-            cuda::cupti::library().to_owned(),
+            platform::cupti::library().to_owned(),
         ),
     ];
-    if let Ok(version) = cuda::cupti::version() {
+    if let Ok(version) = platform::cupti::version() {
         entries.push(("cupti_api_version".to_owned(), version.to_string()));
     }
     if let Ok(host) = rustix::system::uname().nodename().to_str() {
@@ -397,7 +397,7 @@ fn metadata(
         if let Ok(uuid) = device.uuid() {
             entries.push(("device_uuid".to_owned(), format!("{uuid}")));
         }
-        if let Ok(chip) = cuda::cupti::metrics::chip_name(device.0 as usize) {
+        if let Ok(chip) = platform::cupti::metrics::chip_name(device.0 as usize) {
             entries.push(("chip".to_owned(), chip));
         }
     }
@@ -408,7 +408,7 @@ fn metadata(
 /// the file's `clocks`.
 fn clocks(rows: &Rows, source: &'static str) {
     let before = realtime();
-    let cupti = cuda::cupti::timestamp().ok();
+    let cupti = platform::cupti::timestamp().ok();
     let monotonic = crate::profiling::fences::monotonic();
     let after = realtime();
     rows.send(Message::Clock(ClockRow {

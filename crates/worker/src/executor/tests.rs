@@ -279,7 +279,7 @@ fn read(executor: &Executor, product: &TensorRef) -> Result<Arc<ProductRead>> {
         product,
         CallId::new(9, 0),
         Some(MemoryKind::Host),
-        None::<&cuda::Stream>,
+        None::<&platform::Stream>,
     )?)
 }
 
@@ -287,7 +287,7 @@ fn complete(executor: &Executor, read: &Arc<ProductRead>) -> Result<()> {
     Ok(
         tensors(executor)?.complete_reads(
             std::slice::from_ref(read),
-            None::<&cuda::Stream>,
+            None::<&platform::Stream>,
             &[],
         )?,
     )

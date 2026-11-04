@@ -19,7 +19,7 @@ use std::ops::Range;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, Weak};
 
-use cuda::{DeviceId, Event, Stream};
+use platform::{DeviceId, Event, Stream};
 use ipc::{Locator, TransferTransport, Wake, WorkerEndpoint};
 
 use super::backing::TransportBuffer;

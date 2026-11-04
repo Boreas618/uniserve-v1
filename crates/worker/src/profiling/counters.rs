@@ -1,7 +1,7 @@
 //! The always-on counters CUPTI gives a serving rank: the watch of the
 //! driver calls that make its threads wait for the device
 //! ([`super::blocking`]) and the record of its streams' device time
-//! ([`cuda::cupti::activity`], reported as `ForwardStats::stream_us`).
+//! ([`platform::cupti::activity`], reported as `ForwardStats::stream_us`).
 //!
 //! A rank subscribes the process to CUPTI as it starts ([`subscribe`]),
 //! before loading modules and capturing graphs so that collectors observe
@@ -10,14 +10,14 @@
 //! the subscription with the session collectors. A profiler that holds
 //! CUPTI's one subscription (Nsight Systems) leaves the rank without them.
 
-use cuda::cupti::activity::StreamActivity;
-use cuda::cupti::blocking::BlockingWatch;
+use platform::cupti::activity::StreamActivity;
+use platform::cupti::blocking::BlockingWatch;
 
 /// Subscribe the process to CUPTI; a failure (another CUPTI client holds
 /// the subscription) is logged, and the rank serves without CUPTI.
 pub(crate) fn subscribe() {
-    match cuda::cupti::subscriber::subscribe() {
-        Ok(()) => tracing::info!("CUPTI is subscribed ({})", cuda::cupti::library()),
+    match platform::cupti::subscriber::subscribe() {
+        Ok(()) => tracing::info!("CUPTI is subscribed ({})", platform::cupti::library()),
         Err(error) => tracing::warn!(
             "CUPTI is not subscribed, and no CUPTI counter or profiling session is \
              available: {error}"
@@ -35,8 +35,8 @@ pub(crate) struct Counters {
 impl Counters {
     /// Start the counters, recording the device time of `streams` by name
     /// (`device`, `copy`); `None` when the process is not subscribed.
-    pub(crate) fn start(streams: &[(&'static str, cuda::Stream)]) -> Option<Self> {
-        if !cuda::cupti::subscriber::subscribed() {
+    pub(crate) fn start(streams: &[(&'static str, platform::Stream)]) -> Option<Self> {
+        if !platform::cupti::subscriber::subscribed() {
             return None;
         }
         let watch = BlockingWatch::start()

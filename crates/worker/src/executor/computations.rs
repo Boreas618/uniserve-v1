@@ -62,7 +62,7 @@
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 
-use cuda::{DeviceId, Stream};
+use platform::{DeviceId, Stream};
 use ipc::{
     Batch as BatchPlan, BufferId, Call, CallKind, ForwardMode, ForwardStats, RequestKey, WorkerInfo,
 };
@@ -458,7 +458,7 @@ impl Opening {
         parts: &mut Parts<'_>,
         plan: &BatchPlan,
         job: &Job,
-        page_loads: Option<&Arc<cuda::Event>>,
+        page_loads: Option<&Arc<platform::Event>>,
     ) -> Result<Self> {
         let first = plan
             .calls
