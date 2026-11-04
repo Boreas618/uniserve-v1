@@ -836,7 +836,7 @@ fn single_rank_communicators_run_collectives() {
     let data = DeviceAllocation::linear(DEVICE, 16).unwrap();
     let host = PinnedBuffer::new(DEVICE, 16).unwrap();
     let id = UniqueId::new().unwrap();
-    let mut communicator = Communicator::init(DEVICE, 1, 0, &id).unwrap();
+    let communicator = Communicator::init(DEVICE, 1, 0, &id).unwrap();
     assert_eq!((communicator.rank(), communicator.size()), (0, 1));
 
     // SAFETY: the buffers outlive the synchronization below.
@@ -1707,7 +1707,7 @@ fn a_communicator_splits_into_a_subgroup_and_a_rank_left_out_gets_none() {
     let _driver = exclusive_driver();
     let id = UniqueId::new().unwrap();
     let world = Communicator::init(DEVICE, 1, 0, &id).unwrap();
-    let mut tp = world
+    let tp = world
         .split(&[0], 0)
         .unwrap()
         .expect("the only rank is in the subgroup");
