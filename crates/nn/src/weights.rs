@@ -960,7 +960,9 @@ fn convert(from: DType, to: DType, bytes: &[u8], tensor: &str) -> Result<Vec<u8>
         | (DType::F16, DType::F32)
         | (DType::F16, DType::BF16)
         | (DType::F32, DType::BF16)
-        | (DType::F32, DType::F16) => {}
+        | (DType::F32, DType::F16)
+        | (DType::F32, DType::I16)
+        | (DType::I16, DType::F32) => {}
         (same, target) if same == target => return Ok(bytes.to_vec()),
         (source, target) => {
             return Err(Error::weight(
@@ -987,6 +989,8 @@ fn convert(from: DType, to: DType, bytes: &[u8], tensor: &str) -> Result<Vec<u8>
             }
             DType::F16 => half_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])),
             DType::F32 => f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
+            // A PCM sample is an integer that F32 holds exactly, so the read is lossless.
+            DType::I16 => f32::from(i16::from_le_bytes([chunk[0], chunk[1]])),
             other => {
                 return Err(Error::weight(
                     tensor,
@@ -1000,6 +1004,7 @@ fn convert(from: DType, to: DType, bytes: &[u8], tensor: &str) -> Result<Vec<u8>
             }
             DType::F16 => converted.extend_from_slice(&f32_to_half(value).to_le_bytes()),
             DType::F32 => converted.extend_from_slice(&value.to_le_bytes()),
+            DType::I16 => converted.extend_from_slice(&f32_to_i16(value).to_le_bytes()),
             other => {
                 return Err(Error::weight(
                     tensor,
@@ -1009,6 +1014,22 @@ fn convert(from: DType, to: DType, bytes: &[u8], tensor: &str) -> Result<Vec<u8>
         }
     }
     Ok(converted)
+}
+
+/// The `i16` a sample becomes: nearest, ties to even, saturating at both ends.
+///
+/// A PCM track is a clip, not a wrap: a sample beyond the range stores at the end of it rather
+/// than folding to the opposite sign, and a NaN stores as zero (the saturating cast's answer, and a
+/// NaN in a checkpoint is already corrupt).
+fn f32_to_i16(value: f32) -> i16 {
+    let rounded = value.round_ties_even();
+    if rounded >= f32::from(i16::MAX) {
+        i16::MAX
+    } else if rounded <= f32::from(i16::MIN) {
+        i16::MIN
+    } else {
+        rounded as i16
+    }
 }
 
 /// The `f32` values of `bytes`, which hold `dtype` elements.
@@ -1192,5 +1213,63 @@ mod tests {
         assert!(text.contains("bf16"));
         assert!(text.contains("up_gate"));
         assert!(text.contains("up+gate"));
+    }
+
+    /// A PCM sample converts to its nearest integer, ties to even, and clamps at both ends: a clip
+    /// does not wrap, and the two ends are the values an audio codec actually reaches.
+    #[test]
+    fn a_sample_converts_to_the_nearest_sixteen_bit_integer() {
+        let bytes: Vec<u8> = [
+            0.0f32, 0.5, 1.5, 2.5, -0.5, -1.5, 32767.4, 32768.0, -32768.4, -40000.0, 3.0,
+        ]
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+        let converted = convert(DType::F32, DType::I16, &bytes, "pcm").unwrap();
+        let samples: Vec<i16> = converted
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| i16::from_le_bytes(*pair))
+            .collect();
+        assert_eq!(
+            samples,
+            [0, 0, 2, 2, 0, -2, 32767, 32767, -32768, -32768, 3],
+            "nearest with ties to even, saturated at both ends"
+        );
+        // And back: every one of those integers is a float exactly.
+        let back = convert(DType::I16, DType::F32, &converted, "pcm").unwrap();
+        let floats: Vec<f32> = back
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| f32::from_le_bytes(*word))
+            .collect();
+        assert_eq!(
+            floats,
+            [
+                0.0, 0.0, 2.0, 2.0, 0.0, -2.0, 32767.0, 32767.0, -32768.0, -32768.0, 3.0
+            ]
+        );
+    }
+
+    /// Every other pair that names I16 is refused, and the refusal names both types.
+    #[test]
+    fn a_sample_converts_only_to_and_from_f32() {
+        for (from, to) in [
+            (DType::BF16, DType::I16),
+            (DType::I16, DType::BF16),
+            (DType::F16, DType::I16),
+            (DType::I16, DType::F16),
+            (DType::U8, DType::I16),
+            (DType::I16, DType::U8),
+        ] {
+            let bytes = vec![0u8; 2];
+            let error = convert(from, to, &bytes, "pcm").unwrap_err().to_string();
+            assert!(
+                error.contains(&from.to_string()) && error.contains(&to.to_string()),
+                "{from} to {to} was refused without naming both: {error}"
+            );
+        }
     }
 }
