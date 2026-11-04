@@ -414,12 +414,7 @@ pub trait Denoiser {
     fn draw_noise(&self, f: &Forward, seed: Seed, out: Latents) -> Result<()>;
 
     /// Fold `cond` into the latents the schedule starts from.
-    fn prepare_latents<'a>(
-        &self,
-        f: &Forward,
-        cond: Conditioning<'a>,
-        out: Latents,
-    ) -> Result<()>;
+    fn prepare_latents<'a>(&self, f: &Forward, cond: Conditioning<'a>, out: Latents) -> Result<()>;
 
     /// One denoising step: update `latents` in place with the model's velocity.
     fn denoise<'a>(
