@@ -55,7 +55,7 @@ pub(crate) fn slot_mapping(
     table: &ipc::BlockTable,
     page: PageGeometry,
     positions: Range<u32>,
-) -> Option<Vec<i64>> {
+) -> Option<Vec<i32>> {
     if page.block_size == 0 || page.units_per_page != 1 {
         return None;
     }
@@ -76,43 +76,63 @@ pub(crate) fn slot_mapping(
         let slot = unit
             .checked_mul(block_size)?
             .checked_add(position % block_size)?;
-        slots.push(i64::try_from(slot).ok()?);
+        slots.push(i32::try_from(slot).ok()?);
     }
     Some(slots)
 }
 
-/// For each call of `calls`, in order, the forward row whose hidden state feeds
-/// the call's `logits()`: the last row the call occupies, when the call has
-/// consumer slots that draw from it.
+/// One entry per forward row: the row whose hidden state the row's logits come
+/// from, or -1 when the row produces no logits.
 ///
-/// A row is one query interval of `forward`, grouped by call in scheduling
-/// order (`ForwardBatch::call_indices`). Sampling reads the interval's last
-/// token, so the row to read is the last row carrying the call's index; a call
-/// with no consumer slots samples nothing and states -1, as a row that no call
-/// reads does.
+/// `rows[i]` is the half-open span of forward rows call `i` occupies, in call
+/// order and contiguous, which is how the assembly builds them. What samples
+/// depends on the kind (`CausalLm`'s reading, model's answer):
 ///
-/// `None` when a call that has consumer slots occupies no row: the batch would
-/// ask a kernel to sample a row it does not have.
-pub(crate) fn logits_rows(calls: &[ipc::Call], forward: &ipc::ForwardBatch) -> Option<Vec<i64>> {
-    let mut last_row: Vec<Option<u32>> = vec![None; calls.len()];
-    for (row, call_index) in forward.call_indices.iter().enumerate() {
-        let call_index = usize::try_from(*call_index).ok()?;
-        if call_index >= calls.len() {
+/// - a **prefill** is sampled once, at its last query row, so only that row's
+///   entry names a row;
+/// - a **decode** evaluates one row per request and every row samples, so the
+///   mapping is the identity;
+/// - a **verify** carries one row per candidate position of its request, in
+///   candidate order, so its rows are the positions that sample and the mapping
+///   is the identity there too;
+/// - every other kind produces latents rather than logits, and a call with no
+///   consumer slots is sampled by nobody: both leave -1 on every row.
+///
+/// `None` when the calls and the spans disagree, when the spans are not the
+/// contiguous row order of one batch, or when a sampling prefill has no row —
+/// a batch must not ask a kernel to sample a row it does not have.
+pub(crate) fn logits_rows(calls: &[ipc::Call], rows: &[Range<u32>]) -> Option<Vec<i64>> {
+    if calls.len() != rows.len() {
+        return None;
+    }
+    let mut total = 0usize;
+    for span in rows {
+        if usize::try_from(span.start).ok()? != total || span.end < span.start {
             return None;
         }
-        last_row[call_index] = Some(u32::try_from(row).ok()?);
+        total = usize::try_from(span.end).ok()?;
     }
-    calls
-        .iter()
-        .zip(last_row)
-        .map(|(call, row)| {
-            if call.consumer_slots.is_empty() {
-                return Some(-1);
+    let mut logits = vec![-1i64; total];
+    for (call, span) in calls.iter().zip(rows) {
+        if call.consumer_slots.is_empty() {
+            continue;
+        }
+        let start = usize::try_from(span.start).ok()?;
+        let end = usize::try_from(span.end).ok()?;
+        match call.kind {
+            ipc::CallKind::Forward(ipc::ForwardMode::Prefill) => {
+                let last = end.checked_sub(1).filter(|last| *last >= start)?;
+                logits[last] = i64::try_from(last).ok()?;
             }
-            // A sampling call must occupy at least one row.
-            Some(i64::from(row?))
-        })
-        .collect()
+            ipc::CallKind::Forward(ipc::ForwardMode::Decode | ipc::ForwardMode::Verify) => {
+                for row in start..end {
+                    logits[row] = i64::try_from(row).ok()?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(logits)
 }
 
 #[cfg(test)]
@@ -193,40 +213,53 @@ mod tests {
         call
     }
 
-    #[test]
-    fn a_sampling_call_reads_its_last_row() {
-        let calls = [
-            call(ipc::CallKind::Forward(ipc::ForwardMode::Prefill), true),
-            call(ipc::CallKind::Forward(ipc::ForwardMode::Decode), true),
-            call(
-                ipc::CallKind::Transfer(ipc::TransferMode::CacheExport),
-                false,
-            ),
-        ];
-        // Call 0 has rows 0 and 1, call 1 has row 2, the transfer has none.
-        let mut forward = ipc::ForwardBatch::default();
-        forward.push(0, 4, 12, 8, true);
-        forward.push(0, 4, 20, 8, true);
-        forward.push(1, 5, 30, 1, true);
+    fn prefill() -> ipc::CallKind {
+        ipc::CallKind::Forward(ipc::ForwardMode::Prefill)
+    }
 
-        assert_eq!(logits_rows(&calls, &forward), Some(vec![1, 2, -1]));
+    fn decode() -> ipc::CallKind {
+        ipc::CallKind::Forward(ipc::ForwardMode::Decode)
     }
 
     #[test]
-    fn a_sampling_call_without_a_row_is_a_fault() {
-        // Call 1 samples but no row carries it.
+    fn a_prefill_is_sampled_at_its_last_row_only() {
+        // Two calls, three rows: a prefill of two query rows, then a decode.
+        let calls = [call(prefill(), true), call(decode(), true)];
+        assert_eq!(logits_rows(&calls, &[0..2, 2..3]), Some(vec![-1, 1, 2]));
+    }
+
+    #[test]
+    fn a_decode_and_a_verify_sample_every_row() {
+        let verify = ipc::CallKind::Forward(ipc::ForwardMode::Verify);
+        let calls = [call(decode(), true), call(verify, true)];
+        assert_eq!(
+            logits_rows(&calls, &[0..2, 2..5]),
+            Some(vec![0, 1, 2, 3, 4])
+        );
+    }
+
+    #[test]
+    fn a_call_nobody_samples_and_a_media_call_produce_no_logits() {
         let calls = [
-            call(ipc::CallKind::Forward(ipc::ForwardMode::Prefill), true),
-            call(ipc::CallKind::Forward(ipc::ForwardMode::Decode), true),
+            call(prefill(), false),
+            call(decode(), false),
+            call(ipc::CallKind::Media(ipc::MediaCall::Denoising), true),
         ];
-        let mut forward = ipc::ForwardBatch::default();
-        forward.push(0, 4, 12, 8, true);
+        assert_eq!(
+            logits_rows(&calls, &[0..1, 1..3, 3..4]),
+            Some(vec![-1, -1, -1, -1])
+        );
+    }
 
-        assert_eq!(logits_rows(&calls, &forward), None);
-
-        // A row that names no call in the batch is a fault too.
-        let mut stray = ipc::ForwardBatch::default();
-        stray.push(7, 4, 12, 8, true);
-        assert_eq!(logits_rows(&calls, &stray), None);
+    #[test]
+    fn mismatched_rows_are_a_fault() {
+        let calls = [call(prefill(), true), call(decode(), true)];
+        // One span for two calls.
+        assert_eq!(logits_rows(&calls, &[0..1]), None);
+        // Spans that are not one contiguous row order.
+        assert_eq!(logits_rows(&calls, &[0..2, 3..4]), None);
+        assert_eq!(logits_rows(&calls, &[1..2, 2..3]), None);
+        // A sampling prefill with no row.
+        assert_eq!(logits_rows(&calls, &[0..0, 0..1]), None);
     }
 }
