@@ -1628,8 +1628,9 @@ mod tests {
         serve_target(&mut roster, &mut switch);
         roster.commands.clear();
         roster.serves.clear();
-        // The precopy claimed the target's world on each node; only the
-        // revert's claims are asserted below.
+        // The precopy spawned the target and claimed its world on each node;
+        // only what the revert does is asserted below.
+        roster.spawns.clear();
         roster.claims.clear();
 
         roster.scripted = vec![report_event(
