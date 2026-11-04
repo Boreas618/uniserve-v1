@@ -646,8 +646,18 @@ impl Scheduler {
                 self.policy = Some(policy);
             }
             Err(fatal) => {
-                tracing::error!(reason = %fatal, "the policy failed and cannot be reverted");
-                self.fail(format!("the scheduling policy failed: {fatal}"));
+                // Both failures are named: the one that ended the policy, which
+                // is what the daemon and a reader of the log need first, and the
+                // failed takeover that leaves the epoch with no policy at all.
+                tracing::error!(
+                    reason = %error,
+                    takeover = %fatal,
+                    "the policy failed and cannot be reverted"
+                );
+                self.fail(format!(
+                    "the scheduling policy failed with `{error}`, and no previous policy can \
+                     take over: {fatal}"
+                ));
                 self.policy = Some(policy);
             }
         }
