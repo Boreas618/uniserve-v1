@@ -314,11 +314,12 @@ fn stage_weights(args: &Args) -> Result<()> {
         )?;
         let _ = &decoder;
         println!(
-            "loaded: {} layers, {} registers, clip {}x{} latent cells, {} frames out",
+            "loaded: {} layers, {} registers, clip {}x{} latent cells, {} frames kept of {} decoded",
             config.video_vae.decoder_num_layers,
             config.video_vae.decoder_num_register_tokens,
             args.latent_height,
             args.latent_width,
+            kept_frames(&config.video_vae),
             canvas.frames_out(&config.video_vae),
         );
     }
@@ -491,9 +492,16 @@ fn stage_decode(args: &Args) -> Result<()> {
         weights.reserved >> 20,
         weights.pools.mapped_bytes(platform::PoolKind::Resident) >> 20
     );
+    // The decoder decodes more frames than the clip keeps: the temporal upsampler emits
+    // `latent_frames · ratio` and the clip's own length crops the padding off. Both numbers are printed
+    // because a page comparing a raster against "the frames out" reads the wrong count otherwise - 28
+    // decoded against 25 kept is exactly the kind of pair this round has spent rounds on.
+    let decoded = canvas.frames_out(&config.video_vae);
+    let kept = kept_frames(&config.video_vae);
     println!(
-        "decoder: {} frames out, {} position rows, {} latent channels, {dtype}",
-        canvas.frames_out(&config.video_vae),
+        "decoder: {kept} frames out ({decoded} decoded, {} trimmed), {} position rows, \
+         {} latent channels, {dtype}",
+        decoded - u32::try_from(kept).unwrap_or(decoded),
         rows,
         latent_channels
     );
@@ -1232,6 +1240,12 @@ fn write_h3t(path: &Path, shape: &[u64], dtype: u8, payload: &[u8]) -> Result<()
     std::fs::write(path, bytes)
         .map_err(|error| Failure::message(format!("{}: {error}", path.display())))?;
     Ok(())
+}
+
+/// The frames one clip keeps: its body, the frames the final clip drops and the tail that overlaps the
+/// next clip - the span the decoder trims to, which is fewer than the frames it decodes.
+fn kept_frames(config: &minimax_h3::VideoVaeConfig) -> u64 {
+    u64::from(config.clip_length + config.token_drop + minimax_h3::decoding::OVERLAP_FRAMES)
 }
 
 /// Whether a `--latents` value is a bare non-negative integer - an evaluation index a caller meant as
