@@ -388,6 +388,11 @@ const PACKED_VOCABULARY: u64 = 256;
 const PACKED_HEAD_DIM: u64 = 8;
 const PACKED_EXPERTS: u64 = 2;
 
+/// The block scale a linear table holds at `index`, nonzero so that padding stays distinguishable.
+fn scale_byte(index: u64) -> u8 {
+    (index % 255 + 1) as u8
+}
+
 fn packed_model_shard() -> TempDir {
     let dir = TempDir::new().unwrap_or_else(|error| panic!("a temporary directory: {error}"));
     let config = format!(
@@ -397,8 +402,8 @@ fn packed_model_shard() -> TempDir {
             "hidden_size": {PACKED_HIDDEN},
             "intermediate_size": {PACKED_HIDDEN},
             "num_hidden_layers": 1,
-            "num_attention_heads": 2,
-            "num_key_value_heads": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
             "head_dim": {PACKED_HEAD_DIM},
             "hidden_act": "silu",
             "rms_norm_eps": 1e-6,
@@ -477,11 +482,13 @@ fn packed_model_shard() -> TempDir {
             "U8".to_owned(),
             vec![seed; (rows * columns / 2) as usize],
         ));
+        // The block scales identify their own position, so a region read from the wrong rank or with
+        // the wrong stride changes the *set* of published bytes and not only their order.
         owned.push((
             format!("{name}.weight_scale"),
             vec![rows, columns / 16],
             "F8_E4M3".to_owned(),
-            vec![1u8; (rows * columns / 16) as usize],
+            (0..rows * columns / 16).map(scale_byte).collect(),
         ));
         owned.push((
             format!("{name}.weight_scale_2"),
@@ -496,8 +503,8 @@ fn packed_model_shard() -> TempDir {
             f32::from(seed).to_le_bytes().to_vec(),
         ));
     };
-    let query = 2 * PACKED_HEAD_DIM;
-    let key_value = PACKED_HEAD_DIM;
+    let query = 4 * PACKED_HEAD_DIM;
+    let key_value = 2 * PACKED_HEAD_DIM;
     packed_tensor(
         "model.layers.0.self_attn.q_proj".to_owned(),
         query,
@@ -584,4 +591,85 @@ fn a_whole_calibrated_checkpoint_loads_its_projections_packed_and_its_router_den
     assert!(named.contains(&"gather_gemm_nvfp4"), "{named:?}");
     assert!(named.contains(&"route_gemm_nvfp4"), "{named:?}");
     assert!(named.contains(&"topk_softmax"), "the router is dense: {named:?}");
+}
+
+/// The published block scales of `projection` at `rank`, in the product's arrangement, as the store
+/// was handed them.
+fn published_scales(store: &Retaining, projection: &str) -> Vec<u8> {
+    let mut found: Vec<&Vec<u8>> = store
+        .published
+        .iter()
+        .filter(|(key, ..)| {
+            key.layout == nn::weights::WeightLayout::NVFP4_SCALES_SWIZZLED
+                && key
+                    .region
+                    .tensors
+                    .iter()
+                    .any(|tensor| tensor.contains(projection))
+        })
+        .map(|(_, bytes, ..)| bytes)
+        .collect();
+    assert_eq!(found.len(), 1, "one published table for {projection}");
+    found.remove(0).clone()
+}
+
+/// A row-parallel packed projection is read from **this rank's columns of the file**, and the table
+/// the store receives is that rank's scales permuted — not rank 0's, and not the row-major padding of
+/// them, which is what a skipped permutation or an off-by-one stride would publish.
+#[test]
+fn a_rank_one_packed_projection_reads_its_own_columns() {
+    let dir = packed_model_shard();
+    let config = qwen3_moe::Config::read(dir.path()).expect("the fixture config");
+    let mut tables = Vec::new();
+    for rank in [0_usize, 1] {
+        let checkpoint = Checkpoint::open(dir.path()).expect("the shard opens");
+        let mut store = Retaining::default();
+        let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+        let partition = qwen3_moe::Partition::new(&config, 2, rank, 1, 0).expect("a rank of two");
+        qwen3_moe::load::load_checkpoint(
+            dir.path(),
+            partition,
+            &mut loader,
+            qwen3_moe::LoadOptions::default(),
+            ops::fp4::ScaleLayout::Linear,
+        )
+        .expect("the calibrated checkpoint loads at this rank");
+        // `o_proj` is row-parallel: the file is `[hidden, query]` and this rank takes `query / 2`
+        // columns, so its scales are one block of every two in each row.
+        tables.push(published_scales(&store, "o_proj"));
+    }
+
+    let rows = PACKED_HIDDEN;
+    let file_blocks = (4 * PACKED_HEAD_DIM) / 16;
+    for (rank, table) in tables.iter().enumerate() {
+        // The padded 128x4 table: `rows` padded to 128, this rank's one block padded to four.
+        assert_eq!(table.len() as u64, rows.div_ceil(128) * 128 * 4, "rank {rank}'s table size");
+
+        let mut published: Vec<u8> = table.iter().copied().filter(|byte| *byte != 0).collect();
+        let mut expected: Vec<u8> = (0..rows)
+            .map(|row| scale_byte(row * file_blocks + rank as u64))
+            .collect();
+        published.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(published, expected, "rank {rank} publishes exactly its own block scales");
+
+        let mut row_major = vec![0_u8; table.len()];
+        for row in 0..rows {
+            row_major[(row * 4) as usize] = scale_byte(row * file_blocks + rank as u64);
+        }
+        assert_ne!(
+            *table, row_major,
+            "rank {rank} publishes the permuted table, not the row-major one"
+        );
+    }
+    assert_ne!(tables[0], tables[1], "the two ranks read different columns");
+}
+
+/// The permutation's test data is one-based on purpose, and this is where that is stated: the table
+/// is zero-padded, so a value of zero means a hole rather than a scale, and every value is shifted by
+/// one so that no genuine scale can be mistaken for padding.
+#[test]
+fn the_permutation_test_data_starts_at_one() {
+    assert_eq!(scale_byte(0), 1, "the first scale is one, not zero");
+    assert!(scale_byte(254) != 0 && scale_byte(255) == 1, "the pattern wraps away from zero");
 }
