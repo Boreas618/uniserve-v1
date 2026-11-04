@@ -9,6 +9,10 @@
 //! `route`/`place`, and JSON messages. What they test is therefore the transport
 //! the mechanism relies on, with the interface's real types on both ends.
 
+// Clippy counts an integration test crate's helpers as tests only when the
+// crate says so; a failed unwrap here is the test's failure report.
+#![cfg(test)]
+
 use scheduling::guest::wire::{self, Call};
 use scheduling::guest::{
     CallView, ExpertLoad, ExpertOrder, Init, Limits, Nanos, PageId, PhaseId, Plan, RequestId,
@@ -317,10 +321,7 @@ fn the_message_is_written_into_the_module() {
     let toy = Toy::new().body(Call::Route.export(), "(i32.load8_u (local.get 0))");
     let mut policy = policy(&engine, toy);
 
-    assert_eq!(
-        policy.route(&request(), &[]).unwrap(),
-        usize::from(b'{')
-    );
+    assert_eq!(policy.route(&request(), &[]).unwrap(), usize::from(b'{'));
 }
 
 #[test]

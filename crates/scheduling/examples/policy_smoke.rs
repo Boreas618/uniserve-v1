@@ -17,14 +17,16 @@
 //! precompiled the way the Program Server does it (§5.3), and the artifact is
 //! what loads, which is the path a deployment takes.
 
+use std::error::Error;
 use std::process::ExitCode;
 
-use scheduling::guest::wire::{self, Call};
+use scheduling::Engine;
+use scheduling::guest::wire;
 use scheduling::guest::{
     CallView, Duration, Event, ExpertLoad, Init, Limits, Plan, RankView, ReplicaView, RequestView,
-    Room, Shortage, Storage,
+    Room, Shortage, Snapshot, Storage,
 };
-use scheduling::{Engine, PolicyError};
+use serde::de::DeserializeOwned;
 
 fn main() -> ExitCode {
     let mut arguments = std::env::args().skip(1);
@@ -37,8 +39,8 @@ fn main() -> ExitCode {
     match run(&path, precompile) {
         Ok(()) => ExitCode::SUCCESS,
         Err(failure) => {
-            // `PolicyError`'s message names the call that failed, which is what
-            // the daemon reports as the update's first error (§7.3).
+            // A `PolicyError`'s message names the call that failed, which is
+            // what the daemon reports as the update's first error (§7.3).
             eprintln!("{failure}");
             ExitCode::FAILURE
         }
@@ -46,14 +48,18 @@ fn main() -> ExitCode {
 }
 
 /// Loads the module, instantiates it, drives every call once.
-fn run(path: &str, precompile: bool) -> Result<(), PolicyError> {
-    let bytes = std::fs::read(path).map_err(|error| PolicyError::Load {
+fn run(path: &str, precompile: bool) -> Result<(), Box<dyn Error>> {
+    let bytes = std::fs::read(path).map_err(|error| scheduling::PolicyError::Load {
         message: format!("cannot read {path}: {error}"),
     })?;
     let engine = Engine::new()?;
     let module = if precompile {
         let artifact = engine.precompile(&bytes)?;
-        eprintln!("precompiled {} bytes into {} bytes", bytes.len(), artifact.len());
+        eprintln!(
+            "precompiled {} bytes into {} bytes",
+            bytes.len(),
+            artifact.len()
+        );
         engine.module(&artifact)?
     } else {
         engine.module(&bytes)?
@@ -61,7 +67,7 @@ fn run(path: &str, precompile: bool) -> Result<(), PolicyError> {
 
     let init = Init {
         parameters: Default::default(),
-        state: snapshot(),
+        state: snapshot()?,
     };
     let ceilings = Limits::default();
     let mut policy = module.instantiate(&init, &ceilings)?;
@@ -77,8 +83,12 @@ fn run(path: &str, precompile: bool) -> Result<(), PolicyError> {
     );
 
     policy.observe(&[
-        Event::Arrived { request: request(1) },
-        Event::Arrived { request: request(2) },
+        Event::Arrived {
+            request: request(1)?,
+        },
+        Event::Arrived {
+            request: request(2)?,
+        },
         Event::Stepped {
             step: 0,
             duration: Duration(0),
@@ -104,40 +114,39 @@ fn run(path: &str, precompile: bool) -> Result<(), PolicyError> {
     })?;
     println!("reclaim: {} victims", victims.len());
 
-    let ranks: Vec<RankView> =
-        wire::decode(br#"[{"index":0,"in_flight":1},{"index":1,"in_flight":0}]"#).unwrap();
-    let rank = policy.route(&request(1), &ranks)?;
-    println!("route: rank {rank}");
+    let ranks: Vec<RankView> = decode(br#"[{"index":0,"in_flight":1},{"index":1,"in_flight":0}]"#)?;
+    println!("route: rank {}", policy.route(&request(1)?, &ranks)?);
 
-    let call: CallView =
-        wire::decode(br#"{"request":1,"phase":1,"kind":{"kind":"prefill"}}"#).unwrap();
-    let replicas: Vec<ReplicaView> = wire::decode(
+    let call: CallView = decode(br#"{"request":1,"phase":1,"kind":{"kind":"prefill"}}"#)?;
+    let replicas: Vec<ReplicaView> = decode(
         br#"[{"index":0,"block":0,"kinds":[{"kind":"prefill"},{"kind":"decode"}],
               "resident_requests":1,"capacity":7}]"#,
-    )
-    .unwrap();
-    let replica = policy.place(&call, &replicas)?;
-    println!("place: replica {replica}");
+    )?;
+    println!("place: replica {}", policy.place(&call, &replicas)?);
 
-    let warm = policy.warm(&room)?;
-    println!("warm: {} pages", warm.len());
+    println!("warm: {} pages", policy.warm(&room)?.len());
 
     let load = ExpertLoad {
         ranks: 2,
         experts: 4,
         tokens: vec![10, 0, 4, 4],
     };
-    let order = policy.experts(&load)?;
-    println!("experts: {} placements", order.placement.len());
+    println!(
+        "experts: {} placements",
+        policy.experts(&load)?.placement.len()
+    );
 
-    println!("ok: {} calls answered", Call::ALL.len());
+    println!("ok: every call answered");
     Ok(())
 }
 
-/// A small state at instantiation: two queued token requests, two ranks, one
-/// prefill phase.
-fn snapshot() -> scheduling::guest::Snapshot {
-    wire::decode(
+/// A small state at instantiation: two queued token requests, one prefill
+/// phase, two ranks.
+///
+/// Written as the encoding rather than as a struct literal, so a view that
+/// gains a field does not change this harness.
+fn snapshot() -> Result<Snapshot, Box<dyn Error>> {
+    decode(
         br#"{
             "step": 0,
             "requests": [
@@ -150,18 +159,21 @@ fn snapshot() -> scheduling::guest::Snapshot {
             "ranks": [{"index":0,"in_flight":0},{"index":1,"in_flight":0}]
         }"#,
     )
-    .unwrap()
 }
 
 /// One queued token request.
-fn request(id: u64) -> RequestView {
-    wire::decode(
+fn request(id: u64) -> Result<RequestView, Box<dyn Error>> {
+    decode(
         format!(
             r#"{{"id":{id},"state":{{"state":"queued"}},"class":{{"class":"token"}},"phase":1}}"#
         )
         .as_bytes(),
     )
-    .unwrap()
+}
+
+/// Decodes a view or message of the interface from JSON.
+fn decode<T: DeserializeOwned>(json: &[u8]) -> Result<T, Box<dyn Error>> {
+    Ok(wire::decode(json)?)
 }
 
 /// Prints what a step's plan asks for.
