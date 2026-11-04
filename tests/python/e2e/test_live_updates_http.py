@@ -383,6 +383,7 @@ def _stream_count(
     read: list[str],
     done: threading.Event,
     reasons: list[str] | None = None,
+    prompt: str = PROMPT,
 ) -> None:
     """Streams the count, appending each content delta to `read` and each
     finish reason to `reasons`.
@@ -392,7 +393,7 @@ def _stream_count(
         f"{base_url}/v1/chat/completions",
         json={
             "model": model,
-            "messages": [{"role": "user", "content": PROMPT}],
+            "messages": [{"role": "user", "content": prompt}],
             "chat_template_kwargs": {"enable_thinking": False},
             "temperature": 0,
             "max_completion_tokens": 8192,
@@ -836,6 +837,110 @@ def _stop_pid(pid: int) -> None:
     )
 
 
+#: The streams a hot restart hands over: three counts of different lengths, so
+#: their event boundaries fall at different points of the response, and the
+#: number each stream must carry with no gap and no repetition.
+HANDED_STREAMS = (200, 500, 900)
+
+
+def _handoff_records(log: Path) -> dict[str, list[dict]]:
+    """The handoff records the daemons logged, by kind.
+
+    The predecessor writes `handoff stream` per response it froze and
+    `handoff streams adopted` once; the successor writes `handoff adopted` when
+    it starts writing a taken-over response and `handoff finished` when it
+    ends. Each is one log line whose message ends in one JSON object.
+    """
+    records: dict[str, list[dict]] = {
+        "frozen": [],
+        "paused": [],
+        "adopted": [],
+        "finished": [],
+    }
+    # The prefixes are matched longest first: "handoff stream " is a prefix of
+    # "handoff streams adopted ".
+    prefixes = (
+        ("paused", "handoff streams adopted "),
+        ("finished", "handoff finished "),
+        ("adopted", "handoff adopted "),
+        ("frozen", "handoff stream "),
+    )
+    for line in _log_lines(log):
+        for kind, prefix in prefixes:
+            index = line.find(prefix)
+            if index < 0:
+                continue
+            try:
+                records[kind].append(json.loads(line[index + len(prefix) :]))
+            except json.JSONDecodeError:
+                continue
+            break
+    return records
+
+
+def _write_handoff_artifacts(
+    log: Path, records: dict[str, list[dict]], numbers: list[int]
+) -> Path:
+    """Writes the handoff evidence under `artifacts/handoff-streams/<UTC>/`.
+
+    `streams.jsonl` holds one line per handed-over response, with what each
+    process recorded of it: the freeze, the takeover and the end, and the pause
+    between them. `summary.json` holds the counts and the pauses.
+    """
+    stamp = time.strftime("%Y-%m-%dT%H-%M-%SZ", time.gmtime())
+    directory = (
+        Path(__file__).resolve().parents[3]
+        / "artifacts"
+        / "handoff-streams"
+        / stamp
+    )
+    directory.mkdir(parents=True, exist_ok=True)
+    frozen = {record["request_id"]: record for record in records["frozen"]}
+    adopted = {record["request_id"]: record for record in records["adopted"]}
+    finished = {record["request_id"]: record for record in records["finished"]}
+    pauses: list[int] = []
+    with (directory / "streams.jsonl").open("w") as out:
+        for request_id, freeze in frozen.items():
+            taken = adopted.get(request_id, {})
+            end = finished.get(request_id, {})
+            pauses.append(takeover_pause(freeze, taken))
+            line = {
+                "request_id": request_id,
+                "frozen": freeze,
+                "adopted": taken,
+                "finished": end,
+                "now_ns": time.monotonic_ns(),
+            }
+            out.write(json.dumps(line) + "\n")
+    summary = {
+        "streams": len(frozen),
+        "adopted": len(adopted),
+        "finished": len(finished),
+        "pause_ms": {
+            "min": min(pauses) if pauses else None,
+            "max": max(pauses) if pauses else None,
+        },
+        "numbers_per_stream": numbers,
+    }
+    (directory / "summary.json").write_text(
+        json.dumps(summary, indent=2) + "\n"
+    )
+    print(f"handoff artifacts: {directory}")
+    return directory
+
+
+def takeover_pause(freeze: dict, taken: dict) -> int:
+    """The pause a handed-over response took, in milliseconds.
+
+    It is measured from the predecessor's freeze to the successor's first
+    frame, from the two processes' monotonic clocks, which share an origin.
+    """
+    at_ns = taken.get("at_ns")
+    if at_ns is None:
+        return freeze["pause_ms"]
+    return max(0, (at_ns - freeze["frozen_at_ns"]) // 1_000_000)
+
+
 def test_a_hot_restart_hands_the_deployment_to_a_successor_daemon(
     tmp_path: Path, runtime: Path
 ):
@@ -860,19 +965,36 @@ def _restart_while_streaming(
     assert status["deployment"]["engine"] == "ready", status
     (old_daemon,) = _pids(log, "Daemon")
 
-    read: list[str] = []
-    done = threading.Event()
-    streaming = threading.Thread(
-        target=_stream_count, args=(base_url, name, read, done)
+    # Three streams in flight at the restart, of different lengths so their
+    # boundaries fall at different events of different requests.
+    reads: list[list[str]] = [[] for _ in HANDED_STREAMS]
+    dones = [threading.Event() for _ in HANDED_STREAMS]
+    streaming = [
+        threading.Thread(
+            target=_stream_count,
+            args=(base_url, name, read, done),
+            kwargs={
+                "prompt": (
+                    f"Count from 1 to {last}, separated by commas and spaces. "
+                    "Write only the numbers."
+                )
+            },
+        )
+        for read, done, last in zip(reads, dones, HANDED_STREAMS, strict=True)
+    ]
+    for thread in streaming:
+        thread.start()
+    _wait_until(
+        lambda: all(len(read) >= 32 for read in reads),
+        300,
+        "the counts did not stream",
     )
-    streaming.start()
-    _wait_until(lambda: len(read) >= 32, 300, "the count did not stream")
     restarted = _admin(base_url, "restart")
     assert restarted.status_code == 200, restarted.text
     successor = restarted.json()["result"]["pid"]
     successors.append(successor)
     assert successor != old_daemon
-    before_restart = len(read)
+    before_restart = [len(read) for read in reads]
 
     # The successor serves the same deployment, so it holds the same programs'
     # server: a deployment reaches its scheduling policy only through it, and
@@ -884,15 +1006,75 @@ def _restart_while_streaming(
         f"{inherited['config'][:2000]}"
     )
 
-    # New requests are served while the old daemon finishes the count.
+    # New requests are served while the old daemon finishes its streams.
     for _ in range(3):
         reply = _chat(base_url, name, "Say hello.")
         assert reply["choices"][0]["message"]["content"]
-    streaming.join(timeout=1800)
-    assert done.is_set(), "the count did not end"
-    assert len(read) > before_restart, "the stream ended at the restart"
-    numbers = [int(word) for word in re.findall(r"\d+", "".join(read))]
-    assert numbers[:200] == list(range(1, 201)), "".join(read)[:400]
+    for thread in streaming:
+        thread.join(timeout=1800)
+    assert all(done.is_set() for done in dones), "a stream did not end"
+    for index, (read, done, last) in enumerate(
+        zip(reads, dones, HANDED_STREAMS, strict=True)
+    ):
+        assert len(read) > before_restart[index], (
+            f"stream {index} ended at the restart"
+        )
+        # Every stream carries its count whole: a frame lost, repeated or
+        # reordered at the boundary — the one thing the handoff must not do —
+        # breaks the sequence, and the boundary lies inside it, not after the
+        # first two hundred numbers.
+        numbers = [int(word) for word in re.findall(r"\d+", "".join(read))]
+        assert numbers == list(range(1, len(numbers) + 1)), (
+            f"stream {index} broke: {''.join(read)[:400]}"
+        )
+        assert len(numbers) > before_restart[index], (
+            f"stream {index} carried no number after the restart"
+        )
+        assert numbers and numbers[-1] >= last // 2, (
+            f"stream {index} stopped at {numbers[-1] if numbers else 0}"
+        )
+
+    # The records prove the streams moved rather than ended: each was frozen,
+    # taken over by the successor at the pause the successor measured, and
+    # finished there.
+    _wait_until(
+        lambda: len(_handoff_records(log)["finished"]) >= len(HANDED_STREAMS),
+        300,
+        "the successor did not finish the handed-over streams",
+    )
+    records = _handoff_records(log)
+    frozen = records["frozen"]
+    assert len(frozen) == len(HANDED_STREAMS), frozen
+    assert all(record["adopted"] for record in frozen), frozen
+    assert {record["successor_pid"] for record in frozen} == {successor}, frozen
+    assert {record["pid"] for record in frozen} == {old_daemon}, frozen
+    assert all(record["pause_ms"] >= 0 for record in frozen), frozen
+    assert records["paused"], "the predecessor recorded no pause"
+    assert records["paused"][-1]["pid"] == old_daemon, records["paused"]
+    assert records["paused"][-1]["successor_pid"] == successor, records[
+        "paused"
+    ]
+    adopted = {record["request_id"]: record for record in records["adopted"]}
+    finished = {record["request_id"]: record for record in records["finished"]}
+    frozen_at = {
+        record["request_id"]: record["frozen_at_ns"] for record in frozen
+    }
+    assert set(adopted) == set(frozen_at), (adopted, frozen_at)
+    assert set(finished) == set(frozen_at), (finished, frozen_at)
+    for request_id, record in adopted.items():
+        assert record["pid"] == successor, record
+        assert record["frozen_at_ns"] == frozen_at[request_id], record
+        assert record["at_ns"] >= record["frozen_at_ns"], record
+        assert finished[request_id]["pid"] == successor, finished[request_id]
+        assert finished[request_id]["at_ns"] > record["at_ns"], (
+            record,
+            finished[request_id],
+        )
+    _write_handoff_artifacts(
+        log,
+        records,
+        [len(re.findall(r"\d+", "".join(read))) for read in reads],
+    )
 
     # The old daemon exits once its requests ended; the engine and its
     # workers are the same processes throughout.
