@@ -671,6 +671,17 @@ pub struct QuantizedStack {
     pub global_scale: Weight,
     /// The layout the block scales are stored in.
     pub layout: ScaleLayout,
+    /// `[1]` f32: the activation encoder's global scale for this stack's activations — **1.0**.
+    ///
+    /// One, and published rather than defaulted at the call site, because of what the encoder's two
+    /// levels do. With `s = max(|x / g|) / 6` and a code `round(x / (g · s))`, the effective step is
+    /// `g · s = max(|x|) / 6`: **the code does not depend on `g`, and neither does the reconstruction
+    /// `code · s' · token`, in which the encoder's own factor cancels.** So the calibrated activation
+    /// scale changes no value in a dynamically quantized activation, and folding it into
+    /// [`Self::global_scale`] would fold a factor into a table that has already absorbed it. The
+    /// checkpoint's per-expert activation scales stay published beside the weights as the
+    /// checkpoint's own data ([`Self::input_scale`]) and no operand multiplies a value by them.
+    pub encode_scale: Weight,
     /// `[projections, experts]` f32, row-major, in the same order: the reciprocal of each expert's
     /// **per-projection** activation tensor scale, when the caller asked for it.
     ///
@@ -1492,11 +1503,21 @@ impl<'a> WeightLoader<'a> {
         } else {
             None
         };
+        // The encoder's global scale is one: the calibrated activation scale cancels out of both the
+        // code and the reconstruction (see `QuantizedStack::encode_scale`), and a host value here
+        // would be a number someone later "corrects" back to the checkpoint's.
+        let encode_scale = self.constant(
+            &format!("{name}__nvfp4_encode_scale"),
+            DType::F32,
+            Shape::new(&[1]),
+            &1.0_f32.to_ne_bytes(),
+        )?;
         Ok(QuantizedStack {
             values,
             scales,
             global_scale,
             layout,
+            encode_scale,
             input_scale,
         })
     }

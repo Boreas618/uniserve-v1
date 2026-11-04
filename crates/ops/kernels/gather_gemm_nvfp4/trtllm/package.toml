@@ -1,0 +1,75 @@
+# The gather_gemm_nvfp4 operator's trtllm-gen backend: design 5.2's program package.
+#
+# One native module per descriptor: the trtllm-gen batched-GEMM launch code that
+# FLASHINFER_MOE calls for a routed, block-scaled product (`PermuteGemm1::Runner`),
+# compiled out of the FlashInfer distribution against the pinned `trtllm-gen-bmm`
+# artifact, with the artifact's cubins this descriptor's options select published
+# beside the module under `cubins/`. The entry is the operator's `GatherNvfp4Call`.
+#
+# The kernels take encoded activations: every one of the artifact's 1588 kernels
+# with E2M1 weights takes an E2M1 activation too, which is why the operator's
+# `hidden` is packed two codes a byte and why `nvfp4_quantize` runs before it. The
+# weights must be in the block-swizzled layout the kernels read, which the
+# descriptor's `layout` states for both stacks' block scales.
+
+op = "gather_gemm_nvfp4"
+backend = "trtllm"
+
+[toolchain]
+kind = "nvcc"
+version = "13.0.48"
+packages = [{ name = "flashinfer-python", version = "0.6.18" }]
+
+[module]
+form = "native"
+entries = { launch = "uniserve_gather_gemm_nvfp4" }
+
+[source]
+kind = "cuda"
+files = ["src/build.py", "src/entry.cpp", "src/entry.h"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_100f"]
+
+# `hidden_2048_intermediate_768_experts_128_top_8_activation_silu_dtype_bf16_scale_f8e4m3_layout_swizzled_128x4_tile_128x128_cluster_1x1`.
+#
+# `tile` and `cluster` are the MMA tactic's, and they are enforced where a tactic is
+# chosen: the build publishes only the artifact's cubins whose names carry this
+# tile and cluster, so the runner's configuration list is exactly this geometry.
+#
+# `activation` names the fused gated epilogue: `silu` is the artifact's `Swiglu`,
+# `gelu_tanh` its `Geglu`. The manifest's `[parameters.selected]` states the rest of the
+# options a kernel must have been built with, including the two the entry fills itself:
+# the BF16-output gated kernels of this artifact all carry a per-column f32 bias
+# (`mBiasType = M`), and this operator has none, so the entry hands them zeros.
+[kernel.descriptors]
+dimensions = { hidden = ["2048", "7168", "4096"], intermediate = ["768", "14336", "1536"], experts = ["128", "256", "64"], top = ["8", "4", "2"], activation = ["silu", "gelu_tanh"], dtype = ["bf16"], scale = ["f8e4m3", "u8"], layout = ["swizzled_128x4", "linear"], tile = ["128x8", "128x16", "128x32", "128x64", "128x128", "128x192", "128x256"], cluster = ["1x1", "2x1", "1x2"] }
+
+[parameters]
+# The trtllm-gen batched-GEMM artifact: the pin its manifest is hashed by, and the
+# header (`include/flashinferMetaInfo.h`) whose kernel table names every cubin.
+artifact = "trtllm-gen-bmm"
+artifact_sha256 = "011635d3c36756addcdc148eea90c984f2d7611ba375626aaaf466d355c80e50"
+
+# The descriptor's own values the artifact's table is filtered by, as the entry
+# compiles them in. A cubin whose name disagrees with any of these is not
+# published, so a tactic the operator's geometry cannot use is not offerable.
+[parameters.selected]
+mDtypeA = "E2m1"
+mDtypeB = "E2m1"
+mDtypeC = "Bfloat16"
+mDtypeAcc = "Fp32"
+mSfLayoutA = "swizzled_128x4"
+mSfLayoutB = "linear"
+mSfBlockSizeA = "16"
+mSfBlockSizeB = "16"
+mUsePerTokenSfA = "0"
+mUsePerTokenSfB = "1"
+mPerTokenSfDtype = "Fp32"
+mUseShuffledMatrix = "1"
+mBiasType = "m"
+mBiasDtype = "Fp32"
+mFusedAct = "1"
+mActType = "silu"

@@ -24,8 +24,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use qwen3_moe::weights::{expert_sources, parameter_sources};
 use qwen3_moe::Config;
+use qwen3_moe::weights::{expert_sources, parameter_sources};
 
 fn main() -> ExitCode {
     let root = match root_argument() {
