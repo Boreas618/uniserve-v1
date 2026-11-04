@@ -42,6 +42,7 @@
 //!    its facts (`generation::continuation`). Either computes what it
 //!    computed before.
 
+use crate::scheduler::completion::CallCompletion;
 use super::*;
 use crate::WorkerGroupId;
 use crate::trajectories::{Offloaded, Restored, image_trajectory};
@@ -285,7 +286,7 @@ impl Scheduler {
         &mut self,
         id: RequestId,
         call: &Call,
-        record: &ipc::CallOutput,
+        record: &CallCompletion,
     ) {
         if record.status != CallStatus::Ok || call.latent_output.is_none() {
             return;

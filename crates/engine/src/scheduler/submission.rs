@@ -17,9 +17,10 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use crate::executor::{BatchResult, Executor, ExecutorError, ExecutorInfo, ExecutorSubmitError};
-use crate::executor::ExecutionBatch;
 use crate::WorkerGroupId;
+use crate::executor::ExecutionBatch;
+use crate::executor::{Executor, ExecutorError, ExecutorInfo, ExecutorSubmitError};
+use crate::scheduler::completion::BatchReport;
 use ipc::BatchCommand;
 
 /// What the mechanism executes through.
@@ -63,8 +64,10 @@ impl Submissions {
     }
 
     /// Waits up to `timeout` for one partial or terminal batch result.
-    pub(super) fn poll(&mut self, timeout: Duration) -> Result<Option<BatchResult>, ExecutorError> {
-        self.executor.poll(timeout)
+    /// Waits up to `timeout` for one partial or terminal batch result, in the
+    /// mechanism's own completion type.
+    pub(super) fn poll(&mut self, timeout: Duration) -> Result<Option<BatchReport>, ExecutorError> {
+        Ok(self.executor.poll(timeout)?.map(BatchReport::from_wire))
     }
 
     /// Closes the pool and its physical workers.

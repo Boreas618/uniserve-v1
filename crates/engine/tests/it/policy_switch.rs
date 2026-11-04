@@ -201,6 +201,65 @@ fn answer<T>(receiver: Receiver<Result<T, String>>) -> Result<T, String> {
 }
 
 #[test]
+fn the_slot_names_the_program_serving_and_the_one_a_precopy_prepared() {
+    let world = World::start();
+    let programs = |world: &World| {
+        world
+            .handle
+            .policy_programs()
+            .recv_timeout(ANSWER)
+            .expect("the scheduler answers with its slot's programs")
+    };
+    let named = |program: Option<PolicyProgram>| {
+        program.map(|program| (program.backend, program.revision))
+    };
+
+    // Nothing serves and nothing waits before the epoch's first precopy.
+    let empty = programs(&world);
+    assert!(named(empty.running).is_none());
+    assert!(named(empty.prepared).is_none());
+
+    // A precopy prepares a candidate without putting it in.
+    world.precopy("fcfs", 1, toy()).expect("the first precopy");
+    let prepared = programs(&world);
+    assert!(named(prepared.running).is_none());
+    assert_eq!(
+        named(prepared.prepared),
+        Some(("fcfs".to_owned(), 1)),
+        "the slot names the program a precopy prepared"
+    );
+
+    // The switchover puts it in: it serves, and nothing waits.
+    world.switch_over().expect("the first switchover");
+    let serving = programs(&world);
+    assert_eq!(
+        named(serving.running),
+        Some(("fcfs".to_owned(), 1)),
+        "the slot names the program serving"
+    );
+    assert!(named(serving.prepared).is_none());
+
+    // The slot's counters agree with the step the scheduler reports, and the
+    // policy that just took over has cost calls — its trial's, carried in with
+    // the candidate (§12).
+    let counters = world
+        .handle
+        .counters()
+        .recv_timeout(ANSWER)
+        .expect("the scheduler answers with its counters");
+    assert_eq!(counters.steps, world.step(), "the steps are the policy's");
+    assert!(
+        counters.policy_calls > 0,
+        "the serving policy has answered at least its trial's calls"
+    );
+    assert_eq!(
+        (counters.kernel_launches, counters.device_ns),
+        (0, 0),
+        "the device's counters are the executor's, not this mechanism's"
+    );
+}
+
+#[test]
 fn the_program_layers_commands_reach_one_scheduler_and_name_what_they_need() {
     let world = World::start();
 
