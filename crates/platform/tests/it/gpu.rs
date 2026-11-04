@@ -1943,6 +1943,8 @@ fn a_convolution_matches_the_definition_of_a_conv1d() {
         .collect();
     let expected = forward_reference(&x, x_dims, &w, w_dims, y_dims, stride, padding, dilation);
 
+    // The definition is an FP32 convolution, so the comparison asks for the
+    // engines that do not down-convert their inputs to TF32.
     let convolution = Convolution::new(
         Tensor::contiguous(vec![1, 2, 5], DataType::F32),
         Tensor::contiguous(vec![3, 2, 3], DataType::F32),
@@ -1950,10 +1952,39 @@ fn a_convolution_matches_the_definition_of_a_conv1d() {
         vec![padding],
         vec![stride],
         vec![dilation],
-    );
+    )
+    .with_tf32_allowed(false);
     let observed = convolve(&cudnn, &stream, &convolution, &x, &w, expected.len(), None);
 
     assert_close(&observed, &expected);
+
+    // With TF32 allowed an engine may round both inputs to ten mantissa bits,
+    // so each product carries up to 2 · 2⁻¹¹ of relative error and the sum is
+    // bounded by that times the products' magnitudes. That is the numerical
+    // contract a layer that leaves TF32 on accepts, and it is what the video
+    // VAE runs under.
+    let largest = |values: &[f32]| {
+        values
+            .iter()
+            .fold(0.0f32, |most, value| most.max(value.abs()))
+    };
+    let taps = (w_dims[1] * w_dims[2]) as f32;
+    let tf32_error = 2.0 * 2f32.powi(-11) * taps * largest(&x) * largest(&w);
+    let allowed = convolve(
+        &cudnn,
+        &stream,
+        &convolution.clone().with_tf32_allowed(true),
+        &x,
+        &w,
+        expected.len(),
+        None,
+    );
+    for (index, (observed, expected)) in allowed.iter().zip(&expected).enumerate() {
+        assert!(
+            (observed - expected).abs() <= tf32_error,
+            "element {index}: {observed} is outside TF32's error bound {tf32_error} around {expected}"
+        );
+    }
 
     // The plan's engine is the record a program carries: eight bytes that
     // round-trip, and a plan built from the recorded engine runs the same
@@ -2030,7 +2061,8 @@ fn a_transposed_convolution_matches_the_definition_of_a_conv_transpose1d() {
         vec![stride],
         vec![dilation],
         vec![output_padding],
-    );
+    )
+    .with_tf32_allowed(false);
     let observed = convolve(&cudnn, &stream, &convolution, &x, &w, expected.len(), None);
 
     assert_close(&observed, &expected);
@@ -2215,7 +2247,8 @@ fn a_channels_last_convolution_matches_the_definition_of_a_conv3d() {
         vec![padding as i64; 3],
         vec![1; 3],
         vec![1; 3],
-    );
+    )
+    .with_tf32_allowed(false);
     assert_eq!(convolution.rank(), 3);
     assert_eq!((batch, channels, filters, kernel), (1, 2, 2, vec![3, 3, 3]));
 
