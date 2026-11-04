@@ -543,13 +543,23 @@ impl Retained {
             .into_iter()
             .nth(index)
             .ok_or_else(|| Error::Interface("a retained weight names no storage".into()))?;
-        let storage = Storage::import(
-            descriptor,
-            record.bytes as usize,
-            device,
-            &[],
-            Protection::ReadOnly,
-        )?;
+        // A weight is published as a DEVICE block (`Storage::retainable`) and imported by its
+        // shareable handle, so a kernel reads it at a device address. The host branch is what a
+        // record published before that change still needs, and what the page pool and the link
+        // scratch use: host storage is mapped and registered with the device, never handed to the
+        // VMM import - a memfd is not a CUDA shareable handle.
+        let storage = match record.placement {
+            ::storage::Placement::Host { .. } => {
+                Storage::import_host(descriptor, record.bytes as usize, device)?
+            }
+            ::storage::Placement::Device { .. } => Storage::import(
+                descriptor,
+                record.bytes as usize,
+                device,
+                &[],
+                Protection::ReadOnly,
+            )?,
+        };
         state.used.insert(key);
         state.weights.insert((device.0, key), Arc::clone(&storage));
         Ok(Some(storage))
@@ -929,13 +939,18 @@ impl ExclusiveStorage for &Retained {
         for (spec, (name, key, gpu)) in specs.iter().zip(&keyed) {
             let created = !found.contains_key(key);
             let storage = match found.remove(key) {
-                Some((record, descriptor)) => Storage::import(
-                    descriptor,
-                    record.bytes as usize,
-                    spec.device,
-                    spec.access,
-                    Protection::ReadWrite,
-                )?,
+                Some((record, descriptor)) => match record.placement {
+                    ::storage::Placement::Host { .. } => {
+                        Storage::map_host(descriptor, record.bytes as usize, spec.device, true)?
+                    }
+                    ::storage::Placement::Device { .. } => Storage::import(
+                        descriptor,
+                        record.bytes as usize,
+                        spec.device,
+                        spec.access,
+                        Protection::ReadWrite,
+                    )?,
+                },
                 None => {
                     let (storage, descriptor) =
                         Storage::retainable(spec.device, spec.bytes, spec.access)?;
@@ -1054,23 +1069,31 @@ impl crate::memory::weights::WeightStorage for Retained {
         }
         let mut state = lock(&self.state);
         let gpu = state.gpu(device)?;
-        let (staging, descriptor) = Storage::host_retainable(device, allocation)?;
-        // SAFETY: the staging storage holds at least `bytes.len()` writable bytes
-        // and the source slice is that long; the server imports the mapping when
-        // the record below is published.
+        // A weight is published as a DEVICE block: the record names a `cuMemCreate` allocation,
+        // which is what a reader imports by its shareable handle, and kernels then address the
+        // weight in device memory without a copy at read time. The allocation is the publisher's,
+        // outside the rank's pools (4.1): `platform::Budget` never sees it, and it outlives this
+        // process because the Storage Server holds its record.
+        let (staging, descriptor) = Storage::retainable(device, allocation, &[])?;
+        let stream = platform::Stream::new(device)?;
+        // SAFETY: the staging storage holds `allocation` writable device bytes and the source
+        // slice is at most that long; the copy is synchronized before the record is published, so
+        // the server's readers never see a half-written weight.
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                staging.address() as *mut u8,
+            platform::memcpy_async(
+                staging.address(),
+                bytes.as_ptr() as u64,
                 bytes.len(),
-            );
+                &stream,
+            )?;
         }
+        stream.synchronize()?;
         // The allocation is a whole number of the driver's granules, so the record
         // states the allocation's length: the server imports exactly that. The
         // tensor states the weight's true length, and the tail of the last granule
         // is never read.
         let record = ::storage::StorageRecord {
-            placement: Placement::Host { numa_node: None },
+            placement: Placement::Device { gpu },
             segment: None,
             bytes: staging.bytes() as u64,
             fabric: None,
@@ -1313,16 +1336,19 @@ impl Retained {
                 .position(|key| *key == tensor.key)
                 .ok_or_else(|| Error::Interface("an unasked storage was found".into()))?;
             let spec = &specs[index];
-            mapped.insert(
-                tensor.key,
-                Storage::import(
+            let mapped_storage = match record.placement {
+                ::storage::Placement::Host { .. } => {
+                    Storage::import_host(descriptor, record.bytes as usize, spec.device)?
+                }
+                ::storage::Placement::Device { .. } => Storage::import(
                     descriptor,
                     record.bytes as usize,
                     spec.device,
                     spec.access,
                     Protection::ReadOnly,
                 )?,
-            );
+            };
+            mapped.insert(tensor.key, mapped_storage);
         }
         keys.iter()
             .map(|key| {
