@@ -53,6 +53,9 @@
 //! request continues, is retried with different parameters, or fails is the executor's decision, not
 //! a numerical one.
 
+/// Lanes one `softmax` program walks at a time: a chunk of the row, not the row.
+const SOFTMAX_TILE: u32 = 8192;
+
 use ops::norm::{Softmax, SoftmaxArgs, SoftmaxDescriptor};
 use ops::sampler::{
     ArgMax, ArgMaxArgs, ArgMaxDescriptor, CandidateOrder, FilterArgs, FilterCandidates,
@@ -386,11 +389,16 @@ impl Sampler {
     }
 
     /// The candidates' distribution.
+    ///
+    /// The tile is a **chunk of the row**, not the row: the program walks the width in tiles of
+    /// `SOFTMAX_TILE` lanes and keeps only a running maximum and a running denominator, so the
+    /// candidate width may be the whole vocabulary. A tile derived from the width would ask for one
+    /// register per candidate.
     pub fn softmax_descriptor(&self) -> SoftmaxDescriptor {
         SoftmaxDescriptor {
             dtype: DType::F32,
             columns: self.width,
-            tile: launch::row_tile(self.width),
+            tile: SOFTMAX_TILE,
             pdl: launch::PDL,
         }
     }

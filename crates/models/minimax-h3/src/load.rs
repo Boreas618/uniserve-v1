@@ -7,6 +7,14 @@
 //! rank holds are the [`Partition`]'s, so this module only builds them, and registers each under the
 //! name its runner addresses: the capability's name, not the checkpoint directory's.
 //!
+//! ## What the caller gets back
+//!
+//! [`MinimaxH3`]: the blocks the executor serves, and the same components behind them as handles.
+//! A block is boxed as `Arc<dyn Encoder>` or `Arc<dyn Decoder>` and those traits publish no
+//! descriptors, so a deployment that can answer "which programs must be compiled for me?" can only
+//! answer it from the concrete components - and that is what the handles are for. They are the same
+//! values the blocks hold, so the weights exist once.
+//!
 //! ## Testing
 //!
 //! A load publishes every tensor through `nn::weights::RetainedWeights`, which only the executor
@@ -38,6 +46,108 @@ use crate::{Error, Partition, Result};
 /// together, and the layers beside them name their block this way.
 pub use crate::partition::Component;
 
+/// A loaded deployment: the blocks this rank serves, and the components they were built from.
+///
+/// The runner needs the first and only the first: [`MinimaxH3::into_model`] hands it over and the
+/// executor serves each block by the capability it implements. The second is what makes the
+/// deployment able to answer for itself: a block is boxed as `Arc<dyn Encoder>` and the trait does
+/// not publish descriptors, so the model's programs can only be enumerated from the components
+/// before they are erased - `keys` walks these handles, and nothing else in the crate reads them.
+///
+/// Every handle is the *same* value the block holds, not a copy: the component is constructed once,
+/// shared by the model and by the walk, and the weights exist once.
+pub struct MinimaxH3 {
+    model: nn::Model,
+    text_encoder: Option<Arc<TextEncoder>>,
+    transformer: Option<Arc<Denoiser>>,
+    transformer_ref: Option<Arc<Denoiser>>,
+    video_postprocessor: Option<Arc<crate::output::VideoPostprocessor>>,
+    video_decoder: Option<Arc<crate::video_vae::VideoDecoder>>,
+    audio_decoder: Option<Arc<AudioDecoder>>,
+}
+
+impl std::fmt::Debug for MinimaxH3 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MinimaxH3")
+            .field("model", &self.model)
+            .field(
+                "text_encoder",
+                &self.text_encoder.as_ref().map(|_| "TextEncoder"),
+            )
+            .field(
+                "transformer",
+                &self.transformer.as_ref().map(|_| "Denoiser"),
+            )
+            .field(
+                "transformer_ref",
+                &self.transformer_ref.as_ref().map(|_| "Denoiser"),
+            )
+            .field(
+                "video_postprocessor",
+                &self
+                    .video_postprocessor
+                    .as_ref()
+                    .map(|_| "VideoPostprocessor"),
+            )
+            .field(
+                "video_decoder",
+                &self.video_decoder.as_ref().map(|_| "VideoDecoder"),
+            )
+            .field(
+                "audio_decoder",
+                &self.audio_decoder.as_ref().map(|_| "AudioDecoder"),
+            )
+            .finish()
+    }
+}
+
+impl MinimaxH3 {
+    /// The blocks this rank serves, as the executor consumes them.
+    pub fn model(&self) -> &nn::Model {
+        &self.model
+    }
+
+    /// The blocks, consuming the deployment: what a runner is handed once nothing else needs to
+    /// enumerate the deployment's programs.
+    pub fn into_model(self) -> nn::Model {
+        self.model
+    }
+
+    /// The text encoder, when this rank places it.
+    pub fn text_encoder(&self) -> Option<&Arc<TextEncoder>> {
+        self.text_encoder.as_ref()
+    }
+
+    /// The base DiT partition, when this rank places it.
+    pub fn transformer(&self) -> Option<&Arc<Denoiser>> {
+        self.transformer.as_ref()
+    }
+
+    /// The reference DiT partition, when this rank places it.
+    ///
+    /// A deployment places at most one of the two (`Partition::validate` refuses both), so exactly
+    /// one of this and [`MinimaxH3::transformer`] is `Some` when a denoiser is placed at all.
+    pub fn transformer_ref(&self) -> Option<&Arc<Denoiser>> {
+        self.transformer_ref.as_ref()
+    }
+
+    /// The weightless post-processing block, when this rank places it.
+    pub fn video_postprocessor(&self) -> Option<&Arc<crate::output::VideoPostprocessor>> {
+        self.video_postprocessor.as_ref()
+    }
+
+    /// The video decoder, when this rank places it.
+    pub fn video_decoder(&self) -> Option<&Arc<crate::video_vae::VideoDecoder>> {
+        self.video_decoder.as_ref()
+    }
+
+    /// The audio decoder, when this rank places it.
+    pub fn audio_decoder(&self) -> Option<&Arc<AudioDecoder>> {
+        self.audio_decoder.as_ref()
+    }
+}
+
 /// Load the deployment this rank places.
 ///
 /// The place and the blocks are the `partition`'s: it names the degrees and the rank's position in
@@ -55,7 +165,7 @@ pub fn load(
     checkpoint: &nn::Checkpoint,
     partition: Partition,
     loader: &mut nn::weights::WeightLoader<'_>,
-) -> Result<nn::Model> {
+) -> Result<MinimaxH3> {
     let (layout, sidecars) = sidecars(checkpoint)?;
     let config = Config::normalize(&layout, &sidecars)?;
     partition.validate(&config)?;
@@ -72,15 +182,26 @@ pub fn load(
     };
 
     let mut blocks = Vec::new();
+    let mut text_encoder: Option<Arc<TextEncoder>> = None;
+    let mut transformer: Option<Arc<Denoiser>> = None;
+    let mut transformer_ref: Option<Arc<Denoiser>> = None;
+    let mut video_postprocessor: Option<Arc<crate::output::VideoPostprocessor>> = None;
+    let mut video_decoder: Option<Arc<crate::video_vae::VideoDecoder>> = None;
+    let mut audio_decoder: Option<Arc<AudioDecoder>> = None;
     for component in partition.blocks.iter() {
         let block = match component {
             Component::TextEncoder => {
                 let source = checkpoint.component("text_encoder")?;
                 let dtype = component.activation();
                 let mut shards = loader.reborrow(source)?;
-                let encoder =
-                    TextEncoder::load(&mut shards, &config.text_encoder, &partition, dtype)?;
-                Block::Encoder(Arc::new(encoder))
+                let encoder = Arc::new(TextEncoder::load(
+                    &mut shards,
+                    &config.text_encoder,
+                    &partition,
+                    dtype,
+                )?);
+                text_encoder = Some(Arc::clone(&encoder));
+                Block::Encoder(encoder)
             }
             Component::Transformer | Component::TransformerRef => {
                 let dit = match component {
@@ -154,7 +275,12 @@ pub fn load(
                 if let Some(encoders) = encoders.take() {
                     denoiser.attach_encoders(encoders)?;
                 }
-                Block::Denoiser(Arc::new(denoiser))
+                let denoiser = Arc::new(denoiser);
+                match dit {
+                    Dit::Base => transformer = Some(Arc::clone(&denoiser)),
+                    Dit::Reference => transformer_ref = Some(Arc::clone(&denoiser)),
+                }
+                Block::Denoiser(denoiser)
             }
             Component::VideoPostprocessor => {
                 // Weightless: the splice's only constants are the reference's ImageNet means and standard
@@ -179,16 +305,19 @@ pub fn load(
                     shape,
                     &bytes(crate::output::PIXEL_STD),
                 )?;
-                let postprocessor = crate::output::VideoPostprocessor::new(dtype, mean, std)?;
-                nn::Block::Decoder(Arc::new(postprocessor))
+                let postprocessor =
+                    Arc::new(crate::output::VideoPostprocessor::new(dtype, mean, std)?);
+                video_postprocessor = Some(Arc::clone(&postprocessor));
+                nn::Block::Decoder(postprocessor)
             }
             Component::AudioDecoder => {
                 // The audio decoder has no layout tables - every table it reads is a weight bound
                 // at load - so it constructs from its own component and its sidecar alone.
                 let source = checkpoint.component("audio_vae")?;
                 let mut shards = loader.reborrow(source)?;
-                let decoder = AudioDecoder::load(&config.audio_vae, &mut shards)?;
-                Block::Decoder(Arc::new(decoder))
+                let decoder = Arc::new(AudioDecoder::load(&config.audio_vae, &mut shards)?);
+                audio_decoder = Some(Arc::clone(&decoder));
+                Block::Decoder(decoder)
             }
             Component::VideoDecoder => {
                 // One block serves every canvas: the tile grid is arithmetic on a request's raster,
@@ -244,15 +373,16 @@ pub fn load(
                 // A VAE directory holds both halves; the decoder reads its own keys from it.
                 let source = checkpoint.component(component.directories()[0])?;
                 let mut shards = loader.reborrow(source)?;
-                let decoder = crate::video_vae::VideoDecoder::load(
+                let decoder = Arc::new(crate::video_vae::VideoDecoder::load(
                     &config.video_vae,
                     canvas,
                     attention,
                     dtype,
                     input,
                     &mut shards,
-                )?;
-                Block::Decoder(Arc::new(decoder))
+                )?);
+                video_decoder = Some(Arc::clone(&decoder));
+                Block::Decoder(decoder)
             }
             Component::LatentEncoder => {
                 // No block of its own: the two condition encoders are the `denoiser` block's
@@ -273,7 +403,15 @@ pub fn load(
     // places no encoder - `Denoiser::places_encoders` answers that, and `encode_media` refuses a
     // request that carries media it holds no encoder for.
 
-    Ok(nn::Model::new(blocks))
+    Ok(MinimaxH3 {
+        model: nn::Model::new(blocks),
+        text_encoder,
+        transformer,
+        transformer_ref,
+        video_postprocessor,
+        video_decoder,
+        audio_decoder,
+    })
 }
 
 /// The checkpoint's pipeline layout and its sidecar documents.
