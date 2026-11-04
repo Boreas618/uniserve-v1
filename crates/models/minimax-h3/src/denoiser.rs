@@ -2818,11 +2818,11 @@ impl Denoiser {
         let groups = self.cache.groups().count() as u64;
         let entries = arena.tensor(DType::I32, Shape::new(&[1, groups]))?;
         self.cache.entries_of(f, step_index, entries)?;
-        // The cache's tables are the deployment's type (`Projections::dtype`, the modulation
-        // projections' own), so the gather's destination is that type: an F32 buffer here is the
-        // same bytes in another type at a stated-FP32 deployment and a mixed pair at a BF16 one.
-        let modulation =
-            arena.tensor(self.cache.dtype(), Shape::new(&[groups, 2 * hidden_size]))?;
+        // The plan states this buffer's element as the stack's (`element`, `output.modulation`), and
+        // so does this line: one number, two guards. The cache then refuses a table of another type
+        // (`AdaLnCache::output` compares the destination with its own weights), so a cache whose
+        // projections drifted away from the stack's type is a named refusal and not a mixed gather.
+        let modulation = arena.tensor(hidden.dtype, Shape::new(&[groups, 2 * hidden_size]))?;
         self.cache.output(f, entries, modulation)?;
 
         // The solver's scale: one FP32 word the `step` table indexes into the coefficient table.
