@@ -459,6 +459,12 @@ impl Tensor {
                 self.byte_alignment
             )));
         }
+        if self.strides.iter().any(|&stride| stride <= 0) {
+            return Err(Error::invalid(format!(
+                "a convolution tensor's strides are positive element counts, not {:?}",
+                self.strides
+            )));
+        }
         if self.dims.iter().any(|&dim| dim <= 0) {
             return Err(Error::invalid(format!(
                 "a convolution tensor has an empty dimension: {:?}",
@@ -634,11 +640,17 @@ impl Convolution {
     /// The bytes each of the three tensors spans, for checking the caller's
     /// buffers.
     pub fn bytes(&self) -> ConvolutionBytes {
+        // The span a tensor touches, not the number of its elements: a view
+        // with a stride larger than its extent reaches further than its
+        // dimensions multiply out to, and the caller's range must cover that.
         let element = |tensor: &Tensor| {
             let elements = tensor
                 .dims
                 .iter()
-                .try_fold(1i64, |total, &dim| total.checked_mul(dim))
+                .zip(&tensor.strides)
+                .try_fold(1i64, |total, (&dim, &stride)| {
+                    total.checked_add((dim - 1).checked_mul(stride)?)
+                })
                 .unwrap_or(0);
             elements.max(0) as u64 * tensor.dtype.bytes() as u64
         };
@@ -1981,6 +1993,35 @@ mod tests {
                 w: 4 * 4,
                 y: 16 * 4,
             }
+        );
+
+        // A channels-last tensor spans the same bytes as its contiguous twin,
+        // and a view with a wider stride spans more than its elements.
+        let channels_last = Tensor {
+            dims: vec![1, 2, 2, 2, 2],
+            strides: vec![16, 1, 8, 4, 2],
+            dtype: DataType::F32,
+            byte_alignment: 16,
+        };
+        let spanned = Convolution {
+            x: channels_last.clone(),
+            ..convolution.clone()
+        };
+        assert_eq!(spanned.bytes().x, 16 * 4, "a packed channels-last tensor");
+
+        let padded = Tensor {
+            strides: vec![32, 1, 16, 8, 4],
+            ..channels_last
+        };
+        let spanned = Convolution {
+            x: padded,
+            ..convolution
+        };
+        // 1 + (1−1)·32 + (2−1)·1 + (2−1)·16 + (2−1)·8 + (2−1)·4 = 30 elements.
+        assert_eq!(
+            spanned.bytes().x,
+            30 * 4,
+            "a view whose outermost stride is wider than its extent"
         );
     }
 
