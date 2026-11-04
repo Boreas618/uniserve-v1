@@ -486,6 +486,22 @@ pub struct PolicyUsage {
     pub fuel: u64,
 }
 
+/// What one scheduler tells the control thread's counters on a statistics tick:
+/// the step it reached, and what its policy has cost (§12).
+///
+/// The step is the epoch's own count — the scheduler takes one per policy step
+/// (`Scheduler::policy_step`) — so the engine's largest is the epoch's step
+/// count, while each batch a step submits is counted separately by the batch
+/// counters.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Progress {
+    /// The step this scheduler reached; zero before its first policy step.
+    pub step: u64,
+    /// The calls and fuel of the scheduler's policy, or `None` before its first
+    /// switchover.
+    pub usage: Option<PolicyUsage>,
+}
+
 /// The running cost of the instance a slot serves, and of the ones it replaced.
 #[derive(Debug, Default)]
 struct Cost {

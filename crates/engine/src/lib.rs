@@ -62,7 +62,7 @@ pub use crate::scheduler::{
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_RUNNING_REQUESTS, DomainStats, EncoderStats,
     ExecutionDomainStats, GeneralStats, GroupCache, PREFETCH_FLOOR_TOKENS, ParkedCache,
     PolicyBytes, PolicyProgram, PolicyReverted, PolicySlot, PolicySource, PolicyUsage,
-    PrefixCacheUsage, PrefixStats, ProgramSource, RoutePolicy, RouteTrial, Scheduler,
+    PrefixCacheUsage, PrefixStats, ProgramSource, Progress, RoutePolicy, RouteTrial, Scheduler,
     SchedulerConfig, SchedulerStats, SchedulerStatsReporter, Stage, TimingStats, TrialState,
     Validators, WorkerStats, arrival_view, ceilings_of,
 };
