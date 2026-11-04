@@ -202,6 +202,7 @@ pub(crate) fn groups(
             tokens,
             ImageParams::default(),
             Vec::new(),
+            0,
         )
     };
 
@@ -281,6 +282,7 @@ pub(crate) fn groups(
                     0,
                     image,
                     shape.negative_token_ids.clone(),
+                    1,
                 )],
             );
             if !requests.is_empty() {
@@ -325,6 +327,7 @@ fn warmup_request(
     tokens: usize,
     image: ImageParams,
     negative_token_ids: Vec<u32>,
+    images: u16,
 ) -> GenerationRequest {
     GenerationRequest {
         request_id,
@@ -340,8 +343,10 @@ fn warmup_request(
             ..SamplingParams::default()
         },
         image,
-        // One generated image, the budget a client's image request states.
-        max_images: 1,
+        // The images the request asks for: one for an image shape, none for a
+        // request that only generates tokens, since a text deployment has no
+        // image path to run and no shape to read.
+        max_images: images,
         max_und_tokens: tokens,
         stop_strings: Vec::new(),
         stop_token_ids: Vec::new(),
@@ -529,8 +534,8 @@ mod tests {
             .collect();
         assert_eq!(
             shapes,
-            [(64, 64), (128, 64), (64, 128)],
-            "the rank's prepared shapes, each once"
+            [(64, 64), (64, 128), (128, 64)],
+            "the rank's prepared shapes, each once, in the order it prepared them"
         );
     }
 
