@@ -595,6 +595,18 @@ extern "C" int32_t UNISERVE_CONV_ENTRY(const uniserve_conv_call* call, void* str
     return 1;
   }
   char* error = const_cast<char*>(call->error);
+  // `tf32` is a permission, not a requirement: it says an FP32 convolution *may*
+  // narrow its inputs to TF32. A convolution whose inputs are half precision has no
+  // such choice, so asking for it there is not a call this module can honour. An FP32
+  // convolution may both grant and withhold the permission, and the engine selection
+  // below is what makes the withholding real: with `tf32` clear, only an engine that
+  // does not narrow its inputs is used.
+  if (call->tf32 != 0 && !kFp32Inputs) {
+    return refuse(error,
+                  "a convolution's tf32 value describes FP32 inputs only: this module's input "
+                  "element type cannot use it");
+  }
+
   if (call->input == nullptr || call->weight == nullptr || call->out == nullptr) {
     return refuse(error, "a convolution needs the addresses of its input, filter and output");
   }
@@ -637,18 +649,6 @@ extern "C" int32_t UNISERVE_CONV_ENTRY(const uniserve_conv_call* call, void* str
       return refuse(error, "a convolution's output extents are positive");
     }
   }
-  // `tf32` is a permission, not a requirement: it says an FP32 convolution *may*
-  // narrow its inputs to TF32. A convolution whose inputs are half precision has no
-  // such choice, so asking for it there is not a call this module can honour. An FP32
-  // convolution may both grant and withhold the permission, and the engine selection
-  // below is what makes the withholding real: with `tf32` clear, only an engine that
-  // does not narrow its inputs is used.
-  if (call->tf32 != 0 && !kFp32Inputs) {
-    return refuse(error,
-                  "a convolution's tf32 value describes FP32 inputs only: this module's input "
-                  "element type cannot use it");
-  }
-
   int32_t device = 0;
   if (cudaGetDevice(&device) != cudaSuccess) {
     return refuse(error, "a convolution needs the caller's device");
