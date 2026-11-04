@@ -127,12 +127,27 @@ pub fn load(
                 let decoder = AudioDecoder::load(&config.audio_vae, &mut shards)?;
                 Block::Decoder(Box::new(decoder))
             }
-            Component::VideoDecoder | Component::LatentEncoder => {
-                // The video decoder is sized by the canvas a request serves and the condition
-                // encoders become capability blocks as their layers land; until then a deployment
-                // that places one is refused here rather than served by a half-built block.
+            Component::VideoDecoder => {
+                // The video decoder is sized by the canvas a request serves, and a `Block` can only
+                // be handed to a runner through a capability: its layers are complete, but until
+                // `Decoder` grows the layout methods a canvas-sized block cannot be placed, so a
+                // deployment that places one is refused here rather than served by a half-built
+                // block.
                 return Err(Error::Unsupported(format!(
                     "the {} block has no construction yet, so it cannot be placed",
+                    component.name()
+                )));
+            }
+            Component::LatentEncoder => {
+                // Both condition encoders are written to the reference (`VideoEncoder::encode` and
+                // `AudioEncoder`), and neither is the text tower: `nn::Encoder` takes a token batch,
+                // an image shape and a prompt, while these take pixels `[1, 3, frames, height,
+                // width]` and raw samples `[1, 1, samples]`. `nn::model::Block` has no kind for a
+                // condition encoder, so a deployment that places this component is refused by name
+                // rather than served by a block that would misdescribe itself as a text tower.
+                return Err(Error::Unsupported(format!(
+                    "the {} block holds the two condition encoders, which need an nn condition-encoder \
+                     capability that does not exist; `Encoder` is the text tower's interface",
                     component.name()
                 )));
             }
