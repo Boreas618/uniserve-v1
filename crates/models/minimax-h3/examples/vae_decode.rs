@@ -559,7 +559,7 @@ fn stage_decode(args: &Args) -> Result<()> {
         );
     }
     let (latent_bytes, generated) = match &args.latents {
-        Some(path) if !path.exists() && is_index(&path) => {
+        Some(path) if !path.exists() && is_index(path) => {
             // A bare number is an *evaluation index*, not a path, and three runs have now stopped on
             // one: the flag is the only place in this stage a caller names an input, so it is where
             // the confusion lands. Say the file the index would name, so the corrected command is
