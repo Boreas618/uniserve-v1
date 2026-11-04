@@ -1,0 +1,35 @@
+# The nvfp4_quantize operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py`.
+#
+# One program encodes a row's run of whole K16 blocks into packed E2M1 values
+# and their E4M3 block scales; the row count comes from the grid, so one module
+# serves every row count.
+
+op = "nvfp4_quantize"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/nvfp4_quantize.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_100f", "sm_90a"]
+
+# `input_bf16_columns_2048_layout_linear_block_256_pdl_true`.
+[kernel.descriptors]
+dimensions = { input = ["bf16", "f16"], columns = ["2048", "4096", "8192", "32768"], layout = ["linear"], block = ["256", "512", "1024", "2048", "4096"], pdl = ["true", "false"] }
+
+[parameters]
