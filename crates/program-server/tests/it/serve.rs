@@ -20,7 +20,7 @@ op = "rms_norm"
 backend = "triton"
 
 [toolchain]
-kind = "python"
+kind = "triton"
 version = "3.7.1"
 
 [module]
@@ -58,7 +58,7 @@ fn config(temporary: &Path) -> ServerConfig {
         toolchains: ToolchainConfig {
             nvcc: None,
             python: std::path::PathBuf::from("/python/bin/python"),
-            wasmtime: None,
+            wasm: None,
             max_jobs: 1,
         },
         devices: Vec::new(),
@@ -91,7 +91,11 @@ fn a_server_answers_an_installation_and_a_listing_over_its_socket() {
     std::fs::write(&configuration.socket, b"stale").unwrap();
 
     let server = Arc::new(ProgramServer::open(&configuration).unwrap());
-    std::thread::spawn(move || server.serve());
+    std::thread::spawn(move || {
+        if let Err(error) = server.serve() {
+            eprintln!("the server stopped: {error}");
+        }
+    });
     let mut client = connect(&configuration.socket);
 
     let directory = package(&temporary.path().join("package"));
@@ -109,7 +113,11 @@ fn a_server_does_not_take_a_socket_another_server_answers_on() {
     let temporary = tempfile::tempdir().unwrap();
     let configuration = config(temporary.path());
     let server = Arc::new(ProgramServer::open(&configuration).unwrap());
-    std::thread::spawn(move || server.serve());
+    std::thread::spawn(move || {
+        if let Err(error) = server.serve() {
+            eprintln!("the server stopped: {error}");
+        }
+    });
     // Wait until it listens.
     drop(connect(&configuration.socket));
 

@@ -292,9 +292,7 @@ pub struct StoreFile {
 /// Whether a build's file name is a path inside the module directory:
 /// relative, and every component a name.
 fn is_relative_name(name: &str) -> bool {
-    !name.is_empty()
-        && !name.starts_with('/')
-        && name.split('/').all(|component| is_name(component))
+    !name.is_empty() && !name.starts_with('/') && name.split('/').all(is_name)
 }
 
 /// Whether a store name is one path component: non-empty, no separator, and

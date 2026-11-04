@@ -147,8 +147,24 @@ impl ProgramServer {
     ///
     /// Fails when the socket cannot be bound or a listener cannot be made.
     pub fn serve(self: Arc<Self>) -> Result<()> {
-        Queue::drive(Arc::clone(&self.queue));
+        self.serve_until(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+    }
+
+    /// Serves until `stop` is set: what [`Self::serve`] does, for a supervisor
+    /// that must shut the server down. The socket is removed on the way out.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the socket cannot be bound or a listener cannot be made.
+    pub fn serve_until(self: Arc<Self>, stop: Arc<std::sync::atomic::AtomicBool>) -> Result<()> {
+        // The queue's driver runs beside the listener: it starts the builds
+        // the request queue holds and wakes the requests waiting on them.
+        std::thread::spawn({
+            let queue = Arc::clone(&self.queue);
+            move || Queue::drive(queue)
+        });
         let listener = bind(&self.socket)?;
+        listener.set_nonblocking(true)?;
         tracing::info!(
             "program server listening on {} with {} package(s)",
             self.socket.display(),
@@ -157,14 +173,25 @@ impl ProgramServer {
                 .map(|packages| packages.len())
                 .unwrap_or(0)
         );
-        for stream in listener.incoming() {
-            let stream = match stream {
-                Ok(stream) => stream,
+        while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+            let stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    // A supervisor can shut the server down between two
+                    // accept attempts; a client's connection is still handled
+                    // by its own thread, so this wait costs it nothing.
+                    std::thread::sleep(ACCEPT_TICK);
+                    continue;
+                }
                 Err(error) => {
                     tracing::warn!("accepting a program server connection: {error}");
+                    std::thread::sleep(ACCEPT_TICK);
                     continue;
                 }
             };
+            if stream.set_nonblocking(false).is_err() {
+                continue;
+            }
             let server = Arc::clone(&self);
             std::thread::spawn(move || {
                 if let Err(error) = server.serve_connection(stream) {
@@ -172,6 +199,9 @@ impl ProgramServer {
                 }
             });
         }
+        self.queue.stop();
+        // A socket file left behind would keep the next server from binding.
+        let _ = std::fs::remove_file(&self.socket);
         Ok(())
     }
 
@@ -613,11 +643,12 @@ impl ProgramServer {
                 file: handle,
             });
         }
+        let entries = entries_of(&package, &self.store.directory(&path))?;
         Ok(Module {
             form: package.manifest.module.form,
             files: module_files,
             metadata: package.manifest.module.metadata.clone(),
-            entries: package.manifest.module.entries.clone(),
+            entries,
         })
     }
 
@@ -806,6 +837,35 @@ impl ProgramServer {
     }
 }
 
+/// The C entries a module is launched through: its package's
+/// `[module.entries]`, overridden by each role the module's entries file names
+/// (design section 4.2). The file is part of the module, written by the build
+/// for this descriptor, so a package whose modules each launch through their
+/// own C entry answers the entries of the module it resolved.
+fn entries_of(package: &Package, directory: &Path) -> Result<BTreeMap<String, String>> {
+    let mut entries = package.manifest.module.entries.clone();
+    let Some(name) = package.manifest.module.entries_file.as_deref() else {
+        return Ok(entries);
+    };
+    let file = directory.join(name);
+    let text = fs::read_to_string(&file).map_err(|error| {
+        Error::Protocol(format!(
+            "the module names its entries in {name}, which it does not hold: {error}"
+        ))
+    })?;
+    let written: BTreeMap<String, String> = serde_json::from_str(&text).map_err(|error| {
+        Error::Protocol(format!(
+            "{name} is not a JSON object of C entry roles to symbols: {error}"
+        ))
+    })?;
+    entries.extend(written);
+    Ok(entries)
+}
+
+/// How long the listener waits between accept attempts, so a supervisor can
+/// stop the server.
+const ACCEPT_TICK: Duration = Duration::from_millis(10);
+
 /// The queue's side of a build: what is being built, and who waits for it.
 struct Queue {
     store: Arc<Store>,
@@ -965,12 +1025,22 @@ impl Queue {
         self.wake.notify_all();
     }
 
+    /// Stops the queue's driver once the build it was starting has ended.
+    fn stop(&self) {
+        self.lock().stopping = true;
+        self.wake.notify_all();
+    }
+
     /// Compiles one module into the store.
     fn compile(&self, job: &BuildJob) -> Result<()> {
         let package = &job.package;
         let kind = package.toolchain();
         let toolchain = self.toolchains.get(kind)?;
-        if toolchain.version() != package.manifest.toolchain.version {
+        // A package that compiles nothing has no compiler version to match;
+        // its `[toolchain] version` is empty and is not compared.
+        if kind != crate::manifest::ToolchainKind::None
+            && toolchain.version() != package.manifest.toolchain.version
+        {
             return Err(Error::Toolchain {
                 kind,
                 message: format!(

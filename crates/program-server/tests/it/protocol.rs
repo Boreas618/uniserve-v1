@@ -274,6 +274,75 @@ fn a_listing_names_the_packages_revisions_and_modules() {
 }
 
 #[test]
+fn the_four_phases_of_a_program_slot_travel_whole() {
+    let mut client = server_on(|connection| {
+        let (request, _) = connection.receive::<wire::Request>().unwrap();
+        let Some(wire::request::Request::Prepare(prepare)) = request.request else {
+            panic!("a prepare");
+        };
+        // The server echoes what it selected, phase and all.
+        connection
+            .send(
+                &wire::ServerMessage {
+                    message: Some(wire::server_message::Message::Prepared(wire::Prepared {
+                        programs: prepare
+                            .programs
+                            .iter()
+                            .map(|program| wire::Chosen {
+                                op: program.op.clone(),
+                                phase: program.phase,
+                                program: Some(wire::ProgramRef {
+                                    backend: "triton".into(),
+                                    revision: 1,
+                                    arguments: String::new(),
+                                }),
+                            })
+                            .collect(),
+                    })),
+                },
+                &[],
+            )
+            .unwrap();
+    });
+
+    let phases = [
+        PhaseKind::Prefill,
+        PhaseKind::Decode,
+        PhaseKind::Encode,
+        PhaseKind::Denoise,
+    ];
+    let request = PrepareRequest {
+        targets: Vec::new(),
+        programs: phases
+            .iter()
+            .map(|phase| ProgramRequest {
+                slot: ProgramSlot {
+                    op: "attention".into(),
+                    phase: Some(*phase),
+                },
+                selector: Selector::Latest {
+                    backend: "triton".into(),
+                    arguments: toml::Table::new(),
+                },
+            })
+            .collect(),
+        descriptors: vec![Descriptors {
+            op: "attention".into(),
+            keys: vec!["phase_prefill".into()],
+        }],
+    };
+    let prepared = client.prepare(&request, &mut |_| {}).unwrap();
+    assert_eq!(
+        prepared
+            .programs
+            .iter()
+            .map(|chosen| chosen.slot.phase)
+            .collect::<Vec<_>>(),
+        phases.map(Some)
+    );
+}
+
+#[test]
 fn a_native_module_comes_back_with_its_entries_by_role() {
     let mut client = server_on(|connection| {
         let _ = connection.receive::<wire::Request>().unwrap();

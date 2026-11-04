@@ -27,7 +27,7 @@ op = "rms_norm"
 backend = "triton"
 
 [toolchain]
-kind = "python"
+kind = "triton"
 version = "3.7.1"
 
 [module]
@@ -61,7 +61,7 @@ fn a_manifest_says_what_the_package_is_and_how_it_is_built() {
 
     assert_eq!(manifest.op, "rms_norm");
     assert_eq!(manifest.backend, "triton");
-    assert_eq!(manifest.toolchain.kind, ToolchainKind::Python);
+    assert_eq!(manifest.toolchain.kind, ToolchainKind::Triton);
     assert_eq!(manifest.toolchain.version, "3.7.1");
     assert_eq!(manifest.module.form, ModuleForm::Cubin);
     assert_eq!(manifest.source.kind, SourceKind::Triton);
@@ -169,6 +169,61 @@ descriptors = { dimensions = { dtype = ["bf16"] } }
     assert_eq!(manifest.module.entries.len(), 4);
 }
 
+/// A native package whose launch symbol differs per descriptor: the compile
+/// script writes the module's entries, and `[module.entries]` stays the
+/// package's default.
+const ENTRIES_FILE: &str = r#"
+op = "expert_exchange"
+backend = "deepep"
+
+[toolchain]
+kind = "nvcc"
+version = "13.0.48"
+
+[module]
+form = "native"
+entries_file = "entries.json"
+
+[module.entries]
+launch = "uniserve_exchange_launch"
+
+[source]
+kind = "cuda"
+files = ["src/exchange.cu"]
+
+[kernel]
+architectures = ["sm_100a"]
+descriptors = { dimensions = { dtype = ["bf16"] } }
+"#;
+
+#[test]
+fn a_native_module_may_name_a_file_its_build_writes_its_entries_into() {
+    let root = package(ENTRIES_FILE, &["src/exchange.cu"]);
+    let manifest = Manifest::load(root.path()).unwrap();
+    assert_eq!(
+        manifest.module.entries_file.as_deref(),
+        Some("entries.json")
+    );
+    assert_eq!(
+        manifest.module.entries.get("launch").map(String::as_str),
+        Some("uniserve_exchange_launch"),
+        "the package keeps its default launch entry"
+    );
+}
+
+#[test]
+fn a_cubin_module_may_not_name_an_entries_file() {
+    let text = REASONABLE.replace(
+        "metadata = \"metadata.json\"",
+        "metadata = \"metadata.json\"\nentries_file = \"entries.json\"",
+    );
+    let root = package(
+        &text,
+        &["src/rms.py", "src/compile.py", "tuning/tactics.json"],
+    );
+    assert!(Manifest::load(root.path()).is_err());
+}
+
 #[test]
 fn a_cubin_module_with_a_c_entry_is_refused() {
     let text = REASONABLE.replace(
@@ -189,7 +244,7 @@ op = "gather_gemm"
 backend = "cute"
 
 [toolchain]
-kind = "python"
+kind = "triton"
 version = "4.6.2"
 
 [module]
@@ -214,7 +269,7 @@ op = "rms_norm"
 backend = "triton"
 
 [toolchain]
-kind = "python"
+kind = "triton"
 version = "3.7.1"
 
 [module]
@@ -324,6 +379,43 @@ files = ["src/lib.rs"]
 "#;
     let root = package(text, &["src/lib.rs"]);
     assert!(Manifest::load(root.path()).is_err());
+}
+
+/// An executable program: a program the main process runs as its own process,
+/// stored as it is (design section 5.1).
+const EXECUTABLE: &str = r#"
+op = "sampler"
+backend = "process"
+
+[toolchain]
+kind = "none"
+version = ""
+
+[module]
+form = "executable"
+
+[source]
+kind = "executable"
+files = ["bin/sampler"]
+
+[kernel]
+architectures = ["sm_100a"]
+descriptors = { dimensions = { dtype = ["bf16"] } }
+"#;
+
+#[test]
+fn an_executable_package_stores_its_binary_and_compiles_nothing() {
+    let root = package(EXECUTABLE, &["bin/sampler"]);
+    let manifest = Manifest::load(root.path()).unwrap();
+    assert_eq!(manifest.module.form, ModuleForm::Executable);
+    assert_eq!(manifest.toolchain.kind, ToolchainKind::None);
+    assert_eq!(
+        manifest.source(root.path()).unwrap().toolchain(),
+        ToolchainKind::None,
+        "an executable is stored as it is: nothing compiles it"
+    );
+    assert!(manifest.module.metadata.is_none());
+    assert!(manifest.module.entries.is_empty());
 }
 
 #[test]

@@ -161,12 +161,9 @@ pub fn command() -> Command {
                         .value_name("PATH")
                         .help("the interpreter of the Program Server's Python environment"),
                 )
-                .arg(
-                    Arg::new("wasmtime")
-                        .long("wasmtime")
-                        .value_name("PATH")
-                        .help("the wasmtime binary that precompiles the scheduling policies"),
-                ),
+                .arg(Arg::new("wasm").long("wasm").value_name("PATH").help(
+                    "the precompiler that turns a scheduling policy into a module for this host",
+                )),
         )
         .subcommand(
             Command::new("install")
@@ -230,7 +227,7 @@ pub fn options(matches: &ArgMatches) -> Result<Options> {
                         .get_one::<String>("python")
                         .map(PathBuf::from)
                         .unwrap_or_else(|| PathBuf::from("python/.venv/bin/python")),
-                    wasmtime: matches.get_one::<String>("wasmtime").map(PathBuf::from),
+                    wasm: matches.get_one::<String>("wasm").map(PathBuf::from),
                     max_jobs: limits.max_jobs,
                 },
                 devices,
