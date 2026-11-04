@@ -690,6 +690,13 @@ impl Op for PagedAttention {
         }
     }
 
+    /// The same bound as `dense_attention`, for the same reason and with the same declared bound.
+    ///
+    /// Paging changes *where* the `max_kv_len` products of one row come from — pages addressed by the
+    /// scheduler instead of a contiguous run — and not how many there are, nor the dtype they
+    /// accumulate in (FP32). So the reduction length is `max_kv_len` (a descriptor field here: the
+    /// deployment's cache length, known at selection time), `rtol = γₙ + u` for the reduction and the
+    /// write, and `atol` is the normalized-weights' value term `(2γₙ + u) · max|v|`.
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
         let reduction = u64::from(descriptor.max_kv_len);
         let accumulate = DType::F32;
