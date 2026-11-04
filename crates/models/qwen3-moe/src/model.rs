@@ -141,6 +141,11 @@ pub struct Plan {
     pub factors: u64,
     /// Elements per dense feed-forward row; zero when every layer routes to experts.
     pub feed_forward: u64,
+    /// Elements per row of this rank's vocabulary shard: the head's output width.
+    pub vocabulary: u64,
+    /// Elements per row of the gathered logits matrix, `vocabulary × tensor parallel`; zero when
+    /// one rank projects the whole vocabulary and no gather happens.
+    pub gathered: u64,
     /// Bytes of the attention program's workspace.
     pub workspace: u64,
 }
@@ -170,6 +175,19 @@ impl Plan {
             } else {
                 0
             },
+            vocabulary: element(
+                partition.padded_vocabulary_shard(config.vocab_size),
+                "the vocabulary shard",
+            )?,
+            gathered: if partition.tensor_parallel > 1 {
+                element(
+                    partition.padded_vocabulary_shard(config.vocab_size)
+                        * partition.tensor_parallel,
+                    "the gathered vocabulary",
+                )?
+            } else {
+                0
+            },
             workspace: options.attention_workspace_bytes,
         })
     }
@@ -192,6 +210,8 @@ impl Plan {
             (self.tokens * self.query, dtype),        // attended output
             (self.tokens * self.feed_forward, dtype), // dense gate
             (self.tokens * self.feed_forward, dtype), // dense up
+            (self.tokens * self.vocabulary, dtype),   // the vocabulary shard's logits
+            (self.tokens * self.gathered, dtype),     // the gathered logits, absent on one rank
         ] {
             let bytes = element
                 .bytes()
@@ -694,16 +714,34 @@ impl CausalLm for Qwen3Moe {
 
     fn logits(&self, f: &Forward, hidden: TensorView, out: TensorView) -> nn::Result<()> {
         let rows = hidden.rows();
+        let plan = self.plan(rows).map_err(capability)?;
+        // The plan's two widths are the model's, not the launch's: a loaded head whose shard width
+        // disagrees with the partition would otherwise be given a buffer of the wrong width and
+        // write past it.
+        if plan.vocabulary != u64::from(self.head.padded()) {
+            return Err(capability(Error::Config(format!(
+                "the plan reserves {} columns for the vocabulary shard, the head projects {}",
+                plan.vocabulary,
+                self.head.padded()
+            ))));
+        }
         let projected = f
             .arena
-            .tensor(
-                self.dtype,
-                Shape::new(&[rows, u64::from(self.head.padded())]),
-            )
+            .tensor(self.dtype, Shape::new(&[rows, plan.vocabulary]))
             .map_err(Error::from)
             .map_err(capability)?;
+        let gathered = if plan.gathered == 0 {
+            None
+        } else {
+            Some(
+                f.arena
+                    .tensor(self.dtype, Shape::new(&[rows, plan.gathered]))
+                    .map_err(Error::from)
+                    .map_err(capability)?,
+            )
+        };
         self.head
-            .forward(f, hidden, projected, None, out)
+            .forward(f, hidden, projected, gathered, out)
             .map_err(Error::from)
             .map_err(capability)
     }
@@ -774,6 +812,9 @@ mod tests {
         assert_eq!(plan.factors, 64);
         // Every layer routes to experts, so no dense feed-forward buffer is planned.
         assert_eq!(plan.feed_forward, 0);
+        // One rank projects the whole vocabulary and gathers nothing.
+        assert_eq!(plan.vocabulary, 151936);
+        assert_eq!(plan.gathered, 0);
     }
 
     #[test]
@@ -794,6 +835,29 @@ mod tests {
         assert_eq!(plan.key_value, 128);
     }
 
+    /// A sharded head plans both logits matrices: its own padded shard, and the gather every rank
+    /// writes into. The plan is what sizes the arena, so a gather it forgot would be a write past
+    /// the reservation on the first sharded deployment.
+    #[test]
+    fn a_sharded_head_plans_its_shard_and_the_gather() {
+        let config = config();
+        let single = Plan::new(&config, &Partition::single(), 1, &LoadOptions::default()).unwrap();
+        let sharded = Plan::new(
+            &config,
+            &Partition::new(&config, 2, 0, 1, 0).unwrap(),
+            1,
+            &LoadOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(sharded.vocabulary, 75968);
+        assert_eq!(sharded.gathered, 151936);
+        assert_eq!(single.gathered, 0);
+        assert!(
+            sharded.bytes(DType::BF16).unwrap() > sharded.vocabulary * 2,
+            "the gather's own rows are reserved"
+        );
+    }
+
     #[test]
     fn the_plan_bytes_follow_the_token_count() {
         let config = config();
@@ -805,8 +869,10 @@ mod tests {
                 .unwrap()
         };
         // Per token: two F32 factor columns, three hidden buffers, three query-width buffers
-        // (query, rotated query, attended output) and three key/value-width buffers.
-        let per_token = 2 * 64 * 4 + 3 * 2048 * 2 + 3 * 4096 * 2 + 3 * 512 * 2;
+        // (query, rotated query, attended output), three key/value-width buffers and the logits'
+        // row. Two rank's worth of logits are planned only where a gather happens, and the single
+        // rank plans none.
+        let per_token = 2 * 64 * 4 + 3 * 2048 * 2 + 3 * 4096 * 2 + 3 * 512 * 2 + 151936 * 2;
         assert_eq!(bytes(2) - bytes(1), per_token);
     }
 }
