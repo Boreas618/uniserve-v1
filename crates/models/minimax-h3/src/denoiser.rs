@@ -2004,14 +2004,215 @@ impl Denoiser {
                     .project_audio(f, encoded, row_range(text, start, rows)?)?;
             }
             if piece.rows > 0 {
-                return Err(Error::config(format!(
-                    "condition {:?} is visual, and the video encoder's posterior epilogue does not \
-                     exist: `VideoEncoder::encode` writes the 48-channel moments, and a condition's \
-                     rows are the 24 normalised channels (`notes/h3/encoder-audit.md` H1)",
-                    piece.role
-                )));
+                let visual = u32::try_from(start).map_err(|_| {
+                    Error::config("a condition row start above u32::MAX".to_owned())
+                })? + piece.audio_rows;
+                self.encode_visual(f, piece, encoders, text, visual)?;
             }
         }
+        Ok(())
+    }
+
+    /// Encode one visual condition and write its patch rows into the prefix source.
+    ///
+    /// The chain is the reference's, and each step is its own program:
+    ///
+    /// 1. the tiled video encoder over the piece's pixels ([`crate::tiled_encode::ClipEncoder`]),
+    ///    stitching its tiles into the run's raster;
+    /// 2. `quant_conv` once, on the stitched moments ([`crate::encoding::VideoEncoder::project`]);
+    /// 3. the posterior epilogue, which samples the condition's latent from the moments and the
+    ///    piece's draw and applies the per-channel affine
+    ///    ([`crate::encoding::VideoEncoder::posterior`]);
+    /// 4. the patchify into `video_channels * 4`-wide rows;
+    /// 5. the anchoring, `t · clean + (1 - t) · draw`, in FP32, and the projection into the source.
+    ///
+    /// The draw is patchified like the latent: the reference's condition noise is drawn at latent
+    /// resolution, so the two operands of the anchor are rows only after the same mapping.
+    fn encode_visual(
+        &self,
+        f: &Forward,
+        piece: &nn::capability::MediaInput,
+        encoders: &ConditionEncoders,
+        text: TensorView,
+        start: u32,
+    ) -> Result<()> {
+        let pixels = piece.pixels.ok_or_else(|| {
+            Error::config(format!(
+                "condition {:?} declares {} visual rows and no pixels were offered",
+                piece.role, piece.rows
+            ))
+        })?;
+        let draw = piece.noise.ok_or_else(|| {
+            Error::config(format!(
+                "condition {:?} is visual and the runner offered no draw for it",
+                piece.role
+            ))
+        })?;
+        let compression = u64::from(crate::encoding::SPATIAL_RATIO);
+        if pixels.shape.rank() != 5 || pixels.shape.dim(0) != 1 {
+            return Err(Error::config(format!(
+                "condition {:?} reads [1, channels, frames, height, width] pixels, not {:?}",
+                piece.role,
+                pixels.shape.dims()
+            )));
+        }
+        if pixels.dtype != DType::F32 || draw.dtype != DType::F32 {
+            return Err(Error::config(format!(
+                "condition {:?} is encoded in FP32: pixels are {} and the draw {}",
+                piece.role, pixels.dtype, draw.dtype
+            )));
+        }
+        let (in_channels, frames, height, width) = (
+            pixels.shape.dim(1),
+            pixels.shape.dim(2),
+            pixels.shape.dim(3),
+            pixels.shape.dim(4),
+        );
+        let (taller, wider) = (
+            u32::try_from(height).unwrap_or(0),
+            u32::try_from(width).unwrap_or(0),
+        );
+        let clip = crate::tiled_encode::ClipEncoder::new(taller, wider)?;
+        let plan = clip.plan();
+        // One packed copy per tile, taken from the piece's own raster. `FramePad` - which pads a
+        // tile's edges - reads each frame's rows in place, so it wants the *tile's* row stride and a
+        // tile cut from a wider raster has the raster's: the kernel refuses it by name ("a frame's
+        // pixels of one channel are not contiguous"). `CopyBlock` is the strided-to-packed copy, and
+        // the tile's own pixels are a few megabytes against the encoder's set.
+        let raster = {
+            let strides = pixels.strides.as_slice();
+            TensorView::with_strides(
+                pixels.offset_elements(0),
+                pixels.dtype,
+                Shape::new(&[in_channels, frames, height, width]),
+                nn::Strides::new(&strides[1..]),
+            )
+        };
+        // A run's tiles are uniform (the seam split keeps every tile at the tile size), so one
+        // buffer holds any tile of this run and its extents are the plan's largest.
+        // The run's raster is the whole encoding's: the plan is the identity crop, so the raster's
+        // own latent extent is what the tiles stitch into. It carries the **moments'** channels and
+        // not the latent's - the encoder's last level writes `2 * latent_channels`, and `quant_conv`
+        // projects those to the two fields the posterior samples from, so the stitch, the projection
+        // and the posterior's first operand share one width
+        // (`crate::encoding::VideoEncoder::moments`).
+        let video_channels = u64::from(self.config.transformer.video_channels);
+        let (origin, end) = plan.extent();
+        let run_rows = u64::from(end - origin);
+        let run_columns = u64::from(wider / crate::encoding::SPATIAL_RATIO);
+        let frame_count = u32::try_from(frames)
+            .map_err(|_| Error::config("a condition of more frames than u32 holds".to_owned()))?;
+        let latent_frames = u64::from(encoders.video.latent_frames(frame_count)?);
+        let (tile_height, tile_width) = plan.tiles.iter().fold((0_u64, 0_u64), |held, tile| {
+            (
+                held.0.max(u64::from(tile.rows.1) * compression),
+                held.1.max(u64::from(tile.columns.1) * compression),
+            )
+        });
+        let buffer = f.arena().tensor(
+            DType::F32,
+            Shape::new(&[in_channels, frames, tile_height, tile_width]),
+        )?;
+        let copy = nn::layers::CopyBlock::new(DType::F32)?;
+        let mut tiles = Vec::with_capacity(plan.tiles.len());
+        for tile in &plan.tiles {
+            let (tile_height, tile_width) = (
+                u64::from(tile.rows.1) * compression,
+                u64::from(tile.columns.1) * compression,
+            );
+            let source = TensorView::with_strides(
+                raster.offset_elements(
+                    u64::from(tile.rows.0) * compression * width
+                        + u64::from(tile.columns.0) * compression,
+                ),
+                raster.dtype,
+                Shape::new(&[in_channels, frames, tile_height, tile_width]),
+                raster.strides,
+            );
+            let packed = [
+                frames * tile_height * tile_width,
+                tile_height * tile_width,
+                tile_width,
+                1,
+            ];
+            let mut destination_strides = [0_i64; ops::copy_block::RANK];
+            for (axis, stride) in packed.iter().enumerate() {
+                destination_strides[axis] = i64::try_from(*stride).map_err(|_| {
+                    Error::config("a condition tile is larger than i64 strides address".to_owned())
+                })?;
+            }
+            let destination = TensorView::with_strides(
+                buffer.offset_elements(0),
+                DType::F32,
+                Shape::new(&[in_channels, frames, tile_height, tile_width]),
+                nn::Strides::new(&packed),
+            );
+            copy.forward(f, source, destination, &destination_strides)?;
+            // The encoder's tile view is the packed copy at the shape it pads from, with the batch
+            // axis the scene's contract asks for.
+            tiles.push(TensorView::with_strides(
+                buffer.offset_elements(0),
+                DType::F32,
+                Shape::new(&[1, in_channels, frames, tile_height, tile_width]),
+                nn::Strides::new(&[
+                    in_channels * frames * tile_height * tile_width,
+                    frames * tile_height * tile_width,
+                    tile_height * tile_width,
+                    tile_width,
+                    1,
+                ]),
+            ));
+        }
+
+        let moment_channels = 2 * video_channels;
+        let run = f.arena().tensor(
+            DType::F32,
+            Shape::new(&[moment_channels, latent_frames, run_rows, run_columns]),
+        )?;
+        clip.encode(
+            f,
+            &encoders.video,
+            &plan,
+            crate::tiled_encode::Scene {
+                pixels: &tiles,
+                blended: run,
+            },
+        )?;
+
+        // `quant_conv` once over the stitched raster, then the posterior's sample: the moments in,
+        // the normalised latent out at half their width.
+        let moments = f.arena().tensor(DType::F32, run.shape)?;
+        encoders.video.project(f, run, moments)?;
+        let latent = f.arena().tensor(
+            DType::F32,
+            Shape::new(&[video_channels, latent_frames, run_rows, run_columns]),
+        )?;
+        encoders.video.posterior(f, moments, draw, latent)?;
+
+        // The latent becomes rows, the draw becomes rows - the draw is drawn at latent resolution,
+        // so it takes the same mapping - and the anchor mixes them in place over the latent's rows.
+        // `ScaledAdd` is `target ← β · target + α · source`, so the reference's `t · clean + (1 - t) ·
+        // draw` is β = t on the latent's rows and α = 1 - t on the draw's.
+        let patch = nn::layers::Patch::new(video_channels, run_rows, run_columns)?;
+        let rows = u64::from(piece.rows);
+        let columns = video_channels * 4;
+        let clean = f.arena().tensor(DType::F32, Shape::new(&[rows, columns]))?;
+        patch.forward(f, latent, clean, latent_frames)?;
+        let anchored = f.arena().tensor(DType::F32, Shape::new(&[rows, columns]))?;
+        patch.forward(f, draw, anchored, latent_frames)?;
+        // `target ← β · target + α · source` with the target the latent's rows and the source the
+        // draw's: α weights the draw, β the latent, so the result is `t · clean + (1 - t) · draw`.
+        nn::layers::ScaledAdd
+            .forward(
+                f,
+                clean,
+                anchored,
+                1.0 - VISUAL_CONDITION_TIME,
+                VISUAL_CONDITION_TIME,
+            )
+            .map_err(Error::from)?;
+        self.transformer
+            .project(f, clean, row_range(text, start, rows)?)?;
         Ok(())
     }
 
