@@ -1196,6 +1196,7 @@ dependencies = [
  "models",
  "png",
  "proto",
+ "scheduling",
  "serde",
  "serde_json",
  "sha2",
@@ -1208,6 +1209,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "wat",
 ]
 
 [[package]]
