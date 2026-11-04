@@ -1201,6 +1201,22 @@ impl Denoiser {
         latents: nn::Latents,
         cond: nn::Conditioning<'_>,
     ) -> Result<()> {
+        self.denoise_traced(f, step, latents, cond, None)
+    }
+
+    /// [`Denoiser::denoise`] with the design's numeric diagnosis attached.
+    ///
+    /// `trace` names layers and borrows one view each, which this forward fills with the packed
+    /// rows that layer produced. With `None` the forward is the served one: the only difference a
+    /// trace makes is one gather per named layer (`specs/worker.md` 10 - a diagnosis, never a gate).
+    pub fn denoise_traced(
+        &self,
+        f: &Forward,
+        step: &nn::Step,
+        latents: nn::Latents,
+        cond: nn::Conditioning<'_>,
+        trace: Option<&crate::transformer::Trace<'_>>,
+    ) -> Result<()> {
         let tables = Tables::new(self.config.attention, cond.state);
         let video = latents.video;
         let channels = video.shape.dim(0);
@@ -1312,6 +1328,7 @@ impl Denoiser {
             visible.as_ref(),
             segments.as_ref(),
             tokens as u32,
+            trace,
         )?;
 
         // The output: the step's final modulation, then each modality's head.

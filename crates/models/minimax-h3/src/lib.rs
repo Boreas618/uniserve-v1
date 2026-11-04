@@ -67,6 +67,7 @@ pub use config::{
 };
 pub use load::load;
 pub use partition::{Component, Partition};
+pub use transformer::Trace;
 
 /// What this crate can fail with.
 #[derive(Debug, thiserror::Error)]
