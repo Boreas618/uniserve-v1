@@ -369,9 +369,39 @@ impl Scheduler {
         let Some(plan) = self.policy_step() else {
             return Vec::new();
         };
+        // The page decisions run first: a prefetch's pins are in flight by the
+        // time this step's calls are built.
+        self.execute_plan_pages(&plan);
         let batches = self.assemble_plan(&plan);
         self.end_step(started.elapsed());
         batches
+    }
+
+    /// Executes the page half of a validated plan (§4.4).
+    ///
+    /// The policy names pages to hand to the host KV cache and requests whose
+    /// host hit should deepen; the mechanism owns the caches and moves exactly
+    /// what it named, after validating that every name is a live, unreferenced
+    /// device page. A move that the host cache cannot take leaves the pages
+    /// where they are: the plan asked, the limit refused, and no request is at
+    /// fault.
+    fn execute_plan_pages(&mut self, plan: &Plan) {
+        let units: Vec<u32> = plan
+            .offload
+            .iter()
+            .filter_map(|page| views::unit_of(*page))
+            .collect();
+        if units.is_empty() {
+            return;
+        }
+        let moved = self.offload_units(&units);
+        if moved < units.len() {
+            tracing::debug!(
+                asked = units.len(),
+                moved,
+                "the host KV cache took fewer pages than the plan offered"
+            );
+        }
     }
 
     /// One step's plan: observe, dispatch, validate (§4.4).

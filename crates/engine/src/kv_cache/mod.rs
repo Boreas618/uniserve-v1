@@ -1111,6 +1111,44 @@ impl BlockPool {
             })
             .map(|(&head, _)| head)
             .collect();
+        self.take_idle(&mut inner, heads)
+    }
+
+    /// Takes exactly the pages the named units belong to out of the free
+    /// queue, the way [`Self::acquire_idle_from`] takes a range of it.
+    ///
+    /// A policy names pages to offload by unit, and the mechanism must move
+    /// those pages and no others: asking for a range would pull in every idle
+    /// page that follows.
+    pub(crate) fn acquire_idle_units(&self, units: &[u32]) -> Vec<IdlePage> {
+        let mut inner = lock(&self.inner);
+        let end = inner.withdrawn.min(inner.meta.len() as u32);
+        let wanted: Vec<u32> = units.iter().copied().filter(|unit| *unit < end).collect();
+        if wanted.is_empty() {
+            return Vec::new();
+        }
+        let heads: Vec<u32> = inner
+            .pages
+            .iter()
+            .filter(|(_, page)| {
+                page.aliases.contains(&None)
+                    && page
+                        .units
+                        .iter()
+                        .any(|unit| wanted.contains(&unit.0))
+                    && page.units.iter().all(|unit| {
+                        let meta = &inner.meta[unit.0 as usize];
+                        meta.state == UnitState::Cached && meta.ref_cnt == 0
+                    })
+            })
+            .map(|(&head, _)| head)
+            .collect();
+        self.take_idle(&mut inner, heads)
+    }
+
+    /// Pins the named pages, takes their units out of the free queue, and
+    /// returns them idle: the second half of both acquisitions above.
+    fn take_idle(&self, inner: &mut PoolInner, heads: Vec<u32>) -> Vec<IdlePage> {
         let mut idle = Vec::with_capacity(heads.len());
         for head in heads {
             let Some(page) = inner.pages.get(&head) else {
