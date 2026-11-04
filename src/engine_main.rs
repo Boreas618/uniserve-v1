@@ -84,7 +84,6 @@
 //! purge, watchdog, probe, close}`, `Submission::wait`) are published in
 //! `crates/executor` and are used as they are written there.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -104,16 +103,14 @@ use executor::memory::retained::Retained;
 use executor::memory::weights::WeightStore;
 use executor::memory::Memory;
 use executor::watchdog::{Running, Watchdog};
-use engine::{PolicyProgram, PolicySlot, PolicySource, Scheduler, Stage};
+use crate::engine_plan::EpochPlan;
+use daemon::epoch::BuildConfig;
+use engine::{Scheduler, Stage};
 use ipc::{ProgramCommand, ProgramStatus, UpdateFailure};
-use nn::WeightLoader;
 use ops::{Generation, KernelEntry};
 use program_server::program::Programs;
-use program_server::{
-    Client, Descriptors, Module, PrepareRequest, Program, ProgramRequest, ProgramSlot, Selector,
-    Target,
-};
-use daemon::epoch::BuildConfig;
+use program_server::{Client, Descriptors, Module, PrepareRequest, Program, ProgramRequest, Selector,
+    Target};
 
 /// The epoch as this node takes it at start.
 ///
@@ -288,7 +285,13 @@ pub(crate) struct MainProcess {
 impl MainProcess {
     /// Connects to the daemon, loads the epoch's model, and starts the epoch's
     /// threads in the order §2.4 lists.
+    ///
+    /// The epoch's configuration is resolved against this node's arguments first
+    /// ([`EpochPlan`]), because three of the things the main process needs are
+    /// the node's rather than the epoch's: which devices it serves, where its
+    /// Program Server is, and what those devices measure.
     fn start(args: &EngineArgs, build: &BuildConfig) -> Result<Self> {
+        let plan = EpochPlan::of(args, build)?;
         let mut control = Control::connect(
             &Endpoints {
                 requests: args.requests.clone(),
@@ -298,7 +301,7 @@ impl MainProcess {
         )?;
         // The request interface's handshake: this process says who it is, and
         // the daemon answers with the engine spec and the epoch record (§2.3).
-        let epoch = handshake(&mut control, args, &build)?;
+        let epoch = handshake(&mut control, args, build)?;
 
         // §8: the rank's retained weights outlive every world of the epoch, so the store is built
         // once, before the model loads, and keeps what it maps for the epoch's life.
@@ -310,57 +313,58 @@ impl MainProcess {
         )
         .context("connecting to the Storage Server")?;
         let mut weights = WeightStore::new(Arc::clone(&storage));
-        let placement = Placement::of(&args, build)?;
-        let model = load_model(&args.model, &placement, &mut weights)
-            .context("loading the epoch's model")?;
+        let placement = Placement::of(args, build)?;
+        // One model per rank: every device's runner reads the same weights, so a second device costs
+        // one `Arc` and not a second load.
+        let model = Arc::new(
+            load_model(&args.model, &placement, &mut weights)
+                .context("loading the epoch's model")?,
+        );
 
         // The owners of §4 are opened before any thread that borrows them, and
         // released in reverse order by `close`.
-        let mut memory = build.open_memory()?;
-        let blocking = ThreadPool::new(build.blocking_limits());
+        let mut memory = plan.open_memory()?;
+        let blocking = ThreadPool::new(plan.blocking_limits());
         let modules = blocking.lane::<Install>(BlockingKind::ModuleLoad)?;
-        let programs = Arc::new(Mutex::new(Client::connect(build.program_server())?));
+        let programs = Arc::new(Mutex::new(Client::connect(plan.program_server())?));
 
-        // §2.4's watchdog exists before any device command: `start`'s own commands are bounded by
-        // the same stall bound as every command the control thread issues afterwards.
-        let watchdog = Watchdog::new(build.watchdog_timeout())?;
+        // §2.4's watchdog exists before any device command: `start`'s own commands
+        // are bounded by the same stall bound as every command the control thread
+        // issues afterwards.
+        let watchdog = Watchdog::new(plan.watchdog_timeout())?;
         let update = HotUpdate::new(epoch.generation);
 
-        let mut executors = Vec::with_capacity(build.devices().len());
-        let mut generations = Vec::with_capacity(build.devices().len());
-        for device in build.devices() {
+        let mut executors = Vec::with_capacity(plan.devices().len());
+        let mut generations = Vec::with_capacity(plan.devices().len());
+        for device in plan.devices() {
             let generation = Arc::new(Generation::new(epoch.generation, std::iter::empty()));
-            let runners = build.runners(device, &model, &mut memory, &generation)?;
-            let executor = Executor::spawn(device, runners, build.events(), build.graph(device)?)?;
+            let runners = plan.runners(
+                *device,
+                Arc::clone(&model),
+                &mut memory,
+                &generation,
+            )?;
+            let executor =
+                Executor::spawn(*device, runners, plan.events(), plan.graph(*device)?)?;
             // §7.3 step 2 shadows a replaced operator beside the serving one, so the region it runs
             // in is mapped before any batch: the executor books it from the scratch pool the graph
             // storage sized. Then §4.5's warmup runs every captured bucket once, so the first
             // request does not pay for a capture. Nothing is serving yet, so the control thread
             // waits here; `serve` never does (§2.4).
-            // A device that cannot map its shadow region or warm up never serves: both are the
-            // same stall bound as any other command, and the process fails its start rather than
-            // serving without them.
             let shadow = executor.set_shadow()?;
-            device_command(&watchdog, device, "shadow region", shadow)
+            device_command(&watchdog, *device, "shadow region", shadow)
                 .with_context(|| format!("mapping the shadow region of device {}", device.0))?;
             let warmup = executor.warmup()?;
-            device_command(&watchdog, device, "warmup", warmup)
+            device_command(&watchdog, *device, "warmup", warmup)
                 .with_context(|| format!("warming up device {}", device.0))?;
             executors.push(executor);
             generations.push(generation);
         }
-        // The executors own the device streams from here on; the blocks and
-        // their memory stay with the process, which outlives every executor.
-        // This node's schedulers, one thread per DP rank, each handing its
-        // batches to the executors above through `executor::Batches` (§2.4,
-        // §4.4). The handle is sched's (M561); a node that holds none keeps an
-        // empty list and serves only what its peers' schedulers ask of it.
-        let schedulers: Vec<engine::SchedulerHandle> = if args.scheduler_node {
-            Vec::new()
-        } else {
-            Vec::new()
-        };
 
+        // This node's schedulers, one thread per DP rank, each handing its batches to the executors
+        // above through `executor::Batches` (§2.4, §4.4). A node that holds none keeps an empty list
+        // and serves only what its peers' schedulers ask of it.
+        let schedulers: Vec<Scheduler> = Vec::new();
 
         Ok(Self {
             control,
@@ -374,7 +378,7 @@ impl MainProcess {
             programs,
             precopy: None,
             generations,
-            targets: build.targets(),
+            targets: plan.targets().to_vec(),
         })
     }
 
@@ -923,6 +927,24 @@ impl MainProcess {
         reply: Option<u32>,
     ) -> Result<()> {
         discard_policy(&mut self.schedulers);
+        // The executors already rebound or recaptured this generation's graphs, and a generation
+        // that never serves must give its captures back (§7.3 step 2): `purge` releases what is
+        // older than the serving generation, which a discarded one is not, so the executor drops it
+        // by name. A device still busy with the capture is answered by the queue's own order.
+        for executor in &self.executors {
+            match executor.discard(generation) {
+                Ok(submission) => {
+                    if let Err(error) =
+                        device_command(&self.watchdog, executor.device(), "discard", submission)
+                    {
+                        tracing::warn!(%error, "discarding a failed generation on a device failed");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "queueing a failed generation's discard failed");
+                }
+            }
+        }
         self.precopy = None;
         if let Err(error) = self.update.precopy_failed(generation, failure.clone()) {
             tracing::error!(%error, "discarding a failed precopy failed");
