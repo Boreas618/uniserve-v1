@@ -37,26 +37,6 @@ pub struct Graphs {
 /// Newest first is what lets a bucket an update did not prepare keep serving: its programs did not
 /// change, so the newest generation that named it is the same program. Smallest within a generation
 /// is the planning rule (4.5): a batch is served by the smallest bucket that holds it.
-/// The entries a purge of `generation` releases, over the table's keys alone.
-///
-/// A capture of `generation` is released only when a **newer** capture of the same bucket exists:
-/// the newer one is what serves from then on, so the older one is what a commit retires. A capture
-/// with no newer sibling is the program its bucket still serves (`served_key` takes the newest at or
-/// below the serving generation), so releasing it would leave the bucket with nothing to answer.
-fn released(keys: &[(Bucket, u64)], generation: u64) -> Vec<(Bucket, u64)> {
-    let serving: Vec<Bucket> = keys
-        .iter()
-        .filter(|(_, captured_generation)| *captured_generation > generation)
-        .map(|(bucket, _)| *bucket)
-        .collect();
-    keys.iter()
-        .filter(|(bucket, captured_generation)| {
-            *captured_generation == generation && serving.contains(bucket)
-        })
-        .copied()
-        .collect()
-}
-
 fn served_key(
     keys: impl Iterator<Item = (Bucket, u64)>,
     generation: u64,
@@ -79,6 +59,26 @@ fn served_key(
         }
     }
     best
+}
+
+/// The entries a purge of `generation` releases, over the table's keys alone.
+///
+/// A capture of `generation` is released only when a **newer** capture of the same bucket exists:
+/// the newer one is what serves from then on, so the older one is what a commit retires. A capture
+/// with no newer sibling is the program its bucket still serves (`served_key` takes the newest at or
+/// below the serving generation), so releasing it would leave the bucket with nothing to answer.
+fn released(keys: &[(Bucket, u64)], generation: u64) -> Vec<(Bucket, u64)> {
+    let serving: Vec<Bucket> = keys
+        .iter()
+        .filter(|(_, captured_generation)| *captured_generation > generation)
+        .map(|(bucket, _)| *bucket)
+        .collect();
+    keys.iter()
+        .filter(|(bucket, captured_generation)| {
+            *captured_generation == generation && serving.contains(bucket)
+        })
+        .copied()
+        .collect()
 }
 
 impl Graphs {
