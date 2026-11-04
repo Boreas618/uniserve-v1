@@ -72,6 +72,23 @@ impl StageAnswer {
 }
 
 
+/// An update's ask that the following step's batches also run in shadow for a
+/// world generation (§7.3 step 2), with the answer that waits for the step which
+/// shadows them.
+///
+/// The ask is kept until it is answered: a refused shadow submission answers it
+/// at once with the executor's reason, and a submitted one answers it when its
+/// step has ended, so an answer never claims a pass that has not run.
+pub(super) struct ShadowPass {
+    /// The world generation whose operators the shadow pass runs.
+    pub(super) generation: u64,
+    /// One of the step's batches was submitted as a shadow: the step that owns
+    /// the answer has begun, and ends before the answer is sent.
+    pub(super) shadowed: bool,
+    /// Where the ask's answer goes, in the shape every stage's answer takes.
+    pub(super) answer: StageAnswer,
+}
+
 impl Scheduler {
     /// Removes a queued media request while preserving FIFO order for its peers.
     fn remove_waiting_media(&mut self, request_id: RequestId) -> Option<PendingMedia> {
@@ -479,6 +496,48 @@ impl Scheduler {
             "the shadow pass of generation {generation} starts when a step submits through \
              executor::Batches; this scheduler still submits its batches to the worker processes"
         ))
+    }
+
+    /// The world generation the following step's batches also run in shadow
+    /// for, if an update asked (§7.3 step 2). The step reads it before it
+    /// submits, since it names the kernels the shadow pass compares against.
+    #[allow(dead_code)]
+    pub(super) fn shadow_generation(&self) -> Option<u64> {
+        self.shadow_pass.as_ref().map(|pass| pass.generation)
+    }
+
+    /// Records that a batch of this step was submitted as a shadow pass: the
+    /// ask is answered when the step ends, so an answer never claims a pass
+    /// that has not run.
+    #[allow(dead_code)]
+    pub(super) fn note_shadowed(&mut self) {
+        if let Some(pass) = self.shadow_pass.as_mut() {
+            pass.shadowed = true;
+        }
+    }
+
+    /// A shadow submission the executor refused: a shadow pass's failure is the
+    /// update's (§7.3 step 2), so the ask is answered with it and the epoch
+    /// serves on.
+    #[allow(dead_code)]
+    pub(super) fn shadow_failed(&mut self, reason: impl Into<String>) {
+        if let Some(pass) = self.shadow_pass.take() {
+            pass.answer.send(Err(reason.into()));
+        }
+    }
+
+    /// Answers an ask whose step has shadowed its batches: the step that owned
+    /// the answer has ended by now, and its number is the boundary the pass ran
+    /// at.
+    pub(super) fn settle_shadow(&mut self) {
+        let shadowed = self.shadow_pass.as_ref().is_some_and(|pass| pass.shadowed);
+        if !shadowed {
+            return;
+        }
+        let step = self.step;
+        if let Some(pass) = self.shadow_pass.take() {
+            pass.answer.send(Ok(handle::StageApplied { step }));
+        }
     }
 
     /// What this scheduler has done and what its policy has cost (§12).
