@@ -8,6 +8,13 @@ use crate::config::TransformerConfig;
 use crate::partition::Partition;
 use crate::{Error, Result};
 
+/// Whether the engine can compose the compression branch of VSA.
+///
+/// False until `vsa_compress_pooled` exists: the reference's branch 3 is a dense masked softmax over
+/// live tiles, and the placeholder in [`Sparse::forward`] is not it. Flipping this to true is part of
+/// the same commit that swaps the call, so the two can never disagree.
+pub const COMPRESSION_COMPOSED: bool = false;
+
 /// One layer's sparse attention: four projections, the tile preparation, and both attentions.
 pub struct Sparse {
     /// The query, key and value projections, `[inner, hidden]` each.
@@ -43,6 +50,8 @@ pub struct Sparse {
 
 impl Sparse {
     /// Read layer `index`'s sparse attention of a DiT partition.
+    ///
+    /// Refuses while [`COMPRESSION_COMPOSED`] is false: see the module documentation.
     pub fn load(
         index: u32,
         config: &TransformerConfig,
@@ -52,6 +61,17 @@ impl Sparse {
         partition: &Partition,
         loader: &mut WeightLoader<'_>,
     ) -> Result<Self> {
+        if !COMPRESSION_COMPOSED {
+            return Err(Error::Unsupported(
+                "H3's VSA compression branch is a dense masked softmax over every live tile \
+                 (uniserve/nn/attention/vsa/segments.py:466-479) and needs the op \
+                 `vsa_compress_pooled` (pooled scores, pooled values and each tile's live size in, \
+                 the rows' dtype out); without it a sparse layer would fold a compression that \
+                 averages only the selected tiles, so a sparse checkpoint is refused rather than \
+                 served as a different model"
+                    .to_owned(),
+            ));
+        }
         let prefix = format!("transformer_blocks.{index}.attn");
         let hidden = u64::from(config.hidden_size);
         let head = u64::from(config.head_dim);
@@ -232,6 +252,11 @@ impl Sparse {
         self.fine
             .forward(f, query, key, value, &tables, scratch.fine)?;
 
+        // PLACEHOLDER for branch 3: the reference's compression is a dense masked softmax over every
+        // *live* tile (`vsa/segments.py:466-473`) and this attends only the selected ones, so it is
+        // not equal to it. Unreachable while `COMPRESSION_COMPOSED` is false; replaced by the
+        // `vsa_compress_pooled` call in the commit that makes it true.
+        //
         // The compression reads one pooled row per tile with the same selection, in FP32, and
         // writes the rows' dtype; the gate then weights it into the fine rows.
         let pooled_tables = SegmentTables {
