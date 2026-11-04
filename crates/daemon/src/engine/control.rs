@@ -356,6 +356,11 @@ impl EngineControl {
             build: proto::BUILD.to_owned(),
             peer: Some(hello::Peer::Engine(process::Engine {
                 deployment: self.deployment.clone(),
+                // This connection asks the daemon's supervisor to start and stop processes; it is
+                // not one itself, so it states no engine number and no interface, and no command is
+                // addressed to it.
+                engine: 0,
+                interface: 0,
             })),
         })?;
         let welcome: process::Welcome = control

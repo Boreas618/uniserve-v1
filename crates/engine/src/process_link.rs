@@ -47,7 +47,9 @@ impl ProcessLink {
     /// Fails when nothing listens there, when the daemon refuses the engine, or
     /// when this process already has a link.
     pub fn connect(address: &str, deployment: &str) -> anyhow::Result<Self> {
-        let processes = processes::ProcessClient::connect(address, deployment)?;
+        // A link states no engine number: it is the engine's own test surface, and the daemons it
+        // is exercised against answer by the connection rather than by a process number.
+        let processes = processes::ProcessClient::connect(address, deployment, 0)?;
         let commands = processes::take_commands().context(
             "this process already reads its daemon's process interface: one link per process",
         )?;
