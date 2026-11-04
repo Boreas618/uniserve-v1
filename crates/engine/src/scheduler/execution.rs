@@ -391,15 +391,48 @@ impl Scheduler {
             .iter()
             .filter_map(|page| views::unit_of(*page))
             .collect();
-        if units.is_empty() {
-            return;
+        if !units.is_empty() {
+            let moved = self.offload_units(&units);
+            if moved < units.len() {
+                tracing::debug!(
+                    asked = units.len(),
+                    moved,
+                    "the host KV cache took fewer pages than the plan offered"
+                );
+            }
         }
-        let moved = self.offload_units(&units);
-        if moved < units.len() {
-            tracing::debug!(
-                asked = units.len(),
-                moved,
-                "the host KV cache took fewer pages than the plan offered"
+        for request in &plan.prefetch {
+            self.prefetch_host(ipc::RequestId(request.0));
+        }
+    }
+
+    /// Deepens one request's host KV cache hit as far as the host holds it.
+    ///
+    /// The device hit cannot grow, so the deepening is the host boundary
+    /// beyond it: asking again after host pages arrive raises the boundary,
+    /// and the answer is recorded so the next dispatch sees what the request
+    /// can reuse. A request the mechanism cannot place, or whose host lookup
+    /// is still in flight, keeps what it had: the plan asked, the cache is not
+    /// ready, and no request is at fault.
+    fn prefetch_host(&mut self, id: ipc::RequestId) {
+        let Some(state) = self.running.get(&id) else {
+            return;
+        };
+        let Some((target, hit)) = self.prefill_target(state) else {
+            return;
+        };
+        let device_hit = hit.cached_tokens.min(state.req.prompt_token_ids.len());
+        if let admission::HostHit::Serving(boundary) = admission::host_prefix(
+            &mut self.kv_offload,
+            state,
+            &target,
+            device_hit,
+            usize::MAX,
+        ) {
+            self.recorder.prefix_hit(
+                scheduling::guest::RequestId(id.0),
+                u32::try_from(device_hit).unwrap_or(u32::MAX),
+                u32::try_from(boundary.saturating_sub(device_hit)).unwrap_or(u32::MAX),
             );
         }
     }
