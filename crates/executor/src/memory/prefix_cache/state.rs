@@ -343,6 +343,48 @@ mod tests {
         Ok(())
     }
 
+    /// A page's blocks are the same list in both directions of a transfer: the export gathers
+    /// these cells into its rows, and the destination scatters the same rows back into its own
+    /// cells. So pages are read in page order, and a page past the table is refused rather than
+    /// wrapped onto another request's units.
+    #[test]
+    fn a_page_runs_its_blocks_in_page_order_and_refuses_a_page_past_its_table() -> Result<()> {
+        use crate::memory::prefix_cache::block_tables::{GroupShape, GroupTable};
+
+        let state = group(2, 1, 2);
+        let plan = crate::memory::prefix_cache::plan::CachePlan {
+            columns: 2,
+            plane_bytes: 16,
+            quantized: false,
+            unit_bytes: 64,
+            dtype: ipc::PrefixCacheDtype::BFloat16,
+            groups: vec![state.clone()],
+            states: Vec::new(),
+            checkpoints: vec![checkpoint(0, 4)],
+        };
+        // Two pages of one unit each, starting at page 3, with the units 5 and 6.
+        let table = GroupTable {
+            shape: GroupShape::new(64, 1, None)?,
+            start_page: 3,
+            units: vec![ipc::UnitId(5), ipc::UnitId(6)],
+            allocated_tokens: 128,
+        };
+        let (rows, runs) = page_runs(&plan, &state, &table, 8, 3, 2)?;
+        // Four planes a page over two fields, twice.
+        assert_eq!(rows, 8);
+        assert_eq!(
+            runs,
+            vec![(0, vec![5, 8 + 5, 6, 8 + 6]), (1, vec![5, 8 + 5, 6, 8 + 6]),]
+        );
+        // A page the table does not hold is a mistake in the caller, not a page of zeros.
+        let past = page_runs(&plan, &state, &table, 8, 5, 1).expect_err("a page past the table");
+        assert!(
+            past.to_string().contains("past its block table"),
+            "the refusal names the table: {past}"
+        );
+        Ok(())
+    }
+
     /// The fields `page_cells` names are exactly the storages the plan asks for: no state plane
     /// reaches past the last one the pool allocates, which is what `state_fields` exists to say.
     #[test]
