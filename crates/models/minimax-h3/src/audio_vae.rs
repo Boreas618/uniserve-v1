@@ -28,6 +28,7 @@
 //! convolutions run through cuDNN without TF32: spec 9 keeps TF32 for the video VAE's FP32 `conv3d`
 //! alone.
 
+use crate::programs::Programs;
 use crate::{AudioVaeConfig, Error, Result};
 use nn::layers::{
     AudioActivation, Conv1d, ConvGeometry, ConvTranspose1d, PcmInterleave, ScaledAdd,
@@ -1006,6 +1007,111 @@ impl AudioDecoder {
         Ok(())
     }
 
+    /// The programs one decode of `config` launches, with no weights and no device.
+    ///
+    /// Every launch goes through the same construction the layer uses: `nn`'s `descriptor_of`
+    /// accessors for the convolutions, the activation and the interleave, and the model's own
+    /// config arithmetic ([`stages`], [`blocks`]) for the shapes they are built at.
+    ///
+    /// The per-row programs — the residual accumulation and the stage's divide — carry their width in
+    /// the descriptor, so they are stated once per stage width and per sample count the deployment
+    /// serves (`buckets`). The per-channel ones do not: a convolution's key is its geometry, and a
+    /// clip of another length replays the compiled program.
+    pub fn programs(config: &AudioVaeConfig, buckets: &[u32]) -> Result<Vec<(String, String)>> {
+        use ops::audio_activation::AudioActivation as AudioActivationOp;
+        use ops::conv::{Conv1d as Conv1dOp, ConvTranspose1d as ConvTranspose1dOp};
+        use ops::pcm::PcmInterleave as PcmInterleaveOp;
+        use ops::residual::ScaledAdd as ScaledAddOp;
+
+        let mut programs = Programs::default();
+        // The decoder computes in FP32 and its convolutions' weights are normalized at load, so every
+        // convolution below reads and writes that one type.
+        let dtype = DType::F32;
+        let decoder_dim = config.decoder_dim;
+        // The channel pairs are the weight's, not the key's: a convolution's descriptor is its
+        // geometry and its element types, so the three opening convolutions are their three kernels.
+        for (kernel, stride, padding) in [
+            // The statistics as a one-by-one convolution, the projection into the latent width, and
+            // the pre-convolution of kernel seven.
+            (1, 1, 0),
+            (1, 1, 0),
+            (7, 1, 3),
+        ] {
+            programs.launch::<Conv1dOp>(&Conv1d::descriptor_of(
+                dtype,
+                dtype,
+                true,
+                dtype,
+                geometry(kernel, stride, padding)?,
+                false,
+            ));
+        }
+
+        let stages = stages(config)?;
+        for stage in &stages {
+            programs.launch::<ConvTranspose1dOp>(&ConvTranspose1d::descriptor_of(
+                dtype,
+                dtype,
+                true,
+                dtype,
+                geometry(stage.kernel, stage.rate, stage.padding)?,
+                false,
+            ));
+        }
+
+        for block in &blocks(config)? {
+            let channels = block.channels;
+            for step in &block.steps {
+                // A step is an activation, a convolution, an activation and a convolution.
+                for padding in [step.padding, (block.kernel - 1) / 2] {
+                    programs.launch::<AudioActivationOp>(&AudioActivation::descriptor_of(
+                        dtype,
+                        channels,
+                        ACTIVATION_KERNEL,
+                        ACTIVATION_RATIO,
+                        ACTIVATION_BLOCK,
+                    ));
+                    programs.launch::<Conv1dOp>(&Conv1d::descriptor_of(
+                        dtype,
+                        dtype,
+                        true,
+                        dtype,
+                        geometry(block.kernel, 1, padding)?,
+                        false,
+                    ));
+                }
+            }
+        }
+
+        let last = stages
+            .last()
+            .map_or(decoder_dim, |stage| stage.channels_out);
+        programs.launch::<AudioActivationOp>(&AudioActivation::descriptor_of(
+            dtype,
+            last,
+            ACTIVATION_KERNEL,
+            ACTIVATION_RATIO,
+            ACTIVATION_BLOCK,
+        ));
+        programs.launch::<Conv1dOp>(&Conv1d::descriptor_of(
+            dtype,
+            dtype,
+            true,
+            dtype,
+            geometry(1, 1, 0)?,
+            false,
+        ));
+        programs.launch::<PcmInterleaveOp>(&PcmInterleave::descriptor_of(dtype)?);
+
+        for bucket in buckets {
+            for stage in &stages {
+                let columns = u64::from(stage.channels_out) * u64::from(*bucket);
+                programs.launch::<ScaledAddOp>(&ScaledAdd.descriptor(dtype, dtype, columns)?);
+            }
+        }
+        Ok(programs.finish())
+    }
+
     /// One stage's output: its three blocks summed and divided by three.
     fn stage(
         &self,
@@ -1429,6 +1535,44 @@ pub(crate) mod tests {
     use super::*;
 
     /// The checkpoint's audio VAE config (`audio_vae/config.json`).
+    /// The decoder states its programs from its own configuration, and the statement is a **set**: a
+    /// convolution's key carries element types only (its geometry travels in the call structure), so
+    /// a kernel-one projection and a kernel-nine filter are one program, while the fused activation
+    /// is one per channel count.
+    #[test]
+    fn the_decoder_states_its_programs_from_its_own_config() {
+        let config = audio_config();
+        let programs = AudioDecoder::programs(&config, &[64, 256]).expect("the decoder's programs");
+        assert!(!programs.is_empty());
+        for (operator, key) in &programs {
+            assert!(!operator.is_empty() && !key.is_empty(), "{operator} {key}");
+        }
+        let count = |operator: &str| {
+            programs
+                .iter()
+                .filter(|(name, _)| name == operator)
+                .count()
+        };
+
+        // One program for every one-dimensional convolution of the decoder, in either direction: the
+        // window, the bias and the stride are launch values.
+        assert_eq!(count("conv1d"), 1);
+        assert_eq!(count("conv_transpose1d"), 1);
+        // The interleave converts two channels whatever the clip's length.
+        assert_eq!(count("pcm_interleave"), 1);
+
+        let stages = stages(&config).expect("the stages");
+        // The fused activation's key is the channel count, so a decoder has one per stage width plus
+        // the post-activation, which repeats the last width and shares its program.
+        assert_eq!(count("audio_activation"), stages.len());
+
+        // A row program carries its width, so the stage sums and the divide are per width and per
+        // sample count — deduplicated where a width and a count collide.
+        let row_programs = count("scaled_add");
+        assert!(row_programs > 0 && row_programs < 2 * stages.len(), "{programs:?}");
+        assert_eq!(programs.len(), count("conv1d") + count("conv_transpose1d") + count("pcm_interleave") + count("audio_activation") + row_programs);
+    }
+
     pub(crate) fn audio_config() -> AudioVaeConfig {
         let sidecar = serde_json::json!({
             "encoder_dim": 64,
