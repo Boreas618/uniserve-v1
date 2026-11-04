@@ -30,6 +30,7 @@ use minimax_h3::checkpoint::{Layout, Sidecars};
 use minimax_h3::config::Config;
 use minimax_h3::denoiser::ConditionEncoders;
 use minimax_h3::load;
+use minimax_h3::load::stored_dtype;
 use minimax_h3::partition::{Component, Components, Partition};
 
 /// The task a deployment serves, by the name its deployment file gives it.
@@ -166,6 +167,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("  {directory}: {} MiB of tensors", bytes / (1 << 20));
                 }
                 Err(error) => println!("  {directory}: not openable here ({error})"),
+            }
+            // `dtype = "auto"` converts nothing, so the element type the deployment loads this
+            // component in is the one its tensors are stored in. Printing it next to the count is
+            // what makes a store list's dtype auditable against the export it will run on.
+            match stored_dtype(&checkpoint, directory) {
+                Ok(dtype) => println!("  {directory}: {dtype}, which is what `auto` loads"),
+                Err(error) => println!("  {directory}: no single representation ({error})"),
             }
         }
         println!("  at most {} MiB of host memory", budget / (1 << 20));
