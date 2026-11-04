@@ -5,14 +5,25 @@
 //! own during a program-layer update; the `Sampler` layer calls them in this order (specs/worker.md
 //! 9, "采样"):
 //!
-//! 1. `logits_shape` applies the request's penalties and divides by its temperature.
+//! 1. `logits_shape` applies the request's penalties and divides by its temperature. **A row whose
+//!    temperature is zero divides by one**, not by zero: `uniserve/sampling/select.py:443` states
+//!    the rule ("a zero temperature divides by one; callers select those rows by argmax"), and without
+//!    it every greedy request would be shaped into `inf` and `nan` logits. The shaped row is then the
+//!    penalized logits themselves, so the row's largest candidate is its greedy token.
 //! 2. `top_k` keeps the `width` largest logits of each row, sorted, with the vocabulary id of each.
 //! 3. `filter_candidates` applies the row's top-k width, its nucleus threshold and its min-p
 //!    threshold, and reports whether the row's candidates form a usable distribution.
 //! 4. `softmax` over the candidates (the shared operator in [`crate::norm`]).
-//! 5. `inverse_cdf` draws one token per row from one uniform draw, ordering the candidates by
-//!    vocabulary id so a draw is deterministic for a fixed random value.
-//! 6. `argmax` picks the largest candidate for a row without a positive temperature.
+//! 5. `inverse_cdf` draws one token per row from one uniform draw, inverting the row's cumulative
+//!    distribution **in the candidate order it was given** — descending logit order, the order
+//!    `top_k` and `filter_candidates` leave behind (see [`InverseCdfArgs::probabilities`]). The order
+//!    is not rearranged by vocabulary id: `uniserve/sampling/categorical.py` inverts the CDF in the
+//!    order it receives, and a rearrangement would make the same draw select a different token than
+//!    the reference for the same probabilities.
+//! 6. `argmax` picks the largest candidate, which is a row's greedy token: with the divide-by-one
+//!    rule the shaped row keeps the logits' order, so its largest candidate is the token a sampling
+//!    path would pick at temperature zero — the reference resolves those rows this way rather than
+//!    through a draw.
 //! 7. `log_softmax` and `logprob_gather` report the log-probability of the tokens the caller asks
 //!    for.
 //!
