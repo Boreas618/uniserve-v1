@@ -24,7 +24,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Strides, TensorView};
+use crate::tensor::{DType, TensorView};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -130,16 +130,9 @@ impl Op for CrossFade {
                 ),
             ));
         }
-        if args.out.strides != Strides::row_major(args.out.shape) {
-            return Err(Error::argument(
-                Self::NAME,
-                format!(
-                    "the output is written row-major; found strides {}",
-                    args.out.strides
-                ),
-            ));
-        }
-
+        // The same rule as `unpatchify_video`'s, and stated once: `tensor::row_writable`. `out` may
+        // still alias `current` — every element is read before the position it lives at is written.
+        let out_strides = crate::tensor::row_writable(&args.out, Self::NAME)?;
         let mut arguments = Arguments::new();
         arguments
             .view(args.previous)
@@ -172,6 +165,35 @@ impl Op for CrossFade {
                 Error::argument(
                     Self::NAME,
                     format!("{} columns do not fit a kernel parameter", dims[3]),
+                )
+            })?)
+            // The destination's outer strides: one row is written contiguously and its base is
+            // addressed with these, which is what lets a tile land inside a larger raster.
+            .u32(u32::try_from(out_strides[0]).map_err(|_| {
+                Error::argument(
+                    Self::NAME,
+                    format!(
+                        "the tile's channel stride {} does not fit a kernel parameter",
+                        out_strides[0]
+                    ),
+                )
+            })?)
+            .u32(u32::try_from(out_strides[1]).map_err(|_| {
+                Error::argument(
+                    Self::NAME,
+                    format!(
+                        "the tile's frame stride {} does not fit a kernel parameter",
+                        out_strides[1]
+                    ),
+                )
+            })?)
+            .u32(u32::try_from(out_strides[2]).map_err(|_| {
+                Error::argument(
+                    Self::NAME,
+                    format!(
+                        "the tile's row stride {} does not fit a kernel parameter",
+                        out_strides[2]
+                    ),
                 )
             })?)
             .u32(descriptor.block)

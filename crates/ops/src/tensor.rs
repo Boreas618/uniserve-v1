@@ -383,6 +383,48 @@ impl fmt::Debug for Strides {
     }
 }
 
+/// Check that `out` can be written one row at a time, and answer its outer strides.
+///
+/// A decoder writes each tile into its own sub-region of one bigger raster, so a destination is a
+/// strided block by construction. What a row-at-a-time write needs of it, and no more: the innermost
+/// axis is unit-strided — so a row is written contiguously and the inner loop vectorizes — and no two
+/// rows overlap, so each outer stride is at least the sweep of the axes inside it. A transposed
+/// destination is refused: nobody synthesizes one, and allowing it would put a gather in the inner
+/// loop for no caller.
+///
+/// The outer strides are answered in axis order (`[channel, frame, row]` for a four-axis raster) so
+/// the operator can pass them as launch parameters; the innermost stride is 1 by the rule and never
+/// travels.
+pub fn row_writable(out: &TensorView, op: &'static str) -> Result<[u64; MAX_RANK]> {
+    let strides = out.strides.as_slice();
+    let mut outer = [0_u64; MAX_RANK];
+    if strides.last() != Some(&1) {
+        return Err(Error::argument(
+            op,
+            format!(
+                "a destination written a row at a time must be unit-strided along its last axis; \
+                 found strides {:?}",
+                out.strides
+            ),
+        ));
+    }
+    for axis in (0..strides.len() - 1).rev() {
+        let inner = out.shape.dim(axis + 1) * strides[axis + 1];
+        if strides[axis] < inner {
+            return Err(Error::argument(
+                op,
+                format!(
+                    "axis {axis} of the destination advances by {} but its inner axes span {inner}: \
+                     the rows would overlap",
+                    strides[axis]
+                ),
+            ));
+        }
+    }
+    outer[..strides.len() - 1].copy_from_slice(&strides[..strides.len() - 1]);
+    Ok(outer)
+}
+
 /// A borrowed view of device memory: an address, an element type, extents and element strides.
 ///
 /// The address is the first element; a kernel indexes from it with the strides, so a view of a
@@ -538,5 +580,47 @@ impl fmt::Debug for TensorView {
             .field("shape", &self.shape)
             .field("strides", &self.strides)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn view(shape: &[u64], strides: &[u64]) -> TensorView {
+        TensorView {
+            ptr: DevicePtr::new(0x1000),
+            dtype: DType::BF16,
+            shape: Shape::new(shape),
+            strides: Strides::new(strides),
+        }
+    }
+
+    #[test]
+    fn a_row_major_destination_is_writable_and_so_is_a_block_of_a_bigger_one() {
+        // A contiguous `[2, 3, 8, 16]` raster: the outer strides are the row-major ones.
+        let contiguous = &[384, 128, 16, 1];
+        assert_eq!(
+            row_writable(&view(&[2, 3, 8, 16], contiguous), "test").unwrap()[..3],
+            [384, 128, 16]
+        );
+
+        // The same tile placed at an origin inside a `[2, 6, 64, 128]` parent: the parent's strides
+        // are the tile's, and only the base address moved — which is exactly the decoder's case.
+        let placed = &[49152, 8192, 128, 1];
+        assert_eq!(
+            row_writable(&view(&[2, 3, 8, 16], placed), "test").unwrap()[..3],
+            [49152, 8192, 128]
+        );
+    }
+
+    #[test]
+    fn a_transposed_or_overlapping_destination_is_refused() {
+        // The last axis is not unit-strided: a row would be a gather, and no caller synthesizes one.
+        assert!(row_writable(&view(&[2, 3, 8, 16], &[384, 128, 1, 8]), "test").is_err());
+        // The rows overlap: the row stride is shorter than a row.
+        assert!(row_writable(&view(&[2, 3, 8, 16], &[384, 128, 8, 1]), "test").is_err());
+        // The planes overlap, which a row-size check alone would miss.
+        assert!(row_writable(&view(&[2, 3, 8, 16], &[384, 64, 16, 1]), "test").is_err());
     }
 }
