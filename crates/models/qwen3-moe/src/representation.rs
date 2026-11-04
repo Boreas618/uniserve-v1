@@ -46,8 +46,12 @@ pub enum Representation {
     /// `F8_E4M3`), `.weight_scale_2` (one tensor scale) and `.input_scale` (the calibration's
     /// activation scale), except for the modules `excluded` names.
     Nvfp4 {
-        /// The modules the calibration left in their source dtype, as the checkpoint writes them.
+        /// The modules the calibration left in their source dtype, as `config.json` writes them.
         excluded: Vec<String>,
+        /// The same list as the export's own file writes it, when it wrote one. The two need not be
+        /// equal — they list different module classes — but a parameter they disagree about is a
+        /// checkpoint no single reading is right for, and [`Representation::adopts`] refuses it.
+        also_excluded: Vec<String>,
     },
 }
 
@@ -63,18 +67,24 @@ impl Representation {
             (None, None) => Ok(Self::Dense),
             (Some(declared), None) | (None, Some(declared)) => Self::from_fields(&declared),
             (Some(config), Some(side)) => {
-                if config.algorithm != side.algorithm || config.excluded != side.excluded {
+                if config.algorithm != side.algorithm {
                     return Err(Error::Config(format!(
                         "the checkpoint declares two different quantizations: `config.json` says \
-                         {} excluding {} modules and `{DECLARATION_FILE}` says {} excluding {}; a \
-                         checkpoint written by two tools is one neither of them owns",
-                        config.algorithm,
-                        config.excluded.len(),
-                        side.algorithm,
-                        side.excluded.len(),
+                         {} and `{DECLARATION_FILE}` says {}; a checkpoint written by two tools is \
+                         one neither of them owns",
+                        config.algorithm, side.algorithm,
                     )));
                 }
-                Self::from_fields(&config)
+                // The two exclusion lists need not be identical: a compressed-tensors block lists \
+                // what *it* would quantize (its `targets`) while ModelOpt lists every module it \
+                // left alone, so the lists differ in names that are not projections at all. What \
+                // must not differ is a parameter's fate, and that is decided per parameter in \
+                // `adopts`, where the caller states the role.
+                Self::from_fields(&Declared {
+                    excluded: config.excluded,
+                    also_excluded: side.excluded,
+                    ..config
+                })
             }
         }
     }
@@ -91,12 +101,41 @@ impl Representation {
     /// `weight` as a matrix, or silently keeping it dense — produces a model that runs and measures
     /// nothing.
     pub fn adopts(&self, parameter: &str, role: Role) -> Result<Adopted> {
-        let Self::Nvfp4 { excluded } = self else {
+        let Self::Nvfp4 {
+            excluded,
+            also_excluded,
+        } = self
+        else {
             return Ok(Adopted::Source);
         };
         let excluded_here = excluded
             .iter()
             .any(|module| matches_module(module, parameter));
+        // The two files' lists may differ in names neither of them quantizes, but a parameter they
+        // disagree about is a checkpoint no single reading is right for.
+        if !also_excluded.is_empty()
+            && also_excluded
+                .iter()
+                .any(|module| matches_module(module, parameter))
+                != excluded_here
+        {
+            return Err(Error::Config(format!(
+                "the checkpoint's two declarations disagree about `{parameter}`: `config.json` \
+                 {} it and `{DECLARATION_FILE}` {} it, and a packed tensor read as dense is a \
+                 matrix of E2M1",
+                if excluded_here { "excludes" } else { "quantizes" },
+                if excluded_here { "quantizes" } else { "excludes" },
+            )));
+        }
+        // A calibration quantizes a *module class* — ModelOpt's NVFP4 packs `Linear` and nothing
+        // else — so a role outside that class is source by its class, not by being listed: the
+        // checkpoint whose declaration this loader reads lists no norm and no vocabulary matrix, and
+        // its shards carry them in BF16. The router is a `Linear` in the checkpoint's own module
+        // tree, which is exactly why it has to be named in the exclusion list and why a calibration
+        // that forgot to name it is a fact worth refusing rather than a nuisance.
+        if !LinearClass::covers(role) {
+            return Ok(Adopted::Source);
+        }
         match (role, excluded_here) {
             (_, true) => Ok(Adopted::Source),
             (Role::Projection, false) => Ok(Adopted::Quantized),
@@ -129,6 +168,7 @@ impl Representation {
                 }
                 Ok(Self::Nvfp4 {
                     excluded: declared.excluded.clone(),
+                    also_excluded: declared.also_excluded.clone(),
                 })
             }
             other => Err(Error::Config(format!(
@@ -187,6 +227,22 @@ pub fn parameters(config: &Config) -> Vec<(String, Role)> {
     parameters
 }
 
+/// The module class an NVFP4 calibration packs, and the roles that fall in it.
+///
+/// The checkpoint's own module tree is the authority: `mlp.gate` and every projection are `Linear`,
+/// the norms and the vocabulary matrices are not. The `Role` split follows that tree, so this is the
+/// one place that decides what a calibration's statement can even be about.
+struct LinearClass;
+
+impl LinearClass {
+    fn covers(role: Role) -> bool {
+        match role {
+            Role::Projection | Role::Router => true,
+            Role::Embedding | Role::Head | Role::Norm => false,
+        }
+    }
+}
+
 /// A parameter's role, which decides whether a quantized form of it is served.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
@@ -233,6 +289,8 @@ struct Declared {
     method: Option<String>,
     /// The modules the calibration left in their source dtype.
     excluded: Vec<String>,
+    /// The other file's list, when both files state one; empty when only one file does.
+    also_excluded: Vec<String>,
 }
 
 /// The declaration inside `config.json`, when it states one.
@@ -311,12 +369,109 @@ impl Declared {
                 )));
             }
         };
+        // The compressed-tensors spelling states the same quantization as a group instead of an
+        // algorithm name: `config_groups.group_0.weights` carries the bits, the kind and the block.
+        let (algorithm, group_excluded) = match string("quant_algo")? {
+            Some(algorithm) => (algorithm, Vec::new()),
+            None => match value.get("config_groups") {
+                Some(groups) => {
+                    let algorithm = group_algorithm(groups, what)?;
+                    let ignored = match value.get("ignore") {
+                        None | Some(Value::Null) => Vec::new(),
+                        Some(Value::Array(items)) => items
+                            .iter()
+                            .map(|item| {
+                                item.as_str().map(str::to_owned).ok_or_else(|| {
+                                    Error::Config(format!(
+                                        "{what} lists {item} among its ignored modules, and a name \
+                                         is expected"
+                                    ))
+                                })
+                            })
+                            .collect::<Result<Vec<_>>>()?,
+                        Some(other) => {
+                            return Err(Error::Config(format!(
+                                "{what} states `ignore` as {other}, and a list of names is expected"
+                            )));
+                        }
+                    };
+                    (algorithm, ignored)
+                }
+                None => (String::new(), Vec::new()),
+            },
+        };
+        if !group_excluded.is_empty() && !excluded.is_empty() {
+            return Err(Error::Config(format!(
+                "{what} states both `ignore` and `exclude_modules`, and a file that says the same \
+                 thing twice in two spellings is one this loader cannot trust"
+            )));
+        }
         Ok(Self {
-            algorithm: string("quant_algo")?.unwrap_or_default(),
+            algorithm,
+            // The compressed-tensors spelling is written by ModelOpt's own exporter, so it carries
+            // no method of its own; the group it states is what pins the spelling (see below).
             method: string("quant_method")?.or(producer_method(value)),
-            excluded,
+            also_excluded: Vec::new(),
+            excluded: if excluded.is_empty() { group_excluded } else { excluded },
         })
     }
+}
+
+/// The algorithm a compressed-tensors `config_groups` block states, refused when this tree does not
+/// serve it.
+///
+/// The block names a bit width, a kind and a block size, and those three *are* the algorithm: four
+/// bits of E2M1 over a block of sixteen with an F8_E4M3 block scale is NVFP4, and any other triple is
+/// a quantization whose tensors this loader would read under names that mean something else. The
+/// group's `targets` matter too: this tree quantizes linear projections, so a calibration that
+/// targets another class states a checkpoint whose packing this model cannot follow.
+fn group_algorithm(groups: &Value, what: &str) -> Result<String> {
+    let groups = groups.as_object().ok_or_else(|| {
+        Error::Config(format!(
+            "{what} states `config_groups` as {groups}, and an object of groups is expected"
+        ))
+    })?;
+    let mut algorithm: Option<String> = None;
+    for (name, group) in groups {
+        let weights = group.get("weights").ok_or_else(|| {
+            Error::Config(format!("{what}'s group `{name}` states no `weights`"))
+        })?;
+        let bits = weights.get("num_bits").and_then(Value::as_u64);
+        let kind = weights.get("type").and_then(Value::as_str);
+        let block = weights.get("group_size").and_then(Value::as_u64);
+        let this = match (bits, kind, block) {
+            (Some(4), Some("float"), Some(16)) => "NVFP4",
+            (bits, kind, block) => {
+                return Err(Error::Config(format!(
+                    "{what}'s group `{name}` states {bits:?} bits of {kind:?} over a block of \
+                     {block:?}, and this tree serves NVFP4: four bits of E2M1 over a block of \
+                     sixteen with an F8_E4M3 scale. Reading another quantization under those names \
+                     would read its storage as a matrix"
+                )));
+            }
+        };
+        match group.get("targets") {
+            None => {}
+            Some(Value::Array(targets))
+                if targets.iter().all(|target| target.as_str() == Some("Linear")) => {}
+            Some(other) => {
+                return Err(Error::Config(format!(
+                    "{what}'s group `{name}` targets {other}, and this tree quantizes linear \
+                     projections: a calibration that quantizes another module class states a \
+                     checkpoint whose packing the model cannot follow"
+                )));
+            }
+        }
+        if let Some(previous) = &algorithm
+            && previous != this
+        {
+            return Err(Error::Config(format!(
+                "{what} states two quantizations at once, `{previous}` and `{this}`"
+            )));
+        }
+        algorithm = Some(this.to_owned());
+    }
+    algorithm.ok_or_else(|| Error::Config(format!("{what}'s `config_groups` is empty")))
 }
 
 /// The producing tool, when the export names one instead of a method: ModelOpt writes
@@ -506,18 +661,139 @@ mod tests {
         assert_eq!(
             Representation::read(&dir).unwrap(),
             Representation::Nvfp4 {
-                excluded: vec!["lm_head".to_owned()]
+                excluded: vec!["lm_head".to_owned()],
+                also_excluded: Vec::new(),
             }
         );
 
+        // A different algorithm is a different checkpoint, and no reading resolves it.
         std::fs::write(
             dir.join("config.json"),
-            r#"{"quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4",
-                "exclude_modules": ["lm_head", "model.layers.0.mlp.gate"]}}"#,
+            r#"{"quantization_config": {"quant_method": "modelopt", "quant_algo": "FP8"}}"#,
         )
         .unwrap();
         let refused = Representation::read(&dir).expect_err("two different declarations");
         assert!(format!("{refused}").contains("two different quantizations"), "{refused}");
+    }
+
+    #[test]
+    fn two_files_that_disagree_about_a_projection_refuse_that_projection_and_no_other() {
+        let dir = tempdir();
+        // The two lists differ where it does not matter — a name neither file quantizes — and agree
+        // where it does: `mlp.gate` is excluded by both, the projections by neither.
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4",
+                "exclude_modules": ["model.layers.0.mlp.gate"]}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(DECLARATION_FILE),
+            r#"{"quantization": {"quant_algo": "NVFP4",
+                "exclude_modules": ["model.layers.0.mlp.gate", "lm_head"]}}"#,
+        )
+        .unwrap();
+        let representation = Representation::read(&dir).expect("a consistent declaration");
+        assert_eq!(
+            representation
+                .adopts("model.layers.0.self_attn.q_proj.weight", Role::Projection)
+                .expect("a packed projection"),
+            Adopted::Quantized
+        );
+        assert_eq!(
+            representation
+                .adopts("model.layers.0.mlp.gate.weight", Role::Router)
+                .expect("an excluded router"),
+            Adopted::Source
+        );
+
+        // Now the one disagreement that matters: a projection one file packs and the other does not.
+        std::fs::write(
+            dir.join(DECLARATION_FILE),
+            r#"{"quantization": {"quant_algo": "NVFP4",
+                "exclude_modules": ["model.layers.0.mlp.gate", "model.layers.0.self_attn.q_proj"]}}"#,
+        )
+        .unwrap();
+        let representation = Representation::read(&dir).expect("the algorithm still agrees");
+        let refused = representation
+            .adopts("model.layers.0.self_attn.q_proj.weight", Role::Projection)
+            .expect_err("a projection the two files disagree about");
+        let message = format!("{refused}");
+        assert!(message.contains("disagree about"), "{message}");
+        assert!(message.contains("q_proj"), "{message}");
+        // A parameter they agree about is still answered normally.
+        assert_eq!(
+            representation
+                .adopts("model.layers.3.self_attn.o_proj.weight", Role::Projection)
+                .expect("a projection both files pack"),
+            Adopted::Quantized
+        );
+    }
+
+    #[test]
+    fn the_calibrated_checkpoints_compressed_tensors_block_is_read_as_nvfp4() {
+        // The shape `Qwen3-30B-A3B-NVFP4`'s `config.json` states: the calibration as a group (bits,
+        // kind, block, target class) rather than as an algorithm name, and its excluded modules under
+        // `ignore`. Written by ModelOpt's compressed-tensors exporter, so the block is the whole
+        // statement and the side file's `producer` is the method.
+        let dir = tempdir();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"quantization_config": {
+                "config_groups": {"group_0": {
+                    "input_activations": {"dynamic": false, "num_bits": 4, "type": "float",
+                                          "group_size": 16},
+                    "weights": {"dynamic": false, "num_bits": 4, "type": "float",
+                                "group_size": 16},
+                    "targets": ["Linear"]}},
+                "ignore": ["model.layers.0.mlp.gate", "model.layers.1.mlp.gate"]}}"#,
+        )
+        .unwrap();
+        let representation = Representation::read(&dir).expect("the calibrated declaration");
+        assert!(representation.is_encoded());
+        assert_eq!(
+            representation
+                .adopts("model.layers.0.self_attn.q_proj.weight", Role::Projection)
+                .expect("a packed projection"),
+            Adopted::Quantized
+        );
+        assert_eq!(
+            representation
+                .adopts("model.layers.0.mlp.experts.7.down_proj.weight", Role::Projection)
+                .expect("a packed expert projection"),
+            Adopted::Quantized
+        );
+        assert_eq!(
+            representation
+                .adopts("model.layers.0.mlp.gate.weight", Role::Router)
+                .expect("the router is ignored by name"),
+            Adopted::Source
+        );
+        assert_eq!(
+            representation
+                .adopts("model.embed_tokens.weight", Role::Embedding)
+                .expect("the vocabulary matrix is not a linear projection"),
+            Adopted::Source
+        );
+
+        // The block *is* the algorithm: four bits of a float over sixteen is NVFP4, and another
+        // triple is a packing whose tensors these names would misread.
+        for (bits, kind, block) in [(8, "float", 16), (4, "int", 16), (4, "float", 32)] {
+            std::fs::write(
+                dir.join("config.json"),
+                format!(
+                    r#"{{"quantization_config": {{
+                        "config_groups": {{"group_0": {{
+                            "weights": {{"num_bits": {bits}, "type": "{kind}",
+                                         "group_size": {block}}},
+                            "targets": ["Linear"]}}}}}}}}"#
+                ),
+            )
+            .unwrap();
+            let refused = Representation::read(&dir).expect_err("an unserved packing");
+            let message = format!("{refused}");
+            assert!(message.contains("this tree serves NVFP4"), "{message}");
+        }
     }
 
     /// A directory under the system's temporary root, removed when the test ends.
