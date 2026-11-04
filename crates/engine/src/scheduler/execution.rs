@@ -418,9 +418,22 @@ impl Scheduler {
             }
         };
         let live = self.live();
-        if let Err(error) = mechanism::validate_victims(&shortage, &victims, &live) {
-            let _ = self.policy_failed(policy, error);
-            return;
+        match mechanism::validate_victims(&shortage, &victims, &live) {
+            Ok(()) => {}
+            Err(mechanism::VictimError::Invalid(error)) => {
+                let _ = self.policy_failed(policy, error);
+                return;
+            }
+            Err(mechanism::VictimError::Vanished(message)) => {
+                // Nothing of this step can free a page or end a request between
+                // the observation the policy answered from and this call, so a
+                // victim that is gone means the mechanism let go of it without
+                // recording that it did: an invariant of its own, never the
+                // policy's decision (§4.4's taxonomy).
+                self.policy = Some(policy);
+                self.invariant_broken(&message);
+                return;
+            }
         }
         self.policy = Some(policy);
         for victim in &victims {
@@ -777,6 +790,14 @@ impl Scheduler {
         for phase in views::phases(&self.info) {
             live.phases.insert(phase.id, phase);
         }
+        // What the policy was told is the recorder's own account of it: the
+        // snapshot it was instantiated with, plus every page, encoder entry and
+        // request announced since, less what it was told is gone. A reclaim is
+        // judged against that, not against the mechanism's table, which may
+        // have moved on since the policy last heard.
+        live.told_pages = std::borrow::Cow::Borrowed(self.recorder.announced_pages());
+        live.told_encodings = std::borrow::Cow::Borrowed(self.recorder.announced_encodings());
+        live.told_requests = std::borrow::Cow::Borrowed(self.recorder.announced_requests());
         live
     }
 
