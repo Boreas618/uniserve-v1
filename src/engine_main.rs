@@ -1853,13 +1853,10 @@ fn report_of(status: &ProgramStatus) -> Option<proto::process::Report> {
             reason: reason.clone(),
             fatal: *fatal,
         }),
-        // A probation failure is a fault the main process observed, and the revert that follows
-        // states the generation it left (§7.3 step 4).
-        ProgramStatus::Failed { failure, .. } => Kind::Fault(proto::process::Fault {
-            kind: "probation".to_owned(),
-            reason: failure.reason(),
-            device: 0,
-        }),
+        // A probation failure is not a fault of the device: the revert that follows it states the
+        // generation it left and the first error, so reporting it twice would name a device the
+        // failure did not happen on (§7.3 step 4).
+        ProgramStatus::Failed { .. } => return None,
     };
     Some(proto::process::Report { kind: Some(kind) })
 }
