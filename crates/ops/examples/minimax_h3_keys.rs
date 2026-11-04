@@ -9,6 +9,23 @@
 //! The output is `notes/programs/minimax-h3-keys.txt`: what a kernel program must package for
 //! `crates/models/minimax-h3`, so no package has to guess a variant.
 //!
+//! ## Regenerating the list, and its second opinion
+//!
+//! The list and the check that reads it back are one recipe, because a list regenerated without its
+//! check is a list nobody has asked whether it is complete:
+//!
+//! ```text
+//! cargo run -q -p ops --example minimax_h3_keys > notes/programs/minimax-h3-keys.txt
+//! .venv/bin/python crates/models/minimax-h3/tools/check_encoder_manifests.py \
+//!     --against notes/programs/minimax-h3-keys.txt
+//! ```
+//!
+//! The second command is a host-side set difference in one direction only: it asks whether every key
+//! the encoders' descriptor calls name is in the list, and names the ones that are not. Rows the
+//! encoders do not call belong to other stages and are not failures. It also states how many calls
+//! it could express, so a green cannot be read as complete coverage of a stage whose field sets the
+//! tool does not model.
+//!
 //! ## Where the numbers come from
 //!
 //! Every geometry below is the checkpoint's, read from
