@@ -138,11 +138,33 @@ pub fn load(
                     crate::video_vae::TILE_PIXELS / spatial,
                     crate::video_vae::TILE_PIXELS / spatial,
                 );
+                // The clip's rows are packed in the attention's order, so the decoder needs it at
+                // load. It is the denoisers' and it must be one: two partitions that attend
+                // differently would pack one clip two ways, and one table can only gather one.
+                let mut kinds = config.denoisers.values().map(|dit| dit.attention);
+                let attention = kinds.next().ok_or_else(|| {
+                    Error::checkpoint(
+                        "the checkpoint states no DiT, so no attention kind packs the video \
+                         decoder's clip rows"
+                            .to_owned(),
+                    )
+                })?;
+                if kinds.any(|kind| kind != attention) {
+                    return Err(Error::Unsupported(format!(
+                        "the {} block gathers a clip's rows in the denoisers' attention order, and \
+                         this checkpoint's DiT partitions attend differently",
+                        component.name()
+                    )));
+                }
                 // A VAE directory holds both halves; the decoder reads its own keys from it.
                 let source = checkpoint.component(component.directories()[0])?;
                 let mut shards = loader.reborrow(source)?;
-                let decoder =
-                    crate::video_vae::VideoDecoder::load(&config.video_vae, canvas, &mut shards)?;
+                let decoder = crate::video_vae::VideoDecoder::load(
+                    &config.video_vae,
+                    canvas,
+                    attention,
+                    &mut shards,
+                )?;
                 Block::Decoder(Box::new(decoder))
             }
             Component::LatentEncoder => {

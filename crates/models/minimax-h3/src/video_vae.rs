@@ -479,6 +479,10 @@ struct Layer {
 /// which is what `Rotary::apply`'s absent gains express.
 pub struct VideoDecoder {
     canvas: Canvas,
+    /// How the denoiser that produced this clip's latents attends. The clip's rows are packed in that
+    /// attention's order, so the table that gathers them is keyed by it - a property of the deployment,
+    /// stated once at load, not of a request.
+    packing: AttentionKind,
     /// The tile stitch: the unpatchify and one compiled blend per seam width, built at load so that no
     /// layer is built on a request's path.
     stitch: crate::decoding::ClipDecoder,
@@ -666,6 +670,7 @@ impl VideoDecoder {
     pub fn load(
         config: &VideoVaeConfig,
         canvas: Canvas,
+        attention: AttentionKind,
         loader: &mut WeightLoader,
     ) -> Result<Self> {
         let width = config.decoder_num_attention_heads * config.decoder_attention_head_dim;
@@ -807,6 +812,7 @@ impl VideoDecoder {
         .sectioned(Sections::new(&sections)?)?;
         Ok(Self {
             canvas,
+            packing: attention,
             stitch,
             width,
             input,
@@ -941,24 +947,19 @@ impl VideoDecoder {
     /// The layout's tables, keyed by the extents the layout states.
     ///
     /// This is the shape the capability protocol asks for; a request's own state is none of it.
-    pub fn layout_tables(
-        &self,
-        layout: &nn::capability::Layout,
-        attention: AttentionKind,
-    ) -> Result<Vec<StateTable>> {
+    pub fn layout_tables(&self, layout: &nn::capability::Layout) -> Result<Vec<StateTable>> {
         let video = layout.video;
-        self.tables(attention, video.frames, video.height, video.width)
+        self.tables(self.packing, video.frames, video.height, video.width)
     }
 
     /// Write the layout's table bytes, in [`Self::layout_tables`]' order.
     pub fn prepare_layout(
         &self,
         layout: &nn::capability::Layout,
-        attention: AttentionKind,
         out: &mut [Vec<u8>],
     ) -> Result<()> {
         let video = layout.video;
-        self.table_bytes(attention, video.frames, video.height, video.width, out)
+        self.table_bytes(self.packing, video.frames, video.height, video.width, out)
     }
 
     /// Decode one clip's latent rows into the pixel block of every token.
