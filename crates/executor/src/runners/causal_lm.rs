@@ -862,10 +862,11 @@ pub trait KvProvider: Send + Sync {
 
 /// A causal language model's runner: one block's decode and prefill phases.
 pub struct CausalLmRunner<M: CausalLm> {
-    /// The buckets whose graph launched kernels and recorded no node table, so a rebind has no
-    /// node to address. A capture records it (the sink is the only source of the table) and a
-    /// programme update that would rebind one of these buckets is refused by name in `precopy`.
-    unannotated: std::collections::BTreeSet<Bucket>,
+    /// The `(generation, bucket)` pairs whose graph launched kernels and recorded no node table, so
+    /// a rebind has no node to address there. A capture records it (the sink is the only source of
+    /// the table); a programme update that would rebind a bucket of the **serving** generation is
+    /// refused by name in `precopy`, and a discarded or purged generation's entries go with it.
+    unannotated: std::collections::BTreeSet<(u64, Bucket)>,
     /// The executor's name for this runner.
     id: RunnerId,
     /// The phases it serves, in scheduler order.
@@ -1188,7 +1189,14 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 changed.push((operator, key.to_owned()));
             }
         }
-        if !changed.is_empty() && !self.unannotated.is_empty() {
+        let serving = self.generation.number();
+        let unannotated: Vec<Bucket> = self
+            .unannotated
+            .iter()
+            .filter(|(generation, _)| *generation == serving)
+            .map(|(_, bucket)| *bucket)
+            .collect();
+        if !changed.is_empty() && !unannotated.is_empty() {
             // A rebind needs a graph node to set the new kernel's parameters on. A bucket whose
             // capture reported no node table has none, so the update would quietly do nothing:
             // every batch would keep launching the old kernel while the generation claimed the new
@@ -1196,7 +1204,7 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
             return Err(Error::Invariant(format!(
                 "the serving graphs of buckets {:?} recorded no node table, so the {} changed \
                  kernel(s) cannot be rebound onto them: the operator launches are not annotated",
-                self.unannotated.iter().collect::<Vec<_>>(),
+                unannotated,
                 changed.len()
             )));
         }
@@ -1332,7 +1340,9 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         }
         // A prepared generation that never served: its graphs go, then their arena regions where
         // no other generation holds the bucket, in `Captured`'s order. The serving generation and
-        // probation's old one are keyed separately and are not touched.
+        // probation's old one are keyed separately and are not touched. What the capture recorded
+        // about that generation's annotation goes with it.
+        self.unannotated.retain(|(captured, _)| *captured != generation);
         let dropped = self.graphs.discard(generation);
         let dropped_count = dropped.len();
         for bucket in dropped
@@ -1368,6 +1378,7 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         // region released under a live executable would be reused by the next generation's
         // capture while the old graph still addressed it. Exactly this generation's graphs go - a
         // released generation may be numbered either side of the serving one.
+        self.unannotated.retain(|(captured, _)| *captured != generation);
         let dropped = self.graphs.purge(generation);
         let dropped_count = dropped.len();
         let mut released = 0u64;
@@ -1484,7 +1495,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// (4.5). The forward executes nothing while it is captured.
     fn capture(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
         let kernels = self.generation_named(generation)?;
-        let walked = self.walk_capture(bucket, &kernels)?;
+        let walked = self.walk_capture(bucket, generation, &kernels)?;
         let held = hold_kernels(&kernels, &walked.nodes)?;
         let captured = Captured::new(walked.template, walked.nodes, held)?;
         self.graphs.insert(bucket, generation, captured);
@@ -1496,6 +1507,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
     fn walk_capture(
         &mut self,
         bucket: Bucket,
+        generation: u64,
         kernels: &Arc<ops::Generation>,
     ) -> Result<Walked> {
         let stream = self.stream.clone();
@@ -1531,7 +1543,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             .filter(|node| matches!(node.kind(), Ok(platform::GraphNodeKind::Kernel)))
             .count();
         if nodes.is_empty() && launched > 0 {
-            self.unannotated.insert(bucket);
+            self.unannotated.insert((generation, bucket));
             tracing::error!(
                 %bucket,
                 launched,
@@ -1539,7 +1551,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
                  needs to rebind this bucket will be refused"
             );
         } else {
-            self.unannotated.remove(&bucket);
+            self.unannotated.remove(&(generation, bucket));
         }
         Ok(Walked { template, nodes })
     }
@@ -1561,7 +1573,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 "no graph of bucket {bucket} in generation {current}"
             )));
         }
-        let walked = self.walk_capture(bucket, &kernels)?;
+        let walked = self.walk_capture(bucket, self.generation.number(), &kernels)?;
         let served = self.graphs.captured(bucket, current).ok_or_else(|| {
             Error::Invariant(format!("no graph of bucket {bucket} in generation {current}"))
         })?;
