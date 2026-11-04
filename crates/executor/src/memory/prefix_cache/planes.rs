@@ -45,7 +45,7 @@ use crate::memory::retained::{
     ExclusiveSpec, ExclusiveStorage, Retained, SegmentPart, SegmentedSpec,
 };
 use crate::stream::{Issue, RowFill};
-use crate::tensor::{Backing, DType, MemoryKind};
+use crate::tensor::{Backing, DType};
 use crate::{Error, Result};
 
 /// The two K/V fields, in storage order.

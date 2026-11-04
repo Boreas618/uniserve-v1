@@ -13,11 +13,9 @@
 //! that hold it, laid out in the rank's own pages by a copy manifest
 //! ([`restore`]).
 
-mod host;
-mod pages;
+pub mod host;
+pub mod pages;
 pub(crate) mod restore;
 mod storage;
 
-pub(crate) use host::{BankPages, LatentHostPool, WHOLE_IMAGE};
-pub(crate) use pages::{LatentExport, LatentImport, LatentPool, LatentUpdate, TrajectoryVersion};
 pub use storage::{LatentPlan, LatentStorage};

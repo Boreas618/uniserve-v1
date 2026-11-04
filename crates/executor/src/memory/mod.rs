@@ -20,7 +20,6 @@ pub mod request_slots;
 pub mod retained;
 
 pub use latent::LatentPlan;
-pub(crate) use prefix_cache::block_tables::AttentionRow;
 pub use prefix_cache::block_tables::{
     BlockTableStorage, BlockTableUpdate, BlockTables, GroupShape, GroupTable,
 };
