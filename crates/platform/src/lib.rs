@@ -65,7 +65,8 @@ pub use cublas::{
     MatrixLayout,
 };
 pub use cudnn::{
-    Convolution, ConvolutionArgs, ConvolutionBytes, ConvolutionPlan, Cudnn, Engine, Tensor,
+    Convolution, ConvolutionArgs, ConvolutionBytes, ConvolutionKind, ConvolutionPlan, Cudnn,
+    Engine, Tensor,
 };
 pub use device::{
     Device, DeviceAttribute, DeviceId, DeviceUuid, MemoryInfo, profiler_start, profiler_stop,
