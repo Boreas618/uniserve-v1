@@ -59,6 +59,12 @@ pub enum Group {
     AudioCondition = 3,
 }
 
+/// The VAE's spatial compression: one latent cell per `16 x 16` output pixels.
+pub const LATENT_COMPRESSION: u32 = 16;
+
+/// The DiT's patch side in latent cells: one token per `2 x 2` patch of a latent frame.
+pub const PATCH_SIDE: u32 = 2;
+
 /// The `(height, width)` latent raster of a canvas.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct LatentRaster {
@@ -69,15 +75,19 @@ pub struct LatentRaster {
 }
 
 impl LatentRaster {
-    /// Patch rows of one latent frame: one row per 2x2 patch.
+    /// Patch rows of one latent frame: one row per [`PATCH_SIDE`]-square patch.
     pub fn patch_rows(&self) -> u32 {
-        (self.height / 2) * (self.width / 2)
+        (self.height / PATCH_SIDE) * (self.width / PATCH_SIDE)
     }
 }
 
 /// The `(time, height, width)` token grid of `frames` latent frames of a latent raster.
 pub fn video_grid(frames: u32, raster: LatentRaster) -> (u32, u32, u32) {
-    (frames, raster.height / 2, raster.width / 2)
+    (
+        frames,
+        raster.height / PATCH_SIDE,
+        raster.width / PATCH_SIDE,
+    )
 }
 
 /// The latent raster of a canvas whose sides are multiples of the VAE's patch grid.
@@ -91,8 +101,8 @@ pub fn latent_raster(canvas: &Canvas) -> Result<LatentRaster> {
         )));
     }
     Ok(LatentRaster {
-        height: canvas.height / 16,
-        width: canvas.width / 16,
+        height: canvas.height / LATENT_COMPRESSION,
+        width: canvas.width / LATENT_COMPRESSION,
     })
 }
 
@@ -1363,9 +1373,11 @@ mod tests {
             // A count that already has the form is its own answer.
             assert_eq!(align_num_frames(frames), frames);
         }
-        // Shorter than one clip is one clip.
-        assert_eq!(align_num_frames(1), 22);
-        assert_eq!(align_num_frames(22), 22);
+        // Shorter than one clip is one clip: `CLIP_FRAMES` of body plus the `CLIP_LATENTS` carried
+        // over is the shortest count the pipeline generates.
+        let shortest = CLIP_FRAMES + CLIP_LATENTS;
+        assert_eq!(align_num_frames(1), shortest);
+        assert_eq!(align_num_frames(shortest), shortest);
     }
 
     #[test]
@@ -1375,7 +1387,11 @@ mod tests {
                 video_latent_frames(frames).expect("a legal frame count"),
                 latents
             );
-            assert_eq!(latents, (frames - 5) / 17 * 5 + 2);
+            // Each whole clip contributes `CLIP_LATENTS`, and the pipeline carries two more.
+            assert_eq!(
+                latents,
+                (frames - CLIP_LATENTS) / CLIP_FRAMES * CLIP_LATENTS + 2
+            );
         }
         for illegal in [21_u32, 100, 0] {
             assert!(video_latent_frames(illegal).is_err(), "{illegal}");
@@ -1387,18 +1403,31 @@ mod tests {
         for (frames, latents) in [(107, 178), (124, 207), (192, 320), (362, 603)] {
             assert_eq!(audio_latent_frames(frames), latents);
             assert_eq!(audio_rows(frames), 2 * latents);
-            assert_eq!(audio_samples(frames), latents * 800);
+            // One `AUDIO_HOP` of samples per audio latent step.
+            assert_eq!(audio_samples(frames), latents * AUDIO_HOP);
         }
     }
 
     #[test]
     fn the_latent_raster_is_the_canvas_over_the_vaes_compression() {
-        let raster = latent_raster(&canvas()).expect("a legal canvas");
-        assert_eq!((raster.height, raster.width), (48, 84));
-        assert_eq!(raster.patch_rows(), 24 * 42);
-        let framed = video_grid(37, raster);
-        assert_eq!(framed, (37, 24, 42));
-        assert_eq!(framed.0 * framed.1 * framed.2, 37 * 1008);
+        let raster_canvas = canvas();
+        let raster = latent_raster(&raster_canvas).expect("a legal canvas");
+        // The raster is the canvas over the VAE's compression, and its patch grid the raster over
+        // the DiT's patch side.
+        let (rows, columns) = (
+            raster_canvas.height / LATENT_COMPRESSION,
+            raster_canvas.width / LATENT_COMPRESSION,
+        );
+        assert_eq!((raster.height, raster.width), (rows, columns));
+        let (patched_rows, patched_columns) = (rows / PATCH_SIDE, columns / PATCH_SIDE);
+        assert_eq!(raster.patch_rows(), patched_rows * patched_columns);
+        let latents = 37;
+        let framed = video_grid(latents, raster);
+        assert_eq!(framed, (latents, patched_rows, patched_columns));
+        assert_eq!(
+            framed.0 * framed.1 * framed.2,
+            latents * patched_rows * patched_columns
+        );
 
         let off_grid = Canvas {
             width: 1340,
