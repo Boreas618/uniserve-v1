@@ -139,8 +139,13 @@ def swizzled_offsets(rows, scale_columns):
     )
 
 
-def decode(values, scales, rows, columns, layout):
-    """The module's bytes as an FP64 tile: each code times its block's scale."""
+def decode(values, scales, token_scale, rows, columns, layout):
+    """The module's bytes as an FP64 tile: each code times its block's scale and its row's factor.
+
+    Encoding is two-level: the block's E4M3 scale is relative to the row's per-token factor, so a
+    code dequantizes to `code * block_scale * token_scale[row]`. Both come from the module's own
+    buffers, which is the point of this stage: a wrong factor shows up as a wrong tile.
+    """
     scale_columns = columns // BLOCK_ELEMENTS
     table_codes = e2m1_table().to(values.device)
     table_scales = e4m3_table().to(values.device)
@@ -157,7 +162,8 @@ def decode(values, scales, rows, columns, layout):
     decoded = torch.zeros(rows, columns, dtype=torch.float64, device=values.device)
     decoded[:, 0::2] = table_codes[low]
     decoded[:, 1::2] = table_codes[high]
-    return decoded * block_scales.repeat_interleave(BLOCK_ELEMENTS, dim=1)
+    factor = token_scale.to(torch.float64).reshape(rows, 1)
+    return decoded * block_scales.repeat_interleave(BLOCK_ELEMENTS, dim=1) * factor
 
 
 def half_step(unit):
@@ -288,13 +294,17 @@ def stage_producer(module, rows, columns, block, layout, global_scale, seed):
 
     # The global scale is a device operand: one FP32 element, as the operator passes it.
     scale = torch.tensor([global_scale], dtype=torch.float32, device="cuda")
-    module.launch((rows * (columns // block), 1, 1), source, values, scales, rows, scale)
+    # One program per row: the row's factor is a reduction over the row.
+    token_scale = torch.zeros(rows, dtype=torch.float32, device="cuda")
+    module.launch((rows, 1, 1), source, values, scales, rows, scale, token_scale)
 
-    decoded = decode(values, scales, rows, columns, layout)
+    decoded = decode(values, scales, token_scale, rows, columns, layout)
     exact = source.to(torch.float64)
     # The unit each element was encoded in: the scale the module wrote for its
     # block. Recovered from the buffer, so a wrong scale shows up here.
-    scale_of_element = _scale_per_element(values, scales, rows, columns, layout)
+    scale_of_element = _scale_per_element(values, scales, rows, columns, layout) * token_scale.to(
+        torch.float64
+    ).reshape(rows, 1)
     unit = torch.where(scale_of_element != 0, exact / scale_of_element, torch.zeros_like(exact))
     bound = half_step(unit) * scale_of_element.abs()
 
@@ -315,7 +325,7 @@ def stage_producer(module, rows, columns, block, layout, global_scale, seed):
             f"decoded {decoded[row, column].item():.6e} "
             f"step {bound[row, column].item():.6e}"
         )
-    return values, scales, outside
+    return values, scales, token_scale, outside
 
 
 def _scale_per_element(values, scales, rows, columns, layout):
@@ -335,7 +345,7 @@ def _scale_per_element(values, scales, rows, columns, layout):
     return block_scales.repeat_interleave(BLOCK_ELEMENTS, dim=1)
 
 
-def stage_consumer(module, values, scales, rows, columns, layout, seed):
+def stage_consumer(module, values, scales, token_scale, rows, columns, layout, seed):
     """Stage 2: the module's codes and scales in FP64 and on the device, the same bytes.
 
     The activation codes and their scales are the producer's own output buffers;
@@ -361,7 +371,9 @@ def stage_consumer(module, values, scales, rows, columns, layout, seed):
     scale_table = e4m3_table().to("cuda")
     decoded_a = _decode_codes(values, rows, k, codes)
     decoded_b = _decode_codes(weights, n, k, codes)
-    activation_scales = _scale_per_element(values, scales, rows, columns, layout)[:, 0:k:BLOCK_ELEMENTS]
+    activation_scales = _scale_per_element(values, scales, rows, columns, layout)[
+        :, 0:k:BLOCK_ELEMENTS
+    ] * token_scale.to(torch.float64).reshape(rows, 1)
     weight_scales = _atom_scales(scale_table, weight_scale_bytes, n, scale_columns)
 
     exact = torch.matmul(
@@ -465,7 +477,7 @@ def main():
 
     module = QuantizeModule(arguments.quantize)
     print(f"quantize module: {arguments.quantize} (entry {module.name}, layout {layout})")
-    values, scales, outside = stage_producer(
+    values, scales, token_scale, outside = stage_producer(
         module, arguments.rows, arguments.columns, arguments.block, layout,
         arguments.global_scale, arguments.seed,
     )
@@ -481,7 +493,14 @@ def main():
         # the codes are the producer's own bytes: the consumer contracts what
         # the producer wrote, not a re-packing done here.
         failures += stage_consumer(
-            gemm, values, scales, arguments.rows, arguments.columns, layout, arguments.seed
+            gemm,
+            values,
+            scales,
+            token_scale,
+            arguments.rows,
+            arguments.columns,
+            layout,
+            arguments.seed,
         )
     print(
         "PASS" if failures == 0
