@@ -10,8 +10,9 @@ scores[head, i, j] = Σ_w pooled_query[head, i, w] · pooled_key[head, j, w]
 
 There is no scale and no softmax: the caller applies both afterwards — the selection only compares,
 and the attention scales its own products — so a program writes the raw sum of products and nothing
-else. The operands are read in the descriptor's element type and the products accumulate in FP32,
-which is the operator's tolerance: the standard bound for a ``width``-term contraction.
+else. Both operands are FP32 — the type ``vsa_prepare_tiles`` pools a tile's per-head means in —
+and the products accumulate in FP32, which is the operator's tolerance: the standard bound for a
+``width``-term contraction.
 
 A program is one (head, query tile): it holds the query row in registers and walks the key tiles a
 tile of them at a time, so every key row is read once per query tile and the scores of a row are

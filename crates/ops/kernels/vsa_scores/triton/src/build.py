@@ -7,13 +7,16 @@ dimensions give, and the compilation options.
 `width` is the contraction and `block` the lanes it uses, so both are compiled; `heads` sizes no
 tile — a program is one head and the grid carries the count — and it is in the key because the
 scores' layout and the tolerance's reduction length are the operator's, not this package's choice.
+There is no element-type dimension: both operands are FP32, the type `vsa_prepare_tiles` pools in.
 """
 
 import _compile
 import vsa_scores as kernels
 
-#: The element types the pooled rows are stored in; the products accumulate in FP32.
-DTYPES = {"bf16": "bf16", "f16": "fp16", "f32": "fp32"}
+#: The pooled rows are FP32 by construction — `vsa_prepare_tiles` pools each tile's per-head means
+#: as the accumulation its pooling runs in — so the operand type is the operator's, not a
+#: descriptor field, and the products accumulate in FP32 over a `width`-term contraction.
+POOLED = "fp32"
 
 
 def warps_of(block):
@@ -27,8 +30,8 @@ def spec(fields, parameters, target):
     return {
         "kernel": kernels._vsa_scores_kernel,
         "signature": {
-            "query_ptr": "*" + DTYPES[fields["dtype"]],
-            "key_ptr": "*" + DTYPES[fields["dtype"]],
+            "query_ptr": "*" + POOLED,
+            "key_ptr": "*" + POOLED,
             "out_ptr": "*fp32",
             "query_tiles": "i32",
             "key_tiles": "i32",

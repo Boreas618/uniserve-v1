@@ -59,12 +59,13 @@ def load_kernel(package):
     return module
 
 
-def run(module, *, dtype, heads, width, block, query_tiles, key_tiles, seed=23):
+def run(module, *, heads, width, block, query_tiles, key_tiles, seed=23):
     """Contract one pair of pooled tilings and compare with the operator's product."""
     torch.manual_seed(seed)
-    element = {"bf16": torch.bfloat16, "f16": torch.float16, "f32": torch.float32}[dtype]
-    query = torch.randn(heads, query_tiles, width, dtype=element)
-    key = torch.randn(heads, key_tiles, width, dtype=element)
+    # Both operands are FP32: that is the type `vsa_prepare_tiles` pools a tile's per-head means
+    # in, and the operator refuses anything else, so there is no element type to vary here.
+    query = torch.randn(heads, query_tiles, width, dtype=torch.float32)
+    key = torch.randn(heads, key_tiles, width, dtype=torch.float32)
     out = torch.full((heads, query_tiles, key_tiles), float("nan"), dtype=torch.float32)
 
     module._vsa_scores_kernel[(query_tiles, heads, 1)](
@@ -92,7 +93,7 @@ def run(module, *, dtype, heads, width, block, query_tiles, key_tiles, seed=23):
     if violations:
         position = int(((error > allowed) | torch.isnan(out)).reshape(-1).nonzero()[0])
         raise SystemExit(
-            f"{dtype} heads {heads} width {width} block {block} "
+            f"heads {heads} width {width} block {block} "
             f"{query_tiles}x{key_tiles} tiles: {violations} of {out.numel()} scores outside the "
             f"bound ({unset} never written); first at {position}: "
             f"{float(out.reshape(-1)[position])} vs {float(expected.reshape(-1)[position])}, "
@@ -115,17 +116,11 @@ def main():
     module = load_kernel(options.package)
 
     checked = 0
-    # The fixture's cell, then the two masks: a key count that is not a multiple of the 16-tile
+    # The fixture's cell, then the two edges: a key count that is not a multiple of the 16-tile
     # step, and a contraction narrower than the block of lanes.
-    checked += run(
-        module, dtype="bf16", heads=2, width=128, block=128, query_tiles=3, key_tiles=7
-    )
-    checked += run(
-        module, dtype="f16", heads=3, width=64, block=128, query_tiles=2, key_tiles=5
-    )
-    checked += run(
-        module, dtype="f32", heads=1, width=32, block=128, query_tiles=4, key_tiles=20
-    )
+    checked += run(module, heads=2, width=128, block=128, query_tiles=3, key_tiles=7)
+    checked += run(module, heads=3, width=64, block=128, query_tiles=2, key_tiles=5)
+    checked += run(module, heads=1, width=32, block=128, query_tiles=4, key_tiles=20)
     print(f"ok: {checked} scores within the contraction's bound, both masks exercised")
     return 0
 
