@@ -1,5 +1,5 @@
 //! One epoch switch: the phases that move a deployment's main processes from
-//! the serving epoch to a target one (`specs/worker.md` §7.4, §7.3).
+//! the serving epoch to a target one (`specs/worker.md` §7.4, §7.3, §2.5).
 //!
 //! The switch is driven by events the node roster delivers and by the
 //! operator's commit or rollback; every phase ends on an acknowledgement a
@@ -10,30 +10,31 @@
 //! commanded down its own connection (`Serve`). The roster behind those verbs
 //! is the caller's; this module owns the order.
 //!
-//! Sequence (§7.4, as front publishes it):
+//! The target takes the standby path, in front's order (§7.4):
 //!
-//! 1. **Precopy.** Each node claims the target world's storage — scopes
-//!    included, since a claim ends the world's retention of every other scope
-//!    — and starts the target executable at a later generation of the same
-//!    group and rank. The child's own `Hello` states the build it runs: the
-//!    daemon's own executable's is known up front, another executable's is
-//!    fixed by its first child and every other child must report the same.
-//!    The epoch is ready when every node's target reports `Precopied`, parked
-//!    on its storage; `PrecopyFailed` drops it and leaves serving alone.
-//! 2. **Switchover.** Every parked target is promoted in place (`Promote`) and
-//!    answers `Switched`; then the target's record is published as on
-//!    probation, the frontend is told to serve the target epoch and resubmit
-//!    the kept facts, and the old epoch's main processes are drained. The
-//!    pause is measured from the switchover's first command to the last
-//!    drained epoch. From the frontend's `Serve` on, a dead target is not a
-//!    drop: the previous epoch must admit and serve again.
-//! 3. **Probation.** A failure the target reports, or a target process that
-//!    exits, reverts.
-//! 4. **Commit** records the target as serving once it acknowledges,
-//!    commands `Stop` of the old generation and retires the previous world's
-//!    storage; **revert** acknowledges, serves the previous epoch again,
-//!    stops the target generation, records it purged and marks the target
-//!    configuration unavailable, so applying it again needs `force`.
+//! 1. **Preparing.** Every node starts the target executable at the next
+//!    generation of the serving group and rank, then claims the target
+//!    world's storage for the node's scopes. The child parks on its storage
+//!    and reports `Parked { generation }`; the daemon numbers nothing — the
+//!    child's number is authoritative and is the generation the switch
+//!    commands from then on. The child's own `Hello` states the build it
+//!    runs: the daemon's own executable's build is known up front, another
+//!    executable's is fixed by its first child and every other child must
+//!    report the same.
+//! 2. **Promoting.** Every parked child is promoted in place (`Promote`) and
+//!    answers `Promoted { generation }`.
+//! 3. **Serving.** The record says serving, the frontend is told to serve the
+//!    target epoch and resubmit the kept facts, and the previous epoch's main
+//!    processes are drained. The pause is measured from the first promote to
+//!    the last drained epoch. From the frontend's `Serve` on, a dead target is
+//!    not a drop: the previous epoch must admit and serve again.
+//! 4. **Probation**, recorded once the drain completed: a failure the target
+//!    reports, or a target process that exits, reverts.
+//! 5. **Commit** records the target as serving once it acknowledges, stops
+//!    the old generation and purges and retires the previous world; **revert**
+//!    acknowledges, serves the previous epoch again, stops the target
+//!    generation, records it purged and marks the target configuration
+//!    unavailable, so applying it again needs `force`.
 //!
 //! A world dropped before the switchover is kept in [`Switch::discarded`] and
 //! passed in the next claim's `retire`: storage ends only through a claim,
@@ -123,6 +124,12 @@ pub(crate) trait Roster {
     fn command(&mut self, host: &str, generation: u64, command: process::Command);
     /// Commands the frontend to serve `epoch` from `requests`.
     fn serve(&mut self, epoch: u64, requests: &str);
+    /// Makes the previous epoch's main process of `generation` on `host`
+    /// admit again after its drain. Exec settles whether the wire for that is
+    /// `Revert` or `Pause { paused: false }` (§2.3, §7.4); this method is
+    /// where that answer lands, so the switch states only that the epoch
+    /// must admit again.
+    fn resume(&mut self, host: &str, generation: u64, reason: &str);
     /// Takes the events that arrived since the last call.
     fn events(&mut self) -> Vec<Event>;
 }
@@ -130,12 +137,12 @@ pub(crate) trait Roster {
 /// Where a switch is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
-    /// The target's main processes start as parked standbys.
-    Precopy,
-    /// The parked targets are promoted in place and answer `Switched`.
+    /// The target's main processes start and park on their claimed storage.
+    Preparing,
+    /// The parked targets are promoted in place and answer `Promoted`.
     Promoting,
     /// The target serves and the old epoch's main processes are drained.
-    Draining,
+    Serving,
     /// The target serves on trial.
     Probation,
     /// The operator committed; the target acknowledges.
@@ -152,8 +159,18 @@ pub(crate) enum Phase {
 pub(crate) struct Switch {
     epochs: Arc<Epochs>,
     update: Update,
+    /// The target epoch's number, which the record is kept under.
     target: u64,
+    /// The previous epoch's number, which `Serve` and `Drain` name.
     previous: u64,
+    /// The launch generation the target's children are started at: the
+    /// serving generation's next one.
+    spawn_generation: u64,
+    /// The previous epoch's launch generation.
+    previous_generation: u64,
+    /// The target's generation as its child reported it: authoritative, and
+    /// `None` until the first report.
+    generation: Option<u64>,
     /// The target epoch's record, whose status the switch advances.
     record: EpochRecord,
     /// The worker group every main process of the deployment is in.
@@ -170,11 +187,19 @@ pub(crate) struct Switch {
     parked: BTreeSet<String>,
     promoted: BTreeSet<String>,
     drained: BTreeSet<String>,
+    /// Hosts whose main process of the previous epoch exited during the
+    /// switch: their epoch is replaced before it can serve again.
+    previous_dead: BTreeSet<String>,
+    /// Hosts whose previous-epoch main process reported serving again.
+    serving: BTreeSet<String>,
+    /// A restore waiting for the previous epoch to be replaced before the
+    /// frontend is served it.
+    pending_restore: Option<Failure>,
     committed: BTreeSet<String>,
     reverted: BTreeSet<String>,
     failure: Option<Failure>,
     /// Where the switchover began and how long its pause took: from its first
-    /// command to the last drained epoch.
+    /// promote to the last drained epoch.
     switchover_started: Option<Instant>,
     pause: Option<Duration>,
     /// Whether a serving main process of the previous epoch exited during the
@@ -184,7 +209,9 @@ pub(crate) struct Switch {
 }
 
 impl Switch {
-    /// A switch of `previous` to the epoch `target`, whose record is `record`.
+    /// A switch of epoch `previous` (launch generation `previous_generation`)
+    /// to epoch `target`, whose record is `record`. The target is started one
+    /// generation after the serving one; its own report is authoritative.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         epochs: Arc<Epochs>,
@@ -192,6 +219,7 @@ impl Switch {
         target: u64,
         record: EpochRecord,
         previous: u64,
+        previous_generation: u64,
         group: String,
         nodes: Vec<Node>,
         start: Start,
@@ -205,17 +233,23 @@ impl Switch {
             update,
             target,
             previous,
+            spawn_generation: previous_generation + 1,
+            previous_generation,
+            generation: None,
             record,
             group,
             nodes,
             start: start.clone(),
             build: start.build,
             requests,
-            phase: Phase::Precopy,
+            phase: Phase::Preparing,
             retire: Vec::new(),
             parked: BTreeSet::new(),
             promoted: BTreeSet::new(),
             drained: BTreeSet::new(),
+            previous_dead: BTreeSet::new(),
+            serving: BTreeSet::new(),
+            pending_restore: None,
             committed: BTreeSet::new(),
             reverted: BTreeSet::new(),
             failure: None,
@@ -240,6 +274,11 @@ impl Switch {
         &self.record
     }
 
+    /// The target's generation as its child reported it, once one did.
+    pub(crate) fn generation(&self) -> Option<u64> {
+        self.generation
+    }
+
     /// Why the update failed, when it did.
     pub(crate) fn failure(&self) -> Option<&Failure> {
         self.failure.as_ref()
@@ -262,9 +301,50 @@ impl Switch {
         self.promotion_due
     }
 
-    /// Starts the precopy: every node claims the target world's storage, then
-    /// starts the target's main process at the target generation.
+    /// The generation the target's main processes run at: its own reported
+    /// number once one reported, the generation it was spawned at before.
+    fn target_generation(&self) -> u64 {
+        self.generation.unwrap_or(self.spawn_generation)
+    }
+
+    /// Whether `generation` names a main process of the target epoch: any
+    /// generation from the one the switch spawned on, since a promoted or
+    /// relaunched child reports the next one.
+    fn is_target(&self, generation: u64) -> bool {
+        generation >= self.spawn_generation
+    }
+
+    /// Whether `generation` names a main process of the previous epoch.
+    fn is_previous(&self, generation: u64) -> bool {
+        generation >= self.previous_generation && !self.is_target(generation)
+    }
+
+    /// Starts the precopy: every node starts the target's main process, then
+    /// claims the target world's storage before the child maps it.
     pub(crate) fn start(&mut self, roster: &mut impl Roster) {
+        for node in &self.nodes {
+            let spawn = Spawn {
+                host: node.host.clone(),
+                group: self.group.clone(),
+                rank: node.rank,
+                generation: self.spawn_generation,
+                executable: self.start.executable.clone(),
+                arguments: self.start.arguments.clone(),
+                environment: self.start.environment.clone(),
+                inherit: Vec::new(),
+            };
+            if let Err(reason) = roster.spawn(spawn) {
+                self.failed(
+                    roster,
+                    Failure {
+                        kind: "spawn_failed".to_owned(),
+                        reason,
+                        device: None,
+                    },
+                );
+                return;
+            }
+        }
         let retire = std::mem::take(&mut self.retire);
         for node in &self.nodes {
             if let Err(reason) = roster.claim(
@@ -285,29 +365,6 @@ impl Switch {
                 return;
             }
         }
-        for node in &self.nodes {
-            let spawn = Spawn {
-                host: node.host.clone(),
-                group: self.group.clone(),
-                rank: node.rank,
-                generation: self.target,
-                executable: self.start.executable.clone(),
-                arguments: self.start.arguments.clone(),
-                environment: self.start.environment.clone(),
-                inherit: Vec::new(),
-            };
-            if let Err(reason) = roster.spawn(spawn) {
-                self.failed(
-                    roster,
-                    Failure {
-                        kind: "spawn_failed".to_owned(),
-                        reason,
-                        device: None,
-                    },
-                );
-                return;
-            }
-        }
     }
 
     /// Takes the roster's events and advances the switch as they and the
@@ -319,29 +376,53 @@ impl Switch {
         self.progress(roster);
     }
 
-    /// The target of `generation` on `host` is parked on its storage and ready
-    /// for the switchover (`Report::Precopied`). Whether that report is the
-    /// standby's own readiness or a separate `Parked` report is the caller's
-    /// mapping; this input is the one line.
+    /// The target's main process of `generation` on `host` parked on its
+    /// storage and is ready to be promoted (`Report::Parked`). The caller's
+    /// mapping from the wire is the one line; this input is the phase's.
     pub(crate) fn parked(&mut self, roster: &mut impl Roster, host: &str, generation: u64) {
-        if self.phase != Phase::Precopy || generation != self.target {
+        if self.phase != Phase::Preparing || !self.accept(roster, host, generation) {
             return;
         }
         self.parked.insert(host.to_owned());
         self.progress(roster);
     }
 
-    /// The epoch `epoch` finished draining: it admits nothing and the facts of
-    /// its requests are kept for the epoch the frontend is to serve. Whether
-    /// the frontend or the old epoch's main processes report it is the
-    /// caller's mapping.
-    pub(crate) fn drained(&mut self, roster: &mut impl Roster, epoch: u64) {
-        if self.phase != Phase::Draining || epoch != self.previous {
+    /// The target's main process of `generation` on `host` is promoted and
+    /// serves in place (`Report::Promoted`).
+    pub(crate) fn promoted(&mut self, roster: &mut impl Roster, host: &str, generation: u64) {
+        if self.phase != Phase::Promoting || !self.accept(roster, host, generation) {
             return;
         }
-        self.drained
-            .extend(self.nodes.iter().map(|node| node.host.clone()));
+        self.promoted.insert(host.to_owned());
         self.progress(roster);
+    }
+
+    /// The epoch `epoch` finished draining: it admits nothing and the facts of
+    /// its requests are kept for the epoch the frontend serves. Whether the
+    /// frontend or the old epoch's main processes report it is the caller's
+    /// mapping.
+    pub(crate) fn drained(&mut self, roster: &mut impl Roster, host: &str, epoch: u64) {
+        if self.phase != Phase::Serving || epoch != self.previous {
+            return;
+        }
+        self.drained.insert(host.to_owned());
+        self.progress(roster);
+    }
+
+    /// The main process of `generation` on `host` serves again after being
+    /// replaced: a restore that waited for the previous epoch can now serve
+    /// it.
+    pub(crate) fn serving(&mut self, roster: &mut impl Roster, host: &str, generation: u64) {
+        if self.pending_restore.is_none() || generation < self.previous_generation {
+            return;
+        }
+        self.previous_generation = self.previous_generation.max(generation);
+        self.serving.insert(host.to_owned());
+        if self.previous_dead.is_subset(&self.serving)
+            && let Some(failure) = self.pending_restore.take()
+        {
+            self.finish_restore(roster, &failure.reason);
+        }
     }
 
     /// The operator commits: the target serves from now on and the previous
@@ -351,10 +432,11 @@ impl Switch {
             return;
         }
         self.phase = Phase::Committing;
+        let generation = self.target_generation();
         for node in &self.nodes {
             roster.command(
                 &node.host,
-                self.target,
+                generation,
                 command(process::command::Kind::Commit(process::Commit {})),
             );
         }
@@ -363,35 +445,52 @@ impl Switch {
     /// The operator rolls back, or the probation did: the previous epoch
     /// serves again and the target is dropped.
     pub(crate) fn revert(&mut self, roster: &mut impl Roster, reason: String) {
+        let failure = Failure {
+            kind: "reverted".to_owned(),
+            reason,
+            device: None,
+        };
         match self.phase {
-            Phase::Probation => {
-                let failure = Failure {
-                    kind: "reverted".to_owned(),
-                    reason: reason.clone(),
-                    device: None,
-                };
-                self.reverting(roster, failure);
-            }
+            Phase::Probation => self.reverting(roster, failure),
             // The switchover happened and the frontend serves the target:
             // the previous epoch must admit and serve again.
-            Phase::Draining => {
-                let failure = Failure {
-                    kind: "reverted".to_owned(),
-                    reason,
-                    device: None,
-                };
-                self.restore(roster, failure);
-            }
-            Phase::Precopy | Phase::Promoting => {
-                let failure = Failure {
-                    kind: "reverted".to_owned(),
-                    reason,
-                    device: None,
-                };
-                self.failed(roster, failure);
-            }
+            Phase::Serving => self.restore(roster, failure),
+            Phase::Preparing | Phase::Promoting => self.failed(roster, failure),
             Phase::Committing | Phase::Reverting | Phase::Purged | Phase::Abandoned => {}
         }
+    }
+
+    /// Accepts `generation` as a target main process's, or refuses the node:
+    /// the child numbers the generation it prepared, so any number from the
+    /// one the switch spawned on names this epoch, and the highest reported
+    /// is the epoch's current generation. A lower number is another epoch's.
+    fn accept(&mut self, roster: &mut impl Roster, host: &str, generation: u64) -> bool {
+        if generation < self.spawn_generation {
+            self.refuse(roster, host, generation);
+            return false;
+        }
+        if self.generation.is_none_or(|recorded| generation > recorded) {
+            self.generation = Some(generation);
+        }
+        true
+    }
+
+    /// Stops a node's target whose report names an older generation, and
+    /// drops the target epoch.
+    fn refuse(&mut self, roster: &mut impl Roster, host: &str, generation: u64) {
+        roster.stop(host, &self.group, Some(generation));
+        self.failed(
+            roster,
+            Failure {
+                kind: "generation_mismatch".to_owned(),
+                reason: format!(
+                    "the main process on {host} reported generation {generation}, older than the \
+                 generation {} the target was spawned at",
+                    self.spawn_generation
+                ),
+                device: None,
+            },
+        );
     }
 
     /// The scopes a claim keeps: the node's own `(group, rank)`, which the
@@ -412,8 +511,9 @@ impl Switch {
         self.record.status = Status::Purged;
         self.epochs.record(self.target, self.record.clone());
         self.update.revert();
+        let generation = self.target_generation();
         for node in &self.nodes {
-            roster.stop(&node.host, &self.group, Some(self.target));
+            roster.stop(&node.host, &self.group, Some(generation));
         }
         self.phase = Phase::Abandoned;
     }
@@ -424,10 +524,11 @@ impl Switch {
         self.update.fail(failure.clone());
         self.failure = Some(failure.clone());
         self.phase = Phase::Reverting;
+        let generation = self.target_generation();
         for node in &self.nodes {
             roster.command(
                 &node.host,
-                self.target,
+                generation,
                 command(process::command::Kind::Revert(process::Revert {
                     reason: failure.reason.clone(),
                 })),
@@ -436,21 +537,33 @@ impl Switch {
     }
 
     /// Returns to the previous epoch after the frontend was told the target
-    /// serves: the previous epoch's main processes admit again, the frontend
-    /// serves it, and the target is stopped and retired.
-    ///
-    /// The surviving epoch is brought out of its drain with `Revert` ("the
-    /// reverse of the switchover"). If exec settles on `Pause { paused:
-    /// false }` as the un-drain, [`Switch::resume`] is the one line.
+    /// serves: the previous epoch admits again, the frontend serves it, and
+    /// the target is stopped and retired.
     fn restore(&mut self, roster: &mut impl Roster, failure: Failure) {
         self.update.fail(failure.clone());
         self.failure = Some(failure.clone());
-        self.resume(roster, &failure.reason);
+        if self.previous_dead.is_empty() {
+            // The epoch that served before the switchover still runs: it
+            // only has to admit again.
+            self.finish_restore(roster, &failure.reason);
+            return;
+        }
+        // Its replacement must serve first: serving it before that would
+        // route requests to an epoch that is not running.
+        self.pending_restore = Some(failure);
+        self.phase = Phase::Reverting;
+    }
+
+    /// Serves the previous epoch again once it is running, and drops the
+    /// target.
+    fn finish_restore(&mut self, roster: &mut impl Roster, reason: &str) {
+        self.resume(roster, reason);
         roster.serve(self.previous, &self.requests);
         self.retire.push(self.target);
         let retire = std::mem::take(&mut self.retire);
+        let generation = self.target_generation();
         for node in &self.nodes {
-            roster.stop(&node.host, &self.group, Some(self.target));
+            roster.stop(&node.host, &self.group, Some(generation));
             let _ = roster.claim(&node.host, self.previous, &self.scopes(node), &retire);
         }
         self.record.status = Status::Purged;
@@ -462,13 +575,7 @@ impl Switch {
     /// The previous epoch admits again after its drain.
     fn resume(&mut self, roster: &mut impl Roster, reason: &str) {
         for node in &self.nodes {
-            roster.command(
-                &node.host,
-                self.previous,
-                command(process::command::Kind::Revert(process::Revert {
-                    reason: reason.to_owned(),
-                })),
-            );
+            roster.resume(&node.host, self.previous_generation, reason);
         }
     }
 
@@ -477,11 +584,13 @@ impl Switch {
         self.record.status = Status::Purged;
         self.epochs.record(self.target, self.record.clone());
         self.update.revert();
+        self.resume(roster, "the update reverted");
         roster.serve(self.previous, &self.requests);
         self.retire.push(self.target);
         let retire = std::mem::take(&mut self.retire);
+        let generation = self.target_generation();
         for node in &self.nodes {
-            roster.stop(&node.host, &self.group, Some(self.target));
+            roster.stop(&node.host, &self.group, Some(generation));
             let _ = roster.claim(&node.host, self.previous, &self.scopes(node), &retire);
         }
         self.phase = Phase::Abandoned;
@@ -510,7 +619,7 @@ impl Switch {
 
     /// A child of `generation` says what build it runs.
     fn hello(&mut self, roster: &mut impl Roster, host: String, generation: u64, build: String) {
-        if generation != self.target {
+        if !self.is_target(generation) {
             return;
         }
         match &self.build {
@@ -518,7 +627,7 @@ impl Switch {
             Some(expected) => {
                 // The child is not the build this epoch runs: it is stopped
                 // before it counts as the epoch's process.
-                roster.stop(&host, &self.group, Some(self.target));
+                roster.stop(&host, &self.group, Some(generation));
                 self.failed(
                     roster,
                     Failure {
@@ -551,27 +660,33 @@ impl Switch {
             reason,
             device: None,
         };
-        if generation == self.previous {
+        if self.is_previous(generation) {
             match self.phase {
-                Phase::Precopy | Phase::Promoting => {
+                Phase::Preparing | Phase::Promoting => {
                     // The serving epoch's main process died: the standby
                     // promotion (§2.5) takes over. The switch itself stops.
+                    self.previous_dead.insert(host);
                     self.promotion_due = true;
                     self.failed(roster, failure);
                 }
-                Phase::Draining => {
-                    // Nothing is left to drain: the target serves on.
+                Phase::Serving => {
+                    // This host has nothing left to drain, and the epoch
+                    // must be replaced before it could serve again.
+                    self.previous_dead.insert(host.clone());
                     self.promotion_due = true;
-                    self.drained
-                        .extend(self.nodes.iter().map(|node| node.host.clone()));
+                    self.drained.insert(host);
                     self.progress(roster);
+                }
+                Phase::Probation | Phase::Committing | Phase::Reverting => {
+                    self.previous_dead.insert(host);
+                    self.promotion_due = true;
                 }
                 _ => {}
             }
-        } else if generation == self.target {
+        } else if self.is_target(generation) {
             match self.phase {
-                Phase::Precopy | Phase::Promoting => self.failed(roster, failure),
-                Phase::Draining => self.restore(roster, failure),
+                Phase::Preparing | Phase::Promoting => self.failed(roster, failure),
+                Phase::Serving => self.restore(roster, failure),
                 Phase::Probation => self.reverting(roster, failure),
                 Phase::Reverting => {
                     // The previous epoch is to serve anyway: finish.
@@ -595,13 +710,18 @@ impl Switch {
         use process::report::Kind;
         // The kind drives the phase; the whole report still states a failure.
         let kind = report.kind.clone();
-        match (self.phase, generation, kind) {
-            (Phase::Precopy, generation, Some(Kind::Precopied(_))) if generation == self.target => {
-                self.parked(roster, &host, generation);
-            }
-            (Phase::Precopy, generation, Some(Kind::PrecopyFailed(failed)))
-                if generation == self.target =>
+        match (self.phase, kind) {
+            // `Report::Parked` and `Report::Promoted` are not in this
+            // branch's `process.proto` yet (front's `026466b20`,
+            // `2d477b9b5`); when they land, the daemon's mapping calls
+            // `parked` and `promoted` here. Until then those two inputs are
+            // the phase's only sources.
+            (Phase::Serving, Some(Kind::Drained(drained)))
+                if generation == self.previous_generation =>
             {
+                self.drained(roster, &host, drained.epoch);
+            }
+            (Phase::Preparing, Some(Kind::PrecopyFailed(failed))) if self.is_target(generation) => {
                 self.failed(
                     roster,
                     Failure {
@@ -611,42 +731,27 @@ impl Switch {
                     },
                 );
             }
-            (Phase::Promoting, generation, Some(Kind::Switched(_)))
-                if generation == self.target =>
-            {
-                self.promoted.insert(host);
-            }
-            (Phase::Draining, generation, Some(Kind::Drained(drained)))
-                if generation == self.previous =>
-            {
-                let _ = drained;
-                self.drained(roster, self.previous);
-            }
-            (Phase::Draining, generation, _) if generation == self.target => {
+            (Phase::Serving, _) if self.is_target(generation) => {
                 if let Some(failure) = Failure::of_report(&report) {
                     self.restore(roster, failure);
                 }
             }
-            (Phase::Probation, generation, _) if generation == self.target => {
+            (Phase::Probation, _) if self.is_target(generation) => {
                 if let Some(failure) = Failure::of_report(&report) {
                     self.reverting(roster, failure);
                 }
             }
-            (Phase::Committing, generation, Some(Kind::Committed(_)))
-                if generation == self.target =>
-            {
+            (Phase::Committing, Some(Kind::Committed(_))) if self.is_target(generation) => {
                 self.committed.insert(host);
             }
-            (Phase::Committing, generation, _) if generation == self.target => {
+            (Phase::Committing, _) if self.is_target(generation) => {
                 if let Some(failure) = Failure::of_report(&report) {
                     self.promotion_due = true;
                     self.update.fail(failure.clone());
                     self.failure = Some(failure);
                 }
             }
-            (Phase::Reverting, generation, Some(Kind::Reverted(_)))
-                if generation == self.target =>
-            {
+            (Phase::Reverting, Some(Kind::Reverted(_))) if self.is_target(generation) => {
                 self.reverted.insert(host);
             }
             _ => {}
@@ -658,44 +763,55 @@ impl Switch {
     fn progress(&mut self, roster: &mut impl Roster) {
         let hosts: BTreeSet<String> = self.nodes.iter().map(|node| node.host.clone()).collect();
         match self.phase {
-            Phase::Precopy if hosts.is_subset(&self.parked) => {
+            Phase::Preparing if hosts.is_subset(&self.parked) => {
                 self.phase = Phase::Promoting;
                 self.switchover_started = Some(Instant::now());
+                let generation = self.target_generation();
                 for node in &self.nodes {
                     // One step, first, so that moving it with exec's answer is
                     // a one-line change.
                     roster.command(
                         &node.host,
-                        self.target,
+                        generation,
                         command(process::command::Kind::Promote(process::Promote {})),
                     );
                 }
             }
             Phase::Promoting if hosts.is_subset(&self.promoted) => {
-                self.record.status = Status::Probation;
+                self.record.status = Status::Serving;
                 self.epochs.record(self.target, self.record.clone());
                 roster.serve(self.target, &self.requests);
                 for node in &self.nodes {
                     roster.command(
                         &node.host,
-                        self.previous,
+                        self.previous_generation,
                         command(process::command::Kind::Drain(process::Drain {
                             epoch: self.previous,
                         })),
                     );
                 }
-                self.phase = Phase::Draining;
+                self.phase = Phase::Serving;
             }
-            Phase::Draining if hosts.is_subset(&self.drained) => {
+            Phase::Serving if hosts.is_subset(&self.drained) => {
                 self.pause = self.switchover_started.map(|started| started.elapsed());
+                self.record.status = Status::Probation;
+                self.epochs.record(self.target, self.record.clone());
                 self.phase = Phase::Probation;
             }
             Phase::Committing if hosts.is_subset(&self.committed) => {
                 self.record.status = Status::Serving;
                 self.epochs.record(self.target, self.record.clone());
                 let retire = vec![self.previous];
+                let generation = self.target_generation();
                 for node in &self.nodes {
-                    roster.stop(&node.host, &self.group, Some(self.previous));
+                    roster.stop(&node.host, &self.group, Some(self.previous_generation));
+                    roster.command(
+                        &node.host,
+                        generation,
+                        command(process::command::Kind::Purge(process::Purge {
+                            generation: self.previous_generation,
+                        })),
+                    );
                     // The previous world's storage ends on the node that
                     // served it while the target keeps its own.
                     let _ = roster.claim(&node.host, self.target, &self.scopes(node), &retire);
@@ -733,19 +849,13 @@ mod tests {
         stops: Vec<(String, String, Option<u64>)>,
         commands: Vec<(String, u64, process::command::Kind)>,
         serves: Vec<(u64, String)>,
+        resumes: Vec<(String, u64, String)>,
         scripted: Vec<Event>,
         fail_spawn: Option<String>,
         fail_claim: Option<String>,
     }
 
     impl Fake {
-        fn with(events: impl IntoIterator<Item = Event>) -> Self {
-            Self {
-                scripted: events.into_iter().collect(),
-                ..Self::default()
-            }
-        }
-
         fn drains(&self) -> usize {
             self.commands
                 .iter()
@@ -753,12 +863,14 @@ mod tests {
                 .count()
         }
 
-        fn reverts(&self, generation: u64) -> usize {
+        fn commands_of<'a>(
+            &'a self,
+            generation: u64,
+            matches: impl Fn(&process::command::Kind) -> bool + 'a,
+        ) -> usize {
             self.commands
                 .iter()
-                .filter(|(_, which, kind)| {
-                    *which == generation && matches!(kind, process::command::Kind::Revert(_))
-                })
+                .filter(|(_, which, kind)| *which == generation && matches(kind))
                 .count()
         }
     }
@@ -803,6 +915,11 @@ mod tests {
 
         fn serve(&mut self, epoch: u64, requests: &str) {
             self.serves.push((epoch, requests.to_owned()))
+        }
+
+        fn resume(&mut self, host: &str, generation: u64, reason: &str) {
+            self.resumes
+                .push((host.to_owned(), generation, reason.to_owned()));
         }
 
         fn events(&mut self) -> Vec<Event> {
@@ -857,6 +974,7 @@ mod tests {
             12,
             record(),
             11,
+            5,
             "engine:0".to_owned(),
             nodes(),
             start(),
@@ -869,18 +987,6 @@ mod tests {
         Report { kind: Some(kind) }
     }
 
-    fn precopied() -> Report {
-        report(process::report::Kind::Precopied(process::Precopied {
-            generation: 12,
-        }))
-    }
-
-    fn switched() -> Report {
-        report(process::report::Kind::Switched(process::Switched {
-            generation: 12,
-        }))
-    }
-
     fn report_event(host: &str, generation: u64, report: Report) -> Event {
         Event::Report {
             host: host.to_owned(),
@@ -889,10 +995,10 @@ mod tests {
         }
     }
 
-    fn hello(host: &str, build: &str) -> Event {
+    fn hello(host: &str, generation: u64, build: &str) -> Event {
         Event::Hello {
             host: host.to_owned(),
-            generation: 12,
+            generation,
             build: build.to_owned(),
         }
     }
@@ -905,39 +1011,42 @@ mod tests {
         }
     }
 
-    /// Spawns and answers the precopy on every node.
-    fn precopied_everywhere(roster: &mut Fake, switch: &mut Switch) {
+    /// Spawns, claims and reports the targets parked.
+    fn prepared(roster: &mut Fake, switch: &mut Switch) {
         switch.start(roster);
-        roster.scripted = vec![
-            hello("n0", "2.0.0+new"),
-            hello("n1", "2.0.0+new"),
-            report_event("n0", 12, precopied()),
-            report_event("n1", 12, precopied()),
-        ];
+        roster.scripted = vec![hello("n0", 6, "2.0.0+new"), hello("n1", 6, "2.0.0+new")];
         switch.advance(roster);
+        switch.parked(roster, "n0", 6);
+        switch.parked(roster, "n1", 6);
     }
 
     /// Promotes on every node and drains the old epoch away.
     fn serve_target(roster: &mut Fake, switch: &mut Switch) {
-        precopied_everywhere(roster, switch);
-        roster.scripted = vec![
-            report_event("n0", 12, switched()),
-            report_event("n1", 12, switched()),
-        ];
-        switch.advance(roster);
-        switch.drained(roster, 11);
+        prepared(roster, switch);
+        switch.promoted(roster, "n0", 6);
+        switch.promoted(roster, "n1", 6);
+        switch.drained(roster, "n0", 11);
+        switch.drained(roster, "n1", 11);
     }
 
-    /// The phases in order: a claim (with the node's scope) and a spawn per
-    /// node at a later generation of the same group and rank, the target
-    /// promoted before anything serves, then the frontend served and the old
-    /// epoch drained.
+    /// Front's order: spawn, claim, `Parked`, `Promote`, `Promoted`, `Serve`,
+    /// `Drain`, `Drained`, and the record moves `Precopy` → `Serving` →
+    /// `Probation` only after the drain.
     #[test]
     fn the_switch_moves_through_its_phases_in_order() {
         let (epochs, mut switch) = setup();
         let mut roster = Fake::default();
         switch.start(&mut roster);
 
+        assert_eq!(roster.spawns.len(), 2);
+        for (index, spawn) in roster.spawns.iter().enumerate() {
+            assert_eq!(spawn.host, nodes()[index].host);
+            assert_eq!(spawn.group, "engine:0");
+            assert_eq!(spawn.rank, nodes()[index].rank);
+            assert_eq!(spawn.generation, 6, "the serving generation's next one");
+            assert_eq!(spawn.executable, "/opt/uniserve");
+            assert_eq!(spawn.arguments, vec!["engine".to_owned()]);
+        }
         assert_eq!(roster.claims.len(), 2);
         for (index, (_, world, scopes, retire)) in roster.claims.iter().enumerate() {
             assert_eq!(*world, 12);
@@ -950,42 +1059,33 @@ mod tests {
                 }]
             );
         }
-        assert_eq!(roster.spawns.len(), 2);
-        for (index, spawn) in roster.spawns.iter().enumerate() {
-            assert_eq!(spawn.host, nodes()[index].host);
-            assert_eq!(spawn.group, "engine:0");
-            assert_eq!(spawn.rank, nodes()[index].rank);
-            assert_eq!(spawn.generation, 12);
-            assert_eq!(spawn.executable, "/opt/uniserve");
-            assert_eq!(spawn.arguments, vec!["engine".to_owned()]);
-        }
-        assert_eq!(switch.phase(), Phase::Precopy);
+        assert_eq!(switch.phase(), Phase::Preparing);
         assert_eq!(
             epochs.get(12).map(|record| record.status),
             Some(Status::Precopy)
         );
 
-        precopied_everywhere_parked(&mut roster, &mut switch);
+        roster.scripted = vec![hello("n0", 6, "2.0.0+new"), hello("n1", 6, "2.0.0+new")];
+        switch.advance(&mut roster);
+        switch.parked(&mut roster, "n0", 6);
+        switch.parked(&mut roster, "n1", 6);
         assert_eq!(switch.phase(), Phase::Promoting);
+        assert_eq!(switch.generation(), Some(6));
         assert_eq!(roster.commands.len(), 2);
         assert!(
             roster
                 .commands
                 .iter()
-                .all(|(_, generation, kind)| *generation == 12
+                .all(|(_, generation, kind)| *generation == 6
                     && matches!(kind, process::command::Kind::Promote(_)))
         );
-        assert!(roster.serves.is_empty(), "nothing serves before the ack");
 
-        roster.scripted = vec![
-            report_event("n0", 12, switched()),
-            report_event("n1", 12, switched()),
-        ];
-        switch.advance(&mut roster);
-        assert_eq!(switch.phase(), Phase::Draining);
+        switch.promoted(&mut roster, "n0", 6);
+        switch.promoted(&mut roster, "n1", 6);
+        assert_eq!(switch.phase(), Phase::Serving);
         assert_eq!(
             epochs.get(12).map(|record| record.status),
-            Some(Status::Probation)
+            Some(Status::Serving)
         );
         assert_eq!(
             roster.serves,
@@ -997,23 +1097,17 @@ mod tests {
                 .commands
                 .iter()
                 .filter(|(_, _, kind)| matches!(kind, process::command::Kind::Drain(_)))
-                .all(|(_, generation, _)| *generation == 11)
+                .all(|(_, generation, _)| *generation == 5)
         );
 
-        switch.drained(&mut roster, 11);
+        switch.drained(&mut roster, "n0", 11);
+        switch.drained(&mut roster, "n1", 11);
         assert_eq!(switch.phase(), Phase::Probation);
+        assert_eq!(
+            epochs.get(12).map(|record| record.status),
+            Some(Status::Probation)
+        );
         assert!(switch.pause().is_some());
-    }
-
-    /// Answers the precopy and the children's builds only.
-    fn precopied_everywhere_parked(roster: &mut Fake, switch: &mut Switch) {
-        roster.scripted = vec![
-            hello("n0", "2.0.0+new"),
-            hello("n1", "2.0.0+new"),
-            report_event("n0", 12, precopied()),
-            report_event("n1", 12, precopied()),
-        ];
-        switch.advance(roster);
     }
 
     /// A failed precopy drops the target, retires its world through the next
@@ -1026,7 +1120,7 @@ mod tests {
         switch.start(&mut roster);
         roster.scripted = vec![report_event(
             "n0",
-            12,
+            6,
             report(process::report::Kind::PrecopyFailed(
                 process::PrecopyFailed {
                     reason: "no storage".to_owned(),
@@ -1048,7 +1142,7 @@ mod tests {
         assert!(
             roster
                 .stops
-                .contains(&("n0".to_owned(), "engine:0".to_owned(), Some(12)))
+                .contains(&("n0".to_owned(), "engine:0".to_owned(), Some(6)))
         );
     }
 
@@ -1059,7 +1153,7 @@ mod tests {
         let (_epochs, mut switch) = setup();
         let mut roster = Fake::default();
         switch.start(&mut roster);
-        roster.scripted = vec![hello("n0", "2.0.0+old")];
+        roster.scripted = vec![hello("n0", 6, "2.0.0+old")];
         switch.advance(&mut roster);
 
         assert_eq!(switch.phase(), Phase::Abandoned);
@@ -1070,7 +1164,7 @@ mod tests {
         assert!(
             roster
                 .stops
-                .contains(&("n0".to_owned(), "engine:0".to_owned(), Some(12)))
+                .contains(&("n0".to_owned(), "engine:0".to_owned(), Some(6)))
         );
         assert!(roster.commands.is_empty());
     }
@@ -1083,15 +1177,15 @@ mod tests {
         let (epochs, mut switch) = setup();
         let mut roster = Fake::default();
         switch.start(&mut roster);
-        roster.scripted = vec![hello("n0", "3.0.0+theirs")];
+        roster.scripted = vec![hello("n0", 6, "3.0.0+theirs")];
         switch.advance(&mut roster);
-        assert_eq!(switch.phase(), Phase::Precopy);
+        assert_eq!(switch.phase(), Phase::Preparing);
         assert_eq!(
             epochs.get(12).map(|record| record.build_config.executable),
             Some("3.0.0+theirs".to_owned())
         );
 
-        roster.scripted = vec![hello("n1", "3.0.0+other")];
+        roster.scripted = vec![hello("n1", 6, "3.0.0+other")];
         switch.advance(&mut roster);
         assert_eq!(switch.phase(), Phase::Abandoned);
         assert_eq!(
@@ -1101,12 +1195,115 @@ mod tests {
         assert_eq!(switch.discarded(), &[12]);
     }
 
-    /// A target that dies after the frontend was told it serves does not
-    /// leave the deployment unserved: the previous epoch admits again
-    /// (`Revert`), the frontend serves it, and the target is stopped and
-    /// retired.
+    /// A child that names a generation older than the one the target was
+    /// spawned at is another epoch's: it is refused, stopped, and the target
+    /// dropped. A later generation is this epoch's and is accepted.
     #[test]
-    fn a_target_death_while_draining_restores_the_previous_epoch() {
+    fn an_older_generation_is_refused() {
+        let (_epochs, mut switch) = setup();
+        let mut roster = Fake::default();
+        switch.start(&mut roster);
+        switch.parked(&mut roster, "n0", 7);
+        assert_eq!(switch.generation(), Some(7));
+        switch.parked(&mut roster, "n1", 4);
+        assert_eq!(switch.phase(), Phase::Abandoned);
+        assert_eq!(
+            switch.failure().map(|failure| failure.kind.as_str()),
+            Some("generation_mismatch")
+        );
+        assert!(
+            roster
+                .stops
+                .contains(&("n1".to_owned(), "engine:0".to_owned(), Some(4)))
+        );
+    }
+
+    /// A target that dies after `Commit` was sent is replaced by a promoted
+    /// or relaunched main process; its `Committed` comes from that newer
+    /// generation and still completes the commit.
+    #[test]
+    fn a_commit_acknowledged_by_a_promoted_generation_completes() {
+        let (_epochs, mut switch) = setup();
+        let mut roster = Fake::default();
+        serve_target(&mut roster, &mut switch);
+        switch.commit(&mut roster);
+        roster.scripted = vec![
+            exit_event("n1", 6),
+            report_event(
+                "n0",
+                7,
+                report(process::report::Kind::Committed(process::Committed {})),
+            ),
+            report_event(
+                "n1",
+                7,
+                report(process::report::Kind::Committed(process::Committed {})),
+            ),
+        ];
+        switch.advance(&mut roster);
+
+        assert_eq!(switch.phase(), Phase::Purged);
+        assert_eq!(switch.update().state, UpdateState::Committed);
+        assert_eq!(switch.generation(), Some(7));
+        assert!(
+            roster
+                .stops
+                .iter()
+                .all(|(_, _, generation)| *generation == Some(5))
+        );
+    }
+
+    /// A revert after the previous epoch's main process died waits for its
+    /// replacement to serve before the frontend is routed there.
+    #[test]
+    fn a_restore_waits_for_the_previous_epoch_to_be_replaced() {
+        let (_epochs, mut switch) = setup();
+        let mut roster = Fake::default();
+        prepared(&mut roster, &mut switch);
+        switch.promoted(&mut roster, "n0", 6);
+        switch.promoted(&mut roster, "n1", 6);
+        roster.scripted = vec![exit_event("n0", 5)];
+        switch.advance(&mut roster);
+        switch.drained(&mut roster, "n1", 11);
+        assert_eq!(switch.phase(), Phase::Probation);
+        assert!(switch.promotion_due());
+        roster.serves.clear();
+
+        roster.scripted = vec![report_event(
+            "n1",
+            6,
+            report(process::report::Kind::Fault(process::Fault {
+                kind: "sticky".to_owned(),
+                reason: "an illegal address".to_owned(),
+                device: 0,
+            })),
+        )];
+        switch.advance(&mut roster);
+        assert_eq!(switch.phase(), Phase::Reverting);
+        assert!(
+            roster.serves.is_empty(),
+            "the replacement of the dead epoch must serve first"
+        );
+
+        switch.serving(&mut roster, "n0", 7);
+        assert_eq!(switch.phase(), Phase::Abandoned);
+        assert_eq!(
+            roster.serves,
+            vec![(11, "unix:/run/requests.sock".to_owned())]
+        );
+        assert!(
+            roster
+                .resumes
+                .iter()
+                .all(|(_, generation, _)| *generation == 7)
+        );
+    }
+
+    /// A target that dies after the frontend was told it serves does not
+    /// leave the deployment unserved: the previous epoch admits again, the
+    /// frontend serves it, and the target is stopped and retired.
+    #[test]
+    fn a_target_death_while_serving_restores_the_previous_epoch() {
         let (_epochs, mut switch) = setup();
         let mut roster = Fake::default();
         serve_target(&mut roster, &mut switch);
@@ -1114,12 +1311,19 @@ mod tests {
         roster.commands.clear();
         roster.serves.clear();
         roster.claims.clear();
+        roster.resumes.clear();
 
-        roster.scripted = vec![exit_event("n0", 12)];
+        roster.scripted = vec![exit_event("n0", 6)];
         switch.advance(&mut roster);
 
         assert_eq!(switch.phase(), Phase::Abandoned);
-        assert_eq!(roster.reverts(11), 2, "the old epoch admits on each node");
+        assert_eq!(roster.resumes.len(), 2, "the old epoch admits on each node");
+        assert!(
+            roster
+                .resumes
+                .iter()
+                .all(|(_, generation, _)| *generation == 5)
+        );
         assert_eq!(
             roster.serves,
             vec![(11, "unix:/run/requests.sock".to_owned())]
@@ -1127,9 +1331,14 @@ mod tests {
         assert!(
             roster
                 .stops
-                .contains(&("n0".to_owned(), "engine:0".to_owned(), Some(12)))
+                .contains(&("n0".to_owned(), "engine:0".to_owned(), Some(6)))
         );
-        assert_eq!(ratio(&roster.claims), vec![("n1".to_owned(), 11, vec![12])]);
+        assert!(
+            roster
+                .claims
+                .iter()
+                .all(|(_, world, _, retire)| *world == 11 && retire == &[12])
+        );
         assert_eq!(
             switch
                 .update()
@@ -1137,16 +1346,6 @@ mod tests {
                 .map(|failure| failure.kind.as_str()),
             Some("process_exit")
         );
-    }
-
-    /// The world a claim retires, as `(host, world, retire)`.
-    fn ratio(
-        claims: &[(String, u64, Vec<process::Scope>, Vec<u64>)],
-    ) -> Vec<(String, u64, Vec<u64>)> {
-        claims
-            .iter()
-            .map(|(host, world, _, retire)| (host.clone(), *world, retire.clone()))
-            .collect()
     }
 
     /// A failure the target reports on probation records the failure itself —
@@ -1162,7 +1361,7 @@ mod tests {
 
         roster.scripted = vec![report_event(
             "n1",
-            12,
+            6,
             report(process::report::Kind::Fault(process::Fault {
                 kind: "sticky".to_owned(),
                 reason: "an illegal address".to_owned(),
@@ -1173,21 +1372,21 @@ mod tests {
         assert_eq!(switch.phase(), Phase::Reverting);
         assert_eq!(roster.commands.len(), 2, "a revert per node");
         assert!(roster.commands.iter().all(|(_, generation, kind)| {
-            *generation == 12 && matches!(kind, process::command::Kind::Revert(_))
+            *generation == 6 && matches!(kind, process::command::Kind::Revert(_))
         }));
         assert!(roster.serves.is_empty(), "the frontend waits for the ack");
 
         roster.scripted = vec![
             report_event(
                 "n0",
-                12,
+                6,
                 report(process::report::Kind::Reverted(process::Reverted {
                     reason: String::new(),
                 })),
             ),
             report_event(
                 "n1",
-                12,
+                6,
                 report(process::report::Kind::Reverted(process::Reverted {
                     reason: String::new(),
                 })),
@@ -1223,7 +1422,7 @@ mod tests {
     }
 
     /// A commit records the target as serving once it acknowledges, stops the
-    /// old generation and retires its storage.
+    /// old generation, purges its programs and retires its storage.
     #[test]
     fn a_commit_retires_the_previous_epoch() {
         let (epochs, mut switch) = setup();
@@ -1244,12 +1443,12 @@ mod tests {
         roster.scripted = vec![
             report_event(
                 "n0",
-                12,
+                6,
                 report(process::report::Kind::Committed(process::Committed {})),
             ),
             report_event(
                 "n1",
-                12,
+                6,
                 report(process::report::Kind::Committed(process::Committed {})),
             ),
         ];
@@ -1266,7 +1465,11 @@ mod tests {
             roster
                 .stops
                 .iter()
-                .all(|(_, group, generation)| group == "engine:0" && *generation == Some(11))
+                .all(|(_, group, generation)| group == "engine:0" && *generation == Some(5))
+        );
+        assert_eq!(
+            roster.commands_of(6, |kind| matches!(kind, process::command::Kind::Purge(_))),
+            2
         );
         assert_eq!(roster.claims.len(), 2, "each node retires the old world");
         assert!(
@@ -1286,7 +1489,7 @@ mod tests {
         let mut roster = Fake::default();
         serve_target(&mut roster, &mut switch);
         switch.commit(&mut roster);
-        roster.scripted = vec![exit_event("n1", 12)];
+        roster.scripted = vec![exit_event("n1", 6)];
         switch.advance(&mut roster);
 
         assert_eq!(switch.phase(), Phase::Committing);
@@ -1302,14 +1505,15 @@ mod tests {
         );
     }
 
-    /// A serving main process that exits during the precopy hands the failure
-    /// domain to the standby promotion instead of reverting the update.
+    /// A serving main process that exits during the preparing hands the
+    /// failure domain to the standby promotion instead of reverting the
+    /// update.
     #[test]
-    fn a_serving_exit_during_precopy_hands_over_to_promotion() {
+    fn a_serving_exit_during_preparing_hands_over_to_promotion() {
         let (_epochs, mut switch) = setup();
         let mut roster = Fake::default();
         switch.start(&mut roster);
-        roster.scripted = vec![exit_event("n1", 11)];
+        roster.scripted = vec![exit_event("n1", 5)];
         switch.advance(&mut roster);
 
         assert_eq!(switch.phase(), Phase::Abandoned);
@@ -1332,7 +1536,7 @@ mod tests {
         };
         switch.start(&mut roster);
         assert_eq!(switch.phase(), Phase::Abandoned);
-        assert!(roster.spawns.is_empty());
+        assert_eq!(roster.spawns.len(), 2, "the children are stopped again");
         assert_eq!(
             switch.failure().map(|failure| failure.kind.as_str()),
             Some("claim_failed")
@@ -1348,7 +1552,7 @@ mod tests {
         assert!(
             roster
                 .stops
-                .contains(&("n0".to_owned(), "engine:0".to_owned(), Some(12)))
+                .contains(&("n0".to_owned(), "engine:0".to_owned(), Some(6)))
         );
     }
 }
