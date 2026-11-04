@@ -24,6 +24,10 @@
 //!
 //! With fewer than two devices it prints why and returns, so it is safe on a CPU-only host.
 
+#![allow(
+    clippy::expect_used,
+    reason = "a probe's prerequisite failure must fail the test, not be handled"
+)]
 use std::sync::{Arc, Barrier};
 
 use platform::nccl::ReduceOp;
@@ -42,7 +46,10 @@ impl platform::Budget for Unbounded {
 #[derive(Debug)]
 struct RankReport {
     rank: i32,
-    #[allow(dead_code, reason = "printed with the rank's readings when the probe reports")]
+    #[allow(
+        dead_code,
+        reason = "printed with the rank's readings when the probe reports"
+    )]
     device: DeviceId,
     /// The four f32 the buffer held after one uncaptured collective.
     eager: [f32; 4],
@@ -52,9 +59,9 @@ struct RankReport {
 
 /// What one rank does on its own thread.
 ///
-/// Both ranks write `16 * (rank + 1)` into four f32 and sum in place, so a rank that received both
-/// reads `4 * (16 + 32) = 192`; a rank that only saw itself reads \(4 \times 16\) or
-/// \(4 \times 32\), which the caller's assertion rejects.
+/// Both ranks write `16 * (rank + 1)` into each of four f32 and sum in place, so a rank that
+/// received both reads 48 in every element; a rank that only saw itself reads 16 or 32, which the
+/// assertion rejects.
 fn run_rank(
     device: DeviceId,
     rank: i32,
@@ -143,6 +150,13 @@ fn run_rank(
         .map_err(|error| format!("synchronize after the replay: {error}"))?;
     let replayed = read_back(&host, &buffer, &stream)?;
 
+    // The graphs must be destroyed before the communicator they hold: NCCL's own teardown of a
+    // communicator whose captured graphs still exist hangs (the caller measured that order in a C
+    // probe on four devices, and this probe hung at exactly this point in its first version). The
+    // executor's pools and generations follow the same rule: a generation's graph execs are
+    // destroyed before the communicator their collective node names.
+    drop(exec);
+    drop(graph);
     communicator
         .destroy()
         .map_err(|error| format!("Communicator::destroy: {error}"))?;
@@ -231,7 +245,9 @@ fn one_process_captures_a_collective_across_two_devices() {
 
 /// Asserts what the executor's design needs and prints the answer.
 fn assert_probe_answer(reports: &[RankReport]) {
-    let expected = 4.0 * (16.0 + 32.0);
+    // Each rank's four elements hold its own value (16 for rank 0, 32 for rank 1), so a sum over
+    // both ranks leaves every element at 48. A rank that saw only itself reads 16 or 32.
+    let expected = 16.0 + 32.0;
     let rank0 = reports
         .iter()
         .find(|report| report.rank == 0)
