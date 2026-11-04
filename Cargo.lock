@@ -3354,7 +3354,6 @@ version = "2.0.0"
 dependencies = [
  "nn",
  "ops",
- "safetensors",
  "serde",
  "serde_json",
  "tempfile",
@@ -4724,6 +4723,7 @@ version = "2.0.0"
 dependencies = [
  "anyhow",
  "clap",
+ "crossbeam-channel",
  "daemon",
  "engine",
  "executor",
@@ -4738,6 +4738,7 @@ dependencies = [
  "proto",
  "qwen3-moe",
  "rustix",
+ "serde",
  "serde_json",
  "storage",
  "storage-server",
