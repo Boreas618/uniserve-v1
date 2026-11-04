@@ -397,6 +397,20 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
                 bytes / (1 << 20),
                 bytes
             );
+            // The entries in the order the plan reserves them, which is the order the arena's
+            // offsets follow: the note describes this list by name and shape, so it must be
+            // printable from the same call that sizes it.
+            if std::env::var("H3_DIT_BUFFERS").is_ok() {
+                for buffer in &plan {
+                    println!(
+                        "    {:28} {:5} {:>12} elements {:>12} B",
+                        buffer.name,
+                        buffer.element,
+                        buffer.elements,
+                        buffer.bytes()
+                    );
+                }
+            }
         }
     }
 
@@ -486,72 +500,6 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             arena,
             arena / (1 << 20)
         );
-        if canvas.width == 1536 && false {
-            // The DiT's plan, from the crate's own function. `t2va` reads the generated groups and
-            // `fl2va`/`ref2va` read a condition's clean level too, so both are printed: they are
-            // different plans, and a deployment's task decides which one its rank sizes against.
-
-            for conditioned in [false, true] {
-                let groups = minimax_h3::modulation::Groups::of(conditioned);
-                let task = if conditioned {
-                    nn::capability::VideoTask::FirstLastToVideoAudio
-                } else {
-                    nn::capability::VideoTask::TextToVideoAudio
-                };
-                let arrangement =
-                    minimax_h3::partition::Partition::serving(&config, task, 1, 1, 0, 0)?
-                        .arrangement(denoiser)?;
-                let request = nn::capability::Layout {
-                    video: nn::capability::LatentShape {
-                        channels: denoiser.transformer.video_channels,
-                        frames: minimax_h3::packing::video_latent_frames(124)?,
-                        height: canvas.height / ratio,
-                        width: canvas.width / ratio,
-                    },
-                    audio: Some(nn::capability::LatentShape {
-                        channels: minimax_h3::config::AUDIO_CHANNELS
-                            * denoiser.transformer.audio_channels,
-                        frames: minimax_h3::packing::audio_latent_frames(124),
-                        height: 1,
-                        width: 1,
-                    }),
-                    text_rows: arrangement.text_rows,
-                    condition_rows: arrangement.condition_rows,
-                    condition_elements: 0,
-                };
-                let plan = minimax_h3::denoiser::denoise_arena(
-                    denoiser,
-                    &arrangement,
-                    groups.count(),
-                    nn::DType::BF16,
-                    &request,
-                )?;
-                let bytes: u64 = plan.iter().map(minimax_h3::decoding::Buffer::bytes).sum();
-                if std::env::var("H3_DIT_BUFFERS").is_ok() {
-                    for buffer in &plan {
-                        println!(
-                            "      {:28} {:5} {:>12} elements {:>12} B",
-                            buffer.name,
-                            buffer.element,
-                            buffer.elements,
-                            buffer.bytes()
-                        );
-                    }
-                }
-                println!(
-                    "  DiT plan {} at {}x{}: {} entries, {}",
-                    if conditioned {
-                        "conditioned"
-                    } else {
-                        "generated"
-                    },
-                    canvas.width,
-                    canvas.height,
-                    plan.len(),
-                    mib(bytes / (1 << 20))
-                );
-            }
-        }
     }
     for frames in [124_u32, 362] {
         // `audio_arena` takes audio latent steps, not video frames: one latent step is 800 samples and
