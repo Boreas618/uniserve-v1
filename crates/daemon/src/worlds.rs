@@ -60,6 +60,7 @@ use crate::engine::client::{EngineClient, EngineState, Successor};
 use crate::engine::hold::Kept;
 use crate::leader::{Leader, Replica, UpdateError, locked, stats_sink};
 use crate::options::{PreviousWorld, RollbackOptions, ServeConfig};
+use crate::updates::resolve;
 
 // The epoch layer owns these three definitions; the API and the leader still
 // name them as `crate::worlds::{…}` until their `use` lines move to
@@ -1405,38 +1406,6 @@ impl Leader {
             .find(|replica| locked(&replica.worlds).trial.is_some())
             .ok_or_else(|| UpdateError::Refused("no world is on trial".to_owned()))
     }
-}
-
-fn resolve(
-    current: &ServeConfig,
-    request: &ApplyRequest,
-) -> Result<
-    (
-        ServeConfig,
-        crate::options::Stated,
-        crate::options::UpdateOptions,
-    ),
-    UpdateError,
-> {
-    let (mut target, stated) = match &request.config {
-        Some(text) => crate::options::resolve_text(text, &request.set),
-        None => crate::options::overridden(current, &request.set)
-            .map(|(config, paths)| (config, crate::options::Stated::from_paths(paths))),
-    }
-    .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
-    target
-        .validate(&stated)
-        .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
-    let update = target.update_config.clone();
-    if request.config.is_none() {
-        target.update_config = current.update_config.clone();
-    }
-    if target.served_model_name() != current.served_model_name() {
-        return Err(UpdateError::Refused(
-            "the served model name names the deployment: deploy another one instead".into(),
-        ));
-    }
-    Ok((target, stated, update))
 }
 
 /// Records the operator's decision before publication or retirement. A
