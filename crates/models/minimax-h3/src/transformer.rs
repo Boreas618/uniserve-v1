@@ -75,6 +75,23 @@ pub struct Layer {
 }
 
 impl Layer {
+    /// Every checkpoint tensor one stack layer reads, as complete names.
+    ///
+    /// [`Layer::load`]'s own requests, in its order: the two norms, the feed-forward's two
+    /// projections, then the attention's.
+    pub fn keys(index: u32, kind: AttentionKind) -> Vec<String> {
+        let prefix = format!("transformer_blocks.{index}");
+        let mut keys: Vec<String> = ["norm1.weight", "norm2.weight"]
+            .iter()
+            .map(|suffix| format!("{prefix}.{suffix}"))
+            .collect();
+        for name in ["ff.net.0.proj.weight", "ff.net.2.weight"] {
+            keys.push(format!("{prefix}.{name}"));
+        }
+        keys.extend(attention::Layer::keys(index, kind));
+        keys
+    }
+
     /// Read layer `index` of a partition.
     fn load(
         kind: AttentionKind,
@@ -528,6 +545,24 @@ pub(crate) fn host_bytes(dtype: nn::DType, values: &[f32]) -> Result<Vec<u8>> {
 }
 
 impl Transformer {
+    /// Every checkpoint tensor one DiT partition of the stack reads, as complete names.
+    ///
+    /// The four end projections and the output norm are the block's own; the per-layer tensors and
+    /// the attention's come from [`Layer::keys`]. A student's stacked heads are the same `proj_out`
+    /// and `audio_proj_out` tensors, fused at load, so the list is one list for both forms.
+    pub fn keys(config: &TransformerConfig, kind: AttentionKind) -> Vec<String> {
+        let mut keys = Vec::new();
+        for name in ["proj_in", "audio_proj_in", "proj_out", "audio_proj_out"] {
+            keys.push(format!("{name}.weight"));
+            keys.push(format!("{name}.bias"));
+        }
+        keys.push("norm_out.norm.weight".to_owned());
+        for index in 0..config.num_hidden_layers {
+            keys.extend(Layer::keys(index, kind));
+        }
+        keys
+    }
+
     /// Project one modality's patchified audio rows into the hidden width.
     pub fn project_audio(&self, f: &Forward, rows: TensorView, out: TensorView) -> Result<()> {
         let audio = self.audio_proj_in.as_ref().ok_or_else(|| {
