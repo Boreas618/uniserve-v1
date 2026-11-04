@@ -121,6 +121,108 @@ impl Track {
     }
 }
 
+/// One scratch buffer of a decoder's forward, with the element type it holds.
+///
+/// The executor sizes the arena from these; the model never allocates. Names are the ones the arena
+/// plan in `notes/h3/decoders-interface.md` uses, so a mismatch is visible in one place.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Buffer {
+    /// The buffer's name.
+    pub name: &'static str,
+    /// Its element type: `f16`, `f32` or `u8`.
+    pub element: &'static str,
+    /// How many elements it holds.
+    pub elements: u64,
+}
+
+impl Buffer {
+    /// The bytes the buffer occupies.
+    pub fn bytes(&self) -> u64 {
+        let width = match self.element {
+            "u8" => 1,
+            "f16" => 2,
+            _ => 4,
+        };
+        self.elements * width
+    }
+}
+
+/// The scratch one video clip's decode needs, one entry per distinct lifetime.
+///
+/// A clip decodes every tile of its grid in one call (`TiledDecoder.decode` batches them), so the
+/// token buffers hold all tiles at once: [`crate::video_vae::Tile`]s are all the same shape and the
+/// stitched crop trims the last to the raster. The buffers are the reference's own: a residual stream
+/// and its normalization, the fused query-key-value projection with its rotary factors, the attention
+/// output, the gated feed-forward, the decoded pixels of one tile batch, and the RGB bytes with the
+/// overlap block carried between clips.
+pub fn video_arena(config: &crate::VideoVaeConfig, canvas: &crate::video_vae::Canvas) -> Result<Vec<Buffer>> {
+    let tiles = crate::video_vae::Tiles::of(config, canvas)?;
+    let grid = tiles.tiles(config, canvas);
+    let width = u64::from(config.decoder_num_attention_heads)
+        * u64::from(config.decoder_attention_head_dim);
+    let ffn = width * u64::from(config.decoder_ffn_mult);
+    let (rotated, _) = crate::video_vae::rotary(config)?;
+    let rows_per_tile = u64::from(canvas.rows());
+    let rows = rows_per_tile * grid.len() as u64;
+    let (height, width_px) = canvas.pixels(config);
+    let frames = canvas.frames_out(config);
+    Ok(vec![
+        Buffer {
+            name: "tokens",
+            element: "f16",
+            elements: rows * width,
+        },
+        Buffer {
+            name: "normalized",
+            element: "f16",
+            elements: rows * width,
+        },
+        Buffer {
+            name: "qkv",
+            element: "f16",
+            elements: rows * 3 * width,
+        },
+        Buffer {
+            name: "rotary",
+            element: "f32",
+            elements: rows * u64::from(rotated),
+        },
+        Buffer {
+            name: "attended",
+            element: "f16",
+            elements: rows * width,
+        },
+        Buffer {
+            name: "gate_up",
+            element: "f16",
+            elements: rows * 2 * ffn,
+        },
+        Buffer {
+            name: "pixels",
+            element: "f16",
+            elements: grid.len() as u64
+                * u64::from(crate::output::Rgb::CHANNELS)
+                * u64::from(frames)
+                * u64::from(height)
+                * u64::from(width_px),
+        },
+        Buffer {
+            name: "rgb",
+            element: "u8",
+            elements: grid.len() as u64
+                * u64::from(crate::output::Rgb::CHANNELS)
+                * u64::from(frames)
+                * u64::from(height)
+                * u64::from(width_px),
+        },
+        Buffer {
+            name: "overlap",
+            element: "f16",
+            elements: crate::output::Rgb::of(frames, height, width_px).overlap_elements(),
+        },
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +334,40 @@ mod tests {
         // Clips overlap by two latent frames: the second clip starts five frames after the first.
         let per_frame = patch_rows as usize;
         assert_eq!(rows[7 * per_frame], rows[5 * per_frame]);
+    }
+    #[test]
+    fn the_video_arena_holds_all_tiles_of_one_clip() {
+        let config = crate::video_vae::tests::video_config();
+        let canvas = crate::video_vae::Canvas::clip(&config, 48, 80);
+        let arena = video_arena(&config, &canvas).expect("the arena");
+        // 768x1280 at 256/64 is 4 x 7 tiles, each 16x16 latent voxels of 7 frames.
+        assert_eq!(canvas.frames, 7);
+        assert_eq!(canvas.height, 48);
+        assert_eq!(canvas.width, 80);
+        let tiles = crate::video_vae::Tiles::of(&config, &canvas)
+            .expect("the grid")
+            .tiles(&config, &canvas)
+            .len();
+        assert_eq!(tiles, 28);
+        let tokens = arena
+            .iter()
+            .find(|buffer| buffer.name == "tokens")
+            .expect("the residual stream");
+        // 28 tiles of 1797 rows of 2048 channels.
+        assert_eq!(tokens.elements, 28 * 1797 * 2048);
+        assert_eq!(tokens.bytes(), tokens.elements * 2);
+        // The rotary factors are the rotated width, not the head.
+        let rotary = arena
+            .iter()
+            .find(|buffer| buffer.name == "rotary")
+            .expect("the factors");
+        assert_eq!(rotary.elements, 28 * 1797 * 48);
+        // Every buffer is named once and no buffer is empty.
+        let mut names: Vec<&str> = arena.iter().map(|buffer| buffer.name).collect();
+        let count = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), count);
+        assert!(arena.iter().all(|buffer| buffer.elements > 0));
     }
 }
