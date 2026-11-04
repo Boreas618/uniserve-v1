@@ -136,6 +136,7 @@ pub use proto::request::{
 pub use request::*;
 pub use tensor::*;
 pub use transfer::*;
+pub use update::{ProgramStatus, UpdateFailure};
 pub use peer::{PeerAccepted, PeerRegistration};
 pub use phase::PhaseId;
 pub use program::ProgramCommand;
