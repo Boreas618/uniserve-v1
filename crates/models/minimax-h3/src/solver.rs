@@ -162,7 +162,15 @@ impl Solver {
         start.forward(f, sample, sample).map_err(Error::from)
     }
 
-    /// The coefficients of one step, as the published table holds them.
+    /// The coefficients of one step, as the published table holds them: `sigma - sigma_next`.
+    ///
+    /// **The direction is the solver's, not a rumour of it.** The released network predicts a
+    /// velocity pointing from the sample towards its clean end, and the released step advances the
+    /// sample along the *time* the network reads, `x += v · (t_next - t)` with `t = 1 - sigma`
+    /// (`uniserve/diffusion/solver.py`, `CleanSampleEulerSolver`: `clean = 1 - timestep = sigma`,
+    /// `x' = x·r + (v·sigma + x)·(1 - r) = x + (sigma - sigma_next)·v`, `r = sigma_next / sigma`).
+    /// The interval is therefore positive on a descending trajectory, and the last one is the
+    /// schedule's own final sigma: the last step lands the sample on its clean estimate.
     ///
     /// This is the schedule's arithmetic without a launch, for the loading boundary's tests and for
     /// the executor's own diagnostics.
@@ -170,7 +178,7 @@ impl Solver {
         let steps = schedule.steps(modality)?;
         Ok(steps
             .into_iter()
-            .map(|step| step.sigma_next - step.sigma)
+            .map(|step| step.sigma - step.sigma_next)
             .collect())
     }
 
@@ -293,30 +301,33 @@ mod tests {
     }
 
     #[test]
-    fn a_coefficient_is_minus_the_sigma_interval() {
+    fn a_coefficient_is_the_interval_the_time_advances() {
         let schedule = base();
         let coefficients = Solver::coefficients(&schedule, Modality::Video).expect("coefficients");
         let steps = schedule.steps(Modality::Video).expect("steps");
         assert_eq!(coefficients.len(), steps.len());
         for (coefficient, step) in coefficients.iter().zip(&steps) {
-            assert!(*coefficient < 0.0);
-            assert!((coefficient - (step.sigma_next - step.sigma)).abs() < 1e-6);
+            // The trajectory descends in sigma and ascends in the network's time, so the interval
+            // the clean-ward velocity is scaled by is positive: `t_next - t = sigma - sigma_next`.
+            assert!(*coefficient > 0.0);
+            assert!((coefficient - (step.sigma - step.sigma_next)).abs() < 1e-6);
         }
-        // The last step lands exactly on the clean endpoint.
-        assert!((coefficients[48] - -steps[48].sigma).abs() < 1e-6);
+        // The last step lands exactly on the clean endpoint: the whole final level is added.
+        assert!((coefficients[48] - steps[48].sigma).abs() < 1e-6);
     }
 
     #[test]
     fn the_released_clean_sample_form_closes_to_the_same_step() {
-        // The velocity points from the clean sample towards the noise, `v = (x - x0) / sigma`, so the
-        // release reaches `x + v Δsigma` through the clean estimate it recovers:
-        //   x0 = x - v sigma;  x' = x r + x0 (1 - r),  r = sigma_next / sigma.
+        // The released network's velocity points from the sample towards its clean end,
+        // `v = (x0 - x) / sigma`: the solver recovers the clean estimate as `x0 = x + v sigma` and
+        // then blends it in, `x' = x r + x0 (1 - r)` with `r = sigma_next / sigma`. That is the
+        // reference's own sign, and it closes to `x + v (sigma - sigma_next)`.
         let (sigma, sigma_next) = (0.75f32, 0.25f32);
         let ratio = sigma_next / sigma;
         for (x, v) in [(0.5f32, 1.25f32), (-2.0, 0.125), (0.0, -3.0)] {
-            let clean = x - v * sigma;
+            let clean = x + v * sigma;
             let released = x * ratio + clean * (1.0 - ratio);
-            let euler = x + v * (sigma_next - sigma);
+            let euler = x + v * (sigma - sigma_next);
             assert!(
                 (released - euler).abs() < 1e-6,
                 "released {released} and euler {euler} disagree"
