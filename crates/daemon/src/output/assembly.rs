@@ -32,31 +32,71 @@ use crate::output::{
 type Result<T> = std::result::Result<T, OutputError>;
 
 /// The timings of one request's stream.
-struct StreamClock {
+pub(crate) struct StreamClock {
     started: Instant,
+    /// When `started` was, in microseconds since the UNIX epoch: the origin a
+    /// successor's clock continues from.
+    started_unix_us: u64,
     compile_us: u64,
     queue_us: Option<u64>,
     first_visible_output_us: Option<u64>,
 }
 
 impl StreamClock {
-    fn new(started: Instant, compile_us: u64) -> Self {
+    pub(crate) fn new(started: Instant, compile_us: u64) -> Self {
         Self {
             started,
+            started_unix_us: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_micros() as u64)
+                .unwrap_or_default(),
             compile_us,
             queue_us: None,
             first_visible_output_us: None,
         }
     }
 
+    /// Continues the clock `state` records, whose response entered the server
+    /// at `started_unix_us` and took `compile_us` to reach the engine.
+    pub(crate) fn resume(
+        state: &proto::handoff::Assembly,
+        started_unix_us: u64,
+        compile_us: u64,
+    ) -> Self {
+        Self {
+            started: super::run::started_instant(started_unix_us),
+            started_unix_us,
+            compile_us,
+            queue_us: state.queue_us,
+            first_visible_output_us: state.first_visible_output_us,
+        }
+    }
+
+    /// The clock's timings in a state the successor continues from.
+    pub(crate) fn state(&self, assembly: &mut proto::handoff::Assembly) {
+        assembly.queue_us = self.queue_us;
+        assembly.first_visible_output_us = self.first_visible_output_us;
+    }
+
+    /// How long the request took to reach the engine, in microseconds.
+    pub(crate) fn compile_us(&self) -> u64 {
+        self.compile_us
+    }
+
+    /// When the request entered the server, in microseconds since the UNIX
+    /// epoch.
+    pub(crate) fn started_unix_us(&self) -> u64 {
+        self.started_unix_us
+    }
+
     /// Records the queue wait from the engine's scheduling timestamps, in
     /// UNIX seconds.
-    fn scheduled(&mut self, queued_at: f64, scheduled_at: f64) {
+    pub(crate) fn scheduled(&mut self, queued_at: f64, scheduled_at: f64) {
         self.queue_us = Some(((scheduled_at - queued_at).max(0.0) * 1e6) as u64);
     }
 
     /// Records the first visible output, once.
-    fn visible(&mut self) {
+    pub(crate) fn visible(&mut self) {
         let elapsed = self.elapsed_us();
         self.first_visible_output_us.get_or_insert(elapsed);
     }
@@ -65,7 +105,7 @@ impl StreamClock {
         self.started.elapsed().as_micros() as u64
     }
 
-    fn timings(&self) -> RuntimeTimings {
+    pub(crate) fn timings(&self) -> RuntimeTimings {
         RuntimeTimings {
             compile_us: self.compile_us,
             queue_us: self.queue_us,

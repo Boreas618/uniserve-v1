@@ -8,7 +8,7 @@ import _compile
 import logits_gather as kernels
 
 #: The hidden state's dtype, and the gathered row's.
-DTYPES = {"bf16": "bf16", "fp16": "fp16", "fp32": "fp32"}
+DTYPES = {"bf16": "bf16", "fp16": "fp16", "fp32": "fp32", "f32": "fp32"}
 
 
 def spec(fields, parameters, target):

@@ -99,14 +99,24 @@ impl PrimaryContext {
                 Err(error) => return Ok(Some(error)),
             },
         };
-        let driver = driver()?;
-        // SAFETY: `probe` is the stream created above for this context, which
-        // outlives it, and the query waits for nothing.
-        let status = unsafe { (driver.stream_query)(probe) };
-        match driver.check(status, "cuStreamQuery") {
-            Ok(()) => Ok(None),
-            Err(error) => Ok(Some(error)),
-        }
+        // The probe runs on whichever thread asks, which for the control
+        // thread is a thread that has never had this context current, so the
+        // context is entered for the query: `cuStreamQuery` on a stream of a
+        // context that is not current answers with an invalid-context status,
+        // which would read as a poisoned context.
+        let answer = in_context(self.raw(), |driver| {
+            driver.check(
+                // SAFETY: `probe` is the stream created above for this
+                // context, which is current here and outlives the call; the
+                // query waits for nothing.
+                unsafe { (driver.stream_query)(probe) },
+                "cuStreamQuery",
+            )
+        });
+        // A context that cannot even be made current, or whose query fails,
+        // cannot be running the job's work, and the status that says so is the
+        // answer.
+        Ok(answer.err())
     }
 
     /// The probe stream, created on first use. Creating an object in a context

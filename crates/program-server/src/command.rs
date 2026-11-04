@@ -205,6 +205,10 @@ pub fn options(matches: &ArgMatches) -> Result<Options> {
             if let Some(reserve) = matches.get_one::<u64>("host-reserve") {
                 limits.host_reserve = *reserve;
             }
+            // `--target` names an architecture: the command line says what
+            // this host builds for, and the Program Server opens no device
+            // (design section 4.1). A caller that knows each device's GPU
+            // model as well fills `ServeOptions::devices` itself.
             let devices = matches
                 .get_many::<String>("target")
                 .map(|targets| {

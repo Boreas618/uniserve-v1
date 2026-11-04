@@ -1,0 +1,42 @@
+# The act_and_mul operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
+# driver the Program Server runs for one descriptor and target).
+#
+# The descriptor is the gating's own: the element type, the output row width,
+# the tile one program walks, the activation, the two input row strides, whether
+# the views span 2**31 elements (the module then addresses in 64 bits), and the
+# dependent-launch and stepwise flags. The key is the one
+# `ActAndMulDescriptor`'s `Display` prints, e.g.
+# `dtype_bf16_width_3072_block_4096_activation_silu_gate_stride_6144_value_stride_3072_wide_false_pdl_false_stepwise_false`.
+#
+# The row strides are whole multiples of the row width — the two halves of one
+# packed projection, or two separately written ones. The values narrow to the
+# keys `model` publishes for H3 and Qwen3-MoE.
+
+op = "act_and_mul"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/act_and_mul.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+[kernel.descriptors]
+dimensions = { dtype = ["bf16", "f16", "f32"], width = ["1024", "1536", "2048", "3072", "4096", "6144", "7168", "8192", "12288", "16384"], block = ["1024", "2048", "4096", "8192"], activation = ["silu", "gelu", "gelu_tanh"], gate_stride = ["1024", "1536", "2048", "3072", "4096", "4608", "6144", "7168", "8192", "9216", "12288", "14336", "16384", "18432", "21504", "24576", "28672", "32768", "36864", "43008", "49152", "57344", "65536", "73728", "98304", "131072"], value_stride = ["1024", "1536", "2048", "3072", "4096", "4608", "6144", "7168", "8192", "9216", "12288", "14336", "16384", "18432", "21504", "24576", "28672", "32768", "36864", "43008", "49152", "57344", "65536", "73728", "98304", "131072"], wide = ["true", "false"], pdl = ["true", "false"], stepwise = ["true", "false"] }
+
+[parameters]

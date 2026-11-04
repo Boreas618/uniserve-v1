@@ -404,6 +404,13 @@ pub(crate) static OUTCOMES: Outcomes = Outcomes {
 /// recorded. The token metrics count only a request that finished.
 pub(crate) struct RequestStats {
     inner: RequestOutputStream,
+    outcome: RequestOutcome,
+}
+
+/// One request's statistics, folded from its output events by a body that is
+/// not a stream of them: the handoffable response body drives one engine
+/// event at a time (design §7.5.1) and reports each output here.
+pub(crate) struct RequestOutcome {
     labels: EngineLabels,
     started: Instant,
     /// The request whose summary line is logged when it ends, when request
@@ -426,6 +433,17 @@ impl RequestStats {
     ) -> Self {
         Self {
             inner,
+            outcome: RequestOutcome::new(labels, started, log),
+        }
+    }
+
+}
+
+impl RequestOutcome {
+    /// A recorder for a request accepted at `started`, recorded under
+    /// `labels`.
+    pub(crate) fn new(labels: EngineLabels, started: Instant, log: Option<String>) -> Self {
+        Self {
             labels,
             started,
             log,
@@ -434,9 +452,20 @@ impl RequestStats {
         }
     }
 
+    /// When the request was accepted.
+    pub(crate) fn started(&self) -> Instant {
+        self.started
+    }
+
+    /// Counts a request the client abandoned or a successor took over, so it
+    /// is not counted twice and the in-flight gauge ends with this process.
+    pub(crate) fn abandoned(&mut self) {
+        self.record("abort", None);
+    }
+
     /// Folds one output event into the request's statistics, recording the
     /// request at its terminal event.
-    fn observe(&mut self, event: &RequestOutput) {
+    pub(crate) fn observe(&mut self, event: &RequestOutput) {
         match event {
             // `queued_at` and `scheduled_at` are engine wall-clock UNIX
             // seconds; a negative difference is clamped to zero.
@@ -519,8 +548,8 @@ impl Stream for RequestStats {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let next = ready!(self.inner.poll_next_unpin(cx));
         match &next {
-            Some(Ok(event)) => self.observe(event),
-            Some(Err(_)) | None => self.record("error", None),
+            Some(Ok(event)) => self.outcome.observe(event),
+            Some(Err(_)) | None => self.outcome.record("error", None),
         }
         Poll::Ready(next)
     }
@@ -530,7 +559,15 @@ impl Drop for RequestStats {
     /// Records a request whose stream was dropped before its terminal event
     /// as aborted.
     fn drop(&mut self) {
-        self.record("abort", None);
+        self.outcome.abandoned();
+    }
+}
+
+impl Drop for RequestOutcome {
+    /// Records a request whose body ended before its terminal event as
+    /// aborted, so a handed-over or abandoned response is counted once.
+    fn drop(&mut self) {
+        self.abandoned();
     }
 }
 

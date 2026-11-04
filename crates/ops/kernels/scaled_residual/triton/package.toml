@@ -1,0 +1,36 @@
+# The scaled_residual operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
+# driver the Program Server runs for one descriptor and target).
+#
+# The descriptor is the residual update's own: the element type, the row width, the
+# element tile one program walks, and whether the update carries a bias. The key is
+# the one `ScaledResidualDescriptor`'s `Display` prints, e.g.
+# `dtype_bf16_columns_3072_block_1024_update_bias_true`.
+
+op = "scaled_residual"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/scaled_residual.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+[kernel.descriptors]
+dimensions = { dtype = ["bf16", "f16", "f32"], columns = ["768", "1024", "1536", "2048", "3072", "4096", "5120", "5376", "6144", "7168", "8192", "12288", "16384"], block = ["1024", "2048", "4096", "8192"], update_bias = ["true", "false"] }
+
+[parameters]

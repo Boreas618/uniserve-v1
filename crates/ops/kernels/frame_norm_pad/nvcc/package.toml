@@ -1,0 +1,42 @@
+# The frame_norm_pad operator's CUDA backend: design 5.2's program package.
+#
+# One native module per descriptor: `pad(silu(group_norm(frame)))` for a video
+# convolution's input (`ops::frame::FrameNormPadCall`, 728 bytes), written in one pass
+# with the arithmetic of PyTorch's own group-norm apply, SiLU and padding kernels.
+#
+# The storage, the normalization branch and the single-pixel path are part of the
+# compilation the operator validates; the module reads them from the call and
+# instantiates the matching kernel, so one object serves every branch and the
+# descriptor is what the store keys the revision by.
+
+op = "frame_norm_pad"
+backend = "nvcc"
+
+[toolchain]
+kind = "nvcc"
+version = "13.0.48"
+packages = []
+
+[module]
+form = "native"
+
+[module.entries]
+launch = "uniserve_frame_norm_pad"
+
+[source]
+kind = "cuda"
+files = [
+    "include/uniserve_frame_norm_pad.h",
+    "src/frame.cu",
+    "src/build.py",
+]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+[kernel.descriptors]
+dimensions = { dtype = ["f32"], channels_last = ["true", "false"], centered = ["true", "false"], single_pixel = ["true", "false"] }
+
+[parameters]

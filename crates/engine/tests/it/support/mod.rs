@@ -20,7 +20,6 @@ pub(crate) fn image_digest(id: u64) -> [u8; 32] {
 use engine::{Executor, Scheduler, SchedulerConfig, SimEngine, SpecialTokenIds};
 use engine::{GenerationFeatures, GenerationLimits, ModelDtype};
 use ipc::{CallKind, ForwardMode, MediaCall};
-use proto::request::SchedulingPolicy;
 
 /// Builds a scheduler whose model limits follow from `executor`'s call kinds.
 ///
@@ -93,18 +92,16 @@ pub(crate) fn scheduler(
 
 /// Builds a scheduler that batches at most `max_batch` calls per pass and
 /// orders waiting requests by `policy`.
-pub(crate) fn scheduler_with_policy(
+pub(crate) fn scheduler_with_depth(
     executor: Box<dyn Executor>,
     special_tokens: SpecialTokenIds,
     max_batch: usize,
-    policy: SchedulingPolicy,
 ) -> anyhow::Result<Scheduler> {
     scheduler_with(
         executor,
         special_tokens,
         SchedulerConfig {
             max_batch,
-            policy,
             ..Default::default()
         },
     )

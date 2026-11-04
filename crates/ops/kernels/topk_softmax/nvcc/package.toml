@@ -33,6 +33,6 @@ architectures = ["sm_100a", "sm_90a"]
 
 # `scores_bf16_experts_128_top_8_renormalize_true_scale_none`.
 [kernel.descriptors]
-dimensions = { scores = ["bf16", "fp16", "f32"], experts = ["128", "256", "64", "32"], top = ["8", "4", "2", "1"], renormalize = ["true", "false"], scale = ["none", "bf16", "fp16", "f32"] }
+dimensions = { scores = ["bf16", "f16", "f32"], experts = ["128", "256", "64", "32"], top = ["8", "4", "2", "1"], renormalize = ["true", "false"], scale = ["none", "bf16", "f16", "f32"] }
 
 [parameters]

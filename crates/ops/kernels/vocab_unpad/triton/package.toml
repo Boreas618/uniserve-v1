@@ -1,0 +1,34 @@
+# The vocab_unpad operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py`.
+#
+# One program copies a block of the unpadded logits; the row count is a launch
+# value.
+
+op = "vocab_unpad"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/vocab_unpad.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+# `dtype_bf16_vocabulary_151936_padded_151936_block_1024_pdl_false`.
+[kernel.descriptors]
+dimensions = { dtype = ["bf16", "f16", "f32"], vocabulary = ["151936", "152064", "248320"], padded = ["151936", "152064", "248320", "253952"], block = ["1024", "512", "2048", "4096"], pdl = ["true", "false"] }
+
+[parameters]
