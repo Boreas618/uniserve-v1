@@ -75,6 +75,12 @@ pub struct SamplerState {
     pub counts: TensorView,
     /// `[rows, PARAMETER_COLUMNS]` f32: temperature, top-k width, top-p, min-p, repetition,
     /// frequency and presence in [`ops::sampler::PARAMETER_COLUMNS`] order.
+    ///
+    /// That order is the operators' and the executor writes it; the reference's own parameter table
+    /// (`uniserve/sampling/top_k.py:41-43`) orders the same values differently, so aligning ours to
+    /// it would move every value one column and turn a nucleus threshold into a min-p threshold on
+    /// every request. This doc and `Sampler::check` are the only two places in this crate that know
+    /// the count: the check uses the constant, so a column added to the operators needs nothing here.
     pub parameters: TensorView,
     /// `[rows]` i32: the slot each row belongs to.
     pub slots: TensorView,
