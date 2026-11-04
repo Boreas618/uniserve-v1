@@ -297,6 +297,11 @@ def run_rows(case: dict, out: Path) -> None:
 def stack_packing(case: dict):
     """The dense layout the candidate's case describes, in the reference's own terms.
 
+    The case describes a `t2va` request: a conditioned one carries its condition rows in
+    `padded_tokens` without naming their tags or extents, so the layout here would be a different
+    request's and the comparison would measure the difference rather than the arithmetic. Such a
+    case is refused by task, not silently packed as if it had no conditions.
+
     The case carries the *padded* row count rather than the alignment that produced it, so the
     layout is rebuilt from the reference's own row functions and the padding the candidate used is
     checked against them: a case whose padded count cannot hold its content rows names that
@@ -304,6 +309,12 @@ def stack_packing(case: dict):
     """
     packing = reference("uniserve.models.minimax_h3.packing")
 
+    task = case.get("task")
+    if task != "t2va":
+        raise SystemExit(
+            f"the case's task is {task!r}, and this probe rebuilds a dense layout without "
+            "conditions; a conditioned request's rows are not described by the case"
+        )
     canvas = canvas_of({"height": case["height"], "width": case["width"]})
     frames = int(case["frames"])
     text_rows = int(case["text_tokens"])
@@ -450,6 +461,14 @@ def run_stack_out(stack: Path, checkpoint: Path, out: Path) -> int:
     The input is the whole contract: both implementations run the same bytes through the same
     layer count at the same step, so the comparison is about arithmetic rather than about who drew
     the noise or which packing produced the rows.
+
+    Three things it checks before it runs, each refused by name: the input's shape against the
+    case's `padded_tokens` and `hidden`, the checkpoint's hidden size against the case's, and the
+    case's `layers` against the layers it then runs (it runs the case's, so a case that says one
+    layer and a checkpoint that holds fifty runs one layer of that fifty). Two things it does not
+    check, because the case does not carry them: the alignment the candidate padded its row count
+    to (only that the padding can hold the content rows), and a conditioned request's condition
+    rows - a case whose task is not `t2va` is refused rather than packed as if it had none.
     """
     torch = reference("torch")
     sys.path.insert(0, str(Path(__file__).resolve().parent))
