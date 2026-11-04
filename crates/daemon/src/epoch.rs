@@ -542,6 +542,10 @@ pub struct PreparedProcess {
 pub struct Epochs {
     records: Mutex<BTreeMap<u64, EpochRecord>>,
     processes: Mutex<Vec<ManagedProcess>>,
+    /// The daemon's process table, once the daemon that supervises this
+    /// node's processes attached it: the processes are the supervisor's to
+    /// report, and this record keeps what each of them is (§2.3).
+    supervised: std::sync::OnceLock<std::sync::Arc<Mutex<Vec<ManagedProcess>>>>,
     update: Mutex<Option<Update>>,
     /// The last launch generation allocated per worker group and rank.
     generations: Mutex<BTreeMap<(String, u64), u64>>,
@@ -908,12 +912,26 @@ impl Epochs {
 
     /// Replaces the node's process table with `processes`.
     pub fn set_processes(&self, processes: Vec<ManagedProcess>) {
-        *locked(&self.processes) = processes;
+        match self.supervised.get() {
+            Some(table) => *locked(table) = processes,
+            None => *locked(&self.processes) = processes,
+        }
     }
 
     /// The node's process table.
     pub fn processes(&self) -> Vec<ManagedProcess> {
-        locked(&self.processes).clone()
+        match self.supervised.get() {
+            Some(table) => locked(table).clone(),
+            None => locked(&self.processes).clone(),
+        }
+    }
+
+    /// Reports the node's processes from `table` from now on: the daemon that
+    /// supervises them writes them there as they start and end, so the record
+    /// names every process of the deployment and never a stale one (§2.3).
+    /// The first table attached is the one kept.
+    pub fn attach_processes(&self, table: std::sync::Arc<Mutex<Vec<ManagedProcess>>>) {
+        let _ = self.supervised.set(table);
     }
 
     /// The epochs and the process table as `GET /admin/config` reports
@@ -1500,6 +1518,46 @@ mod tests {
         let serving_epoch = epochs.get(0).expect("the epoch is recorded");
         assert_eq!(serving_epoch.status, Status::Serving);
         assert_eq!(serving_epoch.policy, serving.programs.policy);
+    }
+
+    /// The process table reports what the daemon attached: every process it
+    /// supervises, with the fields the daemon's own service wrote, and no
+    /// row of a process that ended (§2.3).
+    #[test]
+    fn the_process_table_reports_the_processes_the_daemon_supervises() {
+        let epochs = Epochs::new();
+        epochs.set_processes(vec![ManagedProcess {
+            role: Role::MainProcess,
+            group: "engine".to_owned(),
+            rank: 0,
+            pid: Some(41),
+            epoch: Some(0),
+            build: "uniserve".to_owned(),
+            generation: 3,
+            state: ProcessState::Serving,
+        }]);
+        let table = std::sync::Arc::new(Mutex::new(Vec::new()));
+        epochs.attach_processes(std::sync::Arc::clone(&table));
+
+        // The daemon's service owns the rows from now on: an empty table
+        // reports no process, and the record's own rows are not reported
+        // beside it.
+        assert!(epochs.processes().is_empty());
+        *locked(&table) = vec![ManagedProcess {
+            role: Role::MainProcess,
+            group: "engine".to_owned(),
+            rank: 0,
+            pid: Some(42),
+            epoch: Some(0),
+            build: "uniserve".to_owned(),
+            generation: 4,
+            state: ProcessState::Serving,
+        }];
+        let reported = epochs.report();
+        assert_eq!(reported["processes"].as_array().map(Vec::len), Some(1));
+        assert_eq!(reported["processes"][0]["pid"], serde_json::json!(42));
+        assert_eq!(reported["processes"][0]["generation"], serde_json::json!(4));
+        assert_eq!(reported["processes"][0]["state"], "serving");
     }
 
     /// Which layer a change moves on is decided by what it moves, never by

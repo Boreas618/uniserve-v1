@@ -155,6 +155,9 @@ pub struct Daemon {
     /// the adapter; behind a lock because a `Daemon` is shared between the
     /// HTTP threads and the channel ends are not themselves `Sync`.
     link: std::sync::Mutex<Option<roster::EpochLink>>,
+    /// The processes this node supervises, which the service keeps current
+    /// (§2.3): the epoch layer and `GET /admin/config` read them.
+    table: Option<service::ProcessTable>,
     /// One token per thing the epoch layer has to read, so the thread that
     /// advances the switch waits instead of polling.
     awake: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
@@ -202,7 +205,7 @@ impl Daemon {
             wake: wake_reader,
         };
 
-        let (served, thread, commands, link, awake) = if options.node_rank == 0 {
+        let (served, thread, commands, link, awake, table) = if options.node_rank == 0 {
             let (joins, members) = join_members(&options)?;
             let leader_address = leader_address(&options, &members);
             // Engines may run on any joined node. A deployment with a
@@ -234,6 +237,10 @@ impl Daemon {
             let (greetings, greetings_rx) = std::sync::mpsc::channel();
             let (exits, exits_rx) = std::sync::mpsc::channel();
             let (activity, awake) = std::sync::mpsc::channel();
+            // The processes this node supervises, which the service keeps
+            // current and the admin API reports (§2.3, §7.4).
+            let table: service::ProcessTable = Default::default();
+            let published = Arc::clone(&table);
             let thread = std::thread::Builder::new()
                 .name("daemon".into())
                 .spawn(move || {
@@ -249,6 +256,7 @@ impl Daemon {
                         greetings,
                         exits,
                         activity,
+                        published,
                         &stop,
                     )
                 })
@@ -269,6 +277,7 @@ impl Daemon {
                 Some(commands),
                 link,
                 Some(awake),
+                Some(table),
             )
         } else {
             let leader = join_leader(&options)?;
@@ -278,11 +287,12 @@ impl Daemon {
                 .name("daemon".into())
                 .spawn(move || service::serve_member(local, leader, &stop))
                 .context("starting the daemon's service")?;
-            (None, thread, None, None, None)
+            (None, thread, None, None, None, None)
         };
         let (address, socket) = served.unzip();
         Ok(Self {
             commands,
+            table,
             link: std::sync::Mutex::new(link),
             awake: std::sync::Mutex::new(awake),
             address,
@@ -322,6 +332,8 @@ impl Daemon {
         let (greetings, greetings_rx) = std::sync::mpsc::channel();
         let (exits, exits_rx) = std::sync::mpsc::channel();
         let (activity, awake) = std::sync::mpsc::channel();
+        let table: service::ProcessTable = Default::default();
+        let published = Arc::clone(&table);
         let leader = matches!(handed, HandedService::Leader { .. });
         let node = host.clone();
         let thread = std::thread::Builder::new()
@@ -337,6 +349,7 @@ impl Daemon {
                     greetings,
                     exits,
                     activity,
+                    published,
                     &stop,
                 )
             })
@@ -356,6 +369,7 @@ impl Daemon {
         };
         let (address, socket) = address.unzip();
         Ok(Self {
+            table: leader.then_some(table),
             link: std::sync::Mutex::new(link),
             awake: std::sync::Mutex::new(leader.then_some(awake)),
             commands,
@@ -425,6 +439,12 @@ impl Daemon {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()?;
+        // The epoch records report the node's processes: the service writes
+        // them into this table as they start and end, and the epoch layer's
+        // roster adds what each launch is (§2.3, §7.4).
+        if let Some(table) = &self.table {
+            epochs.attach_processes(Arc::clone(table));
+        }
         let roster = roster::ProcessRoster::new(epochs.clone(), deployment, Vec::new(), link);
         Some((
             Arc::new(crate::updates::driver::Driver::new(

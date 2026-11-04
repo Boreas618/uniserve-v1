@@ -334,6 +334,62 @@ pub(crate) const EPOCH_ENGINE: u64 = 0;
 /// `members` joined before, and other nodes may join at `joins`. Returns
 /// what it served when `stop` asks for a hot restart's handoff, and `None`
 /// once it stopped.
+/// The daemon's process table: the processes this node supervises, which
+/// `GET /admin/config` reports and which a successor daemon keeps (§2.3).
+pub(crate) type ProcessTable =
+    std::sync::Arc<std::sync::Mutex<Vec<crate::epoch::ManagedProcess>>>;
+
+/// Publishes the node's live processes into `table`, keeping what the epoch
+/// layer recorded of each of them — its epoch, its build and the state it
+/// reported — and dropping the rows of processes that ended.
+fn publish(local: &Local, table: &ProcessTable) {
+    let live = local.supervisor.live();
+    let mut rows = match table.lock() {
+        Ok(rows) => rows,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    rows.retain(|row| live.iter().any(|process| same_process(row, process)));
+    for process in live {
+        if let Some(row) = rows.iter_mut().find(|row| same_process(row, &process)) {
+            row.pid = Some(process.pid);
+            continue;
+        }
+        rows.push(crate::epoch::ManagedProcess {
+            role: if process.group == FRONTEND_GROUP {
+                crate::epoch::Role::Frontend
+            } else {
+                crate::epoch::Role::MainProcess
+            },
+            group: process.group,
+            rank: u64::from(process.rank),
+            pid: Some(process.pid),
+            // The epoch a main process serves is its own report's, which the
+            // epoch layer records against this row.
+            epoch: None,
+            build: proto::BUILD.to_owned(),
+            generation: process.generation,
+            // The daemon sees it running; whether it serves requests, parks
+            // or failed is what the process itself reports, which the epoch
+            // layer records against this row.
+            state: crate::epoch::ProcessState::Serving,
+        });
+    }
+}
+
+/// Whether `row` and `process` are the same process: one launch generation of
+/// one worker group's rank.
+fn same_process(
+    row: &crate::epoch::ManagedProcess,
+    process: &crate::supervision::supervisor::HandedProcess,
+) -> bool {
+    row.group == process.group
+        && row.rank == u64::from(process.rank)
+        && row.generation == process.generation
+}
+
+/// The worker group the application's process runs in.
+const FRONTEND_GROUP: &str = "frontend";
+
 pub(crate) fn serve_leader(
     host: &str,
     local: Local,
@@ -346,6 +402,7 @@ pub(crate) fn serve_leader(
     greetings: Sender<(u64, Greeting)>,
     exits: Sender<Exit>,
     wake: Sender<()>,
+    processes: ProcessTable,
     stop: &Stop,
 ) -> anyhow::Result<Option<(HandedService, Vec<OwnedFd>)>> {
     let mut nodes = vec![Node {
@@ -376,6 +433,7 @@ pub(crate) fn serve_leader(
             exits,
             pending: HashMap::new(),
             wake,
+            processes,
         },
         stop,
     )
@@ -418,6 +476,9 @@ pub(crate) struct LeaderService {
     /// A token per thing the epoch layer has to read: a greeting, a report or
     /// an exit wakes the thread that advances the switch.
     wake: Sender<()>,
+    /// The daemon's process table, which this service keeps current as
+    /// processes start and end (§2.3, §7.4).
+    processes: ProcessTable,
 }
 
 /// Runs the leader's service from `service` until `stop`.
@@ -442,9 +503,14 @@ pub(crate) fn run_leader(
         exits,
         mut pending,
         wake,
+        processes,
     } = service;
     let host = host.as_str();
     loop {
+        // What this node supervises now, for the daemon's process table: the
+        // loop turns on events, so a reader of `GET /admin/config` sees the
+        // processes that started and ended (§2.3).
+        publish(&local, &processes);
         if stop.handoff() {
             let service = LeaderService {
                 host: host.to_owned(),
@@ -463,6 +529,7 @@ pub(crate) fn run_leader(
                 exits,
                 pending,
                 wake,
+                processes,
             };
             return service.hand_over().map(Some);
         }
@@ -986,6 +1053,9 @@ impl LeaderService {
             exits: _,
             pending: _,
             wake: _,
+            // The table is the daemon's, like the command channel: the
+            // successor's own service publishes into it.
+            processes: _,
         } = self;
         let (listener_descriptor, unix, address) = listener.hand_over();
         let mut descriptors = vec![listener_descriptor];
@@ -1046,6 +1116,7 @@ pub(crate) fn resume(
     greetings: Sender<(u64, Greeting)>,
     exits: Sender<Exit>,
     wake: Sender<()>,
+    processes: ProcessTable,
     stop: &Stop,
 ) -> anyhow::Result<Option<(HandedService, Vec<OwnedFd>)>> {
     let mut descriptors = descriptors.into_iter();
@@ -1131,6 +1202,7 @@ pub(crate) fn resume(
                     exits,
                     pending: HashMap::new(),
                     wake,
+                    processes,
                 },
                 stop,
             )
