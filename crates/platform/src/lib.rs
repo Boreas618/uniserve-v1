@@ -72,6 +72,7 @@ pub use launch::{Cluster, ClusterScheduling, Function, FunctionAttribute, Launch
 pub use library::Library;
 pub use memory::{DeviceAllocation, HostRegistration, PinnedBuffer};
 pub use native::NativeLibrary;
+pub use nccl::{Communicator, UniqueId};
 pub use nvml::{Nvml, NvmlMemory};
 pub use pool::VirtualPool;
 pub use stream::{CaptureStatus, Stream};
