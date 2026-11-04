@@ -516,11 +516,14 @@ impl RequestState {
         // the next commit's sampling position must state: a decode draws for
         // its token, and a prefill draws when it samples its last row. A
         // verification installs the tokens a drafter proposed without drawing,
-        // and a prompt chunk that samples nothing draws nothing either.
+        // and a prompt chunk that samples nothing draws nothing either. The
+        // call declares that it sampled by carrying the output it sampled into
+        // (`Call::token_output`); `consumer_slots` is the worker's, filled after
+        // this call was planned and never reported back.
         if matches!(
             call.kind,
             CallKind::Forward(ForwardMode::Decode) | CallKind::Forward(ForwardMode::Prefill)
-        ) && !call.consumer_slots.is_empty()
+        ) && call.token_output.is_some()
         {
             self.sampling_position = self.sampling_position.saturating_add(1);
         }
