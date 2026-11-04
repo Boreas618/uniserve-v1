@@ -245,7 +245,10 @@ fn main() {
 
     // A deployment that stores its pages as E4M3 reads them through the same attention program with
     // one scale per page, and fills them with the write that derives that scale.
-    for phase in [ops::attention::Phase::Prefill, ops::attention::Phase::Decode] {
+    for phase in [
+        ops::attention::Phase::Prefill,
+        ops::attention::Phase::Decode,
+    ] {
         lines.push((
             "paged_attention".to_owned(),
             key(&ops::attention::Descriptor {

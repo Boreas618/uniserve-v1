@@ -8,9 +8,9 @@
 
 use nn::{
     AdaptivePool, Conv1d, Conv3d, ConvGeometry, ConvTranspose1d, DType, DevicePtr, FrameNormPad,
-    GatedResidual, KvGroup, KvPlanes, KvView, Linear,
-    ModulatedRmsNorm, Patch, Rotary, Rotate, Rotation, ScaledResidual, ScaledResidualRmsNorm,
-    Shape, Snake, SwiGlu, TensorView, VsaTiles, Weight, WeightedRmsNorm,
+    GatedResidual, KvGroup, KvPlanes, KvView, Linear, ModulatedRmsNorm, Patch, Rotary, Rotate,
+    Rotation, ScaledResidual, ScaledResidualRmsNorm, Shape, Snake, SwiGlu, TensorView, VsaTiles,
+    Weight, WeightedRmsNorm,
 };
 use ops::gemm::WeightOrder;
 
@@ -365,8 +365,7 @@ fn a_convolution_states_the_descriptor_its_launch_takes() {
         Conv1d::descriptor_of(DType::F32, DType::F32, false, DType::F32, geometry, false)
     );
 
-    let transposed =
-        ConvTranspose1d::new(transposed_weight, None, geometry, false).unwrap();
+    let transposed = ConvTranspose1d::new(transposed_weight, None, geometry, false).unwrap();
     assert_eq!(
         transposed.descriptor(DType::F32, DType::F32),
         ConvTranspose1d::descriptor_of(DType::F32, DType::F32, false, DType::F32, geometry, false)
