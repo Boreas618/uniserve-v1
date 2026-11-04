@@ -256,6 +256,16 @@ pub struct ImageShape {
     pub grid: [u32; 3],
 }
 
+/// The prompt an encode's tables are derived from.
+///
+/// The tokens are host values, exactly as the request carried them: no ids are spliced, because the
+/// splice is part of the layout's arithmetic and not of the input's transport.
+#[derive(Clone, Copy)]
+pub struct EncoderPrompt<'a> {
+    /// The request's prompt token ids, in order.
+    pub ids: &'a [u32],
+}
+
 /// The shape of one encode: the rows it fills and the grids it merges.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct EncoderLayout {
@@ -491,9 +501,20 @@ pub trait Encoder {
 
     /// Write the host bytes of each table of `layout`, in [`Self::state_tables`]' order.
     ///
+    /// `prompt` is the request's own tokens, on the host and unspliced: two of a tower's tables (the
+    /// interleaved M-RoPE positions and the prompt rows its images replace) are arithmetic over the
+    /// token ids, and that arithmetic belongs to the model rather than to the runner. The ids are
+    /// deliberately **not** part of the layout: every table's shape follows from the layout's
+    /// counts, only the bytes follow from the ids, so two prompts of one shape share one capture.
+    ///
     /// `out[i]` is `state_tables(layout)[i]`'s bytes, row-major in its element type, already the
     /// right length; the executor uploads it. No allocation, no synchronization, no read-back.
-    fn prepare_state(&self, layout: &EncoderLayout, out: &mut [Vec<u8>]) -> Result<()>;
+    fn prepare_state(
+        &self,
+        prompt: &EncoderPrompt<'_>,
+        layout: &EncoderLayout,
+        out: &mut [Vec<u8>],
+    ) -> Result<()>;
 
     /// Encode `inputs` into `out`.
     fn encode(&self, f: &Forward, inputs: EncoderInputs<'_>, out: EncoderOutputs) -> Result<()>;
@@ -504,8 +525,13 @@ pub trait Denoiser {
     /// The latent layout this request needs.
     fn layout(&self, request: &VideoRequest<'_>) -> Layout;
 
-    /// Draw the initial noise of `out` from `seed`.
-    fn draw_noise(&self, f: &Forward, seed: Seed, out: Latents) -> Result<()>;
+    /// Draw the initial noise of `out` from `seed`, addressed within `layout`.
+    ///
+    /// The layout is a parameter because the draw's element offsets are functions of the request's
+    /// condition noise shapes, which only a layout names: a model that had to remember a
+    /// layout-to-offsets map would hold mutable request state, and the seed addressing is a pure
+    /// function of `(seed, layout, element index)`.
+    fn draw_noise(&self, f: &Forward, seed: Seed, layout: Layout, out: Latents) -> Result<()>;
 
     /// Fold `cond` into the latents the schedule starts from.
     fn prepare_latents<'a>(&self, f: &Forward, cond: Conditioning<'a>, out: Latents) -> Result<()>;
