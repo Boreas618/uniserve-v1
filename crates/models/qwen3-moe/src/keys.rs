@@ -28,6 +28,31 @@ use ops::attention::Phase;
 use ops::moe::exchange::Mode;
 
 use crate::model::Mlp;
+
+/// The cache-write row a deployment compiles for `cache_dtype`: the operator's name and its key.
+///
+/// `nn` dispatches the write on the plane's type — an E4M3 plane is written through the scaled write,
+/// which divides by the page's own scale on the way in, and every other plane through the plain
+/// scatter — so the row must follow the dispatch. A row that named one program for both planes
+/// builds a module nothing launches and leaves the launched one absent, and the failure then reads
+/// as a missing program rather than as this function's.
+pub fn write_row(
+    attention: &nn::layers::Attention,
+    projection: DType,
+    cache: DType,
+) -> (&'static str, String) {
+    if cache == DType::F8E4M3 {
+        (
+            <ops::kv::KvWriteScaled as Op>::NAME,
+            attention.scaled_write_descriptor(projection).to_string(),
+        )
+    } else {
+        (
+            <ops::kv::KvWrite as Op>::NAME,
+            attention.write_descriptor(projection, cache).to_string(),
+        )
+    }
+}
 use crate::{Error, Qwen3Moe, Result};
 
 impl Qwen3Moe {
@@ -96,15 +121,19 @@ impl Qwen3Moe {
                 );
             }
 
-            // The cache write and the two attention phases: the same layer, three programs, because
-            // a prefill reads a whole sequence and a decode reads one token per row.
-            push(
-                "kv_write",
-                attention
-                    .attention
-                    .write_descriptor(dtype, cache_dtype)
-                    .to_string(),
-            );
+            // The cache write, which the layer dispatches on the plane's type: an E4M3 plane goes
+            // through the scaled write — it divides by the page's own scale on the way in, the same
+            // tensor the read multiplies by — and every other plane through the plain scatter. Two
+            // programs, two keys: a row that named one for both would build a module nothing
+            // launches and leave the launched one absent.
+            {
+                let (operator, key) = write_row(&attention.attention, dtype, cache_dtype);
+                push(operator, key);
+            }
+
+            // The two attention phases: the same layer, two programs, because a prefill reads a whole
+            // sequence and a decode reads one token per row. The phase is a key field, so the two
+            // rows are two keys and neither stands for the other.
             for phase in [Phase::Prefill, Phase::Decode] {
                 push(
                     "paged_attention",
