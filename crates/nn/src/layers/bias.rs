@@ -22,7 +22,7 @@ use crate::forward::Forward;
 use crate::layers::launch::PDL;
 
 /// Elements one bias program adds.
-const BLOCK: u32 = 1024;
+pub const BLOCK: u32 = 1024;
 
 /// A per-channel bias, and the residual it is added to.
 #[derive(Clone, Copy, Default)]

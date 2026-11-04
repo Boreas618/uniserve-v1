@@ -18,7 +18,7 @@ use ops::{DType, PhaseKind, Shape, TensorView};
 use crate::capability::{KvGroup, KvPlanes, KvView, TokenBatch};
 use crate::error::{Error, Result};
 use crate::forward::Forward;
-use crate::layers::launch::{kv_tile, PDL};
+use crate::layers::launch::{PDL, kv_tile};
 
 /// Which implementation reads the keys and values.
 ///
@@ -922,9 +922,11 @@ mod tests {
         let table = |dtype: DType, shape: &[u64]| {
             TensorView::new(DevicePtr::new(0x2_0000), dtype, Shape::new(shape))
         };
-        assert!(attention
-            .check_page_table(table(DType::I32, &[15, 4]), 15)
-            .is_ok());
+        assert!(
+            attention
+                .check_page_table(table(DType::I32, &[15, 4]), 15)
+                .is_ok()
+        );
         // A table built as a vector: the shape a harness gets wrong, named with the batch's own
         // sequence count rather than as the operator's axis count.
         let error = attention
@@ -935,12 +937,16 @@ mod tests {
             "{error}"
         );
         // Another batch's table, and pages that are not whole i32 words.
-        assert!(attention
-            .check_page_table(table(DType::I32, &[8, 4]), 15)
-            .is_err());
-        assert!(attention
-            .check_page_table(table(DType::BF16, &[15, 4]), 15)
-            .is_err());
+        assert!(
+            attention
+                .check_page_table(table(DType::I32, &[8, 4]), 15)
+                .is_err()
+        );
+        assert!(
+            attention
+                .check_page_table(table(DType::BF16, &[15, 4]), 15)
+                .is_err()
+        );
     }
 
     #[test]
@@ -979,9 +985,11 @@ mod tests {
         let audio = Attention::fp32(64, 8, 8, 4_096, true, 0.125).unwrap();
         assert_eq!(audio.backend(), AttentionBackend::Fp32);
         assert!(audio.causal());
-        assert!(!Attention::fp32(64, 8, 8, 4_096, false, 0.125)
-            .unwrap()
-            .causal());
+        assert!(
+            !Attention::fp32(64, 8, 8, 4_096, false, 0.125)
+                .unwrap()
+                .causal()
+        );
         // A history window reads the causal mask only.
         assert!(Attention::dense(128, 32, 4, 8_192, false, Some(1_024), 0.088).is_err());
         assert!(Attention::dense(0, 32, 4, 8_192, true, None, 0.088).is_err());

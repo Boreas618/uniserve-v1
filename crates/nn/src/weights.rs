@@ -243,6 +243,14 @@ pub struct WeightRequest {
     pub layout: WeightLayout,
     /// The logical extents after conversion.
     pub shape: Shape,
+    /// The element type this tensor is read as whatever the deployment states, when it has one.
+    ///
+    /// A representation the model pins per tensor - the reference keeps a timestep embedding in
+    /// FP32 and a modulation projection in BF16 at every preset (`weights.py:186-224`) - cannot be
+    /// expressed by the loader's policy, which is one value for every weight it reads. A pin wins
+    /// over the policy, and it is part of the retained key: two loaders of one checkpoint that read
+    /// one tensor at two types retain two different weights.
+    pub pinned: Option<DType>,
 }
 
 impl WeightRequest {
@@ -258,6 +266,7 @@ impl WeightRequest {
             tensor,
             layout: WeightLayout::ROW_MAJOR,
             shape,
+            pinned: None,
         }
     }
 
@@ -274,6 +283,7 @@ impl WeightRequest {
             tensor,
             layout: WeightLayout::ROW_MAJOR,
             shape,
+            pinned: None,
         }
     }
 
@@ -289,7 +299,14 @@ impl WeightRequest {
             source: WeightSource::Parts { parts, shape },
             layout,
             shape,
+            pinned: None,
         }
+    }
+
+    /// The same request read as `dtype`, whatever the loader's policy states.
+    pub fn pinned(mut self, dtype: DType) -> Self {
+        self.pinned = Some(dtype);
+        self
     }
 
     /// The same request in another layout.
@@ -803,7 +820,7 @@ impl<'a> WeightLoader<'a> {
 
         let files = self.identities(&names)?;
         let source_dtype = self.checkpoint_dtype(&names)?;
-        let dtype = self.target_dtype(&names)?;
+        let dtype = self.target_dtype(&names, request.pinned)?;
         let region = WeightRegion {
             tensors: names.clone(),
             start,
@@ -1709,9 +1726,12 @@ impl<'a> WeightLoader<'a> {
     }
 
     /// The element type the weight is retained as.
-    fn target_dtype(&self, names: &[String]) -> Result<DType> {
+    fn target_dtype(&self, names: &[String], pinned: Option<DType>) -> Result<DType> {
         let checkpoint = self.checkpoint_dtype(names)?;
-        let dtype = self.dtype.unwrap_or(checkpoint);
+        // A pin is the model's statement about this tensor; the policy is the deployment's about
+        // every tensor it reads. The pin wins, because a representation the reference fixes at
+        // every preset is not a property of the deployment.
+        let dtype = pinned.or(self.dtype).unwrap_or(checkpoint);
         // A representation that is not converted (BF16 kept as BF16, a packed NVFP4 field of
         // bytes kept as bytes) is read as it is; only a stated change goes through `convert`.
         if dtype == checkpoint {

@@ -14,6 +14,25 @@ pub enum Error {
     #[error(transparent)]
     Ops(#[from] ops::Error),
 
+    /// One operator's launch failed, with the program it selected.
+    ///
+    /// A native entry reports its own failure by the name it was loaded under
+    /// (`native entry \`uniserve_gemm\` failed with status 1`), which says nothing about *which*
+    /// call it was: one operator is launched at many descriptor keys in one forward, and a runtime
+    /// refusal of one cell reads exactly like a refusal of another. The forward, which resolves the
+    /// program and holds the descriptor, is the only place both are in scope, so it names them here
+    /// rather than leaving a stop to be narrowed by guesswork.
+    #[error("operator `{operator}` descriptor {descriptor}: {source}")]
+    Launch {
+        /// The operator whose program failed, as its package names it.
+        operator: &'static str,
+        /// The descriptor key of the program that was selected.
+        descriptor: String,
+        /// What the launch failed with.
+        #[source]
+        source: ops::Error,
+    },
+
     /// A call into the CUDA boundary failed.
     #[error("platform: {0}")]
     Platform(#[from] ops::platform::PlatformError),
@@ -82,6 +101,15 @@ impl Error {
     pub(crate) fn policy(problem: impl Into<String>) -> Self {
         Self::Policy {
             problem: problem.into(),
+        }
+    }
+
+    /// A failed launch, named by its operator and the program it selected.
+    pub(crate) fn launch(operator: &'static str, descriptor: String, source: ops::Error) -> Self {
+        Self::Launch {
+            operator,
+            descriptor,
+            source,
         }
     }
 
