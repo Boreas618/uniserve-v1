@@ -207,6 +207,48 @@ impl Layouts {
         Ok(bound)
     }
 
+    /// The largest number of video tiles any layout of this deployment reaches.
+    ///
+    /// The compression's score matrix is `[heads, query tiles, tiles]`, so its tile axis must cover
+    /// every video tile of every layout the deployment can be asked for. It counts **all** video
+    /// tiles and not the kept ones: a tile the sparsity drops keeps its column and says so through
+    /// its size being zero, which is what masks it out of the softmax, so a bound of the kept tiles
+    /// would under-size the matrix by `1 / (1 - sparsity)` - a fifth of it at `.8`.
+    ///
+    /// Only a sparse deployment has tiles. A dense one refuses by name rather than answering zero,
+    /// because a zero bound would size nothing and the refusal would then arrive at a launch.
+    pub fn tiles_bound(&self) -> Result<u32> {
+        let crate::config::AttentionKind::Sparse { .. } = self.config.attention else {
+            return Err(Error::config(
+                "a dense deployment has no tiles to bound".to_owned(),
+            ));
+        };
+        let tile = self.config.attention.capacity_rows();
+        let mut bound = 0;
+        for canvas in self.config.offered_canvases() {
+            let mut frames = crate::CLIP_FRAMES + crate::CLIP_LATENTS;
+            while frames <= MAX_FRAMES {
+                if let Ok(segment) = packing::segment_packing(
+                    frames,
+                    canvas,
+                    self.arrangement.text_rows,
+                    self.arrangement.condition_rows,
+                    tile,
+                    tile,
+                ) {
+                    bound = bound.max(segment.extent.video_tiles);
+                }
+                frames += crate::CLIP_FRAMES;
+            }
+        }
+        if bound == 0 {
+            return Err(Error::config(
+                "a deployment offers no canvas a layout can be built for".to_owned(),
+            ));
+        }
+        Ok(bound)
+    }
+
     pub fn segment_of(&self, layout: &Layout) -> Result<packing::SegmentPacking> {
         let tile = match self.config.attention {
             crate::config::AttentionKind::Sparse { tile, .. } => tile,
@@ -2864,6 +2906,56 @@ mod tests {
         let mut broken = layout;
         broken.video.frames = 24;
         assert!(sparse_layouts().segment_of(&broken).is_err());
+    }
+
+    #[test]
+    fn the_tile_bound_covers_every_layout_the_deployment_serves() {
+        // The compression's score matrix has one column per video tile, so the bound has to cover
+        // every layout the deployment can be asked for - not only the longest frame count, because a
+        // canvas with a taller grid can hold more tiles at a shorter one.
+        let rules = sparse_layouts();
+        let bound = rules
+            .tiles_bound()
+            .expect("a sparse deployment bounds its tiles");
+        let tile = rules.config.attention.capacity_rows();
+        let mut largest = 0;
+        for canvas in rules.config.offered_canvases() {
+            let mut frames = crate::CLIP_FRAMES + crate::CLIP_LATENTS;
+            while frames <= MAX_FRAMES {
+                if let Ok(segment) = packing::segment_packing(
+                    frames,
+                    canvas,
+                    rules.arrangement.text_rows,
+                    rules.arrangement.condition_rows,
+                    tile,
+                    tile,
+                ) {
+                    let tiles = segment.extent.video_tiles;
+                    assert!(
+                        tiles <= bound,
+                        "{tiles} tiles at {}x{} and {frames} frames exceed the bound {bound}",
+                        canvas.width,
+                        canvas.height
+                    );
+                    largest = largest.max(tiles);
+                }
+                frames += crate::CLIP_FRAMES;
+            }
+        }
+        // And the bound is reached rather than merely safe: a number larger than any layout's spends
+        // memory on nothing, and one smaller refuses on the device instead of counting.
+        assert_eq!(largest, bound);
+    }
+
+    #[test]
+    fn a_dense_deployment_has_no_tile_bound_to_ask_for() {
+        let error = layouts()
+            .tiles_bound()
+            .expect_err("a dense deployment has no tiles");
+        assert!(
+            matches!(error, Error::Config(ref problem) if problem.contains("dense")),
+            "{error:?}"
+        );
     }
 
     #[test]
