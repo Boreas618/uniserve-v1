@@ -1834,6 +1834,25 @@ impl Cudnn {
             format!("engine heuristic fill 6 a fresh descriptor, never counted, MAX_ENGINE_CONFIGS slots requested: {line}"),
             None,
         ));
+        // 7: two reads in a row from one descriptor. If the first fills and
+        // the second does not, the read consumes the list; if both fill, a
+        // read is repeatable and nothing about the count matters.
+        let twice = self
+            .fill_once(heuristic, listed as i64, listed.max(1), -1, false)
+            .and_then(|first| {
+                self.fill_once(heuristic, listed as i64, listed.max(1), -1, false)
+                    .map(|second| (first, second))
+            });
+        let line = match twice {
+            Ok((first, second)) => format!("first: {first}; second: {second}"),
+            Err(error) => format!("refused: {error}"),
+        };
+        steps.push((
+            format!(
+                "engine heuristic fill 7 two reads in a row from the counted descriptor: {line}"
+            ),
+            None,
+        ));
         steps
     }
 
