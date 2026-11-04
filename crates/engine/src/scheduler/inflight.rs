@@ -12,8 +12,8 @@
 //! `InflightInput::Media` that does not advance state, which applies as soon
 //! as the producers of its tensor inputs have left the queue.
 
-use crate::scheduler::completion::CallCompletion;
 use super::*;
+use crate::scheduler::completion::CallCompletion;
 use ipc::MediaCall;
 
 /// Algorithm inputs retained until their call completes.
