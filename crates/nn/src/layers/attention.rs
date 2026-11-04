@@ -12,7 +12,7 @@ use ops::attention::dense::{DenseArgs, DenseAttention, DenseDescriptor};
 use ops::attention::sparse::{SparseArgs, SparseAttention, SparseDescriptor};
 use ops::attention::{Args, Descriptor, Mask, PagedAttention, Phase};
 use ops::kv::{self, Descriptor as KvDescriptor, KvWrite};
-use ops::{DType, DevicePtr, PhaseKind, Shape, TensorView};
+use ops::{PhaseKind, TensorView};
 
 use crate::capability::{KvView, TokenBatch};
 use crate::error::{Error, Result};
@@ -275,11 +275,10 @@ impl Attention {
     ///
     /// `cu_seq_lens_q`/`cu_seq_lens_k` are the `[sequences + 1]` i32 row offsets the scheduler
     /// writes, given together or both absent. Absent means **one sequence**, `[0, q_tokens]` and
-    /// `[0, kv_tokens]`: a decoder that runs one sequence per tile owns no table, and the launch is
-    /// the one it would make with that two-element table — the tables' addresses travel to the
-    /// program as zero, which a package reads as the single-sequence offsets. A batch that packs
-    /// several sequences always passes both, and giving one without the other is refused here
-    /// rather than left to a program.
+    /// `[0, kv_tokens]`: a decoder that runs one sequence per tile owns no table, and the
+    /// descriptor carries that fact, so the call launches the single-sequence program rather than
+    /// reading a table at a null address. A batch that packs several sequences always passes both,
+    /// and one table without the other is refused by the operator.
     ///
     /// Serves both the `Dense` and the `Fp32` backend; the element types the views carry decide the
     /// descriptor, and the package behind it decides the tile and split heuristics.
@@ -320,8 +319,9 @@ impl Attention {
             },
             windowed: self.window.is_some(),
             max_kv_len: self.max_kv_len,
+            // Which of the two programs this call launches, not what this launch reads.
+            cu_seq_lens: cu_seq_lens_q.is_some(),
         };
-        let (cu_seq_lens_q, cu_seq_lens_k) = single_sequence(cu_seq_lens_q, cu_seq_lens_k)?;
         let args = DenseArgs {
             query,
             key,
@@ -591,29 +591,6 @@ impl Attention {
     }
 }
 
-/// The offset tables a dense call packs by, or the absent pair that means one sequence.
-///
-/// One sequence needs no table — its offsets are `[0, tokens]` by construction — so both tables are
-/// absent together and the call carries a zero address and the shape a two-element table has. The
-/// program reads a zero address as those offsets, and nothing on the host writes anything.
-fn single_sequence(
-    queries: Option<TensorView>,
-    keys: Option<TensorView>,
-) -> Result<(TensorView, TensorView)> {
-    match (queries, keys) {
-        (Some(queries), Some(keys)) => Ok((queries, keys)),
-        (None, None) => {
-            let absent = TensorView::new(DevicePtr::new(0), DType::I32, Shape::new(&[2]));
-            Ok((absent, absent))
-        }
-        _ => Err(Error::shape(
-            "Attention::attend_dense",
-            "the query and key offsets are given together, or both absent for one sequence"
-                .to_owned(),
-        )),
-    }
-}
-
 /// The per-page scale a plane's call carries: exactly one when the plane is FP8.
 ///
 /// An FP8 plane without its scale would be read unnormalized and a scaled plane of another type
@@ -645,6 +622,8 @@ pub const TRTLLM_WORKSPACE_BYTES: u64 = 512 << 20;
 
 #[cfg(test)]
 mod tests {
+    use ops::{DType, DevicePtr, Shape};
+
     use super::*;
 
     #[test]
@@ -719,33 +698,5 @@ mod tests {
             "a scale on a plane that has none"
         );
         assert!(page_scale(bf16, None).unwrap().is_none());
-    }
-
-    /// A call of one sequence carries the same argument shapes as the one with a two-element table,
-    /// so `None` is the same launch and not a second path with its own assumptions.
-    #[test]
-    fn one_sequence_needs_no_offset_table() {
-        let tokens = 1_024_u64;
-        let table = TensorView::new(DevicePtr::new(0x1_000), DType::I32, Shape::new(&[2]));
-        let (queries, keys) = single_sequence(Some(table), Some(table)).unwrap();
-        assert_eq!(queries.ptr, table.ptr);
-        assert_eq!(keys.ptr, table.ptr);
-
-        let (queries, keys) = single_sequence(None, None).unwrap();
-        // The shape a program reads its offsets with is the one a two-element table has, and the
-        // address is zero: the program takes `[0, tokens]` from it, and the host writes nothing.
-        assert_eq!(queries.shape.dims(), &[2]);
-        assert_eq!(keys.shape.dims(), &[2]);
-        assert_eq!(queries.dtype, DType::I32);
-        assert_eq!(queries.ptr, DevicePtr::new(0));
-        assert_eq!(keys.ptr, DevicePtr::new(0));
-
-        // Half a table would leave one side with an address and the other with none.
-        assert!(single_sequence(Some(table), None).is_err());
-        assert!(single_sequence(None, Some(table)).is_err());
-        // A table of any other length is the batch path's, and the descriptor's bound is what
-        // decides it, not this rule.
-        let odd = TensorView::new(DevicePtr::new(0x2_000), DType::I32, Shape::new(&[tokens]));
-        assert!(single_sequence(Some(odd), Some(odd)).is_ok());
     }
 }
