@@ -17,7 +17,8 @@
 //! `residual, hidden = add_rms_norm(attn, residual, post_attention_norm)`, and returns
 //! `mlp(hidden)` unsummed. The first layer receives the embeddings with no residual yet, and the
 //! last update is added once at the end, which is the reference's `norm(hidden + residual)` with
-//! `norm` the identity.
+//! `norm` the identity (`uniserve/models/qwen3/transformer.py:178-201` for the layer, and
+//! `uniserve/models/transformer.py:436-451` for the final fold).
 //!
 //! A DeepStack addition is the one place the recurrence is cut: the reference adds the layer's own
 //! output to the residual (`residual + hidden`, one rounding), then the features (a second
@@ -183,9 +184,8 @@ impl Rank {
         for (name, heads) in [
             ("query", config.num_attention_heads),
             ("key/value", config.num_key_value_heads),
-            ("intermediate", config.intermediate_size),
         ] {
-            if !heads.is_multiple_of(degree) && name != "intermediate" {
+            if !heads.is_multiple_of(degree) {
                 return Err(Error::config(format!(
                     "the text encoder's {heads} {name} heads do not split over {degree} ranks"
                 )));
@@ -585,6 +585,8 @@ pub struct TextEncoder {
     rotary: Rotary,
     layers: Vec<Layer>,
     tower: VisionTower,
+    /// The row operator that splices the vision rows into the prompt and adds the DeepStack taps.
+    rows: Rows,
     activation: GatedActivation,
     /// The coefficient of the residual stream: one, read as a weight by the fused operator.
     residual: ScaledResidual,
@@ -666,6 +668,7 @@ impl TextEncoder {
             .map_err(Error::from)?,
             layers,
             tower: VisionTower::load(loader, &config.vision, dtype)?,
+            rows: Rows::new(dtype, hidden).map_err(Error::from)?,
             activation: GatedActivation::new(ACTIVATION),
             residual: ScaledResidual::new(
                 ones(
@@ -754,10 +757,11 @@ impl TextEncoder {
                 inputs.tables.positions.numel()
             )));
         }
-        if inputs.tables.vision_rows.numel() != tokens {
+        if inputs.tables.vision_destinations.numel() != u64::from(plan.merged) {
             return Err(invalid_input(format!(
-                "{} vision row maps for {tokens} tokens",
-                inputs.tables.vision_rows.numel()
+                "{} vision destinations for {} merged vision rows",
+                inputs.tables.vision_destinations.numel(),
+                plan.merged
             )));
         }
         if inputs.batch.num_tokens != plan.tokens {
@@ -863,7 +867,12 @@ impl TextEncoder {
             .forward(f, inputs.ids, hidden)
             .map_err(Error::from)?;
         if !inputs.images.is_empty() {
-            Rows::replace(f, hidden, buffers.features, inputs.tables.vision_rows)?;
+            self.rows.replace(
+                f,
+                hidden,
+                buffers.features,
+                inputs.tables.vision_destinations,
+            )?;
         }
 
         // 3. The prompt's M-RoPE factors, once for the whole stack.
@@ -904,7 +913,7 @@ impl TextEncoder {
                         next as u64 * rows,
                         rows,
                     );
-                    Rows::add(f, hidden, features, inputs.tables.vision_rows)?;
+                    self.rows.add(f, hidden, features, inputs.tables.vision_destinations)?;
                 }
                 carried = None;
                 next += 1;

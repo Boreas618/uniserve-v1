@@ -35,6 +35,14 @@
 //! table's bilinear blend accumulates in FP32 and rounds once into `dtype` (the reference's
 //! `(table[indices] * weights).sum(0)` before `.to(hidden.dtype)`), and the rotary factors are FP32.
 //!
+//! ## The tubelet layout
+//!
+//! The patch embedding reads the processor's flat tubelets, channel-major
+//! (`in_channels · temporal_patch · patch²`, the layout Qwen-VL image processors emit) against the
+//! checkpoint's Conv3d weight flattened in the same order (`uniserve/nn/vision/modules.py:37-46`,
+//! `TubeletEmbed`): the convolution's kernel equals its stride, so one matrix product over the
+//! flattened tubelets evaluates it, and no permutation sits between the checkpoint and the product.
+//!
 //! ## The two GELUs
 //!
 //! The reference uses both of PyTorch's GELU forms: the block MLPs take the checkpoint's
@@ -45,7 +53,6 @@ use nn::capability::ImageInput;
 use nn::layers::{Attention, Gelu, LayerNorm, Linear, PositionInterpolate, Rotate, ScaledResidual};
 use nn::weights::{WeightLoader, WeightRequest};
 use nn::{Arena, DevicePtr, Forward, Shape, TensorView, Weight};
-use ops::gelu::Approximation;
 use ops::gemm::WeightOrder;
 use ops::rope::Rotation;
 
@@ -547,7 +554,8 @@ pub struct VisionTower {
     dtype: nn::DType,
     patch: Linear,
     position: Weight,
-    interpolate: PositionInterpolate,
+    /// The learned table's side and the side it is resampled from: one square grid.
+    position_grid: u32,
     attention: Attention,
     rotate: Rotate,
     layers: Vec<Block>,
@@ -568,13 +576,14 @@ impl VisionTower {
     pub fn load(loader: &mut WeightLoader<'_>, config: &VisionConfig, dtype: nn::DType) -> Result<Self> {
         let hidden = u64::from(config.hidden_size);
         let tubelet = u64::from(Geometry::tubelet(config));
-        let activation = match config.hidden_act {
-            VisionActivation::GeluTanh => Approximation::Tanh,
+        // The checkpoint's activation, and the merger's exact form, are two different GELUs.
+        let blocks_gelu = match config.hidden_act {
+            VisionActivation::GeluTanh => Gelu::tanh(),
         };
         let heads = config.num_heads;
         let head_dim = Geometry::head_dim(config)?;
         // The position table must be a square grid: its rows are indexed by `row · side + column`.
-        Geometry::position_grid(config)?;
+        let position_grid = Geometry::position_grid(config)?;
         let layers = (0..config.depth)
             .map(|index| Block::load(loader, config, index))
             .collect::<Result<Vec<_>>>()?;
@@ -603,16 +612,14 @@ impl VisionTower {
                 &format!("{PREFIX}.pos_embed.weight"),
                 Shape::new(&[u64::from(bound), hidden]),
             )?,
-            interpolate: PositionInterpolate::new(u32::try_from(hidden).map_err(|_| {
-                invalid("VisionTower", "a hidden state wider than a u32")
-            })?),
+            position_grid,
             attention,
             rotate: Rotate::new(head_dim, heads, Rotation::Half).map_err(Error::from)?,
             layers,
             merger: Merger::load(loader, &format!("{PREFIX}.merger"), config, false)?,
             deepstack,
-            blocks_gelu: Gelu::new(activation),
-            merger_gelu: Gelu::new(Approximation::Exact),
+            blocks_gelu,
+            merger_gelu: Gelu::exact(),
             residual: ScaledResidual::new(
                 ones(
                     loader,
@@ -683,15 +690,24 @@ impl VisionTower {
         self.patch
             .forward(f, image.pixels, buffers.hidden)
             .map_err(Error::from)?;
-        self.interpolate
-            .forward(
-                f,
-                self.position.view(),
-                image.position_index,
-                image.position_weight,
-                buffers.normalized,
-            )
-            .map_err(Error::from)?;
+        // The resample's descriptor names both grids, so the layer is built for the image's own
+        // (rectangular) patch grid; the taps and weights are the request's tables.
+        PositionInterpolate::new(
+            self.dtype,
+            u64::from(self.config.hidden_size),
+            self.position_grid,
+            geometry.height,
+            geometry.width,
+        )
+        .map_err(Error::from)?
+        .forward(
+            f,
+            self.position.view(),
+            image.position_index,
+            image.position_weight,
+            buffers.normalized,
+        )
+        .map_err(Error::from)?;
         self.residual
             .forward(f, buffers.hidden, buffers.normalized)
             .map_err(Error::from)?;
