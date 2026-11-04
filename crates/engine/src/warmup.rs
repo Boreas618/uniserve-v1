@@ -202,6 +202,7 @@ pub(crate) fn groups(
             tokens,
             ImageParams::default(),
             Vec::new(),
+            0,
         )
     };
 
@@ -281,6 +282,7 @@ pub(crate) fn groups(
                     0,
                     image,
                     shape.negative_token_ids.clone(),
+                    1,
                 )],
             );
             if !requests.is_empty() {
@@ -325,6 +327,7 @@ fn warmup_request(
     tokens: usize,
     image: ImageParams,
     negative_token_ids: Vec<u32>,
+    images: u16,
 ) -> GenerationRequest {
     GenerationRequest {
         request_id,
@@ -340,8 +343,10 @@ fn warmup_request(
             ..SamplingParams::default()
         },
         image,
-        // One generated image, the budget a client's image request states.
-        max_images: 1,
+        // The images the request asks for: one for an image shape, none for a
+        // request that only generates tokens, since a text deployment has no
+        // image path to run and no shape to read.
+        max_images: images,
         max_und_tokens: tokens,
         stop_strings: Vec::new(),
         stop_token_ids: Vec::new(),
@@ -479,7 +484,7 @@ mod tests {
         };
         assert_eq!(request.prompt_token_ids.len(), 1);
         assert_eq!(request.max_und_tokens, 2);
-        assert_eq!(request.image.steps, 0, "no image work in a token request");
+        assert_eq!(request.max_images, 0, "no image in a token request");
     }
 
     #[test]
@@ -505,21 +510,18 @@ mod tests {
             |_| {},
         );
 
-        // The denoiser runs one request at a time, so each shape is its own
-        // group of one request that runs every step and decodes its image.
-        assert_eq!(groups.len(), 3, "one group per shape");
-        for group in &groups {
+        // The token runtime's group comes first; the shapes follow, one group
+        // each, because the denoiser runs one request at a time.
+        let images: Vec<&Group> = groups.iter().filter(|group| group.what != "token").collect();
+        assert_eq!(images.len(), 3, "one group per shape");
+        for group in &images {
             let [request] = &group.requests[..] else {
                 panic!("an image warm-up group holds one request");
             };
             assert_eq!(request.image.steps, IMAGE_STEPS, "every denoising step");
             assert_eq!(request.max_images, 1, "and one decoded image");
-            assert_eq!(
-                (request.image.height, request.image.width),
-                (request.image.height, request.image.width),
-            );
         }
-        let shapes: Vec<(u32, u32)> = groups
+        let shapes: Vec<(u32, u32)> = images
             .iter()
             .map(|group| {
                 let request = &group.requests[0];
@@ -528,8 +530,8 @@ mod tests {
             .collect();
         assert_eq!(
             shapes,
-            [(64, 64), (128, 64), (64, 128)],
-            "the rank's prepared shapes, each once"
+            [(64, 64), (64, 128), (128, 64)],
+            "the rank's prepared shapes, each once, in the order it prepared them"
         );
     }
 
@@ -540,8 +542,12 @@ mod tests {
         // so the request carries the model's framing of an empty negative
         // prompt as a client's request does.
         let groups = groups_of(image_rank(vec![shape(64, 64, 2, vec![11, 12, 13])]), |_| {});
+        let image = groups
+            .iter()
+            .find(|group| group.what == "64x64 image of 2 branches")
+            .expect("the rank's guided shape is warmed");
         assert_eq!(
-            groups[0].requests[0].negative_prompt_token_ids,
+            image.requests[0].negative_prompt_token_ids,
             [11, 12, 13],
             "the shape's negative tokens travel in the request"
         );
@@ -555,9 +561,14 @@ mod tests {
             // three-branch shape either.
             |config| config.generation_limits.max_cfg_branches = 2,
         );
+        let images: Vec<&str> = groups
+            .iter()
+            .map(|group| group.what.as_str())
+            .filter(|what| *what != "token")
+            .collect();
         assert_eq!(
-            groups.len(),
-            1,
+            images,
+            ["64x64 image of 1 branches"],
             "the shape the deployment's limits refuse is left out"
         );
     }

@@ -242,9 +242,9 @@ pub(crate) fn block_id(blocks: &[String], name: &str) -> Option<ComponentId> {
 
 /// The blocks of every worker of the world: the table `ComponentId`s number, so
 /// a phase's block and a replica's block name the same component.
-pub(crate) fn world_blocks(executor: &dyn Executor) -> Vec<String> {
+pub(crate) fn world_blocks(world: &dyn super::submission::World) -> Vec<String> {
     let mut names = Vec::new();
-    for (_, info) in &executor.info().workers {
+    for (_, info) in &world.info().workers {
         names.extend(blocks(info));
     }
     names.sort();
@@ -1178,14 +1178,13 @@ fn replica_facts(
     request: RequestKey,
     kind: CallKind,
 ) -> Vec<(ReplicaView, crate::WorkerGroupId, String)> {
-    let executor = scheduler.executor.inner();
     candidate_facts(
         scheduler,
         request,
         kind,
         scheduler
             .placement
-            .worker_candidates(executor, &scheduler.info, kind),
+            .worker_candidates(&scheduler.executor, &scheduler.info, kind),
     )
 }
 
@@ -1201,8 +1200,8 @@ fn candidate_facts<'a>(
     kind: CallKind,
     candidates: impl Iterator<Item = (&'a crate::WorkerGroupId, &'a str, &'a WorkerInfo)>,
 ) -> Vec<(ReplicaView, crate::WorkerGroupId, String)> {
-    let executor = scheduler.executor.inner();
-    let table = world_blocks(executor);
+    let world = &scheduler.executor;
+    let table = world_blocks(world);
     let decode_stage = matches!(
         kind,
         CallKind::Forward(ForwardMode::Decode | ForwardMode::Verify)
@@ -1219,7 +1218,7 @@ fn candidate_facts<'a>(
                 resident_requests: resident_requests(&scheduler.placement, worker),
                 // The executor reports whether a worker's queue has room, not
                 // how many rows that is; a plan may submit one call's worth.
-                capacity: u32::from(executor.has_capacity(worker)),
+                capacity: u32::from(world.has_capacity(worker)),
                 holds_request: holds_request(
                     &scheduler.placement,
                     request,
@@ -1256,9 +1255,9 @@ pub(crate) fn call(
 /// Every replica a `place` decision may choose, for `Snapshot::replicas`: one
 /// per worker of the world, in the executor's order.
 pub(crate) fn replica_catalog(scheduler: &Scheduler) -> Vec<ReplicaView> {
-    let executor = scheduler.executor.inner();
-    let table = world_blocks(executor);
-    executor
+    let world = &scheduler.executor;
+    let table = world_blocks(world);
+    world
         .info()
         .workers
         .iter()
@@ -1273,7 +1272,7 @@ pub(crate) fn replica_catalog(scheduler: &Scheduler) -> Vec<ReplicaView> {
                 block: block_id(&table, bound).unwrap_or(ComponentId(0)),
                 kinds: worker_phases(info),
                 resident_requests: resident_requests(&scheduler.placement, worker),
-                capacity: u32::from(executor.has_capacity(worker)),
+                capacity: u32::from(world.has_capacity(worker)),
                 holds_request: false,
                 prefills_only: scheduler.placement.prefill_groups.contains(worker),
                 holds_component: false,
@@ -1309,7 +1308,7 @@ pub(crate) fn snapshot(scheduler: &Scheduler, step: u64, recorded: &RecordedTabl
         pages: pages(scheduler),
         encodings: encodings(scheduler),
         replicas: replica_catalog(scheduler),
-        phases: phases_in(&scheduler.info, &world_blocks(scheduler.executor.inner())),
+        phases: phases_in(&scheduler.info, &world_blocks(&scheduler.executor)),
         ranks: Vec::new(),
     }
 }
@@ -1376,7 +1375,34 @@ pub(crate) fn queued(scheduler: &Scheduler) -> Vec<ViewRequestId> {
 /// The validators read a `Plan`'s names against it, so it is built at the step
 /// the plan belongs to and rebuilt after `reclaim` changes the state.
 pub(crate) fn live(scheduler: &Scheduler, step: u64, recorded: &RecordedTable) -> Live<'static> {
-    Live::of(&snapshot(scheduler, step, recorded), queued(scheduler))
+    let mut live = Live::of(&snapshot(scheduler, step, recorded), queued(scheduler));
+    // The told sets are the recorder's, owned here because this state outlives
+    // the borrow of the scheduler: the switch hands it over to a candidate.
+    live.told_pages = std::borrow::Cow::Owned(
+        scheduler
+            .recorder
+            .announced_pages()
+            .iter()
+            .copied()
+            .collect(),
+    );
+    live.told_encodings = std::borrow::Cow::Owned(
+        scheduler
+            .recorder
+            .announced_encodings()
+            .iter()
+            .copied()
+            .collect(),
+    );
+    live.told_requests = std::borrow::Cow::Owned(
+        scheduler
+            .recorder
+            .announced_requests()
+            .iter()
+            .copied()
+            .collect(),
+    );
+    live
 }
 
 /// The live state a step's starvation rule reads: the views of the requests the
@@ -1411,7 +1437,6 @@ pub(crate) fn watching(scheduler: &Scheduler, recorded: &RecordedTable) -> Live<
     }
     live
 }
-
 
 /// A queued request and the ranks, for `route`: the first request the
 /// mechanism is still to admit, and the ranks it may be routed to.

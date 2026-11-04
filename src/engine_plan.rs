@@ -66,6 +66,12 @@ pub(crate) struct EpochPlan {
     world_size: usize,
     /// Batches the rank's schedulers keep in flight, which the capacity plan relays through.
     queue_depth: usize,
+    /// This rank's worker group, which the rank facts name as its identity.
+    group: String,
+    /// The watchdog the launch file states apart from the build config (§2.4), when it states one.
+    watchdog_override: Option<Duration>,
+    /// This rank's part of the epoch's parallel shape (§4.3, §5.1), resolved with the plan.
+    placement: Placement,
 }
 
 impl EpochPlan {
@@ -76,6 +82,7 @@ impl EpochPlan {
     /// guessed its devices from the epoch's parallelism would capture graphs on another rank's
     /// device.
     pub(crate) fn of(launch: &Launch, build: &daemon::epoch::BuildConfig) -> Result<Self> {
+        let placement = Placement::of(launch, build)?;
         if launch.devices.is_empty() {
             bail!(
                 "rank {} of group {} was started with no device to serve",
@@ -138,26 +145,10 @@ impl EpochPlan {
             world: launch.world,
             world_size: launch.world_size as usize,
             queue_depth: launch.queue_depth as usize,
+            group: launch.group.clone(),
+            watchdog_override: launch.watchdog_timeout_s.map(Duration::from_secs),
+            placement,
         })
-    }
-
-    /// The epoch's build config, for an accessor that needs another of its fields.
-    pub(crate) fn build(&self) -> &daemon::epoch::BuildConfig {
-        &self.build
-    }
-
-    /// The checkpoint this rank serves.
-    pub(crate) fn checkpoint(&self) -> &Path {
-        &self.checkpoint
-    }
-
-    /// The bucket catalog every device captures, built once from `cuda_graph`.
-    ///
-    /// A catalog is a property of the epoch, not of a device, so `graph` and `runners` share it
-    /// rather than each building one: two catalogs of one epoch would be two answers to what a
-    /// batch may be, and a batch that fits one but not the other would have no graph to replay.
-    pub(crate) fn buckets(&self) -> &Buckets {
-        &self.buckets
     }
 
     /// The blocking pools' admission bounds, one lane per kind (§2.4).
@@ -246,9 +237,79 @@ impl EpochPlan {
         })
     }
 
-    /// How long a job may run without rank progress before it is reported `Stalled` (§2.4).
+    /// How long a job may run without rank progress before it is reported `Stalled` (§2.4): the
+    /// launch file's when it states one apart from the build config, and the build config's else.
     pub(crate) fn watchdog_timeout(&self) -> Duration {
-        self.build.worker.watchdog_timeout
+        self.watchdog_override
+            .unwrap_or(self.build.worker.watchdog_timeout)
+    }
+
+    /// The launch-file and build-config facts a scheduler derives an epoch's configuration from.
+    ///
+    /// Every fact this process can state is read from the source that owns it: the launch file the
+    /// daemon wrote (`group`, `rank`, `world`, `world_size`, `devices`, the watchdog), the epoch's
+    /// build config (`dtype`, `max_running_requests`, `max_model_len`, the host cache), the captured
+    /// catalog (`max_batch`, `max_num_batched_tokens`, `graph_tiers`; a batch larger than the
+    /// largest bucket is refused before a kernel runs, so the catalog is the admission bound), and,
+    /// for the page size and the cache dtype, what was opened rather than what was asked for.
+    ///
+    /// The facts no source states stay `None`, and that is the answer rather than a gap to fill
+    /// with a guess: `hosts` is the deployment's hosts in rank order, which the launch file does not
+    /// carry (`Launch::peers` is this node's peer addresses), and `bos`, `eos`, `end_of_image` and
+    /// `generation_limits` are the checkpoint's tokenizer and generation facts, which neither the
+    /// launch file nor the model's configuration states. `engine::EngineConfig::of` refuses each of
+    /// them by name, so a deployment that needs one fails with the fact it is missing.
+    pub(crate) fn rank_facts(
+        &self,
+        memory: &Memory,
+        model: &qwen3_moe::Qwen3Moe,
+    ) -> Result<engine::RankFacts> {
+        let (rows, tokens) = self.buckets.bounds();
+        // The graph sizes this rank captures, which is the tier a plan's batch must fit (§4.5).
+        let graph_tiers = self
+            .buckets
+            .iter()
+            .map(|bucket| bucket.tokens)
+            .collect::<std::collections::BTreeSet<u32>>()
+            .into_iter()
+            .collect();
+        Ok(engine::RankFacts {
+            model: Some(self.checkpoint.display().to_string()),
+            dtype: Some(self.build.dtype.clone()),
+            world: Some(self.world),
+            group: Some(self.group.clone()),
+            rank: Some(self.rank as usize),
+            world_size: Some(self.world_size),
+            devices: Some(
+                self.devices
+                    .iter()
+                    .map(|device| device.0.to_string())
+                    .collect(),
+            ),
+            hosts: None,
+            peers: None,
+            max_running_requests: Some(self.build.max_running_requests.get()),
+            max_batch: Some(rows as usize),
+            max_num_batched_tokens: Some(tokens as usize),
+            block_size: Some(cache_page_size(memory, model)?),
+            kv_cache_dtype: Some(cache_dtype(model, self.build.kv_cache.dtype)?),
+            host_cache: match (self.build.kv_cache.host_ratio, self.build.kv_cache.host_gib) {
+                // A deployment that states neither keeps no host tier of its own, which is what a
+                // storage grant of `None` means.
+                (None, None) => None,
+                (ratio, gib) => Some(engine::HostCacheSize::new(
+                    ratio,
+                    gib.map(|gib| gib.get() << 30),
+                )?),
+            },
+            graph_tiers: Some(graph_tiers),
+            bos: None,
+            eos: None,
+            end_of_image: None,
+            generation_limits: None,
+            max_model_len: self.build.max_model_len.map(|length| length.get()),
+            watchdog_timeout: Some(self.watchdog_timeout()),
+        })
     }
 
     /// The Program Server's targets this rank resolves a module for (§5.3).
@@ -258,9 +319,10 @@ impl EpochPlan {
 
     /// The runners `device` serves: one per block of the loaded model (§4.3).
     ///
-    /// This is the single match on model class in the tree. Everything downstream of it - the
-    /// buckets, the arena, the sampler, the graphs - is written against `nn`'s capability traits,
-    /// so a second causal-language class joins as a variant here and changes nothing else.
+    /// The model's class was resolved once, when it was loaded and its resident memory opened
+    /// ([`EpochPlan::load_and_open`]), so this builds the runner that class needs from the model it
+    /// is handed. Everything downstream - the buckets, the arena, the sampler, the graphs - is
+    /// written against `nn`'s capability traits.
     pub(crate) fn runners(
         &self,
         device: DeviceId,
@@ -268,7 +330,6 @@ impl EpochPlan {
         memory: &mut Memory,
         generation: &Arc<Generation>,
     ) -> Result<Vec<NamedRunner>> {
-        let class = architectural_class(&self.checkpoint)?;
         let mut runners: Vec<NamedRunner> = Vec::new();
         // One model per rank is loaded and mapped on the rank's first device, and a kernel on a
         // second device would read the first device's addresses: a node whose rank serves two
@@ -282,8 +343,8 @@ impl EpochPlan {
                 device.0
             );
         }
-        match class.as_str() {
-            "Qwen3MoeForCausalLM" => {
+        {
+            {
                 let geometry = Geometry {
                     hidden: narrow(model.config().hidden_size, "hidden_size")?,
                     hidden_dtype: model.dtype(),
@@ -328,12 +389,54 @@ impl EpochPlan {
                 )?;
                 runners.push(NamedRunner::new(RunnerId(0), Box::new(runner)));
             }
+        }
+        Ok(runners)
+    }
+
+    /// Loads the rank's model and opens the resident owners it leaves room for (§4.3, §8, 4.1).
+    ///
+    /// **This is the single match on model class in the tree**, and the arm loads the class it
+    /// names: the checkpoint is opened, its config and partition read, the weights mapped through
+    /// `weights` (a weight converted once is published to retained storage and mapped read-only
+    /// afterwards), and the model built. It then opens the memory, because the capacity plan
+    /// measures a device the weights are already mapped on - what is left, not what was there
+    /// before the load - and returns both, so the caller holds no model class of its own and no
+    /// knowledge of the order the two must be done in.
+    pub(crate) fn load_and_open(
+        &self,
+        weights: &mut dyn nn::RetainedWeights,
+        storage: &mut dyn executor::memory::retained::ExclusiveStorage,
+    ) -> Result<(Arc<qwen3_moe::Qwen3Moe>, Memory)> {
+        let placement = &self.placement;
+        let class = architectural_class(&self.checkpoint)?;
+        match class.as_str() {
+            "Qwen3MoeForCausalLM" => {
+                // §8: the checkpoint's own representation stands unless the deployment fixed
+                // another, which is the build config's `dtype` and `quantization`.
+                let opened = nn::Checkpoint::open(&self.checkpoint)?;
+                let mut loader = nn::WeightLoader::new(&opened, weights, None, None);
+                let config = qwen3_moe::Config::read(&self.checkpoint)?;
+                let partition = qwen3_moe::Partition::new(
+                    &config,
+                    placement.tensor_parallel as usize,
+                    placement.tensor_rank as usize,
+                    placement.expert_parallel as usize,
+                    placement.expert_rank as usize,
+                )?;
+                let model = qwen3_moe::load(
+                    &self.checkpoint,
+                    partition,
+                    &mut loader,
+                    placement.load_options,
+                )?;
+                let memory = self.open_memory(&model, storage)?;
+                Ok((Arc::new(model), memory))
+            }
             other => bail!(
                 "{} declares model class {other}, which this build cannot serve",
                 self.checkpoint.display()
             ),
         }
-        Ok(runners)
     }
 
     /// Opens the rank's resident owners from the capacity plan (4.1, 8).
@@ -353,14 +456,6 @@ impl EpochPlan {
             .devices
             .first()
             .context("this rank serves no device to open its resident memory on")?;
-        let class = architectural_class(&self.checkpoint)?;
-        if class != "Qwen3MoeForCausalLM" {
-            bail!(
-                "{} declares model class {class}, which states no cache geometry this build can \
-                 plan",
-                self.checkpoint.display()
-            );
-        }
         // The KV geometry is the model's own: its layer count, the heads each layer stores and the
         // width of a head. Every figure comes from `config()`, so a checkpoint whose shape this
         // build cannot state is refused by name below rather than planned with a literal.
@@ -585,3 +680,43 @@ fn architectural_class(checkpoint: &Path) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("{} declares no model class", path.display()))?;
     Ok(class.to_owned())
 }
+
+/// How this rank takes part in the deployment's parallel shape (§4.3, §5.1), as the build config
+/// fixes it and the daemon's launch places it.
+pub(crate) struct Placement {
+    tensor_parallel: u32,
+    tensor_rank: u32,
+    expert_parallel: u32,
+    expert_rank: u32,
+    load_options: qwen3_moe::LoadOptions,
+}
+
+impl Placement {
+    /// This rank's part of the epoch's parallel shape.
+    ///
+    /// Tensor parallelism splits every layer of the group's ranks; expert parallelism splits the
+    /// routed experts of the deployment's schedulers. A rank's ordinal places it in both: its
+    /// tensor rank is its position inside its scheduler's group, and its expert rank is which
+    /// scheduler's share of the experts it keeps.
+    fn of(launch: &Launch, build: &daemon::epoch::BuildConfig) -> Result<Self> {
+        let tensor_parallel = u32::try_from(build.tensor_parallel_size.get())
+            .context("a tensor-parallel degree larger than u32::MAX")?;
+        if tensor_parallel == 0 {
+            bail!("a tensor-parallel degree of zero splits nothing");
+        }
+        let data_parallel = u32::try_from(build.data_parallel_size.get())
+            .context("a data-parallel degree larger than u32::MAX")?;
+        let expert_parallel = if build.expert_parallel { data_parallel } else { 1 };
+        Ok(Self {
+            tensor_parallel,
+            tensor_rank: launch.rank % tensor_parallel,
+            expert_parallel,
+            expert_rank: (launch.rank / tensor_parallel) % expert_parallel,
+            // The deployment's page size is the cache's (`kv_cache_config.block_size`), and the
+            // attention program's workspace is the load config's; neither is ours to guess, so the
+            // model's own defaults stand until the loader takes them from the build config.
+            load_options: qwen3_moe::LoadOptions::default(),
+        })
+    }
+}
+

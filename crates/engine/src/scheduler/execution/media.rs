@@ -445,7 +445,7 @@ impl Scheduler {
             .get(&(request, component.to_owned()));
         let (worker, bound, _) = self
             .placement
-            .component_candidates(self.executor.inner(), work, component)
+            .component_candidates(&self.executor, work, component)
             .find(|(worker, _, _)| owner.is_none_or(|owner| *worker == owner))?;
         let config = self.executor.info().component_config(worker, bound)?;
         Some((worker, config))
@@ -767,7 +767,7 @@ impl Scheduler {
             .is_some_and(|component| {
                 self.placement
                     .component_target(
-                        self.executor.inner(),
+                        &self.executor,
                         request,
                         CallKind::Media(media_call),
                         component,
@@ -1227,7 +1227,7 @@ impl Scheduler {
         let (worker, selected_component) = self
             .placement
             .select_worker(
-                self.executor.inner(),
+                &self.executor,
                 &self.info,
                 &call,
                 &placement::Choice::Existing,
