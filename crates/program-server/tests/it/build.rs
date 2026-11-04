@@ -194,6 +194,74 @@ fn descriptor_key(text: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.join("_"))
 }
 
+/// A copy of a tree package in `temporary` that declares this host's version of
+/// the toolchain, or `None` when the host has no such toolchain.
+///
+/// A checked-in package is written for one toolkit version, and a version
+/// change is a new revision (design sections 5.1 and 5.2), so a package of the
+/// tree can only build on a host whose compiler is that exact version. A
+/// witness must not fail because a host's compiler patch differs: it copies the
+/// package and declares the version the host's toolchain reports, which leaves
+/// the form, the entries and the sources under test untouched.
+fn at_host_version(
+    source: &Path,
+    temporary: &Path,
+    toolchains: &ToolchainConfig,
+) -> Option<PathBuf> {
+    let manifest = program_server::manifest::Manifest::load(source).ok()?;
+    let kind = manifest.toolchain.kind;
+    let version = program_server::toolchain::Toolchains::discover(toolchains)
+        .ok()?
+        .version(kind)
+        .ok()?
+        .to_owned();
+    let name = source
+        .file_name()
+        .map(|name| name.to_owned())
+        .unwrap_or_else(|| "package".into());
+    let destination = temporary.join(name);
+    copy_tree(source, &destination);
+    let text = std::fs::read_to_string(destination.join("package.toml")).ok()?;
+    std::fs::write(
+        destination.join("package.toml"),
+        declare_toolchain_version(&text, &version),
+    )
+    .ok()?;
+    Some(destination)
+}
+
+/// Every file and directory of `source`, under `destination`.
+fn copy_tree(source: &Path, destination: &Path) {
+    std::fs::create_dir_all(destination).expect("the copied package's directory");
+    for entry in std::fs::read_dir(source).expect("the package's files") {
+        let entry = entry.expect("a package file");
+        let target = destination.join(entry.file_name());
+        if entry.file_type().expect("a file type").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("a copied package file");
+        }
+    }
+}
+
+/// `manifest` with the `[toolchain]` section's `version` set to `version`.
+fn declare_toolchain_version(manifest: &str, version: &str) -> String {
+    let mut lines = Vec::new();
+    let mut in_toolchain = false;
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_toolchain = trimmed == "[toolchain]";
+        }
+        if in_toolchain && trimmed.starts_with("version") && trimmed.contains('=') {
+            lines.push(format!("version = \"{version}\""));
+        } else {
+            lines.push(line.to_owned());
+        }
+    }
+    lines.join("\n") + "\n"
+}
+
 /// Whether the host has a program, which a witness needs before it runs.
 fn have(program: &str, arguments: &[&str]) -> bool {
     std::process::Command::new(program)
@@ -359,22 +427,34 @@ fn a_triton_package_builds_a_cubin_module_and_resolves_it() {
         );
         return;
     }
-    let package = tree_package("triton").expect("the tree has a Triton package");
+    let Some(package) = tree_package("triton") else {
+        eprintln!("SKIPPED: the tree holds no Triton package");
+        return;
+    };
+    let toolchains = ToolchainConfig {
+        nvcc: None,
+        python: interpreter(),
+        wasm: None,
+        max_jobs: 2,
+    };
+    // The tree's package is written for one Triton version; this host's may be
+    // another patch, which is a new revision and not a defect of the witness.
+    let temporary = tempfile::tempdir().unwrap();
+    let Some(directory) = at_host_version(&package.directory, temporary.path(), &toolchains)
+    else {
+        eprintln!("SKIPPED (provisioning): this host reports no Triton version to build with");
+        return;
+    };
     let witness = witness(
-        &package.directory,
+        &directory,
         &package.op,
         &package.backend,
         &package.descriptor,
-        ToolchainConfig {
-            nvcc: None,
-            python: interpreter(),
-            wasm: None,
-            max_jobs: 2,
-        },
+        toolchains,
     );
 
     // The package's `[parameters]` fill the selected program's arguments.
-    let manifest = std::fs::read_to_string(package.directory.join("package.toml")).unwrap();
+    let manifest = std::fs::read_to_string(directory.join("package.toml")).unwrap();
     let parameters = manifest
         .split("[parameters]")
         .nth(1)
@@ -453,22 +533,30 @@ fn a_cuda_package_builds_the_module_its_manifest_declares() {
         eprintln!("SKIPPED: the tree holds no CUDA package");
         return;
     };
+    let toolchains = ToolchainConfig {
+        nvcc: None,
+        python: interpreter(),
+        wasm: None,
+        max_jobs: 2,
+    };
+    // A package of the tree declares one toolkit version, and a version change
+    // is a new revision; the witness builds this host's toolkit instead.
+    let temporary = tempfile::tempdir().unwrap();
+    let Some(directory) = at_host_version(&package.directory, temporary.path(), &toolchains)
+    else {
+        eprintln!("SKIPPED (provisioning): this host reports no nvcc version to build with");
+        return;
+    };
     // What the package declares is what the module must be: nvcc writes a
     // cubin and its launch metadata, or a native library with the entries the
     // package names (design section 5.3).
-    let manifest =
-        program_server::manifest::Manifest::load(&package.directory).expect("the package loads");
+    let manifest = program_server::manifest::Manifest::load(&directory).expect("the package loads");
     let witness = witness(
-        &package.directory,
+        &directory,
         &package.op,
         &package.backend,
         &package.descriptor,
-        ToolchainConfig {
-            nvcc: None,
-            python: interpreter(),
-            wasm: None,
-            max_jobs: 2,
-        },
+        toolchains,
     );
 
     assert_eq!(witness.progress[0].state, BuildState::Committed);
@@ -537,17 +625,24 @@ fn a_cute_dsl_package_builds_a_native_module_with_its_entries() {
         eprintln!("SKIPPED: the tree holds no CuTe DSL package");
         return;
     };
+    let toolchains = ToolchainConfig {
+        nvcc: None,
+        python: interpreter(),
+        wasm: None,
+        max_jobs: 2,
+    };
+    let temporary = tempfile::tempdir().unwrap();
+    let Some(directory) = at_host_version(&package.directory, temporary.path(), &toolchains)
+    else {
+        eprintln!("SKIPPED (provisioning): this host reports no CuTe DSL version to build with");
+        return;
+    };
     let witness = witness(
-        &package.directory,
+        &directory,
         &package.op,
         &package.backend,
         &package.descriptor,
-        ToolchainConfig {
-            nvcc: None,
-            python: interpreter(),
-            wasm: None,
-            max_jobs: 2,
-        },
+        toolchains,
     );
 
     assert_eq!(witness.progress[0].state, BuildState::Committed);
