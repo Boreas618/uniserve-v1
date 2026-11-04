@@ -513,6 +513,15 @@ pub struct PolicyUsage {
     /// has had: a switchover carries its predecessor's total forward, so the
     /// counters only ever grow.
     pub fuel: u64,
+    /// Those calls by decision, the instance serving now and every one it
+    /// replaced (§4.4).
+    ///
+    /// This is the epoch's call discipline as a caller can see it: one `observe`
+    /// and one `dispatch` per step whatever they answer, each optional decision
+    /// only where the state names it, and the trial a precopy ran on the
+    /// instance a switchover adopts. A policy that replaced another carries the
+    /// replaced instance's counts forward, as `calls` and `fuel` do.
+    pub decisions: scheduling::PolicyCost,
 }
 
 /// What one scheduler tells the control thread's counters on a statistics tick:
@@ -538,6 +547,9 @@ struct Cost {
     /// Fuel of the instances that stopped serving, and of the trials whose
     /// candidates were adopted.
     spent: u64,
+    /// The decisions of the instances that stopped serving; the serving
+    /// instance's own are read from it, as its fuel is.
+    decisions: scheduling::PolicyCost,
 }
 
 impl Cost {
@@ -556,12 +568,14 @@ impl Cost {
         PolicyUsage {
             calls: self.calls,
             fuel: self.spent + instance.fuel_consumed(),
+            decisions: self.decisions + instance.cost(),
         }
     }
 
     /// An instance stops serving: its fuel stays in the total.
     fn replace(&mut self, instance: &PolicyInstance) {
         self.spent += instance.fuel_consumed();
+        self.decisions = self.decisions + instance.cost();
     }
 
     /// A trial's calls are counted when its candidate is adopted: they are
