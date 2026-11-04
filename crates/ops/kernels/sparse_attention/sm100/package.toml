@@ -41,6 +41,6 @@ target = "arch"
 architectures = ["sm_100a"]
 
 [kernel.descriptors]
-dimensions = { block = ["64", "128"], dtype = ["bf16"], output = ["bf16"], head_dim = ["128"], lse = ["true", "false"], keys = ["40960"] }
+dimensions = { block = ["64", "128"], dtype = ["bf16"], output = ["bf16"], head_dim = ["128"], lse = ["true", "false"] }
 
 [parameters]

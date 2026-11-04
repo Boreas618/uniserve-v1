@@ -1,0 +1,44 @@
+# The sparse_attention operator's SM90 backend: design 5.2's program package.
+#
+# One native module per descriptor: H3's Video Sparse Attention, attention over the key
+# blocks a caller selected (`ops::attention::sparse::SparseCall`, 704 bytes), on Hopper.
+# The kernel is the warpgroup-pipelined SM90a block-sparse forward pass carried verbatim in
+# this package's sources; this package owns the operator's side — the call structure, the
+# geometry checks its TMA copies need, and the one thing this backend does not do, which
+# is write the softmax normalizer.
+#
+# The kernel's query tile and key block are both fixed at 128 rows, so this backend serves
+# the descriptor's block 128 and only that.
+
+op = "sparse_attention"
+backend = "sm90"
+
+[toolchain]
+kind = "nvcc"
+version = "13.0.48"
+packages = []
+
+[module]
+form = "native"
+
+[module.entries]
+launch = "uniserve_sparse_attention"
+
+[source]
+kind = "cuda"
+files = [
+    "include/uniserve_sparse_attention.h",
+    "src/block_sparse_sm90a.cuh",
+    "src/attention.cu",
+    "src/build.py",
+]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_90a"]
+
+[kernel.descriptors]
+dimensions = { block = ["128"], dtype = ["bf16"], output = ["bf16"], head_dim = ["128"], lse = ["false"] }
+
+[parameters]
