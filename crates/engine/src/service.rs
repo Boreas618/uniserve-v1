@@ -186,8 +186,11 @@ impl Generations {
     /// same content, or the next unused number for a content not prepared yet.
     ///
     /// A repeated precopy of the same program is the same generation - the
-    /// daemon repeats a precopy it did not see answered - so it neither prepares
-    /// the program twice nor takes a second number for it.
+    /// daemon repeats a precopy it did not see answered - so it takes no second
+    /// number for it. Whether it prepares again is the precopy's decision: a
+    /// program the policy no longer holds is prepared again under the number it
+    /// already has, because `Precopied` promises that a switchover to it can
+    /// follow.
     fn number_of(&mut self, key: &ProgramKey) -> u64 {
         match self.named.iter().find(|(_, named)| *named == key) {
             Some((number, _)) => *number,
@@ -2802,14 +2805,23 @@ fn apply_process_command(
                 program.revision,
                 program.stated.clone(),
             );
-            let (generation, prepared) = {
+            let (generation, held) = {
                 let mut generations = crate::lock(generations);
-                let known = generations.named.values().any(|named| *named == key);
-                (generations.number_of(&key), known)
+                let number = generations.number_of(&key);
+                // The policy holds this program where a switchover needs it
+                // when it is the prepared candidate, or the content now serving
+                // - a switchover to that one only renames what serves.
+                let held = generations.candidate.as_ref() == Some(&key)
+                    || generations
+                        .serving
+                        .as_ref()
+                        .is_some_and(|(_, serving)| *serving == key);
+                (number, held)
             };
-            // A program this engine already prepared is answered with its number
-            // and not prepared again.
-            if prepared {
+            // Nothing is prepared twice and the number stands: `Precopied`
+            // promises a switchover to the number can follow, so a program the
+            // engine holds is answered as it is.
+            if held {
                 return Some(precopied(generation));
             }
             let Some(policies) = policies else {
@@ -3134,6 +3146,26 @@ mod tests {
         }
     }
 
+    fn precopy_of(
+        backend: &str,
+        revision: u32,
+        kernels: Vec<proto::process::KernelProgram>,
+    ) -> proto::process::Command {
+        proto::process::Command {
+            kind: Some(proto::process::command::Kind::Precopy(
+                proto::process::Precopy {
+                    kernels,
+                    policy: Some(proto::process::Program {
+                        backend: backend.to_owned(),
+                        revision,
+                        arguments: Default::default(),
+                    }),
+                    ..Default::default()
+                },
+            )),
+        }
+    }
+
     fn kernel_program() -> proto::process::KernelProgram {
         proto::process::KernelProgram {
             op: "rms_norm".to_owned(),
@@ -3396,6 +3428,56 @@ mod tests {
             precopy(Vec::new()),
         ));
         assert_eq!(policy.calls().len(), before, "nothing was prepared twice");
+    }
+
+    #[test]
+    fn a_precopy_of_a_program_the_engine_named_before_prepares_it_again() {
+        use proto::process::report::Kind;
+
+        let policy = Recording::default();
+        let generations = Mutex::new(Generations::default());
+        let store = store();
+        let mut run = |command| apply_process_command(&policy, &generations, Some(&store), command);
+        let first = |report| match answered(report) {
+            Kind::Precopied(precopied) => precopied.generation,
+            other => panic!("a precopy is answered by Precopied, not {other:?}"),
+        };
+
+        // One program prepared and switched in, then a second prepared and
+        // switched in over it: the first is named by the engine, and the policy
+        // holds neither it nor its number's content as what serves.
+        let one = first(run(precopy(Vec::new())));
+        assert!(matches!(answered(run(switchover(one))), Kind::Switched(_)));
+        let two = first(run(precopy_of("priority", 5, Vec::new())));
+        assert!(matches!(answered(run(switchover(two))), Kind::Switched(_)));
+        let prepared = policy
+            .calls()
+            .iter()
+            .filter(|call| call.as_str() == "precopy")
+            .count();
+        assert_eq!(prepared, 2, "two programs prepared");
+
+        // The first program again: its number stands, and it is prepared
+        // again, because the switchover the answer promises must be able to
+        // follow it.
+        assert_eq!(
+            first(run(precopy(Vec::new()))),
+            one,
+            "the number the program already has"
+        );
+        assert_eq!(
+            policy
+                .calls()
+                .iter()
+                .filter(|call| call.as_str() == "precopy")
+                .count(),
+            prepared + 1,
+            "the policy prepared it again rather than promising a switchover it could not take"
+        );
+        assert!(
+            matches!(answered(run(switchover(one))), Kind::Switched(switched) if switched.generation == one),
+            "the switchover the precopy promised applies"
+        );
     }
 
     #[test]
