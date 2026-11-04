@@ -561,15 +561,7 @@ impl Attention {
             }
             return self.write_quantized(f, batch, planes, key, value);
         }
-        let descriptor = KvDescriptor {
-            dtype: key.dtype,
-            kv: planes.key.dtype,
-            page: self.page_size,
-            heads: self.kv_heads,
-            head_dim: self.head_dim,
-            tile: kv_tile(self.head_dim),
-            pdl: PDL,
-        };
+        let descriptor = self.write_descriptor(key.dtype, planes.key.dtype);
         let args = kv::Args {
             key,
             value,
@@ -597,15 +589,7 @@ impl Attention {
         key: TensorView,
         value: TensorView,
     ) -> Result<()> {
-        let descriptor = kv::QuantizeDescriptor {
-            dtype: key.dtype,
-            scale: DType::F32,
-            page: self.page_size,
-            heads: self.kv_heads,
-            head_dim: self.head_dim,
-            block: kv_tile(self.head_dim),
-            pdl: PDL,
-        };
+        let descriptor = self.quantize_descriptor(key.dtype);
         let rows = u64::from(self.kv_heads) * u64::from(self.head_dim);
         for (name, cache, scale, initialized, source) in [
             (
@@ -646,6 +630,65 @@ impl Attention {
             )?;
         }
         Ok(())
+    }
+
+    /// The descriptor one paged attention launches with.
+    ///
+    /// `phase` is the batch's — a prefill reads a whole sequence and a decode one token — and the
+    /// three element types are the query's, the cache plane's and the output's, because the program
+    /// is compiled for the combination. The window and the deployment's bound are the layer's: a
+    /// windowed attention and a full one are different programs, and `max_kv_len` is the reduction
+    /// length the 7.3 tolerance is written against.
+    pub fn descriptor(
+        &self,
+        phase: Phase,
+        query: DType,
+        key_value: DType,
+        output: DType,
+    ) -> Descriptor {
+        Descriptor {
+            phase,
+            query,
+            key_value,
+            output,
+            head_dim: self.head_dim,
+            page_size: self.page_size,
+            q_heads: self.q_heads,
+            kv_heads: self.kv_heads,
+            mask: Mask::Causal,
+            windowed: self.window.is_some(),
+            max_kv_len: self.max_kv_len,
+        }
+    }
+
+    /// The descriptor the cache write launches with: the projection's type and the plane's.
+    ///
+    /// Both are key fields and they differ in an E4M3 deployment, which is why the projection's own
+    /// dtype cannot stand in for the cache's.
+    pub fn write_descriptor(&self, projection: DType, cache: DType) -> KvDescriptor {
+        KvDescriptor {
+            dtype: projection,
+            kv: cache,
+            page: self.page_size,
+            heads: self.kv_heads,
+            head_dim: self.head_dim,
+            tile: kv_tile(self.head_dim),
+            pdl: PDL,
+        }
+    }
+
+    /// The descriptor the quantizing cache write launches with: the projection's type, one plane's
+    /// page scales and the geometry both share.
+    pub fn quantize_descriptor(&self, projection: DType) -> kv::QuantizeDescriptor {
+        kv::QuantizeDescriptor {
+            dtype: projection,
+            scale: DType::F32,
+            page: self.page_size,
+            heads: self.kv_heads,
+            head_dim: self.head_dim,
+            block: kv_tile(self.head_dim),
+            pdl: PDL,
+        }
     }
 
     /// Read the cache and write this batch's attended output.
@@ -700,19 +743,7 @@ impl Attention {
                 ));
             }
         }
-        let descriptor = Descriptor {
-            phase,
-            query: query.dtype,
-            key_value: planes.key.dtype,
-            output: out.dtype,
-            head_dim: self.head_dim,
-            page_size: self.page_size,
-            q_heads: self.q_heads,
-            kv_heads: self.kv_heads,
-            mask: Mask::Causal,
-            windowed: self.window.is_some(),
-            max_kv_len: self.max_kv_len,
-        };
+        let descriptor = self.descriptor(phase, query.dtype, planes.key.dtype, out.dtype);
         // An FP8 plane stores each page divided by its own FP32 scale; the plane's element type
         // decides whether the call carries one, so a mismatch in either direction is an argument
         // error rather than a silently unscaled read. The scales are this layer's, so two layers of

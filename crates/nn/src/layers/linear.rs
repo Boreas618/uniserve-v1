@@ -6,12 +6,12 @@
 //! (specs/worker.md 4.2), so it is checked against the weight at construction and against the input
 //! at every call.
 
-use ops::TensorView;
 use ops::fp4::{
     BLOCK_ELEMENTS, GemmArgs, GemmDescriptor, Nvfp4Gemm, Nvfp4Quantize, QuantizeArgs,
     QuantizeDescriptor, ScaleLayout,
 };
 use ops::gemm::{self, Descriptor, Epilogue, Gemm, WeightOrder};
+use ops::{DType, TensorView};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -105,6 +105,29 @@ impl Linear {
     /// `out = input · weight + bias`.
     ///
     /// `input` is `[m, k]` and `out` is `[m, n]`, both row-major on their last axis.
+    /// The descriptor [`Self::forward`] launches with, for an input and an output of these
+    /// element types.
+    ///
+    /// The row count is not in it: rows are a launch value and not a key field, so one request space
+    /// enumerates a descriptor per pair of element types and the operator is compiled once for
+    /// every row count that reaches it. This is the same arithmetic `forward` runs — `forward` calls
+    /// this — so an enumeration built on it cannot drift from what the model launches.
+    pub fn descriptor(&self, input: DType, output: DType) -> Descriptor {
+        Descriptor {
+            input,
+            weight: self.weight.dtype(),
+            accumulate: ACCUMULATE,
+            output,
+            order: self.order,
+            epilogue: if self.bias.is_some() {
+                Epilogue::Bias
+            } else {
+                Epilogue::None
+            },
+            k: self.k,
+        }
+    }
+
     pub fn forward(&self, f: &Forward, input: TensorView, out: TensorView) -> Result<()> {
         let k = u64::from(self.k);
         let n = u64::from(self.n);
@@ -124,19 +147,7 @@ impl Linear {
                 ),
             ));
         }
-        let descriptor = Descriptor {
-            input: input_dtype,
-            weight: self.weight.dtype(),
-            accumulate: ACCUMULATE,
-            output: out.dtype,
-            order: self.order,
-            epilogue: if self.bias.is_some() {
-                Epilogue::Bias
-            } else {
-                Epilogue::None
-            },
-            k: self.k,
-        };
+        let descriptor = self.descriptor(input_dtype, out.dtype);
         let args = gemm::Args {
             input,
             weight: self.weight.view(),
@@ -324,6 +335,41 @@ impl Nvfp4Linear {
     /// `[m, n]`; `alpha` is `[1]` FP32, the product of the activation's and the weight's tensor
     /// scales, computed on device by whoever produced the activation scale. The packed activation
     /// and its block scales are taken from the forward's arena.
+    /// The descriptor of the activation encoding this projection runs first.
+    pub fn encode_descriptor(&self) -> QuantizeDescriptor {
+        QuantizeDescriptor {
+            input: self.input,
+            columns: self.k,
+            layout: self.layout,
+            block: self.block,
+            pdl: false,
+        }
+    }
+
+    /// The descriptor of the packed product, for `m` activation rows and an output of `output`.
+    ///
+    /// `m` is a key field here and not in [`Linear::descriptor`]: the product's grid is computed
+    /// from the row count and the module is compiled per row count, which is why the deployment
+    /// enumerates the bucket sizes the executor builds rather than an unbounded row count.
+    pub fn descriptor(&self, m: u32, output: DType) -> GemmDescriptor {
+        GemmDescriptor {
+            packed: DType::U8,
+            scale: self.scales.dtype(),
+            accumulate: ACCUMULATE,
+            output,
+            layout: self.layout,
+            epilogue: if self.bias.is_some() {
+                Epilogue::Bias
+            } else {
+                Epilogue::None
+            },
+            m,
+            n: self.n,
+            k: self.k,
+            pdl: false,
+        }
+    }
+
     pub fn forward(
         &self,
         f: &Forward,
@@ -362,13 +408,7 @@ impl Nvfp4Linear {
         let values = arena.tensor(ops::DType::U8, ops::Shape::new(&[rows, k / 2]))?;
         let scale_shape = self.layout.shape(rows, k);
         let scales = arena.tensor(ops::DType::U8, scale_shape)?;
-        let quantize = QuantizeDescriptor {
-            input: self.input,
-            columns: self.k,
-            layout: self.layout,
-            block: self.block,
-            pdl: false,
-        };
+        let quantize = self.encode_descriptor();
         let encoded = QuantizeArgs {
             input,
             values,
@@ -378,22 +418,7 @@ impl Nvfp4Linear {
         f.operate::<Nvfp4Quantize>(&quantize, encoded)?;
 
         // 2. Contract the encoded activation with the checkpoint's weight.
-        let descriptor = GemmDescriptor {
-            packed: ops::DType::U8,
-            scale: self.scales.dtype(),
-            accumulate: ACCUMULATE,
-            output: out.dtype,
-            layout: self.layout,
-            epilogue: if self.bias.is_some() {
-                Epilogue::Bias
-            } else {
-                Epilogue::None
-            },
-            m,
-            n: self.n,
-            k: self.k,
-            pdl: false,
-        };
+        let descriptor = self.descriptor(m, out.dtype);
         let args = GemmArgs {
             input: values,
             weight: self.packed.view(),

@@ -7,8 +7,8 @@
 //! gathers the rows whose logits the batch asks for before calling the head, so the head reads a
 //! `[rows, hidden]` view and a graph replays over a fixed row count.
 
-use ops::TensorView;
 use ops::logits::{self, GatherDescriptor, LogitsGather, UnpadDescriptor, VocabUnpad};
+use ops::{DType, TensorView};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -166,16 +166,40 @@ impl ParallelLMHead {
                 "a gathered width above u32::MAX".to_owned(),
             )
         })?;
-        let descriptor = UnpadDescriptor {
-            dtype: gathered.dtype,
-            vocabulary: self.vocabulary,
-            padded: width,
-            block: 1024,
-            pdl: crate::layers::launch::PDL,
-        };
+        let descriptor = self.unpad_descriptor(gathered.dtype, width);
         let args = logits::UnpadArgs { gathered, out };
 
         f.operate::<VocabUnpad>(&descriptor, args)
+    }
+
+    /// The descriptor the vocabulary shard's projection launches with.
+    ///
+    /// The head projects through an ordinary dense product whose output width is the rank's shard,
+    /// so its descriptor is a [`Linear`]'s: this answers that layer's descriptor for the element
+    /// types a deployment names, without the caller building the layer. It is fallible where
+    /// [`Linear::new`] is, which for the head's own two-dimensional weight is never.
+    pub fn projection_descriptor(
+        &self,
+        input: DType,
+        output: DType,
+    ) -> Result<ops::gemm::Descriptor> {
+        let linear = Linear::new(self.weight, None, ops::gemm::WeightOrder::NxK)?;
+        Ok(linear.descriptor(input, output))
+    }
+
+    /// The descriptor the vocabulary unpad launches with, for a gathered matrix of `gathered_width`
+    /// columns.
+    ///
+    /// The gathered width is `padded × ranks`, so it is a launch value that follows the deployment's
+    /// rank count rather than a property of the head; the vocabulary and the block are the head's.
+    pub fn unpad_descriptor(&self, dtype: DType, gathered_width: u32) -> UnpadDescriptor {
+        UnpadDescriptor {
+            dtype,
+            vocabulary: self.vocabulary,
+            padded: gathered_width,
+            block: 1024,
+            pdl: crate::layers::launch::PDL,
+        }
     }
 
     /// The offset of this rank's shard in the gathered vocabulary; 0 for an unsharded head.
