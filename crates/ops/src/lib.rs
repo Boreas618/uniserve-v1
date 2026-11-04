@@ -72,7 +72,9 @@
 //! operator, and never from a measurement of the pair being compared.
 
 pub mod activation;
+pub mod adaptive_pool;
 pub mod attention;
+pub mod audio_activation;
 pub mod audio_resample;
 pub mod bias;
 pub mod block_copy;
@@ -98,13 +100,17 @@ pub mod moe;
 pub mod noise;
 pub mod norm;
 pub mod op;
+pub mod patch;
+pub mod pcm;
 pub mod phase;
 pub mod platform;
+pub mod position;
 pub mod prefix_cache;
 pub mod replicate_pad;
 pub mod residual;
 pub mod resize;
 pub mod rope;
+pub mod rows;
 pub mod sampler;
 pub mod segments;
 pub mod snake;

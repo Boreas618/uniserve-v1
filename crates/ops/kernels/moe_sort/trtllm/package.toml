@@ -1,0 +1,48 @@
+# The moe_sort operator's trtllm-gen backend: design 5.2's program package.
+#
+# One native module per descriptor: the routing pipeline that groups the
+# routers' `tokens x top` route ids into tiles of permuted rows per local
+# expert, and the two permutation maps the grouped GEMMs and the combine read
+# (`ops::moe::sort::Call`, 632 bytes).
+#
+# It follows TRT-LLM's own routing pipeline
+# (`cpp/tensorrt_llm/kernels/moe/trtllmGen/routing/RoutingKernel.cuh`, the
+# histogram/offsets kernels and `routingMainKernel`'s block path) with the same
+# outputs and the same ordering — permuted rows of one expert in ascending
+# expanded-route order. Two kernels, no cluster path: the block path covers
+# every batch the slice runs, and a token count that outgrew a grid's blocks is
+# the whole grid's limit, not this pipeline's.
+
+op = "moe_sort"
+backend = "trtllm"
+
+[toolchain]
+kind = "nvcc"
+version = "13.0.48"
+packages = []
+
+[module]
+form = "native"
+
+[module.entries]
+launch = "uniserve_moe_sort"
+
+[source]
+kind = "cuda"
+files = [
+    "include/uniserve_moe_sort.h",
+    "src/entry.cpp",
+    "src/routing.cu",
+    "src/build.py",
+]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_100f"]
+
+# `experts_128_top_8_local_128_tile_128_scales_f32`.
+[kernel.descriptors]
+dimensions = { experts = ["128", "256", "64"], top = ["8", "4", "2"], local = ["128", "256", "64"], tile = ["128", "64", "256"], scales = ["f32", "bf16", "f16"] }
+
+[parameters]

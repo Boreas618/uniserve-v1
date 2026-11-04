@@ -138,3 +138,59 @@ fn every_qwen3_moe_key_of_the_slice_is_covered_by_its_operator_s_package() {
         failures.join("\n")
     );
 }
+
+/// The names `ops` prints for its element types: the vocabulary a descriptor
+/// value that carries an element type must come from. Taken from `ops`' own
+/// `DType`, so a package cannot invent a spelling the operator will never
+/// produce (`fp16` for `f16`, say) and then silently cover no key.
+fn element_type_names() -> Vec<String> {
+    [
+        ops::DType::U8,
+        ops::DType::I32,
+        ops::DType::I64,
+        ops::DType::F16,
+        ops::DType::BF16,
+        ops::DType::F32,
+        ops::DType::F8E4M3,
+        ops::DType::F4E2M1,
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect()
+}
+
+/// The descriptor fields whose values are element types (`ops`' `DType`
+/// `Display`), across the operators of design section 9.
+const ELEMENT_TYPE_FIELDS: [&str; 7] =
+    ["dtype", "input", "weight", "output", "accumulate", "scores", "scales"];
+
+#[test]
+fn every_element_type_a_descriptor_can_carry_is_one_ops_prints() {
+    let names = element_type_names();
+    let mut failures = Vec::new();
+    for package in packages() {
+        let manifest = Manifest::load(&package).expect("a package the tree ships");
+        let Some(kernel) = &manifest.kernel else {
+            continue;
+        };
+        for (field, values) in &kernel.descriptors.dimensions {
+            if !ELEMENT_TYPE_FIELDS.contains(&field.as_str()) {
+                continue;
+            }
+            for value in values {
+                if !names.contains(value) {
+                    failures.push(format!(
+                        "{} {}: {field} = {value:?} is not one of {names:?}",
+                        manifest.op, manifest.backend
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} descriptor values name no element type `ops` prints:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
