@@ -35,6 +35,14 @@ pub fn set_sink(sink: Option<&mut (dyn Sink + 'static)>) {
     SINK.with(|cell| cell.set(pointer));
 }
 
+/// Whether a sink is installed on this thread.
+///
+/// The layer that launches asks before it builds a descriptor key: every launch of a serving step
+/// passes the question, while a capture is the exception, and the key is a formatted string.
+pub fn installed() -> bool {
+    SINK.with(|cell| cell.get().is_some())
+}
+
 /// Tell the installed sink about a launch, if one is installed.
 ///
 /// Called by the layer that launches, right after the launch: `operator` is [`crate::Op::NAME`] and
@@ -54,7 +62,7 @@ pub fn launched(operator: &'static str, key: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Sink, launched, set_sink};
+    use super::{Sink, installed, launched, set_sink};
 
     struct Recording(Vec<(String, String)>);
 
@@ -80,5 +88,15 @@ mod tests {
                 ("gemm".to_owned(), "input_bf16_k_2048".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn the_question_answers_for_the_sink_the_launch_would_reach() {
+        assert!(!installed(), "a fresh thread has no sink");
+        let mut recording = Recording(Vec::new());
+        set_sink(Some(&mut recording));
+        assert!(installed());
+        set_sink(None);
+        assert!(!installed());
     }
 }
