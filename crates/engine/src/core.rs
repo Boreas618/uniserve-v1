@@ -1339,20 +1339,6 @@ impl SchedulerHandle {
         Self::over_batches(config, batches)
     }
 
-    /// The same boot, from the launch file at `path` rather than facts already
-    /// read: what a main process does with the file it was started with.
-    ///
-    /// A file that cannot be read, or that states a value of the wrong kind, is
-    /// a failure naming the file and the key; a fact the file does not state is
-    /// refused by [`EngineConfig::of`], with the fact's name and its source.
-    pub fn boot_from(
-        path: impl AsRef<std::path::Path>,
-        batches: Arc<dyn Batches>,
-    ) -> anyhow::Result<Self> {
-        let facts = crate::launch_file::read(path)?;
-        Self::boot(&facts, batches)
-    }
-
     /// Builds the scheduler `config` states over `executor` and runs it.
     fn assemble(
         config: EngineConfig,
