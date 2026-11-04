@@ -442,12 +442,14 @@ pub(crate) async fn apply(
         ));
         interference = Some((done, task));
         let mut starting = Vec::new();
+        let build = crate::epoch::BuildConfig::of(&target);
         for (ordinal, spec) in specs.iter().cloned().enumerate() {
             let control = Arc::clone(&control);
             let observer = Arc::new(Observer::default());
             let sink = stats_sink(target.model().to_owned(), Arc::clone(&observer), ordinal);
+            let build = build.clone();
             starting.push(tokio::task::spawn_blocking(move || {
-                control.start(spec, sink)
+                control.start(spec, &build, sink)
             }));
             observers.push(observer);
         }
@@ -834,8 +836,9 @@ pub(crate) async fn rollback(
                         Arc::clone(&replica.observer),
                         replica.ordinal,
                     );
+                    let build = crate::epoch::BuildConfig::of(&locked(&replica.config));
                     Arc::new(
-                        tokio::task::spawn_blocking(move || control.start(spec, sink))
+                        tokio::task::spawn_blocking(move || control.start(spec, &build, sink))
                             .await
                             .context("the predecessor restart task did not complete")??,
                     )

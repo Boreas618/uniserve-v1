@@ -30,10 +30,11 @@ use std::time::Duration;
 use crate::supervision::DaemonOptions;
 use anyhow::Context as _;
 use models::video::plan::{MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS};
+pub use proto::request::StandbyStorage;
 use proto::request::wire;
 use proto::request::{
     ExpertExchange, FlashInferBackend, GraphPolicy, LoadFormat, ModelDtype, PrefixCacheDtype,
-    SchedulingPolicy, StandbyStorage,
+    SchedulingPolicy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1487,7 +1488,9 @@ impl ServeConfig {
 
 /// The user's runtime directory, where this node's sockets lie beside its
 /// Storage Server's.
-fn runtime_directory() -> PathBuf {
+/// The directory this daemon keeps its runtime files in: its sockets, and the
+/// launch and build-config files its main processes read.
+pub(crate) fn runtime_directory() -> PathBuf {
     storage::socket::default_socket()
         .parent()
         .map_or_else(std::env::temp_dir, Path::to_path_buf)
