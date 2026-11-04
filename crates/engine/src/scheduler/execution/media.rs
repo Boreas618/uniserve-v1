@@ -5,7 +5,8 @@
 //! encoding and muxing, host task pools, tracked by the media occupancy
 //! ([`Occupancy`]); `plan_media_call` builds one call with its products,
 //! buffer bindings, latent pages and reading components, and
-//! `prepare_media_batches` forms the media batches a refill dispatches.
+//! `assemble_batch` plans a media call of the step's plan onto the batch of its
+//! phase and component.
 
 use super::*;
 use ipc::MediaCall;
@@ -170,7 +171,7 @@ impl Scheduler {
             .collect()
     }
 
-    fn ready_calls(&self, state: &MediaFlowState) -> Vec<MediaCall> {
+    pub(in crate::scheduler) fn ready_calls(&self, state: &MediaFlowState) -> Vec<MediaCall> {
         let sampling = state.request.sampling;
         let graph = &state.graph;
         // A product is produced once its producing call has left the
@@ -587,7 +588,7 @@ impl Scheduler {
     /// every other placed call holds its component exclusively. Media
     /// reading, encoding and muxing calls also place tasks on host task
     /// pools.
-    fn media_demand(&self, request: RequestKey, media_call: MediaCall, units: u32) -> Demand {
+    pub(in crate::scheduler) fn media_demand(&self, request: RequestKey, media_call: MediaCall, units: u32) -> Demand {
         let component = self.media_component(media_call);
         let placed_component = component.as_ref().and_then(|component| {
             self.placement
@@ -750,7 +751,7 @@ impl Scheduler {
     /// that choice: a request already placed on the component is checked only
     /// against its owning worker's queue, and one resident on a candidate
     /// worker for another component only against that worker's queue.
-    fn call_has_queue_capacity(&self, request: RequestKey, media_call: MediaCall) -> bool {
+    pub(in crate::scheduler) fn call_has_queue_capacity(&self, request: RequestKey, media_call: MediaCall) -> bool {
         self.info
             .media_components
             .get(&media_call)
@@ -774,7 +775,7 @@ impl Scheduler {
     /// decode round always claims the whole capacity. The capacity counts as
     /// one when the component is not measured in media units or the request
     /// is not yet placed on it.
-    fn call_units(&self, state: &MediaFlowState, media_call: MediaCall) -> u32 {
+    pub(in crate::scheduler) fn call_units(&self, state: &MediaFlowState, media_call: MediaCall) -> u32 {
         let width = || {
             self.media_component(media_call)
                 .as_deref()
@@ -815,13 +816,13 @@ impl Scheduler {
     /// reserved buffer on that worker, names the components that read the
     /// call's products from the request's graph, and registers the call as in
     /// flight. The cursors advance before the worker is selected, so an error
-    /// can leave the request partially planned; `prepare_media_batches`
-    /// latches engine-fatal on any error.
+    /// can leave the request partially planned; `assemble_batch` latches
+    /// engine-fatal on any error.
     ///
     /// A latent encoding call is a visual round while condition units remain
     /// unscheduled, covering the next units its free ranks encode together,
     /// and otherwise the request's one audio call (`latent_round`).
-    fn plan_media_call(
+    pub(in crate::scheduler) fn plan_media_call(
         &mut self,
         id: RequestId,
         media_call: MediaCall,
@@ -1277,145 +1278,5 @@ impl Scheduler {
             0,
         );
         Ok((call, placement))
-    }
-
-    /// Selects the ready calls of running video requests and builds one
-    /// media pass: one batch per selected call kind, followed by a
-    /// command-only batch for any lifecycle commands the pass takes.
-    ///
-    /// Independent audio and video branches are linked by tensor inputs, not
-    /// by a state predecessor. Returns no batches when nothing fits, and when
-    /// planning finds a broken invariant, which latches engine-fatal.
-    pub(in crate::scheduler) fn prepare_media_batches(&mut self) -> Vec<ExecutionBatch> {
-        // Every resident request, in `running_order`, offers each call
-        // `ready_calls` lists, and a call is selected when the components and
-        // host task pools it occupies have free capacity and its worker's
-        // queue can accept a batch. No per-request cap applies beyond that
-        // capacity and the rank queues.
-        let mut occupancy = self.media_occupancy();
-        let mut candidates = Vec::new();
-        for id in self.running_order.clone() {
-            let Some(state) = self.media_state(id) else {
-                continue;
-            };
-            // A request offers nothing further while the call carrying its
-            // worker admission is in flight; `process_diffusion_result` marks
-            // it registered on that call's valid result.
-            if state.terminal_intent.is_terminal()
-                || state.admission_state == WorkerRegistration::InFlight
-            {
-                continue;
-            }
-            for media_call in self.ready_calls(state) {
-                let demand = self.media_demand(
-                    state.admission.request_key,
-                    media_call,
-                    self.call_units(state, media_call),
-                );
-                if !occupancy.admits(&demand, id, self)
-                    || !self.call_has_queue_capacity(state.admission.request_key, media_call)
-                {
-                    continue;
-                }
-                occupancy.occupy(&demand, id);
-                candidates.push((id, media_call));
-            }
-        }
-        if candidates.is_empty() {
-            return Vec::new();
-        }
-
-        let submit_at = Instant::now();
-        // The pass also takes the queued commands of its candidate requests
-        // and every queued `Finish`, except those `take_commands` defers.
-        let candidate_requests = candidates.iter().map(|(id, _)| *id).collect::<HashSet<_>>();
-        let commands = self.take_commands(|command| {
-            candidate_requests.contains(&command.request_key().request_id)
-                || matches!(command, BatchCommand::Finish { .. })
-        });
-
-        // One batch per media call: a batch is one numerical call on one component,
-        // so a rank receives it as a single homogeneous group. Batches keep the
-        // order in which their first call was selected.
-        let mut call_order = Vec::new();
-        let mut call_batches: HashMap<MediaCall, (u64, Vec<(Call, RequestPlacement)>)> =
-            HashMap::new();
-        for (_, media_call) in &candidates {
-            if !call_batches.contains_key(media_call) {
-                call_batches.insert(*media_call, (self.inflight.next_batch_id(), Vec::new()));
-                call_order.push(*media_call);
-            }
-        }
-
-        // A call's index within its batch is the request index of its call id.
-        let mut admissions = Vec::new();
-        for (id, media_call) in candidates.into_iter() {
-            let Some((batch_id, calls)) = call_batches.get_mut(&media_call) else {
-                self.invariant_broken("every selected media call has its batch");
-                return Vec::new();
-            };
-            let planned = match u32::try_from(calls.len()) {
-                Ok(request_index) => self.plan_media_call(
-                    id,
-                    media_call,
-                    CallId::new(*batch_id, request_index),
-                    &mut admissions,
-                ),
-                Err(_) => Err("a batch's request count fits the IPC index"),
-            };
-            match planned {
-                Ok(planned) => calls.push(planned),
-                Err(invariant) => {
-                    self.invariant_broken(invariant);
-                    return Vec::new();
-                }
-            }
-        }
-
-        // A request's admission travels with the batch of the first call that
-        // uses it.
-        let mut starts: HashMap<MediaCall, Vec<BatchCommand>> = HashMap::new();
-        for request in admissions {
-            let owner = call_order.iter().copied().find(|media_call| {
-                call_batches[media_call]
-                    .1
-                    .iter()
-                    .any(|(call, _)| call.request_key == request.request_key)
-            });
-            let Some(owner) = owner else {
-                self.invariant_broken("an admitted media request has a selected call");
-                return Vec::new();
-            };
-            starts.entry(owner).or_default().push(BatchCommand::Start {
-                request: Box::new(request),
-            });
-        }
-
-        let mut batches = Vec::with_capacity(call_order.len() + 1);
-        for media_call in call_order {
-            let Some((batch_id, calls)) = call_batches.remove(&media_call) else {
-                self.invariant_broken("every selected media call has its batch");
-                return Vec::new();
-            };
-            let batch_commands = starts.remove(&media_call).unwrap_or_default();
-            let batch = ExecutionBatch::new(batch_id, calls, batch_commands, Vec::new());
-            self.inflight.register_pending_batch(&batch, submit_at);
-            batches.push(batch);
-        }
-
-        // Retirement is its own batch, submitted after the calls of this pass.
-        // Its result is the retirement acknowledgement, so no call's result
-        // waits for storage the round no longer needs.
-        if !commands.is_empty() {
-            let batch = ExecutionBatch::new(
-                self.inflight.next_batch_id(),
-                Vec::new(),
-                commands,
-                Vec::new(),
-            );
-            self.inflight.register_pending_batch(&batch, submit_at);
-            batches.push(batch);
-        }
-        batches
     }
 }

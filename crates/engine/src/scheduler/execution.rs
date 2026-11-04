@@ -4,7 +4,7 @@
 //!
 //! - Refill and dispatch: `refill_executor` admits requests, asks the
 //!   generation assembler (`assemble`) and the video media planner
-//!   (`prepare_media_batches`) for batches while a rank queue has room, and
+//!   for batches while a rank queue has room, and
 //!   `dispatch_submissions` hands them to the executor in order per worker,
 //!   each after the batches producing its inputs.
 //! - Video media scheduling: a video request runs the calls of its graph
@@ -360,14 +360,6 @@ impl Scheduler {
         // workers close; a sleeping one runs nothing.
         if self.closing || self.asleep {
             return Vec::new();
-        }
-        // Video media work runs the ready calls of its graph through the media
-        // planner; the plan's media work entries replace that path when the
-        // media planner is cut, so a video request is decided by one policy
-        // like every other request.
-        let batches = self.prepare_media_batches();
-        if !batches.is_empty() {
-            return batches;
         }
         let started = std::time::Instant::now();
         let Some(plan) = self.policy_step() else {
