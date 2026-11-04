@@ -204,6 +204,25 @@ pub(crate) struct DeviceBooking {
 }
 
 impl DeviceBooking {
+    /// The device storage this rank's deployment may hold on `device`: the
+    /// budget its metrics report states, and what every booking is checked
+    /// against.
+    pub fn budget(&self) -> u64 {
+        self.quota
+    }
+
+    /// The bytes this rank books for its graph plan's pools, which the ledger
+    /// releases while the rank sleeps and books again when it wakes.
+    pub fn graph_bytes(&self) -> u64 {
+        self.graph
+    }
+
+    /// The bytes the rank's process holds at the measurement, with a profiling
+    /// session's storage included.
+    pub fn process_bytes(&self) -> u64 {
+        self.process + self.profiling
+    }
+
     /// Books the items in the GPU's ledger, the graph pool only while
     /// `graphs` are resident: a sleeping rank's graph storage is released.
     /// Returns the ledger after the booking.
