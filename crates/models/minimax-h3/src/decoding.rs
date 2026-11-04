@@ -233,9 +233,12 @@ pub fn video_arena(
     let raster = u64::from(frames) * u64::from(height) * u64::from(width_px);
     let channels = u64::from(crate::output::Rgb::CHANNELS);
     // **The order is the reservation order**: the clip-level buffers are reserved once, before the
-    // tile loop, and live across the whole clip; the per-tile ones are reserved inside it and reused by
-    // every tile. `VideoDecoder::decode` reserves them in this list's order, and the executor sizes the
-    // arena by the sum, because the clip-level buffers are live while the per-tile ones are in use.
+    // tile loop, and live across the whole clip; the transformer's fourteen are reserved there too, once
+    // (`VideoDecoder::scratch`), and reused by every tile - the arena never rewinds, so a per-tile
+    // reservation would grow the clip's footprint by the tile count. The token buffers *are* per tile,
+    // because each tile's decode owns its own, and their sum is the `tokens` entry. The executor sizes
+    // the arena by the sum. There is no entry for the clip's blended raster: the blend's destination is
+    // the caller's `DecodedMedia.video`, which is the runner's buffer and not the arena's.
     let patch = u64::from(config.out_channels)
         * u64::from(config.temporal_compression())
         * u64::from(config.spatial_compression())
@@ -243,11 +246,6 @@ pub fn video_arena(
     Ok(vec![
         Buffer {
             name: "decoded",
-            element: "f16",
-            elements: raster * channels,
-        },
-        Buffer {
-            name: "blended",
             element: "f16",
             elements: raster * channels,
         },
@@ -581,10 +579,15 @@ impl ClipDecoder {
                 out.shape.dims()
             )));
         }
-        // The clip-level buffers, reserved once: the raster every tile is decoded into and then read
-        // from as a neighbour. `out` is the stitched result, so the two rasters the seam needs are
-        // these two and the plan's `decoded` is the only clip-level reservation this call makes.
+        // The clip-level buffers, reserved once: `decoded` holds every tile as it was decoded and is read
+        // as an unmodified neighbour, and `out` - the caller's raster - takes the stitch, which is why the
+        // plan lists no third raster. `scratch` is the transformer's fourteen, reserved here so that every
+        // tile of the clip shares them.
         let decoded = f.arena().tensor(out.dtype, out.shape)?;
+        // The transformer's fourteen buffers, reserved **once per clip** and reused by every tile: the
+        // arena never rewinds, so a per-tile reservation would grow the clip's footprint by the tile
+        // count while the plan states them once.
+        let scratch = decoder.scratch(f)?;
         let patch = self.patch;
         let mut start = 0_u64;
         for tile in tiles {
@@ -600,7 +603,7 @@ impl ClipDecoder {
             let tokens = f
                 .arena()
                 .tensor(out.dtype, Shape::new(&[tile_rows, patch]))?;
-            decoder.decode(f, latent, positions, tokens)?;
+            decoder.decode(f, latent, positions, tokens, &scratch)?;
             self.write_tile(f, tile, tokens, decoded, out)?;
             start += tile_voxels;
         }
@@ -884,8 +887,8 @@ mod tests {
         // The clip-level buffers come first and the per-tile ones after, which is the order the model
         // reserves them in: a plan that lists them the other way round is a plan the code does not
         // follow.
-        let clip_level: Vec<&str> = arena.iter().take(3).map(|buffer| buffer.name).collect();
-        assert_eq!(clip_level, ["decoded", "blended", "tokens"]);
+        let clip_level: Vec<&str> = arena.iter().take(2).map(|buffer| buffer.name).collect();
+        assert_eq!(clip_level, ["decoded", "tokens"]);
         // Every buffer is named once and no buffer is empty.
         let mut names: Vec<&str> = arena.iter().map(|buffer| buffer.name).collect();
         let count = names.len();
