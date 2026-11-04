@@ -13,7 +13,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cuda::Event;
+use platform::Event;
 
 use crate::{Completion, Error, Result};
 

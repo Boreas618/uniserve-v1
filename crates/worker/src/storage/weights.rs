@@ -50,7 +50,7 @@ use ::storage::manifest::weights::RetainedStorage;
 use ::storage::manifest::{self, Field, StorageLayout};
 use ::storage::protocol::Access;
 use ::storage::{Key, Mode, Placement, StorageRecord, TensorRecord};
-use cuda::{DeviceAllocation, DeviceId, Protection};
+use platform::{DeviceAllocation, DeviceId, Protection};
 use sha2::{Digest, Sha256};
 use tvm_ffi::Any;
 
@@ -1308,7 +1308,7 @@ impl Published {
                 "resident weights export a retained descriptor",
             ))?;
             let fabric = match allocation.export()? {
-                Some(cuda::ShareableHandle::Fabric(bytes)) => {
+                Some(platform::ShareableHandle::Fabric(bytes)) => {
                     Some(::storage::protocol::FabricHandle(bytes))
                 }
                 _ => None,

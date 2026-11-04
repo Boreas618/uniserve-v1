@@ -15,12 +15,12 @@
 //! called. What differs is when the device sees the work, so a function
 //! generic over [`Issue`] never reads back what it issued. An event recorded
 //! into a job reports itself incomplete until the record is made
-//! ([`cuda::Event::queue_record`]), so storage fenced by it is not
+//! ([`platform::Event::queue_record`]), so storage fenced by it is not
 //! returned early.
 
 use std::sync::Arc;
 
-use cuda::{CopyBatch, Event, Stream, StridedCopy};
+use platform::{CopyBatch, Event, Stream, StridedCopy};
 
 use super::{Deferred, EventPool};
 use crate::ffi::DeferredCall;
@@ -66,9 +66,9 @@ pub trait Issue: Copy {
     ///
     /// # Safety
     /// Every destination stays valid until the copies ran. A source of a
-    /// [`cuda::SourceOrder::DuringCall`] batch is host storage
+    /// [`platform::SourceOrder::DuringCall`] batch is host storage
     /// readable during this call, and need not outlive it; a source of a
-    /// [`cuda::SourceOrder::Stream`] batch stays valid until the
+    /// [`platform::SourceOrder::Stream`] batch stays valid until the
     /// copies ran.
     unsafe fn copy(&self, copies: &CopyBatch) -> Result<()>;
 
@@ -185,9 +185,9 @@ unsafe fn fill_device(fill: Fill, stream: &Stream) -> Result<()> {
     // SAFETY: forwarded from the caller.
     unsafe {
         match width {
-            1 => cuda::memset_d8(address, value as u8, count, stream)?,
-            2 => cuda::memset_d16(address, value as u16, count, stream)?,
-            4 => cuda::memset_d32(address, value, count, stream)?,
+            1 => platform::memset_d8(address, value as u8, count, stream)?,
+            2 => platform::memset_d16(address, value as u16, count, stream)?,
+            4 => platform::memset_d32(address, value, count, stream)?,
             _ => {
                 return Err(Error::Invariant(format!(
                     "a fill writes elements of 1, 2 or 4 bytes, not {width}"
@@ -232,8 +232,8 @@ unsafe fn fill_device_rows(fill: RowFill, stream: &Stream) -> Result<()> {
     // SAFETY: forwarded from the caller.
     unsafe {
         match width {
-            1 => cuda::memset_2d_d8(address, pitch, value as u8, count, height, stream)?,
-            4 => cuda::memset_2d_d32(address, pitch, value, count, height, stream)?,
+            1 => platform::memset_2d_d8(address, pitch, value as u8, count, height, stream)?,
+            4 => platform::memset_2d_d32(address, pitch, value, count, height, stream)?,
             _ => {
                 return Err(Error::Invariant(format!(
                     "a row fill writes elements of 1 or 4 bytes, not {width}"

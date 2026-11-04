@@ -1,13 +1,14 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/cuda",
+    "crates/platform",
     "crates/daemon",
     "crates/engine",
     "crates/ipc",
     "crates/manager",
     "crates/models",
     "crates/nixl",
+    "crates/program-server",
     "crates/proto",
     "crates/scheduling",
     "crates/scheduling/guest",
@@ -27,12 +28,13 @@ license = "Apache-2.0"
 readme = "README.md"
 
 [workspace.dependencies]
-cuda = { path = "crates/cuda" }
+platform = { path = "crates/platform" }
 daemon = { path = "crates/daemon" }
 engine = { path = "crates/engine" }
 ipc = { path = "crates/ipc" }
 models = { path = "crates/models" }
 nixl = { path = "crates/nixl" }
+program-server = { path = "crates/program-server" }
 proto = { path = "crates/proto" }
 scheduling = { path = "crates/scheduling" }
 scheduling-guest = { path = "crates/scheduling/guest" }

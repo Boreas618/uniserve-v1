@@ -28,7 +28,7 @@ const SCRATCH: &str = "link measurement scratch";
 pub(crate) fn measure(
     retained: &Retained,
     sources: &Sources,
-    device: cuda::DeviceId,
+    device: platform::DeviceId,
     at: Placement,
 ) -> Result<Vec<LinkBandwidth>> {
     let into = match at {

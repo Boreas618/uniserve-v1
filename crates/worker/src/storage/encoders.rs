@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use ::storage::Key;
 use ::storage::protocol::{PageShape, Reply, Request};
-use cuda::DeviceId;
+use platform::DeviceId;
 use ipc::EncoderPoolInfo;
 
 use crate::ffi::{Backing, DType};

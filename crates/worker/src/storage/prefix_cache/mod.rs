@@ -35,7 +35,7 @@ pub(crate) use transfers::TransferBases;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use cuda::{DeviceId, Event, EventFlags, Stream};
+use platform::{DeviceId, Event, EventFlags, Stream};
 use ipc::CallId;
 use ipc::{BlockTable, BufferId, CacheTransfer, PageCopy, RequestKey, Wake};
 use tvm_ffi::Any;
@@ -119,7 +119,7 @@ fn request_states(
     if let Some(stream) = stream {
         for (_, view) in states.views() {
             // SAFETY: the banks are new; nothing else addresses them.
-            unsafe { cuda::memset_d8(view.address(), 0, view.nbytes() as usize, stream) }?;
+            unsafe { platform::memset_d8(view.address(), 0, view.nbytes() as usize, stream) }?;
         }
     }
     Ok(Some(states))
