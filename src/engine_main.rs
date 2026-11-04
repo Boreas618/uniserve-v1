@@ -1019,6 +1019,14 @@ impl MainProcess {
         command: proto::process::Command,
     ) -> Result<Option<UpdateFailure>> {
         let current = self.update.current();
+        // A revert carries the daemon's own account of why, which `ipc::ProgramCommand` does not
+        // keep: read it here so the report repeats the operator's reason rather than inventing one.
+        let reverted_by = match &command.kind {
+            Some(proto::process::command::Kind::Revert(revert)) => {
+                Some(revert.reason.clone()).filter(|reason| !reason.is_empty())
+            }
+            _ => None,
+        };
         let Some(program) = ProgramCommand::from_command(command.clone(), current)? else {
             // The rest are this process's own lifecycle, and no scheduler's: sched's handle
             // answers every one of them with exactly that (a park, promote, drain, serve or pause
@@ -1059,7 +1067,7 @@ impl MainProcess {
             }
             return Ok(None);
         };
-        match self.program(program, None)? {
+        match self.program_with(program, None, reverted_by)? {
             // A precopy answers when its installs finish, from `advance_precopy`.
             None => Ok(None),
             Some(status) => {
@@ -1097,6 +1105,20 @@ impl MainProcess {
         command: ProgramCommand,
         reply: Option<u32>,
     ) -> Result<Option<ProgramStatus>> {
+        self.program_with(command, reply, None)
+    }
+
+    /// §7.3: one program-layer command, with the daemon's own reason when it stated one.
+    ///
+    /// A revert's reason is the daemon's account of why an operator ended the probation; it is
+    /// carried into the epoch's record instead of a reason this process makes up. A peer's command
+    /// states none, and the epoch's own failures state their own.
+    fn program_with(
+        &mut self,
+        command: ProgramCommand,
+        reply: Option<u32>,
+        reverted_by: Option<String>,
+    ) -> Result<Option<ProgramStatus>> {
         let status = match command {
             ProgramCommand::Precopy {
                 generation,
@@ -1108,10 +1130,14 @@ impl MainProcess {
             }
             ProgramCommand::Switchover { generation, step } => self.switchover(generation, step)?,
             ProgramCommand::Commit { generation } => self.commit(generation)?,
+            // The operator's rollback is the daemon's decision, and its reason - when the
+            // daemon states one - is what the record keeps. It is not a policy failure: nothing
+            // about the scheduling policy failed, and saying it did would put a policy error in
+            // the epoch's record and in the daemon's account of why the update ended.
             ProgramCommand::Revert { generation } => self.revert(
                 generation,
-                UpdateFailure::Policy {
-                    error: "the daemon reverted the update".into(),
+                UpdateFailure::Threshold {
+                    reason: reverted_by.unwrap_or_else(|| "the daemon reverted the update".into()),
                 },
             )?,
             ProgramCommand::Purge { generation } => self.purge(generation)?,
