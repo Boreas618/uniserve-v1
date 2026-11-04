@@ -125,6 +125,18 @@ impl ToolchainKind {
     }
 }
 
+impl ModuleSpec {
+    /// The metadata file's name inside the module directory, for one
+    /// descriptor: the manifest may name it with `{descriptor}`, because a
+    /// package that carries one metadata JSON per descriptor names one file
+    /// per descriptor.
+    pub fn metadata_name(&self, descriptor: &str) -> Option<String> {
+        self.metadata
+            .as_ref()
+            .map(|name| name.replace(DESCRIPTOR_PLACEHOLDER, descriptor))
+    }
+}
+
 /// The toolchain a package declares, with the version it was written for and
 /// the external Python packages it imports.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

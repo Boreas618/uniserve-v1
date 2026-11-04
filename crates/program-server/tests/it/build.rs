@@ -263,3 +263,142 @@ fn install_prepare_committed_resolve() {
     stop.store(true, Ordering::SeqCst);
     thread.join().unwrap();
 }
+
+/// A vendor cubin package: the package carries the cubin and the launch
+/// metadata its vendor produced, and nothing compiles it (design section 5.3).
+const CUBIN_MANIFEST: &str = r#"
+op = "paged_attention"
+backend = "trtllm"
+
+[toolchain]
+kind = "none"
+version = ""
+
+[module]
+form = "cubin"
+metadata = "metadata_{descriptor}.json"
+
+[source]
+kind = "cubin"
+files = ["artifact/module_{descriptor}.cubin", "artifact/metadata_{descriptor}.json"]
+
+[kernel]
+architectures = ["sm_100a"]
+descriptors = { dimensions = { dtype = ["bf16"], page = ["64"] } }
+"#;
+
+/// The bytes of a cubin, as a package carries them: an ELF object with the
+/// little-endian CUDA magic. The Program Server stores it as it is; no driver
+/// reads it here.
+fn cubin_bytes() -> Vec<u8> {
+    let mut bytes = vec![0u8; 64];
+    bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+    bytes.extend_from_slice(b"\x33\x22\x11\x00");
+    bytes
+}
+
+#[test]
+fn a_vendor_cubin_is_installed_stored_and_resolved_as_it_is() {
+    let temporary = tempfile::tempdir().unwrap();
+    let package = temporary.path().join("paged_attention-trtllm");
+    std::fs::create_dir_all(package.join("artifact")).unwrap();
+    std::fs::write(package.join("package.toml"), CUBIN_MANIFEST).unwrap();
+    let key = "dtype_bf16_page_64";
+    let cubin = cubin_bytes();
+    std::fs::write(package.join(format!("artifact/module_{key}.cubin")), &cubin).unwrap();
+    std::fs::write(
+        package.join(format!("artifact/metadata_{key}.json")),
+        br#"{"name": "uniserve_paged_attention_trtllm"}"#,
+    )
+    .unwrap();
+
+    let package_root = temporary.path().join("packages");
+    std::fs::create_dir_all(&package_root).unwrap();
+    let store = temporary.path().join("store");
+    std::fs::create_dir_all(&store).unwrap();
+    let configuration = ServerConfig {
+        socket: temporary.path().join("program-server.sock"),
+        package_root: package_root.clone(),
+        store_roots: vec![Root {
+            path: store.clone(),
+            writable: true,
+        }],
+        upstream: None,
+        limits: Limits::default(),
+        // A vendor cubin compiles nothing, so this server needs no compiler
+        // at all: neither the Python environment nor nvcc exists here.
+        toolchains: ToolchainConfig {
+            nvcc: None,
+            python: temporary.path().join("no-python"),
+            wasm: None,
+            max_jobs: 1,
+        },
+        devices: vec![Device {
+            arch: Target::new("sm_100a"),
+            model: Target::new("b200"),
+        }],
+    };
+    let (_server, stop, thread) = start(&configuration);
+    let mut client = Client::connect(&configuration.socket).unwrap();
+
+    let installed = client.install(&package).unwrap();
+    assert_eq!(installed.package.revision, 1);
+
+    let target = Target::new("sm_100a");
+    let request = PrepareRequest {
+        targets: vec![target.clone()],
+        programs: vec![ProgramRequest {
+            slot: ProgramSlot::all("paged_attention"),
+            selector: Selector::Latest {
+                backend: "trtllm".into(),
+                arguments: toml::Table::new(),
+            },
+        }],
+        descriptors: vec![Descriptors {
+            op: "paged_attention".into(),
+            keys: vec![key.to_owned()],
+        }],
+    };
+    let mut progress = Vec::new();
+    let prepared = client
+        .prepare(&request, &mut |step| progress.push(step))
+        .unwrap();
+    assert_eq!(prepared.programs.len(), 1);
+    assert_eq!(progress.len(), 1);
+    assert_eq!(progress[0].state, BuildState::Committed);
+
+    let module = store
+        .join("paged_attention/trtllm/1")
+        .join(target.as_str())
+        .join(key);
+    assert_eq!(
+        std::fs::read(module.join("module.cubin")).unwrap(),
+        cubin,
+        "the module is the package's cubin, byte for byte"
+    );
+
+    let program = prepared.programs[0].program.clone();
+    let resolved = client
+        .resolve("paged_attention", &program, &target, key, &mut |_| {})
+        .unwrap();
+    assert_eq!(resolved.form, ModuleForm::Cubin);
+    assert_eq!(
+        resolved.metadata.as_deref(),
+        Some(format!("metadata_{key}.json").as_str())
+    );
+    let mut bytes = Vec::new();
+    resolved
+        .files
+        .iter()
+        .find(|file| file.name == "module.cubin")
+        .expect("the cubin arrives on a descriptor")
+        .file
+        .try_clone()
+        .unwrap()
+        .read_to_end(&mut bytes)
+        .unwrap();
+    assert_eq!(bytes, cubin);
+
+    stop.store(true, Ordering::SeqCst);
+    thread.join().unwrap();
+}

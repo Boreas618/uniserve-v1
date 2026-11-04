@@ -180,11 +180,12 @@ impl PackageSource {
 
     /// The metadata JSON's name in the module directory: the name the
     /// manifest gives, or Triton's own `metadata.json`.
-    pub fn metadata_name(&self) -> String {
+    /// The metadata file's name for one descriptor: what the package writes
+    /// and what the module carries (design section 5.3).
+    pub fn metadata_name(&self, descriptor: &str) -> String {
         self.manifest
             .module
-            .metadata
-            .clone()
+            .metadata_name(descriptor)
             .unwrap_or_else(|| "metadata.json".to_owned())
     }
 
@@ -209,7 +210,7 @@ impl PackageSource {
                         ),
                     ));
                 }
-                let metadata = self.metadata_name();
+                let metadata = self.metadata_name(key);
                 let path = dir.path().join(&metadata);
                 if !path.is_file() {
                     return Err(self.failure(
@@ -627,7 +628,7 @@ fn write_cuda_metadata(
         "global_scratch_size": integer("global_scratch_size", 0),
         "global_scratch_align": integer("global_scratch_align", 1),
     });
-    let path = dir.path().join(package.metadata_name());
+    let path = dir.path().join(package.metadata_name(key));
     let text = serde_json::to_vec_pretty(&metadata)
         .map_err(|error| package.failure(key, target, format!("writing metadata: {error}")))?;
     std::fs::write(path, text)?;
@@ -761,14 +762,16 @@ impl Source for CuteDslSource {
                 ),
             ));
         }
-        let interpreter = toolchain.script_interpreter().ok_or_else(|| Error::Toolchain {
-            kind: ToolchainKind::CuteDsl,
-            message: format!(
-                "no Python environment to run {}: create crates/program-server/python with \
+        let interpreter = toolchain
+            .script_interpreter()
+            .ok_or_else(|| Error::Toolchain {
+                kind: ToolchainKind::CuteDsl,
+                message: format!(
+                    "no Python environment to run {}: create crates/program-server/python with \
                  `uv sync`",
-                script.display()
-            ),
-        })?;
+                    script.display()
+                ),
+            })?;
         let job = ToolJob::new(interpreter, &package.root, &log)
             .argument(&script)
             .environment(package.environment(key, target, dir));
@@ -817,7 +820,7 @@ impl Source for CubinSource {
         // whole build, and it needs no toolchain at all.
         let mut copied_cubin = false;
         let mut copied_metadata = false;
-        let metadata = package.metadata_name();
+        let metadata = package.metadata_name(key);
         for relative in package.manifest.source.files_for(key) {
             let source = package.file(&relative);
             if !source.is_file() {
@@ -998,7 +1001,11 @@ fn build_wasm_crate(
         .environment(package.environment(key, target, dir));
     crate::toolchain::execute(&job, max_jobs)
         .map_err(|error| package.failure_with_log(key, target, error, log))?;
-    find_wasm(&target_directory.join("wasm32-unknown-unknown").join("release"))
+    find_wasm(
+        &target_directory
+            .join("wasm32-unknown-unknown")
+            .join("release"),
+    )
 }
 
 /// The one `.wasm` file a wasm32 build wrote in `directory`.
@@ -1008,7 +1015,10 @@ fn find_wasm(directory: &Path) -> Result<PathBuf> {
         .collect::<std::result::Result<Vec<_>, _>>()?
         .into_iter()
         .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "wasm"))
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "wasm")
+        })
         .collect::<Vec<_>>();
     // A Cdylib names its output after the crate; a package that writes the
     // raw module under its own name states which one it is.
@@ -1118,9 +1128,7 @@ mod tests {
             br#"{"name": "vendor"}"#,
         )
         .unwrap();
-        let metadata = metadata.map_or(String::new(), |name| {
-            format!("metadata = \"{name}\"\n")
-        });
+        let metadata = metadata.map_or(String::new(), |name| format!("metadata = \"{name}\"\n"));
         std::fs::write(
             directory.join("package.toml"),
             format!(
