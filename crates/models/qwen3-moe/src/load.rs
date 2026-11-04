@@ -24,7 +24,7 @@ use std::f64::consts::PI;
 use std::path::Path;
 
 use nn::layers::{Attention, Embedding, Linear, Moe, ParallelLMHead, RmsNorm, Rotary, SwiGlu};
-use nn::weights::{QuantizedStack, Weight, WeightLayout, WeightLoader, WeightRequest};
+use nn::weights::{Nvfp4Names, QuantizedStack, Weight, WeightLayout, WeightLoader, WeightRequest};
 use nn::{DType, Shape};
 use ops::fp4::ScaleLayout;
 use ops::gemm::WeightOrder;
@@ -475,8 +475,9 @@ fn expert_block(
                 &expert_source.checkpoint_prefix,
                 &["up", "gate"],
                 vocabulary,
+                Nvfp4Names::vllm(),
                 layout,
-            false,
+                false,
             )
             .map_err(Error::from)?;
         let down: QuantizedStack = loader
@@ -485,8 +486,9 @@ fn expert_block(
                 &expert_source.checkpoint_prefix,
                 &["down"],
                 vocabulary,
+                Nvfp4Names::vllm(),
                 layout,
-            false,
+                false,
             )
             .map_err(Error::from)?;
         let activation = activation(config.hidden_act)?;
