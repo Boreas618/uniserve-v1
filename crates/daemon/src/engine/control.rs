@@ -129,11 +129,32 @@ impl EngineControl {
     /// reports that its start failed.
     pub fn start(
         &self,
-        mut spec: wire::EngineSpec,
+        spec: wire::EngineSpec,
         build: &crate::epoch::BuildConfig,
         stats: StatsSink,
     ) -> anyhow::Result<EngineClient> {
         let engine = self.next_engine.fetch_add(1, Ordering::Relaxed);
+        self.start_at(spec, engine, build, stats)
+    }
+
+    /// [`EngineControl::start`] under a number the caller allocated.
+    ///
+    /// A standby's number comes from the epoch layer's one allocator
+    /// ([`crate::epoch::Epochs::next_generation`]), which also numbers the
+    /// launches an epoch switch starts; two counters for one identity would
+    /// drift the day a standby exists, so the standby path does not use
+    /// `next_engine`.
+    ///
+    /// # Errors
+    ///
+    /// As [`EngineControl::start`].
+    pub fn start_at(
+        &self,
+        mut spec: wire::EngineSpec,
+        engine: u64,
+        build: &crate::epoch::BuildConfig,
+        stats: StatsSink,
+    ) -> anyhow::Result<EngineClient> {
         // A spec of no world starts a world of its own, which takes the
         // identity of its first engine; an engine that replaces a lost one
         // goes on with its world.
