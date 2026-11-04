@@ -266,18 +266,7 @@ impl Layouts {
                 height: raster.height,
                 width: raster.width,
             },
-            // The audio latent is the stereo pair of channel planes, channel-major:
-            // `[AUDIO_CHANNELS, audio_channels, steps]`, `2 * 32 * steps` elements. `channels * frames`
-            // is the buffer's size and the executor sizes a draw from that product, so the stereo
-            // factor belongs in `channels` - declaring `audio_channels` alone would state half the
-            // elements the denoiser reads as rows (`audio_rows = AUDIO_CHANNELS * steps`, each of
-            // `audio_channels` features).
-            audio: Some(LatentShape {
-                channels: crate::config::AUDIO_CHANNELS * self.config.transformer.audio_channels,
-                frames: packing::audio_latent_frames(frames),
-                height: 1,
-                width: 1,
-            }),
+            audio: Some(self.audio_latent(packing::audio_latent_frames(frames))),
             text_rows: self.arrangement.text_rows,
             condition_rows: self.arrangement.condition_rows,
             condition_elements: self.condition_elements(&conditions_of(request), &canvas),
@@ -326,16 +315,31 @@ impl Layouts {
                 height: raster.height,
                 width: raster.width,
             },
-            audio: Some(LatentShape {
-                channels: self.config.transformer.audio_channels,
-                frames: packing.audio_rows / crate::config::AUDIO_CHANNELS,
-                height: 1,
-                width: 1,
-            }),
+            audio: Some(self.audio_latent(audio_steps(packing.audio_rows)?)),
             text_rows: packing.text_rows,
             condition_rows: packing.condition_rows,
             condition_elements,
         })
+    }
+
+    /// The audio latent a generated frame count holds.
+    ///
+    /// The layout's `channels * frames` is the latent's element count and the executor sizes the
+    /// buffer and its noise draw from that product; the denoiser reads those elements as
+    /// `AUDIO_CHANNELS * steps` rows of `audio_channels` features, channel-major. So the stereo pair
+    /// of channel planes is the `channels`, and a `steps` count is the `frames` - stating
+    /// `audio_channels` as the channels declares half the elements the branch reads, which a single
+    /// rank cannot see and every rank after it pays for in the draw's offset.
+    ///
+    /// **Every constructor of a layout builds its audio stream here.** The half-buffer got in twice
+    /// because two constructors stated the decomposition separately.
+    fn audio_latent(&self, steps: u32) -> LatentShape {
+        LatentShape {
+            channels: crate::config::AUDIO_CHANNELS * self.config.transformer.audio_channels,
+            frames: steps,
+            height: 1,
+            width: 1,
+        }
     }
 
     /// The packing a layout's extents came from.
@@ -859,6 +863,22 @@ impl Layouts {
 /// The frame count a request is snapped to.
 pub fn frames_of(request: &VideoRequest) -> u32 {
     packing::align_num_frames(request.frames)
+}
+
+/// The steps a packing's audio rows hold: one row per channel plane per step.
+///
+/// The packing states the stream in rows, `AUDIO_CHANNELS * steps`, which is the one place the
+/// decomposition is written down; a row count that does not divide is a packing this model did not
+/// build, not a stream to round.
+fn audio_steps(rows: u32) -> Result<u32> {
+    rows.checked_div(crate::config::AUDIO_CHANNELS)
+        .filter(|_| rows.is_multiple_of(crate::config::AUDIO_CHANNELS))
+        .ok_or_else(|| {
+            Error::config(format!(
+                "the packing's {rows} audio rows do not divide into {} channel planes",
+                crate::config::AUDIO_CHANNELS
+            ))
+        })
 }
 
 /// Elements of the audio latent a layout holds: `AUDIO_CHANNELS * audio_channels * steps`, the
@@ -2338,6 +2358,32 @@ mod tests {
     }
 
     #[test]
+    fn both_layout_constructors_declare_one_audio_latent() {
+        // Two constructors build a layout - the capability's infallible `cover` and the packing's
+        // `layout` - and a runner reads whichever its stage was given. They must state one audio
+        // stream: the half-buffer got in because they stated the decomposition separately, and the
+        // product is what sizes the latent and its draw.
+        let rule = layouts();
+        let request = conditioned();
+        let covered = rule.cover(&request);
+        let (laid, _) = rule
+            .layout(&request)
+            .expect("the conditioned request packs");
+        assert_eq!(covered.audio, laid.audio);
+        let audio = laid
+            .audio
+            .expect("a request that produces audio carries its latent");
+        let steps = audio.frames;
+        assert_eq!(
+            u64::from(audio.channels) * u64::from(steps),
+            u64::from(crate::config::AUDIO_CHANNELS)
+                * u64::from(rule.config.transformer.audio_channels)
+                * u64::from(steps),
+            "the stereo pair of channel planes is the latent's element count"
+        );
+    }
+
+    #[test]
     fn a_condition_arrives_as_the_packing_reads_it() {
         // The request states a role and an encoded raster; the packing wants a canvas and a frame
         // count. A reference without pixels is an audio reference and has no frame.
@@ -2351,10 +2397,12 @@ mod tests {
         assert_eq!(frame.canvas.aspect, (26, 15));
         assert_eq!(frame.num_frames, 1);
         assert_eq!(conditions[1].role, packing::Role::Reference);
-        assert_eq!(
-            conditions[1].frame.expect("a clip has pixels").num_frames,
-            12
-        );
+        // A reference clip's frame count is a *generated* count, `17n + 5`: the fixture asks for 22,
+        // the smallest one, and the packing reads it as the clip's five latent frames. 12 is not a
+        // count H3 generates, and a fixture stating one would test a stream the model cannot serve.
+        let clip = conditions[1].frame.expect("a clip has pixels").num_frames;
+        assert_eq!(clip, 22);
+        assert_eq!(clip, packing::align_num_frames(clip));
         assert_eq!(conditions[1].audio_samples, 24_000);
         assert!(
             conditions[2].frame.is_none(),
