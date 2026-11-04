@@ -56,16 +56,14 @@ pub enum Applied {
     Planned(serde_json::Value),
     /// The daemon's own options or executable change: a hot restart of the
     /// daemon with the target configuration applies them. When the change
-    /// also changes what a world executes, the daemon's successor applies
-    /// `then`, the same change, which then changes the world alone: the
-    /// orchestrator changes before what it orchestrates.
+    /// also changes what the main processes are built from, the daemon's
+    /// successor applies `then`, the same change, which the epoch layer then
+    /// switches: the orchestrator changes before what it orchestrates.
     Daemon {
         config: Box<ServeConfig>,
         executable: Option<String>,
         then: Option<Box<ApplyRequest>>,
     },
-    /// A new world executes on trial.
-    World(serde_json::Value),
     /// The epoch layer's switch runs on trial: the target's main processes
     /// serve while the previous epoch is parked (§7.4).
     Epoch(serde_json::Value),

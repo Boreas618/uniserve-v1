@@ -597,7 +597,6 @@ fn applied_result(
         Ok(Applied::Unchanged) => Ok(json!({ "change": "none" })),
         Ok(Applied::InPlace(plan)) => Ok(json!({ "change": "in_place", "plan": plan })),
         Ok(Applied::Planned(plan)) => Ok(json!({ "change": "planned", "plan": plan })),
-        Ok(Applied::World(report)) => Ok(json!({ "change": "world", "world": report })),
         Ok(Applied::Epoch(report)) => Ok(json!({ "change": "epoch", "epoch": report })),
         Ok(Applied::Program(report)) => Ok(json!({ "change": "program", "program": report })),
         Ok(Applied::Daemon { .. }) => Err((

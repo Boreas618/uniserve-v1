@@ -376,22 +376,12 @@ impl Leader {
             Some(index) => vec![index],
             None => (0..replicas.len()).collect(),
         };
-        if !request.dry_run {
-            locked(&self.replicas.pending).clear();
-        }
         let mut reports = Vec::new();
-        for (position, index) in indices.iter().copied().enumerate() {
+        for index in indices.iter().copied() {
             let replica = replicas
                 .get(index)
                 .ok_or_else(|| UpdateError::Refused(format!("no replica {index}")))?;
             match Box::pin(replica.apply(request.clone())).await? {
-                Applied::World(report) => {
-                    *locked(&self.replicas.pending) = indices[position + 1..]
-                        .iter()
-                        .map(|index| (*index, request.clone()))
-                        .collect();
-                    return Ok(Applied::World(report));
-                }
                 applied @ Applied::Daemon { .. } => {
                     if request.replica.is_some() {
                         return Err(UpdateError::Refused(

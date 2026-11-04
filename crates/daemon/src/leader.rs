@@ -87,8 +87,6 @@ pub struct Leader {
 pub(crate) struct Replicas {
     pub(crate) serving: watch::Sender<Vec<Arc<Replica>>>,
     pub(crate) replacing: tokio::sync::Mutex<()>,
-    pub(crate) pending:
-        std::sync::Mutex<std::collections::VecDeque<(usize, crate::updates::change::ApplyRequest)>>,
     pub(crate) adapters: Arc<std::sync::Mutex<BTreeMap<String, Adapter>>>,
     pub(crate) schedulers: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -953,7 +951,6 @@ impl Leader {
                     .collect(),
             ),
             replacing: tokio::sync::Mutex::new(()),
-            pending: std::sync::Mutex::new(std::collections::VecDeque::new()),
             adapters: Arc::clone(&adapters),
             schedulers,
         });
