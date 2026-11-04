@@ -400,8 +400,6 @@ fn a_pool_keeps_addresses_and_contents_across_a_suspension() {
         Some(mapped as u64),
         "the pool books the storage it maps, and the booking carries the pool's total"
     );
-    let bookings = budget.bookings();
-
     let stream = device.stream().unwrap();
     let host = PinnedBuffer::new(DEVICE, 256).unwrap();
 
@@ -450,6 +448,10 @@ fn a_pool_keeps_addresses_and_contents_across_a_suspension() {
     assert_eq!(read(&host), vec![9; 256]);
 
     drop(fill);
+    // The baseline for "books nothing new" is taken after the restore, because
+    // the suspension and the restore do book: the first books the pool down to
+    // nothing, the second books back what it maps.
+    let bookings = budget.bookings();
     let address = second.address();
     allocator.free(second);
     let again = allocator.allocate(PoolKind::Graph, 1 << 20).unwrap();
