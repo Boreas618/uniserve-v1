@@ -35,6 +35,79 @@ use crate::checkpoint::{Checkpoint, FileIdentity};
 use crate::error::{Error, Result};
 use crate::tensor::Backing;
 
+/// The suffix one export spells each field of a calibrated NVFP4 projection with (specs/worker.md
+/// 8, 9).
+///
+/// A calibrated checkpoint states a projection's fields as four tensor names that differ only in
+/// their suffix, and the suffix set is a property of the export, not of the format: two calibration
+/// runs of the same model written by different toolchains name the same three numbers differently.
+/// The loader is told which vocabulary its checkpoint speaks, because reading it as the other one
+/// would either fail or — worse — accept a half-converted checkpoint whose plain `weight` is a
+/// BF16 matrix beside a `weight_scale` nothing normalizes.
+///
+/// The two constructors are the export shapes this tree meets. **`weight_scale` is the same name in
+/// both and means the same thing** — the K16 block scales — so it is not a mistake that the two
+/// disagree about the packed values and the per-tensor scale only; renaming it in either
+/// constructor would be. The per-tensor scale is `weight_scale_2` in the vLLM spelling and
+/// `weight_tensor_scale` in the diffusers one, and an export that carries no activation scale says
+/// so by having no tensor under [`Nvfp4Names::input_scale`], which the loader reports as this
+/// vocabulary rather than as a missing name.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Nvfp4Names {
+    /// What this vocabulary is called, in refusals: the export that writes it.
+    pub export: &'static str,
+    /// The packed E2M1 values, two codes a byte.
+    pub values: &'static str,
+    /// The K16 block scales, one byte each in `F8_E4M3` or `U8`.
+    pub block_scale: &'static str,
+    /// The per-tensor scale the block scales are normalized against.
+    pub tensor_scale: &'static str,
+    /// The calibration's activation scale, when the export states one.
+    pub input_scale: &'static str,
+}
+
+impl Nvfp4Names {
+    /// The vLLM/ModelOpt spelling: `weight`, `weight_scale`, `weight_scale_2`, `input_scale`.
+    ///
+    /// This is what a Qwen3-MoE calibrated checkpoint states, and what
+    /// `uniserve/quantization/quantizer.py` writes.
+    pub const fn vllm() -> Self {
+        Self {
+            export: "vLLM ModelOpt",
+            values: "weight",
+            block_scale: "weight_scale",
+            tensor_scale: "weight_scale_2",
+            input_scale: "input_scale",
+        }
+    }
+
+    /// The diffusers/ModelOpt spelling: `weight_packed`, `weight_scale`, `weight_tensor_scale`,
+    /// `input_scale`.
+    ///
+    /// This is what the FastH3 export states, in every component that is quantized (its
+    /// `transformer` and `vae` state 100 and 216 packed projections respectively), and its VAE adds
+    /// `scale1`/`scale2` beside them for the layers ModelOpt calibrated in a second scheme.
+    pub const fn diffusers() -> Self {
+        Self {
+            export: "diffusers ModelOpt",
+            values: "weight_packed",
+            block_scale: "weight_scale",
+            tensor_scale: "weight_tensor_scale",
+            input_scale: "input_scale",
+        }
+    }
+}
+
+impl fmt::Display for Nvfp4Names {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} (`{}`, `{}`, `{}`)",
+            self.export, self.values, self.block_scale, self.tensor_scale
+        )
+    }
+}
+
 /// The arrangement of a weight's bytes that its reading operator declares.
 ///
 /// The names enter the retained key, so each one is a stable statement about layout, not about the
@@ -695,9 +768,19 @@ impl<'a> WeightLoader<'a> {
         values: &WeightRequest,
         scales: &WeightRequest,
         input_scale: Option<&WeightRequest>,
+        names: Nvfp4Names,
         layout: ScaleLayout,
         global_scale: f32,
     ) -> Result<QuantizedWeight> {
+        // The requests name the fields, so their absence is where a wrong vocabulary shows up: a
+        // checkpoint opened as the other export's spelling has a `weight_packed` where this asked
+        // for a `weight`, and the refusal says which spelling was expected and why.
+        for (request, field, suffix) in [
+            (values, "packed E2M1 values", names.values),
+            (scales, "K16 block scales", names.block_scale),
+        ] {
+            self.check_nvfp4_field(&request.tensor, names, field, suffix)?;
+        }
         if !(global_scale.is_finite() && global_scale > 0.0) {
             return Err(Error::weight(
                 &values.tensor,
@@ -743,6 +826,12 @@ impl<'a> WeightLoader<'a> {
         let input_scale = match input_scale {
             None => None,
             Some(request) => {
+                self.check_nvfp4_field(
+                    &request.tensor,
+                    names,
+                    "calibration's activation scale",
+                    names.input_scale,
+                )?;
                 let reciprocal = self.activation_reciprocal(request)?;
                 let shape = Shape::new(&[1]);
                 let bytes = reciprocal.to_le_bytes();
@@ -780,6 +869,33 @@ impl<'a> WeightLoader<'a> {
             layout,
             input_scale,
         })
+    }
+
+    /// Check that a checkpoint holds one of a projection's NVFP4 fields, naming the export's
+    /// spelling when it does not.
+    ///
+    /// The spelling is the whole point: the same number is `weight` in one export and
+    /// `weight_packed` in another, so "not found" against a name the loader expected to be right
+    /// hides which export the checkpoint came from. A checkpoint opened with one vocabulary and
+    /// written in the other is a loading-boundary error, not a corrupt checkpoint.
+    fn check_nvfp4_field(
+        &self,
+        tensor: &str,
+        names: Nvfp4Names,
+        field: &str,
+        suffix: &str,
+    ) -> Result<()> {
+        if self.checkpoint.tensor(tensor).is_some() {
+            return Ok(());
+        }
+        Err(Error::weight(
+            tensor,
+            format!(
+                "this checkpoint was opened as the {names} spelling of a calibrated NVFP4 \
+                 projection, whose {field} is `{suffix}`, and it holds no tensor of this name; the \
+                 other export's spelling names the same field differently"
+            ),
+        ))
     }
 
     /// Read one tensor's single floating number and answer its reciprocal.
@@ -828,12 +944,18 @@ impl<'a> WeightLoader<'a> {
     /// weight needs its own name. A block-scale layout whose per-expert entry is padded, or a
     /// projection count that would break the swizzle's 128-row tiles, is refused here rather than
     /// read as a table no program expects.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the design's stack carries its own name, the checkpoint's prefix, the projections, \
+                  the expert count, the export's spelling and the scale layout"
+    )]
     pub fn nvfp4_stack(
         &mut self,
         name: &str,
         prefix: &str,
         projections: &[&str],
         experts: u32,
+        names: Nvfp4Names,
         layout: ScaleLayout,
         input_scale: bool,
     ) -> Result<QuantizedStack> {
@@ -846,8 +968,9 @@ impl<'a> WeightLoader<'a> {
         let count = u64::from(experts);
         let per = projections.len() as u64;
 
-        // Every field of every expert, by the suffix set `nvfp4` consumes.
-        let mut names = Vec::new();
+        // Every field of every expert, by the export's own suffix set.
+        let spelling = names;
+        let mut fields = Vec::new();
         let mut rows = None;
         let mut columns = None;
         let mut values_bytes = Vec::new();
@@ -859,17 +982,25 @@ impl<'a> WeightLoader<'a> {
         for expert in 0..count {
             for projection in projections {
                 let stem = format!("{prefix}.{expert}.{projection}_proj");
-                let (values_name, scales_name) =
-                    (format!("{stem}.weight"), format!("{stem}.weight_scale"));
-                let tensor_name = format!("{stem}.weight_scale_2");
-                names.push(values_name.clone());
-                names.push(scales_name.clone());
-                names.push(tensor_name.clone());
-                let activation_name = format!("{stem}.input_scale");
+                let (values_name, scales_name) = (
+                    format!("{stem}.{}", spelling.values),
+                    format!("{stem}.{}", spelling.block_scale),
+                );
+                let tensor_name = format!("{stem}.{}", spelling.tensor_scale);
+                fields.push(values_name.clone());
+                fields.push(scales_name.clone());
+                fields.push(tensor_name.clone());
+                let activation_name = format!("{stem}.{}", spelling.input_scale);
                 if input_scale {
-                    names.push(activation_name.clone());
+                    fields.push(activation_name.clone());
                 }
 
+                self.check_nvfp4_field(
+                    &values_name,
+                    spelling,
+                    "packed E2M1 values",
+                    spelling.values,
+                )?;
                 let values = self.checkpoint.read(&values_name)?;
                 if values.dtype != DType::U8 {
                     return Err(Error::weight(
@@ -983,7 +1114,7 @@ impl<'a> WeightLoader<'a> {
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect();
-        let files = self.identities(&names)?;
+        let files = self.identities(&fields)?;
 
         let values = self.publish_computed(
             WeightKey {
@@ -992,7 +1123,7 @@ impl<'a> WeightLoader<'a> {
                 layout: WeightLayout::NVFP4_VALUES,
                 region: WeightRegion {
                     tensors: std::iter::once(format!("{name}__nvfp4_values"))
-                        .chain(names.iter().cloned())
+                        .chain(fields.iter().cloned())
                         .collect(),
                     start: 0,
                     shape: values_shape,
@@ -1015,7 +1146,7 @@ impl<'a> WeightLoader<'a> {
                 },
                 region: WeightRegion {
                     tensors: std::iter::once(format!("{name}__nvfp4_scales"))
-                        .chain(names.iter().cloned())
+                        .chain(fields.iter().cloned())
                         .collect(),
                     start: 0,
                     shape: scales_shape,
@@ -1032,7 +1163,7 @@ impl<'a> WeightLoader<'a> {
                 layout: WeightLayout::ROW_MAJOR,
                 region: WeightRegion {
                     tensors: std::iter::once(format!("{name}__nvfp4_tensor_scales"))
-                        .chain(names.iter().cloned())
+                        .chain(fields.iter().cloned())
                         .collect(),
                     start: 0,
                     shape: Shape::new(&[count, per]),
@@ -1049,9 +1180,9 @@ impl<'a> WeightLoader<'a> {
                 .collect();
             let shape = Shape::new(&[count, per]);
             let files = self.identities(
-                &names
+                &fields
                     .iter()
-                    .filter(|name| name.ends_with(".input_scale"))
+                    .filter(|field| field.ends_with(&format!(".{}", spelling.input_scale)))
                     .cloned()
                     .collect::<Vec<_>>(),
             )?;
