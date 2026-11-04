@@ -38,10 +38,12 @@ ANSWER_MARKER = "#### "
 
 # A value may sit between whitespace and punctuation: the optional ``$`` of
 # a money answer, parentheses, or a full stop the model wrote after the
-# number. The value itself keeps its sign, thousands commas and decimal
-# fraction, and anything else around it means the text holds no value.
+# number. A letter or digit next to the value means the text around the
+# marker is not the answer alone, so ``#### The answer is 18`` and
+# ``#### 18 apples`` hold no value. The value itself keeps its sign,
+# thousands commas and decimal fraction.
 _ANSWER_VALUE = re.compile(
-    r"[^\d+\-]*"
+    r"[^\w+\-]*"
     r"(?P<number>[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)"
     r"[^\w]*"
 )
@@ -53,7 +55,9 @@ def extract_answer(text: str) -> Decimal | None:
     The marker is ``#### `` including its space, so text whose only marker is
     ``####20`` holds no answer. Whitespace and punctuation may surround the
     value; text that does not reduce to one optionally signed integer or
-    decimal, with optional ``$`` and thousands commas, yields ``None``.
+    decimal, with optional ``$`` and thousands commas, yields ``None``. A
+    letter or digit next to the value is not punctuation, so
+    ``#### The answer is 18`` and ``#### 18 apples`` hold no answer either.
 
     Args:
         text: A generated response or a dataset row's reference answer.
