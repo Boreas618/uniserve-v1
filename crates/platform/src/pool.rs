@@ -419,42 +419,100 @@ impl VirtualPool {
         Ok(())
     }
 
-    /// Maps new physical storage at every chunk's address and copies its
-    /// saved contents back. Restoring a pool that is not suspended does
-    /// nothing.
+    /// Maps new physical storage at every chunk's address and copies its saved
+    /// contents back. Restoring a pool that is not suspended does nothing.
     ///
     /// # Errors
     ///
-    /// Fails when the driver cannot allocate or map a chunk, or a copy
-    /// fails; the chunks not yet restored stay suspended.
+    /// Fails when the driver cannot create or map a chunk, when a booking
+    /// refuses the chunk's new total, or when a copy fails — and then maps
+    /// nothing: the chunks this call had already mapped are released again
+    /// before the error is returned, so the pool ends exactly as suspended as
+    /// it began and every chunk keeps its saved contents.
     pub fn restore(&mut self) -> Result<()> {
         if !self.suspended {
             return Ok(());
         }
         let stream = Stream::new(self.device)?;
+        let mut mapped: Vec<usize> = Vec::new();
+        let mut failure: Option<Error> = None;
         for index in 0..self.chunks.len() {
             if self.chunks[index].block.is_some() {
                 continue;
             }
             let (offset, bytes) = (self.chunks[index].offset, self.chunks[index].bytes);
-            let block = self.map(offset, bytes)?;
+            let block = match self.map(offset, bytes) {
+                Ok(block) => block,
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            };
             self.chunks[index].block = Some(block);
-            if let Some(saved) = self.chunks[index].saved.take() {
-                let address = self.address + offset;
-                in_context(self.context.raw(), |driver| {
-                    // SAFETY: the chunk was mapped above; the host buffer
-                    // holds its saved contents.
-                    driver.check(
-                        unsafe {
-                            (driver.memcpy_async)(address, saved.address(), bytes, stream.handle())
-                        },
-                        "cuMemcpyAsync",
-                    )
-                })?;
-                stream.synchronize()?;
+            mapped.push(index);
+            let Some(saved) = self.chunks[index].saved.as_ref() else {
+                continue;
+            };
+            let address = self.address + offset;
+            let copied = in_context(self.context.raw(), |driver| {
+                // SAFETY: the chunk was mapped above; the host buffer holds its
+                // saved contents and is as long as the chunk.
+                driver.check(
+                    unsafe {
+                        (driver.memcpy_async)(address, saved.address(), bytes, stream.handle())
+                    },
+                    "cuMemcpyAsync",
+                )
+            })
+            .and_then(|()| stream.synchronize());
+            if let Err(error) = copied {
+                failure = Some(error);
+                break;
             }
         }
-        self.suspended = false;
+        match failure {
+            None => {
+                self.suspended = false;
+                // The contents are back on the device; the host copies are no
+                // longer needed.
+                for chunk in &mut self.chunks {
+                    chunk.saved = None;
+                }
+                Ok(())
+            }
+            Some(error) => {
+                // A half-restored pool would book part of its storage, which a
+                // standby's accounting must not have to reason about.
+                for index in mapped {
+                    let _ = self.release_chunk(index);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Releases the chunk `index` this pool mapped, keeping its saved contents
+    /// and the booked total true to what the pool maps.
+    fn release_chunk(&mut self, index: usize) -> Result<()> {
+        let Some(block) = self.chunks[index].block.take() else {
+            return Ok(());
+        };
+        let address = self.address + self.chunks[index].offset;
+        let bytes = self.chunks[index].bytes;
+        in_context(self.context.raw(), |driver| {
+            driver.check(
+                // SAFETY: the chunk was mapped by this pool and nothing
+                // addresses it while the pool is suspended.
+                unsafe { (driver.mem_unmap)(address, bytes) },
+                "cuMemUnmap",
+            )?;
+            driver.check(
+                // SAFETY: the handle is this pool's reference.
+                unsafe { (driver.mem_release)(block.raw()) },
+                "cuMemRelease",
+            )
+        })?;
+        self.rebook();
         Ok(())
     }
 }

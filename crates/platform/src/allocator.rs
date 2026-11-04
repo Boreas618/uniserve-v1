@@ -55,6 +55,14 @@ impl PoolKind {
         }
     }
 
+    /// The pool at `index` of [`Self::index`], for the allocator's fixed-size
+    /// table of pools.
+    pub(crate) fn from_index(index: usize) -> Option<Self> {
+        [Self::Graph, Self::Scratch, Self::Resident]
+            .get(index)
+            .copied()
+    }
+
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Graph => "graph",
@@ -414,19 +422,61 @@ impl Allocator {
 
     /// Maps new physical storage at every suspended block's address and copies
     /// its saved contents back, booking each pool's new total before each
-    /// mapping. Restoring a pool that is not suspended does nothing.
+    /// mapping. Restoring an allocator that is not suspended does nothing.
+    ///
+    /// This is all or nothing across the allocator. If any pool cannot be
+    /// restored — the driver refuses a block, a copy fails, or the budget
+    /// refuses the new total — every pool this call had already brought back is
+    /// suspended again before the error, which names the pool that refused and
+    /// carries its cause, so a standby is either fully promoted or fully parked.
+    /// [`Self::mapped_bytes`] answers for every pool after a failed restore what
+    /// it answered before the call, and each block keeps its saved contents; a
+    /// caller may therefore retry the restore once the condition that refused it
+    /// has passed.
     ///
     /// # Errors
     ///
-    /// Fails when the driver cannot create or map a block's storage, when a
-    /// pool's budget refuses the new total, or when a copy fails; the blocks
-    /// not yet restored stay suspended.
+    /// [`Error::InvalidArgument`] naming the pool that refused, when the driver,
+    /// a copy or the budget refuses; if one of the already-restored pools
+    /// cannot be parked again, the error says so, since only then is the standby
+    /// left partially promoted.
     pub fn restore(&mut self) -> Result<()> {
-        let mut outcome = Ok(());
-        for pool in self.pools.iter_mut().flatten() {
-            outcome = outcome.and(pool.restore());
+        let mut restored = [false; POOLS];
+        for index in 0..POOLS {
+            let outcome = match self.pools[index].as_mut() {
+                Some(pool) => pool.restore(),
+                None => continue,
+            };
+            if let Err(error) = outcome {
+                let kind = PoolKind::from_index(index).unwrap_or(PoolKind::Graph);
+                let mut rollback = Ok(());
+                for (other, was_restored) in restored.iter().enumerate() {
+                    if !*was_restored {
+                        continue;
+                    }
+                    if let Some(pool) = self.pools[other].as_mut() {
+                        rollback = rollback.and(pool.suspend());
+                    }
+                }
+                return Err(match rollback {
+                    Ok(()) => Error::invalid(format!(
+                        "the {} pool of {} could not be restored, so every pool stays parked: \
+                         {error}",
+                        kind.name(),
+                        self.device.id()
+                    )),
+                    Err(rollback) => Error::invalid(format!(
+                        "the {} pool of {} could not be restored ({error}) and the pools restored \
+                         before it could not be parked again ({rollback}): the standby is partially \
+                         promoted",
+                        kind.name(),
+                        self.device.id()
+                    )),
+                });
+            }
+            restored[index] = true;
         }
-        outcome
+        Ok(())
     }
 
     fn pool(&mut self, pool: PoolKind) -> Result<&mut VirtualPool> {
