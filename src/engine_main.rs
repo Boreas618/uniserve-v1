@@ -2721,13 +2721,25 @@ impl MainProcess {
         let info = first.info();
         let mut segments = Vec::new();
         for scheduler in &self.schedulers {
-            let groups = scheduler
+            // A group that cannot describe its cache is reported with what the others stated rather
+            // than failing the start: the segments are what a *successor* maps, and a successor that
+            // finds one missing refuses by name, while a process that refused to state what it is
+            // over this would hang the epoch before its first policy - the deadlock this report
+            // exists to end.
+            let groups = match scheduler
                 .describe_cache()
                 .recv_timeout(self.watchdog.stall_bound())
-                .map_err(|error| {
-                    anyhow::anyhow!("a scheduler did not describe its cache: {error}")
-                })?
-                .map_err(|error| anyhow::anyhow!("describing a worker group's cache: {error}"))?;
+            {
+                Ok(Ok(groups)) => groups,
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "a worker group did not describe its cache");
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "a scheduler did not describe its cache in time");
+                    continue;
+                }
+            };
             segments.extend(groups.into_iter().map(|group| {
                 proto::request::wire::CacheSegments {
                     worker_group: group.worker_group,
