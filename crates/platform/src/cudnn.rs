@@ -176,6 +176,11 @@ const NUMERICAL_NOTE_DOWN_CONVERT_INPUTS: i32 = 1;
 /// `CUDNN_CROSS_CORRELATION`: the convolution PyTorch's `Conv*d` computes.
 const CROSS_CORRELATION: i32 = 1;
 
+/// `CUDNN_HEUR_MODE_B`: the exhaustive list of engine configurations for the
+/// operation graph, where [`HEURISTIC_MODE_A`] is the performance shortlist
+/// (often one configuration).
+const HEURISTIC_MODE_B: i32 = 1;
+
 /// The most engine configurations one heuristic query is asked to return.
 const MAX_ENGINE_CONFIGS: usize = 32;
 
@@ -1203,6 +1208,57 @@ pub struct Cudnn {
 // threads is safe because every call enters the device's context.
 unsafe impl Send for Cudnn {}
 
+/// What one heuristic query proposed, and what the exactness filter did with
+/// it.
+///
+/// The two ways a query can leave nothing to serve a request are different
+/// facts — the heuristic listed no engine at all, or it listed engines and
+/// every one of them down-converts its inputs — and a request that fails says
+/// which one it was.
+struct Configs {
+    /// The mode the query asked: [`HEURISTIC_MODE_A`] or [`HEURISTIC_MODE_B`].
+    mode: i32,
+    /// How many configurations the heuristic listed.
+    returned: usize,
+    /// How many of them were read back.
+    inspected: usize,
+    /// The ones this request may use, best first.
+    kept: Vec<Descriptor>,
+    /// The numerical notes of the ones the exactness filter refused.
+    dropped: Vec<i32>,
+}
+
+impl Configs {
+    /// The error for a request this proposal cannot serve.
+    fn empty(&self, shape: &str) -> Error {
+        if self.returned == 0 {
+            return Error::invalid(format!(
+                "cuDNN's heuristic (mode {}) returned no engine configuration for {shape}",
+                mode_name(self.mode)
+            ));
+        }
+        Error::invalid(format!(
+            "cuDNN's heuristic (mode {}) listed {} engine configuration(s) for {shape}; of the \
+             {} it returned here, every one down-converts its inputs to TF32 (numerical notes \
+             {:?}), so this cuDNN version has no engine that keeps the convolution's inputs in \
+             FP32 precision",
+            mode_name(self.mode),
+            self.returned,
+            self.inspected,
+            self.dropped
+        ))
+    }
+}
+
+/// The name cuDNN's header gives the heuristic `mode`, for an error message.
+fn mode_name(mode: i32) -> &'static str {
+    match mode {
+        HEURISTIC_MODE_A => "A",
+        HEURISTIC_MODE_B => "B",
+        _ => "?",
+    }
+}
+
 impl Cudnn {
     /// Creates a cuDNN handle for `device`.
     ///
@@ -1235,34 +1291,52 @@ impl Cudnn {
         unsafe { (self.api.get_version)() }
     }
 
-    /// The engines cuDNN's heuristic proposes for `convolution`, best first,
-    /// at most `limit` of them.
+    /// The engines this shape has under `convolution`'s precision rule, best
+    /// first, at most `limit` of them.
     ///
     /// This is how the tuning data is made: the program's package runs it
-    /// once on an idle GPU (§5.4) and records one [`Engine`] per shape.
+    /// once on an idle GPU (§5.4) and records one [`Engine`] per shape. It asks
+    /// the heuristic's exhaustive list (mode B), not the performance shortlist:
+    /// the record has to be found again when the program loads, and a
+    /// shortlist is not a list to search for a property in.
+    ///
+    /// When `convolution` requires exact numerics, the engines that
+    /// down-convert their inputs are not among the ones this shape has.
     pub fn engines(&self, convolution: &Convolution, limit: usize) -> Result<Vec<Engine>> {
         convolution.check()?;
         let device = Device::new(self.device)?;
         let _context = device.enter()?;
         let operation = Operation::describe(self.api, convolution)?;
-        let configs = self.configs(&operation, limit, convolution.allow_tf32)?;
-        if configs.is_empty() {
-            return Err(Error::invalid(
-                "cuDNN's heuristic proposes no engine for this convolution",
-            ));
+        let proposal = self.configs(
+            &operation.graph,
+            limit,
+            HEURISTIC_MODE_B,
+            !convolution.allow_tf32,
+        )?;
+        if proposal.kept.is_empty() {
+            return Err(proposal.empty("this convolution"));
         }
-        configs
+        proposal
+            .kept
             .iter()
             .map(|config| self.global_index(config))
             .collect()
     }
 
     /// Builds the execution plan for `convolution`, running the recorded
-    /// `engine` when one is given (the program's tuning data) or the
-    /// heuristic's first choice otherwise.
+    /// `engine` when one is given (the program's tuning data) or the fastest
+    /// engine the heuristic offers otherwise.
     ///
     /// The heuristic is asked once here, at program load; service reuses the
     /// plan.
+    ///
+    /// Which list it asks follows from what the request is for. Without a
+    /// recorded engine and without a precision rule, the performance
+    /// shortlist (mode A) is exactly the list wanted: its first entry is the
+    /// fastest engine. A recorded engine has to be found rather than picked,
+    /// and a shape that requires exact numerics has to be searched for an
+    /// engine that keeps its inputs in FP32 — neither is a property of a
+    /// shortlist, so both ask the exhaustive list (mode B).
     pub fn plan(
         &self,
         convolution: &Convolution,
@@ -1272,16 +1346,20 @@ impl Cudnn {
         let device = Device::new(self.device)?;
         let _context = device.enter()?;
         let operation = Operation::describe(self.api, convolution)?;
-        let mut configs = self.configs(&operation, MAX_ENGINE_CONFIGS, convolution.allow_tf32)?;
-        if configs.is_empty() {
-            return Err(Error::invalid(
-                "cuDNN's heuristic proposes no engine for this convolution",
-            ));
+        let exact = !convolution.allow_tf32;
+        let mode = if engine.is_some() || exact {
+            HEURISTIC_MODE_B
+        } else {
+            HEURISTIC_MODE_A
+        };
+        let mut proposal = self.configs(&operation.graph, MAX_ENGINE_CONFIGS, mode, exact)?;
+        if proposal.kept.is_empty() {
+            return Err(proposal.empty("this convolution"));
         }
         let position = match engine {
             Some(recorded) => {
                 let mut position = None;
-                for (index, config) in configs.iter().enumerate() {
+                for (index, config) in proposal.kept.iter().enumerate() {
                     if self.global_index(config)? == recorded {
                         position = Some(index);
                         break;
@@ -1289,15 +1367,18 @@ impl Cudnn {
                 }
                 position.ok_or_else(|| {
                     Error::invalid(format!(
-                        "cuDNN's heuristic proposes no engine {} for this convolution; \
-                         the shape has to be measured again against this cuDNN version",
+                        "cuDNN's heuristic (mode {}) lists {} engine configuration(s) for this \
+                         convolution and none of them is engine {}; the shape has to be \
+                         measured again against this cuDNN version",
+                        mode_name(mode),
+                        proposal.kept.len(),
                         recorded.global_index
                     ))
                 })?
             }
             None => 0,
         };
-        let chosen = configs.swap_remove(position);
+        let chosen = proposal.kept.swap_remove(position);
         let recorded = self.global_index(&chosen)?;
 
         let (plan, workspace_bytes) = self.execution_plan(&chosen, None)?;
@@ -1535,13 +1616,48 @@ impl Cudnn {
 
         let heuristic = stage!(
             "engine heuristic: mode A, operation graph, finalize",
-            Self::heuristic(self.api, &graph)
+            Self::heuristic(self.api, &graph, HEURISTIC_MODE_A)
         );
         let available = stage!(
             "engine heuristic: count the configurations",
             self.api
                 .count(&heuristic, ATTR_ENGINEHEUR_RESULTS, TYPE_BACKEND_DESCRIPTOR)
         );
+        // The other way a request ends up with no engine is the exactness
+        // filter dropping everything the heuristic listed, and that can only
+        // be seen in the exhaustive list: mode A is the performance shortlist
+        // and may hold one configuration. Both are counted and their notes
+        // read here, so one run separates "no engine for this shape" from "no
+        // engine that keeps its inputs in FP32".
+        let mode_b = stage!(
+            "engine heuristic: mode B, operation graph, finalize",
+            Self::heuristic(self.api, &graph, HEURISTIC_MODE_B)
+        );
+        let listed_b = stage!(
+            "engine heuristic: mode B, count the configurations",
+            self.api
+                .count(&mode_b, ATTR_ENGINEHEUR_RESULTS, TYPE_BACKEND_DESCRIPTOR)
+        );
+        let exhaustive = stage!(
+            "engine heuristic: mode B, read up to eight configurations and their numerical notes",
+            self.configs(&graph, 8, HEURISTIC_MODE_B, false)
+        );
+        let mut notes_b = Vec::new();
+        for config in &exhaustive.kept {
+            notes_b.push(stage!(
+                "engine heuristic: a mode B configuration's numerical notes",
+                self.numerical_notes(config)
+            ));
+        }
+        steps.push((
+            format!(
+                "engine heuristic: mode B listed {listed_b} configuration(s); the numerical \
+                 notes of the first {} are {notes_b:?}, and note {NUMERICAL_NOTE_DOWN_CONVERT_INPUTS} \
+                 (TF32 for FP32 inputs) is the one a full-precision request refuses",
+                notes_b.len()
+            ),
+            None,
+        ));
         if available == 0 {
             steps.push((
                 String::from("engine heuristic: cuDNN proposes no engine for this convolution"),
@@ -1553,6 +1669,14 @@ impl Cudnn {
             "engine heuristic: read the first configuration",
             Self::first_config(self.api, &heuristic, available)
         );
+        let notes_a = stage!(
+            "engine heuristic: mode A's first configuration's numerical notes",
+            self.numerical_notes(&config)
+        );
+        steps.push((
+            format!("engine heuristic: mode A's first configuration carries the numerical notes {notes_a:?}"),
+            None,
+        ));
         stage!(
             "engine configuration: read the engine's global index",
             self.global_index(&config)
@@ -1589,10 +1713,9 @@ impl Cudnn {
         steps
     }
 
-    /// The engine heuristic descriptor of `graph` in mode A, finalized.
-    fn heuristic(api: &'static Api, graph: &Descriptor) -> Result<Descriptor> {
+    /// The engine heuristic descriptor of `graph` in `mode`, finalized.
+    fn heuristic(api: &'static Api, graph: &Descriptor, mode: i32) -> Result<Descriptor> {
         let heuristic = Descriptor::create(api, DESCRIPTOR_ENGINE_HEURISTIC)?;
-        let mode = HEURISTIC_MODE_A;
         let call = "cudnnBackendSetAttribute";
         api.set_one(
             &heuristic,
@@ -1635,26 +1758,33 @@ impl Cudnn {
         Ok(config)
     }
 
-    /// The engine configurations cuDNN's heuristic proposes for `operation`,
-    /// best first: descriptors this module created for the library to fill,
-    /// so it owns and destroys them.
-    fn configs(
-        &self,
-        operation: &Operation,
-        limit: usize,
-        allow_tf32: bool,
-    ) -> Result<Vec<Descriptor>> {
-        let heuristic = Self::heuristic(self.api, &operation.graph)?;
-        let available =
+    /// The engine configurations cuDNN's heuristic proposes for `operation` in
+    /// `mode`, best first: descriptors this module created for the library to
+    /// fill, so it owns and destroys them.
+    ///
+    /// `exact` keeps only the configurations whose engine does not down-convert
+    /// its inputs, which is what a model that declares full FP32 precision
+    /// asks for; [`Configs`] says what the filter dropped, so a request it
+    /// empties can name the reason instead of reporting a missing engine.
+    fn configs(&self, graph: &Descriptor, limit: usize, mode: i32, exact: bool) -> Result<Configs> {
+        let heuristic = Self::heuristic(self.api, graph, mode)?;
+        let returned =
             self.api
                 .count(&heuristic, ATTR_ENGINEHEUR_RESULTS, TYPE_BACKEND_DESCRIPTOR)?;
-        let wanted = available.min(limit.clamp(1, MAX_ENGINE_CONFIGS));
+        let mut proposal = Configs {
+            mode,
+            returned,
+            kept: Vec::new(),
+            inspected: 0,
+            dropped: Vec::new(),
+        };
+        let wanted = returned.min(limit.clamp(1, MAX_ENGINE_CONFIGS));
         let mut configs = Vec::with_capacity(wanted);
         for _ in 0..wanted {
             configs.push(Descriptor::create(self.api, DESCRIPTOR_ENGINE_CONFIG)?);
         }
         if configs.is_empty() {
-            return Ok(configs);
+            return Ok(proposal);
         }
         let mut handles: Vec<Handle> = configs.iter().map(|config| config.raw).collect();
         let written = self.api.get(
@@ -1667,19 +1797,25 @@ impl Cudnn {
         // Keep the configurations the library filled; the rest are destroyed
         // with their `Descriptor`.
         configs.truncate(written);
-        if allow_tf32 {
-            return Ok(configs);
-        }
-        // A model that declares full FP32 precision refuses the engines cuDNN
-        // marks as down-converting their inputs, which is where TF32 lives.
-        let mut exact = Vec::with_capacity(configs.len());
+        proposal.inspected = configs.len();
         for config in configs {
-            if self.down_converts_inputs(&config)? {
-                continue;
+            if exact {
+                // A model that declares full FP32 precision refuses the
+                // engines cuDNN marks as down-converting their inputs, which is
+                // where TF32 lives.
+                let notes = self.numerical_notes(&config)?;
+                if notes.contains(&NUMERICAL_NOTE_DOWN_CONVERT_INPUTS) {
+                    for note in notes {
+                        if !proposal.dropped.contains(&note) {
+                            proposal.dropped.push(note);
+                        }
+                    }
+                    continue;
+                }
             }
-            exact.push(config);
+            proposal.kept.push(config);
         }
-        Ok(exact)
+        Ok(proposal)
     }
 
     /// The engine descriptor a finalized engine configuration names.
@@ -1701,16 +1837,17 @@ impl Cudnn {
         Ok(engine)
     }
 
-    /// Whether `config`'s engine declares that it down-converts its inputs
-    /// (`CUDNN_NUMERICAL_NOTE_DOWN_CONVERT_INPUTS`), the note TF32 carries.
-    fn down_converts_inputs(&self, config: &Descriptor) -> Result<bool> {
+    /// The numerical notes `config`'s engine declares — the properties cuDNN
+    /// warns about, of which `CUDNN_NUMERICAL_NOTE_DOWN_CONVERT_INPUTS` (TF32
+    /// for FP32 inputs) is the one a full-precision request refuses.
+    fn numerical_notes(&self, config: &Descriptor) -> Result<Vec<i32>> {
         let engine = self.engine_of(config)?;
         let count = self
             .api
             .count(&engine, ATTR_ENGINE_NUMERICAL_NOTE, TYPE_NUMERICAL_NOTE)?;
         let mut notes = vec![0i32; count];
         if count == 0 {
-            return Ok(false);
+            return Ok(notes);
         }
         self.api.get(
             &engine,
@@ -1719,7 +1856,7 @@ impl Cudnn {
             &mut notes,
             "cudnnBackendGetAttribute",
         )?;
-        Ok(notes.contains(&NUMERICAL_NOTE_DOWN_CONVERT_INPUTS))
+        Ok(notes)
     }
 
     /// The engine a finalized engine configuration names.
@@ -2237,6 +2374,7 @@ mod tests {
                     TYPE_BACKEND_DESCRIPTOR as i64,
                 ),
                 ("CUDNN_HEUR_MODE_A", HEURISTIC_MODE_A as i64),
+                ("CUDNN_HEUR_MODE_B", HEURISTIC_MODE_B as i64),
                 (
                     "CUDNN_NUMERICAL_NOTE_DOWN_CONVERT_INPUTS",
                     NUMERICAL_NOTE_DOWN_CONVERT_INPUTS as i64,
