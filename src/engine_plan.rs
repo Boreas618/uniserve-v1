@@ -281,6 +281,9 @@ impl EpochPlan {
             // of it, so the graph reservation is not divided among streams.
             streams: 1,
             scratch,
+            // The shadow region alone, which the paired forward's twins allocate; `scratch` keeps
+            // the reservation that also holds the state group's snapshot (7.3, 4.5).
+            shadow,
             // The KV pool: the units the capacity plan fitted, each the size of a cache unit. This
             // rank keeps its keys and values in the process - that is what a prefix cache is - so
             // the figure is the plan's and not zero. A pool whose figure is zero is not reserved,

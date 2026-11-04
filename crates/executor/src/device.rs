@@ -112,9 +112,16 @@ pub struct GraphStorage {
     pub budget: u64,
     /// How many streams the executor issues on; the graph range is divided among them.
     pub streams: usize,
-    /// Bytes of the device's scratch pool: the shadow pair's region and the paired forward's
-    /// pages (7.3). Zero when the rank never shadows.
+    /// Bytes of the device's scratch pool: the shadow pair's region and the state group's
+    /// snapshot, one reservation (7.3, 4.5). Zero when the rank never shadows.
     pub scratch: u64,
+    /// Bytes of the shadow region alone, which the paired forward's twins allocate.
+    ///
+    /// The reservation covers `shadow + snapshot`, and the two tenants take their own figures from
+    /// it: giving the twins the reservation would leave the snapshot nothing to allocate, which a
+    /// model with no state group cannot show (its snapshot is zero) and one with a state group
+    /// shows on the first update it takes.
+    pub shadow: u64,
     /// Bytes of the device's resident pool, which the storage owners carve through the same
     /// allocator (4.1). Zero when the rank keeps nothing resident in this process.
     pub resident: u64,
@@ -159,6 +166,7 @@ impl Executor {
         events: Arc<EventPool>,
         pools: Arc<std::sync::Mutex<Pools>>,
         scratch: u64,
+        shadow: u64,
     ) -> Result<Self> {
         let counters = Arc::new(SharedCounters::default());
         // What the device thread is performing, read by whoever reports a stall from another thread
@@ -189,6 +197,7 @@ impl Executor {
             runners,
             queue: Arc::clone(&queue),
             scratch,
+            shadow,
             pools: Arc::clone(&pools),
             counters: Arc::clone(&counters),
             storage: Arc::clone(&storage),
@@ -546,8 +555,10 @@ struct Device {
     device: DeviceId,
     runners: Vec<NamedRunner>,
     queue: Arc<JobQueue>,
-    /// Bytes for the shadow pair's region, as the engine sized it.
+    /// Bytes of the scratch pool's reservation: the shadow region and the snapshot (7.3, 4.5).
     scratch: u64,
+    /// Bytes of the shadow region alone, which the twins allocate from that reservation.
+    shadow: u64,
     /// The device's one graph pool, which also lends its allocator for the shadow pair's region.
     pools: Arc<std::sync::Mutex<Pools>>,
     /// What the device thread has done, shared with the handle the control thread reads.
@@ -692,9 +703,12 @@ impl Device {
                     .pools
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
+                // The reservation covers `shadow + snapshot` and is taken once; the twins take the
+                // shadow region and the snapshot takes its own figure, so the two tenants of one
+                // pool never claim each other's bytes.
                 pools.reserve_scratch(self.scratch)?;
                 for named in &mut self.runners {
-                    let twins = ops::Twins::new(pools.allocator(), self.scratch)
+                    let twins = ops::Twins::new(pools.allocator(), self.shadow)
                         .map_err(|error| Error::Interface(error.to_string()))?;
                     let shadow = crate::shadow::Shadow::new(self.device, twins)?;
                     named.runner.attach_shadow(shadow);
