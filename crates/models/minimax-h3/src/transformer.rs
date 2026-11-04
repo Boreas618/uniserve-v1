@@ -166,13 +166,19 @@ impl Layer {
             &scratch.attention,
             update,
         )?;
+        // The MLP norm folds the attention's gated update into the residual and copies the result
+        // out: the block's second residual reads it after the down projection has overwritten
+        // `update`, and `retain` is what lets one launch produce both the normalized feed-forward
+        // input and that residual base (`crates/ops/kernels/modulated_rms_norm`: with `update` the
+        // kernel stores the gated sum, and with `retain` it copies the same value out).
         let mlp_norm = ModulatedRmsNorm::new(
             self.norm2,
             shift_mlp,
             scale_mlp,
             Some(gate_attention),
             self.eps,
-        )?;
+        )?
+        .with_retain();
         mlp_norm.forward(f, hidden, Some(update), rows, normalized, None, Some(out))?;
 
         // Feed-forward: the packed value and gate halves, the gated activation, the down
