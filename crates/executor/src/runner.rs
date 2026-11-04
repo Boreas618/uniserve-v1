@@ -43,6 +43,16 @@ pub trait Runner: Send {
     /// Serves one batch: stage its inputs, choose its bucket, and return the device work.
     fn submit(&mut self, batch: Batch) -> Result<Jobs>;
 
+    /// The media buckets this runner's plan captures, stated at spawn (2.4).
+    ///
+    /// Stated here rather than answered on demand because the mechanism chooses a device without
+    /// asking the device thread: the executor's handle mirrors this list beside the phases, the way
+    /// it mirrors those, and the mechanism's planner selects from the mirror. A causal-LM runner
+    /// states none - its plan holds no media graph (`plan::Bucket::causal_lm` refuses one).
+    fn media_plan(&self) -> Vec<crate::plan::Bucket> {
+        Vec::new()
+    }
+
     /// The resident cache this runner reads, when it reads one: what a sleep gives back and a wake
     /// maps again (2.5).
     ///
