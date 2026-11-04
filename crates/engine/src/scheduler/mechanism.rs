@@ -1086,6 +1086,15 @@ impl Recorder {
     }
 
     /// The requests the policy has been told about.
+    /// The requests the policy currently knows, as the mechanism's own account
+    /// of what it last told: a request leaves here when its end is announced,
+    /// which is what makes this the set to compare against the mechanism's
+    /// queues. (The `announced_*` sets below are cumulative: they answer "was
+    /// this ever shown", which is the victim rules' question, not this one.)
+    pub(crate) fn known(&self) -> impl Iterator<Item = RequestId> + '_ {
+        self.told.keys().copied()
+    }
+
     pub(crate) fn announced_requests(&self) -> &BTreeSet<RequestId> {
         &self.announced_requests
     }
