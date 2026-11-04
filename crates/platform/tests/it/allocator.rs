@@ -6,6 +6,7 @@
 //! These tests need a CUDA device; they take the driver lock of `gpu.rs`, so
 //! they neither block nor are blocked by the tests there.
 
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -375,8 +376,9 @@ fn a_restore_a_shrunk_budget_refuses_parks_every_pool_again() {
 /// block is given out again at its address.
 ///
 /// The bookings are part of the behaviour: mapping a block books the pool's
-/// total before the storage exists, and neither a suspend/restore pair nor the
-/// reuse of a freed block books anything new. (That a refused booking leaves
+/// total before the storage exists, a suspension books the pool down to
+/// nothing and the restore books it back, and giving out a freed block books
+/// nothing at all because it maps nothing. (That a refused booking leaves
 /// nothing mapped is
 /// [`an_allocation_over_the_device_budget_fails_before_it_maps_anything`].)
 #[test]
@@ -398,8 +400,6 @@ fn a_pool_keeps_addresses_and_contents_across_a_suspension() {
         Some(mapped as u64),
         "the pool books the storage it maps, and the booking carries the pool's total"
     );
-    let bookings = budget.bookings();
-
     let stream = device.stream().unwrap();
     let host = PinnedBuffer::new(DEVICE, 256).unwrap();
 
@@ -423,12 +423,18 @@ fn a_pool_keeps_addresses_and_contents_across_a_suspension() {
         allocator.allocate(PoolKind::Graph, 1 << 20).is_err(),
         "a suspended allocator gives out nothing"
     );
+    assert_eq!(
+        budget.booked(PoolKind::Graph),
+        Some(0),
+        "a suspended pool maps nothing, so the budget must stop counting it: an over-count \
+         would refuse an allocation that fits"
+    );
     allocator.restore().unwrap();
     assert_eq!(allocator.mapped_bytes(PoolKind::Graph), mapped);
     assert_eq!(
-        budget.bookings(),
-        bookings,
-        "a suspend/restore pair books nothing new: the storage comes back over the booking"
+        budget.booked(PoolKind::Graph),
+        Some(mapped as u64),
+        "the storage counts again once the restore has mapped it"
     );
 
     // SAFETY: the ranges lie inside the restored blocks, at their addresses.
@@ -442,6 +448,10 @@ fn a_pool_keeps_addresses_and_contents_across_a_suspension() {
     assert_eq!(read(&host), vec![9; 256]);
 
     drop(fill);
+    // The baseline for "books nothing new" is taken after the restore, because
+    // the suspension and the restore do book: the first books the pool down to
+    // nothing, the second books back what it maps.
+    let bookings = budget.bookings();
     let address = second.address();
     allocator.free(second);
     let again = allocator.allocate(PoolKind::Graph, 1 << 20).unwrap();
@@ -456,4 +466,179 @@ fn a_pool_keeps_addresses_and_contents_across_a_suspension() {
         bookings,
         "giving out a freed block books nothing new"
     );
+}
+
+/// The device's ledger behind several allocators of the same pool: it counts
+/// what they hold together, adding what each reports and releasing what each
+/// gives up.
+struct SharedLedger {
+    total: AtomicU64,
+    limit: u64,
+}
+
+impl SharedLedger {
+    fn new(limit: u64) -> Arc<Self> {
+        Arc::new(Self {
+            total: AtomicU64::new(0),
+            limit,
+        })
+    }
+
+    fn total(&self) -> u64 {
+        self.total.load(Ordering::Relaxed)
+    }
+
+    fn add(&self, bytes: u64) -> platform::Result<()> {
+        let held = self.total() + bytes;
+        if held > self.limit {
+            return Err(Error::InvalidArgument(format!(
+                "the device's ledger refuses {held} bytes of a {}-byte allowance",
+                self.limit
+            )));
+        }
+        self.total.fetch_add(bytes, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+/// One allocator's place in a [`SharedLedger`]: a booking carries that
+/// allocator's own pool total, so the adapter keeps the total it last reported
+/// and passes the difference on — the shape a device with several allocators of
+/// one pool needs (a rank's graph pools are several).
+struct Adapter {
+    ledger: Arc<SharedLedger>,
+    last: Mutex<u64>,
+}
+
+impl Budget for Adapter {
+    fn book(&self, _device: DeviceId, _pool: PoolKind, bytes: u64) -> platform::Result<()> {
+        let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
+        if bytes >= *last {
+            self.ledger.add(bytes - *last)?;
+        } else {
+            self.ledger
+                .total
+                .fetch_sub(*last - bytes, Ordering::Relaxed);
+        }
+        // The ledger moved before this adapter's total does, so a refusal leaves
+        // both as they were.
+        *last = bytes;
+        Ok(())
+    }
+}
+
+fn with_adapter(device: &platform::Device, ledger: &Arc<SharedLedger>) -> Allocator {
+    let adapter = Arc::new(Adapter {
+        ledger: Arc::clone(ledger),
+        last: Mutex::new(0),
+    });
+    let booking: Arc<dyn Budget> = adapter;
+    Allocator::new(device, booking).unwrap()
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn several_allocators_of_one_pool_book_one_ledger_through_an_adapter() {
+    let _driver = exclusive_driver();
+    let device = platform::Device::new(DEVICE).unwrap();
+    let ledger = SharedLedger::new(32 << 20);
+    let mut first = with_adapter(&device, &ledger);
+    let mut second = with_adapter(&device, &ledger);
+    first.reserve(PoolKind::Graph, 8 << 20).unwrap();
+    second.reserve(PoolKind::Graph, 8 << 20).unwrap();
+
+    // A booking carries the allocator's own pool total, not a device-wide one,
+    // which is what lets an adapter tell the two apart.
+    let one = first.allocate(PoolKind::Graph, 4096).unwrap();
+    assert_eq!(first.mapped_bytes(PoolKind::Graph), one.len());
+    assert_eq!(ledger.total(), one.len() as u64);
+    let two = second.allocate(PoolKind::Graph, 4096).unwrap();
+    assert_eq!(second.mapped_bytes(PoolKind::Graph), two.len());
+    assert_eq!(
+        ledger.total(),
+        one.len() as u64 + two.len() as u64,
+        "the ledger counts what both allocators hold"
+    );
+
+    // A suspension reports the pool down to nothing, and the ledger releases
+    // exactly that allocator's share; the restore puts it back.
+    first.suspend().unwrap();
+    assert_eq!(ledger.total(), two.len() as u64);
+    first.restore().unwrap();
+    assert_eq!(ledger.total(), one.len() as u64 + two.len() as u64);
+}
+
+/// A buffer handed out before a suspension still names its block afterwards: the
+/// pool released the block's storage, so exporting it is refused rather than
+/// naming a handle the driver has taken back, and once the restore has mapped
+/// new storage the same buffer exports that storage.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn an_exported_block_follows_the_storage_a_restore_maps() {
+    let _driver = exclusive_driver();
+    let device = platform::Device::new(DEVICE).unwrap();
+    let budget = RecordingBudget::new(8 << 20);
+    let mut allocator = with_budget(&device, &budget);
+    allocator.reserve(PoolKind::Graph, 8 << 20).unwrap();
+    let block = allocator.allocate(PoolKind::Graph, 4096).unwrap();
+    assert!(
+        block.export().unwrap().as_raw_fd() >= 0,
+        "a mapped block exports a descriptor"
+    );
+
+    allocator.suspend().unwrap();
+    let refused = block.export().unwrap_err();
+    assert!(
+        refused.to_string().contains("suspended"),
+        "an exported answer names the suspension, not a driver error: {refused}"
+    );
+
+    // The restore maps new storage; the block the buffer holds must name it.
+    allocator.restore().unwrap();
+    assert!(
+        block.export().unwrap().as_raw_fd() >= 0,
+        "after the restore the block exports the storage the restore mapped"
+    );
+}
+
+/// A block is given out read-write whatever its last holder asked the device
+/// for: the pool puts the access back when it hands the block on.
+///
+/// A read-only block handed on would fault the next holder's first write, and a
+/// device fault is a sticky error that kills the process rather than failing the
+/// call — so if the pool ever stops restoring the access, the fill below is what
+/// this test does to itself.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn a_block_is_given_out_read_write_whatever_its_last_holder_asked_for() {
+    let _driver = exclusive_driver();
+    let device = platform::Device::new(DEVICE).unwrap();
+    let budget = RecordingBudget::new(8 << 20);
+    let mut allocator = with_budget(&device, &budget);
+    allocator.reserve(PoolKind::Resident, 8 << 20).unwrap();
+    let stream = device.stream().unwrap();
+
+    let parked = allocator.allocate(PoolKind::Resident, 4096).unwrap();
+    let address = parked.address();
+    allocator
+        .set_protection(&parked, platform::Protection::ReadOnly)
+        .unwrap();
+    allocator.free(parked);
+
+    let again = allocator.allocate(PoolKind::Resident, 4096).unwrap();
+    assert_eq!(
+        again.address(),
+        address,
+        "the freed block comes back at its address"
+    );
+    // SAFETY: a block from `allocate` is read-write, which is the invariant
+    // under test; the range lies inside the block.
+    unsafe { platform::memset_d8(address, 0x5b, 16, &stream) }.unwrap();
+    stream.synchronize().unwrap();
+    let host = platform::PinnedBuffer::new(DEVICE, 16).unwrap();
+    // SAFETY: the block is mapped and holds the bytes; the host buffer is as
+    // long as the copy.
+    unsafe { platform::memcpy_async(host.address(), address, 16, &stream) }.unwrap();
+    stream.synchronize().unwrap();
+    assert_eq!(read(&host), vec![0x5b; 16]);
 }
