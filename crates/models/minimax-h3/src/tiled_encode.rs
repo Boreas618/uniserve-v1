@@ -203,6 +203,15 @@ mod tests {
     }
 
     #[test]
+    fn a_raster_that_is_not_whole_patches_is_refused_rather_than_truncated() {
+        // The compression is 16 pixels; a raster that does not divide by it has no latent extent,
+        // and the encoder reads whole patches, so nothing may round the raster down silently.
+        assert!(ClipEncoder::new(1000, 700).is_err());
+        assert!(ClipEncoder::new(768, 1344).is_ok());
+        assert!(ClipEncoder::new(416, 992).is_ok());
+    }
+
+    #[test]
     fn the_canvas_plan_covers_every_latent_position() {
         let encoder = canvas();
         assert_eq!(encoder.latent_extent(), (48, 84));
