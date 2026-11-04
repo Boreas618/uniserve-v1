@@ -607,6 +607,17 @@ impl PrefixCache {
         UnitColumn::bind(&self.planes, stream)
     }
 
+    /// The units a gather for `slot`'s pages of `group` reads, in page order.
+    ///
+    /// This is the row the attention kernel gathers through: the same units
+    /// [`install`](Self::install) wrote, or a refusal when the slot holds no
+    /// table for the group. A caller that has just installed an allocation can
+    /// ask here what the batch's gather will actually read.
+    pub fn slot_pages(&self, slot: u32, group: u32) -> Result<Vec<u32>> {
+        let table = self.tables.table(slot, group)?;
+        Ok(table.units.iter().map(|unit| unit.0).collect())
+    }
+
     /// Install scheduler page assignments: validate them all, write the
     /// changed rows on `stream`, then commit them on the host.
     pub fn install(&mut self, assignments: &[BlockTable], stream: impl Issue) -> Result<()> {
@@ -1261,6 +1272,119 @@ mod fixed_bytes_tests {
         assert_eq!(at(200, 1) - one_column, 100 * 8);
         // A second stream adds one more column, not a re-count of the first.
         assert_eq!(at(100, 2) - one_column, 100 * 8);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::retained::LocalStorage;
+    use crate::stream::EventPool;
+    use crate::stream::recorded::Batch;
+
+    /// A pool of one dense group of two layers with 8 tokens per page.
+    fn plan() -> Arc<CachePlan> {
+        Arc::new(
+            CachePlan::new(plan::CacheDescription {
+                columns: 2,
+                plane_bytes: 128,
+                quantized: false,
+                unit_bytes: 2 * 128 + 2,
+                dtype: ipc::PrefixCacheDtype::BFloat16,
+                groups: vec![plan::CacheGroupPlan {
+                    window: None,
+                    state: false,
+                    draft: false,
+                    block_size: 8,
+                    units_per_page: 1,
+                    layers: vec!["layers.0".into(), "layers.1".into()],
+                    layer_ids: vec![0, 1],
+                    axis: plan::GroupAxis {
+                        offset: 0,
+                        total: 2,
+                    },
+                    num_kv_heads: 2,
+                    total_kv_heads: 2,
+                    kv_head_offset: 0,
+                    head_dim: 8,
+                    dtype: crate::memory::allocation::ElementType::BF16,
+                    compute_dtype: crate::memory::allocation::ElementType::BF16,
+                }],
+                states: Vec::new(),
+                checkpoints: Vec::new(),
+            })
+            .expect("a dense plan of two layers"),
+        )
+    }
+
+    /// The row a batch's gather reads is the units the allocation named - not zeros, and not
+    /// another request's pages. This is the assertion whose absence let a graph run clean against
+    /// the wrong pages: only `install` writes a request slot's row.
+    #[test]
+    fn an_installed_allocation_is_the_row_the_batch_gathers() -> Result<()> {
+        let mut cache = PrefixCache::new(
+            plan(),
+            /* units */ 8,
+            None,
+            /* request_pool_size */ 2,
+            /* width */ 4,
+            /* import_capacity */ 1,
+            None,
+            None,
+            &mut LocalStorage,
+            Arc::new(conversion::Unimported),
+        )?;
+        let batch = Batch::new(None, EventPool::new());
+
+        // Slot 1 is the first usable slot: slot 0 is the block tables' sentinel row.
+        let allocation = ipc::BlockTable {
+            request_pool_idx: 1,
+            group_id: 0,
+            start_page: 0,
+            unit_ids: vec![ipc::UnitId(3), ipc::UnitId(4), ipc::UnitId(5)],
+            allocated_tokens: 24,
+        };
+        cache.install(std::slice::from_ref(&allocation), batch.on().host())?;
+        assert_eq!(
+            cache.slot_pages(1, 0)?,
+            vec![3, 4, 5],
+            "the gather does not read the units the allocation named"
+        );
+
+        // A later batch grows the page run: the row becomes the units it now names.
+        let extended = ipc::BlockTable {
+            unit_ids: vec![
+                ipc::UnitId(3),
+                ipc::UnitId(4),
+                ipc::UnitId(5),
+                ipc::UnitId(6),
+            ],
+            allocated_tokens: 32,
+            ..allocation
+        };
+        cache.install(std::slice::from_ref(&extended), batch.on().host())?;
+        assert_eq!(
+            cache.slot_pages(1, 0)?,
+            vec![3, 4, 5, 6],
+            "the row did not follow the allocation that grew it"
+        );
+
+        // The sentinel row is never a request's: a batch that names slot 0 is refused by name.
+        let sentinel = ipc::BlockTable {
+            request_pool_idx: 0,
+            ..extended
+        };
+        let refused = cache
+            .install(&[sentinel], batch.on().host())
+            .expect_err("slot 0 is not a request slot");
+        assert!(
+            refused.to_string().contains("block table"),
+            "the refusal does not say what was wrong: {refused}"
+        );
+
+        // A slot that holds nothing answers a refusal, not a row of zeros.
+        assert!(cache.slot_pages(2, 0).is_err());
         Ok(())
     }
 }
