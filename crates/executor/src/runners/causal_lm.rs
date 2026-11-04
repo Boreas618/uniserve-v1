@@ -441,11 +441,16 @@ struct Columns {
     draws: Column,
     /// `[rows]` the sampled ids, read back after a replay.
     readback: platform::PinnedBuffer,
+    /// One row of logits, `[vocabulary]`, read back for a greedy request whose first token is taken
+    /// on the host (see `read_sampled`): a bucket is homogeneous in its sampling path, so a prefill
+    /// bucket that ends a greedy prompt cannot argmax in its graph - the graph draws.
+    logits_row: platform::PinnedBuffer,
 }
 
 impl Columns {
-    /// Allocates the columns for the largest bucket `buckets` holds.
-    fn new(device: DeviceId, buckets: &Buckets) -> Result<Self> {
+    /// Allocates the columns for the largest bucket `buckets` holds, with `vocabulary` as the width
+    /// of the logits row the greedy first token is taken from.
+    fn new(device: DeviceId, buckets: &Buckets, vocabulary: u32) -> Result<Self> {
         let largest = buckets
             .iter()
             .max_by_key(|bucket| (bucket.rows, bucket.tokens))
@@ -467,6 +472,10 @@ impl Columns {
             slots: Column::new(device, DType::I32, rows)?,
             draws: Column::new(device, DType::F32, rows)?,
             readback: platform::PinnedBuffer::new(device, (rows * 4) as usize)?,
+            logits_row: platform::PinnedBuffer::new(
+                device,
+                (u64::from(vocabulary) * 4) as usize,
+            )?,
         })
     }
 }
@@ -751,6 +760,12 @@ impl CommitColumns {
 struct Sampled {
     /// `[rows]` i32 sampled token ids, in the bucket's row order.
     tokens: TensorView,
+    /// `[rows, vocabulary]` the bucket's raw logits, kept for a bucket that may hold a greedy
+    /// request's prompt ending: its first token is the argmax of that row, which the captured graph
+    /// cannot produce because a bucket is homogeneous in its sampling path.
+    ///
+    /// `None` for a decode bucket, whose variant already states which path it takes.
+    logits: Option<TensorView>,
 }
 
 /// The sampling step's own device state: the slot histories its penalties read.
@@ -1088,7 +1103,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let mut staging = Staging::new();
         staging.reserve(&buckets)?;
         let commit_rows = largest_rows(&buckets)?;
-        let columns = Columns::new(device, &buckets)?;
+        let columns = Columns::new(device, &buckets, geometry.vocabulary)?;
         let sampling = if buckets.iter().any(|bucket| bucket.variant.samples()) {
             Some(Sampling::new(device, &stream, geometry)?)
         } else {
@@ -1902,6 +1917,87 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// so the device segment is measured from the launch to this wait and the host segment from
     /// there to the output.
     ///
+    /// Replaces a greedy row's drawn token with the argmax of its logits row, taken on the host.
+    ///
+    /// A request whose temperature is zero asks for its largest candidate, and the captured graph of
+    /// a prefill bucket draws for every row of the bucket (a bucket is homogeneous in its sampling
+    /// path, and a greedy prefill variant would double the largest graphs' memory to decide one
+    /// token). The host has the logits - the arena buffer is live until the next `begin` - so the
+    /// decision is made here, once per request, before the token leaves this process.
+    ///
+    /// The penalties are no-ops for a row whose slot has committed nothing, which is what a prompt
+    /// ending is: a row whose slot already holds committed tokens would need the penalized logits,
+    /// which the graph computes and this path does not, so it is **refused by name** rather than
+    /// argmaxed over the raw row.
+    fn greedy_first_tokens(
+        &mut self,
+        logits: TensorView,
+        rows: usize,
+        sampling: &[i32],
+    ) -> Result<()> {
+        if logits.dtype != DType::F32 {
+            return Err(Error::Invalid(format!(
+                "a greedy request's first token is argmaxed on the host, which reads f32 logits, \
+                 and this deployment's logits are {}",
+                logits.dtype
+            )));
+        }
+        let width = u64::from(self.geometry.vocabulary);
+        let row_bytes = (width * 4) as usize;
+        if row_bytes > self.columns.logits_row.len() {
+            return Err(Error::Invariant(
+                "the logits row buffer is narrower than the vocabulary".into(),
+            ));
+        }
+        let columns = ops::sampler::PARAMETER_COLUMNS as usize;
+        for row in 0..rows {
+            let samples_nothing = self.staging.logits_rows()[row] < 0;
+            let greedy = self.staging.parameters(rows)[row * columns + ops::sampler::TEMPERATURE as usize]
+                == 0.0;
+            if samples_nothing || !greedy {
+                continue;
+            }
+            let slot = self.staging.slots(rows)[row];
+            let position = usize::try_from(slot)
+                .ok()
+                .and_then(|slot| sampling.get(slot).copied())
+                .unwrap_or(0);
+            if position > 0 {
+                return Err(Error::Invalid(format!(
+                    "a greedy row of slot {slot} ends a prompt that already holds {position} \
+                     committed token(s): its token is the argmax of its penalized logits, which only \
+                     the captured sampler computes"
+                )));
+            }
+            let source = logits.ptr.address() + row as u64 * width * 4;
+            // SAFETY: the source is the row's `width` f32 inside the logits tensor the graph wrote,
+            // the destination is this runner's pinned row buffer of that length, and the stream has
+            // completed the launch that wrote it.
+            unsafe {
+                platform::memcpy_async(self.columns.logits_row.address(), source, row_bytes, &self.stream)?;
+            }
+            self.stream.synchronize()?;
+            // SAFETY: the copy above filled `width` f32 in the pinned row buffer, and the token
+            // buffer holds one i32 per row of this bucket.
+            let best = unsafe {
+                let values =
+                    std::slice::from_raw_parts(self.columns.logits_row.as_ptr().cast::<f32>(), width as usize);
+                let mut best = 0_usize;
+                for (index, value) in values.iter().enumerate() {
+                    if value.is_finite() && (*value > values[best] || !values[best].is_finite()) {
+                        best = index;
+                    }
+                }
+                best
+            };
+            // SAFETY: the readback buffer holds `rows` i32 and `row` is inside it.
+            unsafe {
+                *self.columns.readback.as_ptr().cast::<i32>().add(row) = best as i32;
+            }
+        }
+        Ok(())
+    }
+
     /// A bucket that samples nothing answers with an empty output: nothing was measured and no call
     /// produced a token.
     fn read_sampled(&mut self, bucket: Bucket, launched: Instant) -> Result<BatchOutput> {
@@ -1965,6 +2061,17 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 ),
             )
         };
+        // A greedy request's first token is the argmax of its prompt-ending row, taken here on the
+        // host: the bucket is homogeneous in its sampling path, so a prefill bucket's graph draws,
+        // and a draw cannot produce a greedy token (the candidates are in token-id order before the
+        // inverse CDF). Only a bucket that kept its logits view can answer this - a decode bucket's
+        // variant already states that it is greedy, and its graph argmaxes. The tokens are corrected
+        // in place, in the buffer the copy above filled, so a step allocates nothing (4.5).
+        if let Some(logits) = samples.logits
+            && !bucket.variant.is_decode()
+        {
+            self.greedy_first_tokens(logits, rows, sampling)?;
+        }
         let states = states_of(
             self.staging.slots(rows),
             self.staging.batch_rows(),
@@ -2256,9 +2363,17 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 .forward(forward, logits, &state, self.columns.draws.device, &samples)
                 .map_err(Error::from)?;
         }
+        // A prefill bucket may end a greedy request's prompt, whose first token is the argmax of the
+        // row - a decision the graph cannot make for one row of a bucket that draws. The view is kept
+        // (the arena's buffer is live until the next `begin`, and `read_sampled` runs before that);
+        // a decode bucket's variant already states its path.
+        let logits = (!bucket.variant.is_decode()).then_some(logits);
         self.bucket_samples
             .borrow_mut()
-            .insert(bucket, Sampled { tokens: samples.tokens });
+            .insert(bucket, Sampled {
+                tokens: samples.tokens,
+                logits,
+            });
         self.commit_step(forward, bucket, &samples)?;
         Ok(())
     }
