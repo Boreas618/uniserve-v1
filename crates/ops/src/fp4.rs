@@ -6,7 +6,8 @@
 //! form at run time and the products read it:
 //!
 //! ```text
-//! nvfp4_quantize   encode a BF16/FP16 row block into packed E2M1 values and E4M3 block scales
+//! nvfp4_quantize   encode a BF16/FP16 row into packed E2M1 values, E4M3 block scales and one
+//!                  per-token factor
 //! nvfp4_gemm       a dense product over packed weights, a packed activation and one FP32 alpha
 //! ```
 //!
@@ -115,8 +116,26 @@ pub struct QuantizeArgs {
     pub values: TensorView,
     /// The E4M3 block scales, in the descriptor's layout.
     pub scales: TensorView,
-    /// The encoder's global scale: the reciprocal of the checkpoint's FP32 tensor scale.
-    pub global_scale: f32,
+    /// `[1]` FP32: the encoder's global scale, the reciprocal of the checkpoint's activation tensor
+    /// scale.
+    ///
+    /// A device operand rather than a launch scalar: the encoder is calibrated data of the tensor
+    /// it encodes, published beside the weights, and the product that consumes the encoding reads
+    /// it as each thread block starts — so a host value here would serialize the pair.
+    pub global_scale: TensorView,
+    /// `[rows]` FP32: the row's **dequantization factor**, the number the product multiplies a
+    /// block's E4M3 scale by.
+    ///
+    /// Encoding is two-level micro-scaling, not one: a row is first brought into the range of the
+    /// block format by a factor the row itself determines, and each sixteen-element block then
+    /// carries its own E4M3 scale relative to that factor. A product reads both, so the factor is
+    /// an output of the encode beside `values` and `scales`.
+    ///
+    /// The value is the reference encoder's: `token_scale[r] = amax(row r) * global_scale`, and
+    /// the block's scale is `block_amax / (6 * amax(row r))`, so a dequantized element is
+    /// `code * block_scale * token_scale`. This is a *data* output and not a descriptor field: the
+    /// same module serves every row count, and no compilation depends on how many rows there are.
+    pub token_scale: TensorView,
 }
 
 /// Encoding activations into the checkpoint's E2M1 representation.
@@ -180,19 +199,26 @@ impl Op for Nvfp4Quantize {
         args.scales
             .require_shape(Self::NAME, descriptor.layout.shape(rows, columns))?;
 
-        let elements = rows * columns;
+        args.global_scale.require_row(Self::NAME, DType::F32, 1)?;
+
+        args.token_scale
+            .require_shape(Self::NAME, Shape::new(&[rows]))?;
+        args.token_scale.require_row(Self::NAME, DType::F32, rows)?;
+
+        // One program per row: the row's amax is a reduction over the whole row and every block of
+        // the row is scaled against it, so a program that owned a fragment of a row could not
+        // state the factor its blocks are relative to. The block size is the chunk a program walks
+        // the row in, not the grid's extent.
+        let elements = rows;
         let mut arguments = Arguments::new();
         arguments
             .view(args.input)
             .view(args.values)
             .view(args.scales)
             .u64(rows)
-            .f32(args.global_scale);
-        kernel.launch(
-            LaunchGrid::covering(elements, u64::from(descriptor.block))?,
-            &mut arguments,
-            stream,
-        )
+            .view(args.global_scale)
+            .view(args.token_scale);
+        kernel.launch(LaunchGrid::covering(elements, 1)?, &mut arguments, stream)
     }
 
     fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
@@ -200,14 +226,23 @@ impl Op for Nvfp4Quantize {
         QuantizeArgs {
             values: twins.shadow_of(args.values),
             scales: twins.shadow_of(args.scales),
+            token_scale: twins.shadow_of(args.token_scale),
             ..args
         }
     }
 
     fn tolerance(_descriptor: &Self::Descriptor) -> Tolerance {
-        // An encoding is a table lookup per element and per block: two implementations of the same
-        // variant produce the same bytes. Two encoder backends that round differently are two
-        // programs, which is why the layout is part of the descriptor.
+        // The encode is a declared step with a bound of its own, and it is not the product's: an
+        // element's error is the E2M1 rounding of its code relative to its block's scale (half a
+        // step of a four-bit format, so one sixteenth of the block's scale) plus the two divisions
+        // that state the per-token factor and the block scale (one rounding each, as the reference
+        // encoder's approximate reciprocal does). The product over an encoded operand keeps the
+        // 7.3 bound over its own contraction and absorbs none of this.
+        //
+        // Between two implementations of one variant the bytes are nonetheless equal: an encoding
+        // is a table lookup per element and per block, and two encoders that round differently are
+        // two programs, which is why the layout is part of the descriptor. So the operator states
+        // the arithmetic above in its documentation and compares exactly.
         Tolerance::exact()
     }
 }

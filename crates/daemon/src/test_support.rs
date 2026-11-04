@@ -166,21 +166,23 @@ pub(crate) fn sim_client(cores: Vec<SchedulerHandle>) -> EngineClient {
         latent_seed: 0,
     };
     let model_name = first.model_name().to_owned();
-    // The control thread routes every submission by an instance of the same
-    // program the schedulers carry: `policy_on` installed it on each core, and
-    // the engine installs it here for the route. Without one the engine has no
-    // policy to route a request with and refuses every submission.
-    let policy = {
-        let (program, module) = engine::packaged_policy(engine::BatchCapacity::of(first.info()));
-        engine::EpochPolicy {
-            program,
-            module: std::sync::Arc::new(engine::PolicyBytes::new(module)),
-        }
-    };
+    // The policy the epoch serves with, installed before the first submission
+    // (§7.3 steps 2 and 3): a simulated engine has no Program Server to
+    // command one, and an engine whose route instance is unset places no
+    // request at all.
+    let (policy, module) = engine::packaged_policy(engine::BatchCapacity::of(first.info()));
+    let source: Arc<dyn engine::PolicySource + Send + Sync> =
+        Arc::new(engine::PolicyBytes::new(module));
     let (daemon, engine) = UnixStream::pair().expect("a socket pair");
     std::thread::Builder::new()
         .name("sim-engine".into())
-        .spawn(move || engine::serve_requests(engine, cores, Some(policy)))
+        .spawn(move || {
+            let epoch = engine::EpochPolicy {
+                program: policy,
+                module: source,
+            };
+            engine::serve_requests(engine, cores, Some(epoch))
+        })
         .expect("start the simulated engine");
     EngineClient::new(
         proto::Connection::from_unix(daemon.try_clone().expect("clone the request socket"))
@@ -366,8 +368,15 @@ impl crate::updates::switch::Roster for Uncommanded {
         Ok(())
     }
 
-    fn spawn(&mut self, _spawn: proto::process::Spawn) -> Result<u32, String> {
-        Ok(1)
+    fn spawn(
+        &mut self,
+        _spawn: proto::process::Spawn,
+        _launch: &crate::engine::launch::Launch,
+    ) -> Result<crate::updates::switch::Spawned, String> {
+        Ok(crate::updates::switch::Spawned {
+            generation: _spawn.generation,
+            pid: 1,
+        })
     }
 
     fn stop(&mut self, _host: &str, _group: &str, _generation: Option<u64>) {}

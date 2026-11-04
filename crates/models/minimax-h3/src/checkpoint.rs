@@ -549,6 +549,19 @@ fn number(object: &Map<String, Value>, key: &str) -> Result<f64> {
         })
 }
 
+/// The names of `keys` that `present` does not hold, in the order they were asked.
+///
+/// This is the loading boundary's one question about a checkpoint's contents: a block states the
+/// tensors it reads, and the checkpoint either holds each of them or does not. It is deliberately
+/// not a `keys`-versus-`load` comparison - that half is the loader's own
+/// [`nn::Checkpoint::reading`], which answers what a load left unread once it has run.
+pub fn absent(keys: &[String], present: impl Fn(&str) -> bool) -> Vec<&str> {
+    keys.iter()
+        .map(String::as_str)
+        .filter(|key| !present(key))
+        .collect()
+}
+
 /// One number a contract states as an FP32 quantity (the schedule's shifts).
 fn single(object: &Map<String, Value>, key: &str) -> Result<f32> {
     Ok(number(object, key)? as f32)
@@ -566,6 +579,33 @@ mod tests {
         let path = root.join(relative);
         fs::create_dir_all(path.parent().expect("a sidecar has a parent")).expect("create");
         fs::write(&path, body).expect("write");
+    }
+
+    /// The check a load's report is built from: it names exactly what is missing, in the order
+    /// asked, and says nothing cluttered when nothing is.
+    #[test]
+    fn a_key_list_reports_the_names_a_checkpoint_does_not_hold() {
+        let keys = [
+            "transformer_blocks.0.attn.to_q.weight".to_owned(),
+            "transformer_blocks.0.attn.to_q.bias".to_owned(),
+            "norm_out.linear.weight".to_owned(),
+        ];
+        let held = |key: &str| !key.ends_with(".bias");
+
+        assert_eq!(
+            absent(&keys, held),
+            ["transformer_blocks.0.attn.to_q.bias".to_owned()],
+            "one absent tensor, named whole, and the two held ones left out of the report"
+        );
+        assert!(
+            absent(&keys, |_| true).is_empty(),
+            "a checkpoint that holds every name reports no absent tensor, so a load has nothing to refuse"
+        );
+        assert_eq!(
+            absent(&keys, |_| false).len(),
+            keys.len(),
+            "every name is reported when none is held"
+        );
     }
 
     fn base_index(dits: &[&str]) -> String {

@@ -38,6 +38,7 @@ mod patch;
 mod pcm;
 mod pool;
 mod position;
+mod posterior;
 mod residual;
 mod rgb;
 mod rope;
@@ -60,9 +61,9 @@ pub use embedding::Embedding;
 pub use exchange::UlyssesExchange;
 pub use frame::{FrameMoments, FrameNormPad, FramePad};
 pub use head::{ParallelLMHead, gather_rows};
-pub use linear::Linear;
+pub use linear::{Linear, Nvfp4Linear};
 pub use modulation::{GatedResidual, ModulatedRmsNorm};
-pub use moe::Moe;
+pub use moe::{EncodedGeometry, Moe, TILE_ROWS, encoded_bytes};
 pub use noise::{Key as NoiseKey, Noise};
 pub use norm::{LayerNorm, RmsNorm};
 pub use ops::activation::Activation;
@@ -72,6 +73,7 @@ pub use patch::Patch;
 pub use pcm::PcmInterleave;
 pub use pool::AdaptivePool;
 pub use position::PositionInterpolate;
+pub use posterior::Posterior;
 pub use residual::{
     ScaledAdd, ScaledResidual, ScaledResidualLayerNorm, ScaledResidualRmsNorm, WeightedRmsNorm,
 };

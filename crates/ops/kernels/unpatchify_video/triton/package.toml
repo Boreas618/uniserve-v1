@@ -4,8 +4,9 @@
 # transformer's packed tokens, a token's channel-major patch scattered into place, with the
 # checkpoint's per-channel scale and bias when the descriptor asks for them.
 #
-# The grid, the patch and the affine flag are the model's geometry, so they are the
-# compilation; the affine form's launch carries two more operands and is its own variant.
+# The affine form is its own program because its launch carries two more pointers; everything else
+# the operator reads — the channels, the token grid and the patch — travels as words, so one module
+# of a form serves every raster.
 
 op = "unpatchify_video"
 backend = "triton"
@@ -28,8 +29,9 @@ target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 [kernel.descriptors]
-# `patch` is the `frames×height×width` voxels one token carries; the grid follows the model's
-# latents and the decoder's output raster.
-dimensions = { dtype = ["bf16", "f16", "f32"], channels = ["3", "24"], patch = ["1x2x2", "1x4x4", "4x16x16"], affine = ["true", "false"], block = ["1024"], pdl = ["false", "true"] }
+# The affine form is its own program because its launch carries two more pointers; everything else
+# the operator reads — the channels, the token grid and the patch — travels as words, so one module
+# of a form serves every raster.
+dimensions = { dtype = ["bf16", "f16", "f32"], affine = ["true", "false"], block = ["1024"], pdl = ["false"] }
 
 [parameters]

@@ -53,6 +53,9 @@
 //! request continues, is retried with different parameters, or fails is the executor's decision, not
 //! a numerical one.
 
+/// Lanes one `softmax` program walks at a time: a chunk of the row, not the row.
+const SOFTMAX_TILE: u32 = 8192;
+
 use ops::norm::{Softmax, SoftmaxArgs, SoftmaxDescriptor};
 use ops::sampler::{
     ArgMax, ArgMaxArgs, ArgMaxDescriptor, CandidateOrder, FilterArgs, FilterCandidates,
@@ -246,14 +249,7 @@ impl Sampler {
         let candidates = Candidates::reserve(arena, rows, vocabulary, width)?;
 
         // 1. Penalties and temperature.
-        let shape = ShapeDescriptor {
-            dtype: logits.dtype,
-            vocabulary: self.vocabulary,
-            block: self.block,
-            extras: self.extras,
-            divide: true,
-            pdl: launch::PDL,
-        };
+        let shape = self.shape_descriptor(logits.dtype);
         let args = ShapeArgs {
             logits,
             counts: state.counts,
@@ -266,13 +262,7 @@ impl Sampler {
         f.operate::<LogitsShape>(&shape, args)?;
 
         // 2. The candidate set: the `width` largest, then the row's own thresholds.
-        let top = TopKDescriptor {
-            dtype: DType::F32,
-            vocabulary: self.vocabulary,
-            width: self.width,
-            ids: DType::I32,
-            pdl: launch::PDL,
-        };
+        let top = self.top_descriptor();
         let args = TopKArgs {
             logits: candidates.shaped,
             values: candidates.values,
@@ -281,11 +271,7 @@ impl Sampler {
 
         f.operate::<TopK>(&top, args)?;
 
-        let filter = FilterDescriptor {
-            width: self.width,
-            ids: DType::I32,
-            pdl: launch::PDL,
-        };
+        let filter = self.filter_descriptor();
         let args = FilterArgs {
             values: candidates.values,
             ids: candidates.ids,
@@ -299,11 +285,7 @@ impl Sampler {
         // candidates in: the reference reorders them by token id before its inverse CDF
         // (`uniserve/sampling/top_k.py:307-314`), and a fixed draw selects the same token only when
         // the columns mean the same thing on both sides.
-        let order = OrderDescriptor {
-            values: DType::F32,
-            ids: DType::I32,
-            pdl: launch::PDL,
-        };
+        let order = self.order_descriptor();
         let args = OrderArgs {
             values: candidates.values,
             ids: candidates.ids,
@@ -314,12 +296,7 @@ impl Sampler {
         f.operate::<CandidateOrder>(&order, args)?;
 
         // 4. The candidates' distribution, then one draw per row.
-        let softmax = SoftmaxDescriptor {
-            dtype: DType::F32,
-            columns: self.width,
-            tile: launch::row_tile(self.width),
-            pdl: launch::PDL,
-        };
+        let softmax = self.softmax_descriptor();
         let args = SoftmaxArgs {
             x: candidates.ordered_values,
             out: candidates.probabilities,
@@ -327,12 +304,7 @@ impl Sampler {
 
         f.operate::<Softmax>(&softmax, args)?;
 
-        let draw = InverseCdfDescriptor {
-            width: self.width,
-            ids: DType::I32,
-            tokens: self.tokens,
-            pdl: launch::PDL,
-        };
+        let draw = self.draw_descriptor();
         let args = InverseCdfArgs {
             probabilities: candidates.probabilities,
             ids: candidates.ordered_ids,
@@ -344,12 +316,7 @@ impl Sampler {
 
         // 5. The reported log-probabilities, over the shaped distribution of the whole vocabulary.
         if let Some(logprobabilities) = samples.logprobabilities {
-            let softmax = LogSoftmaxDescriptor {
-                dtype: DType::F32,
-                columns: self.vocabulary,
-                tile: self.block,
-                pdl: launch::PDL,
-            };
+            let softmax = self.log_softmax_descriptor();
             let logprobs = arena.tensor(DType::F32, Shape::new(&[rows, vocabulary]))?;
             let args = LogSoftmaxArgs {
                 x: candidates.shaped,
@@ -358,11 +325,7 @@ impl Sampler {
 
             f.operate::<LogSoftmax>(&softmax, args)?;
 
-            let gather = LogprobDescriptor {
-                columns: self.vocabulary,
-                ids: self.tokens,
-                pdl: launch::PDL,
-            };
+            let gather = self.logprob_descriptor();
             let args = LogprobArgs {
                 logprobabilities: logprobs,
                 tokens: samples.tokens,
@@ -373,6 +336,110 @@ impl Sampler {
         }
 
         Ok(())
+    }
+
+    /// The descriptors this layer launches with, each built in exactly one place.
+    ///
+    /// Every field is layer geometry or a fixed element type — the vocabulary, the candidate width,
+    /// the row block, the token width — so a request space enumerates them without a stream, an
+    /// arena or a batch, and both sampling paths launch these. The row count of a draw is a launch
+    /// value and appears in none of them.
+    ///
+    /// Penalties and temperature over the whole vocabulary: `logits`' element type is the one thing
+    /// a deployment chooses.
+    pub fn shape_descriptor(&self, logits: DType) -> ShapeDescriptor {
+        ShapeDescriptor {
+            dtype: logits,
+            vocabulary: self.vocabulary,
+            block: self.block,
+            extras: self.extras,
+            divide: true,
+            pdl: launch::PDL,
+        }
+    }
+
+    /// The candidate set: the `width` largest of each row.
+    pub fn top_descriptor(&self) -> TopKDescriptor {
+        TopKDescriptor {
+            dtype: DType::F32,
+            vocabulary: self.vocabulary,
+            width: self.width,
+            ids: DType::I32,
+            pdl: launch::PDL,
+        }
+    }
+
+    /// The row's own thresholds applied to its candidates.
+    pub fn filter_descriptor(&self) -> FilterDescriptor {
+        FilterDescriptor {
+            width: self.width,
+            ids: DType::I32,
+            pdl: launch::PDL,
+        }
+    }
+
+    /// The candidates reordered by token id, so a draw does not depend on the order the top-k
+    /// program kept.
+    pub fn order_descriptor(&self) -> OrderDescriptor {
+        OrderDescriptor {
+            values: DType::F32,
+            ids: DType::I32,
+            pdl: launch::PDL,
+        }
+    }
+
+    /// The candidates' distribution.
+    ///
+    /// The tile is a **chunk of the row**, not the row: the program walks the width in tiles of
+    /// `SOFTMAX_TILE` lanes and keeps only a running maximum and a running denominator, so the
+    /// candidate width may be the whole vocabulary. A tile derived from the width would ask for one
+    /// register per candidate.
+    pub fn softmax_descriptor(&self) -> SoftmaxDescriptor {
+        SoftmaxDescriptor {
+            dtype: DType::F32,
+            columns: self.width,
+            tile: SOFTMAX_TILE,
+            pdl: launch::PDL,
+        }
+    }
+
+    /// One inverse-CDF draw per row, over the ordered candidates.
+    pub fn draw_descriptor(&self) -> InverseCdfDescriptor {
+        InverseCdfDescriptor {
+            width: self.width,
+            ids: DType::I32,
+            tokens: self.tokens,
+            pdl: launch::PDL,
+        }
+    }
+
+    /// The greedy path's argmax over the shaped row.
+    pub fn argmax_descriptor(&self) -> ArgMaxDescriptor {
+        ArgMaxDescriptor {
+            dtype: DType::F32,
+            width: self.vocabulary,
+            ids: self.tokens,
+            pdl: launch::PDL,
+        }
+    }
+
+    /// The reported log-probabilities over the shaped distribution of the whole vocabulary.
+    pub fn log_softmax_descriptor(&self) -> LogSoftmaxDescriptor {
+        LogSoftmaxDescriptor {
+            dtype: DType::F32,
+            columns: self.vocabulary,
+            tile: self.block,
+            pdl: launch::PDL,
+        }
+    }
+
+    /// The reported log-probability of the token each row drew.
+    pub fn logprob_descriptor(&self) -> LogprobDescriptor {
+        LogprobDescriptor {
+            columns: self.vocabulary,
+            ids: self.tokens,
+            pdl: launch::PDL,
+        }
     }
 
     /// What both sampling paths read: the logit rows, the request state, and the outputs.
@@ -538,14 +605,7 @@ impl Sampler {
         let arena = f.arena();
         let shaped = arena.tensor(DType::F32, Shape::new(&[rows, vocabulary]))?;
 
-        let shape = ShapeDescriptor {
-            dtype: logits.dtype,
-            vocabulary: self.vocabulary,
-            block: self.block,
-            extras: self.extras,
-            divide: true,
-            pdl: launch::PDL,
-        };
+        let shape = self.shape_descriptor(logits.dtype);
         let args = ShapeArgs {
             logits,
             counts: state.counts,
@@ -558,12 +618,7 @@ impl Sampler {
         f.operate::<LogitsShape>(&shape, args)?;
 
         // The column of a dense vocabulary row is the token id, so the index is the token.
-        let argmax = ArgMaxDescriptor {
-            dtype: DType::F32,
-            width: self.vocabulary,
-            ids: self.tokens,
-            pdl: launch::PDL,
-        };
+        let argmax = self.argmax_descriptor();
         let args = ArgMaxArgs {
             values: shaped,
             out: samples.tokens,
@@ -572,12 +627,7 @@ impl Sampler {
         f.operate::<ArgMax>(&argmax, args)?;
 
         if let Some(logprobabilities) = samples.logprobabilities {
-            let softmax = LogSoftmaxDescriptor {
-                dtype: DType::F32,
-                columns: self.vocabulary,
-                tile: self.block,
-                pdl: launch::PDL,
-            };
+            let softmax = self.log_softmax_descriptor();
             let logprobs = arena.tensor(DType::F32, Shape::new(&[rows, vocabulary]))?;
             let args = LogSoftmaxArgs {
                 x: shaped,
@@ -586,11 +636,7 @@ impl Sampler {
 
             f.operate::<LogSoftmax>(&softmax, args)?;
 
-            let gather = LogprobDescriptor {
-                columns: self.vocabulary,
-                ids: self.tokens,
-                pdl: launch::PDL,
-            };
+            let gather = self.logprob_descriptor();
             let args = LogprobArgs {
                 logprobabilities: logprobs,
                 tokens: samples.tokens,

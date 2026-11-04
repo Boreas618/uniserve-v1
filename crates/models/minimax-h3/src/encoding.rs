@@ -54,7 +54,7 @@ use crate::audio_vae::Binder;
 /// `nn.LayerNorm`'s default epsilon, which the reference's audio projection does not override.
 const NORM_EPS: f32 = 1e-5;
 use crate::config::VideoVaeConfig;
-use crate::video_vae::{Seams, MINIMUM_OVERLAP, TILE_PIXELS};
+use crate::video_vae::{MINIMUM_OVERLAP, Seams, TILE_PIXELS};
 use crate::{Error, Result};
 
 /// The spatial compression of the video encoder: input pixels per latent position.
@@ -112,6 +112,66 @@ pub struct Stack {
     pub blocks: u32,
     /// Latent channels.
     pub latent_channels: u32,
+    /// The clip the network reads: its frames and what one clip yields.
+    pub clip: Clip,
+}
+
+/// The clip a causal encoder cuts a raster into, and what its frames are worth.
+///
+/// Three numbers of one geometry, stated together because every use needs all three: the frames the
+/// network reads at once, the latent frames one complete clip yields, and the latent frames a
+/// condition drops from its last clip because a later clip of a generated video would overlap them.
+/// A condition's own latent count follows from them ([`Clip::latent_frames`]), and packing takes this
+/// value rather than three loose numbers so that the count has one statement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Clip {
+    /// Frames one clip of the encoder's raster is.
+    pub frames: u32,
+    /// Latent frames one complete clip yields.
+    pub latents: u32,
+    /// Latent frames a condition drops from its last clip.
+    pub token_drop: u32,
+}
+
+impl Clip {
+    /// The clip a checkpoint's video VAE config states.
+    pub fn of(config: &VideoVaeConfig) -> Result<Self> {
+        let clip = Self {
+            frames: config.clip_length,
+            latents: config.clip_latents(),
+            token_drop: config.token_drop,
+        };
+        if clip.frames == 0 || clip.latents <= clip.token_drop {
+            return Err(Error::config(format!(
+                "a clip of {} frames yields {} latent frames and drops {}; the drop must leave some",
+                clip.frames, clip.latents, clip.token_drop
+            )));
+        }
+        Ok(clip)
+    }
+
+    /// The latent frames a **condition** of `frames` frames encodes to.
+    ///
+    /// A condition is cut into clips of [`Self::frames`] frames, each yielding [`Self::latents`] latent
+    /// frames, and the last clip's trailing [`Self::token_drop`] latent frames are dropped - so 17
+    /// frames are 2 and 22 are 7. A single frame is a still and yields one: the network's causal front
+    /// padding makes one frame one latent frame (`video_vae.py:1105-1113`), and the reference encodes
+    /// an image or a keyframe through the same network alone (`encoding.py:41-51`).
+    ///
+    /// This is a **different statement** from a generated timeline's (`packing::video_latent_frames`:
+    /// `17n + 5` frames to `5n + 2` latents). The two agree on the counts a generation uses, and only
+    /// this one accepts the counts a condition may be - a condition is cut and padded, not generated.
+    pub fn latent_frames(&self, frames: u32) -> Result<u32> {
+        if frames == 0 {
+            return Err(Error::config(
+                "a video condition of no frame encodes nothing".to_owned(),
+            ));
+        }
+        if frames == 1 {
+            return Ok(1);
+        }
+        Ok(frames.div_ceil(self.frames) * self.latents - self.token_drop)
+    }
 }
 
 impl Stack {
@@ -165,6 +225,7 @@ impl Stack {
             spatial_strides: config.spatial_downsample_factors.clone(),
             blocks: config.layers_per_block,
             latent_channels: config.latent_channels,
+            clip: Clip::of(config)?,
         })
     }
 
@@ -626,13 +687,13 @@ pub fn audio_sources(config: &crate::AudioVaeConfig) -> Result<Vec<crate::audio_
 // The video encoder's device path.
 // ---------------------------------------------------------------------------------------------
 
+use nn::Forward;
 use nn::layers::{
     AdaptivePool, Attention, Conv1d, Conv3d, ConvGeometry, FrameMoments, FrameNormPad, FramePad,
-    GatedActivation, LayerNorm, Linear, ScaledAdd, Snake, Transpose, WeightOrder,
+    GatedActivation, LayerNorm, Linear, Posterior, ScaledAdd, Snake, Transpose, WeightOrder,
 };
 use nn::weights::{Weight, WeightLoader, WeightRequest};
-use nn::Forward;
-use nn::{DType, Shape, TensorView};
+use nn::{DType, Shape, Strides, TensorView};
 
 /// One causal convolution of the encoder and the normalization that feeds it.
 ///
@@ -681,6 +742,10 @@ pub struct VideoEncoder {
     output: Normalized,
     /// The one-by-one projection after the moments.
     moments: Conv3d,
+    /// The latent space's per-channel affine, `(sample − mean) / std` as a one-by-one convolution.
+    normalize: Conv3d,
+    /// The posterior's epilogue: the sample a condition reads, from the projected moments.
+    sampler: Posterior,
     /// Whether the spatial padding mirrors the edge rows and columns (the checkpoint's mode) or
     /// replicates them.
     reflect: bool,
@@ -706,6 +771,145 @@ fn read(loader: &mut WeightLoader, name: &str, shape: &[u64]) -> Result<Weight> 
         0,
         Shape::new(shape),
     ))?)
+}
+
+/// The per-channel affine of the latent space, in the encoder's direction: `(sample − mean) / std`.
+///
+/// Multiplying by `1 / std` and shifting by `−mean / std` is a one-by-one convolution whose weight is
+/// the diagonal, so the encoder undoes the decoder's `value · std + mean` with one operator of the
+/// same shape as the projection beside it (`audio_vae::denormalize_tables` is that other direction).
+///
+/// **Declared deviation.** The reference's `(lat - mean) / std` is a subtraction and a division in
+/// f32 - two roundings - while a convolution's multiply-add is one. The values agree to at most 1 ulp
+/// of the f32 sample (6e-8 relative), against the 1e-4 the conditioned path is compared at; the
+/// epilogue before it is bit-exact, so this is the only step that differs from torch.
+pub fn normalize_tables(mean: &[f32], std: &[f32]) -> Result<(Vec<f32>, Vec<f32>)> {
+    let channels = mean.len();
+    if channels == 0 || std.len() != channels {
+        return Err(Error::config(format!(
+            "the latent statistics hold {} means and {} deviations",
+            mean.len(),
+            std.len()
+        )));
+    }
+    let mut scale = vec![0.0_f32; channels * channels];
+    let mut shift = vec![0.0_f32; channels];
+    for channel in 0..channels {
+        let deviation = std[channel];
+        if !deviation.is_finite() || deviation <= 0.0 {
+            return Err(Error::config(format!(
+                "latent channel {channel} has a deviation of {deviation}, which cannot be divided by"
+            )));
+        }
+        scale[channel * channels + channel] = 1.0 / deviation;
+        shift[channel] = -mean[channel] / deviation;
+    }
+    Ok((scale, shift))
+}
+
+/// A constant weight of `values` in FP32, published once at load.
+///
+/// The checkpoint has no tensor for the latent statistics: they are config fields, and this is where
+/// arithmetic on them becomes a weight the convolution can read. `audio_vae::constants` publishes the
+/// decoder's pair the same way.
+fn constants(
+    loader: &mut WeightLoader<'_>,
+    name: &str,
+    shape: Shape,
+    values: &[f32],
+) -> Result<Weight> {
+    let bytes: Vec<u8> = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    Ok(loader.constant(name, DType::F32, shape, &bytes)?)
+}
+
+/// The geometry of one posterior sample: the positions it reads and the channels it writes.
+///
+/// The sample is `[latent_channels, frames, rows, columns]` like every other raster here, and
+/// `ops::posterior` reads `[positions, channels]` - so the call states the positions
+/// (`frames · rows · columns`) once, here, and both the strides and the operator's channel count come
+/// from it. Every refusal is on this type rather than inside a forward, because a raster of the wrong
+/// channel count is a configuration mistake and not a runtime condition.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Sample {
+    /// Positions the sample has: `frames · rows · columns`.
+    pub positions: u64,
+    /// Latent channels of one position.
+    pub channels: u64,
+}
+
+impl Sample {
+    /// The sample of `latent_channels` channels over the raster `moments`, `noise` and `out` share.
+    ///
+    /// `moments` holds both fields of the posterior, so it has twice the sample's channels; `noise` and
+    /// `out` hold the sample's own. All three are FP32 rasters of one geometry, packed as the encoder
+    /// writes them: the call addresses them through two strides, and a plane that is not packed has no
+    /// single pair of them.
+    pub fn of(
+        latent_channels: u32,
+        moments: TensorView,
+        noise: TensorView,
+        out: TensorView,
+    ) -> Result<Self> {
+        let channels = u64::from(latent_channels);
+        if channels == 0 {
+            return Err(Error::config(
+                "a latent raster with no channels has no sample".to_owned(),
+            ));
+        }
+        let wide = 2 * channels;
+        for (name, view, expected) in [
+            ("moments", moments, wide),
+            ("noise", noise, channels),
+            ("out", out, channels),
+        ] {
+            if view.dtype != DType::F32 {
+                return Err(Error::config(format!(
+                    "the {name} raster is {}, and a condition's posterior is FP32 throughout: the \
+                     reference draws and samples in f32",
+                    view.dtype
+                )));
+            }
+            if view.shape.rank() != 4 {
+                return Err(Error::config(format!(
+                    "the {name} raster is {:?}, a [channels, frames, rows, columns] raster expected",
+                    view.shape.dims()
+                )));
+            }
+            if view.shape.dim(0) != expected {
+                return Err(Error::config(format!(
+                    "the {name} raster has {} channels, {expected} expected for a {latent_channels}-\
+                     channel latent",
+                    view.shape.dim(0)
+                )));
+            }
+            let packed = Strides::row_major(view.shape);
+            if view.strides != packed {
+                return Err(Error::config(format!(
+                    "the {name} raster's strides are {:?} over {:?}: a channel-major sample \
+                     addresses a packed raster through two strides, and a view is refused rather than \
+                     copied",
+                    view.strides.as_slice(),
+                    view.shape.dims()
+                )));
+            }
+        }
+        if noise.shape != out.shape || moments.shape.dims()[1..] != out.shape.dims()[1..] {
+            return Err(Error::config(format!(
+                "the posterior's rasters disagree: moments {:?}, noise {:?}, out {:?}",
+                moments.shape.dims(),
+                noise.shape.dims(),
+                out.shape.dims()
+            )));
+        }
+        let positions = moments.shape.dims()[1..].iter().product::<u64>();
+        Ok(Self {
+            positions,
+            channels,
+        })
+    }
 }
 
 /// Read one convolution of the checkpoint: `from` input channels, `to` output, `kernel` taps.
@@ -858,12 +1062,33 @@ impl VideoEncoder {
             1,
             [1; 3],
         )?;
+        // The latent space's affine: the checkpoint states its statistics, not a tensor for them.
+        let latent = u64::from(stack.latent_channels);
+        let (scale, shift) = normalize_tables(&config.latents_mean, &config.latents_std)?;
+        let normalize = Conv3d::new(
+            constants(
+                loader,
+                "video_vae.normalize.weight",
+                Shape::new(&[latent, latent, 1, 1, 1]),
+                &scale,
+            )?,
+            Some(constants(
+                loader,
+                "video_vae.normalize.bias",
+                Shape::new(&[latent]),
+                &shift,
+            )?),
+            geometry(1, [1; 3])?,
+            true,
+        )?;
         Ok(Self {
             stack,
             input,
             levels,
             output,
             moments,
+            normalize,
+            sampler: Posterior::new(),
             reflect,
         })
     }
@@ -925,14 +1150,205 @@ fn rows(view: TensorView) -> Result<TensorView> {
     Ok(view.reshape(Shape::new(&[rows, columns])))
 }
 
+/// The distinct extents of a run, in the order they are first named.
+///
+/// A grid names every tile's extent and a uniform grid names the same one 28 times; the reservation is per
+/// distinct extent, so this is what keeps a uniform run to one set. The order is first-seen because a
+/// plan's sets are reported in reservation order.
+fn distinct(extents: &[Extent]) -> Vec<Extent> {
+    let mut seen: Vec<Extent> = Vec::with_capacity(extents.len());
+    for extent in extents {
+        if !seen.contains(extent) {
+            seen.push(*extent);
+        }
+    }
+    seen
+}
+
+/// The buffers one tile extent's encode works in, reserved once for a whole run of tiles.
+///
+/// A run's tiles are not uniform - the right and bottom edges of a grid are shorter - so a scratch holds
+/// one set per **distinct** tile extent and each call takes the set its own extent names. A set's buffers
+/// are then exactly the call's shape, which matters because a convolution writes the view it is handed:
+/// a sub-window of a larger buffer would be strided, and the convolution path takes a destination's
+/// address and shape, not its strides.
+pub struct EncoderScratch {
+    sets: Vec<(Extent, EncoderSet)>,
+}
+
+impl EncoderScratch {
+    /// The set a tile of this extent encodes in.
+    fn of(&self, extent: Extent) -> Result<&EncoderSet> {
+        self.sets
+            .iter()
+            .find(|(known, _)| *known == extent)
+            .map(|(_, set)| set)
+            .ok_or_else(|| {
+                Error::config(format!(
+                    "no encoder buffers were reserved for a {} by {} tile of {} frames",
+                    extent.height, extent.width, extent.frames
+                ))
+            })
+    }
+
+    /// How many distinct tile extents the scratch covers.
+    pub fn sets(&self) -> usize {
+        self.sets.len()
+    }
+}
+
+/// One tile extent's buffers: the input pad, the input convolution's output and a set per level.
+///
+/// The moment convolution writes the caller's `out`, so no buffer is held for it: the tile's result is
+/// the moments, and the one-by-one projection that follows runs once, on the stitched raster
+/// ([`VideoEncoder::project`]).
+struct EncoderSet {
+    padded: TensorView,
+    stream: TensorView,
+    levels: Vec<LevelSet>,
+}
+
+/// One level's buffers: the pair its blocks alternate between, one working buffer the block reads back,
+/// its shortcut projection where the first block widens, and the pad and strided output where the level
+/// downsamples.
+///
+/// The pair is the level's **own** width, not the buffer the level was handed. Alternating with the
+/// incoming buffer instead reads a level's second block against its input width whenever the level widens
+/// it - which three of the six levels do - so a two-block level would write a wider value into a narrower
+/// view.
+struct LevelSet {
+    first: TensorView,
+    second: TensorView,
+    working: TensorView,
+    projected: Option<TensorView>,
+    pad: Option<TensorView>,
+    strided: Option<TensorView>,
+}
+
 impl VideoEncoder {
     /// Encode one raster into the posterior moments of its latent.
     ///
-    /// `pixels` is `[1, in_channels, frames, height, width]` FP32 — one tile of a clip, normalized by
-    /// [`normalize`] — and `out` is `[1, 2 · latent_channels, frames', height / 16, width / 16]`. The
-    /// caller tiles a clip as [`Grid`] states and stitches the tiles' latents; a band of latent rows
-    /// may be encoded on its own through [`Grid::band`].
+    /// One tile, with its buffers reserved for the call: a driver of several tiles reserves once with
+    /// [`Self::reserve`] and calls [`Self::encode_tile`] instead, or the arena carries one tile's buffers
+    /// per tile.
     pub fn encode(&self, f: &Forward, pixels: TensorView, out: TensorView) -> Result<()> {
+        let (_, _, frames, height, width) = extent(pixels)?;
+        let raster = Extent {
+            frames: u32::try_from(frames)
+                .map_err(|_| Error::config("too many frames".to_owned()))?,
+            height: u32::try_from(height).map_err(|_| Error::config("too tall".to_owned()))?,
+            width: u32::try_from(width).map_err(|_| Error::config("too wide".to_owned()))?,
+        };
+        let scratch = self.reserve(f, &[raster])?;
+        self.encode_tile(f, &scratch, pixels, out)
+    }
+
+    /// Reserve the buffers one run of tiles encodes in, one set per distinct tile extent.
+    ///
+    /// The arena never rewinds, so a driver that encodes a grid of tiles must reserve once and hand the
+    /// same scratch to every tile: a reservation inside the loop is multiplied by the tile count, and one
+    /// tile's buffers are most of a gigabyte at the served canvas. [`video_encoder_tile_arena`] states
+    /// what one set holds.
+    pub fn reserve(&self, f: &Forward, extents: &[Extent]) -> Result<EncoderScratch> {
+        if extents.is_empty() {
+            return Err(Error::config(
+                "an encoder run with no tile extent has nothing to reserve".to_owned(),
+            ));
+        }
+        let mut sets: Vec<(Extent, EncoderSet)> = Vec::new();
+        for extent in distinct(extents) {
+            sets.push((extent, self.set(f, extent)?));
+        }
+        Ok(EncoderScratch { sets })
+    }
+
+    /// The buffers one tile extent needs.
+    fn set(&self, f: &Forward, raster: Extent) -> Result<EncoderSet> {
+        let extents = self.stack.extents(raster);
+        let buffer = |channels: u64, extent: &Extent| -> Result<TensorView> {
+            Ok(f.arena().tensor(
+                DType::F32,
+                Shape::new(&[
+                    1,
+                    channels,
+                    u64::from(extent.frames),
+                    u64::from(extent.height),
+                    u64::from(extent.width),
+                ]),
+            )?)
+        };
+        let padded = f.arena().tensor(
+            DType::F32,
+            Shape::new(&[
+                1,
+                u64::from(self.stack.input_channels),
+                u64::from(raster.frames + 2),
+                u64::from(raster.height + 2),
+                u64::from(raster.width + 2),
+            ]),
+        )?;
+        let stream = buffer(u64::from(self.stack.widths[0]), &extents[0])?;
+        let mut levels = Vec::with_capacity(extents.len() - 1);
+        for index in 0..extents.len() - 1 {
+            let width = u64::from(self.stack.widths[index]);
+            let extent = &extents[index];
+            let next = &extents[index + 1];
+            let downsample = self.levels[index].downsample.is_some();
+            levels.push(LevelSet {
+                first: buffer(width, extent)?,
+                second: buffer(width, extent)?,
+                working: buffer(width, extent)?,
+                // The first block of a level widens from the previous level's width; later blocks add to
+                // their own width and project nothing.
+                projected: match self.levels[index]
+                    .blocks
+                    .first()
+                    .map(|block| block.shortcut.is_some())
+                {
+                    Some(true) => Some(buffer(width, extent)?),
+                    _ => None,
+                },
+                pad: match downsample {
+                    true => Some(f.arena().tensor(
+                        DType::F32,
+                        Shape::new(&[
+                            1,
+                            width,
+                            u64::from(extent.frames) + 2,
+                            u64::from(extent.height) + 1,
+                            u64::from(extent.width) + 1,
+                        ]),
+                    )?),
+                    false => None,
+                },
+                strided: match downsample {
+                    true => Some(buffer(width, next)?),
+                    false => None,
+                },
+            });
+        }
+        Ok(EncoderSet {
+            padded,
+            stream,
+            levels,
+        })
+    }
+
+    /// Encode one tile into a reserved set of buffers.
+    ///
+    /// This is the entry point a driver of several tiles uses: it reserves once with [`Self::reserve`]
+    /// and hands the same scratch to every tile, which is the difference between one tile's buffers and
+    /// one tile's buffers times the grid. `pixels` is `[1, in_channels, frames, height, width]` FP32 -
+    /// one tile of a clip, normalized by [`normalize`] - and `out` is
+    /// `[1, 2 · latent_channels, frames', height / 16, width / 16]`. A tile whose extent was not reserved
+    /// is refused by name rather than read past the buffers.
+    pub fn encode_tile(
+        &self,
+        f: &Forward,
+        scratch: &EncoderScratch,
+        pixels: TensorView,
+        out: TensorView,
+    ) -> Result<()> {
         let (batch, channels, frames, height, width) = extent(pixels)?;
         if batch != 1 {
             return Err(Error::config(format!(
@@ -945,106 +1361,155 @@ impl VideoEncoder {
                 self.stack.input_channels
             )));
         }
-        if frames < u64::from(crate::config::CLIP_FRAMES) {
+        if frames != 1 && frames != u64::from(self.stack.clip.frames) {
             return Err(Error::config(format!(
-                "a {frames}-frame raster is shorter than the {}-frame clip",
-                crate::config::CLIP_FRAMES
+                "a video encoder reads one still (one frame) or one {}-frame clip, not {frames}",
+                self.stack.clip.frames
             )));
         }
-        let extents = self.stack.extents(Extent {
+        let raster = Extent {
             frames: u32::try_from(frames)
                 .map_err(|_| Error::config("too many frames".to_owned()))?,
             height: u32::try_from(height).map_err(|_| Error::config("too tall".to_owned()))?,
             width: u32::try_from(width).map_err(|_| Error::config("too wide".to_owned()))?,
-        });
+        };
+        let set = scratch.of(raster)?;
 
         // The input convolution reads padded pixels; it has no normalization of its own.
-        let padded = f.arena().tensor(
-            DType::F32,
-            Shape::new(&[batch, channels, frames + 2, height + 2, width + 2]),
-        )?;
-        FramePad::new(self.reflect).forward(f, pixels, padded, 1, 1, 2)?;
-        let first = u64::from(self.stack.widths[0]);
-        let mut hidden = f.arena().tensor(
-            DType::F32,
-            Shape::new(&[batch, first, frames, height, width]),
-        )?;
-        self.input.forward(f, padded, hidden)?;
+        FramePad::new(self.reflect).forward(f, pixels, set.padded, 1, 1, 2)?;
+        self.input.forward(f, set.padded, set.stream)?;
 
-        // The blocks alternate between two buffers: one holds the residual stream, the other the
-        // block's output, which the scaled addition folds back into the stream. A level's blocks all
-        // write the level's width, which is the next level's input width.
+        // A level's blocks alternate between its own pair of buffers, and the level's input is a third
+        // buffer it never writes: the first block reads the previous level's output, each later block
+        // reads the one before it, and every block writes the level's width.
+        let mut source = set.stream;
         for (index, level) in self.levels.iter().enumerate() {
-            let extent = extents[index];
-            let width = u64::from(self.stack.widths[index]);
-            let mut target = f.arena().tensor(
-                DType::F32,
-                Shape::new(&[
-                    batch,
-                    width,
-                    u64::from(extent.frames),
-                    u64::from(extent.height),
-                    u64::from(extent.width),
-                ]),
-            )?;
-            for block in &level.blocks {
-                self.block(f, block, hidden, target)?;
-                std::mem::swap(&mut hidden, &mut target);
+            let buffers = &set.levels[index];
+            for (at, block) in level.blocks.iter().enumerate() {
+                let target = match at % 2 {
+                    0 => buffers.first,
+                    _ => buffers.second,
+                };
+                self.block(f, block, source, target, buffers.working, buffers.projected)?;
+                source = target;
             }
             if let Some(downsample) = &level.downsample {
-                // The padding comes off the source's extents: two zero frames in front and one pixel
-                // after the bottom and the right edge, which is what halves an even extent exactly.
-                let next = extents[index + 1];
-                let padded = f.arena().tensor(
-                    DType::F32,
-                    Shape::new(&[
-                        batch,
-                        width,
-                        u64::from(extent.frames) + 2,
-                        u64::from(extent.height) + 1,
-                        u64::from(extent.width) + 1,
-                    ]),
-                )?;
-                FramePad::new(self.reflect).forward(f, hidden, padded, 0, 0, 2)?;
-                let mut strided = f.arena().tensor(
-                    DType::F32,
-                    Shape::new(&[
-                        batch,
-                        width,
-                        u64::from(next.frames),
-                        u64::from(next.height),
-                        u64::from(next.width),
-                    ]),
-                )?;
-                downsample.forward(f, padded, strided)?;
-                std::mem::swap(&mut hidden, &mut strided);
+                let (Some(pad), Some(strided)) = (buffers.pad, buffers.strided) else {
+                    return Err(Error::config(format!(
+                        "level {index} downsamples without the buffers for it"
+                    )));
+                };
+                FramePad::new(self.reflect).forward(f, source, pad, 0, 0, 2)?;
+                downsample.forward(f, pad, strided)?;
+                source = strided;
             }
         }
 
-        // The moment convolution writes `2 · latent_channels`; the one-by-one projection narrows it to
-        // the latent's own channels, which is the posterior the caller reads.
-        // The moment convolution writes `2 * latent_channels`; the one-by-one projection after it
-        // narrows that to the latent's own channels. The scratch is the moment extent, which is twice
-        // the output's channel count - sizing it from `out` would half it.
-        let mut moment_extent = out.shape.dims().to_vec();
-        moment_extent[1] = 2 * u64::from(self.stack.latent_channels);
-        let moments = f.arena().tensor(DType::F32, Shape::new(&moment_extent))?;
-        self.output.run(f, hidden, moments)?;
-        Ok(self.moments.forward(f, moments, out)?)
+        // The moment convolution writes `2 · latent_channels` into the caller's view. The one-by-one
+        // projection that follows it runs **once for the whole raster**, after the tiles are stitched
+        // (`project`), because that is the reference's order: the tiles produce moments, the tiler
+        // blends them, and the projection reads the stitched result.
+        self.output.run(f, source, out)
+    }
+
+    /// The latent frames a **condition** of `frames` frames encodes to.
+    ///
+    /// A condition is cut into clips of [`Stack::clip_frames`] frames, each yielding
+    /// [`Stack::clip_latents`] latent frames, and the last clip's trailing [`Stack::token_drop`] latent
+    /// frames are dropped - so 17 frames are 2 latent frames and 22 are 7. A single frame is a still and
+    /// yields one (`encoding.py:104-111`; the network's causal front padding makes one frame one latent
+    /// frame, `video_vae.py:1105-1113`).
+    ///
+    /// This is a **different statement** from the generated timeline's `packing::video_latent_frames`
+    /// (`17n + 5` frames to `5n + 2` latents). The two agree on the counts a generation uses and this
+    /// one alone accepts the counts a condition may be - 17, 30, any length - because a condition is
+    /// cut and padded, not generated.
+    pub fn latent_frames(&self, frames: u32) -> Result<u32> {
+        self.stack.clip.latent_frames(frames)
+    }
+
+    /// Project the stitched moments to the posterior's two fields: one call, after the stitch.
+    ///
+    /// The reference's `Encoder` wraps the tiled network and runs `quant_conv` on the stitched
+    /// moments, so a tile's own output is not yet projected. A one-by-one convolution commutes with the
+    /// blend in real arithmetic - the blend's weights do not depend on the channel - so projecting per
+    /// tile would be the same value for more work; it is written this way because it is also the order
+    /// the posterior is sampled in, which does depend on it: the sample reads a mean and a log-variance
+    /// of the same position, and a per-tile projection would entangle two tiles' roundings before they
+    /// were blended.
+    ///
+    /// `moments` is a tile's or the whole run's `[2 · latent_channels, frames, rows, columns]`; `out` is
+    /// the same shape. Nothing is reserved: the projection reads and writes the caller's views.
+    pub fn project(&self, f: &Forward, moments: TensorView, out: TensorView) -> Result<()> {
+        self.moments.forward(f, moments, out).map_err(Error::from)
+    }
+
+    /// The posterior sample a condition reads: `moments` and the runner's `noise` to `out`.
+    ///
+    /// The reference's `DiagonalGaussian` and the tail of `LatentEncoder`: the channel axis splits into
+    /// mean and log-variance, the log-variance is clamped to `(-30, 20)`, scaled by `exp(0.5 · ·)`,
+    /// mixed with the noise and added to the mean; the sum is rounded through FP16 **as a step**; and
+    /// the per-channel affine of [`normalize_tables`] turns it into the latent the conditioner reads.
+    /// The epilogue is `ops::posterior`, exact by contract, so the only rounding that differs from
+    /// torch is the affine's fused multiply-add ([`normalize_tables`] declares it).
+    ///
+    /// `moments` is the projected moments of the whole stitched raster and `out` is the condition's
+    /// latent, both `[channels, frames, rows, columns]` FP32; `noise` is the runner's draw in the same
+    /// order - the reference's `condition_noise_shapes` is channel-major and the draw is addressed by
+    /// element index, so that order is what reproduces it. The operator addresses every operand
+    /// through two strides, so a channel-major raster needs **no copy and no transpose**: the moments'
+    /// two halves are one buffer cut by an offset, the sample is written into one scratch raster (the
+    /// affine cannot read and write `out` at once), and the affine reads that raster into `out`.
+    pub fn posterior(
+        &self,
+        f: &Forward,
+        moments: TensorView,
+        noise: TensorView,
+        out: TensorView,
+    ) -> Result<()> {
+        let sample = Sample::of(self.stack.latent_channels, moments, noise, out)?;
+        let positions = sample.positions;
+        let channels = sample.channels;
+        // A channel-major raster: neighbouring positions are neighbouring elements, and one channel is
+        // one whole plane away. The two halves of the moments differ by exactly `channels` planes.
+        let strides = Strides::new(&[1, positions]);
+        let view = |ptr| {
+            TensorView::with_strides(ptr, DType::F32, Shape::new(&[positions, channels]), strides)
+        };
+        let drawn = f.arena().tensor(DType::F32, out.shape)?;
+        self.sampler.forward(
+            f,
+            view(moments.ptr),
+            view(moments.offset_elements(channels * positions)),
+            view(noise.ptr),
+            view(drawn.ptr),
+        )?;
+        self.normalize.forward(f, drawn, out).map_err(Error::from)
     }
 
     /// One residual block: two normalized convolutions, added to the input or its projection.
-    fn block(&self, f: &Forward, block: &Block, values: TensorView, out: TensorView) -> Result<()> {
-        let hidden = f.arena().tensor(DType::F32, values.shape)?;
-        block.first.run(f, values, hidden)?;
-        block.second.run(f, hidden, out)?;
-        let residual = match &block.shortcut {
-            Some(shortcut) => {
-                let projected = f.arena().tensor(DType::F32, values.shape)?;
+    fn block(
+        &self,
+        f: &Forward,
+        block: &Block,
+        values: TensorView,
+        out: TensorView,
+        working: TensorView,
+        projected: Option<TensorView>,
+    ) -> Result<()> {
+        block.first.run(f, values, working)?;
+        block.second.run(f, working, out)?;
+        let residual = match (&block.shortcut, projected) {
+            (Some(shortcut), Some(projected)) => {
                 shortcut.forward(f, values, projected)?;
                 projected
             }
-            None => values,
+            (Some(_), None) => {
+                return Err(Error::config(
+                    "a block that widens its input has no buffer to project it into".to_owned(),
+                ));
+            }
+            (None, _) => values,
         };
         // The reference groups the sum as `residual + (values + bias)` and adds the convolution's
         // bias in a pass of its own; cuDNN adds that bias in a pass of its own too, and IEEE addition
@@ -1328,15 +1793,18 @@ impl AudioEncoder {
         self.input.forward(f, samples, hidden)?;
 
         // A stage runs its three units at the stage's inner width, which is the width it receives, then
-        // snaked and widened into the next width. Each unit needs three buffers: the residual stream, and
-        // two for its two convolutions, because the sum reads what the first snake read.
+        // snaked and widened into the next width. Each unit needs two buffers - the two its convolutions
+        // write, because the second snake reads what the first convolution wrote - and they are the
+        // stage's shape, so the stage reserves them once and the three units take turns: a unit writes
+        // `first` from the residual stream before reading it, and `second` from its own convolution. The
+        // residual stream itself is `hidden`, which no unit writes.
         let mut extent = length;
         for stage in &self.stages {
             let inner = u64::from(stage.inner);
             let inner_shape = Shape::new(&[batch, inner, extent]);
+            let first = f.arena().tensor(DType::F32, inner_shape)?;
+            let second = f.arena().tensor(DType::F32, inner_shape)?;
             for unit in &stage.units {
-                let first = f.arena().tensor(DType::F32, inner_shape)?;
-                let second = f.arena().tensor(DType::F32, inner_shape)?;
                 unit.snakes[0].forward(f, hidden, unit.alphas[0].view(), first)?;
                 unit.convs[0].forward(f, first, second)?;
                 unit.snakes[1].forward(f, second, unit.alphas[1].view(), first)?;
@@ -1410,6 +1878,234 @@ impl AudioEncoder {
     fn width_of(&self, stage: &EncoderStage) -> u32 {
         stage.inner * 2
     }
+}
+
+/// Every buffer **one tile's** video encode takes from `Forward::arena()`, in reservation order.
+///
+/// `VideoEncoder::encode` reads one tile, so this is one call's list: the padded pixels, the input
+/// convolution's output, then per level the alternating pair its blocks swap (one buffer for the level's
+/// width, plus the block's own working buffer and the shortcut's projection), the pad and the strided
+/// output where the level downsamples, and the moments convolution's output.
+///
+/// **A caller that encodes several tiles must hoist these buffers out of its loop.** The arena never
+/// rewinds - its only rewind is the executor's per-forward `reset` - so a driver that calls `encode` once
+/// per tile multiplies this whole list by the tile count. The level-0 buffers are the pixels at the
+/// encoder's first width, so at a 256-by-64-pixel tile they are ~143 MB each: four of them is most of a
+/// gigabyte for one tile, and a tiled reference clip is tens of tiles. This function states one tile so
+/// The conditioning pass's own reservations for one visual condition.
+///
+/// A condition's sizes are the **condition's**, not a request's: the pass runs once per condition and
+/// the encoder's own set is reserved beside it, so nothing here multiplies by a request's clip or frame
+/// count. Three conditions in one request are three sequential uses of one plan, not three plans.
+///
+/// `latent` is the condition's **latent** extent - the encoder's own rule decided the frame count
+/// (`VideoEncoder::latent_frames`), so a still is one frame. The six buffers, in the order the pass
+/// reserves them:
+///
+/// | name | extent | why |
+/// | --- | --- | --- |
+/// | `tile` | `in_channels · frames · tile_height · tile_width` | **one** buffer, refilled per tile: the tiles are uniform, so a per-tile buffer would grow with the grid and buy nothing. The extents are the plan's largest tile, taken from the same `Tiles` the decoder's grid uses |
+/// | `stitch` | `2 · latent_channels · frames · rows · columns` | the moments' two halves, stitched over the grid |
+/// | `moments` | the same | the projection the posterior reads |
+/// | `sample` | `latent_channels · frames · rows · columns` | the posterior's draw |
+/// | `clean` | `patch_rows · latent_channels · 4` | the condition's latent patchified into rows |
+/// | `anchored` | the same | those rows at the condition's timestep |
+///
+/// `patch_rows` is the latent's voxels divided by four: the condition's rows are `2 x 2` latent
+/// patches, so `latent_channels · 4` columns, and a 84 x 48 latent gives 42 x 24 of them a frame.
+pub fn conditioning_arena(
+    config: &crate::VideoVaeConfig,
+    frames: u32,
+    latent: Extent,
+) -> Result<Vec<crate::decoding::Buffer>> {
+    let stack = Stack::of(config)?;
+    // The tile buffer is in **pixels**, so its frame axis is the condition's own, while every other
+    // buffer is in latents. Two frame counts in one plan is exactly the confusion this check removes.
+    let expected = stack.clip.latent_frames(frames)?;
+    if expected != latent.frames {
+        return Err(Error::config(format!(
+            "{frames} frames of condition are {expected} latent frames, and the plan was given {}",
+            latent.frames
+        )));
+    }
+    // The tile is the **encoder's** own grid, not the decoder's: this buffer is the encoder's input, so
+    // the plan reads the enumeration the encoder's driver reads. The two are one rule today - the
+    // checkpoint's 256-pixel tiles with a 64-pixel minimum overlap - and taking it from this side is
+    // what keeps the plan right if either ever moves.
+    let ratio = config.spatial_compression();
+    let grid = Grid::of(latent.height * ratio, latent.width * ratio)?;
+    let tile = (
+        grid.rows.lengths.iter().copied().max().unwrap_or(0),
+        grid.columns.lengths.iter().copied().max().unwrap_or(0),
+    );
+    if tile.0 == 0 || tile.1 == 0 {
+        return Err(Error::config(
+            "a condition with no tile has no plan".to_owned(),
+        ));
+    }
+    if !latent.height.is_multiple_of(2) || !latent.width.is_multiple_of(2) {
+        return Err(Error::config(format!(
+            "a condition's rows are 2 x 2 latent patches, and {} x {} has an odd axis",
+            latent.height, latent.width
+        )));
+    }
+    let latent_frames = u64::from(latent.frames);
+    let rows = u64::from(latent.height);
+    let columns = u64::from(latent.width);
+    let voxels = latent_frames * rows * columns;
+    let channels = u64::from(config.latent_channels);
+    let patch_rows = voxels / 4;
+    let buffer = |name: &str, elements: u64| crate::decoding::Buffer {
+        name: name.to_owned(),
+        element: "f32",
+        elements,
+    };
+    Ok(vec![
+        buffer(
+            "tile",
+            u64::from(stack.input_channels)
+                * u64::from(frames)
+                * u64::from(tile.0)
+                * u64::from(tile.1),
+        ),
+        buffer("stitch", 2 * channels * voxels),
+        buffer("moments", 2 * channels * voxels),
+        buffer("sample", channels * voxels),
+        buffer("clean", patch_rows * channels * 4),
+        buffer("anchored", patch_rows * channels * 4),
+    ])
+}
+
+/// the multiplication is visible rather than hidden inside a driver.
+pub fn video_encoder_tile_arena(
+    config: &VideoVaeConfig,
+    raster: Extent,
+) -> Result<Vec<crate::decoding::Buffer>> {
+    let stack = Stack::of(config)?;
+    let extents = stack.extents(raster);
+    let mut plan = Vec::new();
+    let mut push = |name: String, elements: u64| {
+        plan.push(crate::decoding::Buffer {
+            name,
+            element: "f32",
+            elements,
+        });
+    };
+    let pixels = |extent: &Extent| {
+        u64::from(extent.frames) * u64::from(extent.height) * u64::from(extent.width)
+    };
+    push(
+        "padded".to_owned(),
+        u64::from(stack.input_channels)
+            * u64::from(raster.frames + 2)
+            * u64::from(raster.height + 2)
+            * u64::from(raster.width + 2),
+    );
+    for (index, level) in extents.iter().take(extents.len() - 1).enumerate() {
+        let width = u64::from(stack.widths[index]);
+        let input = match index {
+            0 => u64::from(stack.widths[0]),
+            _ => u64::from(stack.widths[index - 1]),
+        };
+        // The pair a level's blocks alternate between, and the working buffer each block reads back.
+        push(format!("level{index}.first"), width * pixels(level));
+        push(format!("level{index}.second"), width * pixels(level));
+        push(format!("level{index}.working"), width * pixels(level));
+        // Only the first block of a level widens its input, and only when the level does.
+        if input != width {
+            push(format!("level{index}.projected"), width * pixels(level));
+        }
+        let next = &extents[index + 1];
+        if next.frames < level.frames || next.height < level.height || next.width < level.width {
+            push(
+                format!("level{index}.pad"),
+                width
+                    * u64::from(level.frames + 2)
+                    * u64::from(level.height + 1)
+                    * u64::from(level.width + 1),
+            );
+            push(format!("level{index}.strided"), width * pixels(next));
+        }
+    }
+    Ok(plan)
+}
+
+/// Every buffer one audio encode takes from `Forward::arena()`, in reservation order.
+///
+/// The encoder's `encode` reserves the input convolution's output, then per stage the two buffers its
+/// three units take turns in plus the snake's buffer and the widened one it passes on, then the tail
+/// snake's buffer and the convolution's features. The projection that follows runs once per batch row
+/// and reserves its own working set each time, which is why the rows appear separately here.
+///
+/// The list matters because the arena never rewinds, so everything accumulates for the length of the
+/// encode. The dominant entries are the first stage's, which run at the *sample* rate: at 207 latent
+/// frames a three-minute track is 165,600 samples, and one `[2, 64, 165600]` f32 buffer is 84.8 MB, so
+/// the encoder's plan is several hundred MB even though its weights are 0.12 GiB.
+pub fn audio_encoder_arena(
+    config: &crate::AudioVaeConfig,
+    batch: u64,
+    samples: u64,
+) -> Result<Vec<crate::decoding::Buffer>> {
+    let mut plan = Vec::new();
+    let mut push = |name: String, elements: u64| {
+        plan.push(crate::decoding::Buffer {
+            name,
+            element: "f32",
+            elements,
+        });
+    };
+    let stack = AudioStack::of(config)?;
+    let width = u64::from(stack.encoder_dim);
+    push("input".to_owned(), batch * width * samples);
+    let mut extent = samples;
+    let mut inner = width;
+    for (index, rate) in stack.rates.iter().enumerate() {
+        let rate = u64::from(*rate);
+        if rate == 0 || extent == 0 {
+            return Err(Error::config(format!(
+                "audio encoder stage {index} has rate {rate} at extent {extent}"
+            )));
+        }
+        let widened = extent / rate;
+        push(format!("stage{index}.first"), batch * inner * extent);
+        push(format!("stage{index}.second"), batch * inner * extent);
+        push(format!("stage{index}.snake"), batch * inner * extent);
+        push(format!("stage{index}.next"), batch * 2 * inner * widened);
+        extent = widened;
+        inner *= 2;
+    }
+    let wide = u64::from(stack.latent_dim);
+    let channels = u64::from(stack.latent_channels);
+    push("tail".to_owned(), batch * wide * extent);
+    push("features".to_owned(), batch * wide * extent);
+    // The projection, per row: its transposed features, its four residual-shaped buffers, the attention's
+    // three projections and its output, the gated unit's four, and the two views the row's latent is
+    // written through.
+    for row in 0..batch {
+        let frames = extent;
+        for (name, elements) in [
+            ("transpose", frames * wide),
+            ("shortcut", frames * channels),
+            ("normed", frames * wide),
+            ("attended", frames * wide),
+            ("query", frames * wide),
+            ("key", frames * wide),
+            ("value", frames * wide),
+            ("pooled", frames * channels),
+            ("projected", frames * channels),
+            ("mlp_normed", frames * channels),
+            ("updated", frames * channels),
+            ("gate_normed", frames * channels),
+            ("gate", frames * 2 * channels),
+            ("gated_value", frames * 2 * channels),
+            ("product", frames * 2 * channels),
+            ("pooled_matrix", channels * frames),
+            ("narrowed", channels * frames),
+        ] {
+            push(format!("row{row}.{name}"), elements);
+        }
+    }
+    Ok(plan)
 }
 
 /// A `[batch, rows, columns]` view as `[batch · rows, columns]`: the row axis the operators that work
@@ -1635,6 +2331,276 @@ mod tests {
     use super::*;
     use crate::video_vae::tests::video_config;
 
+    /// A video encoder over the fixture's config: the stack is all `latent_frames` needs, so no
+    /// weights are loaded.
+    fn encoder_stack() -> Stack {
+        Stack::of(&video_config()).expect("the fixture's stack")
+    }
+
+    #[test]
+    fn the_conditioning_plan_is_one_tile_per_run_not_one_per_tile() {
+        // A condition's plan is the pass's, so nothing in it scales with the tile grid: the two
+        // canvases here are the served ones and their grids differ in tile count, while the plan's
+        // six buffers are the same six of the same size. A per-tile buffer would fail this on the
+        // larger canvas and nowhere else.
+        let config = video_config();
+        let stack = Stack::of(&config).expect("the stack");
+        // The condition's latent frame count is the encoder's own rule, so the test derives it rather
+        // than naming it: the two frame counts in this plan - the tile's, in pixels, and every other
+        // buffer's, in latents - are what `conditioning_arena` checks against each other.
+        let frames = 25;
+        let latent_frames = stack
+            .clip
+            .latent_frames(frames)
+            .expect("the condition's latent frames");
+        let vertical = Extent {
+            frames: latent_frames,
+            height: 84,
+            width: 48,
+        };
+        let wide = Extent {
+            frames: latent_frames,
+            height: 48,
+            width: 84,
+        };
+        let first = conditioning_arena(&config, frames, vertical).expect("the vertical condition");
+        let second = conditioning_arena(&config, frames, wide).expect("the wide condition");
+        let names: Vec<&str> = first.iter().map(|buffer| buffer.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["tile", "stitch", "moments", "sample", "clean", "anchored"]
+        );
+        assert_eq!(
+            second
+                .iter()
+                .map(|buffer| buffer.name.as_str())
+                .collect::<Vec<_>>(),
+            names,
+            "the same six buffers, whatever the canvas"
+        );
+        // The tile buffer is **one** tile's pixels, not the grid's: its extent is the largest tile of
+        // the decoder's own grid, which is the same `Tiles` the decode reads, and the grid's count
+        // never enters it.
+        let tile = first
+            .iter()
+            .find(|buffer| buffer.name == "tile")
+            .expect("a tile buffer");
+        let canvas = crate::video_vae::Canvas::clip(&config, vertical.height, vertical.width);
+        let tiles = crate::video_vae::Tiles::of(&config, &canvas).expect("the grid");
+        let grid = tiles.tiles(&config, &canvas);
+        assert!(grid.len() > 1, "the fixture's canvas is more than one tile");
+        let (tile_height, tile_width) = grid
+            .iter()
+            .map(|tile| tile.canvas.pixels(&config))
+            .max_by_key(|(height, width)| u64::from(*height) * u64::from(*width))
+            .expect("a largest tile");
+        assert_eq!(
+            tile.elements,
+            u64::from(stack.input_channels)
+                * u64::from(frames)
+                * u64::from(tile_height)
+                * u64::from(tile_width),
+            "the tile buffer is one tile's pixels, refilled per tile"
+        );
+    }
+
+    #[test]
+    fn a_still_is_one_frame_of_tile_and_the_pair_must_agree() {
+        // A still is the case the plan's two frame counts can disagree about, in both directions: its
+        // own frame count is one and so is its latent count, and a still's latent extent paired with a
+        // generated piece's frame count describes a condition that cannot exist.
+        let config = video_config();
+        let still = Extent {
+            frames: 1,
+            height: 84,
+            width: 48,
+        };
+        let plan = conditioning_arena(&config, 1, still).expect("a still's plan");
+        assert_eq!(plan.len(), 6);
+        let stack = Stack::of(&config).expect("the stack");
+        let canvas = crate::video_vae::Canvas::clip(&config, still.height, still.width);
+        let grid = crate::video_vae::Tiles::of(&config, &canvas).expect("the grid");
+        let (tile_height, tile_width) = grid
+            .tiles(&config, &canvas)
+            .iter()
+            .map(|tile| tile.canvas.pixels(&config))
+            .max_by_key(|(height, width)| u64::from(*height) * u64::from(*width))
+            .expect("a largest tile");
+        // One frame of pixels: the tile term scales with the condition's own frame count, and that is
+        // the whole difference between a still's plan and a 25-frame piece's.
+        assert_eq!(
+            plan[0].elements,
+            u64::from(stack.input_channels) * u64::from(tile_height) * u64::from(tile_width)
+        );
+        // A still's latents with a generated piece's frame count is refused rather than sized.
+        let mismatched = Extent { frames: 1, ..still };
+        assert!(conditioning_arena(&config, 25, mismatched).is_err());
+    }
+
+    #[test]
+    fn a_condition_that_is_not_whole_patches_is_refused() {
+        // The condition's rows are `2 x 2` latent patches, so an odd axis has no row count at all and
+        // must be refused here rather than sized by a division that rounds.
+        let config = video_config();
+        let odd = Extent {
+            frames: 1,
+            height: 83,
+            width: 48,
+        };
+        assert!(conditioning_arena(&config, 1, odd).is_err());
+    }
+
+    #[test]
+    fn a_condition_is_counted_by_its_own_rule() {
+        // The reference counts a condition in clips: every clip of `clip_length` frames yields
+        // `clip_latents` latent frames and the last clip's trailing `token_drop` are dropped, so the
+        // canonical 22 frames (`clip_length + 5`) are two clips less three.
+        let clip = encoder_stack().clip;
+        assert_eq!(clip.latent_frames(1).expect("a still"), 1);
+        assert_eq!(
+            clip.latent_frames(clip.frames).expect("one clip"),
+            clip.latents - clip.token_drop
+        );
+        let tail = clip.frames + crate::config::CLIP_LATENTS;
+        assert_eq!(
+            clip.latent_frames(tail).expect("a clip and a tail"),
+            2 * clip.latents - clip.token_drop
+        );
+        // A length no generation produces is a condition all the same: two clips and a short tail.
+        assert_eq!(
+            clip.latent_frames(2 * clip.frames - 4)
+                .expect("a short last clip"),
+            2 * clip.latents - clip.token_drop
+        );
+        assert!(clip.latent_frames(0).is_err());
+
+        // The generated timeline's rule agrees on the canonical count, which is why the two must be
+        // stated separately rather than one standing in for the other.
+        assert_eq!(
+            clip.latent_frames(tail).expect("a clip and a tail"),
+            crate::packing::video_latent_frames(tail).expect("the generated rule")
+        );
+    }
+
+    #[test]
+    fn a_run_reserves_one_set_per_distinct_tile_extent() {
+        let tile = |height: u32, width: u32| Extent {
+            frames: 25,
+            height,
+            width,
+        };
+        // A uniform grid names one extent many times and reserves once; a grid with shorter edges names
+        // two, in the order they first appear.
+        assert_eq!(distinct(&[tile(256, 256); 28]), vec![tile(256, 256)]);
+        assert_eq!(
+            distinct(&[
+                tile(256, 256),
+                tile(256, 192),
+                tile(256, 256),
+                tile(256, 192)
+            ]),
+            vec![tile(256, 256), tile(256, 192)]
+        );
+        assert_eq!(
+            distinct(&[tile(192, 192), tile(256, 256)]),
+            vec![tile(192, 192), tile(256, 256)],
+            "the order is the order they are named"
+        );
+    }
+
+    #[test]
+    fn the_video_encoders_tile_plan_is_one_tile_and_says_so() {
+        let config = video_config();
+        let stack = Stack::of(&config).expect("the stack");
+        let raster = Extent {
+            frames: 25,
+            height: 64,
+            width: 256,
+        };
+        let plan = video_encoder_tile_arena(&config, raster).expect("the plan");
+        // A tiled driver looks every entry up by name, so what a plan owes the driver is its set of
+        // names: the tile's pad, and per level the pair its blocks alternate between and the working
+        // buffer each block reads back, a projection exactly where the level widens, and the pad and
+        // strided output exactly where it downsamples. Nothing else, and no name twice. This is stated
+        // as the set and not as a count because a count of a formula is a second copy of the plan's
+        // arithmetic, and the copy is what drifts - the input convolution's output is `level0.first`,
+        // not a buffer of its own.
+        let extents = stack.extents(raster);
+        let mut expected = vec!["padded".to_owned()];
+        for (index, level) in extents.iter().take(extents.len() - 1).enumerate() {
+            let width = stack.widths[index];
+            let input = match index {
+                0 => stack.widths[0],
+                _ => stack.widths[index - 1],
+            };
+            expected.push(format!("level{index}.first"));
+            expected.push(format!("level{index}.second"));
+            expected.push(format!("level{index}.working"));
+            if input != width {
+                expected.push(format!("level{index}.projected"));
+            }
+            let next = &extents[index + 1];
+            if next.frames < level.frames || next.height < level.height || next.width < level.width
+            {
+                expected.push(format!("level{index}.pad"));
+                expected.push(format!("level{index}.strided"));
+            }
+        }
+        let mut planned: Vec<&str> = plan.iter().map(|buffer| buffer.name.as_str()).collect();
+        planned.sort_unstable();
+        let mut wanted: Vec<&str> = expected.iter().map(String::as_str).collect();
+        wanted.sort_unstable();
+        assert_eq!(
+            planned, wanted,
+            "the plan reserves exactly the buffers a tiled driver looks up, once each"
+        );
+        // Level 0 runs at the tile's pixels and the encoder's first width, and it is the entry a tiled
+        // driver multiplies by its tile count.
+        let first = plan
+            .iter()
+            .find(|buffer| buffer.name == "level0.first")
+            .expect("level 0's first buffer");
+        assert_eq!(
+            first.elements,
+            u64::from(stack.widths[0]) * 25 * 64 * 256,
+            "level 0 is the tile's pixels at the first width"
+        );
+    }
+
+    #[test]
+    fn the_audio_encoders_arena_names_every_buffer_it_reserves() {
+        let config = crate::audio_vae::tests::audio_config();
+        let stack = AudioStack::of(&config).expect("the stack");
+        let samples = 207 * u64::from(stack.samples_per_latent);
+        let batch = 2;
+        let plan = audio_encoder_arena(&config, batch, samples).expect("the plan");
+        // The input convolution, four buffers per stage, the tail pair, and each row's projection.
+        assert_eq!(
+            plan.len(),
+            1 + 4 * stack.rates.len() + 2 + 17 * batch as usize
+        );
+        // The first stage runs at the sample rate, at the input width: the encoder's largest buffer.
+        let first = plan
+            .iter()
+            .find(|buffer| buffer.name == "stage0.first")
+            .expect("stage 0's first buffer");
+        assert_eq!(
+            first.elements,
+            batch * u64::from(stack.encoder_dim) * samples
+        );
+        // The lengths divide by each rate in turn, so the tail sees one row per latent frame.
+        let tail = plan
+            .iter()
+            .find(|buffer| buffer.name == "tail")
+            .expect("the tail snake's buffer");
+        assert_eq!(tail.elements, batch * u64::from(stack.latent_dim) * 207);
+        let mut names: Vec<&str> = plan.iter().map(|buffer| buffer.name.as_str()).collect();
+        let count = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), count, "every buffer is named once");
+    }
+
     #[test]
     fn a_pixel_normalizes_and_quantizes_back_to_itself() {
         let rgb = crate::output::Rgb::of(1, 1, 1);
@@ -1653,10 +2619,94 @@ mod tests {
                 );
             }
         }
-        // The extremes are exact: the normalization maps 0 and 255 outside the [-1, 1] range the
-        // decoder works in, which is expected — the encoder reads the raster, not latents.
-        assert!(normalize([0, 0, 0])[0] < -2.0);
-        assert!(normalize([255, 255, 255])[0] > 2.0);
+        // The extremes land outside the band the decoder works in - `Rgb::quantize` maps a value
+        // back through `value · std + mean` and clamps to the byte range, so one inside [-1, 1]
+        // loses nothing. Being outside is the property; how far outside is the checkpoint's
+        // statistics' business, not this test's.
+        for channel in 0..3 {
+            let low = normalize([0, 0, 0])[channel];
+            let high = normalize([255, 255, 255])[channel];
+            assert!(low < -1.0, "channel {channel}: {low} from zero");
+            assert!(high > 1.0, "channel {channel}: {high} from 255");
+        }
+    }
+
+    /// A raster view of `channels` over one frame's `rows × columns`, for the shape tests: nothing
+    /// reads it, so the pointer is the null one.
+    fn raster(channels: u64, frames: u64, rows: u64, columns: u64, dtype: DType) -> TensorView {
+        TensorView::new(
+            nn::DevicePtr::new(0),
+            dtype,
+            Shape::new(&[channels, frames, rows, columns]),
+        )
+    }
+
+    #[test]
+    fn the_posterior_sample_is_the_rasters_own_geometry() {
+        let config = video_config();
+        let channels = u64::from(config.latent_channels);
+        let moments = raster(2 * channels, 7, 30, 52, DType::F32);
+        let noise = raster(channels, 7, 30, 52, DType::F32);
+        let out = raster(channels, 7, 30, 52, DType::F32);
+        let sample = Sample::of(config.latent_channels, moments, noise, out).expect("a sample");
+        assert_eq!(sample.channels, channels);
+        assert_eq!(sample.positions, 7 * 30 * 52);
+        // The moments' rows are twice the sample's, which is what makes the two fields one tensor.
+        assert_eq!(moments.shape.dim(0), 2 * sample.channels);
+
+        // A moments raster of the sample's own width has no log-variance to read.
+        let narrow = raster(channels, 7, 30, 52, DType::F32);
+        assert!(Sample::of(config.latent_channels, narrow, noise, out).is_err());
+        // A noise raster of the moments' width is two draws where the sample wants one.
+        let wide_noise = raster(2 * channels, 7, 30, 52, DType::F32);
+        assert!(Sample::of(config.latent_channels, moments, wide_noise, out).is_err());
+        // An FP16 raster is the decoder's precision, not the encoder's posterior.
+        let half = raster(channels, 7, 30, 52, DType::F16);
+        assert!(Sample::of(config.latent_channels, moments, half, out).is_err());
+        // A view whose planes overlap has no single channel stride.
+        let strided = TensorView::with_strides(
+            nn::DevicePtr::new(0),
+            DType::F32,
+            Shape::new(&[channels, 7, 30, 52]),
+            Strides::new(&[30 * 52, 30 * 52, 52, 1]),
+        );
+        assert!(Sample::of(config.latent_channels, moments, strided, out).is_err());
+        // A noise raster of another clip is a different sample.
+        let other = raster(channels, 5, 30, 52, DType::F32);
+        assert!(Sample::of(config.latent_channels, moments, other, out).is_err());
+    }
+
+    #[test]
+    fn the_encoders_affine_inverts_the_latent_statistics() {
+        let config = video_config();
+        let channels = config.latents_mean.len();
+        let (scale, shift) =
+            normalize_tables(&config.latents_mean, &config.latents_std).expect("the affine");
+        assert_eq!(scale.len(), channels * channels);
+        assert_eq!(shift.len(), channels);
+        for channel in 0..channels {
+            assert_eq!(
+                scale[channel * channels + channel],
+                1.0 / config.latents_std[channel]
+            );
+            assert_eq!(
+                shift[channel],
+                -config.latents_mean[channel] / config.latents_std[channel]
+            );
+        }
+        // Off the diagonal there is nothing: each channel scales on its own.
+        let off = scale
+            .iter()
+            .enumerate()
+            .filter(|(index, value)| index % (channels + 1) != 0 && **value != 0.0)
+            .count();
+        assert_eq!(off, 0);
+
+        // A deviation of zero cannot be divided by, and a shorter table names the wrong channel count.
+        let mut zeroed = config.latents_std.clone();
+        zeroed[3] = 0.0;
+        assert!(normalize_tables(&config.latents_mean, &zeroed).is_err());
+        assert!(normalize_tables(&config.latents_mean, &config.latents_std[..2]).is_err());
     }
 
     #[test]

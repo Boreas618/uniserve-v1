@@ -7,11 +7,11 @@
 //! `tf32` flag is the model's numerical declaration for an FP32 convolution (the video VAE keeps it
 //! on, as the `quality` preset does).
 
-use ops::TensorView;
 use ops::conv::{
     Args, Conv1d as Conv1dOp, Conv3d as Conv3dOp, ConvTranspose1d as ConvTranspose1dOp, Descriptor,
     Geometry,
 };
+use ops::{DType, TensorView};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -122,6 +122,21 @@ impl Conv3d {
             self.tf32,
         )
     }
+
+    /// The descriptor this layer's launch takes, for a walk that asks a model which programs it
+    /// launches with no device.
+    pub fn descriptor(&self, input: DType, output: DType) -> Descriptor {
+        descriptor_of(
+            input,
+            &self.weight,
+            self.bias.as_ref(),
+            output,
+            self.geometry,
+            3,
+            false,
+            self.tf32,
+        )
+    }
 }
 
 /// A one-dimensional convolution (the audio decoder's convolutions).
@@ -163,6 +178,20 @@ impl Conv1d {
             &self.weight,
             self.bias.as_ref(),
             out,
+            self.geometry,
+            1,
+            false,
+            self.tf32,
+        )
+    }
+
+    /// The descriptor this layer's launch takes; see [`Conv3d::descriptor`].
+    pub fn descriptor(&self, input: DType, output: DType) -> Descriptor {
+        descriptor_of(
+            input,
+            &self.weight,
+            self.bias.as_ref(),
+            output,
             self.geometry,
             1,
             false,
@@ -216,10 +245,59 @@ impl ConvTranspose1d {
             self.tf32,
         )
     }
+
+    /// The descriptor this layer's launch takes; see [`Conv3d::descriptor`].
+    pub fn descriptor(&self, input: DType, output: DType) -> Descriptor {
+        descriptor_of(
+            input,
+            &self.weight,
+            self.bias.as_ref(),
+            output,
+            self.geometry,
+            1,
+            true,
+            self.tf32,
+        )
+    }
+}
+
+/// The descriptor one convolution launch takes.
+///
+/// The three layers share one launch, so they share the construction of its descriptor: an accessor
+/// per layer that built it separately would be three chances for one to drift from the operator it
+/// names, and the walk that asks a model for its programs reads exactly this.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "every argument is a geometry or an element type the descriptor states separately"
+)]
+fn descriptor_of(
+    input: DType,
+    weight: &Weight,
+    bias: Option<&Weight>,
+    output: DType,
+    geometry: ConvGeometry,
+    rank: u32,
+    transposed: bool,
+    tf32: bool,
+) -> Descriptor {
+    Descriptor {
+        input,
+        weight: weight.dtype(),
+        output,
+        geometry: geometry.descriptor(),
+        bias: bias.is_some(),
+        tf32,
+        rank,
+        transposed,
+    }
 }
 
 /// The launch the three convolutions share.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the descriptor's own arguments plus the launch's views; one helper keeps the three \
+              layers' launches identical"
+)]
 fn launch(
     f: &Forward,
     owner: &'static str,
@@ -238,16 +316,16 @@ fn launch(
             "the bias and the output have different element types".to_owned(),
         ));
     }
-    let descriptor = Descriptor {
-        input: input.dtype,
-        weight: weight.dtype(),
-        output: out.dtype,
-        geometry: geometry.descriptor(),
-        bias: bias.is_some(),
-        tf32,
+    let descriptor = descriptor_of(
+        input.dtype,
+        weight,
+        bias,
+        out.dtype,
+        geometry,
         rank,
         transposed,
-    };
+        tf32,
+    );
     let args = Args {
         input,
         weight: weight.view(),

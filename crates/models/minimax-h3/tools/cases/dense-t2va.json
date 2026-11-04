@@ -1,0 +1,12 @@
+{
+  "canvas": {"width": 1344, "height": 768},
+  "num_frames": 124,
+  "num_text_tokens": 40,
+  "text_capacity": 128,
+  "condition_capacity": 128,
+  "token_multiple": 64,
+  "attention": {"kind": "dense"},
+  "conditions": [],
+  "vision_spans": [],
+  "clip": {"frames": 17, "latents": 5, "token_drop": 1}
+}

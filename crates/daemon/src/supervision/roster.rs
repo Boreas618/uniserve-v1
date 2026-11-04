@@ -93,13 +93,18 @@ pub(crate) struct ProcessRoster {
     /// Launches the epoch layer stopped: their exit is not a failure.
     stopping: BTreeSet<u64>,
     /// A resume's fresh generation, waiting for the child to park so it can be
-    /// promoted: the launch generation and the epoch it serves.
+    /// promoted: the launch generation the spawn allocated and the epoch it
+    /// serves.
     resuming: BTreeMap<u64, u64>,
+    /// The epoch a fresh generation is being started for: `spawn` allocates
+    /// the generation itself, so the epoch waits here until that number is
+    /// known.
+    resuming_epoch: Option<u64>,
     /// How the loop last started a main process: the executable and its
     /// arguments, for the fresh generation a restore may need.
     start: Option<(
         String,
-        Vec<String>,
+        crate::engine::launch::Launch,
         std::collections::HashMap<String, String>,
     )>,
     /// Events the adapter raised, ahead of the ones still on the wire.
@@ -129,6 +134,7 @@ impl ProcessRoster {
             requests: String::new(),
             stopping: BTreeSet::new(),
             resuming: BTreeMap::new(),
+            resuming_epoch: None,
             start: None,
             queued: VecDeque::new(),
             next_request: 1,
@@ -308,7 +314,9 @@ impl ProcessRoster {
         {
             let epochs = Arc::clone(&self.epochs);
             let failure = crate::epoch::Failure {
-                kind: "exited".to_owned(),
+                // The vocabulary `Failure` names: a main process that ended
+                // during probation (§7.3 step 4).
+                kind: "process_exit".to_owned(),
                 reason: format!("a main process of the update exited ({})", exit.status),
                 device: None,
             };
@@ -339,7 +347,7 @@ impl ProcessRoster {
 
     /// Starts a fresh generation of the previous epoch for a restore whose
     /// processes are gone: claim its world, let it park, and promote it.
-    fn fresh(&mut self, host: &str, generation: u64, epoch: u64, group: &str, rank: u64) {
+    fn fresh(&mut self, host: &str, epoch: u64, group: &str, rank: u64) {
         let scope = process::Scope {
             group: group.to_owned(),
             rank: rank as u32,
@@ -347,27 +355,32 @@ impl ProcessRoster {
         match self.claim(host, epoch, &[scope], &[]) {
             Ok(()) => {}
             Err(reason) => {
-                tracing::warn!(%host, generation, %reason, "claiming the previous epoch for a restore failed");
+                tracing::warn!(%host, epoch, %reason, "claiming the previous epoch for a restore failed");
                 return;
             }
         }
-        let Some((executable, arguments, environment)) = self.start.clone() else {
+        let Some((executable, launch, environment)) = self.start.clone() else {
             return;
         };
-        self.resuming.insert(generation, epoch);
+        // The fresh process's identity is allocated here, from the same
+        // counter the epoch's children took theirs from: it is above the
+        // target's generation, so the process the target ends never names this
+        // one, and the epoch waits for the number its `Parked` reports.
+        let generation = self.epochs.next_generation(group, rank);
+        self.resuming_epoch = Some(epoch);
         let start = Spawn {
             host: host.to_owned(),
             group: group.to_owned(),
             rank: rank as u32,
             generation,
             executable,
-            arguments,
+            arguments: Vec::new(),
             environment,
             inherit: Vec::new(),
         };
-        if let Err(reason) = self.spawn(start) {
-            tracing::warn!(%host, generation, %reason, "starting the previous epoch for a restore failed");
-            self.resuming.remove(&generation);
+        if let Err(reason) = self.spawn(start, &launch) {
+            tracing::warn!(%host, epoch, %reason, "starting the previous epoch for a restore failed");
+            self.resuming_epoch = None;
         }
     }
 }
@@ -400,11 +413,37 @@ impl Roster for ProcessRoster {
         }
     }
 
-    fn spawn(&mut self, spawn: Spawn) -> Result<u32, String> {
+    fn spawn(
+        &mut self,
+        mut spawn: Spawn,
+        launch: &crate::engine::launch::Launch,
+    ) -> Result<crate::updates::switch::Spawned, String> {
+        // The launch generation is the caller's, allocated once from the
+        // deployment's one counter ([`Epochs::next_generation`]): the switch
+        // spawns an epoch's children at one number and commands them by it, so
+        // taking a second number here would give one launch two identities —
+        // the switch's and this node's — and the child's `Parked` would name a
+        // generation no command reaches. A launch with no number is a caller
+        // that allocated none, not a process to start (§2.3, §7.4).
         let generation = spawn.generation;
+        if generation == 0 {
+            return Err("a spawn states no launch generation".to_owned());
+        }
+        let mut launch = launch.clone();
+        launch.engine = generation;
+        let path =
+            crate::engine::launch::write(&crate::options::runtime_directory(), generation, &launch)
+                .map_err(|error| {
+                    format!("writing the launch file of engine {generation}: {error}")
+                })?;
+        spawn.arguments = vec![
+            "engine".to_owned(),
+            "--launch".to_owned(),
+            path.display().to_string(),
+        ];
         self.start = Some((
             spawn.executable.clone(),
-            spawn.arguments.clone(),
+            launch.clone(),
             spawn.environment.clone(),
         ));
         self.launches.insert(
@@ -417,10 +456,16 @@ impl Roster for ProcessRoster {
                 pid: None,
             },
         );
+        // A fresh generation of a restore: its epoch is now known under the
+        // number this spawn allocated, so its `Parked` promotes it.
+        if let Some(epoch) = self.resuming_epoch.take() {
+            self.resuming.insert(generation, epoch);
+        }
         let start = process::request::Kind::Spawn(spawn);
         let reply = self.request(start)?;
         if !reply.error.is_empty() {
             self.launches.remove(&generation);
+            self.resuming.remove(&generation);
             return Err(reply.error);
         }
         let Some(process::reply::Kind::Spawned(spawned)) = reply.kind else {
@@ -430,7 +475,12 @@ impl Roster for ProcessRoster {
             launch.pid = Some(spawned.pid);
         }
         self.row(generation, ProcessState::Starting);
-        Ok(spawned.pid)
+        // The generation the process was actually started at, which is what a
+        // stop names and what a restore binds to.
+        Ok(crate::updates::switch::Spawned {
+            generation,
+            pid: spawned.pid,
+        })
     }
 
     fn stop(&mut self, _host: &str, group: &str, generation: Option<u64>) {
@@ -528,8 +578,7 @@ impl Roster for ProcessRoster {
         let Some(epoch) = epoch else {
             return;
         };
-        let fresh = self.epochs.next_generation(&group, rank);
-        self.fresh(host, fresh, epoch, &group, rank);
+        self.fresh(host, epoch, &group, rank);
         let _ = reason;
     }
 
@@ -578,8 +627,6 @@ mod tests {
 
     fn service(info: Arc<Epochs>) -> (Service, EpochLink) {
         let (requests, incoming) = std::sync::mpsc::channel::<(Request, Sender<process::Reply>)>();
-        let (_commands, sent) = std::sync::mpsc::channel();
-        let (reports, received) = std::sync::mpsc::channel();
         let (exits, exited) = std::sync::mpsc::channel();
         let (greetings, greeted) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -620,7 +667,11 @@ mod tests {
             }
             drop(info);
         });
-        let (processes, _commands_rx, _reports_tx) = ProcessCommands::pair();
+        // The adapter's downward end and the test's two ends of the one
+        // channel the daemon commands its main processes on: the commands the
+        // adapter sends, and the reports a test plays back up. Keeping a
+        // different pair here reads as an adapter that commands nothing.
+        let (processes, sent, reports) = ProcessCommands::pair();
         let link = EpochLink {
             requests,
             greetings: greeted,
@@ -646,6 +697,29 @@ mod tests {
             arguments: vec!["engine".to_owned()],
             environment: Default::default(),
             inherit: Vec::new(),
+        }
+    }
+
+    fn launch() -> crate::engine::launch::Launch {
+        crate::engine::launch::Launch {
+            build_config: "/run/build-config-1.json".into(),
+            model: "/models/qwen3".into(),
+            requests: "unix:/run/requests.sock".to_owned(),
+            processes: "unix:/run/processes.sock".to_owned(),
+            engine: 1,
+            program_server: "/run/programs.sock".to_owned(),
+            devices: vec![0],
+            group: "engine".to_owned(),
+            rank: 0,
+            deployment: "deployment".to_owned(),
+            world: 1,
+            scheduler_node: true,
+            peers: Vec::new(),
+            watchdog_timeout_s: None,
+            rollback_s: None,
+            queue_depth: 4,
+            world_size: 1,
+            standby: false,
         }
     }
 
@@ -675,10 +749,10 @@ mod tests {
             state: ProcessState::Serving,
         }]);
 
-        assert_eq!(
-            roster.spawn(spawn("n0", 7)).expect("the node starts it"),
-            4242
-        );
+        let spawned = roster
+            .spawn(spawn("n0", 7), &launch())
+            .expect("the node starts it");
+        assert_eq!(spawned.pid, 4242);
         let rows = epochs.processes();
         assert_eq!(rows.len(), 2, "the frontend's row survives the write");
         assert_eq!(rows[1].state, ProcessState::Starting);
@@ -748,7 +822,9 @@ mod tests {
         let epochs = Arc::new(Epochs::new());
         let (service, link) = service(Arc::clone(&epochs));
         let mut roster = roster(&epochs, link);
-        roster.spawn(spawn("n0", 7)).expect("the node starts it");
+        roster
+            .spawn(spawn("n0", 7), &launch())
+            .expect("the node starts it");
         service
             .greetings
             .send((
@@ -788,8 +864,12 @@ mod tests {
         let epochs = Arc::new(Epochs::new());
         let (service, link) = service(Arc::clone(&epochs));
         let mut roster = roster(&epochs, link);
-        roster.spawn(spawn("n0", 7)).expect("the node starts it");
-        roster.spawn(spawn("n0", 8)).expect("the node starts it");
+        roster
+            .spawn(spawn("n0", 7), &launch())
+            .expect("the node starts it");
+        roster
+            .spawn(spawn("n0", 8), &launch())
+            .expect("the node starts it");
 
         roster.stop("n0", "engine", Some(7));
         let exit = |generation: u64, status: &str| Exit {

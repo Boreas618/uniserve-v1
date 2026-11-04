@@ -63,7 +63,7 @@ pub(crate) struct Node {
 /// How the target epoch's main processes are started: the executable, the
 /// build identity it must report when the daemon knows it, and its arguments
 /// and environment.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Start {
     /// The target main process's executable.
     pub(crate) executable: String,
@@ -72,8 +72,12 @@ pub(crate) struct Start {
     /// another executable, whose first child's `Hello` fixes it and every
     /// other child must then report the same.
     pub(crate) build: Option<String>,
-    /// Arguments after the program name.
-    pub(crate) arguments: Vec<String>,
+    /// The launch a process of this epoch is started with: the contents of
+    /// its launch file, which the adapter writes for the process it starts
+    /// (`engine/launch.rs`). Every field is the epoch's; the process's own
+    /// identity is the generation the spawn carries, which the adapter puts
+    /// into the file's `engine` (§2.3, §7.4).
+    pub(crate) launch: crate::engine::launch::Launch,
     /// Variables set over the daemon's environment.
     pub(crate) environment: HashMap<String, String>,
 }
@@ -102,6 +106,15 @@ pub(crate) enum Event {
     },
 }
 
+/// What a spawn produced: the process's own launch generation, which is the
+/// number the supervisor keys its launches by, and its pid. The switch keeps
+/// the generation, because it is what a later stop names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Spawned {
+    pub(crate) generation: u64,
+    pub(crate) pid: u32,
+}
+
 /// What the switch asks of the nodes: claim a world's storage, start and
 /// stop main processes, command one generation's main process, command the
 /// frontend, and take the events that arrive. The daemon's supervision is
@@ -118,8 +131,12 @@ pub(crate) trait Roster {
         scopes: &[process::Scope],
         retire: &[u64],
     ) -> Result<(), String>;
-    /// Starts `spawn` and returns the child's process id.
-    fn spawn(&mut self, spawn: Spawn) -> Result<u32, String>;
+    /// Starts `spawn` and returns the child's own generation and process id.
+    fn spawn(
+        &mut self,
+        spawn: Spawn,
+        launch: &crate::engine::launch::Launch,
+    ) -> Result<Spawned, String>;
     /// Stops one launch generation of `group` on `host`; every generation
     /// when `generation` is `None`.
     fn stop(&mut self, host: &str, group: &str, generation: Option<u64>);
@@ -156,8 +173,12 @@ impl<T: Roster + ?Sized> Roster for Box<T> {
         (**self).claim(host, world, scopes, retire)
     }
 
-    fn spawn(&mut self, spawn: Spawn) -> Result<u32, String> {
-        (**self).spawn(spawn)
+    fn spawn(
+        &mut self,
+        spawn: Spawn,
+        launch: &crate::engine::launch::Launch,
+    ) -> Result<Spawned, String> {
+        (**self).spawn(spawn, launch)
     }
 
     fn stop(&mut self, host: &str, group: &str, generation: Option<u64>) {
@@ -236,6 +257,10 @@ pub(crate) struct Switch {
     /// `previous_generation + 1` (§2.5). A promoted standby must never reach
     /// this number, or one number would name two epochs.
     spawn_generation: u64,
+    /// What the roster actually started: host and the process's own launch
+    /// generation, which is what a stop names. A target that fails before it
+    /// reports has no model generation yet, so the switch stops these.
+    spawned: Vec<(String, u64)>,
     /// The previous epoch's launch generation.
     previous_generation: u64,
     /// The target's generation as its child reported it: authoritative, and
@@ -254,6 +279,10 @@ pub(crate) struct Switch {
     phase: Phase,
     /// Worlds whose storage must be retired by the next claim.
     retire: Vec<u64>,
+    /// The hosts whose target main process was told to park: a command can
+    /// only be addressed to a generation that has connected, so each park is
+    /// sent once, on that child's `Hello`.
+    park_sent: BTreeSet<String>,
     parked: BTreeSet<String>,
     promoted: BTreeSet<String>,
     drained: BTreeSet<String>,
@@ -314,6 +343,7 @@ impl Switch {
             target,
             previous,
             spawn_generation,
+            spawned: Vec::new(),
             previous_generation,
             generation: None,
             record,
@@ -324,6 +354,7 @@ impl Switch {
             requests,
             phase: Phase::Preparing,
             retire: discarded,
+            park_sent: BTreeSet::new(),
             parked: BTreeSet::new(),
             promoted: BTreeSet::new(),
             drained: BTreeSet::new(),
@@ -411,21 +442,27 @@ impl Switch {
                 rank: node.rank,
                 generation: self.spawn_generation,
                 executable: self.start.executable.clone(),
-                arguments: self.start.arguments.clone(),
+                // The adapter writes the launch file for this process and
+                // passes its path: the arguments are its to state.
+                arguments: Vec::new(),
                 environment: self.start.environment.clone(),
                 inherit: Vec::new(),
             };
-            if let Err(reason) = roster.spawn(spawn) {
-                self.failed(
-                    roster,
-                    Failure {
-                        kind: "spawn_failed".to_owned(),
-                        reason,
-                        device: None,
-                    },
-                );
-                return;
-            }
+            let spawned = match roster.spawn(spawn, &self.start.launch) {
+                Ok(spawned) => spawned,
+                Err(reason) => {
+                    self.failed(
+                        roster,
+                        Failure {
+                            kind: "spawn_failed".to_owned(),
+                            reason,
+                            device: None,
+                        },
+                    );
+                    return;
+                }
+            };
+            self.spawned.push((node.host.clone(), spawned.generation));
         }
         let retire = std::mem::take(&mut self.retire);
         for node in &self.nodes {
@@ -543,6 +580,16 @@ impl Switch {
         }
     }
 
+    /// The generation `host` actually started the target at: the number the
+    /// node's allocator gave that child, which its reports carry and its
+    /// commands are addressed to. `None` before `start` spawned it.
+    fn spawned_generation(&self, host: &str) -> Option<u64> {
+        self.spawned
+            .iter()
+            .find(|(spawned, _)| spawned == host)
+            .map(|(_, generation)| *generation)
+    }
+
     /// Accepts `generation` as a target main process's: the child numbers the
     /// generation it prepared, so any number from the one the switch spawned
     /// on names this epoch, and the highest reported is its current
@@ -576,9 +623,18 @@ impl Switch {
         self.record.status = Status::Purged;
         self.epochs.record(self.target, self.record.clone());
         self.update.revert();
-        let generation = self.target_generation();
-        for node in &self.nodes {
-            roster.stop(&node.host, &self.group, Some(generation));
+        // The target's processes are stopped by the generation each one was
+        // actually started at: before the first report no model generation
+        // exists, and the epoch's spawn generation is only a floor.
+        if self.spawned.is_empty() {
+            let generation = self.target_generation();
+            for node in &self.nodes {
+                roster.stop(&node.host, &self.group, Some(generation));
+            }
+        } else {
+            for (host, generation) in &self.spawned {
+                roster.stop(host, &self.group, Some(*generation));
+            }
         }
         self.phase = Phase::Abandoned;
     }
@@ -731,6 +787,21 @@ impl Switch {
                 self.epochs.record(self.target, self.record.clone());
             }
         }
+        // §7.4 step 1: the child claimed its scopes read-only as the
+        // predecessor's standby and parks at the end of its start; `Park` is
+        // what turns that into the `Parked` this phase waits for. It is sent
+        // now, on the child's `Hello`, because a command is addressed to a
+        // generation the roster has connected and a child that was just forked
+        // has not. One step per node, at the generation the node allocated, and
+        // the child buffers it until its serve loop runs.
+        if self.phase == Phase::Preparing && self.park_sent.insert(host.clone()) {
+            let generation = self.spawned_generation(&host).unwrap_or(generation);
+            roster.command(
+                &host,
+                generation,
+                command(process::command::Kind::Park(process::Park {})),
+            );
+        }
     }
 
     /// A main process of `generation` exited.
@@ -830,6 +901,25 @@ impl Switch {
                     },
                 );
             }
+            // A target that faults while it prepares — a park that could not
+            // take, a device error — never becomes the epoch: the previous one
+            // serves on and the target is dropped, exactly as a failed precopy
+            // drops it. Without this arm the switch would wait in `Preparing`
+            // for a readiness no process of that generation will ever send.
+            (Phase::Preparing, _) if self.is_target(generation) => {
+                if let Some(failure) = Failure::of_report(&report) {
+                    self.failed(roster, failure);
+                }
+            }
+            // The same while it is promoted: `Promote` resumes the target's
+            // schedulers, and a device fault as they start is such a report.
+            // The frontend is not served the target until every `Promoted`
+            // arrives, so a half-promoted epoch serves nobody and is dropped.
+            (Phase::Promoting, _) if self.is_target(generation) => {
+                if let Some(failure) = Failure::of_report(&report) {
+                    self.failed(roster, failure);
+                }
+            }
             (Phase::Serving, _) if self.is_target(generation) => {
                 if let Some(failure) = Failure::of_report(&report) {
                     self.restore(roster, failure);
@@ -879,10 +969,13 @@ impl Switch {
             Phase::Preparing if hosts.is_subset(&self.parked) => {
                 self.phase = Phase::Promoting;
                 self.switchover_started = Some(Instant::now());
-                let generation = self.target_generation();
                 for node in &self.nodes {
-                    // One step, first, so that moving it with exec's answer is
-                    // a one-line change.
+                    // One step per node, at the generation that node started
+                    // its child at: a two-node epoch has two numbers, and the
+                    // highest one addresses no process on the other node.
+                    let generation = self
+                        .spawned_generation(&node.host)
+                        .unwrap_or_else(|| self.target_generation());
                     roster.command(
                         &node.host,
                         generation,
@@ -895,6 +988,13 @@ impl Switch {
                 self.epochs.record(self.target, self.record.clone());
                 roster.serve(self.target, &self.requests);
                 for node in &self.nodes {
+                    // One number addresses the previous epoch on every node,
+                    // which is right while the epoch arm runs one node and one
+                    // main process (`apply_epoch` refuses more): the switch
+                    // never launched the previous epoch, so it holds no
+                    // per-node number for it. Lifting that refusal means the
+                    // previous epoch's generations must come from the process
+                    // table the same way the target's come from `spawned`.
                     roster.command(
                         &node.host,
                         self.previous_generation,
@@ -915,8 +1015,11 @@ impl Switch {
                 self.record.status = Status::Serving;
                 self.epochs.record(self.target, self.record.clone());
                 let retire = vec![self.previous];
-                let generation = self.target_generation();
                 for node in &self.nodes {
+                    // Addressed per node for the same reason `Promote` is.
+                    let generation = self
+                        .spawned_generation(&node.host)
+                        .unwrap_or_else(|| self.target_generation());
                     roster.stop(&node.host, &self.group, Some(self.previous_generation));
                     roster.command(
                         &node.host,
@@ -968,6 +1071,10 @@ mod tests {
         scripted: Vec<Event>,
         fail_spawn: Option<String>,
         fail_claim: Option<String>,
+        /// The generation the roster allocates for the first process it
+        /// starts, and each one after it: the real adapter allocates every
+        /// process's number, which is not the epoch's spawn generation.
+        allocate_from: Option<u64>,
     }
 
     impl Fake {
@@ -1006,13 +1113,20 @@ mod tests {
             Ok(())
         }
 
-        fn spawn(&mut self, spawn: Spawn) -> Result<u32, String> {
+        fn spawn(
+            &mut self,
+            spawn: Spawn,
+            _launch: &crate::engine::launch::Launch,
+        ) -> Result<Spawned, String> {
             if let Some(reason) = &self.fail_spawn {
                 return Err(reason.clone());
             }
             let pid = self.spawns.len() as u32 + 1;
+            let generation = self
+                .allocate_from
+                .map_or(spawn.generation, |base| base + u64::from(pid) - 1);
             self.spawns.push(spawn);
-            Ok(pid)
+            Ok(Spawned { generation, pid })
         }
 
         fn stop(&mut self, host: &str, group: &str, generation: Option<u64>) {
@@ -1080,7 +1194,26 @@ mod tests {
         Start {
             executable: "/opt/uniserve".to_owned(),
             build: Some("2.0.0+new".to_owned()),
-            arguments: vec!["engine".to_owned()],
+            launch: crate::engine::launch::Launch {
+                build_config: "/run/build-config-11.json".into(),
+                model: "/models/qwen3".into(),
+                requests: "unix:/run/requests.sock".to_owned(),
+                processes: "unix:/run/processes.sock".to_owned(),
+                engine: 7,
+                program_server: "/run/programs.sock".to_owned(),
+                devices: vec![0],
+                group: "engine".to_owned(),
+                rank: 0,
+                deployment: "qwen3".to_owned(),
+                world: 11,
+                scheduler_node: true,
+                peers: Vec::new(),
+                watchdog_timeout_s: None,
+                rollback_s: None,
+                queue_depth: 4,
+                world_size: 1,
+                standby: false,
+            },
             environment: HashMap::new(),
         }
     }
@@ -1172,7 +1305,13 @@ mod tests {
             assert_eq!(spawn.rank, nodes()[index].rank);
             assert_eq!(spawn.generation, 6, "the serving generation's next one");
             assert_eq!(spawn.executable, "/opt/uniserve");
-            assert_eq!(spawn.arguments, vec!["engine".to_owned()]);
+            // The adapter writes the launch file and states the argv that
+            // reads it ([`crate::engine::launch`]): the switch starts a child,
+            // not a command line, so it states none.
+            assert!(
+                spawn.arguments.is_empty(),
+                "a spawn states no arguments: {spawn:?}"
+            );
         }
         assert_eq!(roster.claims.len(), 2);
         for (index, (_, world, scopes, retire)) in roster.claims.iter().enumerate() {
@@ -1191,17 +1330,46 @@ mod tests {
             epochs.get(12).map(|record| record.status),
             Some(Status::Precopy)
         );
+        assert!(
+            roster.commands.is_empty(),
+            "a child that was just forked cannot be commanded: it has not connected"
+        );
 
-        roster.scripted = vec![hello("n0", 6, "2.0.0+new"), hello("n1", 6, "2.0.0+new")];
+        // The children connect, and each is told to park on the read-only
+        // mapping it claimed. A repeated hello does not park it twice.
+        roster.scripted = vec![
+            hello("n0", 6, "2.0.0+new"),
+            hello("n1", 6, "2.0.0+new"),
+            hello("n0", 6, "2.0.0+new"),
+        ];
         switch.advance(&mut roster);
+        assert_eq!(switch.phase(), Phase::Preparing);
+        assert_eq!(roster.commands.len(), 2, "one park per node");
+        for (index, (host, generation, kind)) in roster.commands.iter().enumerate() {
+            assert_eq!(host, &nodes()[index].host);
+            assert_eq!(*generation, 6, "the generation the node spawned it at");
+            assert!(matches!(kind, process::command::Kind::Park(_)));
+        }
+        assert!(
+            !roster
+                .commands
+                .iter()
+                .any(|(_, _, kind)| matches!(kind, process::command::Kind::Promote(_))),
+            "nothing is promoted before the targets parked"
+        );
+
         switch.parked(&mut roster, "n0", 6);
+        assert_eq!(
+            switch.phase(),
+            Phase::Preparing,
+            "one host's readiness promotes nothing"
+        );
         switch.parked(&mut roster, "n1", 6);
         assert_eq!(switch.phase(), Phase::Promoting);
         assert_eq!(switch.generation(), Some(6));
-        assert_eq!(roster.commands.len(), 2);
+        assert_eq!(roster.commands.len(), 4, "two parks, then two promotes");
         assert!(
-            roster
-                .commands
+            roster.commands[2..]
                 .iter()
                 .all(|(_, generation, kind)| *generation == 6
                     && matches!(kind, process::command::Kind::Promote(_)))
@@ -1240,6 +1408,182 @@ mod tests {
             Some(Status::Probation)
         );
         assert!(switch.pause().is_some());
+    }
+
+    /// The target's children park on their read-only mapping, and the switch
+    /// waits for each of them: a readiness of another generation is not this
+    /// target's, and no promotion is sent until every node parked.
+    #[test]
+    fn a_target_is_promoted_only_after_every_node_parked() {
+        let (_epochs, mut switch) = setup();
+        let mut roster = Fake::default();
+        switch.start(&mut roster);
+        roster.scripted = vec![hello("n0", 6, "2.0.0+new"), hello("n1", 6, "2.0.0+new")];
+        switch.advance(&mut roster);
+
+        // `n0` reports the serving epoch's generation, not the target's.
+        switch.parked(&mut roster, "n0", 5);
+        switch.parked(&mut roster, "n1", 6);
+        assert_eq!(
+            switch.phase(),
+            Phase::Preparing,
+            "a foreign generation's readiness is not the target's"
+        );
+        assert!(
+            !roster
+                .commands
+                .iter()
+                .any(|(_, _, kind)| matches!(kind, process::command::Kind::Promote(_))),
+            "nothing is promoted while a node has not parked"
+        );
+
+        switch.parked(&mut roster, "n0", 6);
+        assert_eq!(switch.phase(), Phase::Promoting);
+        assert_eq!(
+            roster.commands_of(6, |kind| matches!(kind, process::command::Kind::Promote(_))),
+            2
+        );
+    }
+
+    /// A target that faults while it prepares never becomes the epoch: a park
+    /// that could not take must not leave the switch waiting for a readiness
+    /// no process of that generation will send.
+    #[test]
+    fn a_fault_while_preparing_drops_the_target() {
+        let (epochs, mut switch) = setup();
+        let mut roster = Fake::default();
+        switch.start(&mut roster);
+        roster.scripted = vec![
+            hello("n0", 6, "2.0.0+new"),
+            report_event(
+                "n0",
+                6,
+                report(process::report::Kind::Fault(process::Fault {
+                    kind: "sticky".to_owned(),
+                    reason: "the park faulted the device".to_owned(),
+                    device: 0,
+                })),
+            ),
+        ];
+        switch.advance(&mut roster);
+
+        assert_eq!(switch.phase(), Phase::Abandoned);
+        assert_eq!(
+            switch.failure().map(|failure| failure.kind.as_str()),
+            Some("sticky")
+        );
+        assert_eq!(
+            epochs.get(12).map(|record| record.status),
+            Some(Status::Purged)
+        );
+        assert!(
+            !roster
+                .commands
+                .iter()
+                .any(|(_, _, kind)| matches!(kind, process::command::Kind::Promote(_))),
+            "the failed target was never promoted"
+        );
+        assert!(
+            roster
+                .stops
+                .contains(&("n0".to_owned(), "engine:0".to_owned(), Some(6)))
+        );
+    }
+
+    /// Every node allocates its own launch generation, and a command reaches
+    /// the process of the generation that node started: addressing the highest
+    /// number any node reported would reach no process on the other node and
+    /// the phase would wait for an answer that cannot come.
+    #[test]
+    fn each_node_is_commanded_at_the_generation_it_allocated() {
+        let (_epochs, mut switch) = setup();
+        let mut roster = Fake {
+            allocate_from: Some(6),
+            ..Fake::default()
+        };
+        switch.start(&mut roster);
+        assert_eq!(
+            roster.spawns.len(),
+            2,
+            "two nodes, each allocated its own generation"
+        );
+
+        roster.scripted = vec![hello("n0", 6, "2.0.0+new"), hello("n1", 7, "2.0.0+new")];
+        switch.advance(&mut roster);
+        let parks: Vec<_> = roster
+            .commands
+            .iter()
+            .filter(|(_, _, kind)| matches!(kind, process::command::Kind::Park(_)))
+            .map(|(host, generation, _)| (host.as_str(), *generation))
+            .collect();
+        assert_eq!(parks, vec![("n0", 6), ("n1", 7)]);
+
+        switch.parked(&mut roster, "n0", 6);
+        switch.parked(&mut roster, "n1", 7);
+        assert_eq!(switch.phase(), Phase::Promoting);
+        let promotes: Vec<_> = roster
+            .commands
+            .iter()
+            .filter(|(_, _, kind)| matches!(kind, process::command::Kind::Promote(_)))
+            .map(|(host, generation, _)| (host.as_str(), *generation))
+            .collect();
+        assert_eq!(
+            promotes,
+            vec![("n0", 6), ("n1", 7)],
+            "each node's own generation, not the highest reported"
+        );
+    }
+
+    /// A target that faults while it is promoted never serves: one node
+    /// answers `Promoted` and the other faults as its schedulers start. The
+    /// frontend is not served the target until every node answered, so
+    /// dropping it leaves the previous epoch serving and the trial unstarted.
+    #[test]
+    fn a_fault_while_promoting_drops_the_target() {
+        let (epochs, mut switch) = setup();
+        let mut roster = Fake::default();
+        switch.start(&mut roster);
+        roster.scripted = vec![hello("n0", 6, "2.0.0+new"), hello("n1", 6, "2.0.0+new")];
+        switch.advance(&mut roster);
+        switch.parked(&mut roster, "n0", 6);
+        switch.parked(&mut roster, "n1", 6);
+        assert_eq!(switch.phase(), Phase::Promoting);
+
+        switch.promoted(&mut roster, "n0", 6);
+        assert_eq!(
+            switch.phase(),
+            Phase::Promoting,
+            "one node's promotion does not serve the epoch"
+        );
+        roster.scripted = vec![report_event(
+            "n1",
+            6,
+            report(process::report::Kind::Fault(process::Fault {
+                kind: "illegal_address".to_owned(),
+                reason: "the resumed schedulers faulted".to_owned(),
+                device: 1,
+            })),
+        )];
+        switch.advance(&mut roster);
+
+        assert_eq!(switch.phase(), Phase::Abandoned);
+        assert_eq!(
+            switch.failure().map(|failure| failure.kind.as_str()),
+            Some("illegal_address")
+        );
+        assert_eq!(
+            epochs.get(12).map(|record| record.status),
+            Some(Status::Purged)
+        );
+        assert!(
+            roster.serves.is_empty(),
+            "the frontend never switched to the dropped epoch"
+        );
+        assert!(
+            roster
+                .stops
+                .contains(&("n1".to_owned(), "engine:0".to_owned(), Some(6)))
+        );
     }
 
     /// A world an earlier switch dropped is retired by the next switch's
@@ -1310,7 +1654,15 @@ mod tests {
         assert_eq!(switch.phase(), Phase::Abandoned);
         assert_eq!(switch.update().state, UpdateState::Reverted);
         assert!(switch.update().unavailable().is_none());
-        assert!(roster.commands.is_empty(), "no promote, drain or commit");
+        assert!(
+            !roster.commands.iter().any(|(_, _, kind)| matches!(
+                kind,
+                process::command::Kind::Promote(_)
+                    | process::command::Kind::Drain(_)
+                    | process::command::Kind::Commit(_)
+            )),
+            "no promote, drain or commit"
+        );
         assert!(roster.serves.is_empty(), "the frontend never switched");
         assert_eq!(switch.discarded(), &[12]);
         assert_eq!(
@@ -1321,6 +1673,41 @@ mod tests {
             roster
                 .stops
                 .contains(&("n0".to_owned(), "engine:0".to_owned(), Some(6)))
+        );
+    }
+
+    /// The roster allocates every process's own generation, so a target that
+    /// dies before it reports is stopped where it was actually started — not
+    /// at the epoch's spawn generation, which no process need ever have had.
+    #[test]
+    fn a_target_that_dies_before_it_reports_is_stopped_where_it_was_started() {
+        let (_epochs, mut switch) = setup();
+        let mut roster = Fake {
+            allocate_from: Some(41),
+            ..Fake::default()
+        };
+        switch.start(&mut roster);
+        roster.scripted = vec![exit_event("n0", 41)];
+        switch.advance(&mut roster);
+
+        assert_eq!(switch.phase(), Phase::Abandoned);
+        assert!(
+            roster
+                .stops
+                .contains(&("n0".to_owned(), "engine:0".to_owned(), Some(41)))
+        );
+        assert!(
+            roster
+                .stops
+                .contains(&("n1".to_owned(), "engine:0".to_owned(), Some(42))),
+            "the other node's child, at the generation its spawn allocated"
+        );
+        assert!(
+            !roster
+                .stops
+                .iter()
+                .any(|(_, _, generation)| *generation == Some(6)),
+            "no stop names the epoch's spawn generation, which no process had"
         );
     }
 
@@ -1344,7 +1731,13 @@ mod tests {
                 .stops
                 .contains(&("n0".to_owned(), "engine:0".to_owned(), Some(6)))
         );
-        assert!(roster.commands.is_empty());
+        assert!(
+            !roster
+                .commands
+                .iter()
+                .any(|(_, _, kind)| matches!(kind, process::command::Kind::Promote(_))),
+            "the stopped target was never promoted"
+        );
     }
 
     /// Another executable's build is unknown until its first child connects:
@@ -1720,7 +2113,15 @@ mod tests {
         )];
         switch.advance(&mut roster);
         assert_eq!(switch.phase(), Phase::Reverting);
-        assert_eq!(roster.commands.len(), 2, "a revert per node");
+        assert_eq!(
+            roster
+                .commands
+                .iter()
+                .filter(|(_, _, kind)| matches!(kind, process::command::Kind::Revert(_)))
+                .count(),
+            2,
+            "a revert per node"
+        );
         assert!(roster.commands.iter().all(|(_, generation, kind)| {
             *generation == 6
                 && matches!(kind, process::command::Kind::Revert(revert)

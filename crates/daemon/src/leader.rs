@@ -88,12 +88,11 @@ pub struct Leader {
 pub(crate) struct Replicas {
     pub(crate) serving: watch::Sender<Vec<Arc<Replica>>>,
     pub(crate) replacing: tokio::sync::Mutex<()>,
-    pub(crate) pending:
-        std::sync::Mutex<std::collections::VecDeque<(usize, crate::worlds::ApplyRequest)>>,
-    pub(crate) group: std::sync::Mutex<Option<crate::worlds::group::Trial>>,
-    pub(crate) commit: std::sync::Mutex<Option<crate::worlds::Commit>>,
     pub(crate) adapters: Arc<std::sync::Mutex<BTreeMap<String, Adapter>>>,
     pub(crate) schedulers: Arc<std::sync::atomic::AtomicUsize>,
+    /// The update layer, so a replica that loses its engine asks whether an
+    /// update in flight owns that decision (§7.2, §7.4).
+    pub(crate) updates: std::sync::Weak<crate::updates::driver::Driver>,
 }
 
 /// Keeps deployment updates and replica recovery out of a daemon handoff.
@@ -121,7 +120,7 @@ pub enum Task {
 /// `observer`, which reads each world's rates.
 pub(crate) fn stats_sink(
     model_name: String,
-    observer: Arc<crate::worlds::Observer>,
+    observer: Arc<crate::observe::Observer>,
     replica: usize,
 ) -> StatsSink {
     Box::new(move |world, scheduler, snapshot| {
@@ -195,6 +194,18 @@ impl Leader {
         }
     }
 
+    /// Ends every replica's parked standby (§2.5).
+    ///
+    /// A daemon that hands the deployment to a successor calls this before the
+    /// handoff: the successor numbers and starts its own standbys, and a parked
+    /// process of the old daemon would otherwise keep a second engine's memory
+    /// on the device for a deployment that never knew it was there.
+    pub(crate) async fn end_standbys(&self) {
+        for replica in self.replicas() {
+            replica.end_standby().await;
+        }
+    }
+
     /// Stops every replica and its workers.
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         for replica in self.replicas() {
@@ -224,10 +235,17 @@ impl Leader {
     }
 
     pub(crate) fn engine_handoff(&self) -> anyhow::Result<Vec<EngineHandoff>> {
-        anyhow::ensure!(
-            locked(&self.replicas.group).is_none(),
-            "the replica group is on trial: commit it or roll it back before a daemon restart"
-        );
+        // A handover passes the serving engine, its world and the
+        // configuration to the successor, not the update in progress: an
+        // epoch switch's children and phases or a program trial's record do
+        // not cross it, so the handover waits for the update to end
+        // (`specs/worker.md` §7.5, one update at a time).
+        if let Some(update) = crate::updates::in_flight(
+            self.updates.running(),
+            self.epochs().program_update().is_some(),
+        ) {
+            anyhow::bail!("{update}: a daemon handover waits until the update ends");
+        }
         self.replicas()
             .iter()
             .map(|replica| replica.engine_handoff())
@@ -493,7 +511,7 @@ impl Leader {
                 let starting = Arc::clone(&control);
                 let build = build.clone();
                 tokio::task::spawn_blocking(move || {
-                    let observer = Arc::new(crate::worlds::Observer::default());
+                    let observer = Arc::new(crate::observe::Observer::default());
                     let sink = stats_sink(model, Arc::clone(&observer), index);
                     let client = starting.start(spec.clone(), &build, sink)?;
                     spec.world = client.world();
@@ -577,24 +595,25 @@ impl Leader {
         world: u64,
     ) -> anyhow::Result<()> {
         let filled = crate::epoch::FilledPrograms::of(config);
-        // What a startup switch asks the Program Servers for is the
-        // scheduling policy alone: it installs no kernel. The engine resolves
-        // the kernel programs an operator needs when it loads them, so a
-        // `prepare` for every operator's package would refuse on a host that
-        // installs none, and the epoch's own record still names the whole
-        // deployment (`filled`).
-        let policy_only = crate::epoch::FilledPrograms {
-            kernels: std::collections::BTreeMap::new(),
-            policy: filled.policy.clone(),
-        };
+        // The startup switch installs the epoch's programs as its record names
+        // them: the scheduling policy *and* the kernel of every operator the
+        // deployment selects. A main process resolves no kernel itself — its
+        // backends are the installed programs, and a kernel it was never given
+        // fails the first request that needs it — so an epoch that prepared the
+        // policy alone serves its first token with nothing to run.
+        //
+        // A Program Server without a program for one of those operators refuses
+        // the epoch by name here, before it serves, which is the correct
+        // refusal: the deployment selects a backend whose package is not
+        // installed.
         let servers = self.program_servers(config);
         let leader_host = self.program_leader_host(config, &servers);
         let prepared = {
             let servers = servers.clone();
             let leader_host = leader_host.clone();
-            let policy_only = policy_only.clone();
+            let filled = filled.clone();
             tokio::task::spawn_blocking(move || {
-                crate::engine::control::prepare_epoch(&servers, &leader_host, &policy_only, &[])
+                crate::engine::control::prepare_epoch(&servers, &leader_host, &filled, &[])
             })
             .await
             .context("preparing the epoch's programs")?
@@ -620,9 +639,9 @@ impl Leader {
                 processes,
                 crate::epoch::Update::new(0, installed),
             );
-            // No kernel moves at a startup switch: it installs the
-            // scheduling policy the epoch serves with.
-            switch.precopy(&std::collections::BTreeMap::new(), &prepared.policy)?;
+            // The epoch's programs, kernels and policy alike: the main
+            // processes serve their first request with them.
+            switch.precopy(&prepared.kernels, &prepared.policy)?;
             switch.switchover()?;
             switch.commit()?;
             Ok::<_, crate::epoch::Failure>(switch.generations().to_vec())
@@ -642,6 +661,33 @@ impl Leader {
         // reports and a later update is routed against (§7.2, §7.4).
         // The first epoch of a daemon is epoch 0 (§7.4).
         let epoch = self.epochs().install(0, &deployment, world, &generations);
+        // The process table names every main process this daemon manages, and
+        // the serving one is the first (§7.4): a switch addresses the process it
+        // replaces by this generation, `GET /admin/config` lists it, and without
+        // the row a deployment started here looks like one with no main process
+        // at all — which is what an epoch switch refuses for.
+        if let Some(engine) = self
+            .replicas
+            .serving
+            .borrow()
+            .first()
+            .and_then(|replica| replica.hold().client())
+            .and_then(|client| client.engine())
+        {
+            let mut processes = self.epochs().processes();
+            processes.retain(|process| process.generation != engine);
+            processes.push(crate::epoch::ManagedProcess {
+                role: crate::epoch::Role::MainProcess,
+                group: crate::engine::control::ENGINE_GROUP.to_owned(),
+                rank: 0,
+                pid: None,
+                epoch: Some(world),
+                build: deployment.build_config.executable.clone(),
+                generation: engine,
+                state: crate::epoch::ProcessState::Serving,
+            });
+            self.epochs().set_processes(processes);
+        }
         tracing::info!(
             epoch,
             world,
@@ -766,7 +812,7 @@ impl Leader {
         control: Arc<EngineControl>,
         client: EngineClient,
         served: wire::EngineSpec,
-        observer: Arc<crate::worlds::Observer>,
+        observer: Arc<crate::observe::Observer>,
         updates: Arc<crate::updates::driver::Driver>,
     ) -> anyhow::Result<Self> {
         let Prepared {
@@ -924,7 +970,7 @@ impl Leader {
         images: MediaConnector,
         readout: Option<ReadoutEncoder>,
         options: &ServeConfig,
-        observer: Arc<crate::worlds::Observer>,
+        observer: Arc<crate::observe::Observer>,
         updates: Arc<crate::updates::driver::Driver>,
     ) -> Self {
         let logging = &options.logging_config;
@@ -960,11 +1006,9 @@ impl Leader {
                     .collect(),
             ),
             replacing: tokio::sync::Mutex::new(()),
-            pending: std::sync::Mutex::new(std::collections::VecDeque::new()),
-            group: std::sync::Mutex::new(None),
-            commit: std::sync::Mutex::new(None),
             adapters: Arc::clone(&adapters),
             schedulers,
+            updates: Arc::downgrade(&updates),
         });
         for replica in replicas.serving.borrow().iter() {
             replica.monitor();
@@ -1349,24 +1393,39 @@ impl Leader {
         &self,
         number: u64,
         target: &ServeConfig,
-        dry_run: bool,
         force: bool,
+        dry_run: bool,
     ) -> Result<Option<crate::epoch::Update>, UpdateError> {
-        // One update at a time (§7.2): an epoch switch replaces the very main
-        // processes a program-layer change would precopy into.
-        if self.updates.running() {
-            return Err(UpdateError::Refused(
-                "an epoch switch is running: one update at a time".to_owned(),
-            ));
-        }
-        // Nor does a program-layer change replace one that is still on
-        // probation: the epoch's last resort is the generation that served
-        // before it, and it stays so until the commit or the revert (§7.2,
-        // §7.3 step 4).
-        if self.epochs().program_in_flight() {
-            return Err(UpdateError::InProgress);
-        }
         let current = self.serving_config()?;
+        // One update at a time (§7.2, §7.4): an epoch switch and a program
+        // update are each the deployment's one update, and the program
+        // layer's callers reach this method directly as well as through the
+        // entry, so the check lives here. A dry run answers without touching
+        // the processes or the records the update in flight owns, which is
+        // what the entry does for the layers above (§7.2).
+        if !dry_run
+            && let Some(update) = crate::updates::in_flight(
+                self.updates.running(),
+                self.epochs().program_update().is_some(),
+            )
+        {
+            return Err(UpdateError::Refused(format!(
+                "another update is in flight: {update}"
+            )));
+        }
+        // A target that reverted with a failure is unavailable until it is
+        // applied with `force` (§7.2, §7.3 step 4), the program layer's as
+        // much as the epoch layer's.
+        if !force
+            && let Some(failure) = self
+                .epochs()
+                .unavailable(&crate::epoch::Deployment::of(target.clone()))
+        {
+            return Err(UpdateError::Refused(format!(
+                "the configuration reverted with a failure ({}); apply it again with force",
+                failure.reason
+            )));
+        }
         let Some(update) = self.route(&current, target, false).await? else {
             return Ok(None);
         };
@@ -1388,6 +1447,11 @@ impl Leader {
                     failure.reason
                 ))
             })?;
+        // The programs moved in place; a parked standby prepared from the old
+        // ones is replaced (§2.5).
+        for replica in self.replicas.serving.borrow().iter() {
+            replica.restart_standby();
+        }
         Ok(Some(recorded))
     }
 
@@ -1594,7 +1658,7 @@ pub(crate) struct EngineHandoff {
     pub(crate) asleep: bool,
     pub(crate) sleep_paused: bool,
     /// The configurations a rollback marked unavailable.
-    pub(crate) unavailable: Vec<crate::worlds::Unavailable>,
+    pub(crate) unavailable: Vec<crate::updates::epoch::Unavailable>,
 }
 
 /// What the leader serves, for `GET /admin/status`.
@@ -1751,7 +1815,7 @@ pub(crate) fn locked<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_
 }
 
 /// One independent replica's engine lifecycle and its
-/// worlds (`crate::worlds`).
+/// worlds (`crate::updates::entry`).
 pub(crate) struct Replica {
     pub(crate) registry: std::sync::Weak<Replicas>,
     pub(crate) ordinal: usize,
@@ -1780,23 +1844,31 @@ pub(crate) struct Replica {
     sleep_paused: AtomicBool,
     /// The LoRA adapters the workers hold, by name (`Leader::load_adapter`).
     pub(crate) adapters: Arc<std::sync::Mutex<BTreeMap<String, Adapter>>>,
-    /// The deployment's worlds: the executing one, a trial, a change in
-    /// progress and the configurations a rollback marked unavailable.
-    pub(crate) worlds: std::sync::Mutex<crate::worlds::WorldState>,
-    /// Every world's scheduler statistics, which a trial reads.
-    pub(crate) observer: Arc<crate::worlds::Observer>,
+    /// The engine that executes, and the configurations a rollback marked
+    /// unavailable.
+    pub(crate) worlds: std::sync::Mutex<crate::updates::entry::WorldState>,
+    /// Every engine's scheduler statistics, which the status reads.
+    pub(crate) observer: Arc<crate::observe::Observer>,
     /// The profiling session that runs, or the last that ended
     /// (`crate::profiling`).
     pub(crate) profiles: crate::profiling::Profiles,
     /// Numerical manifests reused when planning successor rank budgets.
     pub(crate) manifests: std::sync::Mutex<storage::manifest::Planner>,
+    /// The parked standby standing beside the serving engine (§2.5), if one is
+    /// live. Started by [`Replica::keep_standby`], taken by
+    /// [`Replica::promote_standby`].
+    pub(crate) standby: std::sync::Mutex<Option<Standby>>,
+    /// Serializes starting a standby: two callers that both saw none must not
+    /// both start a process, since a second engine of the same scope is a
+    /// whole copy of its device storage.
+    standby_starting: tokio::sync::Mutex<()>,
 }
 
 impl Replica {
     pub(crate) fn new(
         options: &ServeConfig,
         client: Arc<EngineClient>,
-        observer: Arc<crate::worlds::Observer>,
+        observer: Arc<crate::observe::Observer>,
         ordinal: usize,
         registry: std::sync::Weak<Replicas>,
         adapters: Arc<std::sync::Mutex<BTreeMap<String, Adapter>>>,
@@ -1816,13 +1888,15 @@ impl Replica {
             asleep: AtomicBool::new(false),
             sleep_paused: AtomicBool::new(false),
             adapters,
-            worlds: std::sync::Mutex::new(crate::worlds::WorldState {
+            worlds: std::sync::Mutex::new(crate::updates::entry::WorldState {
                 executing: client.world(),
                 ..Default::default()
             }),
             observer,
             profiles: crate::profiling::Profiles::default(),
             manifests: std::sync::Mutex::new(storage::manifest::Planner::default()),
+            standby: std::sync::Mutex::new(None),
+            standby_starting: tokio::sync::Mutex::new(()),
         });
         hold.serve(client);
         replica
@@ -1840,6 +1914,7 @@ impl Replica {
             .client()
             .expect("a constructed replica has its engine");
         tokio::spawn(watch_engine(Arc::clone(self), Arc::downgrade(&client)));
+        self.start_standby();
     }
 
     pub(crate) fn hold(&self) -> &Arc<RequestHold> {
@@ -1848,7 +1923,7 @@ impl Replica {
 
     /// Restarts the committed world while the caller owns its replacement
     /// lock. A pending commit must finish publication before calling this.
-    pub(crate) async fn recover(&self) -> anyhow::Result<Arc<EngineClient>> {
+    pub(crate) async fn recover(self: &Arc<Self>) -> anyhow::Result<Arc<EngineClient>> {
         let control = Arc::clone(
             self.control
                 .get()
@@ -1870,7 +1945,219 @@ impl Replica {
         reload_adapters(self, &client).await;
         self.hold.serve(Arc::clone(&client));
         info!("the relaunched engine serves");
+        self.start_standby();
         Ok(client)
+    }
+}
+
+/// Whether a replica keeps a standby (§2.5): the deployment reserved room for
+/// one (`worker_config.standby`), the replica's engine serves rather than being
+/// parked, draining or failing, and the world it executes is the world the
+/// deployment serves. A standby anywhere else is a second engine of a scope
+/// nothing routes to, or a copy of the device storage the serving engine needs.
+fn keeps_standby(wanted: bool, serving: EngineState, world_serves: bool) -> bool {
+    wanted && world_serves && serving == EngineState::Ready
+}
+
+/// A standby main process started beside this replica's serving engine (§2.5):
+/// a second process of the serving world, parked with its scope's storage
+/// claimed read-only, promoted in place when the serving engine is lost.
+pub(crate) struct Standby {
+    pub(crate) client: Arc<EngineClient>,
+    /// The launch generation the standby was started under, from the epoch
+    /// layer's one allocator.
+    pub(crate) generation: u64,
+}
+
+impl Replica {
+    /// Starts the standby in the background, if this replica serves and has
+    /// none. Errors are logged: a replica without a standby still serves, and a
+    /// loss then relaunches ([`Replica::recover`]) instead of promoting.
+    pub(crate) fn start_standby(self: &Arc<Self>) {
+        let replica = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(error) = replica.keep_standby().await {
+                warn!(
+                    model = %replica.model_name,
+                    "the standby could not be started: {error:#}"
+                );
+            }
+        });
+    }
+
+    /// Whether the world this replica's engine executes is still the world the
+    /// deployment serves. A switch moves service to its target through the
+    /// frontend, and the replica's own engine is then the drained previous
+    /// epoch's: it keeps no standby and is not promoted, because nothing routes
+    /// to it and a promoted process would be a second engine of a purged world.
+    fn serves_serving_epoch(&self) -> bool {
+        let Some(driver) = self
+            .registry
+            .upgrade()
+            .and_then(|registry| registry.updates.upgrade())
+        else {
+            return true;
+        };
+        let Some((_, record)) = driver.epochs().serving() else {
+            return true;
+        };
+        let Some(served) = locked(&self.served).as_ref().map(|spec| spec.world) else {
+            return true;
+        };
+        record.world == served
+    }
+
+    /// Ends the parked standby, if one is live: dropping its client closes the
+    /// control connection, which ends its process and releases the read-only
+    /// claim it holds on its world's storage.
+    pub(crate) fn drop_standby(&self) {
+        let dropped = { locked(&self.standby).take() };
+        if let Some(standby) = dropped {
+            info!(
+                generation = standby.generation,
+                "the standby is dropped: its world no longer serves"
+            );
+        }
+    }
+
+    /// Replaces the parked standby with one prepared from what the deployment
+    /// runs now: a program update moves the serving engine in place, and a
+    /// standby started before it holds the programs the update replaced. A
+    /// promoted standby would then serve kernels the epoch's record no longer
+    /// names, so the parked process is dropped and another started.
+    pub(crate) fn restart_standby(self: &Arc<Self>) {
+        // Dropping the parked client closes its control connection, which ends
+        // its process.
+        let replaced = { locked(&self.standby).take() };
+        drop(replaced);
+        self.start_standby();
+    }
+
+    /// Starts the standby that stands beside this replica's serving engine, if
+    /// one is wanted and none is live (§2.5).
+    ///
+    /// The standby stands by for the world the serving engine executes: it is
+    /// started under a number from the epoch layer's one allocator, claims the
+    /// scope's storage read-only (the launch file states the role), and parks
+    /// once it is prepared. A replica whose engine is itself parked, draining or
+    /// failing has no standby: there is nothing to stand beside.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the process cannot be started or does not report that it
+    /// stands by. The caller decides whether to retry.
+    pub(crate) async fn keep_standby(self: &Arc<Self>) -> anyhow::Result<()> {
+        // `worker_config.standby` decides whether a standby exists at all
+        // (§2.5): each standby rank holds a CUDA context, graph pools and
+        // workspaces of its own, and a deployment that has not reserved them
+        // cannot hold a second engine of the same scope.
+        let wanted = locked(&self.config).worker_config.standby;
+        if !wanted {
+            return Ok(());
+        }
+        let Some(control) = self.control.get().cloned() else {
+            return Ok(());
+        };
+        let _starting = self.standby_starting.lock().await;
+        let Some(serving) = self.hold.client() else {
+            return Ok(());
+        };
+        if !keeps_standby(wanted, serving.state(), self.serves_serving_epoch()) {
+            return Ok(());
+        }
+        {
+            let mut slot = locked(&self.standby);
+            match slot.as_ref().map(|standby| standby.client.state()) {
+                // A parked standby is the one this replica wants.
+                Some(EngineState::Standby) => return Ok(()),
+                // A standby that failed or ended is replaced: dropping the
+                // client closes its control connection, and its process ends.
+                Some(_) => *slot = None,
+                None => {}
+            }
+        }
+        let Some(mut spec) = locked(&self.served).clone() else {
+            return Ok(());
+        };
+        let Some(driver) = self
+            .registry
+            .upgrade()
+            .and_then(|registry| registry.updates.upgrade())
+        else {
+            return Ok(());
+        };
+        let epochs = Arc::clone(driver.epochs());
+        let generation = epochs.next_generation(crate::engine::control::ENGINE_GROUP, 0);
+        // The standby executes the serving engine's world: it maps that world's
+        // weights and its KV cache read-only, ready to be promoted into the same
+        // scope (§2.5). What a successor maps is the cache the serving engine
+        // holds **now**, not the segments it started with: a cache that grew or
+        // was resized since the launch would hand the standby units that are
+        // shorter than the ones it will be promoted into, and the failure would
+        // surface at promotion rather than here. `DescribeCache` is the same
+        // account the epoch switch's target is built from.
+        let segments = match serving.describe_cache().await {
+            Ok(segments) => segments,
+            Err(reason) => {
+                // No standby is better than one that maps the wrong units: the
+                // loss path relaunches the engine instead (`Replica::recover`).
+                warn!(
+                    model = %self.model_name,
+                    "the standby was not started: the serving engine did not describe its cache: {reason}"
+                );
+                return Ok(());
+            }
+        };
+        spec.predecessor = Some(wire::Predecessor {
+            world: spec.world,
+            segments,
+        });
+        let build = crate::epoch::BuildConfig::of(&locked(&self.config));
+        let sink = stats_sink(
+            self.model_name.clone(),
+            Arc::clone(&self.observer),
+            self.ordinal,
+        );
+        let client = Arc::new(
+            tokio::task::spawn_blocking(move || control.start_at(spec, generation, &build, sink))
+                .await??,
+        );
+        info!(
+            generation,
+            "the standby is prepared beside the serving engine"
+        );
+        *locked(&self.standby) = Some(Standby { client, generation });
+        Ok(())
+    }
+
+    /// Promotes the parked standby in place if this replica has one (§2.5), and
+    /// answers the client that now serves.
+    ///
+    /// The promoted process is the same process, with its graphs at their
+    /// addresses: it takes the storage its scope claimed read-only and serves
+    /// under the serving engine's world. A standby that cannot be promoted is
+    /// dropped, and the caller's loss path relaunches the engine instead.
+    pub(crate) async fn promote_standby(self: &Arc<Self>) -> Option<Arc<EngineClient>> {
+        let standby = locked(&self.standby).take()?;
+        self.hold.hold();
+        match standby.client.promote(Vec::new(), false, true).await {
+            Ok(()) => {
+                self.hold.serve(Arc::clone(&standby.client));
+                info!(
+                    generation = standby.generation,
+                    "the standby was promoted and serves"
+                );
+                self.start_standby();
+                Some(standby.client)
+            }
+            Err(error) => {
+                warn!(
+                    generation = standby.generation,
+                    "the standby could not be promoted: {error}; the engine is relaunched"
+                );
+                None
+            }
+        }
     }
 }
 
@@ -1881,9 +2168,27 @@ impl Replica {
     ///
     /// # Errors
     ///
+    /// Ends the parked standby this replica keeps, if it has one (§2.5).
+    ///
+    /// A standby is a process of its own: ending it here means nothing of this
+    /// replica's stays on the device after the daemon is gone, and a successor
+    /// daemon starts its own instead of adopting a process it never numbered.
+    /// Dropping the client closes the control connection, which the standby's
+    /// engine treats as the end of the process.
+    pub(crate) async fn end_standby(&self) {
+        let standby = { locked(&self.standby).take() };
+        if let Some(standby) = standby {
+            if let Err(error) = tokio::task::spawn_blocking(move || standby.client.shutdown()).await
+            {
+                warn!("the standby's shutdown did not complete: {error}");
+            }
+        }
+    }
+
     /// Fails when the blocking shutdown task does not complete, which happens
     /// only if it panics or its runtime is shutting down.
     pub(crate) async fn shutdown(&self) -> anyhow::Result<()> {
+        self.end_standby().await;
         let hold = self.hold();
         let client = hold.client();
         hold.close("the daemon is shutting down");
@@ -1922,15 +2227,6 @@ impl Replica {
     ///
     /// Fails when no engine this leader started serves.
     pub(crate) fn engine_handoff(&self) -> anyhow::Result<EngineHandoff> {
-        {
-            let worlds = locked(&self.worlds);
-            if let Some(trial) = &worlds.trial {
-                anyhow::bail!(
-                    "world {} is on trial: commit it or roll it back before the daemon restarts",
-                    trial.world
-                );
-            }
-        }
         let client = self
             .hold()
             .client()
@@ -1960,7 +2256,7 @@ impl Replica {
 
     /// Takes over the configurations a rollback marked unavailable on the
     /// leader a hot restart replaced.
-    pub(crate) fn adopt_unavailable(&self, unavailable: Vec<crate::worlds::Unavailable>) {
+    pub(crate) fn adopt_unavailable(&self, unavailable: Vec<crate::updates::epoch::Unavailable>) {
         let mut worlds = locked(&self.worlds);
         for mark in unavailable {
             worlds.unavailable.insert(mark.digest.clone(), mark);
@@ -2251,53 +2547,7 @@ pub(crate) async fn watch_engine(replica: Arc<Replica>, mut client: std::sync::W
         let Some(states) = client.upgrade().map(|client| client.states()) else {
             return;
         };
-        let reason = lost(states).await;
-        if let Some(registry) = replica.registry.upgrade() {
-            let world = locked(&replica.worlds).executing;
-            let group_trial = locked(&registry.group)
-                .as_ref()
-                .is_some_and(|trial| trial.contains(world));
-            if group_trial {
-                let _deployment = registry.replacing.lock().await;
-                if !client
-                    .upgrade()
-                    .is_some_and(|client| replica.hold.serves(&client))
-                {
-                    return;
-                }
-                if locked(&registry.group)
-                    .as_ref()
-                    .is_some_and(|trial| trial.contains(world))
-                {
-                    if let Err(error) = crate::worlds::group::rollback(&registry, reason).await {
-                        tracing::error!(%error, "the group rollback failed");
-                    }
-                    return;
-                }
-            }
-            let committing = locked(&registry.commit)
-                .as_ref()
-                .is_some_and(|decision| decision.pending.contains(&world));
-            if committing {
-                let _deployment = registry.replacing.lock().await;
-                if !client
-                    .upgrade()
-                    .is_some_and(|client| replica.hold.serves(&client))
-                {
-                    return;
-                }
-                if locked(&registry.commit)
-                    .as_ref()
-                    .is_some_and(|decision| decision.pending.contains(&world))
-                {
-                    replica.hold.hold();
-                    if let Err(error) = crate::worlds::complete_commit(&registry).await {
-                        tracing::error!(%error, world, "commit and engine recovery remain pending");
-                    }
-                    return;
-                }
-            }
-        }
+        let reason = lost(states, &replica).await;
         let _replacing = replica.replacing.lock().await;
         let Some(lost_client) = client.upgrade() else {
             return;
@@ -2305,21 +2555,40 @@ pub(crate) async fn watch_engine(replica: Arc<Replica>, mut client: std::sync::W
         if !replica.hold.serves(&lost_client) {
             return;
         }
-        // A world on trial is not relaunched: the deployment rolls back to
-        // the previous world, with the reason naming the world as the
-        // trial's own watch names it, whichever notices the loss first.
-        let world = lost_client.world();
-        let on_trial = locked(&replica.worlds)
-            .trial
-            .as_ref()
-            .is_some_and(|trial| trial.world == world);
         drop(lost_client);
-        if on_trial {
-            let reason = format!("world {world} lost its engine: {reason}");
-            if let Err(error) = crate::worlds::rollback(&replica, reason).await {
-                tracing::error!("the rollback failed: {error:#}");
-            }
+        // Once the switch's target serves, the engine this replica lost is
+        // the target's: the switch judges its death itself and reverts to the
+        // previous epoch, and a relaunch from here would start the target
+        // again from a `served` spec the switch is in the middle of reverting.
+        // Before the switchover the lost engine is the previous epoch's, which
+        // a relaunch restores as any loss does.
+        if let Some(registry) = replica.registry.upgrade()
+            && let Some(updates) = registry.updates.upgrade()
+            && updates.phase().is_some_and(|phase| {
+                matches!(
+                    phase,
+                    crate::updates::switch::Phase::Serving
+                        | crate::updates::switch::Phase::Probation
+                        | crate::updates::switch::Phase::Committing
+                        | crate::updates::switch::Phase::Reverting
+                )
+            })
+        {
+            tracing::error!(
+                %reason,
+                "the engine was lost while the switch's target served; the switch reverts"
+            );
             return;
+        }
+        // A world the deployment no longer serves is relaunched, not promoted:
+        // the frontend serves another epoch, and a revert to this one has to
+        // find its engine alive.
+        if replica.serves_serving_epoch()
+            && let Some(promoted) = replica.promote_standby().await
+        {
+            tracing::info!(%reason, "the standby promoted in place; it serves");
+            client = Arc::downgrade(&promoted);
+            continue;
         }
         tracing::error!(%reason, "the engine was lost; starting another");
         match replica.recover().await {
@@ -2338,11 +2607,19 @@ pub(crate) async fn watch_engine(replica: Arc<Replica>, mut client: std::sync::W
 }
 
 /// Waits until the engine whose states `states` observes stops serving,
-/// and returns why. A draining or standing-by engine is no loss.
-async fn lost(mut states: watch::Receiver<EngineState>) -> String {
+/// and returns why. A draining or standing-by engine is no loss — but a world
+/// the deployment stops serving keeps no standby, and a parked engine is the
+/// first moment the watcher learns the switch drained it: the standby's
+/// read-only claim on that world would outlive the purge that frees it.
+async fn lost(mut states: watch::Receiver<EngineState>, replica: &Replica) -> String {
     loop {
         match states.borrow_and_update().clone() {
-            EngineState::Ready | EngineState::Parked | EngineState::Standby => {}
+            EngineState::Parked | EngineState::Standby => {
+                if !replica.serves_serving_epoch() {
+                    replica.drop_standby();
+                }
+            }
+            EngineState::Ready => {}
             EngineState::Failed(error) => return format!("the engine failed: {error}"),
             EngineState::Closed => return "the engine process ended".to_owned(),
         }
@@ -2428,7 +2705,7 @@ mod tests {
     };
     use proto::request::{ImageParams, SamplingParams};
 
-    use super::Leader;
+    use super::{EngineState, Leader, keeps_standby};
     use crate::input::GenerateRequest;
     use crate::model::ModelParameters;
     use crate::openai::ChatCompletionRequest;
@@ -2934,5 +3211,29 @@ mod tests {
             &spec(scheduling("priority", 128, None, 128)),
             Some(&capacity)
         ));
+    }
+
+    /// A standby exists only where the deployment reserved room for one and the
+    /// replica's world is the world the deployment serves (§2.5). Each of the
+    /// three conditions is a whole engine's device storage when it is wrong.
+    #[test]
+    fn a_standby_exists_only_where_the_deployment_reserved_one_and_the_world_serves() {
+        assert!(keeps_standby(true, EngineState::Ready, true));
+        // Nothing reserved: a second engine would take the serving engine's
+        // memory, so the deployment asks for none.
+        assert!(!keeps_standby(false, EngineState::Ready, true));
+        // A parked, standing-by, failed or closed engine has nothing to stand
+        // beside, and a standby of a standby is a third copy.
+        assert!(!keeps_standby(true, EngineState::Parked, true));
+        assert!(!keeps_standby(true, EngineState::Standby, true));
+        assert!(!keeps_standby(
+            true,
+            EngineState::Failed("a fatal fault".into()),
+            true
+        ));
+        assert!(!keeps_standby(true, EngineState::Closed, true));
+        // A world a switch replaced keeps no standby: nothing routes to it, and
+        // its read-only claim would outlive the purge.
+        assert!(!keeps_standby(true, EngineState::Ready, false));
     }
 }

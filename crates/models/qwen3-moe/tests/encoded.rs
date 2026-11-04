@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use nn::weights::{RetainedWeights, WeightKey};
+use nn::weights::{Nvfp4Names, RetainedWeights, WeightKey};
 use nn::{
     Backing, Checkpoint, DType, DevicePtr, Shape, WeightLayout, WeightLoader,
     weights::WeightRequest,
@@ -206,7 +206,12 @@ fn a_two_expert_encoded_stack_is_joined_expert_major_with_its_three_fields() {
             "model.layers.0.mlp.experts",
             &["up", "gate"],
             EXPERTS,
+            Nvfp4Names::vllm(),
+            nn::weights::ValueLayout::Shuffled {
+                epilogue_tile_m: 128,
+            },
             ScaleLayout::Linear,
+            false,
         )
         .expect("a two-expert encoded stack loads");
 
@@ -267,7 +272,12 @@ fn a_packed_field_that_is_not_u8_is_refused_by_name() {
             "model.layers.0.mlp.experts",
             &["up"],
             EXPERTS,
+            Nvfp4Names::vllm(),
+            nn::weights::ValueLayout::Shuffled {
+                epilogue_tile_m: 128,
+            },
             ScaleLayout::Linear,
+            false,
         )
         .unwrap_err();
     assert!(format!("{error}").contains("up_proj.weight"), "{error}");
@@ -291,7 +301,12 @@ fn a_stack_whose_experts_declare_different_scale_types_is_refused() {
             "model.layers.0.mlp.experts",
             &["up"],
             EXPERTS,
+            Nvfp4Names::vllm(),
+            nn::weights::ValueLayout::Shuffled {
+                epilogue_tile_m: 128,
+            },
             ScaleLayout::Linear,
+            false,
         )
         .unwrap_err();
     let message = format!("{error}");
@@ -310,7 +325,12 @@ fn a_projection_the_shard_does_not_hold_is_refused_by_name() {
             "model.layers.0.mlp.experts",
             &["down"],
             EXPERTS,
+            Nvfp4Names::vllm(),
+            nn::weights::ValueLayout::Shuffled {
+                epilogue_tile_m: 128,
+            },
             ScaleLayout::Linear,
+            false,
         )
         .unwrap_err();
     assert!(format!("{error}").contains("down"), "{error}");

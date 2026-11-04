@@ -468,10 +468,12 @@ mod tests {
 
     #[test]
     fn a_dmd_ladder_keeps_one_evaluation_per_rung_though_two_round_together() {
-        // Two rungs a nanosecond apart under a strong shift collapse to one FP32 sigma. The reference
-        // keeps both (`schedule.py:154-174`): a ladder's length is its evaluations, and it must match
-        // the checkpoint's fused per-step head tables, so a collapse would misalign every step.
-        let spec = ScheduleSpec::dmd(vec![999_999_999, 1_000_000_000], 1_000_000_000.0, shifts())
+        // Two rungs one part in a billion apart under a strong shift collapse to one FP32 sigma. The
+        // reference keeps both (`schedule.py:154-174`): a ladder's length is its evaluations, and it
+        // must match the checkpoint's fused per-step head tables, so a collapse would misalign every
+        // step. The rungs descend, as a ladder's must - the collapse is in the shifted sigmas, not in
+        // the rungs.
+        let spec = ScheduleSpec::dmd(vec![1_000_000_000, 999_999_999], 1_000_000_000.0, shifts())
             .expect("a ladder of two rungs");
         let schedule = Schedule::new(&spec).expect("a ladder of two rungs");
         let video = schedule.sigmas(Modality::Video);

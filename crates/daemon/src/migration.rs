@@ -1130,6 +1130,22 @@ mod tests {
         Recompute,
     }
 
+    /// How long a wait in an image test may last before it is a stall.
+    ///
+    /// Every step of these tests is driven by the test itself and a simulated
+    /// engine answers at once, so a wait that outlives this is a defect: it
+    /// must name the wait it was in rather than consume the run's summary.
+    const STALL: Duration = Duration::from_secs(30);
+
+    /// Awaits `wait`, failing the test when `what` does not answer in
+    /// [`STALL`].
+    async fn within<F: std::future::Future>(what: &str, wait: F) -> F::Output {
+        match tokio::time::timeout(STALL, wait).await {
+            Ok(value) => value,
+            Err(_) => panic!("{what} did not answer within {} s", STALL.as_secs()),
+        }
+    }
+
     /// An interleaved request preempted at `phase` by `preemption` resumes
     /// where it was and completes as one stream: each image and token once,
     /// images numbered in order, each image's start and steps read once,
@@ -1153,19 +1169,23 @@ mod tests {
 
         let hold = Arc::new(RequestHold::new());
         hold.serve(Arc::clone(&whole));
-        let (mut events, _) = Migrator::new(hold, 0)
-            .submit(Request::Generation(Box::new(request.clone())))
-            .await
-            .unwrap();
+        let (mut events, _) = within(
+            "the migrator's first submit",
+            Migrator::new(hold, 0).submit(Request::Generation(Box::new(request.clone()))),
+        )
+        .await
+        .unwrap();
         let mut expected = Read::default();
         expected.finish(&mut events).await;
 
         let hold = Arc::new(RequestHold::new());
         hold.serve(Arc::clone(&first));
-        let (mut events, _) = Migrator::new(Arc::clone(&hold), 0)
-            .submit(Request::Generation(Box::new(request)))
-            .await
-            .unwrap();
+        let (mut events, _) = within(
+            "the migrator's second submit",
+            Migrator::new(Arc::clone(&hold), 0).submit(Request::Generation(Box::new(request))),
+        )
+        .await
+        .unwrap();
         let mut read = Read::default();
         advance(&mut events, &pace, phase, &mut read).await;
         let tokens_read = read.tokens.clone();
@@ -1184,7 +1204,10 @@ mod tests {
                 };
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 drop(pace);
-                parking.await.unwrap().unwrap();
+                within("the park", parking)
+                    .await
+                    .expect("the park task")
+                    .expect("the park");
                 (second_log, Some(resumed_id))
             }
             Preemption::Recompute => {
@@ -1201,7 +1224,10 @@ mod tests {
                 };
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 drop(pace);
-                updating.await.unwrap().unwrap();
+                within("the weight update", updating)
+                    .await
+                    .expect("the weight update's task")
+                    .expect("the weight update");
                 (first_log.clone(), None)
             }
             Preemption::Sleep => {
@@ -1211,8 +1237,13 @@ mod tests {
                 };
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 drop(pace);
-                sleeping.await.unwrap().unwrap();
-                first.resize_cache(wire::CacheChange::Wake).await.unwrap();
+                within("the sleep", sleeping)
+                    .await
+                    .expect("the sleep's task")
+                    .expect("the sleep");
+                within("the wake", first.resize_cache(wire::CacheChange::Wake))
+                    .await
+                    .unwrap();
                 (first_log.clone(), None)
             }
         };

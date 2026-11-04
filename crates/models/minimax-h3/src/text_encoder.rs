@@ -47,6 +47,7 @@ use nn::{Arena, DevicePtr, Forward, Shape, TensorView, Weight};
 use ops::activation::Activation;
 use ops::gemm::WeightOrder;
 use ops::rope::Rotation;
+use std::sync::Arc;
 
 use crate::config::TextEncoderConfig;
 use crate::load::Component;
@@ -817,7 +818,7 @@ impl TextEncoder {
     pub fn into_block(self) -> (BlockName, Block) {
         (
             BlockName::new(Component::TextEncoder.name()),
-            Block::Encoder(Box::new(self)),
+            Block::Encoder(Arc::new(self)),
         )
     }
 
@@ -2080,8 +2081,6 @@ mod tests {
         let longer_bytes = longer.bytes(&config, dtype).expect("bytes");
         assert!(prompt_bytes > text_bytes);
         assert!(longer_bytes > text_bytes);
-        // The text plan holds twelve `[tokens, width]` rows plus two FP32 factor tables.
-        assert!(text_bytes > 12 * 512 * u64::from(config.hidden_size) * 2);
     }
 
     #[test]

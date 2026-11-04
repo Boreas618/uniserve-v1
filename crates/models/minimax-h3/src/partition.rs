@@ -38,6 +38,9 @@ pub enum Component {
     AudioDecoder,
     /// Both condition encoders, which `ref2va` uses.
     LatentEncoder,
+    /// The video postprocessor: the clip splice. Holds no weights, so it names no checkpoint directory and
+    /// its block is a [`nn::Block::Decoder`] whose operation is the splice rather than a decode.
+    VideoPostprocessor,
 }
 
 impl Component {
@@ -50,17 +53,19 @@ impl Component {
             Self::VideoDecoder => 3,
             Self::AudioDecoder => 4,
             Self::LatentEncoder => 5,
+            Self::VideoPostprocessor => 6,
         }
     }
 
     /// Every component a deployment may place.
-    pub const ALL: [Component; 6] = [
+    pub const ALL: [Component; 7] = [
         Component::TextEncoder,
         Component::Transformer,
         Component::TransformerRef,
         Component::VideoDecoder,
         Component::AudioDecoder,
         Component::LatentEncoder,
+        Component::VideoPostprocessor,
     ];
 
     /// The component's name in the checkpoint and in a deployment file.
@@ -75,6 +80,7 @@ impl Component {
             Self::VideoDecoder => "video_decoder",
             Self::AudioDecoder => "audio_decoder",
             Self::LatentEncoder => "latent_encoder",
+            Self::VideoPostprocessor => "video_postprocessor",
         }
     }
 
@@ -90,6 +96,9 @@ impl Component {
             Self::VideoDecoder => &["vae"],
             Self::AudioDecoder => &["audio_vae"],
             Self::LatentEncoder => &["vae", "audio_vae"],
+            // The postprocessor holds no weights: its arithmetic is the splice, and the constants it reads
+            // are the ImageNet means and standard deviations the reference hard-codes.
+            Self::VideoPostprocessor => &[],
         }
     }
 
@@ -105,7 +114,8 @@ impl Component {
     /// the blocks beside them and no conversion is made for them.
     pub const fn activation(self) -> DType {
         match self {
-            Self::VideoDecoder => DType::F16,
+            // The postprocessor reads and writes the video decoder's rasters, so it holds their element type.
+            Self::VideoDecoder | Self::VideoPostprocessor => DType::F16,
             Self::TextEncoder
             | Self::Transformer
             | Self::TransformerRef
@@ -127,6 +137,7 @@ impl Component {
             Self::VideoDecoder => "video_decoder",
             Self::AudioDecoder => "audio_decoder",
             Self::LatentEncoder => "latent_encoder",
+            Self::VideoPostprocessor => "video_postprocessor",
         }
     }
 
@@ -275,6 +286,15 @@ pub struct Partition {
     pub tensor_parallel: usize,
     /// This rank's position in the text encoder's tensor-parallel group.
     pub tensor_rank: usize,
+    /// This rank's position in the **denoiser's** Ulysses group.
+    ///
+    /// A second, independent rank: the text encoder's tensor shard and the denoiser's sequence shard
+    /// are different groups, and a deployment may shard one and not the other. The denoiser's rank
+    /// decides which slice of the initial noise stream it draws and which shard of the packed rows it
+    /// writes, so a deployment that split the sequence and left this at zero would have every rank
+    /// draw and write the same shard - a whole video, self-consistent, and not the one the reference
+    /// makes.
+    pub sequence_rank: usize,
     /// The blocks this rank places.
     ///
     /// A base release holds both DiT partitions and a deployment places one; a rank that places
@@ -302,9 +322,22 @@ impl Partition {
             ulysses_degree: 1,
             tensor_parallel: 1,
             tensor_rank: 0,
+            sequence_rank: 0,
             blocks: Components::ALL.without(Component::TransformerRef),
             text_rows: RELEASED_TEXT_ROWS,
             condition_rows: RELEASED_CONDITION_ROWS,
+        }
+    }
+
+    /// The same partition, placed at `rank` of the denoiser's sequence group.
+    ///
+    /// A builder rather than another positional `usize` on [`Self::new`] and [`Self::serving`]: those
+    /// already take the text encoder's degree and rank, and two adjacent integers of the same type
+    /// with different meanings is how a deployment ends up sharded one way and drawing the other.
+    pub fn at_sequence_rank(self, rank: usize) -> Self {
+        Self {
+            sequence_rank: rank,
+            ..self
         }
     }
 
@@ -317,12 +350,15 @@ impl Partition {
     /// The decoders are placed for every task, because every task returns video and audio. The
     /// condition encoders are placed for the tasks that carry conditions - `fl2va`'s keyframes and
     /// `ref2va`'s references and keyframes - and not for `t2va`, whose request has none.
+    /// `sequence_rank` is this rank's place in the denoiser's Ulysses group; it is not the text
+    /// encoder's (`tensor_rank`), and a deployment must state both.
     pub fn serving(
         config: &Config,
         task: VideoTask,
         ulysses_degree: usize,
         tensor_parallel: usize,
         tensor_rank: usize,
+        sequence_rank: usize,
     ) -> Result<Self> {
         let dit = TASK_DITS
             .iter()
@@ -355,8 +391,14 @@ impl Partition {
         ) {
             blocks = blocks.with(Component::LatentEncoder);
         }
-        let partition =
-            Self::new(config, ulysses_degree, tensor_parallel, tensor_rank)?.placing(blocks);
+        let partition = Self::new(
+            config,
+            ulysses_degree,
+            tensor_parallel,
+            tensor_rank,
+            sequence_rank,
+        )?
+        .placing(blocks);
         partition.validate(config)?;
         Ok(partition)
     }
@@ -393,16 +435,22 @@ impl Partition {
     }
 
     /// A deployment's partition, checked against the checkpoint's head counts.
+    ///
+    /// `tensor_rank` and `sequence_rank` are two different groups' positions, and both are stated: a
+    /// deployment that sharded the denoiser's sequence and named only the text encoder's rank would
+    /// have every rank draw the same noise.
     pub fn new(
         config: &Config,
         ulysses_degree: usize,
         tensor_parallel: usize,
         tensor_rank: usize,
+        sequence_rank: usize,
     ) -> Result<Self> {
         let partition = Self {
             ulysses_degree,
             tensor_parallel,
             tensor_rank,
+            sequence_rank,
             blocks: Components::ALL.without(Component::TransformerRef),
             text_rows: RELEASED_TEXT_ROWS,
             condition_rows: RELEASED_CONDITION_ROWS,
@@ -423,6 +471,12 @@ impl Partition {
                 "partition degrees must be positive".to_owned(),
             ));
         }
+        if self.sequence_rank >= self.ulysses_degree {
+            return Err(Error::config(format!(
+                "the denoiser's rank {} is outside its Ulysses degree {}",
+                self.sequence_rank, self.ulysses_degree
+            )));
+        }
         if !self.ulysses_degree.is_power_of_two() {
             return Err(Error::config(format!(
                 "the Ulysses degree {} is not a power of two",
@@ -436,6 +490,20 @@ impl Partition {
         {
             return Err(Error::config(
                 "a rank cannot hold both the base and the reference denoiser: they are one block"
+                    .to_owned(),
+            ));
+        }
+        // The two condition encoders are the `Denoiser` block's own half - it runs them in
+        // `prepare_conditioning`, once per request - so a rank that claims their directories must
+        // hold a DiT to run them, and a partition that claimed the VAEs with no denoiser would load
+        // weights nothing could use.
+        if self.blocks.contains(Component::LatentEncoder)
+            && !self.blocks.contains(Component::Transformer)
+            && !self.blocks.contains(Component::TransformerRef)
+        {
+            return Err(Error::config(
+                "a rank cannot hold the condition encoders without a denoiser: they are its \
+                 conditioning half"
                     .to_owned(),
             ));
         }
@@ -535,7 +603,7 @@ mod tests {
     #[test]
     fn four_way_ulysses_and_text_tensor_parallelism_split_the_heads() {
         let config = config();
-        let partition = Partition::new(&config, 4, 4, 2).expect("four ranks");
+        let partition = Partition::new(&config, 4, 4, 2, 0).expect("four ranks");
         assert_eq!(partition.denoiser_heads(56), 14);
         assert_eq!(partition.text_query_heads(&config), 16);
         assert_eq!(partition.text_key_value_heads(&config), 2);
@@ -544,30 +612,48 @@ mod tests {
     #[test]
     fn eight_way_ulysses_splits_fifty_six_heads_into_seven() {
         let config = config();
-        let partition = Partition::new(&config, 8, 8, 0).expect("eight ranks");
+        let partition = Partition::new(&config, 8, 8, 0, 0).expect("eight ranks");
         assert_eq!(partition.denoiser_heads(56), 7);
         assert_eq!(partition.tensor_rank, 0);
     }
 
     #[test]
+    fn the_condition_encoders_cannot_be_placed_without_a_denoiser() {
+        // They are the denoiser's conditioning half, so a rank that claims their two checkpoint
+        // directories must hold the DiT that runs them; otherwise it loads weights nothing uses.
+        let config = config();
+        let mut alone = Partition::single();
+        alone.blocks = Components::of([Component::LatentEncoder]);
+        let error = alone.validate(&config).expect_err("no denoiser");
+        assert!(format!("{error}").contains("conditioning half"), "{error}");
+
+        // With a denoiser beside them the same partition validates, which is the placement the
+        // deployment actually uses.
+        let mut together = alone;
+        together.blocks = together.blocks.with(Component::Transformer);
+        together.validate(&config).expect("a denoiser beside them");
+    }
+
+    #[test]
     fn a_partition_that_does_not_divide_the_heads_is_refused() {
         let config = config();
-        let error = Partition::new(&config, 3, 4, 0).expect_err("three is not a power of two");
+        let error = Partition::new(&config, 3, 4, 0, 0).expect_err("three is not a power of two");
         assert!(
             matches!(error, Error::Config(ref problem) if problem.contains("power of two")),
             "{error}"
         );
-        let error = Partition::new(&config, 5, 1, 0).expect_err("five does not divide 56");
+        let error = Partition::new(&config, 5, 1, 0, 0).expect_err("five does not divide 56");
         assert!(
             matches!(error, Error::Config(ref problem) if problem.contains("Ulysses")),
             "{error}"
         );
-        let error = Partition::new(&config, 1, 3, 0).expect_err("three does not divide 64 heads");
+        let error =
+            Partition::new(&config, 1, 3, 0, 0).expect_err("three does not divide 64 heads");
         assert!(
             matches!(error, Error::Config(ref problem) if problem.contains("query heads")),
             "{error}"
         );
-        let error = Partition::new(&config, 1, 1, 1).expect_err("rank outside the degree");
+        let error = Partition::new(&config, 1, 1, 1, 0).expect_err("rank outside the degree");
         assert!(
             matches!(error, Error::Config(ref problem) if problem.contains("outside")),
             "{error}"
@@ -635,11 +721,33 @@ mod tests {
     }
 
     #[test]
+    fn the_sequence_rank_is_the_denoisers_and_not_the_encoders() {
+        let config = config();
+        // One tensor shard over two sequence shards: every rank's `tensor_rank` is 0, and the
+        // partition still tells the two ranks apart - which is what the denoiser's draw offsets and
+        // row shards are counted from.
+        let first = Partition::serving(&config, VideoTask::TextToVideoAudio, 2, 1, 0, 0)
+            .expect("two ranks");
+        let second = first.at_sequence_rank(1);
+        assert_eq!(first.tensor_rank, second.tensor_rank);
+        assert_eq!(first.ulysses_degree, second.ulysses_degree);
+        assert_ne!(first.sequence_rank, second.sequence_rank);
+        first.validate(&config).expect("the first rank");
+        second.validate(&config).expect("the second rank");
+
+        // A rank outside its own degree is refused rather than drawn as another rank's.
+        let outside = first.at_sequence_rank(2);
+        let refused = outside.validate(&config).expect_err("outside the degree");
+        assert!(refused.to_string().contains("denoiser's rank"), "{refused}");
+    }
+
+    #[test]
     fn a_deployment_places_one_denoiser_and_the_encoders_its_task_needs() {
         let config = config();
 
         // `t2va` carries no conditions, so it needs no condition encoder.
-        let t2va = Partition::serving(&config, VideoTask::TextToVideoAudio, 1, 1, 0).expect("t2va");
+        let t2va =
+            Partition::serving(&config, VideoTask::TextToVideoAudio, 1, 1, 0, 0).expect("t2va");
         assert_eq!(
             t2va.blocks,
             Components::of([
@@ -651,15 +759,15 @@ mod tests {
         );
 
         // A keyframe is a condition unit, so `fl2va` runs the encoders; it shares `t2va`'s DiT.
-        let fl2va =
-            Partition::serving(&config, VideoTask::FirstLastToVideoAudio, 1, 1, 0).expect("fl2va");
+        let fl2va = Partition::serving(&config, VideoTask::FirstLastToVideoAudio, 1, 1, 0, 0)
+            .expect("fl2va");
         assert!(fl2va.blocks.contains(Component::LatentEncoder));
         assert!(fl2va.blocks.contains(Component::Transformer));
         assert!(!fl2va.blocks.contains(Component::TransformerRef));
 
         // `ref2va` is the reference partition, and its references and keyframes need the encoders.
-        let ref2va =
-            Partition::serving(&config, VideoTask::ReferenceToVideoAudio, 1, 1, 0).expect("ref2va");
+        let ref2va = Partition::serving(&config, VideoTask::ReferenceToVideoAudio, 1, 1, 0, 0)
+            .expect("ref2va");
         assert!(ref2va.blocks.contains(Component::TransformerRef));
         assert!(!ref2va.blocks.contains(Component::Transformer));
         assert!(ref2va.blocks.contains(Component::LatentEncoder));
@@ -673,10 +781,10 @@ mod tests {
             .denoisers
             .remove(&crate::checkpoint::Dit::Base)
             .expect("the base partition");
-        let error = Partition::serving(&config, VideoTask::TextToVideoAudio, 1, 1, 0)
+        let error = Partition::serving(&config, VideoTask::TextToVideoAudio, 1, 1, 0, 0)
             .expect_err("no transformer");
         assert!(error.to_string().contains("transformer"), "{error}");
-        Partition::serving(&config, VideoTask::ReferenceToVideoAudio, 1, 1, 0)
+        Partition::serving(&config, VideoTask::ReferenceToVideoAudio, 1, 1, 0, 0)
             .expect("the reference partition is held");
     }
 }

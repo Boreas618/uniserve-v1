@@ -436,7 +436,6 @@ impl RequestStats {
             outcome: RequestOutcome::new(labels, started, log),
         }
     }
-
 }
 
 impl RequestOutcome {
