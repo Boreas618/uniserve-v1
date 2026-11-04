@@ -232,6 +232,61 @@ descriptors = { dimensions = { dtype = ["bf16"], head_dim = ["128"] } }
 }
 
 #[test]
+fn a_scheduling_policy_is_a_wasm_package_without_metadata_or_entry() {
+    let text = r#"
+op = "scheduling"
+backend = "fcfs"
+
+[toolchain]
+kind = "wasm"
+version = "wasmtime-31"
+
+[module]
+form = "wasm"
+
+[source]
+kind = "wasm"
+files = ["src/lib.rs"]
+
+[kernel]
+architectures = ["wasm32"]
+descriptors = { keys = ["default"] }
+"#;
+    let root = package(text, &["src/lib.rs"]);
+    let manifest = Manifest::load(root.path()).unwrap();
+    assert_eq!(manifest.module.form, ModuleForm::Wasm);
+    assert!(manifest.module.metadata.is_none());
+    assert!(manifest.module.entry.is_none());
+    assert!(manifest.kernel.descriptors.covers("default"));
+}
+
+#[test]
+fn a_wasm_module_with_a_c_entry_is_refused() {
+    let text = r#"
+op = "scheduling"
+backend = "fcfs"
+
+[toolchain]
+kind = "wasm"
+version = "wasmtime-31"
+
+[module]
+form = "wasm"
+entry = "uniserve_fcfs"
+
+[source]
+kind = "wasm"
+files = ["src/lib.rs"]
+
+[kernel]
+architectures = ["wasm32"]
+descriptors = { keys = ["default"] }
+"#;
+    let root = package(text, &["src/lib.rs"]);
+    assert!(Manifest::load(root.path()).is_err());
+}
+
+#[test]
 fn a_package_missing_its_manifest_is_refused() {
     let root: PathBuf = tempfile::tempdir().unwrap().keep();
     assert!(Manifest::load(Path::new(&root)).is_err());

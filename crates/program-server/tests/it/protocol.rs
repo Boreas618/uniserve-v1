@@ -273,6 +273,63 @@ fn a_listing_names_the_packages_revisions_and_modules() {
 }
 
 #[test]
+fn a_listing_names_a_policy_module_as_a_wasm_module() {
+    let mut client = server_on(|connection| {
+        let _ = connection.receive::<wire::Request>().unwrap();
+        connection
+            .send(
+                &wire::ServerMessage {
+                    message: Some(wire::server_message::Message::Listing(wire::Listing {
+                        packages: vec![wire::ListedPackage {
+                            op: "scheduling".into(),
+                            backend: "fcfs".into(),
+                            revision: 1,
+                            modules: vec![wire::ListedModule {
+                                target: "wasm32".into(),
+                                descriptor: "default".into(),
+                                form: wire::ModuleForm::Wasm as i32,
+                            }],
+                        }],
+                    })),
+                },
+                &[],
+            )
+            .unwrap();
+    });
+
+    let listing = client.list().unwrap();
+    assert_eq!(listing.packages[0].modules[0].form, ModuleForm::Wasm);
+}
+
+#[test]
+fn a_listed_module_of_an_unknown_form_is_refused_rather_than_guessed() {
+    let mut client = server_on(|connection| {
+        let _ = connection.receive::<wire::Request>().unwrap();
+        connection
+            .send(
+                &wire::ServerMessage {
+                    message: Some(wire::server_message::Message::Listing(wire::Listing {
+                        packages: vec![wire::ListedPackage {
+                            op: "rms_norm".into(),
+                            backend: "triton".into(),
+                            revision: 1,
+                            modules: vec![wire::ListedModule {
+                                target: "sm_100a".into(),
+                                descriptor: "dtype_bf16".into(),
+                                form: 99,
+                            }],
+                        }],
+                    })),
+                },
+                &[],
+            )
+            .unwrap();
+    });
+
+    assert!(matches!(client.list(), Err(Error::Protocol(_))));
+}
+
+#[test]
 fn the_protocol_speaks_phases_and_arguments_of_its_own_vocabulary() {
     // The wire's phases map onto the record's, and arguments travel as a
     // TOML table, so a program's types survive the connection.

@@ -57,6 +57,11 @@ pub enum ModuleForm {
     /// A native library with a C ABI, loaded with `dlopen`. The package's
     /// host code builds the launches, the TMA descriptors and the grid.
     Native,
+    /// A wasm32 program precompiled for this host's CPU, which wasmtime
+    /// loads. A scheduling policy is such a program (design section 5.3); it
+    /// is a flat byte blob, not a kernel, so it has neither launch metadata
+    /// nor a C entry.
+    Wasm,
 }
 
 /// A kind of source: what compiles a package's files into a module.
@@ -365,6 +370,11 @@ impl Manifest {
         if self.module.form == ModuleForm::Native && self.module.entry.is_none() {
             return Err(ManifestError::Invalid(
                 "a native module must name its C entry".into(),
+            ));
+        }
+        if self.module.form == ModuleForm::Wasm && self.module.entry.is_some() {
+            return Err(ManifestError::Invalid(
+                "a wasm module has no C entry; it is a precompiled module, not a library".into(),
             ));
         }
         Ok(())
