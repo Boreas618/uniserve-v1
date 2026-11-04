@@ -55,6 +55,20 @@ use crate::model::{ModelConfig, ModelParameters};
 use crate::options::{ReasoningParser, ServeConfig, Stated};
 use crate::output::RequestOutputStream;
 
+/// How long the epoch's Program Servers may take to select its programs.
+///
+/// A Program Server that selects a program compiles it when it has no module,
+/// so this is generous; it exists so that a daemon that waits here says which
+/// wait it is in instead of staying silent for the length of a run.
+const PREPARE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How long the main processes may take to take the epoch's programs.
+///
+/// A backstop beyond the engine's own budget for the steps (§7.3: the precopy
+/// waits up to 20 minutes, a switch, commit, revert or purge 2), which fire
+/// first and name the process that did not answer.
+const SWITCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25 * 60);
+
 /// One model served over its engine process.
 ///
 /// Construction spawns Tokio tasks, so every constructor must be called
@@ -608,17 +622,44 @@ impl Leader {
         // installed.
         let servers = self.program_servers(config);
         let leader_host = self.program_leader_host(config, &servers);
+        // Each step of the install says so before it waits: a deployment that
+        // hangs here is otherwise silent for as long as the run lasts, and the
+        // last line printed is the only thing that names where it waited.
+        tracing::info!(
+            world,
+            engines = ?engines,
+            kernels = filled.kernels.len(),
+            policy = %filled.policy.backend,
+            leader = %leader_host,
+            servers = ?servers
+                .iter()
+                .map(|server| format!("{} at {}", server.host, server.socket.display()))
+                .collect::<Vec<_>>(),
+            "preparing the epoch's programs at its Program Servers"
+        );
         let prepared = {
             let servers = servers.clone();
             let leader_host = leader_host.clone();
             let filled = filled.clone();
-            tokio::task::spawn_blocking(move || {
+            let preparing = tokio::task::spawn_blocking(move || {
                 crate::engine::control::prepare_epoch(&servers, &leader_host, &filled, &[])
-            })
-            .await
-            .context("preparing the epoch's programs")?
+            });
+            match tokio::time::timeout(PREPARE_TIMEOUT, preparing).await {
+                Ok(joined) => joined.context("preparing the epoch's programs")?,
+                Err(_) => anyhow::bail!(
+                    "the epoch's Program Servers selected nothing within {} s \
+                     (the last step logged above is where the daemon waited)",
+                    PREPARE_TIMEOUT.as_secs()
+                ),
+            }
             .context("preparing the epoch's programs")?
         };
+        tracing::info!(
+            world,
+            kernels = prepared.kernels.len(),
+            policy = %prepared.policy.backend,
+            "the epoch's programs are resolved; sending them to the main processes"
+        );
         let deployment = crate::epoch::Deployment {
             config: config.clone(),
             build_config: crate::epoch::BuildConfig::of(config),
@@ -633,7 +674,7 @@ impl Leader {
             .collect();
         let commands = commands.clone();
         let installed = deployment.clone();
-        let generations = tokio::task::spawn_blocking(move || {
+        let switching = tokio::task::spawn_blocking(move || {
             let mut switch = crate::engine::control::ProgramSwitch::new(
                 &commands,
                 processes,
@@ -645,9 +686,16 @@ impl Leader {
             switch.switchover()?;
             switch.commit()?;
             Ok::<_, crate::epoch::Failure>(switch.generations().to_vec())
-        })
-        .await
-        .context("switching the main processes to the epoch's programs")?
+        });
+        let generations = match tokio::time::timeout(SWITCH_TIMEOUT, switching).await {
+            Ok(joined) => joined.context("switching the main processes to the epoch's programs")?,
+            Err(_) => anyhow::bail!(
+                "the main processes took the epoch's programs in neither Precopy, \
+                 Switchover nor Commit within {} s (the last step logged above is \
+                 where the daemon waited)",
+                SWITCH_TIMEOUT.as_secs()
+            ),
+        }
         .map_err(|failure| {
             anyhow::anyhow!(
                 "the main processes did not take the epoch's programs ({}): {}",
