@@ -354,7 +354,6 @@ fn main() {
         );
     }
 
-
     // ---- The row gathers: `nn::layers::gather_rows` binds `logits_gather` with the gathered width
     // in its key, so every place the DiT gathers whole rows is a cell of this operator.
     //
@@ -366,6 +365,9 @@ fn main() {
         (DType::BF16, HIDDEN),
         (DType::F32, 18 * HIDDEN),
         (DType::F32, 2 * HIDDEN),
+        // The solver's step coefficient: `[steps, 1]` FP32, gathered at the evaluation the
+        // executor's `step` table names, so one staging word serves every step (`solver.rs`).
+        (DType::F32, 1),
         (DType::I32, 1),
         (DType::I32, 2),
         (DType::I32, 4),
