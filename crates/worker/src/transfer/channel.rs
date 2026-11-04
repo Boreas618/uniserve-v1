@@ -7,7 +7,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use cuda::SourceOrder;
+use platform::SourceOrder;
 use ipc::{Locator, TransferTransport};
 
 use super::read::{NativeRead, ReadCall, payload};

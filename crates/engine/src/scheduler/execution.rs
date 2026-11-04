@@ -39,6 +39,8 @@ mod projection;
 mod results;
 
 use super::*;
+use scheduling::PolicyError;
+use scheduling::guest::Plan;
 use ipc::{BufferId, MediaCall};
 
 pub(super) use media::Occupancy;
@@ -342,39 +344,154 @@ impl Scheduler {
         progressed
     }
 
-    /// Selects the batches of one pass, alternating between video media work
-    /// and generation work. A pass yields one batch per `(kind, component)` it
-    /// selected, each a single numerical call.
+    /// Executes one step of the policy (§4.4).
     ///
-    /// `prefer_media` is set after a generation pass yields batches and
-    /// cleared after a media pass does; either kind runs when the other has
-    /// nothing to schedule.
+    /// The step is the mechanism's whole scheduling act: observe the events
+    /// since the previous step, ask for one plan on the room the mechanism has,
+    /// validate it against the live state, and execute it. A decision the
+    /// validators reject, a trap, or a starved request is a policy failure: the
+    /// switch serves on under the previous policy, or the epoch stops.
     fn schedule_batches(&mut self) -> Vec<ExecutionBatch> {
         // A closing scheduler lets what is in flight drain before its
         // workers close; a sleeping one runs nothing.
         if self.closing || self.asleep {
             return Vec::new();
         }
-        if self.prefer_media {
-            let batches = self.prepare_media_batches();
-            if !batches.is_empty() {
-                self.prefer_media = false;
-                return batches;
-            }
-        }
-        let batches = self.assemble();
-        if batches.is_empty() {
-            if self.fatal {
-                return Vec::new();
-            }
-            let batches = self.prepare_media_batches();
-            if !batches.is_empty() {
-                self.prefer_media = false;
-            }
+        // Video media work runs the ready calls of its graph through the media
+        // planner; the plan's media work entries replace that path when the
+        // media planner is cut, so a video request is decided by one policy
+        // like every other request.
+        let batches = self.prepare_media_batches();
+        if !batches.is_empty() {
             return batches;
         }
-        self.prefer_media = true;
-        batches
+        let Some(plan) = self.policy_step() else {
+            return Vec::new();
+        };
+        self.assemble_plan(&plan)
+    }
+
+    /// One step's plan: observe, dispatch, validate (§4.4).
+    ///
+    /// Nothing decides before the policy is installed: an epoch waits for its
+    /// first `Switchover` (§7.3), and a scheduler with no slot schedules
+    /// nothing. The slot is taken out of the scheduler for the calls and put
+    /// back whatever they answer, so a failure can hand the mechanism's state
+    /// to the switch without borrowing the scheduler the slot lives in.
+    fn policy_step(&mut self) -> Option<Plan> {
+        let Some(mut policy) = self.policy.take() else {
+            return None;
+        };
+        self.step += 1;
+        let room = views::room(self, self.step);
+        let live = self.live();
+        // Everything that changed since the previous step, in the order it
+        // happened, closed before this step's dispatch.
+        self.recorder.close();
+        let events = self.recorder.take();
+        if let Err(error) = policy.observe(&events) {
+            return self.policy_failed(policy, error);
+        }
+        let plan = match policy.dispatch(&room) {
+            Ok(plan) => plan,
+            Err(error) => return self.policy_failed(policy, error),
+        };
+        if let Err(error) = mechanism::validate_plan(&plan, &room, &live) {
+            return self.policy_failed(policy, error);
+        }
+        self.policy = Some(policy);
+        Some(plan)
+    }
+
+    /// A policy failure: serve on under the previous policy (§7.3), or stop the
+    /// epoch when there is none to serve under.
+    ///
+    /// The state the previous policy is instantiated on is the mechanism's at
+    /// this moment, built here and handed over owned: the slot lives inside the
+    /// scheduler, so the mechanism cannot lend it a borrow of the scheduler.
+    fn policy_failed(
+        &mut self,
+        mut policy: policy::PolicySlot,
+        error: PolicyError,
+    ) -> Option<Plan> {
+        let state = self.trial_state();
+        match policy.fail(&error, &state) {
+            Ok(report) => {
+                tracing::warn!(
+                    scheduler = ?report.scheduler,
+                    backend = %report.program.backend,
+                    revision = report.program.revision,
+                    reason = %report.reason,
+                    "the policy failed; serving on under the previous one"
+                );
+                self.policy_report = Some(report);
+                self.policy = Some(policy);
+            }
+            Err(fatal) => {
+                tracing::error!(reason = %fatal, "the policy failed and cannot be reverted");
+                self.fail(format!("the scheduling policy failed: {fatal}"));
+                self.policy = Some(policy);
+            }
+        }
+        None
+    }
+
+    /// The mechanism's state at a batch boundary, owned, for the switch.
+    fn trial_state(&self) -> policy::TrialState {
+        policy::TrialState {
+            snapshot: views::snapshot(self, self.step, self.recorder.recorded()),
+            room: views::room(self, self.step),
+            shortage: views::shortage_now(self),
+            arrival: None,
+            call: None,
+            expert_load: views::expert_load_of(self),
+        }
+    }
+
+    /// The objects the validators read, as they stand now.
+    fn live(&self) -> mechanism::Live {
+        let mut live = mechanism::Live {
+            queue: self
+                .waiting
+                .iter()
+                .map(|state| scheduling::guest::RequestId(state.req.request_id.0))
+                .chain(
+                    self.waiting_media
+                        .iter()
+                        .map(|pending| scheduling::guest::RequestId(pending.request.request_id.0)),
+                )
+                .collect(),
+            ..mechanism::Live::default()
+        };
+        for request in views::requests(self, self.recorder.recorded()) {
+            live.requests.insert(request.id, request);
+        }
+        for page in views::pages(self) {
+            live.pages.insert(page.id, page);
+        }
+        for entry in views::encodings(self) {
+            live.encodings.insert(entry.id, entry);
+        }
+        for phase in views::phases(&self.info) {
+            live.phases.insert(phase.id, phase);
+        }
+        live
+    }
+
+    /// Installs the step's policy: the epoch's first one, or the one a
+    /// `Switchover` prepared. Only a batch boundary may adopt, so no work is
+    /// ever decided by one policy and executed under another.
+    pub(super) fn adopt(&mut self, policy: policy::PolicySlot) {
+        debug_assert!(
+            self.inflight.pending_batches.is_empty() && self.inflight.pending_submissions.is_empty(),
+            "a policy is adopted at a batch boundary"
+        );
+        self.policy = Some(policy);
+    }
+
+    /// The report of a policy failure, for the control thread to hand up.
+    pub(super) fn take_policy_report(&mut self) -> Option<policy::PolicyReverted> {
+        self.policy_report.take()
     }
 
     /// Allocates the completion product of a state-advancing media call that

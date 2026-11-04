@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use cuda::{CopyBatch, DeviceId, SourceOrder, Stream, memset_d32};
+use platform::{CopyBatch, DeviceId, SourceOrder, Stream, memset_d32};
 
 use super::{BlockTableUpdate, GroupShape};
 use crate::ffi::{Backing, DType};

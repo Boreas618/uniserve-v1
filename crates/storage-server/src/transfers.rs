@@ -363,7 +363,7 @@ impl Server {
                 let known = &mut self.transfers.contexts;
                 for context in contexts {
                     tracing::info!(
-                        gpu = %cuda::DeviceUuid(context.gpu),
+                        gpu = %platform::DeviceUuid(context.gpu),
                         bytes = context.bytes,
                         "the Transfer Server's CUDA context"
                     );

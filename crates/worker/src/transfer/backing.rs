@@ -3,7 +3,7 @@
 use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use cuda::Event;
+use platform::Event;
 
 use super::vmm::pool::{PoolChunk, VmmPool};
 use super::{

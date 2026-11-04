@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
-use cuda::Stream;
+use platform::Stream;
 use ipc::{
     BufferAllocation, BufferId, Call, CallKind, DType as WireDType, DimBound, MediaCall,
     RequestKey, ShapeBound, TensorRef, TransferHandle, WorkerEndpoint,
@@ -233,7 +233,7 @@ fn relay_entries_are_bounded_by_the_unresolved_window() -> Result<()> {
     );
     store.complete_reads(&[lease], None, &[])?;
     store.release_calls(&[(request(), first.producer_call_id)]);
-    store.release_requests(&HashSet::new(), &HashSet::new(), None::<&cuda::Stream>)?;
+    store.release_requests(&HashSet::new(), &HashSet::new(), None::<&platform::Stream>)?;
     store.bind_outputs(&[(second, CPU)], placement)?;
     Ok(())
 }

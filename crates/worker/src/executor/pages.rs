@@ -29,7 +29,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use cuda::{DeviceId, Stream};
+use platform::{DeviceId, Stream};
 use ipc::{
     Batch as BatchPlan, BlockTable, CallKind, CanvasSampling, DType, ForwardMode, RequestKey,
     ShapeBound, TensorRef,

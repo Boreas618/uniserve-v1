@@ -116,7 +116,7 @@ pub(crate) struct Maintenance {
     pub(crate) request_slots: usize,
     /// The rank's CUDA devices, whose contexts the rank probes while jobs
     /// are in flight (`Service::watch_jobs`).
-    pub(crate) devices: Vec<cuda::DeviceId>,
+    pub(crate) devices: Vec<platform::DeviceId>,
     /// Whether a rank of the loaded model captures graphs under a policy
     /// that captures: a world succeeding this one that configures graphs
     /// takes a graph share for its warmup's captures only then.
@@ -828,7 +828,7 @@ impl Service<'_> {
                     units.sort_unstable();
                     units.dedup();
                     if !units.is_empty() {
-                        let stream = cuda::Stream::new(planes.device().ok_or_else(|| {
+                        let stream = platform::Stream::new(planes.device().ok_or_else(|| {
                             Error::Invalid("cache publication requires a device pool".into())
                         })?)?;
                         let column = crate::storage::prefix_cache::planes::UnitColumn::bind(
@@ -1004,7 +1004,7 @@ impl Service<'_> {
                 let head_bytes = match (planes.as_ref(), device) {
                     (Some(planes), Some(device)) => {
                         let plan = planes.plan();
-                        let granularity = cuda::HandleType::Descriptor.granularity(device)? as u64;
+                        let granularity = platform::HandleType::Descriptor.granularity(device)? as u64;
                         u64::from(crate::storage::PlaneLayout::whole_granules(
                             1 + scratch + plan.progress_units(),
                             plan.plane_bytes,
@@ -1173,7 +1173,7 @@ impl Service<'_> {
                     .iter()
                     .map(|(_, storage)| Arc::clone(storage))
                     .collect();
-                let stream = cuda::Stream::new(device)?;
+                let stream = platform::Stream::new(device)?;
                 planes.adopt_inherited(&storages, predecessor.num_units, &stream)?;
                 renew_graphs()?;
                 let keys: Vec<_> = mapped.iter().map(|(key, _)| *key).collect();
@@ -1403,7 +1403,7 @@ impl Service<'_> {
     /// at its promotion) books none of them either.
     fn book_profiling(
         &mut self,
-        device: Option<cuda::DeviceId>,
+        device: Option<platform::DeviceId>,
         bytes: u64,
     ) -> crate::Result<Option<String>> {
         let (Some(retained), Some(device)) = (self.maintenance.retained.clone(), device) else {
@@ -1442,7 +1442,7 @@ impl Service<'_> {
     /// Books no profiling storage on `device` any more. A failure leaves
     /// the larger booking in the ledger, which only overstates the rank's
     /// storage, so it is logged rather than failing the session's end.
-    fn unbook_profiling(&mut self, device: Option<cuda::DeviceId>) {
+    fn unbook_profiling(&mut self, device: Option<platform::DeviceId>) {
         let failure = match self.book_profiling(device, 0) {
             Ok(None) => return,
             Ok(Some(refusal)) => refusal,
@@ -1469,13 +1469,13 @@ impl Service<'_> {
         let Some(weights) = self.maintenance.weights.as_ref() else {
             return Ok(false);
         };
-        let mut needed: BTreeMap<cuda::DeviceId, u64> = BTreeMap::new();
+        let mut needed: BTreeMap<platform::DeviceId, u64> = BTreeMap::new();
         for storage in &weights.storages {
             if let crate::ffi::MemoryKind::Cuda(device) = crate::ffi::Backing::device(&**storage) {
                 *needed.entry(device).or_default() += crate::ffi::Backing::bytes(&**storage) as u64;
             }
         }
-        let short = |needed: &BTreeMap<cuda::DeviceId, u64>| -> crate::Result<Option<(cuda::DeviceId, u64, u64)>> {
+        let short = |needed: &BTreeMap<platform::DeviceId, u64>| -> crate::Result<Option<(platform::DeviceId, u64, u64)>> {
             for (&device, &bytes) in needed {
                 let free = device.memory_info()?.free;
                 if free < bytes {
@@ -1545,7 +1545,7 @@ impl Service<'_> {
     /// bookings, those `bytes` does not name at 0: a transient copy the rank
     /// holds beside its other storage. Refused, past the quota, with the
     /// ledger's entries.
-    fn book_staging(&self, bytes: &BTreeMap<cuda::DeviceId, u64>) -> crate::Result<()> {
+    fn book_staging(&self, bytes: &BTreeMap<platform::DeviceId, u64>) -> crate::Result<()> {
         let Some(retained) = self.maintenance.retained.as_deref() else {
             return Ok(());
         };
@@ -1569,7 +1569,7 @@ impl Service<'_> {
 /// next launch then faults inside CUPTI (`uniserve.cuda_graph.renew_executables`).
 /// A rank CUPTI does not instrument keeps its executables.
 fn renew_graphs() -> crate::Result<()> {
-    if cuda::cupti::subscriber::subscribed() {
+    if platform::cupti::subscriber::subscribed() {
         crate::ffi::Interpreter::import("uniserve.cuda_graph.renew_executables")?
             .call_values(&[])?;
     }
@@ -1603,7 +1603,7 @@ fn restore(
     if planes.segments().is_none() {
         return Ok(());
     }
-    let stream = cuda::Stream::new(device)?;
+    let stream = platform::Stream::new(device)?;
     planes.restore_segments(storage, &stream, limit)
 }
 

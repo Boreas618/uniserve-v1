@@ -14,7 +14,7 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use cuda::{DeviceId, Event};
+use platform::{DeviceId, Event};
 use ipc::TokenLogprob;
 
 use crate::ffi::{Backing, DType};
@@ -800,7 +800,7 @@ mod tests {
         let lease = pool.lease(1, 2, &[], false)?;
         let mut buffer = lock(&lease);
         let events = EventPool::default();
-        let lent = buffer.lend_bytes(5, None, None::<&cuda::Stream>, &events)?;
+        let lent = buffer.lend_bytes(5, None, None::<&platform::Stream>, &events)?;
         assert_eq!(lent.shape(), &[5]);
         assert_eq!(lent.dtype(), DType::U8);
         // Five bytes from the back leave one whole token word.
@@ -808,7 +808,7 @@ mod tests {
         assert_eq!((offset, words.shape()), (0, &[1_i64][..]));
         assert!(
             buffer
-                .lend_bytes(4, None, None::<&cuda::Stream>, &events)
+                .lend_bytes(4, None, None::<&platform::Stream>, &events)
                 .is_err()
         );
         Ok(())
@@ -835,7 +835,7 @@ mod tests {
     fn retire(lease: &Arc<Mutex<OutputBuffer>>, words: usize) -> Result<Vec<i64>> {
         let mut buffer = lock(lease);
         // Host leases are sealed on no stream.
-        buffer.seal::<&cuda::Stream>(&[], &EventPool::default())?;
+        buffer.seal::<&platform::Stream>(&[], &EventPool::default())?;
         buffer.register_lent(words, Vec::new())?;
         buffer.copies_finished();
         buffer.readback()?;
@@ -894,7 +894,7 @@ mod tests {
         assert!(buffer.lend_words().is_err());
         assert!(
             buffer
-                .lend_bytes(1, None, None::<&cuda::Stream>, &events)
+                .lend_bytes(1, None, None::<&platform::Stream>, &events)
                 .is_err()
         );
 
@@ -910,7 +910,7 @@ mod tests {
             2,
         ];
         write(&lent, &words);
-        buffer.seal::<&cuda::Stream>(&[], &events)?;
+        buffer.seal::<&platform::Stream>(&[], &events)?;
         let layout = || LogprobLayout {
             rows: vec![0],
             counts: vec![1],

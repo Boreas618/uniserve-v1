@@ -24,7 +24,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use cuda::{CopyBatch, DeviceId, Event, SourceOrder, Stream, StridedCopy};
+use platform::{CopyBatch, DeviceId, Event, SourceOrder, Stream, StridedCopy};
 
 use crate::ffi::MethodCall;
 use crate::ffi::{DeferredCall, Handle};

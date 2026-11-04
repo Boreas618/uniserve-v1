@@ -43,7 +43,7 @@ mod tensor;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use cuda::{DeviceId, Stream};
+use platform::{DeviceId, Stream};
 use ipc::{Batch as BatchPlan, BufferId, CallKind, ForwardStats, RequestKey, TransferMode};
 
 use super::backend::{WorkerBackend, WorkerBatch};

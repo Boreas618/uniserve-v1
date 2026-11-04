@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-use cuda::{CopyBatch, DeviceId, SourceOrder, Stream, reclaim};
+use platform::{CopyBatch, DeviceId, SourceOrder, Stream, reclaim};
 use ipc::{Locator, TensorTransfer, TransferTransport, WorkerEndpoint};
 use worker::ffi::{Backing, DType, MemoryKind};
 use worker::storage::LocalStorage;
