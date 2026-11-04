@@ -47,7 +47,7 @@ pub struct CallId(pub u64);
 /// reaches this type: [`Batches::submit`](crate::Batches::submit) answers `Error::Invalid`
 /// synchronously for a batch it cannot serve, so an entry here is what execution did, and a
 /// [`CallStatus::Error`] entry is always a device failure.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CallOutput {
     /// The call the batch advanced.
     pub call: CallId,
@@ -66,20 +66,49 @@ pub struct CallOutput {
     /// The slot's trajectory position the commit table advanced: a denoising trajectory's next
     /// step, and for a text decode the number of tokens the call's slot has committed.
     pub step_index: u32,
+    /// The cache extent execution initialized, rejected speculative positions included: the slot's
+    /// logical position after the commit.
+    pub cache_computed_len: u32,
+    /// The accepted prefix a successor may read: the slot's sampling position after the commit.
+    pub cache_visible_len: u32,
+    /// The log-probability of each accepted token, aligned with [`CallOutput::tokens`]: empty when
+    /// the step produced none, which is a state and not a placeholder.
+    pub token_logprobs: Vec<f32>,
+    /// Ranked log-probabilities for each scored prompt position, in input order.
+    pub prompt_logprobs: Vec<Vec<ipc::TokenLogprob>>,
+    /// A token-denoising readout's candidate log-probabilities, in its own candidate order.
+    pub candidate_logprobs: Vec<f32>,
 }
 
 impl CallOutput {
-    /// A completed call that sampled `tokens` and stands at `step_index`.
-    pub fn completed(call: CallId, tokens: Vec<u32>, step_index: u32) -> Self {
+    /// A completed call that sampled `tokens` and stands at `step_index`, from the slot state
+    /// `state` the commit table left.
+    pub fn completed(call: CallId, tokens: Vec<u32>, state: RowState) -> Self {
         Self {
             call,
             status: CallStatus::Ok,
             error_code: None,
             error_message: None,
             tokens,
-            step_index,
+            step_index: state.step_index,
+            cache_computed_len: state.cache_computed_len,
+            cache_visible_len: state.cache_visible_len,
+            token_logprobs: Vec::new(),
+            prompt_logprobs: Vec::new(),
+            candidate_logprobs: Vec::new(),
         }
     }
+}
+
+/// Where the commit table left one call's slot, as the completion reads it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RowState {
+    /// The slot's trajectory position: the denoising trajectory's next step.
+    pub step_index: u32,
+    /// The cache extent execution initialized, rejected speculative positions included.
+    pub cache_computed_len: u32,
+    /// The accepted prefix a successor may read.
+    pub cache_visible_len: u32,
 }
 
 /// What one serving step produced (4.4).
@@ -88,7 +117,7 @@ impl CallOutput {
 /// the tokens, and folds the timing into the statistics of the calls' domain. A step that samples
 /// nothing (a chunk of a prefill that ends no prompt, a warmup, a program-layer command) completes
 /// with no call and nothing measured.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct BatchOutput {
     /// One entry per call the batch advanced, in the order the batch named them.
     pub calls: Vec<CallOutput>,
@@ -157,7 +186,17 @@ pub struct BatchColumns {
 
 impl BatchColumns {
     /// The number of rows (sequences) the columns describe.
+    ///
+    /// A row is one sequence's query, which is not the same as a call: a verify batch carries
+    /// several rows for one call, and the per-row columns (`slots`, `parameters`) are as long as
+    /// the rows. `rows.calls` counts the calls instead, which sized the sampler's views to one row
+    /// when a call held three.
     pub fn rows(&self) -> usize {
+        self.rows.rows()
+    }
+
+    /// The calls the columns describe.
+    pub fn calls(&self) -> usize {
         self.rows.calls.len()
     }
 

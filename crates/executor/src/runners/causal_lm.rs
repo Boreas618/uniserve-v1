@@ -26,7 +26,7 @@ use ops::{DType, Generation, TensorView};
 use platform::DeviceId;
 
 use crate::arena::{Pools, PoolMetrics, StreamId};
-use crate::batch::{Batch, BatchColumns, BatchOutput, CallId, CallOutput, Job, Jobs};
+use crate::batch::{Batch, BatchColumns, BatchOutput, CallId, CallOutput, Job, Jobs, RowState};
 use crate::captured::Captured;
 use crate::graph::Graphs;
 use crate::plan::{Bucket, Buckets, Shape};
@@ -613,7 +613,7 @@ impl CommitColumns {
             slots: slots.max(1),
             readback: platform::PinnedBuffer::new(
                 device,
-                slots.max(1) as usize * std::mem::size_of::<i32>(),
+                2 * slots.max(1) as usize * std::mem::size_of::<i32>(),
             )?,
         };
         // The roles a decode step leaves inert hold their starting values; only `table` is written
@@ -646,6 +646,12 @@ impl CommitColumns {
     /// The device address of the per-slot trajectory positions.
     fn sampling_ptr(&self) -> ops::DevicePtr {
         self.sampling.device.ptr
+    }
+
+    /// The device address of the per-slot logical positions: the cache extent execution
+    /// initialized.
+    fn logical_ptr(&self) -> ops::DevicePtr {
+        self.logical.device.ptr
     }
 
 
@@ -1666,7 +1672,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             ));
         }
         let slots = self.commit.slots();
-        if slots * std::mem::size_of::<i32>() > self.commit.readback_len() {
+        if 2 * slots * std::mem::size_of::<i32>() > self.commit.readback_len() {
             return Err(Error::Invariant(
                 "the commit table's readback buffer is smaller than the slot count".into(),
             ));
@@ -1681,8 +1687,16 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 bytes,
                 &self.stream,
             )?;
+            // The two per-slot lengths the completion reports: the logical position execution
+            // initialized and the sampling position a successor may read.
             platform::memcpy_async(
                 self.commit.readback_address(),
+                self.commit.logical_ptr().address(),
+                slots * std::mem::size_of::<i32>(),
+                &self.stream,
+            )?;
+            platform::memcpy_async(
+                self.commit.readback_address() + (slots * std::mem::size_of::<i32>()) as u64,
                 self.commit.sampling_ptr().address(),
                 slots * std::mem::size_of::<i32>(),
                 &self.stream,
@@ -1696,20 +1710,33 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let host_start = Instant::now();
         // SAFETY: the copies above filled `rows` i32 with the sampled ids and `slots` i32 with the
         // table's trajectory positions.
-        let (ids, steps) = unsafe {
+        let (ids, logical, sampling) = unsafe {
             (
                 std::slice::from_raw_parts(self.columns.readback.as_ptr().cast::<i32>(), rows),
                 std::slice::from_raw_parts(self.commit.readback_ptr().cast::<i32>(), slots),
+                std::slice::from_raw_parts(
+                    (self.commit.readback_ptr() as usize + slots * std::mem::size_of::<i32>())
+                        as *const i32,
+                    slots,
+                ),
             )
         };
         let row_slots = self.staging.slots(rows);
-        let mut positions = Vec::with_capacity(rows);
+        let mut states = Vec::with_capacity(rows);
         for slot in row_slots {
-            // A padded row names no slot, so no trajectory position belongs to it.
-            positions.push(if *slot < 0 {
-                0
+            // A padded row names no slot, so the commit table states nothing about it.
+            states.push(if *slot < 0 {
+                RowState::default()
             } else {
-                steps.get(*slot as usize).copied().unwrap_or(0).max(0) as u32
+                let at = *slot as usize;
+                RowState {
+                    // For text the slot's trajectory position is the number of tokens it has
+                    // committed, which the table keeps in the sampling column; a latent
+                    // trajectory advances the same column one step at a time.
+                    step_index: length_at(sampling, at),
+                    cache_computed_len: length_at(logical, at),
+                    cache_visible_len: length_at(sampling, at),
+                }
             });
         }
         let calls = calls_output(
@@ -1717,7 +1744,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             self.staging.logits_rows(),
             self.staging.batch_rows(),
             self.staging.calls(),
-            &positions,
+            &states,
         )?;
         Ok(BatchOutput {
             calls,
@@ -2128,6 +2155,12 @@ impl ops::capture::Sink for Recording {
     }
 }
 
+/// The non-negative length a per-slot table column holds for `slot`, or zero when the table has no
+/// such slot: a length is never negative, and a padded row names no slot at all.
+fn length_at(column: &[i32], slot: usize) -> u32 {
+    column.get(slot).copied().unwrap_or(0).max(0) as u32
+}
+
 /// Names each call's tokens and trajectory position: the step's output in the mechanism's order
 /// (4.4).
 ///
@@ -2141,7 +2174,7 @@ pub fn calls_output(
     sampling_rows: &[i32],
     rows: &nn::BatchRows,
     calls: &[CallId],
-    steps: &[u32],
+    states: &[RowState],
 ) -> Result<Vec<CallOutput>> {
     if ids.len() < sampling_rows.len() {
         return Err(Error::Invariant(format!(
@@ -2150,17 +2183,17 @@ pub fn calls_output(
             sampling_rows.len()
         )));
     }
-    if steps.len() != calls.len() {
+    if states.len() != calls.len() {
         return Err(Error::Invariant(format!(
-            "the batch names {} calls and {} trajectory positions",
+            "the batch names {} rows and {} commit positions",
             calls.len(),
-            steps.len()
+            states.len()
         )));
     }
     let mut output: Vec<CallOutput> = calls
         .iter()
-        .zip(steps)
-        .map(|(call, step)| CallOutput::completed(*call, Vec::new(), *step))
+        .zip(states)
+        .map(|(call, state)| CallOutput::completed(*call, Vec::new(), *state))
         .collect();
     for (index, row) in sampling_rows.iter().copied().enumerate() {
         // `logits_rows` names the token row that feeds `logits`; a negative entry is a row that
@@ -2440,14 +2473,25 @@ mod sampled_output_tests {
             &[1, 0],
             &batch,
             &[CallId(7), CallId(9)],
-            &[3, 4],
+            &[
+                RowState { step_index: 3, cache_computed_len: 3, cache_visible_len: 3 },
+                RowState { step_index: 4, cache_computed_len: 4, cache_visible_len: 4 },
+            ],
         )
         .expect("both rows belong to a call");
         assert_eq!(
             output,
             vec![
-                CallOutput::completed(CallId(7), vec![111], 3),
-                CallOutput::completed(CallId(9), vec![222], 4),
+                CallOutput::completed(
+                    CallId(7),
+                    vec![111],
+                    RowState { step_index: 3, cache_computed_len: 3, cache_visible_len: 3 },
+                ),
+                CallOutput::completed(
+                    CallId(9),
+                    vec![222],
+                    RowState { step_index: 4, cache_computed_len: 4, cache_visible_len: 4 },
+                ),
             ]
         );
     }
@@ -2456,9 +2500,22 @@ mod sampled_output_tests {
     /// bucket with no sampling row states no call and measures nothing.
     #[test]
     fn a_call_that_samples_nothing_still_completes() {
-        let output = calls_output(&[], &[-1], &rows(&[(0, 0..4)]), &[CallId(1)], &[7])
-            .expect("no sampling rows");
-        assert_eq!(output, vec![CallOutput::completed(CallId(1), Vec::new(), 7)]);
+        let output = calls_output(
+            &[],
+            &[-1],
+            &rows(&[(0, 0..4)]),
+            &[CallId(1)],
+            &[RowState { step_index: 7, cache_computed_len: 4, cache_visible_len: 4 }],
+        )
+        .expect("no sampling rows");
+        assert_eq!(
+            output,
+            vec![CallOutput::completed(
+                CallId(1),
+                Vec::new(),
+                RowState { step_index: 7, cache_computed_len: 4, cache_visible_len: 4 }
+            )]
+        );
     }
 
     /// A sampling row outside every call, or fewer sampled ids than sampling rows, is an invariant
@@ -2466,8 +2523,9 @@ mod sampled_output_tests {
     #[test]
     fn a_row_no_call_owns_is_refused() {
         let batch = rows(&[(0, 0..1)]);
-        calls_output(&[5], &[3], &batch, &[CallId(1)], &[0]).expect_err("row 3 belongs to no call");
-        calls_output(&[], &[0], &batch, &[CallId(1)], &[0])
+        calls_output(&[5], &[3], &batch, &[CallId(1)], &[RowState::default()])
+            .expect_err("row 3 belongs to no call");
+        calls_output(&[], &[0], &batch, &[CallId(1)], &[RowState::default()])
             .expect_err("no id was sampled for row 0");
         calls_output(&[5], &[0], &batch, &[CallId(1)], &[])
             .expect_err("one call, no trajectory position");
