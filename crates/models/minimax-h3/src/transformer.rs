@@ -58,8 +58,16 @@ pub(crate) fn projection_halves(projection: TensorView) -> (TensorView, TensorVi
     (value, gate)
 }
 
-/// The rotary width of one head's three axes: 16 frequencies per axis, 32 channels each.
-pub const ROTATED_AXES: [u32; 3] = [32, 32, 32];
+/// The rotary width of one head's three axes: `2 * rope_frequency_dim` channels each.
+///
+/// The width is the checkpoint's `rope_freq_dim`, not a constant of this module: the reference
+/// builds its rotary embedding as `RotaryEmbedding(2 * rope_frequency_dim)`
+/// (`uniserve/models/minimax_h3/denoiser.py:231`) and applies that one spectrum to each of the
+/// three coordinates (`attention.py:94-105`). Three is the model's own count: `position_ids` is
+/// `[3, rows]`, one coordinate for time, height and width.
+pub fn rotated_axes(config: &TransformerConfig) -> [u32; 3] {
+    [2 * config.rope_frequency_dim; 3]
+}
 
 /// One dilated layer of the stack.
 pub struct Layer {
@@ -113,7 +121,7 @@ impl Layer {
                 index,
                 config,
                 rows,
-                &ROTATED_AXES,
+                &rotated_axes(config),
                 tile_bound,
                 partition,
                 loader,
