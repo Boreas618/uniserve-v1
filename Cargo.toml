@@ -22,6 +22,7 @@ members = [
     "crates/scheduling",
     "crates/scheduling/guest",
     "crates/scheduling/policies/fcfs",
+    "crates/scheduling/policies/fixture",
     "crates/scheduling/policies/priority",
     "crates/storage",
     "crates/storage-server",

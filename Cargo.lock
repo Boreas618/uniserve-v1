@@ -3705,6 +3705,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "scheduling-policy-fixture"
+version = "2.0.0"
+dependencies = [
+ "scheduling-guest",
+]
+
+[[package]]
 name = "scheduling-policy-priority"
 version = "2.0.0"
 dependencies = [
