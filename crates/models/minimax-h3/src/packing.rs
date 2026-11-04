@@ -112,7 +112,14 @@ pub fn align_num_frames(requested: u32) -> u32 {
         .max(CLIP_FRAMES + CLIP_LATENTS)
 }
 
-/// Latent frames a generated frame count encodes to: `5n + 2` for `n` clips.
+/// The latent frames one clip decodes: its own [`CLIP_LATENTS`] and the two the next clip repeats.
+///
+/// Consecutive clips advance by [`CLIP_LATENTS`], so a timeline of `n` clips holds
+/// `n * CLIP_LATENTS + (CLIP_LATENT_WINDOW - CLIP_LATENTS)` latent frames - the "`5n + 2`" that the
+/// frame rule and its inverse both depend on. The two appear once, here.
+pub const CLIP_LATENT_WINDOW: u32 = CLIP_LATENTS + 2;
+
+/// Latent frames a generated frame count encodes to: `n * CLIP_LATENTS + 2` for `n` clips.
 pub fn video_latent_frames(num_frames: u32) -> Result<u32> {
     if num_frames < CLIP_FRAMES + CLIP_LATENTS || num_frames % CLIP_FRAMES != CLIP_LATENTS {
         return Err(Error::config(format!(
@@ -120,26 +127,45 @@ pub fn video_latent_frames(num_frames: u32) -> Result<u32> {
         )));
     }
     let clips = (num_frames - CLIP_LATENTS) / CLIP_FRAMES;
-    Ok(clips * CLIP_LATENTS + 2)
+    Ok(clips * CLIP_LATENTS + (CLIP_LATENT_WINDOW - CLIP_LATENTS))
+}
+
+/// The clips of a latent timeline: how many [`CLIP_LATENTS`]-frame windows it holds.
+///
+/// The inverse of [`video_latent_frames`]' clip count, and the one place a latent timeline is read
+/// back: a count that is off by a clip is an empty table or one that stops short of the last window,
+/// and neither shows as an error at the call site. Refuses a timeline no clip sequence produces,
+/// including the zero-clip one (two latent frames), rather than returning the truncated division.
+pub fn clip_count(latent_frames: u32) -> Result<u32> {
+    let extra = CLIP_LATENT_WINDOW - CLIP_LATENTS;
+    let aligned = latent_frames.checked_sub(extra).ok_or_else(|| {
+        Error::config(format!(
+            "an H3 latent timeline holds at least {CLIP_LATENT_WINDOW} latent frames, got \
+             {latent_frames}"
+        ))
+    })?;
+    if aligned == 0 || !aligned.is_multiple_of(CLIP_LATENTS) {
+        return Err(Error::config(format!(
+            "an H3 latent frame count has the form {CLIP_LATENTS}n + {extra} with n positive, got \
+             {latent_frames}"
+        )));
+    }
+    Ok(aligned / CLIP_LATENTS)
 }
 
 /// The generated frame count of a latent frame count: the inverse of [`video_latent_frames`].
 ///
-/// A decode of `5n + 2` latent frames produces the `17n + 5` frames those latents were encoded from, so
-/// the decoder's tables can be derived from a layout's latent extents without knowing the request's
-/// frame rule. Refuses a latent count no clip timeline produces.
+/// A decode of `n * CLIP_LATENTS + 2` latent frames produces the `n * CLIP_FRAMES + CLIP_LATENTS`
+/// frames those latents were encoded from, so the decoder's tables can be derived from a layout's
+/// latent extents without knowing the request's frame rule. Refuses a latent count no clip timeline
+/// produces.
 pub fn video_output_frames(latent_frames: u32) -> Result<u32> {
-    let aligned = latent_frames.checked_sub(2).ok_or_else(|| {
-        Error::config(format!(
-            "an H3 latent timeline holds at least {CLIP_LATENTS} latent frames, got {latent_frames}"
-        ))
-    })?;
-    if aligned % CLIP_LATENTS != 0 {
-        return Err(Error::config(format!(
-            "an H3 latent frame count has the form {CLIP_LATENTS}n + 2, got {latent_frames}"
-        )));
-    }
-    Ok((aligned / CLIP_LATENTS) * CLIP_FRAMES + CLIP_FRAMES)
+    let clips = clip_count(latent_frames)?;
+    let frames = clips
+        .checked_mul(CLIP_FRAMES)
+        .and_then(|frames| frames.checked_add(CLIP_LATENTS))
+        .ok_or_else(|| Error::config("the H3 frame count overflows".to_owned()))?;
+    Ok(frames)
 }
 
 /// Audio latent steps of a generated frame count: the duration in 40 Hz latents, rounded to the
@@ -1425,6 +1451,33 @@ mod tests {
         }
         for illegal in [21_u32, 100, 0] {
             assert!(video_latent_frames(illegal).is_err(), "{illegal}");
+        }
+    }
+
+    #[test]
+    fn a_frame_count_survives_its_encode_and_decode() {
+        // The inverse must return the count it was given for every legal count, which is the one
+        // property the constant in its return expression cannot get away with being wrong.
+        for frames in (22..=400).filter(|frames| frames % CLIP_FRAMES == CLIP_LATENTS) {
+            let latents = video_latent_frames(frames).expect("a legal frame count");
+            assert_eq!(
+                video_output_frames(latents).expect("the inverse of a legal count"),
+                frames,
+                "{frames} frames"
+            );
+            assert_eq!(
+                clip_count(latents).expect("a legal timeline"),
+                (frames - CLIP_LATENTS) / CLIP_FRAMES,
+                "{frames} frames"
+            );
+        }
+        // No clip timeline produces fewer than one clip's window, and neither does a truncated one.
+        for refused in [0_u32, 2, CLIP_LATENT_WINDOW - 1, CLIP_LATENT_WINDOW + 1] {
+            assert!(clip_count(refused).is_err(), "{refused} latent frames");
+            assert!(
+                video_output_frames(refused).is_err(),
+                "{refused} latent frames"
+            );
         }
     }
 
