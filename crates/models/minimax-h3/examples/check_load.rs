@@ -6,17 +6,15 @@
 //! This is the loading boundary's own check, and it needs no device: `nn::HostStore` keeps the
 //! weights in host memory, so `load` runs its real path - sidecars, the fold, the encoders'
 //! attach, the tables - while every layer it builds is built for enumeration and never executes.
-//! What it answers is the question an index walk cannot: which of a component's tensors the load
-//! actually asked for (`Checkpoint::reading`).
+//! What it answers is the question an index walk cannot: whether a component's load **publishes**
+//! the weights it says it reads, and which tensors of its declared directories it left alone.
 //!
-//! Two failures it catches and nothing else does:
-//!
-//! - a load that reaches into a directory its component does not declare (a `ref2va` deployment
-//!   that opened `transformer/` while placing `transformer_ref/`): the declared directory reports
-//!   **zero** tensors read, and that is this program's error;
-//! - a component whose loader silently skips a group of names it needs: those names appear in the
-//!   unread column, which is a report rather than a refusal, because a component of a shared
-//!   export legitimately leaves its sibling's tensors alone.
+//! - The verdict is the number of weight regions the store published. A component that publishes
+//!   none asked the checkpoint for nothing, whatever its key list says.
+//! - The per-name `read`/`unread` columns come from `Checkpoint::reading`, which records a claim the
+//!   loader takes per name; this loader reads bytes without claiming, so the columns are printed as
+//!   information and are not a verdict. When the claims land, the unread column becomes the second
+//!   finding: a component whose loader silently skips a group of names it needs.
 //!
 //! **Host memory.** One component is loaded at a time and its own tensor bytes are printed before
 //! it loads, so a caller can pick something that fits the machine: a DiT partition is about 63 GB,
