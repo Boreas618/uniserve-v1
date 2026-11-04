@@ -959,6 +959,39 @@ impl CachePlanes {
         Ok(())
     }
 
+    /// Sets units `[first, first + count)` "initialized" flag of every column to one on
+    /// `stream`: the unit's values and scales are in place and a reader may use them.
+    pub(crate) fn mark_units_initialized(
+        &self,
+        first: u32,
+        count: u32,
+        stream: impl Issue,
+    ) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        self.require_unit(first + count - 1)?;
+        let units = self.num_units as usize;
+        let columns = self.plan.columns as usize;
+        let (first, count) = (first as usize, count as usize);
+        for initialized in &self.initialized {
+            // SAFETY: the fill lies inside the flag allocation owned by this
+            // pool, whose units the caller has mapped; the caller orders the
+            // fills.
+            unsafe {
+                stream.memset_2d(RowFill {
+                    address: initialized.address() + first as u64,
+                    pitch: units,
+                    value: 1,
+                    width: 1,
+                    count,
+                    height: columns,
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn plan(&self) -> &Arc<CachePlan> {
         &self.plan
     }
@@ -1566,6 +1599,26 @@ impl UnitColumn {
             }
             self.planes
                 .reset_units(units[start], (end - start) as u32, false, stream)?;
+            start = end;
+        }
+        Ok(())
+    }
+
+    /// Commit transferred values and scales of whole units: set both fields'
+    /// initialization flags in every column, in runs like `recycle`.
+    pub(crate) fn mark_initialized(&self, units: &[u32], stream: impl Issue) -> Result<()> {
+        self.require_stream(stream)?;
+        let mut units = units.to_vec();
+        units.sort_unstable();
+        units.dedup();
+        let mut start = 0;
+        while start < units.len() {
+            let mut end = start + 1;
+            while end < units.len() && units[end] == units[end - 1] + 1 {
+                end += 1;
+            }
+            self.planes
+                .mark_units_initialized(units[start], (end - start) as u32, stream)?;
             start = end;
         }
         Ok(())
