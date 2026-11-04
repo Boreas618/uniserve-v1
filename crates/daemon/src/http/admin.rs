@@ -720,7 +720,10 @@ async fn program_update(
     };
     let epochs = leader.epochs();
     let number = admin.running_number();
-    let planned = match leader.apply_programs(number, &target, true).await {
+    let planned = match leader
+        .apply_programs(number, &target, request.force, true)
+        .await
+    {
         Ok(Some(planned)) => planned,
         Ok(None) => return Ok(None),
         Err(error) => return Err(refused_precopy(admin, &epochs, number, &error)),
@@ -733,7 +736,10 @@ async fn program_update(
     }
     let epoch = epochs.serving().map_or(0, |(epoch, _)| epoch);
     program_phase(admin, &epochs, Phase::Precopy, epoch, &planned);
-    match leader.apply_programs(number, &target, false).await {
+    match leader
+        .apply_programs(number, &target, request.force, false)
+        .await
+    {
         Ok(Some(update)) => {
             // The main processes prepared, switched to and now serve the new
             // generation; the probation decides it (§7.3 steps 2-4).

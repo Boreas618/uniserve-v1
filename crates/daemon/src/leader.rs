@@ -1351,6 +1351,7 @@ impl Leader {
         &self,
         number: u64,
         target: &ServeConfig,
+        force: bool,
         dry_run: bool,
     ) -> Result<Option<crate::epoch::Update>, UpdateError> {
         let current = self.serving_config()?;
@@ -1364,6 +1365,19 @@ impl Leader {
         ) {
             return Err(UpdateError::Refused(format!(
                 "another update is in flight: {update}"
+            )));
+        }
+        // A target that reverted with a failure is unavailable until it is
+        // applied with `force` (§7.2, §7.3 step 4), the program layer's as
+        // much as the epoch layer's.
+        if !force
+            && let Some(failure) = self
+                .epochs()
+                .unavailable(&crate::epoch::Deployment::of(target.clone()))
+        {
+            return Err(UpdateError::Refused(format!(
+                "the configuration reverted with a failure ({}); apply it again with force",
+                failure.reason
             )));
         }
         let Some(update) = self.route(&current, target, false).await? else {
