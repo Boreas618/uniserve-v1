@@ -599,6 +599,19 @@ fn bytes_that_are_not_a_module_are_rejected() {
 }
 
 #[test]
+fn a_module_is_shared_by_the_scheduler_threads_and_an_instance_moves_to_one() {
+    // Every DP rank's scheduler thread instantiates the same policy from the
+    // module it holds (§4.4: one instance per scheduler thread), and the route
+    // instance on the control thread is another; so a module is shared across
+    // threads and an instance can be built on one and called on another.
+    fn shared<T: Send + Sync + Clone>() {}
+    fn movable<T: Send>() {}
+    shared::<PolicyModule>();
+    shared::<Engine>();
+    movable::<PolicyInstance>();
+}
+
+#[test]
 fn the_default_budget_is_a_call_budget() {
     let engine = engine();
     let policy = policy(&engine, Toy::new());
