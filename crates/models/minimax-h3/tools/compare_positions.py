@@ -31,6 +31,7 @@ that is not a whole number would itself be a defect worth seeing.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -65,7 +66,47 @@ def load(path: Path) -> np.ndarray:
         raise ValueError(
             f"{path}: a payload that does not match its shape {shape}"
         )
+    if dtype not in (np.int32, np.int64):
+        raise ValueError(
+            f"{path}: coordinates are integers, not {np.dtype(dtype)}"
+        )
     return np.frombuffer(payload, dtype=dtype).reshape(shape)
+
+
+# The fields that decide the table, and so must agree before two tables mean
+# anything to each other.
+CASE_FIELDS = (
+    ("num_frames",),
+    ("num_text_tokens",),
+    ("text_capacity",),
+    ("condition_capacity",),
+    ("token_multiple",),
+    ("canvas", "height"),
+    ("canvas", "width"),
+    ("attention", "kind"),
+)
+
+
+def field_of(case: dict, path: tuple[str, ...]):
+    """One field of a case, or `None` where it is not stated."""
+    value = case
+    for key in path:
+        if not isinstance(value, dict) or key not in value:
+            return None
+        value = value[key]
+    return value
+
+
+def cases_agree(ours: dict, ref: dict) -> list[str]:
+    """The fields on which two cases disagree, named so a pairing is refused."""
+    differing = []
+    for path in CASE_FIELDS:
+        if field_of(ours, path) != field_of(ref, path):
+            differing.append(
+                f"{'.'.join(path)}: ours {field_of(ours, path)}"
+                f", reference {field_of(ref, path)}"
+            )
+    return differing
 
 
 def to_rows_axes(values: np.ndarray, layout: str) -> np.ndarray:
@@ -218,6 +259,46 @@ def self_test() -> int:
             failures += 1
         else:
             print("ok   the container reads back as [3, rows]")
+
+        # A coordinate table that is not an integer one is refused rather than
+        # compared: the reference carries FP64 for the cosine's sake, and a
+        # fractional coordinate is a defect this tool must not round away.
+        floats = Path(directory) / "floats.h3t"
+        floats.write_bytes(
+            b"H3D1"
+            + bytes([0, 2])
+            + (3).to_bytes(8, "little")
+            + (rows).to_bytes(8, "little")
+            + reference.T.astype(np.float64).tobytes()
+        )
+        try:
+            load(floats)
+            print("FAIL a float64 coordinate table was read")
+            failures += 1
+        except ValueError:
+            print("ok   a float64 coordinate table is refused")
+
+    # Two directories pair only if they describe the same request.
+    case = {
+        "canvas": {"height": 256, "width": 256},
+        "num_frames": 22,
+        "num_text_tokens": 60,
+        "text_capacity": 128,
+        "condition_capacity": 192,
+        "token_multiple": 1,
+        "attention": {"kind": "dense"},
+    }
+    if cases_agree(case, dict(case)):
+        print("FAIL two identical cases disagreed")
+        failures += 1
+    else:
+        print("ok   two identical cases agree")
+    named = cases_agree(case, {**case, "canvas": {"height": 256, "width": 512}})
+    if named and "canvas.width" in named[0]:
+        print("ok   a different canvas is named")
+    else:
+        print(f"FAIL a different canvas was not named: {named}")
+        failures += 1
     return 1 if failures else 0
 
 
@@ -225,10 +306,10 @@ def main() -> int:
     """Compare the two files, or prove the comparison."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--ours", type=Path, help="positions.h3t from examples/positions.rs"
+        "--ours", type=Path, help="the directory examples/positions.rs wrote"
     )
     parser.add_argument(
-        "--ref", type=Path, help="dense.position_ids.npy from dump_tables.py"
+        "--ref", type=Path, help="the directory dump_tables.py wrote"
     )
     parser.add_argument(
         "--ours-layout",
@@ -254,9 +335,25 @@ def main() -> int:
     if arguments.self_test:
         return self_test()
     if arguments.ours is None or arguments.ref is None:
-        parser.error(
-            "--ours and --ref name the tables, or --self-test proves the tool"
-        )
+        parser.error("--ours and --ref name the directories, or --self-test")
+
+    # A pair is only a comparison if both sides describe the same request: the
+    # dump writes its case beside its table, and so does our probe.
+    our_case = arguments.ours / "case.json"
+    ref_case = arguments.ref / "case.json"
+    for path in (our_case, ref_case):
+        if not path.is_file():
+            parser.error(
+                f"{path} is missing; a directory pairs a table with its case"
+            )
+    differing = cases_agree(
+        json.loads(our_case.read_text()), json.loads(ref_case.read_text())
+    )
+    if differing:
+        print("the two directories describe different requests:")
+        for line in differing:
+            print(f"  {line}")
+        return 2
 
     orders = {name: index for index, name in enumerate(AXES)}
     try:
@@ -268,8 +365,13 @@ def main() -> int:
     if sorted(mapping) != [0, 1, 2]:
         parser.error("--mapping must name each axis once")
 
-    ours = to_rows_axes(load(arguments.ours), arguments.ours_layout)
-    ref = to_rows_axes(np.load(arguments.ref), arguments.ref_layout)
+    ref_table = arguments.ref / "dense.position_ids.npy"
+    if not ref_table.is_file():
+        parser.error(f"{ref_table} is missing; a dense dump writes it")
+    ours = to_rows_axes(
+        load(arguments.ours / "positions.h3t"), arguments.ours_layout
+    )
+    ref = to_rows_axes(np.load(ref_table), arguments.ref_layout)
     report = compare(ours, ref, mapping)
     show(report, arguments.ours_layout, arguments.ref_layout)
     return 0 if report["equal"] else 1
