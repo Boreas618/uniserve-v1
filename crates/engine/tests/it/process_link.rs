@@ -3,8 +3,8 @@
 //! daemon, one process has one reader, and closing the link ends the connection.
 //!
 //! The daemon is a socket of this test's own, speaking the process interface's
-//! frames: it welcomes the engine, sends it its commands, and reads back what the
-//! engine reports.
+//! frames: it welcomes each engine that connects, sends the first one its
+//! commands, and reads back what it reports.
 //!
 //! One test carries the whole exchange because a process's commands are read
 //! once: [`engine::ProcessLink::connect`] takes them for the process, so a second
@@ -16,11 +16,13 @@ use std::time::Duration;
 
 use engine::{PolicyProgram, PolicyReverted, ProcessLink};
 use proto::process::{
-    self, downstream, event, upstream, Command, Downstream, Event, Hello, Upstream, Welcome,
+    self, downstream, event, upstream, Command, Connection, Downstream, Event, Hello, Upstream,
+    Welcome,
 };
 use proto::Listener;
 
-/// How long a step of the exchange may take.
+/// How long a step of the exchange may take, and how long the test's daemon
+/// waits for one message before it looks at the connection again.
 const PATIENCE: Duration = Duration::from_secs(10);
 
 /// A socket path of this test's own, removed when the test ends.
@@ -50,71 +52,89 @@ impl Drop for Socket {
     }
 }
 
-/// The daemon's side of the interface, for `accepts` engines in turn: each is
-/// welcomed, sent `commands`, and answered with the reports it sent before it
-/// closed.
+/// The daemon's side of the interface: it accepts `accepts` engines, and serves
+/// each on a thread of its own, so a second connection is welcome while the
+/// first is still open.
+///
+/// Answers the handler of each connection, in the order they were accepted; a
+/// handler answers the reports its engine sent before it closed.
 fn daemon(
     listener: Listener,
     commands: Vec<Command>,
     accepts: usize,
-) -> std::thread::JoinHandle<Vec<Vec<process::Report>>> {
+) -> std::thread::JoinHandle<Vec<std::thread::JoinHandle<Vec<process::Report>>>> {
     std::thread::spawn(move || {
-        let mut rounds = Vec::new();
-        while rounds.len() < accepts {
-            let mut connection = loop {
+        let mut handlers = Vec::new();
+        while handlers.len() < accepts {
+            let connection = loop {
                 match listener.try_accept() {
                     Ok(Some(connection)) => break connection,
                     Ok(None) => std::thread::sleep(Duration::from_millis(5)),
                     Err(error) => panic!("the test's daemon accepts no engine: {error}"),
                 }
             };
-            let hello = connection
-                .recv::<Hello>(PATIENCE)
-                .expect("the engine's hello arrives")
-                .expect("the engine sends a hello");
-            assert!(
-                matches!(
-                    hello.peer,
-                    Some(process::hello::Peer::Engine(process::Engine { .. }))
-                ),
-                "an engine connects, not another peer"
-            );
-            connection
-                .send(&Welcome {
-                    major: proto::PROTOCOL_MAJOR,
-                    minor: proto::PROTOCOL_MINOR,
-                    build: proto::BUILD.to_owned(),
-                    refusal: String::new(),
-                    nodes: Vec::new(),
-                })
-                .expect("the welcome is sent");
-            for command in &commands {
-                connection
-                    .send(&Downstream {
-                        kind: Some(downstream::Kind::Event(Event {
-                            kind: Some(event::Kind::Command(command.clone())),
-                        })),
-                    })
-                    .expect("the command is sent");
-            }
-
-            let mut reports = Vec::new();
-            loop {
-                match connection.recv::<Upstream>(PATIENCE) {
-                    Ok(Some(Upstream {
-                        kind: Some(upstream::Kind::Report(report)),
-                    })) => reports.push(report),
-                    Ok(Some(_)) => {}
-                    // The engine closed its side: the daemon sees the
-                    // connection end.
-                    Ok(None) | Err(proto::Error::Closed) => break,
-                    Err(error) => panic!("the test's daemon reads no more: {error}"),
-                }
-            }
-            rounds.push(reports);
+            // The first engine is the one this test speaks to; a second is one
+            // the engine side must refuse, so it is welcomed and left to close.
+            let commands = if handlers.is_empty() {
+                commands.clone()
+            } else {
+                Vec::new()
+            };
+            handlers.push(std::thread::spawn(move || serve(connection, commands)));
         }
-        rounds
+        handlers
     })
+}
+
+/// One accepted connection: welcomes the engine, sends it `commands`, and reads
+/// the reports it sends until it closes.
+fn serve(mut connection: Connection, commands: Vec<Command>) -> Vec<process::Report> {
+    let hello = connection
+        .recv::<Hello>(PATIENCE)
+        .expect("the engine's hello arrives")
+        .expect("the engine sends a hello");
+    assert!(
+        matches!(
+            hello.peer,
+            Some(process::hello::Peer::Engine(process::Engine { .. }))
+        ),
+        "an engine connects, not another peer"
+    );
+    connection
+        .send(&Welcome {
+            major: proto::PROTOCOL_MAJOR,
+            minor: proto::PROTOCOL_MINOR,
+            build: proto::BUILD.to_owned(),
+            refusal: String::new(),
+            nodes: Vec::new(),
+        })
+        .expect("the welcome is sent");
+    for command in &commands {
+        connection
+            .send(&Downstream {
+                kind: Some(downstream::Kind::Event(Event {
+                    kind: Some(event::Kind::Command(command.clone())),
+                })),
+            })
+            .expect("the command is sent");
+    }
+
+    let mut reports = Vec::new();
+    loop {
+        match connection.recv::<Upstream>(PATIENCE) {
+            Ok(Some(Upstream {
+                kind: Some(upstream::Kind::Report(report)),
+            })) => reports.push(report),
+            Ok(Some(_)) => {}
+            // A quiet interval is not the engine leaving: only its close is.
+            // The test process runs hundreds of threads, so a report may be
+            // slower than this wait without anything being wrong.
+            Ok(None) => {}
+            Err(proto::Error::Closed) => break,
+            Err(error) => panic!("the test's daemon reads no more: {error}"),
+        }
+    }
+    reports
 }
 
 /// A switchover the daemon commands an epoch's main process to perform.
@@ -165,7 +185,7 @@ fn the_link_receives_the_daemons_commands_unasked_and_reports_back() {
         Some(process::command::Kind::Commit(_))
     ));
 
-    // A report reaches the daemon, from this thread and from another one.
+    // A report reaches the daemon, from this thread.
     link.report(process::Report {
         kind: Some(process::report::Kind::Switched(process::Switched {
             generation: 3,
@@ -178,8 +198,12 @@ fn the_link_receives_the_daemons_commands_unasked_and_reports_back() {
         kind: Some(process::report::Kind::PolicyReverted(
             PolicyReverted {
                 scheduler: Some(1),
-                program: PolicyProgram::from_arguments("fcfs", 3, &std::collections::BTreeMap::new())
-                    .expect("a program with the policy's defaults"),
+                program: PolicyProgram::from_arguments(
+                    "fcfs",
+                    3,
+                    &std::collections::BTreeMap::new(),
+                )
+                .expect("a program with the policy's defaults"),
                 reason: "a decision named a request no longer resident".to_owned(),
                 fatal: false,
             }
@@ -188,6 +212,9 @@ fn the_link_receives_the_daemons_commands_unasked_and_reports_back() {
     })
     .expect("the report is sent");
 
+    // …and from another thread, which shares the one connection with the
+    // reader: reports are what a scheduler or the control thread sends without
+    // waiting for an answer.
     let reporting = Arc::clone(&link);
     let reporter = std::thread::spawn(move || {
         reporting
@@ -209,7 +236,11 @@ fn the_link_receives_the_daemons_commands_unasked_and_reports_back() {
     // this main process leaving.
     let link = Arc::into_inner(link).expect("the reporter's share is gone");
     link.close();
-    let rounds = daemon.join().expect("the test's daemon ends");
+    let handlers = daemon.join().expect("the test's daemon ends");
+    let rounds: Vec<Vec<process::Report>> = handlers
+        .into_iter()
+        .map(|handler| handler.join().expect("a connection's handler ends"))
+        .collect();
     let reports = &rounds[0];
     assert_eq!(reports.len(), 3, "every report arrived");
     assert!(
@@ -226,7 +257,10 @@ fn the_link_receives_the_daemons_commands_unasked_and_reports_back() {
             assert_eq!(reverted.scheduler, Some(1), "the scheduler that failed");
             assert_eq!(reverted.backend, "fcfs");
             assert_eq!(reverted.revision, 3);
-            assert!(!reverted.fatal, "the epoch served on under the previous policy");
+            assert!(
+                !reverted.fatal,
+                "the epoch served on under the previous policy"
+            );
             assert!(
                 reverted.reason.contains("no longer resident"),
                 "the policy's own account: {}",
