@@ -979,6 +979,34 @@ impl Moe {
         }
     }
 
+    /// The router's raw scores for `hidden`: `[tokens, experts]`, the gate's product before the
+    /// top-k softens it.
+    ///
+    /// This is the array that separates a routing difference of *scale* from one of *selection*.
+    /// The top-k operator applies the softmax itself, so the scores are the last place a factor can
+    /// be seen directly: a score row a fraction of a reference's yields nearly equal weights, an
+    /// order that follows that row rather than the reference's, and ids that mostly agree anyway —
+    /// which no comparison of outputs can tell from a defect in the experts.
+    ///
+    /// `scores` is the caller's `[tokens, experts]` buffer of the input's dtype, so a dump reads
+    /// host memory and a capture writes to the arena's.
+    pub fn gate(&self, f: &Forward, hidden: TensorView, scores: TensorView) -> Result<()> {
+        hidden
+            .require_row("Moe::gate", hidden.dtype, u64::from(self.hidden))
+            .map_err(Error::from)?;
+        let expected = Shape::new(&[hidden.rows(), u64::from(self.experts)]);
+        if scores.dtype != hidden.dtype || scores.shape != expected {
+            return Err(Error::shape(
+                "Moe::gate",
+                format!(
+                    "the scores are {expected:?} of {}, not {:?} of {}",
+                    hidden.dtype, scores.shape, scores.dtype
+                ),
+            ));
+        }
+        self.router.forward(f, hidden, scores)
+    }
+
     /// The routing prefix: the router, its top-k, the expert map, and the sort that groups the
     /// routes into the tiles a grouped product reads.
     ///

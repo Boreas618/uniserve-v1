@@ -600,6 +600,52 @@ impl Qwen3Moe {
         self.layers[layer].route(f, hidden, normalized, ids, weights)
     }
 
+    /// The router's raw scores at one layer, from that layer's own input rows.
+    ///
+    /// `hidden` is the layer's input — the reference's `hidden_{layer}` — `[tokens, hidden]`, and
+    /// `scores` is the caller's `[tokens, experts]` buffer of the same dtype, which receives the
+    /// gate's product before the top-k softens it. The layer's input norm runs, then its gate, and
+    /// nothing else.
+    ///
+    /// This is the measurement a routing difference needs first. `topk_softmax` applies the softmax
+    /// itself, so the scores are the last point at which a *factor* is visible as a factor: scores
+    /// that are a fraction of a reference's give nearly equal weights, an order that follows those
+    /// scores, and ids that mostly agree — the exact signature of a routing defect that a comparison
+    /// of weights alone would call "flat weights" and a comparison of ids alone would call "close".
+    ///
+    /// Like [`Self::route`], the answer is about a **state**, not a block's update, and a layer whose
+    /// MLP is dense has no gate to answer from.
+    pub fn gate(
+        &self,
+        f: &Forward,
+        hidden: TensorView,
+        layer: usize,
+        scores: TensorView,
+    ) -> Result<()> {
+        if layer >= self.layers.len() {
+            return Err(Error::Config(format!(
+                "layer {layer} was asked for but the model has {}",
+                self.layers.len()
+            )));
+        }
+        let tokens = hidden.rows();
+        let plan = self.plan(tokens)?;
+        if hidden.shape.rank() != 2
+            || hidden.shape.dim(0) != tokens
+            || hidden.shape.dim(1) != plan.hidden
+        {
+            return Err(Error::Config(format!(
+                "hidden is {:?}, [{tokens}, {}] expected",
+                hidden.shape.dims(),
+                plan.hidden
+            )));
+        }
+        let normalized = f
+            .arena()
+            .tensor(hidden.dtype, Shape::new(&[tokens, plan.hidden]))?;
+        self.layers[layer].gate(f, hidden, normalized, scores)
+    }
+
     /// Run layers `start..=last` on the caller's rows, and answer the state after `last` (with
     /// `stage = None`) or that cut inside it.
     ///
@@ -818,6 +864,18 @@ impl DecoderLayer {
     /// `stop` cuts the layer short for an in-layer walk and answers the tensor that cut produces;
     /// the sublayers it skips are not launched at all. With `stop = None` the answer is `update`,
     /// the layer's output.
+    /// The router's raw scores at this layer: its own input norm, then its gate, and nothing else.
+    fn gate(
+        &self,
+        f: &Forward,
+        hidden: TensorView,
+        normalized: TensorView,
+        scores: TensorView,
+    ) -> Result<()> {
+        self.input_norm.forward(f, hidden, normalized)?;
+        self.mlp.gate(f, normalized, scores)
+    }
+
     /// The router's choice at this layer: its own input norm, then its router, and nothing else.
     ///
     /// `hidden` is the layer's *input* — the residual stream below it — and `normalized` is the
@@ -986,6 +1044,18 @@ impl Mlp {
             Mlp::Dense(_) => Err(Error::Config(
                 "this layer's MLP is dense: it chooses no experts, so it has no routing to answer"
                     .to_owned(),
+            )),
+        }
+    }
+}
+
+impl Mlp {
+    /// The router's raw scores for this sublayer, on rows the layer's input norm already produced.
+    fn gate(&self, f: &Forward, normalized: TensorView, scores: TensorView) -> Result<()> {
+        match self {
+            Mlp::Experts(moe) => moe.gate(f, normalized, scores).map_err(Error::from),
+            Mlp::Dense(_) => Err(Error::Config(
+                "this layer's MLP is dense: it has no gate to answer scores from".to_owned(),
             )),
         }
     }
