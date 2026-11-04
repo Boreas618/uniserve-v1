@@ -665,6 +665,36 @@ impl Epochs {
         record.status = Status::Serving;
     }
 
+    /// Records epoch `epoch` as serving the `deployment` this node installed
+    /// at startup: its build config and programs, the generation its main
+    /// processes numbered, and the world it executes (§7.4). The daemon
+    /// records nothing it did not install, so this is called with what the
+    /// main processes answered, not with what the configuration asked for.
+    ///
+    /// Answers the epoch's number.
+    pub fn install(
+        &self,
+        epoch: u64,
+        deployment: &Deployment,
+        world: u64,
+        generations: &[u64],
+    ) -> u64 {
+        self.record(
+            epoch,
+            EpochRecord {
+                build_config: deployment.build_config.clone(),
+                kernels: deployment.programs.kernels.clone(),
+                policy: deployment.programs.policy.clone(),
+                previous_kernels: BTreeMap::new(),
+                previous_policy: None,
+                status: Status::Serving,
+                generation: generations.first().copied(),
+                world,
+            },
+        );
+        epoch
+    }
+
     /// Gives the epochs the daemon's command channel to its main processes,
     /// once, when the daemon starts (§2.3): the program layer commands
     /// through it and reads its reports.

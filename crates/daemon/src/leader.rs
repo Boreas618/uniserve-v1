@@ -505,6 +505,7 @@ impl Leader {
             .iter()
             .filter_map(|(client, _, _)| client.engine())
             .collect();
+        let world = clients.first().map_or(0, |(client, _, _)| client.world());
         let mut clients = clients.into_iter();
         let (client, served, observer) = clients
             .next()
@@ -540,7 +541,7 @@ impl Leader {
             // update (§2.3, §7.3).
             leader.epochs.supervise(commands.clone());
             leader
-                .install_programs(commands, config, engines)
+                .install_programs(commands, config, engines, world)
                 .await
                 .context("installing the epoch's programs in its main processes")?;
         }
@@ -566,16 +567,27 @@ impl Leader {
         commands: &crate::supervision::ProcessCommands,
         config: &ServeConfig,
         engines: Vec<u64>,
+        world: u64,
     ) -> anyhow::Result<()> {
         let filled = crate::epoch::FilledPrograms::of(config);
+        // What a startup switch asks the Program Servers for is the
+        // scheduling policy alone: it installs no kernel. The engine resolves
+        // the kernel programs an operator needs when it loads them, so a
+        // `prepare` for every operator's package would refuse on a host that
+        // installs none, and the epoch's own record still names the whole
+        // deployment (`filled`).
+        let policy_only = crate::epoch::FilledPrograms {
+            kernels: std::collections::BTreeMap::new(),
+            policy: filled.policy.clone(),
+        };
         let servers = self.program_servers(config);
         let leader_host = self.program_leader_host(config, &servers);
         let prepared = {
             let servers = servers.clone();
             let leader_host = leader_host.clone();
-            let filled = filled.clone();
+            let policy_only = policy_only.clone();
             tokio::task::spawn_blocking(move || {
-                crate::engine::control::prepare_epoch(&servers, &leader_host, &filled, &[])
+                crate::engine::control::prepare_epoch(&servers, &leader_host, &policy_only, &[])
             })
             .await
             .context("preparing the epoch's programs")?
@@ -584,7 +596,7 @@ impl Leader {
         let deployment = crate::epoch::Deployment {
             config: config.clone(),
             build_config: crate::epoch::BuildConfig::of(config),
-            programs: prepared.clone(),
+            programs: filled,
         };
         let processes: Vec<crate::engine::control::EpochProcess> = engines
             .into_iter()
@@ -594,13 +606,16 @@ impl Leader {
             })
             .collect();
         let commands = commands.clone();
+        let installed = deployment.clone();
         let generations = tokio::task::spawn_blocking(move || {
             let mut switch = crate::engine::control::ProgramSwitch::new(
                 &commands,
                 processes,
-                crate::epoch::Update::new(0, deployment),
+                crate::epoch::Update::new(0, installed),
             );
-            switch.precopy(&prepared.kernels, &prepared.policy)?;
+            // No kernel moves at a startup switch: it installs the
+            // scheduling policy the epoch serves with.
+            switch.precopy(&std::collections::BTreeMap::new(), &prepared.policy)?;
             switch.switchover()?;
             switch.commit()?;
             Ok::<_, crate::epoch::Failure>(switch.generations().to_vec())
@@ -614,7 +629,15 @@ impl Leader {
                 failure.reason
             )
         })?;
+        // The daemon's record of what executes: the epoch's build config and
+        // the programs its main processes took, with the number they gave
+        // them (`EpochRecord::generation`), which `GET /admin/config`
+        // reports and a later update is routed against (§7.2, §7.4).
+        // The first epoch of a daemon is epoch 0 (§7.4).
+        let epoch = self.epochs.install(0, &deployment, world, &generations);
         tracing::info!(
+            epoch,
+            world,
             generations = ?generations,
             "the main processes serve the epoch's programs"
         );
