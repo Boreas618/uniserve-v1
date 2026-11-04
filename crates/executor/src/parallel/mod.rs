@@ -8,3 +8,4 @@
 //! communicators. Device collectives never use it.
 
 pub mod host;
+pub(crate) mod topology;
