@@ -190,6 +190,14 @@ impl Paused {
                     "pid": std::process::id(),
                     "pause_ms": pause_ms,
                     "frozen_at_ns": frozen.frozen_at_ns,
+                    // When the engine moved this response's stream to the
+                    // successor (design §7.5.1 step 4). The ownership window
+                    // runs from here to the successor's first new frame, which
+                    // its own `handoff adopted` record carries; it is null
+                    // when the successor took nothing over. This is where the
+                    // stream is no longer the predecessor's, which is what a
+                    // successor's death in that window costs.
+                    "engine_at_ns": taken.map(|adopted| adopted.at_ns),
                     "adopted": taken.is_some(),
                 })
             );
