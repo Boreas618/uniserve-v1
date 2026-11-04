@@ -10,9 +10,18 @@ use crate::{DataType, DeviceId, DevicePtr, DeviceRange, Error, PrimaryContext, R
 
 /// `ncclCommSuspend`'s flag that releases the communicator's dynamic device
 /// storage.
+///
+/// The API documentation gives it as `0x01`; the system `nccl.h` this crate
+/// builds against does not define it at all, and only newer NCCL headers carry
+/// `#define NCCL_SUSPEND_MEM 0x01`. It is therefore a flag from the
+/// documentation rather than a header number, and
+/// [`tests::the_nccl_constants_are_the_headers`] does not table it: naming it
+/// there would fail on every machine whose header lacks it.
 const NCCL_SUSPEND_MEM: i32 = 0x01;
 
-/// `NCCL_SPLIT_NOCOLOR`: the colour a rank that does not join a split passes.
+/// `NCCL_SPLIT_NOCOLOR`: the colour a rank that does not join a split passes,
+/// `#define NCCL_SPLIT_NOCOLOR -1` in `nccl.h`, compared there by
+/// [`tests::the_nccl_constants_are_the_headers`].
 const NCCL_SPLIT_NOCOLOR: i32 = -1;
 
 /// The 128-byte rendezvous token every rank of a communicator initializes
@@ -597,5 +606,15 @@ mod tests {
     fn a_communicator_moves_to_its_device_thread() {
         fn movable<T: Send>() {}
         movable::<Communicator>();
+    }
+
+    /// The one constant this crate takes from `nccl.h` is compared with it: a
+    /// split is only correct if the "not in this group" colour is the header's.
+    #[test]
+    fn the_nccl_constants_are_the_headers() {
+        crate::header::assert_constants(
+            "nccl.h",
+            &[("NCCL_SPLIT_NOCOLOR", super::NCCL_SPLIT_NOCOLOR as i64)],
+        );
     }
 }
