@@ -103,6 +103,13 @@ pub(crate) const SAMPLER_PARAMETERS: usize = 8;
 /// `page` is the cache's page geometry and `max_kv_len` the attention
 /// descriptor's static bound on a sequence, both of which the mechanism states
 /// to the executor rather than letting each side derive them.
+///
+/// The slot mapping is written through the deployment's cache group: the batch
+/// types one KV kind, and a deployment with more than one cache group (a hybrid
+/// model's several KV kinds) would need the batch to name its group before this
+/// could address the others. Until then the first group is the only one, and
+/// `None` says so rather than mapping through a group the batch does not own.
+/// The same holds of the page geometry the caller passes.
 pub(crate) fn columns(
     requests: &[(Call, RequestPlacement)],
     inputs: &[Vec<i32>],
