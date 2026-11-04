@@ -52,7 +52,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::engine::client::EngineClient;
-use crate::worlds::{Observer, Sample};
+use crate::observe::{Observer, Sample};
 
 /// The span before a world change whose steps make the schedulers'
 /// baselines: sixty of their once-a-second reports.

@@ -376,18 +376,21 @@ impl Projections {
             )));
         }
         let arena = f.arena();
+        // The intermediates are the tables' own element type, not FP32: the reference casts each
+        // activation to the weight's type before every projection (`adaln_cache.py:128`), so a wider
+        // running value would hand the next projection a number the checkpoint never produced. The
+        // embedding stays FP32 - it is the one input the model computes rather than reads, and the
+        // reference leaves it so until the first projection reads it.
+        let dtype = output_out.dtype;
         let hidden = arena.tensor(
-            nn::DType::F32,
+            dtype,
             Shape::new(&[groups, u64::from(self.time_hidden_dim)]),
         )?;
         let activated = arena.tensor(
-            nn::DType::F32,
+            dtype,
             Shape::new(&[groups, u64::from(self.time_hidden_dim)]),
         )?;
-        let time = arena.tensor(
-            nn::DType::F32,
-            Shape::new(&[groups, u64::from(self.time_dim)]),
-        )?;
+        let time = arena.tensor(dtype, Shape::new(&[groups, u64::from(self.time_dim)]))?;
         let linear = |weights: &(Weight, Weight)| {
             nn::layers::Linear::new(weights.0, Some(weights.1), nn::layers::WeightOrder::NxK)
         };
