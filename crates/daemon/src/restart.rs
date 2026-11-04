@@ -145,6 +145,12 @@ struct Takeover {
     admin: HandedAdmin,
     jobs: Vec<(VideoJob, Option<u64>)>,
     then: Option<crate::updates::change::ApplyRequest>,
+    /// Whether new requests waited when the predecessor handed over. The
+    /// successor's gate starts as the predecessor's ended: a hot restart must
+    /// not reopen admissions (§7.5.1), and the in-process hold alone would
+    /// reopen them once the frontend serves.
+    #[serde(default)]
+    frontend_paused: bool,
 }
 
 /// One replica's control connection and executing world. Descriptors follow
@@ -367,6 +373,7 @@ impl Restarter {
                     admin: admin.hand_over(),
                     jobs: job_records,
                     then: then.map(|request| *request),
+                    frontend_paused: leader.status().paused,
                 })),
                 &borrowed,
             )?;
@@ -665,6 +672,7 @@ async fn prepared_successor(
         admin,
         jobs,
         then,
+        frontend_paused,
     } = *takeover;
     let mut descriptors = descriptors.into_iter();
     let mut next = || {
@@ -760,6 +768,15 @@ async fn prepared_successor(
         let mut processes = epoch_records.processes();
         processes.push(process);
         epoch_records.set_processes(processes);
+    }
+    if frontend_paused {
+        // The predecessor was gated when it handed over, so the successor's
+        // gate starts closed: the in-process hold is re-asserted here (its
+        // `adopt_pause` already carried the per-replica state, and this is the
+        // one place that states the deployment's), and the frontend's gate,
+        // once a frontend process holds one, is closed at the same point.
+        leader.pause();
+        info!("the successor continues gated: admissions stay closed across the handoff");
     }
     let first = Arc::clone(&leader.replicas()[0]);
     *crate::leader::locked(&first.config) = options;

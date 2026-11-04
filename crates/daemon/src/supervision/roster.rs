@@ -250,6 +250,20 @@ impl ProcessRoster {
         let Some(launch) = self.launches.get(&generation) else {
             return;
         };
+        // §7.3 step 4: a failure a main process reports during a program-layer
+        // probation ends that probation in favour of the generation that served
+        // before. The revert commands the processes and waits for their
+        // answers, which arrive on the channel this thread reads, so it runs on
+        // a thread of its own.
+        if let Some(failure) = crate::epoch::Failure::of_report(&report) {
+            let epochs = Arc::clone(&self.epochs);
+            std::thread::Builder::new()
+                .name("program-revert".into())
+                .spawn(move || {
+                    epochs.program_failure(failure);
+                })
+                .ok();
+        }
         let host = launch.host.clone();
         if let Some(Kind::Drained(drained)) = &report.kind
             && let Some(launch) = self.launches.get_mut(&generation)
@@ -289,6 +303,28 @@ impl ProcessRoster {
     /// One supervised process exited.
     fn exited(&mut self, exit: Exit) {
         let generation = exit.generation;
+        // A main process of the update in flight that exits ends the probation
+        // (§7.3 step 4), on a thread of its own for the reason above.
+        if let Some(program) = self.epochs.program_update()
+            && program.update.state == crate::epoch::UpdateState::Probation
+            && program
+                .prepared
+                .iter()
+                .any(|prepared| prepared.generation == generation)
+        {
+            let epochs = Arc::clone(&self.epochs);
+            let failure = crate::epoch::Failure {
+                kind: "exited".to_owned(),
+                reason: format!("a main process of the update exited ({})", exit.status),
+                device: None,
+            };
+            std::thread::Builder::new()
+                .name("program-revert".into())
+                .spawn(move || {
+                    epochs.program_failure(failure);
+                })
+                .ok();
+        }
         let state = if self.stopping.remove(&generation) {
             ProcessState::Stopped
         } else {

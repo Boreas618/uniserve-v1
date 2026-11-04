@@ -2582,6 +2582,7 @@ fn policy_usage(
         .fold(route, |sum, usage| PolicyUsage {
             calls: sum.calls + usage.calls,
             fuel: sum.fuel + usage.fuel,
+            decisions: sum.decisions + usage.decisions,
         })
 }
 
@@ -3679,7 +3680,11 @@ mod tests {
 
     #[test]
     fn the_epochs_policy_cost_is_the_route_instance_and_every_scheduler() {
-        let usage = |calls, fuel| PolicyUsage { calls, fuel };
+        let usage = |calls, fuel| PolicyUsage {
+            calls,
+            fuel,
+            decisions: scheduling::PolicyCost::default(),
+        };
         // A scheduler that has no policy yet states nothing and adds nothing,
         // and the control thread's route instance is part of the epoch's cost
         // whether or not any scheduler serves.
@@ -3696,6 +3701,86 @@ mod tests {
             usage(1, 10),
             "the route instance alone is still the epoch's cost"
         );
+    }
+
+    #[test]
+    fn the_route_instance_is_fed_every_event_batch_the_control_thread_translates() {
+        // §4.4's route row: the control thread's own instance is what answers
+        // `route`, and it is told what the schedulers report - one `observe` per
+        // batch of events, whatever the batch carries, and nothing for an empty
+        // one. The translation itself is `the_route_instance_hears_emissions_and_ends`;
+        // this states that the translated events reach the instance.
+        let engine = crate::scheduler::process_engine().expect("the policy engine loads");
+        let toy = crate::scheduler::testing::Toy::default();
+        let ceilings = toy.limits;
+        let program = PolicyProgram {
+            backend: "toy".to_owned(),
+            revision: 1,
+            arguments: Default::default(),
+            stated: Default::default(),
+        };
+        let policy = RoutePolicy::install(
+            &engine,
+            &crate::PolicyBytes::new(crate::scheduler::testing::toy_module(&toy)),
+            program,
+            &TrialState::default(),
+            &ceilings,
+        )
+        .expect("the route instance installs on an empty state");
+        let routing = Routing {
+            slots: Vec::new(),
+            requests: Mutex::default(),
+            cache_routes: Mutex::default(),
+            fronts: Mutex::default(),
+            state: AtomicI32::new(proto::request::wire::EngineState::Ready as i32),
+            failed: AtomicBool::new(false),
+            trial: AtomicBool::new(false),
+            route: Mutex::new(RouteState {
+                engine: None,
+                ceilings,
+                instance: Some(policy),
+                candidate: None,
+                pending: Vec::new(),
+                reports: Vec::new(),
+            }),
+            generations: Mutex::default(),
+            policy_reports: Mutex::new(Vec::new()),
+        };
+        let observes = || {
+            let state = crate::lock(&routing.route);
+            let policy = state.instance.as_ref().expect("the instance serves");
+            policy.usage().decisions.calls(scheduling::Call::Observe)
+        };
+
+        let now = scheduling::guest::Nanos(1_000);
+        let emitted = policy_event(
+            RequestId(7),
+            &Event::TextToken {
+                id: 1,
+                logprob: None,
+            },
+            now,
+        )
+        .expect("a token is an emission");
+        let finished = policy_event(
+            RequestId(7),
+            &Event::Finished {
+                reason: FinishReason::Stop,
+                stop_reason: None,
+                prompt_tokens: 4,
+                completion_tokens: 2,
+                images: 0,
+            },
+            now,
+        )
+        .expect("an end is a finish");
+
+        routing.observe_route(vec![emitted.clone()]);
+        assert_eq!(observes(), 1, "one batch of events is one observe");
+        routing.observe_route(vec![finished, emitted]);
+        assert_eq!(observes(), 2, "a batch is one observe whatever it carries");
+        routing.observe_route(Vec::new());
+        assert_eq!(observes(), 2, "an empty batch asks the policy nothing");
     }
 
     #[test]

@@ -27,12 +27,17 @@
 //! - [`manifest`]: the `package.toml` of section 5.2.
 //! - [`protocol`]: the append-only Protobuf protocol and its client, which
 //!   the daemon and the main process use.
+//! - [`cubin_launch`]: the plan of one launch of an installed module, read from a recipe. The
+//!   crate's `cubin-launch` binary performs it on a device: it exists to observe the arithmetic
+//!   of the packages that are a cubin with no launcher of their own, and it is the one thing in
+//!   this crate that allocates device memory or launches a kernel.
 //! - [`program`]: [`Program`], the backend name, revision and arguments an
 //!   epoch fills each operator with (section 5.1), shared by the daemon and
 //!   the main process.
 
 pub mod builder;
 pub mod command;
+pub mod cubin_launch;
 pub mod manifest;
 pub mod program;
 pub mod protocol;

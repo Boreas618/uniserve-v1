@@ -321,9 +321,11 @@ def check_normal(module, dtype):
     got = out[0].to(torch.float32).numpy()
     error = np.abs(got - expected)
     allowed = tolerance * np.abs(expected) + np.finfo(np.float32).tiny
-    violations = int((error > allowed).sum())
+    # `~(error <= allowed)`: a NaN never compares greater than the bound, so the plain form
+    # would count it as inside.
+    violations = int((~(error <= allowed)).sum())
     print(
-        f"normal: rows form, max |error| {error.max():.3e} at rtol {tolerance:.3e}, "
+        f"normal: rows form, max |error| {np.nan_to_num(error).max():.3e} at rtol {tolerance:.3e}, "
         f"{violations} of {elements} outside the bound ({dtype})"
     )
     if violations:
