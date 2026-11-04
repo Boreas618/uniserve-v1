@@ -130,16 +130,17 @@ impl ProcessCommands {
     /// waiting at most `timeout` for one.
     pub fn report(&self, timeout: Duration) -> Option<(u64, proto::process::Report)> {
         let deadline = Instant::now() + timeout;
-        loop {
-            let reports = self
-                .reports
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match reports.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                Ok(report) => return Some(report),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return None,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
-            }
+        let reports = self
+            .reports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Every answer ends the wait: a report, the deadline, or a service that
+        // stopped sending. `recv_timeout` already waits the whole `timeout`, so
+        // there is nothing to loop over.
+        match reports.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(report) => Some(report),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
         }
     }
 }
@@ -221,93 +222,93 @@ impl Daemon {
 
         let (served, thread, commands, link, requests, frontend_greeted, awake, table) =
             if options.node_rank == 0 {
-            let (joins, members) = join_members(&options)?;
-            let leader_address = leader_address(&options, &members);
-            // Engines may run on any joined node. A deployment with a
-            // network address exposes process control on that interface;
-            // single-host deployments retain their Unix socket.
-            let (address, socket) = match leader_address {
-                Some(ip) => (std::net::SocketAddr::new(ip, 0).to_string(), None),
-                None => (
-                    format!("unix:{}", options.socket.display()),
-                    Some(options.socket.clone()),
-                ),
+                let (joins, members) = join_members(&options)?;
+                let leader_address = leader_address(&options, &members);
+                // Engines may run on any joined node. A deployment with a
+                // network address exposes process control on that interface;
+                // single-host deployments retain their Unix socket.
+                let (address, socket) = match leader_address {
+                    Some(ip) => (std::net::SocketAddr::new(ip, 0).to_string(), None),
+                    None => (
+                        format!("unix:{}", options.socket.display()),
+                        Some(options.socket.clone()),
+                    ),
+                };
+                if let Some(parent) = options.socket.parent() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("creating {}", parent.display()))?;
+                }
+                // A socket a stopped daemon left behind is replaced.
+                let _ = std::fs::remove_file(&options.socket);
+                let listener = Listener::bind(&address)
+                    .with_context(|| format!("binding the process socket {address}"))?;
+                let address = listener.address().to_owned();
+                // While nodes may join, their processes reach this node's
+                // Storage Server too: their Transfer Servers read its storage.
+                let local = local(&options, leader_address, joins.is_some())?;
+                let host = options.host.clone();
+                let (commands, commands_rx) = std::sync::mpsc::channel();
+                let (reports, reports_rx) = std::sync::mpsc::channel();
+                let (requests, requests_rx) = std::sync::mpsc::channel();
+                let (greetings, greetings_rx) = std::sync::mpsc::channel();
+                let (frontend_greetings, frontend_greeted) = std::sync::mpsc::channel();
+                let (exits, exits_rx) = std::sync::mpsc::channel();
+                let (activity, awake) = std::sync::mpsc::channel();
+                // The processes this node supervises, which the service keeps
+                // current and the admin API reports (§2.3, §7.4).
+                let table: service::ProcessTable = Default::default();
+                let published = Arc::clone(&table);
+                let thread = std::thread::Builder::new()
+                    .name("daemon".into())
+                    .spawn(move || {
+                        service::serve_leader(
+                            &host,
+                            local,
+                            listener,
+                            joins,
+                            members,
+                            commands_rx,
+                            reports,
+                            requests_rx,
+                            greetings,
+                            Some(frontend_greetings),
+                            exits,
+                            activity,
+                            published,
+                            &stop,
+                        )
+                    })
+                    .context("starting the daemon's service")?;
+                let commands = ProcessCommands {
+                    commands,
+                    reports: Arc::new(std::sync::Mutex::new(reports_rx)),
+                };
+                let link = Some(roster::EpochLink {
+                    requests: requests.clone(),
+                    greetings: greetings_rx,
+                    exits: exits_rx,
+                    commands: commands.clone(),
+                });
+                (
+                    Some((address, socket)),
+                    thread,
+                    Some(commands),
+                    link,
+                    Some(requests),
+                    Some(frontend_greeted),
+                    Some(awake),
+                    Some(table),
+                )
+            } else {
+                let leader = join_leader(&options)?;
+                let address = leader.local_ip();
+                let local = local(&options, address, true)?;
+                let thread = std::thread::Builder::new()
+                    .name("daemon".into())
+                    .spawn(move || service::serve_member(local, leader, &stop))
+                    .context("starting the daemon's service")?;
+                (None, thread, None, None, None, None, None, None)
             };
-            if let Some(parent) = options.socket.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("creating {}", parent.display()))?;
-            }
-            // A socket a stopped daemon left behind is replaced.
-            let _ = std::fs::remove_file(&options.socket);
-            let listener = Listener::bind(&address)
-                .with_context(|| format!("binding the process socket {address}"))?;
-            let address = listener.address().to_owned();
-            // While nodes may join, their processes reach this node's
-            // Storage Server too: their Transfer Servers read its storage.
-            let local = local(&options, leader_address, joins.is_some())?;
-            let host = options.host.clone();
-            let (commands, commands_rx) = std::sync::mpsc::channel();
-            let (reports, reports_rx) = std::sync::mpsc::channel();
-            let (requests, requests_rx) = std::sync::mpsc::channel();
-            let (greetings, greetings_rx) = std::sync::mpsc::channel();
-            let (frontend_greetings, frontend_greeted) = std::sync::mpsc::channel();
-            let (exits, exits_rx) = std::sync::mpsc::channel();
-            let (activity, awake) = std::sync::mpsc::channel();
-            // The processes this node supervises, which the service keeps
-            // current and the admin API reports (§2.3, §7.4).
-            let table: service::ProcessTable = Default::default();
-            let published = Arc::clone(&table);
-            let thread = std::thread::Builder::new()
-                .name("daemon".into())
-                .spawn(move || {
-                    service::serve_leader(
-                        &host,
-                        local,
-                        listener,
-                        joins,
-                        members,
-                        commands_rx,
-                        reports,
-                        requests_rx,
-                        greetings,
-                        Some(frontend_greetings),
-                        exits,
-                        activity,
-                        published,
-                        &stop,
-                    )
-                })
-                .context("starting the daemon's service")?;
-            let commands = ProcessCommands {
-                commands,
-                reports: Arc::new(std::sync::Mutex::new(reports_rx)),
-            };
-            let link = Some(roster::EpochLink {
-                requests: requests.clone(),
-                greetings: greetings_rx,
-                exits: exits_rx,
-                commands: commands.clone(),
-            });
-            (
-                Some((address, socket)),
-                thread,
-                Some(commands),
-                link,
-                Some(requests),
-                Some(frontend_greeted),
-                Some(awake),
-                Some(table),
-            )
-        } else {
-            let leader = join_leader(&options)?;
-            let address = leader.local_ip();
-            let local = local(&options, address, true)?;
-            let thread = std::thread::Builder::new()
-                .name("daemon".into())
-                .spawn(move || service::serve_member(local, leader, &stop))
-                .context("starting the daemon's service")?;
-            (None, thread, None, None, None, None, None, None)
-        };
         let (address, socket) = served.unzip();
         Ok(Self {
             commands,

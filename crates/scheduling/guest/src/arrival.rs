@@ -239,6 +239,14 @@ impl<K: Order> Arrival<K> {
             share,
             room.page_tokens,
         );
+        if chunk == 0 {
+            // Nothing left to ingest: this phase's write is structural (a close
+            // cache, a feedback state, a block's commit), so its charge is the
+            // one the mechanism states rather than a chunk to size. Without
+            // this the request is never named, the pass stays non-token, and
+            // the decoders behind it wait for ever.
+            return (view.next_tokens, true);
+        }
         (chunk, true)
     }
 

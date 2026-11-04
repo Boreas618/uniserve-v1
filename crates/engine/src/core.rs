@@ -25,7 +25,6 @@ use std::thread::JoinHandle;
 use crate::executor::{Executor, TransferConfig, WorkerGroupId};
 // The executor crate's device-side submission path, named here rather than
 // through this process's worker-process executor.
-use executor::batch::Batches;
 use crate::handle::{CommandSender, EventRx, SubmitError};
 #[cfg(feature = "testing")]
 use crate::scheduler::{
@@ -38,6 +37,7 @@ use crate::scheduler::{SchedulerConfig, SchedulerStats};
 use crate::worker::{WorkerExecutor, WorkerGroup, WorkerProcessArgs};
 use crate::{CommandWaker, GenerationLimits, Request};
 use anyhow::Context as _;
+use executor::batch::Batches;
 #[cfg(test)]
 use ipc::ComponentDistribution;
 use ipc::WorkerInfo;
@@ -512,11 +512,7 @@ pub struct RankFacts {
 }
 
 /// A fact the derivation needs, named with where it comes from.
-fn fact<'a, T>(
-    value: &'a Option<T>,
-    name: &str,
-    source: &str,
-) -> anyhow::Result<&'a T> {
+fn fact<'a, T>(value: &'a Option<T>, name: &str, source: &str) -> anyhow::Result<&'a T> {
     value.as_ref().with_context(|| {
         format!("the engine's facts state no {name}, which is the {source}'s to state")
     })
@@ -1061,10 +1057,7 @@ impl SchedulerHandle {
     /// capabilities and completes from its reports; `batches` is the executor
     /// crate's own submission path, which the shadow pass of §7.3 step 2 and,
     /// once the splice lands, the step's own submissions go through.
-    pub fn start(
-        config: EngineConfig,
-        batches: Arc<dyn Batches>,
-    ) -> anyhow::Result<Self> {
+    pub fn start(config: EngineConfig, batches: Arc<dyn Batches>) -> anyhow::Result<Self> {
         anyhow::ensure!(
             config.data_parallel_size == 1,
             "one handle is one scheduler thread, but the config states {} ranks: start a \
@@ -1208,10 +1201,7 @@ impl SchedulerHandle {
     /// no pool or pools that disagree about a component, when a pool serves fewer
     /// request rows than `max_running_requests` running requests need, or when
     /// the scheduler's thread cannot be started.
-    pub fn over_batches(
-        config: EngineConfig,
-        batches: Arc<dyn Batches>,
-    ) -> anyhow::Result<Self> {
+    pub fn over_batches(config: EngineConfig, batches: Arc<dyn Batches>) -> anyhow::Result<Self> {
         anyhow::ensure!(
             config.data_parallel_size == 1,
             "one handle is one scheduler thread, but the config states {} ranks: start one \
@@ -1360,10 +1350,7 @@ impl SchedulerHandle {
     /// Applies `config`'s per-world settings to a freshly built scheduler: its
     /// world identity, its prefix reuse and state interval, its prefill groups,
     /// and the host storages its ranks map.
-    fn configured(
-        mut scheduler: Scheduler,
-        config: &EngineConfig,
-    ) -> anyhow::Result<Scheduler> {
+    fn configured(mut scheduler: Scheduler, config: &EngineConfig) -> anyhow::Result<Scheduler> {
         scheduler.set_world(config.world);
         scheduler.set_prefix_reuse(config.prefix_cache);
         scheduler.set_state_interval(config.state_interval);
