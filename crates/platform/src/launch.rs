@@ -270,3 +270,38 @@ fn empty_attribute() -> LaunchAttribute {
         value: LaunchAttributeValue { pad: [0; 64] },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_launch_rejects_empty_grid_block_and_cluster_dimensions() {
+        // A zero dimension is the caller's mistake, named before the driver
+        // sees the launch.
+        for config in [
+            LaunchConfig {
+                grid: [0, 1, 1],
+                ..LaunchConfig::new([1, 1, 1], [1, 1, 1])
+            },
+            LaunchConfig {
+                block: [1, 1, 0],
+                ..LaunchConfig::new([1, 1, 1], [1, 1, 1])
+            },
+            LaunchConfig {
+                cluster: Some(Cluster::new([1, 0, 1])),
+                ..LaunchConfig::new([1, 1, 1], [1, 1, 1])
+            },
+        ] {
+            assert!(matches!(config.check(), Err(Error::InvalidArgument(_))));
+        }
+
+        let well_formed = LaunchConfig {
+            cluster: Some(Cluster::new([2, 1, 1])),
+            pdl: true,
+            cooperative: false,
+            ..LaunchConfig::new([2, 4, 1], [128, 1, 1])
+        };
+        assert!(well_formed.check().is_ok());
+    }
+}
