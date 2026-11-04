@@ -279,6 +279,10 @@ pub(crate) struct Switch {
     phase: Phase,
     /// Worlds whose storage must be retired by the next claim.
     retire: Vec<u64>,
+    /// The hosts whose target main process was told to park: a command can
+    /// only be addressed to a generation that has connected, so each park is
+    /// sent once, on that child's `Hello`.
+    park_sent: BTreeSet<String>,
     parked: BTreeSet<String>,
     promoted: BTreeSet<String>,
     drained: BTreeSet<String>,
@@ -350,6 +354,7 @@ impl Switch {
             requests,
             phase: Phase::Preparing,
             retire: discarded,
+            park_sent: BTreeSet::new(),
             parked: BTreeSet::new(),
             promoted: BTreeSet::new(),
             drained: BTreeSet::new(),
@@ -477,18 +482,6 @@ impl Switch {
                 return;
             }
         }
-        // §7.4 step 1: the target's children mapped their world's storage as
-        // its standby and park at the end of their start; `Park` is what turns
-        // that into the `Parked` this phase waits for. Each child is commanded
-        // at the generation the node actually started it at, and one step per
-        // node, as the promotion is.
-        for (host, generation) in &self.spawned {
-            roster.command(
-                host,
-                *generation,
-                command(process::command::Kind::Park(process::Park {})),
-            );
-        }
     }
 
     /// Takes the roster's events and advances the switch as they and the
@@ -585,6 +578,16 @@ impl Switch {
             Phase::Preparing | Phase::Promoting => self.failed(roster, failure),
             Phase::Committing | Phase::Reverting | Phase::Purged | Phase::Abandoned => {}
         }
+    }
+
+    /// The generation `host` actually started the target at: the number the
+    /// node's allocator gave that child, which its reports carry and its
+    /// commands are addressed to. `None` before `start` spawned it.
+    fn spawned_generation(&self, host: &str) -> Option<u64> {
+        self.spawned
+            .iter()
+            .find(|(spawned, _)| spawned == host)
+            .map(|(_, generation)| *generation)
     }
 
     /// Accepts `generation` as a target main process's: the child numbers the
@@ -784,6 +787,21 @@ impl Switch {
                 self.epochs.record(self.target, self.record.clone());
             }
         }
+        // §7.4 step 1: the child claimed its scopes read-only as the
+        // predecessor's standby and parks at the end of its start; `Park` is
+        // what turns that into the `Parked` this phase waits for. It is sent
+        // now, on the child's `Hello`, because a command is addressed to a
+        // generation the roster has connected and a child that was just forked
+        // has not. One step per node, at the generation the node allocated, and
+        // the child buffers it until its serve loop runs.
+        if self.phase == Phase::Preparing && self.park_sent.insert(host.clone()) {
+            let generation = self.spawned_generation(&host).unwrap_or(generation);
+            roster.command(
+                &host,
+                generation,
+                command(process::command::Kind::Park(process::Park {})),
+            );
+        }
     }
 
     /// A main process of `generation` exited.
@@ -942,10 +960,13 @@ impl Switch {
             Phase::Preparing if hosts.is_subset(&self.parked) => {
                 self.phase = Phase::Promoting;
                 self.switchover_started = Some(Instant::now());
-                let generation = self.target_generation();
                 for node in &self.nodes {
-                    // One step, first, so that moving it with exec's answer is
-                    // a one-line change.
+                    // One step per node, at the generation that node started
+                    // its child at: a two-node epoch has two numbers, and the
+                    // highest one addresses no process on the other node.
+                    let generation = self
+                        .spawned_generation(&node.host)
+                        .unwrap_or_else(|| self.target_generation());
                     roster.command(
                         &node.host,
                         generation,
@@ -978,8 +999,11 @@ impl Switch {
                 self.record.status = Status::Serving;
                 self.epochs.record(self.target, self.record.clone());
                 let retire = vec![self.previous];
-                let generation = self.target_generation();
                 for node in &self.nodes {
+                    // Addressed per node for the same reason `Promote` is.
+                    let generation = self
+                        .spawned_generation(&node.host)
+                        .unwrap_or_else(|| self.target_generation());
                     roster.stop(&node.host, &self.group, Some(self.previous_generation));
                     roster.command(
                         &node.host,
@@ -1284,13 +1308,24 @@ mod tests {
             epochs.get(12).map(|record| record.status),
             Some(Status::Precopy)
         );
-        // §7.4 step 1: each child is told to park on its read-only mapping as
-        // soon as it started and its world is claimed, at the generation the
-        // node gave it, and before anything is promoted.
+        assert!(
+            roster.commands.is_empty(),
+            "a child that was just forked cannot be commanded: it has not connected"
+        );
+
+        // The children connect, and each is told to park on the read-only
+        // mapping it claimed. A repeated hello does not park it twice.
+        roster.scripted = vec![
+            hello("n0", 6, "2.0.0+new"),
+            hello("n1", 6, "2.0.0+new"),
+            hello("n0", 6, "2.0.0+new"),
+        ];
+        switch.advance(&mut roster);
+        assert_eq!(switch.phase(), Phase::Preparing);
         assert_eq!(roster.commands.len(), 2, "one park per node");
         for (index, (host, generation, kind)) in roster.commands.iter().enumerate() {
             assert_eq!(host, &nodes()[index].host);
-            assert_eq!(*generation, 6);
+            assert_eq!(*generation, 6, "the generation the node spawned it at");
             assert!(matches!(kind, process::command::Kind::Park(_)));
         }
         assert!(
@@ -1301,19 +1336,16 @@ mod tests {
             "nothing is promoted before the targets parked"
         );
 
-        roster.scripted = vec![hello("n0", 6, "2.0.0+new"), hello("n1", 6, "2.0.0+new")];
-        switch.advance(&mut roster);
         switch.parked(&mut roster, "n0", 6);
+        assert_eq!(
+            switch.phase(),
+            Phase::Preparing,
+            "one host's readiness promotes nothing"
+        );
         switch.parked(&mut roster, "n1", 6);
         assert_eq!(switch.phase(), Phase::Promoting);
         assert_eq!(switch.generation(), Some(6));
         assert_eq!(roster.commands.len(), 4, "two parks, then two promotes");
-        assert!(
-            roster.commands[..2]
-                .iter()
-                .all(|(_, _, kind)| matches!(kind, process::command::Kind::Park(_))),
-            "the parks precede the promotion"
-        );
         assert!(
             roster.commands[2..]
                 .iter()
