@@ -25,7 +25,7 @@
 //!   (`:51-56`). [`Tile::above`] and [`Tile::left`] name those reads, and the driver keeps a second
 //!   raster for them.
 
-use crate::encoding::{Extent, Grid, VideoEncoder, SPATIAL_RATIO};
+use crate::encoding::{Extent, Grid, SPATIAL_RATIO, VideoEncoder};
 use crate::{Error, Result};
 use nn::layers::CrossFade;
 use nn::{DType, Forward, Shape, Strides, TensorView};
