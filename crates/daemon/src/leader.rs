@@ -1803,6 +1803,10 @@ pub(crate) struct Replica {
     pub(crate) profiles: crate::profiling::Profiles,
     /// Numerical manifests reused when planning successor rank budgets.
     pub(crate) manifests: std::sync::Mutex<storage::manifest::Planner>,
+    /// The parked standby standing beside the serving engine (§2.5), if one is
+    /// live. Started by [`Replica::keep_standby`], taken by
+    /// [`Replica::promote_standby`].
+    pub(crate) standby: std::sync::Mutex<Option<Standby>>,
 }
 
 impl Replica {
@@ -1836,6 +1840,7 @@ impl Replica {
             observer,
             profiles: crate::profiling::Profiles::default(),
             manifests: std::sync::Mutex::new(storage::manifest::Planner::default()),
+            standby: std::sync::Mutex::new(None),
         });
         hold.serve(client);
         replica
@@ -1853,6 +1858,7 @@ impl Replica {
             .client()
             .expect("a constructed replica has its engine");
         tokio::spawn(watch_engine(Arc::clone(self), Arc::downgrade(&client)));
+        self.start_standby();
     }
 
     pub(crate) fn hold(&self) -> &Arc<RequestHold> {
@@ -1861,7 +1867,7 @@ impl Replica {
 
     /// Restarts the committed world while the caller owns its replacement
     /// lock. A pending commit must finish publication before calling this.
-    pub(crate) async fn recover(&self) -> anyhow::Result<Arc<EngineClient>> {
+    pub(crate) async fn recover(self: &Arc<Self>) -> anyhow::Result<Arc<EngineClient>> {
         let control = Arc::clone(
             self.control
                 .get()
@@ -1883,7 +1889,136 @@ impl Replica {
         reload_adapters(self, &client).await;
         self.hold.serve(Arc::clone(&client));
         info!("the relaunched engine serves");
+        self.start_standby();
         Ok(client)
+    }
+}
+
+/// A standby main process started beside this replica's serving engine (§2.5):
+/// a second process of the serving world, parked with its scope's storage
+/// claimed read-only, promoted in place when the serving engine is lost.
+pub(crate) struct Standby {
+    pub(crate) client: Arc<EngineClient>,
+    /// The launch generation the standby was started under, from the epoch
+    /// layer's one allocator.
+    pub(crate) generation: u64,
+}
+
+impl Replica {
+    /// Starts the standby in the background, if this replica serves and has
+    /// none. Errors are logged: a replica without a standby still serves, and a
+    /// loss then relaunches ([`Replica::recover`]) instead of promoting.
+    pub(crate) fn start_standby(self: &Arc<Self>) {
+        let replica = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(error) = replica.keep_standby().await {
+                warn!(
+                    model = %replica.model_name,
+                    "the standby could not be started: {error:#}"
+                );
+            }
+        });
+    }
+
+    /// Starts the standby that stands beside this replica's serving engine, if
+    /// one is wanted and none is live (§2.5).
+    ///
+    /// The standby stands by for the world the serving engine executes: it is
+    /// started under a number from the epoch layer's one allocator, claims the
+    /// scope's storage read-only (the launch file states the role), and parks
+    /// once it is prepared. A replica whose engine is itself parked, draining or
+    /// failing has no standby: there is nothing to stand beside.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the process cannot be started or does not report that it
+    /// stands by. The caller decides whether to retry.
+    pub(crate) async fn keep_standby(self: &Arc<Self>) -> anyhow::Result<()> {
+        let Some(control) = self.control.get().cloned() else {
+            return Ok(());
+        };
+        let Some(serving) = self.hold.client() else {
+            return Ok(());
+        };
+        if serving.state() != EngineState::Ready {
+            return Ok(());
+        }
+        {
+            let mut slot = locked(&self.standby);
+            match slot.as_ref().map(|standby| standby.client.state()) {
+                // A parked standby is the one this replica wants.
+                Some(EngineState::Standby) => return Ok(()),
+                // A standby that failed or ended is replaced: dropping the
+                // client closes its control connection, and its process ends.
+                Some(_) => *slot = None,
+                None => {}
+            }
+        }
+        let Some(mut spec) = locked(&self.served).clone() else {
+            return Ok(());
+        };
+        let Some(driver) = self
+            .registry
+            .upgrade()
+            .and_then(|registry| registry.updates.upgrade())
+        else {
+            return Ok(());
+        };
+        let epochs = Arc::clone(driver.epochs());
+        let generation = epochs.next_generation(crate::engine::control::ENGINE_GROUP, 0);
+        // The standby executes the serving engine's world: it claims the same
+        // scope's storage read-only and is promoted into it, so nothing is
+        // handed over while the serving engine runs (empty segments).
+        spec.predecessor = Some(wire::Predecessor {
+            world: spec.world,
+            segments: Vec::new(),
+        });
+        let build = crate::epoch::BuildConfig::of(&locked(&self.config));
+        let sink = stats_sink(
+            self.model_name.clone(),
+            Arc::clone(&self.observer),
+            self.ordinal,
+        );
+        let client = Arc::new(
+            tokio::task::spawn_blocking(move || control.start_at(spec, generation, &build, sink))
+                .await??,
+        );
+        info!(
+            generation,
+            "the standby is prepared beside the serving engine"
+        );
+        *locked(&self.standby) = Some(Standby { client, generation });
+        Ok(())
+    }
+
+    /// Promotes the parked standby in place if this replica has one (§2.5), and
+    /// answers the client that now serves.
+    ///
+    /// The promoted process is the same process, with its graphs at their
+    /// addresses: it takes the storage its scope claimed read-only and serves
+    /// under the serving engine's world. A standby that cannot be promoted is
+    /// dropped, and the caller's loss path relaunches the engine instead.
+    pub(crate) async fn promote_standby(self: &Arc<Self>) -> Option<Arc<EngineClient>> {
+        let standby = locked(&self.standby).take()?;
+        self.hold.hold();
+        match standby.client.promote(Vec::new(), false, true).await {
+            Ok(()) => {
+                self.hold.serve(Arc::clone(&standby.client));
+                info!(
+                    generation = standby.generation,
+                    "the standby was promoted and serves"
+                );
+                self.start_standby();
+                Some(standby.client)
+            }
+            Err(error) => {
+                warn!(
+                    generation = standby.generation,
+                    "the standby could not be promoted: {error}; the engine is relaunched"
+                );
+                None
+            }
+        }
     }
 }
 
@@ -2287,6 +2422,11 @@ pub(crate) async fn watch_engine(replica: Arc<Replica>, mut client: std::sync::W
                 "the engine was lost while the switch's target served; the switch reverts"
             );
             return;
+        }
+        if let Some(promoted) = replica.promote_standby().await {
+            tracing::info!(%reason, "the standby promoted in place; it serves");
+            client = Arc::downgrade(&promoted);
+            continue;
         }
         tracing::error!(%reason, "the engine was lost; starting another");
         match replica.recover().await {
