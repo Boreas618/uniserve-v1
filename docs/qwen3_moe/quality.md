@@ -12,6 +12,8 @@ The protocol lives in `uniserve_eval/qwen3_moe.toml` (suite `qwen3-moe-gsm8k`); 
 | `qwen3-moe-gsm8k-nvfp4` | local `nvidia/Qwen3-30B-A3B-NVFP4` export | `bfloat16` | `precision="nvfp4"`, `kv_cache_dtype="bfloat16"` |
 | `qwen3-moe-gsm8k-bf16-fp8-kv` | `/workspace/models/Qwen3-30B-A3B` | `float8_e4m3fn` | `precision="bfloat16"`, `kv_cache_dtype="float8_e4m3fn"` |
 
+All three cells also record `checkpoint = "Qwen3-30B-A3B"`; the column shows the fields that differ.
+
 The BF16 and FP8 KV cells serve the Qwen3-MoE checkpoint at `/workspace/models/Qwen3-30B-A3B`, named by `UNISERVE_QWEN3_MOE_MODEL`; the profile defaults the path. The NVFP4 cell serves a local copy of `nvidia/Qwen3-30B-A3B-NVFP4`, a ModelOpt unified export whose own `config.json` declares its quantization; `UNISERVE_QWEN3_MOE_NVFP4_MODEL` names that directory and has no default, so a host without the export cannot run the NVFP4 cell. The other two cells' server commands do not name the variable. The cells differ in the checkpoint path and the KV cache dtype, and the FP8 KV cell also names an attention provider (see [FP8 KV pages](#fp8-kv-pages)). Each cell's `provenance` is its identity in the comparison.
 
 No cell states `dtype` or `quantization`: the checkpoint's own representation is used, and `quantization_config` and its precision presets are retired in favour of the checkpoint representation and the `quantization` field. The serving capacity is build configuration: `--mem-fraction-static` defaults to 0.80 and `kv_cache_config.max_tokens` to 65536, and a host may lower either through `UNISERVE_QWEN3_MOE_MEM_FRACTION` or `UNISERVE_QWEN3_MOE_KV_MAX_TOKENS` without making a cell's two runs incomparable.
@@ -50,7 +52,7 @@ SE = sqrt(p1 (1 - p1) / n1 + p2 (1 - p2) / n2)
 interval = d ± 1.959963985 * SE
 ```
 
-The factor `1.959963985` is the two-sided 95% normal quantile. The candidate is accepted exactly when `|d| <= 1.959963985 * SE`, equivalently when the interval contains zero. `uniserve-eval compare` prints the report as JSON with both accuracies and counts, `d`, `SE`, the interval, the verdict and both provenances, and exits 0 when accepted, 2 when rejected, and 1 when a bundle is missing or the runs are not comparable.
+The factor is the two-sided 95% normal quantile the evaluator computes, `statistics.NormalDist().inv_cdf(0.975) = 1.959963984540054` (`1.959963985` rounded here); the acceptance is `|d| <=` that factor times `SE`, equivalently the interval contains zero. `uniserve-eval compare` prints the report as JSON with both accuracies and counts, `d`, `SE`, the interval, the verdict and both provenances, and exits 0 when accepted, 2 when rejected, and 1 when a bundle is missing or the runs are not comparable.
 
 ## FP8 KV pages
 
@@ -70,7 +72,7 @@ export UNISERVE_QWEN3_MOE_CUDA_VISIBLE_DEVICES=0
 # UNISERVE_QWEN3_FP8_ATTENTION_BACKEND selects the FP8 cell's provider.
 ```
 
-The commands run from the checkout with the environment of the installation instructions, including the `bench` extra for the Parquet split. Run the evaluator's GSM8K tests, the fixed-sample-set pre-flight, the plan, and the two runs, then compare each cell:
+The commands run from the checkout with the environment of the installation instructions, including the `bench` extra for the Parquet split. Run the evaluator's GSM8K tests, the fixed-sample-set pre-flight, the baseline plan and run, the candidate plan and its three cell runs, then compare each cell:
 
 ```bash
 .venv/bin/python -m pytest -q tests/python/unit/eval_driver/test_gsm8k_benchmark.py tests/python/unit/eval_driver/test_accuracy_compare.py
