@@ -81,66 +81,39 @@ pub struct Batch {
     pub generation: u64,
 }
 
-/// One call of a batch: which request slot it evaluates and which rows it owns.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct BatchCall {
-    /// The mechanism's name for this call, which the step's output names it by (4.4).
-    pub call: CallId,
-    /// The runner's request slot (the design's `request_pool_idx`), which addresses the model's
-    /// per-slot state; not the mechanism's request identity.
-    pub request: u32,
-    /// What kind of call the rows evaluate.
-    pub kind: CallKind,
-    /// The attention cache group whose KV pages the rows write and attend.
-    pub cache_group: u32,
-    /// The half-open range of the batch's token columns these rows occupy.
-    pub rows: Range<u32>,
-}
-
-/// What a call of a causal language model evaluates in this slice.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum CallKind {
-    /// A chunk of prompt tokens, writing the KV cache.
-    Prefill,
-    /// One token per row drawn from the slot state.
-    Decode,
-}
-
 /// The host columns of one batch, in the layout the phase's kernels read.
 ///
 /// The mechanism writes these from the request state it owns; the executor stages them into the
-/// pinned arena and uploads them on the batch's stream, then builds the device views the model
-/// reads. Every vector has one entry per token, or one per row where a field says so; the runner
-/// pads them to the bucket it serves and never reorders them.
+/// pinned arena, uploads them on the batch's stream and builds the device views the model reads.
+/// The row layout is `nn::BatchRows`, the model's own host half — one definition, no conversion in
+/// the mechanism. The runner pads to the bucket it serves and never reorders what the mechanism
+/// wrote; a padded row carries `slot_mapping = -1` and a commit slot below zero, so it writes no
+/// cache page and keeps no token state.
 #[derive(Clone, Default, Debug)]
 pub struct BatchColumns {
-    /// One entry per call, in scheduling order.
-    pub calls: Vec<BatchCall>,
-    /// Every query token, concatenated over the calls in `calls` order.
-    pub input_ids: Vec<u32>,
-    /// The absolute position of each query token in its request's sequence (RoPE).
-    pub positions: Vec<u32>,
-    /// One KV slot per query token: the cache row the KV-write kernel writes; `-1` for a token
-    /// that does not persist past its visible prefix.
-    pub slot_mapping: Vec<i64>,
-    /// Per row: the cached prefix plus the query length, the length attention reads.
-    pub seq_lens: Vec<u32>,
-    /// Per row: how many query tokens this call evaluates.
-    pub query_lens: Vec<u32>,
-    /// Per row: whether the query interval persists in the prefix cache (`u8`, 0 or 1).
-    pub write_cache: Vec<u8>,
-    /// Per row: the token row whose hidden state feeds `logits`, for rows that sample.
-    pub logits_rows: Vec<u32>,
-    /// The total number of query tokens, so the runner sizes its bucket without recounting.
-    pub num_tokens: u32,
+    /// The rows and their calls, as the model reads them: positions, slot mapping, lengths, query
+    /// offsets, the sampling rows and the calls.
+    pub rows: nn::BatchRows,
+    /// `[tokens]` the ids the embedding op reads; the runner stages them to the descriptor's id
+    /// element type.
+    pub input_ids: Vec<i32>,
+    /// `[rows]` the sampler's slot view: the runner's per-slot sampling state.
+    pub slots: Vec<i32>,
+    /// `rows x ops::sampler::PARAMETER_COLUMNS` f32 request parameters, row-major.
+    pub parameters: Vec<f32>,
+    /// `ops::commit`'s column table, column-major `[columns][rows]` i64; a negative commit slot
+    /// belongs to a padded row and keeps its token state.
+    pub commit: Vec<i64>,
     /// The KV page size in tokens, the same number the policy sees in `Room`.
     pub page_size: u32,
+    /// The attention descriptor's static bound on a sequence's KV length.
+    pub max_kv_len: u32,
 }
 
 impl BatchColumns {
     /// The number of rows (sequences) the columns describe.
     pub fn rows(&self) -> usize {
-        self.calls.len()
+        self.rows.calls.len()
     }
 
     /// The number of query tokens the columns describe.
@@ -151,40 +124,37 @@ impl BatchColumns {
     /// Whether every column has the length its field promises for `shape`, so that a mis-sized
     /// batch fails before a launch rather than after one.
     pub fn check(&self, shape: &Shape) -> Result<()> {
+        let tokens = self.rows.tokens();
+        let rows = self.rows.calls.len();
         for (name, actual, expected) in [
-            ("input_ids", self.input_ids.len(), self.num_tokens as usize),
-            ("positions", self.positions.len(), self.num_tokens as usize),
+            ("input_ids", self.input_ids.len(), tokens),
+            ("slots", self.slots.len(), rows),
             (
-                "slot_mapping",
-                self.slot_mapping.len(),
-                self.num_tokens as usize,
+                "parameters",
+                self.parameters.len(),
+                rows * ops::sampler::PARAMETER_COLUMNS as usize,
             ),
         ] {
             if actual != expected {
                 return Err(Error::Invalid(format!(
-                    "{name} has {actual} entries, the batch has {} tokens",
-                    self.num_tokens
+                    "{name} has {actual} entries, the batch has {rows} rows and {tokens} tokens"
                 )));
             }
         }
-        for (name, actual) in [
-            ("seq_lens", self.seq_lens.len()),
-            ("query_lens", self.query_lens.len()),
-            ("write_cache", self.write_cache.len()),
-            ("logits_rows", self.logits_rows.len()),
-        ] {
-            if actual != self.calls.len() {
-                return Err(Error::Invalid(format!(
-                    "{name} has {actual} entries, the batch has {} calls",
-                    self.calls.len()
-                )));
-            }
-        }
-        if self.num_tokens > shape.tokens {
+        if self.commit.len() % rows.max(1) != 0 {
             return Err(Error::Invalid(format!(
-                "the batch holds {} tokens, more than its shape's {}",
-                self.num_tokens, shape.tokens
+                "commit has {} entries, not a whole number of columns over {rows} rows",
+                self.commit.len()
             )));
+        }
+        if tokens > shape.tokens as usize || rows > shape.rows as usize {
+            return Err(Error::Invalid(format!(
+                "the batch holds {rows} rows and {tokens} tokens, more than its shape's {} and {}",
+                shape.rows, shape.tokens
+            )));
+        }
+        if self.page_size == 0 {
+            return Err(Error::Invalid("the batch's page size is zero".into()));
         }
         Ok(())
     }
