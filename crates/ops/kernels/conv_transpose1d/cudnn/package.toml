@@ -57,6 +57,6 @@ target = "arch"
 architectures = ["sm_100a", "sm_100f"]
 
 [kernel.descriptors]
-dimensions = { input = ["bf16", "f32"], weight = ["bf16", "f32"], output = ["bf16", "f32"], geometry_kernel = ["4x1x1", "2x1x1", "8x1x1"], stride = ["2x1x1", "1x1x1"], padding = ["1x1x1", "0x0x0"], dilation = ["1x1x1"], groups = ["1"], bias = ["false"], tf32 = ["true", "false"], rank = ["1"], transposed = ["true"] }
+dimensions = { input = ["bf16", "f32"], weight = ["bf16", "f32"], output = ["bf16", "f32"], geometry_kernel = ["2x1x1", "4x1x1", "8x1x1", "9x1x1"], stride = ["1x1x1", "2x1x1", "5x1x1"], padding = ["0x0x0", "1x1x1", "2x1x1"], dilation = ["1x1x1"], groups = ["1"], bias = ["true", "false"], tf32 = ["true", "false"], rank = ["1"], transposed = ["true"] }
 
 [parameters]

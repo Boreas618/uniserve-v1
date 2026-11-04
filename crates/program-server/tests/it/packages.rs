@@ -405,3 +405,34 @@ fn every_shipping_package_declares_its_toolchain_version() {
         "no fixture takes the empty version the rule exists for"
     );
 }
+
+/// The expert exchange's topology is a descriptor dimension, so the store keeps the
+/// group sizes apart — and the package covers exactly the one a host can serve today.
+///
+/// `ranks` being in the module key is what stops a module built for one group from
+/// being resolved for another. The larger groups have no module on purpose: the
+/// executor's `group` interface, over which a package would exchange peer handles,
+/// is not named yet, and `create` refuses those groups by name rather than falling
+/// back to one rank (`test/create_check.py` in the package checks that refusal).
+#[test]
+fn the_exchange_covers_one_group_size_and_no_other() {
+    let package = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/ops/kernels/expert_exchange/alltoall");
+    let manifest = Manifest::load(&package).expect("the exchange's package parses");
+    let key = |ranks: u32| {
+        format!(
+            "mode_dispatch_hidden_2048_top_8_experts_128_max_tokens_8192_ranks_{ranks}_dtype_bf16"
+        )
+    };
+    assert!(
+        manifest.covers(&key(1)),
+        "the package must build the module of the one rank it serves"
+    );
+    for ranks in [2, 4, 8] {
+        assert!(
+            !manifest.covers(&key(ranks)),
+            "the package declares a module for a group of {ranks} ranks, which no host \
+             can serve: the transport for a group is not named yet"
+        );
+    }
+}
