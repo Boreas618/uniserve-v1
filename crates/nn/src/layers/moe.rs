@@ -22,12 +22,13 @@
 //! program selects the transport. A `Moe` layer built for a placement that does not hold every
 //! expert refuses the forward rather than computing a routing the weights do not have.
 
-use ops::fp4::ScaleLayout;
+use ops::fp4::{BLOCK_ELEMENTS, Nvfp4Quantize, QuantizeArgs, QuantizeDescriptor, ScaleLayout};
 use ops::moe::combine::{self, MoeUnpermute, UnpermuteArgs};
 use ops::moe::exchange::{self, ExchangeArgs, ExpertExchange, Mode};
 use ops::moe::grouped::{
-    Activation, GatherGemm, GatherGemmArgs, GatherGemmDescriptor, GatherGemmNvfp4Descriptor,
-    RouteGemm, RouteGemmArgs, RouteGemmDescriptor, RouteGemmNvfp4Descriptor,
+    Activation, GatherGemm, GatherGemmArgs, GatherGemmDescriptor, GatherGemmNvfp4,
+    GatherGemmNvfp4Args, GatherGemmNvfp4Descriptor, RouteGemm, RouteGemmArgs, RouteGemmDescriptor,
+    RouteGemmNvfp4, RouteGemmNvfp4Args, RouteGemmNvfp4Descriptor,
 };
 use ops::moe::routing::{
     ExpertGather, GatherArgs, GatherDescriptor, TopkArgs, TopkDescriptor, TopkSoftmax,
@@ -87,6 +88,16 @@ const MMA_CLUSTER: (u32, u32) = (1, 1);
 /// buffer is padded to.
 pub const TILE_ROWS: u32 = MMA_TILE.0;
 
+/// Elements of a row one activation-encoding program holds at a time.
+///
+/// A whole number of sixteen-element scale blocks, as the layout requires, and small enough that a
+/// 2048-element row is walked in a handful of passes rather than materialized in one block.
+const ENCODE_CHUNK: u32 = 1024;
+
+/// The encoder's chunk is a whole number of scale blocks; a chunk that were not would have a partial
+/// block with no scale to name it.
+const _: () = assert!(ENCODE_CHUNK % BLOCK_ELEMENTS == 0);
+
 /// The geometry one encoded expert step's buffers are sized from.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct EncodedGeometry {
@@ -119,7 +130,15 @@ pub struct EncodedGeometry {
 ///
 /// `layout` is the activation encoding's block-scale layout: a field of the products' descriptors,
 /// not of the weights, whose scales have their own layout.
-pub fn encoded_bytes(tokens: u64, geometry: EncodedGeometry, layout: ScaleLayout) -> u64 {
+pub fn encoded_bytes(
+    tokens: u64,
+    geometry: EncodedGeometry,
+    layout: ScaleLayout,
+    dtype: DType,
+) -> Result<u64> {
+    let width_bytes = dtype
+        .bytes()
+        .ok_or_else(|| Error::shape("Moe", format!("{dtype} has no byte size")))?;
     let EncodedGeometry {
         hidden,
         intermediate,
@@ -134,19 +153,21 @@ pub fn encoded_bytes(tokens: u64, geometry: EncodedGeometry, layout: ScaleLayout
         .max(grouped_workspace_bytes(routes, hidden));
     let mut total: u64 = 0;
     for bytes in [
-        tokens * (hidden / 2),        // the activation's packed codes
+        tokens * (hidden / 2),        // the activation's packed codes, a byte per two codes
         scales(tokens, hidden),       // its block scales
         tokens * 4,                   // its per-token factor, F32
-        routes * intermediate * 2,    // FC1's gated rows, the hidden type
+        routes * intermediate * width_bytes, // FC1's gated rows, the hidden type
         routes * (intermediate / 2),  // their packed codes
         scales(routes, intermediate), // their block scales
         routes * 4,                   // their per-token factor, F32
-        routes * hidden * 2,          // FC2's rows, one per route
+        routes * hidden * width_bytes, // FC2's rows, one per route
         scratch,                      // the products' scratch
     ] {
-        total = total.next_multiple_of(ALIGNMENT).saturating_add(bytes);
+        // Each buffer starts on the arena's alignment, so the plan is the sum of the aligned
+        // extents: the order the step reserves them in does not change the total.
+        total = total.saturating_add(bytes.next_multiple_of(ALIGNMENT));
     }
-    total
+    Ok(total)
 }
 
 /// The expert stacks a block multiplies.
@@ -784,7 +805,7 @@ impl Moe {
     ///
     /// [`encoded_bytes`] states the extents; this answers them for this block's geometry, which is
     /// what a deployment asks when it sizes the arena from its plan.
-    pub fn encoded_bytes(&self, tokens: u64, layout: ScaleLayout) -> u64 {
+    pub fn encoded_bytes(&self, tokens: u64, layout: ScaleLayout, dtype: DType) -> Result<u64> {
         encoded_bytes(
             tokens,
             EncodedGeometry {
@@ -795,7 +816,28 @@ impl Moe {
                 tile: u64::from(self.tile),
             },
             layout,
+            dtype,
         )
+    }
+
+    /// The descriptor of one activation encoding this block runs.
+    ///
+    /// The chunk a program walks a row in is the block: the encoder reduces over the whole row and
+    /// scales every block of it against that row's factor, so the chunk is how much of the row one
+    /// pass holds, not how many values a key spans.
+    pub fn quantize_descriptor(
+        &self,
+        input: DType,
+        columns: u32,
+        layout: ScaleLayout,
+    ) -> QuantizeDescriptor {
+        QuantizeDescriptor {
+            input,
+            columns,
+            layout,
+            block: ENCODE_CHUNK,
+            pdl: crate::layers::launch::PDL,
+        }
     }
 
     /// The first product's descriptor over an encoded stack: the block scale's element type and the
@@ -855,64 +897,140 @@ impl Moe {
     /// `out = Σ_routes weight · expert(hidden)` over packed experts.
     ///
     /// The routing, the sort and the combine are the dense block's; the two products read the
-    /// encoded stacks, and each carries its own block scales and per-expert reciprocals. FC2 writes
-    /// one row per route — the `top` repeats are what `moe_unpermute` sums — and its rows are the
-    /// permuted ones, padding included, which the combine reads through the same map.
+    /// encoded stacks with E2M1 activations, so each of their operands is produced here by
+    /// `nvfp4_quantize`:
+    ///
+    /// ```text
+    /// encode(hidden [tokens, hidden])            -> codes, block scales, one factor per token
+    /// gather_gemm_nvfp4                          -> gated rows [routes, intermediate], BF16
+    /// encode(gated [routes, intermediate])        -> codes, block scales, one factor per route
+    /// route_gemm_nvfp4                           -> rows [routes, hidden], BF16
+    /// moe_unpermute                              -> out [tokens, hidden], FP32 sum, one rounding
+    /// ```
+    ///
+    /// The encoder's global scale is the stack's [`QuantizedStack::encode_scale`] — one — because a
+    /// calibrated activation scale cancels out of both the code and the reconstruction; the expert's
+    /// own scales reach the product through its `[projections, experts]` table. No row-expansion
+    /// operator appears: the encoded gather is token-major and expands as it multiplies.
     fn forward_encoded(&self, f: &Forward, hidden: TensorView, out: TensorView) -> Result<()> {
         let ExpertStacks::Encoded { up_gate, down } = &self.stacks else {
             return Err(Error::Unsupported(
                 "Moe::forward_encoded: the block's experts are dense".to_owned(),
             ));
         };
-        let _ = (up_gate, down, out);
+        let tokens = hidden.rows();
+        let hidden_width = u64::from(self.hidden);
+        let intermediate = u64::from(self.intermediate);
+        hidden
+            .require_row("Moe", hidden.dtype, hidden_width)
+            .map_err(Error::from)?;
+        out.require_row("Moe", out.dtype, hidden_width)
+            .map_err(Error::from)?;
+        if out.rows() != tokens {
+            return Err(Error::shape(
+                "Moe",
+                format!("{} input rows against {} output rows", tokens, out.rows()),
+            ));
+        }
 
-        // 1-3. The routing prefix is the dense block's, and it is what states the route count every
-        // later step of the block is sized from.
+        // 1-3. The router, its top-k, the map and the sort: the prefix every expert product shares.
         let routes = self.route(f, hidden)?;
+        let rows = routes.rows;
+        let arena = f.arena();
 
-        // 4-6 are the packed pair's own chain, and they are refused here rather than half-built.
-        // The encoded products read E2M1 activations with their own block scales, so each operand
-        // is produced by `nvfp4_quantize` inside this block:
-        //
-        //   1. `nvfp4_quantize(hidden)` — `[tokens, hidden]` BF16 → packed E2M1 values
-        //      `[tokens, hidden / 2]`, activation block scales, and the per-token scale both
-        //      products read as `hidden_token_scale`;
-        //   2. `gather_gemm_nvfp4` — the token-major gather product: it reads the encoding above
-        //      with `numTokens` and `permutedIdxToTokenIdx`, gathers the rows itself, and writes the
-        //      gated BF16 output one row per route;
-        //   3. `nvfp4_quantize(gated)` — the same encoding over `[routes, intermediate]`, whose
-        //      per-token scale is one per route;
-        //   4. `route_gemm_nvfp4` — the down product, one row per route;
-        //   5. `moe_unpermute` — the `top` repeats of each token summed in FP32, one rounding.
-        //
-        // No row-expansion operator appears: the encoded gather is token-major by the design's
-        // ruling, and the product reads `permutedIdxToTokenIdx` to expand as it multiplies. Two
-        // facts of the chain are not this layer's to invent:
-        //
-        // 1. **`nvfp4_quantize` writes no per-token scale.** Its operand set is `input`, `values`,
-        //    `scales` and the checkpoint's `global_scale`; the per-token factor both products take
-        //    as `hidden_token_scale` (`[tokens]` for FC1, `[routes]` for FC2) is computed in the same
-        //    pass over a row as its block scales, so it belongs on the encoder's operand set rather
-        //    than in a second kernel or in this layer.
-        // 2. **The encoder's one scalar** is the artifact's constant `1 / (448 · 6)`, folded into
-        //    the block scales rather than passed per request: it belongs in `nvfp4_quantize`'s
-        //    descriptor, and a layer that synthesised a device value for it would be inventing a
-        //    number the design puts elsewhere.
-        //
-        // The scratch the two products need is already stated by [`Self::workspace_bytes`] over the
-        // plan's route count, so nothing else in the step waits on this.
-        Err(Error::Unsupported(format!(
-            "Moe::forward_encoded: the encoded products read E2M1 activations and the five launches \
-             that produce them are stated, but `nvfp4_quantize` has no per-token scale output — the \
-             `hidden_token_scale` `[tokens]` (FC1) and `[routes]` (FC2) operand both products read — \
-             and its descriptor has no field for the encoder's constant 1/(448·6). The block's {} \
-             experts and {} hidden elements are built, its scratch is {} bytes for {} routes, and \
-             the dense path is unaffected",
-            self.experts,
-            self.hidden,
-            self.workspace_bytes(routes.rows),
-            routes.rows
-        )))
+        // 4. The activation's encoding: the same pass computes the block scales and the row factor
+        //    the product multiplies by, and its global scale is the stack's neutral.
+        let layout = ScaleLayout::Linear;
+        let values = arena.tensor(DType::U8, Shape::new(&[tokens, hidden_width / 2]))?;
+        let scales = arena.tensor(DType::U8, layout.shape(tokens, hidden_width))?;
+        let token_scale = arena.tensor(DType::F32, Shape::new(&[tokens]))?;
+        let first = self.quantize_descriptor(
+            hidden.dtype,
+            u32::try_from(hidden_width)
+                .map_err(|_| Error::shape("Moe", format!("{hidden_width} hidden elements")))?,
+            layout,
+        );
+        let args = QuantizeArgs {
+            input: hidden,
+            values,
+            scales,
+            global_scale: up_gate.encode_scale.view(),
+            token_scale,
+        };
+        f.operate::<Nvfp4Quantize>(&first, args)?;
+
+        // 5. FC1: the token-major gather product, one gated row per permuted route.
+        let gated = arena.tensor(hidden.dtype, Shape::new(&[rows, intermediate]))?;
+        let workspace = arena.tensor(DType::U8, Shape::new(&[self.workspace_bytes(rows).max(1)]))?;
+        let descriptor = self.gather_nvfp4_descriptor(
+            hidden.dtype,
+            DType::U8,
+            layout,
+        );
+        let args = GatherGemmNvfp4Args {
+            hidden: values,
+            hidden_scale: scales,
+            hidden_token_scale: token_scale,
+            weights: up_gate.values.view(),
+            scales: up_gate.scales.view(),
+            global_scale: up_gate.global_scale.view(),
+            tile_to_expert: routes.tile_to_expert,
+            tile_to_limit: routes.tile_to_limit,
+            permuted_to_expanded: routes.permuted_to_expanded,
+            num_non_exiting_tiles: routes.num_non_exiting_tiles,
+            out: gated,
+            workspace,
+        };
+        f.operate::<GatherGemmNvfp4>(&descriptor, args)?;
+
+        // 6. The gated rows' own encoding: FC1's epilogue is a BF16 row, so this is a program of its
+        //    own rather than a wider operand of the second product.
+        let gated_values = arena.tensor(DType::U8, Shape::new(&[rows, intermediate / 2]))?;
+        let gated_scales = arena.tensor(DType::U8, layout.shape(rows, intermediate))?;
+        let gated_token_scale = arena.tensor(DType::F32, Shape::new(&[rows]))?;
+        let second = self.quantize_descriptor(
+            hidden.dtype,
+            u32::try_from(intermediate)
+                .map_err(|_| Error::shape("Moe", format!("{intermediate} intermediate elements")))?,
+            layout,
+        );
+        let args = QuantizeArgs {
+            input: gated,
+            values: gated_values,
+            scales: gated_scales,
+            global_scale: down.encode_scale.view(),
+            token_scale: gated_token_scale,
+        };
+        f.operate::<Nvfp4Quantize>(&second, args)?;
+
+        // 7. FC2: one row per permuted route, the `top` repeats still separate.
+        let products = arena.tensor(hidden.dtype, Shape::new(&[rows, hidden_width]))?;
+        let descriptor = self.route_nvfp4_descriptor(hidden.dtype, DType::U8, layout);
+        let args = RouteGemmNvfp4Args {
+            hidden: gated_values,
+            hidden_scale: gated_scales,
+            hidden_token_scale: gated_token_scale,
+            weights: down.values.view(),
+            scales: down.scales.view(),
+            global_scale: down.global_scale.view(),
+            tile_to_expert: routes.tile_to_expert,
+            tile_to_limit: routes.tile_to_limit,
+            permuted_to_expanded: routes.permuted_to_expanded,
+            num_non_exiting_tiles: routes.num_non_exiting_tiles,
+            out: products,
+            workspace,
+        };
+        f.operate::<RouteGemmNvfp4>(&descriptor, args)?;
+
+        // 8. Sum the routes back in FP32 and round once to the hidden dtype.
+        let combine = self.combine_descriptor(products.dtype, out.dtype);
+        let args = UnpermuteArgs {
+            routes: products,
+            expanded_to_permuted: routes.expanded_to_permuted,
+            scales: routes.weights,
+            out,
+        };
+        f.operate::<MoeUnpermute>(&combine, args)
     }
 
     /// `out = Σ_routes weight · expert(hidden)` over an expert-parallel group.
@@ -1281,6 +1399,7 @@ pub(super) mod tests {
             scales: weight(DType::U8, &[u64::from(experts), rows, columns / 16]),
             global_scale: weight(DType::F32, &[projections, u64::from(experts)]),
             layout: ops::fp4::ScaleLayout::Linear,
+            encode_scale: weight(DType::F32, &[1]),
             input_scale: None,
         };
         Moe::quantized(
@@ -1343,6 +1462,7 @@ pub(super) mod tests {
             scales: weight(DType::U8, &[u64::from(experts), rows, columns / 16]),
             global_scale: weight(DType::F32, &[projections, u64::from(experts)]),
             layout: ops::fp4::ScaleLayout::Linear,
+            encode_scale: weight(DType::F32, &[1]),
             input_scale: None,
         };
         // Down's contraction is the gated width, so 512 experts' contraction does not fit 768.
