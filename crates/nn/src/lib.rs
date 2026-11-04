@@ -74,6 +74,6 @@ pub use ops::PhaseKind;
 pub use ops::{DType, DevicePtr, MAX_RANK, Shape, Strides, TensorView};
 pub use tensor::Backing;
 pub use weights::{
-    Quantization, QuantizedStack, QuantizedWeight, RetainedWeights, Weight, WeightKey, WeightLayout,
-    WeightLoader,
+    Quantization, QuantizedStack, QuantizedWeight, RetainedWeights, Weight, WeightKey,
+    WeightLayout, WeightLoader,
 };
