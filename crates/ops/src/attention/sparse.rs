@@ -640,7 +640,8 @@ mod tests {
         );
         assert!(far.atol >= near.atol);
         // A BF16 output's own rounding dominates: u_out = 2^-8 / 2.
-        assert!(far.rtol > 0.0019 && far.rtol < 0.01, "rtol = {}", far.rtol);
+        // u_out of BF16 alone is 2^-8; the 65536-key accumulation adds 2*gamma on top.
+        assert!(far.rtol > 0.003 && far.rtol < 0.05, "rtol = {}", far.rtol);
         assert!(far.atol > 0.0 && far.atol < 0.1, "atol = {}", far.atol);
         assert!(
             far.allows(1.0, 1.002),

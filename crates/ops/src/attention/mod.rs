@@ -65,8 +65,10 @@
 //! region the executor allocates from its scratch pool and zeroes before its first use: trtllm-gen
 //! keeps its multi-CTA reduction counters there across launches.
 
+pub mod dense;
 pub mod sparse;
 
+pub use dense::{DenseArgs, DenseAttention, DenseCall, DenseDescriptor};
 pub use sparse::{SparseArgs, SparseAttention, SparseCall, SparseDescriptor};
 
 use std::ffi::c_void;
