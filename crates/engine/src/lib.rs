@@ -59,6 +59,7 @@ pub use crate::handle::{
 // submits them in.
 pub use crate::kv_cache::{HostCacheSize, IndexedPage};
 pub use crate::scheduler::SpecialTokenIds;
+pub use crate::scheduler::submission::Submissions;
 pub use crate::scheduler::{
     Arrival, BatchCapacity, Candidate, DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH,
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_RUNNING_REQUESTS, DomainStats, EncoderStats,
