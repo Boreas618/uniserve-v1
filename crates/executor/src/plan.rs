@@ -372,54 +372,72 @@ mod tests {
 
     /// Every shape a scheduler can hand in is planned into the **smallest** captured bucket that
     /// holds it, derived independently by brute force over the captured set: a larger bucket still
-    /// produces correct tokens and costs throughput, a smaller one would corrupt them, so the rule
-    /// is checked for every row and token count of every variant, not at a few samples.
+    /// produces correct tokens and costs throughput, a smaller one would corrupt them.
+    ///
+    /// The shapes are the ones a batch hands in, which is what makes the catalog able to hold them
+    /// at all: a decode forward's row count is its token count, and a prefill chunk holds at least
+    /// as many tokens as rows. A shape outside both domains is the other test's subject - it is
+    /// refused by name rather than planned, and asking this one to plan it would assert a coverage
+    /// the catalog does not claim.
     #[test]
     fn every_shape_is_planned_into_the_smallest_bucket_that_holds_it() {
         let buckets = Buckets::causal_lm(&[1, 8, 32], &[128, 512], true);
         let captured: Vec<Bucket> = buckets.iter().copied().collect();
         assert!(!captured.is_empty());
+        let mut planned = 0;
         for &variant in &[
             Variant::DecodeGreedy,
             Variant::DecodeSampled,
             Variant::PrefillWrite,
             Variant::PrefillOutput,
         ] {
+            let decode = matches!(variant, Variant::DecodeGreedy | Variant::DecodeSampled);
             for rows in 1..=32u32 {
-                for tokens in 1..=512u32 {
+                let counts: Box<dyn Iterator<Item = u32>> = if decode {
+                    Box::new(std::iter::once(rows))
+                } else {
+                    Box::new(rows..=512)
+                };
+                for tokens in counts {
                     let shape = Shape {
                         rows,
                         tokens,
                         variant,
                     };
-                    // Brute force: the smallest holder, sorted by (rows, tokens) like `select`'s
-                    // ascending order, computed here rather than taken from the code under test.
+                    // Brute force: the smallest holder by rows and then tokens, computed from the
+                    // captured set rather than taken from the code under test.
                     let expected = captured
                         .iter()
                         .copied()
                         .filter(|bucket| bucket.holds(&shape))
                         .min_by_key(|bucket| (bucket.rows, bucket.tokens));
+                    let Some(expected) = expected else {
+                        assert_eq!(
+                            buckets.select(&shape),
+                            None,
+                            "{shape} has no holder and must not be planned"
+                        );
+                        continue;
+                    };
+                    planned += 1;
                     assert_eq!(
                         buckets.select(&shape),
-                        expected,
+                        Some(expected),
                         "{shape} must be planned into its smallest holder"
                     );
                     // Whatever it picks does hold the shape, and nothing smaller does.
-                    let chosen = buckets.select(&shape).expect("the catalog covers this shape");
-                    assert!(chosen.holds(&shape), "{chosen} does not hold {shape}");
                     for bucket in &captured {
                         if bucket.holds(&shape) {
                             assert!(
-                                bucket.rows > chosen.rows
-                                    || (bucket.rows == chosen.rows
-                                        && bucket.tokens >= chosen.tokens),
-                                "{bucket} is smaller than {chosen} for {shape}"
+                                (bucket.rows, bucket.tokens) >= (expected.rows, expected.tokens),
+                                "{bucket} is smaller than {expected} for {shape}"
                             );
                         }
                     }
                 }
             }
         }
+        assert!(planned > 0, "no shape was planned at all");
     }
 
     /// A shape the plan does not cover is refused by name - with the shape and its variant - and
