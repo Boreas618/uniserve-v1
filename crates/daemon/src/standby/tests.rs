@@ -335,7 +335,8 @@ fn a_parked_standby_that_dies_leaves_the_domain_to_a_relaunch() {
 fn a_standby_whose_preparation_failed_drops_the_domains_standbys() {
     let mut roster = roster();
     start(&mut roster);
-    // `b` reports `PrecopyFailed`: the domain's standby world is kept whole
+    // `b` reports that its preparation failed (no `Parked`): the domain's
+    // standby world is kept whole
     // or not at all, so `c`'s standby is dropped with it.
     assert_eq!(roster.standby_lost("b"), vec![terminate("c", SERVING + 1)]);
     assert_eq!(roster.state()[1].phase.as_str(), "absent");

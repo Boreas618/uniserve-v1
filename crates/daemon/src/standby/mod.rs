@@ -329,10 +329,12 @@ impl Roster {
     }
 
     /// The standby child of `host` reported that it prepared and parked:
-    /// `Report::Precopied { generation }`, the report that gates the start of
-    /// a standby. A child whose preparation failed reports
-    /// `Report::PrecopyFailed` instead, and the caller feeds it to
-    /// [`Roster::standby_lost`]: a standby world is kept whole or not at all.
+    /// `Report::Parked { generation }`, the report that gates the start of a
+    /// standby (the child mapped the epoch's weights and cache read-only,
+    /// captured its graphs on warmup scratch and parked). A child whose
+    /// preparation failed reports that failure instead, which the caller
+    /// feeds to [`Roster::standby_lost`]: a standby world is kept whole or not
+    /// at all.
     pub fn parked(&mut self, host: &str, generation: u64) {
         let Some(domain) = self.domain_of(host) else {
             return;
@@ -352,7 +354,7 @@ impl Roster {
     }
 
     /// A standby child of `host` is gone: it failed to start or died, or it
-    /// reported `Report::PrecopyFailed`, its preparation having failed. A
+    /// reported that its preparation failed (`Report::Parked` never came). A
     /// domain's standby is one world: a member's loss drops every member's
     /// standby, and the domain relaunches when it next fails.
     pub fn standby_lost(&mut self, host: &str) -> Vec<Action> {
@@ -467,9 +469,9 @@ impl Roster {
     }
 
     /// The promotion of the host's standby took effect:
-    /// `Report::Switched { generation }`, the report that a generation
-    /// executes from then on. Once every member answered, the old generation
-    /// is stopped and the domain may start a new standby.
+    /// `Report::Promoted { generation }`, the report that the child serves in
+    /// place after its `Command::Promote`. Once every member answered, the old
+    /// generation is stopped and the domain may start a new standby.
     pub fn promoted(&mut self, host: &str, generation: u64) -> Vec<Action> {
         let Some(domain) = self.domain_of(host) else {
             return Vec::new();
