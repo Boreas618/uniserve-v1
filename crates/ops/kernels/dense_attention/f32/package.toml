@@ -1,6 +1,8 @@
 # The dense_attention operator's f32 backend: design 5.2's program package, and
 # design 9's "FP32 attention: cuBLASLt SGEMM and a softmax kernel program" — the
-# audio encoder's and the VSA compression branch's path.
+# audio encoder's and the VSA compression branch's path. The slice needs it because
+# those two consumers hold their activations in FP32 (`specs/worker.md` 9), and the
+# BF16 projection paths are the `fa4` backend's business, not this program's.
 #
 # One native module per descriptor, and one work item per 64 query rows per head:
 # cuBLASLt computes the tile's scores, a kernel masks them and writes the
@@ -8,14 +10,19 @@
 # a kernel copies the tile's real rows into the caller's output. The module owns
 # its host work, so `Op::launch` computes no grid.
 #
-# The descriptor's `mask` is compiled in (a causal module refuses a dense call and
-# the other way round); its `window` is not, because the window is a bound the call
-# carries and one module serves both. Only FP32 activations are declared, which is
-# what this backend is for — the bf16 projection paths are the `fa4` backend's.
+# The descriptor is `ops`'s, field for field, and nothing else is added to it: the
+# element types, head width, heads, the mask and the window. Two of those are
+# compiled in — the mask (a causal module refuses a dense call and the other way
+# round) and whether a launch carries `[batch + 1]` sequence offsets, which `ops`
+# prints only for the form that carries none. The window is not compiled: it is a
+# bound the call carries, so one module serves a windowed and an unwindowed call.
+# No length is named: a launch's extents, and the descriptor's cap on them, arrive
+# in the call.
 #
-# The length caps are the lengths this backend declares it serves; a call is
-# refused if it packs more keys than its descriptor's cap, so a longer sequence is
-# a new descriptor and a new module, not a slower launch.
+# Only FP32 activations are declared, which is what this backend is for: the f32
+# path's arithmetic is one FP32 product accumulated in FP32, the exponentials and
+# their sum in FP32, and the output's own single rounding — the accumulation
+# `dense_attention`'s tolerance is derived from for the FP32 dtype.
 
 op = "dense_attention"
 backend = "f32"
@@ -44,15 +51,14 @@ script = "src/build.py"
 target = "arch"
 architectures = ["sm_100a", "sm_100f"]
 
-# `dtype_f32_kv_f32_out_f32_head_dim_64_q_heads_8_kv_heads_8_mask_dense_window_false_len_4096`,
-# the audio encoder's shape in the operator's own test, is one of these cells.
+# `dtype_f32_kv_f32_out_f32_head_dim_64_q_heads_8_kv_heads_8_mask_dense_window_false`
+# — the audio encoder's shape in the operator's own test — is one of these cells, and
+# adding `_cu_seq_lens_false` is the one-sequence form of it.
 [kernel.descriptors]
-dimensions = { dtype = ["f32"], kv = ["f32"], out = ["f32"], head_dim = ["64", "128"], q_heads = ["32", "24", "16", "8"], kv_heads = ["8", "4", "2", "1"], mask = ["causal", "dense"], window = ["false", "true"], len = ["8192", "16384", "32768", "40960"] }
+dimensions = { dtype = ["f32"], kv = ["f32"], out = ["f32"], head_dim = ["64", "128"], q_heads = ["32", "24", "16", "8"], kv_heads = ["8", "4", "2", "1"], mask = ["causal", "dense"], window = ["false", "true"], cu_seq_lens = ["false"] }
 
 [parameters]
-# The problem this backend is built for: one 64-row query tile over the packed key
-# extent of the descriptor's longest call. The script compiles the mask only, so
-# these name the shape the module is expected to serve rather than a configuration
-# chosen for it.
+# The work item this backend is built for: query rows per tile. The script compiles
+# the mask and the sequence form only, so this names the shape the module is
+# expected to serve rather than a configuration chosen for it.
 tile = 64
-keys = 8192

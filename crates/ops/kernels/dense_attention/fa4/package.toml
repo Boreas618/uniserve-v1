@@ -42,7 +42,7 @@ architectures = ["sm_100a", "sm_100f"]
 # field. `max_kv_len` is a bound the caller supplies, deliberately absent from the key, so it
 # is a build parameter here and not a dimension.
 [kernel.descriptors]
-dimensions = { dtype = ["bf16", "f16"], kv = ["bf16", "f16"], out = ["bf16", "f16"], head_dim = ["128", "64"], q_heads = ["32", "24", "16"], kv_heads = ["4", "8", "2"], mask = ["causal", "dense"], window = ["false"] }
+dimensions = { dtype = ["bf16", "f16"], kv = ["bf16", "f16"], out = ["bf16", "f16"], head_dim = ["128", "64"], q_heads = ["56", "32", "24", "16"], kv_heads = ["56", "4", "8", "2"], mask = ["causal", "dense"], window = ["false"] }
 
 [parameters]
 # The representative problem the vendor's configuration is chosen for: the batch and
