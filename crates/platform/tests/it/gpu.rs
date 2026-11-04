@@ -9,8 +9,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use cuda::nccl::{Communicator, DataType, ReduceOp, UniqueId};
-use cuda::{
+use platform::nccl::{Communicator, DataType, ReduceOp, UniqueId};
+use platform::{
     CaptureStatus, CopyBatch, DeviceAllocation, DeviceAttribute, DeviceGuard, DeviceId, Error,
     Event, EventFlags, GraphExec, HandleType, Nvml, PeerMapping, PinnedBuffer, PrimaryContext,
     Protection, SegmentedMapping, ShareableHandle, SourceOrder, Stream, Strided, StridedCopy,
@@ -862,19 +862,19 @@ fn a_created_segment_is_counted_as_created_until_it_is_released() {
         Err(Error::ProcessNotFound { .. }) => return,
         Err(error) => panic!("{error}"),
     };
-    let created_before = cuda::created_bytes(DEVICE);
+    let created_before = platform::created_bytes(DEVICE);
     let _descriptor = segmented.create(0).unwrap();
-    assert_eq!(cuda::created_bytes(DEVICE), created_before + bytes as u64);
+    assert_eq!(platform::created_bytes(DEVICE), created_before + bytes as u64);
     let held = nvml.process_storage(DEVICE).unwrap();
     assert!(
         held >= before + bytes as u64 / 2,
         "NVML attributes the held creation to no process: {before} -> {held} bytes"
     );
     // What the process holds of its own leaves the created segment out.
-    assert!(held - cuda::created_bytes(DEVICE) < before + bytes as u64 / 2);
+    assert!(held - platform::created_bytes(DEVICE) < before + bytes as u64 / 2);
 
     segmented.release(0).unwrap();
-    assert_eq!(cuda::created_bytes(DEVICE), created_before);
+    assert_eq!(platform::created_bytes(DEVICE), created_before);
     let released = nvml.process_storage(DEVICE).unwrap();
     assert!(
         released < before + bytes as u64 / 2,

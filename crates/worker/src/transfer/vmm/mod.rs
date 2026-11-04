@@ -21,7 +21,7 @@ use std::ops::Range;
 use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use cuda::{
+use platform::{
     DeviceGuard, DeviceId, Event, IpcEventHandle, PeerMapping, ShareableHandle, SourceOrder,
     Stream, memset_d32,
 };

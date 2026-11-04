@@ -852,7 +852,7 @@ mod tests {
         unsafe {
             std::ptr::copy_nonoverlapping(words.as_ptr(), lent.address() as *mut i64, words.len());
         }
-        buffer.seal::<&cuda::Stream>(&[], &crate::EventPool::default())?;
+        buffer.seal::<&platform::Stream>(&[], &crate::EventPool::default())?;
         buffer.register_lent(words.len(), Vec::new())?;
         buffer.copies_finished();
         buffer.readback()?;

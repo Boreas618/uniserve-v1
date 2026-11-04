@@ -24,7 +24,7 @@ use std::os::fd::OwnedFd;
 use std::time::Instant;
 
 use ::storage::protocol::{ContextBytes, Link, LinkBandwidth, LinkEnd};
-use cuda::{
+use platform::{
     DeviceAllocation, DeviceAttribute, DeviceId, Event, EventFlags, HostRegistration, Nvml,
     PrimaryContext, Stream, memcpy_async,
 };
@@ -62,14 +62,14 @@ impl Gpus {
     /// whose driver shows the process no GPU, has none: its Transfer
     /// Server copies between host storage only. Discovery creates no CUDA
     /// context.
-    pub(super) fn discover() -> Result<Self, cuda::Error> {
+    pub(super) fn discover() -> Result<Self, platform::Error> {
         let count = match DeviceId::count() {
             Ok(count) => count,
-            Err(cuda::Error::Load { .. }) => {
+            Err(platform::Error::Load { .. }) => {
                 tracing::info!("no CUDA driver: the Transfer Server copies host storage only");
                 0
             }
-            Err(cuda::Error::Driver {
+            Err(platform::Error::Driver {
                 code: CUDA_ERROR_NO_DEVICE,
                 ..
             }) => {
@@ -228,7 +228,7 @@ pub(super) fn measure(gpus: &Gpus) -> Result<(Vec<LinkBandwidth>, Vec<ContextByt
         }
     }
     // The measurement's storage is released before the context is measured.
-    cuda::reclaim::flush()?;
+    platform::reclaim::flush()?;
     let contexts = if gpus.gpus.is_empty() {
         Vec::new()
     } else {
@@ -241,10 +241,10 @@ pub(super) fn measure(gpus: &Gpus) -> Result<(Vec<LinkBandwidth>, Vec<ContextByt
                     bytes: nvml.process_storage(gpu.device)?,
                 })
             })
-            .collect::<Result<_, cuda::Error>>()?
+            .collect::<Result<_, platform::Error>>()?
     };
     drop(held);
-    cuda::reclaim::flush()?;
+    platform::reclaim::flush()?;
     for measured in &links {
         tracing::info!(
             source = %storage_name(&measured.link.source),

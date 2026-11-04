@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use cuda::{DeviceGuard, Event, EventFlags, HostRegistration, SourceOrder, Stream};
+use platform::{DeviceGuard, Event, EventFlags, HostRegistration, SourceOrder, Stream};
 use ipc::SharedMemory;
 use ipc::{Locator, TransferTransport};
 

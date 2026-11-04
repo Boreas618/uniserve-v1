@@ -1,7 +1,7 @@
 //! A session's collectors on one rank, and their arming at step boundaries.
 //!
 //! Every CUPTI-based collector reaches CUPTI through the process's one
-//! subscription (`cuda::cupti::subscriber`): the timeline enables its records
+//! subscription (`platform::cupti::subscriber`): the timeline enables its records
 //! and callbacks on it, and the profiling APIs (range profiler, PM sampling,
 //! PC sampling) belong to the same CUPTI. A collector is prepared when the
 //! session starts ([`Collectors::prepare`]), armed and disarmed at step
@@ -14,11 +14,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use cuda::cupti::pc_sampling::PcSampler;
-use cuda::cupti::pm_sampling::PmSampler;
-use cuda::cupti::range_profiler::{RangeProfiler, Ranges};
-use cuda::cupti::timeline::{self, Timeline};
-use cuda::{DeviceId, PrimaryContext};
+use platform::cupti::pc_sampling::PcSampler;
+use platform::cupti::pm_sampling::PmSampler;
+use platform::cupti::range_profiler::{RangeProfiler, Ranges};
+use platform::cupti::timeline::{self, Timeline};
+use platform::{DeviceId, PrimaryContext};
 use proto::profile::{Collector, GraphTrace, MetricRanges, SessionRequest};
 
 use super::artifact::{Message, Rows};
@@ -264,7 +264,7 @@ impl Collectors {
                             .call_values(&[tvm_ffi::Any::from(
                                 graphs == timeline::GraphTrace::Whole,
                             )])
-                            .map_err(|error| cuda::Error::InvalidArgument(error.to_string()))?;
+                            .map_err(|error| platform::Error::InvalidArgument(error.to_string()))?;
                         *running = Some(started);
                         self.nvtx_before = Some(nvtx(true));
                         Ok(())
@@ -569,7 +569,7 @@ fn stop(prepared: &mut Prepared, rows: &Rows) -> std::result::Result<(), String>
 fn send_ranges(
     rows: &Rows,
     profiler: &RangeProfiler,
-    collected: cuda::cupti::range_profiler::Collected,
+    collected: platform::cupti::range_profiler::Collected,
 ) {
     if collected.dropped > 0 {
         tracing::warn!(
@@ -590,7 +590,7 @@ fn prepare(
     context: Option<&PrimaryContext>,
 ) -> std::result::Result<Prepared, String> {
     let cupti = || {
-        cuda::cupti::subscriber::subscribe().map_err(|error| {
+        platform::cupti::subscriber::subscribe().map_err(|error| {
             format!("the process holds no CUPTI subscription (a profiler may hold it): {error}")
         })
     };
@@ -691,9 +691,9 @@ fn prepare(
 }
 
 /// Run `work` on the rank's PC sampler.
-fn with_rank_sampler(work: impl FnOnce(&mut PcSampler) -> cuda::Result<()>) -> cuda::Result<()> {
+fn with_rank_sampler(work: impl FnOnce(&mut PcSampler) -> platform::Result<()>) -> platform::Result<()> {
     let sampler = pc_sampling::rank()
-        .ok_or_else(|| cuda::Error::InvalidArgument("the rank keeps no PC sampler".to_owned()))?;
+        .ok_or_else(|| platform::Error::InvalidArgument("the rank keeps no PC sampler".to_owned()))?;
     work(&mut crate::lock(sampler))
 }
 

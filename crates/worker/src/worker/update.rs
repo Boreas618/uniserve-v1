@@ -17,7 +17,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use cuda::Protection;
+use platform::Protection;
 use tvm_ffi::Any;
 
 use super::loading::{Description, LoadedModel};
@@ -50,7 +50,7 @@ pub(crate) struct WeightUpdate {
     /// Runtime-owned expert routing, bound before numerical graph capture.
     pub(crate) routing: Handle,
     /// Creating handles of the allocations currently mapped at graph addresses.
-    pub(crate) allocations: BTreeMap<::storage::Key, Arc<cuda::PhysicalAllocation>>,
+    pub(crate) allocations: BTreeMap<::storage::Key, Arc<platform::PhysicalAllocation>>,
     /// Background weight redistribution, before the common commit boundary.
     pub(crate) rebalance: Option<ExpertUpdate>,
     pub(crate) distributed: Option<Arc<DwdpUpdate>>,
@@ -153,7 +153,7 @@ impl WeightUpdate {
             + transfer.manifest.conversion_bytes(
                 &transfer.request,
                 0,
-                cuda::DeviceAllocation::granularity(device)? as u64,
+                platform::DeviceAllocation::granularity(device)? as u64,
             )
             + self
                 .distributed
