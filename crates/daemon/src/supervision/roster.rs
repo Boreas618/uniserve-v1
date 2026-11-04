@@ -93,8 +93,13 @@ pub(crate) struct ProcessRoster {
     /// Launches the epoch layer stopped: their exit is not a failure.
     stopping: BTreeSet<u64>,
     /// A resume's fresh generation, waiting for the child to park so it can be
-    /// promoted: the launch generation and the epoch it serves.
+    /// promoted: the launch generation the spawn allocated and the epoch it
+    /// serves.
     resuming: BTreeMap<u64, u64>,
+    /// The epoch a fresh generation is being started for: `spawn` allocates
+    /// the generation itself, so the epoch waits here until that number is
+    /// known.
+    resuming_epoch: Option<u64>,
     /// How the loop last started a main process: the executable and its
     /// arguments, for the fresh generation a restore may need.
     start: Option<(
@@ -129,6 +134,7 @@ impl ProcessRoster {
             requests: String::new(),
             stopping: BTreeSet::new(),
             resuming: BTreeMap::new(),
+            resuming_epoch: None,
             start: None,
             queued: VecDeque::new(),
             next_request: 1,
@@ -303,7 +309,7 @@ impl ProcessRoster {
 
     /// Starts a fresh generation of the previous epoch for a restore whose
     /// processes are gone: claim its world, let it park, and promote it.
-    fn fresh(&mut self, host: &str, generation: u64, epoch: u64, group: &str, rank: u64) {
+    fn fresh(&mut self, host: &str, epoch: u64, group: &str, rank: u64) {
         let scope = process::Scope {
             group: group.to_owned(),
             rank: rank as u32,
@@ -311,29 +317,29 @@ impl ProcessRoster {
         match self.claim(host, epoch, &[scope], &[]) {
             Ok(()) => {}
             Err(reason) => {
-                tracing::warn!(%host, generation, %reason, "claiming the previous epoch for a restore failed");
+                tracing::warn!(%host, epoch, %reason, "claiming the previous epoch for a restore failed");
                 return;
             }
         }
         let Some((executable, launch, environment)) = self.start.clone() else {
             return;
         };
-        self.resuming.insert(generation, epoch);
-        // The fresh process's own number is the spawn's to set: `spawn`
-        // allocates it and writes the launch file that names it.
+        // The fresh process's own number is the spawn's to allocate and to
+        // write into its launch file; the epoch waits for that number.
+        self.resuming_epoch = Some(epoch);
         let start = Spawn {
             host: host.to_owned(),
             group: group.to_owned(),
             rank: rank as u32,
-            generation,
+            generation: 0,
             executable,
             arguments: Vec::new(),
             environment,
             inherit: Vec::new(),
         };
         if let Err(reason) = self.spawn(start, &launch) {
-            tracing::warn!(%host, generation, %reason, "starting the previous epoch for a restore failed");
-            self.resuming.remove(&generation);
+            tracing::warn!(%host, epoch, %reason, "starting the previous epoch for a restore failed");
+            self.resuming_epoch = None;
         }
     }
 }
@@ -406,10 +412,16 @@ impl Roster for ProcessRoster {
                 pid: None,
             },
         );
+        // A fresh generation of a restore: its epoch is now known under the
+        // number this spawn allocated, so its `Parked` promotes it.
+        if let Some(epoch) = self.resuming_epoch.take() {
+            self.resuming.insert(generation, epoch);
+        }
         let start = process::request::Kind::Spawn(spawn);
         let reply = self.request(start)?;
         if !reply.error.is_empty() {
             self.launches.remove(&generation);
+            self.resuming.remove(&generation);
             return Err(reply.error);
         }
         let Some(process::reply::Kind::Spawned(spawned)) = reply.kind else {
@@ -517,8 +529,7 @@ impl Roster for ProcessRoster {
         let Some(epoch) = epoch else {
             return;
         };
-        let fresh = self.epochs.next_generation(&group, rank);
-        self.fresh(host, fresh, epoch, &group, rank);
+        self.fresh(host, epoch, &group, rank);
         let _ = reason;
     }
 
@@ -568,7 +579,7 @@ mod tests {
     fn service(info: Arc<Epochs>) -> (Service, EpochLink) {
         let (requests, incoming) = std::sync::mpsc::channel::<(Request, Sender<process::Reply>)>();
         let (_commands, sent) = std::sync::mpsc::channel();
-        let (reports, received) = std::sync::mpsc::channel();
+        let (reports, _received) = std::sync::mpsc::channel();
         let (exits, exited) = std::sync::mpsc::channel();
         let (greetings, greeted) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
