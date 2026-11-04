@@ -206,6 +206,65 @@ def order_of(path):
     return (index, CUTS.index(cut) if cut in CUTS else len(CUTS))
 
 
+def compare_ids(actual, expected, scores):
+    """How two expert selections differ, in the classes that decide what a difference means.
+
+    A row whose *set* of experts agrees and whose order does not is not a difference at all: the
+    weights travel with their ids, so the block's sum is the same. A row whose set differs is only a
+    defect if the two sides were not free to differ: with a bf16 gate the probability of the 8th and
+    9th expert is *exactly* equal often enough to matter (measured: about six rows in a hundred), and
+    then either selection is right. `scores` is the reference's `router_logits`, when it was written
+    beside the ids, and it is what tells those two apart.
+    """
+    actual = np.asarray(actual)
+    expected = np.asarray(expected)
+    if expected.ndim != 2:
+        return None
+    sets_agree = [
+        set(row_a.tolist()) == set(row_e.tolist())
+        for row_a, row_e in zip(actual, expected)
+    ]
+    order_only = sum(
+        1
+        for agrees, row_a, row_e in zip(sets_agree, actual, expected)
+        if agrees and not np.array_equal(row_a, row_e)
+    )
+    differing = [index for index, agrees in enumerate(sets_agree) if not agrees]
+    if not differing:
+        if order_only:
+            return (
+                f"every row's set of experts agrees; the order differs on {order_only} of "
+                f"{len(sets_agree)} rows, which the sum does not see"
+            )
+        return "every index agrees"
+    if scores is None:
+        return (
+            f"{len(differing)} of {len(sets_agree)} rows select a different set; first at row "
+            f"{differing[0]}: {actual[differing[0]].tolist()} against the reference's "
+            f"{expected[differing[0]].tolist()} — no router logits beside the ids, so a boundary tie "
+            "cannot be told from a defect"
+        )
+    top = expected.shape[1]
+    tied, unexplained = [], []
+    for row in differing:
+        row_scores = np.asarray(scores[row], dtype=np.float64)
+        probabilities = np.exp(row_scores - row_scores.max())
+        probabilities /= probabilities.sum()
+        ordered = np.sort(probabilities)[::-1]
+        (tied if ordered[top - 1] == ordered[top] else unexplained).append(row)
+    parts = []
+    if tied:
+        parts.append(f"{len(tied)} on a tied boundary (the 8th and 9th probabilities are equal in the "
+                     "reference's own logits, so either selection is right)")
+    if unexplained:
+        row = unexplained[0]
+        parts.append(
+            f"{len(unexplained)} unexplained; first at row {row}: {actual[row].tolist()} against the "
+            f"reference's {expected[row].tolist()}"
+        )
+    return f"{len(differing)} of {len(sets_agree)} rows select a different set: " + "; ".join(parts)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--reference", required=True, type=pathlib.Path)
@@ -282,17 +341,21 @@ def main():
                     "exactly anyway"
                 )
             # An index is not a quantity: nothing about `17` is "3% away" from `18`. It is equal or
-            # it is not, and the only informative summary is how many differ and where.
+            # it is not, and the classes below say what a difference costs.
+            # The scores that decide a tie live beside the ids under a name one step away from it:
+            # `hidden_02_router_ids` -> `hidden_02_router_logits`, and for a writer that names the
+            # file only for its ids, `_ids` -> `_logits`.
+            candidates = [
+                path.name.replace("_router_ids", "_router_logits"),
+                path.name.replace("_ids", "_logits"),
+            ]
+            logits_path = next(
+                (beside for beside in (path.with_name(name) for name in candidates) if beside.exists()),
+                None,
+            )
+            scores = np.load(logits_path) if logits_path is not None else None
+            reading = compare_ids(actual, expected, scores) or "every index agrees"
             differ = np.argwhere(actual != expected)
-            total = expected.size
-            if differ.size == 0:
-                reading = "every index agrees"
-            else:
-                row = tuple(int(value) for value in differ[0])
-                reading = (
-                    f"{differ.shape[0]} of {total} differ; first at {row}: "
-                    f"{int(actual[row])} against the reference's {int(expected[row])}"
-                )
             lines.append(
                 f"{path.name:<16} {str(expected.shape):<12} {'exact':>10} {'-':>10} {'-':>10}"
                 f" {'-':>10}  {reading}"
