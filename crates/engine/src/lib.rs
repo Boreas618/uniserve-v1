@@ -73,7 +73,7 @@ pub use crate::scheduler::{
     SchedulerConfig, SchedulerStats, SchedulerStatsReporter, Stage, TimingStats, TrialState,
     Validators, WorkerStats, arrival_view, ceilings_of,
 };
-pub use crate::service::{EpochPolicy, continuation_slot, run_engine, serve_requests};
+pub use crate::service::{continuation_slot, run_engine, serve_requests};
 #[cfg(feature = "testing")]
 pub use crate::sim::{
     BatchEvent, ContextLog, ContextWrite, Pace, SimEngine, SimExecutor, SimSpeculation,

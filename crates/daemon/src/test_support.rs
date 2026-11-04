@@ -176,13 +176,7 @@ pub(crate) fn sim_client(cores: Vec<SchedulerHandle>) -> EngineClient {
     let (daemon, engine) = UnixStream::pair().expect("a socket pair");
     std::thread::Builder::new()
         .name("sim-engine".into())
-        .spawn(move || {
-            let epoch = engine::EpochPolicy {
-                program: policy,
-                module: source,
-            };
-            engine::serve_requests(engine, cores, Some(epoch))
-        })
+        .spawn(move || engine::serve_requests(engine, cores, policy, source))
         .expect("start the simulated engine");
     EngineClient::new(
         proto::Connection::from_unix(daemon.try_clone().expect("clone the request socket"))

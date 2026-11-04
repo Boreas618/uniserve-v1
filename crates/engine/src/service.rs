@@ -610,9 +610,9 @@ struct Attachment {
     info: wire::EngineInfo,
 }
 
-/// Serves the daemon's requests on `stream` with `schedulers`, under `policy`,
-/// until the daemon commands a shutdown or closes the connection, then shuts
-/// every scheduler down.
+/// Serves the daemon's requests on `stream` with `schedulers`, under `policy`
+/// read from `policies`, until the daemon commands a shutdown or closes the
+/// connection, then shuts every scheduler down.
 ///
 /// The connection has said hello and been welcomed, and the engine has
 /// reported itself ready; from here on it carries submissions, commands,
@@ -634,39 +634,20 @@ struct Attachment {
 pub fn serve_requests(
     stream: UnixStream,
     schedulers: Vec<SchedulerHandle>,
-    policy: Option<EpochPolicy>,
+    policy: PolicyProgram,
+    policies: Arc<dyn PolicySource + Send + Sync>,
 ) -> anyhow::Result<()> {
     let writer = stream
         .try_clone()
         .context("sharing the daemon's connection")?;
-    let policies = policy
-        .as_ref()
-        .map(|policy| Arc::clone(&policy.module) as Arc<dyn PolicySource + Send + Sync>);
     serve(
         Connection::from_unix(stream)?,
         Connection::from_unix(writer)?,
         schedulers,
         None,
-        policies,
-        policy,
+        Some(policies),
+        Some(policy),
     )
-}
-
-/// The policy an epoch starts with, when its owner names it directly rather
-/// than through the process interface (§7.3).
-///
-/// Production installs an epoch's policy with the daemon's `Precopy` and
-/// `Switchover` commands, which the epoch's command thread applies. A caller
-/// that owns the engine's connection itself and sends no commands — the
-/// daemon library's in-process client is one — names the same installation
-/// here, and the engine serves its requests under it from the first one. The
-/// program's decisions are what the control thread routes by; the schedulers
-/// carry the policy their own installation gave them.
-pub struct EpochPolicy {
-    /// The program the route decisions follow.
-    pub program: PolicyProgram,
-    /// The module the program's decisions are instantiated from.
-    pub module: Arc<dyn PolicySource + Send + Sync>,
 }
 
 /// [`serve_requests`] over a connection read through `reader` and written
@@ -681,7 +662,7 @@ fn serve(
     schedulers: Vec<SchedulerHandle>,
     attachment: Option<Attachment>,
     policies: Option<Arc<dyn PolicySource + Send + Sync>>,
-    start: Option<EpochPolicy>,
+    serving: Option<PolicyProgram>,
 ) -> anyhow::Result<()> {
     let prepared = schedulers.iter().any(SchedulerHandle::starts_on_trial);
     let count = schedulers.len();
@@ -720,9 +701,12 @@ fn serve(
     // serves: the route instance answers before the first submission, because
     // nothing else installs one here. A daemon that commands its epochs'
     // policies over the process interface states none, and its precopy does.
-    if let Some(start) = start {
+    if let Some(program) = serving {
+        let source = policies
+            .as_ref()
+            .context("an engine serving a stated policy needs the source of its module")?;
         routing
-            .precopy_route(start.module.as_ref(), start.program)
+            .precopy_route(source.as_ref(), program)
             .map_err(anyhow::Error::msg)?;
         routing.switchover_route().map_err(anyhow::Error::msg)?;
     }
@@ -2666,7 +2650,7 @@ fn precopy_failed(reason: impl Into<String>) -> proto::process::Report {
 ///
 /// A trait so the commands can be run against a double in a test, where no
 /// scheduler exists; the engine's implementation is [`Routing`].
-trait PolicyStages {
+trait EpochPolicy {
     /// §7.3 step 2: prepare `program`'s policy on the current state, on every
     /// scheduler and on the control thread, executing nothing.
     fn precopy(
@@ -2697,7 +2681,7 @@ trait PolicyStages {
     fn purge(&self) -> Result<(), String>;
 }
 
-impl PolicyStages for Routing {
+impl EpochPolicy for Routing {
     fn precopy(
         &self,
         policies: &Arc<dyn PolicySource + Send + Sync>,
@@ -2822,7 +2806,7 @@ fn answer_stage(answer: crossbeam_channel::Receiver<Result<(), String>>) -> Resu
 /// purge names the generation it means, and one this engine has already reached
 /// changes nothing.
 fn apply_process_command(
-    policy: &dyn PolicyStages,
+    policy: &dyn EpochPolicy,
     generations: &Mutex<Generations>,
     policies: Option<&Arc<dyn PolicySource + Send + Sync>>,
     command: proto::process::Command,
@@ -3154,7 +3138,7 @@ mod tests {
         }
     }
 
-    impl PolicyStages for Recording {
+    impl EpochPolicy for Recording {
         fn precopy(
             &self,
             _policies: &Arc<dyn PolicySource + Send + Sync>,
