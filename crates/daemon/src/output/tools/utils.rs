@@ -90,19 +90,19 @@ pub(super) fn safe_text_len(input: &mut Partial<&str>, marker: &str) -> ModalRes
 /// balance, not correct interleaving.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct JsonObjectScanState {
-    object_depth: usize,
-    array_depth: usize,
+    pub(super) object_depth: usize,
+    pub(super) array_depth: usize,
     /// Whether the scan is inside a string literal, where braces and brackets
     /// are not structural.
-    in_string: bool,
+    pub(super) in_string: bool,
     /// Whether the previous string byte was an unescaped backslash.
-    escape: bool,
-    phase: JsonObjectScanPhase,
+    pub(super) escape: bool,
+    pub(super) phase: JsonObjectScanPhase,
 }
 
 /// Progress of one `take_json_object` scan.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-enum JsonObjectScanPhase {
+pub(super) enum JsonObjectScanPhase {
     /// No byte consumed; the next byte must be `{`.
     #[default]
     Initial,

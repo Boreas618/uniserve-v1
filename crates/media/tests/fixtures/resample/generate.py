@@ -75,12 +75,13 @@ def lanczos_cases() -> None:
     for name, (channels, height, width, out_height, out_width) in cases.items():
         pixels = pattern(channels, height, width)
         image = Image.frombytes("RGB", (width, height), pixels.transpose(1, 2, 0).tobytes())
+        source = pixels.transpose(1, 2, 0).tobytes()
         expected = image.resize((out_width, out_height), Image.Resampling.LANCZOS)
         write_case(
             "lanczos",
             name,
             f"{name} {channels} {height} {width} {out_height} {out_width}",
-            bytes(pixels.tobytes()),
+            source,
             expected.tobytes(),
         )
 

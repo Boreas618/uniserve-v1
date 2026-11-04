@@ -35,6 +35,13 @@ pub mod process {
     include!(concat!(env!("OUT_DIR"), "/uniserve.process.rs"));
 }
 
+/// The state a hot restart hands its successor for the responses in flight
+/// (`handoff.proto`, specs/worker.md §7.5.1).
+#[allow(clippy::all, reason = "code generated from the schema")]
+pub mod handoff {
+    include!(concat!(env!("OUT_DIR"), "/uniserve.handoff.rs"));
+}
+
 /// The interfaces' major version: peers of different majors refuse each
 /// other. It changes only when a field is removed or changes meaning, which
 /// takes a planned restart of every daemon.
@@ -43,8 +50,17 @@ pub const PROTOCOL_MAJOR: u32 = 1;
 /// The interfaces' minor version: the additions this build knows. Minor 1
 /// adds the leader's answer of the nodes it knows now (`NodesQuery`). Minor 2
 /// adds explicit publication of committed worlds' immutable pages. Minor 3
-/// carries generated artifacts over TCP in bounded parts.
-pub const PROTOCOL_MINOR: u32 = 3;
+/// carries generated artifacts over TCP in bounded parts. Minor 4 adds the
+/// management of a main process's epoch: the commands parking, promotion and
+/// program switch (`Park`, `Promote`, `Precopy`, `Switchover`, `Commit`,
+/// `Revert`, `Purge`), the programs those commands carry, and the main
+/// process's reports (`Precopied`, `PolicyReverted`), and the acknowledgements
+/// and fault reports the main process answers a command with (`Switched`,
+/// `Committed`, `Reverted`, `Purged`, `Stalled`, `Fault`, `PrecopyFailed`,
+/// `NonFiniteLogits`); the frontend's peer registration and the daemon's
+/// commands to it (`Serve`, `Drain`, `Pause`, `Drained`); and the main
+/// process's `/metrics` counters (`FromEngine::Metrics`).
+pub const PROTOCOL_MINOR: u32 = 4;
 
 /// The build this crate is compiled in: the package version, then `+` and a
 /// digest of the workspace sources every artifact of the build is compiled

@@ -183,13 +183,13 @@ impl HuggingFaceTokenizer {
     /// `IncrementalDecoder::next_chunk` withholds; the serving output stages
     /// pass the stop-string holdback computed by `stop_string_holdback_bytes`.
     pub fn create_decode_stream(
-        &self,
+        self: &Arc<Self>,
         prompt_token_ids: &[u32],
         skip_special_tokens: bool,
         min_bytes_to_buffer: usize,
-    ) -> IncrementalDecoder<'_> {
+    ) -> IncrementalDecoder {
         IncrementalDecoder::new(
-            self,
+            Arc::clone(self),
             prompt_token_ids,
             skip_special_tokens,
             min_bytes_to_buffer,
