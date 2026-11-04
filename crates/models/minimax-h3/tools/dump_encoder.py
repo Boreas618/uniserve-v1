@@ -203,25 +203,38 @@ def encoder_sidecars(checkpoint: Path):
 
 
 # The safetensors element type names, as its headers spell them, and the torch types they mean.
-ELEMENTS = {"F64": "float64", "F32": "float32", "F16": "float16", "BF16": "bfloat16"}
+ELEMENTS = {
+    "F64": "float64",
+    "F32": "float32",
+    "F16": "float16",
+    "BF16": "bfloat16",
+    "I64": "int64",
+    "I32": "int32",
+    "I8": "int8",
+    "U8": "uint8",
+}
 
 
-def checkpoint_dtype(checkpoint: Path):
-    """The one element type the export's text encoder shards hold.
+def shard_dtype(directory: Path):
+    """The one element type the shards under `directory` hold, from their own headers.
 
-    Read from the shards' own headers rather than assumed: the precision rule keeps the checkpoint's
-    own representation and converts nothing, so a reference loaded at a harness's constant would be
-    a page for a model nobody serves - and the two sides would agree with each other while both
-    disagreed with the export. Two types in one component is refused, naming both.
+    Read rather than assumed: the precision rule keeps the checkpoint's own representation and
+    converts nothing, so a reference loaded at a harness's constant would be a page for a model
+    nobody serves - and the two sides would agree with each other while both disagreed with the
+    export. Two types in one component is refused, naming both.
     """
     torch = reference("torch")
     safetensors = reference("safetensors")
-    directory = checkpoint / "text_encoder"
     found = {}
     for path in sorted(directory.glob("*.safetensors")):
         with safetensors.safe_open(str(path), framework="pt") as handle:
             for name in handle.keys():
                 spelling = handle.get_slice(name).get_dtype()
+                # Index tables are integers and say nothing about the representation a weight is
+                # stored in: counting them would refuse a component that holds one.
+                if spelling not in ELEMENTS or ELEMENTS[spelling] in ("int8", "int16", "int32",
+                                                                     "int64", "uint8"):
+                    continue
                 found.setdefault(spelling, name)
     if not found:
         raise SystemExit(
@@ -239,6 +252,11 @@ def checkpoint_dtype(checkpoint: Path):
     if name is None:
         raise SystemExit(f"an element type this probe does not know: {spelling}")
     return getattr(torch, name)
+
+
+def checkpoint_dtype(checkpoint: Path):
+    """The element type the export's text encoder holds, through [`shard_dtype`]."""
+    return shard_dtype(checkpoint / "text_encoder")
 
 
 def load_encoder(case: dict, checkpoint: Path, device: str, dtype):

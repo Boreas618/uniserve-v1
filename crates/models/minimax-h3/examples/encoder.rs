@@ -28,6 +28,7 @@ use nn::{
 use platform::{DeviceId, PoolKind};
 
 use minimax_h3::config::Config;
+use minimax_h3::load;
 use minimax_h3::partition::Partition;
 use minimax_h3::text_encoder::TextEncoder;
 use minimax_h3::vision::VisionTower;
@@ -233,6 +234,9 @@ impl Args {
 
 /// The ids the checkpoint's tokenizer gives the default prompt.
 ///
+/// The export's text encoder component: the language stack's weights and the tower's.
+const TEXT_ENCODER: &str = "text_encoder";
+
 /// The prompt the harness encodes when asked for no particular one.
 const DEFAULT_PROMPT: &str = "a cat walking on the grass";
 
@@ -248,8 +252,8 @@ const DEFAULT_IDS: [u32; 6] = [64, 8251, 11435, 389, 279, 16359];
 /// page this stage writes follows the export rather than a harness constant. Two types in one
 /// component is a deployment question, not a diagnosis one: it is refused, by name and with both
 /// types, rather than answered by picking one.
-fn compute_dtype(source: &Checkpoint, stated: Option<DType>) -> Result<DType> {
-    let own = checkpoint_dtype(source)?;
+fn compute_dtype(checkpoint: &Checkpoint, component: &str, stated: Option<DType>) -> Result<DType> {
+    let own = load::stored_dtype(checkpoint, component)?;
     match stated {
         None => {
             println!("dtype: {own}, the checkpoint's own (`auto`)");
@@ -262,26 +266,6 @@ fn compute_dtype(source: &Checkpoint, stated: Option<DType>) -> Result<DType> {
             );
             Ok(dtype)
         }
-    }
-}
-
-/// The one element type the export's `text_encoder` holds, from its own tensor headers.
-fn checkpoint_dtype(source: &Checkpoint) -> Result<DType> {
-    match source.dtypes().as_slice() {
-        [only] => Ok(*only),
-        [] => Err(Failure::message(
-            "the export's text encoder holds no tensors: nothing to encode with",
-        )),
-        many => Err(Failure::message(format!(
-            "the export's text encoder holds {} element types ({}); the precision rule keeps the \
-             checkpoint's own representation and converts nothing, so this stage refuses rather \
-             than choose one",
-            many.len(),
-            many.iter()
-                .map(|dtype| dtype.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ))),
     }
 }
 
@@ -336,7 +320,7 @@ fn stage_weights(args: &Args) -> Result<()> {
 
     let checkpoint = Checkpoint::open(&args.root)?;
     let source = checkpoint.component("text_encoder")?;
-    let dtype = compute_dtype(source, None)?;
+    let dtype = compute_dtype(&checkpoint, TEXT_ENCODER, None)?;
     let mut store = HostStore::new();
     let mut loader = WeightLoader::new(source, &mut store, None, None);
     let encoder = TextEncoder::load(&mut loader, text, &Partition::single(), dtype)?;
@@ -794,7 +778,7 @@ fn stage_encode(args: &Args) -> Result<()> {
     };
     let checkpoint = Checkpoint::open(&args.root)?;
     let source = checkpoint.component("text_encoder")?;
-    let dtype = compute_dtype(source, stated)?;
+    let dtype = compute_dtype(&checkpoint, TEXT_ENCODER, stated)?;
 
     // 1. The device and the generation the compiled programs were loaded for.
     let device = platform::Device::new(DeviceId(args.device))?;
@@ -954,7 +938,7 @@ fn stage_encode(args: &Args) -> Result<()> {
         prompt = json_string(&args.prompt),
         vocab = text.vocab_size,
         element = dtype,
-        own = checkpoint_dtype(checkpoint.component("text_encoder")?)?,
+        own = load::stored_dtype(&checkpoint, TEXT_ENCODER)?,
     );
     std::fs::write(directory.join("case.json"), case)
         .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
