@@ -204,12 +204,17 @@ pub struct TopKDescriptor {
     pub dtype: DType,
     /// The vocabulary width of a row.
     ///
-    /// A launch size, not a compilation: the program walks the row at runtime
-    /// (`do_not_specialize = ["rows", "vocabulary", "width"]`), so neither this nor `width` enters
-    /// the key. A key that named them would demand a module per vocabulary the deployment happens
-    /// to serve, and a manifest would have to declare every one of them.
+    /// A launch size, not a compilation: the program reads the row at runtime
+    /// (`do_not_specialize = ["rows", "vocabulary", "width"]`), so it does not enter the key - a
+    /// key that named it would demand a module per vocabulary the deployment happens to serve.
     pub vocabulary: u32,
-    /// How many candidates a row keeps; a launch size for the same reason as `vocabulary`.
+    /// How many candidates a row keeps: the live count, a **launch** value.
+    ///
+    /// The buffers are this many lanes wide per row and every emitted lane past it is masked, so
+    /// the live count does not enter the key. What enters it is its **padded** width - the next
+    /// power of two - because the emission ends in a bitonic sort, and a sort needs a power-of-two
+    /// network. A deployment's candidate count is a vocabulary (151936, which is `2^6 · 2371`), so
+    /// the network is widened and the buffers are not.
     pub width: u32,
     /// Element type of the emitted vocabulary ids.
     pub ids: DType,
@@ -217,12 +222,24 @@ pub struct TopKDescriptor {
     pub pdl: bool,
 }
 
+/// The bitonic network a candidate count is compiled to: the next power of two at or above it.
+///
+/// One function on purpose. It is the only place the padding is derived, so the key a store builds
+/// (`TopKDescriptor`'s display) and the width a program is compiled to (`src/build.py` reading the
+/// key) cannot disagree - and a caller that needs the number, such as a plan sizing a store, gets it
+/// from here rather than rounding for itself.
+pub fn network_width(width: u32) -> u32 {
+    width.next_power_of_two()
+}
+
 impl fmt::Display for TopKDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // `vocabulary` and `width` are absent on purpose: the program takes both as runtime scalars,
-        // so one module serves every vocabulary and every candidate count.
+        // `vocabulary` and the live `width` are absent on purpose: the program takes both as runtime
+        // scalars, so one module serves every vocabulary and every candidate count up to its
+        // network. What the key names is the network: the live count padded to a power of two.
         Key::new()
             .field("dtype", self.dtype)
+            .field("width", network_width(self.width))
             .field("ids", self.ids)
             .field("pdl", self.pdl)
             .finish(formatter)
@@ -307,7 +324,13 @@ impl Op for TopK {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct FilterDescriptor {
     /// How many candidates a row carries.
+    ///
+    /// A runtime value, not a compilation: the program walks the row in `tile`-sized chunks, so one
+    /// module serves every candidate count and neither this nor the tile is a request the deployment
+    /// has to enumerate.
     pub width: u32,
+    /// The tile the program walks the row in: a chunk, never the row.
+    pub tile: u32,
     /// Element type of the emitted vocabulary ids.
     pub ids: DType,
     /// Launch with programmatic dependent launch.
@@ -318,6 +341,7 @@ impl fmt::Display for FilterDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
             .field("width", self.width)
+            .field("tile", self.tile)
             .field("ids", self.ids)
             .field("pdl", self.pdl)
             .finish(formatter)
@@ -381,10 +405,8 @@ impl Op for FilterCandidates {
             .view(args.ids)
             .view(args.parameters)
             .view(args.valid)
-            .u64(rows);
-        // The candidate width is compiled into the program, so it is not a parameter here: a word the
-        // module does not declare would push the two scratch addresses the compiler's launcher appends
-        // out of place.
+            .u64(rows)
+            .u64(width);
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 
@@ -408,6 +430,9 @@ impl Op for FilterCandidates {
 pub struct InverseCdfDescriptor {
     /// How many candidates a row carries.
     pub width: u32,
+    /// Lanes one program walks at a time: a chunk of the row, not the row, so the walk costs the
+    /// same registers at any width.
+    pub tile: u32,
     /// Element type of the candidate vocabulary ids.
     pub ids: DType,
     /// The element type of an emitted token.
@@ -420,6 +445,7 @@ impl fmt::Display for InverseCdfDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
             .field("width", self.width)
+            .field("tile", self.tile)
             .field("ids", self.ids)
             .field("tokens", self.tokens)
             .field("pdl", self.pdl)
@@ -488,15 +514,16 @@ impl Op for InverseCdf {
         }
 
         let mut arguments = Arguments::new();
+        // The row count and the width are both runtime values: the program walks the row in tiles
+        // of the descriptor's `tile` lanes, so no block covers the row and nothing in the
+        // signature depends on its width.
         arguments
             .view(args.probabilities)
             .view(args.ids)
             .view(args.draws)
             .view(args.tokens)
-            .u64(rows);
-        // The candidate width is compiled into the program, so it is not a parameter here: a word the
-        // module does not declare would push the two scratch addresses the compiler's launcher appends
-        // out of place.
+            .u64(rows)
+            .u32(descriptor.width);
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 

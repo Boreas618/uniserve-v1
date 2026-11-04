@@ -156,11 +156,10 @@ pub struct Plan {
     pub gathered: u64,
     /// Bytes of the attention program's workspace.
     pub workspace: u64,
-    /// Bytes the encoded expert step reserves in the routed layers; zero when the experts are dense
-    /// or no layer routes.
+    /// Bytes one routed layer's expert step reserves; zero when no layer routes.
     ///
     /// One reservation serves every routed layer, as the rest of the plan does: the step's buffers
-    /// are reused as the layer loop advances.
+    /// are released as the layer loop advances, so a plan is one layer deep.
     pub moe: u64,
 }
 
@@ -204,11 +203,14 @@ impl Plan {
                 0
             },
             workspace: options.attention_workspace_bytes,
-            moe: if options.experts_encoded && config.num_experts > 0 {
-                // The activation encoding's block scales are the CUTLASS product's plain layout.
-                nn::layers::encoded_bytes(
+            moe: if config.num_experts > 0 {
+                // One routed layer's whole step: the routing prefix, the permuted pair, and the
+                // encoded planes when the checkpoint stores them encoded. Sized from the same
+                // `max_permuted_rows` the runtime reserves, so plan and step cannot disagree. The
+                // activation encoding's block scales are the CUTLASS product's plain layout.
+                nn::layers::step_bytes(
                     tokens,
-                    nn::layers::EncodedGeometry {
+                    nn::layers::MoeGeometry {
                         hidden: element(config.hidden_size, "hidden_size")?,
                         intermediate: element(
                             config.moe_intermediate_size,
@@ -220,6 +222,7 @@ impl Plan {
                     },
                     ops::fp4::ScaleLayout::Linear,
                     dtype,
+                    options.experts_encoded,
                 )?
             } else {
                 0
@@ -474,9 +477,14 @@ impl Qwen3Moe {
         let mut residual = hidden;
         let mut input = hidden;
         for (index, layer) in self.layers[..=last].iter().enumerate() {
+            // One layer's scratch is dead once its launches are enqueued: the plan is one layer
+            // deep and the next layer is handed the same addresses, which is what a replayed graph
+            // expects. The layer-independent buffers above were reserved before this mark.
+            let mark = f.arena.mark();
             layer.forward(
                 f, batch, cache, index, &buffers, residual, cosine, sine, input,
             )?;
+            f.arena.release(mark);
             if index == 0 {
                 residual = buffers.residual;
             }
@@ -736,11 +744,15 @@ impl CausalLm for Qwen3Moe {
         let mut residual = hidden;
         let mut input = hidden;
         for (index, layer) in self.layers.iter().enumerate() {
+            // As in `forward_through`: the step's scratch is one layer's and is reused as the loop
+            // advances.
+            let mark = f.arena.mark();
             layer
                 .forward(
                     f, batch, cache, index, &buffers, residual, cosine, sine, input,
                 )
                 .map_err(capability)?;
+            f.arena.release(mark);
             if index == 0 {
                 residual = buffers.residual;
             }
@@ -953,11 +965,22 @@ mod tests {
         // tile per route, so the step reserves 15360 permuted rows rather than 120.
         let routes = 120 * 128;
         let down_rows = routes * 2048 * 2;
+        let gated_rows = routes * 768 * 2;
         assert!(
             encoded.moe >= down_rows,
             "the encoded step reserves {} bytes, the down product's rows alone are {down_rows}",
             encoded.moe
         );
+        // The permuted pair is permuted-height on both paths: the combine indexes it through the
+        // sort's map, so the dense path pays it too and the encoded path's addition is its
+        // activation planes.
+        assert!(
+            dense.moe >= down_rows + gated_rows,
+            "the dense step reserves {} bytes against the pair's {}",
+            dense.moe,
+            down_rows + gated_rows
+        );
+        assert!(encoded.moe > dense.moe);
         assert!(encoded.bytes(DType::BF16).unwrap() > dense.bytes(DType::BF16).unwrap());
     }
 
@@ -965,7 +988,7 @@ mod tests {
     fn the_plan_bytes_follow_the_token_count() {
         let config = config();
         let partition = Partition::single();
-        let bytes = |tokens: u64| {
+        let plan = |tokens: u64| {
             Plan::new(
                 &config,
                 &partition,
@@ -974,14 +997,20 @@ mod tests {
                 DType::BF16,
             )
             .unwrap()
-            .bytes(DType::BF16)
-            .unwrap()
         };
+        let one = plan(1);
+        let two = plan(2);
         // Per token: two F32 factor columns, three hidden buffers, three query-width buffers
         // (query, rotated query, attended output), three key/value-width buffers and the logits'
         // row. Two rank's worth of logits are planned only where a gather happens, and the single
         // rank plans none.
         let per_token = 2 * 64 * 4 + 3 * 2048 * 2 + 3 * 4096 * 2 + 3 * 512 * 2 + 151936 * 2;
-        assert_eq!(bytes(2) - bytes(1), per_token);
+        // The expert step grows with the batch as well, at the permutation's padded height rather
+        // than at `tokens · top`, so its own term is the difference the plan states for it.
+        let step = two.moe - one.moe;
+        assert_eq!(
+            two.bytes(DType::BF16).unwrap() - one.bytes(DType::BF16).unwrap(),
+            per_token + step
+        );
     }
 }

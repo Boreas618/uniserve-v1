@@ -154,6 +154,11 @@ pub struct GatherGemmArgs {
     pub weights: TensorView,
     /// `[tokens, top]` i32 route ids — the source of the expanded route count.
     pub ids: TensorView,
+    /// `[tokens, top]` i32: the permuted row of each `(token, route)` pair, as `moe_sort` writes it
+    /// (the same map `moe_unpermute` reads). It is the consumer's lookup, not this product's: the
+    /// product writes row `p` of `out` at the sort's permuted row `p`, so the map is what lets the
+    /// reader find a route afterwards.
+    pub expanded_to_permuted: TensorView,
     /// `[max_tiles]` i32 expert of each tile.
     pub tile_to_expert: TensorView,
     /// `[max_tiles]` i32 live rows of each tile.
@@ -387,7 +392,6 @@ impl Op for RouteGemm {
         let top = u64::from(descriptor.top);
         let rows = args.rows.rows();
         let tokens = args.ids.rows();
-        let expanded = tokens * top;
 
         args.rows
             .require_shape(Self::NAME, Shape::new(&[rows, intermediate]))?;
@@ -429,8 +433,6 @@ impl Op for RouteGemm {
                 ),
             ));
         }
-        args.out
-            .require_shape(Self::NAME, Shape::new(&[expanded, hidden]))?;
         args.out.require_row(Self::NAME, descriptor.dtype, hidden)?;
 
         let mut call = RouteCall {
@@ -445,7 +447,6 @@ impl Op for RouteGemm {
             width: to_i64(Self::NAME, hidden)?,
             intermediate: to_i64(Self::NAME, intermediate)?,
             experts: to_i64(Self::NAME, experts)?,
-            expanded_rows: to_i64(Self::NAME, expanded)?,
             dtype: dtype_code(descriptor.dtype),
             error: [0; 512],
         };
@@ -516,14 +517,13 @@ pub struct RouteCall {
     pub width: i64,
     pub intermediate: i64,
     pub experts: i64,
-    pub expanded_rows: i64,
     pub dtype: i64,
     pub error: [u8; 512],
 }
 
 /// The layout of [`RouteCall`], for its header's mirror and its test.
 pub const ROUTE_CALL_LAYOUT: RouteCallLayout = RouteCallLayout {
-    size: 616,
+    size: 608,
     rows: 0,
     weights: 8,
     out: 16,
@@ -535,9 +535,8 @@ pub const ROUTE_CALL_LAYOUT: RouteCallLayout = RouteCallLayout {
     width: 64,
     intermediate: 72,
     experts: 80,
-    expanded_rows: 88,
-    dtype: 96,
-    error: 104,
+    dtype: 88,
+    error: 96,
 };
 
 /// The layout of [`RouteCall`], for the header's mirror and its test.
@@ -555,7 +554,6 @@ pub struct RouteCallLayout {
     pub width: usize,
     pub intermediate: usize,
     pub experts: usize,
-    pub expanded_rows: usize,
     pub dtype: usize,
     pub error: usize,
 }
@@ -820,18 +818,21 @@ pub struct RouteNvfp4Call {
     pub num_non_exiting_tiles: *const i32,
     /// `[routes, hidden]`: the contracted rows.
     pub out: *mut c_void,
-    /// The scratch the program may use; the entry grows it itself when it is short.
+    /// The scratch the program needs, sized by the plan; the entry refuses a short one and never
+    /// grows it.
     pub workspace: *mut c_void,
     /// Bytes of `workspace`.
     pub workspace_bytes: i64,
     /// Rows of the gated product and of the output: the padded route count.
     pub routes: i64,
-    /// The contraction length: the expert width of FC1.
+    /// The output width, as the descriptor and the runner name it.
     pub hidden_size: i64,
-    /// The output width.
+    /// The contraction length: one expert's intermediate width.
     pub intermediate: i64,
     /// Experts the weight stack holds.
     pub experts: i64,
+    /// Routes per token; the artifact's configuration list is indexed by it.
+    pub top: i64,
     /// The compiled MMA tile, rows by columns.
     pub tile_m: i64,
     pub tile_n: i64,
@@ -1514,9 +1515,10 @@ impl Op for RouteGemmNvfp4 {
             workspace: address(args.workspace.ptr) as usize as *mut c_void,
             workspace_bytes: to_i64(Self::NAME, args.workspace.numel())?,
             routes: to_i64(Self::NAME, routes)?,
-            hidden_size: to_i64(Self::NAME, intermediate)?,
-            intermediate: to_i64(Self::NAME, hidden)?,
+            hidden_size: to_i64(Self::NAME, hidden)?,
+            intermediate: to_i64(Self::NAME, intermediate)?,
             experts: to_i64(Self::NAME, experts)?,
+            top: i64::from(descriptor.top),
             tile_m: i64::from(descriptor.tile.0),
             tile_n: i64::from(descriptor.tile.1),
             cluster_m: i64::from(descriptor.cluster.0),
