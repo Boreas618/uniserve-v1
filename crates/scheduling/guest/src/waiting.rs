@@ -158,6 +158,7 @@ mod tests {
             arrived_at: Nanos(arrived),
             admitted_at: None,
             prompt_tokens: 0,
+            prefill_tokens: 0,
             generated_tokens: 0,
             cached_prefix_tokens: 0,
             prefilled_tokens: 0,

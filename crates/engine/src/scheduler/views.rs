@@ -364,6 +364,7 @@ pub(crate) struct RequestFacts {
     pub arrived_at: Nanos,
     pub admitted_at: Option<Nanos>,
     pub prompt_tokens: u32,
+    pub prefill_tokens: u32,
     pub generated_tokens: u32,
     pub cached_prefix_tokens: u32,
     pub prefilled_tokens: u32,
@@ -390,6 +391,7 @@ pub(crate) fn request_view(facts: RequestFacts) -> RequestView {
         arrived_at: facts.arrived_at,
         admitted_at: facts.admitted_at,
         prompt_tokens: facts.prompt_tokens,
+        prefill_tokens: facts.prefill_tokens,
         generated_tokens: facts.generated_tokens,
         cached_prefix_tokens: facts.cached_prefix_tokens,
         prefilled_tokens: facts.prefilled_tokens,
@@ -707,10 +709,51 @@ fn next_phase(scheduler: &Scheduler, state: &RequestState, id: RequestId) -> Opt
 /// The token charge of a request's next call, when that call is not a prefill
 /// or refill chunk: the mechanism's own cost function, read without planning
 /// the call.
+/// The context length the request's next prefill must reach: its prompt, or
+/// the tokens its context already holds plus the block a commit writes. A
+/// canvas-generating request's commit extends the context past its prompt, and
+/// the prefill that writes it is sized from this end.
+fn prefill_end(state: &RequestState) -> u32 {
+    let prompt = u32::try_from(state.prompt_tokens).unwrap_or(u32::MAX);
+    // Every vision block of an input image writes its cache tokens into the
+    // context at its prompt position, so the prefill that reaches it is sized
+    // past the text around it.
+    let mut blocks = 0u32;
+    let mut cursor = generation::BlockCursor::default();
+    while let Some((_, input)) = state.input_block(cursor) {
+        if input.encoder != crate::ImageEncoder::Vision {
+            break;
+        }
+        let Some(tokens) = input.num_cache_tokens else {
+            break;
+        };
+        blocks = blocks.saturating_add(tokens);
+        let Some(next) = state.next_block(cursor) else {
+            break;
+        };
+        cursor = next;
+    }
+    let commit = u32::try_from(state.canvas_commit.len()).unwrap_or(u32::MAX);
+    prompt
+        .saturating_add(blocks)
+        .max(state.cache_visible_len.saturating_add(commit))
+}
+
 fn next_tokens(scheduler: &Scheduler, state: &RequestState, id: RequestId) -> u32 {
     match scheduler.peek_next_call_variant(id) {
-        // A prefill or refill chunk is charged the chunk the policy sizes.
-        Some(CallKind::Forward(ForwardMode::Prefill)) | None => 0,
+        // A prompt chunk or a refill is charged the chunk the policy sizes; a
+        // structural write (a close cache, a feedback state, a block's commit,
+        // a publish) writes one position of its own and states it, because
+        // nothing is left to size.
+        Some(CallKind::Forward(ForwardMode::Prefill)) => u32::from(
+            scheduler
+                .num_scheduled_prompt_tokens(id)
+                .is_none_or(|count| count >= state.req.prompt_token_ids.len() as u32)
+                && scheduler
+                    .num_scheduled_images(id)
+                    .is_none_or(|count| count >= state.req.multimodal_inputs.images.len()),
+        ),
+        None => 0,
         Some(CallKind::Forward(ForwardMode::Decode)) => 1,
         Some(CallKind::Forward(ForwardMode::Verify)) => {
             let drafts = scheduler.verify_drafts(id, state.cache_visible_len).len();
@@ -718,6 +761,19 @@ fn next_tokens(scheduler: &Scheduler, state: &RequestState, id: RequestId) -> u3
         }
         Some(CallKind::Forward(ForwardMode::TokenDenoising)) if state.req.is_readout() => {
             u32::try_from(state.req.readout.len()).unwrap_or(u32::MAX)
+        }
+        // A canvas step spends a whole canvas of a step's token budget, the
+        // same bound the deployment's launch was checked against: it denoises
+        // text tokens on the worker's canvas, not an image of the request's
+        // latent raster, so it is charged neither the image's latent units nor
+        // its guidance branches.
+        Some(CallKind::Forward(ForwardMode::TokenDenoising))
+            if scheduler.config.canvas.is_some() && !state.req.is_readout() =>
+        {
+            scheduler
+                .config
+                .canvas
+                .map_or(0, |canvas| canvas.canvas_length)
         }
         Some(CallKind::Forward(ForwardMode::TokenDenoising)) => {
             let units = scheduler.worker_image_latent_units_for(state).max(1);
@@ -831,6 +887,7 @@ pub(crate) fn request(
         arrived_at: nanos_at(state.queued_at),
         admitted_at: recorded.admitted_at,
         prompt_tokens: u32::try_from(state.prompt_tokens).unwrap_or(u32::MAX),
+        prefill_tokens: prefill_end(state),
         generated_tokens: u32::try_from(state.num_generated_tokens).unwrap_or(u32::MAX),
         cached_prefix_tokens: recorded.cached_prefix_tokens,
         prefilled_tokens: prefilled,
@@ -882,6 +939,7 @@ pub(crate) fn diffusion_request(
         arrived_at: nanos_at(queued_at),
         admitted_at: recorded.admitted_at,
         prompt_tokens: u32::try_from(request.prompt_token_ids.len()).unwrap_or(u32::MAX),
+        prefill_tokens: u32::try_from(request.prompt_token_ids.len()).unwrap_or(u32::MAX),
         generated_tokens: 0,
         cached_prefix_tokens: 0,
         prefilled_tokens: 0,
@@ -1582,6 +1640,7 @@ mod tests {
             arrived_at: Nanos(10),
             admitted_at: Some(Nanos(20)),
             prompt_tokens: 128,
+            prefill_tokens: 128,
             generated_tokens: 5,
             cached_prefix_tokens: 64,
             prefilled_tokens: 96,

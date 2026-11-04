@@ -27,6 +27,7 @@ use proto::request::wire;
 use tracing::info;
 
 use crate::engine::client::EngineState;
+use crate::engine::hold::HoldState;
 use crate::leader::{Leader, Replica, UpdateError, locked};
 use crate::options::ServeConfig;
 use crate::updates::change::{Applied, ApplyRequest, resolve};
@@ -499,16 +500,22 @@ impl Leader {
                 target.nnodes.get()
             )));
         }
-        let epochs = self.updates.epochs();
-        let (previous_epoch, serving) = epochs.serving().ok_or_else(|| {
-            UpdateError::Refused("no epoch serves: there is nothing to switch from".to_owned())
-        })?;
+        // Whether this daemon has an engine process of its own is asked first:
+        // a daemon that has none runs no epoch change at all, and the missing
+        // means — not the state of its epochs — is what its caller has to fix,
+        // so the answer is "no engine process here" (§7.2: the service cannot
+        // apply the change) rather than a refusal of a valid one.
+        //
         // The deployment's argv comes from its leader node's control: the
         // arguments an engine process of this daemon starts with are the
         // same for every host (the daemon's sockets travel with them).
         let replicas = self.replicas();
         let control = replicas[0].control.get().ok_or(UpdateError::NoEngine)?;
         let serving_client = replicas[0].hold().client().ok_or(UpdateError::NoEngine)?;
+        let epochs = self.updates.epochs();
+        let (previous_epoch, serving) = epochs.serving().ok_or_else(|| {
+            UpdateError::Refused("no epoch serves: there is nothing to switch from".to_owned())
+        })?;
         // The previous epoch's processes are addressed by their LAUNCH
         // generation — `Drain`, `Stop` and `Purge` take it — never by the
         // record's `generation`, which is the model generation the main process
@@ -707,7 +714,13 @@ impl Replica {
                     EngineState::Closed => unavailable(world, "its engine process ended"),
                 }
             }
-            None => unavailable(worlds.executing, "requests wait for its engine"),
+            // A hold that closed names why it closed, and it names it to the
+            // requests it fails: the status states the same reason rather
+            // than that requests merely wait for an engine that will not come.
+            None => match hold.state() {
+                HoldState::Closed(reason) => unavailable(worlds.executing, &reason),
+                _ => unavailable(worlds.executing, "requests wait for its engine"),
+            },
         };
         serde_json::json!({
             "config": printed,

@@ -389,33 +389,31 @@ impl Restarter {
             replica.client.attach(&requests);
         }
 
-        let (pid, taken) = 'serving: loop {
-            match recv(&mut channel).await? {
-                (Message::Adopted { pid, streams }, _) => {
-                    info!(
-                        count = streams.len(),
-                        "the successor took the responses in flight over"
-                    );
-                    break 'serving (0, Some((pid, streams)));
-                }
-                (Message::Serving { pid }, _) => break (pid, None),
-                (Message::Failed { reason }, _) => {
-                    anyhow::bail!("the successor took the service and gave up: {reason}")
-                }
-                (other, _) => anyhow::bail!("the successor answered {other:?}"),
+        // The successor answers once: it either took the responses in flight
+        // over, or serves without them, or gave up.
+        let (pid, taken) = match recv(&mut channel).await? {
+            (Message::Adopted { pid, streams }, _) => {
+                info!(
+                    count = streams.len(),
+                    "the successor took the responses in flight over"
+                );
+                (pid, Some((pid, streams)))
             }
+            (Message::Serving { pid }, _) => (pid, None),
+            (Message::Failed { reason }, _) => {
+                anyhow::bail!("the successor took the service and gave up: {reason}")
+            }
+            (other, _) => anyhow::bail!("the successor answered {other:?}"),
         };
+        // The successor's own id either way: it is the process the `handoff ...
+        // adopted` record names, and the one every response it did not take
+        // stays paused behind here.
         match taken {
             Some((successor_pid, streams)) => paused.decide(&streams, successor_pid),
             // A successor that serves without taking any response over: every
             // response in flight stays here.
-            None => {
-                let pid = std::process::id();
-                let _ = pid;
-                paused.decide(&[], std::process::id());
-            }
+            None => paused.decide(&[], pid),
         }
-        let pid = pid;
         info!(
             pid,
             "the successor serves; this daemon finishes its requests"

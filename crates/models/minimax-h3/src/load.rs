@@ -227,6 +227,22 @@ pub fn load(
                 // reach, over every canvas the DiT offers and every legal frame count.
                 let rows = Layouts::new(denoiser.clone(), arrangement)?.rows_bound()?;
                 let source = checkpoint.component(dit.directory())?;
+                // Every tensor this partition's denoiser reads, asked of the block itself: `load`
+                // states no name of its own. A name the checkpoint lacks is refused here rather
+                // than surfacing as a read error deep in `Denoiser::load`, so the report names the
+                // block, its directory and every absent tensor at once.
+                let keys = Denoiser::keys(denoiser);
+                let missing = crate::checkpoint::absent(&keys, |key| source.tensor(key).is_some());
+                if !missing.is_empty() {
+                    return Err(Error::checkpoint(format!(
+                        "the {} block asks {} tensors and {} of them are not in {}/: {}",
+                        component.name(),
+                        keys.len(),
+                        missing.len(),
+                        dit.directory(),
+                        missing.join(", ")
+                    )));
+                }
                 let mut shards = loader.reborrow(source)?;
                 // A parallel-decoding student stacks one head per fine interval; the boundary that
                 // owns the checkpoint fuses them into one head per evaluation block and publishes
@@ -378,31 +394,11 @@ pub fn load(
         blocks.push((BlockName::new(component.block()), block));
     }
 
-    // The encoders are constructed and attached, and nothing writes a condition row yet:
-    // `Denoiser::prepare_conditioning` returns before the video encoder's posterior epilogue
-    // exists. A deployment that would serve `fl2va` or `ref2va` is therefore refused by the tasks
-    // it names rather than loaded and served with a video conditioned on nothing - a load that
-    // succeeds here would be a different model than the one the checkpoint states.
-    if partition.blocks.contains(Component::LatentEncoder) {
-        let mut conditioned: Vec<String> = config
-            .denoisers
-            .values()
-            .flat_map(|denoiser| denoiser.tasks.iter())
-            .filter(|task| !matches!(task, nn::capability::VideoTask::TextToVideoAudio))
-            .map(|task| format!("{task:?}"))
-            .collect();
-        conditioned.sort();
-        conditioned.dedup();
-        if !conditioned.is_empty() {
-            return Err(Error::Unsupported(format!(
-                "this deployment places the condition encoders for {}, and neither task can be \
-                 served yet: the conditioning pass writes no condition row until the video \
-                 encoder's posterior epilogue exists, so a conditioned request would produce a \
-                 video conditioned on nothing",
-                conditioned.join(", ")
-            )));
-        }
-    }
+    // A conditioned deployment is served as the checkpoint states it: the encoders are attached to
+    // the denoiser block, and `prepare_conditioning` writes a condition's audio rows and its visual
+    // rows from them. What a runner must not do is offer a conditioned request to a deployment that
+    // places no encoder - `Denoiser::places_encoders` answers that, and `encode_media` refuses a
+    // request that carries media it holds no encoder for.
 
     Ok(MinimaxH3 {
         model: nn::Model::new(blocks),

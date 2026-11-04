@@ -249,6 +249,36 @@ pub struct TokenRefiner {
 }
 
 impl TokenRefiner {
+    /// Every checkpoint tensor the refiner reads, as complete names.
+    ///
+    /// [`TokenRefiner::load`]'s requests, in its order: the input projection, each block's ten
+    /// weights, and the final norm.
+    pub fn keys(config: &TransformerConfig) -> Vec<String> {
+        let mut keys = vec![
+            "context_embedder.weight".to_owned(),
+            "context_embedder.bias".to_owned(),
+        ];
+        for index in 0..config.num_refiner_layers {
+            let prefix = format!("token_refiner.refiner_blocks.{index}");
+            for name in [
+                "norm1.weight",
+                "norm2.weight",
+                "attn.norm_q.weight",
+                "attn.norm_k.weight",
+                "attn.to_q.weight",
+                "attn.to_k.weight",
+                "attn.to_v.weight",
+                "attn.to_out.0.weight",
+                "ff.net.0.proj.weight",
+                "ff.net.2.weight",
+            ] {
+                keys.push(format!("{prefix}.{name}"));
+            }
+        }
+        keys.push("token_refiner.final_norm.weight".to_owned());
+        keys
+    }
+
     /// Read the checkpoint's token refiner, bounded to `rows` packed rows per request.
     ///
     /// `rows` is the deployment layout's padded row count: the attention's key extent and the width

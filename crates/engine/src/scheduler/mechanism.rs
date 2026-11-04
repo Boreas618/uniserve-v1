@@ -473,6 +473,18 @@ fn validate_work_entry(
             format!("{} is given no tokens to run", work.request.0),
         ));
     }
+    if by_this_plan {
+        // A request this plan admits has no resident view yet, so the work's
+        // own bounds cannot be checked against it: a queued view states no
+        // prompt length and no prefilled count, and a prefill chunk or a decode
+        // charge measured against those zeros would refuse every plan that
+        // admits a request and runs it in one step (§4.4). The live step
+        // applies the admission before it checks the rest, so that is where
+        // these bounds are decided — `validate_after_admission` on the state
+        // admission left — and the trial, which applies nothing, reads the
+        // same rule from the plan's own admission.
+        return Ok(());
+    }
     let Some(phase) = live.phases.get(&work.phase) else {
         return Err(invalid(
             Call::Dispatch,
@@ -490,9 +502,15 @@ fn validate_work_entry(
             ));
         }
         PhaseKind::Prefill => {
+            // The mechanism states the charge of the call it will plan: a
+            // prompt chunk is sized by the policy against what is left, and a
+            // structural write (a close cache, a feedback state, a block's
+            // commit) is one position with nothing left to size.
             let remaining = request
-                .prompt_tokens
-                .saturating_sub(request.prefilled_tokens);
+                .prefill_tokens
+                .max(request.prompt_tokens)
+                .saturating_sub(request.prefilled_tokens)
+                .max(request.next_tokens);
             if work.tokens > remaining {
                 return Err(invalid(
                     Call::Dispatch,
@@ -1336,6 +1354,7 @@ mod tests {
             arrived_at: Nanos(0),
             admitted_at: None,
             prompt_tokens: 0,
+            prefill_tokens: 0,
             generated_tokens: 0,
             cached_prefix_tokens: 0,
             prefilled_tokens: 0,
@@ -1835,7 +1854,11 @@ mod tests {
         // the residency the live step will have made; without that, a mid-flight
         // install whose first plan admits and runs a request could never pass
         // probation.
-        let queued = request(1, RequestState::Queued);
+        let mut queued = request(1, RequestState::Queued);
+        // A queued request's prompt is known from its submission; the plan
+        // admits it and runs its first chunk from the prompt's start.
+        queued.prompt_tokens = 4;
+        queued.prefill_tokens = 4;
         let live = live(vec![queued], vec![RequestId(1)], &[(0, PhaseKind::Prefill)]);
         let work = Work {
             request: RequestId(1),

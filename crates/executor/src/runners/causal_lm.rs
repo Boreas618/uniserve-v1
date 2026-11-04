@@ -441,11 +441,16 @@ struct Columns {
     draws: Column,
     /// `[rows]` the sampled ids, read back after a replay.
     readback: platform::PinnedBuffer,
+    /// One row of logits, `[vocabulary]`, read back for a greedy request whose first token is taken
+    /// on the host (see `read_sampled`): a bucket is homogeneous in its sampling path, so a prefill
+    /// bucket that ends a greedy prompt cannot argmax in its graph - the graph draws.
+    logits_row: platform::PinnedBuffer,
 }
 
 impl Columns {
-    /// Allocates the columns for the largest bucket `buckets` holds.
-    fn new(device: DeviceId, buckets: &Buckets) -> Result<Self> {
+    /// Allocates the columns for the largest bucket `buckets` holds, with `vocabulary` as the width
+    /// of the logits row the greedy first token is taken from.
+    fn new(device: DeviceId, buckets: &Buckets, vocabulary: u32) -> Result<Self> {
         let largest = buckets
             .iter()
             .max_by_key(|bucket| (bucket.rows, bucket.tokens))
@@ -467,6 +472,10 @@ impl Columns {
             slots: Column::new(device, DType::I32, rows)?,
             draws: Column::new(device, DType::F32, rows)?,
             readback: platform::PinnedBuffer::new(device, (rows * 4) as usize)?,
+            logits_row: platform::PinnedBuffer::new(
+                device,
+                (u64::from(vocabulary) * 4) as usize,
+            )?,
         })
     }
 }
@@ -751,6 +760,29 @@ impl CommitColumns {
 struct Sampled {
     /// `[rows]` i32 sampled token ids, in the bucket's row order.
     tokens: TensorView,
+    /// `[rows, vocabulary]` the bucket's raw logits, kept for a bucket that may hold a greedy
+    /// request's prompt ending: its first token is the argmax of that row, which the captured graph
+    /// cannot produce because a bucket is homogeneous in its sampling path.
+    ///
+    /// `None` for a decode bucket, whose variant already states which path it takes.
+    logits: Option<TensorView>,
+}
+
+/// The largest candidate of one row: a greedy request's token.
+///
+/// The first finite value wins ties (the lowest token id, which is what `torch.max` answers for a
+/// row of distinct logits and what keeps two runs alike for a tied one), and a row whose values are
+/// all non-finite answers candidate zero rather than an arbitrary index. This is the same rule the
+/// captured `argmax` operator applies on the device, and it is here in one place so the host path
+/// and its test cannot disagree about it.
+fn argmax(values: &[f32]) -> usize {
+    let mut best = 0_usize;
+    for (index, value) in values.iter().enumerate() {
+        if value.is_finite() && (*value > values[best] || !values[best].is_finite()) {
+            best = index;
+        }
+    }
+    best
 }
 
 /// The sampling step's own device state: the slot histories its penalties read.
@@ -816,6 +848,41 @@ impl Sampling {
     }
 }
 
+/// The refusal a provider that cannot install a batch's block tables gives, over the tables alone.
+///
+/// A batch whose slots have no pages yet carries none, and no provider needs anything for it; one
+/// whose slots do carry tables needs them written into the pooled table before the gather reads it.
+/// A provider that dropped them would gather the slot's previous pages, so the non-empty case is
+/// refused by name until the provider holds a cache.
+fn install_block_tables_unavailable(tables: &[ipc::BlockTable]) -> Result<()> {
+    match tables.first() {
+        None => Ok(()),
+        Some(table) => Err(Error::Invalid(format!(
+            "this runner holds no cache to install request slot {}'s row of group {} into, and a \
+             gather would read whatever that row held before: the cache provider is the device \
+             executor's, attached before the first capture",
+            table.request_pool_idx, table.group_id
+        ))),
+    }
+}
+
+/// The refusal a provider that cannot apply a batch's cache units gives, over the allocation alone.
+///
+/// A batch that reads a fresh prefix carries none, and no provider needs anything for it; one that
+/// reuses a cached prefix carries the copies that put the prefix in its own pages, and a provider
+/// that dropped them would serve the wrong tokens. So the empty case is served by everyone and the
+/// non-empty one is refused by name until the provider holds a cache.
+fn apply_cache_units_unavailable(units: &[ipc::CacheUnitAllocation]) -> Result<()> {
+    if units.is_empty() {
+        return Ok(());
+    }
+    Err(Error::Unsupported(
+        "this runner's cache provider does not apply a batch's cache units, so a request reusing a \
+         cached prefix would read pages that were never copied"
+            .into(),
+    ))
+}
+
 /// What the runner needs from the block's resident KV cache to build a batch's `nn::KvView`.
 ///
 /// The cache is the memory owner's (8's resident pages and its block tables); the runner only
@@ -830,6 +897,52 @@ pub trait KvProvider: Send + Sync {
     fn attach_pools(&mut self, pools: Arc<std::sync::Mutex<crate::arena::Pools>>) -> Result<()> {
         let _ = pools;
         Ok(())
+    }
+
+    /// Applies what the mechanism allocated for this batch's cache pages, on `stream`, before the
+    /// batch's forward reads them.
+    ///
+    /// Two things happen here and nowhere else: the units the mechanism acquired for the request's
+    /// slot become the cache's own (an imported unit's flags say it holds bytes, so a later read
+    /// does not treat it as unwritten), and every `(source, destination)` pair is copied - the
+    /// request reuses a leased prefix, and a destination that still held an older page would serve
+    /// the wrong tokens. The source's lease is the mechanism's and runs to completion; the copy
+    /// reads it and never writes it.
+    ///
+    /// Issuing on the batch's stream is what orders the copy before the graph: the forward that
+    /// reads those pages runs on the same stream afterwards, so no barrier is needed and none is
+    /// taken (a barrier here would serialize the batch's own work).
+    ///
+    /// A provider that holds no cache refuses an allocation rather than dropping it: a batch whose
+    /// prefix copies were dropped serves the wrong pages, and a silent drop is the one failure this
+    /// seam must not have.
+    fn apply_cache_units(
+        &mut self,
+        units: &[ipc::CacheUnitAllocation],
+        stream: &platform::Stream,
+    ) -> Result<()> {
+        let _ = stream;
+        apply_cache_units_unavailable(units)
+    }
+
+    /// Installs the batch's slot rows into the cache's pooled table, on the batch's stream.
+    ///
+    /// The gather [`Self::block_table`] performs later copies **row `slot` of the pooled table** for
+    /// every request slot the batch names. That row is the only place a request's pages live for the
+    /// gather, and nothing else writes it: a batch whose rows are not installed gathers whatever the
+    /// slot held before - zeros, or another request's pages - and the graph then runs clean against
+    /// the wrong memory. It is the one failure that looks like a model defect rather than a cache
+    /// one, so a provider that holds no cache refuses a table rather than dropping it.
+    ///
+    /// It is issued before [`Self::apply_cache_units`]: the row must exist before the graph reads it,
+    /// and the acquired units are this cache's before anything is copied into them.
+    fn install_block_tables(
+        &mut self,
+        tables: &[ipc::BlockTable],
+        stream: &platform::Stream,
+    ) -> Result<()> {
+        let _ = stream;
+        install_block_tables_unavailable(tables)
     }
 
     /// How many attention groups the model's layers index.
@@ -1007,7 +1120,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let mut staging = Staging::new();
         staging.reserve(&buckets)?;
         let commit_rows = largest_rows(&buckets)?;
-        let columns = Columns::new(device, &buckets)?;
+        let columns = Columns::new(device, &buckets, geometry.vocabulary)?;
         let sampling = if buckets.iter().any(|bucket| bucket.variant.samples()) {
             Some(Sampling::new(device, &stream, geometry)?)
         } else {
@@ -1103,11 +1216,21 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         batch.columns.check(&shape)?;
         let bucket = self.bucket_for(&shape)?;
         self.staging.stage(&batch.columns, &batch.calls, &shape, bucket)?;
-        // The upload and the device views are staged by the executor's stream work, then the
-        // bucket's graph is replayed (design §9, `每批的规划`). Until `nn::TokenBatch`/`KvView`
-        // and platform's allocator are published, the staging is as far as this path can go; the
-        // replay job is what the executor performs once they are.
-        let _ = &self.model;
+        // The batch's slot rows are installed first: the gather reads row `slot` of the cache's
+        // pooled table, so the row must state the request's own pages before the replay, and the
+        // table states where the row begins (`start_page`) and how far it runs.
+        self.kv.install_block_tables(&batch.block_tables, &self.stream)?;
+        // Then what the mechanism allocated for this batch's pages, on the same stream: the units
+        // must be this cache's before anything is copied into them, and the copies must be in place
+        // when the graph reads those pages. A batch that cannot be applied is refused at submit -
+        // the same place, and with the same kind of error, as any other batch this device cannot
+        // serve.
+        self.kv.apply_cache_units(&batch.cache_units, &self.stream)?;
+        // The columns are staged here, on the submitting thread; everything that touches the
+        // device is the replay job, which this executor's device thread performs in `serve`: the
+        // staged columns are uploaded, the bucket's graph is launched - the smallest captured
+        // bucket holding this shape - and the sampled tokens are read back, all before `submit`
+        // returns its output (4.5, 2.4: one thread issues to the streams).
         Ok(Jobs::new([Job::Replay {
             runner: self.id,
             bucket,
@@ -1302,8 +1425,10 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         }
         // A prepared generation that never took over: its graphs go, and with them the kernels
         // they held. The serving generation's graphs, arena plans and sampler regions stay
-        // exactly as they were, so an abandoned update cannot disturb a batch in flight.
-        let dropped = self.graphs.purge(generation);
+        // exactly as they were, so an abandoned update cannot disturb a batch in flight. This is
+        // `discard`, not `purge`: an abandoned generation is one nobody serves from, so its whole
+        // set goes whatever its number is beside the serving one.
+        let dropped = self.graphs.discard(generation);
         let dropped_count = dropped.len();
         if self.next.as_ref().map(|next| next.number()) == Some(generation) {
             self.next = None;
@@ -1403,7 +1528,7 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         // region released under a live executable would be reused by the next generation's
         // capture while the old graph still addressed it. Exactly this generation's graphs go - a
         // released generation may be numbered either side of the serving one.
-        let dropped = self.graphs.purge(generation);
+        let dropped = self.graphs.purge(generation, self.generation.number());
         let dropped_count = dropped.len();
         let mut released = 0u64;
         // Both generations' graphs can address one bucket's plan: the pool records a plan per
@@ -1809,6 +1934,83 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// so the device segment is measured from the launch to this wait and the host segment from
     /// there to the output.
     ///
+    /// Replaces a greedy row's drawn token with the argmax of its logits row, taken on the host.
+    ///
+    /// A request whose temperature is zero asks for its largest candidate, and the captured graph of
+    /// a prefill bucket draws for every row of the bucket (a bucket is homogeneous in its sampling
+    /// path, and a greedy prefill variant would double the largest graphs' memory to decide one
+    /// token). The host has the logits - the arena buffer is live until the next `begin` - so the
+    /// decision is made here, once per request, before the token leaves this process.
+    ///
+    /// The penalties are no-ops for a row whose slot has committed nothing, which is what a prompt
+    /// ending is: a row whose slot already holds committed tokens would need the penalized logits,
+    /// which the graph computes and this path does not, so it is **refused by name** rather than
+    /// argmaxed over the raw row.
+    fn greedy_first_tokens(
+        &mut self,
+        logits: TensorView,
+        rows: usize,
+        sampling: &[i32],
+    ) -> Result<()> {
+        if logits.dtype != DType::F32 {
+            return Err(Error::Invalid(format!(
+                "a greedy request's first token is argmaxed on the host, which reads f32 logits, \
+                 and this deployment's logits are {}",
+                logits.dtype
+            )));
+        }
+        let width = u64::from(self.geometry.vocabulary);
+        let row_bytes = (width * 4) as usize;
+        if row_bytes > self.columns.logits_row.len() {
+            return Err(Error::Invariant(
+                "the logits row buffer is narrower than the vocabulary".into(),
+            ));
+        }
+        let columns = ops::sampler::PARAMETER_COLUMNS as usize;
+        for row in 0..rows {
+            let samples_nothing = self.staging.logits_rows()[row] < 0;
+            let greedy = self.staging.parameters(rows)[row * columns + ops::sampler::TEMPERATURE as usize]
+                == 0.0;
+            if samples_nothing || !greedy {
+                continue;
+            }
+            let slot = self.staging.slots(rows)[row];
+            let position = usize::try_from(slot)
+                .ok()
+                .and_then(|slot| sampling.get(slot).copied())
+                .unwrap_or(0);
+            if position > 0 {
+                return Err(Error::Invalid(format!(
+                    "a greedy row of slot {slot} ends a prompt that already holds {position} \
+                     committed token(s): its token is the argmax of its penalized logits, which only \
+                     the captured sampler computes"
+                )));
+            }
+            let source = logits.ptr.address() + row as u64 * width * 4;
+            // SAFETY: the source is the row's `width` f32 inside the logits tensor the graph wrote,
+            // the destination is this runner's pinned row buffer of that length, and the stream has
+            // completed the launch that wrote it.
+            unsafe {
+                platform::memcpy_async(self.columns.logits_row.address(), source, row_bytes, &self.stream)?;
+            }
+            self.stream.synchronize()?;
+            // SAFETY: the copy above filled `width` f32 in the pinned row buffer, and the token
+            // buffer holds one i32 per row of this bucket.
+            // SAFETY: the copy above filled `width` f32 in the pinned row buffer.
+            let best = unsafe {
+                argmax(std::slice::from_raw_parts(
+                    self.columns.logits_row.as_ptr().cast::<f32>(),
+                    width as usize,
+                ))
+            };
+            // SAFETY: the readback buffer holds `rows` i32 and `row` is inside it.
+            unsafe {
+                *self.columns.readback.as_ptr().cast::<i32>().add(row) = best as i32;
+            }
+        }
+        Ok(())
+    }
+
     /// A bucket that samples nothing answers with an empty output: nothing was measured and no call
     /// produced a token.
     fn read_sampled(&mut self, bucket: Bucket, launched: Instant) -> Result<BatchOutput> {
@@ -1872,6 +2074,17 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 ),
             )
         };
+        // A greedy request's first token is the argmax of its prompt-ending row, taken here on the
+        // host: the bucket is homogeneous in its sampling path, so a prefill bucket's graph draws,
+        // and a draw cannot produce a greedy token (the candidates are in token-id order before the
+        // inverse CDF). Only a bucket that kept its logits view can answer this - a decode bucket's
+        // variant already states that it is greedy, and its graph argmaxes. The tokens are corrected
+        // in place, in the buffer the copy above filled, so a step allocates nothing (4.5).
+        if let Some(logits) = samples.logits
+            && !bucket.variant.is_decode()
+        {
+            self.greedy_first_tokens(logits, rows, sampling)?;
+        }
         let states = states_of(
             self.staging.slots(rows),
             self.staging.batch_rows(),
@@ -2147,13 +2360,33 @@ impl<M: CausalLm> CausalLmRunner<M> {
             extras: None,
         };
         let samples = Samples::reserve(arena, DType::I32, rows, false)?;
-        sampling
-            .sampler
-            .forward(forward, logits, &state, self.columns.draws.device, &samples)
-            .map_err(Error::from)?;
+        // A greedy bucket takes each row's largest candidate; every other sampling bucket draws one
+        // from the row's distribution. The two are different launch sequences in the sampler layer
+        // (`Sampler::greedy` and `Sampler::forward`), and a draw cannot produce a greedy token: the
+        // candidates are ordered by token id before the inverse CDF, so a draw of zero selects the
+        // lowest id rather than the largest logit.
+        if bucket.variant.greedy() {
+            sampling
+                .sampler
+                .greedy(forward, logits, &state, &samples)
+                .map_err(Error::from)?;
+        } else {
+            sampling
+                .sampler
+                .forward(forward, logits, &state, self.columns.draws.device, &samples)
+                .map_err(Error::from)?;
+        }
+        // A prefill bucket may end a greedy request's prompt, whose first token is the argmax of the
+        // row - a decision the graph cannot make for one row of a bucket that draws. The view is kept
+        // (the arena's buffer is live until the next `begin`, and `read_sampled` runs before that);
+        // a decode bucket's variant already states its path.
+        let logits = (!bucket.variant.is_decode()).then_some(logits);
         self.bucket_samples
             .borrow_mut()
-            .insert(bucket, Sampled { tokens: samples.tokens });
+            .insert(bucket, Sampled {
+                tokens: samples.tokens,
+                logits,
+            });
         self.commit_step(forward, bucket, &samples)?;
         Ok(())
     }
@@ -2468,6 +2701,80 @@ pub fn calls_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cache-unit seam's two decisions, over the allocation alone: a batch that reads a fresh
+    /// prefix passes through every provider, and one that reuses a leased one is refused by name by
+    /// a provider that holds no cache. The non-empty refusal is the state until the resident cache
+    /// applies the copies; what matters here is that it can never be a silent pass.
+    #[test]
+    fn a_provider_without_a_cache_serves_an_empty_allocation_and_refuses_a_prefix_copy() {
+        assert!(
+            apply_cache_units_unavailable(&[]).is_ok(),
+            "a batch reading a fresh prefix was refused"
+        );
+        let allocation = vec![ipc::CacheUnitAllocation {
+            request_pool_idx: 0,
+            group_id: 0,
+            unit_ids: vec![ipc::UnitId(7)],
+            copies: vec![(ipc::UnitId(3), ipc::UnitId(7))],
+        }];
+        let error = apply_cache_units_unavailable(&allocation)
+            .expect_err("a prefix copy was dropped without a word");
+        assert!(
+            error.to_string().contains("never copied"),
+            "the refusal does not say what would go wrong: {error}"
+        );
+    }
+
+    /// The host argmax of a greedy row is the same rule the captured `argmax` operator applies: the
+    /// largest finite value, ties to the lowest index, and a row of non-finite values answering
+    /// candidate zero rather than an arbitrary index.
+    ///
+    /// The end-to-end proof - a greedy request whose prompt spans several prefill chunks taking the
+    /// argmax of that chunk's row - belongs to the caller's run, which must compare against a
+    /// recomputed argmax and not merely against a rerun of this code: a drawn token is just as
+    /// deterministic.
+    #[test]
+    fn the_host_argmax_is_the_largest_finite_candidate_and_ties_go_to_the_lowest() {
+        assert_eq!(argmax(&[1.0, 3.0, 2.0]), 1);
+        assert_eq!(argmax(&[3.0, 1.0, 1.0]), 0);
+        // Two equal maxima: the first wins, so two runs and two implementations agree.
+        assert_eq!(argmax(&[0.5, 2.0, 2.0]), 1);
+        // A non-finite value is never a candidate, at the head or in the middle.
+        assert_eq!(argmax(&[f32::NAN, 1.5, 1.0]), 1);
+        assert_eq!(argmax(&[1.0, f32::INFINITY, 2.0]), 2);
+        // Every value non-finite: answer zero rather than an index that came from nowhere.
+        assert_eq!(argmax(&[f32::NAN, f32::NAN]), 0);
+    }
+
+    /// A provider that holds no cache refuses a slot row by name, because the gather would otherwise
+    /// read whatever the row held - another request's pages, or zeros - and the graph would run clean
+    /// against the wrong memory.
+    #[test]
+    fn a_provider_without_a_cache_serves_a_batch_with_no_tables_and_refuses_a_slot_row() {
+        assert!(
+            install_block_tables_unavailable(&[]).is_ok(),
+            "a batch whose slots have no pages was refused"
+        );
+        let tables = vec![ipc::BlockTable {
+            request_pool_idx: 3,
+            group_id: 1,
+            start_page: 0,
+            unit_ids: vec![ipc::UnitId(11), ipc::UnitId(12)],
+            allocated_tokens: 256,
+        }];
+        let error = install_block_tables_unavailable(&tables)
+            .expect_err("a slot row was dropped without a word");
+        let message = error.to_string();
+        assert!(
+            message.contains("slot 3") && message.contains("group 1"),
+            "the refusal does not name the row: {message}"
+        );
+        assert!(
+            message.contains("would read whatever that row held"),
+            "the refusal does not say what would go wrong: {message}"
+        );
+    }
 
     /// A mechanism commit table of one row per call, column-major `[COMMIT_FIELDS][rows]`: the one
     /// column a fixture states is the row's destination slot, and the rest keep zero.
