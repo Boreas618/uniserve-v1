@@ -208,8 +208,35 @@ fn a_two_expert_encoded_stack_is_joined_expert_major_with_its_three_fields() {
     );
     // The block scales keep the layout the loader was told to read, and one reciprocal per expert.
     assert_eq!(stack.layout, ScaleLayout::Linear);
-    // One tensor scale per expert, not per projection: it belongs to the expert's whole matrix.
-    assert_eq!(stack.global_scale.view.shape.dims(), &[u64::from(EXPERTS)]);
+    // One tensor scale per (expert, projection), in the reading order the stack fuses: a checkpoint
+    // carries one `weight_scale_2` per projection tensor, so the two halves of `up_gate` generally
+    // differ and a kernel that used one for both would be wrong by their ratio.
+    assert_eq!(
+        stack.global_scale.view.shape.dims(),
+        &[u64::from(EXPERTS), 2]
+    );
+    let published = store
+        .published
+        .iter()
+        .find(|(_, _, dtype, shape, _)| *dtype == DType::F32 && shape.rank() == 2)
+        .expect("the loader publishes the reciprocal table");
+    let reciprocals: Vec<f32> = published
+        .1
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| f32::from_le_bytes(*word))
+        .collect();
+    // The fixture's tensor scales, expert-major and projection-minor: 1, 2 for expert 0's up and
+    // gate, then 17, 18 for expert 1's — published as their reciprocals.
+    let expected: Vec<f32> = [1.0_f32, 2.0, 17.0, 18.0].iter().map(|s| 1.0 / s).collect();
+    assert_eq!(reciprocals.len(), expected.len());
+    for (found, want) in reciprocals.iter().zip(&expected) {
+        assert!(
+            (found - want).abs() <= 1e-6,
+            "{reciprocals:?} against {expected:?}"
+        );
+    }
 }
 
 #[test]
