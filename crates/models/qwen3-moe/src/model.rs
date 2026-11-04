@@ -45,6 +45,7 @@ use nn::layers::{
 use nn::model::{Block, BlockName, Model};
 use nn::weights::Weight;
 use nn::{Arena, DType, Forward, Shape, TensorView};
+use std::sync::Arc;
 
 use crate::{Config, Error, Partition, Result};
 
@@ -341,6 +342,26 @@ impl Qwen3Moe {
     }
 
     /// The activation plan of a forward over `tokens` tokens.
+    /// The vocabulary embedding.
+    pub(crate) fn embedding(&self) -> &Embedding {
+        &self.embedding
+    }
+
+    /// The decoder layers, in order.
+    pub(crate) fn layers(&self) -> &[DecoderLayer] {
+        &self.layers
+    }
+
+    /// The final normalization.
+    pub(crate) fn norm(&self) -> &RmsNorm {
+        &self.norm
+    }
+
+    /// The vocabulary head.
+    pub(crate) fn head(&self) -> &ParallelLMHead {
+        &self.head
+    }
+
     pub fn plan(&self, tokens: u64) -> Result<Plan> {
         Plan::new(&self.config, &self.partition, tokens, &self.options)
     }
@@ -406,7 +427,7 @@ impl Qwen3Moe {
     pub fn into_model(self) -> Model {
         Model::new(vec![(
             BlockName::new("backbone"),
-            Block::CausalLm(Box::new(self)),
+            Block::CausalLm(Arc::new(self)),
         )])
     }
 

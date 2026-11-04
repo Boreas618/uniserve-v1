@@ -54,15 +54,22 @@ impl fmt::Debug for BlockName {
 pub type PhaseId = (BlockName, PhaseKind);
 
 /// One capability a model's block implements.
+///
+/// The payload is shared, not owned: a model that composes its components holds them as
+/// `Arc<TextEncoder>`, `Arc<VideoDecoder>` and so on — it is the owner of its computation, and it is
+/// also the party that must answer what programs those components launch. `Model` carries the same
+/// objects as capability views, so there is one of each, one load, and no drift between the object
+/// the model computes with and the trait object the executor dispatches on. `Arc<T>` coerces to
+/// `Arc<dyn Capability>` at the construction site, as `Box<T>` did.
 pub enum Block {
     /// A tower that turns inputs into conditioning.
-    Encoder(Box<dyn Encoder>),
+    Encoder(Arc<dyn Encoder>),
     /// A diffusion model that denoises latents.
-    Denoiser(Box<dyn Denoiser>),
+    Denoiser(Arc<dyn Denoiser>),
     /// A decoder that turns latents back into media.
-    Decoder(Box<dyn Decoder>),
+    Decoder(Arc<dyn Decoder>),
     /// An autoregressive token model.
-    CausalLm(Box<dyn CausalLm>),
+    CausalLm(Arc<dyn CausalLm>),
 }
 
 impl fmt::Debug for Block {

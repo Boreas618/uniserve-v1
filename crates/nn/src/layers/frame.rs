@@ -26,6 +26,21 @@ impl FramePad {
         Self { reflect }
     }
 
+    /// The descriptor one pad launch takes, for a walk that asks a model which programs it launches
+    /// with no device.
+    ///
+    /// The block tiles are the operator's own split of the values' and the output's extents, so they
+    /// are stated from the views rather than from an element type alone.
+    pub fn pad_descriptor(&self, values: TensorView, out: TensorView) -> frame::FramePadDescriptor {
+        let (block_pixels, block_channels) = frame::FramePadDescriptor::tiles(&values, &out);
+        frame::FramePadDescriptor {
+            dtype: values.dtype,
+            reflect: self.reflect,
+            block_pixels,
+            block_channels,
+        }
+    }
+
     /// Pad `values` `[batch, channels, frames, height, width]` into `out`, whose extra frames are
     /// zeros and whose extra rows and columns are mirrored or replicated.
     ///
@@ -40,13 +55,7 @@ impl FramePad {
         left: u64,
         front: u64,
     ) -> Result<()> {
-        let (block_pixels, block_channels) = frame::FramePadDescriptor::tiles(&values, &out);
-        let descriptor = frame::FramePadDescriptor {
-            dtype: values.dtype,
-            reflect: self.reflect,
-            block_pixels,
-            block_channels,
-        };
+        let descriptor = self.pad_descriptor(values, out);
         let args = frame::FramePadArgs {
             values,
             out,
@@ -71,6 +80,14 @@ impl FrameMoments {
         Self { groups, eps }
     }
 
+    /// The descriptor one moments launch takes, for a walk without a device.
+    pub fn moments_descriptor(&self, values: TensorView) -> frame::FrameMomentsDescriptor {
+        frame::FrameMomentsDescriptor {
+            dtype: values.dtype,
+            epsilon: Float::from(self.eps),
+        }
+    }
+
     /// Reduce each frame's group means and reciprocal standard deviations.
     ///
     /// `values` is `[batch, channels, frames, height, width]` FP32 with each frame's pixels
@@ -82,10 +99,7 @@ impl FrameMoments {
         mean: TensorView,
         rstd: TensorView,
     ) -> Result<()> {
-        let descriptor = frame::FrameMomentsDescriptor {
-            dtype: values.dtype,
-            epsilon: Float::from(self.eps),
-        };
+        let descriptor = self.moments_descriptor(values);
         let args = frame::FrameMomentsArgs {
             values,
             mean,
