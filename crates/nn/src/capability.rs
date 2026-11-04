@@ -453,12 +453,47 @@ pub struct Latents {
     pub audio: Option<TensorView>,
 }
 
+/// Where a piece of raw media anchors in the generated clip.
+///
+/// The reference's three roles, in the order the packed conditioning writes them: first-frame
+/// anchors, last-frame anchors, then references.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MediaRole {
+    /// Anchors the first generated frame.
+    FirstFrame,
+    /// Anchors the last generated frame.
+    LastFrame,
+    /// A reference the request describes.
+    Reference,
+}
+
+/// One piece of raw media a request's conditions are built from.
+///
+/// This is what [`Denoiser::prepare_conditioning`] encodes when the model owns its condition
+/// encoders: pixels before they are latents, samples before they are rows. A task with no conditions
+/// passes an empty slice.
+#[derive(Clone, Copy)]
+pub struct MediaInput {
+    /// Where the piece anchors, which decides where its rows sit in the packed conditioning.
+    pub role: MediaRole,
+    /// `[channels, frames, height, width]` pixels, in the encoder's own channel order and
+    /// normalisation, when the condition is visual. One frame for a still, which is one latent
+    /// frame.
+    pub pixels: Option<TensorView>,
+    /// Samples in the encoder's shape, when the condition carries a soundtrack.
+    pub audio: Option<TensorView>,
+}
+
 /// What a denoiser conditions on at a step.
 ///
 /// The rows of every view follow the order the layout reserves: the encoded text first, then the
 /// request's conditions in the order `VideoRequest` counts them (first-frame anchors, last-frame
-/// anchors, references). A model that needs the roles reads them from the request it laid out, not
-/// from this value, so nothing request-shaped crosses the boundary.
+/// anchors, references).
+///
+/// The one request-shaped thing that crosses here is [`Conditioning::media`], the raw media a
+/// conditioner encodes. It has to: [`Denoiser::prepare_conditioning`] runs once per request, before
+/// any capture, where no request reaches it, and condition rows cannot be built from views that are
+/// already latents. Everything else a request carries stays out.
 #[derive(Clone, Copy)]
 pub struct Conditioning<'a> {
     /// `[rows, width]` encoded text.
@@ -470,6 +505,12 @@ pub struct Conditioning<'a> {
     /// in place over `text`. `None` when the model has no conditioner, or for a task whose
     /// conditioning is nothing but the encoder's features.
     pub source: Option<TensorView>,
+    /// The raw media the request's conditions are built from, in the request's own order.
+    ///
+    /// [`Denoiser::prepare_conditioning`] encodes these and writes the condition rows of `text`;
+    /// empty when the task has no conditions, which is every `t2va` request. The runner owns the
+    /// buffers and the encoders' arena is its own forward, reset after the call.
+    pub media: &'a [MediaInput],
     /// `[rows, …]` encoded reference media, when the task has references.
     pub images: Option<TensorView>,
     /// `[rows, …]` encoded reference audio, when the task has audio references.
