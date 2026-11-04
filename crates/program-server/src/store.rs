@@ -31,16 +31,23 @@ use crate::{Error, Result};
 /// The mark that makes a module directory a committed module.
 pub const COMMITTED: &str = ".committed";
 
+/// Numbers the staging directories one process makes, so two publishes beside
+/// each other never share one.
+static STAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The longest a module path's last segment may be, in bytes.
 ///
 /// A descriptor key is the last segment of a module's path (design section 5.3: every module sits
 /// under `<operator>/<backend>/<revision>/<target>/<descriptor key>`), so a key must be one file
-/// name. Filesystems cap one at 255 bytes and a staged directory's name adds a short prefix, so a
-/// key within this bound always fits. A descriptor whose key is longer cannot name a module: that
-/// operator needs fewer fields, or fields whose values are launch arguments rather than properties
-/// of the problem — a stride the kernel must know to vectorise stays in the key, a capacity the
-/// caller varies does not.
-pub const DESCRIPTOR_NAME_LIMIT: usize = 200;
+/// name, and this is the filesystem's own cap rather than a policy: a longer name has no directory
+/// to live in, whatever the store would like. Publishing stages under a name of its own, short and
+/// independent of the key, so the key's length is the only thing measured here.
+///
+/// A key that reaches this bound is a design smell even when it fits: it usually names values that
+/// are launch arguments rather than properties of the problem — a stride the caller varies, a
+/// capacity it chooses — and the fix belongs in the descriptor, not in the store, which is why this
+/// bound refuses only what cannot be stored.
+pub const DESCRIPTOR_NAME_LIMIT: usize = 255;
 
 /// The path of one module in the store: pure names, no content.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -214,10 +221,13 @@ impl Store {
             ))
         })?;
         std::fs::create_dir_all(parent)?;
+        // The staged name carries no part of the key: a key may be as long as a
+        // file name allows, and a staging name that embedded it would quietly
+        // lower that bound by the length of a suffix.
         let staged = parent.join(format!(
-            ".{}.staged-{}",
-            path.descriptor,
-            std::process::id()
+            ".staged-{}-{}",
+            std::process::id(),
+            STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         if staged.exists() {
             std::fs::remove_dir_all(&staged)?;
