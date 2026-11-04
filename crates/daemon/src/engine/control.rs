@@ -19,6 +19,7 @@ use proto::request::wire;
 use proto::{Connection, Listener};
 
 use crate::engine::client::{EngineClient, EngineState, StatsSink};
+use crate::engine::launch::{self, Launch};
 
 /// The worker group a daemon supervises an engine process under.
 pub(crate) const ENGINE_GROUP: &str = "engine";
@@ -65,6 +66,9 @@ pub struct EngineControl {
     /// leaves an engine with no policy store, and it refuses every policy
     /// precopy with a reason rather than serving without one.
     program_server: Option<PathBuf>,
+    /// Where this daemon writes the files its main processes read: the
+    /// epoch's build config and each process's launch (§2.3).
+    runtime: PathBuf,
     next_engine: AtomicU64,
     /// Engine handoffs can connect in any order. Reading and assigning
     /// their greetings is serialized; each client keeps its buffered reader.
@@ -105,6 +109,7 @@ impl EngineControl {
             host,
             deployment,
             program_server,
+            runtime: crate::options::runtime_directory(),
             next_engine: AtomicU64::new(1),
             incoming: std::sync::Mutex::new(BTreeMap::new()),
         })
@@ -141,7 +146,9 @@ impl EngineControl {
             .map(|workers| workers.executable.clone())
             .context("the engine spec states no workers")?;
         let standby = spec.predecessor.is_some();
-        let mut control = self.spawn(engine, &executable, &spec.host)?;
+        let launch = self.launch(&spec, engine)?;
+        let path = launch::write(&self.runtime, engine, &launch)?;
+        let mut control = self.spawn(engine, &executable, &spec.host, Self::arguments(&path))?;
         let (mut reader, mut writer, hello) = self.accept(engine, Some(&mut control))?;
         let refusal = if hello.major != proto::PROTOCOL_MAJOR {
             format!(
@@ -458,26 +465,115 @@ impl EngineControl {
         Ok(())
     }
 
-    /// The arguments of an engine process of `generation`, after its program
-    /// name: one builder for the engine the deployment serves with and every
-    /// epoch a switch starts (`specs/worker.md` §5.3, §7.3, §7.4). The engine
-    /// resolves an epoch's policy modules through this node's Program Server,
-    /// so that socket travels with the rest of what starts it.
-    fn arguments(&self, generation: u64) -> Vec<String> {
-        let mut arguments = vec![
+    /// The arguments of a main process: its program name and the launch file
+    /// the daemon wrote for it, and nothing else. Everything the process needs
+    /// is in that file, so a flag beside it would be a second account of the
+    /// same thing (`specs/worker.md` §2.3).
+    fn arguments(launch: &Path) -> Vec<String> {
+        vec![
             "engine".to_owned(),
-            "--requests".to_owned(),
-            self.request_address.clone(),
-            "--processes".to_owned(),
-            self.processes.clone(),
-            "--engine".to_owned(),
-            generation.to_string(),
-        ];
-        if let Some(program_server) = &self.program_server {
-            arguments.push("--program-server".to_owned());
-            arguments.push(program_server.display().to_string());
-        }
-        arguments
+            "--launch".to_owned(),
+            launch.display().to_string(),
+        ]
+    }
+
+    /// The launch file's contents for the process `engine`, from the spec the
+    /// deployment resolved for it.
+    ///
+    /// A value the file requires and the daemon cannot state is an error here
+    /// rather than a default: the engine refuses a launch file that lacks one,
+    /// and a default would be a fact the daemon invented about the process.
+    ///
+    /// # Errors
+    ///
+    /// Fails for a spec of no model, no placement or a zero queue depth, a
+    /// child on a host that does not share this daemon's runtime directory, a
+    /// node with no Program Server, a spec of no world, and an epoch whose
+    /// build config has not been written.
+    fn launch(&self, spec: &wire::EngineSpec, engine: u64) -> anyhow::Result<Launch> {
+        anyhow::ensure!(!spec.model.is_empty(), "the engine spec names no model");
+        // Form (A): the child opens the launch file this daemon wrote, so it
+        // has to be this daemon's own host. A remote host needs the launch
+        // contents carried in `process::Spawn`, which the protocol does not do
+        // yet, and a path that exists only here would fail in the child.
+        anyhow::ensure!(
+            spec.host == self.host,
+            "engine host {} does not share this daemon's runtime directory {}: a main process on \
+             another host needs the launch contents carried in `process::Spawn`",
+            spec.host,
+            self.runtime.display()
+        );
+        let placement = spec
+            .placement
+            .as_ref()
+            .context("the engine spec states no placement")?;
+        anyhow::ensure!(
+            !placement.devices.is_empty(),
+            "the placement names no device for this rank"
+        );
+        anyhow::ensure!(
+            placement.queue_depth > 0,
+            "the placement's queue_depth is zero for this rank"
+        );
+        let program_server = self.program_server.as_ref().context(
+            "this node has no Program Server socket, so a main process could resolve no policy \
+             module: it is not started without one",
+        )?;
+        anyhow::ensure!(spec.world != 0, "the engine spec names no world");
+        let build_config = launch::build_config_path(&self.runtime, spec.world);
+        anyhow::ensure!(
+            build_config.is_file(),
+            "the epoch's build config {} has not been written: write it with \
+             `EngineControl::write_build_config` before starting a main process",
+            build_config.display()
+        );
+        // One main process per node today, so it has no peer to accept: the
+        // world is this rank alone. A deployment that starts more states their
+        // addresses here, and the world grows with them (exec's rule: the
+        // world is its peers and itself).
+        let peers: Vec<String> = Vec::new();
+        let world_size = u32::try_from(peers.len() + 1).unwrap_or(u32::MAX);
+        Ok(Launch {
+            build_config,
+            model: PathBuf::from(&spec.model),
+            requests: self.request_address.clone(),
+            processes: self.processes.clone(),
+            engine,
+            program_server: program_server.display().to_string(),
+            devices: placement.devices.clone(),
+            group: ENGINE_GROUP.to_owned(),
+            rank: 0,
+            deployment: self.deployment.clone(),
+            world: spec.world,
+            // The check above makes this node the engine's host, and the
+            // deployment keeps one scheduler node, which is this one.
+            scheduler_node: true,
+            peers,
+            // Both are the epoch's, and the epoch states them in its build
+            // config, which the child reads.
+            watchdog_timeout_s: None,
+            rollback_s: None,
+            queue_depth: placement.queue_depth,
+            world_size,
+        })
+    }
+
+    /// Writes the config `config` builds the epoch whose world is `world`, and
+    /// answers the path every process of that epoch reads.
+    ///
+    /// Whoever owns the epoch's record calls this before starting any of its
+    /// processes: the launch file names the path, and two engines of one epoch
+    /// read the same bytes.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the file cannot be written.
+    pub(crate) fn write_build_config(
+        &self,
+        world: u64,
+        config: &crate::epoch::BuildConfig,
+    ) -> anyhow::Result<PathBuf> {
+        Ok(launch::write_build_config(&self.runtime, world, config)?)
     }
 
     /// What the epoch layer starts one epoch's main process with: the
@@ -489,18 +585,31 @@ impl EngineControl {
     /// `Hello` fixes the identity every other child of the epoch must report.
     pub(crate) fn epoch_start(
         &self,
-        executable: &str,
-        generation: u64,
-    ) -> crate::updates::switch::Start {
-        crate::updates::switch::Start {
-            executable: executable.to_owned(),
-            build: own_executable(executable).then(|| proto::BUILD.to_owned()),
-            arguments: self.arguments(generation),
+        spec: &wire::EngineSpec,
+        engine: u64,
+    ) -> anyhow::Result<crate::updates::switch::Start> {
+        let launch = self.launch(spec, engine)?;
+        let path = launch::write(&self.runtime, engine, &launch)?;
+        let executable = spec
+            .workers
+            .as_ref()
+            .map(|workers| workers.executable.clone())
+            .context("the engine spec states no workers")?;
+        Ok(crate::updates::switch::Start {
+            build: own_executable(&executable).then(|| proto::BUILD.to_owned()),
+            executable,
+            arguments: Self::arguments(&path),
             environment: std::collections::HashMap::new(),
-        }
+        })
     }
 
-    fn spawn(&self, engine: u64, executable: &str, host: &str) -> anyhow::Result<Connection> {
+    fn spawn(
+        &self,
+        engine: u64,
+        executable: &str,
+        host: &str,
+        arguments: Vec<String>,
+    ) -> anyhow::Result<Connection> {
         let (mut control, nodes) = self.connect()?;
         anyhow::ensure!(
             nodes.iter().any(|node| node.host == host),
@@ -512,7 +621,6 @@ impl EngineControl {
         );
 
         let executable = executable.to_owned();
-        let arguments = self.arguments(engine);
         control.send(&process::Upstream {
             kind: Some(upstream::Kind::Request(process::Request {
                 id: 1,
@@ -1380,44 +1488,139 @@ mod tests {
         assert!(failure.reason.contains("priority"), "{}", failure.reason);
     }
 
-    /// An epoch's start names this daemon's own build only for its own
-    /// binary; another executable's children vouch for themselves with their
-    /// first `Hello` (§7.4). The arguments are the engine's own, built once.
+    /// The launch file of the engine the deployment serves with, as the spec
+    /// states it: every field is the daemon's own fact, and the argv is the
+    /// program name and that file, nothing else.
     #[test]
-    fn an_epoch_start_names_the_build_of_the_daemons_own_executable() {
+    fn an_epoch_start_writes_the_launch_file_and_names_its_build() {
         let directory = tempfile::tempdir().unwrap();
         let control = EngineControl::new(
             &directory.path().join("requests.sock"),
             "unix:/run/processes.sock".into(),
             "rank-0".into(),
             "model".into(),
-            Some(std::path::PathBuf::from("/run/program-server.sock")),
+            Some(PathBuf::from("/run/program-server.sock")),
         )
         .unwrap();
 
         let own = std::env::current_exe().unwrap();
-        let start = control.epoch_start(&own.display().to_string(), 9);
+        let config = crate::epoch::BuildConfig::of(&ServeConfig::default());
+        let mut spec = ServeConfig::default().engine_spec().unwrap();
+        spec.host = "rank-0".to_owned();
+        spec.world = 21;
+        spec.placement.as_mut().unwrap().devices = vec![0, 1];
+        spec.workers.as_mut().unwrap().executable = own.display().to_string();
+        control
+            .write_build_config(21, &config)
+            .expect("the epoch's build config");
+
+        let start = control.epoch_start(&spec, 9).expect("the launch file");
         assert_eq!(start.build, Some(proto::BUILD.to_owned()));
         assert_eq!(start.executable, own.display().to_string());
+        assert_eq!(start.arguments.len(), 3, "the program name and the file");
+        assert_eq!(start.arguments[0], "engine");
+        assert_eq!(start.arguments[1], "--launch");
+        let path = PathBuf::from(&start.arguments[2]);
         assert_eq!(
-            start.arguments,
-            vec![
-                "engine".to_owned(),
-                "--requests".to_owned(),
-                control.request_address().to_owned(),
-                "--processes".to_owned(),
-                "unix:/run/processes.sock".to_owned(),
-                "--engine".to_owned(),
-                "9".to_owned(),
-                "--program-server".to_owned(),
-                "/run/program-server.sock".to_owned(),
-            ]
+            path.file_name().and_then(|name| name.to_str()),
+            Some("launch-9.json")
         );
 
-        let other = control.epoch_start("/opt/uniserve-b", 9);
+        let written: Launch =
+            serde_json::from_slice(&std::fs::read(&path).expect("the launch file")).unwrap();
+        assert_eq!(
+            written.build_config,
+            launch::build_config_path(&control.runtime, 21)
+        );
+        assert_eq!(written.model, PathBuf::from(&spec.model));
+        assert_eq!(written.requests, control.request_address());
+        assert_eq!(written.processes, "unix:/run/processes.sock");
+        assert_eq!(written.engine, 9);
+        assert_eq!(written.program_server, "/run/program-server.sock");
+        assert_eq!(written.devices, vec![0, 1]);
+        assert_eq!(written.group, ENGINE_GROUP);
+        assert_eq!(written.rank, 0);
+        assert_eq!(written.deployment, "model");
+        assert_eq!(written.world, 21);
+        assert!(written.scheduler_node);
+        assert_eq!(written.world_size, 1, "its peers and itself");
+        assert_eq!(written.queue_depth, 2);
+        assert_eq!(written.watchdog_timeout_s, None);
+        assert_eq!(written.rollback_s, None);
+
+        // Another executable's children vouch for themselves with their first
+        // `Hello`, so its start names no build (§7.4).
+        spec.workers.as_mut().unwrap().executable = "/opt/uniserve-b".to_owned();
+        let other = control.epoch_start(&spec, 10).expect("its launch file");
         assert_eq!(other.build, None);
         assert_eq!(other.executable, "/opt/uniserve-b");
-        assert_eq!(other.arguments, start.arguments);
+    }
+
+    /// A main process on another host cannot read a launch file this daemon
+    /// wrote: it is refused, naming the protocol form that would carry the
+    /// contents.
+    #[test]
+    fn a_main_process_on_another_host_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let control = EngineControl::new(
+            &directory.path().join("requests.sock"),
+            "unix:/run/processes.sock".into(),
+            "rank-0".into(),
+            "model".into(),
+            Some(PathBuf::from("/run/program-server.sock")),
+        )
+        .unwrap();
+        let mut spec = ServeConfig::default().engine_spec().unwrap();
+        spec.host = "rank-1".to_owned();
+        spec.world = 22;
+        let error = control.epoch_start(&spec, 11).unwrap_err().to_string();
+        assert!(error.contains("another host"), "{error}");
+        assert!(error.contains("process::Spawn"), "{error}");
+    }
+
+    /// A node with no Program Server cannot start a main process that would
+    /// resolve no policy module: it is refused by name, not given an empty
+    /// socket.
+    #[test]
+    fn a_node_with_no_program_server_refuses_to_start_a_main_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let control = EngineControl::new(
+            &directory.path().join("requests.sock"),
+            "unix:/run/processes.sock".into(),
+            "rank-0".into(),
+            "model".into(),
+            None,
+        )
+        .unwrap();
+        let mut spec = ServeConfig::default().engine_spec().unwrap();
+        spec.host = "rank-0".to_owned();
+        spec.world = 23;
+        control
+            .write_build_config(23, &crate::epoch::BuildConfig::of(&ServeConfig::default()))
+            .unwrap();
+        let error = control.epoch_start(&spec, 12).unwrap_err().to_string();
+        assert!(error.contains("Program Server"), "{error}");
+    }
+
+    /// The launch file names the epoch's build config, so an epoch whose
+    /// config nobody wrote cannot be started: the child would read nothing.
+    #[test]
+    fn an_epoch_without_a_written_build_config_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let control = EngineControl::new(
+            &directory.path().join("requests.sock"),
+            "unix:/run/processes.sock".into(),
+            "rank-0".into(),
+            "model".into(),
+            Some(PathBuf::from("/run/program-server.sock")),
+        )
+        .unwrap();
+        let mut spec = ServeConfig::default().engine_spec().unwrap();
+        spec.host = "rank-0".to_owned();
+        spec.world = 24;
+        let error = control.epoch_start(&spec, 13).unwrap_err().to_string();
+        assert!(error.contains("build config"), "{error}");
+        assert!(error.contains("build-config-24.json"), "{error}");
     }
 
     #[test]
