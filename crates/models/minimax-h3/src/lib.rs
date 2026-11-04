@@ -51,6 +51,7 @@ pub mod positions;
 pub mod schedule;
 pub mod solver;
 pub mod text_encoder;
+pub mod tiled_encode;
 pub mod transformer;
 pub mod video_vae;
 pub mod vision;
