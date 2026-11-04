@@ -608,13 +608,6 @@ impl Device {
                 self.synchronize()?;
                 Ok(Step::Done(BatchOutput::default()))
             }
-            Command::Issue(work) => {
-                work.lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .perform()?;
-                self.synchronize()?;
-                Ok(Step::Done(BatchOutput::default()))
-            }
             Command::After(events) => {
                 // The command establishes that the work deferred on these events may run: wait
                 // for them on the host, bounded like every host wait for device work.
