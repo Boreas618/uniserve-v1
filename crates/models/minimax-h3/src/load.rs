@@ -148,6 +148,35 @@ impl MinimaxH3 {
     }
 }
 
+/// Refuse a component whose names the export lacks, before any shard is opened.
+///
+/// A block that composes its names with `format!` inside its layers reports a missing tensor as a
+/// read error from inside a layer, naming no block - the class that cost the first device run a
+/// round (`transformer_blocks.0.ff.net.0.proj.weight.weight`). The block's `keys` is the same list
+/// as data, so this answers it against the index first and names the block, which half of it is
+/// short, and the first few absent tensors.
+///
+/// The list is rank-independent: a degree splits a tensor's rows and never renames it.
+fn require(
+    source: &nn::Checkpoint,
+    keys: &[String],
+    block: &str,
+    what: &str,
+    directory: &str,
+) -> Result<()> {
+    let missing = crate::checkpoint::absent(keys, |key| source.tensor(key).is_some());
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(Error::checkpoint(format!(
+        "the {block} block asks {} tensors for its {what} and {} of them are not in \
+         {directory}/: {}",
+        keys.len(),
+        missing.len(),
+        missing[..missing.len().min(8)].join(", ")
+    )))
+}
+
 /// Load the deployment this rank places.
 ///
 /// The place and the blocks are the `partition`'s: it names the degrees and the rank's position in
@@ -176,21 +205,27 @@ pub fn load(
     // `Block::Denoiser` and the concrete block that holds them is out of reach. A deployment whose
     // tasks carry no conditions places none.
     let mut encoders = if partition.blocks.contains(Component::LatentEncoder) {
-        // The video encoder's names are data too (`VideoEncoder::keys` is the other column of the
-        // table its own load reads), so a name the export lacks is refused here rather than
-        // surfacing as a read error from inside a stack of strides and convolutions.
-        let source = checkpoint.component("vae")?;
-        let keys = crate::encoding::VideoEncoder::keys(&config.video_vae)?;
-        let missing = crate::checkpoint::absent(&keys, |key| source.tensor(key).is_some());
-        if !missing.is_empty() {
-            return Err(Error::checkpoint(format!(
-                "the video encoder that conditions a request asks {} tensors and {} of them are \
-                 not in vae/: {}",
-                keys.len(),
-                missing.len(),
-                missing[..missing.len().min(8)].join(", ")
-            )));
-        }
+        // The encoders' names are data too (`keys` is the other column of the table each one's
+        // load reads), so a name the export lacks is refused here rather than surfacing as a read
+        // error from inside a stack of strides and convolutions. The audio encoder is checked in
+        // the same pass and refuses just as plainly: `ref2va` reads both, and a checkpoint that
+        // holds no audio weights should say so before any stage of it is built.
+        let video = crate::encoding::VideoEncoder::keys(&config.video_vae)?;
+        require(
+            checkpoint.component("vae")?,
+            &video,
+            "latent_encoder",
+            "video encoder",
+            "vae",
+        )?;
+        let audio = crate::encoding::AudioEncoder::keys(&config.audio_vae)?;
+        require(
+            checkpoint.component("audio_vae")?,
+            &audio,
+            "latent_encoder",
+            "audio encoder",
+            "audio_vae",
+        )?;
         Some(ConditionEncoders::load(&config, checkpoint, loader)?)
     } else {
         None
@@ -215,23 +250,20 @@ pub fn load(
                 // answers both, and no degree renames a tensor: the degree splits rows.
                 let encoder_keys = TextEncoder::keys(&config.text_encoder);
                 let tower_keys = crate::vision::VisionTower::keys(&config.text_encoder.vision);
-                for (what, keys) in [
-                    ("the language stack", &encoder_keys),
-                    ("the vision tower", &tower_keys),
-                ] {
-                    let missing =
-                        crate::checkpoint::absent(keys, |key| source.tensor(key).is_some());
-                    if !missing.is_empty() {
-                        return Err(Error::checkpoint(format!(
-                            "the {} block's {what} asks {} tensors and {} of them are not in \
-                             text_encoder/: {}",
-                            component.name(),
-                            keys.len(),
-                            missing.len(),
-                            missing[..missing.len().min(8)].join(", ")
-                        )));
-                    }
-                }
+                require(
+                    source,
+                    &encoder_keys,
+                    component.name(),
+                    "language stack",
+                    "text_encoder",
+                )?;
+                require(
+                    source,
+                    &tower_keys,
+                    component.name(),
+                    "vision tower",
+                    "text_encoder",
+                )?;
                 let dtype = component.activation();
                 let mut shards = loader.reborrow(source)?;
                 let encoder = Arc::new(TextEncoder::load(
@@ -275,17 +307,7 @@ pub fn load(
                 // the partition for its exchange rank, not for a weight slice - so one rank's check
                 // answers for every rank of the deployment.
                 let keys = Denoiser::keys(denoiser);
-                let missing = crate::checkpoint::absent(&keys, |key| source.tensor(key).is_some());
-                if !missing.is_empty() {
-                    return Err(Error::checkpoint(format!(
-                        "the {} block asks {} tensors and {} of them are not in {}/: {}",
-                        component.name(),
-                        keys.len(),
-                        missing.len(),
-                        dit.directory(),
-                        missing.join(", ")
-                    )));
-                }
+                require(source, &keys, component.name(), "denoiser", dit.directory())?;
                 let mut shards = loader.reborrow(source)?;
                 // A parallel-decoding student stacks one head per fine interval; the boundary that
                 // owns the checkpoint fuses them into one head per evaluation block and publishes
@@ -354,12 +376,26 @@ pub fn load(
                 // The audio decoder has no layout tables - every table it reads is a weight bound
                 // at load - so it constructs from its own component and its sidecar alone.
                 let source = checkpoint.component("audio_vae")?;
+                require(
+                    source,
+                    &AudioDecoder::keys(&config.audio_vae)?,
+                    component.name(),
+                    "decoder",
+                    "audio_vae",
+                )?;
                 let mut shards = loader.reborrow(source)?;
                 let decoder = Arc::new(AudioDecoder::load(&config.audio_vae, &mut shards)?);
                 audio_decoder = Some(Arc::clone(&decoder));
                 Block::Decoder(decoder)
             }
             Component::VideoDecoder => {
+                require(
+                    checkpoint.component("vae")?,
+                    &crate::video_vae::VideoDecoder::keys(&config.video_vae)?,
+                    component.name(),
+                    "decoder",
+                    "vae",
+                )?;
                 // One block serves every canvas: the tile grid is arithmetic on a request's raster,
                 // so the block is loaded against the checkpoint's tile - the largest tile any canvas
                 // of this checkpoint produces, since the grid is uniform wherever the canvas holds a

@@ -21,10 +21,12 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use minimax_h3::audio_vae::AudioDecoder;
 use minimax_h3::checkpoint::{Layout, Sidecars};
 use minimax_h3::config::Config;
-use minimax_h3::encoding::VideoEncoder;
+use minimax_h3::encoding::{AudioEncoder, VideoEncoder};
 use minimax_h3::text_encoder::TextEncoder;
+use minimax_h3::video_vae::VideoDecoder;
 use minimax_h3::vision::VisionTower;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -41,9 +43,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // encoder has its own.
     let text_index = index_names(&root.join("text_encoder"))?;
     let vae_index = index_names(&root.join("vae"))?;
+    // The audio directory may hold no index at all - this host's export holds its `config.json`
+    // and nothing else - and that is a fact about the export, not a reason to skip the count: the
+    // lists are still built, and every name in them is reported missing, which is exactly what
+    // `load` refuses with.
+    let audio_index = match index_names(&root.join("audio_vae")) {
+        Ok(index) => index,
+        Err(error) => {
+            println!("audio_vae: {error}");
+            BTreeSet::new()
+        }
+    };
     let text = TextEncoder::keys(&config.text_encoder);
     let tower = VisionTower::keys(&config.text_encoder.vision);
     let video = VideoEncoder::keys(&config.video_vae)?;
+    // The video VAE directory holds both halves: the encoder reads 118 of its 703 names and the
+    // decoder the other 585, so the two lists are partners on one index and nothing is unread.
+    let decoder = VideoDecoder::keys(&config.video_vae)?;
+    // The audio directory holds both halves too, and against this checkpoint none of the tensors
+    // either of them asks for is present - which is the answer `load` must give before a stage of
+    // the audio path is built, so it is reported here rather than skipped.
+    let audio_decoder = AudioDecoder::keys(&config.audio_vae)?;
+    let audio_encoder = AudioEncoder::keys(&config.audio_vae)?;
 
     let mut failed = false;
     report(
@@ -64,7 +85,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "video VAE encoder",
         &video,
         &vae_index,
-        &[&video],
+        &[&video, &decoder],
+        &mut failed,
+    );
+    report(
+        "video VAE decoder",
+        &decoder,
+        &vae_index,
+        &[&video, &decoder],
+        &mut failed,
+    );
+    report(
+        "audio VAE decoder",
+        &audio_decoder,
+        &audio_index,
+        &[&audio_decoder, &audio_encoder],
+        &mut failed,
+    );
+    report(
+        "audio VAE encoder",
+        &audio_encoder,
+        &audio_index,
+        &[&audio_decoder, &audio_encoder],
         &mut failed,
     );
 
