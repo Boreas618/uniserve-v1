@@ -623,7 +623,7 @@ impl MainProcess {
         // one `Arc` and not a second load. The load and the capacity plan are one call because the
         // order between them is the plan's: the weights are mapped first, so what the plan measures
         // is what is left of the device rather than what was there before the model.
-        let (model, mut memory) = plan
+        let (model, mut memory, inventory) = plan
             .load_and_open(&mut weights, &mut &*client)
             .context("loading the epoch's model")?;
 
@@ -685,7 +685,7 @@ impl MainProcess {
         // above through `executor::Batches` (§2.4, §4.4). A node that holds none keeps an empty list
         // and serves only what its peers' schedulers ask of it; a node that is the scheduler node
         // and holds none would accept requests and dispatch nothing, which is refused by name.
-        let schedulers = schedulers(&plan, launch, &memory, &model, &executors)?;
+        let schedulers = schedulers(&plan, launch, &memory, &model, &executors, &inventory)?;
 
         let mut process = Self {
             control,
@@ -3270,6 +3270,7 @@ fn schedulers(
     memory: &Memory,
     model: &qwen3_moe::Qwen3Moe,
     executors: &[Arc<Executor>],
+    rank: &ipc::WorkerInfo,
 ) -> Result<Vec<engine::SchedulerHandle>> {
     if !launch.scheduler_node {
         return Ok(Vec::new());
@@ -3284,9 +3285,28 @@ fn schedulers(
     let config = engine::EngineConfig::of(&facts)?;
     // The scheduler submits through the same devices this process drives, so a batch and a
     // switchover reach one executor thread per device and never two.
-    let batches: Arc<dyn executor::batch::Batches> = Arc::new(executor::batch::Executors::shared(
-        executors.iter().map(Arc::clone).collect(),
-    )?);
+    // The scheduler plans against a description of the pool, and this process is the one pool it
+    // holds: its single rank is this one, its capacities are the launch's (the rank reports what it
+    // holds, not what it was launched for), and its longest sequence is the model's bound. The
+    // inventory is the executor's to hold and the boot's to state, because neither number can be
+    // derived from a batch (4.4).
+    let inventory = executor::batch::Inventory {
+        group: launch.group.clone(),
+        ranks: vec![rank.clone()],
+        placement: executor::batch::Placement {
+            queue_depth: plan.queue_depth(),
+            ranks: plan.world_size(),
+            components: engine::WorkerGroupConfig::single_component(
+                ipc::DEFAULT_COMPONENT,
+                plan.world_size(),
+            ),
+        },
+        max_model_len: plan.max_kv_len(model)?,
+    };
+    let batches: Arc<dyn executor::batch::Batches> = Arc::new(
+        executor::batch::Executors::shared(executors.iter().map(Arc::clone).collect())?
+            .stating(vec![inventory]),
+    );
     let handle = engine::SchedulerHandle::over_batches(config, batches)?;
     Ok(vec![handle])
 }
