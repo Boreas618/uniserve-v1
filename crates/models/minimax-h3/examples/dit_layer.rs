@@ -449,9 +449,20 @@ fn stage_block(args: &Args) -> Result<()> {
     };
     let (layout, packing) = layouts.layout(&request)?;
     let frames = packing::align_num_frames(request.frames);
-    let canvas = pixel_canvas(args.width, args.height);
+    // The canvas comes back from the layout rather than from the request: the layout has already
+    // rounded the pixels to `CANVAS_MULTIPLE` and derived the latent raster, and coordinates
+    // computed against a second rounding of the same request could describe a different canvas than
+    // the rows they belong to. The reconstruction is checked against the layout's own extents.
+    let canvas = canvas_of_layout(&layout)?;
     let tables = packing::dense_tables(&packing, frames, &canvas, request.text_tokens, &[], &[])?;
     let tokens = u64::from(packing.padded_tokens);
+    if tables.position_ids.len() as u64 != tokens || tables.groups.len() as u64 != tokens {
+        return Err(Failure::message(format!(
+            "the row tables hold {} coordinates and {} groups for {tokens} packed rows",
+            tables.position_ids.len(),
+            tables.groups.len()
+        )));
+    }
     println!(
         "request: {}x{}, {} frames, {} rows packed of {} padded, {} attended",
         args.width,
@@ -461,7 +472,6 @@ fn stage_block(args: &Args) -> Result<()> {
         tokens,
         tables.used,
     );
-    let _ = layout;
 
     // 4. Weights on the device, through the loader's own boundary.
     let mut weights = DeviceWeights::new(&device, 0)?;
@@ -663,22 +673,28 @@ fn cache_projections(f: &Forward, projections: &Projections, memory: &AdaLnMemor
     Ok(())
 }
 
-/// The pixel canvas of a request, as the layout's rule rounds it.
-fn pixel_canvas(width: u32, height: u32) -> Canvas {
-    let multiple = minimax_h3::CANVAS_MULTIPLE;
-    let width = width.div_ceil(multiple) * multiple;
-    let height = height.div_ceil(multiple) * multiple;
-    let divisor = gcd(width, height);
-    Canvas {
-        short_edge: width.min(height),
-        aspect: (width / divisor, height / divisor),
-        width,
-        height,
+/// The pixel canvas a layout came from.
+///
+/// The latent extents are pixels over the VAE's sixteen-pixel compression, so the canvas is exactly
+/// recoverable; `packing::latent_raster` then proves it, because a canvas whose raster does not
+/// reproduce the layout's extents would give every row coordinates from another canvas.
+fn canvas_of_layout(layout: &nn::capability::Layout) -> Result<Canvas> {
+    let canvas = Canvas {
+        short_edge: (layout.video.height * 16).min(layout.video.width * 16),
+        aspect: (layout.video.width, layout.video.height),
+        width: layout.video.width * 16,
+        height: layout.video.height * 16,
+    };
+    let raster = packing::latent_raster(&canvas)?;
+    if raster.height != layout.video.height || raster.width != layout.video.width {
+        return Err(Failure::message(format!(
+            "the layout's {}x{} latent raster is not the one its canvas re-derives ({:?})",
+            layout.video.height,
+            layout.video.width,
+            (raster.height, raster.width)
+        )));
     }
-}
-
-fn gcd(a: u32, b: u32) -> u32 {
-    if b == 0 { a.max(1) } else { gcd(b, a % b) }
+    Ok(canvas)
 }
 
 /// The rotary width of one row: the three axes' shares of a head.
