@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Dump one probe of a MiniMax-H3 VAE block from today's implementation.
 
-The reference half of the block-by-block numeric comparison (`specs/worker.md` 10): the Rust half is
-`examples/compare_blocks.rs`, which reads two dump trees and reports the largest absolute and relative
-difference per tensor. This script writes the reference tree, one tensor per probe, in the same
-container (`notes/h3/numeric-diagnosis.md`).
+The reference half of the block-by-block numeric comparison (`specs/worker.md` 10). The Rust half is the
+trace hook that writes `$UNISERVE_DIAG_DIR/<block>/<name>.npy` for the same request and seed, and
+`tools/diagnosis/compare.py` is the comparator that reads both trees and writes `report.json`
+(`notes/h3/diagnosis.md`). This script writes the reference tree, one tensor per probe, under the name
+the hook writes, so the two trees line up by name and not by position.
 
 It runs on the reference's own weight path - `loading.checkpoint.Source` opened through
 `loading.loader.load_weights` with the `weights.ModuleMapping` that `models/minimax_h3/weights.py`
