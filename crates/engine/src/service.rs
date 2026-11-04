@@ -35,6 +35,7 @@ use proto::Connection;
 use proto::request::wire::{self, from_engine, to_engine};
 use proto::request::{ArtifactMedia, EVENT_WINDOW, Event, MigrationCause, Request, RequestId};
 
+use crate::Validators;
 use crate::core::SchedulerHandle;
 use crate::handle::EventRx;
 use crate::scheduler::{
@@ -170,9 +171,14 @@ impl Routing {
         let events = std::mem::take(&mut state.pending);
         let policy = state.instance.as_mut()?;
         let ranks = self.ranks();
+        // Every decision is validated by the mechanism before it is executed,
+        // the control thread's as much as a scheduler thread's (§4.4).
         let outcome = policy
             .observe(&events)
-            .and_then(|()| policy.route(&request, &ranks));
+            .and_then(|()| policy.route(&request, &ranks))
+            .and_then(|index| {
+                Validators::route(&RouteTrial, &request, &ranks, index).map(|()| index)
+            });
         match outcome {
             Ok(index) => Some(index),
             Err(error) => {
@@ -1866,11 +1872,23 @@ fn forward_events(
                 _ = interval.tick() => {
                     // A policy that failed after the commit reverted and
                     // serves on; every daemon records the previous policy as
-                    // the epoch's current one (§7.3).
+                    // the epoch's current one (§7.3). A scheduler's report is
+                    // named here, since a scheduler does not know its index.
+                    //
+                    // The reports wait for the frame that carries them: the
+                    // daemon's decode side of that message is front's, and the
+                    // engine's case is added with it.
                     let reports: Vec<PolicyReverted> = routing
                         .slots
                         .iter()
-                        .filter_map(|slot| slot.handle.take_policy_report())
+                        .enumerate()
+                        .filter_map(|(index, slot)| {
+                            slot.handle.take_policy_report().map(|mut report| {
+                                report.scheduler = Some(index);
+                                report
+                            })
+                        })
+                        .chain(routing.take_policy_reports())
                         .collect();
                     if !reports.is_empty() {
                         crate::lock(&routing.route).reports.extend(reports);
