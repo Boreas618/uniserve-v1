@@ -16,13 +16,19 @@
  * | AAC | aac, stereo, aac_coder=fast, 144 kb/s, 8 threads, planar float input |
  * | container | MP4, one video stream per unit template, one audio stream |
  *
- * Six settings that PyAV leaves at their encoder defaults are set here
- * explicitly, because FFmpeg's AVCodecContext defaults differ from them:
- * `bit_rate = 0` (x264's constant-rate-factor rate control, not the 200 kb/s
- * average bitrate default), `gop_size = -1` and `max_b_frames = -1` (the
- * preset's keyframe interval and B-frame count rather than FFmpeg's 12 and 0),
- * and the muxer's global-header flag. A nonzero failure code leaves a message
- * in a thread-local buffer that `usv_error` returns.
+ * Six settings that are not FFmpeg's AVCodecContext defaults are set here
+ * explicitly, because they are what the reference sees: `bit_rate = 0`,
+ * `gop_size = -1` and `max_b_frames = -1` (libx264's own codec defaults,
+ * libavcodec/libx264.c `x264_defaults`, which `avcodec_alloc_context3`
+ * applies on top of the option table's 200 kb/s, 12 and 0; a negative value
+ * tells libx264 to keep the preset's), `thread_type = FF_THREAD_SLICE`
+ * (PyAV's CodecContext), and the muxer's global-header flag. The rgb24 to
+ * yuv420p conversion uses the dynamic swscale mode PyAV's VideoReformatter
+ * uses: a context whose thread count is set before its first frame, driven
+ * by `sws_scale_frame`. A nonzero failure code leaves a message in a
+ * thread-local buffer that `usv_error` returns; `USV_PLAN` marks a failure of
+ * the media rather than of the codec (a unit without video, a track without
+ * audio).
  */
 
 #include <libavcodec/avcodec.h>
@@ -45,6 +51,10 @@
 
 #define USV_OK 0
 #define USV_ERROR (-1)
+/* A failure of the media itself rather than of the codec: a unit without a
+ * video stream, a track without audio. Rust reports these as plan errors, the
+ * same way the Python boundary raised ValueError for them. */
+#define USV_PLAN (-2)
 
 #define IO_BLOCK 32768
 #define VIDEO_THREADS 8
@@ -67,6 +77,15 @@ static int fail_averror(const char *context, int code) {
     char reason[AV_ERROR_MAX_STRING_SIZE] = {0};
     av_strerror(code, reason, sizeof(reason));
     return fail("%s: %s", context, reason);
+}
+
+/* A failure of the media itself, which Rust reports as a plan error. */
+static int fail_plan(const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    vsnprintf(usv_error_message, sizeof(usv_error_message), format, args);
+    va_end(args);
+    return USV_PLAN;
 }
 
 /* ---- growable byte buffer ------------------------------------------------ */
@@ -270,13 +289,59 @@ static void close_input_memory(AVFormatContext **input) {
 /* ---- codec availability -------------------------------------------------- */
 
 int usv_require_codecs(void) {
-    const char *names[] = {"libx264", "aac"};
-    for (int index = 0; index < 2; index++) {
-        const AVCodec *codec = avcodec_find_encoder_by_name(names[index]);
-        if (!codec) {
-            return fail("the FFmpeg runtime does not provide the %s encoder",
-                        names[index]);
-        }
+    /* Both codecs must be present and must open as encoders in this runtime
+     * with the serving options; a build that lists but cannot open one fails
+     * here, by name, instead of on the first request. */
+    const AVCodec *video = avcodec_find_encoder_by_name("libx264");
+    if (!video) {
+        return fail("the FFmpeg runtime does not provide the libx264 encoder");
+    }
+    const AVCodec *audio = avcodec_find_encoder_by_name("aac");
+    if (!audio) {
+        return fail("the FFmpeg runtime does not provide the aac encoder");
+    }
+
+    AVCodecContext *context = avcodec_alloc_context3(video);
+    if (!context) {
+        return fail("out of memory opening libx264");
+    }
+    context->width = 16;
+    context->height = 16;
+    context->pix_fmt = AV_PIX_FMT_YUV420P;
+    context->time_base = (AVRational){1, 25};
+    context->framerate = (AVRational){25, 1};
+    context->thread_count = VIDEO_THREADS;
+    context->thread_type = FF_THREAD_SLICE;
+    context->bit_rate = 0;
+    context->gop_size = -1;
+    context->max_b_frames = -1;
+    AVDictionary *options = NULL;
+    av_dict_set(&options, "preset", "ultrafast", 0);
+    av_dict_set(&options, "tune", "zerolatency", 0);
+    int code = avcodec_open2(context, video, &options);
+    av_dict_free(&options);
+    avcodec_free_context(&context);
+    if (code < 0) {
+        return fail_averror("opening libx264", code);
+    }
+
+    context = avcodec_alloc_context3(audio);
+    if (!context) {
+        return fail("out of memory opening the aac encoder");
+    }
+    context->sample_fmt = AV_SAMPLE_FMT_FLTP;
+    context->sample_rate = 48000;
+    av_channel_layout_default(&context->ch_layout, 2);
+    context->bit_rate = AUDIO_BIT_RATE;
+    context->time_base = (AVRational){1, 48000};
+    context->thread_count = VIDEO_THREADS;
+    context->thread_type = FF_THREAD_SLICE;
+    av_dict_set(&options, "aac_coder", "fast", 0);
+    code = avcodec_open2(context, audio, &options);
+    av_dict_free(&options);
+    avcodec_free_context(&context);
+    if (code < 0) {
+        return fail_averror("opening the aac encoder", code);
     }
     return USV_OK;
 }
@@ -288,6 +353,7 @@ typedef struct {
     struct SwsContext *scaler;
     const AVCodec *codec;
     AVFrame *frame;
+    AVFrame *rgb;
     AVPacket *packet;
     AVFormatContext *output;
     AVStream *stream;
@@ -302,6 +368,7 @@ static void video_encoder_free(VideoEncoder *encoder) {
         close_output_memory(&encoder->output);
     }
     av_frame_free(&encoder->frame);
+    av_frame_free(&encoder->rgb);
     av_packet_free(&encoder->packet);
     if (encoder->scaler) {
         sws_freeContext(encoder->scaler);
@@ -324,6 +391,9 @@ static int video_encoder_stream(VideoEncoder *encoder) {
     if (code < 0) {
         return fail_averror("writing the video stream's parameters", code);
     }
+    /* PyAV's OutputStream sets the stream's average frame rate from the
+     * codec context; the muxer writes the sample durations from it. */
+    stream->avg_frame_rate = context->framerate;
     encoder->stream = stream;
     return USV_OK;
 }
@@ -357,6 +427,10 @@ static int video_encoder_open(VideoEncoder *encoder, int width, int height,
     context->time_base = (AVRational){1, frame_rate};
     context->framerate = (AVRational){frame_rate, 1};
     context->thread_count = VIDEO_THREADS;
+    /* PyAV's CodecContext sets slice threading on every context it wraps.
+     * libx264 reads it as its sliced-threads switch (libx264.c), so the
+     * reference and this shim give x264 the same threading mode. */
+    context->thread_type = FF_THREAD_SLICE;
     /* The serving encoder's rate control and keyframe spacing (libx264.c
      * reads a negative value as "keep the preset's"). */
     context->bit_rate = 0;
@@ -379,8 +453,9 @@ static int video_encoder_open(VideoEncoder *encoder, int width, int height,
     }
 
     encoder->frame = av_frame_alloc();
+    encoder->rgb = av_frame_alloc();
     encoder->packet = av_packet_alloc();
-    if (!encoder->frame || !encoder->packet) {
+    if (!encoder->frame || !encoder->rgb || !encoder->packet) {
         return fail("out of memory allocating a video frame");
     }
     encoder->frame->format = AV_PIX_FMT_YUV420P;
@@ -391,12 +466,26 @@ static int video_encoder_open(VideoEncoder *encoder, int width, int height,
         return fail_averror("allocating a video frame", code);
     }
 
-    encoder->scaler = sws_getContext(width, height, AV_PIX_FMT_RGB24, width,
-                                     height, AV_PIX_FMT_YUV420P, SWS_BILINEAR,
-                                     NULL, NULL, NULL);
+    /* The rgb24 to yuv420p conversion, in the mode PyAV's VideoReformatter
+     * uses: a dynamic context whose thread count and flags are set before
+     * the first frame, converted by sws_scale_frame. Setting them on a
+     * context from sws_getContext would come too late: that call already
+     * initialized the context with automatic threading. */
+    encoder->scaler = sws_alloc_context();
     if (!encoder->scaler) {
         return fail("creating the rgb24 to yuv420p scaler failed");
     }
+    if (av_opt_set_int(encoder->scaler, "threads", VIDEO_THREADS, 0) < 0) {
+        return fail("setting the scaler's thread count failed");
+    }
+    encoder->scaler->flags = SWS_BILINEAR;
+    encoder->rgb->format = AV_PIX_FMT_RGB24;
+    encoder->rgb->width = width;
+    encoder->rgb->height = height;
+    encoder->rgb->colorspace = AVCOL_SPC_UNSPECIFIED;
+    encoder->rgb->color_range = AVCOL_RANGE_UNSPECIFIED;
+    encoder->frame->colorspace = AVCOL_SPC_UNSPECIFIED;
+    encoder->frame->color_range = AVCOL_RANGE_UNSPECIFIED;
 
     if (video_encoder_stream(encoder) != USV_OK) {
         return USV_ERROR;
@@ -432,10 +521,14 @@ static int video_encoder_send(VideoEncoder *encoder, const uint8_t *rgb24,
     if (code < 0) {
         return fail_averror("making a video frame writable", code);
     }
-    const uint8_t *source[4] = {rgb24, NULL, NULL, NULL};
-    int source_stride[4] = {encoder->width * 3, 0, 0, 0};
-    sws_scale(encoder->scaler, source, source_stride, 0, encoder->height,
-              encoder->frame->data, encoder->frame->linesize);
+    /* The input is one contiguous RGB24 frame; the dynamic scaler reads the
+     * frame properties and writes the allocated yuv420p frame. */
+    encoder->rgb->data[0] = (uint8_t *)rgb24;
+    encoder->rgb->linesize[0] = encoder->width * 3;
+    code = sws_scale_frame(encoder->scaler, encoder->frame, encoder->rgb);
+    if (code < 0) {
+        return fail_averror("converting rgb24 to yuv420p", code);
+    }
     encoder->frame->pts = index;
     code = avcodec_send_frame(encoder->context, encoder->frame);
     if (code < 0) {
@@ -540,6 +633,8 @@ static int audio_encoder_open(AudioEncoder *encoder, int rate) {
     context->bit_rate = AUDIO_BIT_RATE;
     context->time_base = (AVRational){1, rate};
     context->thread_count = VIDEO_THREADS;
+    /* PyAV's CodecContext sets slice threading on every context it wraps. */
+    context->thread_type = FF_THREAD_SLICE;
     if (encoder->output->oformat->flags & AVFMT_GLOBALHEADER) {
         context->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     }
@@ -735,10 +830,11 @@ int usv_mux_open(const uint8_t *first_unit, size_t first_size,
     }
     int index = av_find_best_stream(unit, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
     if (index < 0) {
-        fail("an encoded media unit has no video");
+        code = fail_plan("an encoded media unit has no video");
         goto fail;
     }
     if (muxer_template_stream(muxer, unit, index, &muxer->video) != USV_OK) {
+        code = USV_ERROR;
         goto fail;
     }
     close_input_memory(&unit);
@@ -749,17 +845,18 @@ int usv_mux_open(const uint8_t *first_unit, size_t first_size,
     }
     index = av_find_best_stream(track, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
     if (index < 0) {
-        fail("an encoded audio track has no audio");
+        code = fail_plan("an encoded audio track has no audio");
         goto fail;
     }
     if (muxer_template_stream(muxer, track, index, &muxer->audio) != USV_OK) {
+        code = USV_ERROR;
         goto fail;
     }
     close_input_memory(&track);
 
     code = avformat_write_header(muxer->output, NULL);
     if (code < 0) {
-        fail_averror("writing the assembled MP4's header", code);
+        code = fail_averror("writing the assembled MP4's header", code);
         goto fail;
     }
     *muxer_out = muxer;
@@ -773,7 +870,7 @@ fail:
     }
     buffer_free(&muxer->buffer);
     free(muxer);
-    return USV_ERROR;
+    return code;
 }
 
 /* Copies every packet of `input`'s stream `index` into `target`, shifted by
@@ -836,7 +933,21 @@ int usv_mux_append(UsvMuxer *muxer, const uint8_t *unit, size_t size,
     int index = av_find_best_stream(input, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
     if (index < 0) {
         close_input_memory(&input);
-        return fail("an encoded media unit has no video");
+        return fail_plan("an encoded media unit has no video");
+    }
+    /* Every unit of one request is encoded at the request's canvas; a unit of
+     * another raster would either misalign the rows or change the stream's
+     * geometry mid-container, so it fails the request here. */
+    AVCodecParameters *geometry = input->streams[index]->codecpar;
+    int width = geometry->width;
+    int height = geometry->height;
+    int expected_width = muxer->video->codecpar->width;
+    int expected_height = muxer->video->codecpar->height;
+    if (width != expected_width || height != expected_height) {
+        close_input_memory(&input);
+        return fail_plan(
+            "an encoded media unit is %dx%d, the request's canvas is %dx%d",
+            width, height, expected_width, expected_height);
     }
     code = mux_stream(muxer, input, index, muxer->video, offset, next);
     close_input_memory(&input);
@@ -854,7 +965,7 @@ int usv_mux_finish(UsvMuxer *muxer, const uint8_t *audio, size_t size,
     int index = av_find_best_stream(input, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
     if (index < 0) {
         close_input_memory(&input);
-        return fail("an encoded audio track has no audio");
+        return fail_plan("an encoded audio track has no audio");
     }
     code = mux_stream(muxer, input, index, muxer->audio, 0, NULL);
     close_input_memory(&input);
@@ -888,8 +999,12 @@ void usv_mux_close(UsvMuxer *muxer) {
 /* ---- audio decoding ------------------------------------------------------ */
 
 /* Decodes the first audio stream of `data` to planar float at the stream's
- * native rate and layout, the format conversion PyAV's resampler performs
- * before the reference resamples the track. */
+ * declared rate and channel layout, the format conversion PyAV's resampler
+ * performs before the reference resamples the track: its output is the
+ * decoder context's rate and layout (from the stream's codecpar), and every
+ * decoded frame is converted from that frame's own rate, format and layout.
+ * The distinction matters for HE-AAC, whose frames decode at twice the
+ * declared rate while the reference keeps the declared one. */
 int usv_decode_audio(const uint8_t *data, size_t size, int *rate, int *channels,
                      float **planar, int64_t *samples) {
     MemoryReader reader;
@@ -903,7 +1018,7 @@ int usv_decode_audio(const uint8_t *data, size_t size, int *rate, int *channels,
         av_find_best_stream(input, AVMEDIA_TYPE_AUDIO, -1, -1, &decoder, 0);
     if (index < 0 || !decoder) {
         close_input_memory(&input);
-        return fail("an audio condition carries no audio stream");
+        return fail_plan("an audio condition carries no audio stream");
     }
     AVCodecContext *context = avcodec_alloc_context3(decoder);
     AVFrame *frame = av_frame_alloc();
@@ -911,8 +1026,15 @@ int usv_decode_audio(const uint8_t *data, size_t size, int *rate, int *channels,
     SwrContext *resampler = NULL;
     Buffer output;
     memset(&output, 0, sizeof(output));
-    int channel_count = 0;
-    int sample_rate = 0;
+    AVChannelLayout out_layout;
+    memset(&out_layout, 0, sizeof(out_layout));
+    AVChannelLayout in_layout;
+    memset(&in_layout, 0, sizeof(in_layout));
+    int in_rate = 0;
+    enum AVSampleFormat in_format = AV_SAMPLE_FMT_NONE;
+    int out_rate = 0;
+    int out_channels = 0;
+    int input_open = 0;
 
     if (!context || !frame || !packet) {
         code = fail("out of memory allocating an audio decoder");
@@ -920,29 +1042,36 @@ int usv_decode_audio(const uint8_t *data, size_t size, int *rate, int *channels,
     }
     code = avcodec_parameters_to_context(context, input->streams[index]->codecpar);
     if (code < 0) {
-        fail_averror("reading the audio stream's parameters", code);
+        code = fail_averror("reading the audio stream's parameters", code);
         goto done;
     }
     code = avcodec_open2(context, decoder, NULL);
     if (code < 0) {
-        fail_averror("opening the audio decoder", code);
+        code = fail_averror("opening the audio decoder", code);
         goto done;
     }
-    if (context->ch_layout.nb_channels < 1) {
-        code = fail("an audio stream declares no channels");
+    input_open = 1;
+
+    /* The output parameters are the stream's declared ones, which is what
+     * PyAV's AudioResampler is created with and what read_audio planned. */
+    out_rate = context->sample_rate;
+    av_channel_layout_copy(&out_layout, &context->ch_layout);
+    out_channels = out_layout.nb_channels;
+    if (out_rate <= 0 || out_channels < 1 || out_channels > 2) {
+        code = fail_plan(
+            "an audio condition's stream declares %d channels at %d Hz, "
+            "which a condition track cannot carry",
+            out_channels, out_rate);
         goto done;
     }
 
-    /* The decoder is fed every packet; the resampler converts each decoded
-     * frame to the decoder's own rate and layout with planar float samples. */
     for (;;) {
         int status = av_read_frame(input, packet);
         if (status == AVERROR_EOF) {
             break;
         }
         if (status < 0) {
-            fail_averror("reading an audio stream", status);
-            code = USV_ERROR;
+            code = fail_averror("reading an audio stream", status);
             goto done;
         }
         if (packet->stream_index != index) {
@@ -952,8 +1081,7 @@ int usv_decode_audio(const uint8_t *data, size_t size, int *rate, int *channels,
         status = avcodec_send_packet(context, packet);
         av_packet_unref(packet);
         if (status < 0 && status != AVERROR(EAGAIN)) {
-            fail_averror("decoding an audio packet", status);
-            code = USV_ERROR;
+            code = fail_averror("decoding an audio packet", status);
             goto done;
         }
         for (;;) {
@@ -962,38 +1090,44 @@ int usv_decode_audio(const uint8_t *data, size_t size, int *rate, int *channels,
                 break;
             }
             if (status < 0) {
-                fail_averror("receiving a decoded audio frame", status);
-                code = USV_ERROR;
+                code = fail_averror("receiving a decoded audio frame", status);
                 goto done;
             }
-            if (!resampler) {
-                AVChannelLayout layout;
-                av_channel_layout_copy(&layout, &frame->ch_layout);
-                sample_rate = frame->sample_rate;
-                channel_count = layout.nb_channels;
+            if (frame->ch_layout.nb_channels < 1) {
+                av_frame_unref(frame);
+                continue;
+            }
+            /* A frame's own input parameters; a decoder may change them
+             * mid-stream (HE-AAC switches SBR on after the first frames), so
+             * the converter follows the frame without changing its output. */
+            int frame_rate = frame->sample_rate > 0 ? frame->sample_rate : out_rate;
+            if (!resampler || frame_rate != in_rate ||
+                frame->format != in_format ||
+                av_channel_layout_compare(&frame->ch_layout, &in_layout) != 0) {
+                swr_free(&resampler);
+                av_channel_layout_uninit(&in_layout);
+                av_channel_layout_copy(&in_layout, &frame->ch_layout);
+                in_rate = frame_rate;
+                in_format = frame->format;
                 status = swr_alloc_set_opts2(
-                    &resampler, &layout, AV_SAMPLE_FMT_FLTP, sample_rate,
-                    &layout, frame->format, sample_rate, 0, NULL);
-                av_channel_layout_uninit(&layout);
-                if (status < 0 || !resampler ||
-                    swr_init(resampler) < 0) {
-                    fail_averror("creating the audio channel converter", status);
-                    code = USV_ERROR;
+                    &resampler, &out_layout, AV_SAMPLE_FMT_FLTP, out_rate,
+                    &in_layout, in_format, in_rate, 0, NULL);
+                if (status < 0 || !resampler || swr_init(resampler) < 0) {
+                    code = fail_averror(
+                        "creating the audio sample converter", status);
                     goto done;
                 }
             }
             uint8_t **planes = NULL;
             int capacity = swr_get_out_samples(resampler, frame->nb_samples);
             if (capacity <= 0) {
-                fail("the audio converter allocated no samples");
-                code = USV_ERROR;
+                code = fail("the audio converter allocated no samples");
                 goto done;
             }
             status = av_samples_alloc_array_and_samples(
-                &planes, NULL, channel_count, capacity, AV_SAMPLE_FMT_FLTP, 0);
+                &planes, NULL, out_channels, capacity, AV_SAMPLE_FMT_FLTP, 0);
             if (status < 0) {
-                fail_averror("allocating converted audio samples", status);
-                code = USV_ERROR;
+                code = fail_averror("allocating converted audio samples", status);
                 goto done;
             }
             int converted = swr_convert(resampler, planes, capacity,
@@ -1002,11 +1136,10 @@ int usv_decode_audio(const uint8_t *data, size_t size, int *rate, int *channels,
             if (converted < 0) {
                 av_freep(&planes[0]);
                 av_freep(&planes);
-                fail_averror("converting decoded audio", converted);
-                code = USV_ERROR;
+                code = fail_averror("converting decoded audio", converted);
                 goto done;
             }
-            for (int channel = 0; channel < channel_count && converted > 0;
+            for (int channel = 0; channel < out_channels && converted > 0;
                  channel++) {
                 if (buffer_append(&output, planes[channel],
                                   (size_t)converted * sizeof(float)) != USV_OK) {
@@ -1019,65 +1152,83 @@ int usv_decode_audio(const uint8_t *data, size_t size, int *rate, int *channels,
             av_freep(&planes[0]);
             av_freep(&planes);
             av_frame_unref(frame);
-            if (converted == 0) {
-                break;
-            }
         }
     }
-    /* Flush the decoder's remaining frames. */
-    code = avcodec_send_packet(context, NULL);
-    (void)code;
+
+    /* Flush the decoder's remaining frames, then the converter's delay. The
+     * input parameters of a flushed frame are the last one's, so the
+     * converter is reused. */
+    avcodec_send_packet(context, NULL);
     for (;;) {
         int status = avcodec_receive_frame(context, frame);
         if (status == AVERROR_EOF || status == AVERROR(EAGAIN)) {
             break;
         }
         if (status < 0) {
-            fail_averror("flushing the audio decoder", status);
-            code = USV_ERROR;
+            code = fail_averror("flushing the audio decoder", status);
             goto done;
         }
-        if (!resampler) {
+        if (!resampler || frame->ch_layout.nb_channels < 1) {
             av_frame_unref(frame);
             continue;
         }
         uint8_t **planes = NULL;
         int capacity = swr_get_out_samples(resampler, frame->nb_samples);
-        if (capacity > 0 &&
-            av_samples_alloc_array_and_samples(&planes, NULL, channel_count,
-                                               capacity, AV_SAMPLE_FMT_FLTP,
-                                               0) >= 0) {
+        if (capacity > 0 && av_samples_alloc_array_and_samples(
+                                &planes, NULL, out_channels, capacity,
+                                AV_SAMPLE_FMT_FLTP, 0) >= 0) {
             int converted = swr_convert(resampler, planes, capacity,
                                         (const uint8_t **)frame->extended_data,
                                         frame->nb_samples);
-            for (int channel = 0; channel < channel_count && converted > 0;
+            if (converted < 0) {
+                av_freep(&planes[0]);
+                av_freep(&planes);
+                code = fail_averror("converting a flushed audio frame", converted);
+                goto done;
+            }
+            for (int channel = 0; channel < out_channels && converted > 0;
                  channel++) {
-                buffer_append(&output, planes[channel],
-                              (size_t)converted * sizeof(float));
+                if (buffer_append(&output, planes[channel],
+                                  (size_t)converted * sizeof(float)) != USV_OK) {
+                    av_freep(&planes[0]);
+                    av_freep(&planes);
+                    code = USV_ERROR;
+                    goto done;
+                }
             }
             av_freep(&planes[0]);
             av_freep(&planes);
         }
         av_frame_unref(frame);
     }
-    /* Flush the resampler's delay. */
-    if (resampler && output.size > 0) {
+    if (resampler) {
         for (;;) {
             uint8_t **planes = NULL;
             int capacity = swr_get_out_samples(resampler, 0);
             if (capacity <= 0) {
                 break;
             }
-            if (av_samples_alloc_array_and_samples(&planes, NULL, channel_count,
+            if (av_samples_alloc_array_and_samples(&planes, NULL, out_channels,
                                                    capacity, AV_SAMPLE_FMT_FLTP,
                                                    0) < 0) {
                 break;
             }
             int converted = swr_convert(resampler, planes, capacity, NULL, 0);
-            for (int channel = 0; channel < channel_count && converted > 0;
+            if (converted < 0) {
+                av_freep(&planes[0]);
+                av_freep(&planes);
+                code = fail_averror("flushing the audio converter", converted);
+                goto done;
+            }
+            for (int channel = 0; channel < out_channels && converted > 0;
                  channel++) {
-                buffer_append(&output, planes[channel],
-                              (size_t)converted * sizeof(float));
+                if (buffer_append(&output, planes[channel],
+                                  (size_t)converted * sizeof(float)) != USV_OK) {
+                    av_freep(&planes[0]);
+                    av_freep(&planes);
+                    code = USV_ERROR;
+                    goto done;
+                }
             }
             av_freep(&planes[0]);
             av_freep(&planes);
@@ -1087,14 +1238,13 @@ int usv_decode_audio(const uint8_t *data, size_t size, int *rate, int *channels,
         }
     }
 
-    if (channel_count < 1 || sample_rate <= 0) {
-        fail("an audio stream decoded to no samples");
-        code = USV_ERROR;
+    if (!input_open || out_channels < 1 || out_rate <= 0) {
+        code = fail_plan("an audio stream decoded to no samples");
         goto done;
     }
-    *rate = sample_rate;
-    *channels = channel_count;
-    *samples = (int64_t)(output.size / (sizeof(float) * (size_t)channel_count));
+    *rate = out_rate;
+    *channels = out_channels;
+    *samples = (int64_t)(output.size / (sizeof(float) * (size_t)out_channels));
     *planar = (float *)output.data;
     output.data = NULL;
     output.size = 0;
@@ -1103,6 +1253,8 @@ int usv_decode_audio(const uint8_t *data, size_t size, int *rate, int *channels,
 
 done:
     buffer_free(&output);
+    av_channel_layout_uninit(&in_layout);
+    av_channel_layout_uninit(&out_layout);
     if (resampler) {
         swr_free(&resampler);
     }
