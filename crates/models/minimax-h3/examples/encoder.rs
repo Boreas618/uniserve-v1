@@ -208,10 +208,28 @@ impl Args {
                             .collect::<Result<Vec<u32>>>()?,
                     );
                 }
+                // A prompt with an image is the one input this harness cannot present, and it says
+                // so by name rather than encoding the text alone: the tower's splice needs patch
+                // rows, the grid they came from, and placeholder ids for the prompt, and a case
+                // that carried none of those would spend a device window producing a page that
+                // agrees because both halves dropped the image.
+                "--vision" => {
+                    let value = arguments
+                        .next()
+                        .ok_or_else(|| Failure("--vision needs a value".into()))?;
+                    if value != "none" {
+                        return Err(Failure(format!(
+                            "--vision {value}: this harness presents no image. The tower's forward \
+                             needs the patch rows (`[tokens, patch_pixels]`), the grid they came \
+                             from, and the prompt's placeholder ids; the reference probe refuses a \
+                             case with images for the same reason. Encode a text-only prompt."
+                        )));
+                    }
+                }
                 other => {
                     return Err(Failure(format!(
                         "unknown argument {other}; the flags are --stage, --root, --device, \
-                         --store, --out, --prompt and --prompt-ids"
+                         --store, --out, --prompt, --prompt-ids, --dtype, --pool-mib and --vision"
                     )));
                 }
             }
