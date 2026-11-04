@@ -1,0 +1,167 @@
+# Qwen3-MoE's GSM8K quality confirmation (specs/worker.md §10) on the local
+# Qwen3MoeForCausalLM checkpoint. Three cells confirm the BF16 checkpoint,
+# its ModelOpt NVFP4 export, and the BF16 checkpoint with FP8 KV pages.
+#
+# Each cell runs twice through `uniserve-eval compare`: once against the
+# implementation accepted as the baseline and once against the candidate, on
+# the same 1319-row test split and the same sampling settings. The three
+# cells differ only in the checkpoint path and the KV cache dtype; every
+# other setting is identical, so a cell's two runs measure one change.
+#
+# Environment:
+# - UNISERVE_QWEN3_MOE_MODEL names a local copy of Qwen/Qwen3-30B-A3B; the
+#   design pins /workspace/models/Qwen3-30B-A3B.
+# - UNISERVE_QWEN3_MOE_NVFP4_MODEL names its calibrated ModelOpt NVFP4 export
+#   (nvidia/Qwen3-30B-A3B-NVFP4). Its own config.json declares the
+#   quantization, so no dtype or quantization flag is sent. The variable has
+#   no default: the checkpoint is not part of the BF16 deployment.
+# - UNISERVE_QWEN3_FP8_ATTENTION_BACKEND selects the attention provider of
+#   the FP8 KV cell. It defaults to `torch`, the only provider that reads
+#   per-block FP8 prefix caches at head dimension 128; a candidate
+#   implementation sets it to its own provider (or `auto`) and changes
+#   nothing else.
+# - UNISERVE_QWEN3_MOE_CUDA_VISIBLE_DEVICES selects each server's GPUs.
+# - UNISERVE_QWEN3_MOE_TENSOR_PARALLEL_SIZE sets the tensor-parallel degree.
+# - UNISERVE_QWEN3_MOE_MEM_FRACTION sets each server's share of device
+#   storage.
+#
+# No point states `dtype`: the checkpoint's own numerical representation is
+# used (§1). The BF16 and NVFP4 cells pass no attention backend, so each
+# implementation selects the provider it has; the FP8 KV cell names its
+# provider because today's `auto` selection refuses FP8 pages.
+root = ".."
+artifact_root = "artifacts/benchmark/gsm8k"
+
+[servers.qwen3-moe-bf16]
+host = "127.0.0.1"
+port = 18081
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_QWEN3_MOE_MODEL:-/workspace/models/Qwen3-30B-A3B}", "--served-model-name", "Qwen3-30B-A3B", "--host", "127.0.0.1", "--port", "18081", "--worker-executable", ".venv/bin/uniserve", "--tensor-parallel-size", "${UNISERVE_QWEN3_MOE_TENSOR_PARALLEL_SIZE:-1}", "--max-running-requests", "64", "--set", "max_num_batched_tokens=16384", "--set", "scheduler_config.chunked_prefill_size=16384", "--set", "kv_cache_config.max_tokens=131072", "--set", "kv_cache_config.block_size=64", "--set", "kv_cache_config.dtype=bfloat16", "--mem-fraction-static", "${UNISERVE_QWEN3_MOE_MEM_FRACTION:-0.70}", "--set", "flashinfer_config.workspace_size=${UNISERVE_QWEN3_MOE_FLASHINFER_WORKSPACE_SIZE:-536870912}", "--set", "placement_config.queue_depth=3", "--set", "chat_config.reasoning_parser=none"]
+
+[servers.qwen3-moe-bf16.environment]
+CUDA_VISIBLE_DEVICES = "${UNISERVE_QWEN3_MOE_CUDA_VISIBLE_DEVICES:-0}"
+
+[servers.qwen3-moe-nvfp4]
+host = "127.0.0.1"
+port = 18085
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_QWEN3_MOE_NVFP4_MODEL}", "--served-model-name", "Qwen3-30B-A3B", "--host", "127.0.0.1", "--port", "18085", "--worker-executable", ".venv/bin/uniserve", "--tensor-parallel-size", "${UNISERVE_QWEN3_MOE_TENSOR_PARALLEL_SIZE:-1}", "--max-running-requests", "64", "--set", "max_num_batched_tokens=16384", "--set", "scheduler_config.chunked_prefill_size=16384", "--set", "kv_cache_config.max_tokens=131072", "--set", "kv_cache_config.block_size=64", "--set", "kv_cache_config.dtype=bfloat16", "--mem-fraction-static", "${UNISERVE_QWEN3_MOE_MEM_FRACTION:-0.70}", "--set", "flashinfer_config.workspace_size=${UNISERVE_QWEN3_MOE_FLASHINFER_WORKSPACE_SIZE:-536870912}", "--set", "placement_config.queue_depth=3", "--set", "chat_config.reasoning_parser=none"]
+
+[servers.qwen3-moe-nvfp4.environment]
+CUDA_VISIBLE_DEVICES = "${UNISERVE_QWEN3_MOE_CUDA_VISIBLE_DEVICES:-0}"
+
+[servers.qwen3-moe-bf16-fp8-kv]
+host = "127.0.0.1"
+port = 18086
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_QWEN3_MOE_MODEL:-/workspace/models/Qwen3-30B-A3B}", "--served-model-name", "Qwen3-30B-A3B", "--host", "127.0.0.1", "--port", "18086", "--worker-executable", ".venv/bin/uniserve", "--tensor-parallel-size", "${UNISERVE_QWEN3_MOE_TENSOR_PARALLEL_SIZE:-1}", "--max-running-requests", "64", "--set", "max_num_batched_tokens=16384", "--set", "scheduler_config.chunked_prefill_size=16384", "--set", "kv_cache_config.max_tokens=131072", "--set", "kv_cache_config.block_size=64", "--set", "kv_cache_config.dtype=float8_e4m3fn", "--set", "attention_backend=${UNISERVE_QWEN3_FP8_ATTENTION_BACKEND:-torch}", "--mem-fraction-static", "${UNISERVE_QWEN3_MOE_MEM_FRACTION:-0.70}", "--set", "flashinfer_config.workspace_size=${UNISERVE_QWEN3_MOE_FLASHINFER_WORKSPACE_SIZE:-536870912}", "--set", "placement_config.queue_depth=3", "--set", "chat_config.reasoning_parser=none"]
+
+[servers.qwen3-moe-bf16-fp8-kv.environment]
+CUDA_VISIBLE_DEVICES = "${UNISERVE_QWEN3_MOE_CUDA_VISIBLE_DEVICES:-0}"
+
+# The complete GSM8K test split, in file order, is the fixed sample set: the
+# selected_rows identity in each bundle is what makes two runs comparable.
+# Every cell states the same request shape, sampling settings and arrival
+# policy; only the server's checkpoint path and KV cache dtype differ.
+[benchmarks.qwen3-moe-gsm8k-bf16]
+server = "qwen3-moe-bf16"
+task = "gsm8k"
+model = "Qwen3-30B-A3B"
+dataset = "gsm8k"
+dataset_revision = "740312add88f781978c0658806c59bc2815b9866"
+
+[benchmarks.qwen3-moe-gsm8k-bf16.load]
+num_prompts = 1319
+request_rate = inf
+max_concurrency = 64
+warmup_requests = 1
+seed = 42
+
+[benchmarks.qwen3-moe-gsm8k-bf16.sampling]
+temperature = 0.0
+top_p = 1.0
+sampling_seed = 42
+ignore_eos = false
+max_tokens = 1024
+stream = true
+
+[benchmarks.qwen3-moe-gsm8k-bf16.sampling.extra_body.chat_template_kwargs]
+enable_thinking = false
+
+[benchmarks.qwen3-moe-gsm8k-bf16.metrics]
+accuracy = "higher"
+
+[benchmarks.qwen3-moe-gsm8k-bf16.provenance]
+checkpoint = "Qwen3-30B-A3B"
+precision = "bfloat16"
+kv_cache_dtype = "bfloat16"
+
+[benchmarks.qwen3-moe-gsm8k-nvfp4]
+server = "qwen3-moe-nvfp4"
+task = "gsm8k"
+model = "Qwen3-30B-A3B"
+dataset = "gsm8k"
+dataset_revision = "740312add88f781978c0658806c59bc2815b9866"
+
+[benchmarks.qwen3-moe-gsm8k-nvfp4.load]
+num_prompts = 1319
+request_rate = inf
+max_concurrency = 64
+warmup_requests = 1
+seed = 42
+
+[benchmarks.qwen3-moe-gsm8k-nvfp4.sampling]
+temperature = 0.0
+top_p = 1.0
+sampling_seed = 42
+ignore_eos = false
+max_tokens = 1024
+stream = true
+
+[benchmarks.qwen3-moe-gsm8k-nvfp4.sampling.extra_body.chat_template_kwargs]
+enable_thinking = false
+
+[benchmarks.qwen3-moe-gsm8k-nvfp4.metrics]
+accuracy = "higher"
+
+[benchmarks.qwen3-moe-gsm8k-nvfp4.provenance]
+checkpoint = "Qwen3-30B-A3B"
+precision = "nvfp4"
+kv_cache_dtype = "bfloat16"
+
+[benchmarks.qwen3-moe-gsm8k-bf16-fp8-kv]
+server = "qwen3-moe-bf16-fp8-kv"
+task = "gsm8k"
+model = "Qwen3-30B-A3B"
+dataset = "gsm8k"
+dataset_revision = "740312add88f781978c0658806c59bc2815b9866"
+
+[benchmarks.qwen3-moe-gsm8k-bf16-fp8-kv.load]
+num_prompts = 1319
+request_rate = inf
+max_concurrency = 64
+warmup_requests = 1
+seed = 42
+
+[benchmarks.qwen3-moe-gsm8k-bf16-fp8-kv.sampling]
+temperature = 0.0
+top_p = 1.0
+sampling_seed = 42
+ignore_eos = false
+max_tokens = 1024
+stream = true
+
+[benchmarks.qwen3-moe-gsm8k-bf16-fp8-kv.sampling.extra_body.chat_template_kwargs]
+enable_thinking = false
+
+[benchmarks.qwen3-moe-gsm8k-bf16-fp8-kv.metrics]
+accuracy = "higher"
+
+[benchmarks.qwen3-moe-gsm8k-bf16-fp8-kv.provenance]
+checkpoint = "Qwen3-30B-A3B"
+precision = "bfloat16"
+kv_cache_dtype = "float8_e4m3fn"
+
+[suites.qwen3-moe-gsm8k]
+points = [
+    "qwen3-moe-gsm8k-bf16",
+    "qwen3-moe-gsm8k-nvfp4",
+    "qwen3-moe-gsm8k-bf16-fp8-kv",
+]
