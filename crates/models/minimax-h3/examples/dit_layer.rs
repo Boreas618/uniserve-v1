@@ -32,7 +32,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use minimax_h3::attention::Factors;
+use minimax_h3::attention::{Factors, Visible};
 use minimax_h3::checkpoint::Dit;
 use minimax_h3::config::{Canvas, Config};
 use minimax_h3::denoiser::Layouts;
@@ -535,6 +535,24 @@ fn stage_block(args: &Args) -> Result<()> {
     // exactly the modulation, which reads like an arithmetic difference.
     let evaluation: i32 = 0;
     let step = upload_i32(&stream, &arena, Shape::new(&[1]), &[evaluation])?;
+    // The visibility the deployment's own state tables state: every packed query row sees the
+    // request's **attended** keys and none of the padding rows. Without it the stack attends all
+    // `tokens` rows while the reference producer masks each query to `used` keys - the two sides
+    // would compute different functions on the same input, and the comparison would report the
+    // harness's mask as an arithmetic difference.
+    let used = i32::try_from(tables.used)
+        .map_err(|_| Failure::message(format!("{} attended rows", tables.used)))?;
+    let packed =
+        i32::try_from(tokens).map_err(|_| Failure::message(format!("{tokens} packed rows")))?;
+    let cu_seq_lens_q = upload_i32(&stream, &arena, Shape::new(&[2]), &[0, packed])?;
+    let cu_seq_lens_k = upload_i32(&stream, &arena, Shape::new(&[2]), &[0, used])?;
+    // The descriptor's key bound is the padded row count, which is the model's own statement
+    // (`denoiser.rs`: one program per layout, and a bound is a class rather than a request shape).
+    let visible = Visible {
+        cu_seq_lens_q,
+        cu_seq_lens_k,
+        key_rows: u32::try_from(tokens).unwrap_or(u32::MAX),
+    };
     let (input, input_bytes) = pseudo_rows(&stream, &arena, tokens, hidden)?;
 
     // 8. The forward. `--layers` layers, in place, at the schedule's first evaluation.
@@ -547,7 +565,7 @@ fn stage_block(args: &Args) -> Result<()> {
         input,
         rows,
         Factors { cosine, sine },
-        None,
+        Some(&visible),
         None,
         total,
         None,
