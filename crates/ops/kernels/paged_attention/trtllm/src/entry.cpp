@@ -183,6 +183,9 @@ extern "C" int32_t uniserve_paged_attention(const uniserve_paged_attention_call*
       call->workspace == nullptr) {
     return refuse_call("paged_attention needs out, query, key, value, page_table, seq_lens and workspace");
   }
+  if (call->window_left >= 0) {
+    return refuse_call("the trtllm module is compiled without an attention window");
+  }
   if (call->q_heads % call->kv_heads != 0) {
     return refuse_call("paged_attention needs q_heads to be a multiple of kv_heads");
   }

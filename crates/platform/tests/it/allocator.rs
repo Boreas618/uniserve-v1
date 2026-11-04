@@ -291,12 +291,18 @@ fn a_restore_a_shrunk_budget_refuses_parks_every_pool_again() {
     let budget = RecordingBudget::new(64 << 20);
     let mut allocator = with_budget(&device, &budget);
     for pool in [PoolKind::Graph, PoolKind::Scratch, PoolKind::Resident] {
-        allocator.reserve(pool, 4 << 20).unwrap();
+        allocator.reserve(pool, 64 << 20).unwrap();
     }
     let stream = device.stream().unwrap();
     let graph = allocator.allocate(PoolKind::Graph, 1 << 20).unwrap();
     let scratch = allocator.allocate(PoolKind::Scratch, 1 << 20).unwrap();
-    let resident = allocator.allocate(PoolKind::Resident, 1 << 20).unwrap();
+    // The resident block is the large one: the budget books each pool's *own*
+    // total, so an allowance that refuses one pool's restore has to sit between
+    // that pool's total and the others'. Twice the graph block, after the
+    // driver rounds both, is larger than the graph block on every device.
+    let resident = allocator
+        .allocate(PoolKind::Resident, graph.len() * 2)
+        .unwrap();
     let addresses = (graph.address(), scratch.address(), resident.address());
     // SAFETY: the block holds these bytes and outlives the fill, which the
     // stream runs before the suspension.
@@ -306,11 +312,19 @@ fn a_restore_a_shrunk_budget_refuses_parks_every_pool_again() {
     allocator.suspend().unwrap();
     assert_eq!(allocator.mapped_bytes(PoolKind::Resident), 0);
 
-    // The allowance shrinks below what the three pools mapped. Pools come back
-    // in the allocator's order, so graph (1 MiB) and scratch (2 MiB) map and
-    // the resident pool's 3 MiB is refused — and then nothing may stay
-    // promoted, which is the state a standby's accounting must never see.
-    budget.set_limit((2 << 20) + (1 << 19));
+    // The allowance shrinks to what the graph and scratch pools book, which is
+    // below what the resident pool books: a budget books one pool's total, not
+    // the sum over the three, so the refusal can only land on a pool whose own
+    // total is over the allowance. Both figures come from the blocks the driver
+    // actually gave out, because a block is rounded up to the device's
+    // allocation granularity and a hard-coded limit would be device-dependent.
+    let limit = graph.len().max(scratch.len()) as u64;
+    assert!(
+        limit < resident.len() as u64,
+        "the allowance {limit} must be below the resident block's {} bytes",
+        resident.len()
+    );
+    budget.set_limit(limit);
     let refused = allocator.restore().unwrap_err();
     let message = refused.to_string();
     assert!(message.contains("resident"), "{message}");
