@@ -2372,11 +2372,17 @@ impl MainProcess {
                         let (wire, media) = event.to_wire(proto::request::RequestId(id));
                         if media.is_some() {
                             // An artifact's bytes travel beside its event (`ArtifactPart`), and this
-                            // process does not carry them yet: the event alone would make a daemon
-                            // wait for bytes that never come, so the request is refused by name.
-                            tracing::warn!(
+                            // process does not carry them: a daemon that reads this event waits for
+                            // bytes that never come. It is reachable only if a media request was
+                            // admitted, and the guard against that is the scheduler's - a device
+                            // with no media runner refuses the phase at admission. So this is the
+                            // alarm, not the guard: it fires when the admission rule has been
+                            // bypassed, and the event goes on because the outcome it states is the
+                            // request's own.
+                            tracing::error!(
                                 request = id,
-                                "a request produced media artifacts, which this process does not carry"
+                                "a request produced media artifacts, which this process does not \
+                                 carry: the daemon will wait for bytes that never come"
                             );
                         }
                         self.send_event(proto::request::wire::from_engine::Kind::Event(wire));
