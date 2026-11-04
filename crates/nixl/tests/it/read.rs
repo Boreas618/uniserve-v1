@@ -22,7 +22,7 @@ use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use cuda::{
+use platform::{
     DeviceAllocation, DeviceId, PeerMapping, PinnedBuffer, Protection, SegmentedMapping, Stream,
     memcpy_async,
 };
@@ -99,7 +99,7 @@ enum Transports {
     Rdma,
 }
 
-/// A source whose device storage is a `cuda::vmm` allocation is READ into
+/// A source whose device storage is a `platform::vmm` allocation is READ into
 /// device storage of another process.
 #[test]
 #[ignore = "requires a CUDA device and NIXL"]
@@ -306,7 +306,7 @@ fn source_process() {
     let agent = new_agent("source");
     let bytes: Vec<u8> = (0..REGION_BYTES).map(source_byte).collect();
 
-    // Device storage is a `cuda::vmm` allocation (`cuMemCreate`, mapped
+    // Device storage is a `platform::vmm` allocation (`cuMemCreate`, mapped
     // into a reserved range), as the storage a Storage Server records is.
     let allocation;
     let read_only;

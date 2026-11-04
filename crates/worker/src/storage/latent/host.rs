@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 
 use ::storage::Key;
 use ::storage::protocol::{PageShape, Reply, Request};
-use cuda::{DeviceAttribute, DeviceId};
+use platform::{DeviceAttribute, DeviceId};
 use ipc::{LatentPageCopy, LatentPoolInfo, LatentPoolRef};
 use sha2::{Digest, Sha256};
 

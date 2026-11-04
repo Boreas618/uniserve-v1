@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::Sender;
-use cuda::{DeviceGuard, DeviceId, Event, Stream};
+use platform::{DeviceGuard, DeviceId, Event, Stream};
 use ipc::Wake;
 
 use super::operation::{Completion, Failure, Job};
@@ -36,7 +36,7 @@ pub(super) fn perform(job: Job, post: Post) {
         job: Some(post.id),
         completions: post.completions.clone(),
     };
-    let watched = cuda::cupti::blocking::Watched::enter();
+    let watched = platform::cupti::blocking::Watched::enter();
     let (completion, after) = job.perform_operations();
     performing.job = None;
     crate::profiling::blocking::add("builder", &watched.calls());

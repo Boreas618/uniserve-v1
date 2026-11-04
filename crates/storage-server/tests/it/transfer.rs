@@ -824,7 +824,7 @@ pub(crate) mod device {
     use ::storage::protocol::{
         Event, Link, LinkEnd, Placement, Priority, Region, StorageRecord, Throttle, TransferEnd,
     };
-    use cuda::{
+    use platform::{
         CopyBatch, DeviceAllocation, DeviceId, HandleType, Nvml, PinnedBuffer, ShareableHandle,
         SourceOrder, Stream,
     };
@@ -1460,7 +1460,7 @@ pub(crate) mod device {
         for context in &transfer.contexts {
             eprintln!(
                 "context on {}: {} MiB",
-                cuda::DeviceUuid(context.gpu),
+                platform::DeviceUuid(context.gpu),
                 context.bytes >> 20
             );
             assert!(context.bytes > 0);

@@ -39,14 +39,14 @@ enum Pages {
 /// stream of the latent banks' device. A batch without copies has none.
 #[derive(Default)]
 struct PageFences {
-    device: Option<cuda::DeviceId>,
+    device: Option<platform::DeviceId>,
     /// Behind the loads: the batch's forward waits on it.
-    loads: Option<Arc<cuda::Event>>,
+    loads: Option<Arc<platform::Event>>,
     /// Behind the offloads: the batch's output waits on it.
-    offloads: Option<Arc<cuda::Event>>,
+    offloads: Option<Arc<platform::Event>>,
     /// Behind the trajectory offloads, with the banks' device: the batch's
     /// output waits on it.
-    latents: Option<(cuda::DeviceId, Arc<cuda::Event>)>,
+    latents: Option<(platform::DeviceId, Arc<platform::Event>)>,
 }
 
 /// A submitted batch with its lifecycle and numerical state.
@@ -117,7 +117,7 @@ impl WorkerBatch {
 
     /// The fence of the batch's host KV cache reads once their job issued them
     /// on the copy stream; the batch's forward waits on it.
-    pub(crate) fn page_loads(&self) -> Option<&Arc<cuda::Event>> {
+    pub(crate) fn page_loads(&self) -> Option<&Arc<platform::Event>> {
         match &self.pages {
             Pages::Issued(fences) => fences.loads.as_ref(),
             Pages::Unissued | Pages::Issuing(_) => None,
@@ -697,10 +697,10 @@ impl WorkerBackend {
         // waited for the device, since the last result, travel with this one;
         // the engine adds every result's into its counters. This runs on the
         // control thread, whose own calls are counted here.
-        let control = cuda::cupti::blocking::Calls::current();
+        let control = platform::cupti::blocking::Calls::current();
         crate::profiling::blocking::add("control", &control.since(&self.control_calls));
         self.control_calls = control;
-        let activity = cuda::cupti::activity::take();
+        let activity = platform::cupti::activity::take();
         if activity.dropped_records > 0 {
             tracing::warn!(
                 "CUPTI dropped {} activity records; the streams' device time misses their operations",

@@ -272,6 +272,17 @@ pub enum StreamCancelCause {
     StopStringMatched,
 }
 
+/// What a scheduler reports about the engine itself, rather than about one
+/// request.
+#[derive(Clone, Debug)]
+pub enum EngineEvent {
+    /// The scheduler's policy failed after the update committed, and the
+    /// scheduler serves on under the previous policy (§7.3). The control thread
+    /// forwards this to every daemon, which records the previous policy as the
+    /// epoch's current one.
+    PolicyReverted(crate::scheduler::PolicyReverted),
+}
+
 /// Request-submission failures visible to engine clients.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SubmitError {
