@@ -185,6 +185,23 @@ pub use ops::commit;
 /// the mechanism. The runner pads to the bucket it serves and never reorders what the mechanism
 /// wrote; a padded row carries `slot_mapping = -1` and a commit slot below zero, so it writes no
 /// cache page and keeps no token state.
+///
+/// # The three counts
+///
+/// Every column here follows exactly one of three counts, and a column compared with the wrong one
+/// is a mis-sized batch:
+///
+/// - **tokens** ([`BatchColumns::tokens`]): `input_ids` and the `[tokens]` columns of `rows` —
+///   positions, slot mapping;
+/// - **rows** ([`BatchColumns::rows`]): the sequences. `slots`, `parameters` and the `[rows]`
+///   columns of `rows` — lengths, query offsets, the sampling rows — are one entry per row, and a
+///   call may own several: a verification of three candidates is one call with three rows, and a
+///   call's `BatchRow::rows` span names them;
+/// - **calls** ([`BatchColumns::calls`]): the commit table, one row per call, because a call states
+///   once how its step advances the slot's device state however many rows it evaluated.
+///
+/// A mechanism that fills these columns and an executor that stages them both read this, so the
+/// rule is stated once; [`BatchColumns::check`] enforces it before a launch.
 #[derive(Clone, Default, Debug)]
 pub struct BatchColumns {
     /// The rows and their calls, as the model reads them: positions, slot mapping, lengths, query
