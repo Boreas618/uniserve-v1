@@ -2043,4 +2043,210 @@ mod tests {
 
         movable::<Cudnn>();
     }
+
+    /// Every number this binding passes to cuDNN is compared with the header that
+    /// defines it. A wrong descriptor type or attribute id is not a compile error:
+    /// it is a refused call, a silently ignored attribute, or a plan against the
+    /// wrong descriptor — and the only way to notice used to be a GPU round trip.
+    #[test]
+    fn the_descriptor_numbers_are_the_headers() {
+        crate::header::assert_constants(
+            "cudnn_graph_v9.h",
+            &[
+                (
+                    "CUDNN_BACKEND_CONVOLUTION_DESCRIPTOR",
+                    DESCRIPTOR_CONVOLUTION as i64,
+                ),
+                ("CUDNN_BACKEND_ENGINE_DESCRIPTOR", DESCRIPTOR_ENGINE as i64),
+                (
+                    "CUDNN_BACKEND_ENGINECFG_DESCRIPTOR",
+                    DESCRIPTOR_ENGINE_CONFIG as i64,
+                ),
+                (
+                    "CUDNN_BACKEND_ENGINEHEUR_DESCRIPTOR",
+                    DESCRIPTOR_ENGINE_HEURISTIC as i64,
+                ),
+                (
+                    "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR",
+                    DESCRIPTOR_EXECUTION_PLAN as i64,
+                ),
+                (
+                    "CUDNN_BACKEND_OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR",
+                    DESCRIPTOR_OPERATION_CONVOLUTION_FORWARD as i64,
+                ),
+                (
+                    "CUDNN_BACKEND_OPERATION_CONVOLUTION_BACKWARD_DATA_DESCRIPTOR",
+                    DESCRIPTOR_OPERATION_CONVOLUTION_BACKWARD_DATA as i64,
+                ),
+                (
+                    "CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR",
+                    DESCRIPTOR_OPERATION_GRAPH as i64,
+                ),
+                (
+                    "CUDNN_BACKEND_VARIANT_PACK_DESCRIPTOR",
+                    DESCRIPTOR_VARIANT_PACK as i64,
+                ),
+                ("CUDNN_BACKEND_TENSOR_DESCRIPTOR", DESCRIPTOR_TENSOR as i64),
+                (
+                    "CUDNN_ATTR_CONVOLUTION_COMP_TYPE",
+                    ATTR_CONVOLUTION_COMP_TYPE as i64,
+                ),
+                (
+                    "CUDNN_ATTR_CONVOLUTION_CONV_MODE",
+                    ATTR_CONVOLUTION_CONV_MODE as i64,
+                ),
+                (
+                    "CUDNN_ATTR_CONVOLUTION_DILATIONS",
+                    ATTR_CONVOLUTION_DILATIONS as i64,
+                ),
+                (
+                    "CUDNN_ATTR_CONVOLUTION_FILTER_STRIDES",
+                    ATTR_CONVOLUTION_FILTER_STRIDES as i64,
+                ),
+                (
+                    "CUDNN_ATTR_CONVOLUTION_POST_PADDINGS",
+                    ATTR_CONVOLUTION_POST_PADDINGS as i64,
+                ),
+                (
+                    "CUDNN_ATTR_CONVOLUTION_PRE_PADDINGS",
+                    ATTR_CONVOLUTION_PRE_PADDINGS as i64,
+                ),
+                (
+                    "CUDNN_ATTR_CONVOLUTION_SPATIAL_DIMS",
+                    ATTR_CONVOLUTION_SPATIAL_DIMS as i64,
+                ),
+                ("CUDNN_ATTR_ENGINEHEUR_MODE", ATTR_ENGINEHEUR_MODE as i64),
+                (
+                    "CUDNN_ATTR_ENGINEHEUR_OPERATION_GRAPH",
+                    ATTR_ENGINEHEUR_OPERATION_GRAPH as i64,
+                ),
+                (
+                    "CUDNN_ATTR_ENGINEHEUR_RESULTS",
+                    ATTR_ENGINEHEUR_RESULTS as i64,
+                ),
+                ("CUDNN_ATTR_ENGINECFG_ENGINE", ATTR_ENGINECFG_ENGINE as i64),
+                (
+                    "CUDNN_ATTR_EXECUTION_PLAN_HANDLE",
+                    ATTR_EXECUTION_PLAN_HANDLE as i64,
+                ),
+                (
+                    "CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG",
+                    ATTR_EXECUTION_PLAN_ENGINE_CONFIG as i64,
+                ),
+                (
+                    "CUDNN_ATTR_EXECUTION_PLAN_WORKSPACE_SIZE",
+                    ATTR_EXECUTION_PLAN_WORKSPACE_SIZE as i64,
+                ),
+                (
+                    "CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_ALPHA",
+                    ATTR_OPERATION_CONVOLUTION_FORWARD_ALPHA as i64,
+                ),
+                (
+                    "CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_BETA",
+                    ATTR_OPERATION_CONVOLUTION_FORWARD_BETA as i64,
+                ),
+                (
+                    "CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_CONV_DESC",
+                    ATTR_OPERATION_CONVOLUTION_FORWARD_CONV_DESC as i64,
+                ),
+                (
+                    "CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_W",
+                    ATTR_OPERATION_CONVOLUTION_FORWARD_W as i64,
+                ),
+                (
+                    "CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_X",
+                    ATTR_OPERATION_CONVOLUTION_FORWARD_X as i64,
+                ),
+                (
+                    "CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_Y",
+                    ATTR_OPERATION_CONVOLUTION_FORWARD_Y as i64,
+                ),
+                (
+                    "CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_ALPHA",
+                    ATTR_OPERATION_CONVOLUTION_BWD_DATA_ALPHA as i64,
+                ),
+                (
+                    "CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_BETA",
+                    ATTR_OPERATION_CONVOLUTION_BWD_DATA_BETA as i64,
+                ),
+                (
+                    "CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_CONV_DESC",
+                    ATTR_OPERATION_CONVOLUTION_BWD_DATA_CONV_DESC as i64,
+                ),
+                (
+                    "CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_W",
+                    ATTR_OPERATION_CONVOLUTION_BWD_DATA_W as i64,
+                ),
+                (
+                    "CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_DX",
+                    ATTR_OPERATION_CONVOLUTION_BWD_DATA_DX as i64,
+                ),
+                (
+                    "CUDNN_ATTR_OPERATION_CONVOLUTION_BWD_DATA_DY",
+                    ATTR_OPERATION_CONVOLUTION_BWD_DATA_DY as i64,
+                ),
+                (
+                    "CUDNN_ATTR_OPERATIONGRAPH_HANDLE",
+                    ATTR_OPERATIONGRAPH_HANDLE as i64,
+                ),
+                (
+                    "CUDNN_ATTR_OPERATIONGRAPH_OPS",
+                    ATTR_OPERATIONGRAPH_OPS as i64,
+                ),
+                (
+                    "CUDNN_ATTR_TENSOR_BYTE_ALIGNMENT",
+                    ATTR_TENSOR_BYTE_ALIGNMENT as i64,
+                ),
+                ("CUDNN_ATTR_TENSOR_DATA_TYPE", ATTR_TENSOR_DATA_TYPE as i64),
+                (
+                    "CUDNN_ATTR_TENSOR_DIMENSIONS",
+                    ATTR_TENSOR_DIMENSIONS as i64,
+                ),
+                ("CUDNN_ATTR_TENSOR_STRIDES", ATTR_TENSOR_STRIDES as i64),
+                ("CUDNN_ATTR_TENSOR_UNIQUE_ID", ATTR_TENSOR_UNIQUE_ID as i64),
+                (
+                    "CUDNN_ATTR_VARIANT_PACK_UNIQUE_IDS",
+                    ATTR_VARIANT_PACK_UNIQUE_IDS as i64,
+                ),
+                (
+                    "CUDNN_ATTR_VARIANT_PACK_DATA_POINTERS",
+                    ATTR_VARIANT_PACK_DATA_POINTERS as i64,
+                ),
+                (
+                    "CUDNN_ATTR_VARIANT_PACK_WORKSPACE",
+                    ATTR_VARIANT_PACK_WORKSPACE as i64,
+                ),
+                (
+                    "CUDNN_ATTR_ENGINE_GLOBAL_INDEX",
+                    ATTR_ENGINE_GLOBAL_INDEX as i64,
+                ),
+                (
+                    "CUDNN_ATTR_ENGINE_NUMERICAL_NOTE",
+                    ATTR_ENGINE_NUMERICAL_NOTE as i64,
+                ),
+                ("CUDNN_TYPE_HANDLE", TYPE_HANDLE as i64),
+                ("CUDNN_TYPE_DATA_TYPE", TYPE_DATA_TYPE as i64),
+                ("CUDNN_TYPE_INT64", TYPE_INT64 as i64),
+                ("CUDNN_TYPE_FLOAT", TYPE_FLOAT as i64),
+                ("CUDNN_TYPE_VOID_PTR", TYPE_VOID_PTR as i64),
+                ("CUDNN_TYPE_CONVOLUTION_MODE", TYPE_CONVOLUTION_MODE as i64),
+                ("CUDNN_TYPE_HEUR_MODE", TYPE_HEUR_MODE as i64),
+                ("CUDNN_TYPE_NUMERICAL_NOTE", TYPE_NUMERICAL_NOTE as i64),
+                (
+                    "CUDNN_TYPE_BACKEND_DESCRIPTOR",
+                    TYPE_BACKEND_DESCRIPTOR as i64,
+                ),
+                ("CUDNN_HEUR_MODE_A", HEURISTIC_MODE_A as i64),
+                (
+                    "CUDNN_NUMERICAL_NOTE_DOWN_CONVERT_INPUTS",
+                    NUMERICAL_NOTE_DOWN_CONVERT_INPUTS as i64,
+                ),
+                // `cudnn.h` is a wrapper that only includes the real headers,
+                // so the mode and the statuses are read from `cudnn_graph_v9.h`
+                // itself, where they are defined.
+                ("CUDNN_CROSS_CORRELATION", CROSS_CORRELATION as i64),
+                ("CUDNN_STATUS_SUCCESS", STATUS_SUCCESS as i64),
+            ],
+        );
+    }
 }
