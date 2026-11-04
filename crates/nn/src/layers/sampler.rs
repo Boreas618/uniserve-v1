@@ -68,7 +68,7 @@ use ops::sampler::{
     ArgMax, ArgMaxArgs, ArgMaxDescriptor, CandidateOrder, FilterArgs, FilterCandidates,
     FilterDescriptor, InverseCdf, InverseCdfArgs, InverseCdfDescriptor, LogSoftmax, LogSoftmaxArgs,
     LogSoftmaxDescriptor, LogitsShape, LogprobArgs, LogprobDescriptor, LogprobGather, OrderArgs,
-    OrderDescriptor, ShapeArgs, ShapeDescriptor, TopK, TopKArgs, TopKDescriptor, PARAMETER_COLUMNS,
+    OrderDescriptor, PARAMETER_COLUMNS, ShapeArgs, ShapeDescriptor, TopK, TopKArgs, TopKDescriptor,
 };
 use ops::{DType, Op, Shape, TensorView};
 
