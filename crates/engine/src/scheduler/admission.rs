@@ -444,7 +444,7 @@ impl Scheduler {
                 .ok_or(MediaOutputError::Unserved(product.call))?;
             let (_, bound, info) = self
                 .placement
-                .component_candidates(self.executor.as_ref(), CallKind::Media(product.call), name)
+                .component_candidates(self.executor.inner(), CallKind::Media(product.call), name)
                 .next()
                 .ok_or_else(|| MediaOutputError::Unplaced(name.clone()))?;
             let component = info
@@ -583,7 +583,7 @@ impl Scheduler {
                 .flatten();
             let candidates = self
                 .placement
-                .component_candidates(self.executor.as_ref(), CallKind::Media(call), &component)
+                .component_candidates(self.executor.inner(), CallKind::Media(call), &component)
                 .filter(|(worker, _, _)| {
                     admissible.is_none_or(|encoders| encoders.contains(*worker))
                         && self.executor.is_ready(worker)
@@ -1564,7 +1564,7 @@ impl Scheduler {
         let cache = self.storage.cache()?;
         self.placement
             .worker_candidates(
-                self.executor.as_ref(),
+                self.executor.inner(),
                 &self.info,
                 CallKind::Forward(ForwardMode::Prefill),
             )

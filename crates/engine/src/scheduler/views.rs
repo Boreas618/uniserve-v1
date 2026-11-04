@@ -1178,7 +1178,7 @@ fn replica_facts(
     request: RequestKey,
     kind: CallKind,
 ) -> Vec<(ReplicaView, crate::WorkerGroupId, String)> {
-    let executor = scheduler.executor.as_ref();
+    let executor = scheduler.executor.inner();
     candidate_facts(
         scheduler,
         request,
@@ -1201,7 +1201,7 @@ fn candidate_facts<'a>(
     kind: CallKind,
     candidates: impl Iterator<Item = (&'a crate::WorkerGroupId, &'a str, &'a WorkerInfo)>,
 ) -> Vec<(ReplicaView, crate::WorkerGroupId, String)> {
-    let executor = scheduler.executor.as_ref();
+    let executor = scheduler.executor.inner();
     let table = world_blocks(executor);
     let decode_stage = matches!(
         kind,
@@ -1256,7 +1256,7 @@ pub(crate) fn call(
 /// Every replica a `place` decision may choose, for `Snapshot::replicas`: one
 /// per worker of the world, in the executor's order.
 pub(crate) fn replica_catalog(scheduler: &Scheduler) -> Vec<ReplicaView> {
-    let executor = scheduler.executor.as_ref();
+    let executor = scheduler.executor.inner();
     let table = world_blocks(executor);
     executor
         .info()
@@ -1309,7 +1309,7 @@ pub(crate) fn snapshot(scheduler: &Scheduler, step: u64, recorded: &RecordedTabl
         pages: pages(scheduler),
         encodings: encodings(scheduler),
         replicas: replica_catalog(scheduler),
-        phases: phases_in(&scheduler.info, &world_blocks(scheduler.executor.as_ref())),
+        phases: phases_in(&scheduler.info, &world_blocks(scheduler.executor.inner())),
         ranks: Vec::new(),
     }
 }

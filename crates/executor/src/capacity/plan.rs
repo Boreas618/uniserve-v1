@@ -29,8 +29,12 @@ use super::{
 };
 use crate::capacity::graph_storage_budget_bytes;
 use crate::config::Device;
-use crate::memory::prefix_cache::planes::PlaneLayout;
+use crate::memory::prefix_cache::planes::{PlaneLayout, UnitColumn};
 use crate::memory::{CachePlan, LatentPlan};
+
+/// Unit columns the computations over the prefix cache bind beside the import
+/// workers': one, on the device's primary stream.
+const COMPUTATION_COLUMNS: usize = 1;
 use crate::parallel::host::HostGroup;
 use crate::{Error, Result};
 
@@ -315,6 +319,69 @@ pub(crate) struct TokenLayout {
     latent: Option<LatentPlan>,
     planes: Option<PlaneLayout>,
     warmup_units: u32,
+}
+
+/// Resolve a token rank's capacity plan: the buffers, products and latents
+/// sized, the block size agreed over `group`, the cache pool fitted to the
+/// device grant.
+///
+/// `cache` is the model's geometry: called with a candidate block size, it
+/// answers that size's plan, or `None` when the model cannot serve it. It is
+/// called at least once per candidate size until the ranks agree, so a caller
+/// memoizes it.
+///
+/// `width` is the widest block table a request of the model's length needs,
+/// which the caller derives from its own `max_model_len`; `total_bytes` is the
+/// device's total storage (zero on CPU) and `granularity` its allocation
+/// granularity, in whose granules a device pool splits its planes.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the request, the measured report, the model's facts and the agreement"
+)]
+pub fn token_plan(
+    request: &CapacityRequest,
+    report: Report,
+    facts: &TokenFacts,
+    queue_depth: usize,
+    width: u32,
+    total_bytes: u64,
+    granularity: Option<u64>,
+    group: &HostGroup,
+    mut cache: impl FnMut(usize) -> Result<Option<Arc<CachePlan>>>,
+) -> Result<Plan> {
+    let mut layout = TokenLayout::new(report, request, queue_depth, facts)?;
+    let block_size =
+        resolve_block_size(request.block_size, |size| Ok(cache(size)?.is_some()), group)?;
+    let plan = cache(block_size)?.ok_or_else(|| {
+        Error::Invariant(format!(
+            "the model served block size {block_size} while the ranks agreed it"
+        ))
+    })?;
+
+    // The cache's fixed storage beside its units: block tables, import scratch
+    // and one unit index column per stream the computations over the cache
+    // bind.
+    let fixed = crate::memory::prefix_cache::PrefixCache::fixed_bytes(
+        &plan,
+        0,
+        layout.info().request_slots,
+        width,
+        layout.info().max_unresolved_calls as usize,
+        COMPUTATION_COLUMNS,
+    )?;
+    layout.reserve(request.device, fixed);
+
+    // Every unit column holds one index per unit, charged with each unit.
+    let unit_overhead = COMPUTATION_COLUMNS as u64 * UnitColumn::bytes(1);
+    layout.fit_cache(
+        &plan,
+        unit_overhead,
+        request,
+        total_bytes,
+        granularity,
+        group,
+    )?;
+    Ok(layout.finish(Some(plan)))
 }
 
 impl TokenLayout {

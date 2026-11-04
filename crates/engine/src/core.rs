@@ -23,6 +23,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crate::executor::{Executor, TransferConfig, WorkerGroupId};
+// The executor crate's device-side submission path, named here rather than
+// through this process's worker-process executor.
+use executor::batch::Batches;
 use crate::handle::{CommandSender, EventRx, SubmitError};
 #[cfg(feature = "testing")]
 use crate::scheduler::{
@@ -542,6 +545,11 @@ pub struct SchedulerHandle {
     /// Whether the scheduler started on trial, as a successor world's do;
     /// its commit ends the trial.
     trial: bool,
+    /// The device-side submission path of the executor's own crate, when this
+    /// handle was started with one (`SchedulerHandle::start`). A handle built
+    /// over the worker-process executor has none; the shadow pass and the
+    /// in-process submission both need it.
+    batches: Option<Arc<dyn Batches>>,
     next_id: AtomicU64,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
@@ -821,6 +829,73 @@ impl SchedulerHandle {
     /// group, when the workers of a token runtime hold too few request rows
     /// for `max_running_requests` running requests, or when a group cannot
     /// be launched, a scheduler cannot be built or its warmup fails.
+    /// Starts one scheduler thread — the rank `config` names — over the
+    /// device-side submission path `batches` states, and returns its handle.
+    ///
+    /// One handle is one scheduler thread, so `config` names one rank's worker
+    /// groups: a data-parallel config's ranks start together with
+    /// [`Self::start_all`]. The mechanism still plans from its worker group's
+    /// capabilities and completes from its reports; `batches` is the executor
+    /// crate's own submission path, which the shadow pass of §7.3 step 2 and,
+    /// once the splice lands, the step's own submissions go through.
+    pub fn start(
+        config: EngineConfig,
+        batches: Arc<dyn Batches>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            config.data_parallel_size == 1,
+            "one handle is one scheduler thread, but the config states {} ranks: start a \
+             data-parallel config with start_all",
+            config.data_parallel_size
+        );
+        let GroupArguments {
+            arguments,
+            per_core,
+            transfers,
+            max_running_requests,
+            model_workers,
+            expert_workers,
+        } = Self::group_arguments(&config)?;
+        anyhow::ensure!(
+            model_workers.len() == per_core,
+            "the config holds {} model groups against {per_core} per scheduler, so it is several \
+             ranks': one handle takes one rank's groups",
+            model_workers.len()
+        );
+        let transfer = transfers
+            .into_iter()
+            .next()
+            .context("the config states no transfer edges")?;
+        // `spawn_all` returns groups in argument order, which pairs each with
+        // its identity: the rank's model groups, then its expert groups.
+        let launched = WorkerGroup::spawn_all(arguments)?;
+        let workers = model_workers
+            .iter()
+            .chain(&expert_workers)
+            .map(|worker| worker.id.clone())
+            .zip(launched)
+            .collect::<Vec<_>>();
+        let mut placement = model_workers;
+        placement.extend(expert_workers);
+        let core_config = EngineConfig {
+            worker_groups: placement,
+            transfer,
+            data_parallel_size: 1,
+            expert_parallel: None,
+            ..config
+        };
+        let mut handle = Self::launch(&core_config, max_running_requests, workers)?;
+        handle.batches = Some(batches);
+        if core_config.predecessor.is_none() {
+            handle
+                .publish_world()
+                .recv()
+                .context("the scheduler stopped before publication")?
+                .map_err(anyhow::Error::msg)?;
+        }
+        Ok(handle)
+    }
+
     pub fn start_all(config: EngineConfig) -> anyhow::Result<Vec<Self>> {
         let GroupArguments {
             arguments,
@@ -851,23 +926,6 @@ impl SchedulerHandle {
             if index == 0 {
                 workers.append(&mut shared);
             }
-            let executor = WorkerExecutor::try_new(workers, transfer.clone())?;
-
-            // A token runtime serves `max_running_requests` running requests only while
-            // its workers hold that many request rows beyond the reserve; the
-            // scheduler would otherwise lower the limit. Workers without a prefix
-            // cache fit their request pools to device storage, and the
-            // scheduler bounds their requests by the rows they report.
-            let info = executor.info().runtime_info()?;
-            let request_rows = info.request_slots as usize;
-            let needed_rows = max_running_requests + guidance_prefix_rows(&info);
-            anyhow::ensure!(
-                !info.uses_cache() || request_rows >= needed_rows,
-                "the workers hold {request_rows} request rows, but {max_running_requests} running \
-                 requests need {needed_rows}"
-            );
-
-            let waker = executor.command_waker();
             let mut placement = core_group.to_vec();
             if index == 0 {
                 placement.extend(expert_workers.iter().cloned());
@@ -879,12 +937,7 @@ impl SchedulerHandle {
                 expert_parallel: None,
                 ..config.clone()
             };
-            let scheduler = Self::assemble(core_config.clone(), Box::new(executor), waker)?;
-            // Each scheduler's serving path runs the requests its workers'
-            // reports call for before the scheduler serves; a successor's
-            // run on units of its own world while its predecessor serves.
-            crate::warmup::warm(&scheduler, &core_config)?;
-            cores.push(scheduler);
+            cores.push(Self::launch(&core_config, max_running_requests, workers)?);
         }
         if config.predecessor.is_none() {
             cores[0]
@@ -894,6 +947,40 @@ impl SchedulerHandle {
                 .map_err(anyhow::Error::msg)?;
         }
         Ok(cores)
+    }
+
+    /// Starts one rank's workers and the scheduler that commands them.
+    ///
+    /// `config` names that rank's groups alone; its transfer edges are the ones
+    /// `config.transfer` states.
+    fn launch(
+        config: &EngineConfig,
+        max_running_requests: usize,
+        workers: Vec<(WorkerGroupId, WorkerGroup)>,
+    ) -> anyhow::Result<Self> {
+        let executor = WorkerExecutor::try_new(workers, config.transfer.clone())?;
+
+        // A token runtime serves `max_running_requests` running requests only while
+        // its workers hold that many request rows beyond the reserve; the
+        // scheduler would otherwise lower the limit. Workers without a prefix
+        // cache fit their request pools to device storage, and the
+        // scheduler bounds their requests by the rows they report.
+        let info = executor.info().runtime_info()?;
+        let request_rows = info.request_slots as usize;
+        let needed_rows = max_running_requests + guidance_prefix_rows(&info);
+        anyhow::ensure!(
+            !info.uses_cache() || request_rows >= needed_rows,
+            "the workers hold {request_rows} request rows, but {max_running_requests} running \
+             requests need {needed_rows}"
+        );
+
+        let waker = executor.command_waker();
+        let scheduler = Self::assemble(config.clone(), Box::new(executor), waker)?;
+        // Each scheduler's serving path runs the requests its workers'
+        // reports call for before the scheduler serves; a successor's
+        // run on units of its own world while its predecessor serves.
+        crate::warmup::warm(&scheduler, config)?;
+        Ok(scheduler)
     }
 
     /// Runs a scheduler over an executor supplied by a higher composition
@@ -1024,9 +1111,85 @@ impl SchedulerHandle {
             dead,
             failure,
             trial,
+            batches: None,
             next_id: AtomicU64::new(1),
             thread: Mutex::new(Some(thread)),
         })
+    }
+
+    /// The policy slot of this scheduler, as the control thread holds it (§7.3):
+    /// the program serving and the one a precopy prepared.
+    ///
+    /// The slot lives on the scheduler thread, which alone instantiates, adopts
+    /// and reverts a policy; the handle asks that thread.
+    pub fn policy_mut(&self) -> crate::handle::PolicySlotHandle {
+        crate::handle::PolicySlotHandle::new(self.commands.clone())
+    }
+
+    /// One of §7.3's steps 3 to 6, applied at this scheduler's next boundary
+    /// where no batch and no submission is in flight, and answered with the step
+    /// it applied at.
+    pub fn stage(
+        &self,
+        stage: crate::scheduler::Stage,
+    ) -> crossbeam_channel::Receiver<Result<crate::handle::StageApplied, String>> {
+        self.commands.stage(stage)
+    }
+
+    /// §7.3 step 2's shadow pass for the model generation `generation` (front's
+    /// two axes: the model's generation, not a launch's): the following step's
+    /// batches also run in shadow, against the resident data and without
+    /// writing it.
+    ///
+    /// Answered once one step's batches have been shadowed, or with the reason
+    /// the pass could not run.
+    pub fn shadow(&self, generation: u64) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.commands.shadow(generation)
+    }
+
+    /// One of the daemon's request commands, applied to the request it names,
+    /// answered when it was enqueued.
+    ///
+    /// A command whose bookkeeping is the connection's — a consumer's position,
+    /// a takeover — is answered with that reason: the engine's routing holds the
+    /// request's stream, not a scheduler.
+    pub fn request_command(
+        &self,
+        command: proto::request::wire::Command,
+    ) -> crossbeam_channel::Receiver<Result<(), String>> {
+        let (answer, done) = crossbeam_channel::bounded(1);
+        let _ = answer.send(self.commands.request_command(command));
+        done
+    }
+
+    /// One command of the program-layer update (§2.3, §7.3), as this scheduler
+    /// applies it: the stages, at the boundary they name.
+    ///
+    /// A `Switchover` that names the step its expert group agreed is applied at
+    /// that step alone; one that arrives after it is refused rather than applied
+    /// at a boundary the other ranks did not take.
+    pub fn command(
+        &self,
+        command: ipc::ProgramCommand,
+    ) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.commands.program_command(command)
+    }
+
+    /// One of the epoch's engine commands, as this scheduler applies it (§7.3):
+    /// a stage is answered when it applies; the commands that belong to the
+    /// engine process or to the process holding the Program Server are answered
+    /// with that reason.
+    pub fn engine_command(
+        &self,
+        command: proto::process::Command,
+    ) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.commands.engine_command(command)
+    }
+
+    /// What this scheduler has done and what its policy has cost (§12), answered
+    /// by the scheduler thread.
+    pub fn counters(&self) -> crossbeam_channel::Receiver<crate::handle::Counters> {
+        self.commands.counters()
     }
 
     /// Returns the worker-reported runtime capabilities.
@@ -1228,8 +1391,8 @@ impl SchedulerHandle {
 
     /// §7.3 step 5: probation ended; the replaced policy stays until the next
     /// precopy.
-    pub fn commit_policy(&self) {
-        self.commands.commit_policy();
+    pub fn commit_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.commands.commit_policy()
     }
 
     /// §7.3 step 4: the previous policy answers again, on the state this
