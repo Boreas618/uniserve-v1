@@ -58,7 +58,6 @@ pub(crate) fn scheduler_limits(scheduling: &Scheduling) -> anyhow::Result<Schedu
     })
 }
 
-
 /// A list the spec states, `None` when absent.
 fn sizes(list: &Option<Sizes>) -> Option<Vec<u32>> {
     list.as_ref().map(|list| list.values.clone())
@@ -297,7 +296,7 @@ impl EngineConfig {
             chunked_prefill_size: scheduling
                 .chunked_prefill_size
                 .map_or(DEFAULT_CHUNKED_PREFILL_SIZE, |size| size as usize),
-                graph_tiers: {
+            graph_tiers: {
                 // The deployment's captured graph catalog, ascending and
                 // without duplicates: the largest of them bounds a batch's
                 // tokens (`Room.graph_tiers`).

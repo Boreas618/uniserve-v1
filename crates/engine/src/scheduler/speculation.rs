@@ -372,7 +372,6 @@ impl Scheduler {
             .then_some(state.draft.valid as usize)
     }
 
-
     /// Plans the next chunk of `id`'s refill within `budget` tokens.
     ///
     /// The chunk evaluates the request's tokens from the end of its valid
