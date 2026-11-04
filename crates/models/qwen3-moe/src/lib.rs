@@ -23,12 +23,14 @@ pub mod keys;
 pub mod load;
 pub mod model;
 pub mod partition;
+pub mod representation;
 pub mod weights;
 
 pub use config::{Activation, Config, RopeScaling, YaRn};
 pub use load::load;
 pub use model::{LoadOptions, Plan, Qwen3Moe, Run, Substage};
 pub use partition::Partition;
+pub use representation::{Adopted, Representation, Role};
 
 /// What this crate can fail with.
 #[derive(Debug, thiserror::Error)]
