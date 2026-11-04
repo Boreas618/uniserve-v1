@@ -1,0 +1,41 @@
+# The gated_residual operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
+# driver the Program Server runs for one descriptor and target).
+#
+# The descriptor bakes the element count one launch walks and the row width,
+# because the kernel masks its tile with the count and recovers each element's
+# row from the width; the gate row stride is an int32 launch argument. The key is
+# the one `GatedResidualDescriptor`'s `Display` prints, e.g.
+# `dtype_bf16_indices_i32_width_3072_elements_12288_gate_stride_3072`.
+#
+# The element counts are the row counts of the H3 transformer's buckets times
+# the hidden sizes it uses; the values narrow to exactly the keys `model`
+# publishes for H3.
+
+op = "gated_residual"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/gated_residual.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+[kernel.descriptors]
+dimensions = { dtype = ["bf16", "fp16", "f32"], indices = ["i32", "i64"], width = ["1024", "2048", "3072", "4096", "6144", "7168", "8192"], elements = ["1024", "2048", "3072", "4096", "6144", "7168", "8192", "12288", "16384", "24576", "28672", "32768", "49152", "65536", "98304", "114688", "131072", "196608", "262144", "393216", "458752", "524288", "786432", "1048576", "1572864", "1835008", "2097152", "3145728", "4194304", "6291456", "7340032", "8388608", "12582912", "16777216", "25165824", "29360128", "33554432"], gate_stride = ["1024", "2048", "3072", "4096", "6144", "7168", "8192", "9216", "12288", "14336", "16384", "18432", "21504", "24576", "28672", "32768", "36864", "43008", "49152"] }
+
+[parameters]
