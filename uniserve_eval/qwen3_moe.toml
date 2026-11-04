@@ -23,7 +23,13 @@
 # - UNISERVE_QWEN3_MOE_CUDA_VISIBLE_DEVICES selects each server's GPUs.
 # - UNISERVE_QWEN3_MOE_TENSOR_PARALLEL_SIZE sets the tensor-parallel degree.
 # - UNISERVE_QWEN3_MOE_MEM_FRACTION sets each server's share of device
-#   storage.
+#   storage, 0.80 by default; 60 GiB of BF16 weights leaves room for the KV
+#   cache, graphs and activations on a 96 GiB device as well as the 141 GiB
+#   class.
+# - UNISERVE_QWEN3_MOE_KV_MAX_TOKENS sets the device KV cache capacity,
+#   65536 tokens by default, for the same reason. Both are build config, not
+#   sampling settings: a host may lower them without making the cell's two
+#   runs incomparable.
 #
 # No point states `dtype`: the checkpoint's own numerical representation is
 # used (§1). The BF16 and NVFP4 cells pass no attention backend, so each
@@ -35,7 +41,7 @@ artifact_root = "artifacts/benchmark/gsm8k"
 [servers.qwen3-moe-bf16]
 host = "127.0.0.1"
 port = 18081
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_QWEN3_MOE_MODEL:-/workspace/models/Qwen3-30B-A3B}", "--served-model-name", "Qwen3-30B-A3B", "--host", "127.0.0.1", "--port", "18081", "--worker-executable", ".venv/bin/uniserve", "--tensor-parallel-size", "${UNISERVE_QWEN3_MOE_TENSOR_PARALLEL_SIZE:-1}", "--max-running-requests", "64", "--set", "max_num_batched_tokens=16384", "--set", "scheduler_config.chunked_prefill_size=16384", "--set", "kv_cache_config.max_tokens=131072", "--set", "kv_cache_config.block_size=64", "--set", "kv_cache_config.dtype=bfloat16", "--mem-fraction-static", "${UNISERVE_QWEN3_MOE_MEM_FRACTION:-0.70}", "--set", "flashinfer_config.workspace_size=${UNISERVE_QWEN3_MOE_FLASHINFER_WORKSPACE_SIZE:-536870912}", "--set", "placement_config.queue_depth=3", "--set", "chat_config.reasoning_parser=none"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_QWEN3_MOE_MODEL:-/workspace/models/Qwen3-30B-A3B}", "--served-model-name", "Qwen3-30B-A3B", "--host", "127.0.0.1", "--port", "18081", "--worker-executable", ".venv/bin/uniserve", "--tensor-parallel-size", "${UNISERVE_QWEN3_MOE_TENSOR_PARALLEL_SIZE:-1}", "--max-running-requests", "64", "--set", "max_num_batched_tokens=16384", "--set", "scheduler_config.chunked_prefill_size=16384", "--set", "kv_cache_config.max_tokens=${UNISERVE_QWEN3_MOE_KV_MAX_TOKENS:-65536}", "--set", "kv_cache_config.block_size=64", "--set", "kv_cache_config.dtype=bfloat16", "--mem-fraction-static", "${UNISERVE_QWEN3_MOE_MEM_FRACTION:-0.80}", "--set", "flashinfer_config.workspace_size=${UNISERVE_QWEN3_MOE_FLASHINFER_WORKSPACE_SIZE:-536870912}", "--set", "placement_config.queue_depth=3", "--set", "chat_config.reasoning_parser=none"]
 
 [servers.qwen3-moe-bf16.environment]
 CUDA_VISIBLE_DEVICES = "${UNISERVE_QWEN3_MOE_CUDA_VISIBLE_DEVICES:-0}"
@@ -43,7 +49,7 @@ CUDA_VISIBLE_DEVICES = "${UNISERVE_QWEN3_MOE_CUDA_VISIBLE_DEVICES:-0}"
 [servers.qwen3-moe-nvfp4]
 host = "127.0.0.1"
 port = 18085
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_QWEN3_MOE_NVFP4_MODEL}", "--served-model-name", "Qwen3-30B-A3B", "--host", "127.0.0.1", "--port", "18085", "--worker-executable", ".venv/bin/uniserve", "--tensor-parallel-size", "${UNISERVE_QWEN3_MOE_TENSOR_PARALLEL_SIZE:-1}", "--max-running-requests", "64", "--set", "max_num_batched_tokens=16384", "--set", "scheduler_config.chunked_prefill_size=16384", "--set", "kv_cache_config.max_tokens=131072", "--set", "kv_cache_config.block_size=64", "--set", "kv_cache_config.dtype=bfloat16", "--mem-fraction-static", "${UNISERVE_QWEN3_MOE_MEM_FRACTION:-0.70}", "--set", "flashinfer_config.workspace_size=${UNISERVE_QWEN3_MOE_FLASHINFER_WORKSPACE_SIZE:-536870912}", "--set", "placement_config.queue_depth=3", "--set", "chat_config.reasoning_parser=none"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_QWEN3_MOE_NVFP4_MODEL}", "--served-model-name", "Qwen3-30B-A3B", "--host", "127.0.0.1", "--port", "18085", "--worker-executable", ".venv/bin/uniserve", "--tensor-parallel-size", "${UNISERVE_QWEN3_MOE_TENSOR_PARALLEL_SIZE:-1}", "--max-running-requests", "64", "--set", "max_num_batched_tokens=16384", "--set", "scheduler_config.chunked_prefill_size=16384", "--set", "kv_cache_config.max_tokens=${UNISERVE_QWEN3_MOE_KV_MAX_TOKENS:-65536}", "--set", "kv_cache_config.block_size=64", "--set", "kv_cache_config.dtype=bfloat16", "--mem-fraction-static", "${UNISERVE_QWEN3_MOE_MEM_FRACTION:-0.80}", "--set", "flashinfer_config.workspace_size=${UNISERVE_QWEN3_MOE_FLASHINFER_WORKSPACE_SIZE:-536870912}", "--set", "placement_config.queue_depth=3", "--set", "chat_config.reasoning_parser=none"]
 
 [servers.qwen3-moe-nvfp4.environment]
 CUDA_VISIBLE_DEVICES = "${UNISERVE_QWEN3_MOE_CUDA_VISIBLE_DEVICES:-0}"
@@ -51,7 +57,7 @@ CUDA_VISIBLE_DEVICES = "${UNISERVE_QWEN3_MOE_CUDA_VISIBLE_DEVICES:-0}"
 [servers.qwen3-moe-bf16-fp8-kv]
 host = "127.0.0.1"
 port = 18086
-command = [".venv/bin/uniserve", "serve", "${UNISERVE_QWEN3_MOE_MODEL:-/workspace/models/Qwen3-30B-A3B}", "--served-model-name", "Qwen3-30B-A3B", "--host", "127.0.0.1", "--port", "18086", "--worker-executable", ".venv/bin/uniserve", "--tensor-parallel-size", "${UNISERVE_QWEN3_MOE_TENSOR_PARALLEL_SIZE:-1}", "--max-running-requests", "64", "--set", "max_num_batched_tokens=16384", "--set", "scheduler_config.chunked_prefill_size=16384", "--set", "kv_cache_config.max_tokens=131072", "--set", "kv_cache_config.block_size=64", "--set", "kv_cache_config.dtype=float8_e4m3fn", "--set", "attention_backend=${UNISERVE_QWEN3_FP8_ATTENTION_BACKEND:-torch}", "--mem-fraction-static", "${UNISERVE_QWEN3_MOE_MEM_FRACTION:-0.70}", "--set", "flashinfer_config.workspace_size=${UNISERVE_QWEN3_MOE_FLASHINFER_WORKSPACE_SIZE:-536870912}", "--set", "placement_config.queue_depth=3", "--set", "chat_config.reasoning_parser=none"]
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_QWEN3_MOE_MODEL:-/workspace/models/Qwen3-30B-A3B}", "--served-model-name", "Qwen3-30B-A3B", "--host", "127.0.0.1", "--port", "18086", "--worker-executable", ".venv/bin/uniserve", "--tensor-parallel-size", "${UNISERVE_QWEN3_MOE_TENSOR_PARALLEL_SIZE:-1}", "--max-running-requests", "64", "--set", "max_num_batched_tokens=16384", "--set", "scheduler_config.chunked_prefill_size=16384", "--set", "kv_cache_config.max_tokens=${UNISERVE_QWEN3_MOE_KV_MAX_TOKENS:-65536}", "--set", "kv_cache_config.block_size=64", "--set", "kv_cache_config.dtype=float8_e4m3fn", "--set", "attention_backend=${UNISERVE_QWEN3_FP8_ATTENTION_BACKEND:-torch}", "--mem-fraction-static", "${UNISERVE_QWEN3_MOE_MEM_FRACTION:-0.80}", "--set", "flashinfer_config.workspace_size=${UNISERVE_QWEN3_MOE_FLASHINFER_WORKSPACE_SIZE:-536870912}", "--set", "placement_config.queue_depth=3", "--set", "chat_config.reasoning_parser=none"]
 
 [servers.qwen3-moe-bf16-fp8-kv.environment]
 CUDA_VISIBLE_DEVICES = "${UNISERVE_QWEN3_MOE_CUDA_VISIBLE_DEVICES:-0}"
