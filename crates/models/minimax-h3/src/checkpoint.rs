@@ -16,7 +16,7 @@
 //! [`crate::config::Config`] is the typed architecture the layers consume.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use nn::VideoTask;
 use serde_json::{Map, Value};
@@ -383,11 +383,49 @@ impl Sidecars {
     /// `None` for a checkpoint that holds every directory, and a sidecar both roots lack is an
     /// error naming it.
     pub fn read(root: &Path, base: Option<&Path>, layout: &Layout) -> Result<Self> {
-        let read = |relative: &str| -> Result<Value> { read_sidecar(root, base, relative) };
+        Self::read_through(
+            |relative| read_sidecar(root, base, relative),
+            |relative| optional_sidecar(root, base, relative),
+            layout,
+        )
+    }
+
+    /// Read every sidecar from the roots a loaded checkpoint holds.
+    ///
+    /// A pipeline's components do not have to lie in one directory: an export that continues a base
+    /// release holds its own DiT partition and schedulers, and the base holds the text encoder, the
+    /// processor and the VAEs, which the engine opens as one checkpoint. Each directory is
+    /// therefore read from the component that owns it - `<component>/config.json` from
+    /// `checkpoint.component(component)` - falling back to the pipeline's own root, which is where
+    /// a checkpoint that answers as one tree keeps everything.
+    pub fn read_components(checkpoint: &nn::Checkpoint, layout: &Layout) -> Result<Self> {
+        let root = checkpoint.root();
+        let roots = |relative: &str| -> Vec<PathBuf> {
+            let mut roots = Vec::with_capacity(2);
+            if let Some((component, _)) = relative.split_once('/')
+                && let Ok(held) = checkpoint.component(component)
+            {
+                roots.push(held.root().to_path_buf());
+            }
+            roots.push(root.to_path_buf());
+            roots
+        };
+        Self::read_through(
+            |relative| read_any(&roots(relative), relative),
+            |relative| optional_any(&roots(relative), relative),
+            layout,
+        )
+    }
+
+    /// The body every reader shares: eight named sidecars and each DiT partition's own.
+    fn read_through(
+        read: impl Fn(&str) -> Result<Value>,
+        optional: impl Fn(&str) -> Result<Option<Value>>,
+        layout: &Layout,
+    ) -> Result<Self> {
         let text_encoder = read("text_encoder/config.json")?;
         let processor = read("processor/preprocessor_config.json")?;
-        let video_processor =
-            optional_sidecar(root, base, "processor/video_preprocessor_config.json")?;
+        let video_processor = optional("processor/video_preprocessor_config.json")?;
         let video_vae = read("vae/config.json")?;
         let audio_vae = read("audio_vae/config.json")?;
         let scheduler = read("scheduler/scheduler_config.json")?;
@@ -438,6 +476,35 @@ fn optional_sidecar(root: &Path, base: Option<&Path>, relative: &str) -> Result<
         Some(base) if base.join(relative).is_file() => read_json(&base.join(relative)).map(Some),
         _ => Ok(None),
     }
+}
+
+/// Read one sidecar from the first of `roots` that holds it.
+fn read_any(roots: &[PathBuf], relative: &str) -> Result<Value> {
+    for root in roots {
+        let path = root.join(relative);
+        if path.is_file() {
+            return read_json(&path);
+        }
+    }
+    Err(Error::checkpoint(format!(
+        "neither {} holds {relative}",
+        roots
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" nor ")
+    )))
+}
+
+/// Read one sidecar that a checkpoint may omit, from the first of `roots` that holds it.
+fn optional_any(roots: &[PathBuf], relative: &str) -> Result<Option<Value>> {
+    for root in roots {
+        let path = root.join(relative);
+        if path.is_file() {
+            return read_json(&path).map(Some);
+        }
+    }
+    Ok(None)
 }
 
 /// Read and parse one JSON file.
@@ -764,5 +831,55 @@ mod tests {
             matches!(error, Error::Checkpoint(ref problem) if problem.contains("text_encoder/config.json")),
             "{error}"
         );
+    }
+
+    /// A scratch directory under the system temporary directory, removed when the test ends.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("h3-sidecars-{}-{name}", std::process::id()));
+            std::fs::create_dir_all(&path).expect("a scratch directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_sidecar_is_read_from_the_root_that_holds_it() {
+        // A checkpoint may span an export and the base release it continues, so a directory is
+        // looked up in the component that owns it and only then in the pipeline's own root.
+        let held = Scratch::new("held");
+        let pipeline = Scratch::new("pipeline");
+        std::fs::create_dir_all(held.0.join("text_encoder")).expect("a component directory");
+        std::fs::write(
+            held.0.join("text_encoder/config.json"),
+            "{\"hidden_size\": 5120}",
+        )
+        .expect("a component sidecar");
+        std::fs::write(pipeline.0.join("vae.json"), "{\"blocks\": 36}").expect("a root sidecar");
+
+        let roots = [held.0.clone(), pipeline.0.clone()];
+        let config = read_any(&roots, "text_encoder/config.json").expect("from the component");
+        assert_eq!(config["hidden_size"], 5120);
+        let config = read_any(&roots, "vae.json").expect("from the pipeline root");
+        assert_eq!(config["blocks"], 36);
+
+        // A sidecar neither root holds names both, so the error says where it looked.
+        let missing = read_any(&roots, "audio_vae/config.json").expect_err("neither holds it");
+        assert!(missing.to_string().contains("audio_vae"), "{missing}");
+        assert!(
+            missing.to_string().contains(&held.0.display().to_string()),
+            "{missing}"
+        );
+        let absent = optional_any(&roots, "processor/video_preprocessor_config.json")
+            .expect("an optional sidecar");
+        assert!(absent.is_none());
     }
 }
