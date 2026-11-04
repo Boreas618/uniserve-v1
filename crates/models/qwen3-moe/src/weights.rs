@@ -84,6 +84,56 @@ impl ExpertSource {
     }
 }
 
+/// One expert's three projections in an encoded (NVFP4) checkpoint.
+///
+/// A quantized checkpoint stores each projection three times over: the packed E2M1 nibbles in
+/// `…{projection}_proj.weight` (`[rows, columns/2]` U8), the block scales in
+/// `…{projection}_proj.weight_scale` (one E4M3 scale per sixteen elements in the package's swizzled
+/// layout), and the projection's own FP32 scale in `…{projection}_proj.weight_scale_2`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct EncodedProjection {
+    /// The packed weights, two E2M1 codes per byte along the contraction.
+    pub values: String,
+    /// The block scales.
+    pub scales: String,
+    /// The projection's FP32 tensor scale, whose reciprocal the loader carries.
+    pub global_scale: String,
+}
+
+/// One expert's three encoded projections.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct EncodedTensors {
+    /// The causal (down) projection.
+    pub down: EncodedProjection,
+    /// The up projection.
+    pub up: EncodedProjection,
+    /// The gate projection.
+    pub gate: EncodedProjection,
+}
+
+impl ExpertSource {
+    /// The encoded checkpoint tensor names of expert `expert` under this source.
+    ///
+    /// The suffix set is the one ModelOpt writes and `WeightLoader::nvfp4` consumes; a checkpoint
+    /// that names them differently is a layout the loader does not know and must refuse rather than
+    /// reinterpret bytes.
+    pub fn encoded(&self, expert: usize) -> EncodedTensors {
+        let at = |projection: &str| {
+            let stem = format!("{}.{expert}.{projection}_proj", self.checkpoint_prefix);
+            EncodedProjection {
+                values: format!("{stem}.weight"),
+                scales: format!("{stem}.weight_scale"),
+                global_scale: format!("{stem}.weight_scale_2"),
+            }
+        };
+        EncodedTensors {
+            down: at("down"),
+            up: at("up"),
+            gate: at("gate"),
+        }
+    }
+}
+
 /// Every parameter of a Qwen3-MoE model, keyed by the model's path.
 ///
 /// Sparse layers contribute their router here and their experts through [`expert_sources`]. A tied
@@ -179,6 +229,36 @@ mod tests {
     use super::*;
     use crate::{Activation, Config};
 
+    #[test]
+    fn an_encoded_expert_names_the_packed_scales_and_tensor_scale_the_loader_reads() {
+        let source = ExpertSource {
+            module: "layers.3.mlp.experts".to_owned(),
+            checkpoint_prefix: "model.layers.3.mlp.experts".to_owned(),
+        };
+        let expert = source.encoded(17);
+        // Three names per projection, in the suffix set `WeightLoader::nvfp4` consumes; a checkpoint
+        // that spells them otherwise is a layout the loader refuses rather than reinterprets.
+        assert_eq!(
+            expert.up.values,
+            "model.layers.3.mlp.experts.17.up_proj.weight"
+        );
+        assert_eq!(
+            expert.up.scales,
+            "model.layers.3.mlp.experts.17.up_proj.weight_scale"
+        );
+        assert_eq!(
+            expert.up.global_scale,
+            "model.layers.3.mlp.experts.17.up_proj.weight_scale_2"
+        );
+        assert!(expert.down.values.ends_with("17.down_proj.weight"));
+        assert!(expert.gate.scales.ends_with("17.gate_proj.weight_scale"));
+        // The dense path's names are untouched by the encoded one.
+        assert_eq!(
+            source.tensors(17).up,
+            "model.layers.3.mlp.experts.17.up_proj.weight"
+        );
+    }
+
     fn config(sparse_layers: &[usize], bias: bool, tied: bool) -> Config {
         Config {
             vocab_size: 151936,
@@ -219,7 +299,10 @@ mod tests {
         // embedding, norm and head; then per layer two norms, four projections (q, k, v, o), two
         // per-head norms and the router.
         assert_eq!(sources.len(), 3 + 48 * 9);
-        let names: Vec<&str> = sources.iter().map(|source| source.checkpoint.as_str()).collect();
+        let names: Vec<&str> = sources
+            .iter()
+            .map(|source| source.checkpoint.as_str())
+            .collect();
         assert!(names.contains(&"model.embed_tokens.weight"));
         assert!(names.contains(&"lm_head.weight"));
         assert!(names.contains(&"model.layers.47.self_attn.q_norm.weight"));
