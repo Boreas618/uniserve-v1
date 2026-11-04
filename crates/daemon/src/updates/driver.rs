@@ -210,7 +210,11 @@ mod tests {
             Ok(())
         }
 
-        fn spawn(&mut self, spawn: Spawn) -> Result<u32, String> {
+        fn spawn(
+            &mut self,
+            spawn: Spawn,
+            _launch: &crate::engine::launch::Launch,
+        ) -> Result<u32, String> {
             self.spawns.push(spawn);
             Ok(1)
         }
@@ -254,7 +258,25 @@ mod tests {
             start: Start {
                 executable: "/opt/uniserve".to_owned(),
                 build: Some("2.0.0+new".to_owned()),
-                arguments: vec!["engine".to_owned()],
+                launch: crate::engine::launch::Launch {
+                    build_config: "/run/build-config-12.json".into(),
+                    model: "/models/qwen3".into(),
+                    requests: "unix:/run/requests.sock".to_owned(),
+                    processes: "unix:/run/processes.sock".to_owned(),
+                    engine: 7,
+                    program_server: "/run/programs.sock".to_owned(),
+                    devices: vec![0],
+                    group: "engine".to_owned(),
+                    rank: 0,
+                    deployment: "qwen3".to_owned(),
+                    world: 12,
+                    scheduler_node: true,
+                    peers: Vec::new(),
+                    watchdog_timeout_s: None,
+                    rollback_s: None,
+                    queue_depth: 4,
+                    world_size: 1,
+                },
                 environment: HashMap::new(),
             },
             previous_generation: 5,

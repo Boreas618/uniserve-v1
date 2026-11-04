@@ -594,7 +594,6 @@ impl EngineControl {
         engine: u64,
     ) -> anyhow::Result<crate::updates::switch::Start> {
         let launch = self.launch(spec, engine)?;
-        let path = launch::write(&self.runtime, engine, &launch)?;
         let executable = spec
             .workers
             .as_ref()
@@ -603,7 +602,7 @@ impl EngineControl {
         Ok(crate::updates::switch::Start {
             build: own_executable(&executable).then(|| proto::BUILD.to_owned()),
             executable,
-            arguments: Self::arguments(&path),
+            launch,
             environment: std::collections::HashMap::new(),
         })
     }
@@ -1338,17 +1337,14 @@ mod tests {
 
         let start = control.epoch_start(&spec, 9).unwrap();
         assert_eq!(start.build, Some(proto::BUILD.to_owned()));
-        assert_eq!(start.arguments[0], "engine");
-        assert_eq!(start.arguments[1], "--launch");
-        let written: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(&start.arguments[2]).expect("the launch file"),
-        )
-        .expect("its JSON");
-        assert_eq!(written["engine"], 9);
-        assert_eq!(written["world"], 3);
-        assert_eq!(written["processes"], "unix:/run/processes.sock");
-        assert_eq!(written["queue_depth"], 4);
-        assert_eq!(written["world_size"], 1);
+        // The file is the adapter's to write for the process it starts; the
+        // start carries its contents, with this process's generation.
+        assert_eq!(start.launch.engine, 9);
+        assert_eq!(start.launch.world, 3);
+        assert_eq!(start.launch.processes, "unix:/run/processes.sock");
+        assert_eq!(start.launch.requests, control.request_address());
+        assert_eq!(start.launch.queue_depth, 4);
+        assert_eq!(start.launch.world_size, 1);
 
         spec.workers.as_mut().unwrap().executable = "/opt/uniserve-b".to_owned();
         let other = control.epoch_start(&spec, 9).unwrap();

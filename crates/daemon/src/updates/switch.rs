@@ -63,7 +63,7 @@ pub(crate) struct Node {
 /// How the target epoch's main processes are started: the executable, the
 /// build identity it must report when the daemon knows it, and its arguments
 /// and environment.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Start {
     /// The target main process's executable.
     pub(crate) executable: String,
@@ -72,8 +72,12 @@ pub(crate) struct Start {
     /// another executable, whose first child's `Hello` fixes it and every
     /// other child must then report the same.
     pub(crate) build: Option<String>,
-    /// Arguments after the program name.
-    pub(crate) arguments: Vec<String>,
+    /// The launch a process of this epoch is started with: the contents of
+    /// its launch file, which the adapter writes for the process it starts
+    /// (`engine/launch.rs`). Every field is the epoch's; the process's own
+    /// identity is the generation the spawn carries, which the adapter puts
+    /// into the file's `engine` (§2.3, §7.4).
+    pub(crate) launch: crate::engine::launch::Launch,
     /// Variables set over the daemon's environment.
     pub(crate) environment: HashMap<String, String>,
 }
@@ -119,7 +123,11 @@ pub(crate) trait Roster {
         retire: &[u64],
     ) -> Result<(), String>;
     /// Starts `spawn` and returns the child's process id.
-    fn spawn(&mut self, spawn: Spawn) -> Result<u32, String>;
+    fn spawn(
+        &mut self,
+        spawn: Spawn,
+        launch: &crate::engine::launch::Launch,
+    ) -> Result<u32, String>;
     /// Stops one launch generation of `group` on `host`; every generation
     /// when `generation` is `None`.
     fn stop(&mut self, host: &str, group: &str, generation: Option<u64>);
@@ -156,8 +164,12 @@ impl<T: Roster + ?Sized> Roster for Box<T> {
         (**self).claim(host, world, scopes, retire)
     }
 
-    fn spawn(&mut self, spawn: Spawn) -> Result<u32, String> {
-        (**self).spawn(spawn)
+    fn spawn(
+        &mut self,
+        spawn: Spawn,
+        launch: &crate::engine::launch::Launch,
+    ) -> Result<u32, String> {
+        (**self).spawn(spawn, launch)
     }
 
     fn stop(&mut self, host: &str, group: &str, generation: Option<u64>) {
@@ -411,11 +423,13 @@ impl Switch {
                 rank: node.rank,
                 generation: self.spawn_generation,
                 executable: self.start.executable.clone(),
-                arguments: self.start.arguments.clone(),
+                // The adapter writes the launch file for this process and
+                // passes its path: the arguments are its to state.
+                arguments: Vec::new(),
                 environment: self.start.environment.clone(),
                 inherit: Vec::new(),
             };
-            if let Err(reason) = roster.spawn(spawn) {
+            if let Err(reason) = roster.spawn(spawn, &self.start.launch) {
                 self.failed(
                     roster,
                     Failure {
@@ -1006,7 +1020,11 @@ mod tests {
             Ok(())
         }
 
-        fn spawn(&mut self, spawn: Spawn) -> Result<u32, String> {
+        fn spawn(
+            &mut self,
+            spawn: Spawn,
+            _launch: &crate::engine::launch::Launch,
+        ) -> Result<u32, String> {
             if let Some(reason) = &self.fail_spawn {
                 return Err(reason.clone());
             }
@@ -1080,7 +1098,25 @@ mod tests {
         Start {
             executable: "/opt/uniserve".to_owned(),
             build: Some("2.0.0+new".to_owned()),
-            arguments: vec!["engine".to_owned()],
+            launch: crate::engine::launch::Launch {
+                build_config: "/run/build-config-11.json".into(),
+                model: "/models/qwen3".into(),
+                requests: "unix:/run/requests.sock".to_owned(),
+                processes: "unix:/run/processes.sock".to_owned(),
+                engine: 7,
+                program_server: "/run/programs.sock".to_owned(),
+                devices: vec![0],
+                group: "engine".to_owned(),
+                rank: 0,
+                deployment: "qwen3".to_owned(),
+                world: 11,
+                scheduler_node: true,
+                peers: Vec::new(),
+                watchdog_timeout_s: None,
+                rollback_s: None,
+                queue_depth: 4,
+                world_size: 1,
+            },
             environment: HashMap::new(),
         }
     }
