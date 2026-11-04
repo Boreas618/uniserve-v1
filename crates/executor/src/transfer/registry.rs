@@ -176,9 +176,9 @@ mod tests {
     use std::sync::Weak;
 
     use super::*;
-    use crate::memory::allocation::{Storage, StorageView};
     use crate::memory::allocation::Backing;
-use crate::memory::allocation::ElementType;
+    use crate::memory::allocation::ElementType;
+    use crate::memory::allocation::{Storage, StorageView};
     use crate::transfer::backing::TransportBuffer;
     use crate::transfer::{ByteReservation, Spans, TransferCapacity};
 

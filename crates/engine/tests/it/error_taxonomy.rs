@@ -1,13 +1,24 @@
 //! §4.4's error taxonomy, driven through the production step.
 //!
-//! Each case is a real policy program in WebAssembly text, switched in over a
-//! good one and asked for a step, so the failure travels the path a serving
-//! policy's failure travels: the call fails (a trap, exhausted fuel, limits over
-//! the build config's ceilings, a decision the validators refuse), the
-//! mechanism reports it once with its reason, the previous program is
-//! instantiated on the state the mechanism holds, and that program answers the
-//! next decision. Nothing here is a test-only branch: the scheduler, the switch
-//! and the validators are the ones the epoch runs.
+//! Each case is a real policy program in WebAssembly text, and the case states
+//! where the mechanism refuses it, which is the one thing the taxonomy divides
+//! the six into:
+//!
+//! - **the precopy trial** refuses five of them. §4.4 has a precopy ask every
+//!   decision on the mechanism's current state, so a trap, spent fuel, limits
+//!   over the build config's ceilings and a decision or expert order the
+//!   validators refuse are found before the program can serve: the command
+//!   answers with the reason, the serving program is untouched, and no revert
+//!   happens because nothing was replaced;
+//! - **the live step** refuses the sixth. A starved request is a condition of
+//!   serving, not of a program's answers: the program is switched in, admits a
+//!   request and never advances it, and the mechanism fails it once the
+//!   policy's own timeout passes — reported once with the request named, the
+//!   previous program instantiated on the state the mechanism holds, and that
+//!   program answering the next decision.
+//!
+//! Nothing here is a test-only branch: the scheduler, the trial, the switch and
+//! the validators are the ones the epoch runs.
 
 use std::sync::Arc;
 use std::thread;
@@ -18,13 +29,13 @@ use engine::{
     PolicySource, SimEngine, SimExecutor,
 };
 use ipc::{ImageParams, SamplingParams};
-use scheduling::guest::decision::{Plan, Work};
 use scheduling::guest::Nanos;
+use scheduling::guest::PhaseId;
+use scheduling::guest::RequestId;
+use scheduling::guest::decision::{Plan, Work};
 use scheduling::guest::limits::Limits;
 use scheduling::guest::view::{ExpertLoad, ExpertOrder};
-use scheduling::guest::RequestId;
 use scheduling::guest::wire::Call;
-use scheduling::guest::PhaseId;
 
 use crate::support;
 
@@ -77,7 +88,9 @@ impl Toy {
             },
             plan: Plan::default(),
             // A placement the previous program is recognizable by.
-            experts: ExpertOrder { placement: vec![1, 0] },
+            experts: ExpertOrder {
+                placement: vec![1, 0],
+            },
             observe: Observe::Answers,
             dispatch: Dispatch::Plan,
         }
@@ -88,17 +101,23 @@ impl Toy {
         let limits = serde_json::to_string(&self.limits).expect("limits are JSON");
         let experts = serde_json::to_string(&self.experts).expect("an expert order is JSON");
         let observe = match self.observe {
-            Observe::Answers => "(func (export \"sched_observe\") (param i32 i32) (result i64) i64.const 0)".to_owned(),
-            Observe::Traps => "(func (export \"sched_observe\") (param i32 i32) (result i64) unreachable)".to_owned(),
+            Observe::Answers => {
+                "(func (export \"sched_observe\") (param i32 i32) (result i64) i64.const 0)"
+                    .to_owned()
+            }
+            Observe::Traps => {
+                "(func (export \"sched_observe\") (param i32 i32) (result i64) unreachable)"
+                    .to_owned()
+            }
         };
         let dispatch = match self.dispatch {
             Dispatch::Plan => format!(
-                "(func (export \"{}\") (result i64) i64.const {})",
+                "(func (export \"{}\") (param i32 i32) (result i64) i64.const {})",
                 Call::Dispatch.export(),
                 packed(PLAN, plan.len())
             ),
             Dispatch::Burns => format!(
-                "(func (export \"{}\") (result i64) (loop (br 0)) i64.const 0)",
+                "(func (export \"{}\") (param i32 i32) (result i64) (loop (br 0)) i64.const 0)",
                 Call::Dispatch.export()
             ),
         };
@@ -114,7 +133,7 @@ impl Toy {
              (func (export \"sched_init\") (param i32 i32) (result i64) i64.const 0) \
              {observe} \
              {dispatch} \
-             (func (export \"{limits_call}\") (param i32 i32) (result i64) i64.const {limits_answer}) \
+             (func (export \"{limits_call}\") (result i64) i64.const {limits_answer}) \
              (func (export \"{reclaim_call}\") (param i32 i32) (result i64) i64.const {reclaim_answer}) \
              (func (export \"{warm_call}\") (param i32 i32) (result i64) i64.const {warm_answer}) \
              (func (export \"{experts_call}\") (param i32 i32) (result i64) i64.const {experts_answer}) \
@@ -164,13 +183,17 @@ fn escape(text: &str) -> String {
 /// revert.
 struct World {
     handle: CommandSender,
+    /// The scheduler's own thread. It ends when the world's command channel
+    /// closes, which is when `handle` is dropped with this struct: nothing here
+    /// joins it, so the field is kept for that lifetime rather than read.
+    #[allow(dead_code)]
     thread: thread::JoinHandle<()>,
 }
 
 impl World {
-    /// Starts a scheduler serving `good`, committed, and then puts `failing` in
-    /// so that a failure has a program to serve on under.
-    fn with_previous(good: Toy, failing: Toy) -> Self {
+    /// A scheduler serving `good`, committed: the program that serves on when
+    /// a candidate is refused or a live failure reverts one.
+    fn serving(good: Toy) -> Self {
         let mut sim = SimEngine::new();
         sim.set_text_len(16);
         let scheduler = support::scheduler(
@@ -187,13 +210,60 @@ impl World {
             handle: CommandSender::new(tx),
             thread,
         };
-        world.install("fcfs", 1, good);
+        world
+            .install("fcfs", 1, good)
+            .expect("the good program serves");
         world.handle.commit_policy();
-        world.install("fcfs", 2, failing);
         world
     }
 
-    fn install(&self, backend: &str, revision: u32, toy: Toy) {
+    /// Starts a scheduler serving `good`, committed, and then puts `failing` in
+    /// so that a live failure has a program to serve on under.
+    fn with_previous(good: Toy, failing: Toy) -> Self {
+        let world = Self::serving(good);
+        world
+            .install("fcfs", 2, failing)
+            .expect("the failing program is instantiated before it serves");
+        world
+    }
+
+    /// Offers `failing` as the epoch's next program and answers the trial's
+    /// reason for refusing it.
+    ///
+    /// §4.4's first five failures are decided here rather than live: the trial
+    /// asks every decision on the mechanism's current state, and a program
+    /// whose answers trap, run past their fuel, declare limits above the build
+    /// config's ceilings, or name something that does not exist never becomes
+    /// the serving one.
+    fn refuse(&self, failing: Toy) -> String {
+        let program = PolicyProgram {
+            backend: "fcfs".to_owned(),
+            revision: 2,
+            arguments: Default::default(),
+            stated: Default::default(),
+        };
+        let source: Arc<dyn PolicySource + Send + Sync> =
+            Arc::new(PolicyBytes::new(failing.wasm()));
+        match answer(self.handle.precopy_policy(program, source)) {
+            Ok(()) => panic!("the trial refuses this program, and it did not"),
+            Err(reason) => reason,
+        }
+    }
+
+    /// Asserts a program that was never served left no live failure behind.
+    fn no_failure(&self) {
+        assert!(
+            self.handle
+                .take_policy_report()
+                .try_recv()
+                .ok()
+                .flatten()
+                .is_none(),
+            "a refused candidate is not a live failure: nothing was replaced"
+        );
+    }
+
+    fn install(&self, backend: &str, revision: u32, toy: Toy) -> Result<(), String> {
         let program = PolicyProgram {
             backend: backend.to_owned(),
             revision,
@@ -201,8 +271,8 @@ impl World {
             stated: Default::default(),
         };
         let source: Arc<dyn PolicySource + Send + Sync> = Arc::new(PolicyBytes::new(toy.wasm()));
-        answer(self.handle.precopy_policy(program, source)).expect("the program's precopy");
-        answer(self.handle.switchover_policy()).expect("the switchover puts it in");
+        answer(self.handle.precopy_policy(program, source))?;
+        answer(self.handle.switchover_policy())
     }
 
     /// Waits for the failure report the mechanism records for a failed policy.
@@ -246,116 +316,101 @@ fn eventually<T>(mut poll: impl FnMut() -> Option<T>) -> T {
 
 #[test]
 fn a_trap_in_observe_fails_the_policy() {
-    let world = World::with_previous(
-        Toy::idle(),
-        Toy {
-            observe: Observe::Traps,
-            ..Toy::idle()
-        },
-    );
-    let report = world.failed();
+    let world = World::serving(Toy::idle());
+    let reason = world.refuse(Toy {
+        observe: Observe::Traps,
+        ..Toy::idle()
+    });
+    let reason = reason.to_lowercase();
     assert!(
-        report.reason.to_lowercase().contains("trap")
-            || report.reason.to_lowercase().contains("observ"),
-        "the reason names the failed call: {}",
-        report.reason
+        reason.contains("trap") && reason.contains("observ"),
+        "the reason names the failed call: {reason}"
     );
-    // The previous program answers the next decision: its placement is the one
-    // handed over, and the failed program's is not.
-    let order = world.serving_order();
-    assert_eq!(order.placement, vec![1, 0]);
-    assert!(
-        world.handle.take_policy_report().recv().ok().flatten().is_none(),
-        "a policy fails once, not on every step"
-    );
+    // The serving program answers the next decision, and nothing reverted: a
+    // program the trial refused never held the slot.
+    assert_eq!(world.serving_order().placement, vec![1, 0]);
+    world.no_failure();
 }
 
 #[test]
 fn exhausted_fuel_in_dispatch_fails_the_policy() {
-    let world = World::with_previous(
-        Toy::idle(),
-        Toy {
+    let world = World::serving(Toy::idle());
+    let reason = world
+        .refuse(Toy {
             dispatch: Dispatch::Burns,
             ..Toy::idle()
-        },
-    );
-    let report = world.failed();
-    let reason = report.reason.to_lowercase();
+        })
+        .to_lowercase();
     assert!(
-        reason.contains("fuel") || reason.contains("exhaust") || reason.contains("trap"),
-        "the reason names the spent budget: {}",
-        report.reason
+        reason.contains("fuel") && reason.contains("dispatch"),
+        "the reason names the spent budget and the call it was spent in: {reason}"
     );
     assert_eq!(world.serving_order().placement, vec![1, 0]);
+    world.no_failure();
 }
 
 #[test]
 fn limits_over_the_build_ceiling_fail_the_policy() {
-    let world = World::with_previous(
-        Toy::idle(),
-        Toy {
+    let world = World::serving(Toy::idle());
+    let reason = world
+        .refuse(Toy {
             limits: Limits {
                 // The simulated deployment was built for eight rows at most.
                 max_batch: 1 << 20,
                 ..Toy::idle().limits
             },
             ..Toy::idle()
-        },
-    );
-    let report = world.failed();
-    let reason = report.reason.to_lowercase();
+        })
+        .to_lowercase();
     assert!(
         reason.contains("limit") || reason.contains("ceiling"),
-        "the reason names the limits: {}",
-        report.reason
+        "the reason names the limits: {reason}"
     );
     assert_eq!(world.serving_order().placement, vec![1, 0]);
+    world.no_failure();
 }
 
 #[test]
 fn an_invalid_decision_fails_the_policy_and_applies_nothing() {
-    let world = World::with_previous(
-        Toy::idle(),
-        Toy {
+    let world = World::serving(Toy::idle());
+    let reason = world
+        .refuse(Toy {
             plan: unknown_phase(),
             ..Toy::idle()
-        },
-    );
-    let report = world.failed();
-    let reason = report.reason.to_lowercase();
+        })
+        .to_lowercase();
     assert!(
         reason.contains("phase") || reason.contains("not one of this epoch"),
-        "the reason names the refused decision: {}",
-        report.reason
+        "the reason names the refused decision: {reason}"
     );
-    // Nothing of the refused plan ran: the program that serves on answers, so
-    // the step the refused plan belonged to decided nothing.
+    // Nothing of the refused plan ran, and nothing of it serves: the program
+    // that answers the next decision is the one that was already serving.
     assert_eq!(world.serving_order().placement, vec![1, 0]);
+    world.no_failure();
 }
 
 #[test]
 fn an_invalid_expert_order_fails_the_policy() {
-    let world = World::with_previous(
-        Toy::idle(),
-        Toy {
-            experts: ExpertOrder {
-                placement: vec![0, 0],
-            },
-            ..Toy::idle()
-        },
-    );
+    let world = World::serving(Toy::idle());
     world.handle.publish_expert_load(Some(ExpertLoad {
         ranks: 2,
         experts: 2,
         tokens: vec![1, 1],
     }));
-    let report = world.failed();
+    let reason = world
+        .refuse(Toy {
+            experts: ExpertOrder {
+                placement: vec![0, 0],
+            },
+            ..Toy::idle()
+        })
+        .to_lowercase();
     assert!(
-        report.reason.to_lowercase().contains("expert"),
-        "the reason names the order: {}",
-        report.reason
+        reason.contains("expert"),
+        "the reason names the order: {reason}"
     );
     assert_eq!(world.serving_order().placement, vec![1, 0]);
+    world.no_failure();
 }
 
 /// A policy that admits `admit` and gives it no work, with `timeout` as its
@@ -410,18 +465,14 @@ fn a_starved_request_fails_the_policy() {
     // One millisecond of starvation: the request is admitted by the plan and
     // never given work, and §4.4's watchdog is the mechanism's, not the
     // policy's, so a policy that answers every call correctly still fails.
-    let world = World::with_previous(
-        Toy::idle(),
-        starving(vec![RequestId(1)], Nanos(1_000_000)),
-    );
+    let world = World::with_previous(Toy::idle(), starving(vec![RequestId(1)], Nanos(1_000_000)));
     let mut events = world
         .handle
         .submit(text_request(1, 8, 4))
         .expect("the request is submitted");
     let report = world.failed();
     assert!(
-        report.reason.to_lowercase().contains("starv")
-            && report.reason.contains('1'),
+        report.reason.to_lowercase().contains("starv") && report.reason.contains('1'),
         "the reason names the starved request: {}",
         report.reason
     );

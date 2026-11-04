@@ -30,7 +30,6 @@ use crate::batch::{
 };
 use crate::completion::Outcome;
 use crate::stream::events::{EventPool, JobId};
-use crate::stream::recorded;
 use crate::{Error, Result, lock};
 
 /// One command waiting for the device thread, or being performed by it.
@@ -49,6 +48,9 @@ pub(crate) struct Entry {
     /// Whether this entry is the last step of its submission (4.5: a precopy or a capture pass is
     /// performed one job per queue step, so serving batches interleave with it).
     pub(crate) final_step: bool,
+    /// What this command is doing, written when it is queued: the first half of a failure's report,
+    /// which the device thread completes with the job it was performing.
+    pub(crate) label: String,
 }
 
 /// One command the device executor performs.
@@ -80,10 +82,30 @@ pub(crate) enum Command {
     /// Release everything that references a generation that was prepared and never served, which
     /// is a generation *newer* than the serving one and so out of `Purge`'s reach (7.3 step 2).
     Discard(u64),
-    /// A storage owner's recorded issue work.
-    Issue(std::sync::Arc<std::sync::Mutex<recorded::Batch>>),
     /// Wait for the events deferred storage release hangs on.
     After(Vec<Arc<platform::Event>>),
+}
+
+impl Command {
+    /// What this command is doing, for the report of a failed submission (2.4).
+    pub(crate) fn label(&self) -> String {
+        match self {
+            Self::Batch(batch) => format!("batch {} of phase {}", batch.id.0, batch.phase.0),
+            Self::Warmup => "warming up every bucket of the serving generation".to_owned(),
+            Self::Steps { generation, jobs } => match generation {
+                Some(generation) => format!("step of generation {generation}'s preparation"),
+                None => format!("a step of {} prepared jobs", jobs.len()),
+            },
+            Self::Precopy(next) => format!("preparing generation {}", next.number()),
+            Self::Shadow(batch) => format!("shadowing generation {}", batch.generation),
+            Self::SetShadow => "carving the shadow harness".to_owned(),
+            Self::Switchover(generation) => format!("switching to generation {generation}"),
+            Self::Revert(generation) => format!("reverting generation {generation}"),
+            Self::Purge(generation) => format!("purging generation {generation}"),
+            Self::Discard(generation) => format!("discarding generation {generation}"),
+            Self::After(_) => "waiting for deferred storage work".to_owned(),
+        }
+    }
 }
 
 struct Current {
@@ -157,8 +179,10 @@ impl JobQueue {
             Some((id, state)) => (Some(id), Some(state)),
             None => (None, None),
         };
+        let label = command.label();
         state.pending.push_back(Entry {
             id,
+            label,
             command,
             submission,
             submission_id,
@@ -185,6 +209,7 @@ impl JobQueue {
         state.next += 1;
         state.pending.push_back(Entry {
             id,
+            label: entry.label.clone(),
             command,
             submission: entry.submission.clone(),
             submission_id: entry.submission_id,
@@ -219,6 +244,7 @@ impl JobQueue {
         state.next += 1;
         state.pending.push_back(Entry {
             id,
+            label: Command::After(events.clone()).label(),
             command: Command::After(events),
             submission: None,
             submission_id: None,
@@ -229,16 +255,6 @@ impl JobQueue {
         drop(state);
         self.ready.notify_one();
         id
-    }
-
-    /// The recorded issue work of one storage submission, named for the queue.
-    pub(crate) fn issue(&self, work: recorded::Batch) -> Result<JobId> {
-        self.push(
-            Command::Issue(std::sync::Arc::new(std::sync::Mutex::new(work))),
-            None,
-            JobKind::Issue,
-            None,
-        )
     }
 
     /// The next command, once one is pending or `timeout` passed; `None` when the queue closed.
@@ -275,7 +291,7 @@ impl JobQueue {
     /// Reports that `entry` ended with `result`, and completes the submission that waited on it.
     ///
     /// A serving command hands over the step's output; every other command's output is empty.
-    pub(crate) fn complete(&self, entry: Entry, result: Result<BatchOutput>) {
+    pub(crate) fn complete(&self, entry: Entry, result: Result<BatchOutput>, detail: Option<String>) {
         {
             let mut state = lock(&self.state);
             state.current = None;
@@ -293,7 +309,16 @@ impl JobQueue {
             }
             let outcome = match result {
                 Ok(output) => Outcome::Success(output),
-                Err(error) => Outcome::Failed(Arc::new(error)),
+                Err(error) => {
+                    // The label names the work, not the error: the error already says what broke,
+                    // and the caller's question is which bucket, generation or operator was in hand.
+                    let label = match detail {
+                        Some(detail) => format!("{}: {detail}", entry.label),
+                        None => entry.label.clone(),
+                    };
+                    submission.note_failure(label);
+                    Outcome::Failed(Arc::new(error))
+                }
             };
             submission.finish(outcome);
         }
@@ -388,28 +413,8 @@ pub(crate) fn jobs_of(runner: crate::runner::RunnerId, jobs: crate::batch::Jobs)
                 bucket: *bucket,
                 generation: *generation,
             },
-            Job::Issue { .. } | Job::After { .. } => {
-                unreachable!("a runner returned a job the device queue owns")
-            }
         })
         .collect()
-}
-
-/// The kind of a command, for the watchdog.
-pub(crate) fn kind_of(command: &Command) -> JobKind {
-    match command {
-        Command::Batch(_) => JobKind::Batch,
-        Command::Warmup => JobKind::Warmup,
-        Command::Precopy(_) => JobKind::Precopy,
-        Command::Shadow(_) | Command::SetShadow => JobKind::Shadow,
-        Command::Steps { .. } => JobKind::Precopy,
-        Command::Switchover(_) => JobKind::Switchover,
-        Command::Revert(_) => JobKind::Revert,
-        Command::Purge(_) => JobKind::Purge,
-        Command::Discard(_) => JobKind::Discard,
-        Command::Issue(_) => JobKind::Issue,
-        Command::After(_) => JobKind::After,
-    }
 }
 
 /// The phase a batch names, for the runner lookup.
@@ -454,7 +459,7 @@ mod tests {
         assert_eq!(entry.kind, JobKind::Batch);
         assert!(queue.watchdog_is_running());
 
-        queue.complete(entry, Ok(crate::batch::BatchOutput::default()));
+        queue.complete(entry, Ok(crate::batch::BatchOutput::default()), None);
         assert!(matches!(submission.outcome(), Some(Outcome::Success(_))));
         assert!(queue.in_flight().is_empty());
     }
@@ -474,13 +479,30 @@ mod tests {
 
         let entry = queue.next(Some(Duration::from_millis(10))).expect("first");
         assert_eq!(entry.kind, JobKind::Batch);
-        queue.complete(entry, Ok(crate::batch::BatchOutput::default()));
+        queue.complete(entry, Ok(crate::batch::BatchOutput::default()), None);
         let entry = queue.next(Some(Duration::from_millis(10))).expect("second");
         assert_eq!(entry.kind, JobKind::Purge);
-        queue.complete(entry, Err(Error::State("the purge failed".into())));
+        let capture = Job::Capture {
+            runner: crate::runner::RunnerId(0),
+            bucket: crate::plan::Bucket::decode(128, crate::plan::Variant::DecodeGreedy),
+            generation: 2,
+        };
+        queue.complete(
+            entry,
+            Err(Error::State("the purge failed".into())),
+            Some(capture.describe()),
+        );
 
         assert!(matches!(first.outcome(), Some(Outcome::Success(_))));
         assert!(matches!(second.outcome(), Some(Outcome::Failed(_))));
+        // A failure states which work it happened in, and a success states nothing: the caller's
+        // question about a failure is which command, bucket or operator was in hand, and that fact
+        // exists only on the device thread.
+        assert_eq!(first.failure_label(), None);
+        assert_eq!(
+            second.failure_label(),
+            Some(format!("purging generation 2: {}", capture.describe()))
+        );
     }
 
     /// A capture pass or a precopy performs one job per queue turn and puts the rest at the tail,
@@ -528,7 +550,7 @@ mod tests {
                     order.push("capture");
                     jobs.remove(0);
                     if jobs.is_empty() {
-                        queue.complete(entry, Ok(BatchOutput::default()));
+                        queue.complete(entry, Ok(BatchOutput::default()), None);
                     } else {
                         queue
                             .requeue(&entry, Command::Steps { generation, jobs })
@@ -541,13 +563,13 @@ mod tests {
                 }
                 Command::Batch(_) => {
                     order.push("batch");
-                    queue.complete(entry, Ok(BatchOutput::default()));
+                    queue.complete(entry, Ok(BatchOutput::default()), None);
                     assert!(
                         precopy.outcome().is_none(),
                         "a served batch does not complete the precopy"
                     );
                 }
-                _ => queue.complete(entry, Ok(BatchOutput::default())),
+                _ => queue.complete(entry, Ok(BatchOutput::default()), None),
             }
         }
 
@@ -587,7 +609,7 @@ mod tests {
         while let Some(entry) = queue.next(Some(Duration::from_millis(5))) {
             turns += 1;
             if turns == 1 {
-                queue.complete(entry, Err(Error::State("the shadow comparison failed".into())));
+                queue.complete(entry, Err(Error::State("the shadow comparison failed".into())), None);
             } else {
                 panic!("the rest of the command was performed after a failure");
             }
@@ -605,7 +627,7 @@ mod tests {
             .expect("the wait");
         assert_eq!(entry.id, id);
         assert_eq!(entry.kind, JobKind::After);
-        queue.complete(entry, Ok(crate::batch::BatchOutput::default()));
+        queue.complete(entry, Ok(crate::batch::BatchOutput::default()), None);
 
         // The pool has no deferred work under this job, which is not a failure of the wait.
         assert!(!events.owns(id));

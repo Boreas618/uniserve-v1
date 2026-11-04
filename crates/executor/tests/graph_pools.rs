@@ -32,6 +32,10 @@
 //! It needs `nvcc` on `PATH`, and `UNISERVE_PROBE_ARCH` names the architecture
 //! it compiles for (default `sm_100a`).
 
+#![allow(
+    clippy::expect_used,
+    reason = "a probe's prerequisite failure must fail the test, not be handled"
+)]
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::process::Command;
@@ -61,8 +65,7 @@ impl Budget for Allowance {
 
 /// Compiles the probe's two generations of one kernel into a cubin.
 fn cubin() -> PathBuf {
-    let source =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/generations.cu");
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/generations.cu");
     let output = std::env::temp_dir().join(format!("generations-{}.cubin", std::process::id()));
     let arch = std::env::var("UNISERVE_PROBE_ARCH").unwrap_or_else(|_| "sm_100a".to_owned());
     let status = Command::new("nvcc")
@@ -81,12 +84,7 @@ fn cubin() -> PathBuf {
 ///
 /// `data` and `value` must outlive the capture: the driver records their
 /// addresses as the node's arguments, and the graph is replayed from them.
-fn capture(
-    stream: &Stream,
-    kernel: &Function,
-    data: &mut u64,
-    value: &mut u32,
-) -> GraphExec {
+fn capture(stream: &Stream, kernel: &Function, data: &mut u64, value: &mut u32) -> GraphExec {
     let mut count = WORDS as i32;
     let mut parameters: [*mut c_void; 3] = [
         (data as *mut u64).cast(),
@@ -102,9 +100,11 @@ fn capture(
         )
         .expect("launch inside the capture");
     recording.record().expect("record the launch's node");
-    recording.end().expect("end the capture").instantiate().expect(
-        "instantiate the graph - failing here means two generations cannot share the pool",
-    )
+    recording
+        .end()
+        .expect("end the capture")
+        .instantiate()
+        .expect("instantiate the graph - failing here means two generations cannot share the pool")
 }
 
 /// Replays `graph` and answers the buffer's words.

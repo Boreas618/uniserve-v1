@@ -53,8 +53,8 @@ use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
-use proto::handoff;
 use prost::Message as _;
+use proto::handoff;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -141,7 +141,9 @@ impl Paused {
     pub(crate) fn decide(self, adopted: &[Taken], successor_pid: u32) {
         let decided_at = crate::http::handoff::now_ns();
         for frozen in self.frozen {
-            let taken = adopted.iter().find(|taken| taken.request_id == frozen.request_id);
+            let taken = adopted
+                .iter()
+                .find(|taken| taken.request_id == frozen.request_id);
             let pause_ms = taken.map_or_else(
                 || decided_at.saturating_sub(frozen.frozen_at_ns) / 1_000_000,
                 |taken| taken.at_ns.saturating_sub(frozen.frozen_at_ns) / 1_000_000,
@@ -322,8 +324,7 @@ fn take_over(
                     .as_ref()
                     .map_or(0, |lowering| lowering.started_unix_us),
             );
-            let outcome =
-                leader.request_outcome(&state.request_id, chat.engine_replica, started);
+            let outcome = leader.request_outcome(&state.request_id, chat.engine_replica, started);
             let run = crate::output::run::GenerationRun::resume_stream(
                 &chat,
                 leader.tokenizer(),

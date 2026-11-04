@@ -94,8 +94,30 @@ impl Scheduler {
                 self.inflight.pending_submissions.push_back(batch);
                 continue;
             }
+            // An update may have asked this step's batches to run in shadow too:
+            // the same work against the world whose kernels are being compared,
+            // submitted beside the serving one (7.3 step 2). The copy is made
+            // only when an update asked, and before the serving submit takes the
+            // batch.
+            let shadow = self.shadow_generation();
+            let shadow_batch = shadow.map(|_| batch.clone());
             match self.executor.submit(batch) {
-                Ok(()) => progressed = true,
+                Ok(()) => {
+                    progressed = true;
+                    // A wall or a full queue is not the pass's failure: the
+                    // batch stays with the step and the next one tries again,
+                    // as the serving submit does. A refused pass is answered at
+                    // once, because waiting will not shadow it.
+                    if let (Some(generation), Some(shadow_batch)) = (shadow, shadow_batch) {
+                        match self.executor.shadow(shadow_batch, generation) {
+                            Ok(()) => self.note_shadowed(),
+                            Err(ExecutorSubmitError::Failed(error)) => {
+                                self.shadow_failed(format!("{error:#}"));
+                            }
+                            Err(ExecutorSubmitError::WouldBlock(_)) => {}
+                        }
+                    }
+                }
                 Err(ExecutorSubmitError::WouldBlock(batch)) => {
                     blocked_workers.extend(targets);
                     held_products.extend(batch_products(&batch));
@@ -396,9 +418,22 @@ impl Scheduler {
             }
         };
         let live = self.live();
-        if let Err(error) = mechanism::validate_victims(&shortage, &victims, &live) {
-            let _ = self.policy_failed(policy, error);
-            return;
+        match mechanism::validate_victims(&shortage, &victims, &live) {
+            Ok(()) => {}
+            Err(mechanism::VictimError::Invalid(error)) => {
+                let _ = self.policy_failed(policy, error);
+                return;
+            }
+            Err(mechanism::VictimError::Vanished(message)) => {
+                // Nothing of this step can free a page or end a request between
+                // the observation the policy answered from and this call, so a
+                // victim that is gone means the mechanism let go of it without
+                // recording that it did: an invariant of its own, never the
+                // policy's decision (§4.4's taxonomy).
+                self.policy = Some(policy);
+                self.invariant_broken(&message);
+                return;
+            }
         }
         self.policy = Some(policy);
         for victim in &victims {
@@ -499,8 +534,7 @@ impl Scheduler {
         let floor = self
             .policy
             .as_ref()
-            .map_or(0, |policy| policy.limits().prefetch_min_tokens)
-            as usize;
+            .map_or(0, |policy| policy.limits().prefetch_min_tokens) as usize;
         let Some(state) = self.running.get(&id) else {
             return;
         };
@@ -548,6 +582,11 @@ impl Scheduler {
             return None;
         };
         self.step += 1;
+        // The kernels this step's batches serve on, read once: a switchover
+        // that completes mid-step must not split one step across two worlds
+        // (4.2, 7.3).
+        let generation = self.serving_generation();
+        self.executor.set_generation(generation);
         // The pages that appeared and went since the previous step, then
         // everything else that changed, in the order it happened, closed before
         // this step's dispatch. The room, the live state, and the plan's checks
@@ -574,12 +613,10 @@ impl Scheduler {
         // setup that applies it (§7.6). No load means nothing to decide, not a
         // zero one: the executor has published no routed tokens yet.
         let experts_due = self.expert_load_new
-            || self
-                .expert_asked
-                .is_none_or(|asked| self.step.saturating_sub(asked) >= Self::EXPERT_REBALANCE_STEPS);
-        if experts_due
-            && let Some(load) = views::expert_load_of(self)
-        {
+            || self.expert_asked.is_none_or(|asked| {
+                self.step.saturating_sub(asked) >= Self::EXPERT_REBALANCE_STEPS
+            });
+        if experts_due && let Some(load) = views::expert_load_of(self) {
             let order = match policy.experts(&load) {
                 Ok(order) => order,
                 Err(error) => return self.policy_failed(policy, error),
@@ -595,17 +632,20 @@ impl Scheduler {
             Ok(plan) => plan,
             Err(error) => return self.policy_failed(policy, error),
         };
-        // The plan's admission is the mechanism's own act, bounded by the hard
-        // limits as it goes, and it runs before the plan is checked: a request
-        // the plan admits is resident for the work the same plan gives it, which
-        // is what lets one plan both admit and run a request (§4.4).
-        self.admit_plan(&plan);
-        // Admission is the only thing between the policy's dispatch and the
-        // plan's check, so the state the plan is checked against is read once,
-        // here, after it: the pages are the scheduler's own table borrowed for
-        // the check (design §4.4).
+        // The admission the plan states is checked against the queue the policy
+        // was given, and applied before the rest of the plan is checked: a
+        // request the plan admits is resident for the work the same plan gives
+        // it, which is what lets one plan both admit and run a request (§4.4).
+        // Applying it first would make its own names unqueued.
         let live = self.live();
-        if let Err(error) = mechanism::validate_plan(&plan, &room, &live) {
+        if let Err(error) = mechanism::validate_admission(&plan, &live) {
+            return self.policy_failed(policy, error);
+        }
+        self.admit_plan(&plan);
+        // The rest is read against the state admission has left: the pages are
+        // the scheduler's own table borrowed for the check (design §4.4).
+        let live = self.live();
+        if let Err(error) = mechanism::validate_after_admission(&plan, &room, &live) {
             return self.policy_failed(policy, error);
         }
         self.policy = Some(policy);
@@ -644,8 +684,18 @@ impl Scheduler {
                 self.policy = Some(policy);
             }
             Err(fatal) => {
-                tracing::error!(reason = %fatal, "the policy failed and cannot be reverted");
-                self.fail(format!("the scheduling policy failed: {fatal}"));
+                // Both failures are named: the one that ended the policy, which
+                // is what the daemon and a reader of the log need first, and the
+                // failed takeover that leaves the epoch with no policy at all.
+                tracing::error!(
+                    reason = %error,
+                    takeover = %fatal,
+                    "the policy failed and cannot be reverted"
+                );
+                self.fail(format!(
+                    "the scheduling policy failed with `{error}`, and no previous policy can \
+                     take over: {fatal}"
+                ));
                 self.policy = Some(policy);
             }
         }
@@ -740,6 +790,14 @@ impl Scheduler {
         for phase in views::phases(&self.info) {
             live.phases.insert(phase.id, phase);
         }
+        // What the policy was told is the recorder's own account of it: the
+        // snapshot it was instantiated with, plus every page, encoder entry and
+        // request announced since, less what it was told is gone. A reclaim is
+        // judged against that, not against the mechanism's table, which may
+        // have moved on since the policy last heard.
+        live.told_pages = std::borrow::Cow::Borrowed(self.recorder.announced_pages());
+        live.told_encodings = std::borrow::Cow::Borrowed(self.recorder.announced_encodings());
+        live.told_requests = std::borrow::Cow::Borrowed(self.recorder.announced_requests());
         live
     }
 
