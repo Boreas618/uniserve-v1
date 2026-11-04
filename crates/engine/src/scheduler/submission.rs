@@ -412,8 +412,17 @@ impl InProcess {
     /// The refusals are the mechanism's, stated here because this is where the
     /// batch crosses into the executor's layout: a batch the mechanism could
     /// not state the columns of, a batch of media or denoise calls (2.4 serves
-    /// no media in process yet), and a batch whose shape the mechanism cannot
-    /// state are refused rather than served on invented values.
+    /// no media in process yet), and a batch whose call kinds name no device
+    /// phase are refused rather than served on invented values. The shape is
+    /// the assembly's, not this seam's (`batching::columns::batch_shape`), and
+    /// it is checked against the columns before the batch leaves.
+    ///
+    /// The batch's lifecycle commands do not travel: `executor::Batch` has no
+    /// field for them, because the resources a worker-side command retires —
+    /// a request's row, its buffers, its pages — belong to this process's
+    /// executor once it holds the columns. A batch that completes reports no
+    /// command as failed, which the mechanism reads as its commands having
+    /// been applied.
     fn describe(
         &self,
         batch: &ExecutionBatch,
