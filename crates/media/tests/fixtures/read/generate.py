@@ -42,10 +42,14 @@ def _ffmpeg() -> str:
     named = os.environ.get("UNISERVE_FFMPEG")
     if named:
         return named
-    candidates = (
-        os.path.join(WORKSPACE, "artifacts", "native", "prefix", "bin", "ffmpeg"),
-        "/opt/uv/ffmpeg-8.1.2/bin/ffmpeg",
+    directory = os.environ.get("UNISERVE_FFMPEG_DIR")
+    candidates = []
+    if directory:
+        candidates.append(os.path.join(directory, "bin", "ffmpeg"))
+    candidates.append(
+        os.path.join(WORKSPACE, "artifacts", "native", "prefix", "bin", "ffmpeg")
     )
+    candidates.append("/opt/uv/ffmpeg-8.1.2/bin/ffmpeg")
     for candidate in candidates:
         if os.path.exists(candidate):
             return candidate

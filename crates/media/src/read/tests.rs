@@ -140,20 +140,26 @@ fn floats(bytes: &[u8]) -> Vec<f32> {
 
 /// The external `ffmpeg` the reference video's decode runs through.
 ///
-/// `UNISERVE_FFMPEG` names it; otherwise the provisioned 8.1.2 build beside
-/// the shared runtime is used, then the image's own 8.1.2 build, which
-/// decodes the fixtures to the same frames, and a plain `ffmpeg` on `PATH` is
-/// the last resort. The video fixtures are generated with the same binary.
+/// `UNISERVE_FFMPEG` names it; otherwise the deployed runtime's `bin` (as the
+/// encoder tests resolve their tools), the provisioned 8.1.2 build beside the
+/// shared runtime, and the image's own 8.1.2 build are tried in turn — the
+/// last two decode the fixtures to the same frames — and a plain `ffmpeg` on
+/// `PATH` is the last resort. The video fixtures are generated with the same
+/// binary.
 fn ffmpeg() -> PathBuf {
     if let Some(path) = std::env::var_os("UNISERVE_FFMPEG") {
         return path.into();
     }
-    let candidates = [
+    let mut candidates = Vec::new();
+    if let Some(directory) = std::env::var_os("UNISERVE_FFMPEG_DIR") {
+        candidates.push(PathBuf::from(directory).join("bin/ffmpeg"));
+    }
+    candidates.push(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../artifacts/native/prefix/bin/ffmpeg"),
-        PathBuf::from("/opt/uv/ffmpeg-8.1.2/bin/ffmpeg"),
-    ];
+    );
+    candidates.push(PathBuf::from("/opt/uv/ffmpeg-8.1.2/bin/ffmpeg"));
     for candidate in candidates {
-        if candidate.exists() {
+        if candidate.is_file() {
             return candidate;
         }
     }
