@@ -173,16 +173,31 @@ pub fn open_memory(request: OpenMemory<'_>, storage: &mut dyn ExclusiveStorage) 
 /// never counts storage no process maps. A pool that is not segmented has no
 /// segment to give back, which is not an error.
 ///
+/// **Only the segments go back.** The graph pool and the scratch region stay
+/// mapped: a capture's addresses are fixed for the life of its pool, so a wake
+/// is a remap and never a recapture, and a sleep that released a capture's book
+/// while its mapping stayed would let the next capture book the same bytes
+/// twice. A park therefore returns the KV and not the graphs.
+///
 /// One body for both callers: [`Memory::sleep`] on the control thread and the
 /// device thread's own command handler, which holds the cache handle and no
 /// `Memory`. A second copy of this body is the failure to avoid - it is where a
 /// divergence would surface as a rank that wakes with unwritten pages.
+///
+/// A pool that is not segmented says so and returns: it has nothing to give
+/// back, which is a different fact from a release that freed nothing, and the
+/// line is what tells the two apart in a run's log.
 pub fn sleep(cache: &Arc<Mutex<PrefixCache>>, storage: &mut dyn ExclusiveStorage) -> Result<()> {
     let planes = {
         let cache = lock(cache);
         Arc::clone(cache.planes())
     };
     if planes.segments().is_none() {
+        tracing::info!(
+            pool = "the cache's segments",
+            "this cache holds one segment, so a sleep gives back nothing: the pool has no segment \
+             to release and the graph pool and scratch stay as they are"
+        );
         return Ok(());
     }
     planes.release_segments(0, storage)

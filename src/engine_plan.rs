@@ -29,7 +29,7 @@ use executor::capacity::{graph_storage_budget_bytes, graph_storage_bytes, quota}
 use executor::device::GraphStorage;
 use executor::memory::Memory;
 use executor::plan::{Buckets, Variant};
-use executor::runner::{NamedRunner, RunnerId};
+use executor::runner::{Binding, NamedRunner, RunnerId};
 use executor::runners::causal_lm::{CausalLmRunner, Geometry, KvProvider, Shared};
 use executor::runners::resident::ResidentCache;
 use executor::stream::EventPool;
@@ -254,16 +254,22 @@ impl EpochPlan {
         // rules is the allowance: a deployment that asks for a smaller share gets it, and a device
         // already holding the weights gets only what remains.
         let budget = quota(total, self.build.mem_fraction_static).min(storage.free);
-        // What a rank must be able to map to serve at all: one generation's graph pool and its
-        // scratch. The second pool is a reservation until a preparation captures into it, so it is
-        // not part of this test - a deployment with room for one pool starts and serves, and an
-        // update that needs the second one is refused by name when it maps.
-        let needs = bytes / 2 + scratch + resident;
+        // What a rank must be able to map to serve at all, which is every pool the allocator
+        // books at its first capture: the graph range in full and the scratch. The graph range is
+        // mapped whole and not a pool at a time - `arena::Pools::new` divides the range among the
+        // streams and `Pools::pool` allocates a stream's share in one buffer, with one stream
+        // here - so a rank that holds room for one of the two pools and not both is refused here
+        // rather than at its first capture, after the model load. The resident pool is a
+        // reservation of addresses and not of storage: its bytes are the KV cache the capacity
+        // plan fitted into the same free bytes below, and they map through the Storage Server's
+        // ledger, so charging them here as well would refuse a deployment whose cache fills the
+        // device's free bytes - which is what the fit is meant to do.
+        let needs = bytes + scratch;
         if budget < needs {
             bail!(
                 "device {} has {budget} bytes left of {total} once the model is mapped, at \
-                 mem_fraction_static {}, less than the graph pool and scratch of {needs} a rank \
-                 maps to serve",
+                 mem_fraction_static {}, less than the {needs} bytes of graph range and scratch a \
+                 rank maps to serve",
                 device.0,
                 self.build.mem_fraction_static,
             );
@@ -446,13 +452,15 @@ impl EpochPlan {
                 let provider: Box<dyn KvProvider> =
                     Box::new(ResidentCache::new(memory.shared_cache(), device, rows)?);
                 let runner = CausalLmRunner::new(
-                    RunnerId(0),
-                    vec![PhaseId(0)],
+                    Binding {
+                        id: RunnerId(0),
+                        phases: vec![PhaseId(0)],
+                        device,
+                        stream,
+                    },
                     Shared::new(model),
                     Arc::clone(generation),
                     self.buckets.clone(),
-                    device,
-                    stream,
                     geometry,
                     provider,
                     // A seed that changes with the process, so two runs of one deployment are not

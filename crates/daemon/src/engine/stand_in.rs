@@ -55,7 +55,10 @@ pub(crate) fn main_processes(
                     Some(Answer::Serves(_)) => (
                         Seen::Precopy,
                         Some(process::Report {
-                            kind: Some(report::Kind::Precopied(process::Precopied { generation })),
+                            kind: Some(report::Kind::Precopied(process::Precopied {
+                                generation,
+                                uncompared: Vec::new(),
+                            })),
                         }),
                     ),
                     Some(Answer::Refuses(reason)) => (

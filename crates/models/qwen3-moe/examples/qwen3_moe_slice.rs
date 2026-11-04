@@ -50,7 +50,7 @@ use nn::{
     Shape, TensorView, WeightKey, WeightLoader,
 };
 use ops::{Generation, KernelEntry};
-use qwen3_moe::{Config, LoadOptions, Partition, Run, Substage};
+use qwen3_moe::{Config, LoadOptions, Partition, Plan, Run, Substage};
 
 /// The checkpoint the reference was captured from, when `--checkpoint` does not name another.
 const DEFAULT_CHECKPOINT: &str = "/opt/uv/models/Qwen3-30B-A3B";
@@ -132,6 +132,10 @@ struct Args {
     /// Dump one layer's routing instead of measuring the layer: the router's own top-k, as the
     /// reference's hook records it.
     routing: bool,
+    /// Dump the gate's raw logits instead of measuring the layer: the last point a scale on the
+    /// router is visible as a scale, because the softmax that follows maps any monotone compression
+    /// of a row onto nearly uniform weights.
+    scores: bool,
 }
 
 /// The four stages of the run.
@@ -157,6 +161,7 @@ impl Args {
         let mut substage = None;
         let mut from = None;
         let mut routing = false;
+        let mut scores = false;
         let mut words = std::env::args().skip(1);
         while let Some(word) = words.next() {
             let mut value = |name: &str| -> Result<String> {
@@ -203,6 +208,7 @@ impl Args {
                     })?);
                 }
                 "--routing" => routing = true,
+                "--scores" => scores = true,
                 "--substage" => {
                     let name = value("--substage")?;
                     substage = Some(Substage::parse(&name).ok_or_else(|| {
@@ -230,7 +236,8 @@ impl Args {
                 other => {
                     return Err(Failure::message(format!(
                         "unknown argument `{other}`; expected --stage, --checkpoint, --store, \
-                         --device, --layer, --tokens, --dump or --reference"
+                         --device, --layer, --tokens, --from, --substage, --routing, --scores, \
+                         --dump or --reference"
                     )));
                 }
             }
@@ -277,18 +284,49 @@ impl Args {
             substage,
             from,
             routing,
+            scores,
         })
     }
 }
 
 fn run() -> Result<()> {
     let args = Args::parse()?;
+    check_dump_dir(&args)?;
     match args.stage {
         Stage::Weights => stage_weights(&args),
         Stage::Embedding => stage_embedding(&args),
         Stage::Decode => run_stack(&args, None),
         Stage::Block => run_stack(&args, Some(args.layer)),
     }
+}
+
+/// Refuse a `--dump` directory that holds the reference's stages.
+///
+/// The two sides of every comparison are the reference's hooks' answer and the run's own tensors; a
+/// dump into the reference's directory overwrites the answer with the thing it is meant to judge, and
+/// the comparison that follows reads one file twice — a ratio of exactly 1 with no residual, which is
+/// indistinguishable from a correct run. `hidden_00.npy` is the embedding's stage, which a dump never
+/// writes (a dump starts at layer 1), and `_normalized`/`_attended` name cuts only the hooks produce.
+fn check_dump_dir(args: &Args) -> Result<()> {
+    let Some(dir) = args.dump.as_deref() else {
+        return Ok(());
+    };
+    let marks = [
+        "hidden_00.npy",
+        "hidden_01_normalized.npy",
+        "hidden_01_attended.npy",
+    ];
+    let hit = marks.iter().find(|name| dir.join(name).exists());
+    let Some(name) = hit else {
+        return Ok(());
+    };
+    Err(Failure::message(format!(
+        "--dump {} holds the reference's stages ({name}), so a dump there would overwrite the tensors \
+         every comparison is measured against: write the run's tensors to a directory of their own and \
+         read the reference with --reference {}",
+        dir.display(),
+        dir.display()
+    )))
 }
 
 // -------------------------------------------------------------------------------------------
@@ -778,11 +816,12 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
         // every key it composes resolves and that two identical runs agree. A digest that moves
         // between them is a race or an uninitialized buffer, which is worth knowing before a
         // numerical comparison blames the arithmetic.
-        // The router's own answer, on this layer's own input. It is not a `Substage`: the cuts stop
-        // a layer partway, and this asks a different question - which eight experts the layer
-        // chooses - so it runs the router and nothing else. With `--from` the input is the
-        // reference's state, and a difference in the ids is then our router's arithmetic or our
-        // selection, never an inherited error.
+        // The router's own answer, on the state the forward's MoE is fed. It is not a `Substage`:
+        // the cuts stop a layer partway, and this asks a different question - which eight experts
+        // the layer chooses - so it runs the router and nothing else. That state is the
+        // post-attention sum and not the layer's input rows, because a router fed the input rows is
+        // a router no forward executes; with `--from` both halves come from the reference, so a
+        // difference in the ids is our gate's arithmetic or our selection, never an inherited error.
         if args.routing {
             let top = u64::try_from(config.num_experts_per_tok).unwrap_or(0);
             let mark = arena.mark();
@@ -794,7 +833,8 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
                 DType::F32,
                 Shape::new(&[u64::try_from(tokens_usize(&batch)).unwrap_or(0), top]),
             )?;
-            model.route(&forward, hidden, layer, ids, weights)?;
+            let state = post_attention_state(&stream, &arena, args, layer, &batch, &plan)?;
+            model.route(&forward, state, layer, ids, weights)?;
             stream.synchronize()?;
             let rows = tokens_usize(&batch);
             let top = usize::try_from(top).unwrap_or(0);
@@ -804,45 +844,74 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
             report_routing(args, layer, rows, top, &chosen, &scored)?;
             return Ok(());
         }
+        // The gate's raw logits, on the same state the routing cut uses. The softmax between the
+        // logits and the routing table destroys a great deal: any monotone compression of a row
+        // becomes nearly uniform weights, so a table of eight equal weights is consistent both with
+        // a wrong vector and with a right vector scaled down. This is the tensor that tells them
+        // apart, and its rms is what a reference's own logit rms is compared to.
+        if args.scores {
+            let mark = arena.mark();
+            let state = post_attention_state(&stream, &arena, args, layer, &batch, &plan)?;
+            let rows = tokens_usize(&batch);
+            let experts = config.num_experts;
+            let logits = arena.tensor(
+                DType::BF16,
+                Shape::new(&[
+                    u64::try_from(rows).unwrap_or(0),
+                    u64::try_from(experts).unwrap_or(0),
+                ]),
+            )?;
+            model.gate(&forward, state, layer, logits)?;
+            stream.synchronize()?;
+            let values = download_bf16(&stream, logits, rows, experts)?;
+            arena.release(mark);
+            report_scores(args, layer, rows, experts, &values)?;
+            return Ok(());
+        }
         // Every measurement reserves the plan's scratch - the attention program's 512 MiB workspace
         // among it - and nothing returns it: the arena is a bump allocator sized for one forward,
         // so a second measurement without a release asks for a second copy of the whole step and
         // fails at `plan.bytes` past the first. The mark is taken once and released after each
         // measurement has been read back to the host.
         let mark = arena.mark();
-        let mut digests = Vec::new();
-        for run in 0..2 {
-            let rows = measure(None)?;
-            stream.synchronize()?;
-            let values = download_bf16(
-                &stream,
-                rows,
-                tokens_usize(&batch),
-                usize::try_from(plan.hidden).unwrap_or(0),
-            )?;
-            arena.release(mark);
-            digests.push(digest(&values));
+        // The digest is the block measurement's own evidence that two identical runs agree, and
+        // it costs two extra passes of the layer. A cut, the router's selection or the gate's
+        // scores ask a different question of the same layer, so their runs pay for one forward.
+        if args.substage.is_none() && !args.routing && !args.scores {
+            let mut digests = Vec::new();
+            for run in 0..2 {
+                let rows = measure(None)?;
+                stream.synchronize()?;
+                let values = download_bf16(
+                    &stream,
+                    rows,
+                    tokens_usize(&batch),
+                    usize::try_from(plan.hidden).unwrap_or(0),
+                )?;
+                arena.release(mark);
+                digests.push(digest(&values));
+                println!(
+                    "block: layer {layer}, run {run}: {} rows of {} bf16 columns, digest {digests:?}",
+                    count,
+                    usize::try_from(plan.hidden).unwrap_or(0),
+                );
+            }
             println!(
-                "block: layer {layer}, run {run}: {} rows of {} bf16 columns, digest {digests:?}",
-                count,
-                usize::try_from(plan.hidden).unwrap_or(0),
+                "block: layer {layer} {} across two runs; worst |value| {:.6}, sum {:.6}",
+                if digests[0] == digests[1] {
+                    "reproduced"
+                } else {
+                    "DIFFERS"
+                },
+                digests[0].1,
+                digests[0].0,
             );
-        }
-        println!(
-            "block: layer {layer} {} across two runs; worst |value| {:.6}, sum {:.6}",
-            if digests[0] == digests[1] {
-                "reproduced"
-            } else {
-                "DIFFERS"
-            },
-            digests[0].1,
-            digests[0].0,
-        );
-        if digests[0] != digests[1] {
-            return Err(Failure::message(format!(
-                "layer {layer} gave two different outputs from the same inputs: the digest moved                  from {:?} to {:?}",
-                digests[0], digests[1]
-            )));
+            if digests[0] != digests[1] {
+                return Err(Failure::message(format!(
+                    "layer {layer} gave two different outputs from the same inputs: the digest moved                  from {:?} to {:?}",
+                    digests[0], digests[1]
+                )));
+            }
         }
         // One layer against the reference, without walking the stack: the same comparison the
         // decode stage makes, at a hundredth of the cost, for when a stage has already been named and
@@ -1312,6 +1381,7 @@ fn cut_hook(cut: Substage) -> &'static str {
     match cut {
         Substage::Normalized => "`input_layernorm`",
         Substage::Attended => "`self_attn`",
+        Substage::GateIn => "`post_attention_layernorm`",
         Substage::MlpOut => "`mlp`",
     }
 }
@@ -1326,6 +1396,7 @@ fn cut_file(cut: Substage) -> &'static str {
     match cut {
         Substage::Normalized => "normalized",
         Substage::Attended => "attended",
+        Substage::GateIn => "gate_in",
         Substage::MlpOut => "mlp",
     }
 }
@@ -2075,6 +2146,122 @@ fn f32_to_bf16(value: f32) -> u16 {
 /// the rows, so a row that disagrees here is the layer's own arithmetic. The cost is that the input
 /// carries one bf16 rounding of its own, about `2**-8` relative, which is why the caller of this
 /// function prints the floor it measures against.
+/// Layer `layer`'s post-attention state, summed from the reference's own two hooks.
+///
+/// The router a forward runs is fed `residual + attention`, not the layer's input rows: a cut that
+/// normalized the input would answer about a router no forward executes, and the two are
+/// indistinguishable by shape - both are `[tokens, hidden]` states. The reference records both
+/// halves (`hidden_{layer}` before the attention and `hidden_{layer+1}_attended` its output), so the
+/// sum is this layer's state up to one rounding to the model's dtype, which is the same rounding a
+/// reference computing the sum from its own hooks makes.
+fn post_attention_state(
+    stream: &platform::Stream,
+    arena: &Arena,
+    args: &Args,
+    layer: usize,
+    batch: &TokenBatch,
+    plan: &Plan,
+) -> Result<TensorView> {
+    let Some(dir) = args.reference.as_deref() else {
+        return Err(Failure::message(
+            "a routing or score cut runs on the reference's post-attention state, which the run \
+             cannot rebuild: pass --reference <dir>",
+        ));
+    };
+    // A run that named no `--from` starts at the embedding, and the state's residual half is the
+    // stage the layer would still be handed: `hidden_layer` is that stage in both cases, so the cut
+    // reads it from the reference either way rather than from the run's rows.
+    let from = args.from.unwrap_or(layer);
+    if from != layer {
+        return Err(Failure::message(format!(
+            "--from {from} runs layer {from}, so it has no state for layer {layer}"
+        )));
+    }
+    let rows = tokens_usize(batch);
+    let width = usize::try_from(plan.hidden).unwrap_or(0);
+    let residual = read_stage(dir, layer, rows, width)?;
+    // The attention's own cut inside this layer carries the next index: `hidden_NN_attended` is the
+    // attended output of layer `NN - 1`.
+    let attended = read_stage_named(
+        dir,
+        &format!("hidden_{:02}_attended.npy", layer + 1),
+        rows,
+        width,
+    )?;
+    let state: Vec<f32> = residual
+        .iter()
+        .zip(attended.iter())
+        .map(|(left, right)| left + right)
+        .collect();
+    upload_bf16(stream, arena, &state, rows, width)
+}
+
+/// One reference stage's rows, checked against the run's shape.
+fn read_stage(dir: &Path, index: usize, rows: usize, width: usize) -> Result<Vec<f32>> {
+    read_stage_named(dir, &format!("hidden_{index:02}.npy"), rows, width)
+}
+
+/// One named reference stage's rows, checked against the run's shape.
+fn read_stage_named(dir: &Path, name: &str, rows: usize, width: usize) -> Result<Vec<f32>> {
+    let path = dir.join(name);
+    let (values, their_rows, their_width) = read_npy(&path)?;
+    if their_rows != rows || their_width != width {
+        return Err(Failure::message(format!(
+            "{} is {their_rows} x {their_width}, the run's rows are {rows} x {width}",
+            path.display()
+        )));
+    }
+    Ok(values)
+}
+
+/// Print the gate's raw logits and write them for the comparator.
+fn report_scores(
+    args: &Args,
+    layer: usize,
+    rows: usize,
+    experts: usize,
+    values: &[f32],
+) -> Result<()> {
+    println!(
+        "scores: layer {layer}: rms {:.6e} over every row, {experts} experts per row",
+        rms(values)
+    );
+    for row in 0..rows.min(2) {
+        let scores = &values[row * experts..(row + 1) * experts];
+        let mut ranked: Vec<(f32, usize)> = scores
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(expert, value)| (value, expert))
+            .collect();
+        ranked.sort_by(|left, right| {
+            right
+                .0
+                .partial_cmp(&left.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(left.1.cmp(&right.1))
+        });
+        let top: Vec<String> = ranked
+            .iter()
+            .take(8)
+            .map(|(value, expert)| format!("{expert} {value:.4}"))
+            .collect();
+        println!(
+            "scores: layer {layer} row {row:2}: rms {:.6e}, top 8 [{}]",
+            rms(scores),
+            top.join(", ")
+        );
+    }
+    let Some(dir) = args.dump.as_deref() else {
+        println!("scores: pass --dump to write these for the comparator");
+        return Ok(());
+    };
+    let path = dir.join(format!("hidden_{:02}_gate_scores.npy", layer + 1));
+    write_npy(&path, values, rows, experts)?;
+    println!("scores: {} (the gate's logits, f32)", path.display());
+    Ok(())
+}
+
 fn reference_rows(
     stream: &platform::Stream,
     arena: &Arena,
