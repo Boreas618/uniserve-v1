@@ -27,6 +27,7 @@ use crate::weights::Weight;
 pub struct Sections {
     widths: [u32; MAX_AXES],
     axes: u32,
+    interleaved: bool,
 }
 
 impl Sections {
@@ -54,7 +55,24 @@ impl Sections {
         Ok(Self {
             widths: stored,
             axes: widths.len() as u32,
+            interleaved: false,
         })
+    }
+
+    /// Cycle the axes over the whole spectrum instead of cutting it in order.
+    ///
+    /// Qwen3-VL's interleaved M-RoPE gives frequency `j` the axis `j % axes` while the axis owns
+    /// `j`, so every axis keeps frequencies from the whole range; the contiguous cut, the default,
+    /// gives axis `a` the next `sections[a]` frequencies. The two are different programs
+    /// (`ops::rope::FactorsDescriptor::interleaved`).
+    pub const fn interleaved(mut self) -> Self {
+        self.interleaved = true;
+        self
+    }
+
+    /// Whether the axes cycle over the spectrum.
+    pub const fn is_interleaved(&self) -> bool {
+        self.interleaved
     }
 
     /// How many position axes the rotation reads.
@@ -72,6 +90,7 @@ impl Sections {
 pub struct Rotary {
     frequencies: Weight,
     head_dim: u32,
+    rotated: u32,
     q_heads: u32,
     k_heads: u32,
     epsilon: f32,
@@ -106,18 +125,17 @@ impl Rotary {
                 format!("a head of {head_dim} elements has no rotation pair"),
             ));
         }
-        if frequencies.shape().numel() != u64::from(head_dim / 2) {
+        let pairs = frequencies.shape().numel();
+        if pairs == 0 || pairs * 2 > u64::from(head_dim) {
             return Err(Error::shape(
                 "Rotary",
-                format!(
-                    "{} frequencies for {head_dim} rotated elements",
-                    frequencies.shape().numel()
-                ),
+                format!("{pairs} frequency pairs for a {head_dim} element head"),
             ));
         }
         Ok(Self {
             frequencies,
             head_dim,
+            rotated: head_dim,
             q_heads,
             k_heads,
             epsilon,
@@ -127,17 +145,47 @@ impl Rotary {
         })
     }
 
+    /// Rotate the leading `rotated` channels of each head and pass the rest through.
+    ///
+    /// A multimodal transformer rotates part of a head — H3 turns 96 of its 128 channels and copies
+    /// the trailing 32 as they are — so the factors are `rotated / 2` pairs wide and the sections
+    /// cut `rotated`, not the head. `rotated` is even, at least two, at most the head's width, and
+    /// the frequency table carries exactly `rotated / 2` pairs.
+    pub fn partial(mut self, rotated: u32) -> Result<Self> {
+        if rotated < 2 || !rotated.is_multiple_of(2) || rotated > self.head_dim {
+            return Err(Error::shape(
+                "Rotary::partial",
+                format!(
+                    "a rotation of {rotated} channels does not fit a {} element head with whole pairs",
+                    self.head_dim
+                ),
+            ));
+        }
+        let pairs = self.frequencies.shape().numel();
+        if pairs != u64::from(rotated / 2) {
+            return Err(Error::shape(
+                "Rotary::partial",
+                format!(
+                    "{pairs} frequency pairs for {rotated} rotated elements of a {} element head",
+                    self.head_dim
+                ),
+            ));
+        }
+        self.rotated = rotated;
+        Ok(self)
+    }
+
     /// The same rotation, reading one position coordinate per axis (M-RoPE).
     ///
-    /// The sections must cut the head's rotated width exactly: their widths sum to `head_dim`.
+    /// The sections must cut the head's rotated width exactly: their widths sum to `rotated`.
     pub fn sectioned(mut self, sections: Sections) -> Result<Self> {
         let covered: u32 = sections.widths().iter().sum();
-        if covered != self.head_dim {
+        if covered != self.rotated {
             return Err(Error::shape(
                 "Rotary::sectioned",
                 format!(
-                    "sections cover {covered} elements of a {} element head",
-                    self.head_dim
+                    "sections cover {covered} elements of a {} channel rotation",
+                    self.rotated
                 ),
             ));
         }
@@ -145,9 +193,14 @@ impl Rotary {
         Ok(self)
     }
 
-    /// The rotated width of one head.
-    pub const fn head_dim(&self) -> u32 {
-        self.head_dim
+    /// The query heads: the rank the factors and the per-head norm are applied at.
+    pub const fn heads(&self) -> u32 {
+        self.q_heads
+    }
+
+    /// The rotated width of one head: `head_dim` unless the rotation was narrowed.
+    pub const fn rotated(&self) -> u32 {
+        self.rotated
     }
 
     /// The rotation pairing.
@@ -155,7 +208,7 @@ impl Rotary {
         self.rotation
     }
 
-    /// Turn `positions` into `cosine` and `sine` tables, both `[tokens, head_dim / 2]` FP32.
+    /// Turn `positions` into `cosine` and `sine` tables, both `[tokens, rotated / 2]` FP32.
     ///
     /// A one-dimensional rotation's `positions` is `[…, tokens]`; a sectioned rotation's is
     /// `[axes, …, tokens]`, one coordinate per axis per token, and the tables cover the tokens.
@@ -166,7 +219,7 @@ impl Rotary {
         cosine: TensorView,
         sine: TensorView,
     ) -> Result<()> {
-        let columns = u64::from(self.head_dim / 2);
+        let columns = u64::from(self.rotated / 2);
         cosine
             .require_row("Rotary::factors", ops::DType::F32, columns)
             .map_err(Error::from)?;
@@ -209,11 +262,14 @@ impl Rotary {
         let descriptor = FactorsDescriptor {
             dtype: ops::DType::F32,
             positions: positions.dtype,
-            columns: self.head_dim / 2,
+            columns: self.rotated / 2,
             block: ROTARY_BLOCK,
             scale: self.scale.into(),
             pdl: PDL,
             axes: self.sections.map_or(1, |sections| sections.axes()),
+            interleaved: self
+                .sections
+                .is_some_and(|sections| sections.is_interleaved()),
             sections: self
                 .sections
                 .map_or([0; MAX_AXES], |sections| sections.widths),
@@ -231,7 +287,13 @@ impl Rotary {
     /// Normalize and rotate `query` and `key` into `q_out` and `k_out`.
     ///
     /// `query` and `q_out` are `[tokens, q_heads, head_dim]`, `key` and `k_out`
-    /// `[tokens, k_heads, head_dim]`; the two weights are `[head_dim]`.
+    /// `[tokens, k_heads, head_dim]`; the two weights are `[head_dim]`, given together or both
+    /// absent.
+    ///
+    /// A trained transformer's per-head normalization scales the head by a learned weight; the video
+    /// VAE's decoder normalizes each head without one, and that call passes neither weight, which
+    /// compiles a program with no weight ports (specs/worker.md 9, the per-head norm row;
+    /// `ops::rope::QkNormRopeDescriptor::affine`).
     #[allow(
         clippy::too_many_arguments,
         reason = "a rotation call carries the two projections, their norms, the two factor tables \
@@ -242,8 +304,8 @@ impl Rotary {
         f: &Forward,
         query: TensorView,
         key: TensorView,
-        q_weight: TensorView,
-        k_weight: TensorView,
+        q_weight: Option<TensorView>,
+        k_weight: Option<TensorView>,
         cosine: TensorView,
         sine: TensorView,
         q_out: TensorView,
@@ -282,7 +344,7 @@ impl Rotary {
                 "the query and key tensors have different token counts".to_owned(),
             ));
         }
-        let columns = head_dim / 2;
+        let columns = u64::from(self.rotated / 2);
         if cosine.numel() != tokens * columns || sine.numel() != tokens * columns {
             return Err(Error::shape(
                 "Rotary::apply",
@@ -293,6 +355,26 @@ impl Rotary {
                 ),
             ));
         }
+        let affine = match (q_weight, k_weight) {
+            (Some(q_weight), Some(k_weight))
+                if q_weight.numel() == head_dim && k_weight.numel() == head_dim =>
+            {
+                Some((q_weight, k_weight))
+            }
+            (None, None) => None,
+            (Some(_), Some(_)) => {
+                return Err(Error::shape(
+                    "Rotary::apply",
+                    format!("per-head weights of {head_dim} elements"),
+                ));
+            }
+            _ => {
+                return Err(Error::shape(
+                    "Rotary::apply",
+                    "the per-head weights are given together, or both absent".to_owned(),
+                ));
+            }
+        };
         let descriptor = QkNormRopeDescriptor {
             dtype: query.dtype,
             output: q_out.dtype,
@@ -301,9 +383,16 @@ impl Rotary {
             k_heads: self.k_heads,
             rotation: self.rotation,
             epsilon: self.epsilon.into(),
+            // Full-width unless the configuration narrows it.
+            rotated: self.rotated,
             rows: QK_NORM_TOKENS,
             block: head_dim.next_power_of_two().min(1024) as u32,
+            affine: affine.is_some(),
             pdl: PDL,
+        };
+        let (q_weight, k_weight) = match affine {
+            Some((q_weight, k_weight)) => (Some(q_weight), Some(k_weight)),
+            None => (None, None),
         };
         let args = QkNormRopeArgs {
             query,
