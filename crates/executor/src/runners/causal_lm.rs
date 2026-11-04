@@ -1135,9 +1135,14 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// Runs the paired forward of one changed operator and compares its two results (7.3).
     ///
     /// The old kernel writes the real outputs and the new one its twins; the forward continues on
-    /// the old kernel's result, so the difference of one operator cannot accumulate. The paired
-    /// forward runs without a graph, on the runner's stream, so it touches no captured bucket, and
-    /// its KV goes to scratch pages: nothing a serving request reads is written.
+    /// the old kernel's result, so the difference of one operator cannot accumulate.
+    ///
+    /// The paired forward runs eagerly, on the runner's stream, between two device jobs, and its KV
+    /// goes to scratch pages: the KV cache is the state that persists from one step to the next, so
+    /// that is what must not be written (7.3). Its activations do land in the bucket's arena region,
+    /// which is the only region the model's layers are laid out in; every replay writes that region
+    /// before it reads it, so a paired forward can change no value a request observes, and no
+    /// serving batch can be in flight while it runs (one device thread, one stream).
     fn shadow(
         &mut self,
         operator: &'static str,
