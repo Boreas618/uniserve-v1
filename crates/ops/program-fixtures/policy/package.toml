@@ -1,0 +1,48 @@
+# A program package the delivery test installs to prove the *policy* layer moves
+# the way a kernel program does: the deployment serves `scheduling/fcfs`, this
+# package is a second revision of the same program, and installing it makes the
+# daemon reload its policy module at the program layer.
+#
+# Nothing of ours is in the module: it is sched's own policy crate
+# (`crates/scheduling/policies/fcfs`, whose body is `scheduling_guest::Arrival`
+# ordered by arrival), built for wasm32 by `src/build.py` and precompiled for this
+# host's CPU by the wasm toolchain. The package exists so that a policy is a
+# package like any other, not so that a policy is ours.
+#
+# The build runs when the package is installed, while the tree it was published
+# from still exists — which is why this package carries no wasm binary and no copy
+# of the policy's source (design 6.2: a wasm package is built as it is installed).
+# A host that only serves the installed revision needs neither cargo nor the tree.
+#
+# `[toolchain] version` is empty: an empty version means any version this host
+# has, which is what a fixture that must install on an arbitrary delivery host
+# declares. A serving package pins the precompiler's version instead, because a
+# precompiled artifact carries wasmtime's format.
+#
+# No `[kernel]`: a policy has no GPU architecture and no descriptor, so the store
+# path is `scheduling/fcfs/<revision>/wasm32/default` and `resolve` hands the main
+# process one file, `module.wasm`.
+
+op = "scheduling"
+backend = "fcfs"
+
+[toolchain]
+kind = "wasm"
+version = ""
+packages = []
+
+[module]
+form = "wasm"
+
+[source]
+kind = "wasm"
+files = ["src/build.py"]
+script = "src/build.py"
+
+[parameters]
+chunked_prefill_size = 8192
+max_queued_requests = "unbounded"
+max_batch = 128
+max_num_batched_tokens = 8192
+prefetch_min_tokens = 256
+timeout = "30s"
