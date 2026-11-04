@@ -945,27 +945,22 @@ def main() -> int:
 
     if arguments.interpreter and arguments.op == "logits_shape":
         print(
-            "logits_shape needs a device: its kernel rounds with libdevice's div_rn, "
-            "mul_rn and sub_rn, which the interpreter either cannot load (the CUDA "
-            "module) or returns None from (the portable one)",
+            "skipped: needs a device — its kernel rounds with libdevice's div_rn, mul_rn and sub_rn, which the interpreter either cannot load (the CUDA module) or returns None from (the portable one)",
             file=sys.stderr,
         )
-        return 1
+        return 0
     if arguments.interpreter and arguments.op == "top_k":
         print(
-            "top_k needs a device: its kernel complements a uint32 with `~`, which the "
-            "interpreter turns into the Python integer -1 and refuses",
+            "skipped: needs a device — its kernel complements a uint32 with `~`, which the interpreter turns into the Python integer -1 and refuses",
             file=sys.stderr,
         )
-        return 1
+        return 0
     if arguments.interpreter and arguments.op == "filter_candidates":
         print(
-            "filter_candidates needs a device: its kernel combines a scalar comparison "
-            "with an array comparison using `|`, which the interpreter hands to a bitwise "
-            "ufunc as `numpy.bool_ | ndarray` and which then refuses",
+            "skipped: needs a device — its kernel combines a scalar comparison with an array comparison using `|`, which the interpreter hands to a bitwise ufunc as `numpy.bool_ | ndarray` and which then refuses",
             file=sys.stderr,
         )
-        return 1
+        return 0
 
     key = descriptor_key(arguments.op, arguments)
     print(f"descriptor: {key} ({arguments.op})")

@@ -19,11 +19,12 @@ page, must still hold it. What the interpreter cannot answer is the *value* of a
 truncates every narrowing float cast (measured: `0.1` becomes the bf16 `0.099609375`, and `1.9375`
 becomes `1.0` instead of `2.0`), so those bytes are not compared here.
 
-## What the device answers: every E4M3 code, and why all 256 of them
+## What the device answers: every E4M3 code, and why all of them
 
 The quotient's code is the whole content of the operator, and no tolerance bounds it. E4M3 has
-exactly 256 codes, so the device half enumerates all of them: a source whose quotient by each page's
-scale is exactly each representable value, written through the real path and compared byte for byte.
+exactly 256 codes, two of which are NaN patterns that no arithmetic produces, so the device half
+enumerates the **254 finite ones**: a source whose quotient by each page's scale is exactly each
+representable value, written through the real path and compared byte for byte.
 Every rounding, every subnormal and saturation is covered by construction, and a wrong rounding
 (truncation instead of round-to-nearest-even) shows up as a byte rather than as a small difference.
 
@@ -59,7 +60,7 @@ SENTINELS = (0x7E, 0x3C)
 #: page is visible in the quotient.
 SCALES = (1.0, 0.5, 2.0, 3.7)
 
-#: Every code of E4M3 except the two NaN patterns (`0x7F`, `0xFF`), which no arithmetic produces.
+#: Every code of E4M3 except the two NaN patterns (`0x7F`, `0xFF`), which no arithmetic produces: 254.
 FINITE_CODES = [code for code in range(256) if code not in (0x7F, 0xFF)]
 
 
@@ -221,13 +222,16 @@ def pattern_source(rows, width, per_token, device):
     return (values.to(device) * per_token[:, None]).to(torch.float32)
 
 
-def padding_case(what, sentinel):
-    """A span of three pages with a padding slot in the middle: what must not move, and why."""
+def padding_case(what, sentinel, slots=(0, 16, -1, 32, 33), slot_scales=None):
+    """A span of three pages with a padding slot in the middle: what must not move, and why.
+
+    The default slot list puts two tokens of the third page at their own offsets — so the page is
+    the slot's and not the token's — and leaves the second page's other rows alone; a case that
+    names no slot of page one leaves that page's flag at zero, which is how "only the pages this
+    launch touched" is observable at all.
+    """
     page, heads, head_dim = 16, 8, 128
     width = heads * head_dim
-    # Two tokens of the third page at their own offsets, so the page is the slot's and not the
-    # token's; three pages, so slots 0 to 47 are the whole cache.
-    slots = [0, 16, -1, 32, 33]
     return dict(
         what=what,
         sentinel=sentinel,
@@ -241,7 +245,7 @@ def padding_case(what, sentinel):
         slots=slots,
         # Every page has its own factor, so a kernel that took the token's page instead of the
         # slot's would divide by another page's scale.
-        slot_scales={0: 1.0, 16: 0.5, 32: 2.0, 33: 2.0},
+        slot_scales=slot_scales or {0: 1.0, 16: 0.5, 32: 2.0, 33: 2.0},
         source=pattern_source,
     )
 
@@ -272,6 +276,14 @@ def grid_case(scale, block, pdl):
 INTERPRETER_CASES = [
     padding_case("a padding slot between two live ones", SENTINELS[0]),
     padding_case("a padding slot with another sentinel byte", SENTINELS[1]),
+    # A page no slot names: its whole width must stay the sentinel and its flag must stay zero, so a
+    # kernel that flagged every page would be caught here and nowhere else.
+    padding_case(
+        "a page no slot names",
+        SENTINELS[0],
+        slots=(0, -1, -1, 32, 33),
+        slot_scales={0: 1.0, 32: 2.0, 33: 2.0},
+    ),
 ]
 
 #: Cases only a device can answer: the codes, and the properties that ride with them.
@@ -281,6 +293,12 @@ DEVICE_CASES = [
     grid_case(SCALES[0], 1024, False),
     grid_case(SCALES[1], 128, True),
     padding_case("a padding slot with the codes compared", SENTINELS[0]),
+    padding_case(
+        "a page no slot names, with the codes compared",
+        SENTINELS[1],
+        slots=(0, -1, -1, 32, 33),
+        slot_scales={0: 1.0, 32: 2.0, 33: 2.0},
+    ),
 ]
 
 
@@ -299,10 +317,12 @@ def main() -> int:
     )
     options = parser.parse_args()
     if options.device and not torch.cuda.is_available():
-        raise SystemExit(
-            "the code grid needs the device: the interpreter truncates every narrow cast, so its "
-            "bytes are the tool's and not the kernel's; run without --device for what must not move"
+        print(
+            "skipped: needs a device — the code grid compares stored E4M3 bytes and the interpreter "
+            "truncates every narrow cast, so its bytes would be the tool's and not the kernel's; "
+            "without --device the script runs the half that needs no device"
         )
+        return 0
     module = load_kernel(options.package)
     cases = DEVICE_CASES if options.device else INTERPRETER_CASES
     written = 0
@@ -316,7 +336,7 @@ def main() -> int:
     if not options.device:
         print(
             f"{len(DEVICE_CASES)} cases are left for --device: they compare the stored E4M3 codes "
-            f"against all 256 of the format's finite values, and the interpreter truncates a narrow "
+            f"against all {len(FINITE_CODES)} finite values of the format, and the interpreter truncates a narrow "
             f"store, so a green from it would be a statement about the tool"
         )
     return 0
