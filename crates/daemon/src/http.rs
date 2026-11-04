@@ -349,13 +349,24 @@ async fn serve_on(
         tokio::spawn(async move {
             crate::restart::streams::adopted(std::slice::from_ref(&stream));
             let request_id = stream.request_id.clone();
-            let error = conn::adopt(stream.descriptor, stream.http, stream.body, app)
-                .await
-                .err();
+            let ended = request_id.clone();
+            // The record names the response, which ends with its last frame
+            // and not with the connection the successor keeps serving
+            // (design §7.5.1).
+            let error = conn::adopt(
+                stream.descriptor,
+                stream.http,
+                stream.body,
+                app,
+                move || {
+                    crate::restart::streams::finished(&ended);
+                },
+            )
+            .await
+            .err();
             if let Some(error) = error {
                 tracing::warn!(%request_id, %error, "a handed-over connection ended");
             }
-            crate::restart::streams::finished(&request_id);
         });
     }
 
