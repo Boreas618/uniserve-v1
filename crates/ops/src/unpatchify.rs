@@ -109,6 +109,28 @@ impl Args {
     pub fn tokens(&self) -> u64 {
         u64::from(self.frames) * u64::from(self.height) * u64::from(self.width)
     }
+
+    /// The planar raster a launch writes: `[channels, frames, height, width]`, each spatial axis
+    /// multiplied by the patch it replaces.
+    ///
+    /// The channels are the **outer** axis and the width the **innermost**, so the contiguous row a
+    /// launch may write is `width · patch_width` values — not `channels`. The two differ in every
+    /// geometry this operator serves (`24` against `84` for the transformer's latents, `3` against
+    /// `160` for the decoder's raster), and a launch check that reads the outer axis for the row
+    /// refuses each of them.
+    pub fn raster(&self) -> Shape {
+        Shape::new(&[
+            u64::from(self.channels),
+            u64::from(self.frames) * u64::from(self.patch_frames),
+            u64::from(self.height) * u64::from(self.patch_height),
+            u64::from(self.width) * u64::from(self.patch_width),
+        ])
+    }
+
+    /// Values on the raster's innermost axis, which is the row a launch writes.
+    pub fn raster_row(&self) -> u64 {
+        u64::from(self.width) * u64::from(self.patch_width)
+    }
 }
 
 /// The packed-token to planar-raster mapping, with an optional per-channel denormalization.
@@ -139,15 +161,10 @@ impl Op for Unpatchify {
                     .to_owned(),
             ));
         }
-        let out_shape = Shape::new(&[
-            channels,
-            frames * u64::from(args.patch_frames),
-            height * u64::from(args.patch_height),
-            width * u64::from(args.patch_width),
-        ]);
+        let out_shape = args.raster();
         args.out.require_shape(Self::NAME, out_shape)?;
         args.out
-            .require_row(Self::NAME, descriptor.dtype, out_shape.dims()[0])?;
+            .require_row(Self::NAME, descriptor.dtype, args.raster_row())?;
         args.tokens
             .require_shape(Self::NAME, Shape::new(&[tokens, args.token_width()]))?;
         if args.tokens.dtype != descriptor.dtype {
@@ -309,6 +326,34 @@ mod tests {
         let key = latents().to_string();
         assert!(!key.contains("patch"), "{key}");
         assert!(!key.contains("channels"), "{key}");
+    }
+
+    #[test]
+    fn the_raster_row_is_the_width_and_not_the_channels() {
+        // The transformer's latents: 24 channels out of a `1x2x2` patch, so the raster is
+        // `[24, 37, 48, 84]` and its innermost axis is 84 values — the row a launch writes.
+        let latents = grid();
+        assert_eq!(latents.raster().dims(), &[24, 37, 48, 84]);
+        assert_eq!(latents.raster_row(), 84);
+        assert_ne!(latents.raster_row(), u64::from(latents.channels));
+
+        // The decoder's raster from the same compiled module: 3 channels and a `4x16x16` patch.
+        let decoded = Args {
+            channels: 3,
+            patch_frames: 4,
+            patch_height: 16,
+            patch_width: 16,
+            frames: 9,
+            height: 8,
+            width: 10,
+            ..latents.clone()
+        };
+        assert_eq!(decoded.raster().dims(), &[3, 36, 128, 160]);
+        assert_eq!(decoded.raster_row(), 160);
+
+        // Neither geometry has a raster row equal to its channel count, which is why a launch check
+        // reading the outer axis refuses every real raster instead of admitting it.
+        assert_ne!(decoded.raster_row(), u64::from(decoded.channels));
     }
 
     #[test]
