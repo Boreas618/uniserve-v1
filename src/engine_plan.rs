@@ -43,7 +43,7 @@ use program_server::Target;
 use crate::engine_main::Launch;
 
 /// One epoch's build config, resolved against the node the main process runs on.
-pub struct EpochPlan {
+pub(crate) struct EpochPlan {
     /// The epoch's build config, which the daemon wrote (§7.2).
     build: daemon::epoch::BuildConfig,
     /// The checkpoint this rank serves.
@@ -75,7 +75,7 @@ impl EpochPlan {
     /// starts every rank of a node with the ordinals that rank serves, and a main process that
     /// guessed its devices from the epoch's parallelism would capture graphs on another rank's
     /// device.
-    pub fn of(launch: &Launch, build: &daemon::epoch::BuildConfig) -> Result<Self> {
+    pub(crate) fn of(launch: &Launch, build: &daemon::epoch::BuildConfig) -> Result<Self> {
         if launch.devices.is_empty() {
             bail!(
                 "rank {} of group {} was started with no device to serve",
@@ -142,12 +142,12 @@ impl EpochPlan {
     }
 
     /// The epoch's build config, for an accessor that needs another of its fields.
-    pub fn build(&self) -> &daemon::epoch::BuildConfig {
+    pub(crate) fn build(&self) -> &daemon::epoch::BuildConfig {
         &self.build
     }
 
     /// The checkpoint this rank serves.
-    pub fn checkpoint(&self) -> &Path {
+    pub(crate) fn checkpoint(&self) -> &Path {
         &self.checkpoint
     }
 
@@ -156,7 +156,7 @@ impl EpochPlan {
     /// A catalog is a property of the epoch, not of a device, so `graph` and `runners` share it
     /// rather than each building one: two catalogs of one epoch would be two answers to what a
     /// batch may be, and a batch that fits one but not the other would have no graph to replay.
-    pub fn buckets(&self) -> &Buckets {
+    pub(crate) fn buckets(&self) -> &Buckets {
         &self.buckets
     }
 
@@ -167,7 +167,7 @@ impl EpochPlan {
     /// count for the lane that maps weights and installs programs, and the host's parallelism for
     /// the lanes that read transfers, reclaim storage and handle media. A lane whose bound is
     /// narrower than the work in flight queues it; it never drops it.
-    pub fn blocking_limits(&self) -> Limits {
+    pub(crate) fn blocking_limits(&self) -> Limits {
         let available = std::thread::available_parallelism()
             .map(|count| count.get())
             .unwrap_or(4);
@@ -193,17 +193,17 @@ impl EpochPlan {
     }
 
     /// The Program Server's socket, which the rank's program client connects to.
-    pub fn program_server(&self) -> &Path {
+    pub(crate) fn program_server(&self) -> &Path {
         &self.program_server
     }
 
     /// This rank's devices, in the order the daemon named them.
-    pub fn devices(&self) -> &[DeviceId] {
+    pub(crate) fn devices(&self) -> &[DeviceId] {
         &self.devices
     }
 
     /// The device's completion events: one pool per rank, shared by its executors (§2.4).
-    pub fn events(&self) -> Arc<EventPool> {
+    pub(crate) fn events(&self) -> Arc<EventPool> {
         EventPool::new()
     }
 
@@ -216,7 +216,7 @@ impl EpochPlan {
     /// the shadow pair's region are carved from (7.3). The resident pool is reserved by whoever
     /// carves it - `Memory`, through `Executor::pools()` - so the graph storage asks for none: a
     /// second figure here would be a second claim on the same bytes.
-    pub fn graph(&self, device: DeviceId) -> Result<GraphStorage> {
+    pub(crate) fn graph(&self, device: DeviceId) -> Result<GraphStorage> {
         let handle = platform::Device::new(device)
             .with_context(|| format!("opening device {}", device.0))?;
         let total = handle.total_memory();
@@ -247,12 +247,12 @@ impl EpochPlan {
     }
 
     /// How long a job may run without rank progress before it is reported `Stalled` (§2.4).
-    pub fn watchdog_timeout(&self) -> Duration {
+    pub(crate) fn watchdog_timeout(&self) -> Duration {
         self.build.worker.watchdog_timeout
     }
 
     /// The Program Server's targets this rank resolves a module for (§5.3).
-    pub fn targets(&self) -> &[Target] {
+    pub(crate) fn targets(&self) -> &[Target] {
         &self.targets
     }
 
@@ -261,7 +261,7 @@ impl EpochPlan {
     /// This is the single match on model class in the tree. Everything downstream of it - the
     /// buckets, the arena, the sampler, the graphs - is written against `nn`'s capability traits,
     /// so a second causal-language class joins as a variant here and changes nothing else.
-    pub fn runners(
+    pub(crate) fn runners(
         &self,
         device: DeviceId,
         model: Arc<qwen3_moe::Qwen3Moe>,
@@ -344,7 +344,7 @@ impl EpochPlan {
     /// allowance as it maps, which is what makes the first `mapped <= budget` reading after warmup
     /// count every byte the plan charged. The device's pool set is opened here, first, because the
     /// owners carve their storage from it and the runner is built from them.
-    pub fn open_memory(
+    pub(crate) fn open_memory(
         &self,
         model: &qwen3_moe::Qwen3Moe,
         storage: &mut dyn executor::memory::retained::ExclusiveStorage,
