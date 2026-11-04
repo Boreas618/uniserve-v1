@@ -71,6 +71,7 @@
 //! derived from the reduction length, the accumulation dtype and the output dtype, operator by
 //! operator, and never from a measurement of the pair being compared.
 
+pub mod activation;
 pub mod attention;
 pub mod conv;
 pub mod descriptor;
