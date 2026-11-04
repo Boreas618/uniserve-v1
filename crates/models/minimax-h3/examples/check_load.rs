@@ -130,7 +130,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect::<Result<Vec<_>, _>>()?
     };
     for component in &chosen {
-        if !serving.blocks.contains(**component) {
+        if !serving.blocks.contains(*component) {
             return Err(format!(
                 "`{}` is not placed by {task_name}; the deployment places {}",
                 component.name(),
@@ -162,7 +162,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // One component, one partition: the load path is the deployment's, and what it places is
         // narrowed so that one component's weights are what the store holds.
-        let partition = serving.clone().placing(Components::of([*component]));
+        let partition = serving.placing(Components::of([component]));
         let mut store = HostStore::new();
         {
             let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
