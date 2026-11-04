@@ -2765,10 +2765,13 @@ impl Denoiser {
         for value in &table {
             entry_bytes.extend_from_slice(&value.to_le_bytes());
         }
+        // One row per *time* of the merged ladder, not per solver step: the ladder's distinct
+        // noise levels are what `table` maps a step to, and `entries` is their count - one more
+        // than the steps a request takes, because the last point is a level and not a step.
         let entry_table = loader.constant(
             "minimax_h3.adaln.entries",
             DType::I32,
-            Shape::new(&[u64::from(evaluations), u64::from(groups.count())]),
+            Shape::new(&[entries, u64::from(groups.count())]),
             &entry_bytes,
         )?;
 
