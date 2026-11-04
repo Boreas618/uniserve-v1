@@ -207,7 +207,7 @@ impl EpochPlan {
     /// the shadow pair's region are carved from (7.3). The resident pool is reserved by whoever
     /// carves it - `Memory`, through `Executor::pools()` - so the graph storage asks for none: a
     /// second figure here would be a second claim on the same bytes.
-    pub(crate) fn graph(&self, device: DeviceId) -> Result<GraphStorage> {
+    pub(crate) fn graph(&self, device: DeviceId, resident: u64) -> Result<GraphStorage> {
         let handle = platform::Device::new(device)
             .with_context(|| format!("opening device {}", device.0))?;
         let storage = handle.memory_info()?;
@@ -239,7 +239,7 @@ impl EpochPlan {
         // scratch. The second pool is a reservation until a preparation captures into it, so it is
         // not part of this test - a deployment with room for one pool starts and serves, and an
         // update that needs the second one is refused by name when it maps.
-        let needs = bytes / 2 + scratch;
+        let needs = bytes / 2 + scratch + resident;
         if budget < needs {
             bail!(
                 "device {} has {budget} bytes left of {total} once the model is mapped, at \
@@ -256,7 +256,11 @@ impl EpochPlan {
             // of it, so the graph reservation is not divided among streams.
             streams: 1,
             scratch,
-            resident: 0,
+            // The KV pool: the units the capacity plan fitted, each the size of a cache unit. This
+            // rank keeps its keys and values in the process - that is what a prefix cache is - so
+            // the figure is the plan's and not zero. A pool whose figure is zero is not reserved,
+            // and a KV provider that asks for it is refused by name.
+            resident,
         })
     }
 
@@ -536,7 +540,14 @@ impl EpochPlan {
         let group = executor::parallel::host::HostGroup::single(self.rank as usize);
         let report = rank_report(device, &host)?;
         let planned = executor::capacity::plan_rank(&facts, report, &group)?;
-        let graph = self.graph(device)?;
+        // The keys and values the plan fitted are the process's resident pool: a unit is a cache
+        // unit, and the plan charged them all against the same device allowance the pools are
+        // booked against. A plan that fitted no cache (a rank that serves none) states zero.
+        let resident = match (&planned.plan.cache, planned.plan.info.prefix_cache.as_ref()) {
+            (Some(cache), Some(info)) => u64::from(info.num_units) * cache.unit_bytes,
+            _ => 0,
+        };
+        let graph = self.graph(device, resident)?;
         let pools = executor::device::Executor::open(device, &graph)?;
         let stream = platform::Stream::new(device)
             .with_context(|| format!("creating device {}'s stream", device.0))?;
