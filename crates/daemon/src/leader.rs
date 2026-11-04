@@ -71,6 +71,10 @@ pub struct Leader {
     images: MediaConnector,
     /// The System One readout encoder of a model that serves the readout.
     readout: Option<Arc<ReadoutEncoder>>,
+    /// The epoch layer: the epoch records, the switch in flight and the
+    /// adapter that commands the deployment's main processes (§7.4). It
+    /// shares the records with the admin's `GET /admin/config`.
+    pub(crate) updates: Arc<crate::updates::driver::Driver>,
     /// Whether every request logs a summary line when it ends.
     log_requests: bool,
     /// Periodic throughput logging, stopped with the engine.
@@ -467,6 +471,7 @@ impl Leader {
         config: &ServeConfig,
         stated: &Stated,
         daemon: String,
+        updates: Arc<crate::updates::driver::Driver>,
     ) -> anyhow::Result<Self> {
         let prepared = Self::prepare(config, stated).await?;
         info!(placement = ?prepared.spec.placement, "starting the engine process");
@@ -506,6 +511,7 @@ impl Leader {
             client,
             served,
             observer,
+            updates,
         )?;
         for (index, (client, served, observer)) in clients.enumerate() {
             let replica = Replica::new(
@@ -643,6 +649,7 @@ impl Leader {
         client: EngineClient,
         served: wire::EngineSpec,
         observer: Arc<crate::worlds::Observer>,
+        updates: Arc<crate::updates::driver::Driver>,
     ) -> anyhow::Result<Self> {
         let Prepared {
             model_config,
@@ -746,6 +753,7 @@ impl Leader {
             readout,
             config,
             observer,
+            updates,
         );
         let replica = Arc::clone(&engine.replicas.serving.borrow()[0]);
         let _ = replica.control.set(control);
@@ -769,6 +777,7 @@ impl Leader {
         images: MediaConnector,
         readout: Option<ReadoutEncoder>,
         options: &ServeConfig,
+        updates: Arc<crate::updates::driver::Driver>,
     ) -> Self {
         Self::observed(
             served_model_name,
@@ -779,6 +788,7 @@ impl Leader {
             readout,
             options,
             Arc::default(),
+            updates,
         )
     }
 
@@ -797,6 +807,7 @@ impl Leader {
         readout: Option<ReadoutEncoder>,
         options: &ServeConfig,
         observer: Arc<crate::worlds::Observer>,
+        updates: Arc<crate::updates::driver::Driver>,
     ) -> Self {
         let logging = &options.logging_config;
         let mut info = clients[0].info().clone();
@@ -848,6 +859,7 @@ impl Leader {
             replicas,
             images,
             readout: readout.map(Arc::new),
+            updates,
             log_requests: logging.log_requests,
             _stats_logger: stats_logger,
         }
