@@ -51,10 +51,7 @@ pub struct Descriptor {
     pub channels: u32,
     /// Points per side of the learned table's grid: square, because the checkpoint's table is.
     pub in_side: u32,
-    /// Points per row of the target grid.
-    pub out_rows: u32,
-    /// Points per column of the target grid.
-    pub out_columns: u32,
+
     /// Elements one thread block handles.
     pub block: u32,
     /// Whether the module was compiled for programmatic dependent launch.
@@ -67,8 +64,6 @@ impl fmt::Display for Descriptor {
             .field("dtype", self.dtype)
             .field("channels", self.channels)
             .field("in_side", self.in_side)
-            .field("out_rows", self.out_rows)
-            .field("out_columns", self.out_columns)
             .field("block", self.block)
             .field("pdl", self.pdl)
             .finish(formatter)
@@ -80,11 +75,15 @@ impl fmt::Display for Descriptor {
 pub struct Args {
     /// `[in_side · in_side, channels]` the learned table.
     pub table: TensorView,
-    /// `[out_rows · out_columns, 4]` i32 tap indices into the table's points.
+    /// `[points, 4]` i32 tap indices into the table's points.
+    ///
+    /// Every index must be below `in_side²`: the program does not range-check a table it cannot read
+    /// on the host, so building taps inside the table is the caller's obligation and a table that
+    /// violates it reads a neighbouring point rather than failing.
     pub indices: TensorView,
-    /// `[out_rows · out_columns, 4]` FP32 tap weights, normalized by the caller.
+    /// `[points, 4]` FP32 tap weights, normalized by the caller.
     pub weights: TensorView,
-    /// `[out_rows · out_columns, channels]` the resampled table.
+    /// `[points, channels]` the resampled table.
     pub out: TensorView,
 }
 
@@ -104,9 +103,9 @@ impl Op for PositionInterpolate {
         stream: &Stream,
     ) -> Result<()> {
         let channels = u64::from(descriptor.channels);
-        // The target grid is rectangular: a canvas of any aspect ratio is patches, and its rows and
-        // columns are independent.
-        let points = u64::from(descriptor.out_rows) * u64::from(descriptor.out_columns);
+        // The output's point count is the args' own extent: the grid geometry is the caller's, and
+        // the program never divides by a side.
+        let points = args.out.rows();
 
         args.table.require_shape(
             Self::NAME,
@@ -206,24 +205,24 @@ mod tests {
             dtype: DType::BF16,
             channels: 1280,
             in_side: 48,
-            out_rows: 24,
-            out_columns: 40,
             block: 1024,
             pdl: false,
         }
     }
 
     #[test]
-    fn the_key_states_both_grids_because_the_tables_depend_on_them() {
+    fn the_key_states_the_learned_table_and_not_the_target_grid() {
         assert_eq!(
             descriptor().to_string(),
-            "dtype_bf16_channels_1280_in_side_48_out_rows_24_out_columns_40_block_1024_pdl_false"
+            "dtype_bf16_channels_1280_in_side_48_block_1024_pdl_false"
         );
         // The resample of another grid is another compilation: its index and weight tables differ.
+        // The target grid is the args' extent, so two grids of one table are one program; a
+        // different learned table is another (its taps address a different range).
         assert_ne!(
             descriptor().to_string(),
             Descriptor {
-                out_columns: 80,
+                in_side: 24,
                 ..descriptor()
             }
             .to_string()
