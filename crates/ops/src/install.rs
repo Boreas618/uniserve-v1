@@ -78,6 +78,7 @@ const OPERATORS: &[&str] = &[
     <crate::residual::ScaledResidualRmsNorm as Op>::NAME,
     <crate::residual::ScaledResidualLayerNorm as Op>::NAME,
     <crate::residual::ScaledResidual as Op>::NAME,
+    <crate::residual::ScaledAdd as Op>::NAME,
     <crate::rope::RotaryFactors as Op>::NAME,
     <crate::rope::QkNormRope as Op>::NAME,
     <crate::sampler::LogitsShape as Op>::NAME,

@@ -7,6 +7,7 @@
 //! once:
 //!
 //! ```text
+//! scaled_add                   t = β · t + α · s
 //! scaled_residual              h = h + (u + b) · scale
 //! scaled_residual_rms_norm     h = h + (u + b) · scale;  out = rms(h) · weight
 //! scaled_residual_layer_norm   out = layer_norm(h + (u + b) · scale) · weight + bias
@@ -602,5 +603,207 @@ fn matches(
             operator,
             format!("a {what} buffer was given but the descriptor records none"),
         )),
+    }
+}
+
+/// The elements one `scaled_add` program walks.
+pub const SCALED_ADD_BLOCK: u32 = 1024;
+
+/// One compilation of `scaled_add`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ScaledAddDescriptor {
+    /// Element type of the target, which is read and written.
+    pub target: DType,
+    /// Element type of the source, which is only read.
+    pub source: DType,
+    /// Elements per row.
+    pub columns: u32,
+    /// The elements one program walks.
+    pub block: u32,
+}
+
+impl fmt::Display for ScaledAddDescriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Key::new()
+            .field("target", self.target)
+            .field("source", self.source)
+            .field("columns", self.columns)
+            .field("block", self.block)
+            .finish(formatter)
+    }
+}
+
+/// The arguments of `scaled_add`.
+#[derive(Clone, Copy)]
+pub struct ScaledAddArgs {
+    /// `[rows, columns]`, contiguous: the target, updated in place.
+    pub target: TensorView,
+    /// `[rows, columns]`, contiguous: the source, the same shape as the target.
+    pub source: TensorView,
+    /// The source's coefficient, a host value: no upload, no view.
+    pub alpha: f32,
+    /// The target's coefficient, a host value.
+    pub beta: f32,
+}
+
+/// `target ← β · target + α · source`, in place on the target.
+///
+/// A diffusion solver's Euler step: the latent is scaled by the schedule's coefficient and the
+/// model's velocity added at its own, so the two operands may have different element types on
+/// purpose (a BF16 accumulator stepped by an FP32 source). The products and the sum are computed in
+/// FP32 and stored once into the target's type.
+///
+/// It is not [`ScaledResidual`]: that one adds a *channel-scaled, optionally biased* update into a
+/// running residual stream (`h + (u + b) · scale`, one scale per channel, and no coefficient on the
+/// residual itself). Here both coefficients are per-call host scalars and the target's own value is
+/// scaled. Neither is the other with a flag set.
+pub struct ScaledAdd;
+
+impl Op for ScaledAdd {
+    const NAME: &'static str = "scaled_add";
+
+    type Descriptor = ScaledAddDescriptor;
+    type Args<'a> = ScaledAddArgs;
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let elements = check(descriptor, args)?;
+        let mut arguments = Arguments::new();
+        arguments
+            .view(args.target)
+            .view(args.source)
+            .f32(args.alpha)
+            .f32(args.beta)
+            .i32(elements);
+        kernel.launch(
+            LaunchGrid::covering(u64::from(elements as u32), u64::from(descriptor.block))?,
+            &mut arguments,
+            stream,
+        )
+    }
+
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
+        ScaledAddArgs {
+            target: twins.in_place(args.target, stream),
+            source: twins.shadow_of(args.source),
+            ..args
+        }
+    }
+
+    fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
+        // The two products and the addition each round once in the sum's type, the store once more
+        // into the target's: `2u(target) + u(source)` states the target's roundings and the
+        // source's own representation together. The bound is relative to the result, so a call
+        // whose operands cancel (β·t ≈ −α·s, a result far below both) is compared against the
+        // operands' magnitude by the caller; no per-element bound expresses a cancellation.
+        //
+        // The corner the bound must not hide: with β = 1 and α = 0 the call is the identity, and
+        // with β = 0, α = 1 and equal element types it is a copy — both bit-exact, and both
+        // tested. A stricter bound is what an element type's unit round-off buys and nothing more.
+        Tolerance::new(
+            0.0,
+            2.0 * descriptor.target.unit_roundoff() as f32
+                + descriptor.source.unit_roundoff() as f32,
+        )
+    }
+}
+
+/// Validate a call and answer its flattened element count.
+fn check(descriptor: &ScaledAddDescriptor, args: ScaledAddArgs) -> Result<i32> {
+    if descriptor.columns == 0 || descriptor.block == 0 {
+        return Err(Error::argument(
+            ScaledAdd::NAME,
+            "a row or a block of zero elements adds nothing".to_owned(),
+        ));
+    }
+    let columns = u64::from(descriptor.columns);
+    args.target.require_rank(ScaledAdd::NAME, 2)?;
+    args.target
+        .require_row(ScaledAdd::NAME, descriptor.target, columns)?;
+    args.source.require_rank(ScaledAdd::NAME, 2)?;
+    args.source
+        .require_row(ScaledAdd::NAME, descriptor.source, columns)?;
+    if args.source.shape != args.target.shape {
+        return Err(Error::argument(
+            ScaledAdd::NAME,
+            "the source does not have the target's shape".to_owned(),
+        ));
+    }
+    let elements = args.target.shape.numel();
+    if elements > i32::MAX as u64 {
+        return Err(Error::argument(
+            ScaledAdd::NAME,
+            format!("{elements} elements do not fit the kernel's int32 count"),
+        ));
+    }
+    Ok(elements as i32)
+}
+
+#[cfg(test)]
+mod scaled_add_tests {
+    use super::*;
+    use crate::DevicePtr;
+
+    fn view(dtype: DType, rows: u64, columns: u64) -> TensorView {
+        TensorView::new(DevicePtr::new(0x1000), dtype, Shape::new(&[rows, columns]))
+    }
+
+    fn descriptor(target: DType, source: DType) -> ScaledAddDescriptor {
+        ScaledAddDescriptor {
+            target,
+            source,
+            columns: 64,
+            block: SCALED_ADD_BLOCK,
+        }
+    }
+
+    fn args(target: TensorView, source: TensorView) -> ScaledAddArgs {
+        ScaledAddArgs {
+            target,
+            source,
+            alpha: 0.5,
+            beta: 1.0,
+        }
+    }
+
+    #[test]
+    fn the_key_names_both_element_types_because_a_call_may_mix_them() {
+        assert_eq!(
+            descriptor(DType::BF16, DType::F32).to_string(),
+            "target_bf16_source_f32_columns_64_block_1024"
+        );
+    }
+
+    #[test]
+    fn the_two_operands_must_be_the_shape_the_descriptor_names() {
+        let fine = args(view(DType::BF16, 2, 64), view(DType::F32, 2, 64));
+        assert_eq!(
+            check(&descriptor(DType::BF16, DType::F32), fine).unwrap(),
+            128
+        );
+
+        let wrong_source = args(view(DType::BF16, 2, 64), view(DType::BF16, 2, 64));
+        assert!(
+            check(&descriptor(DType::BF16, DType::F32), wrong_source).is_err(),
+            "a source of another type than the descriptor names"
+        );
+
+        let wrong_shape = args(view(DType::BF16, 2, 64), view(DType::F32, 1, 64));
+        assert!(
+            check(&descriptor(DType::BF16, DType::F32), wrong_shape).is_err(),
+            "a source row count the target does not have"
+        );
+    }
+
+    #[test]
+    fn the_bound_is_the_targets_two_roundings_plus_the_sources_representation() {
+        let bound = <ScaledAdd as Op>::tolerance(&descriptor(DType::BF16, DType::F32));
+        let expected = 2.0 * DType::BF16.unit_roundoff() as f32 + DType::F32.unit_roundoff() as f32;
+        assert_eq!(bound.rtol, expected);
+        assert_eq!(bound.atol, 0.0);
     }
 }
