@@ -1,10 +1,8 @@
-//! Scheduling policy and configured queue and batch limits.
+//! Configured queue, token, and batch limits for scheduling.
 //!
 //! These are requested limits: `Scheduler::new` clamps the token
 //! and sequence limits, and the batch limit when the executor advertises a
 //! nonzero call limit, to the executor's capacity.
-
-use proto::request::SchedulingPolicy;
 
 /// Default maximum calls selected by one generation scheduling pass.
 pub const DEFAULT_MAX_BATCH: usize = 128;
@@ -64,8 +62,6 @@ impl RefillPolicy {
 #[derive(Clone, Debug)]
 /// Sequence, token, and queue limits for scheduling.
 pub struct SchedulerConfig {
-    /// Waiting-queue ordering policy.
-    pub policy: SchedulingPolicy,
     /// Maximum calls selected by one generation scheduling pass, across the
     /// per-call-kind batches the pass emits.
     pub max_batch: usize,
@@ -107,7 +103,6 @@ pub struct SchedulerConfig {
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
-            policy: SchedulingPolicy::Fcfs,
             max_batch: DEFAULT_MAX_BATCH,
             max_num_batched_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS,
             max_running_requests: DEFAULT_MAX_RUNNING_REQUESTS,
