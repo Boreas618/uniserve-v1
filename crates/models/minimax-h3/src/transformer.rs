@@ -246,7 +246,12 @@ pub struct StudentHeads {
 
 /// One modality's fused heads: the weight and bias rows of every evaluation block.
 struct FusedHeads {
-    /// `[blocks, out * hidden]` in the checkpoint's own type: block `b`'s fused weight.
+    /// `[blocks, out * hidden]` FP32: block `b`'s fused weight.
+    ///
+    /// FP32 because the reference builds a student's head FP32 (`transformer.py:307-311`): the fused
+    /// row is a sum of the checkpoint's BF16 rows and rounding it back would round a number the
+    /// reference keeps exact. The projection that reads it takes the stack's BF16 rows, so the only
+    /// rounding is the store into the velocity.
     weight: Weight,
     /// `[blocks, out]`: block `b`'s fused bias.
     bias: Weight,
@@ -419,15 +424,15 @@ impl FusedHeads {
         Ok(Self {
             weight: loader.constant(
                 &format!("denoiser.{modality_name}.student_heads.weight"),
-                dtype,
+                nn::DType::F32,
                 Shape::new(&[blocks, per_head]),
-                &host_bytes(dtype, &fused)?,
+                &host_bytes(nn::DType::F32, &fused)?,
             )?,
             bias: loader.constant(
                 &format!("denoiser.{modality_name}.student_heads.bias"),
-                dtype,
+                nn::DType::F32,
                 Shape::new(&[blocks, out]),
-                &host_bytes(dtype, &fused_bias)?,
+                &host_bytes(nn::DType::F32, &fused_bias)?,
             )?,
             out: u32::try_from(out)
                 .map_err(|_| Error::checkpoint(format!("{name}'s width exceeds u32")))?,
@@ -442,7 +447,7 @@ impl FusedHeads {
 ///
 /// The stacked heads are `[heads * out, hidden]` and `[heads * out]`, head-major, so head `h`'s
 /// weight row `o` starts at `(h * out + o) * hidden` and its bias at `h * out + o`. The products and
-/// the sum stay FP32; the caller rounds the result to the checkpoint's type once.
+/// the sum stay FP32, and so does the table the caller stores them in (`transformer.py:307-311`).
 fn fuse_block(
     values: &[f32],
     biases: &[f32],
@@ -658,6 +663,14 @@ pub struct Transformer {
 }
 
 impl Transformer {
+    /// The element type the checkpoint's weights and the activations they produce are in.
+    ///
+    /// One type for the whole stack: the precision rule keeps the checkpoint's own representation,
+    /// and every layer's operands are of it.
+    pub fn dtype(&self) -> nn::DType {
+        self.proj_in.weight().dtype
+    }
+
     /// Read one DiT partition of the checkpoint.
     ///
     /// `rows` bounds one call's keys: the largest packed row count the deployment's layouts hold,

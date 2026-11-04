@@ -83,6 +83,11 @@ def main() -> int:
     arguments = parser.parse_args()
 
     case = json.loads(arguments.case.read_text())
+    # The encoder's clip rule is the condition's latent count, and it is the checkpoint's, not the
+    # case's: the comparator reads these three numbers, so a case that has drifted from the
+    # reference's `video_vae` section is refused here rather than compared against.
+    if "clip" not in case:
+        raise SystemExit(f"{arguments.case}: no clip; the case must state the encoder's rule")
     arguments.out.mkdir(parents=True, exist_ok=True)
     canvas = canvas_of(case["canvas"])
     conditions = tuple(condition_of(condition) for condition in case.get("conditions", ()))

@@ -384,7 +384,7 @@ impl ScaledResidualLayerNorm {
 
 /// The diffusion solver's update: `target ← β · target + α · source`, in place.
 ///
-/// The Euler step passes `α = σ_next − σ`, `β = 1`; the probability-flow start passes `β = σ₀`,
+/// The Euler step passes `α = σ − σ_next`, `β = 1`; the probability-flow start passes `β = σ₀`,
 /// `α = 0`. Both coefficients are host values, so a captured graph stays valid, and the two
 /// operands' element types differ on purpose — a BF16 trajectory stepped by an FP32 velocity
 /// (specs/worker.md 9, 求解器; `ops::residual::ScaledAdd`).
