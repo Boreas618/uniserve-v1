@@ -1640,6 +1640,42 @@ impl Cudnn {
             Operation::graph(self.api, &forward, None)
         );
 
+        // The graph above names no device, which is legal since cuDNN 9.8 for
+        // building a plan. Counting engines needs no device either, but
+        // materialising an engine configuration does - it carries knobs sized
+        // to one - and "success, nothing written" is exactly how a search
+        // with no device to size results for would read. So the same ops are
+        // also finalized into a graph that carries the handle.
+        let named = stage!(
+            "operation graph: the same ops, carrying CUDNN_ATTR_OPERATIONGRAPH_HANDLE, finalize",
+            Operation::graph(self.api, &forward, Some(&self.handle))
+        );
+        let named_b = stage!(
+            "engine heuristic: mode B on the graph that names the device, finalize",
+            Self::heuristic(self.api, &named, HEURISTIC_MODE_B)
+        );
+        let named_listed = stage!(
+            "engine heuristic: the named graph's mode B, count the configurations",
+            self.api
+                .count(&named_b, ATTR_ENGINEHEUR_RESULTS, TYPE_BACKEND_DESCRIPTOR)
+        );
+        let line = match self.fill_once(
+            &named_b,
+            MAX_ENGINE_CONFIGS as i64,
+            MAX_ENGINE_CONFIGS,
+            -1,
+            false,
+        ) {
+            Ok(line) => line,
+            Err(error) => format!("refused: {error}"),
+        };
+        steps.push((
+            format!(
+                "engine heuristic fill 0 a graph carrying CUDNN_ATTR_OPERATIONGRAPH_HANDLE: \
+                 mode B listed {named_listed}; {line}"
+            ),
+            None,
+        ));
         let heuristic = stage!(
             "engine heuristic: mode A, operation graph, finalize",
             Self::heuristic(self.api, &graph, HEURISTIC_MODE_A)
