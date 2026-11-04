@@ -2450,6 +2450,45 @@ mod tests {
     }
 
     #[test]
+    fn an_arena_plan_names_every_buffer_once_and_declares_a_known_element() {
+        // The executor keys the arena's storage by these names and sizes it by the sum of the element
+        // counts, so a repeated name aliases two buffers and a letter outside the plan vocabulary is
+        // charged four bytes an element (`Buffer::width`'s fallback) - both silent at a canvas, both
+        // wrong for the whole deployment. The group count is an input: the plan scales two entries by
+        // it and nothing else.
+        for rule in [layouts(), sparse_layouts()] {
+            let layout = rule.cover(&request(121, 1344, 768));
+            let plan = denoise_arena(&rule.config, &rule.arrangement, 22, DType::BF16, &layout)
+                .expect("a plan for the released canvas");
+            let mut names = std::collections::HashSet::new();
+            for buffer in &plan {
+                assert!(
+                    names.insert(buffer.name.as_str()),
+                    "{} is listed twice",
+                    buffer.name
+                );
+                assert!(buffer.elements > 0, "{} holds no elements", buffer.name);
+                assert!(
+                    ["bf16", "f16", "f32", "i32"].contains(&buffer.element),
+                    "{} declares {}, which no plan element names",
+                    buffer.name,
+                    buffer.element
+                );
+            }
+            // Every H3 TODO produces a soundtrack, so the stream's own buffers are in every plan: the
+            // rows gathered from the packed sequence, and the head they are projected and solved with.
+            for name in [
+                "audio.hidden",
+                "audio.groups",
+                "audio.normed",
+                "audio.velocity",
+            ] {
+                assert!(names.contains(name), "{name} is not in the plan");
+            }
+        }
+    }
+
+    #[test]
     fn a_layout_declares_the_refiners_boundaries_and_fills_them() {
         // The refiner's document is the prompt: its queries are every padded row and its keys stop
         // at the prompt's last row, so a padding row is never a key. Both kinds declare the pair -
