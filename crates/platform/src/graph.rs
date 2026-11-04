@@ -25,11 +25,6 @@ use crate::driver::{self, Handle, KernelNodeParams as RawKernelNodeParams};
 use crate::launch::Function;
 use crate::{DeviceGuard, DeviceId, Error, PrimaryContext, Result, Stream, reclaim};
 
-/// `CU_STREAM_CAPTURE_MODE_RELAXED`: other threads of the process may keep
-/// issuing CUDA work (the other devices' executors do) without invalidating
-/// the capture, and their work is not captured.
-const CU_STREAM_CAPTURE_MODE_RELAXED: i32 = 2;
-
 /// `CU_STREAM_CAPTURE_STATUS_ACTIVE`.
 const CU_STREAM_CAPTURE_STATUS_ACTIVE: i32 = 1;
 
@@ -357,19 +352,44 @@ pub struct Capture {
     _context: DeviceGuard,
 }
 
+/// `CUstreamCaptureMode`: how a capture interacts with CUDA calls from other
+/// threads of the process, such as the other devices' executors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureMode {
+    /// `CU_STREAM_CAPTURE_MODE_GLOBAL`: an unsafe call from any thread
+    /// invalidates the capture. The strictest mode, which catches a thread
+    /// that issues CUDA work while this one captures.
+    Global,
+    /// `CU_STREAM_CAPTURE_MODE_THREAD_LOCAL`: only the capturing thread's
+    /// unsafe calls invalidate the capture.
+    ThreadLocal,
+    /// `CU_STREAM_CAPTURE_MODE_RELAXED`: other threads' calls are neither
+    /// captured nor invalidating. The executor captures in this mode: its
+    /// device's stream is its own, and the process's other executors keep
+    /// working meanwhile.
+    Relaxed,
+}
+
+impl CaptureMode {
+    fn raw(self) -> i32 {
+        match self {
+            Self::Global => 0,
+            Self::ThreadLocal => 1,
+            Self::Relaxed => 2,
+        }
+    }
+}
+
 impl Capture {
-    /// Begins capturing `stream` in relaxed mode: work other threads issue
-    /// meanwhile is neither captured nor breaks the capture.
-    pub fn begin(stream: &Stream) -> Result<Self> {
+    /// Begins capturing `stream` in `mode`.
+    pub fn begin(stream: &Stream, mode: CaptureMode) -> Result<Self> {
         let context = PrimaryContext::retain(stream.device())?;
         let guard = context.enter()?;
         let driver = driver::driver()?;
         driver.check(
             // SAFETY: the stream is live and not capturing, by this type's
             // contract.
-            unsafe {
-                (driver.stream_begin_capture)(stream.handle(), CU_STREAM_CAPTURE_MODE_RELAXED)
-            },
+            unsafe { (driver.stream_begin_capture)(stream.handle(), mode.raw()) },
             "cuStreamBeginCapture",
         )?;
 
