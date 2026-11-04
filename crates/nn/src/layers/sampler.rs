@@ -376,6 +376,7 @@ impl Sampler {
     pub fn filter_descriptor(&self) -> FilterDescriptor {
         FilterDescriptor {
             width: self.width,
+            tile: CANDIDATE_TILE,
             ids: DType::I32,
             pdl: launch::PDL,
         }
