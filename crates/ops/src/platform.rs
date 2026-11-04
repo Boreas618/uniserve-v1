@@ -15,6 +15,7 @@
 //!   dynamic shared-memory size beyond the driver's default.
 //! - [`NativeLibrary`] and its typed entry lookup: a `dlopen`ed library and the symbol in it.
 //! - [`Allocator`], [`PoolKind`] and [`Buffer`]: the scratch region the shadow buffers live in.
+//! - a device-to-device copy on a stream, for the shadow buffers of in-place operands.
 //! - [`Communicator`]: the collectives a layer runs through an operator.
 //! - a device-to-device copy on a stream, for the shadow buffers of in-place operands.
 //! - `platform::Error`, folded into [`crate::Error::Platform`].
@@ -27,8 +28,8 @@ use std::ffi::c_void;
 pub use platform::Error as PlatformError;
 pub use platform::nccl::{Communicator, DataType as CollectiveType};
 pub use platform::{
-    Allocator, Buffer, Cluster, DataType, Device, Function, FunctionAttribute, LaunchConfig,
-    Library, NativeLibrary, PoolKind, Stream,
+    Allocator, Buffer, Cluster, Device, Function, FunctionAttribute, LaunchConfig, Library,
+    NativeLibrary, PoolKind, Stream,
 };
 
 pub use crate::tensor::DevicePtr;
@@ -47,7 +48,7 @@ pub(crate) fn offset(pointer: DevicePtr, bytes: u64) -> DevicePtr {
 
 /// The raw stream handle a native entry receives (`void* stream`).
 pub(crate) fn stream_handle(stream: &Stream) -> *mut c_void {
-    stream.raw() as usize as *mut c_void
+    stream.raw() as *mut c_void
 }
 
 /// Everything one cubin launch needs besides the argument array.

@@ -39,6 +39,10 @@ pub struct Twin {
 }
 
 /// The shadow buffers of one paired execution.
+///
+/// The region is the executor's scratch pool (specs/worker.md 4.5, 7.3), never the graph pool: a
+/// paired forward writes resident memory not at all, and `Twins` only carves views of the bytes the
+/// executor gave it.
 pub struct Twins {
     buffer: Buffer,
     cursor: u64,
@@ -51,7 +55,7 @@ impl Twins {
     ///
     /// The size is the largest shadow set of the buckets the runner shadows; a paired execution
     /// whose operator needs more records the failure in the region rather than allocating during a
-    /// step. The region is one scratch allocation of the executor's, freed with the `Twins`.
+    /// step. The allocation is the executor's, made once per runner and owned by the `Twins`.
     pub fn new(allocator: &mut Allocator, bytes: u64) -> Result<Self> {
         let bytes = usize::try_from(bytes.max(ALIGNMENT))
             .map_err(|_| Error::Shape("a twin region larger than usize::MAX".to_owned()))?;
@@ -122,7 +126,7 @@ impl Twins {
                 match real.byte_len() {
                     Ok(bytes) => {
                         if let Err(error) = platform::copy_bytes(stream, address, real.ptr, bytes) {
-                            self.fail(error.into());
+                            self.fail(error);
                             return real;
                         }
                     }
