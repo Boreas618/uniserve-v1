@@ -3116,7 +3116,10 @@ impl Denoiser {
         &self.solver
     }
 
-    /// The element type the block computes in: the checkpoint's own, read from the input projection.
+    /// The element type the block computes in: the checkpoint's own, read from a block's gain.
+    ///
+    /// Not from an end projection: those four are pinned FP32 at every preset, so they would report
+    /// the pin and a harness at `auto` would allocate FP32 activations against BF16 blocks.
     ///
     /// A runner allocates the prefix source, the latents and the conditioning's views in it. The
     /// design's default `dtype = "auto"` is the checkpoint's representation converted nowhere, so the
