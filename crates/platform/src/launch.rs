@@ -71,6 +71,13 @@ impl Function {
         parameters: &mut [*mut c_void],
     ) -> Result<()> {
         config.check()?;
+        if stream.device() != self.device.id() {
+            return Err(Error::invalid(format!(
+                "the function belongs to {} but the stream to {}",
+                self.device.id(),
+                stream.device()
+            )));
+        }
 
         let driver = driver::driver()?;
         let _context = stream.enter()?;
