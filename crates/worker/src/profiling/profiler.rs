@@ -23,7 +23,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use crossbeam_channel::{Receiver, Sender};
-use cuda::DeviceId;
+use platform::DeviceId;
 
 use crate::ffi::{Argument, MethodCall};
 use crate::ffi::{Function, Handle};
@@ -254,11 +254,11 @@ impl Profiler {
                 Ok(Some(jobs.start(calls, true)))
             }
             Phase::StartRange => match range {
-                Some(device) => self.range(jobs, move || cuda::profiler_start(device)),
+                Some(device) => self.range(jobs, move || platform::profiler_start(device)),
                 None => Ok(None),
             },
             Phase::StopRange => match range.filter(|_| std::mem::take(&mut self.ranging)) {
-                Some(device) => self.range(jobs, move || cuda::profiler_stop(device)),
+                Some(device) => self.range(jobs, move || platform::profiler_stop(device)),
                 None => Ok(None),
             },
             Phase::Discard => Ok(self.torch.take().map(|profile| {
@@ -280,7 +280,7 @@ impl Profiler {
     fn range(
         &self,
         jobs: &JobQueue,
-        call: impl FnOnce() -> cuda::Result<()> + Send + 'static,
+        call: impl FnOnce() -> platform::Result<()> + Send + 'static,
     ) -> Result<Option<JobId>> {
         let failures = self.failures.0.clone();
         let job = Job::new();
@@ -390,7 +390,7 @@ impl Profiler {
                 Phase::Start | Phase::StartRange => Ok(()),
                 Phase::StopRange => match self.device.filter(|_| std::mem::take(&mut self.ranging))
                 {
-                    Some(device) => cuda::profiler_stop(device).map_err(Error::from),
+                    Some(device) => platform::profiler_stop(device).map_err(Error::from),
                     None => Ok(()),
                 },
                 Phase::Discard => self.torch.take().map_or(Ok(()), |profile| {

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 use std::time::Instant;
 
-use cuda::{DeviceId, Event, EventFlags};
+use platform::{DeviceId, Event, EventFlags};
 use ipc::Wake;
 
 use super::Issue;
