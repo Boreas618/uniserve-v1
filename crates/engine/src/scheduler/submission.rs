@@ -21,6 +21,7 @@ use crate::WorkerGroupId;
 use crate::executor::ExecutionBatch;
 use crate::executor::{Executor, ExecutorError, ExecutorInfo, ExecutorSubmitError};
 use crate::scheduler::completion::BatchReport;
+use executor::completion::Outcome;
 use executor::batch::{
     Batch as DeviceBatch, BatchId as DeviceBatchId, Batches, CallId as DeviceCallId, Submission,
 };
@@ -81,11 +82,28 @@ struct InProcess {
     ready: crossbeam_channel::Receiver<Result<BatchReport, ExecutorError>>,
     /// Submissions still to be waited on, handed to the waiting thread.
     queue: crossbeam_channel::Sender<Pending>,
-    /// Shadow submissions in flight: the executor reports their failure to the
-    /// world's own update (7.3), so the mechanism only keeps them alive.
-    /// Read when a shadow completes; the update path is what submits them.
-    #[allow(dead_code)]
+    /// Shadow submissions in flight (7.3 step 2).
+    ///
+    /// A shadow batch's paired forwards compare themselves on the device, and
+    /// the comparison's verdict is this submission's outcome - no other path
+    /// carries it to the update. The scheduler reads them in `shadow_status`,
+    /// which is why a submission is kept until it has finished.
     shadows: Vec<Submission>,
+}
+
+/// The state of the shadow submissions an update's pass asked for (7.3 step 2).
+///
+/// The pass is answered by the comparison's verdict, not by the fact that the
+/// batch was submitted: a paired forward that failed on the device is the
+/// update's failure, and answering earlier let a wrong kernel reach the
+/// switchover.
+pub(super) enum ShadowStatus {
+    /// At least one shadow batch has not finished.
+    Pending,
+    /// Every shadow batch finished and every pair was within tolerance.
+    Settled,
+    /// A shadow batch failed, with the reason it failed for.
+    Failed(String),
 }
 
 /// One submitted batch, with what the report's calls name.
@@ -252,6 +270,18 @@ impl Submissions {
         }
     }
 
+    /// The state of the shadow submissions of the pass in flight (7.3 step 2).
+    ///
+    /// The worker-process path shadows a world on its workers and submits no
+    /// shadow batch here, so a pass waiting on this arm cannot exist: `shadow`
+    /// refuses it at submission, and the pass is answered with that refusal.
+    pub(super) fn shadow_status(&mut self) -> ShadowStatus {
+        match &mut self.path {
+            Path::Workers(_) => ShadowStatus::Settled,
+            Path::InProcess(arm) => arm.shadow_status(),
+        }
+    }
+
     /// Waits up to `timeout` for one partial or terminal batch result, in the
     /// mechanism's own completion type.
     pub(super) fn poll(&mut self, timeout: Duration) -> Result<Option<BatchReport>, ExecutorError> {
@@ -397,6 +427,39 @@ impl World for Submissions {
 }
 
 impl InProcess {
+    /// The state of this pass's shadow submissions, reading every one that has
+    /// finished and answering the first failure (7.3 step 2).
+    ///
+    /// A failure carries the device thread's label beside its error, so the
+    /// update states which paired forward of which operator and bucket left
+    /// tolerance rather than only the element that did.
+    pub(super) fn shadow_status(&mut self) -> ShadowStatus {
+        let mut failure: Option<String> = None;
+        self.shadows.retain(|submission| match submission.outcome() {
+            None => true,
+            Some(Outcome::Success(_)) => false,
+            Some(Outcome::Failed(error)) => {
+                let reason = match submission.failure_label() {
+                    Some(label) => format!("{label}: {error}"),
+                    None => error.to_string(),
+                };
+                failure.get_or_insert(reason);
+                false
+            }
+            Some(Outcome::Cancelled) => {
+                failure.get_or_insert_with(|| {
+                    "a shadow batch was cancelled before its comparison ran".to_owned()
+                });
+                false
+            }
+        });
+        match failure {
+            Some(reason) => ShadowStatus::Failed(reason),
+            None if self.shadows.is_empty() => ShadowStatus::Settled,
+            None => ShadowStatus::Pending,
+        }
+    }
+
     fn submit(&mut self, batch: ExecutionBatch) -> Result<(), ExecutorSubmitError> {
         let (device, calls) = self.describe(&batch).map_err(ExecutorSubmitError::Failed)?;
         let submission = self

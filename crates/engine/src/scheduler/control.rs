@@ -530,17 +530,31 @@ impl Scheduler {
         }
     }
 
-    /// Answers an ask whose step has shadowed its batches: the step that owned
-    /// the answer has ended by now, and its number is the boundary the pass ran
-    /// at.
+    /// Answers an ask whose step has shadowed its batches, once every shadow
+    /// batch of that pass has finished (7.3 step 2).
+    ///
+    /// The answer is the comparison's: a paired forward that left its
+    /// operator's tolerance, or failed on the device, is the update's failure.
+    /// Answering when the step ended rather than when the batches finished let
+    /// a wrong kernel report as compared and reach the switchover.
     pub(super) fn settle_shadow(&mut self) {
         let shadowed = self.shadow_pass.as_ref().is_some_and(|pass| pass.shadowed);
         if !shadowed {
             return;
         }
-        let step = self.step;
-        if let Some(pass) = self.shadow_pass.take() {
-            pass.answer.send(Ok(handle::StageApplied { step }));
+        match self.executor.shadow_status() {
+            // A device still working: the next pass of the loop asks again, and
+            // the completion that ends it wakes this thread.
+            crate::scheduler::submission::ShadowStatus::Pending => {}
+            crate::scheduler::submission::ShadowStatus::Settled => {
+                let step = self.step;
+                if let Some(pass) = self.shadow_pass.take() {
+                    pass.answer.send(Ok(handle::StageApplied { step }));
+                }
+            }
+            crate::scheduler::submission::ShadowStatus::Failed(reason) => {
+                self.shadow_failed(reason);
+            }
         }
     }
 
