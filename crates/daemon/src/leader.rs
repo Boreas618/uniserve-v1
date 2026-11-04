@@ -1726,7 +1726,7 @@ pub(crate) fn locked<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_
 }
 
 /// One independent replica's engine lifecycle and its
-/// worlds (`crate::worlds`).
+/// worlds (`crate::updates::entry`).
 pub(crate) struct Replica {
     pub(crate) registry: std::sync::Weak<Replicas>,
     pub(crate) ordinal: usize,
@@ -1755,10 +1755,10 @@ pub(crate) struct Replica {
     sleep_paused: AtomicBool,
     /// The LoRA adapters the workers hold, by name (`Leader::load_adapter`).
     pub(crate) adapters: Arc<std::sync::Mutex<BTreeMap<String, Adapter>>>,
-    /// The deployment's worlds: the executing one, a trial, a change in
-    /// progress and the configurations a rollback marked unavailable.
+    /// The engine that executes, and the configurations a rollback marked
+    /// unavailable.
     pub(crate) worlds: std::sync::Mutex<crate::updates::entry::WorldState>,
-    /// Every world's scheduler statistics, which a trial reads.
+    /// Every engine's scheduler statistics, which the status reads.
     pub(crate) observer: Arc<crate::observe::Observer>,
     /// The profiling session that runs, or the last that ended
     /// (`crate::profiling`).
