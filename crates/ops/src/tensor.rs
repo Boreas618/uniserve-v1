@@ -98,6 +98,8 @@ pub enum DType {
     F8E4M3 = 6,
     /// NVFP4 E2M1, two values in one byte.
     F4E2M1 = 7,
+    /// Signed 16-bit integer: the audio decoders' PCM output element.
+    I16 = 8,
 }
 
 impl DType {
@@ -117,6 +119,7 @@ impl DType {
             5 => Self::F32,
             6 => Self::F8E4M3,
             7 => Self::F4E2M1,
+            8 => Self::I16,
             _ => return None,
         })
     }
@@ -126,7 +129,7 @@ impl DType {
         match self {
             Self::F4E2M1 => 4,
             Self::U8 | Self::F8E4M3 => 8,
-            Self::F16 | Self::BF16 => 16,
+            Self::F16 | Self::BF16 | Self::I16 => 16,
             Self::I32 | Self::F32 => 32,
             Self::I64 => 64,
         }
@@ -162,7 +165,7 @@ impl DType {
             Self::F16 => 4.882_812_5e-4,           // 2^-11
             Self::F8E4M3 => 6.25e-2,               // 2^-4
             Self::F4E2M1 => 2.5e-1,                // 2^-2
-            Self::U8 | Self::I32 | Self::I64 => 0.0,
+            Self::U8 | Self::I16 | Self::I32 | Self::I64 => 0.0,
         }
     }
 
@@ -179,6 +182,7 @@ impl fmt::Display for DType {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
             Self::U8 => "u8",
+            Self::I16 => "i16",
             Self::I32 => "i32",
             Self::I64 => "i64",
             Self::F16 => "f16",
