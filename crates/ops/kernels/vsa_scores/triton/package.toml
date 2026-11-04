@@ -1,0 +1,33 @@
+# The vsa_scores operator's Triton backend: design 5.2's program package.
+#
+# The step between VSA's pooling and its selection: one dot product per (head, query tile, key tile)
+# over the pooled per-head means, written as the contiguous FP32
+# [heads, query tiles, key tiles] matrix the selection reads. No scale and no softmax — the caller
+# applies both — so the value is the raw sum of `width` products, accumulated in FP32, and the
+# operator's tolerance is the contraction's own bound.
+
+op = "vsa_scores"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+
+[source]
+kind = "triton"
+files = ["src/vsa_scores.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+# `dtype_bf16_heads_56_width_128_block_128_pdl_false`.
+[kernel.descriptors]
+dimensions = { dtype = ["bf16", "f16", "f32"], heads = ["56"], width = ["128"], block = ["128", "256"], pdl = ["false", "true"] }
+
+[parameters]
