@@ -6,11 +6,16 @@
 //! atomically. It is compiled for the crate's own tests and, through the
 //! `testing` feature, for the tests of the crates that serve over it.
 
+#![expect(
+    clippy::expect_used,
+    reason = "a fixture that cannot be built is the test's failure report"
+)]
+
 use std::sync::Arc;
 
+use tokenizers::AddedToken;
 use tokenizers::Tokenizer as TokenizerBuilder;
 use tokenizers::models::bpe::{BPE, Vocab};
-use tokenizers::AddedToken;
 
 use crate::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 
