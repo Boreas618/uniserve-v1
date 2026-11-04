@@ -93,6 +93,9 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context as _, Result};
 use clap::Args;
 
+use crate::engine_plan::EpochPlan;
+use daemon::epoch::BuildConfig;
+use engine::{PolicyProgram, PolicySource, ProgramSource};
 use executor::batch::Submission;
 use executor::blocking::{BlockingKind, ThreadPool};
 use executor::completion::Outcome;
@@ -104,9 +107,6 @@ use executor::memory::retained::Retained;
 use executor::memory::weights::WeightStore;
 use executor::memory::Memory;
 use executor::watchdog::{Running, Watchdog};
-use crate::engine_plan::EpochPlan;
-use daemon::epoch::BuildConfig;
-use engine::{PolicyProgram, PolicySource, ProgramSource};
 use ipc::{ProgramCommand, ProgramStatus, UpdateFailure};
 use ops::{Generation, KernelEntry};
 use program_server::program::Programs;
@@ -260,9 +260,11 @@ impl ProcessInterface {
             major: proto::PROTOCOL_MAJOR,
             minor: proto::PROTOCOL_MINOR,
             build: proto::BUILD.to_owned(),
-            peer: Some(proto::process::hello::Peer::Engine(proto::process::Engine {
-                deployment: deployment.to_owned(),
-            })),
+            peer: Some(proto::process::hello::Peer::Engine(
+                proto::process::Engine {
+                    deployment: deployment.to_owned(),
+                },
+            )),
         })?;
         // The welcome is the daemon's acceptance of this process: a node that has not admitted it
         // would mint a claim for a process it does not supervise, so nothing is asked before it
@@ -332,7 +334,10 @@ impl ProcessInterface {
                     return Ok(reply);
                 }
                 Some(proto::process::downstream::Kind::Reply(reply)) => {
-                    tracing::warn!(id = reply.id, "an answer to a request this process did not send");
+                    tracing::warn!(
+                        id = reply.id,
+                        "an answer to a request this process did not send"
+                    );
                 }
                 Some(proto::process::downstream::Kind::Event(event)) => self.file(event),
                 None => {}
@@ -356,7 +361,10 @@ impl ProcessInterface {
             match message.kind {
                 Some(proto::process::downstream::Kind::Event(event)) => self.file(event),
                 Some(proto::process::downstream::Kind::Reply(reply)) => {
-                    tracing::warn!(id = reply.id, "an answer to a request this process did not send");
+                    tracing::warn!(
+                        id = reply.id,
+                        "an answer to a request this process did not send"
+                    );
                 }
                 None => {}
             }
@@ -395,19 +403,21 @@ fn claim(
 ) -> Result<ipc::StorageLaunch> {
     let request = proto::process::Request {
         id: 1,
-        kind: Some(proto::process::request::Kind::Claim(proto::process::Claim {
-            host: host.to_owned(),
-            deployment: launch.deployment.clone(),
-            scopes: vec![proto::process::Scope {
-                group: launch.group.clone(),
-                rank: launch.rank,
-            }],
-            // A server the daemon starts for this claim takes the deployment's connector settings;
-            // the main process has none of its own to state.
-            server_arguments: Vec::new(),
-            world: launch.world,
-            retire: Vec::new(),
-        })),
+        kind: Some(proto::process::request::Kind::Claim(
+            proto::process::Claim {
+                host: host.to_owned(),
+                deployment: launch.deployment.clone(),
+                scopes: vec![proto::process::Scope {
+                    group: launch.group.clone(),
+                    rank: launch.rank,
+                }],
+                // A server the daemon starts for this claim takes the deployment's connector settings;
+                // the main process has none of its own to state.
+                server_arguments: Vec::new(),
+                world: launch.world,
+                retire: Vec::new(),
+            },
+        )),
     };
     let reply = process.request(request, CLAIM_TIMEOUT)?;
     if !reply.error.is_empty() {
@@ -467,12 +477,7 @@ pub(crate) fn run(
         std::fs::File::open(&launch.build_config)
             .with_context(|| format!("opening {}", launch.build_config.display()))?,
     )
-    .with_context(|| {
-        format!(
-            "reading the build config {}",
-            launch.build_config.display()
-        )
-    })?;
+    .with_context(|| format!("reading the build config {}", launch.build_config.display()))?;
     let mut main = MainProcess::start(&launch, &build)?;
     let ending = main.serve();
     main.close();
@@ -655,21 +660,17 @@ impl MainProcess {
         for device in plan.devices() {
             let generation = Arc::new(Generation::new(epoch.generation, std::iter::empty()));
             let runners = plan.runners(*device, Arc::clone(&model), &mut memory, &generation)?;
-            let executor = Executor::spawn(
-                *device,
-                runners,
-                plan.events(),
-                Arc::clone(&pools),
-                scratch,
-            )?;
+            let executor =
+                Executor::spawn(*device, runners, plan.events(), Arc::clone(&pools), scratch)?;
             // §7.3 step 2 shadows a replaced operator beside the serving one, so the region it runs
             // in is mapped before any batch: the executor books it from the scratch pool the graph
             // storage sized. Nothing is serving yet, so the control thread waits here; `serve`
             // never does (§2.4).
             //
             // §4.5's warmup is not here: the epoch's first generation holds no kernel until the
-            // daemon's precopy fills it, so there is no bucket to warm. It runs at the first
-            // switchover, which is the boundary the first request is served at.
+            // daemon's precopy fills it - and a precopy that names no kernel (the startup switch)
+            // fills it from the store's built programs - so there is no bucket to warm yet. It runs
+            // at the first switchover, which is the boundary the first request is served at.
             let shadow = executor.set_shadow()?;
             device_command(&watchdog, *device, "shadow region", shadow)
                 .with_context(|| format!("mapping the shadow region of device {}", device.0))?;
@@ -732,9 +733,11 @@ impl MainProcess {
     fn park_standby(&mut self) -> Result<()> {
         self.serving = false;
         self.send_report(proto::process::Report {
-            kind: Some(proto::process::report::Kind::Parked(proto::process::Parked {
-                generation: self.update.current(),
-            })),
+            kind: Some(proto::process::report::Kind::Parked(
+                proto::process::Parked {
+                    generation: self.update.current(),
+                },
+            )),
         });
         Ok(())
     }
@@ -763,7 +766,10 @@ impl MainProcess {
             let stall = self.watchdog.deadline(oldest(&running));
             let mut due = reported + METRICS_EVERY;
             if self.rollback.is_some()
-                && matches!(self.update.phase(), executor::hot_update::Phase::Probation { .. })
+                && matches!(
+                    self.update.phase(),
+                    executor::hot_update::Phase::Probation { .. }
+                )
             {
                 due = due.min(Instant::now() + PROBATION_POLL);
             }
@@ -1008,7 +1014,11 @@ impl MainProcess {
                             // A request that does not convert is the daemon's, not this process's:
                             // it ends with the refusal's event and every other request of the
                             // submission is still admitted.
-                            self.reject(id, proto::request::RejectionKind::Invalid, error.to_string());
+                            self.reject(
+                                id,
+                                proto::request::RejectionKind::Invalid,
+                                error.to_string(),
+                            );
                             continue;
                         }
                     };
@@ -1019,14 +1029,12 @@ impl MainProcess {
                     match scheduler.submit(request) {
                         Ok(stream) => {
                             self.streams.push((id, rank, stream));
-                            self.send_event(
-                                proto::request::wire::from_engine::Kind::Accepted(
-                                    proto::request::wire::Accepted {
-                                        request: id,
-                                        scheduler: rank as u32,
-                                    },
-                                ),
-                            );
+                            self.send_event(proto::request::wire::from_engine::Kind::Accepted(
+                                proto::request::wire::Accepted {
+                                    request: id,
+                                    scheduler: rank as u32,
+                                },
+                            ));
                         }
                         Err(error) => {
                             let kind = match error {
@@ -1085,9 +1093,11 @@ impl MainProcess {
                 Some(proto::process::command::Kind::Park(_)) => {
                     self.park_schedulers("parking for a promotion")?;
                     self.send_report(proto::process::Report {
-                        kind: Some(proto::process::report::Kind::Parked(proto::process::Parked {
-                            generation: current,
-                        })),
+                        kind: Some(proto::process::report::Kind::Parked(
+                            proto::process::Parked {
+                                generation: current,
+                            },
+                        )),
                     });
                 }
                 Some(proto::process::command::Kind::Promote(_)) => {
@@ -1222,6 +1232,36 @@ impl MainProcess {
             return Ok(());
         }
 
+        // A `Precopy` that names no kernel program is the startup switch: the daemon states the
+        // scheduling policy alone, because on a host that runs the worker path there is no kernel
+        // package to prepare (`crates/daemon/src/leader.rs`, `install_programs`). This process
+        // installs what it can actually launch, so an unnamed set is resolved from the store's
+        // listing rather than captured into an empty generation.
+        //
+        // A policy-only *update* also names no kernel, and resolving there would be wrong twice
+        // over: every operator would be re-installed as a new generation, so every kernel's `Arc`
+        // would differ from the serving one and every captured bucket would be rebound or
+        // recaptured for a change no program made. The two states are told apart by what this
+        // process already serves - a startup has no kernel at all, an update has all of them.
+        let never_installed = self
+            .generations
+            .iter()
+            .all(|generation| generation.is_empty());
+        let resolved;
+        let programs = if programs.is_empty() && never_installed {
+            resolved = match self.listed_programs() {
+                Ok(programs) => programs,
+                Err(failure) => return self.abandon_precopy(generation, failure, reply),
+            };
+            tracing::info!(
+                operators = resolved.len(),
+                "the precopy named no kernel program: installing this host's built programs"
+            );
+            &resolved
+        } else {
+            programs
+        };
+
         let tasks = match self.admit_installs(programs, &BTreeMap::new()) {
             Ok(tasks) => tasks,
             Err(failure) => return self.abandon_precopy(generation, failure, reply),
@@ -1250,6 +1290,55 @@ impl MainProcess {
         client
             .list()
             .map_err(|error| format!("reading the Program Server's store: {error}"))
+    }
+
+    /// The programs this host has built, one per operator, for a precopy that names none.
+    ///
+    /// The epoch's first generation has no serving generation to take keys from and a startup
+    /// switch states the scheduling policy alone, so the engine resolves what it can launch: the
+    /// store's listing is the authority, because its packages are the modules actually built for
+    /// this host's targets.
+    ///
+    /// A program is chosen by **identity**, not by a specification: the operator's highest installed
+    /// revision, ties broken by the backend's name so the choice is the same on every run. The
+    /// listing carries no build arguments and none are needed - the store matches a program on
+    /// `(operator, backend)` and fills the package's own parameter defaults, so `arguments` only ever
+    /// overrides a default that the package already states.
+    ///
+    /// An operator built under two backends is one slot and takes one program, which is why the tie
+    /// is broken by name and logged: a deployment that wants a particular backend says so through
+    /// the daemon, which names it in the `Precopy`.
+    fn listed_programs(&self) -> std::result::Result<Programs, UpdateFailure> {
+        let invalid = |reason: String| UpdateFailure::Precopy { reason };
+        let listing = self.listing().map_err(invalid)?;
+        let chosen = select_programs(&listing.packages, &self.targets);
+        if chosen.is_empty() {
+            return Err(invalid(format!(
+                "the precopy named no kernel program and this host has built none: the store's \
+                 listing holds {} package(s) and none has a module for this host's targets, so \
+                 there is nothing to install",
+                listing.packages.len()
+            )));
+        }
+        tracing::info!(
+            packages = listing.packages.len(),
+            operators = chosen.len(),
+            "resolved this host's built programs for a precopy that named none"
+        );
+        let mut programs = Programs::new();
+        for (op, (backend, revision)) in chosen {
+            programs.insert(
+                program_server::program::ProgramSlot { op, phase: None },
+                Program {
+                    backend,
+                    revision,
+                    // The package's own defaults are the arguments the operator's modules were
+                    // built with; the deployment overrides them by naming a program.
+                    arguments: Default::default(),
+                },
+            );
+        }
+        Ok(programs)
     }
 
     /// The module-load tasks one generation needs, one per device (§7.3 step 2).
@@ -1289,14 +1378,20 @@ impl MainProcess {
             let mut known: Vec<String> = learned.get(operator).cloned().unwrap_or_default();
             if keys.is_empty() {
                 if listing.is_none() {
-                    listing = Some(self.listing().map_err(invalid)?);
+                    let read = self.listing().map_err(invalid)?;
+                    listing = Some(read);
                 }
-                let declared = built_keys(
-                    listing.as_ref().expect("the listing was read above"),
-                    &slot.op,
-                    program,
-                    &self.targets,
-                );
+                // The slot was filled immediately above. Reading it through a match rather than a
+                // panic keeps a fault in this function a named refusal, not a dead process: the
+                // workspace denies `expect` for exactly that reason.
+                let declared = match listing.as_ref() {
+                    Some(store) => built_keys(store, &slot.op, program, &self.targets),
+                    None => {
+                        return Err(invalid(
+                            "the Program Server's listing was not read".to_owned(),
+                        ));
+                    }
+                };
                 if declared.is_empty() {
                     // The listing names the modules this host has *built*, not what the package
                     // declares, so an empty answer is a host that built none yet - not a program
@@ -1331,10 +1426,7 @@ impl MainProcess {
             let device = platform::Device::new(ordinal)
                 .map_err(|error| invalid(format!("opening device {}: {error}", ordinal.0)))?;
             let Some(target) = self.targets.get(index).cloned() else {
-                return Err(invalid(format!(
-                    "device {} has no build target",
-                    ordinal.0
-                )));
+                return Err(invalid(format!("device {} has no build target", ordinal.0)));
             };
             let install = Install {
                 programs: Arc::clone(&self.programs),
@@ -1393,7 +1485,6 @@ impl MainProcess {
         self.warming = pending;
         Ok(None)
     }
-
 
     /// §7.3 step 2, second half: advances the precopy at most one stage. It
     /// never waits on a job: a stage that has not finished leaves the precopy
@@ -1509,15 +1600,17 @@ impl MainProcess {
                                 "the walk names a descriptor key this generation learns"
                             );
                             precopy.learned.entry(operator).or_default().push(key);
-                            let tasks = match self.admit_installs(
-                                &precopy.programs,
-                                &precopy.learned,
-                            ) {
-                                Ok(tasks) => tasks,
-                                Err(failure) => {
-                                    return self.abandon_precopy(generation, failure, precopy.reply);
-                                }
-                            };
+                            let tasks =
+                                match self.admit_installs(&precopy.programs, &precopy.learned) {
+                                    Ok(tasks) => tasks,
+                                    Err(failure) => {
+                                        return self.abandon_precopy(
+                                            generation,
+                                            failure,
+                                            precopy.reply,
+                                        );
+                                    }
+                                };
                             precopy.stage = PrecopyStage::Modules(tasks);
                             self.precopy = Some(precopy);
                             return Ok(());
@@ -1670,15 +1763,36 @@ impl MainProcess {
         // A switchover to a generation this process never prepared cannot succeed, and cutting the
         // devices over to try it costs a live graph rebuild to end where it started: it is refused
         // before any device is touched, and the generation that serves keeps serving.
-        if self.prepared.is_empty() {
+        //
+        // "Prepared nothing" and "prepared another" are the same refusal to the daemon and two
+        // different bugs in the log, so the reason names which one. The second is the state a lost
+        // `Precopied` reply leaves: the daemon gave up on a precopy that then completed, retried
+        // `/admin/config`, and now names a generation this process never built. Letting it through
+        // would move the scheduling policy to `generation` first, then fail on the devices, and
+        // report a device fault for a stale number.
+        let stale = self
+            .prepared
+            .iter()
+            .map(|built| built.number())
+            .find(|number| *number != generation);
+        let refused = if self.prepared.is_empty() {
+            Some(format!(
+                "a switchover to generation {generation}, which this process prepared nothing \
+                 for: the precopy that builds it either failed or never arrived"
+            ))
+        } else {
+            stale.map(|other| {
+                format!(
+                    "a switchover to generation {generation}, while this process holds generation \
+                     {other} prepared and never cut over: the precopy that builds {generation} \
+                     either failed or never arrived"
+                )
+            })
+        };
+        if let Some(reason) = refused {
             return Ok(ProgramStatus::PrecopyFailed {
                 generation,
-                failure: UpdateFailure::Precopy {
-                    reason: format!(
-                        "a switchover to generation {generation}, which this process prepared \
-                         nothing for: the precopy that builds it either failed or never arrived"
-                    ),
-                },
+                failure: UpdateFailure::Precopy { reason },
             });
         }
         self.switchover_policy(generation, step);
@@ -1704,8 +1818,7 @@ impl MainProcess {
         // *served* - a reverse switchover on every device - and not a discard of one that never
         // cut over, which is what the phase decides, and it cannot be asked before this line.
         self.update.switchover(generation, Instant::now())?;
-        self.retired =
-            std::mem::replace(&mut self.generations, std::mem::take(&mut self.prepared));
+        self.retired = std::mem::replace(&mut self.generations, std::mem::take(&mut self.prepared));
 
         // §4.5: the first request served on a generation must not pay for a capture, so every
         // captured bucket of the generation that just took over runs once, here, between batches.
@@ -1851,7 +1964,10 @@ impl MainProcess {
                 window.as_secs()
             ),
         };
-        tracing::info!(seconds = window.as_secs(), "an update outlived its probation and is reverted");
+        tracing::info!(
+            seconds = window.as_secs(),
+            "an update outlived its probation and is reverted"
+        );
         // A device that cannot put the generation that served back is a device with no generation at
         // all: the revert's refusal is the epoch's, and it ends by that name rather than continuing to
         // serve a generation the process has just decided it cannot stand behind.
@@ -1968,7 +2084,10 @@ impl MainProcess {
                 _ => executor.revert(current),
             };
             let submission = queued.with_context(|| {
-                format!("queueing device {}'s revert to generation {current}", device.0)
+                format!(
+                    "queueing device {}'s revert to generation {current}",
+                    device.0
+                )
             })?;
             device_command(&self.watchdog, device, "revert", submission)?;
         }
@@ -2074,7 +2193,8 @@ impl MainProcess {
         let Some(scheduler) = self.schedulers.get(*rank) else {
             tracing::debug!(
                 request = command.request,
-                rank, "a request command names a rank this node does not hold"
+                rank,
+                "a request command names a rank this node does not hold"
             );
             return Ok(());
         };
@@ -2112,15 +2232,13 @@ impl MainProcess {
                     error: WORKER_ERA.to_owned(),
                 }),
             ),
-            Some(proto::request::wire::engine_command::Kind::ResizeCache(resize)) => {
-                Some(proto::request::wire::from_engine::Kind::Hooked(
-                    proto::request::wire::Hooked {
-                        id: resize.id,
-                        results: Vec::new(),
-                        error: WORKER_ERA.to_owned(),
-                    },
-                ))
-            }
+            Some(proto::request::wire::engine_command::Kind::ResizeCache(resize)) => Some(
+                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
+                    id: resize.id,
+                    results: Vec::new(),
+                    error: WORKER_ERA.to_owned(),
+                }),
+            ),
             Some(proto::request::wire::engine_command::Kind::UpdateWeights(update)) => Some(
                 proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
                     id: update.id,
@@ -2168,14 +2286,14 @@ impl MainProcess {
             ),
             // The scheduling limits are the schedulers', applied at their next step through the
             // policy slot the process connection names (§4.4).
-            Some(proto::request::wire::engine_command::Kind::Configure(configure)) => Some(
-                proto::request::wire::from_engine::Kind::Configured(
+            Some(proto::request::wire::engine_command::Kind::Configure(configure)) => {
+                Some(proto::request::wire::from_engine::Kind::Configured(
                     proto::request::wire::Configured {
                         id: configure.id,
                         error: EPOCH_LIFECYCLE.to_owned(),
                     },
-                ),
-            ),
+                ))
+            }
             // The storage ledgers and the transfer budgets are each node's daemon's, read over
             // its claim (§8); an epoch's main process holds no claim of the deployment's.
             Some(proto::request::wire::engine_command::Kind::DescribeStorage(describe)) => Some(
@@ -2194,24 +2312,24 @@ impl MainProcess {
             ),
             // What the prefix cache holds is the schedulers' answer, and they are asked through
             // the process connection.
-            Some(proto::request::wire::engine_command::Kind::DescribeCache(describe)) => Some(
-                proto::request::wire::from_engine::Kind::CacheDescribed(
+            Some(proto::request::wire::engine_command::Kind::DescribeCache(describe)) => {
+                Some(proto::request::wire::from_engine::Kind::CacheDescribed(
                     proto::request::wire::CacheDescribed {
                         id: describe.id,
                         error: EPOCH_LIFECYCLE.to_owned(),
                         segments: Vec::new(),
                     },
-                ),
-            ),
-            Some(proto::request::wire::engine_command::Kind::DescribeRequests(describe)) => Some(
-                proto::request::wire::from_engine::Kind::RequestsDescribed(
+                ))
+            }
+            Some(proto::request::wire::engine_command::Kind::DescribeRequests(describe)) => {
+                Some(proto::request::wire::from_engine::Kind::RequestsDescribed(
                     proto::request::wire::RequestsDescribed {
                         id: describe.id,
                         error: EPOCH_LIFECYCLE.to_owned(),
                         requests: Vec::new(),
                     },
-                ),
-            ),
+                ))
+            }
             // Promote, FlushCache and Attach state no id and are answered with a state this
             // process does not own: there is nothing to answer on, and a log line is what is
             // left.
@@ -2271,7 +2389,8 @@ impl MainProcess {
         }
         // The schedulers state their own figures; a node that holds none reports the executors'
         // and a step count of zero, because no step happened here.
-        let (mut steps, mut batches, mut tokens, mut policy_fuel, mut policy_calls) = (0, 0, 0, 0, 0);
+        let (mut steps, mut batches, mut tokens, mut policy_fuel, mut policy_calls) =
+            (0, 0, 0, 0, 0);
         for scheduler in &self.schedulers {
             // A scheduler answers its counters on its own thread: a metrics report is not worth
             // stalling the control thread for, so the pass takes what is there.
@@ -2473,7 +2592,11 @@ impl MainProcess {
         let program = PolicyProgram::from_arguments(
             policy.backend.clone(),
             policy.revision,
-            &policy.arguments.iter().map(|(name, value)| (name.clone(), value.to_string())).collect(),
+            &policy
+                .arguments
+                .iter()
+                .map(|(name, value)| (name.clone(), value.to_string()))
+                .collect(),
         )
         .map_err(|error| anyhow::anyhow!("the update's policy program: {error}"))?;
         let source = Arc::new(
@@ -2493,7 +2616,11 @@ impl MainProcess {
     /// node can name; the control thread does not choose one.
     fn switchover_policy(&self, _generation: u64, _step: Option<u64>) {
         for scheduler in &self.schedulers {
-            if let Err(error) = answer(scheduler.switchover_policy(), self.watchdog.stall_bound(), "the policy switchover") {
+            if let Err(error) = answer(
+                scheduler.switchover_policy(),
+                self.watchdog.stall_bound(),
+                "the policy switchover",
+            ) {
                 tracing::error!(%error, "switching the scheduling policy failed");
             }
         }
@@ -2511,7 +2638,11 @@ impl MainProcess {
     /// and the candidate is dropped at it.
     fn revert_policy(&self, _generation: u64) {
         for scheduler in &self.schedulers {
-            if let Err(error) = answer(scheduler.revert_policy(), self.watchdog.stall_bound(), "the policy revert") {
+            if let Err(error) = answer(
+                scheduler.revert_policy(),
+                self.watchdog.stall_bound(),
+                "the policy revert",
+            ) {
                 tracing::error!(%error, "reverting the scheduling policy failed");
             }
         }
@@ -2536,11 +2667,9 @@ fn report_of(status: &ProgramStatus) -> Option<proto::process::Report> {
     use proto::process::report::Kind;
 
     let kind = match status {
-        ProgramStatus::Precopied { generation } => {
-            Kind::Precopied(proto::process::Precopied {
-                generation: *generation,
-            })
-        }
+        ProgramStatus::Precopied { generation } => Kind::Precopied(proto::process::Precopied {
+            generation: *generation,
+        }),
         ProgramStatus::PrecopyFailed { failure, .. } => {
             Kind::PrecopyFailed(proto::process::PrecopyFailed {
                 reason: failure.reason(),
@@ -2550,11 +2679,9 @@ fn report_of(status: &ProgramStatus) -> Option<proto::process::Report> {
             generation: *generation,
         }),
         ProgramStatus::Committed { .. } => Kind::Committed(proto::process::Committed {}),
-        ProgramStatus::Reverted { reason, .. } => {
-            Kind::Reverted(proto::process::Reverted {
-                reason: reason.clone(),
-            })
-        }
+        ProgramStatus::Reverted { reason, .. } => Kind::Reverted(proto::process::Reverted {
+            reason: reason.clone(),
+        }),
         ProgramStatus::Purged { generation } => Kind::Purged(proto::process::Purged {
             generation: *generation,
         }),
@@ -2800,9 +2927,11 @@ fn resolved(module: program_server::Module) -> executor::Result<Resolved> {
             // The image's kernel symbol is its metadata's name; without metadata the package names
             // the entry itself, and `ops` falls back to the module's single entry.
             let entry = match &metadata {
-                Some(metadata) => ops::CubinMetadata::parse(metadata)
-                    .map_err(|error| invalid(format!("the cubin's metadata: {error}")))?
-                    .name,
+                Some(metadata) => {
+                    ops::CubinMetadata::parse(metadata)
+                        .map_err(|error| invalid(format!("the cubin's metadata: {error}")))?
+                        .name
+                }
                 None => String::new(),
             };
             Ok(Resolved {
@@ -2814,9 +2943,7 @@ fn resolved(module: program_server::Module) -> executor::Result<Resolved> {
         }
         program_server::manifest::ModuleForm::Native => {
             let Some(entry) = module.entries.get(program_server::manifest::LAUNCH_ENTRY) else {
-                return Err(invalid(
-                    "a native module states no launch entry".to_owned(),
-                ));
+                return Err(invalid("a native module states no launch entry".to_owned()));
             };
             let Some(file) = files.next() else {
                 return Err(invalid("a native module carries no library".to_owned()));
@@ -2894,10 +3021,13 @@ impl HostAction for Install {
                         ))
                     })?;
                 let module = resolved(module)?;
-                let entry = ops::install(&self.device, operator, &key, module.as_ops()?)
-                    .map_err(|error| {
-                        executor::Error::Invalid(format!("installing {operator} for {key}: {error}"))
-                    })?;
+                let entry = ops::install(&self.device, operator, &key, module.as_ops()?).map_err(
+                    |error| {
+                        executor::Error::Invalid(format!(
+                            "installing {operator} for {key}: {error}"
+                        ))
+                    },
+                )?;
                 if let Some(entry) = entry {
                     entries.push(entry);
                 }
@@ -2981,6 +3111,78 @@ fn unfinished(submissions: &[Submission], what: &str) -> Option<StageFailure> {
 
 /// The descriptor keys `generation` holds for `operator`: what a precopy must
 /// cover, and exactly what it never adds to (§7.3 step 2, §5.3).
+/// The program each operator of `packages` is installed from, by identity: the highest installed
+/// revision, ties broken by the backend's name so the choice is the same on every run.
+///
+/// Two kinds of package are left out, and both would cost more than they buy:
+///
+/// - one with no module built for one of `targets`. Installing it asks `prepare` to *build* it for
+///   this host, so a store built for other targets would spend a startup's whole precopy clock
+///   compiling modules the first token does not need. The operator then stays missing, and the walk
+///   names it - the honest answer for a host the store was not built for.
+/// - one whose operator this binary does not implement: `admit_installs` refuses a precopy for such
+///   an operator, and a program this process could never launch is not worth failing a switchover
+///   over.
+fn select_programs(
+    packages: &[program_server::protocol::ListedPackage],
+    targets: &[Target],
+) -> BTreeMap<String, (String, u32)> {
+    let mut chosen: BTreeMap<String, (String, u32)> = BTreeMap::new();
+    for package in packages {
+        if package.modules.is_empty() {
+            tracing::debug!(
+                op = %package.op,
+                backend = %package.backend,
+                "a listed package has no built module"
+            );
+            continue;
+        }
+        if !package
+            .modules
+            .iter()
+            .any(|module| targets.contains(&module.target))
+        {
+            tracing::debug!(
+                op = %package.op,
+                backend = %package.backend,
+                "the store holds this operator for another target: not installed"
+            );
+            continue;
+        }
+        if ops::operator_name(&package.op).is_none() {
+            tracing::debug!(
+                op = %package.op,
+                backend = %package.backend,
+                "the store holds an operator this build does not implement"
+            );
+            continue;
+        }
+        let candidate = (package.backend.clone(), package.revision);
+        match chosen.get(&package.op) {
+            // The held program stays when it is the later revision, or the same revision under a
+            // backend that sorts first.
+            Some((backend, revision))
+                if *revision > candidate.1
+                    || (*revision == candidate.1 && backend.as_str() <= candidate.0.as_str()) => {}
+            _ => {
+                if let Some((backend, revision)) = chosen.get(&package.op) {
+                    tracing::info!(
+                        op = %package.op,
+                        taken = %candidate.0,
+                        revision = candidate.1,
+                        held = %backend,
+                        held_revision = revision,
+                        "an operator is built under two backends: the higher revision wins, ties by \
+                         backend name"
+                    );
+                }
+                chosen.insert(package.op.clone(), candidate);
+            }
+        }
+    }
+    chosen
+}
+
 /// The descriptor keys this host has already built for a named package, for this node's targets.
 ///
 /// The epoch's first generation has no serving generation to copy keys from, and without this the
@@ -3079,9 +3281,9 @@ fn schedulers(
     let config = engine::EngineConfig::of(&facts)?;
     // The scheduler submits through the same devices this process drives, so a batch and a
     // switchover reach one executor thread per device and never two.
-    let batches: Arc<dyn executor::batch::Batches> = Arc::new(
-        executor::batch::Executors::shared(executors.iter().map(Arc::clone).collect())?,
-    );
+    let batches: Arc<dyn executor::batch::Batches> = Arc::new(executor::batch::Executors::shared(
+        executors.iter().map(Arc::clone).collect(),
+    )?);
     let handle = engine::SchedulerHandle::over_batches(config, batches)?;
     Ok(vec![handle])
 }
@@ -3125,5 +3327,102 @@ fn handshake(control: &mut Control, launch: &Launch) -> Result<Epoch> {
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use program_server::protocol::{ListedModule, ListedPackage};
+    use program_server::ModuleForm;
 
+    /// A listed package with one built module for `target`.
+    fn package(op: &str, backend: &str, revision: u32, target: &str) -> ListedPackage {
+        ListedPackage {
+            op: op.to_owned(),
+            backend: backend.to_owned(),
+            revision,
+            modules: vec![ListedModule {
+                target: Target::new(target),
+                descriptor: "a-descriptor".to_owned(),
+                form: ModuleForm::Cubin,
+            }],
+        }
+    }
 
+    fn targets() -> Vec<Target> {
+        vec![Target::new("sm_90a")]
+    }
+
+    /// An operator name this build implements, taken from the build rather than written down, so a
+    /// renamed operator does not fail a test about selection.
+    fn implemented() -> &'static str {
+        ops::operators()
+            .first()
+            .copied()
+            .expect("the build implements operators")
+    }
+
+    /// The later installation of an operator is the one a startup installs, whatever order the
+    /// store lists them in.
+    #[test]
+    fn the_highest_revision_of_an_operator_is_chosen() {
+        let op = implemented();
+        for packages in [
+            vec![
+                package(op, "triton", 1, "sm_90a"),
+                package(op, "triton", 3, "sm_90a"),
+            ],
+            vec![
+                package(op, "triton", 3, "sm_90a"),
+                package(op, "triton", 1, "sm_90a"),
+            ],
+        ] {
+            let chosen = select_programs(&packages, &targets());
+            assert_eq!(
+                chosen.get(op),
+                Some(&("triton".to_owned(), 3)),
+                "the highest revision is the one installed"
+            );
+        }
+    }
+
+    /// One operator is one slot and takes one program; when two backends hold the same revision the
+    /// choice is the backend that sorts first, so it repeats on every run.
+    #[test]
+    fn a_tie_on_revision_is_broken_by_the_backend_name() {
+        let op = implemented();
+        for order in [["triton", "flashinfer"], ["flashinfer", "triton"]] {
+            let packages = order
+                .into_iter()
+                .map(|backend| package(op, backend, 2, "sm_90a"))
+                .collect::<Vec<_>>();
+            let chosen = select_programs(&packages, &targets());
+            assert_eq!(
+                chosen.get(op),
+                Some(&("flashinfer".to_owned(), 2)),
+                "the same backend wins whatever order the store lists them in"
+            );
+        }
+    }
+
+    /// Three packages that cannot launch here, for three different reasons, and one that can: only
+    /// the last is installed.
+    #[test]
+    fn only_packages_this_host_could_launch_are_installed() {
+        let op = implemented();
+        let mut unbuilt = package(op, "triton", 9, "sm_90a");
+        unbuilt.modules.clear();
+        let packages = vec![
+            unbuilt,
+            package(op, "triton", 8, "sm_70"),
+            package("an-operator-this-build-lacks", "triton", 7, "sm_90a"),
+            package(op, "triton", 1, "sm_90a"),
+        ];
+
+        let chosen = select_programs(&packages, &targets());
+        assert_eq!(chosen.len(), 1, "one operator can launch here: {chosen:?}");
+        assert_eq!(
+            chosen.get(op),
+            Some(&("triton".to_owned(), 1)),
+            "the package with a module for this target, whatever the others claim"
+        );
+    }
+}
