@@ -176,6 +176,21 @@ pub fn load(
     // `Block::Denoiser` and the concrete block that holds them is out of reach. A deployment whose
     // tasks carry no conditions places none.
     let mut encoders = if partition.blocks.contains(Component::LatentEncoder) {
+        // The video encoder's names are data too (`VideoEncoder::keys` is the other column of the
+        // table its own load reads), so a name the export lacks is refused here rather than
+        // surfacing as a read error from inside a stack of strides and convolutions.
+        let source = checkpoint.component("vae")?;
+        let keys = crate::encoding::VideoEncoder::keys(&config.video_vae)?;
+        let missing = crate::checkpoint::absent(&keys, |key| source.tensor(key).is_some());
+        if !missing.is_empty() {
+            return Err(Error::checkpoint(format!(
+                "the video encoder that conditions a request asks {} tensors and {} of them are \
+                 not in vae/: {}",
+                keys.len(),
+                missing.len(),
+                missing[..missing.len().min(8)].join(", ")
+            )));
+        }
         Some(ConditionEncoders::load(&config, checkpoint, loader)?)
     } else {
         None
