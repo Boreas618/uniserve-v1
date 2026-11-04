@@ -375,24 +375,12 @@ impl FusedHeads {
                 .iter()
                 .map(|weight| *weight as f32)
                 .collect::<Vec<_>>();
+            let (block_weight, block_bias) =
+                fuse_block(&values, &biases, out, hidden, start, &weights);
             let target = (u64::from(block) * per_head) as usize;
-            for entry in 0..per_head {
-                let mut sum = 0.0_f32;
-                for (index, weight) in weights.iter().enumerate() {
-                    let head = start + index as u64;
-                    sum += weight * values[(head * per_head + entry) as usize];
-                }
-                fused[target + entry as usize] = sum;
-            }
+            fused[target..][..block_weight.len()].copy_from_slice(&block_weight);
             let target = (u64::from(block) * out) as usize;
-            for channel in 0..out {
-                let mut sum = 0.0_f32;
-                for (index, weight) in weights.iter().enumerate() {
-                    let head = start + index as u64;
-                    sum += weight * biases[(head * out + channel) as usize];
-                }
-                fused_bias[target + channel as usize] = sum;
-            }
+            fused_bias[target..][..block_bias.len()].copy_from_slice(&block_bias);
         }
         let modality_name = modality.as_str();
         Ok(Self {
@@ -415,6 +403,36 @@ impl FusedHeads {
             blocks: block_count,
         })
     }
+}
+
+/// One block's fused head and bias: `sum_n w[n] * head[start + n]`, in FP32.
+///
+/// The stacked heads are `[heads * out, hidden]` and `[heads * out]`, head-major, so head `h`'s
+/// weight row `o` starts at `(h * out + o) * hidden` and its bias at `h * out + o`. The products and
+/// the sum stay FP32; the caller rounds the result to the checkpoint's type once.
+fn fuse_block(
+    values: &[f32],
+    biases: &[f32],
+    out: u64,
+    hidden: u64,
+    start: u64,
+    weights: &[f32],
+) -> (Vec<f32>, Vec<f32>) {
+    let per_head = out * hidden;
+    let mut weight = vec![0.0_f32; per_head as usize];
+    let mut bias = vec![0.0_f32; out as usize];
+    for (index, scale) in weights.iter().enumerate() {
+        let head = start + index as u64;
+        let source = (head * per_head) as usize;
+        for (entry, target) in weight.iter_mut().enumerate() {
+            *target += scale * values[source + entry];
+        }
+        let source = (head * out) as usize;
+        for (channel, target) in bias.iter_mut().enumerate() {
+            *target += scale * biases[source + channel];
+        }
+    }
+    (weight, bias)
 }
 
 /// A checkpoint tensor's values as FP32, for a derivation that must be exact on the host.
@@ -889,6 +907,33 @@ mod tests {
 
     fn index(tokens: u64) -> TensorView {
         TensorView::new(nn::DevicePtr::new(0), DType::I32, Shape::new(&[tokens]))
+    }
+
+    #[test]
+    fn a_blocks_head_is_the_weighted_sum_of_its_stacked_heads() {
+        // Two heads of one 2x3 output, stacked head-major: head 0 at rows 0..2, head 1 at 2..4.
+        let values = vec![
+            1.0, 2.0, 3.0, // head 0, row 0
+            4.0, 5.0, 6.0, // head 0, row 1
+            10.0, 20.0, 30.0, // head 1, row 0
+            40.0, 50.0, 60.0, // head 1, row 1
+        ];
+        let biases = vec![0.5, -0.5, 5.0, -5.0];
+        let (weight, bias) = fuse_block(&values, &biases, 2, 3, 0, &[0.25, 0.75]);
+        assert_eq!(weight[0], 0.25 * 1.0 + 0.75 * 10.0);
+        assert_eq!(weight[5], 0.25 * 6.0 + 0.75 * 60.0);
+        assert_eq!(bias[0], 0.25 * 0.5 + 0.75 * 5.0);
+        assert_eq!(bias[1], 0.25 * -0.5 + 0.75 * -5.0);
+        assert_eq!(weight.len(), 6, "one block's 2x3 head");
+    }
+
+    #[test]
+    fn a_block_of_the_second_interval_reads_only_its_own_heads() {
+        let values = vec![1.0, 2.0, 100.0, 200.0];
+        let biases = vec![0.0, 9.0];
+        let (weight, bias) = fuse_block(&values, &biases, 1, 2, 1, &[1.0]);
+        assert_eq!(weight, vec![100.0, 200.0]);
+        assert_eq!(bias, vec![9.0]);
     }
 
     #[test]
