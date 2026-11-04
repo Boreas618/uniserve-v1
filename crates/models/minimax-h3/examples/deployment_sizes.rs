@@ -198,6 +198,7 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             shard as usize,
             shard as usize,
             0,
+            0,
         )?;
         let arrangement = partition.arrangement(rules)?;
         for frames in [124_u32, 362] {
@@ -302,7 +303,7 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
                     nn::capability::VideoTask::TextToVideoAudio
                 };
                 let arrangement =
-                    minimax_h3::partition::Partition::serving(&config, task, 1, 1, 0)?
+                    minimax_h3::partition::Partition::serving(&config, task, 1, 1, 0, 0)?
                         .arrangement(denoiser)?;
                 let request = nn::capability::Layout {
                     video: nn::capability::LatentShape {
