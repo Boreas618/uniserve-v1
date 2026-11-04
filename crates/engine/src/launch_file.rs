@@ -38,6 +38,10 @@
 //! | `model_config.max_model_len` | the model's context length |
 //! | `model_config.generation_limits` | what one request may be given to generate |
 //!
+//! The generation limits are the one table whose keys are read over the model's
+//! own default, since a capacity a deployment does not use is declared by the
+//! zero that states none of it; every other fact stands exactly as stated.
+//!
 //! A key the file does not state is left `None` and nothing is guessed in its
 //! place: [`EngineConfig::of`](crate::EngineConfig::of) refuses the missing fact
 //! by its name and by where it comes from, which is what makes an incomplete
@@ -54,6 +58,7 @@ use std::path::Path;
 use anyhow::Context;
 use serde::de::DeserializeOwned;
 
+use crate::GenerationLimits;
 use crate::RankFacts;
 use crate::kv_cache::HostCacheSize;
 
@@ -112,11 +117,40 @@ pub fn parse(text: &str) -> anyhow::Result<RankFacts> {
         bos: value(&tree, "model_config.bos")?,
         eos: value(&tree, "model_config.eos")?,
         end_of_image: value(&tree, "model_config.end_of_image")?,
-        generation_limits: value(&tree, "model_config.generation_limits")?,
+        generation_limits: generation_limits(&tree)?,
         max_model_len: value(&tree, "model_config.max_model_len")?,
         watchdog_timeout: value::<u64>(&tree, "worker_config.watchdog_timeout_ms")?
             .map(std::time::Duration::from_millis),
     })
+}
+
+/// The generation limits the file states, over the model's own default.
+///
+/// The limits are a dozen capacities, and a launch file states the ones its
+/// deployment uses: the rest keep [`GenerationLimits::default`]'s zero, which
+/// declares no capacity for that resource, so a request that needs one is
+/// refused rather than served against a number nobody stated.
+fn generation_limits(tree: &toml::Table) -> anyhow::Result<Option<GenerationLimits>> {
+    let Some(found) = dotted(tree, "model_config.generation_limits") else {
+        return Ok(None);
+    };
+    let stated = found
+        .as_table()
+        .context("the launch file's `model_config.generation_limits` is a table of capacities")?;
+    let mut merged = toml::Value::try_from(GenerationLimits::default())
+        .context("the default generation limits are a TOML table")?;
+    let target = merged
+        .as_table_mut()
+        .context("the default generation limits are a TOML table")?;
+    for (key, value) in stated {
+        target.insert(key.clone(), value.clone());
+    }
+    merged
+        .try_into()
+        .context(
+            "the launch file's `model_config.generation_limits` states capacities of the model",
+        )
+        .map(Some)
 }
 
 /// The host cache the file states, or none when it states no part of it.
@@ -247,8 +281,8 @@ max_latent_units = 1024
         );
         assert_eq!(
             facts.graph_tiers.as_deref(),
-            Some([1, 4, 8, 32, 32].as_slice()),
-            "both phases' sizes, ascending"
+            Some([1, 4, 8, 32].as_slice()),
+            "both phases' sizes, ascending and once each: a tier of both phases is one graph              size"
         );
         assert_eq!(facts.bos, Some(128_000));
         assert_eq!(facts.eos.as_deref(), Some([128_001, 128_008].as_slice()));
