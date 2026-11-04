@@ -51,6 +51,11 @@ pub trait Op {
     /// writes into `twins` instead of the real outputs, so the two results can be compared without
     /// the difference of one operator accumulating through the next. An operand the operator
     /// modifies in place is redirected too, after its current bytes are copied into the twin.
+    ///
+    /// The twins borrow is not tied to the arguments' lifetime: `Forward::operate` owns the twins
+    /// behind a `RefCell` borrowed for the length of the call, while the argument views carry the
+    /// caller's lifetime, and the returned arguments hold views into the twins' buffers rather than
+    /// a reference to the twins themselves.
     fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a>;
 
     /// How far two implementations of this operator may be from another on this descriptor.
