@@ -1227,6 +1227,22 @@ impl Leader {
         // A world of more is refused by name instead of silently writing
         // `world_size = 1` for two processes (exec's rule: the world is its
         // peers and itself).
+        // One main process, not only one node: a data-parallel deployment runs
+        // one replica per main process, and this daemon writes one launch file
+        // and starts one child per node. The count is the target's, decided
+        // from the same expression the replica rollout uses.
+        let processes = if target.moe_config.expert_parallel {
+            1
+        } else {
+            target.data_parallel_size.get()
+        };
+        if processes != 1 {
+            return Err(UpdateError::Refused(format!(
+                "the target epoch runs {processes} data-parallel replicas, and the epoch layer \
+                 starts one main process per node: a replica's launch needs the contents carried \
+                 in `process::Spawn` or a world that states every replica's addresses"
+            )));
+        }
         if target.nnodes.get() != 1 {
             return Err(UpdateError::Refused(format!(
                 "the target epoch runs {} nodes, and a launch file written here names no peer: a \
