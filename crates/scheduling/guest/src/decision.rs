@@ -48,12 +48,12 @@ pub struct Work {
     pub tokens: u32,
 }
 
-/// What is still in flight from earlier steps, as the mechanism grouped it
-/// into numerical calls.
+/// What earlier steps submitted and the mechanism has not completed.
 ///
-/// A batch is one numerical call on one block, so the policy cannot derive
-/// these counts from its own dispatched work alone; they are the consumed part
-/// of this step's room. `prefill_batches` is what today's
+/// A batch is one numerical call on one block, so a policy cannot derive these
+/// counts from its own dispatched work alone. They are not spent out of this
+/// step's token and call budgets — those are per step — but they are how many
+/// prefill batches the step already has outstanding, which is what today's
 /// `PREFILL_WINDOW_CREDITS` bounds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Inflight {
@@ -63,12 +63,6 @@ pub struct Inflight {
     /// Those of them carrying prefill work.
     #[serde(default)]
     pub prefill_batches: u32,
-    /// Calls in them.
-    #[serde(default)]
-    pub calls: u32,
-    /// Tokens they were charged.
-    #[serde(default)]
-    pub tokens: u32,
 }
 
 /// The room this step has left (design §4.4).
@@ -88,7 +82,8 @@ pub struct Room {
     #[serde(default)]
     pub slots: usize,
     /// This step's token cap (the policy's `max_num_batched_tokens`, already
-    /// clamped to the build config's ceiling).
+    /// clamped to the build config's ceiling). It is the step's own budget: work
+    /// submitted in earlier steps was charged to those steps.
     #[serde(default)]
     pub token_budget: u32,
     /// This step's call cap (`max_batch`).
@@ -108,6 +103,23 @@ pub struct Room {
     /// Work submitted by earlier steps and still in flight.
     #[serde(default)]
     pub inflight: Inflight,
+    /// The device KV cache's total units, so a policy can reject a request
+    /// whose worst-case reservation can never fit.
+    #[serde(default)]
+    pub capacity_units: u64,
+    /// The requests whose pages an epoch's precopy warms, in the order the
+    /// mechanism claimed them, each with its pages in prefix order. Empty
+    /// outside a precopy.
+    #[serde(default)]
+    pub warming: Vec<Warming>,
+}
+
+/// One request of an epoch's precopy warming: its pages, in prefix order.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Warming {
+    pub request: RequestId,
+    #[serde(default)]
+    pub pages: Vec<PageId>,
 }
 
 /// Which storage is short.
