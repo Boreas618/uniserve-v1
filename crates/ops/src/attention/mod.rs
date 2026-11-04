@@ -695,6 +695,8 @@ impl Op for PagedAttention {
             }
         }
 
+        trace(descriptor, &args);
+
         let mut call = Call {
             out: address(args.out.ptr) as usize as *mut c_void,
             query: address(args.query.ptr) as usize as *const c_void,
@@ -849,6 +851,111 @@ pub(super) fn check_vector_alignment(
         }
     }
     Ok(())
+}
+
+/// Write the launch's operands and derived steps to standard error, when
+/// `UNISERVE_ATTENTION_TRACE` is set and non-empty.
+///
+/// A fault inside a tensor-core kernel names a program counter, a grid and a warp, and nothing about
+/// the operand behind it. The sm100 programs are compiled for sixteen-byte tensor pointers and take
+/// their strides as `i64` divided by eight, so one operand that is not a whole unit of sixteen bytes
+/// — in its first address or in a step the program walks — is a warp misaligned address with no
+/// operand in the message. This table is the launch's own answer to that: every operand's address,
+/// element type, extents and steps with the unit verdict of each, the two steps the host derives
+/// from a view's axes, and the steps a contiguous `[tokens, heads, dim]` layout would make them.
+///
+/// A diagnostic, off unless asked for: the launch reads the variable and otherwise pays nothing.
+fn trace(descriptor: &Descriptor, args: &Args) {
+    if std::env::var_os("UNISERVE_ATTENTION_TRACE").is_none_or(|value| value.is_empty()) {
+        return;
+    }
+    let unit = descriptor
+        .query
+        .bytes()
+        .map_or(1, |bytes| ATTENTION_ALIGNMENT / bytes.max(1));
+    let heads = u64::from(descriptor.q_heads);
+    let dim = u64::from(descriptor.head_dim);
+    eprintln!(
+        "attention trace: {:?} batch {} tokens {} heads {}/{}x{} page_size {} max_kv_len {} \
+         causal {} window_left {} scale {:e}",
+        descriptor.phase,
+        args.page_table.shape.dim(0),
+        args.query.shape.dim(0),
+        descriptor.q_heads,
+        descriptor.kv_heads,
+        descriptor.head_dim,
+        descriptor.page_size,
+        descriptor.max_kv_len,
+        args.causal,
+        args.window_left,
+        args.scale,
+    );
+    for (name, view) in [
+        ("query", args.query),
+        ("key", args.key),
+        ("value", args.value),
+        ("out", args.out),
+        ("page_table", args.page_table),
+        ("seq_lens", args.seq_lens),
+        ("cum_seq_lens_q", args.cum_seq_lens_q),
+        ("workspace", args.workspace),
+    ] {
+        trace_operand(name, view, unit);
+    }
+    for (name, scale) in [
+        ("key_scale", args.key_scale),
+        ("value_scale", args.value_scale),
+    ] {
+        if let Some(scale) = scale {
+            trace_operand(name, scale, unit);
+        }
+    }
+    // The table's width against the bound the module was compiled for: one comes from the request's
+    // own view, the other from `max_kv_len / page_size`, and a disagreement is a finding of its own.
+    let width = args
+        .page_table
+        .shape
+        .dim(args.page_table.shape.rank().saturating_sub(1));
+    let derived = u64::from(descriptor.max_kv_len) / u64::from(descriptor.page_size).max(1);
+    eprintln!(
+        "attention trace: page table width {width}, max_kv_len/page_size {derived}{}",
+        if width == derived {
+            " (agree)"
+        } else {
+            " DIFFER"
+        }
+    );
+    eprintln!(
+        "attention trace: steps passed query ({}, {}) out ({}, {}) | contiguous ({}, {})",
+        row_stride(&args.query),
+        head_stride(&args.query),
+        row_stride(&args.out),
+        head_stride(&args.out),
+        heads * dim,
+        dim,
+    );
+}
+
+/// One operand's address, extents and steps, with the verdict of each step; see [`trace`].
+fn trace_operand(name: &str, view: TensorView, unit: u64) {
+    let first = platform::address(view.ptr);
+    let mut steps = String::new();
+    for axis in 0..view.strides.rank() {
+        let step = view.strides.get(axis);
+        // The last axis is the element axis and is read contiguously by design.
+        let verdict = if axis + 1 == view.strides.rank() || step.is_multiple_of(unit) {
+            ""
+        } else {
+            " NOT-A-WHOLE-UNIT"
+        };
+        steps.push_str(&format!(" {axis}:{step}{verdict}"));
+    }
+    eprintln!(
+        "attention trace: {name:<14} {} at {first:#x} aligned16 {} shape {:?} steps{steps}",
+        view.dtype,
+        first.is_multiple_of(ATTENTION_ALIGNMENT),
+        view.shape.dims(),
+    );
 }
 
 pub(super) fn address(pointer: DevicePtr) -> u64 {
