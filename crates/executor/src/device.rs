@@ -38,6 +38,15 @@ pub struct Executor {
     pools: Arc<std::sync::Mutex<Pools>>,
     /// What the device has done since it started, for the metrics report (7.3).
     counters: Arc<SharedCounters>,
+    /// The operators the last program-layer update could not compare, each with its reason
+    /// (7.3 step 2): the runners on this device write it as they prepare and shadow a generation,
+    /// and the control thread reports it when the precopy finishes. Empty is a fact - every
+    /// operator the update replaced was compared.
+    uncompared: Arc<std::sync::Mutex<Vec<String>>>,
+    /// The rank's Storage Server client, bound after construction because the control thread builds
+    /// it after the launch's claim while the executors exist before it: a sleep and a wake are the
+    /// only calls that reach the ledger, and the device thread makes them (2.5).
+    storage: Arc<std::sync::Mutex<Option<Arc<crate::memory::retained::Retained>>>>,
 }
 
 /// What a device has done since it started: the metrics report's counters (7.3).
@@ -146,6 +155,8 @@ impl Executor {
         scratch: u64,
     ) -> Result<Self> {
         let counters = Arc::new(SharedCounters::default());
+        let uncompared = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let storage = Arc::new(std::sync::Mutex::new(None));
         let phases: Vec<ipc::PhaseId> = runners
             .iter()
             .flat_map(|named| named.phases.iter().copied())
@@ -153,6 +164,7 @@ impl Executor {
         for named in &mut runners {
             named.runner.attach_pools(Arc::clone(&pools));
             named.runner.attach_counters(Arc::clone(&counters));
+            named.runner.attach_uncompared(Arc::clone(&uncompared));
         }
         let queue = JobQueue::new(device, Arc::clone(&events));
         let state = Device {
@@ -162,6 +174,7 @@ impl Executor {
             scratch,
             pools: Arc::clone(&pools),
             counters: Arc::clone(&counters),
+            storage: Arc::clone(&storage),
             current: None,
             sticky: None,
         };
@@ -181,7 +194,21 @@ impl Executor {
             thread: Some(thread),
             pools,
             counters,
+            storage,
+            uncompared,
         })
+    }
+
+    /// The operators the last program-layer update could not compare, each with its reason (7.3
+    /// step 2), in the order the device's runners recorded them.
+    ///
+    /// Read by the control thread when a precopy finishes, so the update's answer states what it
+    /// has no evidence for instead of leaving that to a log line.
+    pub fn uncompared(&self) -> Vec<String> {
+        self.uncompared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// The device this executor drives.
@@ -294,6 +321,43 @@ impl Executor {
             JobKind::Discard,
             None,
         )?;
+        Ok(submission)
+    }
+
+    /// Binds the rank's Storage Server client to this device, so a sleep can give segments back and
+    /// a wake can map them again (2.5).
+    ///
+    /// Called once by the control thread after the executors are spawned: the client is built after
+    /// the launch's claim, and the devices exist before it.
+    pub fn bind_storage(&self, client: Arc<crate::memory::retained::Retained>) {
+        *self
+            .storage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(client);
+    }
+
+    /// Gives the resident cache's segments back, for a standby's park (2.5).
+    ///
+    /// One call per cache, in the device queue's order: a batch submitted before it finishes first,
+    /// and nothing submitted after it runs until admission opens again on the wake's answer.
+    pub fn sleep(&self) -> Result<Submission> {
+        let id = SubmissionId(self.queue.next_submission());
+        let (submission, _) = Submission::pending(id);
+        self.queue
+            .submit(Command::Sleep, &submission, JobKind::Sleep, None)?;
+        Ok(submission)
+    }
+
+    /// Maps the released cache segments again, `limit` of them or all of them (2.5).
+    ///
+    /// The answer is the measurement of what came back; a shortfall is not an error, because the
+    /// limit is a bound rather than a demand. An `Err` is: the addresses are valid and the K/V is
+    /// not, so the caller must not admit a request on this device.
+    pub fn wake(&self, limit: Option<u32>) -> Result<Submission> {
+        let id = SubmissionId(self.queue.next_submission());
+        let (submission, _) = Submission::pending(id);
+        self.queue
+            .submit(Command::Wake { limit }, &submission, JobKind::Wake, None)?;
         Ok(submission)
     }
 
@@ -447,6 +511,8 @@ struct Device {
     /// nothing more and fails every command it is handed with this error. The main process learns
     /// of it through the control thread's probe and replaces the process (2.2, 2.5).
     sticky: Option<platform::Error>,
+    /// The rank's Storage Server client, which a sleep and a wake reach the ledger through (2.5).
+    storage: Arc<std::sync::Mutex<Option<Arc<crate::memory::retained::Retained>>>>,
 }
 
 impl Device {
@@ -572,6 +638,45 @@ impl Device {
                 }
                 Ok(Step::Done(BatchOutput::default()))
             }
+            Command::Sleep => {
+                let client = self.storage()?;
+                let mut storage: &crate::memory::retained::Retained = &client;
+                for cache in self.caches() {
+                    crate::memory::sleep(&cache, &mut storage)?;
+                }
+                // The segments are given back by now; the device's own work is finished before the
+                // queue hands this command over, so a synchronize here would only wait on nothing.
+                Ok(Step::Done(BatchOutput::default()))
+            }
+            Command::Wake { limit } => {
+                let client = self.storage()?;
+                let mut storage: &crate::memory::retained::Retained = &client;
+                // One call per cache, on the stream of the runner that reads it: a second call for a
+                // cache two runners share would reset the units the first had just mapped (2.5).
+                let mut woken: Vec<*const ()> = Vec::new();
+                for named in &mut self.runners {
+                    let Some(cache) = named.runner.cache() else {
+                        continue;
+                    };
+                    let address = Arc::as_ptr(&cache) as *const ();
+                    if woken.contains(&address) {
+                        continue;
+                    }
+                    woken.push(address);
+                    let stream = named
+                        .runner
+                        .stream()
+                        .ok_or_else(|| {
+                            Error::Invariant(format!(
+                                "runner {} reads a cache but states no stream to wake it on",
+                                named.id.0
+                            ))
+                        })?
+                        .clone();
+                    crate::memory::wake(&cache, &mut storage, &stream, *limit)?;
+                }
+                Ok(Step::Done(BatchOutput::default()))
+            }
             Command::Revert(generation) => {
                 for named in &mut self.runners {
                     named.runner.revert(*generation);
@@ -685,6 +790,42 @@ impl Device {
     }
 
     /// The runner with `id`.
+    /// The rank's Storage Server client, or the refusal a sleep and a wake give when none is bound.
+    ///
+    /// The handle comes back owned so the caller holds it for the length of the call; the slot keeps
+    /// its own share, so a control thread that binds it once serves every park of the epoch.
+    fn storage(&self) -> Result<Arc<crate::memory::retained::Retained>> {
+        self.storage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or_else(|| {
+                Error::State(
+                    "this device has no Storage Server client: a standby cannot give its resident \
+                     cache segments back or map them again"
+                        .into(),
+                )
+            })
+    }
+
+    /// The distinct caches this device's runners read, one per cache.
+    fn caches(&self) -> Vec<Arc<std::sync::Mutex<crate::memory::prefix_cache::PrefixCache>>> {
+        let mut caches = Vec::new();
+        let mut addresses: Vec<*const ()> = Vec::new();
+        for named in &self.runners {
+            let Some(cache) = named.runner.cache() else {
+                continue;
+            };
+            let address = Arc::as_ptr(&cache) as *const ();
+            if addresses.contains(&address) {
+                continue;
+            }
+            addresses.push(address);
+            caches.push(cache);
+        }
+        caches
+    }
+
     fn runner_mut(&mut self, id: RunnerId) -> Result<&mut NamedRunner> {
         self.runners
             .iter_mut()

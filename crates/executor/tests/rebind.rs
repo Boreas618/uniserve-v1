@@ -31,9 +31,11 @@
     reason = "a probe's prerequisite failure must fail the test, not be handled"
 )]
 
+use std::cell::RefCell;
 use std::fmt;
 use std::path::PathBuf;
 use std::process::Command;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use executor::captured::Captured;
@@ -166,10 +168,10 @@ fn capture(
     descriptor: &ProbeDescriptor,
     args: ProbeArgs,
 ) -> (platform::Graph, executor::captured::Nodes) {
-    let capture = Arc::new(Mutex::new(
+    let capture = Rc::new(RefCell::new(
         platform::Capture::begin(stream, CaptureMode::Relaxed).expect("a capture begins"),
     ));
-    let mut recording = Recording::new(Arc::clone(&capture));
+    let mut recording = Recording::new(Rc::clone(&capture));
     ops::capture::set_sink(Some(&mut recording));
     let forward = Forward::new(stream, generation, arena);
     forward
@@ -180,10 +182,9 @@ fn capture(
         panic!("the capture failed while recording a launch: {failure}");
     }
     let nodes = recording.into_nodes();
-    let template = Arc::try_unwrap(capture)
+    let template = Rc::try_unwrap(capture)
         .unwrap_or_else(|_| panic!("the capture is still shared by its recorder"))
         .into_inner()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .end()
         .expect("the capture ends");
     (template, nodes)

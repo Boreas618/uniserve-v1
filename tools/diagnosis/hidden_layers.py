@@ -46,17 +46,61 @@ import numpy as np
 
 #: The three cuts a layer is walked through, in the order the layer runs them. A reference that sets
 #: `hidden_NN_normalized.npy` and the two after it lets one layer be read operator by operator.
-CUTS = ["normalized", "attended", "router_ids", "router_weights", "mlp_out"]
+CUTS = ["normalized", "attended", "gate_in", "router_ids", "router_weights", "mlp_out"]
 
 #: The reference's own module at which each cut's tensor is read, so a cut's file name states which
 #: site wrote it and a comparison never rests on two hands agreeing what a word means.
 CUT_SITES = [
     ("normalized", "input_layernorm's output (its residual add is already in it)"),
     ("attended", "self_attn's output, element [0], before the residual add"),
+    (
+        "gate_in",
+        "post_attention_layernorm's output - the gate's and the experts' input, and the last tensor "
+        "before them that anything compares",
+    ),
     ("router_ids", "the router's selected experts, as ids - compared exactly, never by rms"),
     ("router_weights", "the router's renormalized weights, in the reference's own dtype (bf16)"),
     ("mlp_out", "mlp's output, before the residual add"),
 ]
+
+
+#: Two writers name the gate's logits differently: the reference's hooks write `router_logits` and
+#: the slice writes `gate_scores`. They are the same cut, so a comparison that keyed on the file name
+#: alone would report each as "held on one side only" and never compare them.
+ALIASES = {"router_logits": "gate_scores", "gate_scores": "router_logits"}
+
+
+def counterpart(path):
+    """The other side's name for the same cut, when the two writers spelled it differently."""
+    for cut, alias in ALIASES.items():
+        if path.stem.endswith(cut):
+            return path.with_name(path.stem[: -len(cut)] + alias + path.suffix)
+    return None
+
+
+def readings(path):
+    """The same bytes read as the dtype they claim, and as the other 2-byte numbers they could be.
+
+    A writer that stores bf16 and declares f16 (or the reverse) produces a file that loads without
+    complaint and measures wrong: both are two bytes, and nothing in the header has to agree with what
+    was written. So when a stage's factor is far from one, the same payload is read the other ways and
+    the reading that lands on one names the writer's mistake.
+    """
+    if not path.exists():
+        return {}
+    with open(path, "rb") as handle:
+        version = np.lib.format.read_magic(handle)
+        reader = (
+            np.lib.format.read_array_header_1_0 if version == (1, 0) else np.lib.format.read_array_header_2_0
+        )
+        shape, _, stored = reader(handle)
+        payload = handle.read()
+    readings = {}
+    if stored.itemsize == 2:
+        raw = np.frombuffer(payload, dtype="<u2").astype(np.uint32)
+        readings["bf16"] = (raw << 16).view(np.float32).reshape(shape)
+        readings["f16"] = raw.astype(np.uint16).view(np.float16).reshape(shape).astype(np.float32)
+    return readings
 
 
 def load(path):
@@ -215,6 +259,19 @@ def renormalization_note(actual, expected):
     factor and keeps the update's direction, which is exactly what a short block update with a
     preserved direction looks like.
     """
+    raw = np.asarray(actual, dtype=np.float64)
+    if raw.ndim == 2 and raw.shape[1] > 1:
+        # A flat row is its own signature, and it is not a small-scale one: eight equal weights are
+        # what a score vector whose top entries differ by less than a thousandth gives, and no
+        # selection can survive that spread without the ranking deciding the set.
+        spread_of_values = np.nanmax(raw, axis=1) / np.where(raw.min(axis=1) > 0.0, raw.min(axis=1), np.nan)
+        flat = int(np.sum(spread_of_values < 1.01))
+        if flat == raw.shape[0]:
+            return (
+                f"; every one of {raw.shape[0]} rows is flat to within 1% - eight equal weights. A"
+                " score vector merely multiplied by a small factor keeps its ranking and its set; a"
+                " set that also differs is a different score vector, not a smaller one"
+            )
     ours = np.asarray(actual, dtype=np.float64).sum(axis=1)
     reference = np.asarray(expected, dtype=np.float64).sum(axis=1)
     ratio = ours / np.where(reference == 0.0, np.nan, reference)
@@ -340,9 +397,16 @@ def compare_ids(actual, expected, scores):
                      "reference's own logits, so either selection is right)")
     if unexplained:
         row = unexplained[0]
+        # Where our picks sit in the reference's own ordering, and what the boundary gap is: a set
+        # that is the reference's top six plus ranks nine and eleven is a different score vector,
+        # while ranks one to eight in a different order is the same one.
+        rank_of = {int(expert): place for place, expert in enumerate(np.argsort(-np.asarray(scores[row]), kind="stable"))}
+        ranks = [rank_of.get(int(expert), -1) for expert in actual[row]]
+        ordered = np.asarray(scores[row], dtype=np.float64)[np.argsort(-np.asarray(scores[row]), kind="stable")]
         parts.append(
             f"{len(unexplained)} unexplained; first at row {row}: {actual[row].tolist()} against the "
-            f"reference's {expected[row].tolist()}"
+            f"reference's {expected[row].tolist()}; our picks are the reference's ranks {ranks}, and "
+            f"its {top}/{top + 1} gap is {float(ordered[top - 1] - ordered[top]):.4f}"
         )
     return f"{len(differing)} of {len(sets_agree)} rows select a different set: " + "; ".join(parts)
 
@@ -402,9 +466,24 @@ def main():
             continue
         actual = load(arguments.dump / path.name)
         if actual is None:
+            beside = counterpart(path)
+            if beside is not None:
+                actual = load(arguments.dump / beside.name)
+        if actual is None:
             print(f"{path.name:<16} {'-':<12} {'missing from the dump':>22}")
             if first is None:
                 first = path.name
+            continue
+        if actual.dtype == expected.dtype and np.array_equal(actual, expected) and actual.nbytes:
+            # Bit-identical sides are not a good comparison, they are no comparison: a dump directory
+            # seeded from the reference holds the reference's own file, and a row that reads 0.0 for
+            # every element says "these are the same bytes", which is a provenance question and not a
+            # numerical one.
+            print(
+                f"{path.name:<16} {'-':<12} {'the dump holds the reference bytes':>22}: the two sides are"
+                " bit-identical, so this row measures nothing (was the dump directory seeded from the"
+                " reference?)"
+            )
             continue
         if actual.shape != expected.shape:
             print(f"{path.name:<16} {str(actual.shape):<12} shape differs from {expected.shape}")
@@ -495,6 +574,38 @@ def main():
         sums = ""
         if path.stem.endswith("_router_weights") and expected.ndim == 2:
             sums = renormalization_note(actual, expected)
+        # A stage that is right up to one factor is a different fault from one that is wrong: the
+        # least-squares factor and what remains after removing it say which, and a factor near a power
+        # of two names its own cause.
+        ours_flat = actual.astype(np.float64).ravel()
+        theirs_flat = expected.astype(np.float64).ravel()
+        denominator = float(np.dot(theirs_flat, theirs_flat))
+        if denominator > 0.0:
+            factor = float(np.dot(ours_flat, theirs_flat)) / denominator
+            if abs(factor - 1.0) > 0.01:
+                # A factor far from one is also what a wrong dtype declaration produces, so the same
+                # payload is read the other ways before the number is believed.
+                if not (0.5 < factor < 2.0):
+                    written = arguments.dump / path.name
+                    if not written.exists() and counterpart(path) is not None:
+                        written = arguments.dump / counterpart(path).name
+                    for name, other in readings(written).items():
+                        if other.shape != expected.shape or not np.all(np.isfinite(other)):
+                            continue
+                        a = other.astype(np.float64).ravel()
+                        candidate = float(np.dot(a, theirs_flat)) / denominator if denominator else 0.0
+                        if abs(candidate - 1.0) < 0.01:
+                            sums += (
+                                f"  the dump's bytes read as {name} give {candidate:.4f} x the"
+                                " reference's: the file's dtype does not match what was written into it"
+                            )
+                residual = float(np.linalg.norm(ours_flat - factor * theirs_flat))
+                residual /= float(np.linalg.norm(theirs_flat))
+                sums += (
+                    f"  one factor fits: ours = {factor:.4e} x the reference's, and the residual after"
+                    f" removing it is {residual:.3e}"
+                    + (" (1/2048 is 4.8828e-04)" if 0.9 < factor * 2048.0 < 1.1 else "")
+                )
         lines.append(
             f"{path.name:<16} {str(expected.shape):<12} {rel:10.3e} {rms:10.3e} {absolute:10.3e}"
             f" {increment:10.3e}  {worst} ({rows[worst]:.3e}){flag}{prefix_text}{sums}"

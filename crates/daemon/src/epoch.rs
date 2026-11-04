@@ -2347,7 +2347,10 @@ mod tests {
 
         for acknowledged in [
             proto::process::Report {
-                kind: Some(Kind::Precopied(proto::process::Precopied { generation: 4 })),
+                kind: Some(Kind::Precopied(proto::process::Precopied {
+                    generation: 4,
+                    uncompared: Vec::new(),
+                })),
             },
             proto::process::Report {
                 kind: Some(Kind::Switched(proto::process::Switched { generation: 4 })),

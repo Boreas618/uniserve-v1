@@ -34,12 +34,19 @@ use platform::{DeviceId, PinnedBuffer, Stream};
 use crate::{Error, Result};
 
 /// What one paired forward compared.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Summary {
     /// How many twin buffers were compared.
     pub pairs: usize,
     /// How many elements were compared, over all pairs.
     pub elements: u64,
+    /// The pairs that could not be compared because the two programs wrote outputs of different
+    /// extents, each with the sentence that states it (7.3 step 2).
+    ///
+    /// An operator whose programs are not comparable is skipped, not failed: the operating system
+    /// has nothing to say about which of the two is right, so the update proceeds and states what
+    /// it has no evidence for rather than claiming a comparison it could not make.
+    pub incomparable: Vec<String>,
 }
 
 /// The paired-execution harness of one runner.
@@ -100,13 +107,24 @@ impl Shadow {
         let mut summary = Summary {
             pairs: pairs.len(),
             elements: 0,
+            incomparable: Vec::new(),
         };
         for pair in pairs {
             let bytes = pair.real.byte_len()?;
             if bytes != pair.shadow.byte_len()? {
-                return Err(Error::Invariant(
-                    "the twin and the real buffer have different sizes".into(),
+                // The two programs wrote outputs of different extents: they are not comparable, and
+                // an update is not refused for it - the pair is skipped and named, so the update's
+                // evidence states what it could not measure (7.3 step 2).
+                summary.incomparable.push(format!(
+                    "the twin and the real buffer have different sizes: the real output holds \
+                     {bytes} bytes of {} and the twin {} of {}, so the two programs are not \
+                     comparable",
+                    pair.real.dtype,
+                    pair.shadow.byte_len()?,
+                    pair.shadow.dtype,
                 ));
+                summary.pairs -= 1;
+                continue;
             }
             let bytes = usize::try_from(bytes)
                 .map_err(|_| Error::Invariant("a twin buffer is larger than memory".into()))?;
