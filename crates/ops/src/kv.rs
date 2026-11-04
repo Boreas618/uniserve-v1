@@ -275,6 +275,13 @@ type KvWriteArgs = Args;
 /// because a descriptor must name one program: a field selecting between "apply the scale" and
 /// "derive the scale" would make one key cover two kernels and one tolerance cover two error sources.
 ///
+/// **The scale is derived, never supplied.** The reference derives it from the values it is about to
+/// store (`uniserve/prefix_cache/mha.py`'s quantizing write), and an FP8 cache takes its scales per
+/// block: a checkpoint's per-tensor `k_scale`/`v_scale` floats have no reader here, and a block whose
+/// initialized flag is clear discards whatever its scale buffer held, so such a scalar could not
+/// influence it even as an initial value. A per-tensor scale would be a different layout with a
+/// different reader, not a mode of this operator.
+///
 /// **A block is a page.** The scale this operator maintains is one number per page, indexed by the
 /// page of each token's slot, and a page holds [`page`](Self::page) tokens - the unit this write
 /// fills and `paged_attention` reads. That is the layout the reference states
