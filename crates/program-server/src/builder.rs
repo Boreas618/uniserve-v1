@@ -133,12 +133,7 @@ impl Builder {
                 if let Some(position) = self.queued.iter().position(|queued| queued.key() == key)
                     && let Some(build) = self.queued.remove(position)
                 {
-                    let ahead = self
-                        .queued
-                        .iter()
-                        .take_while(|queued| queued.urgency <= build.urgency)
-                        .count();
-                    self.queued.insert(ahead, build);
+                    self.enqueue(build);
                 }
             }
             joined(true);
@@ -146,7 +141,7 @@ impl Builder {
             // A path built again (a resolve retrying a failed build) replaces
             // what the queue knew about it.
             self.finished.retain(|build| build.key() != key);
-            self.queued.push_back(Build {
+            self.enqueue(Build {
                 path: path.clone(),
                 urgency,
                 state: BuildState::Queued,
@@ -158,6 +153,20 @@ impl Builder {
             path: path.clone(),
             waiter,
         }
+    }
+
+    /// Puts a build where its urgency belongs: ahead of every build of a
+    /// lower urgency, behind the builds of its own urgency that are already
+    /// queued, which keeps their arrival order (design section 6.2: a
+    /// `resolve`'s `Waiting` build goes ahead of the `Background` builds a
+    /// `prepare` queued before it).
+    fn enqueue(&mut self, build: Build) {
+        let ahead = self
+            .queued
+            .iter()
+            .take_while(|queued| queued.urgency >= build.urgency)
+            .count();
+        self.queued.insert(ahead, build);
     }
 
     /// The builds that may start now, given the host's available memory and
