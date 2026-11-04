@@ -330,6 +330,31 @@ struct Scratch {
 }
 
 impl KvProvider for ResidentCache {
+    /// Writes each slot row into the cache's pooled table, on the batch's stream.
+    ///
+    /// `PrefixCache::install` validates the tables (the slot inside the request pool and not the
+    /// reserved row 0, a known group, units that fit the row's width and the group's page geometry)
+    /// and writes every changed row at full width - which also clears the tail of a longer previous
+    /// row - with the row's start page and token extent. A table that does not validate is refused
+    /// there; nothing here second-guesses it.
+    ///
+    /// This is the link whose absence made a first batch silently wrong: the gather reads the
+    /// pooled table's row for a slot, and no serving path wrote one before this call.
+    fn install_block_tables(
+        &mut self,
+        tables: &[ipc::BlockTable],
+        stream: &Stream,
+    ) -> Result<()> {
+        if tables.is_empty() {
+            return Ok(());
+        }
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.install(tables, stream)
+    }
+
     /// Applies what the mechanism allocated for a batch's pages: the units become this cache's, then
     /// the leased prefix's copies are issued on the batch's stream.
     ///

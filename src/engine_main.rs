@@ -550,7 +550,9 @@ pub(crate) struct MainProcess {
     /// has not reached its first switchover admits nothing whatever the daemon has said: the epoch's
     /// first generation holds no kernel and no capture until the daemon's precopy fills it and the
     /// switchover warms it, and a batch admitted before then would reach a graph that does not
-    /// exist.
+    /// exist. The boundary is necessary and not sufficient: the warmup queues one capture per
+    /// device and runs them behind serving batches, so admission is owed to it as well
+    /// ([`Self::open_admission`]).
     serving: bool,
     /// Whether the epoch's first switchover has happened: the boundary the first batch is served
     /// at (§4.5, §7.3 step 3).
@@ -563,6 +565,9 @@ pub(crate) struct MainProcess {
     /// it and answers an invariant error that names a capture bug. The epoch opens serving when the
     /// last submission finishes (`advance_warmup`), and a `Drain` drops what was owed (§4.5).
     admission_owed: bool,
+    /// The launch's own request-slot count, which the daemon records as the epoch's capacity: the
+    /// worker's row count includes the guidance prefix, which is not a request.
+    max_running_requests: u32,
     /// Whether this process was launched as the epoch's standby (§2.5): it admits nothing until
     /// the daemon promotes it *and* the epoch reaches its boundary.
     standby: bool,
@@ -620,6 +625,16 @@ impl MainProcess {
             );
         }
         let epoch = handshake(&mut control, launch)?;
+        // §7.3 step 1: the daemon's launch path blocks until this process states what it is, and it
+        // sends the epoch's first program-layer command only once it has. `Starting` goes out
+        // before the model load, which is minutes long, so the daemon's log and the caller's show a
+        // process that is alive rather than one that vanished after the storage claim; the
+        // `Ready`/`Standby` at the end of `start` is what lets the epoch begin.
+        announce(
+            &mut control,
+            proto::request::wire::EngineState::Starting,
+            None,
+        )?;
         // The daemon's two interfaces are two sockets: the epoch's requests and metrics travel on
         // the request connection above, and everything the daemon asks of this process - the claim,
         // the reports of §7.3, and every command of the program layer - travels on this one.
@@ -736,6 +751,8 @@ impl MainProcess {
             boundary: false,
             pending_serve: false,
             admission_owed: false,
+            max_running_requests: u32::try_from(build.max_running_requests.get())
+                .unwrap_or(u32::MAX),
             standby: launch.standby,
             promoted: false,
             parked: None,
@@ -746,6 +763,15 @@ impl MainProcess {
         if launch.standby {
             process.park_standby()?;
         }
+        // What the daemon waits for before the epoch's first `Precopy`: a process started beside a
+        // serving one is `Standby`, and one launched to serve is `Ready`. Waiting to be ready until
+        // this process had a policy would be waiting for the command that waits for it.
+        let state = if launch.standby {
+            proto::request::wire::EngineState::Standby
+        } else {
+            proto::request::wire::EngineState::Ready
+        };
+        process.announce(state)?;
         Ok(process)
     }
 
@@ -1211,6 +1237,16 @@ impl MainProcess {
         reply: Option<u32>,
         reverted_by: Option<String>,
     ) -> Result<Option<ProgramStatus>> {
+        // §7.3's stages are the epoch's steps, and a step that never arrives is the failure this
+        // line is for: it names the command and the generation, so a log that stops after "claimed
+        // the deployment's storage" says which step the process is waiting for.
+        tracing::info!(
+            stage = program_stage(&command),
+            boundary = self.boundary,
+            serving = self.serving,
+            warming = self.warming.len(),
+            "a program-layer command arrived"
+        );
         let status = match command {
             ProgramCommand::Precopy {
                 generation,
@@ -1502,7 +1538,7 @@ impl MainProcess {
             match submission.outcome() {
                 None => pending.push((device, submission, generation)),
                 Some(Outcome::Success(_)) => {
-                    tracing::debug!(device, generation, "a generation's warmup finished");
+                    tracing::info!(device, generation, "a generation's warmup finished");
                 }
                 Some(outcome) => {
                     self.warming = pending;
@@ -1900,6 +1936,12 @@ impl MainProcess {
             }
         }
 
+        tracing::info!(
+            generation,
+            devices = self.executors.len(),
+            queued = self.warming.len(),
+            "the switchover queued the epoch's warmup and set the boundary"
+        );
         // The boundary the first batch is served at (§4.5): every device serves this generation
         // and its buckets are warming behind the batches that follow. A `Serve` that arrived while
         // the generation was still being filled is honoured now.
@@ -2029,9 +2071,18 @@ impl MainProcess {
     /// here. A `Drain` clears what was owed, because the epoch it was owed to is no longer serving.
     fn open_admission(&mut self) -> Result<()> {
         if !self.warming.is_empty() {
+            tracing::info!(
+                warming = self.warming.len(),
+                "admission is owed to the warmup, which has not finished"
+            );
             self.admission_owed = true;
             return Ok(());
         }
+        tracing::info!(
+            boundary = self.boundary,
+            pending_serve = self.pending_serve,
+            "opening admission"
+        );
         self.admission_owed = false;
         // An early `Serve` is honoured here rather than at its arrival: this is the pass that
         // admits, so the request waiting in the frontend is exactly what it was waiting for.
@@ -2633,6 +2684,99 @@ impl MainProcess {
     ///
     /// A report is unasked, so a failure to state it costs the daemon's record and not this
     /// process's service: it is logged, and the epoch's own transition has already happened.
+    /// States what this process is on the request interface (§7.3 step 1).
+    ///
+    /// The daemon's launch path waits for `Ready` (or `Standby`, for a process started beside a
+    /// serving one) and records the info it carries for the epoch. Nothing else on either side moves
+    /// before it: the first `Precopy` carries the scheduling policy and the first `Switchover` fills
+    /// the generation, so a process that waited to be ready until it had a policy would wait for the
+    /// command that waits for it - the deadlock the caller's stuck run shows.
+    fn announce(&mut self, state: proto::request::wire::EngineState) -> Result<()> {
+        let info = match state {
+            proto::request::wire::EngineState::Ready
+            | proto::request::wire::EngineState::Standby => Some(self.engine_info()?),
+            _ => None,
+        };
+        tracing::info!(
+            state = ?state,
+            schedulers = self.schedulers.len(),
+            devices = self.executors.len(),
+            "stating what this process is to the daemon"
+        );
+        announce(&mut self.control, state, info)
+    }
+
+    /// What the daemon records of this process: the limits every request is checked against, the
+    /// batch the workers were started for, and the KV cache segments a successor on the same
+    /// devices maps (§7.3 step 1).
+    ///
+    /// The figures are the workers' own (`SchedulerHandle::info`), except the cache segments, which
+    /// each scheduler describes for itself: a successor needs what the workers hold now, not what
+    /// this process planned.
+    fn engine_info(&self) -> Result<proto::request::wire::EngineInfo> {
+        let first = self
+            .schedulers
+            .first()
+            .context("this process runs no scheduler, so it states no engine info")?;
+        let info = first.info();
+        let mut segments = Vec::new();
+        for scheduler in &self.schedulers {
+            let groups = scheduler
+                .describe_cache()
+                .recv_timeout(self.watchdog.stall_bound())
+                .map_err(|error| {
+                    anyhow::anyhow!("a scheduler did not describe its cache: {error}")
+                })?
+                .map_err(|error| anyhow::anyhow!("describing a worker group's cache: {error}"))?;
+            segments.extend(groups.into_iter().map(|group| {
+                proto::request::wire::CacheSegments {
+                    worker_group: group.worker_group,
+                    segments: group
+                        .segments
+                        .into_iter()
+                        .map(|segment| proto::request::wire::CacheSegment {
+                            world: segment.world,
+                            ordinal: segment.ordinal,
+                            units: segment.units,
+                        })
+                        .collect(),
+                    held: group.held,
+                    units: group.units,
+                    scratch: group.scratch,
+                }
+            }));
+        }
+        Ok(proto::request::wire::EngineInfo {
+            limits: Some((&first.generation_limits()).into()),
+            video_denoiser: info
+                .video_denoiser
+                .as_ref()
+                .map(|denoiser| denoiser.description.clone())
+                .unwrap_or_default(),
+            latent_encoding_units: first.media_units(ipc::MediaCall::LatentEncoding).unwrap_or(0),
+            schedulers: u32::try_from(self.schedulers.len()).unwrap_or(u32::MAX),
+            capacity: Some(proto::request::wire::BatchCapacity {
+                max_batch: info.max_batch_calls,
+                max_num_batched_tokens: u64::from(info.max_batch_tokens),
+                // The launch's own figure, not the worker's row count: the rows include the
+                // guidance prefix, which is not a request.
+                max_running_requests: self.max_running_requests,
+            }),
+            segments,
+            prefix_seeds: info.prefix_cache.as_ref().map_or_else(Vec::new, |cache| {
+                cache
+                    .seeds()
+                    .into_iter()
+                    .zip(&cache.groups)
+                    .filter_map(|(seed, group)| {
+                        (!matches!(group.kind, ipc::CacheGroupKind::Draft)).then_some(seed)
+                    })
+                    .collect()
+            }),
+            latent_seed: first.latent_seed(),
+        })
+    }
+
     fn send_report(&mut self, report: proto::process::Report) {
         if let Err(error) = self.process.report(report) {
             tracing::warn!(%error, "reporting this epoch's state to the daemon failed");
@@ -2905,11 +3049,42 @@ const EPOCH_LIFECYCLE: &str =
     "this command is the epoch layer's, applied through the process connection rather than the \
      request connection";
 
+/// States a main process's state on the request interface (§7.3 step 1).
+fn announce(
+    control: &mut Control,
+    state: proto::request::wire::EngineState,
+    info: Option<proto::request::wire::EngineInfo>,
+) -> Result<()> {
+    control
+        .daemon_mut()
+        .send(&proto::request::wire::FromEngine {
+            kind: Some(proto::request::wire::from_engine::Kind::State(
+                proto::request::wire::State {
+                    state: state as i32,
+                    info,
+                    error: String::new(),
+                },
+            )),
+        })
+        .context("stating what this process is to the daemon")
+}
+
 /// What the engine answers a command over the deployment's storage ledgers or transfer budgets:
 /// each node's daemon reads them over the claim it holds, not through an epoch's main process (§8).
 const LEDGERS: &str =
     "the storage ledgers and transfer budgets are read by each node's daemon over its claim, not \
      by an epoch's main process";
+
+/// The §7.3 stage a program-layer command belongs to, for the log line each one leaves.
+fn program_stage(command: &ProgramCommand) -> &'static str {
+    match command {
+        ProgramCommand::Precopy { .. } => "precopy",
+        ProgramCommand::Switchover { .. } => "switchover",
+        ProgramCommand::Commit { .. } => "commit",
+        ProgramCommand::Revert { .. } => "revert",
+        ProgramCommand::Purge { .. } => "purge",
+    }
+}
 
 /// The name of an engine command, for a log line about one this epoch does not serve.
 fn engine_command_name(kind: &proto::request::wire::engine_command::Kind) -> &'static str {
