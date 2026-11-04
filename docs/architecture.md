@@ -290,7 +290,7 @@ crates/nixl/            NIXL agents with the UCX backend: storage registration, 
 crates/daemon/          a node's daemon: process supervision, the node's Storage Server claim, the process interface's service; on the leader, the HTTP/OpenAI API, model profiles, input and output processing, metrics and the engine's client
 crates/engine/          the engine process: schedulers, KV cache allocation, worker groups and process launch through the daemons, the request interface's service
 crates/worker/          the worker runtime, installed as the library uniserve/_worker
-crates/uniserve/        the uniserve executable: serve, engine, worker and storage
+src/                    the root package, uniserve: one module per command (serve, frontend, engine, worker, storage, program-server)
 uniserve/           the numerical library, the concrete models, the Python half of each runner and the worker's Python entry
 uniserve_kernels/   Triton, CuTe and CUDA kernels, and the vendored DeepEP and DeepGEMM sources
 uniserve_eval/      HTTP evaluation client
