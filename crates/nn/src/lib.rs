@@ -63,9 +63,9 @@ pub use layers::{
     AdaptivePool, Attention, AttentionBackend, Candidates, Conv1d, Conv3d, ConvGeometry,
     ConvTranspose1d, Embedding, FrameMoments, FrameNormPad, FramePad, GatedActivation,
     GatedResidual, Gelu, LayerNorm, Linear, ModulatedRmsNorm, Moe, Noise, NoiseKey, PackedSwiGlu,
-    ParallelLMHead, RmsNorm, Rotary, Rotation, Sampler, SamplerState, Samples, ScaledResidual,
-    ScaledResidualLayerNorm, ScaledResidualRmsNorm, Snake, SwiGlu, TRTLLM_WORKSPACE_BYTES,
-    UlyssesExchange, VsaTiles, WeightedRmsNorm, gather_rows,
+    ParallelLMHead, RmsNorm, Rotary, Rotation, Sampler, SamplerState, Samples, ScaledAdd,
+    ScaledResidual, ScaledResidualLayerNorm, ScaledResidualRmsNorm, Silu, Snake, SwiGlu,
+    TRTLLM_WORKSPACE_BYTES, UlyssesExchange, VsaTiles, WeightedRmsNorm, gather_rows,
 };
 pub use model::{Block, BlockName, Model, PhaseId};
 pub use ops::PhaseKind;
