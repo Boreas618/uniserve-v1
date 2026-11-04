@@ -543,13 +543,21 @@ impl Retained {
             .into_iter()
             .nth(index)
             .ok_or_else(|| Error::Interface("a retained weight names no storage".into()))?;
-        let storage = Storage::import(
-            descriptor,
-            record.bytes as usize,
-            device,
-            &[],
-            Protection::ReadOnly,
-        )?;
+        // A weight is retained HOST storage (`host_retainable`), which a rank maps as host memory
+        // registered with the device; only a device allocation is imported through the VMM, and a
+        // memfd handed to that path is not a CUDA shareable handle.
+        let storage = match record.placement {
+            ::storage::Placement::Host { .. } => {
+                Storage::import_host(descriptor, record.bytes as usize, device)?
+            }
+            ::storage::Placement::Device { .. } => Storage::import(
+                descriptor,
+                record.bytes as usize,
+                device,
+                &[],
+                Protection::ReadOnly,
+            )?,
+        };
         state.used.insert(key);
         state.weights.insert((device.0, key), Arc::clone(&storage));
         Ok(Some(storage))
@@ -929,13 +937,18 @@ impl ExclusiveStorage for &Retained {
         for (spec, (name, key, gpu)) in specs.iter().zip(&keyed) {
             let created = !found.contains_key(key);
             let storage = match found.remove(key) {
-                Some((record, descriptor)) => Storage::import(
-                    descriptor,
-                    record.bytes as usize,
-                    spec.device,
-                    spec.access,
-                    Protection::ReadWrite,
-                )?,
+                Some((record, descriptor)) => match record.placement {
+                    ::storage::Placement::Host { .. } => {
+                        Storage::map_host(descriptor, record.bytes as usize, spec.device, true)?
+                    }
+                    ::storage::Placement::Device { .. } => Storage::import(
+                        descriptor,
+                        record.bytes as usize,
+                        spec.device,
+                        spec.access,
+                        Protection::ReadWrite,
+                    )?,
+                },
                 None => {
                     let (storage, descriptor) =
                         Storage::retainable(spec.device, spec.bytes, spec.access)?;
@@ -1313,16 +1326,19 @@ impl Retained {
                 .position(|key| *key == tensor.key)
                 .ok_or_else(|| Error::Interface("an unasked storage was found".into()))?;
             let spec = &specs[index];
-            mapped.insert(
-                tensor.key,
-                Storage::import(
+            let mapped_storage = match record.placement {
+                ::storage::Placement::Host { .. } => {
+                    Storage::import_host(descriptor, record.bytes as usize, spec.device)?
+                }
+                ::storage::Placement::Device { .. } => Storage::import(
                     descriptor,
                     record.bytes as usize,
                     spec.device,
                     spec.access,
                     Protection::ReadOnly,
                 )?,
-            );
+            };
+            mapped.insert(tensor.key, mapped_storage);
         }
         keys.iter()
             .map(|key| {
