@@ -16,9 +16,20 @@ const LIBNVML: &str = "libnvidia-ml.so.1";
 type NvmlReturn = i32;
 type NvmlDevice = *mut c_void;
 
+/// `nvmlReturn_t.NVML_SUCCESS`, compared with the header by
+/// [`tests::the_nvml_constants_are_the_headers`].
 const NVML_SUCCESS: NvmlReturn = 0;
+/// `nvmlReturn_t.NVML_ERROR_INSUFFICIENT_SIZE`, the status a process query
+/// answers when the caller's array is too short.
 const NVML_ERROR_INSUFFICIENT_SIZE: NvmlReturn = 7;
-/// `usedGpuMemory` when the driver cannot attribute storage to the process.
+/// `NVML_VALUE_NOT_AVAILABLE`: `usedGpuMemory` when the driver cannot attribute
+/// storage to the process.
+///
+/// The header spells it `#define NVML_VALUE_NOT_AVAILABLE (-1)`, a macro rather
+/// than an enumerator, and the field it fills is unsigned, so the crate keeps it
+/// as `u64::MAX` — the same bits. The header check does not table it: the reader
+/// takes a `#define`'s value only when it starts with a digit or a minus, and
+/// this one starts with a parenthesis.
 const NVML_VALUE_NOT_AVAILABLE: u64 = u64::MAX;
 
 /// `nvmlProcessInfo_t` (v2), returned by the `_v3` process queries.
@@ -44,6 +55,11 @@ struct RawMemory {
 
 /// `NVML_STRUCT_VERSION(Memory, 2)`: the struct size with the version in the
 /// top byte.
+///
+/// This is the encoding `nvml.h` defines as a macro over `sizeof`, not an
+/// enumerator and not a number a header can state, so the header check cannot
+/// compare it; it is checked by the shape of [`RawMemory`] instead, which is
+/// what the size is computed from.
 const NVML_MEMORY_V2: u32 = size_of::<RawMemory>() as u32 | (2 << 24);
 
 /// The signature of NVML's `_v3` process queries.
@@ -276,5 +292,22 @@ impl Drop for Nvml {
     fn drop(&mut self) {
         // SAFETY: balances the nvmlInit of this session.
         let _ = unsafe { (self.api.shutdown)() };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_nvml_constants_are_the_headers() {
+        crate::header::assert_constants(
+            "nvml.h",
+            &[
+                ("NVML_SUCCESS", super::NVML_SUCCESS as i64),
+                (
+                    "NVML_ERROR_INSUFFICIENT_SIZE",
+                    super::NVML_ERROR_INSUFFICIENT_SIZE as i64,
+                ),
+            ],
+        );
     }
 }
