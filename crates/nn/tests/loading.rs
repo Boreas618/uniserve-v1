@@ -1210,3 +1210,60 @@ fn a_host_store_retains_weights_and_answers_the_first_region() {
     );
     assert!(store.retained(&key("other")).unwrap().is_none());
 }
+
+/// A load that reads part of a checkpoint reports the rest by name, so a wrong number can be traced
+/// to the tensors nobody asked for rather than to the ones that loaded. A pipeline qualifies its
+/// components, because two components may hold one name each.
+#[test]
+fn a_reading_names_the_tensors_a_load_never_asked_for() {
+    let directory = tempfile::tempdir().unwrap();
+    shard(
+        directory.path(),
+        "model.safetensors",
+        &[
+            ("a", vec![2], bf16(&[1.0, 2.0])),
+            ("b", vec![2], bf16(&[3.0, 4.0])),
+            ("c", vec![2], bf16(&[5.0, 6.0])),
+        ],
+    );
+    let checkpoint = Checkpoint::open(directory.path()).unwrap();
+    checkpoint.read("a").unwrap();
+    let reading = checkpoint.reading();
+    assert_eq!(reading.read, ["a"]);
+    assert_eq!(reading.unread, ["b", "c"]);
+    assert!(!reading.is_complete());
+
+    // Reading the rest completes it: the report is the claims' complement, not a snapshot of one
+    // moment of the load.
+    checkpoint.read("b").unwrap();
+    checkpoint.read("c").unwrap();
+    assert!(checkpoint.reading().is_complete());
+
+    // A pipeline root answers with its components' names qualified, and a component that was not
+    // read is reported whole.
+    let root = tempfile::tempdir().unwrap();
+    let transformer = root.path().join("transformer");
+    let vae = root.path().join("vae");
+    std::fs::create_dir_all(&transformer).unwrap();
+    std::fs::create_dir_all(&vae).unwrap();
+    shard(
+        &transformer,
+        "model.safetensors",
+        &[("weight", vec![2], bf16(&[1.0, 2.0]))],
+    );
+    shard(
+        &vae,
+        "model.safetensors",
+        &[("weight", vec![2], bf16(&[3.0, 4.0]))],
+    );
+    let pipeline = Checkpoint::open(root.path()).unwrap();
+    pipeline
+        .component("transformer")
+        .unwrap()
+        .read("weight")
+        .unwrap();
+    let reading = pipeline.reading();
+    assert_eq!(reading.read, ["transformer/weight"]);
+    assert_eq!(reading.unread, ["vae/weight"]);
+    assert!(!reading.is_complete());
+}
