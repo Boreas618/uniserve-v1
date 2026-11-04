@@ -15,7 +15,7 @@ use ops::attention::{Args, Descriptor, Mask, PagedAttention, Phase};
 use ops::kv::{self, Descriptor as KvDescriptor, KvQuantize, KvWrite};
 use ops::{DType, PhaseKind, Shape, TensorView};
 
-use crate::capability::{KvView, TokenBatch};
+use crate::capability::{KvGroup, KvPlanes, KvView, TokenBatch};
 use crate::error::{Error, Result};
 use crate::forward::Forward;
 use crate::layers::launch::{kv_tile, PDL};
@@ -475,9 +475,12 @@ impl Attention {
                 self.backend
             )));
         }
+        // One selection for both halves: the layer's index names its planes once, and the read is
+        // handed what the write was handed.
         let planes = cache.planes(group, layer)?;
+        let group_view = cache.group(group)?;
         self.write(f, batch, planes, key, value)?;
-        self.attend(f, batch, cache, group, layer, query, out, workspace)
+        self.attend(f, batch, group_view, planes, query, out, workspace)
     }
 
     /// Write the batch's keys and values into `planes`; slots of `-1` write nothing.
@@ -717,19 +720,25 @@ impl Attention {
         }
     }
 
-    /// Read the cache and write this batch's attended output.
+    /// Read one layer's cached keys and values and write this batch's attended output.
+    ///
+    /// The planes are the caller's *selection* — a layer's own, chosen once by [`Self::forward`] from
+    /// the index the model runs. They arrive as a value rather than as a cache and an index so that a
+    /// reader cannot derive a different layer's plane here: every plane of a group has its geometry,
+    /// so a reader that took the first one answers a plausible number from the wrong layer, which is
+    /// the shape of the defect this signature removes. The group travels for the page table and the
+    /// page size, which are the group's and not a layer's.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the design's attention call carries the batch, the cache, the group index, the \
-                  query, the output and the program's workspace"
+        reason = "the design's attention call carries the batch, the group's geometry, the layer's \
+                  planes, the query, the output and the program's workspace"
     )]
     pub fn attend(
         &self,
         f: &Forward,
         batch: &TokenBatch,
-        cache: &KvView<'_>,
-        group: usize,
-        layer: usize,
+        group: &KvGroup<'_>,
+        planes: &KvPlanes,
         query: TensorView,
         out: TensorView,
         workspace: TensorView,
@@ -737,17 +746,12 @@ impl Attention {
         // The batch's own parts are read by pointer arithmetic inside the programs, so they are
         // checked against each other once here, before any of them is addressed.
         batch.check()?;
-        // The planes this layer reads are its own: every layer of a group keeps its keys and values
-        // apart, and a reader that took the group's first layer would attend over another layer's
-        // cache — layer 0's, which is right by accident, or an unwritten plane.
-        let planes = cache.planes(group, layer)?;
-        let group_view = cache.group(group)?;
-        if group_view.page_size != self.page_size || batch.page_size != self.page_size {
+        if group.page_size != self.page_size || batch.page_size != self.page_size {
             return Err(Error::shape(
                 "Attention::attend",
                 format!(
                     "the layer is built for {} tokens per page, the cache and batch have {} and {}",
-                    self.page_size, group_view.page_size, batch.page_size
+                    self.page_size, group.page_size, batch.page_size
                 ),
             ));
         }
@@ -778,7 +782,7 @@ impl Attention {
         }
         // The page table is the cache's and it carries one row per sequence of this batch.
         self.check_page_table(
-            group_view.block_tables,
+            group.block_tables,
             batch.query_offsets.numel().saturating_sub(1),
         )?;
         let descriptor = self.descriptor(phase, query.dtype, planes.key.dtype, out.dtype);
@@ -794,7 +798,7 @@ impl Attention {
             value: planes.value,
             key_scale,
             value_scale,
-            page_table: group_view.block_tables,
+            page_table: group.block_tables,
             seq_lens: batch.seq_lens,
             cum_seq_lens_q: batch.query_offsets,
             out,
