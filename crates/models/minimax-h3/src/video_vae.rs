@@ -1389,7 +1389,12 @@ pub(crate) mod tests {
         )
         .expect("rows");
         let clip = Canvas::clip(&config, raster.height, raster.width);
-        let clips = (latent_frames - crate::CLIP_LATENTS) / crate::CLIP_FRAMES;
+        // The clip count of the timeline, through the inverse rather than from the latent count's
+        // arithmetic: `17n + 5` frames are `n` clips, and its latent timeline is `5n + 2` frames.
+        let generated =
+            crate::packing::video_output_frames(latent_frames).expect("the frames back");
+        let clips = (generated - crate::CLIP_LATENTS) / crate::CLIP_FRAMES;
+        assert_eq!(clips, 1);
         assert_eq!(rows.len() as u64, u64::from(clips) * clip.voxels());
         let side = u64::from(crate::packing::PATCH_SIDE);
         let columns = u64::from(raster.width) / side;

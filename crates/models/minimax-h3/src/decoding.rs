@@ -980,14 +980,18 @@ mod tests {
         // blend table - which is the point of asserting it.
         let alignment = u64::from(config.spatial_compression());
         let minimum = u64::from(crate::video_vae::MINIMUM_OVERLAP);
-        for (widths, tiles, pixels) in [
-            (&above_widths, 4_u64, 768_u64),
-            (&left_widths, 7, u64::from(WIDTH)),
+        // A seam is visited once per tile of the other axis, so the widths collected along one axis are
+        // that axis' overhang repeated by the grid's other count.
+        let columns = tiles.iter().filter(|tile| tile.row == 0).count() as u64;
+        let rows = tiles.iter().filter(|tile| tile.column == 0).count() as u64;
+        for (widths, across, pixels, repeat) in [
+            (&above_widths, 4_u64, 768_u64, columns),
+            (&left_widths, 7, u64::from(WIDTH), rows),
         ] {
             let total: u64 = widths.iter().map(|width| u64::from(*width)).sum();
             assert_eq!(
                 total,
-                tiles * u64::from(crate::video_vae::TILE_PIXELS) - pixels
+                repeat * (across * u64::from(crate::video_vae::TILE_PIXELS) - pixels)
             );
             assert!(
                 widths
