@@ -164,6 +164,11 @@ impl HotUpdate {
                 self.current
             )));
         }
+        // `failure` and `failed_generation` describe the last update, so a new one supersedes them:
+        // a report that kept the previous verdict would name a failure the update in flight has
+        // nothing to do with, and the epoch's own refusals read this.
+        self.failure = None;
+        self.failed_generation = None;
         self.phase = Phase::Precopying { generation };
         Ok(())
     }
@@ -382,6 +387,22 @@ mod tests {
                 running_ms: 15_000,
             },
         }
+    }
+
+    /// A new update supersedes the last one's verdict: the failure a report names describes the
+    /// update that failed, not one that has since been replaced.
+    #[test]
+    fn a_new_update_supersedes_the_last_one_s_failure() {
+        let mut update = HotUpdate::new(7);
+        update.begin_precopy(8).expect("the first update begins");
+        update
+            .precopy_failed(8, precopy_failure())
+            .expect("the first update fails");
+        assert_eq!(update.failed_generation(), Some(8));
+
+        update.begin_precopy(9).expect("a second update begins");
+        assert_eq!(update.failure(), None, "the failed update is superseded");
+        assert_eq!(update.failed_generation(), None);
     }
 
     fn precopy_failure() -> UpdateFailure {
