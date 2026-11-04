@@ -429,12 +429,9 @@ def run_encode_rows(options) -> int:
             f" under its own directory"
         )
     case = json.loads(case_path.read_text())
-    stated = case.get("pixels")
-    if isinstance(stated, dict):
-        stated = stated.get("file")
-    pixels_path = (
-        Path(stated) if isinstance(stated, str) else Path("pixels.h3t")
-    )
+    # The case names the raster it read; `pixels` is a description of the pattern, not a path.
+    stated = case.get("pixels_file")
+    pixels_path = Path(stated) if isinstance(stated, str) else Path("pixels.h3t")
     if not pixels_path.is_absolute():
         pixels_path = stack / pixels_path
     if not pixels_path.is_file():
@@ -458,6 +455,14 @@ def run_encode_rows(options) -> int:
         raise SystemExit(
             f"{pixels_path} holds {tuple(pixels.shape)};"
             f" an encode reads [channels, frames, rows, columns]"
+        )
+    stated_shape = case.get("pixels_shape")
+    if isinstance(stated_shape, list) and tuple(stated_shape) != tuple(
+        int(extent) for extent in pixels.shape
+    ):
+        raise SystemExit(
+            f"{pixels_path.name} holds {tuple(pixels.shape)} and the case states"
+            f" {tuple(stated_shape)}: the file is not the raster the case names"
         )
     channels, frames, height, width = (int(extent) for extent in pixels.shape)
     if channels != 3:
