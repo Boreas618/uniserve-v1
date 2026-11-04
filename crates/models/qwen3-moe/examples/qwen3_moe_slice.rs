@@ -666,6 +666,11 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
         let embedded = download_bf16(&stream, hidden, rows, width)?;
         write_npy(&dir.join("hidden_00.npy"), &embedded, rows, width)?;
         println!("dump: hidden_00.npy is the embedding's output, {rows} x {width} f32");
+        // Every call reserves a step's scratch, and nothing returns it: the arena is sized for one
+        // forward and not for forty-eight, so each layer's rows are read back to the host and the
+        // arena is then released to the mark taken before the first call. Without the release the
+        // dump would stop a few layers in, with the arena exhausted.
+        let mark = arena.mark();
         for layer in 0..config.num_hidden_layers {
             let out = model.forward_through(&forward, &batch, &cache, hidden, layer)?;
             stream.synchronize()?;
@@ -673,6 +678,7 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
             let name = format!("hidden_{:02}.npy", layer + 1);
             write_npy(&dir.join(&name), &values, rows, width)?;
             println!("dump: {name} is layer {layer}'s output");
+            arena.release(mark);
         }
     }
 
