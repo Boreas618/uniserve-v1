@@ -163,12 +163,35 @@ impl LatentStorage {
                 // Fresh host storage is already zero.
             }
         }
-        Ok(Self {
+        let storage = Self {
             num_pages: narrow(plan.num_pages, "pages")?,
             page_units: narrow(plan.page_units, "page units")?,
             width: narrow(plan.latent_width, "width")?,
             pages,
-        })
+        };
+        storage.check_layout()?;
+        Ok(storage)
+    }
+
+    /// The pool's own layout against the view it actually holds.
+    ///
+    /// [`Self::page_address`] computes a page's offset from `page_units` and
+    /// `width`, so a pool whose view disagrees with those numbers would hand a
+    /// consumer the neighbouring page's values rather than an error - a wrong
+    /// picture instead of a fault. The check runs once, when the pool is made:
+    /// a consumer validating a latent it was handed compares against
+    /// [`Self::width`], and this is what makes that width the view's.
+    fn check_layout(&self) -> Result<()> {
+        let shape = self.pages.shape();
+        let width = shape.last().copied();
+        let units = shape.get(2).copied();
+        if width != Some(i64::from(self.width)) || units != Some(i64::from(self.page_units)) {
+            return Err(Error::Invariant(format!(
+                "latent pool of {} pages x {} units x {} width holds a view of {shape:?}",
+                self.num_pages, self.page_units, self.width
+            )));
+        }
+        Ok(())
     }
 
     /// The element type of latent values.
