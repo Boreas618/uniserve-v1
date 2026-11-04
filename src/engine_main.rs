@@ -255,6 +255,17 @@ impl ProcessInterface {
     /// Connects to `address` and states this process's identity, which the daemon answers with the
     /// deployment's nodes or a refusal (§2.3).
     fn connect(address: &str, deployment: &str, engine: u64) -> Result<Self> {
+        // A process link that cannot name its engine is refused here rather than sent: zero states
+        // "no main process", and a daemon that accepted it would file this connection in the place
+        // of a process it can never command. The launch file states the number, so a launch without
+        // one is the deployment's fault and this is where it is named.
+        if engine == 0 {
+            bail!(
+                "the launch file states engine 0, which names no main process: the daemon addresses \
+                 the epoch's program-layer commands by this number, so a process it started under \
+                 none cannot be commanded"
+            );
+        }
         let mut connection = proto::Connection::connect(address).with_context(|| {
             format!("connecting to the daemon's process interface at {address}")
         })?;
@@ -269,6 +280,10 @@ impl ProcessInterface {
                     // process under, so a command it sends for engine N reaches this process and
                     // not whichever connection the daemon happened to accept Nth.
                     engine,
+                    // This is the process link: the one the daemon's program-layer commands
+                    // travel down. The request link, on its own socket, states `REQUESTS`, so the
+                    // two links of one engine are never confused for one another.
+                    interface: proto::process::Interface::Process as i32,
                 },
             )),
         })?;
@@ -1335,7 +1350,7 @@ impl MainProcess {
                     operators = programs.len(),
                     policy = %policy.backend,
                     policy_revision = policy.revision,
-                    "received the daemon's precopy"
+                    "the daemon's Precopy arrived"
                 );
                 self.start_precopy(generation, &programs, &policy, reply)?;
                 return Ok(None);
@@ -4223,6 +4238,9 @@ fn handshake(control: &mut Control, launch: &Launch) -> Result<Epoch> {
         build: proto::BUILD.to_owned(),
         major: proto::PROTOCOL_MAJOR,
         minor: proto::PROTOCOL_MINOR,
+        // The request link: requests, their events and the epoch's metrics. The process link
+        // states `PROCESS` on its own socket, and both name the same engine number.
+        interface: proto::process::Interface::Requests as i32,
     })?;
     let welcome: proto::request::wire::Welcome = control
         .daemon_mut()

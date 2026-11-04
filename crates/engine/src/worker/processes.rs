@@ -219,6 +219,9 @@ impl ProcessClient {
                 // so a command reaches the process it names rather than whichever connection the
                 // daemon accepted in that place. The leader's planning client is not a process.
                 engine,
+                // A client that is not a main process states no interface, and the daemon keeps
+                // its pre-`interface` behaviour for it.
+                interface: 0,
             })),
         })?;
         let welcome: Welcome = connection
