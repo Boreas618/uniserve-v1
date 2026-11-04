@@ -108,7 +108,6 @@ pub mod phase;
 pub mod platform;
 pub mod position;
 pub mod prefix_cache;
-pub mod replicate_pad;
 pub mod residual;
 pub mod resize;
 pub mod rgb;

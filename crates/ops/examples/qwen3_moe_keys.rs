@@ -18,7 +18,7 @@
 //! this file follows it. Candidate widths and the sampler's extras are the slice's own request
 //! state (`crates/nn/src/layers/sampler.rs`, `Sampler::new`).
 //!
-//! Gaps this file does not fill, named rather than invented, so that the 86 declared operators are
+//! Gaps this file does not fill, named rather than invented, so that the 85 declared operators are
 //! accounted for between the two fixtures and these lines:
 //!
 //! - **The quantized export's family**: `nvfp4_gemm`, `nvfp4_quantize`, `gather_gemm_nvfp4`,

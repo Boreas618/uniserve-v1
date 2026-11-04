@@ -112,7 +112,6 @@ const OPERATORS: &[&str] = &[
     <crate::fp4::Nvfp4Quantize as Op>::NAME,
     <crate::fp4::Nvfp4Gemm as Op>::NAME,
     <crate::snake_beta::SnakeBeta as Op>::NAME,
-    <crate::replicate_pad::ReplicatePad as Op>::NAME,
     <crate::audio_resample::AudioResample as Op>::NAME,
     <crate::resize::AntialiasedResizeUint8 as Op>::NAME,
     <crate::snake::Snake as Op>::NAME,

@@ -223,17 +223,11 @@ fn main() {
 
     // ---- Media: the two programs whose variants do not depend on a resolution.
     //
-    // The audio path pads the ends of a waveform with one axis (`leading = batch · channels`).
-    push(
-        "replicate_pad",
-        ops::replicate_pad::Descriptor {
-            dtype: DType::F32,
-            axes: 1,
-            block: ELEMENTWISE_BLOCK,
-            pdl: PDL,
-        }
-        .to_string(),
-    );
+    // Padding is not one of them: the video VAE's replicate and reflect pads are `frame_pad`'s
+    // `reflect` flag (`crates/ops/src/frame.rs`), and the audio decoder's pads are fused into
+    // `audio_resample` and its convolutions. A general ATen `F.pad(mode="replicate")` over trailing
+    // axes has no caller in the reference, so it is not declared.
+    //
     // The video path's antialiased downscale of a packed uint8 frame, three colour channels.
     push(
         "antialiased_resize_uint8",
