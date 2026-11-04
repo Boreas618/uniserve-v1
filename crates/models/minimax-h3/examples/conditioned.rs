@@ -86,8 +86,6 @@ struct Args {
     /// The request's seed, which addresses the condition's draw.
     seed: u64,
     device: u32,
-    /// Device GiB to reserve for the workspace when it is larger than the plan.
-    arena_gib: u64,
     /// The program store `--stage encode` reads its modules from.
     store: Option<PathBuf>,
 }
@@ -117,7 +115,6 @@ impl Args {
             image: 256,
             seed: 0,
             device: 0,
-            arena_gib: 8,
             store: std::env::var_os("UNISERVE_STORE").map(PathBuf::from),
         };
         let mut words = std::env::args().skip(1);
@@ -181,11 +178,6 @@ impl Args {
                     args.device = value()?
                         .parse()
                         .map_err(|_| "`--device` takes an index".to_owned())?;
-                }
-                "--arena-gib" => {
-                    args.arena_gib = value()?
-                        .parse()
-                        .map_err(|_| "`--arena-gib` takes a number".to_owned())?;
                 }
                 other => return Err(format!("`{other}` is not a flag of this harness")),
             }
@@ -383,7 +375,26 @@ fn encode(args: &Args) -> Result<(), String> {
     };
     let (layout, _packing) = layouts.layout(&request).map_err(show)?;
 
-    let mut weights = DeviceWeights::new(&device, 0)?;
+    // The resident pool is sized by what this partition will publish - the checkpoint's own bytes
+    // for the blocks it places - not by a default: a pool that cannot give out one more buffer is a
+    // stop the caller reads as a defect in the model (`platform: the pool's reservation cannot give
+    // out ... more`), and it is the harness's number that was wrong.
+    let mut published = 0_u64;
+    for component in partition.blocks.iter() {
+        for directory in component.directories() {
+            published += stored_bytes(&checkpoint, directory)?;
+        }
+    }
+    // A conversion at load stores one weight per element in the deployment's type, and the folded
+    // input affine publishes a composed table beside the weights: half again is the margin the
+    // decoder's harness keeps, and it is stated rather than discovered.
+    let resident = (published + published / 2).max(1 << 30);
+    println!(
+        "weights: {} MiB stored for this partition, {} MiB reserved",
+        published >> 20,
+        resident >> 20
+    );
+    let mut weights = DeviceWeights::new(&device, resident)?;
     let model = {
         let mut loader = WeightLoader::new(&checkpoint, &mut weights, None, None);
         minimax_h3::load(&checkpoint, partition, &mut loader).map_err(show)?
@@ -491,7 +502,7 @@ fn encode(args: &Args) -> Result<(), String> {
         + tables
         + (text_elements + source_elements + prefix_elements) * width
         + (pixel_elements + draw_elements) * 4;
-    let arena_bytes = needed.max(args.arena_gib << 30);
+    let arena_bytes = needed;
     let allocator = weights.allocator();
     let reserve = usize::try_from(arena_bytes).unwrap_or(usize::MAX);
     allocator
@@ -775,6 +786,19 @@ fn encode(args: &Args) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The bytes one component's tensors occupy in the checkpoint, which is what the weights pool must
+/// hold before any conversion.
+fn stored_bytes(checkpoint: &Checkpoint, directory: &str) -> Result<u64, String> {
+    let source = checkpoint.component(directory).map_err(show)?;
+    let mut bytes = 0_u64;
+    for name in source.names() {
+        if let Some(location) = source.tensor(name) {
+            bytes += location.bytes.1.saturating_sub(location.bytes.0);
+        }
+    }
+    Ok(bytes)
 }
 
 /// The deployment's element type, as the loaded block reports it.
@@ -1148,7 +1172,7 @@ impl DeviceWeights {
     fn new(device: &platform::Device, requested: u64) -> Result<Self, String> {
         let budget = std::sync::Arc::new(NoLimit);
         let mut pools = platform::Allocator::new(device, budget).map_err(show)?;
-        let mut wanted = requested.max(8 << 30);
+        let mut wanted = requested;
         let mut reserved = None;
         while wanted >= (1 << 30) {
             if pools
