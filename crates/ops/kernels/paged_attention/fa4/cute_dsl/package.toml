@@ -1,0 +1,48 @@
+# The paged_attention operator's fa4 backend: design 5.2's program package.
+#
+# One native module per descriptor: FlashAttention 4's Blackwell paged forward
+# pass, compiled through the vendor's own selection (`flash_attn.cute.interface`)
+# at build time and exported to C. The entry is the operator's
+# `attention::paged::Call`.
+#
+# Whole-query prefill only: the decode cells are the trtllm module's, and FA4's
+# decode path has not been checked against exact attention here. A geometry FA4
+# cannot serve at this shape is a cell this manifest does not declare: no window
+# (FA4 reads a window size as a distance, and the operator's window is a left
+# bound the module is not compiled for), and one element type for query, cache
+# and output.
+
+op = "paged_attention"
+backend = "fa4"
+
+[toolchain]
+kind = "cute_dsl"
+version = "4.5.0"
+packages = [
+    { name = "flash-attn", version = "4.0.0" },
+    { name = "torch", version = "2.9.1" },
+]
+
+[module]
+form = "native"
+entries = { launch = "uniserve_paged_attention" }
+
+[source]
+kind = "cute_dsl"
+files = ["src/fa4.py", "src/build.py", "src/_compile.py", "src/entry.cpp", "src/entry.h"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_100f"]
+
+# `phase_prefill_dtype_bf16_kv_bf16_out_bf16_head_dim_128_page_64_q_heads_32_kv_heads_4_mask_causal_window_false_len_40960`.
+[kernel.descriptors]
+dimensions = { phase = ["prefill"], dtype = ["bf16", "f16"], kv = ["bf16", "f16"], out = ["bf16", "f16"], head_dim = ["128", "64"], page = ["64", "16", "32"], q_heads = ["32", "24", "16"], kv_heads = ["4", "8", "2"], mask = ["causal", "dense"], window = ["false"], len = ["40960"] }
+
+[parameters]
+# The representative problem the vendor's configuration is chosen for: the
+# batch and query length of one prefill. A call of a very different shape runs a
+# configuration chosen for this one.
+batch = 8
+query_len = 512
