@@ -38,7 +38,7 @@ pub(crate) fn run(args: daemon::options::ServeArgs, log: &LogLevels) -> Result<E
     info!(
         model = %options.model,
         served_model_name = options.served_model_name(),
-        bind = %format!("{}:{}", options.server.host, options.server.port),
+        bind = %format!("{}:{}", options.server_config.host, options.server_config.port),
         "resolved frontend options"
     );
     let runtime = crate::runtime()?;
@@ -79,12 +79,14 @@ fn options(config: &daemon::options::ServeConfig) -> Result<frontend::options::O
         host_identity: config.host_identity.clone(),
         nnodes: config.nnodes,
         node_rank: config.node_rank,
-        load: frontend::options::Load {
+        load_config: frontend::options::LoadOptions {
             format: config.load_config.format,
+            download_dir: config.load_config.download_dir.clone(),
             threads: config.load_config.threads,
             weights: config.load_config.weights.clone(),
+            parallel_degrees: config.load_config.parallel_degrees.clone(),
         },
-        server: frontend::options::Server {
+        server_config: frontend::options::ServerOptions {
             host: config.server_config.host.clone(),
             port: config.server_config.port,
             uds: config.server_config.uds.clone(),
@@ -94,45 +96,45 @@ fn options(config: &daemon::options::ServeConfig) -> Result<frontend::options::O
             shutdown_timeout: config.server_config.shutdown_timeout,
             request_id_headers: config.server_config.request_id_headers,
         },
-        logging: frontend::options::Logging {
+        logging_config: frontend::options::LoggingOptions {
             log_requests: config.logging_config.log_requests,
             log_stats: config.logging_config.log_stats,
         },
-        chat: frontend::options::Chat {
+        chat_config: frontend::options::ChatOptions {
             template: config.chat_config.template.clone(),
             template_kwargs: config.chat_config.template_kwargs.clone(),
             template_content_format: content_format(config.chat_config.template_content_format),
             reasoning_parser: reasoning_parser(config.chat_config.reasoning_parser),
         },
-        images: frontend::options::Images {
+        image_fetch_config: frontend::options::ImageFetchOptions {
             timeout: config.image_fetch_config.timeout,
             max_bytes: config.image_fetch_config.max_bytes,
             allow_private: config.image_fetch_config.allow_private,
         },
-        video: frontend::options::Video {
+        video_config: frontend::options::VideoOptions {
             max_seconds: config.video_config.max_seconds,
             resolutions: config.video_config.resolutions.clone(),
             aspect_ratios: config.video_config.aspect_ratios.clone(),
             text_capacities: config.video_config.text_capacities.clone(),
             max_condition_rows: config.video_config.max_condition_rows,
         },
-        media: frontend::options::Media {
+        media_config: frontend::options::MediaOptions {
             directory: config.media_config.directory.clone(),
             allow_remote: config.media_config.allow_remote,
             max_request_bytes: config.media_config.max_request_bytes,
             ffprobe: config.media_config.ffprobe.clone(),
             ffmpeg: config.media_config.ffmpeg.clone(),
         },
-        video_jobs: frontend::options::VideoJobs {
+        video_job_config: frontend::options::VideoJobOptions {
             retention: config.video_job_config.retention,
             max_bytes: config.video_job_config.max_bytes,
         },
-        readout: frontend::options::Readout {
+        readout_config: frontend::options::ReadoutOptions {
             layout: readout_layout(config.readout_config.layout),
             canvas: canvas_mode(config.readout_config.canvas),
             candidates: candidate_tokens(config.readout_config.candidates),
         },
-        migration: frontend::options::Migration {
+        migration_config: frontend::options::MigrationOptions {
             max_migrations: config.migration_config.max_migrations,
         },
     })
@@ -141,9 +143,9 @@ fn options(config: &daemon::options::ServeConfig) -> Result<frontend::options::O
 /// The chat template's content format, which the file spells the same way.
 fn content_format(
     format: daemon::options::ChatTemplateContentFormatOption,
-) -> frontend::options::ChatTemplateContentFormat {
+) -> frontend::options::ChatTemplateContentFormatOption {
     use daemon::options::ChatTemplateContentFormatOption as File;
-    use frontend::options::ChatTemplateContentFormat as Owned;
+    use frontend::options::ChatTemplateContentFormatOption as Owned;
     match format {
         File::Auto => Owned::Auto,
         File::String => Owned::String,
@@ -217,12 +219,12 @@ mod tests {
         assert_eq!(resolved.served_model_name(), "qwen3");
         assert_eq!(resolved.max_model_len, NonZeroU32::new(4096));
         assert_eq!(resolved.host_identity, "node-0");
-        assert_eq!(resolved.server.port, config.server_config.port);
+        assert_eq!(resolved.server_config.port, config.server_config.port);
         assert_eq!(
-            resolved.migration.max_migrations,
+            resolved.migration_config.max_migrations,
             config.migration_config.max_migrations
         );
-        assert_eq!(resolved.media.ffprobe, config.media_config.ffprobe);
+        assert_eq!(resolved.media_config.ffprobe, config.media_config.ffprobe);
 
         let without_model = daemon::options::ServeConfig::default();
         assert!(
