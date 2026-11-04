@@ -128,17 +128,22 @@ pub fn load(
                 Block::Decoder(Box::new(decoder))
             }
             Component::VideoDecoder => {
-                // The decoder's layers are complete and its layout is one tile - 1792 voxels on every
-                // canvas the checkpoint offers, because the checkpoint's 256-pixel tiles leave every
-                // tile the same size - so the block needs no capacity from the request. What is
-                // missing is the capability: `Decoder` declares only `decode`, and the tables that
-                // address a tile are keyed by the layout, so a block cannot be built into a `Block`
-                // (or handed to a runner) before `Decoder::layout_tables`/`prepare_layout` exist.
-                return Err(Error::Unsupported(format!(
-                    "the {} block declares its tables per layout, and the Decoder capability has no \
-                     layout method to declare them with, so it cannot be placed",
-                    component.name()
-                )));
+                // One block serves every canvas: the tile grid is arithmetic on a request's raster,
+                // so the block is loaded against the checkpoint's tile - the largest tile any canvas
+                // of this checkpoint produces, since the grid is uniform wherever the canvas holds a
+                // whole tile - and the seam blends are built here, at load.
+                let spatial = config.video_vae.spatial_compression();
+                let canvas = crate::video_vae::Canvas::clip(
+                    &config.video_vae,
+                    crate::video_vae::TILE_PIXELS / spatial,
+                    crate::video_vae::TILE_PIXELS / spatial,
+                );
+                // A VAE directory holds both halves; the decoder reads its own keys from it.
+                let source = checkpoint.component(component.directories()[0])?;
+                let mut shards = loader.reborrow(source)?;
+                let decoder =
+                    crate::video_vae::VideoDecoder::load(&config.video_vae, canvas, &mut shards)?;
+                Block::Decoder(Box::new(decoder))
             }
             Component::LatentEncoder => {
                 // Both condition encoders are written to the reference (`VideoEncoder::encode` and
