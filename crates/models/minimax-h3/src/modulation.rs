@@ -35,7 +35,7 @@
 use nn::Shape;
 use nn::layers::gather_rows;
 use nn::weights::{Weight, WeightLoader, WeightRequest};
-use nn::{Forward, TensorView};
+use nn::{DType, Forward, TensorView};
 
 use crate::{Error, Result};
 
@@ -236,7 +236,7 @@ impl AdaLnCache {
     /// Bytes the per-forward scratch needs: the entry ids and the largest gathered table.
     pub fn scratch_bytes(&self) -> u64 {
         let elements = self.layer_elements().max(self.output_elements());
-        let width = elements * nn::DType::BF16.bytes().unwrap_or(2);
+        let width = elements * self.dtype().bytes().unwrap_or(2);
         width + u64::from(self.groups.count()) * 4
     }
 }
@@ -316,6 +316,17 @@ impl Projections {
         config: &crate::config::TransformerConfig,
         loader: &mut WeightLoader<'_>,
     ) -> Result<Self> {
+        // **The cache's weights are read as FP32 at every deployment, and its tables follow them.**
+        // The reference casts the activation to the weight's type and takes the tables' type from
+        // the product (`adaln_cache.py:128, 141-145`), so at the released BF16 stack its tables are
+        // BF16. Ours cannot be: our product has one element type for both operands, so a BF16 weight
+        // would meet an FP32 activation and cuBLASLt has no such pair - the first projection of the
+        // forward, found on device. Pinning these weights to FP32 keeps one type on both sides of
+        // every launch of the cache, at the price of the tables being FP32 where the reference's are
+        // the checkpoint's type: one declared deviation, and it is the tables' representation, not
+        // the arithmetic - the projection is a sum of products of the same numbers.
+        let mut loader = loader.with_precision(Some(DType::F32))?;
+        let loader = &mut loader;
         let hidden = u64::from(config.hidden_size);
         let time_dim = u64::from(config.time_dim);
         let time_hidden = u64::from(config.time_hidden_dim);
@@ -400,12 +411,32 @@ impl Projections {
             )));
         }
         let arena = f.arena();
-        // The intermediates are the tables' own element type, not FP32: the reference casts each
-        // activation to the weight's type before every projection (`adaln_cache.py:128`), so a wider
-        // running value would hand the next projection a number the checkpoint never produced. The
-        // embedding stays FP32 - it is the one input the model computes rather than reads, and the
+        // **The activation is cast to the weight's type, and the tables take the projection's type.**
+        // The reference writes both halves of that in one line - `F.linear(activated_timesteps.to(
+        // weight.dtype), weight, bias)` with the tables allocated as `projected.new_empty(...)`
+        // (`adaln_cache.py:128, 141-145`) - so at the released BF16 stack the tables are BF16, and at
+        // a deployment whose weights are FP32 they are FP32. Reading the tables' type from `out`
+        // instead and leaving the weights at the checkpoint's type is what a device run found: the
+        // first projection of the forward asked cuBLASLt for an FP32 activation against a BF16
+        // weight, a pair no algorithm exists for (`input_f32_weight_bf16_...` refused at its plan).
+        //
+        // The embedding stays FP32: it is the one input the model computes rather than reads, and the
         // reference leaves it so until the first projection reads it.
-        let dtype = output_out.dtype;
+        let dtype = self.first.0.dtype();
+        if output_out.dtype != dtype {
+            return Err(Error::config(format!(
+                "the AdaLN tables are {} and the projections' weights are {dtype}: the reference \
+                 takes the tables' type from the projection, so a view of another type is a table \
+                 no launch of this cache can write",
+                output_out.dtype
+            )));
+        }
+        if embedding.dtype != DType::F32 {
+            return Err(Error::config(format!(
+                "the AdaLN embedding is {} and the reference computes it in FP32",
+                embedding.dtype
+            )));
+        }
         let hidden = arena.tensor(
             dtype,
             Shape::new(&[groups, u64::from(self.time_hidden_dim)]),
