@@ -21,7 +21,7 @@ use proto::{Connection, Listener};
 use crate::engine::client::{EngineClient, EngineState, StatsSink};
 
 /// The worker group a daemon supervises an engine process under.
-const ENGINE_GROUP: &str = "engine";
+pub(crate) const ENGINE_GROUP: &str = "engine";
 
 /// How long an engine process takes to connect back to the request socket
 /// once the daemon started it.
