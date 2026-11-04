@@ -26,13 +26,15 @@
 use std::ffi::c_void;
 
 pub use platform::Error as PlatformError;
-pub use platform::nccl::{Communicator, DataType as CollectiveType, ReduceOp};
+pub use platform::nccl::{Communicator, ReduceOp};
 pub use platform::{
     Allocator, Buffer, Cluster, Device, Function, FunctionAttribute, LaunchConfig, Library,
     NativeLibrary, PoolKind, Stream,
 };
+pub use platform::{DataType as CollectiveType, DeviceRange};
 
 pub use crate::tensor::DevicePtr;
+pub use platform::DevicePtr as RangePointer;
 
 use crate::tensor::DType;
 
@@ -148,16 +150,17 @@ pub(crate) fn copy_bytes(
 ///
 /// `send` and `receive` address `count` elements of `dtype` for each rank, bytes that stay valid
 /// until the collective completes.
-pub(crate) unsafe fn all_to_all(
+pub(crate) fn all_to_all(
     communicator: &mut Communicator,
-    send: DevicePtr,
-    receive: DevicePtr,
+    send: DeviceRange,
+    receive: DeviceRange,
     count: usize,
     dtype: CollectiveType,
     stream: &Stream,
-) -> platform::Result<()> {
-    // SAFETY: forwarded from the caller.
-    unsafe { communicator.all_to_all(send.address(), receive.address(), count, dtype, stream) }
+) -> crate::Result<()> {
+    communicator
+        .all_to_all(stream, send, receive, count, dtype)
+        .map_err(crate::Error::Platform)
 }
 
 /// The collective element type for one of `ops`' element types, when NCCL speaks it.
@@ -166,13 +169,13 @@ pub(crate) unsafe fn all_to_all(
 /// never as a buffer a collective reads.
 pub fn collective_type(dtype: DType) -> Option<CollectiveType> {
     Some(match dtype {
-        DType::U8 => CollectiveType::Uint8,
-        DType::I32 => CollectiveType::Int32,
-        DType::I64 => CollectiveType::Int64,
-        DType::F16 => CollectiveType::Float16,
-        DType::BF16 => CollectiveType::Bfloat16,
-        DType::F32 => CollectiveType::Float32,
-        DType::F8E4M3 => CollectiveType::Float8E4M3,
+        DType::U8 => CollectiveType::U8,
+        DType::I32 => CollectiveType::I32,
+        DType::I64 => CollectiveType::I64,
+        DType::F16 => CollectiveType::F16,
+        DType::BF16 => CollectiveType::Bf16,
+        DType::F32 => CollectiveType::F32,
+        DType::F8E4M3 => CollectiveType::F8E4M3,
         DType::F4E2M1 => return None,
     })
 }

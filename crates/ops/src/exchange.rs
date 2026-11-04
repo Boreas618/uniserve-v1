@@ -43,10 +43,17 @@ pub fn scatter(
 ) -> Result<()> {
     let count = checked(input, output, ranks)?;
     let dtype = count.1;
-    // SAFETY: both views address `count.0` elements of `dtype` for each of `ranks` ranks, and both
-    // stay alive until the collective completes (the caller owns them).
-    unsafe { platform::all_to_all(communicator, input.ptr, output.ptr, count.0, dtype, stream) }
-        .map_err(Error::Platform)
+    // Both views address `count.0` elements of `dtype` for each of `ranks` ranks, and both stay
+    // alive until the collective completes: the caller owns them.
+    let send = platform::DeviceRange::new(
+        platform::RangePointer::from_address(input.ptr.address()),
+        input.byte_len()? as usize,
+    );
+    let receive = platform::DeviceRange::new(
+        platform::RangePointer::from_address(output.ptr.address()),
+        output.byte_len()? as usize,
+    );
+    platform::all_to_all(communicator, send, receive, count.0, dtype, stream)
 }
 
 /// Put the heads of every rank back together.
@@ -59,9 +66,16 @@ pub fn gather(
 ) -> Result<()> {
     let count = checked(output, input, ranks)?;
     let dtype = count.1;
-    // SAFETY: as in `scatter`, with the roles of the two views exchanged.
-    unsafe { platform::all_to_all(communicator, input.ptr, output.ptr, count.0, dtype, stream) }
-        .map_err(Error::Platform)
+    // As in `scatter`, with the roles of the two views exchanged.
+    let send = platform::DeviceRange::new(
+        platform::RangePointer::from_address(input.ptr.address()),
+        input.byte_len()? as usize,
+    );
+    let receive = platform::DeviceRange::new(
+        platform::RangePointer::from_address(output.ptr.address()),
+        output.byte_len()? as usize,
+    );
+    platform::all_to_all(communicator, send, receive, count.0, dtype, stream)
 }
 
 /// Check one direction's shapes and give the elements each rank sends and the collective's type.
