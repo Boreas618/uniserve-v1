@@ -1910,21 +1910,15 @@ mod tests {
         let (layout, packing) = rule.layout(&request(121, 1344, 768)).unwrap();
         let tables = rule.table_specs(&layout).unwrap();
         let names: Vec<_> = tables.iter().map(|table| table.name).collect();
-        assert_eq!(
-            names,
-            vec![
-                "audio_indices",
-                "cu_seq_lens_k",
-                "cu_seq_lens_q",
-                "groups",
-                "modulation_indices",
-                "position_ids",
-                "prefix_index",
-                "step",
-                "token_tags",
-                "video_indices"
-            ]
-        );
+        // The order is the executor's contract and only its ends are asserted here: the executor
+        // passes its views in `table_specs`' order and writes the step table after everything else,
+        // so the step is last. The set itself is the code's own list - `state_tables` publishes it
+        // per attention kind - and `each_kind_resolves_its_state_tables_by_its_own_names` pins that
+        // publication against `table_specs`; a literal here would be a third copy, and the copy that
+        // goes stale.
+        assert_eq!(names.last(), Some(&"step"), "{names:?}");
+        let unique: std::collections::BTreeSet<_> = names.iter().collect();
+        assert_eq!(unique.len(), names.len(), "a name repeats: {names:?}");
         // Every table but the step covers one row per packed row.
         let rows = u64::from(packing.padded_tokens);
         for table in &tables {
@@ -1935,9 +1929,12 @@ mod tests {
                 // The audio table is addressed by audio row and names the packed row it occupies,
                 // so its length is the audio rows rather than every packed row.
                 "audio_indices" => assert_eq!(table.shape.dim(0), u64::from(packing.audio_rows)),
-                // The dense visibility table names both ends of the used row run, so it carries one
-                // more entry than there are packed rows.
-                "cu_seq_lens_k" | "cu_seq_lens_q" => assert_eq!(table.shape.dims(), &[2]),
+                // A run's table names both of its ends, so it carries one more entry than the run
+                // has row counts: the pack's used rows, or the prompt's tokens for the refiner's.
+                "cu_seq_lens_k"
+                | "cu_seq_lens_q"
+                | "refiner_cu_seq_lens_k"
+                | "refiner_cu_seq_lens_q" => assert_eq!(table.shape.dims(), &[2]),
                 // The rotation reads the coordinates axis-major, so the axes lead.
                 "position_ids" => assert_eq!(table.shape.dims(), &[3, rows]),
                 // The video indices name the packed row of every video row, and video rows are
@@ -1949,7 +1946,11 @@ mod tests {
             }
         }
         // Axis-major: the rotation reads `[axis, token]`, so the axes are the leading extent.
-        assert_eq!(tables[5].shape.dims(), &[3, rows]);
+        let positions = tables
+            .iter()
+            .find(|table| table.name == "position_ids")
+            .expect("the rotation's coordinates are a table");
+        assert_eq!(positions.shape.dims(), &[3, rows]);
     }
 
     #[test]
