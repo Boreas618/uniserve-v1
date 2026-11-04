@@ -1905,6 +1905,15 @@ impl Replica {
     }
 }
 
+/// Whether a replica keeps a standby (§2.5): the deployment reserved room for
+/// one (`worker_config.standby`), the replica's engine serves rather than being
+/// parked, draining or failing, and the world it executes is the world the
+/// deployment serves. A standby anywhere else is a second engine of a scope
+/// nothing routes to, or a copy of the device storage the serving engine needs.
+fn keeps_standby(wanted: bool, serving: EngineState, world_serves: bool) -> bool {
+    wanted && world_serves && serving == EngineState::Ready
+}
+
 /// A standby main process started beside this replica's serving engine (§2.5):
 /// a second process of the serving world, parked with its scope's storage
 /// claimed read-only, promoted in place when the serving engine is lost.
@@ -1997,7 +2006,8 @@ impl Replica {
         // (§2.5): each standby rank holds a CUDA context, graph pools and
         // workspaces of its own, and a deployment that has not reserved them
         // cannot hold a second engine of the same scope.
-        if !locked(&self.config).worker_config.standby {
+        let wanted = locked(&self.config).worker_config.standby;
+        if !wanted {
             return Ok(());
         }
         let Some(control) = self.control.get().cloned() else {
@@ -2007,10 +2017,7 @@ impl Replica {
         let Some(serving) = self.hold.client() else {
             return Ok(());
         };
-        if serving.state() != EngineState::Ready {
-            return Ok(());
-        }
-        if !self.serves_serving_epoch() {
+        if !keeps_standby(wanted, serving.state(), self.serves_serving_epoch()) {
             return Ok(());
         }
         {
@@ -2629,7 +2636,7 @@ mod tests {
     };
     use proto::request::{ImageParams, SamplingParams};
 
-    use super::Leader;
+    use super::{EngineState, Leader, keeps_standby};
     use crate::input::GenerateRequest;
     use crate::model::ModelParameters;
     use crate::openai::ChatCompletionRequest;
@@ -3135,5 +3142,29 @@ mod tests {
             &spec(scheduling("priority", 128, None, 128)),
             Some(&capacity)
         ));
+    }
+
+    /// A standby exists only where the deployment reserved room for one and the
+    /// replica's world is the world the deployment serves (§2.5). Each of the
+    /// three conditions is a whole engine's device storage when it is wrong.
+    #[test]
+    fn a_standby_exists_only_where_the_deployment_reserved_one_and_the_world_serves() {
+        assert!(keeps_standby(true, EngineState::Ready, true));
+        // Nothing reserved: a second engine would take the serving engine's
+        // memory, so the deployment asks for none.
+        assert!(!keeps_standby(false, EngineState::Ready, true));
+        // A parked, standing-by, failed or closed engine has nothing to stand
+        // beside, and a standby of a standby is a third copy.
+        assert!(!keeps_standby(true, EngineState::Parked, true));
+        assert!(!keeps_standby(true, EngineState::Standby, true));
+        assert!(!keeps_standby(
+            true,
+            EngineState::Failed("a fatal fault".into()),
+            true
+        ));
+        assert!(!keeps_standby(true, EngineState::Closed, true));
+        // A world a switch replaced keeps no standby: nothing routes to it, and
+        // its read-only claim would outlive the purge.
+        assert!(!keeps_standby(true, EngineState::Ready, false));
     }
 }
