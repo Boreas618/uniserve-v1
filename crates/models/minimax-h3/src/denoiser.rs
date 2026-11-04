@@ -2276,7 +2276,7 @@ mod tests {
             },
             nn::capability::ConditionShape {
                 role: ConditionRole::Reference,
-                frames: 12,
+                frames: 22,
                 height: 480,
                 width: 832,
                 audio_samples: 24_000,
@@ -2358,17 +2358,22 @@ mod tests {
         // what the encoder writes and what the input projection reads. A [frames, channels] reshape
         // would halve the row count and shift every row after the reference, with no shape
         // complaint downstream: the projection reads whatever row count it is given.
-        const SHAPES: [nn::capability::ConditionShape; 1] = [nn::capability::ConditionShape {
+        // A 22-frame reference carries a real track: `audio_samples` is the number of samples the
+        // audio encoder produced, and the packed rows follow *that*, `samples / AUDIO_HOP` rounded
+        // up - not the video's frame rate. Passing 22 latent steps' worth of samples (`22 * 800`)
+        // would give 44 rows and still look consistent, which is the trap this pins.
+        let shapes = [nn::capability::ConditionShape {
             role: ConditionRole::Reference,
             frames: 0,
             height: 0,
             width: 0,
-            audio_samples: 22 * crate::config::AUDIO_HOP,
+            audio_samples: crate::packing::audio_samples(22),
         }];
+        let shapes = &shapes;
         let request = VideoRequest {
             task: nn::capability::VideoTask::ReferenceToVideoAudio,
             references: 1,
-            conditions: &SHAPES,
+            conditions: shapes,
             ..request(121, 832, 480)
         };
         let conditions = conditions_of(&request);
@@ -2403,7 +2408,9 @@ mod tests {
                 )
             })
             .collect();
-        let paired = ConditionViews::new(&conditions, &views).unwrap();
+        // Four latents: the keyframe's rows, the clip's rows and its track, the audio reference's
+        // track - `sum((video is not None) + (audio_samples > 0))`, the reference's own count.
+        let paired = ConditionViews::new(&conditions, &views[..4]).unwrap();
         assert!(paired.of(0).0.is_some() && paired.of(0).1.is_none());
         assert!(paired.of(1).0.is_some() && paired.of(1).1.is_some());
         assert!(paired.of(2).0.is_none() && paired.of(2).1.is_some());
@@ -2413,20 +2420,46 @@ mod tests {
     }
 
     #[test]
-    fn the_tables_are_the_layout_s_and_the_step_is_last() {
+    fn the_tables_are_the_layout_s_and_the_step_is_the_executor_s_to_write() {
         let rule = layouts();
-        let (layout, packing) = rule.layout(&request(121, 1344, 768)).unwrap();
+        let request = request(121, 1344, 768);
+        let (layout, packing) = rule.layout(&request).unwrap();
         let tables = rule.table_specs(&layout).unwrap();
         let names: Vec<_> = tables.iter().map(|table| table.name).collect();
-        // The order is the executor's contract and only its ends are asserted here: the executor
-        // passes its views in `table_specs`' order and writes the step table after everything else,
-        // so the step is last. The set itself is the code's own list - `state_tables` publishes it
-        // per attention kind - and `each_kind_resolves_its_state_tables_by_its_own_names` pins that
-        // publication against `table_specs`; a literal here would be a third copy, and the copy that
-        // goes stale.
-        assert_eq!(names.last(), Some(&"step"), "{names:?}");
+        // The executor addresses a table by name, so a name may appear once and no position is
+        // promised: the tables are sorted by name, and any positional claim about them goes stale
+        // the moment a table is added. The set itself is the code's own list, which
+        // `each_kind_resolves_its_state_tables_by_its_own_names` pins against `table_specs`.
         let unique: std::collections::BTreeSet<_> = names.iter().collect();
         assert_eq!(unique.len(), names.len(), "a name repeats: {names:?}");
+        // The step is the one table the model never fills: the executor writes its single index
+        // before each replay, so `write_state` must leave its bytes as the caller offered them.
+        const OFFERED: u8 = 0xAB;
+        let mut state: Vec<Vec<u8>> = tables
+            .iter()
+            .map(|table| {
+                vec![
+                    OFFERED;
+                    (table.shape.numel() as usize) * table.dtype.bytes().unwrap() as usize
+                ]
+            })
+            .collect();
+        rule.write_state(&request, &layout, &mut state)
+            .expect("a dense layout's state is writable");
+        for (table, bytes) in tables.iter().zip(&state) {
+            if table.name == "step" {
+                assert!(
+                    bytes.iter().all(|byte| *byte == OFFERED),
+                    "the executor writes the step index; the model must not"
+                );
+            } else {
+                assert!(
+                    bytes.iter().any(|byte| *byte != OFFERED),
+                    "{} was offered to the model and left unwritten",
+                    table.name
+                );
+            }
+        }
         // Every table but the step covers one row per packed row.
         let rows = u64::from(packing.padded_tokens);
         for table in &tables {
