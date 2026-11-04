@@ -174,8 +174,13 @@ impl Nvml {
     }
 
     /// Device storage that NVML attributes to this process on `device`: every
-    /// allocation of its context, including PyTorch's cached segments, graph
-    /// pools, VMM arenas, communicator buffers and loaded modules.
+    /// allocation of its context, including the allocator's graph and scratch
+    /// pools, communicator buffers and loaded modules.
+    ///
+    /// Design 8's NVML rule keeps storage that this process creates and then
+    /// re-imports from its exported descriptor off that account, because the
+    /// creating handle is dropped; [`crate::Buffer::export`] is the half of it
+    /// this crate provides.
     ///
     /// Fails with [`Error::ProcessNotFound`] when NVML lists no usage for this
     /// PID, as happens inside a PID namespace NVML does not report.

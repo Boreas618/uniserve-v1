@@ -13,7 +13,7 @@ use std::ffi::CString;
 
 use crate::driver::{self, Handle};
 use crate::launch::Function;
-use crate::{Device, DeviceId, Error, PrimaryContext, Result, reclaim};
+use crate::{Device, DeviceId, Error, Result, reclaim};
 
 /// A module of one device loaded as a library (`CUlibrary`).
 ///
@@ -23,8 +23,7 @@ use crate::{Device, DeviceId, Error, PrimaryContext, Result, reclaim};
 /// of the library is resolved in.
 pub struct Library {
     raw: Handle,
-    context: PrimaryContext,
-    device: DeviceId,
+    device: Device,
 }
 
 // SAFETY: a library handle is an immutable driver object usable from any
@@ -47,39 +46,37 @@ impl Library {
             return Err(Error::invalid("a library image is empty"));
         }
 
-        let context = PrimaryContext::retain(device.id())?;
         // PTX text reaches the driver as a C string; a binary image's size
         // comes from its ELF headers, and the appended NUL lies outside them.
         let mut code = Vec::with_capacity(image.len() + 1);
         code.extend_from_slice(image);
         code.push(0);
 
+        let driver = driver::driver()?;
+        let _context = device.enter()?;
         let mut raw = std::ptr::null_mut();
-        driver::in_context(context.raw(), |driver| {
-            driver.check(
-                // SAFETY: the image is live for the call and NUL-terminated;
-                // no JIT or library options are given, and the driver writes
-                // the library handle to the local `raw`.
-                unsafe {
-                    (driver.library_load_data)(
-                        &mut raw,
-                        code.as_ptr().cast(),
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                        0,
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                        0,
-                    )
-                },
-                "cuLibraryLoadData",
-            )
-        })?;
+        driver.check(
+            // SAFETY: the image is live for the call and NUL-terminated; no
+            // JIT or library options are given, and the driver writes the
+            // library handle to the local `raw`.
+            unsafe {
+                (driver.library_load_data)(
+                    &mut raw,
+                    code.as_ptr().cast(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                )
+            },
+            "cuLibraryLoadData",
+        )?;
 
         Ok(Self {
             raw,
-            context,
-            device: device.id(),
+            device: device.clone(),
         })
     }
 
@@ -89,29 +86,29 @@ impl Library {
     pub fn kernel(&self, name: &str) -> Result<Function> {
         let name =
             CString::new(name).map_err(|error| Error::invalid(format!("kernel name: {error}")))?;
+        let driver = driver::driver()?;
+        let _context = self.device.enter()?;
         let mut kernel: Handle = std::ptr::null_mut();
         let mut function: Handle = std::ptr::null_mut();
-        driver::in_context(self.context.raw(), |driver| {
-            driver.check(
-                // SAFETY: the library is loaded; the driver writes the kernel
-                // handle to the local `kernel`.
-                unsafe { (driver.library_get_kernel)(&mut kernel, self.raw, name.as_ptr()) },
-                "cuLibraryGetKernel",
-            )?;
-            driver.check(
-                // SAFETY: the kernel belongs to the library; the current
-                // context is this library's, and the driver writes the
-                // function handle to the local `function`.
-                unsafe { (driver.kernel_get_function)(&mut function, kernel) },
-                "cuKernelGetFunction",
-            )
-        })?;
-        Ok(Function::new(function, self.context.clone()))
+        driver.check(
+            // SAFETY: the library is loaded; the driver writes the kernel
+            // handle to the local `kernel`.
+            unsafe { (driver.library_get_kernel)(&mut kernel, self.raw, name.as_ptr()) },
+            "cuLibraryGetKernel",
+        )?;
+        driver.check(
+            // SAFETY: the kernel belongs to the library; the current context
+            // is the library's device's, and the driver writes the function
+            // handle to the local `function`.
+            unsafe { (driver.kernel_get_function)(&mut function, kernel) },
+            "cuKernelGetFunction",
+        )?;
+        Ok(Function::new(function, self.device.clone()))
     }
 
     /// The device the library is loaded on.
     pub fn device(&self) -> DeviceId {
-        self.device
+        self.device.id()
     }
 
     /// The `CUlibrary` handle.
@@ -122,17 +119,17 @@ impl Library {
 
 impl Drop for Library {
     fn drop(&mut self) {
-        let (context, raw) = (self.context.clone(), self.raw as usize);
+        let (device, raw) = (self.device.clone(), self.raw as usize);
         // The release never blocks the dropping thread (see `reclaim`), and
         // the owner guarantees no executable graph still calls these kernels.
         reclaim::defer(move || {
-            driver::in_context(context.raw(), |driver| {
-                driver.check(
-                    // SAFETY: the library is owned and unloaded once.
-                    unsafe { (driver.library_unload)(raw as Handle) },
-                    "cuLibraryUnload",
-                )
-            })
+            let driver = driver::driver()?;
+            let _context = device.enter()?;
+            driver.check(
+                // SAFETY: the library is owned and unloaded once.
+                unsafe { (driver.library_unload)(raw as Handle) },
+                "cuLibraryUnload",
+            )
         });
     }
 }
