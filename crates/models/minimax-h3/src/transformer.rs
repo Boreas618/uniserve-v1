@@ -154,7 +154,7 @@ fn chunks(table: TensorView, width: u64, first: u64) -> Result<(Weight, Weight, 
             ptr,
             table.dtype,
             Shape::new(&[rows, width]),
-            ops::Strides::new(&[stride, 1]),
+            nn::Strides::new(&[stride, 1]),
         );
         Ok(borrowed(view)?)
     };

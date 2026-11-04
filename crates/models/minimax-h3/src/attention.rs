@@ -21,11 +21,10 @@
 //! composed from `nn::layers::VsaTiles` and `nn::layers::SegmentAttention` and lands with them
 //! (see `crate::transformer`'s note on the sparse preset).
 
-use nn::layers::{Attention, Linear, Rotary, Sections, UlyssesExchange};
+use nn::layers::{Attention, Linear, Rotary, Rotation, Sections, UlyssesExchange};
 use nn::weights::{Weight, WeightLoader, WeightRequest};
 use nn::{Forward, Shape, TensorView};
 use ops::gemm::WeightOrder;
-use ops::rope::Rotation;
 
 use crate::config::TransformerConfig;
 use crate::partition::Partition;
