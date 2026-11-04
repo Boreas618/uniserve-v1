@@ -81,6 +81,7 @@ impl Layer {
         index: u32,
         config: &TransformerConfig,
         rows: u32,
+        tile_bound: u32,
         partition: &Partition,
         loader: &mut WeightLoader<'_>,
     ) -> Result<Self> {
@@ -96,6 +97,7 @@ impl Layer {
                 config,
                 rows,
                 &ROTATED_AXES,
+                tile_bound,
                 partition,
                 loader,
             )?,
@@ -679,6 +681,7 @@ impl Transformer {
         config: &TransformerConfig,
         kind: AttentionKind,
         rows: u32,
+        tile_bound: u32,
         partition: &Partition,
         loader: &mut WeightLoader<'_>,
         heads: Option<StudentHeads>,
@@ -710,7 +713,7 @@ impl Transformer {
         let video_in = u64::from(config.video_channels) * 4;
         let audio_in = u64::from(config.audio_channels);
         let layers = (0..config.num_hidden_layers)
-            .map(|index| Layer::load(kind, index, config, rows, partition, loader))
+            .map(|index| Layer::load(kind, index, config, rows, tile_bound, partition, loader))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             proj_in: projection_with_bias(loader, "proj_in", hidden, video_in)?,
