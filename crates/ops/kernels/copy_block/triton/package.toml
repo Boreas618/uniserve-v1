@@ -1,0 +1,35 @@
+# The copy_block operator's Triton backend: design 5.2's program package.
+#
+# One module per descriptor, and the descriptor is the two element types: the four extents and both
+# stride vectors are launch words, because a clip's tile geometry changes per request and a program
+# per canvas would break a captured call on the next one. There is no permutation dimension: a
+# permutation is the source's strides permuted, which is a launch value like any other.
+#
+# The element block is compiled into the module and is the operator's own constant, so a change of
+# block is a change of this package rather than a new key.
+
+op = "copy_block"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+
+[source]
+kind = "triton"
+files = ["src/copy_block.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+# `source_bf16_out_bf16`.
+[kernel.descriptors]
+dimensions = { source = ["bf16", "f16", "f32"], out = ["bf16", "f16", "f32"] }
+
+[parameters]
