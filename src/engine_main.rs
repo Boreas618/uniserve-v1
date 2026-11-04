@@ -1571,9 +1571,10 @@ impl MainProcess {
     ) -> Result<()> {
         self.discard_policy();
         // The executors already rebound or recaptured this generation's graphs, and a generation
-        // that never serves must give its captures back (§7.3 step 2): `purge` releases what is
-        // older than the serving generation, which a discarded one is not, so the executor drops it
-        // by name. A device still busy with the capture is answered by the queue's own order.
+        // that never serves must give its captures back (§7.3 step 2). A purge names a generation a
+        // switchover or a revert released, and this one was never cut over, so it is discarded: the
+        // executor drops exactly this generation's graphs and kernels. A device still busy with the
+        // capture is answered by the queue's own order.
         for executor in &self.executors {
             match executor.discard(generation) {
                 Ok(submission) => {
