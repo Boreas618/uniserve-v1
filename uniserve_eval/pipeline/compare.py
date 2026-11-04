@@ -27,6 +27,11 @@ from ..accuracy import DifferenceInterval, Proportion, difference_interval
 # The task every compared bundle must have run.
 GSM8K_TASK = "gsm8k"
 
+# The protocol's sample size: GSM8K's complete test split. Two runs of another
+# size are not the confirmation the design defines, since the acceptance
+# interval's width is a function of this count.
+GSM8K_ROWS = 1319
+
 
 @dataclass(frozen=True)
 class Bundle:
@@ -198,6 +203,10 @@ def _require_comparable(reference: Bundle, candidate: Bundle) -> None:
     count = reference_rows.get("count")
     if not isinstance(count, int) or isinstance(count, bool):
         raise ValueError("the selected sample set has no row count")
+    if count != GSM8K_ROWS:
+        raise ValueError(
+            f"the runs scored {count} rows, not the protocol's {GSM8K_ROWS}"
+        )
 
     reference_workload = _mapping(reference.summary.get("workload"), "workload")
     candidate_workload = _mapping(candidate.summary.get("workload"), "workload")
