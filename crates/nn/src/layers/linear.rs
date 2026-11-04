@@ -404,16 +404,23 @@ impl Nvfp4Linear {
             .map_err(|_| Error::shape("Nvfp4Linear", format!("{rows} activation rows")))?;
 
         // 1. Encode the activation into the layout the product reads, into this forward's scratch.
+        //
+        // The encode is two-level: the block's E4M3 scale is relative to the row's own factor
+        // (`amax(row) · global_scale`), and the product dequantizes a code as
+        // `code · block_scale · row factor`. So the factor is an operand of the encode and an
+        // output of it, one per row.
         let arena = f.arena();
         let values = arena.tensor(ops::DType::U8, ops::Shape::new(&[rows, k / 2]))?;
         let scale_shape = self.layout.shape(rows, k);
         let scales = arena.tensor(ops::DType::U8, scale_shape)?;
+        let token_scale = arena.tensor(ops::DType::F32, ops::Shape::new(&[rows]))?;
         let quantize = self.encode_descriptor();
         let encoded = QuantizeArgs {
             input,
             values,
             scales,
             global_scale: self.input_scale.view(),
+            token_scale,
         };
         f.operate::<Nvfp4Quantize>(&quantize, encoded)?;
 

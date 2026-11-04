@@ -87,6 +87,23 @@ fn load_with(
 ) -> Result<Qwen3Moe> {
     let config = Config::read(root)?;
     partition.validate(&config)?;
+    // The plan reserves the encoded step's buffers from this option, so a deployment that names the
+    // wrong encoding would size an arena its own step writes past. The checkpoint decides it, and
+    // the loader is where the two meet.
+    let encoded = matches!(quantization, Quantization::Nvfp4(_))
+        && config.num_experts > 0
+        && config.has_sparse_layers();
+    if options.experts_encoded != encoded {
+        return Err(Error::Config(format!(
+            "the options say the experts are {} and the checkpoint's experts are {}",
+            if options.experts_encoded {
+                "encoded"
+            } else {
+                "dense"
+            },
+            if encoded { "encoded" } else { "dense" }
+        )));
+    }
     let sources = sources(&config);
 
     let hidden = as_u64(config.hidden_size, "hidden_size")?;

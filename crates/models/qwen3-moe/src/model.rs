@@ -39,7 +39,7 @@
 use nn::capability::{CausalLm, KvView, TokenBatch};
 use nn::forward::ALIGNMENT;
 use nn::layers::{
-    Attention, Embedding, Linear, Moe, ParallelLMHead, RmsNorm, Rotary, SwiGlu,
+    Attention, Embedding, Linear, Moe, ParallelLMHead, RmsNorm, Rotary, SwiGlu, TILE_ROWS,
     TRTLLM_WORKSPACE_BYTES,
 };
 use nn::model::{Block, BlockName, Model};
@@ -56,6 +56,13 @@ pub struct LoadOptions {
     pub attention_workspace_bytes: u64,
     /// Tokens one prefix-cache page holds; the deployment's cache decides it.
     pub page_tokens: u32,
+    /// Whether the checkpoint's experts were read as calibrated NVFP4, which makes every routed
+    /// layer's step encode its activations and read the packed products.
+    ///
+    /// It is a load option because it is a property of the checkpoint the loader read, and the plan
+    /// has to know it: the encoded step's buffers are the plan's to reserve, and a plan built for
+    /// dense experts would size an arena the encoded step writes past.
+    pub experts_encoded: bool,
 }
 
 impl Default for LoadOptions {
@@ -65,6 +72,7 @@ impl Default for LoadOptions {
         Self {
             attention_workspace_bytes: TRTLLM_WORKSPACE_BYTES,
             page_tokens: 64,
+            experts_encoded: false,
         }
     }
 }
@@ -148,6 +156,12 @@ pub struct Plan {
     pub gathered: u64,
     /// Bytes of the attention program's workspace.
     pub workspace: u64,
+    /// Bytes the encoded expert step reserves in the routed layers; zero when the experts are dense
+    /// or no layer routes.
+    ///
+    /// One reservation serves every routed layer, as the rest of the plan does: the step's buffers
+    /// are reused as the layer loop advances.
+    pub moe: u64,
 }
 
 impl Plan {
@@ -189,6 +203,25 @@ impl Plan {
                 0
             },
             workspace: options.attention_workspace_bytes,
+            moe: if options.experts_encoded && config.num_experts > 0 {
+                // The activation encoding's block scales are the CUTLASS product's plain layout.
+                nn::layers::encoded_bytes(
+                    tokens,
+                    nn::layers::EncodedGeometry {
+                        hidden: element(config.hidden_size, "hidden_size")?,
+                        intermediate: element(
+                            config.moe_intermediate_size,
+                            "moe_intermediate_size",
+                        )?,
+                        top: element(config.num_experts_per_tok, "num_experts_per_tok")?,
+                        experts: element(config.num_experts, "num_experts")?,
+                        tile: u64::from(TILE_ROWS),
+                    },
+                    ops::fp4::ScaleLayout::Linear,
+                )
+            } else {
+                0
+            },
         })
     }
 
@@ -210,6 +243,7 @@ impl Plan {
             (self.tokens * self.query, dtype),        // attended output
             (self.tokens * self.feed_forward, dtype), // dense gate
             (self.tokens * self.feed_forward, dtype), // dense up
+            (self.moe, DType::U8),                    // the encoded expert step
             (self.tokens * self.vocabulary, dtype),   // the vocabulary shard's logits
             (self.tokens * self.gathered, dtype),     // the gathered logits, absent on one rank
         ] {
@@ -856,6 +890,37 @@ mod tests {
             sharded.bytes(DType::BF16).unwrap() > sharded.vocabulary * 2,
             "the gather's own rows are reserved"
         );
+    }
+
+    /// An encoded expert step's buffers are the plan's to reserve: the arena is sized from the
+    /// plan, and the step writes past a plan that forgot them. So the plan states them when the
+    /// checkpoint's experts were read as NVFP4, and nothing when they were dense.
+    #[test]
+    fn an_encoded_expert_step_is_planned_and_a_dense_one_is_not() {
+        let config = config();
+        let partition = Partition::single();
+        let dense = Plan::new(&config, &partition, 15, &LoadOptions::default()).unwrap();
+        assert_eq!(dense.moe, 0);
+        let encoded = Plan::new(
+            &config,
+            &partition,
+            15,
+            &LoadOptions {
+                experts_encoded: true,
+                ..LoadOptions::default()
+            },
+        )
+        .unwrap();
+        // The permutation's worst case: 120 expanded routes over 128 experts at 128-row tiles is one
+        // tile per route, so the step reserves 15360 permuted rows rather than 120.
+        let routes = 120 * 128;
+        let down_rows = routes * 2048 * 2;
+        assert!(
+            encoded.moe >= down_rows,
+            "the encoded step reserves {} bytes, the down product's rows alone are {down_rows}",
+            encoded.moe
+        );
+        assert!(encoded.bytes(DType::BF16).unwrap() > dense.bytes(DType::BF16).unwrap());
     }
 
     #[test]
