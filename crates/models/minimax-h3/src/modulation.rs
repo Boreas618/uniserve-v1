@@ -236,8 +236,6 @@ pub fn entries(video: &[f32], audio: &[f32], groups: Groups) -> Result<(Vec<f32>
             audio.len()
         )));
     }
-    /// The clean level a visual condition is anchored at: the last sigma point of the schedule.
-    const CLEAN: f32 = 0.999;
     let mut times: Vec<f32> = Vec::new();
     let mut table = Vec::with_capacity(video.len() * groups.count() as usize);
     for (video, audio) in video.iter().zip(audio) {
@@ -245,7 +243,7 @@ pub fn entries(video: &[f32], audio: &[f32], groups: Groups) -> Result<(Vec<f32>
         if groups == Groups::Conditioned {
             // A visual condition sits at the generated video's level until that level is cleaner
             // than its anchor, and an audio reference is always clean.
-            levels.push(video.max(CLEAN));
+            levels.push(video.max(crate::denoiser::VISUAL_CONDITION_TIME));
             levels.push(1.0);
         }
         for level in levels {
