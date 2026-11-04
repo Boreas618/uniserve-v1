@@ -1202,24 +1202,35 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
         // The attention: 32 heads of 64 with as many key/value heads, a dense mask, no window, and
         // **no offsets** - `attend_dense(..., None, None, rows, ...)` attends one clip as one
         // sequence, and the key names that form only by its `cu_seq_lens_false` suffix.
-        push(
-            "dense_attention",
-            ops::attention::DenseDescriptor {
-                query: vae,
-                key_value: vae,
-                output: vae,
-                head_dim: 64,
-                q_heads: 32,
-                kv_heads: 32,
-                mask: ops::attention::Mask::Dense,
-                windowed: false,
-                // A launch bound outside the key: one tile's rows are `voxels + registers + 1` for a
-                // 256 x 256 x 5 tile, and 2048 covers the largest tile the plan decodes.
-                max_kv_len: 2048,
-                cu_seq_lens: false,
-            }
-            .to_string(),
-        );
+        //
+        // **A named gap, not a missing row: only the FP32 backend serves the offset-free form.**
+        // `dense_attention/fa4` is the F16/BF16 backend and its package states why it serves the packed
+        // form alone - FlashAttention-4's interface takes the sequence offsets, so a key without them
+        // is not a launch it can make. So an export that stores its VAE half has the decoder's
+        // attention unresolved until either this call passes one sequence's offsets (`[0, rows]`, the
+        // packed form every other consumer uses) or the FP32 backend's SGEMM program gains an F16
+        // form. Neither is this list's to choose; writing the row here would be a cell no program can
+        // run, which is the one thing this list does not do.
+        if vae == DType::F32 {
+            push(
+                "dense_attention",
+                ops::attention::DenseDescriptor {
+                    query: vae,
+                    key_value: vae,
+                    output: vae,
+                    head_dim: 64,
+                    q_heads: 32,
+                    kv_heads: 32,
+                    mask: ops::attention::Mask::Dense,
+                    windowed: false,
+                    // A launch bound outside the key: one tile's rows are `voxels + registers + 1` for
+                    // a 256 x 256 x 5 tile, and 2048 covers the largest tile the plan decodes.
+                    max_kv_len: 2048,
+                    cu_seq_lens: false,
+                }
+                .to_string(),
+            );
+        }
         // Its projections, at the VAE's own type: the input projection, the three q/k/v projections
         // and `proj_out` carry a bias, while `to_out` and `ff.net.2` fold theirs into the residuals.
         for epilogue in [ops::gemm::Epilogue::None, ops::gemm::Epilogue::Bias] {
@@ -1237,6 +1248,27 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
                 .to_string(),
             );
         }
+    }
+
+    // ---- The video VAE encoder's residual adds.
+    //
+    // Every block of the encoder adds its convolution pair's output back into its input
+    // (`ScaledAdd.forward(f, rows(out), rows(residual), 1.0, 1.0)`) at that stage's own channel count -
+    // `block_out_channels [128, 256, 256, 512, 512, 1024]`, so four distinct widths, and the encoder is
+    // FP32 throughout. `scaled_add` is the operator that widens and narrows in the diffusion path, and
+    // no row of it existed at any of these four widths: the encoder's residual adds are the only
+    // consumer of that family at a VAE channel count.
+    for columns in [128_u32, 256, 512, 1024] {
+        push(
+            "scaled_add",
+            ops::residual::ScaledAddDescriptor {
+                target: DType::F32,
+                source: DType::F32,
+                columns,
+                block: ops::residual::RESIDUAL_BLOCK,
+            }
+            .to_string(),
+        );
     }
 
     // ---- The video VAE's encoder, `vae/config.json` and `encoding.rs`'s own construction.
@@ -1314,6 +1346,14 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
     // Ulysses-2 shard are two calls of the same block rather than two code paths. Every key here is
     // bound by a `t2va` request's first stage, which is why they belong in the list even though no
     // DiT stage binds them.
+    //
+    // **The mask is `causal`, and the tower's is `dense`: one stage reads both.** The base text
+    // encoder hands the language stack `VarlenInput(lengths, lengths, (True,) * len(counts))`
+    // (`uniserve/models/encoder.py:482`) - a prompt is a causal sequence - while the vision tower
+    // hands its rows `(False,)` (`uniserve/models/qwen3_vl/vision.py:281`), because a patch sees the
+    // whole image. This table said `dense` for the text stack until a device asked for
+    // `mask_causal` by name on the first block of stage 4, which is the only instrument that could
+    // have told us: both keys have the same shape, the same heads and the same dtypes.
     for heads in [64_u32, 32] {
         push(
             "dense_attention",
@@ -1324,7 +1364,7 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
                 head_dim: 128,
                 q_heads: heads,
                 kv_heads: heads / 8,
-                mask: ops::attention::Mask::Dense,
+                mask: ops::attention::Mask::Causal,
                 windowed: false,
                 // A prompt's token count is a launch value, not part of the key: the bound below is
                 // the text capacity's own, and the reference masks query rows past the prompt.
