@@ -176,9 +176,9 @@ impl Op for Nvfp4Quantize {
         args.values
             .require_row(Self::NAME, DType::U8, columns / 2)?;
         args.scales
-            .require_shape(Self::NAME, descriptor.layout.shape(rows, columns))?;
+            .require_row(Self::NAME, DType::U8, args.scales.shape.last())?;
         args.scales
-            .require_row(Self::NAME, DType::U8, args.scales.numel())?;
+            .require_shape(Self::NAME, descriptor.layout.shape(rows, columns))?;
 
         let elements = rows * columns;
         let mut arguments = Arguments::new();
@@ -322,10 +322,14 @@ impl Op for Nvfp4Gemm {
         args.weight
             .require_shape(Self::NAME, Shape::new(&[n, u64::from(descriptor.k / 2)]))?;
         args.weight.require_row(Self::NAME, DType::U8, k)?;
+        args.input_scales
+            .require_row(Self::NAME, DType::U8, args.input_scales.shape.last())?;
         args.input_scales.require_shape(
             Self::NAME,
             descriptor.layout.shape(m, u64::from(descriptor.k)),
         )?;
+        args.weight_scales
+            .require_row(Self::NAME, DType::U8, args.weight_scales.shape.last())?;
         args.weight_scales.require_shape(
             Self::NAME,
             ScaleLayout::Swizzled128X4.shape(n, u64::from(descriptor.k)),
