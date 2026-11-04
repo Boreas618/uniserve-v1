@@ -129,6 +129,13 @@ struct Args {
     arena_gib: u64,
     /// The sampling key of stage `denoise`: one seed for the whole request's stream.
     seed: u64,
+    /// The deployment's stated element type; `None` is `dtype = "auto"`, the checkpoint's own.
+    ///
+    /// This is the loader's policy and not a harness convenience: `WeightLoader` converts once, at
+    /// load, and every block takes its type from the weights it was published (specs/worker.md §1).
+    /// Stating it here is how the conversion path - a deployment whose `dtype` differs from its
+    /// export - reaches the model through the same boundary a served request uses.
+    dtype: Option<DType>,
     /// How many of the checkpoint schedule's evaluations stage `denoise` runs; `None` is all of them.
     evaluations: Option<u32>,
     out: PathBuf,
@@ -149,6 +156,7 @@ impl Args {
             text_tokens: 64,
             arena_gib: 12,
             seed: 0,
+            dtype: None,
             evaluations: None,
             out: PathBuf::from("artifacts/h3-dit-layer0"),
         };
@@ -242,13 +250,26 @@ impl Args {
                     })?;
                     args.evaluations = Some(count);
                 }
+                "--dtype" => {
+                    args.dtype = match value("--dtype")?.as_str() {
+                        "auto" => None,
+                        "f32" | "float32" => Some(DType::F32),
+                        "bf16" | "bfloat16" => Some(DType::BF16),
+                        "f16" | "float16" => Some(DType::F16),
+                        other => {
+                            return Err(Failure::message(format!(
+                                "unknown dtype `{other}`; expected auto, bf16, f32 or f16"
+                            )));
+                        }
+                    };
+                }
                 "--out" => args.out = PathBuf::from(value("--out")?),
                 "--help" | "-h" => {
                     return Err(Failure::message(
                         "dit_layer --stage weights|block|denoise [--root PATH] [--store PATH] \
                          [--dit base|ref] [--device N] [--layers N] [--frames N] [--width N] \
                          [--height N] [--text-tokens N] [--arena-gib N] [--seed N] \
-                         [--evaluations N] [--out DIR]",
+                         [--evaluations N] [--dtype auto|bf16|f32|f16] [--out DIR]",
                     ));
                 }
                 other => {
@@ -355,7 +376,7 @@ fn stage_weights(args: &Args) -> Result<()> {
     let mut store = HostWeights::default();
     let rows = Layouts::new(denoiser.clone(), partition.arrangement(&denoiser)?)?.rows_bound()?;
     {
-        let mut loader = WeightLoader::new(dit, &mut store, None, None);
+        let mut loader = WeightLoader::new(dit, &mut store, args.dtype, None);
         let _stack = Transformer::load(
             config,
             denoiser.attention,
@@ -486,7 +507,7 @@ fn stage_denoise(args: &Args) -> Result<()> {
     let mut weights = DeviceWeights::new(&device, 0)?;
     let rows = layouts.rows_bound()?;
     let block = {
-        let mut loader = WeightLoader::new(dit, &mut weights, None, None);
+        let mut loader = WeightLoader::new(dit, &mut weights, args.dtype, None);
         Denoiser::load(
             denoiser_config.clone(),
             arrangement,
@@ -993,7 +1014,7 @@ fn stage_block(args: &Args) -> Result<()> {
     // 4. Weights on the device, through the loader's own boundary.
     let mut weights = DeviceWeights::new(&device, 0)?;
     let (stack, projections, cache, memory) = {
-        let mut loader = WeightLoader::new(dit, &mut weights, None, None);
+        let mut loader = WeightLoader::new(dit, &mut weights, args.dtype, None);
         let rows = layouts.rows_bound()?;
         let stack = Transformer::load(
             &config,
