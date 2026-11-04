@@ -403,6 +403,14 @@ fn main() {
         (48, 48), // 768x768
         (48, 64), // 768x1024
         (42, 48), // 672x768
+        // The 480p class: its caps give pixel sides like 992 and 832, but a canvas side is a
+        // multiple of 32, so every latent side stays even.
+        (62, 26), // 992x416
+        (52, 30), // 832x480
+        (40, 30), // 640x480
+        (30, 30), // 480x480
+        (30, 40), // 480x640
+        (30, 52), // 480x832
     ] {
         for mode in [ops::patch::Mode::Patchify, ops::patch::Mode::Unpatchify] {
             push(
