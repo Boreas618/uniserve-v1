@@ -1128,16 +1128,23 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         let mut jobs = Vec::new();
         let mut buckets: std::collections::BTreeSet<Bucket> = std::collections::BTreeSet::new();
         for (operator, key) in changed {
+            // The buckets that launch this operator, whichever key they use: a program under a new
+            // key of the same operator changes the launch structure of the buckets that launch the
+            // operator at all, and only a walk over them can tell rebind from recapture (4.5).
             for bucket in self.graphs.using(operator, self.generation.number()) {
-                // The paired forward runs first: a difference beyond the operator's tolerance
-                // fails the precopy before anything is rebound or recaptured (7.3).
-                jobs.push(Job::Shadow {
-                    runner: self.id,
-                    operator,
-                    key: key.clone(),
-                    bucket,
-                    generation: next.number(),
-                });
+                // The paired forward runs first, and only where the two generations have a program
+                // under this same key: a kernel cannot be compared with one of another descriptor
+                // (`Forward::operate` pairs on operator and key), so a new key's bucket is left to
+                // the walk, which recaptures it.
+                if next.kernel(operator, &key).is_ok() {
+                    jobs.push(Job::Shadow {
+                        runner: self.id,
+                        operator,
+                        key: key.clone(),
+                        bucket,
+                        generation: next.number(),
+                    });
+                }
                 buckets.insert(bucket);
             }
         }
