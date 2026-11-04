@@ -26,8 +26,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use futures::FutureExt as _;
 use proto::handoff;
+use anyhow::Context as _;
 use thiserror_ext::AsReport as _;
-use tracing::{Level, error, trace};
+use tracing::{error, trace};
 
 use crate::http::stream::{Application, Session, Step};
 use crate::metrics::stats::RequestOutcome;
@@ -58,6 +59,9 @@ pub(crate) struct ChatOutputInputs {
     pub(crate) logprobs: bool,
     /// The request's reasoning and tool-call parsers.
     pub(crate) processor: ChatOutputProcessor,
+    /// The parser set the request's model family chose, which the process
+    /// that continues the response rebuilds the same processors from.
+    pub(crate) parser: handoff::Parser,
     /// The response's OpenAI fields.
     pub(crate) context: ChatResponseContext,
 }
@@ -74,6 +78,7 @@ pub(crate) struct GenerationRun {
     logprobs: bool,
     decode: DecodeStream,
     processor: ChatOutputProcessor,
+    parser: handoff::Parser,
     blocks: StructuredEventState,
     clock: StreamClock,
     emitter: ChatStreamEmitter,
@@ -110,6 +115,7 @@ impl GenerationRun {
             prompt_logprobs,
             logprobs,
             processor,
+            parser,
             context,
         } = inputs;
         let stream = DecodeStream::new(
@@ -131,6 +137,7 @@ impl GenerationRun {
             logprobs,
             decode: stream,
             processor,
+            parser,
             blocks: StructuredEventState::new(),
             clock: StreamClock::new(started, compile_us),
             emitter: ChatStreamEmitter::new(&context, created),
@@ -271,6 +278,99 @@ impl GenerationRun {
         Ok(frames)
     }
 
+    /// Continues the response `state` describes, whose engine events arrive
+    /// on `events`, taken over from the connection that consumed them
+    /// (design §7.5.1 step 4): the successor rebuilds the pipeline the state
+    /// states from its own tokenizer and model family, then resumes every
+    /// stage where the predecessor stopped.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the state names no response or no prompt, or when the
+    /// family's parsers cannot be built.
+    pub(crate) fn resume(
+        state: &handoff::ChatStream,
+        tokenizer: DynTokenizer,
+        events: RequestEvents,
+        outcome: RequestOutcome,
+    ) -> anyhow::Result<Self> {
+        let lowering = state
+            .lowering
+            .as_ref()
+            .context("a handed response states no lowering")?;
+        let response = lowering
+            .response
+            .as_ref()
+            .context("a handed response states no response fields")?;
+        let context = ChatResponseContext::from(response);
+        let request_id = context.request_id.clone();
+        let options = lowering
+            .decode_options
+            .as_ref()
+            .map(decode_options)
+            .unwrap_or_default();
+        let parser = lowering.parser.clone().unwrap_or_default();
+        let mut decode_options = options.clone();
+        let kind = handoff::parser::Kind::try_from(parser.kind)
+            .unwrap_or(handoff::parser::Kind::ParserKindNone);
+        let mut processor = match kind {
+            handoff::parser::Kind::ParserKindQwen3 => ChatOutputProcessor::qwen3(
+                parser.parse_tools.then_some(&[][..]),
+                tokenizer.clone(),
+                parser.parse_reasoning,
+            )?,
+            handoff::parser::Kind::ParserKindGemma4 => ChatOutputProcessor::gemma4(
+                parser.parse_tools,
+                &mut decode_options,
+                tokenizer.clone(),
+                parser.parse_reasoning,
+            )?,
+            handoff::parser::Kind::ParserKindSenseNova
+            | handoff::parser::Kind::ParserKindNone => ChatOutputProcessor::new(None, None),
+        };
+        if let Some(parsers) = state.processor.as_ref() {
+            processor.resume(parsers);
+        }
+        let decode = DecodeStream::resume(
+            request_id.clone(),
+            tokenizer.clone(),
+            lowering.prompt_token_ids.clone(),
+            lowering.prompt_logprobs,
+            lowering.logprobs,
+            options,
+            state.decode.as_ref().unwrap_or(&Default::default()),
+        )
+        .context("resuming the incremental decoder")?;
+        let assembly = state.assembly.clone().unwrap_or_default();
+        let mut blocks = StructuredEventState::new();
+        blocks.resume(&assembly);
+        let mut emitter = ChatStreamEmitter::new(&context, state.chunks.as_ref().map_or(0, |chunks| chunks.created));
+        if let Some(chunks) = state.chunks.as_ref() {
+            emitter.resume(chunks);
+        }
+        let created = state.chunks.as_ref().map_or(0, |chunks| chunks.created);
+        Ok(Self {
+            request_id,
+            created,
+            tokenizer,
+            prompt_token_ids: lowering.prompt_token_ids.clone(),
+            prompt_logprobs: lowering.prompt_logprobs,
+            logprobs: lowering.logprobs,
+            decode,
+            processor,
+            parser,
+            blocks,
+            clock: StreamClock::resume(&assembly, lowering.started_unix_us, lowering.compile_us),
+            emitter,
+            events,
+            image_count: assembly.images,
+            image_steps: assembly.image_steps,
+            context,
+            outcome,
+            ended: false,
+        })
+    }
+
     /// The state a successor goes on writing from, or `None` when this
     /// response cannot be handed over.
     pub(crate) fn freeze_state(&self) -> Option<handoff::ChatStream> {
@@ -288,7 +388,7 @@ impl GenerationRun {
                 decode_options: Some(decode_state(&self.decode.options())),
                 prompt_logprobs: self.prompt_logprobs,
                 logprobs: self.logprobs,
-                parser: None,
+                parser: Some(self.parser.clone()),
                 response: Some(handoff::ChatResponseOptions::from(&self.context)),
                 compile_us: self.clock.compile_us(),
                 started_unix_us: self.clock.started_unix_us(),
@@ -437,6 +537,21 @@ fn unix_us() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|since| since.as_micros() as u64)
         .unwrap_or_default()
+}
+
+impl From<&handoff::ChatResponseOptions> for ChatResponseContext {
+    fn from(state: &handoff::ChatResponseOptions) -> Self {
+        Self {
+            request_id: state.request_id.clone(),
+            response_model: state.response_model.clone(),
+            include_usage: state.include_usage,
+            requested_logprobs: state.requested_logprobs,
+            include_prompt_logprobs: state.include_prompt_logprobs,
+            include_reasoning: state.include_reasoning,
+            return_token_ids: state.return_token_ids,
+            return_tokens_as_token_ids: state.return_tokens_as_token_ids,
+        }
+    }
 }
 
 impl From<&ChatResponseContext> for handoff::ChatResponseOptions {

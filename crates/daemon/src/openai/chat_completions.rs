@@ -132,6 +132,7 @@ async fn chat_completions(
             processor,
         } = output;
         let request_id = response.request_id.clone();
+        let parser = processor.parser().clone();
         let inputs = crate::output::run::ChatOutputInputs {
             tokenizer,
             prompt_token_ids,
@@ -139,6 +140,7 @@ async fn chat_completions(
             prompt_logprobs,
             logprobs,
             processor,
+            parser,
             context: response,
         };
         let run = match crate::output::run::GenerationRun::new(
