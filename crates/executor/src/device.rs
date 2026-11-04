@@ -565,7 +565,7 @@ impl Device {
             }
             Command::Switchover(generation) => {
                 for named in &mut self.runners {
-                    named.runner.switchover(*generation);
+                    named.runner.switchover(*generation)?;
                 }
                 self.synchronize()?;
                 Ok(Step::Done(BatchOutput::default()))

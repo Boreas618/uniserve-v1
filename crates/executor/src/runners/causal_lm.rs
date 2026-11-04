@@ -1239,25 +1239,23 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         );
     }
 
-    fn switchover(&mut self, generation: u64) {
+    fn switchover(&mut self, generation: u64) -> Result<()> {
         // From the next batch on, the prepared generation serves; the old one stays for a revert
-        // (7.3 step 4). A generation that was not prepared here is a generation of kernels only,
-        // and is taken as the serving one unchanged.
+        // (7.3 step 4).
         let prepared = self.next.take().filter(|next| next.number() == generation);
-        let prepared = prepared.unwrap_or_else(|| {
-            // A generation this runner never prepared: the daemon and the executor disagree on
-            // what was precopied. The switchover still happens - the generation's kernels are the
-            // ones the caller named - but the report says the buckets must be captured again.
-            tracing::warn!(
-                generation,
-                "switched to a generation this runner did not prepare; its buckets have no graphs"
-            );
-            Arc::new(
-                self.generation
-                    .replace(generation, std::iter::empty::<ops::KernelEntry>()),
-            )
-        });
+        let Some(prepared) = prepared else {
+            // The daemon asks for the cut-over only after `precopy` built the generation. Taking
+            // the number anyway would serve a generation with no kernels and no graphs, which
+            // answers every later batch with "no graph for this bucket" - a disagreement between
+            // the daemon and this process stated as a defect rather than hidden as a switch.
+            return Err(Error::Invariant(format!(
+                "switchover to generation {generation} found no preparation: this runner serves \
+                 generation {} and prepared none other",
+                self.generation.number()
+            )));
+        };
         self.previous = Some(std::mem::replace(&mut self.generation, prepared));
+        Ok(())
     }
 
     fn attach_pools(&mut self, pools: Arc<std::sync::Mutex<Pools>>) {
