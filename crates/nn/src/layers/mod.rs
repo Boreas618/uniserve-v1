@@ -38,7 +38,7 @@ mod rows;
 mod sampler;
 mod segments;
 
-pub use activation::{GatedActivation, Gelu, PackedSwiGlu, Snake, SwiGlu};
+pub use activation::{GatedActivation, Gelu, PackedSwiGlu, Silu, Snake, SwiGlu};
 pub use attention::{Attention, AttentionBackend, TRTLLM_WORKSPACE_BYTES};
 pub use conv::{Conv1d, Conv3d, ConvGeometry, ConvTranspose1d};
 pub use embedding::Embedding;
@@ -54,7 +54,7 @@ pub use ops::rope::Rotation;
 pub use pool::AdaptivePool;
 pub use position::PositionInterpolate;
 pub use residual::{
-    ScaledResidual, ScaledResidualLayerNorm, ScaledResidualRmsNorm, WeightedRmsNorm,
+    ScaledAdd, ScaledResidual, ScaledResidualLayerNorm, ScaledResidualRmsNorm, WeightedRmsNorm,
 };
 pub use rope::Rotary;
 pub use rows::Rows;

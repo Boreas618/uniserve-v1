@@ -413,3 +413,31 @@ impl Snake {
         f.operate::<ops::snake::Snake>(&descriptor, ops::snake::Args { x, alpha, out })
     }
 }
+
+/// The sigmoid linear unit on one buffer, `out = x / (1 + exp(−x))`.
+///
+/// A plain activation, not a gate: the timestep embedding is `Linear → SiLU → Linear` over one
+/// buffer, and folding it into a doubled gate buffer would compute a product nobody asks for
+/// (specs/worker.md 9, 门控残差; `ops::activation::Silu`).
+pub struct Silu;
+
+impl Silu {
+    /// `out = silu(x)` over the rows.
+    pub fn forward(&self, f: &Forward, x: TensorView, out: TensorView) -> Result<()> {
+        if x.shape.rank() != 2 || x.shape != out.shape {
+            return Err(Error::shape(
+                "Silu",
+                format!("{:?} into {:?}", x.shape.dims(), out.shape.dims()),
+            ));
+        }
+        let columns = u32::try_from(x.shape.last())
+            .map_err(|_| Error::shape("Silu", "more columns than a descriptor holds".to_owned()))?;
+        let descriptor = ops::activation::SiluDescriptor {
+            dtype: x.dtype,
+            columns,
+            block: BLOCK,
+            pdl: PDL,
+        };
+        f.operate::<ops::activation::Silu>(&descriptor, ops::activation::SiluArgs { x, out })
+    }
+}

@@ -330,3 +330,50 @@ impl ScaledResidualLayerNorm {
         f.operate::<LayerNormOp>(&descriptor, args)
     }
 }
+
+/// The diffusion solver's update: `target ← β · target + α · source`, in place.
+///
+/// The Euler step passes `α = σ_next − σ`, `β = 1`; the probability-flow start passes `β = σ₀`,
+/// `α = 0`. Both coefficients are host values, so a captured graph stays valid, and the two
+/// operands' element types differ on purpose — a BF16 trajectory stepped by an FP32 velocity
+/// (specs/worker.md 9, 求解器; `ops::residual::ScaledAdd`).
+pub struct ScaledAdd;
+
+impl ScaledAdd {
+    /// `target ← β · target + α · source` over `[rows, columns]`, writing `target` in place.
+    pub fn forward(
+        &self,
+        f: &Forward,
+        target: TensorView,
+        source: TensorView,
+        alpha: f32,
+        beta: f32,
+    ) -> Result<()> {
+        if target.shape.rank() != 2 || target.shape != source.shape {
+            return Err(Error::shape(
+                "ScaledAdd",
+                format!("{:?} with {:?}", target.shape.dims(), source.shape.dims()),
+            ));
+        }
+        let descriptor = residual::ScaledAddDescriptor {
+            target: target.dtype,
+            source: source.dtype,
+            columns: u32::try_from(target.shape.last()).map_err(|_| {
+                Error::shape(
+                    "ScaledAdd",
+                    "more columns than a descriptor holds".to_owned(),
+                )
+            })?,
+            block: BLOCK,
+        };
+        f.operate::<residual::ScaledAdd>(
+            &descriptor,
+            residual::ScaledAddArgs {
+                target,
+                source,
+                alpha,
+                beta,
+            },
+        )
+    }
+}
