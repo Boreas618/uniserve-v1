@@ -781,11 +781,21 @@ impl MainProcess {
         // shadow region and the state group's snapshot are one reservation (4.5), and a second
         // computation here could disagree with the pool the allocator reserved.
         let scratch = graph.scratch;
+        // The shadow region alone: the twins allocate it, and the reservation beside it holds the
+        // state group's snapshot too (7.3, 4.5).
+        let shadow = graph.shadow;
         for device in plan.devices() {
             let generation = Arc::new(Generation::new(epoch.generation, std::iter::empty()));
             let runners = plan.runners(*device, Arc::clone(&model), &mut memory, &generation)?;
             let executor =
-                Executor::spawn(*device, runners, plan.events(), Arc::clone(&pools), scratch)?;
+                Executor::spawn(
+                    *device,
+                    runners,
+                    plan.events(),
+                    Arc::clone(&pools),
+                    scratch,
+                    shadow,
+                )?;
             // §7.3 step 2 shadows a replaced operator beside the serving one, so the region it runs
             // in is mapped before any batch: the executor books it from the scratch pool the graph
             // storage sized. Nothing is serving yet, so the control thread waits here; `serve`
