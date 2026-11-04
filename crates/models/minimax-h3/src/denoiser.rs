@@ -443,6 +443,18 @@ impl Layouts {
                 dtype: DType::I32,
                 shape: Shape::new(&[rows]),
             },
+            // The text refiner's own boundaries: its queries are every padded row and its keys stop
+            // at the prompt's last row, so a padding row is never a key of any document.
+            StateTable {
+                name: "refiner_cu_seq_lens_k",
+                dtype: DType::I32,
+                shape: Shape::new(&[2]),
+            },
+            StateTable {
+                name: "refiner_cu_seq_lens_q",
+                dtype: DType::I32,
+                shape: Shape::new(&[2]),
+            },
             // The step the schedule evaluates: written by the executor before each replay, one
             // value per (request, capture) rather than per row.
             StateTable {
@@ -497,6 +509,18 @@ impl Layouts {
                 name: "prefix_index",
                 dtype: DType::I32,
                 shape: Shape::new(&[rows]),
+            },
+            // The text refiner's own boundaries: its queries are every padded row and its keys stop
+            // at the prompt's last row, so a padding row is never a key of any document.
+            StateTable {
+                name: "refiner_cu_seq_lens_k",
+                dtype: DType::I32,
+                shape: Shape::new(&[2]),
+            },
+            StateTable {
+                name: "refiner_cu_seq_lens_q",
+                dtype: DType::I32,
+                shape: Shape::new(&[2]),
             },
             StateTable {
                 // Over-allocated to the tile count and filled by segment index, exactly as the
@@ -599,10 +623,16 @@ impl Layouts {
             .iter()
             .map(|row| *row as i32)
             .collect();
-        let filled: [(&str, Vec<u8>); 10] = [
+        // The refiner's document: one prompt, so its queries are every padded row and its keys stop
+        // at the prompt's last row. The prompt's row count is the media clock's own start.
+        let refiner_q = integers(&[0, layout.text_rows as i32]);
+        let refiner_k = integers(&[0, request.text_tokens as i32]);
+        let filled: [(&str, Vec<u8>); 12] = [
             ("audio_indices", integers(&audio)),
             ("video_indices", integers(&video)),
             ("groups", integers(&tables.groups)),
+            ("refiner_cu_seq_lens_q", refiner_q.clone()),
+            ("refiner_cu_seq_lens_k", refiner_k.clone()),
             (
                 "modulation_indices",
                 modulation_indices(&tables.groups, &tables.token_tags),
@@ -707,11 +737,17 @@ impl Layouts {
         let queries = [0, rows as i32];
         let keys = [0, tables.used as i32];
         let specs = self.table_specs(layout)?;
+        // The text refiner's document: one prompt, so its queries are every padded row and its
+        // keys stop at the prompt's last row - a padding row is never a key of any document.
+        let refiner_k = integers(&[0, text_tokens as i32]);
+        let refiner_q = integers(&[0, layout.text_rows as i32]);
         for (name, bytes) in [
             ("audio_indices", integers(&audio_indices)),
             ("video_indices", integers(&video_indices)),
             ("cu_seq_lens_k", integers(&keys)),
             ("cu_seq_lens_q", integers(&queries)),
+            ("refiner_cu_seq_lens_k", refiner_k),
+            ("refiner_cu_seq_lens_q", refiner_q),
             ("groups", integers(&tables.groups)),
             (
                 "modulation_indices",
@@ -953,6 +989,8 @@ pub struct Denoiser {
     /// The schedule's entry times as their sinusoidal embedding, `[entries, frequency_dim]` FP32.
     frequencies: Weight,
     evaluations: u32,
+    /// The text refiner: the prompt features the DiT conditions on, refined once per request.
+    refiner: crate::conditioning::TokenRefiner,
     /// This rank's position in the sequence shard and the shard's degree.
     rank: u32,
     shard: u32,
@@ -1125,7 +1163,7 @@ impl nn::capability::Denoiser for Denoiser {
 }
 
 /// The state tables of a dense layout, in `table_specs`' order (sorted by name).
-const DENSE_TABLES: [&str; 10] = [
+const DENSE_TABLES: [&str; 12] = [
     "audio_indices",
     "cu_seq_lens_k",
     "cu_seq_lens_q",
@@ -1133,6 +1171,8 @@ const DENSE_TABLES: [&str; 10] = [
     "modulation_indices",
     "position_ids",
     "prefix_index",
+    "refiner_cu_seq_lens_k",
+    "refiner_cu_seq_lens_q",
     "step",
     "token_tags",
     "video_indices",
@@ -1143,12 +1183,14 @@ const DENSE_TABLES: [&str; 10] = [
 /// A segment layout has no `cu_seq_lens` pair and carries four tables a dense one does not, so the
 /// two sets do not share positions: a name resolved against the wrong set silently reads another
 /// tensor. [`Tables`] picks the set from the deployment's attention kind for exactly that reason.
-const SEGMENT_TABLES: [&str; 12] = [
+const SEGMENT_TABLES: [&str; 14] = [
     "audio_indices",
     "groups",
     "modulation_indices",
     "position_ids",
     "prefix_index",
+    "refiner_cu_seq_lens_k",
+    "refiner_cu_seq_lens_q",
     "segment_keep",
     "segment_starts",
     "step",
@@ -1187,6 +1229,35 @@ impl<'a> Tables<'a> {
 }
 
 impl Denoiser {
+    /// Refine one request's conditioning: the text encoder's features into the DiT's width.
+    ///
+    /// `source` is the encoder's `[rows, text_dim]` output and `text` the request's `[rows, hidden]`
+    /// conditioning buffer; both are the executor's, and neither is retained. The refiner's
+    /// document boundaries are the `refiner_cu_seq_lens_*` tables of `state`, so its queries are
+    /// every padded row and its keys stop at the prompt's last row.
+    ///
+    /// It runs once per request, before the first evaluation
+    /// (`uniserve/models/minimax_h3/generation.py:145-171`): the conditioning never changes across
+    /// a trajectory, so refining inside the step loop would pay twice per layer per evaluation for
+    /// a value that is already right.
+    pub fn refine_conditioning(
+        &self,
+        f: &Forward,
+        source: TensorView,
+        text: TensorView,
+        state: &[TensorView],
+    ) -> Result<()> {
+        let tables = Tables::new(self.config.attention, state);
+        let documents = crate::conditioning::Documents {
+            cu_seq_lens_q: tables.get("refiner_cu_seq_lens_q")?,
+            cu_seq_lens_k: tables.get("refiner_cu_seq_lens_k")?,
+            key_rows: self.refiner.rows(),
+        };
+        let total = u32::try_from(text.shape.dim(0))
+            .map_err(|_| Error::checkpoint("a conditioning row count above u32::MAX".to_owned()))?;
+        self.refiner.forward(f, source, &documents, total, text)
+    }
+
     /// One denoising step: the latents in, the model's velocity, and the schedule's update.
     ///
     /// The packed rows are assembled from the layout's tables: every row gathers its prefix source
@@ -1487,6 +1558,17 @@ impl Denoiser {
             heads,
         )?;
         let solver = Solver::load(&schedule, loader)?;
+        // The refiner reads the text encoder's features and writes the DiT's conditioning; its rows
+        // are bounded by the same packed-row bound the stack's attention is sized for.
+        // The refiner reads the encoder's rows, whose count is the text capacity - not the packed
+        // row bound: its scratch is sized per row it can see, and a packed bound would size it for
+        // every video row of the widest layout.
+        let refiner = crate::conditioning::TokenRefiner::load(
+            &config.transformer,
+            arrangement.text_rows,
+            partition,
+            loader,
+        )?;
         let rules = Layouts::new(config.clone(), arrangement)?;
         Ok(Self {
             config,
@@ -1500,6 +1582,7 @@ impl Denoiser {
             adaln_output,
             frequencies,
             evaluations,
+            refiner,
             rank: partition.tensor_rank as u32,
             shard: partition.ulysses_degree as u32,
         })
@@ -1643,7 +1726,46 @@ mod tests {
     }
 
     #[test]
-    fn a_sparse_layout_declares_its_tile_tables_and_fills_them() {
+    fn a_layout_declares_the_refiners_boundaries_and_fills_them() {
+        // The refiner's document is the prompt: its queries are every padded row and its keys stop
+        // at the prompt's last row, so a padding row is never a key. Both kinds declare the pair -
+        // a sparse deployment's attention reads tiles, but its refiner reads a document.
+        let rule = layouts();
+        let mut request = request(49, 640, 480);
+        request.text_tokens = 12;
+        let (layout, _) = rule.layout(&request).unwrap();
+        let specs = rule.table_specs(&layout).unwrap();
+        let names: Vec<&str> = specs.iter().map(|table| table.name).collect();
+        for name in ["refiner_cu_seq_lens_q", "refiner_cu_seq_lens_k"] {
+            assert!(names.contains(&name), "{name}");
+            let table = specs.iter().find(|table| table.name == name).unwrap();
+            assert_eq!(table.shape.dims(), &[2], "{name}");
+        }
+        let mut out: Vec<Vec<u8>> = specs
+            .iter()
+            .map(|table| {
+                vec![0_u8; (table.shape.numel() as usize) * table.dtype.bytes().unwrap() as usize]
+            })
+            .collect();
+        rule.write_state(&request, &layout, &mut out).unwrap();
+        let values = |name: &str| -> Vec<i32> {
+            let index = names.iter().position(|table| *table == name).unwrap();
+            out[index]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|word| i32::from_le_bytes(*word))
+                .collect()
+        };
+        assert_eq!(
+            values("refiner_cu_seq_lens_q"),
+            vec![0, layout.text_rows as i32]
+        );
+        assert_eq!(values("refiner_cu_seq_lens_k"), vec![0, 12]);
+    }
+
+    #[test]
+    fn a_sparse_layout_declares_the_refiners_boundaries_too() {
         let rule = sparse_layouts();
         let mut request = request(121, 1344, 768);
         request.text_tokens = 12;
