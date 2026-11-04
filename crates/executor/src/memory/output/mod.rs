@@ -95,9 +95,16 @@ pub struct OutputBuffer {
     copies_finished: bool,
     /// The batch's rows will never all be observed (a failed or cancelled
     /// batch), so its lease may retire without them. Read by [`Self::retired`],
-    /// which decides when the pool recycles the storage; [`Self::abandon`] is
-    /// the only writer, and the runner that fails a batch is the caller it
-    /// waits for - no consumer of [`OutputPool`] exists in this tree yet.
+    /// which decides when the pool recycles the storage.
+    ///
+    /// **The rule this marks:** a product that did not finish is not an answer,
+    /// and a reader that cannot tell it from a finished one will take the tail
+    /// of a cancelled generation as a result. So the path that ends a request
+    /// without success must mark its product abandoned, and whatever hands
+    /// products out must refuse an abandoned one by name. This slice has no
+    /// such path and no consumer of [`OutputPool`], so the field records a rule
+    /// the slice has yet to implement - [`Self::abandon`] is its only writer
+    /// and has no caller.
     abandoned: bool,
     timing_events: bool,
     reserved: Instant,

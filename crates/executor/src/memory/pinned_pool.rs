@@ -22,6 +22,21 @@ use crate::memory::allocation::Storage;
 const MIN_BLOCK: usize = 1 << 16;
 
 /// Reusable page-locked blocks for one CUDA device's copies.
+///
+/// The rule the type owns: a leased block returns to its pool when its last
+/// user drops it and is reused without a device synchronize, so a user whose
+/// device work reads a block retains the block until that work completed.
+///
+/// No path in this build leases a block. [`crate::memory::Memory::pinned`] is
+/// built and never read: the consumer that prepares request inputs on the host
+/// is the executor's input path, which this slice does not have. The two fields
+/// below are the rule's state and not leftovers - `free` is the free list
+/// `lease` hands out of and `PinnedBlock::drop` returns to, and `device`
+/// decides whether a new block is page-locked or pageable host storage.
+///
+/// These are bytes of **host** storage: nothing here books against the device's
+/// allowance or appears in `uniserve:memory_mapped`, so the delivery test's
+/// budget assertion neither reads nor needs this figure.
 pub struct PinnedPool {
     /// The device the blocks are page-locked for; `None` for pageable host
     /// storage.
