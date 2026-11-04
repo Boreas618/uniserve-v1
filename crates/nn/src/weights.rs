@@ -1074,13 +1074,18 @@ mod tests {
 
     #[test]
     fn half_round_trips_the_values_a_checkpoint_holds() {
-        for value in [0.0_f32, 1.0, -1.0, 0.5, 0.1, 65_504.0, 1e-5] {
-            let half = f32_to_half(value);
-            let back = half_to_f32(half);
-            assert!(
-                (back - value).abs() <= value.abs() * 1e-3,
-                "{value} became {back}"
-            );
+        // A subnormal half has an absolute precision of 2^-24, not a relative one, so the bound is
+        // half a unit there and relative only from the smallest normal upward.
+        const SMALLEST_NORMAL: f32 = 6.103_515_6e-5;
+        const HALF_UNIT: f32 = 2.980_232_2e-8;
+        for value in [0.0_f32, 1.0, -1.0, 0.5, 0.1, 65_504.0, 1e-5, 1.192_092_9e-7] {
+            let back = half_to_f32(f32_to_half(value));
+            let bound = if value.abs() < SMALLEST_NORMAL {
+                HALF_UNIT
+            } else {
+                value.abs() * 1e-3
+            };
+            assert!((back - value).abs() <= bound, "{value:e} became {back:e}");
         }
     }
 
@@ -1100,12 +1105,14 @@ mod tests {
                 "{value:e}"
             );
         }
-        // Below half a unit of the smallest subnormal the value is zero; at half a unit it is one.
+        // Below half a unit of the smallest subnormal the value is zero; past half a unit it is
+        // one, and exactly half a unit ties between 0 and 1, where even wins.
         assert_eq!(f32_to_half(2.0e-8), 0);
         assert_eq!(f32_to_half(-2.0e-8), 0x8000);
-        assert_eq!(f32_to_half(2.980_232e-8), 1);
+        assert_eq!(f32_to_half(2.980_232_2e-8), 0);
+        assert_eq!(f32_to_half(4.5e-8), 1);
         // A value that rounds up out of the subnormals becomes the smallest normal.
-        assert_eq!(f32_to_half(6.097_555_6e-5 + 1e-9), 0x0400);
+        assert_eq!(f32_to_half(6.101e-5), 0x0400);
         // Ties round to even, and the largest finite magnitude's neighbourhood rounds to infinity.
         assert_eq!(half_to_f32(f32_to_half(65504.0)), 65504.0);
         assert_eq!(f32_to_half(65_520.0), 0x7c00);
