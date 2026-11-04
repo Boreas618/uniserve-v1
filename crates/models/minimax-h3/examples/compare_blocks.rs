@@ -3,11 +3,11 @@
 //! Run it with
 //!
 //! ```text
-//! cargo run -p minimax-h3 --example compare_blocks -- --dumps <dir> [--out <report.json>]
+//! cargo run -p minimax-h3 --example compare_blocks -- --dumps <dir> [--out <report.md>]
 //! ```
 //!
-//! `<dir>` holds `case.json`, which describes the request whose layout is compared, and one
-//! `.h3t` file per tensor. `crates/models/minimax-h3/tools/dump_tables.py` writes both from
+//! `--out` writes the same table and its JSON block to one file. `<dir>` holds `case.json`, which
+//! describes the request whose layout is compared, and one `.h3t` file per tensor. `crates/models/minimax-h3/tools/dump_tables.py` writes both from
 //! `uniserve/models/minimax_h3/packing.py`, today's implementation; `notes/h3/numeric-diagnosis.md`
 //! holds the case format, the tensor container and what each name means.
 //!
@@ -362,9 +362,10 @@ enum Attention {
     Dense,
     Sparse {
         tile: u32,
-        sparsity: f32,
+        /// FP64, as the checkpoint states it and the reference computes `kept_tiles` in.
+        sparsity: f64,
         #[serde(default)]
-        reference_keep: Option<f32>,
+        reference_keep: Option<f64>,
     },
 }
 
