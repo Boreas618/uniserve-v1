@@ -58,6 +58,66 @@ pub struct PolicyProgram {
     pub arguments: Parameters,
 }
 
+impl PolicyProgram {
+    /// The program a daemon's `Precopy` states (§7.3 step 2, §5.1): the
+    /// backend, the revision, and the policy's arguments as the TOML text of
+    /// each configured value.
+    ///
+    /// The parameter names are the policy's own (§4.4, §7.7): this build knows
+    /// the ones [`Parameters`] declares, and an argument it does not know is
+    /// refused rather than ignored, because the program's arguments are the
+    /// program and serving under fewer of them is not serving under it.
+    pub fn from_arguments(
+        backend: impl Into<String>,
+        revision: u32,
+        arguments: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Self, PolicyError> {
+        let backend = backend.into();
+        let mut parameters = Parameters::default();
+        for (name, value) in arguments {
+            match name.as_str() {
+                "chunked_prefill_size" => {
+                    parameters.chunked_prefill_size = Some(argument(value, name)?)
+                }
+                "max_queued_requests" => {
+                    parameters.max_queued_requests = Some(argument(value, name)?)
+                }
+                "max_batch" => parameters.max_batch = Some(argument(value, name)?),
+                "max_num_batched_tokens" => {
+                    parameters.max_num_batched_tokens = Some(argument(value, name)?)
+                }
+                "prefetch_min_tokens" => {
+                    parameters.prefetch_min_tokens = Some(argument(value, name)?)
+                }
+                "timeout" => parameters.timeout = Some(argument(value, name)?),
+                "expected_speedup" => parameters.expected_speedup = Some(argument(value, name)?),
+                "refill_token_cost" => parameters.refill_token_cost = Some(argument(value, name)?),
+                other => {
+                    return Err(PolicyError::Load {
+                        message: format!(
+                            "the {backend} policy program states `{other}`, which this build's \
+                             policy arguments do not name"
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(Self {
+            backend,
+            revision,
+            arguments: parameters,
+        })
+    }
+}
+
+/// One configured argument of a program, parsed as the type the policy
+/// parameter has.
+fn argument<T: serde::de::DeserializeOwned>(value: &str, name: &str) -> Result<T, PolicyError> {
+    toml::from_str(&format!("value = {value}")).map_err(|error| PolicyError::Load {
+        message: format!("the policy argument `{name} = {value}` does not parse: {error}"),
+    })
+}
+
 /// The policy a scheduler configuration states, before the daemon names the
 /// revision it installed (§5.1).
 ///
@@ -98,18 +158,47 @@ pub fn parameters_of(config: &SchedulerConfig) -> Parameters {
     }
 }
 
-/// The build config's ceilings for a policy's limits (§4.4): the batch, token,
-/// queue, deepening and starvation bounds the epoch was built for.
+/// The build config's hard bounds on what one step may be given to run (§4.4):
+/// the calls and tokens the epoch's workers were started for.
+///
+/// These are the ceilings a policy's `limits()` is checked against, so they
+/// come from the build config — the captured graph tiers' call bound and token
+/// size — and never from the policy's own arguments, which would make the check
+/// vacuous.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BatchCapacity {
+    /// Calls one step may carry, from the workers' batch call bound.
+    pub max_batch: u32,
+    /// Tokens one step may carry, from the workers' batch token bound.
+    pub max_num_batched_tokens: u32,
+}
+
+impl BatchCapacity {
+    /// The capacity the loaded workers were started for.
+    pub fn of(info: &ipc::WorkerInfo) -> Self {
+        Self {
+            max_batch: info.max_batch_calls,
+            max_num_batched_tokens: info.max_batch_tokens,
+        }
+    }
+}
+
+/// The build config's ceilings for a policy's limits (§4.4): the batch and token
+/// bounds the epoch was built for, the deepening floor of a prefix hit, and the
+/// longest starvation deadline.
 ///
 /// A policy declares its limits once at instantiation and they are checked
 /// against these; a limit above its ceiling is a policy failure
-/// (`PolicyError::BadLimits`), never a clamp.
-pub fn ceilings_of(config: &SchedulerConfig) -> Limits {
+/// (`PolicyError::BadLimits`), never a clamp. The queue bound is the policy's
+/// own: the deployment states none the epoch was built for.
+pub fn ceilings_of(capacity: BatchCapacity) -> Limits {
     Limits {
-        chunked_prefill_size: token_count(config.chunked_prefill_size),
-        max_queued_requests: config.max_queued_requests,
-        max_batch: config.max_batch,
-        max_num_batched_tokens: token_count(config.max_num_batched_tokens),
+        // A prefill chunk is bounded by the step's token budget whatever the
+        // policy's own argument says.
+        chunked_prefill_size: capacity.max_num_batched_tokens,
+        max_queued_requests: None,
+        max_batch: capacity.max_batch as usize,
+        max_num_batched_tokens: capacity.max_num_batched_tokens,
         // §4.4 fixes the deepening floor of a prefix hit and the longest
         // starvation deadline (30 s, as sched_ext caps `timeout_ms`).
         prefetch_min_tokens: PREFETCH_FLOOR_TOKENS,
@@ -144,7 +233,11 @@ pub trait PolicySource: Send + Sync {
 ///
 /// A policy's module path is
 /// `scheduling/<backend>/<revision>/<target>/<descriptor>` below the store's
-/// root, the layout every program's modules use.
+/// root, the layout every program's modules use. Open point: `<target>` names
+/// the host the Program Server precompiled the module for (§5.1), not the source
+/// format, and `<descriptor>` is a policy package's single module rather than a
+/// kernel's per-descriptor set; the spelling below follows the design's order
+/// and shrinks to the Program Server's published layout once it is posted.
 #[derive(Clone, Debug)]
 pub struct PolicyStore {
     root: PathBuf,
@@ -173,7 +266,7 @@ impl PolicyStore {
             .join(program.revision.to_string())
             .join("wasm32")
             .join("default")
-            .join("module")
+            .join("module.wasm")
     }
 }
 
@@ -295,11 +388,33 @@ pub enum Stage {
     Commit,
 }
 
+/// A policy instantiated on the state that existed when its precopy ran,
+/// waiting for the switchover that puts it in (§7.3 step 2).
+///
+/// Owned, so the precopy can run on a blocking thread and hand the result back:
+/// the scheduler thread keeps the serving policy throughout, and neither thread
+/// borrows the other's slot.
+pub struct Candidate {
+    program: PolicyProgram,
+    module: PolicyModule,
+    instance: PolicyInstance,
+}
+
+impl Candidate {
+    /// The program the candidate was loaded from.
+    pub fn program(&self) -> &PolicyProgram {
+        &self.program
+    }
+}
+
 /// A policy that failed, and the policy that serves in its place (§7.3).
 ///
 /// An engine-level report, not a request event: the control thread forwards it
 /// to every daemon, which records the previous policy as the epoch's current
-/// one, so a later restart loads that one.
+/// one, so a later restart loads that one. The report does not say the epoch is
+/// fatal; the thread forwarding it knows that from [`PolicySlot::fail`] and
+/// [`RoutePolicy::fail`] returning `Err`, which means no previous policy exists
+/// to serve under.
 #[derive(Clone, Debug)]
 pub struct PolicyReverted {
     /// The scheduler whose instance failed; `None` for the control thread's
@@ -310,6 +425,12 @@ pub struct PolicyReverted {
     /// Why it failed (§4.4's list: a trap, fuel, bad limits, an invalid
     /// decision, an illegal expert order, or starvation).
     pub reason: String,
+    /// Whether the epoch cannot serve on: the failed policy had no previous
+    /// policy to revert to, or the previous policy did not instantiate. It is
+    /// set by the thread that failed the epoch, from [`PolicySlot::fail`] or
+    /// [`RoutePolicy::fail`] returning `Err`; a report at all therefore says the
+    /// policy failed, and `fatal` says whether the epoch did.
+    pub fatal: bool,
 }
 
 /// What a scheduler thread's policy slot hears from outside its own rank.
@@ -344,15 +465,34 @@ pub struct PolicySlot {
     candidate: Option<(PolicyProgram, PolicyModule, PolicyInstance)>,
     /// The stage asked for and not yet applied, applied at the next boundary.
     pending: Option<Stage>,
-    /// The last failure's report, for a mechanism that hands it over by
-    /// polling rather than through `fail`'s answer.
-    report: Option<PolicyReverted>,
     ports: PolicyPorts,
 }
 
 impl PolicySlot {
+    /// The slot a first switchover puts in place from the candidate its precopy
+    /// prepared: §7.3's policy for a fresh epoch, whose precopy ran before any
+    /// policy served.
+    pub fn from_candidate(
+        engine: &Engine,
+        ceilings: Limits,
+        candidate: Candidate,
+        ports: PolicyPorts,
+    ) -> Self {
+        Self {
+            engine: engine.clone(),
+            ceilings,
+            program: candidate.program,
+            module: candidate.module,
+            instance: candidate.instance,
+            previous: None,
+            candidate: None,
+            pending: None,
+            ports,
+        }
+    }
+
     /// Loads `program`'s module from `source` and instantiates it on `state`
-    /// (§7.3: the epoch's first policy).
+    /// (§7.3: a policy put in by a switch from another policy).
     ///
     /// The policy's limits are read once here and checked against `ceilings`; a
     /// limit outside them is a policy failure and the epoch does not serve under
@@ -377,7 +517,6 @@ impl PolicySlot {
             previous: None,
             candidate: None,
             pending: None,
-            report: None,
             ports,
         })
     }
@@ -439,22 +578,27 @@ impl PolicySlot {
         self.instance.experts(load)
     }
 
-    /// §7.3 step 2, on a blocking thread: instantiate `program` on `state` and
-    /// ask it every decision of §4.4 once, executing nothing.
+    /// §7.3 step 2: instantiate `program` on `state` and ask it every decision
+    /// of §4.4 once, executing nothing.
     ///
     /// An answer that does not decode, a trap, fuel exhaustion, limits outside
     /// the build config, a decision that names something that does not exist or
     /// cannot be chosen, and an expert order that is not a legal placement all
-    /// fail the precopy: the candidate is not kept and the serving policy is
+    /// fail the precopy: no candidate is returned and the serving policy is
     /// untouched. `validators` are the mechanism's own, so the candidate is
     /// judged by what will judge it live.
-    pub fn precopy(
-        &mut self,
+    ///
+    /// A static function so it runs on a blocking thread and its [`Candidate`]
+    /// is handed back to the scheduler thread, which keeps the serving slot
+    /// throughout.
+    pub fn prepare(
+        engine: &Engine,
         source: &dyn PolicySource,
         program: PolicyProgram,
         state: TrialState,
+        ceilings: &Limits,
         validators: &dyn Validators,
-    ) -> Result<(), PolicyError> {
+    ) -> Result<Candidate, PolicyError> {
         let TrialState {
             snapshot,
             room,
@@ -467,8 +611,8 @@ impl PolicySlot {
             parameters: program.arguments.clone(),
             state: snapshot,
         };
-        let module = PolicyModule::load(&self.engine, &source.bytes(&program)?)?;
-        let mut instance = module.instantiate(&init, &self.ceilings)?;
+        let module = PolicyModule::load(engine, &source.bytes(&program)?)?;
+        let mut instance = module.instantiate(&init, ceilings)?;
 
         // Every decision of §4.4's table once, on the state that exists now and
         // without executing any of it.
@@ -493,7 +637,39 @@ impl PolicySlot {
             validators.experts(load, &order)?;
         }
 
-        self.candidate = Some((program, module, instance));
+        Ok(Candidate {
+            program,
+            module,
+            instance,
+        })
+    }
+
+    /// Keeps a candidate a precopy prepared, for the switchover to put in.
+    ///
+    /// A newer candidate replaces an older one that never reached its
+    /// switchover: only a later precopy's result can be the one the daemon's
+    /// switchover means.
+    pub fn adopt(&mut self, candidate: Candidate) {
+        self.candidate = Some((candidate.program, candidate.module, candidate.instance));
+    }
+
+    /// A precopy on the calling thread: [`Self::prepare`] and [`Self::adopt`].
+    pub fn precopy(
+        &mut self,
+        source: &dyn PolicySource,
+        program: PolicyProgram,
+        state: TrialState,
+        validators: &dyn Validators,
+    ) -> Result<(), PolicyError> {
+        let candidate = Self::prepare(
+            &self.engine,
+            source,
+            program,
+            state,
+            &self.ceilings,
+            validators,
+        )?;
+        self.adopt(candidate);
         Ok(())
     }
 
@@ -538,7 +714,7 @@ impl PolicySlot {
             }
             Some(Stage::Revert) => {
                 self.revert(state)?;
-                Ok(self.take_report())
+                Ok(None)
             }
             Some(Stage::Purge) => {
                 self.previous = None;
@@ -611,16 +787,10 @@ impl PolicySlot {
             scheduler: self.ports.scheduler,
             program: self.program.clone(),
             reason: error.to_string(),
+            fatal: false,
         };
         self.revert(state)?;
-        self.report = Some(report.clone());
         Ok(report)
-    }
-
-    /// The report of a failure the mechanism did not take from [`Self::fail`]'s
-    /// answer.
-    pub fn take_report(&mut self) -> Option<PolicyReverted> {
-        self.report.take()
     }
 }
 
@@ -738,10 +908,42 @@ impl RoutePolicy {
     }
 
     /// §7.3 step 2 for the control thread's instance: instantiate `program` on
-    /// `state` and ask it one `route` decision, executing nothing.
+    /// `state` and, when the state names a request arriving, ask it one `route`
+    /// decision, executing nothing.
     ///
-    /// `check` validates the answer with the mechanism's own validation of a
-    /// route decision.
+    /// A precopy at a batch boundary may have no request arriving — routing is
+    /// decided when one does — so the trial skips `route` then rather than fail:
+    /// the decision is tried by the next precopy that has an arrival, and the
+    /// instance is installed either way. `validators` are the mechanism's own
+    /// validation of a route decision.
+    pub fn prepare(
+        engine: &Engine,
+        source: &dyn PolicySource,
+        program: PolicyProgram,
+        state: &TrialState,
+        ceilings: &Limits,
+        validators: &dyn Validators,
+    ) -> Result<Candidate, PolicyError> {
+        let init = init_of(&program, state);
+        let module = PolicyModule::load(engine, &source.bytes(&program)?)?;
+        let mut instance = module.instantiate(&init, ceilings)?;
+        if let Some((request, ranks)) = &state.arrival {
+            let index = instance.route(request, ranks)?;
+            validators.route(request, ranks, index)?;
+        }
+        Ok(Candidate {
+            program,
+            module,
+            instance,
+        })
+    }
+
+    /// Keeps a candidate a precopy prepared, for the switchover to put in.
+    pub fn adopt(&mut self, candidate: Candidate) {
+        self.candidate = Some((candidate.program, candidate.module, candidate.instance));
+    }
+
+    /// A precopy on the calling thread: [`Self::prepare`] and [`Self::adopt`].
     pub fn precopy(
         &mut self,
         source: &dyn PolicySource,
@@ -749,18 +951,15 @@ impl RoutePolicy {
         state: &TrialState,
         validators: &dyn Validators,
     ) -> Result<(), PolicyError> {
-        let (request, ranks) = state.arrival.as_ref().ok_or_else(|| {
-            PolicyError::invalid(
-                Call::Route,
-                "the precopy state names no arriving request to route",
-            )
-        })?;
-        let init = init_of(&program, state);
-        let module = PolicyModule::load(&self.engine, &source.bytes(&program)?)?;
-        let mut instance = module.instantiate(&init, &self.ceilings)?;
-        let index = instance.route(request, ranks)?;
-        validators.route(request, ranks, index)?;
-        self.candidate = Some((program, module, instance));
+        let candidate = Self::prepare(
+            &self.engine,
+            source,
+            program,
+            state,
+            &self.ceilings,
+            validators,
+        )?;
+        self.adopt(candidate);
         Ok(())
     }
 
@@ -809,6 +1008,7 @@ impl RoutePolicy {
             scheduler: None,
             program: self.program.clone(),
             reason: error.to_string(),
+            fatal: false,
         };
         self.revert(state)?;
         Ok(report)
@@ -1161,6 +1361,49 @@ mod tests {
     }
 
     #[test]
+    fn a_precopy_prepares_a_candidate_apart_from_the_serving_policy_and_adopting_it_switches() {
+        let engine = Engine::new().expect("an engine");
+        let mut slot = slot(&Toy {
+            plan: plan_of(1),
+            ..Toy::default()
+        });
+
+        // The precopy runs where the serving slot is not: the serving policy
+        // answers throughout, and the candidate is only a value.
+        let candidate = PolicySlot::prepare(
+            &engine,
+            &source(&Toy {
+                plan: plan_of(2),
+                ..Toy::default()
+            }),
+            program("b", 2),
+            state(),
+            &ceilings(),
+            &Checks::default(),
+        )
+        .expect("the candidate passes its precopy");
+        assert_eq!(candidate.program().backend, "b");
+        assert_eq!(slot.program().backend, "a");
+        assert_eq!(
+            slot.dispatch(&Room::default()).expect("an answer").refill,
+            plan_of(1).refill
+        );
+
+        slot.adopt(candidate);
+        slot.request(Stage::Switchover);
+        assert!(
+            slot.boundary(&state())
+                .expect("the boundary applies")
+                .is_none()
+        );
+        assert_eq!(slot.program().backend, "b");
+        assert_eq!(
+            slot.dispatch(&Room::default()).expect("an answer").refill,
+            plan_of(2).refill
+        );
+    }
+
+    #[test]
     fn a_precopy_asks_every_decision_the_state_names() {
         // A trap in each decision's export fails the precopy, which proves the
         // decision was asked: reclaim, route and experts only when the state
@@ -1369,6 +1612,33 @@ mod tests {
     }
 
     #[test]
+    fn a_program_is_built_from_the_arguments_the_daemon_states() {
+        let arguments = [
+            ("chunked_prefill_size".to_owned(), "2048".to_owned()),
+            ("max_batch".to_owned(), "16".to_owned()),
+            ("expected_speedup".to_owned(), "2.5".to_owned()),
+        ]
+        .into_iter()
+        .collect();
+        let program =
+            PolicyProgram::from_arguments("fcfs", 3, &arguments).expect("the arguments parse");
+        assert_eq!(program.backend, "fcfs");
+        assert_eq!(program.revision, 3);
+        assert_eq!(program.arguments.chunked_prefill_size, Some(2048));
+        assert_eq!(program.arguments.max_batch, Some(16));
+        assert_eq!(program.arguments.expected_speedup, Some(2.5));
+    }
+
+    #[test]
+    fn a_program_argument_this_build_does_not_name_is_refused() {
+        let arguments = [("chunked_prefill_size_v2".to_owned(), "2048".to_owned())]
+            .into_iter()
+            .collect();
+        let built = PolicyProgram::from_arguments("fcfs", 3, &arguments);
+        assert!(matches!(built, Err(PolicyError::Load { .. })));
+    }
+
+    #[test]
     fn the_route_feed_carries_arrivals_emissions_and_completions_only() {
         let (feed, received) = RouteFeed::channel();
         let mut slot = PolicySlot::install(
@@ -1452,7 +1722,7 @@ mod tests {
         let path = store.module_path(&program("fcfs", 7));
         assert_eq!(
             path,
-            std::path::Path::new("/programs/scheduling/fcfs/7/wasm32/default/module")
+            std::path::Path::new("/programs/scheduling/fcfs/7/wasm32/default/module.wasm")
         );
     }
 }

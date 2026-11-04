@@ -58,13 +58,13 @@ pub use crate::handle::{
 pub use crate::kv_cache::{HostCacheSize, IndexedPage};
 pub use crate::scheduler::SpecialTokenIds;
 pub use crate::scheduler::{
-    DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
-    DEFAULT_MAX_RUNNING_REQUESTS, DomainStats, EncoderStats, ExecutionDomainStats, GeneralStats,
-    GroupCache, PREFETCH_FLOOR_TOKENS, ParkedCache, PolicyBytes, PolicyPorts, PolicyProgram,
-    PolicyReverted, PolicySlot, PolicySource, PolicyStore, PrefixCacheUsage, PrefixStats,
-    RefillPolicy, RouteFeed, RoutePolicy, Scheduler, SchedulerConfig, SchedulerStats,
-    SchedulerStatsReporter, Stage, TimingStats, TrialState, Validators, WorkerStats, backend_name,
-    ceilings_of, parameters_of, program_of,
+    BatchCapacity, Candidate, DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH,
+    DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_RUNNING_REQUESTS, DomainStats, EncoderStats,
+    ExecutionDomainStats, GeneralStats, GroupCache, PREFETCH_FLOOR_TOKENS, ParkedCache,
+    PolicyBytes, PolicyPorts, PolicyProgram, PolicyReverted, PolicySlot, PolicySource, PolicyStore,
+    PrefixCacheUsage, PrefixStats, RefillPolicy, RouteFeed, RoutePolicy, Scheduler,
+    SchedulerConfig, SchedulerStats, SchedulerStatsReporter, Stage, TimingStats, TrialState,
+    Validators, WorkerStats, backend_name, ceilings_of, parameters_of, program_of,
 };
 pub use crate::service::{continuation_slot, run_engine, serve_requests};
 #[cfg(feature = "testing")]
