@@ -177,7 +177,12 @@ impl Op for CopyBlock {
             arguments.i64(*stride);
         }
         let elements = extents.iter().product::<u64>();
-        arguments.u64(elements).u32(COPY).flag(false).u32(COPY);
+        // `total`, the elements one program moves, and the PDL flag -- and nothing after them. The
+        // block width is NOT the last word a module takes: it is a `tl.constexpr`, fixed by the
+        // module's launch options and never passed in the argument list. A trailing block word here
+        // is one parameter more than the kernel has, which reaches the driver as an unnamed argument
+        // rather than as a refusal.
+        arguments.u64(elements).u32(COPY).flag(false);
         kernel.launch(
             LaunchGrid::covering(elements, u64::from(COPY))?,
             &mut arguments,
