@@ -156,6 +156,7 @@ def main():
     previous = None
     measured = {}
     lines = []
+    uncorrelated = []
     print(f"{'file':<16} {'shape':<12} {'rel':>10} {'rms':>10} {'increment':>10}  worst row")
     # One order for both: a cut the dump holds and the reference lacks still belongs where the walk
     # reaches it, or the table's "reads as the walk" promise breaks.
@@ -191,6 +192,23 @@ def main():
         if first is None and (rel > arguments.floor or rms > arguments.floor):
             first = path.name
             flag = "  <- first outside the floor"
+        # The embedding is the one stage whose answer the harness can prove without the model: the
+        # gather of the prompt's ids. Anything above the floor there is the comparison's own
+        # misalignment - two sides that are not the same tensor, or not the same rows - and every
+        # row after it would be believed. So it is refused before any other row is read.
+        if path.stem == "hidden_00" and rel > arguments.floor:
+            print(
+                f"{path.name:<16} {str(expected.shape):<12} {rel:10.3e} {rms:10.3e}"
+                f" {'-':>10}  {int(np.argmax(rows))} ({rows[int(np.argmax(rows))]:.3e})"
+                "  <- above the floor at an identity stage"
+            )
+            print(
+                f"the comparison is misaligned: hidden_00 is the embedding's own gather and has no "
+                f"model in it, so {rel:.3e} there says the two sides are not the same tensor (or not "
+                "the same rows), not that the model is wrong at its first stage"
+            )
+            return 2
+        uncorrelated.append(rms)
         if increment > largest[1]:
             largest = (path.name, increment)
         prefix_text = "" if prefix is None else f"  (prefix {prefix:.3e})"
@@ -206,6 +224,17 @@ def main():
             if line.startswith(largest[0]):
                 lines[index] = line + "  <- the increment enters here"
     print("\n".join(lines))
+
+    # Two unrelated vectors of one magnitude differ by about sqrt(2) times that magnitude, so a
+    # median near or above 1 is not "the model is uniformly bad" - it is two sides that are not the
+    # same quantity. Saying so in words is what stops the table being read as thirty defects.
+    median = float(np.median(uncorrelated)) if uncorrelated else 0.0
+    if median > 0.5:
+        print(
+            f"every stage is uncorrelated (median rms(diff)/rms(reference) {median:.2f}, and two "
+            "unrelated vectors of one magnitude sit near 1.41): check that the two sides hold the "
+            "same quantity before reading any row as a model defect"
+        )
 
     print()
     print("cuts, each named after the reference tensor that answers it: " + ", ".join(
