@@ -1459,6 +1459,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_position_table_is_one_upload_for_every_canvas() {
+        // The tiles are uniform, so the table is the largest tile's however large the canvas is: a
+        // layout costs the executor one upload of the same size whatever its extents. The two canvases
+        // here are the served ones - 768p at 768 x 1344 (48 x 84 latents) and 672p at 672 x 1536
+        // (42 x 96) - and they are the same table, not two of the same shape by coincidence.
+        let config = video_config();
+        let mut vertical = vec![Vec::new()];
+        let mut wide = vec![Vec::new()];
+        table_bytes_into(&config, 48, 84, &mut vertical).expect("the vertical canvas");
+        table_bytes_into(&config, 42, 96, &mut wide).expect("the wide canvas");
+        assert_eq!(vertical[0].len(), wide[0].len());
+        let tables = table_specs(&config, 48, 84).expect("the one table");
+        assert_eq!(vertical[0].len() as u64, tables[0].shape.numel());
+        // Host bytes of an F32: the descriptor and the buffer agree, or the executor uploads a table
+        // of the wrong length.
+        assert_eq!(
+            vertical[0].len() as u64 * 8,
+            tables[0].shape.numel() * u64::from(tables[0].dtype.bits())
+        );
+    }
+
+    #[test]
+    fn a_layout_with_the_wrong_number_of_tables_is_refused() {
+        // The executor sizes `out` from `table_specs`, so a count that disagrees with the block is a
+        // protocol error and must surface as one rather than as a partially written table.
+        let config = video_config();
+        let mut none: Vec<Vec<u8>> = Vec::new();
+        assert!(table_bytes_into(&config, 48, 84, &mut none).is_err());
+        let mut two = vec![Vec::new(), Vec::new()];
+        assert!(table_bytes_into(&config, 48, 84, &mut two).is_err());
+    }
+
+    #[test]
     fn a_raster_that_fits_one_tile_is_not_split() {
         let split = Seams::split(256, TILE_PIXELS, MINIMUM_OVERLAP, 16).expect("one tile");
         assert_eq!(split.starts, vec![0]);
