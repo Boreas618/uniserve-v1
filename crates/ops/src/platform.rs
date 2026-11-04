@@ -179,6 +179,7 @@ pub fn collective_type(dtype: DType) -> Option<CollectiveType> {
         DType::BF16 => CollectiveType::Bf16,
         DType::F32 => CollectiveType::F32,
         DType::F8E4M3 => CollectiveType::F8E4M3,
+        DType::I16 => CollectiveType::I16,
         DType::F4E2M1 => return None,
     })
 }
