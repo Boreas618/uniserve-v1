@@ -1430,6 +1430,13 @@ impl Scheduler {
                         }
                     }
                 }
+                // The two facts of the hit that no view can compute, recorded
+                // where admission measured them.
+                self.recorder.prefix_hit(
+                    scheduling::guest::RequestId(head.req.request_id.0),
+                    u32::try_from(cached_tokens).unwrap_or(u32::MAX),
+                    u32::try_from(host_tokens).unwrap_or(u32::MAX),
+                );
                 let prefix_tokens = cached_tokens + host_tokens;
                 let first_chunk = n.saturating_sub(prefix_tokens).min(chunk_limit).max(1);
                 let first_chunk_units = cache

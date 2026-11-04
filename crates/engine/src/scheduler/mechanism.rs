@@ -934,6 +934,25 @@ impl Recorder {
         }
     }
 
+    /// Notes the prefix a request was admitted with: the prompt tokens the
+    /// device cache reused, and the tokens the host KV cache could deepen that
+    /// hit by.
+    ///
+    /// Neither is a view's to compute: the device hit is the answer of the
+    /// prefill worker admission probed (`admission::prefill_target`), and the
+    /// host deepening is the boundary `KvOffloadManager::admission` answers,
+    /// less the device hit. Both are known only where admission computes them,
+    /// so they are recorded there and `views.rs` reads them back from
+    /// [`Recorder::recorded`].
+    pub(crate) fn prefix_hit(&mut self, request: RequestId, device_hit: u32, host_deepening: u32) {
+        let recorded = self
+            .recorded
+            .entry(ipc::RequestId(request.0))
+            .or_default();
+        recorded.cached_prefix_tokens = device_hit;
+        recorded.prefetch_tokens = host_deepening;
+    }
+
     /// Notes an admission: the event, and the time the views report as
     /// `admitted_at`.
     pub(crate) fn admitted(&mut self, request: RequestId, at: Nanos) {
