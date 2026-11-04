@@ -888,6 +888,11 @@ struct DeviceWeights {
     pools: platform::Allocator,
     buffers: Vec<platform::Buffer>,
     bytes: u64,
+    /// Every key this store has published, so a second ask answers the first region instead of a
+    /// second block. `HostStore` does this on the host, and a device store that did not would charge
+    /// the pool twice for one weight while the reservation counted it once - the class that made a
+    /// pool one block short in another lane this round.
+    published: Vec<(nn::WeightKey, Backing)>,
     /// The reservation the pool was given, so a failed give-out can name it beside the bytes
     /// published: both numbers then describe publishing, and a reader is not comparing a sum of
     /// weights with a capacity that also holds something else.
@@ -936,6 +941,7 @@ impl DeviceWeights {
             pools,
             buffers: Vec::new(),
             bytes: 0,
+            published: Vec::new(),
             reserved,
         })
     }
@@ -960,8 +966,12 @@ impl platform::Budget for NoLimit {
 }
 
 impl RetainedWeights for DeviceWeights {
-    fn retained(&mut self, _key: &WeightKey) -> nn::Result<Option<Backing>> {
-        Ok(None)
+    fn retained(&mut self, key: &WeightKey) -> nn::Result<Option<Backing>> {
+        Ok(self
+            .published
+            .iter()
+            .find(|(published, _)| published == key)
+            .map(|(_, backing)| *backing))
     }
 
     fn publish(
@@ -971,6 +981,11 @@ impl RetainedWeights for DeviceWeights {
         shape: Shape,
         bytes: &[u8],
     ) -> nn::Result<Backing> {
+        // A key already published answers its own region: a store that allocated again would hand two
+        // layers two buffers for one weight and charge the pool for both.
+        if let Some(backing) = self.retained(key)? {
+            return Ok(backing);
+        }
         let buffer = self
             .pools
             .allocate(platform::PoolKind::Resident, bytes.len())
@@ -1008,6 +1023,7 @@ impl RetainedWeights for DeviceWeights {
         let backing = Backing::new(DevicePtr::new(buffer.address()), bytes.len() as u64);
         backing.view(dtype, shape)?;
         self.bytes += bytes.len() as u64;
+        self.published.push((key.clone(), backing));
         self.buffers.push(buffer);
         let _ = key;
         Ok(backing)
