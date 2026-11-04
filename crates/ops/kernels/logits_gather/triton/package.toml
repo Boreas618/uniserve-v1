@@ -29,6 +29,6 @@ architectures = ["sm_100a", "sm_90a"]
 
 # `dtype_bf16_columns_2048_block_1024_pdl_true`.
 [kernel.descriptors]
-dimensions = { dtype = ["bf16", "fp16", "fp32"], columns = ["2048", "4096", "7168", "151936"], block = ["512", "1024", "2048", "4096"], pdl = ["true", "false"] }
+dimensions = { dtype = ["bf16", "f16", "f32"], columns = ["2048", "4096", "7168", "151936"], block = ["512", "1024", "2048", "4096"], pdl = ["true", "false"] }
 
 [parameters]

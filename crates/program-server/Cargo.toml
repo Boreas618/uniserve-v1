@@ -10,9 +10,15 @@ publish = false
 # prepares programs with it, the main process resolves them), and the
 # `uniserve program-server` command. Sources and toolchains compile a program
 # package with the Program Server's own Python environment under `python/`.
+#
+# `ops` is the one edge into the computation library, and only for the phase
+# vocabulary: the phase is part of an operator's descriptor and of the epoch
+# record's key alike, so it is defined once there and re-exported here
+# (design 5.1, 5.2).
 [dependencies]
 clap.workspace = true
 libc.workspace = true
+ops.workspace = true
 prost.workspace = true
 rustix = { workspace = true, features = ["net"] }
 serde.workspace = true

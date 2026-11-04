@@ -1,0 +1,37 @@
+# The vsa_select_tiles operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
+# driver the Program Server runs for one descriptor and target).
+#
+# The descriptor is the selection's own: the lane width that bounds the key tiles
+# one query tile ranks and keeps. The key is the one `SelectTilesDescriptor`'s
+# `Display` prints, e.g. `block_1024`. The tile count, the query-tile count and the
+# window offset are launch words, so one module serves any sequence that fits its
+# lanes.
+
+op = "vsa_select_tiles"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/vsa_select_tiles.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+[kernel.descriptors]
+dimensions = { block = ["512", "1024", "2048", "4096"] }
+
+[parameters]

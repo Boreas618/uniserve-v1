@@ -1,0 +1,37 @@
+# A program package the delivery test installs to exercise a program-layer
+# update: the same descriptor and launch structure with a
+# deliberately wrong result, so shadow execution refuses it.
+#
+# It names the operator and backend the deployment already serves
+# (`rms_norm`/`triton`) and the same descriptor keys, so installing it is a new
+# revision of that backend, not a new backend, and the deployment's unchanged
+# configuration resolves it. The descriptor values are the ones the Qwen3-MoE
+# slice uses.
+
+op = "rms_norm"
+backend = "triton"
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[source]
+kind = "triton"
+files = ["src/rms_norm.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+# `dtype_bf16_columns_2048_tile_2048_pdl_false`, the serving key.
+[kernel.descriptors]
+dimensions = { dtype = ["bf16"], columns = ["2048", "128"], tile = ["2048", "128"], pdl = ["false"] }
+
+[parameters]
+eps = 1e-06

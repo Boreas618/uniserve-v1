@@ -1,0 +1,42 @@
+# The frame_pad operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
+# driver the Program Server runs for one descriptor and target).
+#
+# The descriptor is the padding's own tile: the element type, whether the rows and
+# columns beside the source are mirrored rather than replicated, and the columns
+# and channels one program writes. `FramePadDescriptor::tiles` derives the tile
+# from the source's strides and the output's layout, so a caller and the compiled
+# program agree on the variant. The key is the one `FramePadDescriptor`'s
+# `Display` prints, e.g.
+# `dtype_bf16_reflect_true_block_pixels_512_block_channels_4`.
+#
+# A contiguous output walks whole rows of up to 512 pixels; any other output walks
+# the 32-column, 64-channel tile.
+
+op = "frame_pad"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/frame_pad.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+[kernel.descriptors]
+dimensions = { dtype = ["bf16", "f16", "f32"], reflect = ["true", "false"], block_pixels = ["32", "64", "128", "256", "512"], block_channels = ["4", "8", "16", "32", "64"] }
+
+[parameters]
