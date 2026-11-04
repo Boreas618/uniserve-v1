@@ -1062,7 +1062,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
             })
-            .ok_or_else(|| Error::State("the runner has no graph pools yet".into()))
+            .ok_or_else(|| Error::State("the runner has no graph pools yet"))
     }
 
     /// Installs the shadow harness, sized for the largest bucket's shadow set.
@@ -1502,6 +1502,23 @@ impl<M: CausalLm> CausalLmRunner<M> {
             .into_inner()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let template = capture.end()?;
+        // The node table comes from the capture sink, and the template is the record of what was
+        // actually launched: the two can only be compared here. A graph that launched kernels and
+        // reported no node table is a graph nothing can rebind and whose launches nothing counts,
+        // so a program-layer update would silently do nothing - it is refused by name instead.
+        if nodes.is_empty() {
+            let launched = template
+                .nodes()?
+                .into_iter()
+                .filter(|node| matches!(node.kind(), Ok(platform::GraphNodeKind::Kernel)))
+                .count();
+            if launched > 0 {
+                return Err(Error::Invariant(format!(
+                    "the capture of {bucket} launched {launched} kernels and reported no node \
+                     table: the operator launches are not annotated, so nothing can rebind it"
+                )));
+            }
+        }
         Ok(Walked { template, nodes })
     }
 
@@ -1804,7 +1821,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let rows = bucket.rows as usize;
         let tokens = bucket.tokens as usize;
         if self.staging.staged().is_none() {
-            return Err(Error::State("a step needs a staged batch".into()));
+            return Err(Error::State("a step needs a staged batch"));
         }
         let batch = self.staging.batch_rows();
 
@@ -2098,7 +2115,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 .sampling
                 .as_ref()
                 .map(|sampling| sampling.counts)
-                .ok_or_else(|| Error::State("a sampling batch has no count table".into()))?,
+                .ok_or_else(|| Error::State("a sampling batch has no count table"))?,
             count: rows,
         };
         forward
