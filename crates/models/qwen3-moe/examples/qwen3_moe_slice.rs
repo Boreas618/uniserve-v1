@@ -98,6 +98,8 @@ struct Args {
     layer: usize,
     tokens: String,
     resident: u64,
+    /// Where the decode stage writes its hidden rows and logits as `.npy`, when asked.
+    dump: Option<PathBuf>,
 }
 
 /// The four stages of the run.
@@ -118,6 +120,7 @@ impl Args {
         let mut layer = 0;
         let mut tokens = String::new();
         let mut resident = 0;
+        let mut dump = None;
         let mut words = std::env::args().skip(1);
         while let Some(word) = words.next() {
             let mut value = |name: &str| -> Result<String> {
@@ -155,6 +158,7 @@ impl Args {
                     })?;
                 }
                 "--tokens" => tokens = value("--tokens")?,
+                "--dump" => dump = Some(PathBuf::from(value("--dump")?)),
                 "--resident" => {
                     let gib = value("--resident")?;
                     let size: u64 = gib.parse().map_err(|_| {
@@ -165,13 +169,14 @@ impl Args {
                 "--help" | "-h" => {
                     return Err(Failure::message(
                         "qwen3_moe_slice --stage weights|embedding|block|decode \
-                         [--checkpoint PATH] [--store PATH] [--device N] [--layer N]",
+                         [--checkpoint PATH] [--store PATH] [--device N] [--layer N] \
+                         [--tokens ID,ID,...] [--dump DIR]",
                     ));
                 }
                 other => {
                     return Err(Failure::message(format!(
                         "unknown argument `{other}`; expected --stage, --checkpoint, --store, \
-                         --device or --layer"
+                         --device, --layer, --tokens or --dump"
                     )));
                 }
             }
@@ -184,6 +189,7 @@ impl Args {
             layer,
             tokens,
             resident,
+            dump,
         })
     }
 }
@@ -647,6 +653,29 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
         }
         return Ok(());
     }
+    // With `--dump`, every stage's output is written as float32 `.npy` for a comparison against a
+    // reference stack: the embedding's rows first, then one file per layer, then the logits. The
+    // stack is walked one layer at a time rather than all at once, because the only way to see a
+    // layer's output is to stop there - `forward_through` runs layers `0..=layer` and releases each
+    // layer's scratch as it ends, so the arena pays for one layer and not the stack.
+    let width = usize::try_from(plan.hidden).unwrap_or(0);
+    if let Some(dir) = args.dump.as_deref() {
+        std::fs::create_dir_all(dir)
+            .map_err(|error| Failure::message(format!("--dump {}: {error}", dir.display())))?;
+        let rows = tokens_usize(&batch);
+        let embedded = download_bf16(&stream, hidden, rows, width)?;
+        write_npy(&dir.join("hidden_00.npy"), &embedded, rows, width)?;
+        println!("dump: hidden_00.npy is the embedding's output, {rows} x {width} f32");
+        for layer in 0..config.num_hidden_layers {
+            let out = model.forward_through(&forward, &batch, &cache, hidden, layer)?;
+            stream.synchronize()?;
+            let values = download_bf16(&stream, out, rows, width)?;
+            let name = format!("hidden_{:02}.npy", layer + 1);
+            write_npy(&dir.join(&name), &values, rows, width)?;
+            println!("dump: {name} is layer {layer}'s output");
+        }
+    }
+
     model.forward(&forward, &batch, &cache, hidden)?;
     let logits = arena.tensor(
         DType::F32,
@@ -663,6 +692,10 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     // The last row's log-softmax, on the host, and its ten best tokens.
     let vocabulary = config.vocab_size;
     let values = download_f32(&stream, logits, vocabulary)?;
+    if let Some(dir) = args.dump.as_deref() {
+        write_npy(&dir.join("logits.npy"), &values, 1, vocabulary)?;
+        println!("dump: logits.npy is the last row, 1 x {vocabulary} f32");
+    }
     let best = top_logprobs(&values, 10);
     println!(
         "decode: {count} prompt tokens, {} layers, {} experts; last row's top-10",
@@ -677,6 +710,37 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
 /// The batch's token count, as a `usize`, for the host-side readbacks.
 fn tokens_usize(batch: &TokenBatch) -> usize {
     usize::try_from(batch.num_tokens).unwrap_or(0)
+}
+
+/// Write `values` as a C-ordered `f32` `.npy` file of `rows` x `columns`.
+///
+/// The format is the small end of `numpy.save`'s: the magic, one version, a header dict padded so
+/// that the header's length is a multiple of 64, then the little-endian data. It is written by hand
+/// because the readback is four lines of header and no dependency the example does not already
+/// have - and a reference comparison wants the array a `numpy.load` returns, nothing else.
+fn write_npy(path: &std::path::Path, values: &[f32], rows: usize, columns: usize) -> Result<()> {
+    let mut header =
+        format!("{{'descr': '<f4', 'fortran_order': False, 'shape': ({rows}, {columns}), }}");
+    // The format's header ends with a newline and starts after a ten-byte preamble, and the whole
+    // preamble is padded to a multiple of 64 bytes with spaces.
+    let unpadded = 10 + header.len() + 1;
+    let padding = (64 - unpadded % 64) % 64;
+    header.push_str(&" ".repeat(padding));
+    header.push('\n');
+    let mut bytes = Vec::with_capacity(10 + header.len() + values.len() * 4);
+    bytes.extend_from_slice(&[0x93, b'N', b'U', b'M', b'P', b'Y']);
+    bytes.extend_from_slice(&[1, 0]);
+    bytes.extend_from_slice(
+        &u16::try_from(header.len())
+            .map_err(|_| Failure::message("a .npy header above 65535 bytes"))?
+            .to_le_bytes(),
+    );
+    bytes.extend_from_slice(header.as_bytes());
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    std::fs::write(path, &bytes)
+        .map_err(|error| Failure::message(format!("{}: {error}", path.display())))
 }
 
 /// A cheap digest of a block's output: its sum and its largest magnitude, both rounded so that a
