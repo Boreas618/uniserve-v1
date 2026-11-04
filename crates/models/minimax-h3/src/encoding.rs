@@ -2087,22 +2087,42 @@ mod tests {
             width: 256,
         };
         let plan = video_encoder_tile_arena(&config, raster).expect("the plan");
-        let levels = stack.widths.len();
-        let downsamplers = stack
-            .temporal_strides
-            .iter()
-            .zip(stack.spatial_strides.iter())
-            .filter(|(temporal, spatial)| *temporal * *spatial > 1)
-            .count();
-        // The input pad and the input convolution's output, then per level the pair its blocks alternate
-        // between, the block's working buffer, a projection where the level widens, and the pad and
-        // strided output where it downsamples; the moments of the latent raster close the list.
-        let widening = (1..levels)
-            .filter(|index| stack.widths[index - 1] != stack.widths[*index])
-            .count();
-        // No moments buffer: the moment convolution writes the caller's view, and the projection that
-        // follows reads the stitched raster.
-        assert_eq!(plan.len(), 2 + levels * 3 + widening + downsamplers * 2);
+        // A tiled driver looks every entry up by name, so what a plan owes the driver is its set of
+        // names: the tile's pad, and per level the pair its blocks alternate between and the working
+        // buffer each block reads back, a projection exactly where the level widens, and the pad and
+        // strided output exactly where it downsamples. Nothing else, and no name twice. This is stated
+        // as the set and not as a count because a count of a formula is a second copy of the plan's
+        // arithmetic, and the copy is what drifts - the input convolution's output is `level0.first`,
+        // not a buffer of its own.
+        let extents = stack.extents(raster);
+        let mut expected = vec!["padded".to_owned()];
+        for (index, level) in extents.iter().take(extents.len() - 1).enumerate() {
+            let width = stack.widths[index];
+            let input = match index {
+                0 => stack.widths[0],
+                _ => stack.widths[index - 1],
+            };
+            expected.push(format!("level{index}.first"));
+            expected.push(format!("level{index}.second"));
+            expected.push(format!("level{index}.working"));
+            if input != width {
+                expected.push(format!("level{index}.projected"));
+            }
+            let next = &extents[index + 1];
+            if next.frames < level.frames || next.height < level.height || next.width < level.width
+            {
+                expected.push(format!("level{index}.pad"));
+                expected.push(format!("level{index}.strided"));
+            }
+        }
+        let mut planned: Vec<&str> = plan.iter().map(|buffer| buffer.name.as_str()).collect();
+        planned.sort_unstable();
+        let mut wanted: Vec<&str> = expected.iter().map(String::as_str).collect();
+        wanted.sort_unstable();
+        assert_eq!(
+            planned, wanted,
+            "the plan reserves exactly the buffers a tiled driver looks up, once each"
+        );
         // Level 0 runs at the tile's pixels and the encoder's first width, and it is the entry a tiled
         // driver multiplies by its tile count.
         let first = plan
