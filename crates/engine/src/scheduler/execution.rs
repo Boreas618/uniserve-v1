@@ -264,16 +264,9 @@ impl Scheduler {
         // Reap cancellations before assembling.
         self.reap_cancellations();
 
-        // Admit request and resource residency even while every execution slot
-        // is occupied. This lets the next batch see the complete resident
-        // cohort instead of admitting only when a slot happens to open.
-        self.admit();
-        self.admit_media();
-
-        // Submit as many batches as the rank queues admit.
+        // Submit as many batches as the rank queues admit. Admission is not
+        // done here: it is the plan's `admit`, executed once per step.
         loop {
-            self.admit();
-            self.admit_media();
             if !self.a_rank_queue_admits() {
                 break;
             }
@@ -560,6 +553,12 @@ impl Scheduler {
             Ok(plan) => plan,
             Err(error) => return self.policy_failed(policy, error),
         };
+        // The plan's admission is the mechanism's own act, bounded by the hard
+        // limits as it goes, and it runs before the plan is checked: a request
+        // the plan admits is resident for the work the same plan gives it, which
+        // is what lets one plan both admit and run a request (§4.4).
+        self.admit_plan(&plan);
+        let live = self.live();
         if let Err(error) = mechanism::validate_plan(&plan, &room, &live) {
             return self.policy_failed(policy, error);
         }

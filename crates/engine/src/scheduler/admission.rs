@@ -20,6 +20,7 @@
 use super::*;
 use crate::kv_cache::{KvOffloadManager, PrefixScope};
 use ipc::ForwardMode;
+use scheduling::guest::Plan;
 
 /// One product a video request reserves: its declared name, the component
 /// output it is reserved under, and its request-sized shape.
@@ -809,12 +810,11 @@ impl Scheduler {
     /// Admission stops at the first request that cannot be routed or
     /// reserved, leaving it at the queue head. A broken scheduler invariant
     /// also requeues the request, latches engine-fatal, and stops.
-    pub(super) fn admit_media(&mut self) {
-        // A closing scheduler admits nothing more, nor does one that sleeps.
-        if self.closing || self.admission_sleeps() {
-            return;
-        }
-        while self.running_request_count() < self.config.max_running_requests {
+    fn admit_media(&mut self, named: usize) {
+        for _ in 0..named {
+            if self.running_request_count() >= self.config.max_running_requests {
+                break;
+            }
             let Some(submission) = self.waiting_media.pop_front() else {
                 break;
             };
@@ -1316,12 +1316,83 @@ impl Scheduler {
     /// when the queue is empty, `max_running_requests` is reached, no request row is
     /// free, the head does not fit yet or finds no ready prefill worker, or a
     /// scheduler invariant breaks.
-    pub(super) fn admit(&mut self) {
+    /// Executes the plan's admission decisions (§4.4): the requests it
+    /// rejects are refused, and the ones it admits are tried in its order, the
+    /// mechanism stopping at the first the hard limits refuse so that a later
+    /// request never bypasses one the policy put first.
+    ///
+    /// The queues are ordered by the plan and bounded by it: a queued request
+    /// the plan does not name waits for a later step's plan, which is what makes
+    /// a policy's admission order its own rather than the arrival order.
+    pub(super) fn admit_plan(&mut self, plan: &Plan) {
         // A closing scheduler admits nothing more, nor does one that sleeps.
         if self.closing || self.admission_sleeps() {
             return;
         }
-        loop {
+        for id in &plan.reject {
+            self.reject_queued(ipc::RequestId(id.0));
+        }
+        let named: Vec<ipc::RequestId> = plan.admit.iter().map(|id| ipc::RequestId(id.0)).collect();
+        self.order_queues_by(&named);
+        let tokens_named = self
+            .waiting
+            .iter()
+            .filter(|state| named.contains(&state.req.request_id))
+            .count();
+        let media_named = self
+            .waiting_media
+            .iter()
+            .filter(|pending| named.contains(&pending.request.request_id))
+            .count();
+        self.admit_tokens(tokens_named);
+        self.admit_media(media_named);
+    }
+
+    /// Refuses one queued request the plan rejected, whether it waits as a
+    /// token request or as a media one.
+    fn reject_queued(&mut self, id: ipc::RequestId) {
+        if let Some(position) = self
+            .waiting
+            .iter()
+            .position(|state| state.req.request_id == id)
+            && let Some(state) = self.waiting.remove(position)
+        {
+            let _ = state.output.events.event_tx.send(Event::Rejected {
+                kind: RejectionKind::Overloaded,
+                message: "the scheduling policy rejected the request as over capacity".into(),
+            });
+        }
+        if let Some(position) = self
+            .waiting_media
+            .iter()
+            .position(|pending| pending.request.request_id == id)
+            && let Some(pending) = self.waiting_media.remove(position)
+        {
+            let _ = pending.event_tx.send(Event::Rejected {
+                    kind: RejectionKind::Overloaded,
+                    message: "the scheduling policy rejected the request as over capacity".into(),
+                });
+        }
+    }
+
+    /// Orders both queues by the plan's admission order: the requests it names
+    /// first and in its order, then the rest in the order they arrived, which is
+    /// the order a later plan's own naming or the mechanism's fallback sees.
+    fn order_queues_by(&mut self, order: &[ipc::RequestId]) {
+        let rank = |id: ipc::RequestId| order.iter().position(|named| *named == id);
+        self.waiting
+            .make_contiguous()
+            .sort_by_key(|state| rank(state.req.request_id).unwrap_or(usize::MAX));
+        self.waiting_media
+            .make_contiguous()
+            .sort_by_key(|pending| rank(pending.request.request_id).unwrap_or(usize::MAX));
+    }
+
+    /// The token half of the plan's admission: at most `named` requests, the
+    /// ones the plan named, and never one behind a request the hard limits
+    /// refused.
+    fn admit_tokens(&mut self, named: usize) {
+        for _ in 0..named {
             if self.running_request_count() >= self.config.max_running_requests
                 || self.storage.request_pool.is_empty()
             {
