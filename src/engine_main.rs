@@ -100,6 +100,8 @@ use executor::control::{Control, Endpoints, Ready};
 use executor::device::{Executor, Probe};
 use executor::host::{HostAction, HostTask, Lane};
 use executor::hot_update::{Action, HotUpdate};
+use executor::memory::retained::Retained;
+use executor::memory::weights::WeightStore;
 use executor::memory::Memory;
 use executor::watchdog::{Running, Watchdog};
 use engine::{PolicyProgram, PolicySlot, PolicySource, Scheduler, Stage};
@@ -193,6 +195,41 @@ pub(crate) struct EngineArgs {
     pub peers: Vec<String>,
 }
 
+impl EngineArgs {
+    /// This rank's Storage Server launch (`specs/worker.md` §8): the server's socket, the
+    /// deployment its claim belongs to, the claim itself and the world exclusive storages are
+    /// created in.
+    fn storage_launch(&self) -> Result<ipc::StorageLaunch> {
+        Ok(ipc::StorageLaunch {
+            socket: self.storage_socket.display().to_string(),
+            deployment: self.deployment.clone(),
+            claim: claim_token(&self.claim)?,
+            // The host KV cache and another host's reach are the deployment's; a rank that needs
+            // either is told so by the daemon that starts it.
+            host_kv_cache: false,
+            tcp: None,
+            peers: Vec::new(),
+            world: self.world,
+            standby: false,
+            standby_storage: ipc::StandbyStorage::Auto,
+        })
+    }
+}
+
+/// The 32 hex digits of a claim token, as the Storage Server takes it.
+fn claim_token(text: &str) -> Result<[u8; 16]> {
+    let text = text.trim();
+    if text.len() != 32 {
+        bail!("a claim is 32 hex digits, not {} characters", text.len());
+    }
+    let mut claim = [0_u8; 16];
+    for (index, byte) in claim.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16)
+            .with_context(|| format!("claim {text} is not hexadecimal"))?;
+    }
+    Ok(claim)
+}
+
 /// Runs the `uniserve engine` command.
 pub(crate) fn run(
     args: &EngineArgs,
@@ -263,10 +300,18 @@ impl MainProcess {
         // the daemon answers with the engine spec and the epoch record (§2.3).
         let epoch = handshake(&mut control, args, &build)?;
 
-        let placement = Placement::of(args, &build);
-        let mut loader = nn::WeightLoader::for_checkpoint(&args.model)
-            .context("opening the checkpoint's weight files")?;
-        let model = load_model(&args.model, &placement, &mut loader)
+        // §8: the rank's retained weights outlive every world of the epoch, so the store is built
+        // once, before the model loads, and keeps what it maps for the epoch's life.
+        let storage = Retained::connect(
+            &args.storage_launch()?,
+            &args.group,
+            args.rank,
+            epoch.generation,
+        )
+        .context("connecting to the Storage Server")?;
+        let mut weights = WeightStore::new(Arc::clone(&storage));
+        let placement = Placement::of(&args, build)?;
+        let model = load_model(&args.model, &placement, &mut weights)
             .context("loading the epoch's model")?;
 
         // The owners of §4 are opened before any thread that borrows them, and
@@ -279,7 +324,7 @@ impl MainProcess {
         let mut executors = Vec::with_capacity(build.devices().len());
         let mut generations = Vec::with_capacity(build.devices().len());
         for device in build.devices() {
-            let generation = Arc::new(Generation(epoch.generation));
+            let generation = Arc::new(Generation::new(epoch.generation, std::iter::empty()));
             let runners = build.runners(device, &model, &mut memory, &generation)?;
             executors.push(Executor::spawn(
                 device,
@@ -983,42 +1028,61 @@ impl MainProcess {
     /// Sends the engine's counters to the daemon, one report a second and a
     /// final flush when the process ends (`specs/worker.md` §2.3).
     ///
-    /// One message per device. The executor states every figure: the launches
-    /// and device nanoseconds its runners counted, the jobs in flight the
-    /// control thread's watchdog reads, and the pools the arena books against
-    /// the rank's budget (§4.1, §8). The scheduler-owned counters of §2.3
-    /// (`steps`, `batches`, `tokens`, the policy's fuel and calls) are reported
-    /// by the schedulers' own handle.
+    /// The executor states its own figures: the launches and device nanoseconds
+    /// its runners counted, the jobs in flight the control thread's watchdog
+    /// reads, and the pools the arena books against the rank's budget - which is
+    /// the invariant of §4.1 and §8, a device never mapping more than its budget
+    /// allows. The scheduler-owned counters (`steps`, `batches`, `tokens`, the
+    /// policy's fuel and calls) come from the schedulers' handle and stay zero
+    /// until it exists.
     fn send_metrics(&mut self) {
-        for executor in &self.executors {
+        let mut kernel_launches = 0_u64;
+        let mut device_ns = 0_u64;
+        let mut queue = Vec::with_capacity(self.executors.len());
+        let mut memory = Vec::with_capacity(self.executors.len());
+        for (rank, executor) in self.executors.iter().enumerate() {
             let counters = executor.counters();
-            let pools = executor.pool_metrics();
-            let report = proto::request::wire::Device {
+            kernel_launches += counters.kernel_launches;
+            device_ns += counters.device_ns;
+            queue.push(proto::request::wire::QueueDepth {
+                rank: rank as u32,
+                depth: executor.watchdog().jobs.len() as u32,
+            });
+            // One allocator books the device's three pools (`arena::DeviceMemory`), so the three
+            // figures sum against one budget and item 5's invariant is reported as it is decided.
+            let pools = executor.memory();
+            memory.push(proto::request::wire::DeviceMemory {
                 device: executor.device().0 as u32,
-                kernel_launches: counters.kernel_launches,
-                device_ns: counters.device_ns,
-                queue_depth: executor.watchdog().jobs.len() as u32,
-                memory: pools
-                    .map(|pools| {
-                        vec![proto::request::wire::DeviceMemory {
-                            budget: pools.budget,
-                            pools: vec![proto::request::wire::PoolMemory {
-                                pool: "graph".to_owned(),
-                                mapped: pools.mapped,
-                            }],
-                        }]
+                budget: pools.budget,
+                pools: ["graph", "scratch", "resident"]
+                    .into_iter()
+                    .zip([pools.graph, pools.scratch, pools.resident])
+                    .map(|(pool, mapped)| proto::request::wire::PoolMemory {
+                        pool: pool.to_owned(),
+                        mapped,
                     })
-                    .unwrap_or_default(),
-            };
-            if let Err(error) = self
-                .control
-                .daemon_mut()
-                .send(&proto::request::wire::FromEngine {
-                    kind: Some(proto::request::wire::from_engine::Kind::Device(report)),
-                })
-            {
-                tracing::warn!(%error, "reporting a device's counters failed");
-            }
+                    .collect(),
+            });
+        }
+        let metrics = proto::request::wire::Metrics {
+            steps: 0,
+            batches: 0,
+            tokens: 0,
+            kernel_launches,
+            device_ns,
+            queue,
+            policy_fuel: 0,
+            policy_calls: 0,
+            memory,
+        };
+        if let Err(error) = self
+            .control
+            .daemon_mut()
+            .send(&proto::request::wire::FromEngine {
+                kind: Some(proto::request::wire::from_engine::Kind::Metrics(metrics)),
+            })
+        {
+            tracing::warn!(%error, "reporting the engine's metrics failed");
         }
     }
 
@@ -1354,15 +1418,42 @@ fn architectural_class(checkpoint: &Path) -> Result<String> {
 }
 
 /// How this rank takes part in the deployment's parallel shape (§4.3, §5.1), as
-/// the build config states it: the model is partitioned by the deployment, and
-/// the match on model class is what turns that shape into the model's own
-/// partition type.
+/// the build config fixes it and the daemon's launch places it.
 struct Placement {
     tensor_parallel: u32,
     tensor_rank: u32,
     expert_parallel: u32,
     expert_rank: u32,
     load_options: qwen3_moe::LoadOptions,
+}
+
+impl Placement {
+    /// This rank's part of the epoch's parallel shape.
+    ///
+    /// Tensor parallelism splits every layer of the group's ranks; expert parallelism splits the
+    /// routed experts of the deployment's schedulers. A rank's ordinal places it in both: its
+    /// tensor rank is its position inside its scheduler's group, and its expert rank is which
+    /// scheduler's share of the experts it keeps.
+    fn of(args: &EngineArgs, build: &BuildConfig) -> Result<Self> {
+        let tensor_parallel = u32::try_from(build.tensor_parallel_size.get())
+            .context("a tensor-parallel degree larger than u32::MAX")?;
+        if tensor_parallel == 0 {
+            bail!("a tensor-parallel degree of zero splits nothing");
+        }
+        let data_parallel = u32::try_from(build.data_parallel_size.get())
+            .context("a data-parallel degree larger than u32::MAX")?;
+        let expert_parallel = if build.expert_parallel { data_parallel } else { 1 };
+        Ok(Self {
+            tensor_parallel,
+            tensor_rank: args.rank % tensor_parallel,
+            expert_parallel,
+            expert_rank: (args.rank / tensor_parallel) % expert_parallel,
+            // The deployment's page size is the cache's (`kv_cache_config.block_size`), and the
+            // attention program's workspace is the load config's; neither is ours to guess, so the
+            // model's own defaults stand until the loader takes them from the build config.
+            load_options: qwen3_moe::LoadOptions::default(),
+        })
+    }
 }
 
 /// The one `match` on model class (§4.3): the executable links the model crates,
@@ -1374,10 +1465,15 @@ struct Placement {
 fn load_model(
     checkpoint: &Path,
     placement: &Placement,
-    loader: &mut WeightLoader<'_>,
+    weights: &mut dyn nn::RetainedWeights,
 ) -> Result<qwen3_moe::Qwen3Moe> {
     match architectural_class(checkpoint)?.as_str() {
         "Qwen3MoeForCausalLM" => {
+            // §8: a weight converted once is published to retained storage and mapped read-only
+            // afterwards; the checkpoint's own representation stands unless the deployment fixed
+            // another, which is the build config's `dtype` and `quantization`.
+            let opened = nn::Checkpoint::open(checkpoint)?;
+            let mut loader = nn::WeightLoader::new(&opened, weights, None, None);
             let config = qwen3_moe::Config::read(checkpoint)?;
             let partition = qwen3_moe::Partition::new(
                 &config,
@@ -1389,7 +1485,7 @@ fn load_model(
             Ok(qwen3_moe::load(
                 checkpoint,
                 partition,
-                loader,
+                &mut loader,
                 placement.load_options,
             )?)
         }
