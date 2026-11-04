@@ -20,7 +20,7 @@
 
 use ops::attention::{Descriptor as AttentionDescriptor, Mask, Phase};
 use ops::moe;
-use ops::rope::{FactorsDescriptor, QkNormRopeDescriptor, Rotation};
+use ops::rope::{FactorsDescriptor, MAX_AXES, QkNormRopeDescriptor, Rotation};
 use ops::{DType, Float};
 
 /// Whether the layers' descriptors are the programmatic-dependent-launch variants.
@@ -209,6 +209,9 @@ fn main() {
             // Qwen3's rope theta is 1e6, from the checkpoint's configuration.
             scale: Float::from(1_000_000.0_f32),
             pdl: PDL,
+            // One-dimensional positions: Qwen3 is text only, so no section is cut.
+            axes: 1,
+            sections: [0; MAX_AXES],
         }),
     ));
     lines.push((

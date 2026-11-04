@@ -214,7 +214,9 @@ impl Checkpoint {
                         source,
                     }
                 })?;
-            let header = u64::try_from(header).map_err(|_| Error::Checkpoint {
+            // `read_metadata` answers the length of the JSON header alone; the payload starts
+            // after the 8-byte little-endian length that precedes it.
+            let header = u64::try_from(header + 8).map_err(|_| Error::Checkpoint {
                 path: path.clone(),
                 problem: "the header is larger than u64::MAX bytes".to_owned(),
             })?;
