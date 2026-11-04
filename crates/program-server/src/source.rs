@@ -28,8 +28,22 @@ use std::path::{Path, PathBuf};
 
 use crate::manifest::{Manifest, ModuleForm, SourceKind, ToolchainKind};
 use crate::target::Target;
-use crate::toolchain::Toolchain;
+use crate::toolchain::{ToolJob, Toolchain};
 use crate::{Error, Result};
+
+/// The name `ops` loads a cubin module by (design section 4.2).
+pub const MODULE_CUBIN: &str = "module.cubin";
+
+/// The name `ops` loads a native module by (design section 4.2).
+pub const MODULE_SO: &str = "module.so";
+
+/// The name the store keeps a precompiled wasm module under; the scheduling
+/// policies are loaded from it (design section 5.3).
+pub const MODULE_WASM: &str = "module.wasm";
+
+/// The file a build's compiler writes its output to, inside the build's
+/// workspace. It is not part of the module; [`collect`] leaves it out.
+const BUILD_LOG: &str = ".build.log";
 
 /// The files a build wrote, relative to its [`Workspace`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -162,6 +176,103 @@ impl PackageSource {
             ("UNISERVE_OUT".into(), dir.path().as_os_str().to_owned()),
         ]
     }
+
+    /// The metadata JSON's name in the module directory: the name the
+    /// manifest gives, or Triton's own `metadata.json`.
+    pub fn metadata_name(&self) -> String {
+        self.manifest
+            .module
+            .metadata
+            .clone()
+            .unwrap_or_else(|| "metadata.json".to_owned())
+    }
+
+    /// A failed build of this package, with the package's identity in the
+    /// error so a log line names what was being built.
+    pub fn failure(&self, key: &str, target: &Target, message: impl Into<String>) -> Error {
+        Error::Build {
+            op: self.manifest.op.clone(),
+            backend: self.manifest.backend.clone(),
+            revision: 0,
+            target: target.to_string(),
+            descriptor: key.to_owned(),
+            message: message.into(),
+        }
+    }
+
+    /// A failed compiler process, with the package's identity and the
+    /// compiler's log.
+    pub fn failure_with_log(
+        &self,
+        key: &str,
+        target: &Target,
+        error: Error,
+        log: &Path,
+    ) -> Error {
+        let cause = match error {
+            Error::Build { message, .. } => message,
+            other => other.to_string(),
+        };
+        self.failure(
+            key,
+            target,
+            format!("{cause}\nthe build log {}:\n{}", log.display(), read_log(log)),
+        )
+    }
+}
+
+/// The file a build's compiler writes its output to.
+fn build_log(dir: &Workspace) -> PathBuf {
+    dir.path().join(BUILD_LOG)
+}
+
+/// The text of a build's log, or a note that it cannot be read.
+fn read_log(log: &Path) -> String {
+    std::fs::read_to_string(log).unwrap_or_else(|error| format!("<unreadable: {error}>"))
+}
+
+/// The files a build wrote into its workspace, relative to the workspace and
+/// in a stable order. The compiler's log is not one of them.
+fn collect(directory: &Path) -> Result<Vec<String>> {
+    fn walk(at: &Path, prefix: &Path, files: &mut Vec<String>) -> Result<()> {
+        let mut entries = std::fs::read_dir(at)?.collect::<std::result::Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let name = entry.file_name();
+            // A dot file is the build's own bookkeeping (its log), not a
+            // module file.
+            if name.to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            let relative = prefix.join(&name);
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                walk(&path, &relative, files)?;
+            } else if kind.is_file() {
+                files.push(relative.to_string_lossy().replace('\\', "/"));
+            }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    walk(directory, Path::new(""), &mut files)?;
+    Ok(files)
+}
+
+/// Checks that a cubin module's metadata JSON names the kernel to launch.
+///
+/// `ops` loads the module with `cuLibraryLoadData` and launches the symbol the
+/// metadata's `name` field gives (design sections 4.2 and 5.3), so a metadata
+/// file without a name builds a module nothing can launch.
+fn check_metadata_symbol(op: &str, metadata: &Path) -> std::result::Result<(), String> {
+    let text = std::fs::read_to_string(metadata).map_err(|error| error.to_string())?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).map_err(|error| error.to_string())?;
+    match parsed.get("name").and_then(serde_json::Value::as_str) {
+        Some(name) if !name.is_empty() => Ok(()),
+        _ => Err(format!("{op}: the metadata has no name field")),
+    }
 }
 
 /// CUDA C++ through nvcc (design section 5.3).
@@ -217,12 +328,83 @@ impl Source for TritonSource {
     fn build(
         &self,
         _op: &str,
-        _key: &str,
-        _target: &Target,
-        _toolchain: &dyn Toolchain,
-        _dir: &Workspace,
+        key: &str,
+        target: &Target,
+        toolchain: &dyn Toolchain,
+        dir: &Workspace,
     ) -> Result<Built> {
-        todo!("the Triton source: drive triton.compile through the python environment")
+        let package = &self.package;
+        let log = build_log(dir);
+        // The package states how its kernel is compiled in its own script: the
+        // descriptor's argument signature, the compile-time values the
+        // descriptor and the parameters give, and the compilation options are
+        // the package's knowledge of its operator, so they live in the
+        // revision (design section 5.2), not in the manifest's free-form
+        // selection table.
+        let script = package.script().map_err(|_| {
+            package.failure(
+                key,
+                target,
+                "a Triton package must name the compile script that builds it in [source] script",
+            )
+        })?;
+        if !script.is_file() {
+            return Err(package.failure(
+                key,
+                target,
+                format!(
+                    "the compile script {} does not exist in the package",
+                    script.display()
+                ),
+            ));
+        }
+        let interpreter = toolchain.script_interpreter().ok_or_else(|| Error::Toolchain {
+            kind: ToolchainKind::Python,
+            message: format!(
+                "no Python environment to run {}: create crates/program-server/python with `uv sync`",
+                script.display()
+            ),
+        })?;
+        let job = ToolJob::new(interpreter, &package.root, &log)
+            .argument(&script)
+            .environment(package.environment(key, target, dir));
+        toolchain
+            .run(job)
+            .map_err(|error| package.failure_with_log(key, target, error, &log))?;
+
+        // A cubin module is the cubin and the metadata JSON that says how to
+        // launch it; a package that wrote neither did not build a module.
+        let cubin = dir.path().join(MODULE_CUBIN);
+        if !cubin.is_file() {
+            return Err(package.failure(
+                key,
+                target,
+                format!(
+                    "the compile script wrote no {MODULE_CUBIN}; its output was:\n{}",
+                    read_log(&log)
+                ),
+            ));
+        }
+        let metadata = package.metadata_name();
+        let metadata_path = dir.path().join(&metadata);
+        if !metadata_path.is_file() {
+            return Err(package.failure(
+                key,
+                target,
+                format!(
+                    "the compile script wrote no {metadata}, the launch metadata the module needs"
+                ),
+            ));
+        }
+        check_metadata_symbol(&package.manifest.op, &metadata_path).map_err(|message| {
+            package.failure(
+                key,
+                target,
+                format!("{metadata} names no kernel to launch: {message}"),
+            )
+        })?;
+        let files = collect(dir.path())?;
+        Ok(Built { files })
     }
 }
 
