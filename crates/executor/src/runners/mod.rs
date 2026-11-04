@@ -10,6 +10,7 @@
 //! on are the same.
 
 pub mod causal_lm;
+pub(crate) mod columns;
 pub mod lifecycle;
 
 pub use causal_lm::CausalLmRunner;

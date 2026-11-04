@@ -189,6 +189,12 @@ pub struct Batch {
     /// and the graph then runs clean against the wrong memory. That failure looks like a model
     /// defect rather than a cache one, so it is refused at submit rather than left to the graph.
     pub block_tables: Vec<ipc::BlockTable>,
+    /// A media computation's columns, and `None` for every causal-LM batch.
+    ///
+    /// One batch is one computation (2.4): a media batch states its inputs here and carries no token
+    /// column a language model reads, and a token batch carries no media inputs. The runner that
+    /// receives one knows which class it serves, so the field is read by the media runners alone.
+    pub media: Option<MediaColumns>,
 }
 
 /// The commit table's own definition, so a producer outside this crate writes its rows against
