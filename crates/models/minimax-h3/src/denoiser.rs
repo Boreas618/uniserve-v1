@@ -115,6 +115,40 @@ impl Layouts {
         })
     }
 
+    /// The canvas a request renders: its pixels rounded to the checkpoint's grid, and the latent
+    /// raster they imply.
+    ///
+    /// The runner allocates rasters from this and never builds a [`Canvas`] itself - a canvas
+    /// reconstructed from a layout is a second statement of a rounding, and the two would agree
+    /// only on the sizes where the rounding is the identity.
+    pub fn canvas(&self, request: &VideoRequest) -> Result<Canvas> {
+        canvas_of(request)
+    }
+
+    /// The element offset and length of each condition's draw in the request's stream, in packed
+    /// order: `(offset, elements)`, one entry per condition, so a runner slices one drawn buffer
+    /// without computing a prefix sum.
+    ///
+    /// An audio reference draws nothing (`condition_elements`) and reads as a zero-length entry at
+    /// the cursor its neighbours left - which is why this is a function and not a runner's prefix
+    /// sum over their counts: a sum over counts is exactly where the audio-only case gets dropped.
+    /// The entries' offsets are a partition of `[0, condition_elements(all))` in request order.
+    pub fn condition_offsets(&self, request: &VideoRequest) -> Result<Vec<(u64, u64)>> {
+        let canvas = canvas_of(request)?;
+        let declared = conditions_of(request);
+        let mut cursor = 0_u64;
+        Ok(declared
+            .iter()
+            .map(|condition| {
+                let elements =
+                    u64::from(self.condition_elements(std::slice::from_ref(condition), &canvas));
+                let entry = (cursor, elements);
+                cursor += elements;
+                entry
+            })
+            .collect())
+    }
+
     /// The elements the request's condition draws occupy, in request order.
     ///
     /// A visual condition's noise is drawn at latent resolution - patched afterwards, so its packed
@@ -1045,6 +1079,23 @@ fn canvas_of_raster(width: u32, height: u32) -> Option<Canvas> {
         width,
         height,
     })
+}
+
+/// The segments a request's conditions pack into, in packed order.
+///
+/// A runner hands one raster, one soundtrack and one draw per segment and reads back the row counts
+/// the packing reserved - it does not re-derive them, because those rows are the same arithmetic as
+/// [`condition_placements`] and a second statement of them is what makes a dropped condition
+/// invisible. Each segment carries its kind, its request index, its anchor (a keyframe's), its
+/// pixels' raster when it has any, and its audio frames.
+///
+/// The rows a condition occupies are `video_rows()` and `audio_rows()`, and a visual condition's
+/// draw elements are [`Layouts::condition_offsets`]'s entry for it.
+impl Denoiser {
+    pub fn segments(&self, request: &VideoRequest) -> Result<Vec<packing::Segment>> {
+        let canvas = canvas_of(request)?;
+        packing::condition_segments(&conditions_of(request), &canvas, self.config.clip)
+    }
 }
 
 /// The rows a request's conditions encode to, and their noise draws.
@@ -3126,6 +3177,94 @@ mod tests {
         let mut config = layouts().config;
         config.attention = AttentionKind::sparse(TILE, 0.8, None).unwrap();
         Layouts::new(config, layouts().arrangement).unwrap()
+    }
+
+    #[test]
+    fn a_conditions_draws_partition_the_condition_block() {
+        // A runner sizes one buffer by `condition_elements` and slices each condition out of it by
+        // `condition_offsets`, so the two have to agree on the same request and the entries have to
+        // be contiguous in packed order. An audio-only reference is the case a prefix sum over
+        // counts gets wrong: it draws nothing (`denoiser.py:452-472`), so its entry is zero-length
+        // at the cursor its neighbours left, and a runner that advanced the cursor by its *rows*
+        // would shift every later draw of the request and change the video silently.
+        let shapes = [
+            nn::capability::ConditionShape {
+                role: nn::capability::ConditionRole::FirstFrame,
+                frames: 1,
+                height: 256,
+                width: 256,
+                audio_samples: 0,
+            },
+            nn::capability::ConditionShape {
+                role: nn::capability::ConditionRole::Reference,
+                frames: 25,
+                height: 256,
+                width: 256,
+                audio_samples: 0,
+            },
+            nn::capability::ConditionShape {
+                role: nn::capability::ConditionRole::Reference,
+                frames: 0,
+                height: 0,
+                width: 0,
+                audio_samples: 48_000,
+            },
+        ];
+        let base = request(121, 256, 256);
+        let request = VideoRequest {
+            conditions: &shapes,
+            references: 2,
+            ..base
+        };
+        let rule = layouts();
+        let offsets = rule
+            .condition_offsets(&request)
+            .expect("a request's offsets");
+        assert_eq!(offsets.len(), shapes.len(), "one entry per condition");
+
+        // Contiguous, in packed order, and starting at zero.
+        let mut cursor = 0_u64;
+        for (offset, elements) in &offsets {
+            assert_eq!(*offset, cursor, "each piece starts where the last ended");
+            cursor += elements;
+        }
+        assert_eq!(
+            offsets[2].1, 0,
+            "an audio reference draws no noise and takes no elements"
+        );
+        assert!(offsets[0].1 > 0 && offsets[1].1 > 0, "a visual piece draws");
+        assert!(
+            offsets[1].1 > offsets[0].1,
+            "25 frames draw more than one still's frame"
+        );
+
+        // And the entries' total is the block the runner sizes: the two public answers agree.
+        let conditions: Vec<packing::Condition> = shapes
+            .iter()
+            .map(|shape| packing::Condition {
+                role: match shape.role {
+                    nn::capability::ConditionRole::FirstFrame => packing::Role::FirstFrame,
+                    nn::capability::ConditionRole::LastFrame => packing::Role::LastFrame,
+                    nn::capability::ConditionRole::Reference => packing::Role::Reference,
+                },
+                frame: (shape.width > 0).then(|| packing::Frame {
+                    canvas: Canvas {
+                        short_edge: shape.width.min(shape.height),
+                        aspect: (1, 1),
+                        width: shape.width,
+                        height: shape.height,
+                    },
+                    num_frames: shape.frames,
+                }),
+                audio_samples: shape.audio_samples,
+            })
+            .collect();
+        let canvas = rule.canvas(&request).expect("a canvas");
+        assert_eq!(
+            cursor,
+            u64::from(rule.condition_elements(&conditions, &canvas)),
+            "the offsets partition the block `condition_elements` sizes"
+        );
     }
 
     #[test]
