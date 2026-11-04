@@ -169,6 +169,14 @@ impl Capacity {
         for canvas in config.offered_canvases() {
             let packing = crate::packing::dense_packing(frames, canvas, text, condition, unit)?;
             largest = largest.max(packing.padded_tokens);
+            // A sparse deployment packs by video tiles as well, and its segments pad the audio
+            // and the video up to whole tiles; the bound is the larger of the two plans at the
+            // same admission, so neither can overrun the scratch.
+            if let crate::config::AttentionKind::Sparse { tile, .. } = config.attention {
+                let segments =
+                    crate::packing::segment_packing(frames, canvas, text, condition, tile, tile)?;
+                largest = largest.max(segments.extent.padded_tokens);
+            }
         }
         if largest == 0 {
             return Err(Error::config(
@@ -407,9 +415,10 @@ mod tests {
             frames: 124,
         };
 
-        // The 5 s 16:9 layout needs 6913 rows; the bound is that or more, in whole units.
+        // The 5 s 16:9 layout of this capacity pads to 38080 rows in today's packing; the bound
+        // is the largest canvas's, so that or more, in whole units.
         let rows = capacity.rows(denoiser).expect("a row bound");
-        assert!(rows >= 6913, "{rows}");
+        assert!(rows >= 38080, "{rows}");
         assert_eq!(
             rows % unit,
             0,
@@ -424,6 +433,33 @@ mod tests {
         .rows(denoiser)
         .expect("a row bound");
         assert!(longer > rows, "{longer} is not larger than {rows}");
+    }
+
+    #[test]
+    fn a_sparse_admission_is_sized_by_the_larger_of_the_two_plans() {
+        use crate::config::tests_support::released_config;
+        let dense = released_config();
+        let (_, dense_dit) = dense
+            .only_denoiser()
+            .expect("the released checkpoint's DiT");
+        let capacity = Capacity {
+            text_rows: 2,
+            condition_rows: 3,
+            frames: 124,
+        };
+        let dense_rows = capacity.rows(dense_dit).expect("a dense row bound");
+
+        // The same admission under a sparse attention of 64-row tiles: its segments pad whole
+        // tiles, so its bound is at least the dense one and never smaller.
+        let mut sparse_dit = dense_dit.clone();
+        sparse_dit.attention =
+            crate::config::AttentionKind::sparse(64, 0.8, None).expect("a sparse attention");
+        let sparse_rows = capacity.rows(&sparse_dit).expect("a sparse row bound");
+        // The segment plan pads whole tiles and its segments pad the audio and the video to
+        // them, so the same admission needs 46848 rows against the dense plan's 38080: a bound
+        // taken from the dense plan alone would under-size the scratch by 8768 rows.
+        assert_eq!(dense_rows, 38080);
+        assert_eq!(sparse_rows, 46848);
     }
 
     #[test]
