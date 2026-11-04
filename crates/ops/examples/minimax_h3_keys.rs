@@ -250,19 +250,21 @@ fn main() {
     // `transformer.py`). The three lengths are the attention projections' `hidden_size`,
     // the output projection's `heads · head_dim = 7168`, and the feed-forward's `ffn_dim = 14336`.
     for k in [HIDDEN, HEADS_TIMES_HEAD_DIM, FFN] {
-        push(
-            "gemm",
-            ops::gemm::Descriptor {
-                input: DType::BF16,
-                weight: DType::BF16,
-                accumulate: DType::F32,
-                output: DType::BF16,
-                order: ops::gemm::WeightOrder::NxK,
-                epilogue: ops::gemm::Epilogue::None,
-                k,
-            }
-            .to_string(),
-        );
+        for epilogue in [ops::gemm::Epilogue::None, ops::gemm::Epilogue::Bias] {
+            push(
+                "gemm",
+                ops::gemm::Descriptor {
+                    input: DType::BF16,
+                    weight: DType::BF16,
+                    accumulate: DType::F32,
+                    output: DType::BF16,
+                    order: ops::gemm::WeightOrder::NxK,
+                    epilogue,
+                    k,
+                }
+                .to_string(),
+            );
+        }
     }
 
     // The audio encoder is FP32 throughout (`Model.forward` casts, and the whole autoencoder runs in
@@ -276,19 +278,21 @@ fn main() {
         AUDIO_LATENT_CHANNELS,
         2 * AUDIO_LATENT_CHANNELS,
     ] {
-        push(
-            "gemm",
-            ops::gemm::Descriptor {
-                input: DType::F32,
-                weight: DType::F32,
-                accumulate: DType::F32,
-                output: DType::F32,
-                order: ops::gemm::WeightOrder::NxK,
-                epilogue: ops::gemm::Epilogue::None,
-                k,
-            }
-            .to_string(),
-        );
+        for epilogue in [ops::gemm::Epilogue::None, ops::gemm::Epilogue::Bias] {
+            push(
+                "gemm",
+                ops::gemm::Descriptor {
+                    input: DType::F32,
+                    weight: DType::F32,
+                    accumulate: DType::F32,
+                    output: DType::F32,
+                    order: ops::gemm::WeightOrder::NxK,
+                    epilogue,
+                    k,
+                }
+                .to_string(),
+            );
+        }
     }
 
     // The DiT's rotation: three position axes of 32 rotated elements each, cut into three sections
