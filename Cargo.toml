@@ -7,7 +7,9 @@ members = [
     "crates/ipc",
     "crates/manager",
     "crates/models",
+    "crates/models/qwen3-moe",
     "crates/nixl",
+    "crates/nn",
     "crates/ops",
     "crates/proto",
     "crates/storage",
@@ -29,7 +31,9 @@ daemon = { path = "crates/daemon" }
 engine = { path = "crates/engine" }
 ipc = { path = "crates/ipc" }
 models = { path = "crates/models" }
+nn = { path = "crates/nn" }
 ops = { path = "crates/ops" }
+qwen3-moe = { path = "crates/models/qwen3-moe" }
 nixl = { path = "crates/nixl" }
 proto = { path = "crates/proto" }
 storage = { path = "crates/storage" }
