@@ -212,6 +212,57 @@ impl Rotary {
     ///
     /// A one-dimensional rotation's `positions` is `[…, tokens]`; a sectioned rotation's is
     /// `[axes, …, tokens]`, one coordinate per axis per token, and the tables cover the tokens.
+    /// The descriptor the factor tables are built with, for positions of `positions`.
+    ///
+    /// The token count is not in it: how many positions a call carries is a launch value, and the
+    /// sections' widths, the axis count and the interleaving are the geometry a model binds once.
+    pub fn factors_descriptor(&self, positions: ops::DType) -> FactorsDescriptor {
+        FactorsDescriptor {
+            dtype: ops::DType::F32,
+            positions,
+            columns: self.rotated / 2,
+            block: ROTARY_BLOCK,
+            scale: self.scale.into(),
+            pdl: PDL,
+            axes: self.sections.map_or(1, |sections| sections.axes()),
+            interleaved: self
+                .sections
+                .is_some_and(|sections| sections.is_interleaved()),
+            sections: self
+                .sections
+                .map_or([0; MAX_AXES], |sections| sections.widths),
+        }
+    }
+
+    /// The descriptor one rotation launches with, for a projection of `input` and an output of
+    /// `output`.
+    ///
+    /// `affine` states whether the per-head normalization has a learned weight, which is a different
+    /// program: with one it loads the weight, without one it has no weight ports.
+    pub fn apply_descriptor(
+        &self,
+        input: ops::DType,
+        output: ops::DType,
+        affine: bool,
+    ) -> QkNormRopeDescriptor {
+        let head_dim = u64::from(self.head_dim);
+        QkNormRopeDescriptor {
+            dtype: input,
+            output,
+            head_dim: self.head_dim,
+            q_heads: self.q_heads,
+            k_heads: self.k_heads,
+            rotation: self.rotation,
+            epsilon: self.epsilon.into(),
+            // Full-width unless the configuration narrows it.
+            rotated: self.rotated,
+            rows: QK_NORM_TOKENS,
+            block: head_dim.next_power_of_two().min(1024) as u32,
+            affine,
+            pdl: PDL,
+        }
+    }
+
     pub fn factors(
         &self,
         f: &Forward,
@@ -259,21 +310,7 @@ impl Rotary {
                 ),
             ));
         }
-        let descriptor = FactorsDescriptor {
-            dtype: ops::DType::F32,
-            positions: positions.dtype,
-            columns: self.rotated / 2,
-            block: ROTARY_BLOCK,
-            scale: self.scale.into(),
-            pdl: PDL,
-            axes: self.sections.map_or(1, |sections| sections.axes()),
-            interleaved: self
-                .sections
-                .is_some_and(|sections| sections.is_interleaved()),
-            sections: self
-                .sections
-                .map_or([0; MAX_AXES], |sections| sections.widths),
-        };
+        let descriptor = self.factors_descriptor(positions.dtype);
         let args = FactorsArgs {
             positions,
             frequencies: self.frequencies.view(),
@@ -375,21 +412,7 @@ impl Rotary {
                 ));
             }
         };
-        let descriptor = QkNormRopeDescriptor {
-            dtype: query.dtype,
-            output: q_out.dtype,
-            head_dim: self.head_dim,
-            q_heads: self.q_heads,
-            k_heads: self.k_heads,
-            rotation: self.rotation,
-            epsilon: self.epsilon.into(),
-            // Full-width unless the configuration narrows it.
-            rotated: self.rotated,
-            rows: QK_NORM_TOKENS,
-            block: head_dim.next_power_of_two().min(1024) as u32,
-            affine: affine.is_some(),
-            pdl: PDL,
-        };
+        let descriptor = self.apply_descriptor(query.dtype, q_out.dtype, affine.is_some());
         let (q_weight, k_weight) = match affine {
             Some((q_weight, k_weight)) => (Some(q_weight), Some(k_weight)),
             None => (None, None),
