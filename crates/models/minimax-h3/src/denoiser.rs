@@ -954,7 +954,8 @@ pub struct ConditionLatents<'a> {
 }
 
 /// The level a visual condition is anchored at: `t z + (1 - t) noise` with `t` this
-/// (`uniserve/models/minimax_h3/denoiser.py:102`).
+/// (`uniserve/models/minimax_h3/denoiser.py:102`), and the level its modulation group sits at
+/// until the generated video is cleaner than it ([`crate::modulation::entries`]).
 pub const VISUAL_CONDITION_TIME: f32 = 0.999;
 
 /// A request's condition latents, each condition's visual view and its audio view.
