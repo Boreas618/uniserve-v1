@@ -387,7 +387,7 @@ fn a_triton_package_builds_a_cubin_module_and_resolves_it() {
 }
 
 #[test]
-fn a_cuda_package_builds_a_native_module_with_its_entries() {
+fn a_cuda_package_builds_the_module_its_manifest_declares() {
     if !have("nvcc", &["--version"]) {
         eprintln!("SKIPPED (provisioning): no nvcc on this host");
         return;
@@ -396,6 +396,11 @@ fn a_cuda_package_builds_a_native_module_with_its_entries() {
         eprintln!("SKIPPED: the tree holds no CUDA package");
         return;
     };
+    // What the package declares is what the module must be: nvcc writes a
+    // cubin and its launch metadata, or a native library with the entries the
+    // package names (design section 5.3).
+    let manifest =
+        program_server::manifest::Manifest::load(&package.directory).expect("the package loads");
     let witness = witness(
         &package.directory,
         &package.op,
@@ -410,33 +415,53 @@ fn a_cuda_package_builds_a_native_module_with_its_entries() {
     );
 
     assert_eq!(witness.progress[0].state, BuildState::Committed);
-    assert_eq!(witness.resolved.form, ModuleForm::Native);
-    assert!(
-        witness.resolved.metadata.is_none(),
-        "a native module has no launch metadata"
-    );
-    let package_manifest = std::fs::read_to_string(package.directory.join("package.toml")).unwrap();
-    let launch = package_manifest
-        .split("[module.entries]")
-        .nth(1)
-        .and_then(|entries| entries.split("launch = \"").nth(1))
-        .and_then(|rest| rest.split('"').next())
-        .expect("a native package names its launch entry");
-    assert_eq!(
-        witness.resolved.entries.get("launch").map(String::as_str),
-        Some(launch),
-        "the module's launch symbol is the package's"
-    );
-    let library = file_of(&witness.resolved, "module.so");
-    assert_eq!(
-        &library[..4],
-        b"\x7fELF",
-        "a native module is a shared object"
-    );
-    assert!(
-        String::from_utf8_lossy(&library).contains(launch),
-        "the module exports the entry its package names"
-    );
+    assert_eq!(witness.resolved.form, manifest.module.form);
+    match manifest.module.form {
+        ModuleForm::Cubin => {
+            let metadata = witness
+                .resolved
+                .metadata
+                .clone()
+                .expect("a cubin module names its launch metadata");
+            assert!(
+                witness.resolved.entries.is_empty(),
+                "a cubin has no C entry"
+            );
+            let cubin = file_of(&witness.resolved, "module.cubin");
+            assert_eq!(&cubin[..4], b"\x7fELF");
+            let text = String::from_utf8(file_of(&witness.resolved, &metadata)).unwrap();
+            let parsed: serde_json::Value =
+                serde_json::from_str(&text).expect("the metadata is JSON");
+            assert!(
+                !parsed
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .is_empty(),
+                "the metadata names the kernel it launches"
+            );
+        }
+        ModuleForm::Native => {
+            assert!(witness.resolved.metadata.is_none());
+            assert_eq!(
+                witness.resolved.entries.get("launch"),
+                manifest.module.entries.get("launch"),
+                "the module's launch symbol is the package's"
+            );
+            let library = file_of(&witness.resolved, "module.so");
+            assert_eq!(&library[..4], b"\x7fELF");
+            let launch = manifest
+                .module
+                .entries
+                .get("launch")
+                .expect("a native package names its launch entry");
+            assert!(
+                String::from_utf8_lossy(&library).contains(launch),
+                "the module exports the entry its package names"
+            );
+        }
+        other => panic!("a CUDA package builds a cubin or a native module, not {other:?}"),
+    }
 
     witness.stop.store(true, Ordering::SeqCst);
     witness.thread.join().unwrap();
