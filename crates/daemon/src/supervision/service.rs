@@ -30,9 +30,9 @@ use std::time::Duration;
 
 use prost::Message as _;
 use proto::process::{
-    self, Answered, Downstream, Event, Exit, Exited, Forwarded, FromMember, Hello, LedgerReport,
-    Node, NodesKnown, Reply, Request, Spawned, Stopped, ToMember, TransfersThrottled, Upstream,
-    Welcome, downstream, event, from_member, hello, reply, request, to_member, upstream,
+    self, Answered, Downstream, Event, Exit, Exited, Forwarded, FromMember, Hello, Interface,
+    LedgerReport, Node, NodesKnown, Reply, Request, Spawned, Stopped, ToMember, TransfersThrottled,
+    Upstream, Welcome, downstream, event, from_member, hello, reply, request, to_member, upstream,
 };
 use proto::{Connection, Handed, Listener};
 
@@ -427,6 +427,8 @@ pub(crate) fn serve_leader(
             next_engine: 1,
             clients: HashMap::new(),
             next_client: 1,
+            process_links: HashMap::new(),
+            request_links: HashMap::new(),
             stops: HashMap::new(),
             commands,
             reports,
@@ -460,6 +462,13 @@ pub(crate) struct LeaderService {
     /// one of them (§2.3).
     clients: HashMap<u64, EngineConnection>,
     next_client: u64,
+    /// The connection each engine's process link is on, by engine number: the
+    /// one link that receives that engine's commands, and the reason a second
+    /// process link for the same number is refused (§2.3).
+    process_links: HashMap<u64, u64>,
+    /// The connection each engine's request link is on, by engine number. It
+    /// never receives a command, and a second request link is refused.
+    request_links: HashMap<u64, u64>,
     /// Stops of an engine, by its request id, awaiting the members'
     /// answers.
     stops: HashMap<(u64, u64), PendingStop>,
@@ -510,6 +519,8 @@ pub(crate) fn run_leader(
         mut next_engine,
         mut clients,
         mut next_client,
+        mut process_links,
+        mut request_links,
         mut stops,
         commands,
         reports,
@@ -539,6 +550,8 @@ pub(crate) fn run_leader(
                 next_engine,
                 clients,
                 next_client,
+                process_links,
+                request_links,
                 stops,
                 commands,
                 reports,
@@ -635,6 +648,9 @@ pub(crate) fn run_leader(
         // Nothing addresses them, so they are kept out of the numbered registry
         // and served for what they ask (§2.3).
         let mut unkeyed: Vec<u64> = Vec::new();
+        // The request links that greeted this round, by the number they state:
+        // filed beside the clients, because a command never goes down one.
+        let mut request_links_new: Vec<(u64, u64)> = Vec::new();
         // Engines: their hellos and requests; a closed engine takes its
         // processes on every node with it.
         for (&engine, peer) in &mut engines {
@@ -642,9 +658,54 @@ pub(crate) fn run_leader(
                 if !peer.welcomed {
                     match peer.connection.try_recv::<Hello>() {
                         Ok(Some(hello)) => {
-                            let refusal = refusal(&hello, |peer| {
+                            // A main process says which of its links this is and
+                            // which engine it serves (§2.3): its process link
+                            // takes the epoch's commands, its request link
+                            // carries the epoch's requests, and a client of the
+                            // socket is neither.
+                            let (stated, link) = match &hello.peer {
+                                Some(hello::Peer::Engine(engine)) => (
+                                    Some(engine.engine).filter(|number| *number != 0),
+                                    engine.interface(),
+                                ),
+                                _ => (None, Interface::Unspecified),
+                            };
+                            let mut refusal = refusal(&hello, |peer| {
                                 matches!(peer, hello::Peer::Engine(_) | hello::Peer::Frontend(_))
                             });
+                            if refusal.is_none() {
+                                refusal = match (link, stated) {
+                                    // A link that receives commands must say
+                                    // which engine's commands it receives.
+                                    (Interface::Process, None) => Some(
+                                        "a process link states no engine number: no command could                                          be addressed to it"
+                                            .to_owned(),
+                                    ),
+                                    // A process has one command link. A second
+                                    // one is a deployment fault, and the first
+                                    // keeps the commands it is serving.
+                                    (Interface::Process, Some(number)) => {
+                                        process_links.get(&number).map(|held| {
+                                            format!(
+                                                "engine {number} already has its process link on \
+                                                 connection {held}; this connection states the \
+                                                 same engine"
+                                            )
+                                        })
+                                    }
+                                    // A process has one request link.
+                                    (Interface::Requests, Some(number)) => {
+                                        request_links.get(&number).map(|held| {
+                                            format!(
+                                                "engine {number} already has its request link on \
+                                                 connection {held}; this connection states the \
+                                                 same engine"
+                                            )
+                                        })
+                                    }
+                                    _ => None,
+                                };
+                            }
                             let welcome = Welcome {
                                 major: proto::PROTOCOL_MAJOR,
                                 minor: proto::PROTOCOL_MINOR,
@@ -657,21 +718,10 @@ pub(crate) fn run_leader(
                                 break;
                             }
                             let frontend = matches!(hello.peer, Some(hello::Peer::Frontend(_)));
-                            // A main process states the engine number its
-                            // launch named, and is numbered by it from here
-                            // on: the epoch layer addresses a main process by
-                            // that number in both directions, and the order
-                            // its many connections arrived in says nothing
-                            // about which of them serves the epoch (§2.3).
-                            let stated = match &hello.peer {
-                                Some(hello::Peer::Engine(engine)) => {
-                                    Some(engine.engine).filter(|number| *number != 0)
-                                }
-                                _ => None,
-                            };
                             tracing::info!(
                                 engine,
                                 stated = stated.unwrap_or(0),
+                                interface = link.as_str_name(),
                                 build = %hello.build,
                                 frontend,
                                 "a process connected"
@@ -679,19 +729,45 @@ pub(crate) fn run_leader(
                             if frontend && let Some(frontend_greetings) = &frontend_greetings {
                                 let _ = frontend_greetings.send(engine);
                             }
-                            // A peer that is not a main process and holds no
-                            // number is not a process of this deployment: it is
-                            // served (a device or storage query) and never
-                            // numbered, because the number a launch named is
-                            // the main process's and a client must not take it.
-                            if !frontend && stated.is_none() {
-                                unkeyed.push(engine);
+                            // Three kinds of peer reach this point: a process's
+                            // command link, which the epoch addresses by number
+                            // and which is filed under it; a process's request
+                            // link, which never receives a command and so is
+                            // kept out of the numbered registry; and a client of
+                            // the socket, which is served for its queries and
+                            // holds no number at all.
+                            if frontend {
+                                // The frontend is commanded by the epoch layer
+                                // like a main process, and is filed by whatever
+                                // number it arrived with (§2.1).
+                            } else {
+                                match (link, stated) {
+                                    // Only a process link takes a number: it is
+                                    // the connection a command goes down.
+                                    (Interface::Process, Some(number)) => {
+                                        // Reserved as the link is read, so that a
+                                        // second process link for the same
+                                        // engine in this same round is refused
+                                        // rather than displacing the first.
+                                        process_links.insert(number, engine);
+                                        renumbered.push((engine, number));
+                                    }
+                                    (Interface::Requests, Some(number)) => {
+                                        request_links_new.push((engine, number));
+                                    }
+                                    // Everything else - a worker's client, the
+                                    // daemon's own client, a link that states a
+                                    // number but not the interface that would
+                                    // make it a command target - is served and
+                                    // never numbered.
+                                    _ => unkeyed.push(engine),
+                                }
                             }
                             // The epoch layer binds this connection to the
                             // launch it started when the peer's first report
                             // names the launch generation (§2.5). A client
                             // sends no report, and takes no greeting.
-                            if frontend || stated.is_some() {
+                            if frontend || link == Interface::Process {
                                 let _ = greetings.send((
                                     stated.unwrap_or(engine),
                                     Greeting {
@@ -699,11 +775,6 @@ pub(crate) fn run_leader(
                                         frontend,
                                     },
                                 ));
-                            }
-                            if let Some(number) = stated
-                                && number != engine
-                            {
-                                renumbered.push((engine, number));
                             }
                             let _ = wake.send(());
                             peer.welcomed = true;
@@ -879,6 +950,19 @@ pub(crate) fn run_leader(
         // The clients leave the numbered registry before any command is read:
         // a command names a launch's engine, and a client that happened to
         // arrive first must not be the connection it names.
+        for (arrived, number) in request_links_new.drain(..) {
+            if let Some(peer) = engines.remove(&arrived) {
+                let client = next_client;
+                next_client += 1;
+                request_links.insert(number, arrived);
+                tracing::info!(
+                    client,
+                    engine = number,
+                    "a request link is not a command target"
+                );
+                clients.insert(client, peer);
+            }
+        }
         for arrived in unkeyed.drain(..) {
             if let Some(peer) = engines.remove(&arrived) {
                 let client = next_client;
@@ -913,6 +997,7 @@ pub(crate) fn run_leader(
                 );
             }
             engines.insert(number, connection);
+            process_links.insert(number, arrived);
             tracing::info!(
                 engine = number,
                 arrived,
@@ -1201,6 +1286,10 @@ impl LeaderService {
             // closed with the predecessor's process.
             clients: _,
             next_client: _,
+            // The link maps are derived from the connections that are handed
+            // over: the successor's first look at a greeted peer files it.
+            process_links: _,
+            request_links: _,
             stops,
             // The command channel is the daemon's, not the service's: the
             // successor makes its own ends when it resumes (`ProcessCommands`).
@@ -1356,6 +1445,8 @@ pub(crate) fn resume(
                     next_engine,
                     clients: HashMap::new(),
                     next_client: 1,
+                    process_links: HashMap::new(),
+                    request_links: HashMap::new(),
                     stops,
                     commands,
                     reports,
