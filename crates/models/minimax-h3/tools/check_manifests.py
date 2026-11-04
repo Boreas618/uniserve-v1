@@ -127,6 +127,16 @@ def expectations(config: dict, degrees: list[int]) -> list[tuple[str, str, str, 
             "denoiser.rs: the video, audio and prefix row gathers",
         )
     )
+    # The packed rows' rotary factors: the DiT rotates three axes of 32 channels each (the attention's
+    # `Sections::new([32, 32, 32])`), and the descriptor names the per-axis widths in its key.
+    add(
+        (
+            "rotary_factors/triton",
+            "sections",
+            "32-32-32",
+            "attention.rs: the packed rows' three rotary axes",
+        )
+    )
     add(("logits_gather/triton", "dtype", "i32", "modulation.rs: the step→entry gather is i32"))
     add(("logits_gather/triton", "columns", "1", "solver.rs: the coefficient table"))
 
