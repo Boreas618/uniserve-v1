@@ -20,6 +20,7 @@
 
 pub(crate) mod continuation;
 
+use crate::scheduler::completion::CallCompletion;
 use super::{EncoderCachePin, GuidancePrefixState, Phase, RequestAllocations, TerminalIntent};
 use crate::kv_cache::{BlockTable, CacheAllocation};
 
@@ -27,7 +28,7 @@ use ipc::{ForwardMode, MediaCall, TransferMode};
 
 use crate::{GenerationRequest, ImageEncoderInput, ImageInput};
 use ipc::{
-    Bounds, BufferId, Call, CallId, CallKind, CallOutput, CallStatus, CanvasStep, DType, DimBound,
+    Bounds, BufferId, Call, CallId, CallKind, CallStatus, CanvasStep, DType, DimBound,
     Readout, RequestKey, SamplingState, ShapeBound, TensorRef, VisionInput,
 };
 use ipc::{CanvasSampling, RequestId, SamplingParams};
@@ -267,7 +268,7 @@ impl RequestState {
     pub(crate) fn process_generation_result(
         &mut self,
         call: &Call,
-        record: &CallOutput,
+        record: &CallCompletion,
     ) -> Result<(), GenerationResultError> {
         if call.call_id.batch_id == 0 {
             return Err(GenerationResultError::MissingCallId);
@@ -1256,7 +1257,7 @@ pub(crate) fn validate_generation_result(
     call: &Call,
     image_cache: Option<(u32, Option<u32>)>,
     state: &RequestState,
-    record: &CallOutput,
+    record: &CallCompletion,
     canvas: Option<&CanvasSampling>,
 ) -> Result<(), GenerationResultError> {
     let request = &state.req;
