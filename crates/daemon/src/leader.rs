@@ -1352,6 +1352,13 @@ impl Leader {
         dry_run: bool,
         force: bool,
     ) -> Result<Option<crate::epoch::Update>, UpdateError> {
+        // One update at a time (§7.2): an epoch switch replaces the very main
+        // processes a program-layer change would precopy into.
+        if self.updates.running() {
+            return Err(UpdateError::Refused(
+                "an epoch switch is running: one update at a time".to_owned(),
+            ));
+        }
         let current = self.serving_config()?;
         let Some(update) = self.route(&current, target, false).await? else {
             return Ok(None);
