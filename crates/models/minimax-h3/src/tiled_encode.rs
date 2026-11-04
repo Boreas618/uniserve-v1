@@ -74,7 +74,12 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// The latent rows the run covers before the crop, `(origin, extent)`.
+    /// The latent rows the run covers before the crop, as `(origin, end)`, `end` exclusive.
+    ///
+    /// A run of `end - origin` latent rows is what the caller's two rasters must hold; the crop then
+    /// keeps `crop.start - origin` to `crop.stop - origin`. The pair is stated as an origin and an
+    /// end rather than a start and a length because the tiles' rows are in raster coordinates and a
+    /// length invites the off-by-one.
     pub fn extent(&self) -> (u32, u32) {
         let end = self
             .tiles
