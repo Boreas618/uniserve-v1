@@ -314,6 +314,33 @@ impl CachePlan {
         })
     }
 
+    /// The field runs a state page's checkpoints need, or zero when the plan
+    /// holds no state group.
+    ///
+    /// One field storage holds `units_per_page * columns` planes of the state
+    /// group's page - the cells one run of that page covers - and the
+    /// checkpoints' plane positions run across fields in order, so the last
+    /// checkpoint's last plane decides how many runs the pool must hold. A
+    /// state plane never shares a field with a K/V plane: every group of the
+    /// pool indexes the same units, so a K/V plane and a state plane at one
+    /// (column, unit) are different bytes of the page.
+    pub fn state_fields(&self) -> u32 {
+        let Some(group) = self.groups.iter().find(|group| group.state) else {
+            return 0;
+        };
+        let capacity = group.units_per_page.saturating_mul(self.columns);
+        if capacity == 0 {
+            return 0;
+        }
+        let last = self
+            .checkpoints
+            .iter()
+            .map(|checkpoint| checkpoint.first_plane.saturating_add(checkpoint.planes))
+            .max()
+            .unwrap_or(0);
+        last.div_ceil(capacity)
+    }
+
     /// Whether groups store different element types: stale bytes of one type
     /// need not decode as finite values of another, so recycled units are
     /// zeroed completely.
@@ -476,6 +503,52 @@ fn gcd(left: u32, right: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A state page's checkpoints need one field storage per `units_per_page * columns` planes.
+    #[test]
+    fn a_state_page_asks_for_the_fields_its_checkpoints_span() {
+        let group = |state: bool| CacheGroupPlan {
+            window: None,
+            state,
+            draft: false,
+            block_size: 64,
+            units_per_page: 1,
+            layers: vec!["layers.0".into(), "layers.1".into()],
+            layer_ids: vec![0, 1],
+            axis: GroupAxis {
+                offset: 0,
+                total: 2,
+            },
+            num_kv_heads: 1,
+            total_kv_heads: 1,
+            kv_head_offset: 0,
+            head_dim: 8,
+            dtype: ElementType::BF16,
+            compute_dtype: ElementType::BF16,
+        };
+        let plan = |state: bool, checkpoints: Vec<Checkpoint>| CachePlan {
+            columns: 2,
+            plane_bytes: 16,
+            quantized: false,
+            unit_bytes: 64,
+            dtype: PrefixCacheDtype::BFloat16,
+            groups: vec![group(state)],
+            states: Vec::new(),
+            checkpoints,
+        };
+        let checkpoint = |first_plane: u32, planes: u32| Checkpoint {
+            first_plane,
+            planes,
+            fields: Vec::new(),
+        };
+        // Two columns and one unit per page: a field holds two planes, so four planes need two.
+        assert_eq!(plan(true, vec![checkpoint(0, 4)]).state_fields(), 2);
+        // A checkpoint that fills one field exactly asks for one.
+        assert_eq!(plan(true, vec![checkpoint(0, 2)]).state_fields(), 1);
+        // A pool with no state group asks for none.
+        assert_eq!(plan(false, vec![checkpoint(0, 4)]).state_fields(), 0);
+        assert_eq!(plan(true, Vec::new()).state_fields(), 0);
+    }
 
     /// A dense pool of a model with many layers per group plans, and a unit spans every column.
     ///
