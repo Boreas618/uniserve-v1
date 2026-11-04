@@ -175,7 +175,12 @@ impl ScaledResidual {
         }
         let descriptor = residual::ScaledResidualDescriptor {
             dtype: hidden.dtype,
-            columns: columns as u32,
+            columns: u32::try_from(columns).map_err(|_| {
+                Error::shape(
+                    "ScaledResidual::forward_with_scale",
+                    "a row wider than a descriptor holds".to_owned(),
+                )
+            })?,
             block: BLOCK,
             update_bias: self.bias.is_some(),
         };
