@@ -29,6 +29,10 @@ Operators, in the order the data meets them:
 - `argmax` — the greedy token: the largest value's index, the lowest index among ties.
 - `logprob_gather` — one token's log-probability per row, read out of the FP32 row
   `log_softmax` produced. Values move, so the comparison is exact.
+- `top_k` — the `width` largest logits of a row, sorted descending, with their vocabulary
+  ids; a tie keeps the **lower vocabulary id first**. A selection, so exact, and the case it
+  turns on is the tie: a radix select that breaks ties by arrival order passes every row
+  without one.
 
 Every case is chosen so a wrong stride, a wrong vocabulary offset or a missing rule shows:
 gathered rows that repeat and come out of order, an unpadded width below the gathered width,
@@ -51,6 +55,12 @@ of reporting a pass it did not observe.**
   Python bool and then hands `numpy.bool_ | ndarray` to a bitwise ufunc, which refuses:
   reproduced with a five-line kernel that does nothing else, so the gap is the interpreter's
   and not this operator's.
+- `top_k` maps the row onto order-preserving unsigned keys and complements them with `~` on a
+  `uint32`, which the interpreter turns into the Python integer `-1` and refuses
+  (`OverflowError('Python integer -1 out of bounds for uint32')`). A five-line kernel that
+  loads, bitcasts to `uint32` and complements reproduces it. `^ 0xFFFFFFFF` would not, so a
+  kernel written that way would run — the gap is in the tool, and whether the package should
+  spell it that way is its author's call, not the check's.
 """
 
 import argparse
@@ -79,6 +89,7 @@ OPERATORS = (
     "inverse_cdf",
     "argmax",
     "logprob_gather",
+    "top_k",
 )
 
 
@@ -506,6 +517,64 @@ def run_logprob_gather(case):
     return failures
 
 
+def run_top_k(case):
+    """Keep a row's largest values with their ids, sorted, and compare exactly."""
+    import top_k as kernels
+
+    dtype = TORCH_TYPES[case["dtype"]]
+    generator = torch.Generator().manual_seed(case["seed"])
+    rows, vocabulary, width = case["rows"], case["vocabulary"], case["width"]
+    logits = torch.randn(rows, vocabulary, generator=generator).to(dtype)
+    if case["ties"]:
+        # Three columns with the same value, and one above them all: the kept ids must be
+        # the three lowest of the tied ones, in that order among equals.
+        logits[0, 5] = 2.0
+        logits[0, 9] = 2.0
+        logits[0, 1] = 2.0
+        logits[0, 40] = 5.0
+    if case["masked_tail"]:
+        # A `-inf` tail, as `filter_candidates` leaves it: a dropped candidate is never kept
+        # while a real one still is.
+        logits[:, vocabulary // 2 :] = float("-inf")
+    values = torch.full((rows, width), float("nan"), dtype=dtype)
+    ids = torch.full((rows, width), -1, dtype=torch.int32)
+
+    kernels._top_k_kernel[(rows,)](
+        logits, values, ids, rows, vocabulary, width, WIDTH=width, STEP=2048
+    )
+
+    exact = logits.cpu().double()
+    # Descending by value, ascending by id among equals: the order the operator promises.
+    failures = 0
+    for row in range(rows):
+        order = torch.argsort(exact[row], descending=True, stable=True)
+        wanted_values = exact[row][order][:width]
+        wanted_ids = order[:width].to(torch.int32)
+        if case["masked_tail"]:
+            keep = wanted_values != float("-inf")
+            got_values = values[row].cpu().double()[keep]
+            got_ids = ids[row].cpu()[keep]
+            value_failures = int((got_values != wanted_values[keep]).sum())
+            id_failures = int((got_ids != wanted_ids[keep]).sum())
+        else:
+            value_failures = int(
+                (values[row].cpu().double() != wanted_values).sum()
+            )
+            id_failures = int((ids[row].cpu() != wanted_ids).sum())
+        failures += value_failures + id_failures
+        if value_failures or id_failures:
+            print(
+                f"  row {row}: {value_failures} values and {id_failures} ids differ; "
+                f"wanted ids {wanted_ids.tolist()[:6]}, got {ids[row].tolist()[:6]}"
+            )
+    print(
+        f"{'exact' if failures == 0 else 'FAIL'}: top_k, {case['label']} — "
+        f"{rows} x {vocabulary} keeping {width}, {case['dtype']}"
+    )
+    print(f"  values and ids: {failures} elements differ from the reference")
+    return failures
+
+
 RUNNERS = {
     "logits_gather": run_logits_gather,
     "vocab_unpad": run_vocab_unpad,
@@ -514,6 +583,7 @@ RUNNERS = {
     "inverse_cdf": run_inverse_cdf,
     "argmax": run_argmax,
     "logprob_gather": run_logprob_gather,
+    "top_k": run_top_k,
 }
 
 
@@ -647,6 +717,39 @@ def cases(operator, flags):
                 "seed": 3,
             },
         ]
+    if operator == "top_k":
+        return [
+            {
+                "label": "the fixture's width out of the vocabulary",
+                "dtype": flags.dtype,
+                "rows": flags.rows,
+                "vocabulary": flags.vocabulary,
+                "width": flags.top_width,
+                "ties": False,
+                "masked_tail": False,
+                "seed": 1,
+            },
+            {
+                "label": "three tied logits, which must come out in ascending id order",
+                "dtype": flags.dtype,
+                "rows": 2,
+                "vocabulary": 64,
+                "width": 8,
+                "ties": True,
+                "masked_tail": False,
+                "seed": 2,
+            },
+            {
+                "label": "a masked -inf tail, which is never kept over a real candidate",
+                "dtype": flags.dtype,
+                "rows": 2,
+                "vocabulary": 100,
+                "width": 8,
+                "ties": False,
+                "masked_tail": True,
+                "seed": 3,
+            },
+        ]
     if operator == "logprob_gather":
         return [
             {
@@ -745,6 +848,11 @@ def descriptor_key(operator, flags):
         return f"dtype_{flags.dtype}_width_{flags.width}_ids_i32_pdl_{pdl}"
     if operator == "logprob_gather":
         return f"columns_{flags.columns}_ids_i32_pdl_{pdl}"
+    if operator == "top_k":
+        return (
+            f"dtype_{flags.dtype}_vocabulary_{flags.vocabulary}"
+            f"_width_{flags.top_width}_ids_i32_pdl_{pdl}"
+        )
     return (
         f"dtype_{flags.dtype}_vocabulary_{flags.vocabulary}_block_{flags.block}"
         f"_extras_{flags.extras}_divide_{flags.divide}_pdl_{pdl}"
@@ -758,6 +866,12 @@ def main() -> int:
     parser.add_argument("--rows", type=int, default=2)
     parser.add_argument("--tokens", type=int, default=8)
     parser.add_argument("--columns", type=int, default=2048)
+    parser.add_argument(
+        "--top-width",
+        type=int,
+        default=2048,
+        help="the candidates a top_k row keeps, a power of two",
+    )
     parser.add_argument(
         "--width",
         type=int,
@@ -797,6 +911,13 @@ def main() -> int:
             "logits_shape needs a device: its kernel rounds with libdevice's div_rn, "
             "mul_rn and sub_rn, which the interpreter either cannot load (the CUDA "
             "module) or returns None from (the portable one)",
+            file=sys.stderr,
+        )
+        return 1
+    if arguments.interpreter and arguments.op == "top_k":
+        print(
+            "top_k needs a device: its kernel complements a uint32 with `~`, which the "
+            "interpreter turns into the Python integer -1 and refuses",
             file=sys.stderr,
         )
         return 1
