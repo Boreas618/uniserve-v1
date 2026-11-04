@@ -172,7 +172,7 @@ impl Daemon {
             wake: wake_reader,
         };
 
-        let (address, thread, commands) = if options.node_rank == 0 {
+        let (served, thread, commands) = if options.node_rank == 0 {
             let (joins, members) = join_members(&options)?;
             let leader_address = leader_address(&options, &members);
             // Engines may run on any joined node. A deployment with a
@@ -230,8 +230,7 @@ impl Daemon {
                 .context("starting the daemon's service")?;
             (None, thread, None)
         };
-        let (address, socket, commands) = address;
-        let (address, socket) = address.unzip();
+        let (address, socket) = served.unzip();
         Ok(Self {
             commands,
             address,
