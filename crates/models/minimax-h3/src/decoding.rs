@@ -28,8 +28,16 @@ use crate::{Error, Result, config::CLIP_FRAMES, config::CLIP_LATENTS};
 /// The frames one decoded clip holds: a 17-frame body, three padding frames and a five-frame tail.
 pub const CLIP_OUTPUT_FRAMES: u32 = 25;
 
+/// Frames of a clip's native output that overlap the next clip.
+pub const OVERLAP_FRAMES: u32 = 5;
+
 /// The first frame of a clip's overlap tail, within its own 25 decoded frames.
-pub const TAIL_START: u32 = 20;
+pub const TAIL_START: u32 = TAIL_START_OF(OVERLAP_FRAMES);
+
+/// The first frame of a tail of `overlap` frames: the clip's native output less the tail.
+const fn TAIL_START_OF(overlap: u32) -> u32 {
+    CLIP_OUTPUT_FRAMES - overlap
+}
 
 /// One clip of a video's timeline.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -51,8 +59,12 @@ impl Clip {
     /// predecessor's and the fifth entirely this clip's. The weights are computed in the decoded
     /// element type there; this is the same table stated exactly, which a quantized implementation
     /// compares against.
-    pub fn overlap_weights(&self) -> [f32; 5] {
-        [0.0, 0.2, 0.4, 0.6, 0.8]
+    pub fn overlap_weights(&self) -> [f32; OVERLAP_FRAMES as usize] {
+        let mut weights = [0.0; OVERLAP_FRAMES as usize];
+        for (index, weight) in weights.iter_mut().enumerate() {
+            *weight = index as f32 / OVERLAP_FRAMES as f32;
+        }
+        weights
     }
 }
 
