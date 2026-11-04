@@ -16,7 +16,8 @@ use std::time::Duration;
 
 use crossbeam_channel::Receiver;
 use engine::{
-    CommandSender, PolicyBytes, PolicyProgram, PolicySource, SimEngine, SimExecutor, StageApplied,
+    CommandSender, PolicyBytes, PolicyProgram, PolicySource, SimEngine, SimExecutor, Stage,
+    StageApplied,
 };
 use scheduling::guest::decision::Plan;
 use scheduling::guest::limits::Limits;
@@ -173,11 +174,11 @@ impl World {
 
     /// The switchover's answer: the step it applied at.
     fn switch_over(&self) -> Result<StageApplied, String> {
-        answer(self.handle.switchover_policy())
+        answer(self.handle.stage(Stage::Switchover))
     }
 
-    /// The revert's answer: the step it applied at.
-    fn revert(&self) -> Result<StageApplied, String> {
+    /// The revert's answer, as the caller that does not use the step reads it.
+    fn revert(&self) -> Result<(), String> {
         answer(self.handle.revert_policy())
     }
 
@@ -197,6 +198,69 @@ fn answer<T>(receiver: Receiver<Result<T, String>>) -> Result<T, String> {
         Ok(result) => result,
         Err(error) => Err(format!("the scheduler did not answer: {error}")),
     }
+}
+
+#[test]
+fn the_program_layers_commands_reach_one_scheduler_and_name_what_they_need() {
+    let world = World::start();
+
+    // A precopy's policy module belongs to the process holding the Program
+    // Server's client, which resolves it once and precopies each scheduler; the
+    // command is answered with that rather than half applied.
+    let precopy = ipc::ProgramCommand::Precopy {
+        generation: 1,
+        programs: Box::default(),
+        policy: program_server::Program {
+            backend: "fcfs".to_owned(),
+            revision: 1,
+            arguments: Default::default(),
+        },
+    };
+    let refused = answer(world.handle.program_command(precopy))
+        .expect_err("a precopy needs its source");
+    assert!(
+        refused.contains("Program Server"),
+        "the refusal names the owner of the program: {refused}"
+    );
+
+    // A switchover that names the step its expert group agreed applies at that
+    // step: this scheduler has taken none, so step zero is now.
+    world.precopy("fcfs", 1, toy()).expect("the first precopy");
+    answer(world.handle.program_command(ipc::ProgramCommand::Switchover {
+        generation: 1,
+        step: Some(0),
+    }))
+    .expect("a switchover at the step the scheduler is at applies");
+
+    // One that names a step still ahead waits for it instead of applying early.
+    world.precopy("priority", 2, toy()).expect("the second precopy");
+    let waiting = world.handle.program_command(ipc::ProgramCommand::Switchover {
+        generation: 2,
+        step: Some(3),
+    });
+    assert!(
+        waiting.recv_timeout(Duration::from_millis(200)).is_err(),
+        "a switchover for a later step does not apply at this one"
+    );
+}
+
+#[test]
+fn a_consumers_position_is_the_connections_and_a_scheduler_refuses_it() {
+    let world = World::start();
+    let command = proto::request::wire::Command {
+        request: 7,
+        kind: Some(proto::request::wire::command::Kind::Consumed(
+            proto::request::wire::Consumed { events: 3 },
+        )),
+    };
+    let refused = world
+        .handle
+        .request_command(command)
+        .expect_err("a consumer's position is not a scheduler's to record");
+    assert!(
+        refused.contains("connection"),
+        "the refusal says whose bookkeeping it is: {refused}"
+    );
 }
 
 #[test]

@@ -2572,7 +2572,7 @@ impl EpochPolicy for Routing {
             .collect();
         let route = self.precopy_route(policies.as_ref(), program.clone());
         for answer in answers {
-            answer_enqueued(answer)?;
+            answer_stage(answer)?;
         }
         route
     }
@@ -2649,19 +2649,7 @@ impl EpochPolicy for Routing {
 
 /// One scheduler's answer to a stage, as the command thread reads it: an
 /// applied stage, the scheduler's reason, or no answer at all.
-fn answer_stage(
-    answer: crossbeam_channel::Receiver<Result<crate::handle::StageApplied, String>>,
-) -> Result<(), String> {
-    match answer.recv_timeout(POLICY_STAGE_TIMEOUT) {
-        Ok(Ok(_applied)) => Ok(()),
-        Ok(Err(reason)) => Err(reason),
-        Err(error) => Err(format!("a scheduler did not answer: {error}")),
-    }
-}
-
-/// A scheduler's answer to a command that is not a stage — a precopy, whose
-/// candidacy the switchover later names.
-fn answer_enqueued(answer: crossbeam_channel::Receiver<Result<(), String>>) -> Result<(), String> {
+fn answer_stage(answer: crossbeam_channel::Receiver<Result<(), String>>) -> Result<(), String> {
     match answer.recv_timeout(POLICY_STAGE_TIMEOUT) {
         Ok(Ok(())) => Ok(()),
         Ok(Err(reason)) => Err(reason),

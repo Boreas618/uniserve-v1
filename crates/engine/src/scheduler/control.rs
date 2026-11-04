@@ -41,6 +41,7 @@ fn engine_command_name(kind: &proto::process::command::Kind) -> &'static str {
 }
 
 
+
 /// Who asked for a stage: the scheduler's own handle, which names the step
 /// the stage applied at, or an engine command, which is answered with
 /// whether it applied.
@@ -304,7 +305,7 @@ impl Scheduler {
                 answer,
             } => self.precopy_policy(program, source, answer),
             Command::StagePolicy { stage, answer } => {
-                self.request_stage(stage, Some(StageAnswer::Step(answer)), None);
+                self.request_stage(stage, Some(answer), None);
             }
             Command::EngineCommand { command, answer } => {
                 self.engine_command(command, answer);
@@ -478,7 +479,7 @@ impl Scheduler {
                 return;
             }
         };
-        self.request_stage(stage, Some(StageAnswer::Applied(answer)), at);
+        self.request_stage(stage, Some(handle::StageAnswer::Applied(answer)), at);
     }
 
     /// Applies an engine command that concerns this scheduler (§7.3).
@@ -522,7 +523,7 @@ impl Scheduler {
                 return;
             }
         };
-        self.request_stage(stage, Some(StageAnswer::Applied(answer)), None);
+        self.request_stage(stage, Some(handle::StageAnswer::Applied(answer)), None);
     }
 
     /// Asks for a stage of §7.3, answered when it is applied.
@@ -535,7 +536,7 @@ impl Scheduler {
     /// `at` is the step an expert group agreed to cut over at, when a peer main
     /// process named it: the stage then waits for that step and refuses to apply
     /// at any other.
-    fn request_stage(&mut self, stage: Stage, answer: Option<StageAnswer>, at: Option<u64>) {
+    fn request_stage(&mut self, stage: Stage, answer: Option<handle::StageAnswer>, at: Option<u64>) {
         if stage == Stage::Switchover {
             self.take_prepared_policy();
             if self.policy_prepared.is_none() {
