@@ -46,7 +46,6 @@ use nn::weights::{WeightLoader, WeightRequest};
 use nn::{Arena, DevicePtr, Forward, Shape, TensorView, Weight};
 use ops::activation::Activation;
 use ops::gemm::WeightOrder;
-use ops::rope::Rotation;
 use std::sync::Arc;
 
 use crate::config::TextEncoderConfig;
@@ -555,7 +554,7 @@ impl Layer {
                 rank.query_heads,
                 rank.key_value_heads,
                 config.rms_norm_eps,
-                Rotation::Half,
+                crate::SPLIT_HALF,
                 1.0,
             )
             .map_err(Error::from)?
@@ -811,7 +810,7 @@ impl TextEncoder {
                 rank.query_heads,
                 rank.key_value_heads,
                 config.rms_norm_eps,
-                Rotation::Half,
+                crate::SPLIT_HALF,
                 1.0,
             )
             .map_err(Error::from)?

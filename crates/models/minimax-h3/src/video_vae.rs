@@ -456,7 +456,6 @@ pub fn sources(config: &VideoVaeConfig) -> crate::Result<Vec<crate::audio_vae::S
 // ---------------------------------------------------------------------------------------------
 
 use nn::Forward;
-use nn::layers::Rotation;
 use nn::layers::{
     Attention, LayerNorm, Linear, PackedSwiGlu, RmsNorm, Rotary, Rows, ScaledResidual, Sections,
 };
@@ -883,7 +882,7 @@ impl VideoDecoder {
             heads,
             heads,
             epsilon,
-            Rotation::Half,
+            crate::SPLIT_HALF,
             1.0,
         )?
         .partial(rotated)?

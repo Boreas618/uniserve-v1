@@ -32,7 +32,7 @@
 //! FP32 when it lands - in its layer's dtype and in this doc - while the fine sparse attention over
 //! the prepared rows stays in the checkpoint's dtype like the dense one.
 
-use nn::layers::{Attention as Flash, Linear, Rotary, Rotation, Sections, UlyssesExchange};
+use nn::layers::{Attention as Flash, Linear, Rotary, Sections, UlyssesExchange};
 use nn::weights::{Weight, WeightLoader, WeightRequest};
 use nn::{Forward, Shape, TensorView};
 use ops::gemm::WeightOrder;
@@ -292,7 +292,7 @@ impl Dense {
             local_heads,
             local_heads,
             config.qk_norm_eps,
-            Rotation::Half,
+            crate::SPLIT_HALF,
             1.0,
         )?
         .partial(rotated)?
