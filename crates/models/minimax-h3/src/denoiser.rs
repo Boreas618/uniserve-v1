@@ -1750,10 +1750,12 @@ pub fn denoise_arena(
     // sequence.
     push(&mut plan, "packed", element, tokens * hidden);
     push(&mut plan, "patched", element, video_rows * patches);
-    // The two input projections are FP32 too (`transformer.py:366-372`), so each reads a widened
-    // copy of its own rows - 96 columns for the video's and 32 for the audio's.
-    push(&mut plan, "patched.wide", "f32", video_rows * patches);
     push(&mut plan, "video.projected", element, video_rows * hidden);
+    // The input projections are FP32 too (`transformer.py:366-372`), so the video's reads a widened
+    // copy of its own rows - 96 columns - which `Transformer::project` reserves after the buffer it
+    // writes. The audio input projection still reads the stack's own rows: `scaled_add` holds no
+    // module for its 32 columns.
+    push(&mut plan, "patched.wide", "f32", video_rows * patches);
     if let Some((audio_rows, _)) = audio {
         push(&mut plan, "audio.projected", element, audio_rows * hidden);
     }
