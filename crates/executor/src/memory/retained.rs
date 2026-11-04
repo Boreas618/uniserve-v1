@@ -590,7 +590,6 @@ impl Retained {
     /// worker's own and the reclaimable ones as free.
     pub(crate) fn scope_bytes(&self, device: DeviceId) -> Result<ScopeBytes> {
         let mut state = lock(&self.state);
-        let gpu = state.gpu(device)?;
         let listing = state
             .client
             .list()
@@ -1006,6 +1005,83 @@ impl ExclusiveStorage for &Retained {
         segments: &[usize],
     ) -> Result<()> {
         self.create_segments(spec, storage, segments)
+    }
+}
+
+impl crate::memory::weights::WeightStorage for Retained {
+    /// A weight's bytes, mapped read-only on `device`; `None` when the server
+    /// holds nothing under `key`.
+    fn fetch(&self, device: DeviceId, key: &[u8; 32]) -> Result<Option<nn::Backing>> {
+        let Some(storage) = self.weight(device, Key(*key))? else {
+            return Ok(None);
+        };
+        Ok(Some(nn::Backing::new(
+            ops::DevicePtr::new(storage.address()),
+            storage.bytes() as u64,
+        )))
+    }
+
+    /// Publish `bytes` under `key` and answer the region they are mapped at.
+    ///
+    /// The bytes outlive the world that stores them, so their record carries no
+    /// segment and no world and lies on the host the server retains; the
+    /// mapping a store answers is the same read-only one a fetch would find,
+    /// so a second store of the same key republishes rather than failing.
+    fn store(&self, device: DeviceId, key: &[u8; 32], bytes: &[u8]) -> Result<nn::Backing> {
+        if bytes.is_empty() {
+            return Err(Error::Invalid("a weight holds no bytes".into()));
+        }
+        let mut state = lock(&self.state);
+        let gpu = state.gpu(device)?;
+        let (staging, descriptor) = Storage::host_retainable(device, bytes.len())?;
+        // SAFETY: the staging storage holds `bytes.len()` writable bytes and the
+        // source slice is at least that long; the server imports the mapping
+        // when the record below is published.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                staging.address() as *mut u8,
+                bytes.len(),
+            );
+        }
+        let record = ::storage::StorageRecord {
+            placement: Placement::Host { numa_node: None },
+            segment: None,
+            bytes: bytes.len() as u64,
+            fabric: None,
+        };
+        let tensor = ::storage::TensorRecord {
+            key: Key(*key),
+            name: format!(
+                "weight-{}",
+                key.iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            ),
+            storage: 0,
+            offset: 0,
+            dtype: "uint8".into(),
+            shape: vec![bytes.len() as u64],
+            strides: vec![1],
+            access: Access::ReadOnly,
+        };
+        state
+            .client
+            .put(
+                vec![tensor],
+                &[(record, std::os::fd::AsFd::as_fd(&descriptor))],
+            )
+            .map_err(|error| storage_error("publishing a retained weight", error))?;
+        drop(state);
+        let Some(storage) = self.weight(device, Key(*key))? else {
+            return Err(Error::Interface(
+                "a published weight was not found under its own key".into(),
+            ));
+        };
+        Ok(nn::Backing::new(
+            ops::DevicePtr::new(storage.address()),
+            storage.bytes() as u64,
+        ))
     }
 }
 

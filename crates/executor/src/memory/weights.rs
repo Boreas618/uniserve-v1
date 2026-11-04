@@ -38,24 +38,24 @@ const WEIGHT_KEY_DOMAIN: &[u8] = b"uniserve-retained-weight\0";
 pub trait WeightStorage: Send + Sync {
     /// The bytes already retained under `key`, mapped read-only, or `None` when the Storage Server
     /// holds none.
-    fn fetch(&self, key: &[u8; 32]) -> Result<Option<Backing>>;
+    fn fetch(&self, device: platform::DeviceId, key: &[u8; 32]) -> Result<Option<Backing>>;
 
     /// Store `bytes` under `key` and answer the read-only region they are mapped at.
     ///
     /// Storing a key twice is the caller's error; a store may publish it again or answer the region
     /// it already holds.
-    fn store(&self, key: &[u8; 32], bytes: &[u8]) -> Result<Backing>;
+    fn store(&self, device: platform::DeviceId, key: &[u8; 32], bytes: &[u8]) -> Result<Backing>;
 }
 
 /// A shared storage, as two owners of one rank's client use it: the store itself and whatever else
 /// the rank maps weights through.
 impl<S: WeightStorage + ?Sized> WeightStorage for std::sync::Arc<S> {
-    fn fetch(&self, key: &[u8; 32]) -> Result<Option<Backing>> {
-        (**self).fetch(key)
+    fn fetch(&self, device: platform::DeviceId, key: &[u8; 32]) -> Result<Option<Backing>> {
+        (**self).fetch(device, key)
     }
 
-    fn store(&self, key: &[u8; 32], bytes: &[u8]) -> Result<Backing> {
-        (**self).store(key, bytes)
+    fn store(&self, device: platform::DeviceId, key: &[u8; 32], bytes: &[u8]) -> Result<Backing> {
+        (**self).store(device, key, bytes)
     }
 }
 
@@ -81,17 +81,26 @@ pub fn retained_key(weight: &WeightKey) -> [u8; 32] {
 /// serves.
 pub struct WeightStore<S: WeightStorage> {
     storage: S,
+    /// The device this store's weights are mapped on. A `Backing` is one device's address, so a
+    /// rank that serves two devices holds one store per device: the storage is the same client.
+    device: platform::DeviceId,
     /// Every weight this rank has mapped, by storage key.
     mapped: BTreeMap<[u8; 32], Backing>,
 }
 
 impl<S: WeightStorage> WeightStore<S> {
-    /// A store over `storage`, with nothing mapped yet.
-    pub fn new(storage: S) -> Self {
+    /// A store over `storage` that maps every weight on `device`, with nothing mapped yet.
+    pub fn new(storage: S, device: platform::DeviceId) -> Self {
         Self {
             storage,
+            device,
             mapped: BTreeMap::new(),
         }
+    }
+
+    /// The device this store maps on.
+    pub fn device(&self) -> platform::DeviceId {
+        self.device
     }
 
     /// How many weights this rank holds, for the metrics report and for tests.
@@ -112,8 +121,10 @@ impl<S: WeightStorage> WeightStore<S> {
         }
         let Some(backing) = self
             .storage
-            .fetch(&storage_key)
-            .map_err(|error| Error::State(format!("mapping retained weight {key}: {error}").leak()))?
+            .fetch(self.device, &storage_key)
+            .map_err(|error| {
+                Error::State(format!("mapping retained weight {key}: {error}").leak())
+            })?
         else {
             return Ok(None);
         };
@@ -169,7 +180,7 @@ impl<S: WeightStorage> RetainedWeights for WeightStore<S> {
         }
         let backing = self
             .storage
-            .store(&storage_key, bytes)
+            .store(self.device, &storage_key, bytes)
             .map_err(|error| nn::Error::Unsupported(format!("publishing weight {key}: {error}")))?;
         self.mapped.insert(storage_key, backing);
         Ok(backing)
@@ -181,8 +192,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use nn::{FileIdentity, WeightLayout};
     use nn::weights::WeightRegion;
+    use nn::{FileIdentity, WeightLayout};
 
     use super::*;
 
@@ -204,7 +215,7 @@ mod tests {
     }
 
     impl WeightStorage for FakeStorage {
-        fn fetch(&self, key: &[u8; 32]) -> Result<Option<Backing>> {
+        fn fetch(&self, _device: platform::DeviceId, key: &[u8; 32]) -> Result<Option<Backing>> {
             self.fetches.fetch_add(1, Ordering::Relaxed);
             Ok(self.published.lock().unwrap().get(key).map(|bytes| {
                 let _ = bytes;
@@ -212,12 +223,14 @@ mod tests {
             }))
         }
 
-        fn store(&self, key: &[u8; 32], bytes: &[u8]) -> Result<Backing> {
+        fn store(
+            &self,
+            _device: platform::DeviceId,
+            key: &[u8; 32],
+            bytes: &[u8],
+        ) -> Result<Backing> {
             self.stores.fetch_add(1, Ordering::Relaxed);
-            self.published
-                .lock()
-                .unwrap()
-                .insert(*key, bytes.to_vec());
+            self.published.lock().unwrap().insert(*key, bytes.to_vec());
             Ok(Backing::new(
                 ops::DevicePtr::new(self.address()),
                 bytes.len() as u64,
@@ -397,11 +410,16 @@ mod tests {
     struct Shared(std::sync::Arc<FakeStorage>);
 
     impl WeightStorage for Shared {
-        fn fetch(&self, key: &[u8; 32]) -> Result<Option<Backing>> {
+        fn fetch(&self, _device: platform::DeviceId, key: &[u8; 32]) -> Result<Option<Backing>> {
             self.0.fetch(key)
         }
 
-        fn store(&self, key: &[u8; 32], bytes: &[u8]) -> Result<Backing> {
+        fn store(
+            &self,
+            _device: platform::DeviceId,
+            key: &[u8; 32],
+            bytes: &[u8],
+        ) -> Result<Backing> {
             self.0.store(key, bytes)
         }
     }
