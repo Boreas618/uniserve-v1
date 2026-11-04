@@ -650,12 +650,17 @@ pub struct TextEncoder {
 }
 
 impl TextEncoder {
-    /// Every checkpoint tensor this encoder reads, by name.
+    /// Every checkpoint tensor the **language stack** reads, by name.
     ///
     /// The names are the sharded reads' own: a tensor-parallel degree splits a tensor's rows and
     /// never renames it, so one list answers for every rank of a deployment and needs no partition.
     /// `load` asks for these and only these, so a checkpoint that lacks one is refused by name
     /// before a byte is read rather than surfacing as a read error inside a layer.
+    ///
+    /// This is not the whole component: `load` builds the vision tower inside the encoder
+    /// (`tower: VisionTower::load(...)`), unconditionally, because a prompt may carry images. A
+    /// caller checking a checkpoint for this block checks `VisionTower::keys(&config.vision)`
+    /// beside this list - the two halves fail for different reasons and are reported apart.
     pub fn keys(config: &TextEncoderConfig) -> Vec<String> {
         let mut keys = vec![format!("{PREFIX}.embed_tokens.weight")];
         for index in 0..config.num_retained_layers {
