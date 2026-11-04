@@ -1347,22 +1347,21 @@ mod tests {
             .write_build_config(3, &crate::epoch::BuildConfig::of(&ServeConfig::default()))
             .unwrap();
         let own = std::env::current_exe().unwrap().display().to_string();
-        let mut spec = wire::EngineSpec {
-            deployment: "model".to_owned(),
-            model: "/models/qwen3".to_owned(),
-            host: "rank-0".to_owned(),
-            world: 3,
-            placement: Some(wire::Placement {
-                devices: vec![0],
-                queue_depth: 4,
-                ..wire::Placement::default()
-            }),
-            workers: Some(wire::Workers {
-                executable: own,
-                ..wire::Workers::default()
-            }),
-            ..wire::EngineSpec::default()
-        };
+        // The deployment's own spec, as `ServeOptions` builds it: an epoch's
+        // start reads the ranks it places, and a spec with no scheduling or
+        // cache tables is no deployment's.
+        let mut spec = ServeConfig::default().engine_spec().unwrap();
+        spec.deployment = "model".to_owned();
+        spec.model = "/models/qwen3".to_owned();
+        spec.host = "rank-0".to_owned();
+        spec.world = 3;
+        let placement = spec.placement.as_mut().expect("the default spec places ranks");
+        placement.devices = vec![0];
+        placement.queue_depth = 4;
+        spec.workers
+            .as_mut()
+            .expect("the default spec names the workers")
+            .executable = own;
 
         let start = control.epoch_start(&spec, 9).unwrap();
         assert_eq!(start.build, Some(proto::BUILD.to_owned()));
