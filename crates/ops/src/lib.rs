@@ -100,6 +100,7 @@ pub mod noise;
 pub mod norm;
 pub mod op;
 pub mod phase;
+pub mod position;
 pub mod platform;
 pub mod prefix_cache;
 pub mod replicate_pad;
