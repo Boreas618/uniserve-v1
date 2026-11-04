@@ -30,10 +30,15 @@ use ipc::{
 };
 
 /// How long a command answer may take.
-const ANSWER: Duration = Duration::from_secs(10);
+///
+/// Generous because the first one is the whole boot of a policy: the precopy
+/// compiles the `fcfs` module inside a debug build, on a machine that runs this
+/// suite's tests in parallel. The bound is the harness's, not the mechanism's;
+/// a mechanism that stopped answering would still fail here, only later.
+const ANSWER: Duration = Duration::from_secs(60);
 
 /// How long a request may take to emit its first token.
-const FIRST_TOKEN: Duration = Duration::from_secs(20);
+const FIRST_TOKEN: Duration = Duration::from_secs(60);
 
 /// The token this pool samples for the `index`th call of every batch.
 const SAMPLED: u32 = 1000;
@@ -148,12 +153,13 @@ impl Serving {
     }
 
     /// The batch's calls, each answered as a completed call that sampled
-    /// [`SAMPLED`] and stands one token past the cache extent the mechanism
-    /// wrote into the batch's own rows.
+    /// [`SAMPLED`] and leaves the cache extent its row was stated with.
     ///
-    /// The positions are the columns', not invented: a real executor reports
-    /// the slot's state after the commit, and the mechanism's next call reads
-    /// them to know what a successor may read.
+    /// The extents are the columns', not invented: `seq_lens` is a row's
+    /// attention length, cached prefix plus its own query, which is exactly the
+    /// cache the call leaves behind - so a prefill of eight prompt tokens
+    /// leaves eight, and a decode of one token on top leaves nine. The
+    /// mechanism's next call reads them to know what a successor may read.
     fn serve(&self, batch: Batch) -> Submission {
         let calls = batch
             .calls
@@ -172,9 +178,11 @@ impl Serving {
                     *call,
                     vec![SAMPLED + index as u32],
                     RowState {
-                        step_index: seen + 1,
-                        cache_computed_len: seen + 1,
-                        cache_visible_len: seen + 1,
+                        // Text carries no denoising trajectory: the step index
+                        // is a media row's, and this pool serves forwards.
+                        step_index: 0,
+                        cache_computed_len: seen,
+                        cache_visible_len: seen,
                     },
                 )
             })
@@ -311,5 +319,107 @@ fn a_request_is_served_through_the_executors_own_batch_path() {
             .collect::<Vec<_>>()
     );
 
+    handle.shutdown();
+}
+
+/// The step's free slots are a hard limit the mechanism keeps by stopping: a
+/// request that does not fit one waits, and is admitted when a slot frees.
+///
+/// §4.4's dispatch row puts the error on *work* put into the step, and gives
+/// `admit` the other rule in the same row: the mechanism admits in the plan's
+/// order, and the first request it cannot place, and those after it, stay
+/// queued. `fcfs` names every queued request, so a refusal here would stop every
+/// world that queues more than it can run at once; a stop serves them in turn.
+#[test]
+fn a_request_that_does_not_fit_a_slot_waits_for_one() {
+    let serving = Arc::new(Serving::new(vec![pool()]));
+    let batches: Arc<dyn Batches> = serving.clone();
+    let mut config = config();
+    config.max_running_requests = 1;
+    let handle = SchedulerHandle::over_batches(config, batches).expect("the pool serves");
+    install(&handle, &serving);
+
+    let mut first = handle
+        .submit(text_request(1, 8, 4))
+        .expect("the first request is submitted");
+    let mut second = handle
+        .submit(text_request(2, 8, 4))
+        .expect("the second request is submitted");
+
+    let mut served = [false, false];
+    let deadline = Instant::now() + FIRST_TOKEN;
+    while !served.iter().all(|done| *done) && Instant::now() < deadline {
+        for (index, events) in [&mut first, &mut second].into_iter().enumerate() {
+            while let Ok(event) = events.try_recv() {
+                match event {
+                    Event::TextToken { .. } | Event::TextTokens { .. } => served[index] = true,
+                    Event::Rejected { .. } | Event::Error { .. } => {
+                        panic!("request {} was refused, not queued", index + 1)
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !served.iter().all(|done| *done) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    assert!(
+        served.iter().all(|done| *done),
+        "both requests were served, one after the other: {served:?}"
+    );
+    handle.shutdown();
+}
+
+/// An admitted request is worked on, in the phase the mechanism tells the
+/// policy it serves next.
+///
+/// A policy's state is append-only: it learns a request from its arrival and
+/// nothing else about it unless the mechanism states it. A request that is
+/// admitted and never restated is one whose phase the policy never learns, so
+/// no policy — `fcfs` included — can plan the work that would prefilled it, and
+/// the epoch dispatches nothing while requests queue behind it. This case
+/// states the mechanism's half: one text request, the real `fcfs` program, and
+/// a batch handed to the executor with no other help.
+#[test]
+fn an_admitted_request_is_prefilled_on_the_next_step() {
+    let serving = Arc::new(Serving::new(vec![pool()]));
+    let batches: Arc<dyn Batches> = serving.clone();
+    let handle = SchedulerHandle::over_batches(config(), batches).expect("the pool serves");
+    install(&handle, &serving);
+    // The consumer is kept open for the case's length: a world whose client
+    // went away ends its requests, which is not what is under test.
+    let _events = handle
+        .submit(text_request(1, 8, 4))
+        .expect("the request is submitted");
+
+    let deadline = Instant::now() + FIRST_TOKEN;
+    while serving.submitted().is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let handed = serving.submitted();
+    let first = handed.first().expect("the pool was handed a batch");
+    assert_eq!(
+        first.shape.rows, 1,
+        "the batch is the one request's, not a full bucket's"
+    );
+    assert!(
+        first.shape.variant.name().starts_with("prefill"),
+        "the request's first call is its prefill, not a later phase: {}",
+        first.shape.variant.name()
+    );
+    // The prefill comes first in submission order: the request's prompt is
+    // written before any token of it is decoded.
+    let decoded_first = handed
+        .iter()
+        .position(|batch| batch.shape.variant.name().starts_with("decode"));
+    assert!(
+        decoded_first.is_none_or(|index| index > 0),
+        "a decode was handed before the prefill: {:?}",
+        handed
+            .iter()
+            .map(|batch| batch.shape.variant.name())
+            .collect::<Vec<_>>()
+    );
     handle.shutdown();
 }

@@ -24,10 +24,13 @@
 
 use nn::{Block, BlockName};
 
+use crate::audio_vae::AudioDecoder;
 use crate::checkpoint::{Dit, Layout, Sidecars};
 use crate::config::Config;
 use crate::denoiser::{Denoiser, Layouts};
+use crate::schedule::Schedule;
 use crate::text_encoder::TextEncoder;
+use crate::transformer::StudentHeads;
 use crate::{Error, Partition, Result};
 
 /// The block type is the partition's; re-exported here because a block and its loading are read
@@ -92,16 +95,112 @@ pub fn load(
                 let rows = Layouts::new(denoiser.clone(), arrangement)?.rows_bound()?;
                 let source = checkpoint.component(dit.directory())?;
                 let mut shards = loader.reborrow(source)?;
-                let denoiser =
-                    Denoiser::load(denoiser.clone(), arrangement, rows, &partition, &mut shards)?;
+                // A parallel-decoding student stacks one head per fine interval; the boundary that
+                // owns the checkpoint fuses them into one head per evaluation block and publishes
+                // them through the same loader, so the model reads fused tables and nothing else.
+                let schedule = Schedule::new(&denoiser.schedule)?;
+                let heads = if denoiser.transformer.output_heads > 1 {
+                    Some(StudentHeads::fuse(
+                        source,
+                        &schedule,
+                        &denoiser.transformer,
+                        &mut shards,
+                    )?)
+                } else {
+                    None
+                };
+                let denoiser = Denoiser::load(
+                    denoiser.clone(),
+                    arrangement,
+                    rows,
+                    &partition,
+                    &mut shards,
+                    heads,
+                )?;
                 Block::Denoiser(Box::new(denoiser))
             }
-            Component::VideoDecoder | Component::AudioDecoder | Component::LatentEncoder => {
-                // The decoders and the condition encoders become capability blocks as their
-                // layers land; until then a deployment that places one is refused here rather
-                // than served by a half-built block.
+            Component::AudioDecoder => {
+                // The audio decoder has no layout tables - every table it reads is a weight bound
+                // at load - so it constructs from its own component and its sidecar alone.
+                let source = checkpoint.component("audio_vae")?;
+                let mut shards = loader.reborrow(source)?;
+                let decoder = AudioDecoder::load(&config.audio_vae, &mut shards)?;
+                Block::Decoder(Box::new(decoder))
+            }
+            Component::VideoDecoder => {
+                // One block serves every canvas: the tile grid is arithmetic on a request's raster,
+                // so the block is loaded against the checkpoint's tile - the largest tile any canvas
+                // of this checkpoint produces, since the grid is uniform wherever the canvas holds a
+                // whole tile - and the seam blends are built here, at load.
+                let spatial = config.video_vae.spatial_compression();
+                let canvas = crate::video_vae::Canvas::clip(
+                    &config.video_vae,
+                    crate::video_vae::TILE_PIXELS / spatial,
+                    crate::video_vae::TILE_PIXELS / spatial,
+                );
+                // The clip's rows are packed in the attention's order, so the decoder needs it at
+                // load. It is the denoisers' and it must be one: two partitions that attend
+                // differently would pack one clip two ways, and one table can only gather one.
+                let mut kinds = config.denoisers.values().map(|dit| dit.attention);
+                let attention = kinds.next().ok_or_else(|| {
+                    Error::checkpoint(
+                        "the checkpoint states no DiT, so no attention kind packs the video \
+                         decoder's clip rows"
+                            .to_owned(),
+                    )
+                })?;
+                if kinds.any(|kind| kind != attention) {
+                    return Err(Error::Unsupported(format!(
+                        "the {} block gathers a clip's rows in the denoisers' attention order, and \
+                         this checkpoint's DiT partitions attend differently",
+                        component.name()
+                    )));
+                }
+                // The decoder's three reference steps before its transformer - denormalise,
+                // post-quantise, project - are one affine, composed here from the checkpoint's own
+                // bytes. Its element type is the type those weights are stored in: `dtype = "auto"`
+                // converts nothing, and the reference reads the projection's type for the same reason.
+                let vae = checkpoint.component(component.directories()[0])?;
+                let (width, dtype, weight, bias) =
+                    crate::video_vae::folded_input(vae, &config.video_vae)?;
+                let latent = u64::from(config.video_vae.latent_channels);
+                let weight = loader.constant(
+                    "video_decoder.input.weight",
+                    dtype,
+                    nn::Shape::new(&[width, latent]),
+                    &weight,
+                )?;
+                let bias = loader.constant(
+                    "video_decoder.input.bias",
+                    dtype,
+                    nn::Shape::new(&[width]),
+                    &bias,
+                )?;
+                let input =
+                    nn::layers::Linear::new(weight, Some(bias), ops::gemm::WeightOrder::NxK)?;
+                // A VAE directory holds both halves; the decoder reads its own keys from it.
+                let source = checkpoint.component(component.directories()[0])?;
+                let mut shards = loader.reborrow(source)?;
+                let decoder = crate::video_vae::VideoDecoder::load(
+                    &config.video_vae,
+                    canvas,
+                    attention,
+                    dtype,
+                    input,
+                    &mut shards,
+                )?;
+                Block::Decoder(Box::new(decoder))
+            }
+            Component::LatentEncoder => {
+                // Both condition encoders are written to the reference (`VideoEncoder::encode` and
+                // `AudioEncoder`), and neither is the text tower: `nn::Encoder` takes a token batch,
+                // an image shape and a prompt, while these take pixels `[1, 3, frames, height,
+                // width]` and raw samples `[1, 1, samples]`. `nn::model::Block` has no kind for a
+                // condition encoder, so a deployment that places this component is refused by name
+                // rather than served by a block that would misdescribe itself as a text tower.
                 return Err(Error::Unsupported(format!(
-                    "the {} block has no construction yet, so it cannot be placed",
+                    "the {} block holds the two condition encoders, which need an nn condition-encoder \
+                     capability that does not exist; `Encoder` is the text tower's interface",
                     component.name()
                 )));
             }

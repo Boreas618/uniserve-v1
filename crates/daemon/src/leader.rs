@@ -41,6 +41,7 @@ use crate::engine::client::{EngineClient, EngineInfo, EngineState, StatsSink, Su
 use crate::engine::control::EngineControl;
 use crate::engine::hold::{HoldState, RequestHold};
 use crate::input::media::MediaConnector;
+use crate::input::processor::LoadModel as _;
 use crate::input::readout::ReadoutEncoder;
 use crate::input::video::{ProcessedVideo, VideoGenerationRequest, VideoService};
 use crate::input::{
@@ -1367,7 +1368,8 @@ impl Leader {
     /// which is where a caller falls through to the world path.
     ///
     /// With `dry_run`, the routing decision alone is made and nothing is
-    /// applied, so a caller can answer what a change would move.
+    /// applied, so a caller can answer what a change would move. `force`
+    /// applies an update a revert marked unavailable (§7.2).
     ///
     /// # Errors
     ///
@@ -1419,7 +1421,7 @@ impl Leader {
         let epochs = Arc::clone(&self.epochs());
         let processes = self.main_processes();
         let recorded = update.clone();
-        tokio::task::spawn_blocking(move || epochs.apply_programs(update, processes))
+        tokio::task::spawn_blocking(move || epochs.apply_programs(update, processes, force))
             .await
             .map_err(|error| UpdateError::Failed(anyhow::anyhow!("applying the update: {error}")))?
             .map_err(|failure| {

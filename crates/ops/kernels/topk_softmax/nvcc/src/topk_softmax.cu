@@ -43,6 +43,17 @@
 #define UNISERVE_TOP 8
 #endif
 
+// The descriptor's own expert count and top-k, for the guard below. A build
+// that does not define them keeps the kernel's defaults and guards nothing,
+// which is what a hand-written nvcc invocation gets.
+#ifndef UNISERVE_EXPERTS
+#define UNISERVE_EXPERTS 0
+#endif
+
+#ifndef UNISERVE_MAX_TOP
+#define UNISERVE_MAX_TOP 0
+#endif
+
 namespace {
 
 constexpr int kWarp = 32;
@@ -72,6 +83,17 @@ extern "C" __global__ void uniserve_topk_softmax(const void* scores, int score_k
                                                  int64_t row_stride, int rows, int experts,
                                                  int top, int renormalize, const void* scale,
                                                  int scale_kind, int32_t* ids, float* weights) {
+  // `experts` and `top` arrive as launch arguments while the iteration count and
+  // the butterfly width are baked into this cubin. A call arriving with a
+  // different expert count would reduce over part of the row and write
+  // valid-looking ids; a wider top-k would read past the pick arrays. A cubin
+  // has no error channel, so a mismatch traps and fails the launch loudly
+  // rather than routing wrongly for the rest of the process's life. Builds that
+  // define neither constant (a hand-written nvcc line) keep the old behaviour.
+  if (UNISERVE_EXPERTS != 0 && (experts != UNISERVE_EXPERTS || top > UNISERVE_MAX_TOP)) {
+    __trap();
+  }
+
   const int row = blockIdx.x * kWarpsPerBlock + threadIdx.x / kWarp;
   const int lane = threadIdx.x % kWarp;
   if (row >= rows) return;  // uniform per warp

@@ -194,7 +194,8 @@ def main() -> int:
     print(
         f"the operator's bound {allowed:.3g} relative = {allowed * largest:.6g}"
     )
-    if difference > allowed * largest:
+    # A difference that is not a number is never inside a bound: `>` would say it is.
+    if not difference <= allowed * largest:
         print("the module exceeds the operator's bound", file=sys.stderr)
         return 1
     return 0
