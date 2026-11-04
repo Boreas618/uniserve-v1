@@ -20,19 +20,21 @@
 //! - **logits_rows**: the rows whose logits are wanted (a prefill's last row, a
 //!   decode's or a verify's every row), `-1` elsewhere;
 //! - **slots**: the sampler's per-slot state row;
-//! - **page_size** and **max_kv_len**: the cache's geometry.
-//!
 //! - **parameters**: the sampler's columns of every row, in the order
 //!   `ops::sampler` names ([`sampler_parameters`]);
 //! - **input_ids**: the tokens each call's rows embed, which the caller states
 //!   because a decode's token comes from the mechanism's request state and not
-//!   from the call.
+//!   from the call;
+//! - **page_size** and **max_kv_len**: the cache's geometry.
 //!
-//! The commit table (`BatchColumns::commit`) is not filled: its eight fields
-//! state accepted progress whose meaning is the executor's (`ops::commit`), and
-//! exec has not yet said which of them the mechanism owns (`M708`). An empty
-//! table is legal in `BatchColumns::check`, so a batch assembled here is a
-//! well-formed batch that commits no token state.
+//! The commit table (`BatchColumns::commit`) is left empty. An empty table is
+//! legal only for a batch that commits nothing at all — a shadow batch, a
+//! cache-only prefill — and the executor states accepted progress in the eight
+//! columns `ops::commit::column` names. The mechanism does not yet state them:
+//! whose value each column carries (`ops::commit`, exec's answer) is open, and
+//! this module never invents one. A batch that does commit and is assembled
+//! here is therefore not yet servable, which is the gap this file records until
+//! the columns are filled.
 //!
 //! A batch whose calls disagree with what the layout promises — a call whose
 //! rows belong to several requests, a token outside its table, a call a token
