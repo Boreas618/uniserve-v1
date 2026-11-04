@@ -1175,6 +1175,12 @@ pub struct CompressPooledDescriptor {
     pub width: u32,
     /// The bound on the key tiles one query tile's softmax reduces over: the deployment's own tile
     /// count, and the reduction length its tolerance is written against.
+    ///
+    /// The **key names its power of two**, because that is what the package compiles the reduction
+    /// to: a program compiled for a bound of 640 and one for 1024 are the same module, and a key
+    /// that told them apart would demand a compilation per tile count a deployment happens to
+    /// request - none of which any enumeration could list. The bound itself stays this value, and so
+    /// does the tolerance, which is a property of the reduction and not of the module.
     pub max_tiles: u32,
     /// Lanes one program holds for the weighted sum of features, rounded up to a power of two.
     pub block: u32,
@@ -1213,7 +1219,7 @@ impl fmt::Display for CompressPooledDescriptor {
             .field("dtype", self.dtype)
             .field("heads", self.heads)
             .field("width", self.width)
-            .field("max_tiles", self.max_tiles)
+            .field("max_tiles", self.max_tiles.next_power_of_two())
             .field("block", self.block)
             .field("pdl", self.pdl)
             .finish(formatter)

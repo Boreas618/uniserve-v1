@@ -371,6 +371,16 @@ pub struct TokenPlan {
 }
 
 impl TokenPlan {
+    /// Bytes one unit's state snapshot occupies, which the scratch pool has to hold beside the
+    /// shadow region (design 4.5): the cache plan's own figure, and zero when the model keeps no
+    /// state per unit.
+    pub fn state_snapshot_bytes(&self) -> u64 {
+        self.plan
+            .cache
+            .as_ref()
+            .map_or(0, |cache| cache.state_snapshot_bytes())
+    }
+
     /// The tokens one page of the served cache holds.
     pub fn block_size(&self) -> u32 {
         self.plan

@@ -103,6 +103,11 @@ TORCH_TYPES = {
 }
 
 #: The operators this script runs.
+#: The bins of one ordering pass, mirroring `ops::sampler::TOP_K_BINS`: a nibble of the key.
+TOP_K_BINS = 16
+#: The lanes one pass reads, as the descriptor names it (`ops::sampler::TopKDescriptor::tile`).
+TOP_K_TILE = 2048
+
 OPERATORS = (
     "logits_gather",
     "vocab_unpad",
@@ -569,11 +574,22 @@ def run_top_k(case):
         # A `-inf` tail, as `filter_candidates` leaves it: a dropped candidate is never kept
         # while a real one still is.
         logits[:, vocabulary // 2 :] = float("-inf")
-    values = torch.full((rows, width), float("nan"), dtype=dtype)
+    values = torch.full((rows, width), float("nan"), dtype=torch.float32)
     ids = torch.full((rows, width), -1, dtype=torch.int32)
+    # The ordering's scratch: two key planes, two id planes and the two nibble tables.
+    workspace = torch.zeros(
+        rows, 4 * width + 2 * TOP_K_BINS, dtype=torch.int32
+    )
 
     kernels._top_k_kernel[(rows,)](
-        logits, values, ids, rows, vocabulary, width, WIDTH=width, STEP=2048
+        logits,
+        values,
+        ids,
+        workspace,
+        rows,
+        vocabulary,
+        width,
+        TILE=case["tile"],
     )
 
     exact = logits.cpu().double()
@@ -761,6 +777,7 @@ def cases(operator, flags):
                 "ties": False,
                 "masked_tail": False,
                 "seed": 1,
+                "tile": TOP_K_TILE,
             },
             {
                 "label": "three tied logits, which must come out in ascending id order",
@@ -771,6 +788,34 @@ def cases(operator, flags):
                 "ties": True,
                 "masked_tail": False,
                 "seed": 2,
+                "tile": TOP_K_TILE,
+            },
+            {
+                # The same row at the deployment's default bound: the quota the equal keys hold is
+                # far smaller than the row, which is the case a rank computed per tile corrupts from
+                # the low slots up, and the case one module has to serve once the key names no width.
+                "label": "the deployment's default bound out of the same vocabulary",
+                "dtype": flags.dtype,
+                "rows": flags.rows,
+                "vocabulary": flags.vocabulary,
+                "width": 128,
+                "ties": False,
+                "masked_tail": False,
+                "seed": 4,
+                "tile": TOP_K_TILE,
+            },
+            {
+                # The boundary the field's removal makes representable: a row that keeps everything
+                # it has, so the quota is the row's width and every slot is written.
+                "label": "a row keeping its whole width",
+                "dtype": flags.dtype,
+                "rows": 2,
+                "vocabulary": 128,
+                "width": 128,
+                "ties": False,
+                "masked_tail": False,
+                "seed": 5,
+                "tile": TOP_K_TILE,
             },
             {
                 "label": "a masked -inf tail, which is never kept over a real candidate",
@@ -781,6 +826,7 @@ def cases(operator, flags):
                 "ties": False,
                 "masked_tail": True,
                 "seed": 3,
+                "tile": TOP_K_TILE,
             },
         ]
     if operator == "logprob_gather":
@@ -882,10 +928,7 @@ def descriptor_key(operator, flags):
     if operator == "logprob_gather":
         return f"columns_{flags.columns}_ids_i32_pdl_{pdl}"
     if operator == "top_k":
-        return (
-            f"dtype_{flags.dtype}_vocabulary_{flags.vocabulary}"
-            f"_width_{flags.top_width}_ids_i32_pdl_{pdl}"
-        )
+        return f"dtype_{flags.dtype}_tile_{TOP_K_TILE}_ids_i32_pdl_{pdl}"
     return (
         f"dtype_{flags.dtype}_vocabulary_{flags.vocabulary}_block_{flags.block}"
         f"_extras_{flags.extras}_divide_{flags.divide}_pdl_{pdl}"
@@ -946,12 +989,6 @@ def main() -> int:
     if arguments.interpreter and arguments.op == "logits_shape":
         print(
             "skipped: needs a device — its kernel rounds with libdevice's div_rn, mul_rn and sub_rn, which the interpreter either cannot load (the CUDA module) or returns None from (the portable one)",
-            file=sys.stderr,
-        )
-        return 0
-    if arguments.interpreter and arguments.op == "top_k":
-        print(
-            "skipped: needs a device — its kernel complements a uint32 with `~`, which the interpreter turns into the Python integer -1 and refuses",
             file=sys.stderr,
         )
         return 0

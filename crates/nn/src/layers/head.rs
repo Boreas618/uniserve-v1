@@ -166,7 +166,7 @@ impl ParallelLMHead {
                 "a gathered width above u32::MAX".to_owned(),
             )
         })?;
-        let descriptor = self.unpad_descriptor(gathered.dtype, width);
+        let descriptor = self.unpad_descriptor(gathered.dtype, out.dtype, width);
         let args = logits::UnpadArgs { gathered, out };
 
         f.operate::<VocabUnpad>(&descriptor, args)
@@ -192,9 +192,20 @@ impl ParallelLMHead {
     ///
     /// The gathered width is `padded × ranks`, so it is a launch value that follows the deployment's
     /// rank count rather than a property of the head; the vocabulary and the block are the head's.
-    pub fn unpad_descriptor(&self, dtype: DType, gathered_width: u32) -> UnpadDescriptor {
+    /// The descriptor the unpadding launch uses: the gathered logits' element type, the type the
+    /// sampler's candidate buffer carries, the vocabulary, the gathered width, the block and PDL.
+    ///
+    /// The two element types are separate because the head's product is in the model's dtype and the
+    /// sampler reads FP32; [`ops::logits::VocabUnpad`] widens here, once.
+    pub fn unpad_descriptor(
+        &self,
+        dtype: DType,
+        output: DType,
+        gathered_width: u32,
+    ) -> UnpadDescriptor {
         UnpadDescriptor {
             dtype,
+            output,
             vocabulary: self.vocabulary,
             padded: gathered_width,
             block: 1024,

@@ -52,6 +52,9 @@ use ops::{DType, Float};
 /// Whether the layers' descriptors are the programmatic-dependent-launch variants.
 const PDL: bool = false;
 
+/// The lanes one `top_k` ordering pass reads, matching `nn::layers::sampler`'s own chunk.
+const TOP_TILE: u32 = 2048;
+
 /// Tokens one `embedding` program handles (`launch::EMBEDDING_TOKENS`).
 const EMBEDDING_TOKENS: u32 = 8;
 
@@ -80,8 +83,8 @@ const MMA_CLUSTER: (u32, u32) = (1, 1);
 /// Permuted rows per tile of the expert sort (`layers/moe.rs`, `Moe::new`'s tile).
 const SORT_TILE: u32 = 128;
 
-/// Lanes one `softmax` program walks at a time: a chunk of the candidate row.
-const SOFTMAX_TILE: u32 = 8192;
+/// Lanes one candidate program walks at a time: a chunk of the row, not the row.
+const CANDIDATE_TILE: u32 = 8192;
 
 /// The candidate width the slice's sampler keeps per row (`Sampler::new`'s `width`).
 ///
@@ -195,6 +198,7 @@ fn main() {
     lines.push((
         "moe_unpermute".to_owned(),
         key(&moe::combine::Descriptor {
+            layout: moe::combine::Layout::Permuted,
             hidden: HIDDEN,
             top: TOP,
             experts: EXPERTS,
@@ -322,6 +326,9 @@ fn main() {
         "vocab_unpad".to_owned(),
         key(&ops::logits::UnpadDescriptor {
             dtype,
+            // The sampler's candidate buffer is FP32 (the row below says the same for
+            // `logits_shape`), so the head's product is widened here.
+            output: DType::F32,
             vocabulary: VOCABULARY,
             padded: VOCABULARY,
             block: 1024,
@@ -348,6 +355,9 @@ fn main() {
             dtype: DType::F32,
             vocabulary: VOCABULARY,
             width: CANDIDATE_WIDTH,
+            // The chunk one ordering pass reads: the only size `top_k`'s key names now that the
+            // kept count is a launch value and the ordering walks the row instead of sorting it.
+            tile: TOP_TILE,
             ids: DType::I32,
             pdl: PDL,
         }),
@@ -356,6 +366,7 @@ fn main() {
         "filter_candidates".to_owned(),
         key(&ops::sampler::FilterDescriptor {
             width: CANDIDATE_WIDTH,
+            tile: CANDIDATE_TILE,
             ids: DType::I32,
             pdl: PDL,
         }),
@@ -375,6 +386,7 @@ fn main() {
         "inverse_cdf".to_owned(),
         key(&ops::sampler::InverseCdfDescriptor {
             width: CANDIDATE_WIDTH,
+            tile: CANDIDATE_TILE,
             ids: DType::I32,
             tokens: DType::I32,
             pdl: PDL,
@@ -402,7 +414,7 @@ fn main() {
         key(&ops::norm::SoftmaxDescriptor {
             dtype: DType::F32,
             columns: CANDIDATE_WIDTH,
-            tile: SOFTMAX_TILE,
+            tile: CANDIDATE_TILE,
             pdl: PDL,
         }),
     ));

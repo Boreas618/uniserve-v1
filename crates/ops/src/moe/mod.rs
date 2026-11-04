@@ -128,6 +128,9 @@ mod tests {
     fn a_metadata_vector_of_the_wrong_element_type_is_refused() {
         let list = TensorView::new(DevicePtr::new(0x1000), DType::BF16, Shape::new(&[120]));
         let error = require_i32_vector("moe_sort", &list).unwrap_err();
-        assert!(error.to_string().contains("expected i32 metadata"), "{error}");
+        assert!(
+            error.to_string().contains("expected i32 metadata"),
+            "{error}"
+        );
     }
 }
