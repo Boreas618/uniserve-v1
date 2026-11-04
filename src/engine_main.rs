@@ -1236,8 +1236,18 @@ impl MainProcess {
         // package to prepare (`crates/daemon/src/leader.rs`, `install_programs`). This process
         // installs what it can actually launch, so an unnamed set is resolved from the store's
         // listing rather than captured into an empty generation.
+        //
+        // A policy-only *update* also names no kernel, and resolving there would be wrong twice
+        // over: every operator would be re-installed as a new generation, so every kernel's `Arc`
+        // would differ from the serving one and every captured bucket would be rebound or
+        // recaptured for a change no program made. The two states are told apart by what this
+        // process already serves - a startup has no kernel at all, an update has all of them.
+        let never_installed = self
+            .generations
+            .iter()
+            .all(|generation| generation.is_empty());
         let resolved;
-        let programs = if programs.is_empty() {
+        let programs = if programs.is_empty() && never_installed {
             resolved = match self.listed_programs() {
                 Ok(programs) => programs,
                 Err(failure) => return self.abandon_precopy(generation, failure, reply),
