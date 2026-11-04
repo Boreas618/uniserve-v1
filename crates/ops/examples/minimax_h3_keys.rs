@@ -267,6 +267,25 @@ fn main() {
         }
     }
 
+    // The sampler's input projection: the activation and the output are FP32 - the reference casts
+    // the sample up and narrows the projection's result afterwards - while the weight stays the
+    // checkpoint's own BF16 (`Linear::descriptor` writes the weight's type, never the activation's).
+    // So this is the one cell whose three element types are not all the same, and the one the
+    // trajectory crosses per evaluation in both directions.
+    push(
+        "gemm",
+        ops::gemm::Descriptor {
+            input: DType::F32,
+            weight: DType::BF16,
+            accumulate: DType::F32,
+            output: DType::F32,
+            order: ops::gemm::WeightOrder::NxK,
+            epilogue: ops::gemm::Epilogue::Bias,
+            k: HIDDEN,
+        }
+        .to_string(),
+    );
+
     // The audio encoder is FP32 throughout (`Model.forward` casts, and the whole autoencoder runs in
     // FP32): its pre-block contracts at the latent width for the fused q/k/v and the shortcut, at
     // the head width for the attended rows, and at the latent channels for the GeGLU's two halves
