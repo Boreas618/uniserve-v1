@@ -773,29 +773,62 @@ mod tests {
     }
 
     #[test]
-    fn the_tile_rows_name_every_clip_voxel_once() {
+    fn the_tile_rows_name_the_voxels_of_every_tile_in_turn() {
         let config = crate::video_vae::tests::video_config();
         let canvas = Canvas::clip(&config, 48, 84);
         let grid = Tiles::of(&config, &canvas)
             .expect("the grid")
             .tiles(&config, &canvas);
         let (rows, counts) = tile_rows(&canvas, &grid);
-        assert_eq!(rows.len() as u64, canvas.voxels());
+        // One count per tile, and the counts add up to the table: the table is the tiles' blocks end to
+        // end, with no padding between them.
         assert_eq!(counts.len(), grid.len());
         assert_eq!(
             counts.iter().map(|count| u64::from(*count)).sum::<u64>(),
             rows.len() as u64
         );
-        // The tiles partition the raster, so the table is a permutation of the clip's rows.
-        let mut seen = vec![false; rows.len()];
-        for row in &rows {
-            assert!(!seen[*row as usize], "row {row} is named twice");
-            seen[*row as usize] = true;
+        // **Tiles overlap in the latent grid**, so the table is longer than the clip's voxels and each
+        // seam voxel is named twice: the tile that owns it and the neighbour that re-decodes its band.
+        // A tile's block is its own canvas — every frame, every row of its latent rows, every column.
+        let voxels = canvas.voxels();
+        assert!(
+            rows.len() as u64 > voxels,
+            "an overlapping grid names more than {} voxels, not fewer",
+            voxels
+        );
+        let mut offset = 0;
+        for (tile, count) in grid.iter().zip(&counts) {
+            let frame_columns = u64::from(canvas.width);
+            let block_rows = u64::from(tile.latent_rows.1 - tile.latent_rows.0);
+            let block_columns = u64::from(tile.latent_columns.1 - tile.latent_columns.0);
+            assert_eq!(
+                u64::from(*count),
+                u64::from(canvas.frames) * block_rows * block_columns,
+                "tile ({}, {}) names a block of its own canvas",
+                tile.row,
+                tile.column
+            );
+            let block = &rows[offset..offset + (*count as usize)];
+            // The block is the raster's own row-major order restricted to the tile's rectangle, so it
+            // starts at the rectangle's origin and rises all the way through.
+            assert_eq!(
+                block[0] as u64,
+                u64::from(tile.latent_rows.0) * frame_columns + u64::from(tile.latent_columns.0)
+            );
+            assert!(block.windows(2).all(|pair| pair[0] < pair[1]));
+            assert!((*block.last().expect("a block has a voxel") as u64) < voxels);
+            offset += *count as usize;
         }
-        assert!(seen.iter().all(|row| *row));
-        // A tile's block is its own rectangle: the first three voxels are the first row's first three
-        // columns of the first frame, so the tile's rows begin at the raster's origin.
-        assert_eq!(rows[0..3].to_vec(), vec![0, 1, 2]);
+        // Every voxel of the clip is covered at least once by the grid, and no voxel is covered more
+        // than twice: the seams are the only place two tiles both decode a position.
+        let mut coverage = vec![0u8; voxels as usize];
+        for row in &rows {
+            coverage[*row as usize] += 1;
+        }
+        assert!(coverage.iter().all(|count| *count >= 1));
+        assert!(coverage.iter().all(|count| *count <= 2));
+        let covered: u64 = coverage.iter().map(|count| u64::from(*count)).sum();
+        assert_eq!(covered, rows.len() as u64);
     }
 
     #[test]

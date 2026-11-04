@@ -1182,13 +1182,17 @@ pub(crate) mod tests {
                 "{name} is bound but not in the table"
             );
         }
-        // The block activations are per dilation and per half: six per block, twelve per stage.
+        // Each of the seven stages' three blocks runs three dilated steps of two convolutions, and each
+        // of those six convolutions carries its own alias-free activation. One activation is **four**
+        // tensors — the SnakeBeta pair (`act.alpha`, `act.beta`) and the two anti-aliasing filters
+        // (`upsample.filter`, `downsample.lowpass.filter`), which `Binder::activation` reads together —
+        // so the number of names under `.activations.` is the site count times four, not the site count.
         assert_eq!(
             bound
                 .iter()
                 .filter(|name| name.contains(".activations."))
                 .count(),
-            7 * BLOCKS_PER_STAGE * 6
+            7 * BLOCKS_PER_STAGE * 6 * 4
         );
         // A configuration with one stage fewer keeps the two lists in step: the table and the load's
         // list are checked against each other, not against a count written down here.
