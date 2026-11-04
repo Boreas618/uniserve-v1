@@ -55,6 +55,14 @@ impl PoolKind {
         }
     }
 
+    /// The pool at `index` of [`Self::index`], for the allocator's fixed-size
+    /// table of pools.
+    pub(crate) fn from_index(index: usize) -> Option<Self> {
+        [Self::Graph, Self::Scratch, Self::Resident]
+            .get(index)
+            .copied()
+    }
+
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Graph => "graph",
@@ -131,6 +139,14 @@ impl Block {
 /// The buffer borrows the block from its pool; it is valid until it is passed
 /// back to [`Allocator::free`] or the allocator is dropped, whichever comes
 /// first.
+///
+/// A buffer a captured graph addresses — a graph-pool activation — must not be
+/// freed while any executable of that graph can still run: freeing returns the
+/// block to its pool, which may hand the same address to the next allocation,
+/// and the graph would then read or write someone else's storage. The graph's
+/// owner keeps its activations for as long as the executable lives (design 4.1
+/// and 7.3), which is what makes two generations of graphs over one buffer
+/// replay correctly in turn.
 pub struct Buffer {
     block: Arc<Block>,
     address: u64,
@@ -246,10 +262,16 @@ impl Buffer {
     /// descriptor (`cuMemExportToShareableHandle`). Closing the descriptor does
     /// not affect the mapping.
     ///
-    /// This is the first half of design 8's NVML rule: the owner imports the
-    /// descriptor and maps it, then drops the handle that created the storage,
-    /// so NVML attributes the storage to the importer and not to the process
-    /// that created it. The Storage Server takes resident storage that way.
+    /// The block stays mapped in this process and the pool keeps the handle it
+    /// created the storage with, so **exporting does not move this process's
+    /// NVML attribution**: design 8's rule is for storage whose attribution
+    /// belongs elsewhere, and it is met by creating and exporting such storage
+    /// through [`crate::vmm::SegmentedMapping::create`], which maps its own
+    /// import of the exported descriptor and drops the creating handle. Storage
+    /// retained by the Storage Server is created that way
+    /// (`crates/worker/src/storage/allocation.rs`, `retainable`); a pool block
+    /// handed over with this descriptor is memory mapped in two processes and
+    /// NVML counts it in both.
     pub fn export(&self) -> Result<OwnedFd> {
         self.block.export()
     }
@@ -400,19 +422,68 @@ impl Allocator {
 
     /// Maps new physical storage at every suspended block's address and copies
     /// its saved contents back, booking each pool's new total before each
-    /// mapping. Restoring a pool that is not suspended does nothing.
+    /// mapping. Restoring an allocator that is not suspended does nothing.
+    ///
+    /// This is all or nothing across the allocator. If any pool cannot be
+    /// restored — the driver refuses a block, a copy fails, or the budget
+    /// refuses the new total — every pool this call had already brought back is
+    /// suspended again before the error, which names the pool that refused and
+    /// carries its cause, so a standby is either fully promoted or fully parked.
+    /// [`Self::mapped_bytes`] answers for every pool after a failed restore what
+    /// it answered before the call, and each block keeps its saved contents; a
+    /// caller may therefore retry the restore once the condition that refused it
+    /// has passed.
     ///
     /// # Errors
     ///
-    /// Fails when the driver cannot create or map a block's storage, when a
-    /// pool's budget refuses the new total, or when a copy fails; the blocks
-    /// not yet restored stay suspended.
+    /// [`Error::InvalidArgument`] naming the pool that refused, when the driver,
+    /// a copy or the budget refuses; if one of the already-restored pools
+    /// cannot be parked again, the error says so, since only then is the standby
+    /// left partially promoted.
     pub fn restore(&mut self) -> Result<()> {
-        let mut outcome = Ok(());
-        for pool in self.pools.iter_mut().flatten() {
-            outcome = outcome.and(pool.restore());
+        let mut restored = [false; POOLS];
+        for index in 0..POOLS {
+            // Only a pool that was parked can be a rollback candidate: a pool
+            // that was live all along must not be parked by another pool's
+            // failure.
+            let outcome = match self.pools[index].as_mut() {
+                Some(pool) => {
+                    let parked = pool.is_suspended();
+                    (parked, pool.restore())
+                }
+                None => continue,
+            };
+            let (was_parked, result) = outcome;
+            if let Err(error) = result {
+                let kind = PoolKind::from_index(index).unwrap_or(PoolKind::Graph);
+                let mut rollback = Ok(());
+                for (other, was_restored) in restored.iter().enumerate() {
+                    if !*was_restored {
+                        continue;
+                    }
+                    if let Some(pool) = self.pools[other].as_mut() {
+                        rollback = rollback.and(pool.suspend());
+                    }
+                }
+                return Err(match rollback {
+                    Ok(()) => Error::invalid(format!(
+                        "the {} pool of {} could not be restored, so every pool stays parked: \
+                         {error}",
+                        kind.name(),
+                        self.device.id()
+                    )),
+                    Err(rollback) => Error::invalid(format!(
+                        "the {} pool of {} could not be restored ({error}) and the pools restored \
+                         before it could not be parked again ({rollback}): the standby is partially \
+                         promoted",
+                        kind.name(),
+                        self.device.id()
+                    )),
+                });
+            }
+            restored[index] = was_parked;
         }
-        outcome
+        Ok(())
     }
 
     fn pool(&mut self, pool: PoolKind) -> Result<&mut VirtualPool> {

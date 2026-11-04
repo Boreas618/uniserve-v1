@@ -13,7 +13,6 @@
 //! every host.
 
 use std::collections::BTreeMap;
-use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
@@ -24,36 +23,15 @@ use serde::{Deserialize, Serialize};
 /// `decode_attention_backend` (design section 5.2), and then the phase is
 /// part of the descriptor: one generation still indexes its kernels by
 /// (operator name, descriptor key) (design section 4.2).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PhaseKind {
-    /// The phase before a token of the request exists: a prompt's tokens.
-    Prefill,
-    /// The phase that produces one token per request per step.
-    Decode,
-    /// The encoding phase of a diffusion computation: inputs become latents.
-    Encode,
-    /// The denoising phase of a diffusion computation: latents become outputs.
-    Denoise,
-}
-
-impl PhaseKind {
-    /// The phase's name, which the program manifests and the record use.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Prefill => "prefill",
-            Self::Decode => "decode",
-            Self::Encode => "encode",
-            Self::Denoise => "denoise",
-        }
-    }
-}
-
-impl fmt::Display for PhaseKind {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
+///
+/// The value is defined once, in `ops`, because the phase is also part of an
+/// operator's descriptor and travels with `nn::TokenBatch`, and `nn` does not
+/// depend on the Program Server (design section 3). The Program Server names
+/// the same value so the epoch record key, the wire message and a package's
+/// descriptor cannot drift apart, and appends no variant of its own: the
+/// variant order is `ops`' declaration order, which is the record's append
+/// order.
+pub use ops::PhaseKind;
 
 /// One program: the backend that implements an operator, the backend's
 /// revision, and the arguments given to it.

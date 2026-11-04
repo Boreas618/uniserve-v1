@@ -1,10 +1,10 @@
 """The gather_gemm package's compile script: one descriptor -> one module.
 
-FC1 of a mixture of experts over FlashInfer's MoE sort metadata: gather each
+FC1 of a mixture of experts over the MoE sort's tile metadata: gather each
 permuted tile's token rows, multiply by the expert's up and gate rows and store
-the gated product. A descriptor is the MMA tile and cluster (the tactic), the
-top-k expansion the sort metadata uses, the gated activation and the problem's
-K and N, which the kernel's tile shapes are derived from.
+the gated product. A descriptor is the problem's hidden and intermediate widths,
+its expert count, its top-k expansion, the gated activation, the element type,
+the MMA tile and the cluster, which is what the operator's key carries.
 """
 
 import cutlass
@@ -14,21 +14,20 @@ from cutlass.cute.runtime import make_ptr
 import _compile
 import gather_gemm as kernels
 
-#: The gated activations the kernel class implements, by the name the package
-#: declares.
+#: The gated activations the kernel class implements, by the operator's name.
 ACTIVATIONS = {"silu": "silu", "gelu_tanh": "gelu_tanh"}
 
-#: (MMA tile M, N) and cluster (M, N) of each tactic the operator offers; the
-#: MoE sort's routing tile equals the MMA tile's M.
-TACTICS = {
-    "m128n128": ((128, 128), (1, 1)),
-    "m256n128": ((256, 128), (2, 1)),
-    "m128n256": ((128, 256), (1, 1)),
-    "m256n256": ((256, 256), (2, 1)),
-}
+#: The element types the kernel serves, by the operator's name.
+DTYPES = {"bf16": cutlass.BFloat16}
 
-#: Elements of a BF16 row a pointer must be aligned to: 32 bytes.
+#: Elements of a row a pointer must be aligned to: 32 bytes.
 ALIGN = 16
+
+
+def shape_of(text):
+    """The (rows, columns) a `MxN` descriptor value names."""
+    rows, columns = text.split("x")
+    return (int(rows), int(columns))
 
 
 def pointer(dtype):
@@ -38,21 +37,23 @@ def pointer(dtype):
 
 def spec(fields, parameters, target):
     """The compilation of one gather_gemm descriptor."""
-    tiler, cluster = TACTICS[fields["tactic"]]
+    tiler = shape_of(fields["tile"])
+    cluster = shape_of(fields["cluster"])
     activation = ACTIVATIONS[fields["activation"]]
-    k = int(fields["k"])
-    n = int(fields["n"])
+    element = DTYPES[fields["dtype"]]
     experts = int(fields["experts"])
-    topk = int(fields["topk"])
+    top = int(fields["top"])
+    hidden = int(fields["hidden"])
+    intermediate = int(fields["intermediate"])
     # The sort metadata and the output rows are runtime sizes; the compile
     # describes one representative problem big enough for every bucket, since
     # the kernel's grids derive from the tile count at launch.
     tokens = int(parameters["tokens"])
-    m = int(parameters["rows"])
+    permuted_rows = int(parameters["permuted_rows"])
     kernel = kernels.GatherGroupedGemmKernel(
         mma_tiler_mn=tiler,
         cluster_shape_mn=cluster,
-        topk=topk,
+        topk=top,
         activation=activation,
     )
     return {
@@ -60,17 +61,17 @@ def spec(fields, parameters, target):
         "entry": "uniserve_gather_gemm",
         "kernel": kernel.wrapper,
         "args": [
-            pointer(cutlass.BFloat16),
-            pointer(cutlass.BFloat16),
-            pointer(cutlass.BFloat16),
+            pointer(element),
+            pointer(element),
+            pointer(element),
             pointer(cutlass.Int32),
             pointer(cutlass.Int32),
             pointer(cutlass.Int32),
             pointer(cutlass.Int32),
             tokens,
-            m,
-            n,
-            k,
+            permuted_rows,
+            2 * intermediate,
+            hidden,
             experts,
         ],
         "options": {
