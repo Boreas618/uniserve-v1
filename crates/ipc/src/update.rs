@@ -131,6 +131,9 @@ pub enum ProgramStatus {
     Reverted {
         /// The generation that was reverted away from.
         generation: u64,
+        /// Why it was reverted: a failure on probation, the rollback threshold,
+        /// or the operator's command.
+        reason: String,
     },
     /// The generation was purged: the last batch of the generation before it
     /// completed and its graphs and kernels are released (§7.3 step 6).
@@ -146,14 +149,22 @@ pub enum ProgramStatus {
         /// The first error.
         failure: UpdateFailure,
     },
-    /// After a commit, the scheduling policy failed and the mechanism
-    /// instantiated the previous policy on the state it holds (§4.4, §7.3).
-    /// The epoch keeps serving; the daemon records the previous policy again.
+    /// The scheduling policy failed and the mechanism instantiated the previous
+    /// policy on the state it holds (§4.4, §7.3). After a commit the epoch keeps
+    /// serving and the daemon records the previous policy again; before one the
+    /// update reverts, and `fatal` says the policy cannot be recovered at all.
     PolicyReverted {
-        /// The generation whose policy failed.
-        generation: u64,
+        /// The scheduler whose policy failed.
+        scheduler: u32,
+        /// The backend the failed policy came from.
+        backend: String,
+        /// That backend's revision.
+        revision: u32,
         /// The policy's error.
-        failure: UpdateFailure,
+        reason: String,
+        /// Whether the mechanism can no longer serve: no previous policy exists
+        /// to instantiate, or the policy failed outside an update.
+        fatal: bool,
     },
 }
 
