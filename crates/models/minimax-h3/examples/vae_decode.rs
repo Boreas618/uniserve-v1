@@ -191,6 +191,44 @@ impl Args {
     }
 }
 
+/// What one eager decode bound: every launch's operator and descriptor key, in launch order.
+///
+/// A captured graph replays without calling `operate`, so a sink installed around a replay records
+/// nothing; this stage is an eager decode, which is why the walk belongs here. The text is the store's
+/// own key-list format - one `operator<TAB>key` per launch - so `tools/walk_gaps.py` reads this file
+/// and `dit_layer`'s with one command.
+struct Walk(Vec<(&'static str, String)>);
+
+impl ops::capture::Sink for Walk {
+    fn launched(&mut self, operator: &'static str, key: &str) {
+        self.0.push((operator, key.to_owned()));
+    }
+}
+
+impl Walk {
+    fn text(&self) -> String {
+        let mut text = String::new();
+        for (operator, key) in &self.0 {
+            text.push_str(operator);
+            text.push('\t');
+            text.push_str(key);
+            text.push('\n');
+        }
+        text
+    }
+
+    fn distinct(&self) -> usize {
+        let mut keys: Vec<(&str, &str)> = self
+            .0
+            .iter()
+            .map(|(operator, key)| (*operator, key.as_str()))
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        keys.len()
+    }
+}
+
 fn run() -> Result<()> {
     let args = Args::parse()?;
     match args.stage {
@@ -497,8 +535,22 @@ fn stage_decode(args: &Args) -> Result<()> {
         Shape::new(&[channels, frames, u64::from(height), u64::from(width_px)]),
     )?;
     let clip = ClipDecoder::new(&config.video_vae, dtype)?;
-    clip.decode_clip(&forward, &decoder, &tiles, latents, positions, out)?;
+    // The walk: what this decode binds, recorded rather than inferred. `tools/walk_gaps.py` diffs it
+    // against the store's key list, so a bound key the store has no program for is one command away
+    // instead of one device round. Installed for the duration of the decode and removed whether it
+    // succeeds or fails: a sink left installed would be reported to by every later launch.
+    let mut walk = Walk(Vec::new());
+    ops::capture::set_sink(Some(&mut walk));
+    let decode_result = clip.decode_clip(&forward, &decoder, &tiles, latents, positions, out);
+    ops::capture::set_sink(None);
+    decode_result?;
     stream.synchronize()?;
+    if walk.0.is_empty() {
+        return Err(Failure::message(
+            "the walk recorded no launches: the decode replayed a captured graph, or no sink was \
+             installed",
+        ));
+    }
 
     // 8. What ran, written where the comparison reads it.
     let raster = download(
@@ -506,6 +558,15 @@ fn stage_decode(args: &Args) -> Result<()> {
         out,
         usize::try_from(channels * frames * u64::from(height) * u64::from(width_px)).unwrap_or(0),
     )?;
+    if raster.iter().all(|byte| *byte == 0) {
+        return Err(Failure::message(
+            "the raster is all zeros: the decode wrote nothing, and a comparison of two such trees \
+             would be a comparison of two empty buffers",
+        ));
+    }
+    // The one transpose: this side's `[channels, frames, rows x columns]` raster to the container's
+    // `[frames, rows x columns, channels]`. Single site, named, and the only place the two layouts
+    // meet.
     let transposed = channels_last(
         &raster,
         channels,
@@ -549,6 +610,15 @@ fn stage_decode(args: &Args) -> Result<()> {
             directory.join("case.json").display()
         ))
     })?;
+    let walk_path = args.out.join("walk.txt");
+    std::fs::write(&walk_path, walk.text())
+        .map_err(|error| Failure::message(format!("{}: {error}", walk_path.display())))?;
+    println!(
+        "walk: {} launches of {} distinct programs -> {}",
+        walk.0.len(),
+        walk.distinct(),
+        walk_path.display()
+    );
     println!(
         "wrote {}/raster.h3t: [{frames}, {height}, {width_px}, {channels}] from {} tiles, latents {}",
         directory.display(),
