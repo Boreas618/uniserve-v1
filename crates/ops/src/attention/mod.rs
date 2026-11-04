@@ -640,6 +640,55 @@ impl Op for PagedAttention {
             Phase::Decode => 1,
         };
 
+        // The compiled programs load their operands in 16-byte units and assert it: the cute
+        // kernel's `tensorptr<bf16, gmem, align16>` and trtllm-gen's vectorized loads both refuse a
+        // pointer that is not 16-byte aligned or a step that is not a multiple of 8 elements of a
+        // 2-byte type. A host-side placement defect that breaks either surfaces here, by name,
+        // rather than as a warp fault inside a kernel with no operand named in it.
+        let element_bytes = descriptor.query.bytes().unwrap_or(2).max(2);
+        let unit = 16 / element_bytes.max(1);
+        for (name, view) in [
+            ("query", args.query),
+            ("key", args.key),
+            ("value", args.value),
+            ("out", args.out),
+        ] {
+            if address(view.ptr) % 16 != 0 {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!(
+                        "the compiled program loads {name} in 16-byte units; its first address \
+                         {:#x} is not a multiple of 16",
+                        address(view.ptr)
+                    ),
+                ));
+            }
+            for axis in 0..view.strides.rank() {
+                let step = view.strides.get(axis);
+                if axis + 1 != view.strides.rank() && !step.is_multiple_of(unit) {
+                    return Err(Error::argument(
+                        Self::NAME,
+                        format!(
+                            "the compiled program steps {name} axis {axis} in 16-byte units; its \
+                             stride {step} is not a multiple of {unit} elements"
+                        ),
+                    ));
+                }
+            }
+        }
+        for (name, view) in [("page_table", args.page_table), ("seq_lens", args.seq_lens)] {
+            if address(view.ptr) % 16 != 0 {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!(
+                        "the compiled program reads {name} in 16-byte units; its first address \
+                         {:#x} is not a multiple of 16",
+                        address(view.ptr)
+                    ),
+                ));
+            }
+        }
+
         let mut call = Call {
             out: address(args.out.ptr) as usize as *mut c_void,
             query: address(args.query.ptr) as usize as *const c_void,
