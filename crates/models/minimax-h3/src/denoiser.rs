@@ -23,11 +23,18 @@
 //! host value, and no table is uploaded from inside a forward.
 
 use nn::capability::{LatentShape, Layout, StateTable, VideoRequest};
-use nn::{DType, Shape};
+use nn::{DType, Forward, Shape, TensorView, Weight, WeightLoader};
 
 use crate::config::{Canvas, DenoiserConfig};
+use crate::modulation::{AdaLnCache, Groups, Projections};
 use crate::packing::{self, DensePacking};
+use crate::schedule::{Modality, Schedule};
+use crate::solver::Solver;
+use crate::transformer::Transformer;
 use crate::{Error, Result};
+
+/// The modulation columns one AdaLN row holds: six affine vectors of three tags each.
+const ADALN_COLUMNS: u64 = 18;
 
 /// The row capacities and the sequence degree a deployment serves.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -465,6 +472,181 @@ fn modulation_indices(groups: &[i32], tags: &[i32]) -> Vec<u8> {
         bytes.extend_from_slice(&(3 * group + tag).to_le_bytes());
     }
     bytes
+}
+
+/// One checkpoint's denoiser: the DiT, the schedule it is evaluated on, its solver and the AdaLN
+/// cache the runner fills once after loading.
+///
+/// ## The AdaLN cache is model memory
+///
+/// The reference derives the modulation tables at load (`weights._prepare_adaln_cache`), so they are
+/// weights rather than per-request execution state: 50 tables of `[entries, 18 * hidden]` plus
+/// `[entries, 2 * hidden]`, about 1.9 GiB at FP32 for a 50-step checkpoint and 0.33 GiB for the DMD
+/// ladder. The cache is allocated through the weight loader, at the schedule's own entry count, and
+/// filled by one post-load launch.
+///
+/// That is a declared deviation from the capability's constant-table mechanism: [`Denoiser::constant_tables`]
+/// is empty and [`Denoiser::prepare_constants`] writes the model's own region, so the executor
+/// allocates nothing and no table is duplicated. It is one model's load-time fold, sized by that
+/// model from its config alone and read only by it; a capability field carrying those views would
+/// make every executor size a table it never reads. The launch stays capture-safe, writing a region
+/// allocated once.
+pub struct Denoiser {
+    config: DenoiserConfig,
+    rules: Layouts,
+    schedule: Schedule,
+    solver: Solver,
+    transformer: Transformer,
+    projections: Projections,
+    cache: AdaLnCache,
+    /// The layer tables `cache` gathers rows from, retained so the post-load launch can write them.
+    adaln_layers: Vec<Weight>,
+    /// The output table of the same cache.
+    adaln_output: Weight,
+    /// The schedule's entry times as their sinusoidal embedding, `[entries, frequency_dim]` FP32.
+    frequencies: Weight,
+    evaluations: u32,
+}
+
+impl Denoiser {
+    /// Read one DiT partition and everything around it.
+    ///
+    /// `rows` bounds the packed row count this deployment serves, which sizes the attention's
+    /// scratch. The cache is sized from the checkpoint's schedule alone - the distinct noise levels
+    /// of its grid - so no request grows it and two requests of one shape share it.
+    pub fn load(
+        config: DenoiserConfig,
+        arrangement: Arrangement,
+        rows: u32,
+        partition: &crate::Partition,
+        loader: &mut WeightLoader<'_>,
+    ) -> Result<Self> {
+        let schedule = Schedule::new(&config.schedule)?;
+        let evaluations = schedule.num_steps()?;
+        let conditioned = config
+            .tasks
+            .iter()
+            .any(|task| !matches!(task, nn::capability::VideoTask::TextToVideoAudio));
+        let groups = Groups::of(conditioned);
+        let (times, table) = crate::modulation::entries(
+            &schedule.timesteps(Modality::Video),
+            &schedule.timesteps(Modality::Audio),
+            groups,
+        )?;
+        let entries = times.len() as u64;
+        let hidden = u64::from(config.transformer.hidden_size);
+        let columns = ADALN_COLUMNS * hidden;
+        let frequency = u64::from(config.transformer.frequency_dim);
+        let projections = Projections::load(&config.transformer, loader)?;
+
+        let frequencies = loader.constant(
+            "minimax_h3.adaln.frequencies",
+            DType::F32,
+            Shape::new(&[entries, frequency]),
+            &projections.frequencies(&times)?,
+        )?;
+        let mut entry_bytes = Vec::with_capacity(table.len() * 4);
+        for value in &table {
+            entry_bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let entry_table = loader.constant(
+            "minimax_h3.adaln.entries",
+            DType::I32,
+            Shape::new(&[u64::from(evaluations), u64::from(groups.count())]),
+            &entry_bytes,
+        )?;
+
+        let mut adaln_layers = Vec::with_capacity(config.transformer.num_hidden_layers as usize);
+        let zeros = vec![0_u8; (entries * columns * 4) as usize];
+        for index in 0..config.transformer.num_hidden_layers {
+            adaln_layers.push(loader.constant(
+                &format!("minimax_h3.adaln.layers.{index}"),
+                DType::F32,
+                Shape::new(&[entries, columns]),
+                &zeros,
+            )?);
+        }
+        let adaln_output = loader.constant(
+            "minimax_h3.adaln.output",
+            DType::F32,
+            Shape::new(&[entries, 2 * hidden]),
+            &vec![0_u8; (entries * 2 * hidden * 4) as usize],
+        )?;
+        let cache = AdaLnCache::new(
+            adaln_layers.clone(),
+            adaln_output,
+            entry_table,
+            groups,
+            config.transformer.hidden_size,
+        )?;
+        let transformer = Transformer::load(
+            &config.transformer,
+            config.attention,
+            rows,
+            partition,
+            loader,
+        )?;
+        let solver = Solver::load(&schedule, loader)?;
+        let rules = Layouts::new(config.clone(), arrangement)?;
+        Ok(Self {
+            config,
+            rules,
+            schedule,
+            solver,
+            transformer,
+            projections,
+            cache,
+            adaln_layers,
+            adaln_output,
+            frequencies,
+            evaluations,
+        })
+    }
+
+    /// The checkpoint this denoiser evaluates.
+    pub const fn config(&self) -> &DenoiserConfig {
+        &self.config
+    }
+
+    /// The layout rule a request is laid out by.
+    pub const fn rules(&self) -> &Layouts {
+        &self.rules
+    }
+
+    /// The schedule this denoiser steps along.
+    pub const fn schedule(&self) -> &Schedule {
+        &self.schedule
+    }
+
+    /// The solver that advances a sample.
+    pub const fn solver(&self) -> &Solver {
+        &self.solver
+    }
+
+    /// How many solver evaluations one request makes.
+    pub const fn evaluations(&self) -> u32 {
+        self.evaluations
+    }
+
+    /// The tables the runner fills after loading.
+    ///
+    /// Empty by construction: the AdaLN cache is model memory (see [`Denoiser`]).
+    pub fn constant_tables(&self) -> Vec<StateTable> {
+        Vec::new()
+    }
+
+    /// Fill the AdaLN cache from the schedule's times: the one post-load launch.
+    pub fn prepare_constants(&self, f: &Forward, out: &[TensorView]) -> Result<()> {
+        if !out.is_empty() {
+            return Err(Error::config(format!(
+                "the H3 AdaLN cache is model memory; {} executor views were offered",
+                out.len()
+            )));
+        }
+        let views: Vec<TensorView> = self.adaln_layers.iter().map(|layer| layer.view()).collect();
+        self.projections
+            .compute(f, self.frequencies.view(), &views, self.adaln_output.view())
+    }
 }
 
 #[cfg(test)]
