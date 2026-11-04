@@ -31,7 +31,9 @@ def capability(target):
     while digits and digits[-1].isalpha():
         digits = digits[:-1]
     if not digits.isdigit():
-        raise SystemExit(f"target {target!r} is not an sm_<capability> architecture")
+        raise SystemExit(
+            f"target {target!r} is not an sm_<capability> architecture"
+        )
     return int(digits)
 
 
@@ -48,13 +50,21 @@ def parse_key(key, dimensions):
     remaining = key
     fields = {}
     while remaining:
-        name = next((one for one in names if remaining.startswith(one + "_")), None)
+        name = next(
+            (one for one in names if remaining.startswith(one + "_")), None
+        )
         if name is None:
-            raise SystemExit(f"{key}: no dimension among {names} starts {remaining!r}")
+            raise SystemExit(
+                f"{key}: no dimension among {names} starts {remaining!r}"
+            )
         rest = remaining[len(name) + 1 :]
         values = sorted(dimensions[name], key=len, reverse=True)
         value = next(
-            (one for one in values if rest == one or rest.startswith(one + "_")),
+            (
+                one
+                for one in values
+                if rest == one or rest.startswith(one + "_")
+            ),
             None,
         )
         if value is None:
@@ -63,10 +73,9 @@ def parse_key(key, dimensions):
             )
         fields[name] = value
         remaining = rest[len(value) :].removeprefix("_")
-    # A descriptor may leave a declared dimension out of its key: an operator
-    # prints a field only for the variant that has it (a narrowed rotation names
-    # its width, an unweighted normalization its flag), so the package's spec
-    # answers for what is missing.
+    missing = sorted(set(dimensions) - set(fields))
+    if missing:
+        raise SystemExit(f"{key}: the descriptor names no {missing}")
     return fields
 
 
@@ -94,10 +103,16 @@ def compile_one(package, target, key, out, spec):
     out.mkdir(parents=True, exist_ok=True)
     (out / "module.cubin").write_bytes(compiled.asm["cubin"])
     metadata = next(
-        path for name, path in compiled.metadata_group.items() if name.endswith(".json")
+        path
+        for name, path in compiled.metadata_group.items()
+        if name.endswith(".json")
     )
     (out / "metadata.json").write_text(Path(metadata).read_text())
-    print(json.dumps({"descriptor": key, "target": target, "symbol": compiled.name}))
+    print(
+        json.dumps(
+            {"descriptor": key, "target": target, "symbol": compiled.name}
+        )
+    )
 
 
 def arguments():
@@ -111,7 +126,10 @@ def arguments():
     if os.environ.get("UNISERVE_OUT"):
         package = Path(os.environ["UNISERVE_PACKAGE"])
         manifest = tomllib.loads((package / "package.toml").read_text())
-        target = os.environ.get("UNISERVE_TARGET") or manifest["kernel"]["architectures"][0]
+        target = (
+            os.environ.get("UNISERVE_TARGET")
+            or manifest["kernel"]["architectures"][0]
+        )
         return (
             package,
             target,

@@ -1,0 +1,36 @@
+# The cross_fade operator's Triton backend: design 5.2's program package.
+#
+# The package declares the descriptor cells the operator declares and **refuses every build**:
+# the operator's launch passes the tile's channels and frames but not its height and width, and
+# a blend along axis 2 or 3 cannot locate its band without them. `src/build.py` states the
+# reason it refuses and `src/cross_fade.py` states what the kernel becomes when the two words
+# arrive in `crates/ops/src/cross_fade.rs`.
+#
+# A refusing package is deliberate: `prepare` reports the reason and the operator, which is
+# better than an operator with no package at all (a bare absence) and far better than a kernel
+# that blends the wrong grid.
+
+op = "cross_fade"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+
+[source]
+kind = "triton"
+files = ["src/cross_fade.py", "src/build.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+[kernel.descriptors]
+dimensions = { dtype = ["f16", "bf16", "f32"], extent = ["5"], axis = ["2", "3"], block = ["1024"], pdl = ["false", "true"] }
+
+[parameters]
