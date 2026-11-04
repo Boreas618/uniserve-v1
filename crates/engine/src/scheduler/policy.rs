@@ -843,6 +843,59 @@ fn init_of(program: &PolicyProgram, state: &TrialState) -> Instantiation {
     }
 }
 
+/// The mechanism's validation of the control thread's only decision.
+///
+/// The route instance answers `route` alone: a plan, victims, a placement, a
+/// warm list and an expert order are a scheduler thread's decisions, judged
+/// there. A route decision must name a rank that is alive.
+pub struct RouteTrial;
+
+impl Validators for RouteTrial {
+    fn plan(&self, _plan: &Plan) -> Result<(), PolicyError> {
+        Ok(())
+    }
+
+    fn victims(&self, _shortage: &Shortage, _victims: &[Victim]) -> Result<(), PolicyError> {
+        Ok(())
+    }
+
+    fn route(
+        &self,
+        _request: &RequestView,
+        ranks: &[RankView],
+        index: usize,
+    ) -> Result<(), PolicyError> {
+        match ranks.get(index) {
+            Some(rank) if rank.alive => Ok(()),
+            Some(_) => Err(PolicyError::invalid(
+                Call::Route,
+                format!("route chose rank {index}, which is not alive"),
+            )),
+            None => Err(PolicyError::invalid(
+                Call::Route,
+                format!("route chose rank {index} of {} ranks", ranks.len()),
+            )),
+        }
+    }
+
+    fn place(
+        &self,
+        _call: &CallView,
+        _replicas: &[ReplicaView],
+        _index: usize,
+    ) -> Result<(), PolicyError> {
+        Ok(())
+    }
+
+    fn warm(&self, _pages: &[PageId]) -> Result<(), PolicyError> {
+        Ok(())
+    }
+
+    fn experts(&self, _load: &ExpertLoad, _order: &ExpertOrder) -> Result<(), PolicyError> {
+        Ok(())
+    }
+}
+
 /// The control thread's own policy instance, which answers `route` (§4.4).
 ///
 /// It is the same program as the scheduler threads' instances and changes with
@@ -1261,6 +1314,46 @@ mod tests {
                 tokens: vec![0],
             }),
         }
+    }
+
+    #[test]
+    fn the_route_trial_refuses_an_index_that_names_no_live_rank() {
+        let ranks = vec![
+            RankView {
+                index: 0,
+                in_flight: 2,
+                alive: true,
+            },
+            RankView {
+                index: 1,
+                in_flight: 0,
+                alive: false,
+            },
+        ];
+        let (request, _) = state().arrival.unwrap();
+        assert!(RouteTrial.route(&request, &ranks, 0).is_ok());
+        let dead = RouteTrial.route(&request, &ranks, 1).unwrap_err();
+        assert!(
+            matches!(
+                dead,
+                PolicyError::Malformed {
+                    call: Call::Route,
+                    ..
+                }
+            ),
+            "a dead rank is a bad decision, got {dead}"
+        );
+        let outside = RouteTrial.route(&request, &ranks, 2).unwrap_err();
+        assert!(
+            matches!(
+                outside,
+                PolicyError::Malformed {
+                    call: Call::Route,
+                    ..
+                }
+            ),
+            "an index outside the ranks is a bad decision, got {outside}"
+        );
     }
 
     /// A `Validators` that accepts every answer unless told otherwise.

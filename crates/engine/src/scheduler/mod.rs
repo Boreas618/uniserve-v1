@@ -45,8 +45,8 @@ pub(crate) use execution::generation_consuming_calls;
 use ipc::{ForwardMode, MediaCall, TransferMode};
 pub use policy::{
     Arrival, BatchCapacity, Candidate, PREFETCH_FLOOR_TOKENS, PolicyBytes, PolicyProgram,
-    PolicyReverted, PolicySlot, PolicySource, PolicyStore, RoutePolicy, Stage, TrialState,
-    Validators, arrival_view, backend_name, ceilings_of, parameters_of, program_of,
+    PolicyReverted, PolicySlot, PolicySource, PolicyStore, RoutePolicy, RouteTrial, Stage,
+    TrialState, Validators, arrival_view, backend_name, ceilings_of, parameters_of, program_of,
 };
 pub(crate) use run::{MAX_GUIDANCE_PREFIX_ROWS, guidance_prefix_rows};
 pub use stats::{

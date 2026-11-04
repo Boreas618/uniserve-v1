@@ -168,9 +168,7 @@ impl Routing {
             request: request.clone(),
         });
         let events = std::mem::take(&mut state.pending);
-        let Some(policy) = state.instance.as_mut() else {
-            return None;
-        };
+        let policy = state.instance.as_mut()?;
         let ranks = self.ranks();
         let outcome = policy
             .observe(&events)
