@@ -27,6 +27,7 @@ use crate::weights::Weight;
 pub struct Sections {
     widths: [u32; MAX_AXES],
     axes: u32,
+    interleaved: bool,
 }
 
 impl Sections {
@@ -54,7 +55,24 @@ impl Sections {
         Ok(Self {
             widths: stored,
             axes: widths.len() as u32,
+            interleaved: false,
         })
+    }
+
+    /// Cycle the axes over the whole spectrum instead of cutting it in order.
+    ///
+    /// Qwen3-VL's interleaved M-RoPE gives frequency `j` the axis `j % axes` while the axis owns
+    /// `j`, so every axis keeps frequencies from the whole range; the contiguous cut, the default,
+    /// gives axis `a` the next `sections[a]` frequencies. The two are different programs
+    /// (`ops::rope::FactorsDescriptor::interleaved`).
+    pub const fn interleaved(mut self) -> Self {
+        self.interleaved = true;
+        self
+    }
+
+    /// Whether the axes cycle over the spectrum.
+    pub const fn is_interleaved(&self) -> bool {
+        self.interleaved
     }
 
     /// How many position axes the rotation reads.
@@ -249,6 +267,9 @@ impl Rotary {
             scale: self.scale.into(),
             pdl: PDL,
             axes: self.sections.map_or(1, |sections| sections.axes()),
+            interleaved: self
+                .sections
+                .is_some_and(|sections| sections.is_interleaved()),
             sections: self
                 .sections
                 .map_or([0; MAX_AXES], |sections| sections.widths),
