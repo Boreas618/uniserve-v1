@@ -1004,8 +1004,10 @@ impl<'a> WeightLoader<'a> {
     /// deployment that asks to quantize a BF16 checkpoint at load does it with the
     /// `nvfp4_quantize` operator on the device, which is where the reference encodes too.
     ///
-    /// `values` is `[rows, columns / 2]` U8 (two E2M1 codes a byte), `scales` holds the block
-    /// scales in the layout `ops::fp4::ScaleLayout::shape(rows, columns)` names, in whatever
+    /// `file` is the arrangement the checkpoint stores its block scales in and `product` the one the
+    /// deployment's kernels read; when the two differ the table is permuted here, and
+    /// [`QuantizedWeight::layout`] states the product's. `values` is `[rows, columns / 2]` U8 (two
+    /// E2M1 codes a byte), `scales` holds the block scales in `file`'s arrangement, in whatever
     /// one-byte type the checkpoint stores them (`F8_E4M3`, or `U8` where the export says so;
     /// [`QuantizedWeight::scales`]`.dtype()` is that type, unchanged), and `global_scale` is the
     /// reciprocal of the checkpoint's FP32 tensor
@@ -1017,7 +1019,8 @@ impl<'a> WeightLoader<'a> {
         scales: &WeightRequest,
         input_scale: Option<&WeightRequest>,
         names: Nvfp4Names,
-        layout: ScaleLayout,
+        file: ScaleLayout,
+        product: ScaleLayout,
         global_scale: f32,
     ) -> Result<QuantizedWeight> {
         // The requests name the fields, so their absence is where a wrong vocabulary shows up: a
@@ -1043,25 +1046,31 @@ impl<'a> WeightLoader<'a> {
         }
         let rows = values.shape.numel() / values.shape.last();
         let columns = values.shape.last() * 2;
-        let expected = layout.shape(rows, columns);
+        let expected = file.shape(rows, columns);
         if scales.shape != expected {
             return Err(Error::weight(
                 &scales.tensor,
                 format!(
-                    "the {layout} block scales of a [{rows}, {columns}] matrix are {:?}, not {:?}",
+                    "the {file} block scales of a [{rows}, {columns}] matrix are {:?}, not {:?}",
                     expected.dims(),
                     scales.shape.dims()
                 ),
             ));
         }
-        let scale_layout = match layout {
+        if file == ScaleLayout::Swizzled128X4 && product == ScaleLayout::Linear {
+            return Err(Error::weight(
+                &scales.tensor,
+                "a swizzled file rewritten into the linear table is a permutation this loader does \
+                 not have: a calibrated export stores its block scales linear"
+                    .to_owned(),
+            ));
+        }
+        let product_layout = match product {
             ScaleLayout::Linear => WeightLayout::NVFP4_SCALES_LINEAR,
             ScaleLayout::Swizzled128X4 => WeightLayout::NVFP4_SCALES_SWIZZLED,
         };
         let mut values_request = values.clone().with_layout(WeightLayout::NVFP4_VALUES);
-        let mut scales_request = scales.clone().with_layout(scale_layout);
         values_request.shape = Shape::new(&[rows, columns / 2]);
-        scales_request.shape = expected;
         let packed = self.load(&values_request)?;
         if packed.dtype() != DType::U8 {
             return Err(Error::weight(
@@ -1069,8 +1078,37 @@ impl<'a> WeightLoader<'a> {
                 format!("packed E2M1 values are U8 bytes, not {}", packed.dtype()),
             ));
         }
-        let scales = self.load(&scales_request)?;
-        block_scale_dtype(&scales_request.tensor, scales.dtype())?;
+        // The file's arrangement and the product's are two statements, and the permutation between
+        // them happens here once: a kernel must never read a table under a claim it does not meet.
+        let scales = if file == product {
+            let mut request = scales.clone().with_layout(product_layout);
+            request.shape = expected;
+            let loaded = self.load(&request)?;
+            block_scale_dtype(&request.tensor, loaded.dtype())?;
+            loaded
+        } else {
+            let bytes = self.checkpoint.read(&scales.tensor)?;
+            let dtype = block_scale_dtype(&scales.tensor, bytes.dtype)?;
+            let blocks = file.columns(columns);
+            let arranged = swizzled_scales(&bytes.bytes, rows, blocks);
+            let shape = product.shape(rows, columns);
+            let files = self.identities(&[scales.tensor.clone()])?;
+            self.publish_computed(
+                WeightKey {
+                    files,
+                    dtype,
+                    layout: product_layout,
+                    region: WeightRegion {
+                        tensors: std::iter::once(format!("{}__nvfp4_scales", scales.tensor)).collect(),
+                        start: 0,
+                        shape,
+                        stride: None,
+                    },
+                },
+                shape,
+                &arranged,
+            )?
+        };
         let input_scale = match input_scale {
             None => None,
             Some(request) => {
@@ -1114,7 +1152,7 @@ impl<'a> WeightLoader<'a> {
             packed,
             scales,
             global_scale,
-            layout,
+            layout: product,
             input_scale,
         })
     }
@@ -2020,6 +2058,12 @@ mod tests {
     ///
     /// The shapes keep `rows * blocks` inside a byte, because the table is bytes: `(56, 4)` pads the
     /// rows only and `(8, 8)` pads both axes.
+    ///
+    /// **The padding is a zero, so the data starts at one.** "Every scale survives exactly once" is
+    /// counted over non-zero entries here, and a table carrying a genuine zero would be one short —
+    /// which is the caller's obligation, not the assertion's: a zero scale is a block the file says is
+    /// empty, indistinguishable in the arranged table from a hole, so a test of this bijection uses
+    /// values a checkpoint would never write as padding.
     #[test]
     fn the_block_scales_are_permuted_into_the_laid_out_table() {
         for (rows, blocks) in [(56_u64, 4_u64), (8, 8)] {
