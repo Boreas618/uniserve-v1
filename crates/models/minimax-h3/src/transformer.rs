@@ -22,6 +22,7 @@ use crate::attention::{self, Factors, Visible};
 use crate::config::{AttentionKind, TransformerConfig};
 use crate::modulation::AdaLnCache;
 use crate::partition::Partition;
+use crate::schedule::Modality;
 use crate::{Error, Result};
 
 use nn::layers::{GatedResidual, Linear, ModulatedRmsNorm, PackedSwiGlu, RmsNorm};
@@ -139,6 +140,68 @@ impl Layer {
         self.down.forward(f, mlp, update)?;
         Ok(GatedResidual::new(gate_mlp)?.forward(f, out, update, rows)?)
     }
+}
+
+impl Transformer {
+    /// The final normalization and one modality's output projection: `hidden` in, velocity out.
+    ///
+    /// The final normalization is modulated like every other one: `[groups, 2 * hidden]` of shift
+    /// and scale, gathered at the AdaLN entry the step reads. `rows` selects each row's group.
+    pub fn velocity(
+        &self,
+        f: &Forward,
+        hidden: TensorView,
+        modality: Modality,
+        modulation: TensorView,
+        rows: TensorView,
+        out: TensorView,
+    ) -> Result<()> {
+        let width = hidden.shape.last();
+        let (shift, scale) = halves(modulation, width)?;
+        let norm = ModulatedRmsNorm::new(
+            borrowed(self.norm_out.weight())?,
+            shift,
+            scale,
+            None,
+            self.config.norm_eps,
+        )?;
+        let arena = f.arena();
+        let dtype = hidden.dtype;
+        let normalized = arena.tensor(dtype, hidden.shape)?;
+        norm.forward(f, hidden, None, rows, normalized, None, None)?;
+        match modality {
+            Modality::Video => Ok(self.video_out.forward(f, normalized, out)?),
+            Modality::Audio => {
+                let audio = self.audio_out.as_ref().ok_or_else(|| {
+                    Error::Unsupported("this H3 partition predicts no audio velocity".to_owned())
+                })?;
+                Ok(audio.forward(f, normalized, out)?)
+            }
+        }
+    }
+}
+
+/// The shift and scale halves of a `[rows, 2 * width]` modulation table, as row-strided weights.
+fn halves(table: TensorView, width: u64) -> Result<(Weight, Weight)> {
+    if table.shape.rank() != 2 || table.shape.last() != 2 * width {
+        return Err(Error::checkpoint(format!(
+            "an output modulation of {:?} is not [rows, 2 * {width}]",
+            table.shape.dims()
+        )));
+    }
+    let rows = table.shape.dim(0);
+    let stride = table.strides.get(0);
+    let element = table.dtype.bytes().unwrap_or(1);
+    let chunk = |index: u64| -> Result<Weight> {
+        let view = TensorView::with_strides(
+            nn::DevicePtr::new(table.ptr.address() + index * width * element),
+            table.dtype,
+            Shape::new(&[rows, width]),
+            nn::Strides::new(&[stride, 1]),
+        );
+        borrowed(view)
+    };
+    Ok((chunk(0)?, chunk(1)?))
 }
 
 /// The six affine vectors one layer's modulation table cuts into.
