@@ -82,7 +82,9 @@ def launch_entry(package):
     manifest = tomllib.loads((package / "package.toml").read_text())
     entry = manifest.get("module", {}).get("entries", {}).get("launch")
     if not entry:
-        raise SystemExit("the package's [module.entries] names no launch symbol")
+        raise SystemExit(
+            "the package's [module.entries] names no launch symbol"
+        )
     return entry
 
 
@@ -99,7 +101,9 @@ def element_type(key, field):
     """The `DType` number a descriptor's field names."""
     token = descriptor_field(key, field)
     if token not in ELEMENT_TYPES:
-        raise SystemExit(f"{field} = {token!r} is not an element type the operator has")
+        raise SystemExit(
+            f"{field} = {token!r} is not an element type the operator has"
+        )
     return ELEMENT_TYPES[token]
 
 
@@ -142,7 +146,9 @@ def main():
     print(" ".join(command), file=sys.stderr)
     built = subprocess.run(command, capture_output=True, text=True, check=False)
     if built.returncode != 0:
-        raise SystemExit(f"nvcc failed with {built.returncode}:\n{built.stderr[-4000:]}")
+        raise SystemExit(
+            f"nvcc failed with {built.returncode}:\n{built.stderr[-4000:]}"
+        )
 
     exported = subprocess.run(
         ["nm", "-D", "--defined-only", str(out / "module.so")],
@@ -150,10 +156,16 @@ def main():
         text=True,
         check=True,
     )
-    symbols = {line.split()[-1] for line in exported.stdout.splitlines() if line.split()}
+    symbols = {
+        line.split()[-1]
+        for line in exported.stdout.splitlines()
+        if line.split()
+    }
     if entry not in symbols:
         raise SystemExit(f"module.so does not export {entry}")
-    print(json.dumps({"descriptor": descriptor, "target": target, "entry": entry}))
+    print(
+        json.dumps({"descriptor": descriptor, "target": target, "entry": entry})
+    )
 
 
 if __name__ == "__main__":
