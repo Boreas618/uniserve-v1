@@ -13,8 +13,9 @@
 // argument order; `stream` is the CUstream of the device the executor drives.
 //
 // `input` is [m, k / 2] packed bytes, `weight` [n, k / 2] packed bytes, both with
-// unit stride on the contraction; `input_scales` the linear [m, k / 16] E4M3
-// matrix, `weight_scales` the 128x4 swizzled [n, k / 16] one; `alpha` the [1] FP32
+// unit stride on the contraction; `input_scales` and `weight_scales` E4M3 in the
+// 128x4 interleaved atom, [m, k / 16] and [n, k / 16] with rows padded to 128 and
+// scale columns to 4; `alpha` the [1] FP32
 // product of the two tensor scales, which the epilogue reads on the device;
 // `bias` the [n] addend a biasing epilogue takes, and `out` the [m, n] product.
 struct uniserve_nvfp4_gemm_call {

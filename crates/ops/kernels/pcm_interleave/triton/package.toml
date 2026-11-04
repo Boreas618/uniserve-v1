@@ -1,0 +1,40 @@
+# The pcm_interleave operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one architecture
+# of `[kernel.architectures]`, built by `src/build.py` (the compile driver the
+# Program Server runs for one descriptor and target).
+#
+# This is the audio decoder's last step: two float channels to interleaved 16-bit
+# PCM, `round_half_to_even(clamp(x, -1, 1) · 32767)` with ties to the even
+# neighbour, which the operator states as an exact tolerance and this module
+# reproduces with one PTX rounding instruction. The output is always i16, and the
+# sample count is a launch value rather than a descriptor field — a request's
+# duration varies while the arithmetic does not — so the key names only the input
+# type, the block and whether the module was compiled for programmatic dependent
+# launch, e.g. `dtype_f32_block_1024_pdl_false`.
+
+op = "pcm_interleave"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/pcm_interleave.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a", "sm_100f"]
+
+[kernel.descriptors]
+dimensions = { dtype = ["f32"], block = ["256", "512", "1024", "2048"], pdl = ["true", "false"] }
+
+[parameters]
