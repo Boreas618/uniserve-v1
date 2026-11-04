@@ -59,6 +59,20 @@ CUT_SITES = [
 ]
 
 
+#: Two writers name the gate's logits differently: the reference's hooks write `router_logits` and
+#: the slice writes `gate_scores`. They are the same cut, so a comparison that keyed on the file name
+#: alone would report each as "held on one side only" and never compare them.
+ALIASES = {"router_logits": "gate_scores", "gate_scores": "router_logits"}
+
+
+def counterpart(path):
+    """The other side's name for the same cut, when the two writers spelled it differently."""
+    for cut, alias in ALIASES.items():
+        if path.stem.endswith(cut):
+            return path.with_name(path.stem[: -len(cut)] + alias + path.suffix)
+    return None
+
+
 def load(path):
     if not path.exists():
         return None
@@ -421,6 +435,10 @@ def main():
             )
             continue
         actual = load(arguments.dump / path.name)
+        if actual is None:
+            beside = counterpart(path)
+            if beside is not None:
+                actual = load(arguments.dump / beside.name)
         if actual is None:
             print(f"{path.name:<16} {'-':<12} {'missing from the dump':>22}")
             if first is None:
