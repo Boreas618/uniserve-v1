@@ -1,0 +1,46 @@
+# The paged_attention operator's trtllm backend: design 5.2's program package.
+#
+# One native module per descriptor: trtllm-gen's FMHA launch code and kernel table,
+# compiled against the artifact's generated header, with the cubins this
+# descriptor's configurations can select published beside the module under
+# `cubins/`. The entry is the operator's `attention::paged::Call`.
+#
+# The manifest records where the kernels come from: `[toolchain] packages` names
+# the FlashInfer distribution that carries the launch code, and
+# `[parameters] artifact` the pinned trtllm-gen artifact the Program Server's
+# fetcher verifies before the build reads it.
+
+op = "paged_attention"
+backend = "trtllm"
+
+[toolchain]
+kind = "nvcc"
+version = "13.0.48"
+packages = [{ name = "flashinfer-python", version = "0.6.18" }]
+
+[module]
+form = "native"
+entries = { launch = "uniserve_paged_attention" }
+
+[source]
+kind = "cuda"
+files = ["src/build.py", "src/entry.cpp", "src/entry.h"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_100f"]
+
+# `phase_decode_dtype_bf16_kv_bf16_out_bf16_head_dim_128_page_64_q_heads_32_kv_heads_4_mask_causal_window_false_len_40960`.
+#
+# An FP8 E4M3 cache is not declared: trtllm-gen reads one E4M3 block scale per
+# sixteen elements of the head dimension per key, per head and per page, and the
+# operator's call carries one FP32 scale per page, so the module could not read
+# the scales the kernel asks for.
+[kernel.descriptors]
+dimensions = { phase = ["decode", "prefill"], dtype = ["bf16", "f16"], kv = ["bf16", "f16"], out = ["bf16", "f16"], head_dim = ["128", "64", "256"], page = ["64", "16", "32"], q_heads = ["32", "24", "16", "8"], kv_heads = ["4", "8", "2", "1"], mask = ["causal", "dense"], window = ["false", "true"], len = ["40960"] }
+
+[parameters]
+# The trtllm-gen artifact: the pin its manifest is hashed by.
+artifact = "trtllm-gen-fmha"
+artifact_sha256 = "d79b5c51fc8597fac57dae0da4afa114fb2014575e4ec3df099ad856d97cabc3"

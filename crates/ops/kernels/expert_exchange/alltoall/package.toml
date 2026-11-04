@@ -1,0 +1,58 @@
+# The expert_exchange operator's alltoall backend: design 5.2's program package.
+#
+# One native module per descriptor: the expert-parallel transport's lifecycle
+# and the two directions of the exchange (`ops::moe::exchange`, the dispatch call
+# of 608 bytes and the combine call of 600 bytes, mirrored in the package's
+# header with their sizes and the error offsets asserted).
+#
+# The transport is an execution resource: the executor creates it through this
+# package's `create` entry, suspends and restores it around a standby, and hands
+# the operator a borrowed handle, so the operator never allocates. The workspace
+# is mapped through the CUDA virtual-memory API, which is what lets `suspend`
+# return the storage while keeping the addresses a captured graph holds.
+#
+# The module serves a group of one rank — an expert-parallel deployment whose
+# experts all live on the launching rank (EP=1). Dispatch packs the rank's own
+# rows with the route ids and weights its experts read, combine sums the one
+# partial each row gets back, and both are exact. A group of several ranks needs
+# the peer-mapping transport (MNNVL/nvlink) whose handshake is this package's
+# host code; `create` refuses such a group instead of pretending to drive it.
+
+op = "expert_exchange"
+backend = "alltoall"
+
+[toolchain]
+kind = "nvcc"
+version = "13.0.48"
+packages = []
+
+[module]
+form = "native"
+
+[module.entries]
+launch = "uniserve_expert_exchange_dispatch"
+combine = "uniserve_expert_exchange_combine"
+create = "uniserve_expert_exchange_create"
+suspend = "uniserve_expert_exchange_suspend"
+restore = "uniserve_expert_exchange_restore"
+release = "uniserve_expert_exchange_release"
+info = "uniserve_expert_exchange_info"
+
+[source]
+kind = "cuda"
+files = [
+    "include/uniserve_expert_exchange.h",
+    "src/exchange.cu",
+    "src/build.py",
+]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_100f"]
+
+# `mode_dispatch_hidden_2048_top_8_experts_128_max_tokens_8192_ranks_1_dtype_bf16`.
+[kernel.descriptors]
+dimensions = { mode = ["dispatch", "combine"], hidden = ["2048", "7168", "4096"], top = ["8", "4", "2"], experts = ["128", "256", "64"], max_tokens = ["8192", "4096", "16384"], ranks = ["1"], dtype = ["bf16", "f16"] }
+
+[parameters]
