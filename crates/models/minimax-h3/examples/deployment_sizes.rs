@@ -86,6 +86,24 @@ fn mib(bytes: u64) -> String {
     }
 }
 
+/// Report a plan that names one buffer twice, and remember to fail the run.
+///
+/// The executor keys the arena's storage by these names, so a repeated name aliases two regions: the
+/// plan stops saying what the block reserves while its arithmetic still adds up, which is a defect
+/// no size a reader checks can find. One plan carried it (`audio.wide`, a patch widening and a head
+/// widening, `f2e1ef10c`), so every plan this example builds is scanned.
+fn distinct_names(label: &str, plan: &[minimax_h3::decoding::Buffer]) {
+    let mut seen = std::collections::HashSet::new();
+    for buffer in plan {
+        if !seen.insert(buffer.name.as_str()) {
+            println!("  PLAN COLLISION: {label} names `{}` twice", buffer.name);
+            PLAN_COLLISIONS.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+static PLAN_COLLISIONS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut root: Option<PathBuf> = None;
     let mut arguments = std::env::args().skip(1);
@@ -157,6 +175,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "\n(recomputed row bounds and decode plans need `--root <checkpoint>`; the stage table \
              above is the note's, and needs neither a checkpoint nor a GPU)"
         );
+    }
+    if PLAN_COLLISIONS.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("a plan names one buffer twice, so two regions would alias".into());
     }
     Ok(())
 }
@@ -397,6 +418,7 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
                 nn::DType::BF16,
                 &request,
             )?;
+            distinct_names(&format!("the DiT plan at {frames} frames"), &plan);
             let bytes: u64 = plan.iter().map(minimax_h3::decoding::Buffer::bytes).sum();
             println!(
                 "DiT plan {name}, {frames} frames: {} entries, {} = {} MiB ({} bytes)",
@@ -427,6 +449,7 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     for frames in [124_u32, 362] {
         let samples = u64::from(minimax_h3::packing::audio_latent_frames(frames)) * 800;
         let plan = minimax_h3::encoding::audio_encoder_arena(&config.audio_vae, 2, samples)?;
+        distinct_names("the audio encoder plan", &plan);
         let bytes: u64 = plan.iter().map(minimax_h3::decoding::Buffer::bytes).sum();
         println!(
             "audio encoder plan {frames} frames ({samples} samples): {} buffers, {}",
@@ -456,6 +479,7 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         ),
     ] {
         let plan = minimax_h3::encoding::conditioning_arena(&config.video_vae, frames, extent)?;
+        distinct_names("the conditioning plan", &plan);
         let bytes: u64 = plan.iter().map(minimax_h3::decoding::Buffer::bytes).sum();
         println!(
             "conditioning plan {frames} frames ({} latent): {} buffers, {} bytes = {} KiB",
@@ -475,6 +499,7 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             canvas.width / ratio,
         );
         let plan = minimax_h3::output::splice_arena(&config.video_vae, &clip, nn::DType::F16)?;
+        distinct_names("the splice plan", &plan);
         let bytes: u64 = plan.iter().map(minimax_h3::decoding::Buffer::bytes).sum();
         println!(
             "splice plan {}x{}: {} buffers, {} bytes = {} MiB",
@@ -491,10 +516,12 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             canvas.height / ratio,
             canvas.width / ratio,
         );
-        let arena: u64 = minimax_h3::decoding::video_arena(&config.video_vae, &latent)?
-            .iter()
-            .map(|buffer| buffer.bytes())
-            .sum();
+        let decode = minimax_h3::decoding::video_arena(&config.video_vae, &latent)?;
+        distinct_names(
+            &format!("the decode plan at {}x{}", canvas.width, canvas.height),
+            &decode,
+        );
+        let arena: u64 = decode.iter().map(|buffer| buffer.bytes()).sum();
         if std::env::var("H3_ARENA_BUFFERS").is_ok() && canvas.width == 1536 {
             for buffer in minimax_h3::decoding::video_arena(&config.video_vae, &latent)? {
                 let bytes = buffer.bytes();
@@ -516,6 +543,7 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             &config.audio_vae,
             minimax_h3::packing::audio_latent_frames(frames),
         )?;
+        distinct_names("the audio decoder plan", &plan);
         let bytes: u64 = plan.iter().map(|buffer| buffer.bytes()).sum();
         println!(
             "audio plan {frames} frames ({} latent steps): {} buffers, {} bytes = {} MiB",
@@ -615,6 +643,7 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             width,
         };
         let plan = minimax_h3::encoding::video_encoder_tile_arena(&config.video_vae, raster)?;
+        distinct_names("the video encoder tile plan", &plan);
         let bytes: u64 = plan.iter().map(|buffer| buffer.bytes()).sum();
         println!(
             "encoder tile {width}x{height} px: {} buffers, {} bytes = {} MiB",
