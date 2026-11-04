@@ -1,10 +1,12 @@
-# The expert_map operator's triton backend: design 5.2's program package.
+# The expert_gather operator's Triton backend: design 5.2's program package.
 #
 # One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the
-# compile driver the Program Server runs for one descriptor and target).
+# architecture of `[kernel.architectures]`, built by `src/build.py`.
+#
+# One program maps a block of expert picks through the permutation; the token
+# count is a launch value and the top-k width a descriptor field.
 
-op = "expert_map"
+op = "expert_gather"
 backend = "triton"
 
 [toolchain]
@@ -18,12 +20,17 @@ metadata = "metadata.json"
 
 [source]
 kind = "triton"
-files = ["src/expert_map.py", "src/build.py", "src/_compile.py"]
+files = ["src/expert_gather.py", "src/build.py", "src/_compile.py"]
 script = "src/build.py"
 
 [kernel]
 target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
+# `experts_128_top_8`.
 [kernel.descriptors]
-dimensions = { experts = ["128", "256"], top = ["8"] }
+dimensions = { experts = ["128", "256", "64", "32"], top = ["8", "4", "2", "1"] }
+
+[parameters]
+# Picks one program maps.
+block = 1024

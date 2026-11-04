@@ -1,54 +1,47 @@
-"""The rope_factors package's compile script: one descriptor -> one module.
+"""The rotary_factors package's compile script: one descriptor -> one module.
 
-A descriptor is the position dtype (the kernel reads positions through their
-own pointer type), the factor dtype, the number of frequencies per row and the
-positions' layout. Factors are FP32 phases rounded once into their output
-dtype, so the phase domain does not depend on the output dtype.
+A descriptor is the factor dtype, the position dtype, the number of frequencies
+per row, the program's block, the scale's bit pattern and the dependent-launch
+flag. The position count stays a runtime value and the row width comes from the
+launch, so one module serves every token count.
 """
 
-import _compile
-import rope_factors as kernels
+import struct
 
-#: Position dtypes. Rotary positions are token offsets, which the caller
-#: passes as int32 or int64.
+import _compile
+import rotary_factors as kernels
+
+#: Position dtypes: token offsets arrive as int32 or int64.
 POSITIONS = {"i32": "i32", "i64": "i64"}
 
-#: Factor dtypes: FP32 keeps the FP32 phase, BF16 halves the table.
-FACTORS = {"fp32": "fp32", "bf16": "bf16"}
+#: Factor dtypes: FP32 keeps the FP32 phase, BF16 and FP16 halve the table.
+FACTORS = {"fp32": "fp32", "bf16": "bf16", "fp16": "fp16"}
 
-#: Positions are one flat sequence: every stride is the element stride, so the
-#: kernel's trailing extents are the empty tuple.
-LAYOUTS = {"sequence": ((), (1,))}
+
+def float_of(bits):
+    """The float a descriptor's hexadecimal bit pattern names."""
+    return struct.unpack("<f", struct.pack("<I", int(bits, 16)))[0]
 
 
 def spec(fields, parameters, target):
-    """The compilation of one rope_factors descriptor."""
-    shape, strides = LAYOUTS[fields["layout"]]
-    half_dim = int(fields["half_dim"])
-    pdl = _compile.capability(target) >= 100
+    """The compilation of one rotary_factors descriptor."""
+    factor = "*" + FACTORS[fields["dtype"]]
+    pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
     return {
         "kernel": kernels._rotary_factors_kernel,
         "signature": {
             "positions": "*" + POSITIONS[fields["positions"]],
             "frequencies": "*fp32",
-            "cosine": "*" + FACTORS[fields["factors"]],
-            "sine": "*" + FACTORS[fields["factors"]],
+            "cosine": factor,
+            "sine": factor,
             "total": "i64",
-            "width": "constexpr",
-            "shape": "constexpr",
-            "strides": "constexpr",
-            "frequency_stride": "constexpr",
-            "scale": "constexpr",
-            "block": "constexpr",
+            "columns": "i32",
+            "scale": "fp32",
+            "BLOCK": "constexpr",
             "PDL": "constexpr",
         },
         "constexprs": {
-            "width": half_dim,
-            "shape": shape,
-            "strides": strides,
-            "frequency_stride": 1,
-            "scale": float(parameters["scale"]),
-            "block": int(parameters["block"]),
+            "BLOCK": int(fields["block"]),
             "PDL": pdl,
         },
         "options": {"num_warps": 4, "launch_pdl": pdl},

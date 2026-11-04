@@ -1,14 +1,15 @@
 """Row-wise RMS normalization: the Triton source of the ``rms_norm`` operator.
 
-One program normalizes one last-axis row with FP32 statistics and rounds once
-when storing to the output dtype. The row's leading-axis geometry is a
-compile-time tuple, so one module covers one (geometry, width, dtypes,
-programmatic-dependent-launch) descriptor and no other.
+One program normalizes one contiguous last-axis row with FP32 statistics and
+rounds once when storing to the output dtype. The descriptor bakes the row tile
+(the program's block) and whether the launch is programmatic-dependent; the row
+count comes from the grid and `columns` from the launch, so one module serves any
+row count whose columns fit the tile.
 
 The kernel body is the one UniServe launched before this package existed
-(``uniserve_kernels/src/uniserve_kernels/norm/rms.py``), unchanged except that
-it imports nothing but Triton: the launch-time wrapper, its operand checks and
-its torch types stay with the operator's Rust side.
+(``uniserve_kernels/src/uniserve_kernels/norm/rms.py``), unchanged except that it
+imports nothing but Triton: the launch-time wrapper, its operand checks and its
+torch types stay with the operator's Rust side.
 """
 
 import triton
@@ -23,52 +24,33 @@ def _pdl_prologue(PDL: tl.constexpr):
         tl.extra.cuda.gdc_launch_dependents()
 
 
-@triton.jit
-def _row_offset(row, shape: tl.constexpr, strides: tl.constexpr):
-    """Return the element offset of flattened row ``row``.
-
-    ``shape`` holds the extents of every leading axis after the first and
-    ``strides`` the element strides of all leading axes, both as compile-time
-    tuples; the first extent only bounds the launch.
-    """
-    offset = tl.full((), 0, tl.int64)
-    remaining = row.to(tl.int64)
-    for axis in tl.static_range(len(shape) - 1, -1, -1):
-        offset += (remaining % shape[axis]) * strides[axis + 1]
-        remaining //= shape[axis]
-    return offset + remaining * strides[0]
-
-
-@triton.jit
+@triton.jit(do_not_specialize=["columns"])
 def _rms_norm_kernel(
     x_ptr,
     w_ptr,
     y_ptr,
-    x_shape: tl.constexpr,
-    x_strides: tl.constexpr,
-    y_shape: tl.constexpr,
-    y_strides: tl.constexpr,
-    n_cols: tl.constexpr,
-    eps: tl.constexpr,
-    block: tl.constexpr,
+    columns,
+    eps,
+    pdl,
+    BLOCK: tl.constexpr,
     PDL: tl.constexpr,  # noqa: N803
 ):
-    """Normalize one hidden-state row per Triton program.
+    """Normalize one row per program.
 
-    Input and output rows are addressed through their own leading-axis strides
-    with unit channel stride. Every program loads its whole row before storing,
-    so the output may alias the input.
+    ``x``, ``w`` and ``y`` are the launch's packed operands (row tile, weight
+    row, output row); ``columns`` is the row width, ``eps`` the variance floor
+    and ``pdl`` the launch's copy of the descriptor's flag. Every program loads
+    its whole row before storing, so the output may alias the input.
     """
     _pdl_prologue(PDL)
 
-    row = tl.program_id(0)
-    offs = tl.arange(0, block)
-    mask = offs < n_cols
-    x_row = _row_offset(row, x_shape, x_strides)
-    y_row = _row_offset(row, y_shape, y_strides)
-    x = tl.load(x_ptr + x_row + offs, mask=mask, other=0.0).to(tl.float32)
-    w = tl.load(w_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    row = tl.program_id(0).to(tl.int64)
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < columns
+    row_base = row * columns
+    x = tl.load(x_ptr + row_base + offsets, mask=mask, other=0.0).to(tl.float32)
+    w = tl.load(w_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
 
-    var = tl.sum(x * x, axis=0) / n_cols
-    y = x * tl.rsqrt(var + eps) * w
-    tl.store(y_ptr + y_row + offs, y, mask=mask)
+    variance = tl.sum(x * x, axis=0) / columns
+    y = x * tl.rsqrt(variance + eps) * w
+    tl.store(y_ptr + row_base + offsets, y, mask=mask)

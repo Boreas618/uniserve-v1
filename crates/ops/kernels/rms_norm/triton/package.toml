@@ -1,8 +1,12 @@
-# The rms_norm operator's triton backend: design 5.2's program package.
+# The rms_norm operator's Triton backend: design 5.2's program package.
 #
 # One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the
-# compile driver the Program Server runs for one descriptor and target).
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
+# driver the Program Server runs for one descriptor and target).
+#
+# One program normalizes one contiguous row in FP32 statistics and rounds once.
+# `columns` is a launch value and `tile` the program's row block, so one module
+# serves any row count whose columns fit the tile.
 
 op = "rms_norm"
 backend = "triton"
@@ -25,8 +29,9 @@ script = "src/build.py"
 target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
+# `dtype_bf16_columns_2048_tile_2048_pdl_true`.
 [kernel.descriptors]
-dimensions = { dtype = ["bf16", "fp16", "fp32"], width = ["768", "2048", "4096", "6144"], layout = ["contiguous"] }
+dimensions = { dtype = ["bf16", "fp16", "fp32"], columns = ["768", "2048", "4096", "6144", "7168"], tile = ["1024", "2048", "4096", "8192"], pdl = ["true", "false"] }
 
 [parameters]
 eps = 1e-06

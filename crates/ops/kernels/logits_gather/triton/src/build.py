@@ -1,36 +1,32 @@
-"""The gather_logits package's compile script: one descriptor -> one module.
+"""The logits_gather package's compile script: one descriptor -> one module.
 
-A descriptor is the hidden state's dtype and width and the row index dtype. One
-program copies one block of one row, so the token and request counts stay
-runtime values.
+A descriptor is the hidden state's dtype, its width, the program's block and the
+dependent-launch flag. The row count stays a runtime value.
 """
 
 import _compile
-import gather_logits as kernels
+import logits_gather as kernels
 
-#: The hidden state's dtype.
+#: The hidden state's dtype, and the gathered row's.
 DTYPES = {"bf16": "bf16", "fp16": "fp16", "fp32": "fp32"}
-
-#: The row index dtype of a request's last position.
-ROWS = {"i32": "i32", "i64": "i64"}
 
 
 def spec(fields, parameters, target):
-    """The compilation of one gather_logits descriptor."""
+    """The compilation of one logits_gather descriptor."""
+    dtype = "*" + DTYPES[fields["dtype"]]
+    pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
     return {
-        "kernel": kernels._gather_logits_kernel,
+        "kernel": kernels._logits_gather_kernel,
         "signature": {
-            "hidden_ptr": "*" + DTYPES[fields["dtype"]],
-            "rows_ptr": "*" + ROWS[fields["rows"]],
-            "out_ptr": "*" + DTYPES[fields["dtype"]],
-            "width": "constexpr",
-            "block": "constexpr",
+            "hidden_ptr": dtype,
+            "rows_ptr": "*i32",
+            "out_ptr": dtype,
+            "count": "i64",
+            "columns": "i32",
+            "BLOCK": "constexpr",
         },
-        "constexprs": {
-            "width": int(fields["width"]),
-            "block": int(parameters["block"]),
-        },
-        "options": {"num_warps": int(parameters["warps"])},
+        "constexprs": {"BLOCK": int(fields["block"])},
+        "options": {"num_warps": 4, "launch_pdl": pdl},
     }
 
 
