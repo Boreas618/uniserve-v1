@@ -2658,7 +2658,8 @@ mod tests {
         let narrow = raster(channels, 7, 30, 52, DType::F32);
         assert!(Sample::of(config.latent_channels, narrow, noise, out).is_err());
         // A noise raster of the moments' width is two draws where the sample wants one.
-        assert!(Sample::of(config.latent_channels, moments, narrow, out).is_err());
+        let wide_noise = raster(2 * channels, 7, 30, 52, DType::F32);
+        assert!(Sample::of(config.latent_channels, moments, wide_noise, out).is_err());
         // An FP16 raster is the decoder's precision, not the encoder's posterior.
         let half = raster(channels, 7, 30, 52, DType::F16);
         assert!(Sample::of(config.latent_channels, moments, half, out).is_err());
