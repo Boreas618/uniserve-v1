@@ -416,6 +416,394 @@ pub fn sources(config: &VideoVaeConfig) -> crate::Result<Vec<crate::audio_vae::S
     Ok(sources)
 }
 
+// ---------------------------------------------------------------------------------------------
+// The video decoder's transformer.
+// ---------------------------------------------------------------------------------------------
+
+use nn::Forward;
+use nn::layers::{
+    Attention, LayerNorm, Linear, PackedSwiGlu, RmsNorm, Rotary, Rows, ScaledResidual, Sections,
+};
+use nn::weights::{Weight, WeightLoader, WeightRequest};
+use ops::gemm::WeightOrder;
+use ops::rope::Rotation;
+use ops::tensor::{DType, Shape, TensorView};
+
+/// One transformer layer of the decoder: the attention half and the gated feed-forward half, each
+/// with its own normalization and its own per-channel residual scale.
+struct Layer {
+    norm1: RmsNorm,
+    query: Linear,
+    key: Linear,
+    value: Linear,
+    output: Linear,
+    /// The scaled anchor of the attention residual, carrying the projection's bias.
+    residual1: ScaledResidual,
+    norm2: RmsNorm,
+    gate_up: Linear,
+    down: Linear,
+    /// The scaled anchor of the feed-forward residual, carrying the projection's bias.
+    residual2: ScaledResidual,
+    gated: PackedSwiGlu,
+}
+
+/// The video decoder's latent stage: one clip's latent voxels become the clip's pixels.
+///
+/// The decoder reads a clip's latents `[frames, height, width]` of [`Canvas`] (seven latent frames of
+/// 24 channels for the checkpoint), runs the 36-layer transformer over the raster's voxel rows plus the
+/// learned register rows and one zero row, and writes one 3×4×16×16 pixel block per voxel. The
+/// per-head normalization before the rotation has no learned weight — the checkpoint stores none,
+/// which is what `Rotary::apply`'s absent gains express.
+pub struct VideoDecoder {
+    canvas: Canvas,
+    width: u32,
+    input: Linear,
+    registers: Weight,
+    register_rows: Weight,
+    zero_row: Weight,
+    zero_rows: Weight,
+    layers: Vec<Layer>,
+    norm: LayerNorm,
+    output: Linear,
+    rotary: Rotary,
+    place: Rows,
+    /// The index table that places each voxel row of the stream.
+    voxel_rows: Weight,
+    config: VideoVaeConfig,
+    ffn_mult: u32,
+    /// Elements per head.
+    head: u64,
+    /// Query heads per token.
+    heads: u64,
+    attention: Attention,
+}
+
+impl VideoDecoder {
+    /// Read the 36 layers and the head of the checkpoint's decoder.
+    pub fn load(
+        config: &VideoVaeConfig,
+        canvas: Canvas,
+        loader: &mut WeightLoader,
+    ) -> Result<Self> {
+        let width = config.decoder_num_attention_heads * config.decoder_attention_head_dim;
+        let head = config.decoder_attention_head_dim;
+        let heads = config.decoder_num_attention_heads;
+        let ffn = width * config.decoder_ffn_mult;
+        let (rotated, sections) = rotary(config)?;
+        let out_channels = config.out_channels
+            * config.temporal_compression()
+            * config.spatial_compression()
+            * config.spatial_compression();
+        let epsilon = config.decoder_norm_eps;
+
+        let input = linear(
+            loader,
+            "decoder.proj_in",
+            u64::from(config.latent_channels),
+            u64::from(width),
+            true,
+        )?;
+        let registers = read(
+            loader,
+            "decoder.register_tokens",
+            &[u64::from(canvas.registers), u64::from(width)],
+        )?;
+        let zero_row = zeroes(loader, "video_vae.zero_row", DType::F16, u64::from(width))?;
+        if canvas.tail == 0 {
+            return Err(Error::config(
+                "the decoder canvas has the trailing zero row".to_owned(),
+            ));
+        }
+        let register_rows = indices(
+            loader,
+            "video_vae.register_rows",
+            canvas.voxels() as u32,
+            canvas.registers as u32,
+        )?;
+        let zero_rows = indices(
+            loader,
+            "video_vae.zero_rows",
+            (canvas.voxels() + u64::from(canvas.registers)) as u32,
+            canvas.tail as u32,
+        )?;
+
+        let mut layers = Vec::with_capacity(config.decoder_num_layers as usize);
+        for index in 0..config.decoder_num_layers {
+            let base = format!("decoder.transformer_blocks.{index}");
+            let weight = read(loader, &format!("{base}.norm1.weight"), &[u64::from(width)])?;
+            let norm1 = RmsNorm::new(weight, epsilon)?;
+            let weight = read(loader, &format!("{base}.norm2.weight"), &[u64::from(width)])?;
+            let norm2 = RmsNorm::new(weight, epsilon)?;
+            let scale1 = read(loader, &format!("{base}.scale1"), &[u64::from(width)])?;
+            let scale2 = read(loader, &format!("{base}.scale2"), &[u64::from(width)])?;
+            // The attention and feed-forward projections' biases belong to their residuals, as the
+            // reference groups them; the projections themselves are bias-free.
+            let out_bias = read(
+                loader,
+                &format!("{base}.attn.to_out.0.bias"),
+                &[u64::from(width)],
+            )?;
+            let down_bias = read(
+                loader,
+                &format!("{base}.ff.net.2.bias"),
+                &[u64::from(width)],
+            )?;
+            layers.push(Layer {
+                norm1,
+                query: linear(
+                    loader,
+                    &format!("{base}.attn.to_q"),
+                    u64::from(width),
+                    u64::from(width),
+                    true,
+                )?,
+                key: linear(
+                    loader,
+                    &format!("{base}.attn.to_k"),
+                    u64::from(width),
+                    u64::from(width),
+                    true,
+                )?,
+                value: linear(
+                    loader,
+                    &format!("{base}.attn.to_v"),
+                    u64::from(width),
+                    u64::from(width),
+                    true,
+                )?,
+                output: linear(
+                    loader,
+                    &format!("{base}.attn.to_out.0"),
+                    u64::from(width),
+                    u64::from(width),
+                    false,
+                )?,
+                residual1: ScaledResidual::new(scale1, Some(out_bias))?,
+                norm2,
+                gate_up: linear(
+                    loader,
+                    &format!("{base}.ff.net.0.proj"),
+                    u64::from(width),
+                    u64::from(ffn),
+                    true,
+                )?,
+                down: linear(
+                    loader,
+                    &format!("{base}.ff.net.2"),
+                    u64::from(ffn),
+                    u64::from(width),
+                    false,
+                )?,
+                residual2: ScaledResidual::new(scale2, Some(down_bias))?,
+                gated: PackedSwiGlu::new(None)?,
+            });
+        }
+
+        let weight = read(loader, "decoder.norm_out.weight", &[u64::from(width)])?;
+        let bias = read(loader, "decoder.norm_out.bias", &[u64::from(width)])?;
+        let norm = LayerNorm::new(weight, Some(bias), epsilon)?;
+        let output = linear(
+            loader,
+            "decoder.proj_out",
+            u64::from(width),
+            u64::from(out_channels),
+            true,
+        )?;
+        let frequencies = frequencies(loader, config)?;
+        let rotary = Rotary::new(
+            frequencies,
+            head,
+            heads,
+            heads,
+            epsilon,
+            Rotation::Half,
+            1.0,
+        )?
+        .partial(rotated)?
+        .sectioned(Sections::new(&sections)?.interleaved())?;
+        Ok(Self {
+            canvas,
+            width,
+            input,
+            registers,
+            register_rows,
+            zero_row,
+            zero_rows,
+            layers,
+            norm,
+            output,
+            rotary,
+            place: Rows::new(DType::F16, u64::from(width))?,
+            voxel_rows: indices(loader, "video_vae.voxel_rows", 0, canvas.voxels() as u32)?,
+            attention: Attention::dense(
+                head,
+                heads,
+                heads,
+                u32::try_from(canvas.rows())
+                    .map_err(|_| Error::config("too many tokens".to_owned()))?,
+                false,
+                None,
+                1.0 / (head as f32).sqrt(),
+            )?,
+            config: config.clone(),
+            ffn_mult: config.decoder_ffn_mult,
+            head: u64::from(head),
+            heads: u64::from(heads),
+        })
+    }
+}
+
+/// Read a projection of the checkpoint: `[out, in]` row-major, with its bias when it has one.
+fn linear(loader: &mut WeightLoader, name: &str, from: u64, to: u64, bias: bool) -> Result<Linear> {
+    let weight = read(loader, &format!("{name}.weight"), &[to, from])?;
+    let bias = if bias {
+        Some(read(loader, &format!("{name}.bias"), &[to])?)
+    } else {
+        None
+    };
+    Ok(Linear::new(weight, bias, WeightOrder::NxK)?)
+}
+
+/// Read one weight.
+fn read(loader: &mut WeightLoader, name: &str, shape: &[u64]) -> Result<Weight> {
+    Ok(loader.load(&WeightRequest::region(
+        name.to_owned(),
+        0,
+        Shape::new(shape),
+    ))?)
+}
+
+/// A constant row of `width` zeros, which the checkpoint's token layout appends.
+fn zeroes(loader: &mut WeightLoader, name: &str, dtype: DType, width: u64) -> Result<Weight> {
+    let bytes = vec![0u8; (width as usize) * dtype.bytes().unwrap_or(4) as usize];
+    Ok(loader.constant(name, dtype, Shape::new(&[1, width]), &bytes)?)
+}
+
+/// A constant index table: `count` rows starting at `start`.
+fn indices(loader: &mut WeightLoader, name: &str, start: u32, count: u32) -> Result<Weight> {
+    let mut bytes = Vec::with_capacity(count as usize * 4);
+    for index in 0..count {
+        bytes.extend_from_slice(&(start + index).to_le_bytes());
+    }
+    Ok(loader.constant(name, DType::I32, Shape::new(&[u64::from(count)]), &bytes)?)
+}
+
+/// The rotary frequency table of the decoder: `theta^(-2i/rotated)` over the rotated width.
+fn frequencies(loader: &mut WeightLoader, config: &VideoVaeConfig) -> Result<Weight> {
+    let (rotated, _) = rotary(config)?;
+    let half = (rotated / 2) as usize;
+    let mut bytes = Vec::with_capacity(half * 4);
+    for index in 0..half {
+        let exponent = 2.0 * index as f64 / f64::from(rotated);
+        let value = f64::from(config.decoder_rope_theta).powf(-exponent) as f32;
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    let name = format!("video_vae.rotary.{rotated}.{}", config.decoder_rope_theta);
+    Ok(loader.constant(&name, DType::F32, Shape::new(&[half as u64]), &bytes)?)
+}
+
+impl VideoDecoder {
+    /// Decode one clip's latent rows into the pixel block of every token.
+    ///
+    /// `latents` is `[voxels, latent_channels]` — one row per latent voxel, in the raster order the
+    /// caller's clip rows select — `positions` is `[rows, 3]` F32, the per-layout table [`positions`]
+    /// computes, and `out` is `[rows, out_channels · 4 · 16 · 16]`: one token's 3×4×16×16 pixel block,
+    /// which the caller scatters into the clip's raster. The rows are the voxels, then the register
+    /// rows, then the trailing zero row.
+    pub fn decode(
+        &self,
+        f: &Forward,
+        latents: TensorView,
+        positions: TensorView,
+        out: TensorView,
+    ) -> Result<()> {
+        let rows = self.canvas.rows();
+        let voxels = self.canvas.voxels();
+        let width = u64::from(self.width);
+        let ffn = width * u64::from(self.ffn_mult);
+        if latents.shape.rank() != 2 || latents.shape.dim(0) != voxels {
+            return Err(Error::config(format!(
+                "the decoder reads {voxels} latent rows, not {:?}",
+                latents.shape.dims()
+            )));
+        }
+        if out.shape.rank() != 2 || out.shape.dim(0) != rows {
+            return Err(Error::config(format!(
+                "the decoder writes {rows} token rows, not {:?}",
+                out.shape.dims()
+            )));
+        }
+
+        let stream = f.arena().tensor(DType::F16, Shape::new(&[rows, width]))?;
+        let projected = f.arena().tensor(DType::F16, Shape::new(&[voxels, width]))?;
+        self.input.forward(f, latents, projected)?;
+        self.place
+            .replace(f, stream, projected, self.voxel_rows.view())?;
+        self.place
+            .replace(f, stream, self.registers.view(), self.register_rows.view())?;
+        self.place
+            .replace(f, stream, self.zero_row.view(), self.zero_rows.view())?;
+
+        let (rotated, _) = rotary(&self.config)?;
+        let half = u64::from(rotated / 2);
+        let cosine = f.arena().tensor(DType::F32, Shape::new(&[rows, half]))?;
+        let sine = f.arena().tensor(DType::F32, Shape::new(&[rows, half]))?;
+        self.rotary.factors(f, positions, cosine, sine)?;
+
+        let (head, heads) = (self.head, self.heads);
+        let normalized = f.arena().tensor(DType::F16, Shape::new(&[rows, width]))?;
+        let query = f.arena().tensor(DType::F16, Shape::new(&[rows, width]))?;
+        let key = f.arena().tensor(DType::F16, Shape::new(&[rows, width]))?;
+        let value = f.arena().tensor(DType::F16, Shape::new(&[rows, width]))?;
+        let rotated_query = f.arena().tensor(DType::F16, Shape::new(&[rows, width]))?;
+        let rotated_key = f.arena().tensor(DType::F16, Shape::new(&[rows, width]))?;
+        let attended = f.arena().tensor(DType::F16, Shape::new(&[rows, width]))?;
+        let update = f.arena().tensor(DType::F16, Shape::new(&[rows, width]))?;
+        let gate_up = f.arena().tensor(DType::F16, Shape::new(&[rows, 2 * ffn]))?;
+        let gated = f.arena().tensor(DType::F16, Shape::new(&[rows, ffn]))?;
+        let hidden = stream;
+        let per_head = |view: TensorView| view.reshape(Shape::new(&[rows, heads, head]));
+
+        for layer in &self.layers {
+            layer.norm1.forward(f, hidden, normalized)?;
+            layer.query.forward(f, normalized, query)?;
+            layer.key.forward(f, normalized, key)?;
+            layer.value.forward(f, normalized, value)?;
+            self.rotary.apply(
+                f,
+                per_head(query),
+                per_head(key),
+                None,
+                None,
+                cosine,
+                sine,
+                per_head(rotated_query),
+                per_head(rotated_key),
+            )?;
+            self.attention.attend_dense(
+                f,
+                per_head(rotated_query),
+                per_head(rotated_key),
+                per_head(value),
+                None,
+                None,
+                attended,
+            )?;
+            layer.output.forward(f, attended, update)?;
+            layer.residual1.forward(f, hidden, update)?;
+
+            layer.norm2.forward(f, hidden, normalized)?;
+            layer.gate_up.forward(f, normalized, gate_up)?;
+            layer.gated.forward(f, gate_up, gated, None)?;
+            layer.down.forward(f, gated, update)?;
+            layer.residual2.forward(f, hidden, update)?;
+        }
+
+        self.norm.forward(f, hidden, normalized)?;
+        Ok(self.output.forward(f, normalized, out)?)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
