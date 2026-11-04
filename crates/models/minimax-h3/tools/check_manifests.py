@@ -146,6 +146,16 @@ def expectations(config: dict, degrees: list[int]) -> list[tuple[str, str, str, 
     for field in ("gate_stride", "value_stride"):
         add(("act_and_mul/triton", field, str(2 * ffn), "transformer.rs: the packed gate and value"))
     add(("silu/triton", "columns", str(time_hidden), "modulation.rs: the cache's activation"))
+    # The one crossing inside the cache: the timestep activation is narrowed into the modulation
+    # projections' type, so its width is the timestep embedding's output and not the hidden width.
+    add(
+        (
+            "scaled_add/triton",
+            "columns",
+            str(config["time_embed_dim"]),
+            "modulation.rs: the timestep activation narrowed into the modulation type",
+        )
+    )
     add(("scaled_add/triton", "columns", str(hidden), "transformer.rs: a widened hidden row"))
     add(("scaled_add/triton", "columns", str(patches), "transformer.rs: a widened patch row"))
     add(("scaled_residual/triton", "columns", "1", "solver.rs: a scalar step coefficient"))
