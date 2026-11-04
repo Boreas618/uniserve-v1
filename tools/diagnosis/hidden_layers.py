@@ -73,6 +73,31 @@ def counterpart(path):
     return None
 
 
+def readings(path):
+    """The same bytes read as the dtype they claim, and as the other 2-byte numbers they could be.
+
+    A writer that stores bf16 and declares f16 (or the reverse) produces a file that loads without
+    complaint and measures wrong: both are two bytes, and nothing in the header has to agree with what
+    was written. So when a stage's factor is far from one, the same payload is read the other ways and
+    the reading that lands on one names the writer's mistake.
+    """
+    if not path.exists():
+        return {}
+    with open(path, "rb") as handle:
+        version = np.lib.format.read_magic(handle)
+        reader = (
+            np.lib.format.read_array_header_1_0 if version == (1, 0) else np.lib.format.read_array_header_2_0
+        )
+        shape, _, stored = reader(handle)
+        payload = handle.read()
+    readings = {}
+    if stored.itemsize == 2:
+        raw = np.frombuffer(payload, dtype="<u2").astype(np.uint32)
+        readings["bf16"] = (raw << 16).view(np.float32).reshape(shape)
+        readings["f16"] = raw.astype(np.uint16).view(np.float16).reshape(shape).astype(np.float32)
+    return readings
+
+
 def load(path):
     if not path.exists():
         return None
@@ -553,6 +578,22 @@ def main():
         if denominator > 0.0:
             factor = float(np.dot(ours_flat, theirs_flat)) / denominator
             if abs(factor - 1.0) > 0.01:
+                # A factor far from one is also what a wrong dtype declaration produces, so the same
+                # payload is read the other ways before the number is believed.
+                if not (0.5 < factor < 2.0):
+                    written = arguments.dump / path.name
+                    if not written.exists() and counterpart(path) is not None:
+                        written = arguments.dump / counterpart(path).name
+                    for name, other in readings(written).items():
+                        if other.shape != expected.shape or not np.all(np.isfinite(other)):
+                            continue
+                        a = other.astype(np.float64).ravel()
+                        candidate = float(np.dot(a, theirs_flat)) / denominator if denominator else 0.0
+                        if abs(candidate - 1.0) < 0.01:
+                            sums += (
+                                f"  the dump's bytes read as {name} give {candidate:.4f} x the"
+                                " reference's: the file's dtype does not match what was written into it"
+                            )
                 residual = float(np.linalg.norm(ours_flat - factor * theirs_flat))
                 residual /= float(np.linalg.norm(theirs_flat))
                 sums += (
