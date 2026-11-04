@@ -963,7 +963,10 @@ def test_a_hot_restart_hands_the_deployment_to_a_successor_daemon(
     # it started, does not stop.
     successors: list[int] = []
     try:
-        with _serve(runtime, log, name) as base_url:
+        # The records this test parses are the predecessor's info lines, and a
+        # RUST_LOG in the host's environment would drop them; the successor
+        # inherits this environment, so both processes log them.
+        with _serve(runtime, log, name, {"RUST_LOG": "info"}) as base_url:
             _restart_while_streaming(base_url, name, log, successors)
     finally:
         for pid in successors:
