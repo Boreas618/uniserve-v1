@@ -958,6 +958,15 @@ pub struct ConditionLatents<'a> {
 /// until the generated video is cleaner than it ([`crate::modulation::entries`]).
 pub const VISUAL_CONDITION_TIME: f32 = 0.999;
 
+/// The level an audio reference sits at: its latent unchanged, so nothing is mixed in
+/// (`uniserve/models/minimax_h3/denoiser.py:104`).
+///
+/// Its packed rows are the **channel-major** audio latent - `2 * frames` rows of `audio_channels`
+/// elements, 74 rows for a 22-frame reference - which is the layout the encoder writes and the
+/// audio input projection reads; a `[frames, channels]` reshape would give 37 rows and shift every
+/// row after the reference.
+pub const AUDIO_CONDITION_TIME: f32 = 1.0;
+
 /// A request's condition latents, each condition's visual view and its audio view.
 struct ConditionViews {
     pairs: Vec<(Option<TensorView>, Option<TensorView>)>,
@@ -1379,7 +1388,8 @@ impl Denoiser {
     ///
     /// A visual condition is anchored as `t z + (1 - t) noise` at `t = VISUAL_CONDITION_TIME` and
     /// projected by the layer that projects the generated rows of its modality; an audio reference
-    /// is projected unchanged (`uniserve/models/minimax_h3/denoiser.py:510-532`).
+    /// is projected unchanged, which is [`AUDIO_CONDITION_TIME`]'s `1.0`
+    /// (`uniserve/models/minimax_h3/denoiser.py:510-532`).
     ///
     /// **Precision, declared.** The reference patches, mixes and projects a visual condition in
     /// FP32 and rounds once, at the copy into the prefix source. This build patches the draw and
@@ -2237,6 +2247,41 @@ mod tests {
         assert_eq!(
             u64::from(rule.condition_elements(&conditions, &canvas_of_raster(832, 480).unwrap())),
             visual
+        );
+    }
+
+    #[test]
+    fn an_audio_reference_is_channel_major_rows() {
+        // The packed audio latent is [2 * frames, audio_channels] - channel-major - because that is
+        // what the encoder writes and what the input projection reads. A [frames, channels] reshape
+        // would halve the row count and shift every row after the reference, with no shape
+        // complaint downstream: the projection reads whatever row count it is given.
+        const SHAPES: [nn::capability::ConditionShape; 1] = [nn::capability::ConditionShape {
+            role: ConditionRole::Reference,
+            frames: 0,
+            height: 0,
+            width: 0,
+            audio_samples: 22 * crate::config::AUDIO_HOP,
+        }];
+        let request = VideoRequest {
+            task: nn::capability::VideoTask::ReferenceToVideoAudio,
+            references: 1,
+            conditions: &SHAPES,
+            ..request(121, 832, 480)
+        };
+        let conditions = conditions_of(&request);
+        let canvas = canvas_of_raster(832, 480).unwrap();
+        let segments = packing::condition_segments(&conditions, &canvas).unwrap();
+        let audio: Vec<_> = segments
+            .iter()
+            .filter(|segment| segment.audio_rows() > 0)
+            .collect();
+        assert_eq!(audio.len(), 1);
+        let frames = crate::packing::audio_latent_frames(22);
+        // One row per channel per latent step: `AUDIO_CHANNELS * frames`, the encoder's layout.
+        assert_eq!(
+            audio[0].audio_rows(),
+            crate::config::AUDIO_CHANNELS * frames
         );
     }
 
