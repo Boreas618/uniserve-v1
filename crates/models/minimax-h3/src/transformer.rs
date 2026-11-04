@@ -21,7 +21,7 @@
 use crate::attention::{self, Factors, Visible};
 use crate::attention_sparse::Segments;
 use crate::config::{AttentionKind, TransformerConfig};
-use crate::modulation::AdaLnCache;
+use crate::modulation::{AdaLnCache, Groups};
 use crate::partition::Partition;
 use crate::schedule::{Modality, Schedule};
 use crate::{Error, Result};
@@ -545,6 +545,148 @@ pub(crate) fn host_bytes(dtype: nn::DType, values: &[f32]) -> Result<Vec<u8>> {
 }
 
 impl Transformer {
+    /// The programs this DiT stack launches, from its configuration and the deployment's partition.
+    ///
+    /// Stated without weights, because a deployment compiles its store before it opens the
+    /// checkpoint. `kind` decides the attention's programs and nothing else; `rows` is the largest
+    /// packed row count the deployment's layouts hold, which is the attention's key bound and the
+    /// activation's launch value. **No collective is a program**: the Ulysses exchange issues a
+    /// communication, so a partition's degree changes the shapes the attention reads and adds no row.
+    pub fn programs(
+        config: &TransformerConfig,
+        kind: AttentionKind,
+        dtype: nn::DType,
+        rows: u32,
+        groups: Groups,
+        partition: &Partition,
+    ) -> Result<Vec<(String, String)>> {
+        use crate::programs::Programs;
+        use nn::layers::gather_rows_descriptor;
+        use ops::activation::ActAndMul as ActAndMulOp;
+        use ops::attention::dense::DenseAttention;
+        use ops::gemm::Gemm;
+        use ops::modulation::GatedResidual as GatedResidualOp;
+        use ops::modulation::ModulatedRmsNorm as ModulatedOp;
+        use ops::norm::RmsNorm as RmsNormOp;
+        use nn::layers::{Attention, Rotary};
+        use ops::rope::Rotation;
+        use ops::rope::{QkNormRope, RotaryFactors};
+
+        if matches!(kind, AttentionKind::Sparse { .. }) {
+            return Err(Error::Unsupported(
+                "a sparse DiT partition's programs: the video-sparse selection and its attention \
+                 program are not stated yet"
+                    .to_owned(),
+            ));
+        }
+
+        let hidden = config.hidden_size;
+        let head = config.head_dim;
+        let heads = partition.denoiser_heads(config.num_attention_heads);
+        let rotated: u32 = ROTATED_AXES.iter().sum();
+        let interaction = 6 * u64::from(hidden);
+        let mut programs = Programs::default();
+
+        // Every projection of the stack: the video and audio entrances, the four of each block's
+        // attention, its feed-forward pair, and the head per modality. None carries a bias.
+        programs.launch::<Gemm>(&Linear::descriptor_of(
+            hidden,
+            dtype,
+            WeightOrder::NxK,
+            false,
+            dtype,
+            dtype,
+        ));
+        programs.launch::<RmsNormOp>(&RmsNorm::descriptor_of(hidden, dtype));
+
+        // The modulation: three row programs, one per gathered table width — the step's entry per
+        // group, a layer's six vectors per tag, and the final normalization's two. The first width is
+        // the group count, so a conditioned deployment's cache is a second program.
+        for columns in [
+            u64::from(groups.count()),
+            18 * u64::from(hidden),
+            2 * u64::from(hidden),
+        ] {
+            programs.launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(
+                nn::DType::I32,
+                columns,
+            )?);
+        }
+
+        // The block's two modulated normalizations: the attention's (no update, no gate) and the
+        // feed-forward's (both, retaining the normalized row for the projection).
+        for (update, retain) in [(false, false), (true, true)] {
+            programs.launch::<ModulatedOp>(&ModulatedRmsNorm::descriptor_of(
+                dtype,
+                dtype,
+                nn::DType::I32,
+                hidden,
+                config.norm_eps,
+                interaction,
+                interaction,
+                interaction,
+                update,
+                retain,
+            ));
+        }
+        programs.launch::<GatedResidualOp>(&GatedResidual::descriptor_of(
+            dtype,
+            nn::DType::I32,
+            u64::from(hidden),
+            interaction,
+        )?);
+
+        // The rotation and the attention, both over this rank's heads.
+        let sections = nn::layers::Sections::new(&ROTATED_AXES)
+            .map_err(Error::from)?
+            .interleaved();
+        programs.launch::<RotaryFactors>(&Rotary::factors_descriptor_of(
+            rotated,
+            1.0,
+            Some(sections),
+            nn::DType::F32,
+        ));
+        programs.launch::<QkNormRope>(&Rotary::apply_descriptor_of(
+            head,
+            heads,
+            heads,
+            Rotation::Half,
+            config.qk_norm_eps,
+            rotated,
+            dtype,
+            dtype,
+            // The checkpoint stores `norm_q` and `norm_k` per head.
+            true,
+        ));
+        let attention = Attention::dense(
+            head,
+            heads,
+            heads,
+            rows,
+            false,
+            None,
+            1.0 / (head as f32).sqrt(),
+        )
+        .map_err(Error::from)?;
+        programs.launch::<DenseAttention>(&attention.dense_descriptor(
+            dtype, dtype, dtype, rows, true,
+        ));
+
+        // The feed-forward's stepwise gated activation: one rounding each, which is a different
+        // program from the fused recipe the video decoder's SwiGLU uses.
+        programs.launch::<ActAndMulOp>(&GatedActivation::descriptor_of(
+            dtype,
+            u64::from(config.intermediate_size),
+            nn::layers::Activation::Silu,
+            u64::from(config.intermediate_size),
+            u64::from(config.intermediate_size),
+            u64::from(rows) * u64::from(config.intermediate_size),
+            true,
+        )?);
+
+        Ok(programs.finish())
+    }
+
     /// Every checkpoint tensor one DiT partition of the stack reads, as complete names.
     ///
     /// The four end projections and the output norm are the block's own; the per-layer tensors and
@@ -1000,6 +1142,89 @@ fn gain(loader: &mut WeightLoader<'_>, name: &str, columns: u64) -> Result<Weigh
 
 #[cfg(test)]
 mod tests {
+
+    /// The stack states its programs from its configuration and its partition: one product, one
+    /// output normalization, the three modulation gathers, the block's two modulated shapes, its
+    /// rotation and attention, and its stepwise gated activation. The Ulysses degree changes the head
+    /// count a key carries and adds no row, because a collective is not a program.
+    #[test]
+    fn the_stack_states_its_programs_from_its_config() {
+        let config = crate::config::tests_support::released_config();
+        let (_, denoiser) = config
+            .denoisers
+            .iter()
+            .next()
+            .expect("a released DiT partition");
+        let transformer = denoiser.transformer;
+        let programs = Transformer::programs(
+            &transformer,
+            AttentionKind::Dense,
+            nn::DType::BF16,
+            32_000,
+            Groups::of(true),
+            &Partition::single(),
+        )
+        .expect("the stack's programs");
+        let count = |operator: &str| {
+            programs
+                .iter()
+                .filter(|(name, _)| name == operator)
+                .count()
+        };
+
+        assert_eq!(count("gemm"), 1);
+        assert_eq!(count("rms_norm"), 1);
+        assert_eq!(count("logits_gather"), 3);
+        assert_eq!(count("modulated_rms_norm"), 2);
+        assert_eq!(count("gated_residual"), 1);
+        assert_eq!(count("qk_norm_rope"), 1);
+        assert_eq!(count("dense_attention"), 1);
+        assert_eq!(count("rotary_factors"), 1);
+        assert_eq!(count("act_and_mul"), 1);
+        assert!(
+            programs
+                .iter()
+                .any(|(name, key)| name == "act_and_mul" && key.contains("stepwise_true")),
+            "the block's activation is the stepwise recipe: {programs:?}"
+        );
+
+        // A conditioned deployment's modulation cache has four groups where a text-only one has two,
+        // so the entries gather is a different program rather than the same one reused.
+        let generated = Transformer::programs(
+            &transformer,
+            AttentionKind::Dense,
+            nn::DType::BF16,
+            32_000,
+            Groups::of(false),
+            &Partition::single(),
+        )
+        .expect("a text-only deployment's programs");
+        let entries = |set: &[(String, String)]| {
+            set.iter()
+                .filter(|(name, _)| name == "logits_gather")
+                .map(|(_, key)| key.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_ne!(entries(&programs), entries(&generated));
+
+        // A sparse partition's programs are not stated: the selection and its attention are missing,
+        // and the walk says so rather than returning the dense set under a sparse name.
+        assert!(
+            Transformer::programs(
+                &transformer,
+                AttentionKind::Sparse {
+                    tile: 32,
+                    sparsity: 0.5,
+                    reference_keep: Some(0.1),
+                },
+                nn::DType::BF16,
+                32_000,
+                Groups::of(true),
+                &Partition::single(),
+            )
+            .is_err()
+        );
+    }
     use super::*;
     use nn::DType;
 

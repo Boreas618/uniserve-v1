@@ -60,7 +60,7 @@ pub use cross_fade::CrossFade;
 pub use embedding::Embedding;
 pub use exchange::UlyssesExchange;
 pub use frame::{FrameMoments, FrameNormPad, FramePad};
-pub use head::{ParallelLMHead, gather_rows};
+pub use head::{ParallelLMHead, gather_rows, gather_rows_descriptor};
 pub use linear::{Linear, Nvfp4Linear};
 pub use modulation::{GatedResidual, ModulatedRmsNorm};
 pub use moe::{
