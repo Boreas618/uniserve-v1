@@ -7,7 +7,8 @@
 //! not on the image) and this layer launches `ops::position::PositionInterpolate` over them.
 //!
 //! The layer carries no weights and no state beyond the compiled form: which dtype, which feature
-//! width, and the two grids.
+//! width, and the two grids. The target grid is rectangular — a tower serves `24×40` as readily as a
+//! square one — while the learned table is square, because the checkpoint's is.
 
 use ops::DType;
 use ops::TensorView;
@@ -25,13 +26,16 @@ pub struct PositionInterpolate {
     datatype: DType,
     channels: u32,
     in_side: u32,
-    out_side: u32,
 }
 
 impl PositionInterpolate {
-    /// A resample from an `in_side`² grid to an `out_side`² grid of rows `channels` wide.
-    pub fn new(dtype: DType, channels: u64, in_side: u32, out_side: u32) -> Result<Self> {
-        if in_side == 0 || out_side == 0 {
+    /// A resample of an `in_side`² table of rows `channels` wide.
+    ///
+    /// The target grid is deliberately not here: the taps are the caller's, so the program is
+    /// geometry-agnostic and the number of resampled points is whatever the views state. `in_side`
+    /// stays because it bounds the taps' indices.
+    pub fn new(dtype: DType, channels: u64, in_side: u32) -> Result<Self> {
+        if in_side == 0 {
             return Err(Error::shape(
                 "PositionInterpolate",
                 "a grid with no points has no table to resample".to_owned(),
@@ -47,15 +51,14 @@ impl PositionInterpolate {
             datatype: dtype,
             channels,
             in_side,
-            out_side,
         })
     }
 
     /// `out[j] = Σ_{t<4} weights[j, t] · table[indices[j, t]]`.
     ///
-    /// `table` is `[in_side², channels]`, `indices` and `weights` are `[out_side², 4]` (i32 and f32),
-    /// and `out` is `[out_side², channels]`. The index and weight tables are the caller's: they
-    /// belong to the grid, and one pair serves every image of that grid.
+    /// `table` is `[in_side², channels]`, `indices` and `weights` are `[points, 4]` (i32 and f32),
+    /// and `out` is `[points, channels]`, the point count the views state. The index and weight
+    /// tables are the caller's: they belong to the grid, and one pair serves every image of it.
     pub fn forward(
         &self,
         f: &Forward,
@@ -68,7 +71,6 @@ impl PositionInterpolate {
             dtype: self.datatype,
             channels: self.channels,
             in_side: self.in_side,
-            out_side: self.out_side,
             block: BLOCK,
             pdl: false,
         };
@@ -90,8 +92,8 @@ mod tests {
 
     #[test]
     fn an_empty_grid_or_an_oversized_width_is_refused() {
-        assert!(PositionInterpolate::new(DType::BF16, 1280, 24, 32).is_ok());
-        assert!(PositionInterpolate::new(DType::BF16, 1280, 0, 32).is_err());
-        assert!(PositionInterpolate::new(DType::BF16, u64::from(u32::MAX) + 1, 24, 32).is_err());
+        assert!(PositionInterpolate::new(DType::BF16, 1280, 24).is_ok());
+        assert!(PositionInterpolate::new(DType::BF16, 1280, 0).is_err());
+        assert!(PositionInterpolate::new(DType::BF16, u64::from(u32::MAX) + 1, 24).is_err());
     }
 }
