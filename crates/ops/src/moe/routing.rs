@@ -219,7 +219,7 @@ impl Op for TopkSoftmax {
         kernel.launch(grid, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         let _ = stream;
         TopkArgs {
             ids: twins.shadow_of(args.ids),
@@ -316,7 +316,7 @@ impl Op for ExpertGather {
         kernel.launch(grid, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         let _ = stream;
         GatherArgs {
             out: twins.shadow_of(args.out),

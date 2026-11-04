@@ -174,7 +174,7 @@ impl Op for KvWrite {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         // The pages are read-modify-write containers: the new kernel writes its twin pages, and the
         // comparison sees the untouched rows as well as the written ones.
         KvWriteArgs {

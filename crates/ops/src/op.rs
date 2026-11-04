@@ -51,7 +51,7 @@ pub trait Op {
     /// writes into `twins` instead of the real outputs, so the two results can be compared without
     /// the difference of one operator accumulating through the next. An operand the operator
     /// modifies in place is redirected too, after its current bytes are copied into the twin.
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a>;
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a>;
 
     /// How far two implementations of this operator may be from another on this descriptor.
     ///

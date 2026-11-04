@@ -146,7 +146,7 @@ impl Op for RotaryFactors {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         let _ = stream;
         FactorsArgs {
             cosine: twins.shadow_of(args.cosine),
@@ -308,7 +308,7 @@ impl Op for QkNormRope {
         kernel.launch(LaunchGrid::linear(programs)?, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         let _ = stream;
         QkNormRopeArgs {
             q_out: twins.shadow_of(args.q_out),

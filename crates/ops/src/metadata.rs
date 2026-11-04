@@ -360,7 +360,7 @@ impl Op for AttentionGatherRows {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         let _ = stream;
         GatherRowsArgs {
             block_tables: twins.shadow_of(args.block_tables),
@@ -755,7 +755,7 @@ impl Op for AttentionGatherDecodeInputs {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         let _ = stream;
         GatherDecodeInputsArgs {
             input_ids: twins.shadow_of(args.input_ids),

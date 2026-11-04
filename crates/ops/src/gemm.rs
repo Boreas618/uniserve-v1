@@ -299,7 +299,7 @@ impl Op for Gemm {
         unsafe { kernel.native(&mut call, stream) }
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         let _ = stream;
         Args {
             out: twins.shadow_of(args.out),

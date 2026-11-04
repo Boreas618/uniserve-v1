@@ -165,7 +165,7 @@ impl Op for LogitsShape {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         let _ = stream;
         ShapeArgs {
             out: twins.shadow_of(args.out),
@@ -267,7 +267,7 @@ impl Op for TopK {
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         let _ = stream;
         TopKArgs {
             values: twins.shadow_of(args.values),
@@ -365,7 +365,7 @@ impl Op for FilterCandidates {
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         FilterArgs {
             values: twins.in_place(args.values, stream),
             valid: twins.shadow_of(args.valid),
@@ -473,7 +473,7 @@ impl Op for InverseCdf {
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         let _ = stream;
         InverseCdfArgs {
             tokens: twins.shadow_of(args.tokens),
@@ -557,7 +557,7 @@ impl Op for ArgMax {
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         let _ = stream;
         ArgMaxArgs {
             out: twins.shadow_of(args.out),
@@ -641,7 +641,7 @@ impl Op for LogSoftmax {
         kernel.launch(LaunchGrid::linear(args.x.rows())?, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         let _ = stream;
         LogSoftmaxArgs {
             out: twins.shadow_of(args.out),
@@ -735,7 +735,7 @@ impl Op for LogprobGather {
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         let _ = stream;
         LogprobArgs {
             out: twins.shadow_of(args.out),

@@ -376,7 +376,7 @@ impl Op for ExpertExchange {
         }
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         let _ = stream;
         // A dispatch writes only the peer slots inside the transport, which the caller does not see
         // as a tensor, so nothing it returns is compared; a combine writes its own rows.

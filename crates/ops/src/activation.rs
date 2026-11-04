@@ -238,7 +238,7 @@ impl Op for ActAndMul {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         let _ = stream;
         ActAndMulArgs {
             out: twins.shadow_of(args.out),
@@ -415,7 +415,7 @@ impl Op for ValueFirstSwiglu {
         kernel.launch(LaunchGrid::linear(programs)?, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         let _ = stream;
         ValueFirstSwigluArgs {
             out: twins.shadow_of(args.out),
@@ -566,7 +566,7 @@ impl Op for ActAndMulE4M3 {
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         let _ = stream;
         ActAndMulE4M3Args {
             out: twins.shadow_of(args.out),
@@ -700,7 +700,7 @@ impl Op for ValueFirstSwigluE4M3 {
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         let _ = stream;
         ValueFirstSwigluE4M3Args {
             out: twins.shadow_of(args.out),
@@ -890,7 +890,7 @@ impl Op for Swiglu {
         kernel.launch(LaunchGrid::linear(programs)?, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         let _ = stream;
         SwigluArgs {
             out: twins.shadow_of(args.out),

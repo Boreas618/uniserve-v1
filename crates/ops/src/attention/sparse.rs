@@ -509,7 +509,7 @@ impl Op for SparseAttention {
         unsafe { kernel.native(&mut call, stream) }
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         let _ = stream;
         SparseArgs {
             out: twins.shadow_of(args.out),

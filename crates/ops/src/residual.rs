@@ -118,7 +118,7 @@ impl Op for WeightedRmsNorm {
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         let _ = stream;
         WeightedRmsNormArgs {
             out: twins.shadow_of(args.out),
@@ -260,7 +260,7 @@ impl Op for ScaledResidualRmsNorm {
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         ScaledResidualRmsNormArgs {
             hidden: twins.in_place(args.hidden, stream),
             out: twins.shadow_of(args.out),
@@ -410,7 +410,7 @@ impl Op for ScaledResidualLayerNorm {
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         let _ = stream;
         ScaledResidualLayerNormArgs {
             out: twins.shadow_of(args.out),
@@ -549,7 +549,7 @@ impl Op for ScaledResidual {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         ScaledResidualArgs {
             hidden: twins.in_place(args.hidden, stream),
             ..args
