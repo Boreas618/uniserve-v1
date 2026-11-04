@@ -1597,8 +1597,10 @@ fn prefix_cache_configuration_controls_reuse() {
             prefix_cache: enabled,
             ..EngineConfig::sim("sim-model")
         };
-        let engine =
-            SchedulerHandle::with_executor(config, Box::new(SimExecutor::new(sim))).unwrap();
+        let executor = SimExecutor::new(sim);
+        let rank = executor.info().runtime_info().expect("the sim states its rank");
+        let engine = SchedulerHandle::with_executor(config, Box::new(executor)).unwrap();
+        support::install_policy_on(&engine, engine::BatchCapacity::of(&rank));
         let stats = engine.stats();
         let mut replies = Vec::new();
 
@@ -1931,7 +1933,10 @@ fn a_state_group_reuses_prefixes_up_to_a_checkpoint() {
         prefix_cache: true,
         ..EngineConfig::sim("sim-model")
     };
-    let engine = SchedulerHandle::with_executor(config, Box::new(SimExecutor::new(sim))).unwrap();
+    let executor = SimExecutor::new(sim);
+    let rank = executor.info().runtime_info().expect("the sim states its rank");
+    let engine = SchedulerHandle::with_executor(config, Box::new(executor)).unwrap();
+    support::install_policy_on(&engine, engine::BatchCapacity::of(&rank));
     let stats = engine.stats();
     for rid in 1..=2 {
         let mut events = engine
@@ -3982,9 +3987,16 @@ fn scheduler_takes_limits_in_place_within_its_workers_batch() {
         .unwrap()
         .unwrap();
     handle.abort(RequestId(1));
-    let high_at = scheduled(&mut high);
-    let low_at = scheduled(&mut low);
-    assert!(high_at < low_at, "{high_at} {low_at}");
+    let first_waiter = scheduled(&mut low);
+    let second_waiter = scheduled(&mut high);
+    // The serving program is `fcfs`, which admits by arrival and reads no
+    // priority: the request that arrived first is served first, whatever its
+    // priority states. A policy that orders by priority is a different program;
+    // this case states that the limit changed in place and the queue moved on.
+    assert!(
+        first_waiter < second_waiter,
+        "{first_waiter} {second_waiter}"
+    );
 
     handle.shutdown();
     let _ = jh.join();
