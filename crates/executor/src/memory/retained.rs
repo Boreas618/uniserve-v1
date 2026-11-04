@@ -1028,13 +1028,33 @@ impl crate::memory::weights::WeightStorage for Retained {
     /// segment and no world and lies on the host the server retains; the
     /// mapping a store answers is the same read-only one a fetch would find,
     /// so a second store of the same key republishes rather than failing.
-    fn store(&self, device: DeviceId, key: &[u8; 32], bytes: &[u8]) -> Result<nn::Backing> {
+    fn granularity(&self, device: DeviceId) -> Result<usize> {
+        Ok(platform::HandleType::Descriptor.granularity(device)?)
+    }
+
+    fn store(
+        &self,
+        device: DeviceId,
+        key: &[u8; 32],
+        bytes: &[u8],
+        allocation: usize,
+    ) -> Result<nn::Backing> {
         if bytes.is_empty() {
             return Err(Error::Invalid("a weight holds no bytes".into()));
         }
+        // The store rounds a weight's true length up to the granule the import needs; a length that
+        // is not such a multiple would be refused by the driver, so it is refused here by name.
+        let granularity = self.granularity(device)?;
+        if allocation < bytes.len() || allocation % granularity != 0 {
+            return Err(Error::Invariant(format!(
+                "a weight of {} bytes cannot be retained in an allocation of {allocation} bytes, \
+                 which is not a multiple of the {granularity}-byte granularity",
+                bytes.len()
+            )));
+        }
         let mut state = lock(&self.state);
         let gpu = state.gpu(device)?;
-        let (staging, descriptor) = Storage::host_retainable(device, bytes.len())?;
+        let (staging, descriptor) = Storage::host_retainable(device, allocation)?;
         // SAFETY: the staging storage holds at least `bytes.len()` writable bytes
         // and the source slice is that long; the server imports the mapping when
         // the record below is published.
