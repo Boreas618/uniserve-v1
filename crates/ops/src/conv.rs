@@ -337,7 +337,7 @@ impl Op for Conv3d {
         Conv::launch(Self::NAME, kernel, descriptor, args, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         let _ = stream;
         Args {
             out: twins.shadow_of(args.out),
@@ -383,7 +383,7 @@ impl Op for Conv1d {
         Conv::launch(Self::NAME, kernel, descriptor, args, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         let _ = stream;
         Args {
             out: twins.shadow_of(args.out),
@@ -424,7 +424,7 @@ impl Op for ConvTranspose1d {
         Conv::launch(Self::NAME, kernel, descriptor, args, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         let _ = stream;
         Args {
             out: twins.shadow_of(args.out),

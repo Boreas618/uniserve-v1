@@ -126,7 +126,7 @@ impl Op for VsaZeroPadding {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         ZeroPaddingArgs {
             values: twins.in_place(args.values, stream),
             ..args
@@ -232,7 +232,7 @@ impl Op for VsaAddGatedTiles {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         AddGatedTilesArgs {
             output: twins.in_place(args.output, stream),
             ..args
@@ -461,7 +461,7 @@ impl Op for VsaComposeGatedRows {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         let _ = stream;
         ComposeGatedRowsArgs {
             output: twins.shadow_of(args.output),
@@ -606,7 +606,7 @@ impl Op for VsaSelectTiles {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         let _ = stream;
         SelectTilesArgs {
             indices: twins.shadow_of(args.indices),
@@ -875,7 +875,7 @@ impl Op for VsaPrepareTiles {
         kernel.launch(LaunchGrid::new([tiles, heads, 1])?, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         PrepareTilesArgs {
             query: twins.in_place(args.query, stream),
             key: twins.in_place(args.key, stream),

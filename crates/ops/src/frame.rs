@@ -240,7 +240,7 @@ impl Op for FramePad {
         kernel.launch(grid, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         let _ = stream;
         FramePadArgs {
             out: twins.shadow_of(args.out),
@@ -408,7 +408,7 @@ impl Op for FrameMoments {
         unsafe { kernel.native(&mut call, stream) }
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         let _ = stream;
         FrameMomentsArgs {
             mean: twins.shadow_of(args.mean),
@@ -743,7 +743,7 @@ impl Op for FrameNormPad {
         unsafe { kernel.native(&mut call, stream) }
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         let _ = stream;
         FrameNormPadArgs {
             out: twins.shadow_of(args.out),

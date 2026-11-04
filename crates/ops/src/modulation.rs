@@ -318,7 +318,7 @@ impl Op for ModulatedRmsNorm {
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         Args {
             update: args.update.map(|update| twins.in_place(update, stream)),
             out: twins.shadow_of(args.out),
@@ -457,7 +457,7 @@ impl Op for GatedResidual {
         )
     }
 
-    fn shadow<'a>(args: Self::Args<'a>, twins: &'a mut Twins, stream: &Stream) -> Self::Args<'a> {
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
         GatedResidualArgs {
             update: twins.in_place(args.update, stream),
             ..args
