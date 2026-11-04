@@ -285,8 +285,16 @@ impl Scheduler {
                 break;
             }
             // The phase names the call kind this entry runs. A phase this epoch
-            // has no call for runs nothing.
+            // has no call for runs nothing, and says so: an entry the policy
+            // named and this loop discards is work the epoch believes it
+            // planned, and a pass that names nothing every step is a stall no
+            // other layer reports.
             let Some(kind) = views::phase_kind(phase).and_then(views::phase_call) else {
+                tracing::debug!(
+                    request = id.0,
+                    phase = phase.0,
+                    "a planned entry names a phase this epoch has no call for"
+                );
                 continue;
             };
             // A spent token budget ends the pass's token work; a media call
