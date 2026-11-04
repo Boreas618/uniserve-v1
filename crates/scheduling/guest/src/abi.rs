@@ -27,7 +27,7 @@
 use crate::decision::{Plan, Room, Shortage, Victim};
 use crate::event::Event;
 use crate::limits::Limits;
-use crate::policy::{Init, Policy};
+use crate::policy::Init;
 use crate::view::{CallView, ExpertLoad, ExpertOrder, RankView, ReplicaView, RequestView};
 use crate::wire::{decode, encode, pack};
 
@@ -40,8 +40,10 @@ use crate::wire::{decode, encode, pack};
 pub extern "C" fn sched_alloc(len: u32) -> u32 {
     let len = len as usize;
     let buffer = vec![0u8; len].into_boxed_slice();
-    u32::try_from(Box::into_raw(buffer) as *mut u8 as usize)
-        .expect("a wasm32 pointer fits in a u32")
+    let Ok(ptr) = u32::try_from(Box::into_raw(buffer) as *mut u8 as usize) else {
+        panic!("a wasm32 pointer fits in a u32");
+    };
+    ptr
 }
 
 /// Releases the buffer of `len` bytes at `ptr`, whether the mechanism wrote it
@@ -83,11 +85,14 @@ fn read<T: serde::de::DeserializeOwned>(bytes: &[u8], what: &str) -> T {
 /// the mechanism frees with [`sched_free`]. A reply that fails to encode is a
 /// trap: it is a defect in the policy, not a decision.
 fn reply<T: serde::Serialize>(reply: &T, what: &str) -> u64 {
-    let bytes = encode(reply).unwrap_or_else(|error| panic!("{what} reply does not encode: {error}"));
+    let bytes =
+        encode(reply).unwrap_or_else(|error| panic!("{what} reply does not encode: {error}"));
     if bytes.is_empty() {
         return 0;
     }
-    let len = u32::try_from(bytes.len()).expect("a reply fits in a u32 length");
+    let Ok(len) = u32::try_from(bytes.len()) else {
+        panic!("a reply fits in a u32 length");
+    };
     let ptr = sched_alloc(len);
     // SAFETY: the buffer is exactly `len` bytes, freshly allocated, and
     // nothing else holds it.
@@ -141,8 +146,7 @@ macro_rules! export_policy {
         extern "C" fn sched_observe(ptr: u32, len: u32) -> u64 {
             // SAFETY: the mechanism's message buffer lives for this call.
             let bytes = unsafe { $crate::abi::message(ptr, len) };
-            let events: ::std::vec::Vec<$crate::Event> =
-                $crate::abi::events_message(bytes);
+            let events: ::std::vec::Vec<$crate::Event> = $crate::abi::events_message(bytes);
             policy(|policy| <$policy as $crate::Policy>::observe(policy, &events));
             0
         }
@@ -152,7 +156,8 @@ macro_rules! export_policy {
             // SAFETY: the mechanism's message buffer lives for this call.
             let bytes = unsafe { $crate::abi::message(ptr, len) };
             let room: $crate::Room = $crate::abi::room_message(bytes);
-            let plan: $crate::Plan = policy(|policy| <$policy as $crate::Policy>::dispatch(policy, &room));
+            let plan: $crate::Plan =
+                policy(|policy| <$policy as $crate::Policy>::dispatch(policy, &room));
             $crate::abi::dispatch_reply(&plan)
         }
 
@@ -171,8 +176,7 @@ macro_rules! export_policy {
             // SAFETY: the mechanism's message buffer lives for this call.
             let bytes = unsafe { $crate::abi::message(ptr, len) };
             let (request, ranks) = $crate::abi::route_message(bytes);
-            policy(|policy| <$policy as $crate::Policy>::route(policy, &request, &ranks))
-                as u32
+            policy(|policy| <$policy as $crate::Policy>::route(policy, &request, &ranks)) as u32
         }
 
         #[unsafe(no_mangle)]
@@ -180,8 +184,7 @@ macro_rules! export_policy {
             // SAFETY: the mechanism's message buffer lives for this call.
             let bytes = unsafe { $crate::abi::message(ptr, len) };
             let (call, replicas) = $crate::abi::place_message(bytes);
-            policy(|policy| <$policy as $crate::Policy>::place(policy, &call, &replicas))
-                as u32
+            policy(|policy| <$policy as $crate::Policy>::place(policy, &call, &replicas)) as u32
         }
 
         #[unsafe(no_mangle)]
@@ -206,7 +209,8 @@ macro_rules! export_policy {
 
         #[unsafe(no_mangle)]
         extern "C" fn sched_limits() -> u64 {
-            let limits: $crate::Limits = policy(|policy| <$policy as $crate::Policy>::limits(policy));
+            let limits: $crate::Limits =
+                policy(|policy| <$policy as $crate::Policy>::limits(policy));
             $crate::abi::limits_reply(&limits)
         }
     };

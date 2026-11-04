@@ -118,6 +118,31 @@ pub struct RequestView {
     /// starved (design §4.4: "驻留且不在等传输的请求超过 ... timeout").
     #[serde(default)]
     pub waiting_transfer: bool,
+    /// The token charge of the request's next call when that call is not a
+    /// prefill or refill chunk (a denoising step is charged its latent units
+    /// times its guidance branches, a verification one token plus its drafts,
+    /// any other call its bound). A prefill or refill chunk is charged the
+    /// chunk the policy sizes instead.
+    #[serde(default)]
+    pub next_tokens: u32,
+    /// The worst-case device KV units the request reserves when it is
+    /// admitted. A request whose reservation exceeds the cache's total
+    /// capacity can never run and is rejected.
+    #[serde(default)]
+    pub reservation_units: u64,
+    /// Tokens the host KV cache could add to the request's prefix hit beyond
+    /// the device hit (the deepening a prefetch would gain); 0 when none.
+    #[serde(default)]
+    pub prefetch_tokens: u32,
+    /// Tokens a refill of the request's draft cache would cost; `None` when
+    /// its draft cache has no gap.
+    #[serde(default)]
+    pub refill_tokens: Option<u32>,
+    /// Whether the request resumed from generated tokens (a migrated or
+    /// preempted request), so ending it as migratable and resubmitting it
+    /// loses nothing. Only such a request may be a `Victim::Request`.
+    #[serde(default)]
+    pub migratable: bool,
     /// The rank recorded for the request's cache resume, when it resumes a
     /// stored cache. `route` returns this rank when it is set; the mechanism
     /// skips the routing decision for it (today `Routing::pick` is skipped the
@@ -243,6 +268,10 @@ pub struct PageView {
     /// Whether the page currently sits in host memory (an offloaded page).
     #[serde(default)]
     pub on_host: bool,
+    /// Whether no resident request continues from the page, so it may be
+    /// offloaded to the host KV cache or freed.
+    #[serde(default)]
+    pub evictable: bool,
 }
 
 /// One encoder cache entry.
@@ -296,6 +325,10 @@ pub struct ReplicaView {
     /// (today `placement.rs`'s prefill-only groups).
     #[serde(default)]
     pub prefills_only: bool,
+    /// Whether it already holds another component of this request, which a
+    /// placement prefers to a replica that holds none of it.
+    #[serde(default)]
+    pub holds_component: bool,
 }
 
 /// The call a `place` decision is about: a request's first call on a block.

@@ -160,10 +160,17 @@ mod tests {
             prompt_tokens: 0,
             generated_tokens: 0,
             cached_prefix_tokens: 0,
+            prefilled_tokens: 0,
             cached_pages: 0,
             last_emitted_at: None,
             class: RequestClass::Token,
             waiting_transfer: false,
+            next_tokens: 1,
+            reservation_units: 0,
+            prefetch_tokens: 0,
+            refill_tokens: None,
+            migratable: true,
+            cache_rank: None,
         }
     }
 

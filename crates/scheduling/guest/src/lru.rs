@@ -72,7 +72,13 @@ impl<I: Copy + Eq + Hash> Lru<I> {
             self.unlink(object);
         }
         let before = self.tail;
-        self.nodes.insert(object, Node { before, after: None });
+        self.nodes.insert(
+            object,
+            Node {
+                before,
+                after: None,
+            },
+        );
         if let Some(before) = before
             && let Some(node) = self.nodes.get_mut(&before)
         {
