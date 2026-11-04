@@ -29,7 +29,6 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-storage-server.workspace = true
 tempfile.workspace = true
 
 [lints]

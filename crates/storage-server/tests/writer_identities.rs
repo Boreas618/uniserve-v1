@@ -27,8 +27,11 @@
 //! prints; the assertion states the outcome the current server code implies, so
 //! that a change in that code changes the test.
 //!
-//! Run on one GPU-less host; no GPU is used. `cargo test -p executor --test
-//! probes one_process_holds_two_rank_writer_identities -- --nocapture`.
+//! Run on one GPU-less host; no GPU is used.
+//!
+//! ```text
+//! cargo test -p storage-server --test writer_identities one_process_holds_two_rank_writer_identities -- --nocapture
+//! ```
 
 use std::io::Write as _;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
@@ -54,18 +57,16 @@ impl Running {
     fn start() -> Self {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let socket = directory.path().join("storage.sock");
-        let (listener, lock) = socket::bind(&socket).expect("a bound socket").expect("no server");
+        let (listener, lock) = socket::bind(&socket)
+            .expect("a bound socket")
+            .expect("no server");
         let mut ends = [0; 2];
         // SAFETY: pipe2 fills the two descriptors it creates.
         let created = unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_NONBLOCK) };
         assert_eq!(created, 0);
         // SAFETY: two new descriptors this program owns.
-        let (reader, writer) = unsafe {
-            (
-                OwnedFd::from_raw_fd(ends[0]),
-                OwnedFd::from_raw_fd(ends[1]),
-            )
-        };
+        let (reader, writer) =
+            unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = Arc::clone(&stop);
         let thread = std::thread::spawn(move || {
@@ -181,7 +182,12 @@ fn one_process_holds_two_rank_writer_identities() {
         let client = if rank == 0 { &mut rank0 } else { &mut rank1 };
         client
             .put(
-                vec![tensor(key(number), &format!("rank{rank}"), 0, Access::Exclusive)],
+                vec![tensor(
+                    key(number),
+                    &format!("rank{rank}"),
+                    0,
+                    Access::Exclusive,
+                )],
                 &[(host(4), storage.as_fd())],
             )
             .expect("a rank publishes its tensor");
@@ -200,7 +206,9 @@ fn one_process_holds_two_rank_writer_identities() {
             got.storages.len()
         ),
         Err(Error::Server { kind, message }) => {
-            println!("probe(writers): rank 1 taking rank 0's write access: refused ({kind:?}: {message})")
+            println!(
+                "probe(writers): rank 1 taking rank 0's write access: refused ({kind:?}: {message})"
+            )
         }
         Err(other) => panic!("unexpected transport answer: {other:?}"),
     }
