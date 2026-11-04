@@ -75,6 +75,9 @@ pub struct Leader {
     log_requests: bool,
     /// Periodic throughput logging, stopped with the engine.
     _stats_logger: Option<StatsLogger>,
+    /// The epochs this node keeps and the program-layer update in flight
+    /// (§7.3): the daemon's record, which the admin API reads and reports.
+    epochs: Arc<crate::epoch::Epochs>,
 }
 
 /// The serving replica set and its sequential rollout. Replicas keep a
@@ -532,6 +535,10 @@ impl Leader {
                 .send_modify(|replicas| replicas.push(replica));
         }
         if let Some(commands) = commands {
+            // The epoch's record commands the same main processes the
+            // daemon's channel reaches, for every later program-layer
+            // update (§2.3, §7.3).
+            leader.epochs.supervise(commands.clone());
             leader
                 .install_programs(commands, config, engines)
                 .await
@@ -937,6 +944,7 @@ impl Leader {
             readout: readout.map(Arc::new),
             log_requests: logging.log_requests,
             _stats_logger: stats_logger,
+            epochs: Arc::new(crate::epoch::Epochs::new()),
         }
     }
 
@@ -1242,6 +1250,139 @@ impl Leader {
         // A request the engine ended at submission names no scheduler; its
         // stream holds its terminal event.
         Ok((events, scheduler.unwrap_or(0) + replica.ordinal as u32))
+    }
+}
+
+impl Leader {
+    /// The epochs this node keeps: the record the admin API reports and a
+    /// program-layer update lives in (§7.2, §7.3).
+    pub(crate) fn epochs(&self) -> Arc<crate::epoch::Epochs> {
+        Arc::clone(&self.epochs)
+    }
+
+    /// This node's main processes, by the engine number their reports carry
+    /// and the node they run on: the processes a program-layer update
+    /// commands (§7.3).
+    pub(crate) fn main_processes(&self) -> Vec<crate::engine::control::EpochProcess> {
+        self.replicas()
+            .iter()
+            .filter_map(|replica| {
+                let engine = replica.hold.client()?.engine()?;
+                let host = locked(&replica.config).host_identity.clone();
+                Some(crate::engine::control::EpochProcess { host, engine })
+            })
+            .collect()
+    }
+
+    /// Routes `target` and applies its program-layer change to this node's
+    /// main processes: the target's programs are prepared at every host's
+    /// Program Server, precopied into each main process, switched to, and
+    /// recorded as the epoch's probation (§7.3 steps 2-4).
+    ///
+    /// Answers the update that is on probation. `Ok(None)` when the change
+    /// moves nothing at the program layer — it belongs to the host layer or
+    /// the epoch layer, or fills the programs the epoch already executes —
+    /// which is where a caller falls through to the world path.
+    ///
+    /// With `dry_run`, the routing decision alone is made and nothing is
+    /// applied, so a caller can answer what a change would move.
+    ///
+    /// # Errors
+    ///
+    /// `UpdateError::Refused` when a Program Server cannot select the
+    /// target's programs; `UpdateError::Failed` when a main process refuses
+    /// the precopy or the switchover, or does not answer. What serves is
+    /// untouched either way.
+    pub(crate) async fn apply_programs(
+        &self,
+        number: u64,
+        target: &ServeConfig,
+        dry_run: bool,
+    ) -> Result<Option<crate::epoch::Update>, UpdateError> {
+        let current = self
+            .replicas()
+            .first()
+            .map(|replica| locked(&replica.config).clone())
+            .ok_or_else(|| UpdateError::Failed(anyhow::anyhow!("no replica serves")))?;
+        let Some(update) = self.route(&current, target, false).await? else {
+            return Ok(None);
+        };
+        if dry_run {
+            return Ok(Some(update));
+        }
+        let mut update = update;
+        update.number = number;
+        let epochs = Arc::clone(&self.epochs);
+        let processes = self.main_processes();
+        let recorded = update.clone();
+        tokio::task::spawn_blocking(move || epochs.apply_programs(update, processes))
+            .await
+            .map_err(|error| UpdateError::Failed(anyhow::anyhow!("applying the update: {error}")))?
+            .map_err(|failure| {
+                UpdateError::Failed(anyhow::anyhow!(
+                    "the main processes did not take the programs ({}): {}",
+                    failure.kind,
+                    failure.reason
+                ))
+            })?;
+        Ok(Some(recorded))
+    }
+
+    /// Ends update `number`'s program-layer probation: every main process
+    /// commits the generation it executes and purges the one it no longer
+    /// runs, and the epoch's record keeps no previous generation (§7.3 steps
+    /// 5-6).
+    ///
+    /// Answers `Ok(false)` when update `number` is not a program-layer one,
+    /// which is where a caller falls through to the world path.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `number` names no update, when it is not the update on
+    /// probation, or when a main process does not answer the commit.
+    pub(crate) async fn commit_programs(&self, number: u64) -> Result<bool, UpdateError> {
+        let program = self
+            .epochs
+            .program_update()
+            .filter(|program| program.update.number == number);
+        if program.is_none() {
+            return Ok(false);
+        }
+        let epochs = Arc::clone(&self.epochs);
+        tokio::task::spawn_blocking(move || epochs.commit_programs())
+            .await
+            .map_err(|error| UpdateError::Failed(anyhow::anyhow!("committing the update: {error}")))?
+            .map_err(UpdateError::Failed)
+    }
+
+    /// Returns every main process to the generation it served before update
+    /// `number`, with `reason`, and records the update as reverted: it is
+    /// unavailable until it is applied with `force` (§7.2, §7.3 step 5).
+    ///
+    /// Answers `Ok(false)` when update `number` is not a program-layer one.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a main process does not answer the revert. What serves is
+    /// the previous generation either way.
+    pub(crate) async fn rollback_programs(
+        &self,
+        number: u64,
+        reason: &str,
+    ) -> Result<bool, UpdateError> {
+        let program = self
+            .epochs
+            .program_update()
+            .filter(|program| program.update.number == number);
+        if program.is_none() {
+            return Ok(false);
+        }
+        let epochs = Arc::clone(&self.epochs);
+        let reason = reason.to_owned();
+        tokio::task::spawn_blocking(move || epochs.revert_programs(&reason))
+            .await
+            .map_err(|error| UpdateError::Failed(anyhow::anyhow!("reverting the update: {error}")))?
+            .map_err(UpdateError::Failed)
     }
 }
 
