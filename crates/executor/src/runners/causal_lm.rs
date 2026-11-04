@@ -1222,11 +1222,13 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 }
             }
             for bucket in launching {
-                // The paired forward runs first, and only where the two generations have a program
+                // The paired forward runs first, and only where **both** generations have a program
                 // under this same key: a kernel cannot be compared with one of another descriptor
-                // (`Forward::operate` pairs on operator and key), so a new key's bucket is left to
-                // the walk, which recaptures it.
-                if next.kernel(operator, &key).is_ok() {
+                // (`Forward::operate` pairs on operator and key), so a key one of them does not hold
+                // - a new launch, or one whose descriptor changed - is left to the walk, which
+                // recaptures the bucket.
+                if next.kernel(operator, &key).is_ok() && self.generation.kernel(operator, &key).is_ok()
+                {
                     jobs.push(Job::Shadow {
                         runner: self.id,
                         operator,
