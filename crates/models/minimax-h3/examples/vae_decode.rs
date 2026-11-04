@@ -50,6 +50,7 @@ const VAE: &str = "vae";
 /// `0` f64, `1` f32, `2` i64, `3` i32, `4` bf16, `5` f16.
 const H3T_F16: u8 = 5;
 const H3T_F32: u8 = 1;
+const H3T_BF16: u8 = 4;
 
 fn main() -> ExitCode {
     match run() {
@@ -394,18 +395,12 @@ fn stage_decode(args: &Args) -> Result<()> {
     //    the reference's three separate steps.
     let component = checkpoint.component(VAE)?;
     let (width, dtype, weight, bias) = folded_input(component, &config.video_vae)?;
-    // The latent container is 16-bit by the precision rule (`specs/worker.md` 9: the video VAE
-    // decoder is FP16, and the reference's own decoder is called with FP16 latents), so an export
-    // whose VAE is another width would write bytes labelled 16-bit from a buffer of another width -
-    // a decode reading half a tensor, and a page of nonsense rather than an error. Naming the export
-    // here is the difference between a refusal and a wrong number.
-    if dtype != DType::F16 {
-        return Err(Failure::message(format!(
-            "the export's video VAE is {dtype}, and this stage's latent container is {H3T_F16} \
-             (float16): the checkpoint's own representation is the one the precision rule keeps, so \
-             this harness refuses rather than writes a container of another width"
-        )));
-    }
+    // The latent container carries the decode's own element type, whatever the deployment states:
+    // `dtype = "auto"` converts nothing, so the export's VAE representation *is* the decode's, and a
+    // container of another width would write bytes labelled one width from a buffer of another - a
+    // decode reading half a tensor, and a page of nonsense rather than an error. The type is named in
+    // `case.json` and in the file's own element code, and a file that disagrees with it is refused
+    // rather than reinterpreted.
     let container = element_of(dtype)?;
     let latent_channels = u64::from(config.video_vae.latent_channels);
     let mut weights = DeviceWeights::new(&device, 0)?;
@@ -524,6 +519,7 @@ fn stage_decode(args: &Args) -> Result<()> {
                 u64::from(canvas.frames),
                 args.latent_height,
                 args.latent_width,
+                dtype,
             )?,
             true,
         ),
@@ -651,8 +647,9 @@ fn element_of(dtype: DType) -> Result<u8> {
     match dtype {
         DType::F16 => Ok(H3T_F16),
         DType::F32 => Ok(H3T_F32),
+        DType::BF16 => Ok(H3T_BF16),
         other => Err(Failure::message(format!(
-            "the raster is {other}; this harness writes float16 and float32 only"
+            "the decode is {other}; this harness writes float16, bfloat16 and float32 only"
         ))),
     }
 }
@@ -1046,16 +1043,46 @@ fn pattern_latents(
     frames: u64,
     height: u32,
     width: u32,
+    dtype: DType,
 ) -> Result<Vec<u8>> {
     let elements = batch * channels * frames * u64::from(height) * u64::from(width);
-    let mut bytes = Vec::with_capacity(usize::try_from(elements * 2).unwrap_or(0));
+    let width_bytes = usize::try_from(dtype.bytes().unwrap_or(0)).unwrap_or(0);
+    if width_bytes == 0 {
+        return Err(Failure::message(format!(
+            "the decode is {dtype}, which has no whole-byte element size"
+        )));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(elements).unwrap_or(0) * width_bytes);
     for index in 0..elements {
         // A sawtooth over the element index, in [-1, 1): the same arithmetic as the reference's own
-        // pseudo-random input, without a generator whose implementation would have to match.
+        // pseudo-random input, without a generator whose implementation would have to match. The
+        // value is rounded into the container's own type, so a bf16 run and an f16 run differ in the
+        // rounding and not in the pattern - which is what makes two pages comparable.
         let value = ((index % 1024) as f32 / 512.0) - 1.0;
-        bytes.extend_from_slice(&half_bits(value).to_le_bytes());
+        match dtype {
+            DType::F16 => bytes.extend_from_slice(&half_bits(value).to_le_bytes()),
+            DType::BF16 => bytes.extend_from_slice(&bf16_bits(value).to_le_bytes()),
+            DType::F32 => bytes.extend_from_slice(&value.to_le_bytes()),
+            other => {
+                return Err(Failure::message(format!(
+                    "the decode is {other}; this harness writes float16, bfloat16 and float32 only"
+                )));
+            }
+        }
     }
     Ok(bytes)
+}
+
+/// The nearest bfloat16 bit pattern of `value`: the high half of its float32, rounded half to even.
+fn bf16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let upper = (bits >> 16) as u16;
+    let remainder = bits & 0xffff;
+    if remainder > 0x8000 || (remainder == 0x8000 && upper & 1 == 1) {
+        upper.wrapping_add(1)
+    } else {
+        upper
+    }
 }
 
 /// The nearest float16 bit pattern of `value`, by the round-to-nearest-even rule `DType::F16` keeps.
