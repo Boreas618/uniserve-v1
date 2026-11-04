@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use engine::ProcessLink;
+use engine::{PolicyProgram, PolicyReverted, ProcessLink};
 use proto::process::{
     self, downstream, event, upstream, Command, Downstream, Event, Hello, Upstream, Welcome,
 };
@@ -172,6 +172,22 @@ fn the_link_receives_the_daemons_commands_unasked_and_reports_back() {
         })),
     })
     .expect("the report is sent");
+    // A policy that failed after its commit: the report §7.3 says the daemon
+    // takes the previous program back by.
+    link.report(process::Report {
+        kind: Some(process::report::Kind::PolicyReverted(
+            PolicyReverted {
+                scheduler: Some(1),
+                program: PolicyProgram::from_arguments("fcfs", 3, &std::collections::BTreeMap::new())
+                    .expect("a program with the policy's defaults"),
+                reason: "a decision named a request no longer resident".to_owned(),
+                fatal: false,
+            }
+            .to_process(),
+        )),
+    })
+    .expect("the report is sent");
+
     let reporting = Arc::clone(&link);
     let reporter = std::thread::spawn(move || {
         reporting
@@ -195,7 +211,7 @@ fn the_link_receives_the_daemons_commands_unasked_and_reports_back() {
     link.close();
     let rounds = daemon.join().expect("the test's daemon ends");
     let reports = &rounds[0];
-    assert_eq!(reports.len(), 2, "both reports arrived");
+    assert_eq!(reports.len(), 3, "every report arrived");
     assert!(
         matches!(
             reports[0].kind,
@@ -203,12 +219,28 @@ fn the_link_receives_the_daemons_commands_unasked_and_reports_back() {
         ),
         "the switchover's report arrived first"
     );
+    // §7.3's revert: every field the daemon records as the epoch's current
+    // policy survives the process interface.
+    match &reports[1].kind {
+        Some(process::report::Kind::PolicyReverted(reverted)) => {
+            assert_eq!(reverted.scheduler, Some(1), "the scheduler that failed");
+            assert_eq!(reverted.backend, "fcfs");
+            assert_eq!(reverted.revision, 3);
+            assert!(!reverted.fatal, "the epoch served on under the previous policy");
+            assert!(
+                reverted.reason.contains("no longer resident"),
+                "the policy's own account: {}",
+                reverted.reason
+            );
+        }
+        other => panic!("the revert arrived as itself, not {other:?}"),
+    }
     assert!(
         matches!(
-            reports[1].kind,
+            reports[2].kind,
             Some(process::report::Kind::Committed(process::Committed {}))
         ),
-        "the other thread's report arrived second"
+        "the other thread's report arrived last"
     );
     assert!(
         rounds[1].is_empty(),

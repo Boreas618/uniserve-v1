@@ -436,25 +436,24 @@ impl Routing {
     /// while `batches` counts every batch every rank finalized, which is larger
     /// because a step submits one batch per (phase, component). `tokens` sums
     /// the tokens the workers' forwards carried, `queue` is each rank's waiting
-    /// depth, and `policy_fuel` and `policy_calls` come from the policy
-    /// instances (§12). The device's counters and the allocators' figures are
+    /// depth, and `policy_fuel` and `policy_calls` are the instances' own
+    /// figures, summed by [`policy_usage`] (§12). The device's counters and the allocators' figures are
     /// not this thread's: they come with the executor's `counters()` and the
     /// allocators' reports.
     fn metrics(&self) -> wire::Metrics {
         let mut metrics = wire::Metrics::default();
-        let mut usage = self.route_usage();
+        let mut reported: Vec<Option<PolicyUsage>> = Vec::with_capacity(self.slots.len());
         for (index, slot) in self.slots.iter().enumerate() {
-            if let Ok(progress) = slot
+            let progress = slot
                 .handle
                 .progress()
                 .recv_timeout(std::time::Duration::from_millis(200))
-            {
-                metrics.steps = metrics.steps.max(progress.step);
-                if let Some(cost) = progress.usage {
-                    usage.calls += cost.calls;
-                    usage.fuel += cost.fuel;
-                }
-            }
+                .ok();
+            metrics.steps = metrics.steps.max(progress.as_ref().map_or(0, |progress| progress.step));
+            // A scheduler that did not answer this tick, and one that has no
+            // policy yet, states no cost: the frame undercounts that rank's
+            // cumulative figure until the rank answers again.
+            reported.push(progress.and_then(|progress| progress.usage));
             let stats = slot.handle.stats();
             metrics.batches += stats.general.steps.load(Ordering::Relaxed);
             metrics.tokens += crate::lock(&stats.worker.forward_mode_tokens)
@@ -466,6 +465,7 @@ impl Routing {
                     .unwrap_or(u32::MAX),
             });
         }
+        let usage = policy_usage(self.route_usage(), reported);
         metrics.policy_fuel = usage.fuel;
         metrics.policy_calls = usage.calls;
         metrics
@@ -2558,6 +2558,24 @@ fn report_policy(report: proto::process::Report) {
     }
 }
 
+/// The epoch's policy cost (§12): the control thread's route instance and every
+/// scheduler's, summed. A scheduler that has no policy yet adds nothing.
+///
+/// Each figure is cumulative per instance and a switchover carries a
+/// scheduler's total forward, so the sum over the schedulers only grows.
+fn policy_usage(
+    route: PolicyUsage,
+    schedulers: impl IntoIterator<Item = Option<PolicyUsage>>,
+) -> PolicyUsage {
+    schedulers
+        .into_iter()
+        .flatten()
+        .fold(route, |sum, usage| PolicyUsage {
+            calls: sum.calls + usage.calls,
+            fuel: sum.fuel + usage.fuel,
+        })
+}
+
 /// §7.3's precondition, or the failure that answers a command with none.
 /// The answer to a precopy that prepared `generation` (§7.3 step 2): the
 /// daemon's own number, echoed back.
@@ -3510,6 +3528,27 @@ mod tests {
             }
         }
         assert!(policy.calls().is_empty());
+    }
+
+    #[test]
+    fn the_epochs_policy_cost_is_the_route_instance_and_every_scheduler() {
+        let usage = |calls, fuel| PolicyUsage { calls, fuel };
+        // A scheduler that has no policy yet states nothing and adds nothing,
+        // and the control thread's route instance is part of the epoch's cost
+        // whether or not any scheduler serves.
+        assert_eq!(
+            policy_usage(
+                usage(3, 300),
+                vec![Some(usage(2, 20)), None, Some(usage(4, 40))]
+            ),
+            usage(9, 360),
+            "every instance's calls and fuel, summed"
+        );
+        assert_eq!(
+            policy_usage(usage(1, 10), Vec::new()),
+            usage(1, 10),
+            "the route instance alone is still the epoch's cost"
+        );
     }
 
     #[test]
