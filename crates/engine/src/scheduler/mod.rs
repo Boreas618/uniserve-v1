@@ -42,8 +42,9 @@ pub use config::{
     DEFAULT_MAX_RUNNING_REQUESTS, RefillPolicy, SchedulerConfig,
 };
 pub use policy::{
-    PREFETCH_FLOOR_TOKENS, PolicyBytes, PolicyPorts, PolicyProgram, PolicyReverted, PolicySlot,
-    PolicySource, PolicyStore, RouteFeed, RoutePolicy, Stage, TrialState, Validators,
+    BatchCapacity, Candidate, PREFETCH_FLOOR_TOKENS, PolicyBytes, PolicyPorts, PolicyProgram, PolicyReverted,
+    PolicySlot, PolicySource, PolicyState, PolicyStore, RouteFeed, RoutePolicy, Stage, TrialState,
+    Validators,
     backend_name, ceilings_of, parameters_of, program_of,
 };
 pub(crate) use execution::generation_consuming_calls;
@@ -157,7 +158,6 @@ const PAGE_FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Number of batches carrying `BatchKind::Prefill` calls that may await
 /// their results before ready decode work takes precedence over further
 /// prefill (`Scheduler::select_batch_kind`).
-const PREFILL_WINDOW_CREDITS: usize = 2;
 
 /// Builds an image-completion event from a base64 PNG payload and, when the
 /// request feeds the image back from the device, the decoded image product's
@@ -465,6 +465,20 @@ pub struct Scheduler {
     /// Finished requests whose storage stays allocated until their workers
     /// acknowledge the `Finish` command.
     retiring_requests: HashMap<RequestId, RetiringRequest>,
+    /// The step's policy: the instance that decides, installed when the
+    /// scheduler starts and replaced only by the switch at a batch boundary.
+    ///
+    /// `None` between construction and [`Scheduler::adopt`]: a slot is
+    /// installed on a state that the scheduler owns, so it is adopted once the
+    /// scheduler exists and before its first step.
+    policy: Option<policy::PolicySlot>,
+    /// The report of a policy failure the mechanism did not take from `fail`'s
+    /// answer, for the control thread.
+    policy_report: Option<policy::PolicyReverted>,
+    /// The events and transitions a policy is told about (§4.4).
+    recorder: mechanism::Recorder,
+    /// The step number this scheduler is at.
+    step: u64,
     /// Maximum number of transfer calls holding a reservation at once
     /// (`Inflight::num_pending_transfers`).
     transfer_capacity: usize,
@@ -487,9 +501,6 @@ pub struct Scheduler {
     /// `assembly_priority`.
     running_order: Vec<RequestId>,
     output: output::OutputSender,
-    /// Whether the next scheduling pass tries video media work before
-    /// generation work (`Scheduler::schedule_batches`).
-    prefer_media: bool,
     /// Engine-fatal latch: set when the executor/worker dies or a scheduler
     /// invariant breaks; the control loop exits and the host converts this
     /// into engine-dead.
