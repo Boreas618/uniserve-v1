@@ -1497,15 +1497,15 @@ impl Cudnn {
         stage!("the convolution's own checks", convolution.check());
 
         let x = stage!(
-            "tensor x: type, dimensions, strides, unique id, finalize",
+            "tensor x: type, dimensions, strides, unique id, byte alignment, finalize",
             Operation::tensor(self.api, &convolution.x, UID_X)
         );
         let w = stage!(
-            "tensor w: type, dimensions, strides, unique id, finalize",
+            "tensor w: type, dimensions, strides, unique id, byte alignment, finalize",
             Operation::tensor(self.api, &convolution.w, UID_W)
         );
         let y = stage!(
-            "tensor y: type, dimensions, strides, unique id, finalize",
+            "tensor y: type, dimensions, strides, unique id, byte alignment, finalize",
             Operation::tensor(self.api, &convolution.y, UID_Y)
         );
         let kernel = stage!(
