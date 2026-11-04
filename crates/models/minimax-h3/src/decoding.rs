@@ -17,11 +17,11 @@
 //!
 //! ## What each decoder hands the media stage
 //!
-//! `DecodedMedia.video` is `[frames, height, width, 3]` **uint8**, channel-last and row-major: the
-//! rgb24 raster a media encoder reads, after the checkpoint's ImageNet denormalization per channel,
-//! a clamp to [0, 1] and one round-half-even quantization. `DecodedMedia.audio` is `[samples, 2]`
-//! **int16**: the interleaved stereo PCM `crate::audio_vae::Pcm` states the arithmetic of. The media
-//! stage encodes those two rasters and muxes them; it reads no model-owned state.
+//! [`crate::output`] states the two rasters and their quantization — the video's `[frames, height,
+//! width, 3]` bytes and the audio's `[samples, 2]` integers — because they are the media stage's
+//! contract rather than this plan's. What belongs here is the arithmetic that decides *which* frames
+//! and *which* samples go where: the clip splice, the overlap the predecessor lends, and the halo a
+//! decoded audio window carries.
 
 use crate::{Error, Result, config::CLIP_FRAMES, config::CLIP_LATENTS};
 
