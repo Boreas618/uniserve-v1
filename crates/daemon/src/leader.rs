@@ -582,24 +582,25 @@ impl Leader {
         world: u64,
     ) -> anyhow::Result<()> {
         let filled = crate::epoch::FilledPrograms::of(config);
-        // What a startup switch asks the Program Servers for is the
-        // scheduling policy alone: it installs no kernel. The engine resolves
-        // the kernel programs an operator needs when it loads them, so a
-        // `prepare` for every operator's package would refuse on a host that
-        // installs none, and the epoch's own record still names the whole
-        // deployment (`filled`).
-        let policy_only = crate::epoch::FilledPrograms {
-            kernels: std::collections::BTreeMap::new(),
-            policy: filled.policy.clone(),
-        };
+        // The startup switch installs the epoch's programs as its record names
+        // them: the scheduling policy *and* the kernel of every operator the
+        // deployment selects. A main process resolves no kernel itself — its
+        // backends are the installed programs, and a kernel it was never given
+        // fails the first request that needs it — so an epoch that prepared the
+        // policy alone serves its first token with nothing to run.
+        //
+        // A Program Server without a program for one of those operators refuses
+        // the epoch by name here, before it serves, which is the correct
+        // refusal: the deployment selects a backend whose package is not
+        // installed.
         let servers = self.program_servers(config);
         let leader_host = self.program_leader_host(config, &servers);
         let prepared = {
             let servers = servers.clone();
             let leader_host = leader_host.clone();
-            let policy_only = policy_only.clone();
+            let filled = filled.clone();
             tokio::task::spawn_blocking(move || {
-                crate::engine::control::prepare_epoch(&servers, &leader_host, &policy_only, &[])
+                crate::engine::control::prepare_epoch(&servers, &leader_host, &filled, &[])
             })
             .await
             .context("preparing the epoch's programs")?
@@ -625,9 +626,9 @@ impl Leader {
                 processes,
                 crate::epoch::Update::new(0, installed),
             );
-            // No kernel moves at a startup switch: it installs the
-            // scheduling policy the epoch serves with.
-            switch.precopy(&std::collections::BTreeMap::new(), &prepared.policy)?;
+            // The epoch's programs, kernels and policy alike: the main
+            // processes serve their first request with them.
+            switch.precopy(&prepared.kernels, &prepared.policy)?;
             switch.switchover()?;
             switch.commit()?;
             Ok::<_, crate::epoch::Failure>(switch.generations().to_vec())
