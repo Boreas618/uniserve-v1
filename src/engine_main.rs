@@ -1231,6 +1231,26 @@ impl MainProcess {
             return Ok(());
         }
 
+        // A `Precopy` that names no kernel program is the startup switch: the daemon states the
+        // scheduling policy alone, because on a host that runs the worker path there is no kernel
+        // package to prepare (`crates/daemon/src/leader.rs`, `install_programs`). This process
+        // installs what it can actually launch, so an unnamed set is resolved from the store's
+        // listing rather than captured into an empty generation.
+        let resolved;
+        let programs = if programs.is_empty() {
+            resolved = match self.listed_programs() {
+                Ok(programs) => programs,
+                Err(failure) => return self.abandon_precopy(generation, failure, reply),
+            };
+            tracing::info!(
+                operators = resolved.len(),
+                "the precopy named no kernel program: installing this host's built programs"
+            );
+            &resolved
+        } else {
+            programs
+        };
+
         let tasks = match self.admit_installs(programs, &BTreeMap::new()) {
             Ok(tasks) => tasks,
             Err(failure) => return self.abandon_precopy(generation, failure, reply),
@@ -1259,6 +1279,86 @@ impl MainProcess {
         client
             .list()
             .map_err(|error| format!("reading the Program Server's store: {error}"))
+    }
+
+    /// The programs this host has built, one per operator, for a precopy that names none.
+    ///
+    /// The epoch's first generation has no serving generation to take keys from and a startup
+    /// switch states the scheduling policy alone, so the engine resolves what it can launch: the
+    /// store's listing is the authority, because its packages are the modules actually built for
+    /// this host's targets.
+    ///
+    /// A program is chosen by **identity**, not by a specification: the operator's highest installed
+    /// revision, ties broken by the backend's name so the choice is the same on every run. The
+    /// listing carries no build arguments and none are needed - the store matches a program on
+    /// `(operator, backend)` and fills the package's own parameter defaults, so `arguments` only ever
+    /// overrides a default that the package already states.
+    ///
+    /// An operator built under two backends is one slot and takes one program, which is why the tie
+    /// is broken by name and logged: a deployment that wants a particular backend says so through
+    /// the daemon, which names it in the `Precopy`.
+    fn listed_programs(&self) -> std::result::Result<Programs, UpdateFailure> {
+        let invalid = |reason: String| UpdateFailure::Precopy { reason };
+        let listing = self.listing().map_err(invalid)?;
+        // The chosen (backend, revision) per operator, by the rule in the doc above.
+        let mut chosen: BTreeMap<String, (String, u32)> = BTreeMap::new();
+        let mut built = 0usize;
+        for package in &listing.packages {
+            // A package with no built module for any target cannot launch here: installing it would
+            // promise a kernel the store cannot resolve.
+            if package.modules.is_empty() {
+                continue;
+            }
+            built += 1;
+            let candidate = (package.backend.clone(), package.revision);
+            match chosen.get(&package.op) {
+                Some((backend, revision))
+                    if *revision > candidate.1
+                        || (*revision == candidate.1
+                            && backend.as_str() <= candidate.0.as_str()) => {}
+                _ => {
+                    if let Some((backend, revision)) = chosen.get(&package.op) {
+                        tracing::info!(
+                            op = %package.op,
+                            taken = %candidate.0,
+                            revision = candidate.1,
+                            held = %backend,
+                            held_revision = revision,
+                            "an operator is built under two backends: the higher revision wins, \
+                             ties by backend name"
+                        );
+                    }
+                    chosen.insert(package.op.clone(), candidate);
+                }
+            }
+        }
+        if chosen.is_empty() {
+            return Err(invalid(format!(
+                "the precopy named no kernel program and this host has built none: the store's \
+                 listing holds {} package(s) and none has a module for this host's targets, so \
+                 there is nothing to install",
+                listing.packages.len()
+            )));
+        }
+        tracing::info!(
+            packages = built,
+            operators = chosen.len(),
+            "resolved this host's built programs for a precopy that named none"
+        );
+        let mut programs = Programs::new();
+        for (op, (backend, revision)) in chosen {
+            programs.insert(
+                program_server::program::ProgramSlot { op, phase: None },
+                Program {
+                    backend,
+                    revision,
+                    // The package's own defaults are the arguments the operator's modules were
+                    // built with; the deployment overrides them by naming a program.
+                    arguments: Default::default(),
+                },
+            );
+        }
+        Ok(programs)
     }
 
     /// The module-load tasks one generation needs, one per device (§7.3 step 2).
