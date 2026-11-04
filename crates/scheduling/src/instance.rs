@@ -46,6 +46,10 @@ pub struct PolicyInstance {
     exports: Exports,
     limits: Limits,
     call_fuel: u64,
+    /// Fuel every call into the module has consumed since instantiation, which
+    /// is how §12's per-step policy cost is measured: the mechanism takes the
+    /// difference around a step's `observe` and `dispatch`.
+    fuel_consumed: u64,
     /// The call whose failure ended this instance, if one did.
     failed: Option<Call>,
 }
@@ -158,6 +162,7 @@ impl PolicyInstance {
             exports,
             limits: Limits::default(),
             call_fuel: DEFAULT_CALL_FUEL,
+            fuel_consumed: 0,
             failed: None,
         };
         policy.initialize(init)?;
@@ -174,6 +179,16 @@ impl PolicyInstance {
     /// Sets the fuel one call may consume, from the mechanism's configuration.
     pub const fn set_call_fuel(&mut self, fuel: u64) {
         self.call_fuel = fuel;
+    }
+
+    /// Fuel every call into the module has consumed since instantiation.
+    ///
+    /// Fuel is a deterministic count of the work the module did, so this is
+    /// the measurement §12 asks for: the mechanism records it before and after
+    /// a step's `observe` and `dispatch` and reports the difference beside the
+    /// step's duration.
+    pub const fn fuel_consumed(&self) -> u64 {
+        self.fuel_consumed
     }
 
     /// The limits the policy declared at instantiation, already checked against
@@ -287,6 +302,7 @@ impl PolicyInstance {
                 .limits
                 .call(&mut policy.store, ())
                 .map_err(|error| classify(Call::Limits, error))?;
+            policy.spent();
             let reply = policy.take_reply(Call::Limits, packed)?;
             decode(Call::Limits, reply)
         })
@@ -325,9 +341,11 @@ impl PolicyInstance {
                 .exports
                 .replying(call)
                 .ok_or_else(|| malformed(call, "this call does not answer with a buffer"))?;
-            export
+            let reply = export
                 .call(&mut self.store, (ptr, len))
-                .map_err(|error| classify(call, error))?
+                .map_err(|error| classify(call, error))?;
+            self.spent();
+            reply
         };
         self.release(call, ptr, len)?;
         self.take_reply(call, packed)
@@ -345,9 +363,11 @@ impl PolicyInstance {
                 .exports
                 .indexing(call)
                 .ok_or_else(|| malformed(call, "this call does not answer with an index"))?;
-            export
+            let index = export
                 .call(&mut self.store, (ptr, len))
-                .map_err(|error| classify(call, error))?
+                .map_err(|error| classify(call, error))?;
+            self.spent();
+            index
         };
         self.release(call, ptr, len)?;
         Ok(index)
@@ -363,6 +383,7 @@ impl PolicyInstance {
             .allocate
             .call(&mut self.store, len)
             .map_err(|error| classify(call, error))?;
+        self.spent();
         if ptr == 0 && len != 0 {
             return Err(malformed(call, "the module could not reserve the message"));
         }
@@ -382,10 +403,13 @@ impl PolicyInstance {
     /// Releases a buffer of the module's memory.
     fn release(&mut self, call: Call, ptr: u32, len: u32) -> Result<(), PolicyError> {
         self.charge(call)?;
-        self.exports
+        let released = self
+            .exports
             .release
             .call(&mut self.store, (ptr, len))
-            .map_err(|error| classify(call, error))
+            .map_err(|error| classify(call, error));
+        self.spent();
+        released
     }
 
     /// Copies the reply an export returned out of the module's memory and
@@ -418,6 +442,14 @@ impl PolicyInstance {
             .read(&self.store, start, &mut reply)
             .map_err(|error| malformed(call, format!("cannot read the reply: {error}")))?;
         Ok(reply)
+    }
+
+    /// Records the fuel the call that just returned consumed.
+    fn spent(&mut self) {
+        let remaining = self.store.get_fuel().unwrap_or(0);
+        self.fuel_consumed = self
+            .fuel_consumed
+            .saturating_add(self.call_fuel.saturating_sub(remaining));
     }
 
     /// Gives the next call into the module its whole fuel budget.
