@@ -542,6 +542,10 @@ pub struct PreparedProcess {
 pub struct Epochs {
     records: Mutex<BTreeMap<u64, EpochRecord>>,
     processes: Mutex<Vec<ManagedProcess>>,
+    /// The daemon's process table, once the daemon that supervises this
+    /// node's processes attached it: the processes are the supervisor's to
+    /// report, and this record keeps what each of them is (§2.3).
+    supervised: std::sync::OnceLock<std::sync::Arc<Mutex<Vec<ManagedProcess>>>>,
     update: Mutex<Option<Update>>,
     /// The last launch generation allocated per worker group and rank.
     generations: Mutex<BTreeMap<(String, u64), u64>>,
@@ -714,12 +718,24 @@ impl Epochs {
         locked(&self.program).clone()
     }
 
+    /// Whether a program-layer update is on probation: the main processes
+    /// execute its generation, and the epoch keeps the generation that served
+    /// before it as the last resort until it is committed or reverted (§7.3
+    /// step 4).
+    pub fn program_in_flight(&self) -> bool {
+        self.program_update()
+            .is_some_and(|program| program.update.state == UpdateState::Probation)
+    }
+
     /// Applies `update`, a program-layer change a routing decision prepared,
     /// to the main processes `processes`: their programs are prepared
     /// (`Precopy`), they switch to the generation each numbered, and the
     /// epoch's record takes the new programs as the probation's (§7.3 steps
     /// 2-4). The probation lasts until [`Self::commit_programs`] or
     /// [`Self::revert_programs`].
+    ///
+    /// Refuses an update a revert marked unavailable unless `force` asks for
+    /// it anyway (§7.2).
     ///
     /// # Errors
     ///
@@ -731,7 +747,21 @@ impl Epochs {
         &self,
         update: Update,
         processes: Vec<crate::engine::control::EpochProcess>,
+        force: bool,
     ) -> Result<(), Failure> {
+        // §7.2: one update is one operation with one probation, committed or
+        // reverted as a whole. A second change applied now would replace the
+        // epoch's last resort with the generation the first update has not
+        // proven yet, so it waits for the commit or the revert.
+        if self.program_in_flight() {
+            return Err(Failure {
+                kind: "in_flight".to_owned(),
+                reason: "a program-layer update is on probation: it is committed or reverted \
+                         before another change is applied"
+                    .to_owned(),
+                device: None,
+            });
+        }
         let commands = locked(&self.commands).clone().ok_or_else(|| Failure {
             kind: "no_command_channel".to_owned(),
             reason: "the daemon has no channel to its main processes".to_owned(),
@@ -742,8 +772,23 @@ impl Epochs {
             reason: "the daemon executes no epoch".to_owned(),
             device: None,
         })?;
+        // §7.2: an update that a revert marked unavailable is refused until
+        // it is applied with `force`, whatever it says about itself.
+        if !force {
+            if let Some(failure) = self.unavailable(&update.target) {
+                return Err(Failure {
+                    kind: "unavailable".to_owned(),
+                    reason: format!(
+                        "this update was reverted and is unavailable after a {} failure: {}",
+                        failure.kind, failure.reason
+                    ),
+                    device: failure.device,
+                });
+            }
+        }
         let programs = update.target.programs.clone();
-        let mut switch = crate::engine::control::ProgramSwitch::new(&commands, processes, update.clone());
+        let mut switch =
+            crate::engine::control::ProgramSwitch::new(&commands, processes, update.clone());
         switch.precopy(&programs.kernels, &programs.policy)?;
         switch.switchover()?;
         // The generation the main processes execute is the epoch's now; the
@@ -787,9 +832,9 @@ impl Epochs {
         let Some(program) = self.program_update() else {
             return Ok(false);
         };
-        let commands = locked(&self.commands).clone().ok_or_else(|| {
-            anyhow::anyhow!("the daemon has no channel to its main processes")
-        })?;
+        let commands = locked(&self.commands)
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("the daemon has no channel to its main processes"))?;
         let processes: Vec<_> = program
             .prepared
             .iter()
@@ -833,12 +878,44 @@ impl Epochs {
     /// Fails when a main process does not answer the revert. The epochs'
     /// records are the previous generation's either way.
     pub fn revert_programs(&self, reason: &str) -> anyhow::Result<bool> {
+        self.revert_programs_because(reason, None)
+    }
+
+    /// Reverts the program-layer update on probation because a main process
+    /// failed, and records that failure as the update's first one (§7.3
+    /// step 4): a main process that exits, an executor it can no longer use, a
+    /// stuck job, a non-finite logit or a policy error all end the probation in
+    /// favour of the generation that served before it, and the update stays
+    /// unavailable with this failure until it is applied with `force` (§7.2).
+    ///
+    /// Answers whether an update was on probation to revert. A process that
+    /// cannot be told is logged, not returned: what serves is the previous
+    /// generation either way, and the report moves nothing.
+    pub fn program_failure(&self, failure: Failure) -> bool {
+        if !self.program_in_flight() {
+            return false;
+        }
+        let reason = format!("{}: {}", failure.kind, failure.reason);
+        if let Err(error) = self.revert_programs_because(&reason, Some(failure)) {
+            tracing::warn!(%error, "reverting the program update after a failure");
+        }
+        true
+    }
+
+    /// [`Self::revert_programs`], with the failure that caused an automatic
+    /// revert recorded as the update's first one when the processes did not
+    /// produce one themselves.
+    fn revert_programs_because(
+        &self,
+        reason: &str,
+        cause: Option<Failure>,
+    ) -> anyhow::Result<bool> {
         let Some(program) = self.program_update() else {
             return Ok(false);
         };
-        let commands = locked(&self.commands).clone().ok_or_else(|| {
-            anyhow::anyhow!("the daemon has no channel to its main processes")
-        })?;
+        let commands = locked(&self.commands)
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("the daemon has no channel to its main processes"))?;
         let processes: Vec<_> = program
             .prepared
             .iter()
@@ -860,7 +937,13 @@ impl Epochs {
         );
         let outcome = switch.revert(reason);
         self.reverted(program.epoch);
-        *locked(&self.update) = Some(switch.update().clone());
+        let mut update = switch.update().clone();
+        // The failure that made the revert automatic is the update's first one
+        // unless a process reported one of its own while it was being told.
+        if let Some(cause) = cause {
+            update.fail(cause);
+        }
+        *locked(&self.update) = Some(update);
         *locked(&self.program) = None;
         if let Err(failure) = outcome {
             anyhow::bail!("reverting the program update: {}", failure.reason);
@@ -890,12 +973,26 @@ impl Epochs {
 
     /// Replaces the node's process table with `processes`.
     pub fn set_processes(&self, processes: Vec<ManagedProcess>) {
-        *locked(&self.processes) = processes;
+        match self.supervised.get() {
+            Some(table) => *locked(table) = processes,
+            None => *locked(&self.processes) = processes,
+        }
     }
 
     /// The node's process table.
     pub fn processes(&self) -> Vec<ManagedProcess> {
-        locked(&self.processes).clone()
+        match self.supervised.get() {
+            Some(table) => locked(table).clone(),
+            None => locked(&self.processes).clone(),
+        }
+    }
+
+    /// Reports the node's processes from `table` from now on: the daemon that
+    /// supervises them writes them there as they start and end, so the record
+    /// names every process of the deployment and never a stale one (§2.3).
+    /// The first table attached is the one kept.
+    pub fn attach_processes(&self, table: std::sync::Arc<Mutex<Vec<ManagedProcess>>>) {
+        let _ = self.supervised.set(table);
     }
 
     /// The epochs and the process table as `GET /admin/config` reports
@@ -1127,17 +1224,24 @@ fn policy_arguments(config: &ServeConfig) -> toml::Table {
         refill_token_cost: Option<f64>,
     }
     let scheduler = &config.scheduler_config;
+    // The token bound this launch gives its workers, which is the same
+    // `max_num_batched_tokens` its `EngineSpec` states (§2.5): the policy's
+    // declared limits are these bounds, not a second opinion about them. A
+    // prefill chunk that the deployment states larger than its token bound is
+    // refused by the mechanism (`PolicyError::BadLimits`), never clamped here.
+    let token_bound = config
+        .max_num_batched_tokens
+        .map(|size| u32::try_from(size.get()).unwrap_or(u32::MAX));
     let arguments = Arguments {
         chunked_prefill_size: scheduler
             .chunked_prefill_size
-            .map(|size| u32::try_from(size.get()).unwrap_or(u32::MAX)),
+            .map(|size| u32::try_from(size.get()).unwrap_or(u32::MAX))
+            .or(token_bound),
         max_queued_requests: scheduler
             .max_queued_requests
             .map(|size| u32::try_from(size.get()).unwrap_or(u32::MAX)),
         max_batch: u32::try_from(scheduler.max_batch.get()).unwrap_or(u32::MAX),
-        max_num_batched_tokens: config
-            .max_num_batched_tokens
-            .map(|size| u32::try_from(size.get()).unwrap_or(u32::MAX)),
+        max_num_batched_tokens: token_bound,
         expected_speedup: config.speculative_config.expected_speedup,
         refill_token_cost: config.speculative_config.refill_token_cost,
     };
@@ -1272,16 +1376,16 @@ mod tests {
         }
     }
 
-
     /// A program-layer update in flight is the epoch's probation: the record
     /// names the programs the main processes took, the previous generation is
     /// kept, and a commit ends the probation without the epoch stopping
     /// (§7.3 steps 4-6).
     #[test]
     fn a_program_update_serves_from_the_generation_it_switched_to_until_it_is_committed() {
-        use crate::engine::stand_in::{main_processes, process, Answer, Seen};
+        use crate::engine::stand_in::{Answer, Seen, main_processes, process};
 
-        let (commands, seen) = main_processes(vec![(7, Answer::Serves(11)), (8, Answer::Serves(12))]);
+        let (commands, seen) =
+            main_processes(vec![(7, Answer::Serves(11)), (8, Answer::Serves(12))]);
         let epochs = Epochs::new();
         let config = ServeConfig::default();
         let serving = Deployment {
@@ -1302,7 +1406,11 @@ mod tests {
         target.programs = programs.clone();
         let update = Update::new(1, target);
         epochs
-            .apply_programs(update, vec![process("rank-0", 7), process("rank-1", 8)])
+            .apply_programs(
+                update,
+                vec![process("rank-0", 7), process("rank-1", 8)],
+                false,
+            )
             .expect("both main processes took the programs");
 
         // The epoch is on probation from the generation the update switched
@@ -1319,7 +1427,9 @@ mod tests {
         assert!(serving_epoch.previous_policy.is_some());
 
         assert!(
-            epochs.commit_programs().expect("both main processes committed"),
+            epochs
+                .commit_programs()
+                .expect("both main processes committed"),
             "a program-layer update is committed here"
         );
         let serving_epoch = epochs.get(0).expect("the epoch is recorded");
@@ -1349,12 +1459,151 @@ mod tests {
         );
     }
 
+    /// A main process that fails during the probation ends it in favour of the
+    /// generation that served before, and the update stays unavailable with the
+    /// failure that caused it until it is applied with `force` (§7.2, §7.3
+    /// step 4).
+    #[test]
+    fn a_main_process_failure_during_probation_reverts_the_program_update() {
+        use crate::engine::stand_in::{main_processes, process, Answer, Seen};
+
+        let (commands, seen) = main_processes(vec![(7, Answer::Serves(11))]);
+        let epochs = Epochs::new();
+        let config = ServeConfig::default();
+        let serving = Deployment {
+            config: config.clone(),
+            build_config: BuildConfig::of(&config),
+            programs: FilledPrograms::of(&config),
+        };
+        epochs.install(0, &serving, 3, &[10]);
+        epochs.supervise(commands);
+
+        let mut target = serving.clone();
+        let mut programs = FilledPrograms::of(&config);
+        programs
+            .policy
+            .arguments
+            .insert("max_batch".to_owned(), toml::Value::Integer(8));
+        target.programs = programs.clone();
+        epochs
+            .apply_programs(Update::new(1, target.clone()), vec![process("rank-0", 7)], false)
+            .expect("the update switches over");
+        assert!(epochs.program_in_flight());
+
+        let failure = Failure {
+            kind: "illegal_address".to_owned(),
+            reason: "the executor can no longer run".to_owned(),
+            device: Some(0),
+        };
+        assert!(
+            epochs.program_failure(failure.clone()),
+            "a failure during probation reverts the update"
+        );
+
+        // The previous generation serves again, nothing is in flight, and the
+        // update is unavailable for the failure that caused the revert.
+        let record = epochs.get(0).expect("the epoch is recorded");
+        assert_eq!(record.status, Status::Serving);
+        assert_eq!(record.policy, serving.programs.policy);
+        assert!(record.previous_policy.is_none());
+        assert!(epochs.program_update().is_none());
+        assert_eq!(
+            epochs.update().expect("the update is recorded").first_failure,
+            Some(failure.clone())
+        );
+        assert_eq!(epochs.unavailable(&target), Some(failure));
+        assert!(
+            !epochs.program_failure(Failure {
+                kind: "policy_error".to_owned(),
+                reason: "no probation to end".to_owned(),
+                device: None,
+            }),
+            "a failure after the revert moves nothing"
+        );
+
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            matches!(seen.last(), Some((7, Seen::Revert(_)))),
+            "the main process was told to revert: {seen:?}"
+        );
+    }
+
+    /// One update is one operation with one probation (§7.2): a second
+    /// program-layer change waits for the first to be committed or reverted,
+    /// so the epoch's last resort stays the generation that served before the
+    /// first began (§7.3 steps 4 and 5).
+    #[test]
+    fn a_second_program_update_waits_for_the_first_ones_probation() {
+        use crate::engine::stand_in::{Answer, main_processes, process};
+
+        let (commands, _seen) = main_processes(vec![(7, Answer::Serves(11))]);
+        let epochs = Epochs::new();
+        let config = ServeConfig::default();
+        let serving = Deployment {
+            config: config.clone(),
+            build_config: BuildConfig::of(&config),
+            programs: FilledPrograms::of(&config),
+        };
+        epochs.install(0, &serving, 3, &[10]);
+        epochs.supervise(commands);
+
+        let mut first = serving.clone();
+        let mut programs = FilledPrograms::of(&config);
+        programs
+            .policy
+            .arguments
+            .insert("max_batch".to_owned(), toml::Value::Integer(8));
+        first.programs = programs;
+        epochs
+            .apply_programs(Update::new(1, first), vec![process("rank-0", 7)], false)
+            .expect("the first update switches over");
+        let last_resort = epochs
+            .get(0)
+            .expect("the epoch is recorded")
+            .previous_policy
+            .clone();
+        assert!(
+            last_resort.is_some(),
+            "the first update keeps the policy it replaced"
+        );
+
+        let mut second = serving.clone();
+        let mut programs = FilledPrograms::of(&config);
+        programs
+            .policy
+            .arguments
+            .insert("max_batch".to_owned(), toml::Value::Integer(4));
+        second.programs = programs;
+        let failure = epochs
+            .apply_programs(Update::new(2, second), vec![process("rank-0", 7)], false)
+            .expect_err("an update on probation is not replaced");
+        assert_eq!(failure.kind, "in_flight");
+
+        // Nothing moved: the first update is still the one in flight, and the
+        // last resort is still the generation that served before it.
+        assert_eq!(
+            epochs
+                .program_update()
+                .expect("the first update is in flight")
+                .update
+                .number,
+            1
+        );
+        assert_eq!(
+            epochs
+                .get(0)
+                .expect("the epoch is recorded")
+                .previous_policy,
+            last_resort
+        );
+    }
+
     /// A revert puts the previous generation back in every main process and
     /// in the epoch's record, and the update stays unavailable with its first
     /// failure until it is applied with `force` (§7.2, §7.3 step 5).
     #[test]
     fn a_reverted_program_update_leaves_the_previous_programs_serving() {
-        use crate::engine::stand_in::{main_processes, process, Answer};
+        use crate::engine::stand_in::{Answer, main_processes, process};
 
         let (commands, seen) = main_processes(vec![(7, Answer::Serves(11))]);
         let epochs = Epochs::new();
@@ -1375,10 +1624,12 @@ mod tests {
             .insert("max_batch".to_owned(), toml::Value::Integer(8));
         target.programs = programs;
         epochs
-            .apply_programs(Update::new(2, target), vec![process("rank-0", 7)])
+            .apply_programs(Update::new(2, target), vec![process("rank-0", 7)], false)
             .expect("the main process took the programs");
         assert!(
-            epochs.revert_programs("a trial refused it").expect("the revert was answered")
+            epochs
+                .revert_programs("a trial refused it")
+                .expect("the revert was answered")
         );
 
         let serving_epoch = epochs.get(0).expect("the epoch is recorded");
@@ -1389,13 +1640,63 @@ mod tests {
         );
         let reverted = seen.lock().unwrap().clone();
         assert!(
-            reverted
-                .iter()
-                .any(|(engine, what)| *engine == 7 && *what == Seen::Revert("a trial refused it".to_owned())),
+            reverted.iter().any(|(engine, what)| *engine == 7
+                && *what == Seen::Revert("a trial refused it".to_owned())),
             "{reverted:?}"
         );
         let update = epochs.update().expect("the update is recorded");
         assert_eq!(update.state, UpdateState::Reverted);
+    }
+
+    /// An update a revert marked unavailable is refused until it is applied
+    /// with `force`, which is the whole of §7.2's refusal: the same target,
+    /// applied again, is not taken twice by accident.
+    #[test]
+    fn a_reverted_update_is_refused_until_it_is_forced() {
+        use crate::engine::stand_in::{Answer, main_processes, process};
+
+        let (commands, _) = main_processes(vec![(7, Answer::Serves(11)), (8, Answer::Serves(12))]);
+        let epochs = Epochs::new();
+        let config = ServeConfig::default();
+        let serving = Deployment {
+            config: config.clone(),
+            build_config: BuildConfig::of(&config),
+            programs: FilledPrograms::of(&config),
+        };
+        epochs.install(0, &serving, 3, &[10]);
+        epochs.supervise(commands);
+
+        let mut target = serving.clone();
+        let mut programs = FilledPrograms::of(&config);
+        programs
+            .policy
+            .arguments
+            .insert("max_batch".to_owned(), toml::Value::Integer(8));
+        target.programs = programs;
+
+        let processes = || vec![process("rank-0", 7), process("rank-1", 8)];
+        epochs
+            .apply_programs(Update::new(1, target.clone()), processes(), false)
+            .expect("the first application is taken");
+        epochs
+            .revert_programs("the policy refused a decision")
+            .expect("the revert is answered");
+
+        let refused = epochs
+            .apply_programs(Update::new(1, target.clone()), processes(), false)
+            .expect_err("a reverted update is unavailable");
+        assert_eq!(refused.kind, "unavailable");
+        assert!(
+            refused.reason.contains("the policy refused a decision"),
+            "{}",
+            refused.reason
+        );
+        assert!(epochs.program_update().is_none());
+
+        epochs
+            .apply_programs(Update::new(1, target), processes(), true)
+            .expect("force applies it anyway");
+        assert!(epochs.program_update().is_some());
     }
 
     /// A refused precopy changes nothing that serves, and an update in flight
@@ -1403,7 +1704,7 @@ mod tests {
     /// program-layer update, so a caller falls through to the world path.
     #[test]
     fn a_refused_precopy_records_no_probation_and_a_commit_falls_through() {
-        use crate::engine::stand_in::{main_processes, process, Answer};
+        use crate::engine::stand_in::{Answer, main_processes, process};
 
         let (commands, _) = main_processes(vec![(
             7,
@@ -1428,13 +1729,103 @@ mod tests {
             .insert("max_batch".to_owned(), toml::Value::Integer(8));
         target.programs = programs;
         let failure = epochs
-            .apply_programs(Update::new(3, target), vec![process("rank-0", 7)])
+            .apply_programs(Update::new(3, target), vec![process("rank-0", 7)], false)
             .expect_err("a refused precopy fails the update");
         assert_eq!(failure.kind, "precopy_failed");
         assert!(epochs.program_update().is_none());
         let serving_epoch = epochs.get(0).expect("the epoch is recorded");
         assert_eq!(serving_epoch.status, Status::Serving);
         assert_eq!(serving_epoch.policy, serving.programs.policy);
+    }
+
+    /// The process table reports what the daemon attached: every process it
+    /// supervises, with the fields the daemon's own service wrote, and no
+    /// row of a process that ended (§2.3).
+    #[test]
+    fn the_process_table_reports_the_processes_the_daemon_supervises() {
+        let epochs = Epochs::new();
+        epochs.set_processes(vec![ManagedProcess {
+            role: Role::MainProcess,
+            group: "engine".to_owned(),
+            rank: 0,
+            pid: Some(41),
+            epoch: Some(0),
+            build: "uniserve".to_owned(),
+            generation: 3,
+            state: ProcessState::Serving,
+        }]);
+        let table = std::sync::Arc::new(Mutex::new(Vec::new()));
+        epochs.attach_processes(std::sync::Arc::clone(&table));
+
+        // The daemon's service owns the rows from now on: an empty table
+        // reports no process, and the record's own rows are not reported
+        // beside it.
+        assert!(epochs.processes().is_empty());
+        *locked(&table) = vec![ManagedProcess {
+            role: Role::MainProcess,
+            group: "engine".to_owned(),
+            rank: 0,
+            pid: Some(42),
+            epoch: Some(0),
+            build: "uniserve".to_owned(),
+            generation: 4,
+            state: ProcessState::Serving,
+        }];
+        let reported = epochs.report();
+        assert_eq!(reported["processes"].as_array().map(Vec::len), Some(1));
+        assert_eq!(reported["processes"][0]["pid"], serde_json::json!(42));
+        assert_eq!(reported["processes"][0]["generation"], serde_json::json!(4));
+        assert_eq!(reported["processes"][0]["state"], "serving");
+    }
+
+    /// The policy's declared limits are the launch's own bounds: the token
+    /// bound the deployment gives its workers is the policy's
+    /// `max_num_batched_tokens`, and an unstated prefill chunk is that same
+    /// bound, so the policy's limits cannot disagree with the workers'
+    /// `BatchCapacity` (§4.4). A deployment that states a chunk larger than
+    /// its bound keeps its own value here — the mechanism refuses it
+    /// (`PolicyError::BadLimits`) rather than this code clamping it.
+    #[test]
+    fn the_policys_limits_are_the_launchs_own_token_bound() {
+        let mut config = ServeConfig::default();
+        config.max_num_batched_tokens = NonZeroUsize::new(8192);
+        config.scheduler_config.chunked_prefill_size = None;
+        let programs = FilledPrograms::of(&config);
+        assert_eq!(
+            programs.policy.arguments["max_num_batched_tokens"],
+            toml::Value::Integer(8192)
+        );
+        assert_eq!(
+            programs.policy.arguments["chunked_prefill_size"],
+            toml::Value::Integer(8192),
+            "an unstated chunk is the deployment's own token bound"
+        );
+
+        // A stated chunk above the bound is stated, not clamped: the
+        // mechanism's `BadLimits` is the refusal.
+        config.scheduler_config.chunked_prefill_size = NonZeroUsize::new(16384);
+        let programs = FilledPrograms::of(&config);
+        assert_eq!(
+            programs.policy.arguments["chunked_prefill_size"],
+            toml::Value::Integer(16384)
+        );
+
+        // A deployment that states no token bound states no limit, and the
+        // mechanism's ceilings are the workers' own.
+        let config = ServeConfig::default();
+        let programs = FilledPrograms::of(&config);
+        assert!(
+            !programs
+                .policy
+                .arguments
+                .contains_key("max_num_batched_tokens")
+        );
+        assert!(
+            !programs
+                .policy
+                .arguments
+                .contains_key("chunked_prefill_size")
+        );
     }
 
     /// Which layer a change moves on is decided by what it moves, never by
@@ -1981,5 +2372,20 @@ mod tests {
         assert_eq!(report["processes"][1]["role"], Value::from("main_process"));
         assert_eq!(report["processes"][1]["epoch"], Value::from(7));
         assert_eq!(report["processes"][1]["state"], Value::from("parked"));
+    }
+
+    /// The epoch's build config is written by the daemon and read by the main
+    /// process through this same type, so what the writer serializes must read
+    /// back: an unset list is written as `null` and must be read as `None`,
+    /// not refused.
+    #[test]
+    fn a_build_config_reads_back_what_it_wrote() {
+        let config = ServeConfig::default();
+        let build = BuildConfig::of(&config);
+        assert!(build.cuda_graph.flow_shapes.is_none());
+        let text = serde_json::to_string(&build).expect("a build config is JSON");
+        let read: BuildConfig =
+            serde_json::from_str(&text).expect("the build config reads back through its writer");
+        assert_eq!(read, build);
     }
 }
