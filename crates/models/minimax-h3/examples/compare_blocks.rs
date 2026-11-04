@@ -248,6 +248,7 @@ fn run() -> Result<String, String> {
         tensors: Vec::new(),
         missing: Vec::new(),
         extra: Vec::new(),
+        nothing_dumped: false,
     };
     let mut seen = Vec::new();
     for named in &tensors {
@@ -665,6 +666,13 @@ struct Report {
     tensors: Vec<Comparison>,
     missing: Vec<String>,
     extra: Vec<String>,
+    /// Whether the reference side held no tensor at all.
+    ///
+    /// An empty reference directory and a fully matching one both leave `tensors` and `missing` empty,
+    /// so without this the report of a run that dumped nothing is indistinguishable from a clean run.
+    /// A probe that could not be dumped - the audio path has no weights in this checkpoint - must read
+    /// as *not dumped*, never as a match.
+    nothing_dumped: bool,
 }
 
 impl Report {
@@ -677,6 +685,14 @@ impl Report {
              tables and bitwise for the coordinates; `largest` and `largest_relative` are the\n\
              worst absolute and relative differences of the coordinates.\n\n",
         );
+        if self.nothing_dumped {
+            text.push_str(
+                "**Nothing was dumped on the reference side.** There is no tensor to compare, so this\n\
+                 report says nothing about the blocks it names: read every one of them as *not dumped*,\n\
+                 which is not the same as a match. A component whose weights are absent from the\n\
+                 checkpoint - the audio path - cannot be dumped at all.\n\n",
+            );
+        }
         text.push_str("| tensor | shape | entries | differing | largest | largest relative |\n");
         text.push_str("|---|---|---|---|---|---|\n");
         for tensor in &self.tensors {
@@ -742,6 +758,7 @@ impl Report {
                 })).collect::<Vec<_>>(),
                 "missing": &self.missing,
                 "extra": &self.extra,
+                "nothing_dumped": self.nothing_dumped,
             }))
             .unwrap_or_default()
         ));
@@ -774,6 +791,7 @@ fn compare_tensor_dumps(
         tensors: Vec::new(),
         missing: Vec::new(),
         extra: Vec::new(),
+        nothing_dumped: theirs.is_empty(),
     };
     for name in &theirs {
         if !ours.iter().any(|ours| ours == name) {
