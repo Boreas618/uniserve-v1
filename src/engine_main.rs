@@ -1374,7 +1374,11 @@ impl MainProcess {
         let current = self.update.current();
         for executor in &self.executors {
             let device = executor.device();
-            match executor.switchover(current) {
+            // §7.3 step 4's revert is the reverse switchover, and `Executor::revert` is the verb
+            // that runs it: a `switchover` back to the kept generation would find nothing prepared
+            // (the cut-over took `next`) and refuse by name - the current generation would be left
+            // serving with no kernels and no graphs.
+            match executor.revert(current) {
                 Ok(submission) => {
                     if let Err(error) = device_command(&self.watchdog, device, "revert", submission) {
                         tracing::error!(%error, "reverting a device's generation failed");
