@@ -602,224 +602,6 @@ pub fn audio_sources(config: &crate::AudioVaeConfig) -> Result<Vec<crate::audio_
     Ok(sources)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::video_vae::tests::video_config;
-
-    #[test]
-    fn a_pixel_normalizes_and_quantizes_back_to_itself() {
-        let rgb = crate::output::Rgb::of(1, 1, 1);
-        for pixel in [
-            [0u8, 0, 0],
-            [255, 255, 255],
-            [124, 116, 104],
-            [1, 2, 3],
-            [200, 10, 77],
-        ] {
-            let restored = rgb.quantize(normalize(pixel));
-            for (channel, (got, want)) in restored.iter().zip(pixel.iter()).enumerate() {
-                assert!(
-                    got.abs_diff(*want) <= 1,
-                    "channel {channel}: {got} for {want} from {pixel:?}"
-                );
-            }
-        }
-        // The extremes are exact: the normalization maps 0 and 255 outside the [-1, 1] range the
-        // decoder works in, which is expected — the encoder reads the raster, not latents.
-        assert!(normalize([0, 0, 0])[0] < -2.0);
-        assert!(normalize([255, 255, 255])[0] > 2.0);
-    }
-
-    #[test]
-    fn a_clip_of_seventeen_frames_becomes_five_latent_frames() {
-        let stack = Stack::of(&video_config()).expect("the stack");
-        let extents = stack.extents(Extent {
-            frames: 17,
-            height: 256,
-            width: 256,
-        });
-        // 17 frames, then 17, 9, 5, 5, 5, 5: one 17-frame clip is five latent frames.
-        assert_eq!(
-            extents
-                .iter()
-                .map(|extent| extent.frames)
-                .collect::<Vec<_>>(),
-            vec![17, 17, 9, 5, 5, 5, 5]
-        );
-        // 256 pixels halve four times: the 16-pixel compression.
-        assert_eq!(
-            extents
-                .iter()
-                .map(|extent| extent.height)
-                .collect::<Vec<_>>(),
-            vec![256, 128, 64, 32, 16, 16, 16]
-        );
-        assert_eq!(stack.moments(extents[0]).expect("moments").frames, 5);
-        // A single frame stays one latent frame.
-        let single = stack
-            .moments(Extent {
-                frames: 1,
-                height: 16,
-                width: 16,
-            })
-            .expect("moments");
-        assert_eq!(single.frames, 1);
-        assert_eq!((single.height, single.width), (1, 1));
-    }
-
-    #[test]
-    fn the_encoder_is_one_hundred_and_eighteen_tensors() {
-        let config = video_config();
-        let table = sources(&config).expect("the encoder's parameters");
-        assert_eq!(table.len(), 118);
-        let names: Vec<&str> = table
-            .iter()
-            .map(|source| source.parameter.as_str())
-            .collect();
-        for expected in [
-            "quant_conv.weight",
-            "input.weight",
-            "norm.bias",
-            "output.weight",
-            "stages.0.blocks.1.norms.0.weight",
-            "stages.5.blocks.0.convolutions.1.bias",
-            "stages.1.blocks.0.shortcut.weight",
-            "stages.3.downsample.weight",
-        ] {
-            assert!(names.contains(&expected), "{expected} is missing");
-        }
-        // The stages whose width is unchanged carry no shortcut, and the last two stride nothing.
-        assert!(!names.contains(&"stages.0.blocks.0.shortcut.weight"));
-        assert!(!names.contains(&"stages.5.blocks.1.shortcut.weight"));
-        assert!(!names.contains(&"stages.4.downsample.weight"));
-        assert!(!names.contains(&"stages.5.downsample.weight"));
-        let mut unique = names.clone();
-        unique.sort_unstable();
-        unique.dedup();
-        assert_eq!(unique.len(), names.len());
-    }
-
-    #[test]
-    fn the_tile_grid_is_the_decoders_grid_in_input_pixels() {
-        let grid = Grid::of(1344, 768).expect("the grid");
-        // The decoder's grid at 16 pixels per latent position: seven rows of 256 with overlaps
-        // [80, 80, 80, 80, 64, 64] and four columns with [96, 80, 80].
-        assert_eq!(grid.rows.starts, vec![0, 176, 352, 528, 704, 896, 1088]);
-        assert_eq!(grid.rows.overlaps, vec![80, 80, 80, 80, 64, 64]);
-        assert_eq!(grid.columns.starts, vec![0, 160, 336, 512]);
-        // Every seam spans whole latent positions: 80/16 = 5, 64/16 = 4, 96/16 = 6.
-        assert_eq!(Grid::blends(&grid.rows), vec![5, 5, 5, 5, 4, 4]);
-        assert_eq!(Grid::blends(&grid.columns), vec![6, 5, 5]);
-        // The rows a raster of tiles owns: each start in latent rows, then the height.
-        assert_eq!(grid.owned(84), vec![0, 11, 22, 33, 44, 56, 68, 84]);
-    }
-
-    #[test]
-    fn a_band_reads_the_tile_rows_it_cross_fades_with() {
-        let grid = Grid::of(1344, 768).expect("the grid");
-        let latent_height = 1344 / SPATIAL_RATIO;
-        assert_eq!(latent_height, 84);
-        // The first band starts at the top: no row above it.
-        assert_eq!(grid.band(84, 0, 11).expect("band"), (0, 0));
-        // A band that starts on a row's own first latent row reads only that row and below.
-        assert_eq!(grid.band(84, 16, 33).expect("band"), (1, 2));
-        // A band that starts inside a row's cross-fade reads the row above.
-        let owned = grid.owned(84);
-        assert_eq!(owned[1], 11);
-        assert_eq!(grid.rows.overlaps[0] / SPATIAL_RATIO, 5);
-        assert_eq!(grid.band(84, 13, 20).expect("band"), (0, 1));
-        // Past the end is refused.
-        assert!(grid.band(84, 80, 90).is_err());
-        assert!(grid.band(84, 5, 5).is_err());
-    }
-
-    #[test]
-    fn the_audio_encoder_stages_land_on_whole_latent_frames() {
-        let stack = AudioStack::of(&crate::audio_vae::tests::audio_config()).expect("the stack");
-        assert_eq!(stack.samples_per_latent, 800);
-        assert_eq!(stack.lengths(800), vec![800, 400, 100, 25, 5, 1]);
-        assert_eq!(stack.lengths(1600), vec![1600, 800, 200, 50, 10, 2]);
-        assert_eq!(stack.latent_frames(800).expect("one frame"), 1);
-        assert_eq!(stack.latent_frames(24000).expect("thirty frames"), 30);
-        // A partial frame is refused: the encoder's output is whole latent frames.
-        assert!(stack.latent_frames(801).is_err());
-        // Each stage doubles the width from the input convolution's.
-        assert_eq!(stack.widths, vec![128, 256, 512, 1024, 2048]);
-        assert_eq!(stack.latent_dim, 2048);
-    }
-
-    #[test]
-    fn the_audio_encoder_table_names_every_parameter() {
-        let table = audio_sources(&crate::audio_vae::tests::audio_config())
-            .expect("the encoder's parameters");
-        // The input pair, five stages of twenty-one — eighteen for the three residual units, two for
-        // the widening convolution and one for the stage's Snake — the output Snake and its pair, the
-        // projection's twenty-two and the mean convolution's pair.
-        assert_eq!(table.len(), 2 + 5 * 21 + 3 + 22 + 2);
-        let names: Vec<&str> = table
-            .iter()
-            .map(|source| source.parameter.as_str())
-            .collect();
-        for expected in [
-            "input.weight",
-            "stages.0.units.0.convs.0.weight",
-            "stages.4.units.2.convs.1.bias",
-            "stages.4.widen.weight",
-            "stages.4.units.2.snakes.0.alpha",
-            "stages.4.snake.alpha",
-            "output_snake.alpha",
-            "output.weight",
-            "projection.qkv.weight",
-            "projection.qkv.bias",
-            "projection.mlp.gate.weight",
-            "mean_projection.bias",
-        ] {
-            assert!(names.contains(&expected), "{expected} is missing");
-        }
-        let mut unique = names.clone();
-        unique.sort_unstable();
-        unique.dedup();
-        assert_eq!(unique.len(), names.len());
-        // Every convolution is weight-normalized: four per stage plus the input, the output and the
-        // mean convolution.
-        let normalized = table
-            .iter()
-            .filter(|source| matches!(source.tensor, crate::audio_vae::Tensor::Normalized { .. }))
-            .count();
-        assert_eq!(normalized, 3 + 5 * 7 + 3);
-        // The fused query-key-value bias names its three checkpoint vectors in order.
-        let bias = table
-            .iter()
-            .find(|source| source.parameter == "projection.qkv.bias")
-            .expect("the fused bias");
-        match &bias.tensor {
-            crate::audio_vae::Tensor::Parts(parts) => assert_eq!(
-                parts,
-                &vec![
-                    "pre_block.attn.q_bias".to_owned(),
-                    "pre_block.attn.zero_k_bias".to_owned(),
-                    "pre_block.attn.v_bias".to_owned(),
-                ]
-            ),
-            other => panic!("the fused bias is {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_stack_with_no_stage_is_refused() {
-        let mut config = video_config();
-        config.block_out_channels.clear();
-        assert!(Stack::of(&config).is_err());
-        let mut config = video_config();
-        config.spatial_downsample_factors.pop();
-        assert!(Stack::of(&config).is_err());
-        let mut config = video_config();
-        config.temporal_downsample_factors[1] = 0;
-        assert!(Stack::of(&config).is_err());
-    }
-}
-
 // ---------------------------------------------------------------------------------------------
 // The video encoder's device path.
 // ---------------------------------------------------------------------------------------------
@@ -1241,5 +1023,223 @@ impl VideoEncoder {
         // commutes, so `(values + bias) + residual` here is the same rounded value
         // (`video_vae.py:852-859`, `:1009-1020`).
         Ok(ScaledAdd.forward(f, rows(out)?, rows(residual)?, 1.0, 1.0)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::video_vae::tests::video_config;
+
+    #[test]
+    fn a_pixel_normalizes_and_quantizes_back_to_itself() {
+        let rgb = crate::output::Rgb::of(1, 1, 1);
+        for pixel in [
+            [0u8, 0, 0],
+            [255, 255, 255],
+            [124, 116, 104],
+            [1, 2, 3],
+            [200, 10, 77],
+        ] {
+            let restored = rgb.quantize(normalize(pixel));
+            for (channel, (got, want)) in restored.iter().zip(pixel.iter()).enumerate() {
+                assert!(
+                    got.abs_diff(*want) <= 1,
+                    "channel {channel}: {got} for {want} from {pixel:?}"
+                );
+            }
+        }
+        // The extremes are exact: the normalization maps 0 and 255 outside the [-1, 1] range the
+        // decoder works in, which is expected — the encoder reads the raster, not latents.
+        assert!(normalize([0, 0, 0])[0] < -2.0);
+        assert!(normalize([255, 255, 255])[0] > 2.0);
+    }
+
+    #[test]
+    fn a_clip_of_seventeen_frames_becomes_five_latent_frames() {
+        let stack = Stack::of(&video_config()).expect("the stack");
+        let extents = stack.extents(Extent {
+            frames: 17,
+            height: 256,
+            width: 256,
+        });
+        // 17 frames, then 17, 9, 5, 5, 5, 5: one 17-frame clip is five latent frames.
+        assert_eq!(
+            extents
+                .iter()
+                .map(|extent| extent.frames)
+                .collect::<Vec<_>>(),
+            vec![17, 17, 9, 5, 5, 5, 5]
+        );
+        // 256 pixels halve four times: the 16-pixel compression.
+        assert_eq!(
+            extents
+                .iter()
+                .map(|extent| extent.height)
+                .collect::<Vec<_>>(),
+            vec![256, 128, 64, 32, 16, 16, 16]
+        );
+        assert_eq!(stack.moments(extents[0]).expect("moments").frames, 5);
+        // A single frame stays one latent frame.
+        let single = stack
+            .moments(Extent {
+                frames: 1,
+                height: 16,
+                width: 16,
+            })
+            .expect("moments");
+        assert_eq!(single.frames, 1);
+        assert_eq!((single.height, single.width), (1, 1));
+    }
+
+    #[test]
+    fn the_encoder_is_one_hundred_and_eighteen_tensors() {
+        let config = video_config();
+        let table = sources(&config).expect("the encoder's parameters");
+        assert_eq!(table.len(), 118);
+        let names: Vec<&str> = table
+            .iter()
+            .map(|source| source.parameter.as_str())
+            .collect();
+        for expected in [
+            "quant_conv.weight",
+            "input.weight",
+            "norm.bias",
+            "output.weight",
+            "stages.0.blocks.1.norms.0.weight",
+            "stages.5.blocks.0.convolutions.1.bias",
+            "stages.1.blocks.0.shortcut.weight",
+            "stages.3.downsample.weight",
+        ] {
+            assert!(names.contains(&expected), "{expected} is missing");
+        }
+        // The stages whose width is unchanged carry no shortcut, and the last two stride nothing.
+        assert!(!names.contains(&"stages.0.blocks.0.shortcut.weight"));
+        assert!(!names.contains(&"stages.5.blocks.1.shortcut.weight"));
+        assert!(!names.contains(&"stages.4.downsample.weight"));
+        assert!(!names.contains(&"stages.5.downsample.weight"));
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len());
+    }
+
+    #[test]
+    fn the_tile_grid_is_the_decoders_grid_in_input_pixels() {
+        let grid = Grid::of(1344, 768).expect("the grid");
+        // The decoder's grid at 16 pixels per latent position: seven rows of 256 with overlaps
+        // [80, 80, 80, 80, 64, 64] and four columns with [96, 80, 80].
+        assert_eq!(grid.rows.starts, vec![0, 176, 352, 528, 704, 896, 1088]);
+        assert_eq!(grid.rows.overlaps, vec![80, 80, 80, 80, 64, 64]);
+        assert_eq!(grid.columns.starts, vec![0, 160, 336, 512]);
+        // Every seam spans whole latent positions: 80/16 = 5, 64/16 = 4, 96/16 = 6.
+        assert_eq!(Grid::blends(&grid.rows), vec![5, 5, 5, 5, 4, 4]);
+        assert_eq!(Grid::blends(&grid.columns), vec![6, 5, 5]);
+        // The rows a raster of tiles owns: each start in latent rows, then the height.
+        assert_eq!(grid.owned(84), vec![0, 11, 22, 33, 44, 56, 68, 84]);
+    }
+
+    #[test]
+    fn a_band_reads_the_tile_rows_it_cross_fades_with() {
+        let grid = Grid::of(1344, 768).expect("the grid");
+        let latent_height = 1344 / SPATIAL_RATIO;
+        assert_eq!(latent_height, 84);
+        // The first band starts at the top: no row above it.
+        assert_eq!(grid.band(84, 0, 11).expect("band"), (0, 0));
+        // A band that starts on a row's own first latent row reads only that row and below.
+        assert_eq!(grid.band(84, 16, 33).expect("band"), (1, 2));
+        // A band that starts inside a row's cross-fade reads the row above.
+        let owned = grid.owned(84);
+        assert_eq!(owned[1], 11);
+        assert_eq!(grid.rows.overlaps[0] / SPATIAL_RATIO, 5);
+        assert_eq!(grid.band(84, 13, 20).expect("band"), (0, 1));
+        // Past the end is refused.
+        assert!(grid.band(84, 80, 90).is_err());
+        assert!(grid.band(84, 5, 5).is_err());
+    }
+
+    #[test]
+    fn the_audio_encoder_stages_land_on_whole_latent_frames() {
+        let stack = AudioStack::of(&crate::audio_vae::tests::audio_config()).expect("the stack");
+        assert_eq!(stack.samples_per_latent, 800);
+        assert_eq!(stack.lengths(800), vec![800, 400, 100, 25, 5, 1]);
+        assert_eq!(stack.lengths(1600), vec![1600, 800, 200, 50, 10, 2]);
+        assert_eq!(stack.latent_frames(800).expect("one frame"), 1);
+        assert_eq!(stack.latent_frames(24000).expect("thirty frames"), 30);
+        // A partial frame is refused: the encoder's output is whole latent frames.
+        assert!(stack.latent_frames(801).is_err());
+        // Each stage doubles the width from the input convolution's.
+        assert_eq!(stack.widths, vec![128, 256, 512, 1024, 2048]);
+        assert_eq!(stack.latent_dim, 2048);
+    }
+
+    #[test]
+    fn the_audio_encoder_table_names_every_parameter() {
+        let table = audio_sources(&crate::audio_vae::tests::audio_config())
+            .expect("the encoder's parameters");
+        // The input pair, five stages of twenty-one — eighteen for the three residual units, two for
+        // the widening convolution and one for the stage's Snake — the output Snake and its pair, the
+        // projection's twenty-two and the mean convolution's pair.
+        assert_eq!(table.len(), 2 + 5 * 21 + 3 + 22 + 2);
+        let names: Vec<&str> = table
+            .iter()
+            .map(|source| source.parameter.as_str())
+            .collect();
+        for expected in [
+            "input.weight",
+            "stages.0.units.0.convs.0.weight",
+            "stages.4.units.2.convs.1.bias",
+            "stages.4.widen.weight",
+            "stages.4.units.2.snakes.0.alpha",
+            "stages.4.snake.alpha",
+            "output_snake.alpha",
+            "output.weight",
+            "projection.qkv.weight",
+            "projection.qkv.bias",
+            "projection.mlp.gate.weight",
+            "mean_projection.bias",
+        ] {
+            assert!(names.contains(&expected), "{expected} is missing");
+        }
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len());
+        // Every convolution is weight-normalized: four per stage plus the input, the output and the
+        // mean convolution.
+        let normalized = table
+            .iter()
+            .filter(|source| matches!(source.tensor, crate::audio_vae::Tensor::Normalized { .. }))
+            .count();
+        assert_eq!(normalized, 3 + 5 * 7 + 3);
+        // The fused query-key-value bias names its three checkpoint vectors in order.
+        let bias = table
+            .iter()
+            .find(|source| source.parameter == "projection.qkv.bias")
+            .expect("the fused bias");
+        match &bias.tensor {
+            crate::audio_vae::Tensor::Parts(parts) => assert_eq!(
+                parts,
+                &vec![
+                    "pre_block.attn.q_bias".to_owned(),
+                    "pre_block.attn.zero_k_bias".to_owned(),
+                    "pre_block.attn.v_bias".to_owned(),
+                ]
+            ),
+            other => panic!("the fused bias is {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_stack_with_no_stage_is_refused() {
+        let mut config = video_config();
+        config.block_out_channels.clear();
+        assert!(Stack::of(&config).is_err());
+        let mut config = video_config();
+        config.spatial_downsample_factors.pop();
+        assert!(Stack::of(&config).is_err());
+        let mut config = video_config();
+        config.temporal_downsample_factors[1] = 0;
+        assert!(Stack::of(&config).is_err());
     }
 }
