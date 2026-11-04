@@ -322,6 +322,55 @@ fn a_request_is_served_through_the_executors_own_batch_path() {
     handle.shutdown();
 }
 
+/// The step's free slots are a hard limit the mechanism keeps by stopping: a
+/// request that does not fit one waits, and is admitted when a slot frees.
+///
+/// §4.4's dispatch row puts the error on *work* put into the step, and gives
+/// `admit` the other rule in the same row: the mechanism admits in the plan's
+/// order, and the first request it cannot place, and those after it, stay
+/// queued. `fcfs` names every queued request, so a refusal here would stop every
+/// world that queues more than it can run at once; a stop serves them in turn.
+#[test]
+fn a_request_that_does_not_fit_a_slot_waits_for_one() {
+    let serving = Arc::new(Serving::new(vec![pool()]));
+    let batches: Arc<dyn Batches> = serving.clone();
+    let mut config = config();
+    config.max_running_requests = 1;
+    let handle = SchedulerHandle::over_batches(config, batches).expect("the pool serves");
+    install(&handle, &serving);
+
+    let mut first = handle
+        .submit(text_request(1, 8, 4))
+        .expect("the first request is submitted");
+    let mut second = handle
+        .submit(text_request(2, 8, 4))
+        .expect("the second request is submitted");
+
+    let mut served = [false, false];
+    let deadline = Instant::now() + FIRST_TOKEN;
+    while !served.iter().all(|done| *done) && Instant::now() < deadline {
+        for (index, events) in [&mut first, &mut second].into_iter().enumerate() {
+            while let Ok(event) = events.try_recv() {
+                match event {
+                    Event::TextToken { .. } | Event::TextTokens { .. } => served[index] = true,
+                    Event::Rejected { .. } | Event::Error { .. } => {
+                        panic!("request {} was refused, not queued", index + 1)
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !served.iter().all(|done| *done) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    assert!(
+        served.iter().all(|done| *done),
+        "both requests were served, one after the other: {served:?}"
+    );
+    handle.shutdown();
+}
+
 /// An admitted request is worked on, in the phase the mechanism tells the
 /// policy it serves next.
 ///
