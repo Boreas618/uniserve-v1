@@ -1924,6 +1924,32 @@ mod tests {
         assert!(refused.to_string().contains("no cache"), "{refused}");
     }
 
+    /// The committed reference carries both halves a difference is read with: the ids and, beside
+    /// them, the margin each was chosen by. The reader takes the file as it is, and step 19's margin
+    /// of exactly zero is the tie this lane argued about for a night.
+    #[test]
+    fn the_reference_continuation_carries_its_margins() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../notes/reference");
+        let file = dir.join("qwen3-greedy-32-margins.json");
+        let ids = super::read_expectation(&file, "").expect("the committed reference");
+        let margins = super::reference_margins(&file);
+        assert_eq!(ids.len(), 32, "{ids:?}");
+        assert_eq!(margins.len(), 32, "{margins:?}");
+        assert_eq!(ids[0], 151667);
+        assert_eq!(ids[19], 358);
+        assert_eq!(margins[19], 0.0, "the tie at step 19");
+        // A file with ids alone is a reference this run still compares against, and its margins read
+        // as absent rather than as zero.
+        let ids_only = dir.join("qwen3-greedy-32.json");
+        assert_eq!(
+            super::read_expectation(&ids_only, "")
+                .expect("its ids")
+                .len(),
+            32
+        );
+        assert!(super::reference_margins(&ids_only).is_empty());
+    }
+
     /// The host tie rule: the first largest wins, which is the one the sampler's argmax takes.
     #[test]
     fn the_argmax_takes_the_first_largest() {
