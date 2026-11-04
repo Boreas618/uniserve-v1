@@ -618,6 +618,42 @@ mod tests {
     /// defaults) and `ncclCommInitRankConfig` is not called at all, so there is
     /// no attribute encoding here to compare. A crate that starts passing a
     /// config owes this test that structure's size and its attribute offsets.
+    /// Every entry point this crate requires is declared by `nccl.h`.
+    ///
+    /// The four it binds only when the library has them — `ncclCommSplit`,
+    /// `ncclAlltoAll`, `ncclCommSuspend`, `ncclCommResume` — are not asserted:
+    /// they are newer than some `nccl.h` a host ships, which is why the crate
+    /// treats their absence as a supported library rather than a broken one.
+    #[test]
+    fn every_required_nccl_entry_point_is_declared_by_the_header() {
+        for name in [
+            "ncclGetErrorString",
+            "ncclGetUniqueId",
+            "ncclCommInitRank",
+            "ncclCommDestroy",
+            "ncclCommAbort",
+            "ncclAllReduce",
+            "ncclReduceScatter",
+            "ncclAllGather",
+            "ncclBroadcast",
+            "ncclSend",
+            "ncclRecv",
+            "ncclGroupStart",
+            "ncclGroupEnd",
+        ] {
+            match crate::header::declares("nccl.h", name) {
+                Some(true) => {}
+                Some(false) => panic!("nccl.h does not declare {name}, which this crate binds"),
+                None => {
+                    eprintln!(
+                        "skipped: nccl.h is not provisioned here, so its entry points were not compared"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_nccl_structures_are_sized_by_the_headers() {
         use crate::header::struct_size;

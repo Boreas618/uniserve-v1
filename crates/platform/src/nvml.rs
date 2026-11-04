@@ -327,6 +327,33 @@ mod tests {
         }
     }
 
+    /// Every entry point this crate binds is declared by `nvml.h`, with the
+    /// version suffix it binds: a wrong suffix is a load failure at start-up,
+    /// and this says which name is wrong before a machine does.
+    #[test]
+    fn every_nvml_entry_point_is_declared_by_the_header() {
+        for name in [
+            "nvmlInit_v2",
+            "nvmlShutdown",
+            "nvmlErrorString",
+            "nvmlDeviceGetHandleByUUID",
+            "nvmlDeviceGetComputeRunningProcesses_v3",
+            "nvmlDeviceGetGraphicsRunningProcesses_v3",
+            "nvmlDeviceGetMemoryInfo_v2",
+        ] {
+            match crate::header::declares("nvml.h", name) {
+                Some(true) => {}
+                Some(false) => panic!("nvml.h does not declare {name}, which this crate binds"),
+                None => {
+                    eprintln!(
+                        "skipped: nvml.h is not provisioned here, so its entry points were not compared"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_nvml_constants_are_the_headers() {
         crate::header::assert_constants(
