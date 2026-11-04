@@ -205,8 +205,10 @@ pub struct MatmulBytes {
     pub b: u64,
     pub c: u64,
     pub d: u64,
-    /// The bias vector of [`Epilogue::Bias`]: `D`'s rows of `D`'s type. It is
-    /// one vector for every batch, as cuBLASLt applies it.
+    /// The bias vector of [`Epilogue::Bias`]: one element per row of `D` as
+    /// the library sees it, of `D`'s type, and one vector for every batch.
+    /// For a [`MatmulDescriptor::row_major`] descriptor the library sees the
+    /// transposed matrices, so that is the matrix's columns.
     pub bias: u64,
 }
 
@@ -865,8 +867,10 @@ mod tests {
                 b: 3 * 6 * 2,
                 c: 4 * 6 * 2,
                 d: 4 * 6 * 2,
-                // One bias vector for every batch: D's rows of D's type.
-                bias: 4 * 2,
+                // One bias vector for every batch: the rows of D as
+                // cuBLASLt sees it, which for a row-major descriptor are the
+                // matrix's columns (6), of D's type (2 bytes).
+                bias: 6 * 2,
             }
         );
     }

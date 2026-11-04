@@ -1449,8 +1449,9 @@ mod tests {
             .expect_err("a wrong output length is caught");
         assert!(error.to_string().contains("give 4"), "{error}");
 
-        // The audio decoder's one-dimensional convolution: rank three.
-        let audio = conv1d(vec![1, 6, 512], vec![12, 6, 7], vec![1, 12, 513]);
+        // The audio decoder's one-dimensional convolution: rank three in
+        // NCDHW form, output (512 + 2·0 - 1·(7 - 1) - 1) + 1 = 508.
+        let audio = conv1d(vec![1, 6, 512], vec![12, 6, 7], vec![1, 12, 508]);
         assert!(audio.check().is_ok(), "{audio:?}");
         assert_eq!(audio.rank(), 1);
     }
