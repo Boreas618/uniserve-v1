@@ -222,6 +222,13 @@ impl<K: Order> Arrival<K> {
         if !kind.writes_prefix_cache() {
             return (work_tokens(kind, 0, view.next_tokens), false);
         }
+        if kind == PhaseKind::Refill {
+            // A refill call's work is the gap its draft cache is short, not a
+            // prompt chunk: today's scheduler plans the gap. Zero means the
+            // request waits for its draft cache; it draws on the prefill
+            // budget all the same (D1 gap (b)).
+            return (view.refill_tokens.unwrap_or(0), true);
+        }
         let start = view
             .cached_prefix_tokens
             .saturating_add(view.prefilled_tokens);
@@ -248,18 +255,21 @@ impl<K: Order> Arrival<K> {
     /// do not carry; the policy's parameters replace them, as design §7.7
     /// says they may.
     fn refill_due(&self, view: &RequestView) -> bool {
+        // A refill is plannable only when it is the request's next call: a
+        // decoding request whose draft cache is short is given a
+        // prefill-class refill chunk by the mechanism, and `plan.refill` is
+        // the one decision that names it. A request whose refill call is in
+        // flight has no ready phase, so it cannot be asked for twice.
+        if !view
+            .phase
+            .is_some_and(|phase| self.phases.kind(phase) == PhaseKind::Refill)
+        {
+            return false;
+        }
         let Some(tokens) = view.refill_tokens else {
             return false;
         };
         if tokens == 0 {
-            return false;
-        }
-        // A request already refilling its draft cache has the refill as its
-        // next call; asking again would start a second one.
-        if view
-            .phase
-            .is_some_and(|phase| self.phases.kind(phase) == PhaseKind::Refill)
-        {
             return false;
         }
         let (Some(speedup), Some(cost)) = (
@@ -836,7 +846,14 @@ mod tests {
             },
         }]);
         let plan = fcfs.dispatch(&room(1024, 8));
-        assert_eq!(plan.work[0].tokens, 64);
+        // 32 prefilled of 100 leaves 68, which *is* the prompt end: a chunk
+        // that reaches the end may end there, so the page clip does not bite.
+        // Clipping needs room smaller than the tokens left.
+        assert_eq!(plan.work[0].tokens, 68);
+        let plan = fcfs.dispatch(&room(40, 8));
+        // Under 68 left and a 40-token share: 32 + 40 = 72, clipped down to
+        // the last 16-token page boundary at or before it, so 32.
+        assert_eq!(plan.work[0].tokens, 32);
     }
 
     #[test]
@@ -846,9 +863,10 @@ mod tests {
         first.phase = Some(PhaseId(0));
         let _ = admit(&mut fcfs, first);
         let mut decode = view(2, 0, 1);
-        decode.phase = Some(PhaseId(1));
         decode.prompt_tokens = 10;
-        let _ = admit(&mut fcfs, decode);
+        // On its decode phase: `admit` would put it back on the prefill phase
+        // and this step would be two prefills.
+        let _ = admit_with_phase(&mut fcfs, decode, PhaseId(1));
         // One batch with prefill work is in flight and another is allowed, so
         // this step still prefills.
         let plan = fcfs.dispatch(&room(1024, 8));
@@ -1002,7 +1020,9 @@ mod tests {
             },
         ];
         assert_eq!(fcfs.route(&view(1, 0, 0), &ranks), 1);
-        // The cursor moved past rank 1, so the next equal load behind it wins.
+        // Today's `Routing::pick` advances one raw counter per pick, not one
+        // past the rank it chose: the second pick starts at 1, so with two
+        // ranks the rotation is [1, 0] and equal load keeps rank 1.
         let ranks = [
             RankView {
                 index: 0,
@@ -1015,7 +1035,7 @@ mod tests {
                 alive: true,
             },
         ];
-        assert_eq!(fcfs.route(&view(2, 0, 0), &ranks), 0);
+        assert_eq!(fcfs.route(&view(2, 0, 0), &ranks), 1);
     }
 
     #[test]
@@ -1261,7 +1281,10 @@ mod tests {
         let plan = fcfs.dispatch(&room);
         let order: Vec<u64> = plan.work.iter().map(|work| work.request.0).collect();
         assert_eq!(order, vec![20]);
-        assert_eq!(plan.work[0].tokens, 100);
+        // `Room::prefill_tokens` is the warming reservation today's
+        // `assemble_batch` charges every prefix-writing call against, so a
+        // 100-token chunk is capped at 64.
+        assert_eq!(plan.work[0].tokens, 64);
         // The over-capacity request is rejected and not also admitted.
         assert_eq!(plan.reject, vec![RequestId(11)]);
         assert_eq!(plan.admit, vec![RequestId(10)]);
