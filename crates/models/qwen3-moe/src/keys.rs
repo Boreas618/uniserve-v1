@@ -25,6 +25,7 @@
 use nn::DType;
 use ops::Op;
 use ops::attention::Phase;
+use ops::moe::exchange::Mode;
 
 use crate::model::Mlp;
 use crate::{Error, Qwen3Moe, Result};
@@ -36,9 +37,14 @@ impl Qwen3Moe {
     /// sees only in the attention layer's write and its read; every other element type is the
     /// model's own (`self.dtype`), the query's and the output's.
     ///
+    /// `capacity` is the exchange transport's **rows per rank** — the one deployment value the
+    /// model cannot know, because it is the runtime's admission bound and not a checkpoint field.
+    /// It is read only when the deployment splits experts, and it is refused as zero there: a rank
+    /// that may hold no row cannot receive the routes its peers send it.
+    ///
     /// The result is what a store must hold for this model to run: `build_store` consumes the same
     /// pairs a fixture prints, so `keys()` and the note cannot disagree.
-    pub fn keys(&self, cache_dtype: DType) -> Result<Vec<(String, String)>> {
+    pub fn keys(&self, cache_dtype: DType, capacity: u32) -> Result<Vec<(String, String)>> {
         let dtype = self.dtype();
         let mut keys: Vec<(String, String)> = Vec::new();
         let mut push = |operator: &str, key: String| keys.push((operator.to_owned(), key));
@@ -156,6 +162,42 @@ impl Qwen3Moe {
             "vocab_unpad",
             self.head().unpad_descriptor(dtype, gathered).to_string(),
         );
+
+        // The expert exchange, when this deployment splits the experts: at one rank every expert
+        // is resident, no route leaves the rank and the layer launches no exchange, so a row for
+        // it would name a program nothing runs. Above one rank each token's routes travel over the
+        // group's transport in both directions, and the two directions are two programs.
+        let ranks = self.partition().expert_parallel;
+        if ranks > 1 {
+            let ranks = u32::try_from(ranks)
+                .map_err(|_| Error::Config(format!("{ranks} ranks do not fit the exchange")))?;
+            if capacity == 0 {
+                return Err(Error::Config(
+                    "this deployment splits the experts and its exchange carries rows per rank, \
+                     and the capacity given is 0"
+                        .to_owned(),
+                ));
+            }
+            let width = |value: usize, what: &str| -> Result<u32> {
+                u32::try_from(value)
+                    .map_err(|_| Error::Config(format!("this checkpoint's {what} is beyond u32")))
+            };
+            let descriptor = ops::moe::exchange::Descriptor {
+                mode: Mode::Dispatch,
+                hidden: width(self.config().hidden_size, "hidden width")?,
+                top: width(self.config().num_experts_per_tok, "routes per token")?,
+                experts: width(self.config().num_experts, "expert count")?,
+                max_tokens: capacity,
+                ranks,
+                dtype,
+            };
+            for mode in [Mode::Dispatch, Mode::Combine] {
+                push(
+                    <ops::moe::exchange::ExpertExchange as Op>::NAME,
+                    ops::moe::exchange::Descriptor { mode, ..descriptor }.to_string(),
+                );
+            }
+        }
 
         keys.sort();
         keys.dedup();

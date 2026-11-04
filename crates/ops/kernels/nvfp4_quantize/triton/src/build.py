@@ -1,8 +1,9 @@
 """The nvfp4_quantize package's compile script: one descriptor -> one module.
 
 A descriptor is the activations' element type, the row width, the block scales'
-layout, the elements one program encodes and the dependent-launch flag. The row
-count comes from the grid, so one module serves every row count.
+layout, the chunk one program walks its row in and the dependent-launch flag. The
+row count is the grid -- one program per row -- so one module serves every row
+count.
 """
 
 import triton
@@ -49,6 +50,8 @@ def spec(fields, parameters, target):
             # A device operand: the deployment's activation scale is published by the loader, so the
             # operator passes its address rather than baking a host constant into the program.
             "global_scale": "*fp32",
+            # The row's dequantization factor: an output of the encode, one FP32 per row.
+            "token_scale_ptr": "*fp32",
             "COLUMNS": "constexpr",
             "BLOCK": "constexpr",
             "SCALE_COLUMNS": "constexpr",
