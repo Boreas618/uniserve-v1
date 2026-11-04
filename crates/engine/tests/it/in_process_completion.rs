@@ -318,3 +318,49 @@ fn a_request_is_served_through_the_executors_own_batch_path() {
 
     handle.shutdown();
 }
+
+/// An admitted request is worked on, in the phase the mechanism tells the
+/// policy it serves next.
+///
+/// A policy's state is append-only: it learns a request from its arrival and
+/// nothing else about it unless the mechanism states it. A request that is
+/// admitted and never restated is one whose phase the policy never learns, so
+/// no policy — `fcfs` included — can plan the work that would prefilled it, and
+/// the epoch dispatches nothing while requests queue behind it. This case
+/// states the mechanism's half: one text request, the real `fcfs` program, and
+/// a batch handed to the executor with no other help.
+#[test]
+fn an_admitted_request_is_prefilled_on_the_next_step() {
+    let serving = Arc::new(Serving::new(vec![pool()]));
+    let batches: Arc<dyn Batches> = serving.clone();
+    let handle = SchedulerHandle::over_batches(config(), batches).expect("the pool serves");
+    install(&handle, &serving);
+    // The consumer is kept open for the case's length: a world whose client
+    // went away ends its requests, which is not what is under test.
+    let _events = handle
+        .submit(text_request(1, 8, 4))
+        .expect("the request is submitted");
+
+    let deadline = Instant::now() + FIRST_TOKEN;
+    while serving.submitted().is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let handed = serving.submitted();
+    let first = handed.first().expect("the pool was handed a batch");
+    assert_eq!(
+        first.shape.rows, 1,
+        "the batch is the one request's, not a full bucket's"
+    );
+    assert!(
+        first.shape.variant.name().starts_with("prefill"),
+        "the request's first call is its prefill, not a later phase: {}",
+        first.shape.variant.name()
+    );
+    assert!(
+        !handed.iter().any(
+            |batch| batch.shape.variant.name().starts_with("decode") && batch.id.0 < first.id.0
+        ),
+        "no decode was handed before the prefill"
+    );
+    handle.shutdown();
+}

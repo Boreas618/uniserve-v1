@@ -593,6 +593,15 @@ impl Scheduler {
         // are all read after it: a page announced now is a page this step's
         // plan may name, so the validators must already see it.
         self.pump_page_changes();
+        // Every request the mechanism holds is stated to the policy here, and
+        // `close` emits an `Updated` for the ones whose view moved: a policy's
+        // state is append-only, so a phase it is never told about is a phase it
+        // does not have, and an admitted request it never hears of again is one
+        // it can never plan work for. The filter is `close`'s, not this loop's,
+        // so a step whose requests did not move tells the policy nothing.
+        for view in views::requests(self, self.recorder.recorded()) {
+            self.recorder.update(view);
+        }
         self.recorder.close();
         let room = self.room();
         // The starvation rule names only a request the watchdog tracks, so the
