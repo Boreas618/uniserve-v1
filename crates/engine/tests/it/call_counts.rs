@@ -449,7 +449,8 @@ fn a_step_asks_the_policy_to_observe_and_dispatch_once_each() {
     assert_eq!(
         usage.calls,
         usage.decisions.each().map(|(_, calls)| calls).sum::<u64>(),
-        "the epoch's total is its instances' decisions, summed"
+        "no call is counted twice: the epoch's total is its instances' decisions, summed, and \
+         this world's only trial is the one it serves under"
     );
     assert!(
         matches!(
