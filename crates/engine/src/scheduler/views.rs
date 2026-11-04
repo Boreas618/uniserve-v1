@@ -238,10 +238,21 @@ pub(crate) fn block_id(blocks: &[String], name: &str) -> Option<ComponentId> {
         .map(|index| ComponentId(u32::try_from(index).unwrap_or(u32::MAX)))
 }
 
+/// The blocks of every worker of the world: the table `ComponentId`s number, so
+/// a phase's block and a replica's block name the same component.
+pub(crate) fn world_blocks(executor: &dyn Executor) -> Vec<String> {
+    let mut names = Vec::new();
+    for (_, info) in &executor.info().workers {
+        names.extend(blocks(info));
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// The block that runs `kind` on this worker group: the component the worker
 /// reports for its media call, or the protocol's default component.
-fn block_of(info: &WorkerInfo, kind: PhaseKind) -> ComponentId {
-    let blocks = blocks(info);
+fn block_of(table: &[String], info: &WorkerInfo, kind: PhaseKind) -> ComponentId {
     let name = match phase_call(kind) {
         Some(CallKind::Media(call)) => info
             .media_components
@@ -249,7 +260,7 @@ fn block_of(info: &WorkerInfo, kind: PhaseKind) -> ComponentId {
             .map_or(DEFAULT_COMPONENT, String::as_str),
         _ => DEFAULT_COMPONENT,
     };
-    block_id(&blocks, name).unwrap_or(ComponentId(0))
+    block_id(table, name).unwrap_or(ComponentId(0))
 }
 
 /// Every phase this worker group can run, in id order.
@@ -257,6 +268,11 @@ fn block_of(info: &WorkerInfo, kind: PhaseKind) -> ComponentId {
 /// `Snapshot::phases`, built once per epoch: a policy reads a request's
 /// `PhaseId` here to learn its kind and its block.
 pub(crate) fn phases(info: &WorkerInfo) -> Vec<PhaseView> {
+    phases_in(info, &blocks(info))
+}
+
+/// Every phase this worker group can run, numbered in the world's block table.
+pub(crate) fn phases_in(info: &WorkerInfo, table: &[String]) -> Vec<PhaseView> {
     PHASES
         .iter()
         .copied()
@@ -270,7 +286,7 @@ pub(crate) fn phases(info: &WorkerInfo) -> Vec<PhaseView> {
         .map(|kind| PhaseView {
             id: phase_id(kind),
             kind,
-            block: block_of(info, kind),
+            block: block_of(table, info, kind),
         })
         .collect()
 }
@@ -1040,6 +1056,7 @@ pub(crate) fn replicas(
 ) -> Vec<ReplicaView> {
     let executor = scheduler.executor.as_ref();
     let info = &scheduler.info;
+    let table = world_blocks(executor);
     let decode_stage = matches!(
         kind,
         CallKind::Forward(ForwardMode::Decode | ForwardMode::Verify)
@@ -1053,7 +1070,7 @@ pub(crate) fn replicas(
         .map(|(index, (worker, bound, worker_info))| {
             replica_view(ReplicaFacts {
                 index,
-                block: block_id(&blocks(info), bound).unwrap_or(ComponentId(0)),
+                block: block_id(&table, bound).unwrap_or(ComponentId(0)),
                 kinds: worker_phases(worker_info),
                 resident_requests: resident_requests(&scheduler.placement, worker),
                 // The executor reports whether a worker's queue has room, not
@@ -1088,7 +1105,7 @@ pub(crate) fn call(
 /// per worker of the world, in the executor's order.
 pub(crate) fn replica_catalog(scheduler: &Scheduler) -> Vec<ReplicaView> {
     let executor = scheduler.executor.as_ref();
-    let table = blocks(&scheduler.info);
+    let table = world_blocks(executor);
     executor
         .info()
         .workers
@@ -1138,7 +1155,7 @@ pub(crate) fn snapshot(scheduler: &Scheduler, step: u64, recorded: &RecordedTabl
         pages: pages(scheduler),
         encodings: encodings(scheduler),
         replicas: replica_catalog(scheduler),
-        phases: phases(&scheduler.info),
+        phases: phases_in(&scheduler.info, &world_blocks(scheduler.executor.as_ref())),
         ranks: Vec::new(),
     }
 }
