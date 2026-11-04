@@ -78,9 +78,15 @@ def parse_key(key, dimensions):
 
 def cutlass_library():
     """The CuTe DSL static runtime archive for this host's CUDA."""
-    import nvidia_cutlass_dsl  # noqa: PLC0415 - the toolchain's own package
+    import importlib.util  # noqa: PLC0415 - resolved from the toolchain's package
 
-    root = Path(nvidia_cutlass_dsl.__file__).parent
+    found = importlib.util.find_spec("nvidia_cutlass_dsl")
+    # The distribution is a namespace package: its directory is in the search
+    # locations, not in an origin module's path.
+    locations = list(getattr(found, "submodule_search_locations", None) or ())
+    if not locations:
+        raise SystemExit("the CuTe DSL package nvidia_cutlass_dsl is not installed")
+    root = Path(locations[0])
     for major in ("cu13", "cu12"):
         archive = root / major / "lib" / "libcuda_dialect_runtime_static.a"
         if archive.exists():
