@@ -237,6 +237,25 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // The splice's plan: one buffer, one clip's raster at the canvas's pixel extents. It does not
+    // grow with the grid or the clip count, because a splice blends one clip at a time.
+    for canvas in NAMED_CANVASES {
+        let clip = minimax_h3::video_vae::Canvas::clip(
+            &config.video_vae,
+            canvas.height / ratio,
+            canvas.width / ratio,
+        );
+        let plan = minimax_h3::output::splice_arena(&config.video_vae, &clip, nn::DType::F16)?;
+        let bytes: u64 = plan.iter().map(minimax_h3::decoding::Buffer::bytes).sum();
+        println!(
+            "splice plan {}x{}: {} buffers, {} bytes = {} MiB",
+            canvas.width,
+            canvas.height,
+            plan.len(),
+            bytes,
+            bytes / (1 << 20)
+        );
+    }
     for canvas in NAMED_CANVASES {
         let latent = minimax_h3::video_vae::Canvas::clip(
             &config.video_vae,
