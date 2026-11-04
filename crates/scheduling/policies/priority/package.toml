@@ -8,14 +8,11 @@ op = "scheduling"
 backend = "priority"
 
 [toolchain]
-name = "wasm32"
-target = "wasm32-unknown-unknown"
-rust-version = "1.96"
-wasmtime = "50.0.1"
+kind = "wasm"
+version = "50.0.1"
 
 [module]
-form = "wasm32"
-precompiled = true
+form = "wasm"
 
 # The same arguments as `fcfs`: the two policies differ only in their order.
 [arguments.chunked_prefill_size]
@@ -42,5 +39,9 @@ description = "Smallest prefix-hit deepening worth prefetching from the host KV 
 default = "30s"
 description = "Longest a resident request may go without progressing before the mechanism treats it as starved."
 
+# The package's build script: it compiles the crate to wasm32 and writes the raw
+# module the Program Server precompiles (design §5.2, §6.2).
 [source]
-files = ["Cargo.toml", "src/lib.rs"]
+kind = "wasm"
+files = ["Cargo.toml", "src/lib.rs", "src/build.py"]
+script = "src/build.py"
