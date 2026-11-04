@@ -334,18 +334,19 @@ impl Pcm {
 /// Every buffer one audio decode takes from `Forward::arena()`, in reservation order.
 ///
 /// The decoder's `forward` reserves: the restoring and projecting pair, the input convolution's output,
-/// then per stage the upsampled signal and the running sum plus four buffers per anti-aliased block
-/// (each block's running value, its two convolution outputs and the second's residual), and finally the
-/// post activation's output and the mono signal the PCM step reads. `frames` is the request's latent frame
-/// count, so every length here grows by the rates.
+/// then per stage the upsampled signal, the running sum, and **one** set of four buffers the stage's three
+/// blocks take turns in (the block's running value, its two convolution outputs and the second's residual).
+/// The post activation's output and the mono signal the PCM step reads close the list. `frames` is the
+/// request's latent frame count, so every length grows by the rates.
 ///
 /// The list matters because the arena never rewinds - its only rewind is the executor's per-forward
 /// `reset` - so every reservation in this walk accumulates and the sum is what a request needs. It is
-/// therefore large: at 207 latent frames the seven stages contribute ~10.6 MB each per buffer, and the
-/// total is about 0.9 GiB against 0.12 GiB of weights. The buffers are, however, uniform in element count
-/// across the stages (the channels halve as the length multiplies), so a scrub-sized set reserved once and
-/// viewed per stage would cut this by the stage and block counts; that is a change to `forward`'s structure
-/// and not something this list can assume.
+/// therefore large: at 207 latent frames each buffer of stages one to six is `[2, c, L]` with `c · L` near
+/// 1.32 M, about 10.6 MB, so those six stages carry most of the total against 0.12 GiB of weights. The
+/// remaining reduction is the shape-family one - `c · L` is within a factor of the patch area across the
+/// stages, so a set sized for the largest and viewed per stage would serve all seven - and it would make
+/// the plan a *bound* rather than a sum of distinct buffers. The stage loop states one shape per stage
+/// today, so this list states what is actually reserved.
 pub fn audio_arena(
     config: &crate::AudioVaeConfig,
     frames: u32,
@@ -374,14 +375,10 @@ pub fn audio_arena(
             .ok_or_else(|| Error::config("an audio length overflows".to_owned()))?;
         push(format!("stage{index}.upsampled"), channels, length);
         push(format!("stage{index}.sum"), channels, length);
-        for block in 0..BLOCKS_PER_STAGE {
-            for part in ["running", "activated", "convolved", "residual"] {
-                push(
-                    format!("stage{index}.block{block}.{part}"),
-                    channels,
-                    length,
-                );
-            }
+        // One set for the stage's blocks, not one per block: a block overwrites all four before it
+        // reads them.
+        for part in ["running", "activated", "convolved", "residual"] {
+            push(format!("stage{index}.{part}"), channels, length);
         }
     }
     push("post".to_owned(), channels, length);
@@ -519,6 +516,18 @@ pub fn sources(config: &AudioVaeConfig) -> Result<Vec<Source>> {
         "decoder.conv_post".to_owned(),
     ));
     Ok(sources)
+}
+
+/// The four buffers one anti-aliased block works in, reserved once per stage and reused by its blocks.
+///
+/// All four are the stage's shape because a block's channels are its stage's; the block overwrites each
+/// before reading it, so the blocks of a stage take turns rather than each taking a share of the arena.
+#[derive(Clone, Copy)]
+struct BlockBuffers {
+    running: TensorView,
+    activated: TensorView,
+    convolved: TensorView,
+    residual: TensorView,
 }
 
 /// The anti-aliased multi-periodicity blocks one decoder stage holds.
@@ -762,8 +771,6 @@ struct DecoderStage {
 /// accumulating on the running value.
 struct DecoderBlock {
     steps: Vec<DecoderStep>,
-    /// The width the block runs at: its stage's output channels.
-    channels: u32,
 }
 
 /// One dilation step: an alias-free activation, the dilated convolution, a second activation and the
@@ -911,10 +918,9 @@ impl AudioDecoder {
                         second_activation,
                     });
                 }
-                stage_blocks.push(DecoderBlock {
-                    steps,
-                    channels: stage.channels_out,
-                });
+                // A block runs at its stage's width and needs no field of its own for it: the stage
+                // reserves the buffers and states the width they are sized by.
+                stage_blocks.push(DecoderBlock { steps });
             }
             built.push(DecoderStage {
                 upsample,
@@ -1004,8 +1010,19 @@ impl AudioDecoder {
         length: u64,
     ) -> Result<TensorView> {
         let accumulated = self.buffer(f, stage.channels, length)?;
+        // The four buffers a block needs are the stage's shape, not the block's, so they are reserved
+        // once here and reused by every block: a block overwrites all four before it reads them (its
+        // first `ScaledAdd` writes `running` from the stage's input with `beta = 0`), while the running
+        // sum is a buffer of its own because it must survive the loop. Reserving them per block instead
+        // multiplied the decoder's arena by the block count, and the arena never rewinds.
+        let scratch = BlockBuffers {
+            running: self.buffer(f, stage.channels, length)?,
+            activated: self.buffer(f, stage.channels, length)?,
+            convolved: self.buffer(f, stage.channels, length)?,
+            residual: self.buffer(f, stage.channels, length)?,
+        };
         for (index, block) in stage.blocks.iter().enumerate() {
-            let block_out = self.block(f, block, input, length)?;
+            let block_out = self.block(f, block, input, scratch)?;
             // The first block initialises the sum; the rest add to it.
             let beta = if index == 0 { 0.0 } else { 1.0 };
             ScaledAdd.forward(f, rows(accumulated)?, rows(block_out)?, 1.0, beta)?;
@@ -1028,17 +1045,20 @@ impl AudioDecoder {
         f: &Forward,
         block: &DecoderBlock,
         input: TensorView,
-        length: u64,
+        scratch: BlockBuffers,
     ) -> Result<TensorView> {
         if block.steps.is_empty() {
             return Err(Error::config("an audio block has no step".to_owned()));
         }
-        let running = self.buffer(f, block.channels, length)?;
-        // `beta = 0` initialises the running value from the stage's input without touching it.
+        let BlockBuffers {
+            running,
+            activated,
+            convolved,
+            residual,
+        } = scratch;
+        // `beta = 0` initialises the running value from the stage's input without touching it. Every
+        // block does this first, which is what makes one set of buffers reusable across the stage.
         ScaledAdd.forward(f, rows(running)?, rows(input)?, 1.0, 0.0)?;
-        let activated = self.buffer(f, block.channels, length)?;
-        let convolved = self.buffer(f, block.channels, length)?;
-        let residual = self.buffer(f, block.channels, length)?;
         for step in &block.steps {
             step.first_activation.forward(f, running, activated)?;
             step.first.forward(f, activated, convolved)?;
@@ -1425,9 +1445,10 @@ pub(crate) mod tests {
         let config = tests::audio_config();
         let frames = 207;
         let plan = audio_arena(&config, frames).expect("the plan");
-        // Three buffers before the stages (restore, project, input), fourteen per stage (the upsampled
-        // signal and the running sum, then four per block), and the post activation and the mono signal.
-        assert_eq!(plan.len(), 3 + 14 * config.decoder_rates.len() + 2);
+        // Three buffers before the stages (restore, project, input), six per stage (the upsampled signal,
+        // the running sum and the four the stage's blocks share), and the post activation and the mono
+        // signal.
+        assert_eq!(plan.len(), 3 + 6 * config.decoder_rates.len() + 2);
         // The lengths follow the rates, so the last stage's buffers cover `frames · Π rates` samples.
         let longest = config
             .decoder_rates
