@@ -482,6 +482,10 @@ message Report {
     // its graphs on scratch and parked, and is ready to be promoted (§2.5,
     // §7.4 step 1). The daemon does not promote a child before this report.
     Parked parked = 12;
+    // `Promote` took effect: the parked standby serves in place, at the
+    // generation it was spawned at, on the addresses its graphs already use
+    // (§2.5). The epoch layer starts `Serve` and `Drain` only after it.
+    Promoted promoted = 13;
   }
 }
 
@@ -493,6 +497,12 @@ message Precopied {
 // spawned at, and the daemon promotes it in place (`Command::Promote`) only
 // after this.
 message Parked {
+  uint64 generation = 1;
+}
+
+// A promoted standby's answer to `Command::Promote`: it serves the generation
+// it was spawned at (§2.5).
+message Promoted {
   uint64 generation = 1;
 }
 
