@@ -151,10 +151,13 @@ impl Args {
                         .ok_or_else(|| format!("`{text}` is not a canvas; write 256x256"))?;
                     args.width = width
                         .parse()
-                        .map_err(|_| format!("`{width}` is not a width"))?;
+                        .map_err(|_| format!("`{width}` is not a width; write 256x256"))?;
                     args.height = height
                         .parse()
-                        .map_err(|_| format!("`{height}` is not a height"))?;
+                        .map_err(|_| format!("`{height}` is not a height; write 256x256"))?;
+                    if args.width == 0 || args.height == 0 {
+                        return Err(format!("`{text}` is a canvas of no pixels; write 256x256"));
+                    }
                 }
                 "--frames" => {
                     args.frames = value()?
@@ -165,11 +168,19 @@ impl Args {
                     args.text_tokens = value()?
                         .parse()
                         .map_err(|_| "`--text-tokens` takes a count".to_owned())?;
+                    if args.text_tokens == 0 {
+                        return Err("`--text-tokens` takes at least one token".to_owned());
+                    }
                 }
                 "--image" => {
                     args.image = value()?
                         .parse()
-                        .map_err(|_| "`--image` takes a pixel side".to_owned())?;
+                        .map_err(|_| "`--image` takes a pixel side, such as 256".to_owned())?;
+                    // A zero-pixel image is a condition of nothing: it would plan no tile and the
+                    // case would carry an empty condition rather than refuse it.
+                    if args.image == 0 {
+                        return Err("`--image` takes at least one pixel, such as 256".to_owned());
+                    }
                 }
                 "--seed" => {
                     args.seed = value()?
