@@ -2635,6 +2635,17 @@ impl Denoiser {
 
         // The audio rows: one element per channel-step pair, projected like any other row.
         if let Some((audio, audio_indices)) = audio {
+            // The audio trajectory is the video's type for the same reason, and the refusal belongs
+            // here rather than in the solver: a sample in another type would first widen the
+            // projection's 32-wide rows (`scaled_add target_f32_source_bf16_columns_32`) and only
+            // then fail against the prediction, which reads as a velocity defect instead of a dtype
+            // one.
+            if audio.dtype != DType::F32 {
+                return Err(Error::config(format!(
+                    "the audio latents are {} and a trajectory is FP32",
+                    audio.dtype
+                )));
+            }
             let audio_rows = u64::from(audio_indices.shape.dim(0) as u32);
             let features = u64::from(self.config.transformer.audio_channels);
             let flat = TensorView::with_strides(
