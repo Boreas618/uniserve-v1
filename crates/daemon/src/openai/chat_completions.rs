@@ -231,7 +231,8 @@ async fn chat_completions(
         // pauses it at its next engine event boundary and the successor
         // collects the rest (design §7.5.1).
         let registration = handoff.register();
-        let stream = crate::http::stream::ResponseStream::start(Box::new(run), false);
+        // The head waits for the document: one status, which is the outcome.
+        let stream = crate::http::stream::ResponseStream::start_held(Box::new(run), false);
         let Some(body) =
             crate::http::stream::HandedBody::new(stream, Some(registration), request_id.clone())
         else {
