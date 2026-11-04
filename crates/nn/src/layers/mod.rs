@@ -33,6 +33,7 @@ mod norm;
 mod residual;
 mod rope;
 mod sampler;
+mod segments;
 
 pub use activation::{GatedActivation, PackedSwiGlu, SwiGlu};
 pub use attention::{Attention, AttentionBackend, TRTLLM_WORKSPACE_BYTES};
@@ -52,6 +53,7 @@ pub use residual::{
 };
 pub use rope::Rotary;
 pub use sampler::{Candidates, Sampler, SamplerState, Samples};
+pub use segments::VsaTiles;
 
 /// The constants a layer's operator descriptor carries and the program package owns.
 ///

@@ -252,7 +252,15 @@ pub struct VideoRequest {
     pub frames: u32,
     /// Frames per second of the output.
     pub fps: u32,
-    /// Reference images or clips the request conditions on.
+    /// Frame-one anchors: each one pins the first generated frame.
+    pub first_frames: u32,
+    /// Last-frame anchors: each one pins the last generated frame.
+    pub last_frames: u32,
+    /// Reference images or clips: they condition the generation as a whole.
+    ///
+    /// The three roles are counted apart because they enter the layout differently — an anchor is
+    /// one encoded frame at a fixed position, a reference is an encoded clip — and the reference
+    /// implementation enforces it (`uniserve/models/denoiser.py`, `ConditionRole`).
     pub references: u32,
 }
 
@@ -310,6 +318,11 @@ pub struct Latents {
 }
 
 /// What a denoiser conditions on at a step.
+///
+/// The rows of every view follow the order the layout reserves: the encoded text first, then the
+/// request's conditions in the order `VideoRequest` counts them (first-frame anchors, last-frame
+/// anchors, references). A model that needs the roles reads them from the request it laid out, not
+/// from this value, so nothing request-shaped crosses the boundary.
 #[derive(Clone, Copy)]
 pub struct Conditioning {
     /// `[rows, width]` encoded text.
