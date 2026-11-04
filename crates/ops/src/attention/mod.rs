@@ -508,16 +508,25 @@ impl Op for PagedAttention {
             ));
         }
 
-        let max_kv_len = max_pages * page_size;
-        if max_kv_len > u64::from(descriptor.max_kv_len) {
+        // The page table's width is the *module's* geometry, not the request's: the compiled
+        // program is told how many pages a row may hold when it is built, and it walks that many
+        // columns of the table. A narrower table is read past its end — the page ids beyond it are
+        // whatever memory holds, and the cache reads they address are arbitrary — so the width is
+        // refused here rather than left to the kernel. A row longer than the request's needs is
+        // padded with zeros, which addresses page 0 the request never asks for.
+        let module_pages = u64::from(descriptor.max_kv_len).div_ceil(page_size);
+        if max_pages != module_pages {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "the module serves reductions of at most {}, the page table can address {max_kv_len} keys",
+                    "the module is compiled for {module_pages} pages a row ({}, page {page_size}) \
+                     and the page table is {max_pages} wide: the compiled walk covers the module's \
+                     width, so a narrower table is read past its end",
                     descriptor.max_kv_len
                 ),
             ));
         }
+        let max_kv_len = module_pages * page_size;
 
         let cum_seq_lens_q = match descriptor.phase {
             Phase::Prefill => {
