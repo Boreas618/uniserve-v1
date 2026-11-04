@@ -289,6 +289,70 @@ mod tests {
         crate::header::assert_constants(
             "cuda.h",
             &[
+                (
+                    "CU_TENSOR_MAP_DATA_TYPE_UINT8",
+                    TensorDataType::Uint8 as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_DATA_TYPE_UINT16",
+                    TensorDataType::Uint16 as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_DATA_TYPE_UINT32",
+                    TensorDataType::Uint32 as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_DATA_TYPE_INT32",
+                    TensorDataType::Int32 as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_DATA_TYPE_UINT64",
+                    TensorDataType::Uint64 as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_DATA_TYPE_INT64",
+                    TensorDataType::Int64 as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_DATA_TYPE_FLOAT16",
+                    TensorDataType::Float16 as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_DATA_TYPE_FLOAT32",
+                    TensorDataType::Float32 as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_DATA_TYPE_FLOAT64",
+                    TensorDataType::Float64 as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_DATA_TYPE_BFLOAT16",
+                    TensorDataType::BFloat16 as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_DATA_TYPE_FLOAT32_FTZ",
+                    TensorDataType::Float32Ftz as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_DATA_TYPE_TFLOAT32",
+                    TensorDataType::TFloat32 as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_DATA_TYPE_TFLOAT32_FTZ",
+                    TensorDataType::TFloat32Ftz as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+                    TensorDataType::Uint4Align8 as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B",
+                    TensorDataType::Uint4Align16 as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_DATA_TYPE_16U6_ALIGN16B",
+                    TensorDataType::Uint6Align16 as i64,
+                ),
                 ("CU_TENSOR_MAP_INTERLEAVE_NONE", Interleave::None as i64),
                 ("CU_TENSOR_MAP_INTERLEAVE_16B", Interleave::B16 as i64),
                 ("CU_TENSOR_MAP_INTERLEAVE_32B", Interleave::B32 as i64),
