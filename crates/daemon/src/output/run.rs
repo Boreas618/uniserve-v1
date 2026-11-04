@@ -835,6 +835,13 @@ impl<M: AsRef<[u8]> + Send + Sync + 'static> VideoContentRun<M> {
         }
     }
 
+    /// The same body, going on at the byte `offset` the process that handed
+    /// it over reached.
+    pub(crate) fn from_offset(mut self, offset: usize) -> Self {
+        self.offset = offset.min(self.media.as_ref().as_ref().len());
+        self
+    }
+
     /// How many bytes the body writes in one frame.
     const CHUNK: usize = 64 * 1024;
 }
