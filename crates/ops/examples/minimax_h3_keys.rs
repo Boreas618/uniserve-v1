@@ -1115,8 +1115,13 @@ fn main() {
 
     // Gaps this file does not fill, named rather than invented. Each is a number the deployment
     // owns, not one this file could read off a config:
-    // - `bias_add`: the decoder's and the video VAE's channel list per call site is a construction
-    //   inside `crates/models/minimax-h3`, so the row arrives with the layer that calls it.
+    // - `bias_add`: the audio decoder's channels are derivable and the video VAE's are not yet, and
+    //   in both cases the two flags belong to the layer that calls it. The audio decoder halves
+    //   `decoder_dim` once per upsample (`diffusers`' `MiniMaxH3AudioBigVGANDecoder.ups`:
+    //   `upsample_initial_channel // 2**i` into `// 2**(i+1)`, and its resblocks sit at the output
+    //   width), so its call sites are 1024, 512, 256, 128, 64, 32, 16 and 8; the video VAE's widths
+    //   come from its own stage list once that decoder is composed. `residual` and `residual_bias`
+    //   decide the key, and they are how the block folds its residual — the layer's, not the config's.
     // - `paged_attention`: the decode attention is trtllm-gen, and its key follows the executor's
     //   page geometry (page size, pages per sequence), which is scheduling and not the model's.
     // - `vsa_select_tiles`: the number of key tiles one query tile may select is the deployment's
