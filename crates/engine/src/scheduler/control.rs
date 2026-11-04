@@ -176,12 +176,13 @@ impl Scheduler {
                 let _ = answer.send(progress);
             }
             Command::DescribePolicyState { ranks, answer } => {
-                // No policy, no state a policy is instantiated with: the epoch
-                // waits for its first switchover (lead's ruling).
-                let state = self.policy.as_ref().map(|_| {
-                    views::trial_state_with_ranks(self, self.step, self.recorder.recorded(), ranks)
-                });
-                let _ = answer.send(state);
+                // The state is the mechanism's, not the serving policy's: an
+                // epoch's first precopy instantiates the epoch's policy on the
+                // state the mechanism holds before any policy serves (§7.3
+                // step 2).
+                let state =
+                    views::trial_state_with_ranks(self, self.step, self.recorder.recorded(), ranks);
+                let _ = answer.send(Some(state));
             }
             Command::CacheWarm {
                 operation,

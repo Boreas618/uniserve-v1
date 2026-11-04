@@ -1106,8 +1106,9 @@ impl CommandSender {
     }
 
     /// Reports the state a policy is instantiated with at the scheduler's next
-    /// boundary, with `ranks` as the control thread knows them; `None` while
-    /// the epoch has no policy yet, which is until its first switchover.
+    /// boundary, with `ranks` as the control thread knows them; `None` when the
+    /// scheduler does not answer in time. The state is the mechanism's, so an
+    /// epoch's first precopy has it before any policy serves.
     ///
     /// The control thread's route instance is instantiated and, after a
     /// `route` failure, reverted on this state (§7.3).

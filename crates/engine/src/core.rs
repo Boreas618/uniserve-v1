@@ -1268,8 +1268,10 @@ impl SchedulerHandle {
 
     /// The state the epoch's policy is instantiated with, as this scheduler
     /// holds it and with `ranks` as the control thread knows them (§7.3);
-    /// `None` while the epoch waits for its first switchover or the scheduler
-    /// does not answer in time.
+    /// `None` when the scheduler does not answer in time.
+    ///
+    /// The state is the mechanism's, not a serving policy's, so an epoch's
+    /// first precopy instantiates its policy on it before any policy serves.
     ///
     /// The control thread instantiates its route instance on it and reverts
     /// there after a `route` failure, so a failure costs one boundary, not the
