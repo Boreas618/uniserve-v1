@@ -155,6 +155,15 @@ impl VirtualPool {
         self.device
     }
 
+    /// Whether the pool is parked: its blocks reserve addresses but none is
+    /// mapped, and every one holds a saved host copy of its contents.
+    ///
+    /// An allocator's rollback uses this to park only the pools its own restore
+    /// brought back, never one that was live all along.
+    pub fn is_suspended(&self) -> bool {
+        self.suspended
+    }
+
     /// The bytes of physical storage the pool maps now: every block whose
     /// storage is mapped, and so exactly what its budget has booked for it.
     pub fn mapped_bytes(&self) -> usize {
