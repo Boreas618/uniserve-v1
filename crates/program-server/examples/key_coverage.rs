@@ -244,11 +244,28 @@ fn cover(
 }
 
 /// Why a package does not cover a key, in one phrase.
+///
+/// A package may declare one table of shapes or several; every shape it declares gets its own
+/// reason, because "this key is the second shape's" and "this key is no shape's" are different
+/// faults and a reader has to be able to tell them apart.
 fn explain(manifest: &Manifest, key: &str) -> String {
     let Some(kernel) = &manifest.kernel else {
         return "a scheduling policy covers only its own descriptor".to_owned();
     };
-    let descriptors = &kernel.descriptors;
+    let shapes = kernel.descriptors.shapes();
+    if shapes.len() == 1 {
+        return explain_shape(&shapes[0], key);
+    }
+    shapes
+        .iter()
+        .enumerate()
+        .map(|(index, shape)| format!("shape {}: {}", index + 1, explain_shape(shape, key)))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Why one declared shape of a package does not cover a key.
+fn explain_shape(descriptors: &program_server::manifest::Descriptors, key: &str) -> String {
     if descriptors.keys.iter().any(|named| named == key) {
         return "named outright".to_owned();
     }
