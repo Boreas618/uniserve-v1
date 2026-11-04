@@ -31,7 +31,7 @@ pub mod state;
 mod transfers;
 
 use self::state::{ScatterOp, SnapshotOp};
-pub use self::state::{Snapshot, StatePlanes};
+pub use self::state::{Snapshot, StatePage, StatePlanes};
 pub(crate) use access::UnitAccesses;
 pub use conversion::Unimported;
 use imports::Imports;
@@ -875,6 +875,102 @@ impl PrefixCache {
         self.release_prefixes(request, &slots, stream)
     }
 
+    /// The state page a transfer carries into a slot, checked against this rank's own units of
+    /// the same pages before any byte is written (design 4.5).
+    ///
+    /// The transfer states, per publishing rank, the retained key its rows are stored under, how
+    /// many rows they are and how wide; this derives the same key from the deployment's own
+    /// identity and computes the same figures from the destination's units. A disagreement is a
+    /// named refusal carrying the key, the two shapes and the figures - never a partial scatter,
+    /// because a half-written state group is silently wrong output rather than a slow import.
+    ///
+    /// `None` answers for a deployment whose model keeps no state per unit; the caller then
+    /// scatters nothing.
+    pub fn state_page(
+        &self,
+        export: &CacheTransfer,
+        tables: &[Arc<GroupTable>],
+        state: Option<crate::transfer::StateIdentity<'_>>,
+    ) -> Result<Option<StatePage>> {
+        let plan = self.planes.plan();
+        let group_index = match plan.groups.iter().position(|group| group.state) {
+            Some(index) => index,
+            None => {
+                if !export.state.is_empty() {
+                    return Err(Error::Invalid(
+                        "a cache transfer states a state page this deployment does not keep".into(),
+                    ));
+                }
+                return Ok(None);
+            }
+        };
+        if export.state.is_empty() {
+            return Err(Error::Invalid(
+                "a cache transfer of a model that keeps state per unit carries no state page"
+                    .into(),
+            ));
+        }
+        let identity = state.ok_or_else(|| {
+            Error::Invalid(
+                "a cache import of a model that keeps state per unit needs the request's token \
+                 prefix, the epoch's representation and the rank's split to key its state page"
+                    .into(),
+            )
+        })?;
+        let table = tables.get(group_index).ok_or_else(|| {
+            Error::Invalid(format!(
+                "no destination table for the state group {group_index}"
+            ))
+        })?;
+        let group = &plan.groups[group_index];
+
+        // The destination's own page: the same pages the transfer names, read in this rank's
+        // units, which is what the rows land in.
+        let block = u64::from(table.shape.block_size);
+        let first_page = u32::try_from(u64::from(export.base_extent) / block)
+            .map_err(|_| Error::Invalid("a state page is past the page index range".into()))?;
+        let carried = u32::try_from(u64::from(export.exported_extent).div_ceil(block))
+            .map_err(|_| Error::Invalid("a state page is past the page index range".into()))?
+            .saturating_sub(first_page);
+        let (rows, runs) =
+            state::page_runs(plan, group, table, self.planes.units(), first_page, carried)?;
+        let width = plan.plane_bytes;
+
+        let layers = u64::from(group.axis.offset)
+            ..u64::from(group.axis.offset) + group.layer_ids.len() as u64;
+        let key = crate::keys::state_key(
+            identity.prefix,
+            &identity.representation,
+            identity.split,
+            &crate::keys::Region::new([layers]),
+        );
+        for entry in &export.state {
+            if entry.key != key.0 {
+                return Err(Error::Invalid(format!(
+                    "the state page of rank {} is retained under another key than this \
+                     deployment derives for the pages [{first_page}, {}): its key is {}, this \
+                     rank's {}",
+                    entry.rank,
+                    first_page + carried,
+                    hex(&entry.key),
+                    hex(&key.0)
+                )));
+            }
+            if entry.rows != rows || entry.width != width {
+                return Err(Error::Invalid(format!(
+                    "the state page of rank {} is {} rows of {} bytes, and rank {}'s own units of \
+                     pages [{first_page}, {}) hold {rows} rows of {width} bytes",
+                    entry.rank,
+                    entry.rows,
+                    entry.width,
+                    0,
+                    first_page + carried
+                )));
+            }
+        }
+        Ok(Some(StatePage { rows, width, runs }))
+    }
+
     /// Export a slot's visible cache extent (see `cache_export::export`). Its
     /// transfer and locations exist once the issuer's work was performed
     /// ([`Self::locate_export`]).
@@ -887,6 +983,7 @@ impl PrefixCache {
         buffer: BufferId,
         transports: &Transports,
         consumers: &[usize],
+        state: Option<cache_export::StateIdentity<'_>>,
         stream: impl Issue,
     ) -> Result<CacheExport> {
         cache_export::export(
@@ -900,6 +997,7 @@ impl PrefixCache {
             buffer,
             transports,
             consumers,
+            state,
             stream,
         )
     }
@@ -1276,6 +1374,11 @@ mod fixed_bytes_tests {
     }
 }
 
+/// The bytes of a key as hex, for a refusal that names both keys.
+fn hex(key: &[u8]) -> String {
+    key.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1316,6 +1419,63 @@ mod tests {
             })
             .expect("a dense plan of two layers"),
         )
+    }
+
+    /// A transfer and a deployment must agree about whether a state page exists at all: a model
+    /// that keeps state per unit cannot be imported without one, and a deployment that keeps none
+    /// cannot be given one. Both are refusals by name, and neither writes a byte.
+    #[test]
+    fn a_state_page_is_refused_where_the_two_worlds_disagree() -> Result<()> {
+        let cache = PrefixCache::new(
+            plan(),
+            /* units */ 8,
+            None,
+            /* request_pool_size */ 2,
+            /* width */ 4,
+            /* import_capacity */ 1,
+            None,
+            None,
+            &mut LocalStorage,
+            Arc::new(conversion::Unimported),
+        )?;
+        let transfer = |state: Vec<ipc::StateTransfer>| ipc::CacheTransfer {
+            source: ipc::BufferId {
+                owner: ipc::RequestKey::new(1, ipc::RequestId(7), 1),
+                producer_call_id: ipc::CallId::new(2, 0),
+                output_index: 0,
+                generation: 2,
+            },
+            destination: "target".into(),
+            base: None,
+            base_extent: 0,
+            exported_extent: 8,
+            compute_dtype: "bfloat16".into(),
+            groups: Vec::new(),
+            state,
+        };
+        // This deployment keeps no state per unit, so a page offered to it is a mistake one of
+        // the two worlds made, and the import says which.
+        let offered = transfer(vec![ipc::StateTransfer {
+            rank: 0,
+            first_row: 0,
+            rows: 4,
+            width: 128,
+            key: vec![7; 32],
+        }]);
+        let error = cache
+            .state_page(&offered, &[], None)
+            .expect_err("a state page the deployment does not keep");
+        assert!(
+            error.to_string().contains("does not keep"),
+            "the refusal names the disagreement: {error}"
+        );
+        // And a transfer that carries none is not silently a model without state.
+        assert!(
+            cache
+                .state_page(&transfer(Vec::new()), &[], None)?
+                .is_none()
+        );
+        Ok(())
     }
 
     /// The row a batch's gather reads is the units the allocation named - not zeros, and not

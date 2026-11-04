@@ -256,6 +256,7 @@ pub(crate) fn export(
         exported_extent: visible,
         compute_dtype: planes.plan().compute_dtype().name().to_owned(),
         groups,
+        state: Vec::new(),
     };
 
     // A transport can accept an export before a later group fails: keep
