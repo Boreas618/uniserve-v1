@@ -360,14 +360,17 @@ impl ProcessRoster {
         let Some((executable, launch, environment)) = self.start.clone() else {
             return;
         };
-        // The fresh process's own number is the spawn's to allocate and to
-        // write into its launch file; the epoch waits for that number.
+        // The fresh process's identity is allocated here, from the same
+        // counter the epoch's children took theirs from: it is above the
+        // target's generation, so the process the target ends never names this
+        // one, and the epoch waits for the number its `Parked` reports.
+        let generation = self.epochs.next_generation(group, rank);
         self.resuming_epoch = Some(epoch);
         let start = Spawn {
             host: host.to_owned(),
             group: group.to_owned(),
             rank: rank as u32,
-            generation: 0,
+            generation,
             executable,
             arguments: Vec::new(),
             environment,
@@ -413,13 +416,17 @@ impl Roster for ProcessRoster {
         mut spawn: Spawn,
         launch: &crate::engine::launch::Launch,
     ) -> Result<crate::updates::switch::Spawned, String> {
-        // The process's own identity, from the deployment's one allocator: a
-        // launch file per process, so an epoch of two nodes never writes one
-        // number for two children (§2.3, §7.4), and a fresh generation of a
-        // restore never inherits the identity of the process it replaces.
-        let generation = self
-            .epochs
-            .next_generation(&spawn.group, u64::from(spawn.rank));
+        // The launch generation is the caller's, allocated once from the
+        // deployment's one counter ([`Epochs::next_generation`]): the switch
+        // spawns an epoch's children at one number and commands them by it, so
+        // taking a second number here would give one launch two identities —
+        // the switch's and this node's — and the child's `Parked` would name a
+        // generation no command reaches. A launch with no number is a caller
+        // that allocated none, not a process to start (§2.3, §7.4).
+        let generation = spawn.generation;
+        if generation == 0 {
+            return Err("a spawn states no launch generation".to_owned());
+        }
         let mut launch = launch.clone();
         launch.engine = generation;
         let path =
@@ -427,7 +434,6 @@ impl Roster for ProcessRoster {
                 .map_err(|error| {
                     format!("writing the launch file of engine {generation}: {error}")
                 })?;
-        spawn.generation = generation;
         spawn.arguments = vec![
             "engine".to_owned(),
             "--launch".to_owned(),
@@ -619,8 +625,6 @@ mod tests {
 
     fn service(info: Arc<Epochs>) -> (Service, EpochLink) {
         let (requests, incoming) = std::sync::mpsc::channel::<(Request, Sender<process::Reply>)>();
-        let (_commands, sent) = std::sync::mpsc::channel();
-        let (reports, _received) = std::sync::mpsc::channel();
         let (exits, exited) = std::sync::mpsc::channel();
         let (greetings, greeted) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -661,7 +665,11 @@ mod tests {
             }
             drop(info);
         });
-        let (processes, _commands_rx, _reports_tx) = ProcessCommands::pair();
+        // The adapter's downward end and the test's two ends of the one
+        // channel the daemon commands its main processes on: the commands the
+        // adapter sends, and the reports a test plays back up. Keeping a
+        // different pair here reads as an adapter that commands nothing.
+        let (processes, sent, reports) = ProcessCommands::pair();
         let link = EpochLink {
             requests,
             greetings: greeted,
