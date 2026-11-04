@@ -330,3 +330,54 @@ fn a_weight_normalized_gain_must_match_the_output_channels() {
     );
     assert!(store.published.is_empty());
 }
+
+#[test]
+fn a_strided_row_parallel_shard_gathers_its_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    // Four rows of six elements: row r holds 6r .. 6r+5.
+    let values: Vec<f32> = (0..24).map(|value| value as f32).collect();
+    shard(
+        dir.path(),
+        "model.safetensors",
+        &[("o_proj.weight", vec![4, 6], bf16(&values))],
+    );
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let mut store = Recording::default();
+
+    let request = WeightRequest::strided("o_proj.weight", 0, Shape::new(&[4, 3]), 6);
+    let weight = {
+        let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+        loader.load(&request).unwrap()
+    };
+    assert_eq!(weight.shape().dims(), &[4, 3]);
+    let (_, bytes, _, _, _) = &store.published[0];
+    assert_eq!(
+        from_bf16(bytes),
+        vec![
+            0.0, 1.0, 2.0, 6.0, 7.0, 8.0, 12.0, 13.0, 14.0, 18.0, 19.0, 20.0
+        ],
+        "columns 0..2 of every row, rows contiguous"
+    );
+
+    // The same request reuses the retained region.
+    {
+        let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+        loader.load(&request).unwrap();
+    }
+    assert_eq!(store.published.len(), 1);
+
+    // A second column block of the same extents is another key.
+    {
+        let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+        loader
+            .load(&WeightRequest::strided(
+                "o_proj.weight",
+                3,
+                Shape::new(&[4, 3]),
+                6,
+            ))
+            .unwrap();
+    }
+    assert_eq!(store.published.len(), 2);
+    assert_ne!(store.published[0].0, store.published[1].0);
+}

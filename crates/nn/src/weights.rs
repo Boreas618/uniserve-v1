@@ -105,6 +105,23 @@ pub enum WeightSource {
         /// The region's extents.
         shape: Shape,
     },
+    /// `shape` elements of `tensor` whose last axis begins at element `start` and repeats every
+    /// `stride` elements.
+    ///
+    /// A tensor-parallel rank reads one column block of a row-parallel projection: every row of the
+    /// checkpoint's tensor contributes `shape.last()` elements, and consecutive rows start `stride`
+    /// elements apart. The loader gathers those rows and converts them like any other weight, so
+    /// the retained storage of a shard is contiguous like the rest.
+    Strided {
+        /// The checkpoint tensor's name.
+        tensor: String,
+        /// The first element of the first row, in the tensor's row-major order.
+        start: u64,
+        /// The gathered region's extents.
+        shape: Shape,
+        /// Elements between the first elements of consecutive rows.
+        row_stride: u64,
+    },
     /// The row-major concatenation of `parts` along their first axis, viewed as `shape`.
     ///
     /// Every part must have the same extents after its first axis. This is how a routed expert's
@@ -147,6 +164,22 @@ impl WeightRequest {
         }
     }
 
+    /// A weight gathered from `tensor`'s rows, each row starting `stride` elements after the last.
+    pub fn strided(tensor: impl Into<String>, start: u64, shape: Shape, row_stride: u64) -> Self {
+        let tensor = tensor.into();
+        Self {
+            source: WeightSource::Strided {
+                tensor: tensor.clone(),
+                start,
+                shape,
+                row_stride,
+            },
+            tensor,
+            layout: WeightLayout::ROW_MAJOR,
+            shape,
+        }
+    }
+
     /// A weight fused from `parts`, viewed as `shape`, in `layout`.
     pub fn parts(
         tensor: impl Into<String>,
@@ -178,6 +211,9 @@ pub struct WeightRegion {
     pub start: u64,
     /// The logical tensor's extents.
     pub shape: Shape,
+    /// The source rows' stride in elements, when the region is a strided sub-matrix. Two gatherings
+    /// of one tensor differ in it, so they cannot collide in retained storage.
+    pub stride: Option<u64>,
 }
 
 impl fmt::Display for WeightRegion {
@@ -189,7 +225,11 @@ impl fmt::Display for WeightRegion {
             self.start,
             self.start + self.shape.numel()
         )?;
-        write!(formatter, "{:?}", self.shape.dims())
+        write!(formatter, "{:?}", self.shape.dims())?;
+        if let Some(stride) = self.stride {
+            write!(formatter, "|stride_{stride}")?;
+        }
+        Ok(())
     }
 }
 
@@ -310,13 +350,19 @@ impl<'a> WeightLoader<'a> {
             )));
         }
 
-        let (names, start, source_shape) = match &request.source {
+        let (names, start, source_shape, stride) = match &request.source {
             WeightSource::Region {
                 tensor,
                 start,
                 shape,
-            } => (vec![tensor.clone()], *start, *shape),
-            WeightSource::Parts { parts, shape } => (parts.clone(), 0, *shape),
+            } => (vec![tensor.clone()], *start, *shape, None),
+            WeightSource::Strided {
+                tensor,
+                start,
+                shape,
+                row_stride,
+            } => (vec![tensor.clone()], *start, *shape, Some(*row_stride)),
+            WeightSource::Parts { parts, shape } => (parts.clone(), 0, *shape, None),
         };
         if let WeightSource::Parts { shape, .. } = &request.source
             && !request.shape.matches(shape)
@@ -336,6 +382,7 @@ impl<'a> WeightLoader<'a> {
             tensors: names.clone(),
             start,
             shape: source_shape,
+            stride,
         };
         let key = WeightKey {
             files,
@@ -438,6 +485,7 @@ impl<'a> WeightLoader<'a> {
                 tensors: vec![format!("{name}__weight_norm"), v.to_owned(), g.to_owned()],
                 start: 0,
                 shape: value.shape,
+                stride: None,
             },
         };
         if let Some(backing) = self.store.retained(&key)? {
@@ -506,6 +554,7 @@ impl<'a> WeightLoader<'a> {
                 tensors: vec![name.to_owned()],
                 start: 0,
                 shape,
+                stride: None,
             },
         };
         let backing = match self.store.retained(&key)? {
@@ -604,6 +653,58 @@ impl<'a> WeightLoader<'a> {
                 }
                 Ok(bytes[begin..end].to_vec())
             }
+            WeightSource::Strided {
+                tensor,
+                start,
+                shape,
+                row_stride,
+            } => {
+                let location = self
+                    .checkpoint
+                    .tensor(tensor)
+                    .ok_or_else(|| Error::MissingTensor(tensor.clone()))?;
+                let element = location.dtype.bytes().ok_or_else(|| {
+                    Error::weight(tensor, format!("{} has no whole-byte size", location.dtype))
+                })?;
+                if shape.rank() == 0 {
+                    return Err(Error::weight(
+                        tensor,
+                        "a gathered weight has an axis".to_owned(),
+                    ));
+                }
+                let row = shape.last();
+                if *row_stride < row {
+                    return Err(Error::weight(
+                        tensor,
+                        format!("a stride of {row_stride} overlaps rows of {row} elements"),
+                    ));
+                }
+                let rows = shape.numel() / row.max(1);
+                let bytes = self.checkpoint.bytes(location)?;
+                let mut gathered =
+                    Vec::with_capacity(usize::try_from(shape.numel() * element).unwrap_or(0));
+                for index in 0..rows {
+                    let begin = start + index * row_stride;
+                    let from = usize::try_from(begin * element).map_err(|_| {
+                        Error::weight(tensor, "a gathered row starts past usize::MAX")
+                    })?;
+                    let to = usize::try_from((begin + row) * element).map_err(|_| {
+                        Error::weight(tensor, "a gathered row ends past usize::MAX")
+                    })?;
+                    if to > bytes.len() {
+                        return Err(Error::weight(
+                            tensor,
+                            format!(
+                                "row {index} (elements {begin}..{}) reaches past the tensor's {} bytes",
+                                begin + row,
+                                bytes.len()
+                            ),
+                        ));
+                    }
+                    gathered.extend_from_slice(&bytes[from..to]);
+                }
+                Ok(gathered)
+            }
             WeightSource::Parts { parts, .. } => {
                 let mut fused = Vec::new();
                 let mut part_shape: Option<Shape> = None;
@@ -655,7 +756,7 @@ fn check_layout(tensor: &str, source: &WeightSource, layout: WeightLayout) -> Re
         WeightLayout::ROW_MAJOR => Ok(()),
         WeightLayout::UP_GATE | WeightLayout::DOWN => match source {
             WeightSource::Parts { .. } => Ok(()),
-            WeightSource::Region { .. } => Err(Error::weight(
+            WeightSource::Region { .. } | WeightSource::Strided { .. } => Err(Error::weight(
                 tensor,
                 format!(
                     "layout {layout} fuses several projections; a single region cannot produce it"
@@ -830,6 +931,7 @@ mod tests {
                 tensors: vec!["up".to_owned(), "gate".to_owned()],
                 start: 0,
                 shape: Shape::new(&[128, 1536, 2048]),
+                stride: None,
             },
         };
         let text = key.to_string();
