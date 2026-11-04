@@ -457,6 +457,23 @@ impl ClipDecoder {
         let view = self.placement(blended, tile, first_row, first_column, 0, 0)?;
         self.unpatchify.forward(f, tokens, plain)?;
         self.unpatchify.forward(f, tokens, view)?;
+        // The blend can only read a neighbour that is one contiguous block. `cross_fade`'s sources are
+        // addressed flat in `[channels, frames, rows, columns]` order and only its destination carries
+        // strides (its program's own note says so), so a shift of a raster wider than the tile reads
+        // the wrong rows past the first. Refusing is the honest answer until the operator reads its
+        // sources through their strides: a silently misread seam is a different picture, not a slower
+        // one. Single-column grids are unaffected, because there the tile's rows are the raster's.
+        if (tile.above != 0 || tile.left != 0) && view.shape.dim(3) != decoded.shape.dim(3) {
+            return Err(Error::Unsupported(format!(
+                "the clip decoder cannot blend tile ({}, {}) of a {}x{} raster: a neighbour of a \
+                 {}-wide tile is not one contiguous block, and cross_fade reads its sources contiguously",
+                tile.row,
+                tile.column,
+                decoded.shape.dim(2),
+                decoded.shape.dim(3),
+                view.shape.dim(3)
+            )));
+        }
         if tile.above != 0 {
             let previous = self.placement(decoded, tile, first_row, first_column, tile.above, 0)?;
             self.blend(tile.above, 2)?
