@@ -1773,6 +1773,12 @@ async fn forward(stream: Stream, routing: &Routing) {
             media,
         };
         replay.push_back((sent, frame.clone()));
+        // A consumer that went away stops holding the request back, so the
+        // stream can run on; the retained window stays bounded by what a
+        // successor can take over from.
+        while replay.len() > EVENT_WINDOW as usize {
+            replay.pop_front();
+        }
         routing.send(front, frame);
         if terminal {
             ended = true;
