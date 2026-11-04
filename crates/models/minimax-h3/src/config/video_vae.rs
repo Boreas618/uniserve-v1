@@ -161,7 +161,7 @@ impl VideoVaeConfig {
         let rounded = rotary_width.round();
         if self.decoder_rope_dim_ratio > 1.0
             || (rotary_width - rounded).abs() > f64::EPSILON
-            || (rounded as u32) % 6 != 0
+            || !(rounded as u32).is_multiple_of(6)
         {
             return Err(Error::config(format!(
                 "{owner}: the decoder rotary width {rotary_width} must divide into three even axes"

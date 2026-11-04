@@ -167,8 +167,8 @@ impl Canvas {
         // the area is capped, so a wide ratio's short side is shorter than the class's edge.
         let (aspect_width, aspect_height) = (i64::from(self.aspect.0), i64::from(self.aspect.1));
         let (width, height) = (i64::from(self.width), i64::from(self.height));
-        self.width % super::CANVAS_MULTIPLE == 0
-            && self.height % super::CANVAS_MULTIPLE == 0
+        self.width.is_multiple_of(super::CANVAS_MULTIPLE)
+            && self.height.is_multiple_of(super::CANVAS_MULTIPLE)
             && (width * aspect_height - height * aspect_width).abs()
                 <= i64::from(super::CANVAS_MULTIPLE) * aspect_width.max(aspect_height)
     }

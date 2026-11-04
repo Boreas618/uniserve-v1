@@ -65,7 +65,7 @@ fn run() -> Result<String, String> {
         .map(|condition| condition.condition())
         .collect::<Result<_, _>>()?;
     let segments = packing::condition_segments(&conditions, &canvas).map_err(problem)?;
-    let spans: Vec<(u32, u32)> = case.vision_spans.iter().copied().collect();
+    let spans: Vec<(u32, u32)> = case.vision_spans.to_vec();
 
     let mut tensors: Vec<Named> = Vec::new();
     match case.attention {
@@ -244,10 +244,10 @@ fn run() -> Result<String, String> {
     for entry in fs::read_dir(&dumps).map_err(|error| format!("{}: {error}", dumps.display()))? {
         let entry = entry.map_err(|error| format!("{}: {error}", dumps.display()))?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if let Some(name) = name.strip_suffix(".h3t") {
-            if !seen.iter().any(|seen| seen == name) {
-                report.extra.push(name.to_owned());
-            }
+        if let Some(name) = name.strip_suffix(".h3t")
+            && !seen.iter().any(|seen| seen == name)
+        {
+            report.extra.push(name.to_owned());
         }
     }
 
@@ -438,7 +438,9 @@ fn read_dump(path: &Path) -> Result<Dump, String> {
             }
             Values::Float(
                 payload
-                    .chunks_exact(8)
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
                     .map(|chunk| {
                         let mut word = [0_u8; 8];
                         word.copy_from_slice(chunk);
@@ -454,7 +456,9 @@ fn read_dump(path: &Path) -> Result<Dump, String> {
             }
             Values::Float(
                 payload
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|chunk| {
                         let mut word = [0_u8; 4];
                         word.copy_from_slice(chunk);

@@ -171,14 +171,14 @@ impl Layout {
                 root.display()
             ))
         })?;
-        if let Some(class) = index.get("_class_name").and_then(Value::as_str) {
-            if class != PIPELINE_CLASS {
-                return Err(Error::checkpoint(format!(
-                    "{} is a {class} checkpoint, not a {PIPELINE_CLASS} pipeline root; the task \
+        if let Some(class) = index.get("_class_name").and_then(Value::as_str)
+            && class != PIPELINE_CLASS
+        {
+            return Err(Error::checkpoint(format!(
+                "{} is a {class} checkpoint, not a {PIPELINE_CLASS} pipeline root; the task \
                      exports under FL2VA/ are not pipeline roots",
-                    root.display()
-                )));
-            }
+                root.display()
+            )));
         }
         let mut dits = Vec::new();
         for dit in Dit::ALL {

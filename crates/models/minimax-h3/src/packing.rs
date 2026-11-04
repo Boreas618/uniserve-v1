@@ -82,7 +82,9 @@ pub fn video_grid(frames: u32, raster: LatentRaster) -> (u32, u32, u32) {
 
 /// The latent raster of a canvas whose sides are multiples of the VAE's patch grid.
 pub fn latent_raster(canvas: &Canvas) -> Result<LatentRaster> {
-    if canvas.width % CANVAS_MULTIPLE != 0 || canvas.height % CANVAS_MULTIPLE != 0 {
+    if !canvas.width.is_multiple_of(CANVAS_MULTIPLE)
+        || !canvas.height.is_multiple_of(CANVAS_MULTIPLE)
+    {
         return Err(Error::config(format!(
             "an H3 canvas side must be a multiple of {CANVAS_MULTIPLE} pixels, got {}x{}",
             canvas.width, canvas.height
@@ -932,10 +934,10 @@ pub fn segment_extent(
 ) -> Result<SegmentExtent> {
     if tile_shape(tile).is_err()
         || text_rows < tile
-        || text_rows % tile != 0
-        || condition_rows % tile != 0
+        || !text_rows.is_multiple_of(tile)
+        || !condition_rows.is_multiple_of(tile)
         || token_multiple < tile
-        || token_multiple % tile != 0
+        || !token_multiple.is_multiple_of(tile)
     {
         return Err(Error::config(
             "a segment layout needs a known tile size, whole-tile text and condition capacities and a whole-tile alignment"

@@ -217,12 +217,12 @@ impl AttentionKind {
                 "H3 VSA sparsity must lie in [0, 1), got {sparsity}"
             )));
         }
-        if let Some(keep) = reference_keep {
-            if !keep.is_finite() || !(0.0 < keep && keep <= 1.0) {
-                return Err(Error::config(format!(
-                    "H3 VSA reference keep rate must lie in (0, 1], got {keep}"
-                )));
-            }
+        if let Some(keep) = reference_keep
+            && (!keep.is_finite() || !(0.0 < keep && keep <= 1.0))
+        {
+            return Err(Error::config(format!(
+                "H3 VSA reference keep rate must lie in (0, 1], got {keep}"
+            )));
         }
         Ok(Self::Sparse {
             tile,
@@ -344,7 +344,9 @@ impl TransformerConfig {
         };
         // Each of the three rotary axes (time, height, width) rotates 2 * rope_frequency_dim
         // channels of a head; the rest stay unrotated.
-        if config.rope_frequency_dim % 2 != 0 || config.rope_frequency_dim * 6 > config.head_dim {
+        if !config.rope_frequency_dim.is_multiple_of(2)
+            || config.rope_frequency_dim * 6 > config.head_dim
+        {
             return Err(Error::config(format!(
                 "H3 transformer rope_freq_dim must be even and rotate at most a head's width, \
                  got {} of {}",
