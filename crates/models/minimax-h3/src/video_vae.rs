@@ -291,6 +291,36 @@ impl Tiles {
     }
 }
 
+/// The width of a decoder head the rotary embedding rotates, and its three shares.
+///
+/// A head is `decoder_attention_head_dim` wide and `decoder_rope_dim_ratio` of it is rotated — 64 and
+/// 0.75 in the checkpoint, so 48 elements — split evenly over the frame, row and column axes: sixteen
+/// each, eight rotation pairs per axis. The trailing elements of a head pass through unrotated. The
+/// base is `decoder_rope_theta` (100), stated by the layer that builds the factors.
+pub fn rotary(config: &VideoVaeConfig) -> Result<(u32, [u32; 3])> {
+    let head = config.decoder_attention_head_dim;
+    let ratio = config.decoder_rope_dim_ratio;
+    if head == 0 || !(0.0..=1.0).contains(&ratio) || ratio == 0.0 {
+        return Err(Error::config(format!(
+            "a {head}-wide head and a rotated fraction of {ratio} do not make a rotation"
+        )));
+    }
+    let width = (head as f64 * f64::from(ratio)).round();
+    if (width - head as f64 * f64::from(ratio)).abs() > 1e-6 || width < 1.0 {
+        return Err(Error::config(format!(
+            "a {ratio} fraction of a {head}-wide head is not a whole width"
+        )));
+    }
+    let width = width as u32;
+    if !width.is_multiple_of(6) || !width.is_multiple_of(2) {
+        return Err(Error::config(format!(
+            "a rotated width of {width} does not split evenly over three axes of pairs"
+        )));
+    }
+    let share = width / 3;
+    Ok((width, [share; 3]))
+}
+
 /// The cell-centre rotary coordinates of the transformer's token rows, as `[rows, 3]` FP32.
 ///
 /// Along an axis of `size`, row `i` sits at `2 * (i + 0.5) / size - 1`, in `[-1, 1)`: the reference's
@@ -500,6 +530,29 @@ pub(crate) mod tests {
                     + u64::from(tile.canvas.tail)
             );
         }
+    }
+
+    #[test]
+    fn three_quarters_of_a_head_rotate_over_three_axes() {
+        let config = video_config();
+        let (width, sections) = rotary(&config).expect("a rotation");
+        assert_eq!(width, 48);
+        assert_eq!(sections, [16, 16, 16]);
+        // The sections are the rotated width, and eight pairs rotate per axis.
+        assert_eq!(sections.iter().sum::<u32>(), width);
+        assert_eq!(width / 6, 8);
+        // A head narrower than the rotation, or a fraction that is not whole, is refused.
+        let mut broken = config.clone();
+        broken.decoder_rope_dim_ratio = 0.7;
+        assert!(rotary(&broken).is_err());
+        let mut broken = config.clone();
+        broken.decoder_attention_head_dim = 6;
+        assert!(rotary(&broken).is_err());
+        // A narrower head rotates all of itself: six elements, two per axis.
+        let mut whole = config.clone();
+        whole.decoder_attention_head_dim = 6;
+        whole.decoder_rope_dim_ratio = 1.0;
+        assert_eq!(rotary(&whole).expect("a rotation"), (6, [2, 2, 2]));
     }
 
     #[test]
