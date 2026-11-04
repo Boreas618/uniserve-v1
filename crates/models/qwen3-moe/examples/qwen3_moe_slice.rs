@@ -730,7 +730,7 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
                 let out = model.forward_substage(&forward, &batch, &cache, hidden, layer, cut)?;
                 stream.synchronize()?;
                 let values = download_bf16(&stream, out, rows, width)?;
-                let file = format!("hidden_{:02}_{}.npy", layer + 1, cut.name());
+                let file = format!("hidden_{:02}_{}.npy", layer + 1, cut_file(cut));
                 let label = format!("layer {layer}'s `{}` cut", cut.name());
                 let stage = Walked {
                     file: &file,
@@ -743,11 +743,22 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
                 // The reference tensor that answers this cut exists only if the caller's hooks
                 // dumped it; without it the cut is our own number and says where in the layer a
                 // number changes, not that the reference agrees.
-                match args.reference.as_deref() {
-                    Some(dir) if dir.join(&file).exists() => {
-                        report_stage(args, stage, &values, &mut table)?;
+                let spelled = format!("hidden_{:02}_{}.npy", layer + 1, cut.name());
+                let found = args.reference.as_deref().and_then(|dir| {
+                    [&file, &spelled]
+                        .into_iter()
+                        .find(|name| dir.join(name.as_str()).exists())
+                        .cloned()
+                });
+                match found {
+                    Some(found) => {
+                        let found = Walked {
+                            file: &found,
+                            ..stage
+                        };
+                        report_stage(args, found, &values, &mut table)?;
                     }
-                    _ => println!(
+                    None => println!(
                         "substage: {label}, rms {:.4e} - no `{file}` in the reference directory, \
                          so it is not compared; the file comes from a post-hook on {}",
                         rms(&values),
@@ -1061,6 +1072,20 @@ fn cut_hook(cut: Substage) -> &'static str {
         Substage::Normalized => "`input_layernorm`",
         Substage::Attended => "`self_attn`",
         Substage::MlpOut => "`mlp`",
+    }
+}
+
+/// The name a cut's tensor carries in a reference directory.
+///
+/// The file is named after the module whose hook produced it, not after the cut: the reference's
+/// third tensor is `mlp` before its residual add, and this crate calls that cut `mlp_out` so its
+/// name states whether the add has happened. Both spellings are accepted when a directory holds
+/// one, because a directory somebody else wrote should not have to know our vocabulary.
+fn cut_file(cut: Substage) -> &'static str {
+    match cut {
+        Substage::Normalized => "normalized",
+        Substage::Attended => "attended",
+        Substage::MlpOut => "mlp",
     }
 }
 
