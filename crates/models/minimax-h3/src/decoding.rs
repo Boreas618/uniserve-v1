@@ -157,7 +157,8 @@ impl Buffer {
     }
 }
 
-/// The clip-latent row of every voxel of every tile, in tile order then voxel order.
+/// The clip-latent row of every voxel of every tile, in tile order then voxel order, with the number of
+/// voxels each tile contributes.
 ///
 /// A tile is a rectangle of the clip's latent raster — every frame, a run of rows and a run of columns —
 /// so its voxels are a subset of the clip's, and a tile's rows cannot be a strided view of the clip's
@@ -167,15 +168,20 @@ impl Buffer {
 ///
 /// `tiles` are in grid order ([`Tiles::tiles`]), and each tile contributes
 /// `frames · (rows_end − rows_start) · (columns_end − columns_start)` entries: the row index
-/// `((frame · h + row) · w + column)` of each of its voxels. The concatenation is a permutation of
+/// `((frame · h + row) · w + column)` of each of its voxels. **The counts are returned with the rows
+/// because they are not all equal**: the seams spread their slack, so the last tile of an axis can be
+/// narrower than the tile size, and a consumer that pads the table to one uniform tile stride needs the
+/// per-tile lengths to know where each block ends. Taken together the entries are a permutation of
 /// `0..frames · h · w`, because the tiles partition the raster.
-pub fn tile_rows(canvas: &Canvas, tiles: &[Tile]) -> Vec<i32> {
+pub fn tile_rows(canvas: &Canvas, tiles: &[Tile]) -> (Vec<i32>, Vec<u32>) {
     let height = u64::from(canvas.height);
     let width = u64::from(canvas.width);
     let mut rows = Vec::with_capacity(canvas.voxels() as usize);
+    let mut counts = Vec::with_capacity(tiles.len());
     for tile in tiles {
         let (first_row, last_row) = tile.latent_rows;
         let (first_column, last_column) = tile.latent_columns;
+        let before = rows.len();
         for frame in 0..u64::from(canvas.frames) {
             for row in u64::from(first_row)..u64::from(last_row) {
                 for column in u64::from(first_column)..u64::from(last_column) {
@@ -183,8 +189,9 @@ pub fn tile_rows(canvas: &Canvas, tiles: &[Tile]) -> Vec<i32> {
                 }
             }
         }
+        counts.push((rows.len() - before) as u32);
     }
-    rows
+    (rows, counts)
 }
 
 /// The scratch one video clip's decode needs, one entry per distinct lifetime.
@@ -755,8 +762,13 @@ mod tests {
         let grid = Tiles::of(&config, &canvas)
             .expect("the grid")
             .tiles(&config, &canvas);
-        let rows = tile_rows(&canvas, &grid);
+        let (rows, counts) = tile_rows(&canvas, &grid);
         assert_eq!(rows.len() as u64, canvas.voxels());
+        assert_eq!(counts.len(), grid.len());
+        assert_eq!(
+            counts.iter().map(|count| u64::from(*count)).sum::<u64>(),
+            rows.len() as u64
+        );
         // The tiles partition the raster, so the table is a permutation of the clip's rows.
         let mut seen = vec![false; rows.len()];
         for row in &rows {
