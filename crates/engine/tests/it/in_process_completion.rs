@@ -240,6 +240,15 @@ fn a_request_is_served_through_the_executors_own_batch_path() {
     let batches: Arc<dyn Batches> = serving.clone();
     let handle = SchedulerHandle::over_batches(config(), batches).expect("the pool serves");
     install(&handle, &serving);
+    // The kernels this epoch serves on, as the control thread's switchover arm
+    // publishes it. The handle's stage command is not the arm that numbers a
+    // generation — that is the process command's — so the test states the
+    // number through the one cell both threads share, and asserts that what the
+    // arm stamped is what the scheduler read once for the step.
+    const GENERATION: u64 = 7;
+    handle
+        .generation()
+        .store(GENERATION, std::sync::atomic::Ordering::Relaxed);
 
     let mut events = handle
         .submit(text_request(1, 8, 4))
@@ -278,11 +287,15 @@ fn a_request_is_served_through_the_executors_own_batch_path() {
         "the pool was asked for both phases: {} batches",
         batches.len()
     );
-    // Every batch names its generation, so the kernels it ran on are stated
-    // rather than assumed.
+    // Every batch names the generation the step read, so the kernels it ran on
+    // are stated rather than assumed, and one step never mixes two worlds.
     assert!(
-        batches.iter().all(|batch| batch.generation > 0),
-        "the switchover published a generation before any batch was served"
+        batches.iter().all(|batch| batch.generation == GENERATION),
+        "every batch of a step carries the generation that step read: {:?}",
+        batches
+            .iter()
+            .map(|batch| batch.generation)
+            .collect::<Vec<_>>()
     );
 
     handle.shutdown();
