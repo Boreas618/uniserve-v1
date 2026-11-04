@@ -462,18 +462,6 @@ fn validate_work_entry(work: &Work, live: &Live) -> Result<(), PolicyError> {
                 ));
             }
         }
-        PhaseKind::Refill => {
-            let gap = request.refill_tokens.unwrap_or(0);
-            if work.tokens > gap {
-                return Err(invalid(
-                    Call::Dispatch,
-                    format!(
-                        "{} is given a {}-token refill chunk, its draft cache is {} tokens short",
-                        work.request.0, work.tokens, gap
-                    ),
-                ));
-            }
-        }
         _ => {
             let charge = request.next_tokens.max(1);
             if work.tokens != charge {
@@ -945,10 +933,7 @@ impl Recorder {
     /// so they are recorded there and `views.rs` reads them back from
     /// [`Recorder::recorded`].
     pub(crate) fn prefix_hit(&mut self, request: RequestId, device_hit: u32, host_deepening: u32) {
-        let recorded = self
-            .recorded
-            .entry(ipc::RequestId(request.0))
-            .or_default();
+        let recorded = self.recorded.entry(ipc::RequestId(request.0)).or_default();
         recorded.cached_prefix_tokens = device_hit;
         recorded.prefetch_tokens = host_deepening;
     }
