@@ -404,6 +404,38 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             mib(bytes / (1 << 20))
         );
     }
+    // The conditioning pass's own arena, which a conditioned deployment reserves once per condition
+    // beside the encoder's set. Two anchors, because the tile buffer is in pixels and the rest are in
+    // latents: a still and a 25-frame reference at the same raster.
+    // The latent raster the packing names: 84 columns by 48 rows, the reference's own.
+    let latent = minimax_h3::encoding::Extent {
+        frames: 1,
+        height: 48,
+        width: 84,
+    };
+    for (frames, extent) in [
+        (1_u32, latent),
+        (
+            // 25 frames of a reference are 7 latent frames by the encoder's own rule, and the plan
+            // refuses a caller that hands it the wrong one of the two counts.
+            25,
+            minimax_h3::encoding::Extent {
+                frames: 7,
+                ..latent
+            },
+        ),
+    ] {
+        let plan = minimax_h3::encoding::conditioning_arena(&config.video_vae, frames, extent)?;
+        let bytes: u64 = plan.iter().map(minimax_h3::decoding::Buffer::bytes).sum();
+        println!(
+            "conditioning plan {frames} frames ({} latent): {} buffers, {} bytes = {} KiB",
+            extent.frames,
+            plan.len(),
+            bytes,
+            bytes / (1 << 10)
+        );
+    }
+
     // The splice's plan: one buffer, one clip's raster at the canvas's pixel extents. It does not
     // grow with the grid or the clip count, because a splice blends one clip at a time.
     for canvas in NAMED_CANVASES {
