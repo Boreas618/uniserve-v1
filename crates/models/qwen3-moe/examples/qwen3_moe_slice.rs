@@ -24,9 +24,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use nn::capability::{KvGroup, KvPlanes, KvView, TokenBatch};
 use nn::{
-    Arena, Backing, CausalLm, Checkpoint, DType, DevicePtr, Forward, RetainedWeights, Shape,
-    WeightKey, WeightLoader,
+    Arena, Backing, CausalLm, Checkpoint, DType, DevicePtr, Forward, PhaseKind, RetainedWeights,
+    Shape, TensorView, WeightKey, WeightLoader,
 };
 use ops::{Generation, KernelEntry};
 use qwen3_moe::{Config, LoadOptions, Partition};
@@ -95,6 +96,7 @@ struct Args {
     store: Option<PathBuf>,
     device: u32,
     layer: usize,
+    tokens: String,
 }
 
 /// The four stages of the run.
@@ -113,6 +115,7 @@ impl Args {
         let mut store = std::env::var_os("UNISERVE_STORE").map(PathBuf::from);
         let mut device = 0;
         let mut layer = 0;
+        let mut tokens = String::new();
         let mut words = std::env::args().skip(1);
         while let Some(word) = words.next() {
             let mut value = |name: &str| -> Result<String> {
@@ -149,6 +152,7 @@ impl Args {
                         Failure::message(format!("--layer takes a number, not `{number}`"))
                     })?;
                 }
+                "--tokens" => tokens = value("--tokens")?,
                 "--help" | "-h" => {
                     return Err(Failure::message(
                         "qwen3_moe_slice --stage weights|embedding|block|decode \
@@ -169,6 +173,7 @@ impl Args {
             store,
             device,
             layer,
+            tokens,
         })
     }
 }
@@ -178,15 +183,12 @@ fn run() -> Result<()> {
     match args.stage {
         Stage::Weights => stage_weights(&args),
         Stage::Embedding => stage_embedding(&args),
-        Stage::Block | Stage::Decode => Err(Failure::message(format!(
-            "stage `{}` (layer {}) is not wired yet: it needs the prefix cache's paged KV views and \
-             the token batch, which the executor builds. Stages `weights` and `embedding` run today.",
-            if args.stage == Stage::Block {
-                "block"
-            } else {
-                "decode"
-            },
-            args.layer
+        Stage::Decode => stage_decode(&args),
+        Stage::Block => Err(Failure::message(format!(
+            "stage `{}` (layer {}) is not wired: `Qwen3Moe` walks every layer in one call and has no \
+             per-layer entry point, so one block cannot be run on its own. Stages `weights`, \
+             `embedding` and `decode` run today.",
+            "block", args.layer
         ))),
     }
 }
@@ -399,6 +401,241 @@ fn stage_embedding(args: &Args) -> Result<()> {
     Ok(())
 }
 
+// -------------------------------------------------------------------------------------------
+// Stage 3: the whole model over one prompt, for the logits the reference records.
+
+/// The region the decode stage reserves: the plan's workspace, every layer's arena temporaries, the
+/// prompt's hidden rows, the logits row and the paged cache.
+///
+/// There is no reset between layers -- the model allocates each layer's temporaries from one arena
+/// and nothing returns the cursor -- so this is sized for the whole stack, not one layer.
+fn decode_arena_bytes(plan: &qwen3_moe::Plan, tokens: u64, config: &Config) -> u64 {
+    let hidden = plan.hidden.saturating_mul(4).saturating_mul(tokens);
+    let logits = u64::try_from(config.vocab_size)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(4);
+    let layers = u64::try_from(config.num_hidden_layers).unwrap_or(0);
+    let plane_row = 64_u64
+        .saturating_mul(u64::try_from(config.num_key_value_heads).unwrap_or(0))
+        .saturating_mul(u64::try_from(config.head_dim).unwrap_or(0))
+        .saturating_mul(2);
+    let cache = layers
+        .saturating_mul(2)
+        .saturating_mul(plane_row)
+        .saturating_mul(4)
+        .max(1 << 20);
+    plan.workspace
+        .saturating_add(hidden)
+        .saturating_add(logits)
+        .saturating_add(cache)
+        .saturating_add(1 << 30)
+}
+
+fn stage_decode(args: &Args) -> Result<()> {
+    let store_root = args.store.clone().ok_or_else(|| {
+        Failure::message(
+            "stage `decode` needs a program store: pass --store <path> or set UNISERVE_STORE",
+        )
+    })?;
+    let tokens: Vec<i32> = args
+        .tokens
+        .split(',')
+        .filter(|part| !part.trim().is_empty())
+        .map(|part| {
+            part.trim().parse().map_err(|_| {
+                Failure::message(format!("--tokens takes comma-separated ids, not `{part}`"))
+            })
+        })
+        .collect::<Result<_>>()?;
+    if tokens.is_empty() {
+        return Err(Failure::message(
+            "stage `decode` needs the prompt's token ids: --tokens 1,2,3 (the reference records \
+             strings and logprobs, not ids, so they come from the caller's tokenizer)",
+        ));
+    }
+    let count = u64::try_from(tokens.len()).unwrap_or(0);
+
+    let checkpoint = Checkpoint::open(&args.checkpoint)?;
+    let config = Config::read(&args.checkpoint)?;
+    let device =
+        platform::Device::new(platform::DeviceId(i32::try_from(args.device).unwrap_or(0)))?;
+    let _guard = device.enter()?;
+    let stream = device.stream()?;
+
+    let needed = needed_keys(&store_root, Stage::Decode)?;
+    let generation = load_generation(&device, &store_root, &needed)?;
+
+    let mut weights = DeviceWeights::new(&device)?;
+    let model = {
+        let mut loader = WeightLoader::new(&checkpoint, &mut weights, None, None);
+        qwen3_moe::load(
+            &args.checkpoint,
+            Partition::single(),
+            &mut loader,
+            LoadOptions::default(),
+        )?
+    };
+
+    // The arena, from the plan and the config's own cache geometry.
+    let plan = model.plan(count)?;
+    let bytes = decode_arena_bytes(&plan, count, &config);
+    let allocator = weights.allocator();
+    let reserve = usize::try_from(bytes).unwrap_or(usize::MAX);
+    allocator.reserve(platform::PoolKind::Graph, reserve)?;
+    let region = allocator.allocate(platform::PoolKind::Graph, reserve)?;
+    let arena = Arena::new(DevicePtr::new(region.address()), bytes);
+    let forward = Forward::new(&stream, &generation, &arena);
+
+    // The batch of one sequence: every prompt token is one query row, the last asks for logits.
+    let page_size = 64_u64;
+    let pages = count.div_ceil(page_size).max(1);
+    let positions: Vec<i32> = (0..count)
+        .map(|at| i32::try_from(at).unwrap_or(0))
+        .collect();
+    let slots: Vec<i32> = (0..count)
+        .map(|at| i32::try_from(at).unwrap_or(0))
+        .collect();
+    let seq_lens = vec![i32::try_from(count).unwrap_or(0)];
+    let query_offsets = vec![0_i32, i32::try_from(count).unwrap_or(0)];
+    let logits_rows = vec![i32::try_from(count.saturating_sub(1)).unwrap_or(0)];
+    let pages_per_row = i32::try_from(pages).unwrap_or(1);
+    let block_table: Vec<i32> = (0..pages_per_row).collect();
+
+    let positions = upload_i32(&stream, &arena, &positions)?;
+    let slot_mapping = upload_i32(&stream, &arena, &slots)?;
+    let seq_lens = upload_i32(&stream, &arena, &seq_lens)?;
+    let query_offsets = upload_i32(&stream, &arena, &query_offsets)?;
+    let logits_rows = upload_i32(&stream, &arena, &logits_rows)?;
+    let block_tables = upload_i32(&stream, &arena, &block_table)?;
+    let batch = TokenBatch {
+        positions,
+        slot_mapping,
+        seq_lens,
+        query_offsets,
+        logits_rows,
+        phase: PhaseKind::Prefill,
+        page_size: u32::try_from(page_size).unwrap_or(64),
+        num_tokens: u32::try_from(count).unwrap_or(0),
+        max_kv_len: u32::try_from(pages.saturating_mul(page_size)).unwrap_or(0),
+        draft_lens: None,
+    };
+
+    // The cache: one group, one plane pair per layer, BF16 with no scales, and flags at zero so the
+    // first write initializes every page it touches.
+    let kv_heads = u64::try_from(config.num_key_value_heads).unwrap_or(0);
+    let head_dim = u64::try_from(config.head_dim).unwrap_or(0);
+    let plane = Shape::new(&[pages, page_size, kv_heads, head_dim]);
+    let flag = Shape::new(&[pages, 1, 1, 1]);
+    let mut planes = Vec::with_capacity(config.num_hidden_layers);
+    for _ in 0..config.num_hidden_layers {
+        planes.push(KvPlanes {
+            key: arena.tensor(DType::BF16, plane)?,
+            value: arena.tensor(DType::BF16, plane)?,
+            key_initialized: zeroed_i32(&stream, &arena, flag)?,
+            value_initialized: zeroed_i32(&stream, &arena, flag)?,
+            key_scale: None,
+            value_scale: None,
+        });
+    }
+    let groups = [KvGroup {
+        block_tables,
+        page_size: u32::try_from(page_size).unwrap_or(64),
+        dtype: DType::BF16,
+        layers: &planes,
+    }];
+    let cache = KvView { groups: &groups };
+
+    // The forward: embed, walk the stack, project the last row.
+    let hidden = arena.tensor(DType::BF16, Shape::new(&[count, plan.hidden]))?;
+    model.embed_input_ids(&forward, positions, hidden)?;
+    model.forward(&forward, &batch, &cache, hidden)?;
+    let logits = arena.tensor(
+        DType::F32,
+        Shape::new(&[1, u64::try_from(config.vocab_size).unwrap_or(0)]),
+    )?;
+    let last_row = TensorView::new(
+        DevicePtr::new(hidden.ptr.address() + (count - 1) * plan.hidden * 2),
+        DType::BF16,
+        Shape::new(&[1, plan.hidden]),
+    );
+    model.logits(&forward, last_row, logits)?;
+    stream.synchronize()?;
+
+    // The last row's log-softmax, on the host, and its ten best tokens.
+    let vocabulary = config.vocab_size;
+    let values = download_f32(&stream, logits, vocabulary)?;
+    let best = top_logprobs(&values, 10);
+    println!(
+        "decode: {count} prompt tokens, {} layers, {} experts; last row's top-10",
+        config.num_hidden_layers, config.num_experts
+    );
+    for (token, logprob) in &best {
+        println!("  {token}\t{logprob:.6}");
+    }
+    Ok(())
+}
+
+/// The ten largest `log_softmax` values of one row, as (token id, logprob), largest first.
+fn top_logprobs(row: &[f32], count: usize) -> Vec<(usize, f64)> {
+    let largest = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if !largest.is_finite() {
+        return Vec::new();
+    }
+    let total: f64 = row
+        .iter()
+        .map(|value| ((value - largest) as f64).exp())
+        .sum();
+    let log_partition = largest as f64 + total.ln();
+    let mut scored: Vec<(usize, f64)> = row
+        .iter()
+        .enumerate()
+        .map(|(token, value)| (token, f64::from(*value) - log_partition))
+        .collect();
+    scored.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(left.0.cmp(&right.0))
+    });
+    scored.truncate(count);
+    scored
+}
+
+/// A flag plane of `shape` i32 zeros: an initialized flag of zero makes the first write initialize
+/// the page it touches.
+fn zeroed_i32(stream: &platform::Stream, arena: &Arena, shape: Shape) -> Result<TensorView> {
+    let view = arena.tensor(DType::I32, shape)?;
+    let zeros = vec![0_i32; usize::try_from(shape.numel()).unwrap_or(0)];
+    // SAFETY: `zeros` outlives the copy, which completes before the wait below.
+    unsafe {
+        platform::memcpy_async(
+            view.ptr.address(),
+            zeros.as_ptr() as u64,
+            std::mem::size_of_val(zeros.as_slice()),
+            stream,
+        )?;
+    }
+    stream.synchronize()?;
+    Ok(view)
+}
+
+/// Download `elements` f32 values.
+fn download_f32(stream: &platform::Stream, view: TensorView, elements: usize) -> Result<Vec<f32>> {
+    let mut values = vec![0_f32; elements];
+    // SAFETY: `values` is written by the copy, which completes before the wait below.
+    unsafe {
+        platform::memcpy_async(
+            values.as_mut_ptr() as u64,
+            view.ptr.address(),
+            std::mem::size_of_val(values.as_slice()),
+            stream,
+        )?;
+    }
+    stream.synchronize()?;
+    Ok(values)
+}
+
 /// The arena for one token's embedding: the plan's workspace plus the output row and slack.
 fn arena_bytes(plan: &qwen3_moe::Plan) -> u64 {
     let row = plan.hidden.saturating_mul(4);
@@ -517,19 +754,26 @@ fn install(
     descriptor: &str,
     directory: &Path,
 ) -> Result<KernelEntry> {
+    // A Triton package's module carries `metadata.json`, whose `name` is the symbol and whose
+    // `shared` is the dynamic shared memory; a vendor cubin carries `launch.json` instead. They are
+    // read in that order because the fixture's operators are Triton ones.
+    let metadata_path = directory.join("metadata.json");
+    let metadata = std::fs::read(&metadata_path).ok();
     let launch = std::fs::read_to_string(directory.join("launch.json")).unwrap_or_default();
-    let entry = json_field(&launch, "name").ok_or_else(|| {
-        Failure::message(format!(
-            "{}: launch.json names no kernel entry",
-            directory.display()
-        ))
-    })?;
+    let entry = metadata
+        .as_deref()
+        .and_then(|bytes| json_field(&String::from_utf8_lossy(bytes), "name"))
+        .or_else(|| json_field(&launch, "name"))
+        .ok_or_else(|| {
+            Failure::message(format!(
+                "{}: neither metadata.json nor launch.json names a kernel entry",
+                directory.display()
+            ))
+        })?;
     let cubin = directory.join("module.cubin");
     if cubin.is_file() {
         let image = std::fs::read(&cubin)
             .map_err(|error| Failure::message(format!("reading {}: {error}", cubin.display())))?;
-        let metadata_path = directory.join("metadata.json");
-        let metadata = std::fs::read(&metadata_path).ok();
         let kernel = ops::install::install(
             device,
             operator,
