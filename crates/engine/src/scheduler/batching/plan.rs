@@ -174,9 +174,20 @@ impl Scheduler {
                     drafts.len() + proposals as usize,
                 );
                 if !self.ensure_decode_capacity(id, cache_visible_len as usize, capacity_target) {
+                    // The request stays where it is for this step, and the pass
+                    // stays non-token behind it: named, because the rest of the
+                    // world cannot see a plan that named work it cannot build.
+                    tracing::debug!(
+                        request = id.0,
+                        visible = cache_visible_len,
+                        target = capacity_target,
+                        drafts = drafts.len(),
+                        proposals,
+                        "a verification waits: the cache does not cover the positions it lands on"
+                    );
                     return None;
                 }
-                self.plan_call(id, |_scheduler, request| {
+                let planned = self.plan_call(id, |_scheduler, request| {
                     generation::plan_verify(
                         request,
                         input_token,
@@ -184,7 +195,16 @@ impl Scheduler {
                         proposals,
                         sampling_state,
                     )
-                })
+                });
+                if planned.is_none() {
+                    tracing::debug!(
+                        request = id.0,
+                        drafts = drafts.len(),
+                        proposals,
+                        "a verification could not be built from the request's state"
+                    );
+                }
+                planned
             }
             Phase::DecodeUnd => {
                 let projected_successor = self.inflight.has_pending_calls(id);
