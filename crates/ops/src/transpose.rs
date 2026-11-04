@@ -24,7 +24,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Strides, TensorView};
+use crate::tensor::{DType, TensorView};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -65,6 +65,24 @@ pub struct Args {
 /// Write a row-major matrix into the transposed row-major matrix.
 pub struct Transpose;
 
+/// Whether a view is packed: each axis's stride is the product of the extents after it.
+///
+/// A unit axis may carry any stride — a `[1, columns]` row taken from a taller matrix does, and it
+/// still moves as one contiguous run — so the comparison is axis by axis rather than against a
+/// row-major stride vector. Two axes that share an element are not packed and are refused by the
+/// same test, because the stride of the outer one is then too small.
+fn contiguous(view: &TensorView) -> bool {
+    let mut expected = 1;
+    for axis in (0..view.shape.rank()).rev() {
+        let extent = view.shape.dim(axis);
+        if extent != 1 && view.strides.get(axis) != expected {
+            return false;
+        }
+        expected *= extent;
+    }
+    true
+}
+
 /// Check that a view is a contiguous matrix of the descriptor's element type.
 fn matrix(view: &TensorView, name: &str, dtype: DType) -> Result<(u64, u64)> {
     view.require_rank(Transpose::NAME, 2)?;
@@ -74,15 +92,14 @@ fn matrix(view: &TensorView, name: &str, dtype: DType) -> Result<(u64, u64)> {
             format!("expected {dtype} {name}, found {}", view.dtype),
         ));
     }
-    let row_major = Strides::row_major(view.shape);
-    if view.strides.as_slice() != row_major.as_slice() {
+    if !contiguous(view) {
         return Err(Error::argument(
             Transpose::NAME,
             format!(
-                "the {name} must be contiguous: its strides are {:?}, a row-major {:?} would be {:?}",
+                "the {name} must be contiguous: its strides are {:?} over {:?}, which is not a \
+                 packed layout",
                 view.strides.as_slice(),
-                view.shape.dims(),
-                row_major.as_slice()
+                view.shape.dims()
             ),
         ));
     }
@@ -180,7 +197,7 @@ impl Op for Transpose {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tensor::Shape;
+    use crate::tensor::{Shape, Strides};
 
     fn descriptor() -> Descriptor {
         Descriptor {
@@ -226,6 +243,17 @@ mod tests {
         let window = view(DType::F32, &[4, 8], &[16, 1]);
         let error = matrix(&window, "input", DType::F32).unwrap_err();
         assert!(format!("{error}").contains("[16, 1]"), "{error}");
+    }
+
+    #[test]
+    fn a_single_row_is_packed_whatever_stride_the_view_carries() {
+        // One frame's channels taken from a taller matrix: the row moves as one run, so refusing it
+        // would refuse a one-frame clip.
+        let one_row = view(DType::F32, &[1, 8], &[999, 1]);
+        assert!(contiguous(&one_row));
+        assert_eq!(matrix(&one_row, "input", DType::F32).unwrap(), (1, 8));
+        assert!(contiguous(&view(DType::F32, &[2, 8], &[8, 1])));
+        assert!(!contiguous(&view(DType::F32, &[2, 8], &[4, 1])));
     }
 
     #[test]
