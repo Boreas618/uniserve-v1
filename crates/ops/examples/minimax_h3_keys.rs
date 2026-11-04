@@ -435,16 +435,18 @@ fn main() {
     );
     // The solver's step flattens the latent to `[elements, 1]` and steps it by one scalar, so the
     // residual's width there is one column and the kernel's `WIDTH` is one.
-    push(
-        "scaled_residual",
-        ScaledResidualDescriptor {
-            dtype: DType::BF16,
-            columns: 1,
-            block: ops::residual::RESIDUAL_BLOCK,
-            update_bias: false,
-        }
-        .to_string(),
-    );
+    for dtype in [DType::BF16, DType::F32] {
+        push(
+            "scaled_residual",
+            ScaledResidualDescriptor {
+                dtype,
+                columns: 1,
+                block: ops::residual::RESIDUAL_BLOCK,
+                update_bias: false,
+            }
+            .to_string(),
+        );
+    }
     push(
         "scaled_residual",
         ScaledResidualDescriptor {
@@ -501,15 +503,20 @@ fn main() {
     // The DiT's row mapping: one key for every raster, because the program reads the canvas as a
     // launch word. A canvas is a multiple of the model's own step and the VAE compresses it 16x, so
     // every latent side a served canvas produces is even — that check is the operator's, at launch.
-    push(
-        "patch",
-        ops::patch::Descriptor {
-            dtype: DType::BF16,
-            block: ops::patch::BLOCK,
-            pdl: PDL,
-        }
-        .to_string(),
-    );
+    // Two element types: the stack's own BF16 rows, and the FP32 latent the sampler patchifies -
+    // `Denoiser::denoise` holds its sample in the latent's type for the whole trajectory, so the
+    // first patch and the last unpatchify of every evaluation cross at FP32.
+    for dtype in [DType::BF16, DType::F32] {
+        push(
+            "patch",
+            ops::patch::Descriptor {
+                dtype,
+                block: ops::patch::BLOCK,
+                pdl: PDL,
+            }
+            .to_string(),
+        );
+    }
     // The two `unpatchify_video` forms the decoder needs: the latents, whose per-channel scale and
     // bias denormalize, and the decoder's own output, which does not. The token grid, the channels
     // and the patch are the request's and travel at launch, so the two forms are the whole set.
@@ -525,6 +532,18 @@ fn main() {
             .to_string(),
         );
     }
+    // The sampler's own crossing: the velocity is FP32 like the sample it advances, so the head's
+    // output unpatchifies without the decoder's per-channel denormalization.
+    push(
+        "unpatchify_video",
+        ops::unpatchify::Descriptor {
+            dtype: DType::F32,
+            affine: false,
+            block: 1024,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
     // The register prefix and the zero tail around the caller's rows.
     push(
         "sequence_append",
@@ -663,18 +682,23 @@ fn main() {
         }
         .to_string(),
     );
-    push(
-        "philox_noise",
-        NoiseDescriptor {
-            dtype: DType::BF16,
-            block: ops::noise::NOISE_BLOCK,
-            // The initial latent noise: one standard normal sample per element, its stream keyed by
-            // the request's seed as a launch scalar (the model has no key view to upload).
-            kind: ops::noise::NoiseKind::Normal,
-            source: ops::noise::KeySource::Scalar,
-        }
-        .to_string(),
-    );
+    // The initial latent noise, in both element types: the request's draw is FP32 because the
+    // reference's sample is (it refuses any other), and the conditioning path draws its own
+    // conditions in the trace type.
+    for dtype in [DType::BF16, DType::F32] {
+        push(
+            "philox_noise",
+            NoiseDescriptor {
+                dtype,
+                block: ops::noise::NOISE_BLOCK,
+                // One standard normal sample per element, its stream keyed by the request's seed as
+                // a launch scalar (the model has no key view to upload).
+                kind: ops::noise::NoiseKind::Normal,
+                source: ops::noise::KeySource::Scalar,
+            }
+            .to_string(),
+        );
+    }
 
     // ---- The audio encoder's head pool, and the video path's last step.
     //
