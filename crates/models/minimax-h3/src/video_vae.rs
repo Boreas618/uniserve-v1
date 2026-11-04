@@ -769,12 +769,16 @@ impl VideoDecoder {
                 )?,
                 residual1: ScaledResidual::new(scale1, Some(out_bias))?,
                 norm2,
+                // The feed-forward's projection is packed: its rows hold the value half and then the
+                // gate half, so it is twice the feed-forward's width and its bias is the packed pair
+                // that the activation adds to each half. Reading it at the feed-forward's own width
+                // loads the value half alone and leaves the gate half at zero.
                 gate_up: linear(
                     loader,
                     &format!("{base}.ff.net.0.proj"),
                     u64::from(width),
-                    u64::from(ffn),
-                    true,
+                    2 * u64::from(ffn),
+                    false,
                 )?,
                 down: linear(
                     loader,
@@ -784,7 +788,11 @@ impl VideoDecoder {
                     false,
                 )?,
                 residual2: ScaledResidual::new(scale2, Some(down_bias))?,
-                gated: PackedSwiGlu::new(None)?,
+                gated: PackedSwiGlu::new(Some(read(
+                    loader,
+                    &format!("{base}.ff.net.0.proj.bias"),
+                    &[2 * u64::from(ffn)],
+                )?))?,
             });
         }
 
