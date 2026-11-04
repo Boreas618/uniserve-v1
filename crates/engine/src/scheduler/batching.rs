@@ -167,7 +167,7 @@ impl Scheduler {
             .get(&id)
             .map(|state| RequestKey::new(self.engine_id, id, state.request_epoch))?;
         self.placement.worker_target(
-            self.executor.as_ref(),
+            self.executor.inner(),
             &self.info,
             request_key,
             call.kind,
