@@ -270,6 +270,8 @@ impl ProgramServer {
                         message: Some(wire::server_message::Message::Resolved(wire::Resolved {
                             form: wire::ModuleForm::from(module.form) as i32,
                             files,
+                            entry: module.entry.unwrap_or_default(),
+                            metadata: module.metadata.unwrap_or_default(),
                         })),
                     },
                     &descriptors,
@@ -586,6 +588,8 @@ impl ProgramServer {
         Ok(Module {
             form: package.manifest.module.form,
             files: module_files,
+            metadata: package.manifest.module.metadata.clone(),
+            entry: package.manifest.module.entry.clone(),
         })
     }
 
@@ -631,12 +635,15 @@ impl ProgramServer {
         })
     }
 
-    /// The program a `prepare` names for an operator.
+    /// The program a `prepare` names for an operator, with the package's
+    /// parameter defaults filled in for every argument the request leaves out
+    /// (design section 5.2): what the daemon records is the program the
+    /// package will run, not a partial one.
     fn select(&self, op: &str, selector: &Selector) -> Result<Program> {
-        match selector {
+        let program = match selector {
             Selector::Fixed(program) => {
                 self.package(op, program)?;
-                Ok(program.clone())
+                program.clone()
             }
             Selector::Latest { backend, arguments } => {
                 let packages = self
@@ -654,13 +661,25 @@ impl ProgramServer {
                         op: op.to_owned(),
                         backend: backend.clone(),
                     })?;
-                Ok(Program {
+                Program {
                     backend: backend.clone(),
                     revision,
                     arguments: arguments.clone(),
-                })
+                }
             }
+        };
+        let package = self.package(op, &program)?;
+        let mut arguments = toml::Table::new();
+        for (name, default) in &package.manifest.parameters {
+            arguments.insert(name.clone(), default.clone());
         }
+        for (name, value) in &program.arguments {
+            arguments.insert(name.clone(), value.clone());
+        }
+        Ok(Program {
+            arguments,
+            ..program
+        })
     }
 
     /// The installed package a program names.
