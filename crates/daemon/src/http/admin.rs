@@ -538,6 +538,14 @@ async fn apply_config(State(state): State<AdminState>, body: axum::body::Bytes) 
             dry_run: body.dry_run,
             force: body.force,
         };
+        // The program layer is tried first, and only on a target resolved
+        // against the serving configuration: a change that fills other
+        // programs moves the main processes in place, and the world path would
+        // answer `none` for it because its build config is unchanged (§7.2,
+        // §7.3).
+        if let Some(program) = program_update(&admin, &leader, &request, body.dry_run).await? {
+            return Ok(program);
+        }
         // The change's future holds the model files it resolves.
         match Box::pin(leader.apply(request)).await {
             Ok(Applied::Daemon {
@@ -664,6 +672,86 @@ async fn commit(State(state): State<AdminState>) -> Response {
         })
     })
     .await
+}
+
+/// Applies a change at the program layer, answering what it did, or `None`
+/// when the change moves nothing there and the world path decides it (§7.2).
+///
+/// The layer is decided on the target resolved against the serving
+/// configuration, and nothing is compared before the target's programs are
+/// prepared at every host's Program Server: a newly installed revision at an
+/// unchanged configuration is a program-layer change.
+async fn program_update(
+    admin: &Arc<Admin>,
+    leader: &Arc<Leader>,
+    request: &ApplyRequest,
+    dry_run: bool,
+) -> Result<Option<serde_json::Value>, (StatusCode, String)> {
+    let Ok(current) = leader.serving_config() else {
+        // No replica serves: the world path answers that account itself.
+        return Ok(None);
+    };
+    let Ok((target, _, _)) = crate::worlds::resolve(&current, request) else {
+        // The change itself is refused; the world path answers it the same way.
+        return Ok(None);
+    };
+    let epochs = leader.epochs();
+    let number = admin.running_number();
+    let planned = match leader.apply_programs(number, &target, true).await {
+        Ok(Some(planned)) => planned,
+        Ok(None) => return Ok(None),
+        Err(error) => return Err(refused_precopy(admin, &epochs, number, &error)),
+    };
+    if dry_run {
+        return Ok(Some(json!({
+            "change": "program",
+            "plan": programs_report(&planned.target.programs),
+        })));
+    }
+    let epoch = epochs.serving().map_or(0, |(epoch, _)| epoch);
+    program_phase(admin, &epochs, Phase::Precopy, epoch, &planned);
+    match leader.apply_programs(number, &target, false).await {
+        Ok(Some(update)) => {
+            // The main processes prepared, switched to and now serve the new
+            // generation; the probation decides it (§7.3 steps 2-4).
+            for phase in [Phase::Precopied, Phase::Switchover, Phase::Switched, Phase::Probation] {
+                program_phase(admin, &epochs, phase, epoch, &update);
+            }
+            Ok(Some(json!({
+                "change": "program",
+                "epoch": epoch,
+                "state": "probation",
+                "update": update.number,
+            })))
+        }
+        Ok(None) => Ok(None),
+        Err(error) => Err(refused_precopy(admin, &epochs, number, &error)),
+    }
+}
+
+/// Reports a program layer that could not take the target's programs and
+/// answers why: what serves is untouched (§7.3 step 2).
+fn refused_precopy(
+    admin: &Arc<Admin>,
+    epochs: &crate::epoch::Epochs,
+    number: u64,
+    error: &UpdateError,
+) -> (StatusCode, String) {
+    let reason = format!("{error:#}");
+    let epoch = epochs.serving().map_or(0, |(epoch, _)| epoch);
+    admin.update_event(
+        number,
+        Phase::PrecopyFailed,
+        epoch,
+        [
+            ("change", json!("program")),
+            ("reason", json!(reason)),
+        ],
+    );
+    (
+        update_status(error),
+        format!("precopy failed: {reason}"),
+    )
 }
 
 /// Reports one phase of a program-layer update on the event log: the phase,
