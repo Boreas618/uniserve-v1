@@ -94,8 +94,30 @@ impl Scheduler {
                 self.inflight.pending_submissions.push_back(batch);
                 continue;
             }
+            // An update may have asked this step's batches to run in shadow too:
+            // the same work against the world whose kernels are being compared,
+            // submitted beside the serving one (7.3 step 2). The copy is made
+            // only when an update asked, and before the serving submit takes the
+            // batch.
+            let shadow = self.shadow_generation();
+            let shadow_batch = shadow.map(|_| batch.clone());
             match self.executor.submit(batch) {
-                Ok(()) => progressed = true,
+                Ok(()) => {
+                    progressed = true;
+                    // A wall or a full queue is not the pass's failure: the
+                    // batch stays with the step and the next one tries again,
+                    // as the serving submit does. A refused pass is answered at
+                    // once, because waiting will not shadow it.
+                    if let (Some(generation), Some(shadow_batch)) = (shadow, shadow_batch) {
+                        match self.executor.shadow(shadow_batch, generation) {
+                            Ok(()) => self.note_shadowed(),
+                            Err(ExecutorSubmitError::Failed(error)) => {
+                                self.shadow_failed(format!("{error:#}"));
+                            }
+                            Err(ExecutorSubmitError::WouldBlock(_)) => {}
+                        }
+                    }
+                }
                 Err(ExecutorSubmitError::WouldBlock(batch)) => {
                     blocked_workers.extend(targets);
                     held_products.extend(batch_products(&batch));
