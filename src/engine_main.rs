@@ -205,6 +205,18 @@ pub(crate) struct Launch {
     /// Required, not defaulted: a world of one on a multi-node deployment sizes this rank's storage
     /// claim for one rank, and the second node's claim would collide with it.
     pub world_size: u32,
+    /// Whether this process was started as the standby of the epoch that serves: it maps its
+    /// scope's storage, loads the epoch's weights, opens its pools and captures its graphs, and
+    /// then parks - executing nothing and admitting nothing - and reports `Parked`. The daemon
+    /// promotes it in place (`Promote`, answered `Promoted`) and only then does the frontend
+    /// submit to it (§2.5, §7.4).
+    ///
+    /// Defaulted rather than required, so that a launch file written before this field existed
+    /// still reads: an initial process is not a standby, and `false` says exactly that. A standby
+    /// that claimed its storage writable would give its scope two writers, which is why the role
+    /// is the launcher's statement rather than the process's guess.
+    #[serde(default)]
+    pub standby: bool,
 }
 
 impl Launch {
@@ -656,7 +668,7 @@ impl MainProcess {
         // and holds none would accept requests and dispatch nothing, which is refused by name.
         let schedulers = schedulers(&plan, launch, &memory, &model, &executors)?;
 
-        Ok(Self {
+        let mut process = Self {
             control,
             schedulers,
             executors,
@@ -675,13 +687,38 @@ impl MainProcess {
             process,
             stopping: false,
             streams: Vec::new(),
-            // The epoch serves from the end of `start` until the daemon drains it; a process the
-            // daemon spawned as a standby parks itself at the end of `start` instead, and the
-            // `Promote` that follows resumes it (2.5).
-            serving: true,
+            // The epoch serves from the end of `start` until the daemon drains it, unless the
+            // launcher started it as a standby: that one parks itself here, before it can admit
+            // anything, and the `Promote` that follows resumes it (2.5, 7.4).
+            serving: !launch.standby,
             parked: None,
             paused: false,
-        })
+        };
+        if launch.standby {
+            process.park_standby()?;
+        }
+        Ok(process)
+    }
+
+    /// §2.5: a standby that has prepared announces itself and executes nothing until promoted.
+    ///
+    /// Its schedulers hold no request and have served no world, so parking them would ask for a
+    /// cache handover that belongs to a drained epoch; what makes this a park is that nothing is
+    /// admitted. `Promote` is the command that ends it.
+    ///
+    /// The report means exactly "prepared and admitted nothing", which is what the daemon gates
+    /// its promotion on: it is sent after `start` has mapped the weights, opened the memory and
+    /// started the runners, and *before* the epoch's first generation has been warmed - a warmup
+    /// belongs to the first switchover, and a standby's own generation reaches it when the daemon
+    /// sends the epoch's programs.
+    fn park_standby(&mut self) -> Result<()> {
+        self.serving = false;
+        self.send_report(proto::process::Report {
+            kind: Some(proto::process::report::Kind::Parked(proto::process::Parked {
+                generation: self.update.current(),
+            })),
+        });
+        Ok(())
     }
 
     /// Serves until the daemon closes the process or a failure ends it.
