@@ -820,18 +820,21 @@ pub struct RouteNvfp4Call {
     pub num_non_exiting_tiles: *const i32,
     /// `[routes, hidden]`: the contracted rows.
     pub out: *mut c_void,
-    /// The scratch the program may use; the entry grows it itself when it is short.
+    /// The scratch the program needs, sized by the plan; the entry refuses a short one and never
+    /// grows it.
     pub workspace: *mut c_void,
     /// Bytes of `workspace`.
     pub workspace_bytes: i64,
     /// Rows of the gated product and of the output: the padded route count.
     pub routes: i64,
-    /// The contraction length: the expert width of FC1.
+    /// The output width, as the descriptor and the runner name it.
     pub hidden_size: i64,
-    /// The output width.
+    /// The contraction length: one expert's intermediate width.
     pub intermediate: i64,
     /// Experts the weight stack holds.
     pub experts: i64,
+    /// Routes per token; the artifact's configuration list is indexed by it.
+    pub top: i64,
     /// The compiled MMA tile, rows by columns.
     pub tile_m: i64,
     pub tile_n: i64,
@@ -1514,9 +1517,10 @@ impl Op for RouteGemmNvfp4 {
             workspace: address(args.workspace.ptr) as usize as *mut c_void,
             workspace_bytes: to_i64(Self::NAME, args.workspace.numel())?,
             routes: to_i64(Self::NAME, routes)?,
-            hidden_size: to_i64(Self::NAME, intermediate)?,
-            intermediate: to_i64(Self::NAME, hidden)?,
+            hidden_size: to_i64(Self::NAME, hidden)?,
+            intermediate: to_i64(Self::NAME, intermediate)?,
             experts: to_i64(Self::NAME, experts)?,
+            top: i64::from(descriptor.top),
             tile_m: i64::from(descriptor.tile.0),
             tile_n: i64::from(descriptor.tile.1),
             cluster_m: i64::from(descriptor.cluster.0),
