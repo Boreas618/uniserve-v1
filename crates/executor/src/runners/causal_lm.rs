@@ -816,6 +816,24 @@ impl Sampling {
     }
 }
 
+/// The refusal a provider that cannot install a batch's block tables gives, over the tables alone.
+///
+/// A batch whose slots have no pages yet carries none, and no provider needs anything for it; one
+/// whose slots do carry tables needs them written into the pooled table before the gather reads it.
+/// A provider that dropped them would gather the slot's previous pages, so the non-empty case is
+/// refused by name until the provider holds a cache.
+fn install_block_tables_unavailable(tables: &[ipc::BlockTable]) -> Result<()> {
+    match tables.first() {
+        None => Ok(()),
+        Some(table) => Err(Error::Invalid(format!(
+            "this runner holds no cache to install request slot {}'s row of group {} into, and a \
+             gather would read whatever that row held before: the cache provider is the device \
+             executor's, attached before the first capture",
+            table.request_pool_idx, table.group_id
+        ))),
+    }
+}
+
 /// The refusal a provider that cannot apply a batch's cache units gives, over the allocation alone.
 ///
 /// A batch that reads a fresh prefix carries none, and no provider needs anything for it; one that
@@ -873,6 +891,26 @@ pub trait KvProvider: Send + Sync {
     ) -> Result<()> {
         let _ = stream;
         apply_cache_units_unavailable(units)
+    }
+
+    /// Installs the batch's slot rows into the cache's pooled table, on the batch's stream.
+    ///
+    /// The gather [`Self::block_table`] performs later copies **row `slot` of the pooled table** for
+    /// every request slot the batch names. That row is the only place a request's pages live for the
+    /// gather, and nothing else writes it: a batch whose rows are not installed gathers whatever the
+    /// slot held before - zeros, or another request's pages - and the graph then runs clean against
+    /// the wrong memory. It is the one failure that looks like a model defect rather than a cache
+    /// one, so a provider that holds no cache refuses a table rather than dropping it.
+    ///
+    /// It is issued before [`Self::apply_cache_units`]: the row must exist before the graph reads it,
+    /// and the acquired units are this cache's before anything is copied into them.
+    fn install_block_tables(
+        &mut self,
+        tables: &[ipc::BlockTable],
+        stream: &platform::Stream,
+    ) -> Result<()> {
+        let _ = stream;
+        install_block_tables_unavailable(tables)
     }
 
     /// How many attention groups the model's layers index.
@@ -1146,17 +1184,21 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         batch.columns.check(&shape)?;
         let bucket = self.bucket_for(&shape)?;
         self.staging.stage(&batch.columns, &batch.calls, &shape, bucket)?;
-        // What the mechanism allocated for this batch's pages is applied here, on the batch's
-        // stream, before the replay: the copies it names must be in place when the graph reads
-        // those pages, and stream order is what puts them there. A batch that cannot be applied is
-        // refused at submit - the same place, and with the same kind of error, as any other batch
-        // this device cannot serve.
+        // The batch's slot rows are installed first: the gather reads row `slot` of the cache's
+        // pooled table, so the row must state the request's own pages before the replay, and the
+        // table states where the row begins (`start_page`) and how far it runs.
+        self.kv.install_block_tables(&batch.block_tables, &self.stream)?;
+        // Then what the mechanism allocated for this batch's pages, on the same stream: the units
+        // must be this cache's before anything is copied into them, and the copies must be in place
+        // when the graph reads those pages. A batch that cannot be applied is refused at submit -
+        // the same place, and with the same kind of error, as any other batch this device cannot
+        // serve.
         self.kv.apply_cache_units(&batch.cache_units, &self.stream)?;
-        // The upload and the device views are staged by the executor's stream work, then the
-        // bucket's graph is replayed (design §9, `每批的规划`). Until `nn::TokenBatch`/`KvView`
-        // and platform's allocator are published, the staging is as far as this path can go; the
-        // replay job is what the executor performs once they are.
-        let _ = &self.model;
+        // The columns are staged here, on the submitting thread; everything that touches the
+        // device is the replay job, which this executor's device thread performs in `serve`: the
+        // staged columns are uploaded, the bucket's graph is launched - the smallest captured
+        // bucket holding this shape - and the sampled tokens are read back, all before `submit`
+        // returns its output (4.5, 2.4: one thread issues to the streams).
         Ok(Jobs::new([Job::Replay {
             runner: self.id,
             bucket,
@@ -2541,6 +2583,35 @@ mod tests {
         assert!(
             error.to_string().contains("never copied"),
             "the refusal does not say what would go wrong: {error}"
+        );
+    }
+
+    /// A provider that holds no cache refuses a slot row by name, because the gather would otherwise
+    /// read whatever the row held - another request's pages, or zeros - and the graph would run clean
+    /// against the wrong memory.
+    #[test]
+    fn a_provider_without_a_cache_serves_a_batch_with_no_tables_and_refuses_a_slot_row() {
+        assert!(
+            install_block_tables_unavailable(&[]).is_ok(),
+            "a batch whose slots have no pages was refused"
+        );
+        let tables = vec![ipc::BlockTable {
+            request_pool_idx: 3,
+            group_id: 1,
+            start_page: 0,
+            unit_ids: vec![ipc::UnitId(11), ipc::UnitId(12)],
+            allocated_tokens: 256,
+        }];
+        let error = install_block_tables_unavailable(&tables)
+            .expect_err("a slot row was dropped without a word");
+        let message = error.to_string();
+        assert!(
+            message.contains("slot 3") && message.contains("group 1"),
+            "the refusal does not name the row: {message}"
+        );
+        assert!(
+            message.contains("would read whatever that row held"),
+            "the refusal does not say what would go wrong: {message}"
         );
     }
 
