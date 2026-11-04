@@ -1165,6 +1165,17 @@ fn main() {
         }
         .to_string(),
     );
+    // The selection, one launch per sparse layer over the same tile extents the scores hold: those
+    // extents are the deployment's tile *bound* (what the sparse scratch allocates for the scores,
+    // the indices and the counts), and the sparsity only decides which tiles the keep table names.
+    // So `block` is a class like the compression's `max_tiles`, not a per-request count.
+    push(
+        "vsa_select_tiles",
+        ops::segments::SelectTilesDescriptor {
+            block: VSA_MAX_TILES.next_power_of_two(),
+        }
+        .to_string(),
+    );
     // The compressed gated tiles that give back the sparse rows.
     push(
         "vsa_add_gated_tiles",
@@ -1240,9 +1251,9 @@ fn main() {
     //   decide the key, and they are how the block folds its residual — the layer's, not the config's.
     // - `paged_attention`: the decode attention is trtllm-gen, and its key follows the executor's
     //   page geometry (page size, pages per sequence), which is scheduling and not the model's.
-    // - `vsa_select_tiles`: the number of key tiles one query tile may select is the deployment's
-    //   sparsity choice; `vsa_prepare_tiles`, `vsa_scores`, `vsa_add_gated_tiles` and
-    //   `vsa_zero_padding` are above, because their geometry is the checkpoint's.
+    // - `vsa_select_tiles` is above with the other four tile passes: its block is the tile bound's
+    //   power of two, which the deployment allocates, and `attention_sparse.rs` launches it once per
+    //   sparse layer of every evaluation.
     // - `softmax`, `swiglu`, `scaled_residual_rms_norm`, `scaled_residual_layer_norm`,
     //   `vsa_compose_gated_rows`: declared, and nothing in either model's code calls them yet, so
     //   there is no geometry to key. They are named here rather than left to be found: the first two
