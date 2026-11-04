@@ -792,6 +792,9 @@ impl Moe {
             hidden,
             weights: up_gate.view(),
             ids: routes.local_ids,
+            // The map the product's reader uses, not the product's own lookup: FC1 writes row `p` at
+            // the sort's permuted row `p`, and this is how a route is found again afterwards.
+            expanded_to_permuted: routes.expanded_to_permuted,
             tile_to_expert: routes.tile_to_expert,
             tile_to_limit: routes.tile_to_limit,
             permuted_to_expanded: routes.permuted_to_expanded,
@@ -1351,6 +1354,7 @@ impl Moe {
             hidden: exchange.states,
             weights: up_gate.view(),
             ids: exchange.ids,
+            expanded_to_permuted,
             tile_to_expert,
             tile_to_limit,
             permuted_to_expanded,
