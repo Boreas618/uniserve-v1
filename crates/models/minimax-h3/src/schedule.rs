@@ -184,6 +184,15 @@ impl Schedule {
     /// The sum is the block's node-sigma increment, so an ordinary Euler step between the two node
     /// sigmas applies that prediction. The other grids have one head, so a block of them is refused.
     pub fn block_weights(&self, modality: Modality, block: u32) -> Result<Vec<f64>> {
+        Ok(self.block_span(modality, block)?.1)
+    }
+
+    /// One evaluation block's first fine interval and its normalized integration weights.
+    ///
+    /// A parallel-decoding student stacks one output head per fine interval, so a block's fused head
+    /// sums the heads that start at this interval, weighted the way [`Schedule::block_weights`]
+    /// returns them.
+    pub fn block_span(&self, modality: Modality, block: u32) -> Result<(u32, Vec<f64>)> {
         let ScheduleGrid::Blocks {
             intervals,
             nodes,
@@ -215,10 +224,13 @@ impl Schedule {
                     .to_owned(),
             ));
         }
-        Ok(weights[start..end]
-            .iter()
-            .map(|weight| weight / total)
-            .collect())
+        Ok((
+            start as u32,
+            weights[start..end]
+                .iter()
+                .map(|weight| weight / total)
+                .collect(),
+        ))
     }
 }
 
