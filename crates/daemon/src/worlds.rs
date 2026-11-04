@@ -1904,36 +1904,20 @@ impl Replica {
                 unmapped.join(", ")
             )));
         }
-        // A successor that does not fit beside the serving world on some
-        // GPU is refused before anything starts, naming each item there.
-        if let Some((_, Some(refusal))) = storage {
-            return Err(UpdateError::Refused(refusal));
-        }
-        let redistribution = match redistribution {
-            Some(Redistribution {
-                refusal: Some(refusal),
-                ..
-            }) => return Err(UpdateError::Refused(refusal)),
-            Some(planned) => Some(planned.report),
-            None => None,
-        };
-        // The world change holds every stage's state across its awaits; boxed,
-        // it does not grow the caller's future by that much.
-        let report = Box::pin(self.change_world(
-            &running,
-            served,
-            current,
-            target,
-            target_spec,
-            target_digest,
-            &update,
-            change,
-            &budgets,
-            &target_hosts,
-            redistribution,
-        ))
-        .await?;
-        Ok(Applied::World(report))
+        // The layers above decide every change that reaches here: the epoch
+        // layer owns what the main processes are built from (the executable,
+        // the parallel ranks, the deployment file, the model's files, the
+        // placement and the KV cache's options, all of them `BuildConfig`),
+        // the program layer what they execute, and this one the daemon's own
+        // options and the scheduling limits, in place. A change that fits
+        // none of them would have needed a successor world, which this
+        // daemon no longer runs: it is refused by name here rather than
+        // half served.
+        Err(UpdateError::Refused(format!(
+            "the change fits no layer: it would have needed a successor world ({}) and the \
+             epoch layer starts one main process from the build config",
+            differing(&served, &target_spec).join(", ")
+        )))
     }
 
     /// Moves the deployment from the world `running` executes to a
