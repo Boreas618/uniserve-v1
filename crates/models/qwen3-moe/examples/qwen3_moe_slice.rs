@@ -13,6 +13,12 @@
 //! --stage decode      the whole model's decode step, against notes/reference/qwen3-reference.json
 //! ```
 //!
+//! `--routing` on the block stage asks the router alone: which eight experts this layer chooses and
+//! with what weights, on the same input the layer would get. It is not one of the cuts — a cut stops
+//! a layer partway — and with `--dump` it writes `hidden_NN_router_ids.npy` as `<i4` (an index
+//! compared as a float is a metric in which 17 against 18 is "0.8 % off") and
+//! `hidden_NN_router_weights.npy` as `<f4`, the two names the reference's hooks write.
+//!
 //! `--from NN` on the block stage replaces the embedding with the reference's own `hidden_NN`, so
 //! the layer that runs is measured on the reference's state: its row is that layer's arithmetic and
 //! carries no prefix's error — the one measurement the layer walk cannot make, because the walk runs
@@ -123,6 +129,9 @@ struct Args {
     /// The reference stage a `--stage block` run starts from: its `hidden_NN` is the run's input
     /// instead of the embedding, which measures one layer's arithmetic and no prefix's.
     from: Option<usize>,
+    /// Dump one layer's routing instead of measuring the layer: the router's own top-k, as the
+    /// reference's hook records it.
+    routing: bool,
 }
 
 /// The four stages of the run.
@@ -147,6 +156,7 @@ impl Args {
         let mut reference = None;
         let mut substage = None;
         let mut from = None;
+        let mut routing = false;
         let mut words = std::env::args().skip(1);
         while let Some(word) = words.next() {
             let mut value = |name: &str| -> Result<String> {
@@ -192,6 +202,7 @@ impl Args {
                         Failure::message(format!("--from takes a stage number, not `{number}`"))
                     })?);
                 }
+                "--routing" => routing = true,
                 "--substage" => {
                     let name = value("--substage")?;
                     substage = Some(Substage::parse(&name).ok_or_else(|| {
@@ -213,7 +224,7 @@ impl Args {
                         "qwen3_moe_slice --stage weights|embedding|block|decode \
                          [--checkpoint PATH] [--store PATH] [--device N] [--layer N] \
                          [--tokens ID,ID,...] [--dump DIR] [--reference DIR] \
-                         [--substage normalized|attended|mlp_out] [--from NN]",
+                         [--substage normalized|attended|mlp_out] [--from NN] [--routing]",
                     ));
                 }
                 other => {
@@ -234,6 +245,11 @@ impl Args {
                 "--from starts a run at a reference stage, so it belongs to --stage block",
             ));
         }
+        if routing && stage != Stage::Block {
+            return Err(Failure::message(
+                "--routing dumps one layer's routing, so it belongs to --stage block",
+            ));
+        }
         if from.is_some() && reference.is_none() {
             return Err(Failure::message(
                 "--from reads the reference's own state, so it needs --reference <dir>",
@@ -251,6 +267,7 @@ impl Args {
             reference,
             substage,
             from,
+            routing,
         })
     }
 }
@@ -752,6 +769,32 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
         // every key it composes resolves and that two identical runs agree. A digest that moves
         // between them is a race or an uninitialized buffer, which is worth knowing before a
         // numerical comparison blames the arithmetic.
+        // The router's own answer, on this layer's own input. It is not a `Substage`: the cuts stop
+        // a layer partway, and this asks a different question - which eight experts the layer
+        // chooses - so it runs the router and nothing else. With `--from` the input is the
+        // reference's state, and a difference in the ids is then our router's arithmetic or our
+        // selection, never an inherited error.
+        if args.routing {
+            let top = u64::try_from(config.num_experts_per_tok).unwrap_or(0);
+            let mark = arena.mark();
+            let ids = arena.tensor(
+                DType::I32,
+                Shape::new(&[u64::try_from(tokens_usize(&batch)).unwrap_or(0), top]),
+            )?;
+            let weights = arena.tensor(
+                DType::F32,
+                Shape::new(&[u64::try_from(tokens_usize(&batch)).unwrap_or(0), top]),
+            )?;
+            model.route(&forward, hidden, layer, ids, weights)?;
+            stream.synchronize()?;
+            let rows = tokens_usize(&batch);
+            let top = usize::try_from(top).unwrap_or(0);
+            let chosen = download_i32(&stream, ids, rows * top)?;
+            let scored = download_f32(&stream, weights, rows * top)?;
+            arena.release(mark);
+            report_routing(args, layer, rows, top, &chosen, &scored)?;
+            return Ok(());
+        }
         // Every measurement reserves the plan's scratch - the attention program's 512 MiB workspace
         // among it - and nothing returns it: the arena is a bump allocator sized for one forward,
         // so a second measurement without a release asks for a second copy of the whole step and
@@ -2040,4 +2083,90 @@ fn reference_rows(
         )));
     }
     upload_bf16(stream, arena, &values, rows, width)
+}
+
+/// Write one layer's routing, named as the reference's hook names it, and print what it chose.
+///
+/// The ids go to disk as **integers**: a float file would hand the comparator a metric in which
+/// `17` against `18` is "0.8 % off", which is meaningless for an index and would hide a real
+/// mismatch inside a relative pass. The weights go as `f32` — the tensor's own type — and are
+/// compared as floats against the reference's bf16-widened copy, whose rounding is their floor.
+fn report_routing(
+    args: &Args,
+    layer: usize,
+    rows: usize,
+    top: usize,
+    ids: &[i32],
+    weights: &[f32],
+) -> Result<()> {
+    for row in 0..rows {
+        let chosen = &ids[row * top..(row + 1) * top];
+        let scored = &weights[row * top..(row + 1) * top];
+        println!(
+            "routing: layer {layer} row {row:2}: ids {chosen:?} weights rms {:.6}",
+            rms(scored)
+        );
+    }
+    let Some(dir) = args.dump.as_deref() else {
+        println!(
+            "routing: layer {layer} chose these; pass --dump to write them for the comparator"
+        );
+        return Ok(());
+    };
+    let index = layer + 1;
+    let ids_path = dir.join(format!("hidden_{index:02}_router_ids.npy"));
+    let weights_path = dir.join(format!("hidden_{index:02}_router_weights.npy"));
+    write_npy_i32(&ids_path, ids, rows, top)?;
+    write_npy(&weights_path, weights, rows, top)?;
+    println!(
+        "dump: {} is layer {layer}'s router ids (<i4) and {} its weights (<f4)",
+        ids_path.display(),
+        weights_path.display()
+    );
+    Ok(())
+}
+
+/// Write an `i32` C-ordered `.npy`: the same container as [`write_npy`] with `'<i4'`.
+fn write_npy_i32(
+    path: &std::path::Path,
+    values: &[i32],
+    rows: usize,
+    columns: usize,
+) -> Result<()> {
+    let mut header =
+        format!("{{'descr': '<i4', 'fortran_order': False, 'shape': ({rows}, {columns}), }}");
+    let unpadded = 10 + header.len() + 1;
+    let padding = (64 - unpadded % 64) % 64;
+    header.push_str(&" ".repeat(padding));
+    header.push('\n');
+    let mut bytes = Vec::with_capacity(10 + header.len() + values.len() * 4);
+    bytes.extend_from_slice(&[0x93, b'N', b'U', b'M', b'P', b'Y']);
+    bytes.extend_from_slice(&[1, 0]);
+    bytes.extend_from_slice(
+        &u16::try_from(header.len())
+            .map_err(|_| Failure::message("a .npy header above 65535 bytes"))?
+            .to_le_bytes(),
+    );
+    bytes.extend_from_slice(header.as_bytes());
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    std::fs::write(path, &bytes)
+        .map_err(|error| Failure::message(format!("{}: {error}", path.display())))
+}
+
+/// Download `elements` `i32` values.
+fn download_i32(stream: &platform::Stream, view: TensorView, elements: usize) -> Result<Vec<i32>> {
+    let mut values = vec![0_i32; elements];
+    // SAFETY: `values` is written by the copy, which completes before the wait below.
+    unsafe {
+        platform::memcpy_async(
+            values.as_mut_ptr() as u64,
+            view.ptr.address(),
+            std::mem::size_of_val(&values[..]),
+            stream,
+        )?;
+    }
+    stream.synchronize()?;
+    Ok(values)
 }
