@@ -117,6 +117,55 @@ mod tests {
     }
 
     #[test]
+    fn a_precopy_carries_program_names_and_arguments_and_never_content() {
+        let mut programs = Programs::new();
+        programs.insert(
+            program_server::ProgramSlot::all("decode_attention"),
+            program_server::Program {
+                backend: "trtllm".to_owned(),
+                revision: 3,
+                arguments: "block = 16".parse().expect("the program's arguments"),
+            },
+        );
+        programs.insert(
+            program_server::ProgramSlot::phase(
+                "rms_norm",
+                program_server::PhaseKind::Prefill,
+            ),
+            program_server::Program {
+                backend: "triton".to_owned(),
+                revision: 2,
+                arguments: toml::Table::new(),
+            },
+        );
+        let command = ProgramCommand::Precopy {
+            generation: 5,
+            programs: Box::new(programs.clone()),
+        };
+
+        let encoded = rmp_serde::to_vec(&command).expect("a precopy encodes");
+        // The module's bytes are not part of the command: a main process
+        // resolves them from its Program Server (§6.3), and the peer channel
+        // carries names only.
+        assert!(
+            encoded.len() < 1024,
+            "a precopy of two programs is {} bytes",
+            encoded.len()
+        );
+        let decoded: ProgramCommand = rmp_serde::from_slice(&encoded).expect("and decodes");
+        assert_eq!(decoded, command);
+        let ProgramCommand::Precopy {
+            generation,
+            programs,
+        } = decoded
+        else {
+            panic!("a precopy decoded as {}", decoded.stage());
+        };
+        assert_eq!(generation, 5);
+        assert_eq!(programs[&program_server::ProgramSlot::all("decode_attention")].revision, 3);
+    }
+
+    #[test]
     fn the_commands_between_main_processes_survive_the_peer_encoding() {
         for command in [
             ProgramCommand::Switchover {

@@ -1245,7 +1245,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "storage",
- "storage-server",
  "tempfile",
  "thiserror",
  "time",
