@@ -112,6 +112,20 @@ const HEADS_TIMES_HEAD_DIM: u32 = 7168;
 const HEADS: u32 = 56;
 const HEAD_DIM: u32 = 128;
 
+/// Rows of one VSA tile (`vsa_tile_size` in `fastvideo_inference.json`: 64 for the FastH3 students,
+/// 128 for OmniRef). `uniserve/models/minimax_h3/packing.py` binds a 64-row tile to a `4×4×4`
+/// spatiotemporal block and refuses any size it does not pack, so this is the checkpoint's number,
+/// not a scheduling choice.
+const VSA_TILE_ROWS: u32 = 64;
+
+/// Rows one VSA program handles (`_BLOCK_ROWS` in `uniserve_kernels/attention/vsa_segments.py`): the
+/// kernel's own tiling inside a tile, compiled in.
+const VSA_BLOCK_ROWS: u32 = 16;
+
+/// The keep policy `vsa_sparsity: 0.8` states — a launch value, not a key, because the count follows
+/// the clip's tile count.
+const _VSA_KEEP_RATE: f64 = 0.2;
+
 /// The transformer's feed-forward width (`ffn_dim`).
 const FFN: u32 = 14336;
 
@@ -662,6 +676,31 @@ fn main() {
         .to_string(),
     );
 
+    // ---- The vision tower's products, all BF16 against FP32 accumulation with no epilogue.
+    //
+    // The key names the contraction, not the output width, so four rows cover nine call sites: the
+    // patch projection reads the flat tubelet (`in_channels · temporal_patch_size · patch²` = 3 · 2 ·
+    // 16² = 1536, `vision.rs`'s `Geometry::tubelet`); the fused qkv branches and the attention
+    // projection contract over `hidden_size` 1152; the MLP's first matrix does too and its second
+    // contracts over `intermediate_size` 4304; and both merger matrices read the merged row
+    // (`hidden_size · spatial_merge_size²` = 4 · 1152 = 4608, `Geometry::merged_width`), the deepstack
+    // mergers included.
+    for k in [1536_u32, 1152, 4304, 4608] {
+        push(
+            "gemm",
+            ops::gemm::Descriptor {
+                input: DType::BF16,
+                weight: DType::BF16,
+                accumulate: DType::F32,
+                output: DType::BF16,
+                order: ops::gemm::WeightOrder::NxK,
+                epilogue: ops::gemm::Epilogue::None,
+                k,
+            }
+            .to_string(),
+        );
+    }
+
     // ---- The audio decoder's and encoder's convolutions, in FP32 with TF32 declared on.
     //
     // The decoder's seven upsamplers are `ConvTranspose1d` with `kernel = decoder_kernel_sizes`,
@@ -775,6 +814,56 @@ fn main() {
         "vsa_scores",
         ops::segments::ScoresDescriptor::new(HEADS, HEAD_DIM, HEAD_DIM.next_power_of_two(), PDL)
             .to_string(),
+    );
+
+    // The pooling that feeds it, and the two tile passes around the attention, all at the tile the
+    // contract names. Q, K and V are contiguous `[rows, 56, 128]` views of one projected interval, so
+    // a row is 7168 elements and a head 128; stage-1 Q and K are normalized and rotated over the
+    // leading 96 of their 128 channels (`attention.py`'s `vsa.NormRope`), which is `ROTATED`.
+    push(
+        "vsa_prepare_tiles",
+        ops::segments::PrepareTilesDescriptor {
+            dtype: DType::BF16,
+            heads: HEADS,
+            width: HEAD_DIM,
+            rotated: ROTATED,
+            tile_rows: VSA_TILE_ROWS,
+            block_rows: VSA_BLOCK_ROWS,
+            epsilon: ops::descriptor::Float::from(NORM_EPSILON),
+            norm: true,
+            query_row_stride: u64::from(HEADS_TIMES_HEAD_DIM),
+            query_head_stride: u64::from(HEAD_DIM),
+            key_row_stride: u64::from(HEADS_TIMES_HEAD_DIM),
+            key_head_stride: u64::from(HEAD_DIM),
+            value_row_stride: u64::from(HEADS_TIMES_HEAD_DIM),
+            value_head_stride: u64::from(HEAD_DIM),
+            // A split-half factor table holds `rotated / 2` values a row.
+            factor_stride: u64::from(ROTATED / 2),
+        }
+        .to_string(),
+    );
+    // A tile's rows past its valid size hold zeros, on both sides of the attention.
+    push(
+        "vsa_zero_padding",
+        ops::segments::ZeroPaddingDescriptor {
+            dtype: DType::BF16,
+            heads: HEADS,
+            tile_rows: VSA_TILE_ROWS,
+            width: HEAD_DIM,
+            block_rows: VSA_BLOCK_ROWS,
+        }
+        .to_string(),
+    );
+    // The compressed gated tiles that give back the sparse rows.
+    push(
+        "vsa_add_gated_tiles",
+        ops::segments::AddGatedTilesDescriptor {
+            dtype: DType::BF16,
+            tile_rows: VSA_TILE_ROWS,
+            width: HEAD_DIM,
+            block_rows: VSA_BLOCK_ROWS,
+        }
+        .to_string(),
     );
 
     // ---- The audio encoder's frame/channel swap, in the audio VAEs' own FP32.
