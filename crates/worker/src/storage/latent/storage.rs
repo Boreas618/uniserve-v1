@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use cuda::{DeviceId, Stream, memset_d8};
+use platform::{DeviceId, Stream, memset_d8};
 
 use crate::ffi::{Backing, DType};
 use crate::storage::allocation::{Storage, StorageView};

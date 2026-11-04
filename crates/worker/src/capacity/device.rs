@@ -36,7 +36,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use ::storage::{GpuLedger, Item};
-use cuda::{DeviceId, Nvml};
+use platform::{DeviceId, Nvml};
 
 use crate::ffi::Function;
 use crate::storage::retained::Retained;
@@ -97,7 +97,7 @@ impl DeviceBudget {
     /// its unused cached blocks: NVML's figure with the plugins' buffers it
     /// attributes to no process, without the storages the server retains,
     /// among them the segments this process created and keeps the creating
-    /// handles of, which NVML attributes to it ([`cuda::created_bytes`]).
+    /// handles of, which NVML attributes to it ([`platform::created_bytes`]).
     ///
     /// Fails when NVML attributes no usage on the device to this process, as
     /// inside a PID namespace NVML does not report.
@@ -109,12 +109,12 @@ impl DeviceBudget {
             .nvml
             .process_storage(device)
             .map_err(|error| match error {
-                cuda::Error::ProcessNotFound { .. } => Error::Unsupported(format!(
+                platform::Error::ProcessNotFound { .. } => Error::Unsupported(format!(
                     "NVML reports no device storage for this process on {device}"
                 )),
                 error => Error::Cuda(error),
             })?;
-        let created = cuda::created_bytes(device);
+        let created = platform::created_bytes(device);
         Ok(process.saturating_sub(created) + self.unattributed.get(&device).copied().unwrap_or(0))
     }
 

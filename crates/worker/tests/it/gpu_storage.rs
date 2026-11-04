@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use cuda::{CopyBatch, DeviceId, SourceOrder, Stream, memset_d8};
+use platform::{CopyBatch, DeviceId, SourceOrder, Stream, memset_d8};
 use ipc::BlockTable;
 use ipc::{PrefixCacheDtype, UnitId};
 use worker::ffi::{Backing, DType, Handle};

@@ -1,0 +1,15 @@
+[package]
+name = "platform"
+description = "The CUDA boundary: driver, virtual memory and allocator, graphs, kernel launch, NVML, NCCL, cuBLASLt and cuDNN, loaded at runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+libc.workspace = true
+libloading.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

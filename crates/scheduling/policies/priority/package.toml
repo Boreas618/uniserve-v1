@@ -1,0 +1,46 @@
+# The `priority` scheduling policy's package (design §5.2).
+#
+# Requests are admitted and batched by the priority they carry, then by
+# arrival; everything else is `fcfs`. The deployment selects it with
+# `scheduler_config.policy = "priority"`.
+
+op = "scheduling"
+backend = "priority"
+
+[toolchain]
+name = "wasm32"
+target = "wasm32-unknown-unknown"
+rust-version = "1.96"
+wasmtime = "50.0.1"
+
+[module]
+form = "wasm32"
+precompiled = true
+
+# The same arguments as `fcfs`: the two policies differ only in their order.
+[arguments.chunked_prefill_size]
+default = 8192
+description = "Tokens of one prefill chunk."
+
+[arguments.max_queued_requests]
+default = "unbounded"
+description = "Bound on the waiting queue, counting token and media requests together."
+
+[arguments.max_batch]
+default = 128
+description = "Calls selected by one scheduling step."
+
+[arguments.max_num_batched_tokens]
+default = 8192
+description = "Token budget of one scheduling step."
+
+[arguments.prefetch_min_tokens]
+default = 256
+description = "Smallest prefix-hit deepening worth prefetching from the host KV cache."
+
+[arguments.timeout]
+default = "30s"
+description = "Longest a resident request may go without progressing before the mechanism treats it as starved."
+
+[source]
+files = ["Cargo.toml", "src/lib.rs"]

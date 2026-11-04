@@ -8,7 +8,7 @@
 //!
 //! Copies run on transfer-pool threads, on one ordinary (non-partitioned)
 //! stream per thread and device: on an SM-partition stream the driver takes
-//! copies of mapped peer windows only one call each (`cuda::copy`).
+//! copies of mapped peer windows only one call each (`platform::copy`).
 
 use super::{ACKNOWLEDGED, CLAIMED};
 use std::any::Any;
@@ -17,7 +17,7 @@ use std::ops::Range;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread::ThreadId;
 
-use cuda::{DeviceGuard, DeviceId, Event, SourceOrder, Stream, memset_d32};
+use platform::{DeviceGuard, DeviceId, Event, SourceOrder, Stream, memset_d32};
 use ipc::Locator;
 
 use super::export_table::SourceGrant;
