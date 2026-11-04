@@ -764,28 +764,21 @@ mod tests {
 
     use super::*;
 
-    /// The package's `rank_holder` binary: a stand-in rank that creates an
-    /// interprocess event on device 0, which makes the driver create its shared
-    /// memory named for that process, and sleeps until it is killed.
-    ///
-    /// A unit test's own executable sits in `target/<profile>/deps`, so the
-    /// binary cargo built beside it is two directories up; `cargo test -p
-    /// daemon` builds the package's binaries, which is why it is there at all.
-    fn rank_holder() -> PathBuf {
-        let executable = std::env::current_exe().unwrap();
-        let binary = executable
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("rank_holder");
-        assert!(
-            binary.is_file(),
-            "{} was not built; run the tests with `cargo test -p daemon`",
-            binary.display()
-        );
-        binary
-    }
+    /// A stand-in rank: creates an interprocess event on device 0, which
+    /// makes the driver create its shared memory named for this process, and
+    /// waits to be killed.
+    const EVENT_HOLDER: &str = "\
+import ctypes, time
+cuda = ctypes.CDLL('libcuda.so.1')
+device, context, event = ctypes.c_int(), ctypes.c_void_p(), ctypes.c_void_p()
+assert cuda.cuInit(0) == 0
+assert cuda.cuDeviceGet(ctypes.byref(device), 0) == 0
+assert cuda.cuDevicePrimaryCtxRetain(ctypes.byref(context), device) == 0
+assert cuda.cuCtxPushCurrent_v2(context) == 0
+# CU_EVENT_DISABLE_TIMING | CU_EVENT_INTERPROCESS
+assert cuda.cuEventCreate(ctypes.byref(event), 2 | 4) == 0
+time.sleep(600)
+";
 
     /// A stand-in rank that maps shared memory under NCCL's prefix, as a
     /// communicator's proxy maps its pool, writes the object's path to the
@@ -824,9 +817,10 @@ time.sleep(600)
             .collect()
     }
 
-    /// Starts a [`rank_holder`] and waits until its event storage exists.
+    /// Starts an [`EVENT_HOLDER`] and waits until its event storage exists.
     fn hold_event() -> (Holder, Vec<PathBuf>) {
-        let mut command = Command::new(rank_holder());
+        let mut command = Command::new("python3");
+        command.args(["-c", EVENT_HOLDER]);
         let holder = Holder(Child::spawn(&mut command).unwrap());
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
