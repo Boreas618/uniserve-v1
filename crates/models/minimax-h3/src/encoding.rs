@@ -1328,15 +1328,18 @@ impl AudioEncoder {
         self.input.forward(f, samples, hidden)?;
 
         // A stage runs its three units at the stage's inner width, which is the width it receives, then
-        // snaked and widened into the next width. Each unit needs three buffers: the residual stream, and
-        // two for its two convolutions, because the sum reads what the first snake read.
+        // snaked and widened into the next width. Each unit needs two buffers - the two its convolutions
+        // write, because the second snake reads what the first convolution wrote - and they are the
+        // stage's shape, so the stage reserves them once and the three units take turns: a unit writes
+        // `first` from the residual stream before reading it, and `second` from its own convolution. The
+        // residual stream itself is `hidden`, which no unit writes.
         let mut extent = length;
         for stage in &self.stages {
             let inner = u64::from(stage.inner);
             let inner_shape = Shape::new(&[batch, inner, extent]);
+            let first = f.arena().tensor(DType::F32, inner_shape)?;
+            let second = f.arena().tensor(DType::F32, inner_shape)?;
             for unit in &stage.units {
-                let first = f.arena().tensor(DType::F32, inner_shape)?;
-                let second = f.arena().tensor(DType::F32, inner_shape)?;
                 unit.snakes[0].forward(f, hidden, unit.alphas[0].view(), first)?;
                 unit.convs[0].forward(f, first, second)?;
                 unit.snakes[1].forward(f, second, unit.alphas[1].view(), first)?;
@@ -1410,6 +1413,84 @@ impl AudioEncoder {
     fn width_of(&self, stage: &EncoderStage) -> u32 {
         stage.inner * 2
     }
+}
+
+/// Every buffer one audio encode takes from `Forward::arena()`, in reservation order.
+///
+/// The encoder's `encode` reserves the input convolution's output, then per stage the two buffers its
+/// three units take turns in plus the snake's buffer and the widened one it passes on, then the tail
+/// snake's buffer and the convolution's features. The projection that follows runs once per batch row
+/// and reserves its own working set each time, which is why the rows appear separately here.
+///
+/// The list matters because the arena never rewinds, so everything accumulates for the length of the
+/// encode. The dominant entries are the first stage's, which run at the *sample* rate: at 207 latent
+/// frames a three-minute track is 165,600 samples, and one `[2, 64, 165600]` f32 buffer is 84.8 MB, so
+/// the encoder's plan is several hundred MB even though its weights are 0.12 GiB.
+pub fn audio_encoder_arena(
+    config: &crate::AudioVaeConfig,
+    batch: u64,
+    samples: u64,
+) -> Result<Vec<crate::decoding::Buffer>> {
+    let mut plan = Vec::new();
+    let mut push = |name: String, elements: u64| {
+        plan.push(crate::decoding::Buffer {
+            name,
+            element: "f32",
+            elements,
+        });
+    };
+    let stack = AudioStack::of(config)?;
+    let width = u64::from(stack.encoder_dim);
+    push("input".to_owned(), batch * width * samples);
+    let mut extent = samples;
+    let mut inner = width;
+    for (index, rate) in stack.rates.iter().enumerate() {
+        let rate = u64::from(*rate);
+        if rate == 0 || extent == 0 {
+            return Err(Error::config(format!(
+                "audio encoder stage {index} has rate {rate} at extent {extent}"
+            )));
+        }
+        let widened = extent / rate;
+        push(format!("stage{index}.first"), batch * inner * extent);
+        push(format!("stage{index}.second"), batch * inner * extent);
+        push(format!("stage{index}.snake"), batch * inner * extent);
+        push(format!("stage{index}.next"), batch * 2 * inner * widened);
+        extent = widened;
+        inner *= 2;
+    }
+    let wide = u64::from(stack.latent_dim);
+    let channels = u64::from(stack.latent_channels);
+    push("tail".to_owned(), batch * wide * extent);
+    push("features".to_owned(), batch * wide * extent);
+    // The projection, per row: its transposed features, its four residual-shaped buffers, the attention's
+    // three projections and its output, the gated unit's four, and the two views the row's latent is
+    // written through.
+    for row in 0..batch {
+        let frames = extent;
+        for (name, elements) in [
+            ("transpose", frames * wide),
+            ("shortcut", frames * channels),
+            ("normed", frames * wide),
+            ("attended", frames * wide),
+            ("query", frames * wide),
+            ("key", frames * wide),
+            ("value", frames * wide),
+            ("pooled", frames * channels),
+            ("projected", frames * channels),
+            ("mlp_normed", frames * channels),
+            ("updated", frames * channels),
+            ("gate_normed", frames * channels),
+            ("gate", frames * 2 * channels),
+            ("gated_value", frames * 2 * channels),
+            ("product", frames * 2 * channels),
+            ("pooled_matrix", channels * frames),
+            ("narrowed", channels * frames),
+        ] {
+            push(format!("row{row}.{name}"), elements);
+        }
+    }
+    Ok(plan)
 }
 
 /// A `[batch, rows, columns]` view as `[batch · rows, columns]`: the row axis the operators that work
@@ -1634,6 +1715,40 @@ impl GeGlu {
 mod tests {
     use super::*;
     use crate::video_vae::tests::video_config;
+
+    #[test]
+    fn the_audio_encoders_arena_names_every_buffer_it_reserves() {
+        let config = crate::audio_vae::tests::audio_config();
+        let stack = AudioStack::of(&config).expect("the stack");
+        let samples = 207 * u64::from(stack.samples_per_latent);
+        let batch = 2;
+        let plan = audio_encoder_arena(&config, batch, samples).expect("the plan");
+        // The input convolution, four buffers per stage, the tail pair, and each row's projection.
+        assert_eq!(
+            plan.len(),
+            1 + 4 * stack.rates.len() + 2 + 17 * batch as usize
+        );
+        // The first stage runs at the sample rate, at the input width: the encoder's largest buffer.
+        let first = plan
+            .iter()
+            .find(|buffer| buffer.name == "stage0.first")
+            .expect("stage 0's first buffer");
+        assert_eq!(
+            first.elements,
+            batch * u64::from(stack.encoder_dim) * samples
+        );
+        // The lengths divide by each rate in turn, so the tail sees one row per latent frame.
+        let tail = plan
+            .iter()
+            .find(|buffer| buffer.name == "tail")
+            .expect("the tail snake's buffer");
+        assert_eq!(tail.elements, batch * u64::from(stack.latent_dim) * 207);
+        let mut names: Vec<&str> = plan.iter().map(|buffer| buffer.name.as_str()).collect();
+        let count = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), count, "every buffer is named once");
+    }
 
     #[test]
     fn a_pixel_normalizes_and_quantizes_back_to_itself() {
