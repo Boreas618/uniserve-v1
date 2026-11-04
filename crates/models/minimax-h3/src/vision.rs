@@ -252,7 +252,7 @@ impl Buffers {
         let merge = u64::from(config.spatial_merge_size);
         let blocks = rows / (merge * merge);
         let width = u64::from(Geometry::merged_width(config));
-        let mut reserve = |shape: Shape| -> Result<TensorView> {
+        let reserve = |shape: Shape| -> Result<TensorView> {
             arena.tensor(dtype, shape).map_err(Error::from)
         };
         Ok(Self {
@@ -270,6 +270,28 @@ impl Buffers {
             down: reserve(Shape::new(&[rows, hidden]))?,
             merged: reserve(Shape::new(&[blocks, width]))?,
         })
+    }
+
+    /// Use `view` as the residual stream instead of this block's own arena buffer.
+    ///
+    /// The diagnosis of specs/worker.md 10 dumps the tower's residual stream after its last block,
+    /// which lives in an arena reservation whose address the runner does not know. Handing the
+    /// runner's own view in as the stream costs nothing and changes no number: the same kernels
+    /// write the same rows, at another address (`notes/h3/text-encoder-tables.md`).
+    pub fn with_stream(mut self, view: TensorView) -> Result<Self> {
+        let rows = self.hidden.rows();
+        let columns = self.hidden.last();
+        if view.shape != self.hidden.shape {
+            return Err(invalid(
+                "VisionTower",
+                format!(
+                    "the diagnostic stream is {:?}, [{rows}, {columns}] expected",
+                    view.shape.dims()
+                ),
+            ));
+        }
+        self.hidden = view;
+        Ok(self)
     }
 
     /// The bytes [`Buffers::new`] reserves for a grid of `patches` patches.
