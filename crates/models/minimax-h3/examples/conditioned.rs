@@ -853,20 +853,30 @@ fn encode(args: &Args) -> Result<(), String> {
         audio: None,
         noise: Some(noise),
     }];
-    denoiser
-        .prepare_conditioning(
-            &forward,
-            Conditioning {
-                text,
-                source: Some(source),
-                media: &media,
-                images: None,
-                audio: None,
-                state: &state_views,
-                step: None,
-            },
-        )
-        .map_err(show)?;
+    // A stop inside the conditioner still leaves the walk behind: the launches that led to it are the
+    // evidence a cold start produces, and a stage that writes nothing on failure costs a round (the
+    // rule `dt_layer` and `vae_decode` were both given this round). The page's files are cleared
+    // before the call, so what is on disk afterwards is this run's and no earlier run's.
+    let directory = args.out.join("latent_encoder");
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("{}: {error}", directory.display()))?;
+    clear_page(&directory)?;
+    let outcome = denoiser.prepare_conditioning(
+        &forward,
+        Conditioning {
+            text,
+            source: Some(source),
+            media: &media,
+            images: None,
+            audio: None,
+            state: &state_views,
+            step: None,
+        },
+    );
+    if let Err(error) = outcome {
+        write_page(&directory, &walk)?;
+        return Err(show(error));
+    }
     stream.synchronize().map_err(show)?;
 
     // 9. The readback: the prefix source, read at the rows the packing gathers each piece from.
@@ -920,9 +930,6 @@ fn encode(args: &Args) -> Result<(), String> {
 
     // 10. The files. The container is FP32 with the deployment's type named in the case, so one
     //     writer serves every deployment and the reader is told what the block computed in.
-    let directory = args.out.join("latent_encoder");
-    std::fs::create_dir_all(&directory)
-        .map_err(|error| format!("{}: {error}", directory.display()))?;
     let mut container = Vec::with_capacity(values.len() * 4);
     for value in &values {
         container.extend_from_slice(&value.to_le_bytes());
@@ -1050,6 +1057,36 @@ fn stored_bytes(checkpoint: &Checkpoint, directory: &str) -> Result<(u64, u64), 
 /// The deployment's element type, as the loaded block reports it.
 fn denoiser_dtype(denoiser: &Denoiser) -> DType {
     denoiser.dtype()
+}
+
+/// Remove the page's files, so a failed stage cannot be read as a previous run's success.
+fn clear_page(directory: &Path) -> Result<(), String> {
+    for name in [
+        "case.json",
+        "walk.txt",
+        "condition_rows.h3t",
+        "condition_noise.h3t",
+        "pixels.h3t",
+    ] {
+        let path = directory.join(name);
+        if path.exists() {
+            std::fs::remove_file(&path)
+                .map_err(|error| format!("clearing {}: {error}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// The one file a stopped stage writes: the walk, so the launches leading to the stop are readable.
+fn write_page(directory: &Path, walk: &Walk) -> Result<(), String> {
+    let path = directory.join("walk.txt");
+    std::fs::write(&path, walk.text()).map_err(|error| format!("{}: {error}", path.display()))?;
+    println!(
+        "stopped: {} launches written to {}",
+        walk.distinct(),
+        path.display()
+    );
+    Ok(())
 }
 
 /// One `.h3t` file: the container's magic, one element-type byte, a rank byte, the extents as `u64`,
