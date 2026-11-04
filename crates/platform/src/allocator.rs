@@ -138,6 +138,86 @@ pub struct Buffer {
     pool: PoolKind,
 }
 
+/// A device address handed to a kernel, a collective or a library call.
+///
+/// It is a plain address, not an owner: nothing here keeps the storage it
+/// points into alive. It exists so that code outside this crate names a place
+/// in device memory without an `unsafe` block and without the crate publishing
+/// raw pointers; the storage's owner keeps it mapped for as long as the call
+/// (or the stream work, or the graph replay that captured it) needs it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DevicePtr(u64);
+
+impl DevicePtr {
+    /// Names the device address `address`.
+    pub const fn from_address(address: u64) -> Self {
+        Self(address)
+    }
+
+    /// The address itself.
+    pub const fn address(self) -> u64 {
+        self.0
+    }
+
+    /// The address `bytes` further on, failing rather than wrapping around the
+    /// end of the address space.
+    pub fn offset(self, bytes: usize) -> Result<Self> {
+        let bytes = u64::try_from(bytes)
+            .map_err(|_| Error::invalid(format!("{bytes} bytes do not fit an address offset")))?;
+        self.0.checked_add(bytes).map(Self).ok_or_else(|| {
+            Error::invalid(format!(
+                "{bytes} bytes past {:#x} run past the address space",
+                self.0
+            ))
+        })
+    }
+}
+
+impl From<&Buffer> for DevicePtr {
+    fn from(buffer: &Buffer) -> Self {
+        Self(buffer.address)
+    }
+}
+
+/// A stretch of device memory: where it starts and how many bytes from there
+/// are valid. Like [`DevicePtr`] it owns nothing; it exists so a caller states
+/// the length an operation may touch, which this crate checks against what the
+/// operation needs before it runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceRange {
+    ptr: DevicePtr,
+    bytes: usize,
+}
+
+impl DeviceRange {
+    /// The range of `bytes` from `ptr`.
+    pub const fn new(ptr: DevicePtr, bytes: usize) -> Self {
+        Self { ptr, bytes }
+    }
+
+    /// Where the range starts.
+    pub const fn ptr(self) -> DevicePtr {
+        self.ptr
+    }
+
+    /// How many bytes from [`Self::ptr`] are valid.
+    pub const fn bytes(self) -> usize {
+        self.bytes
+    }
+}
+
+impl From<&Buffer> for DeviceRange {
+    fn from(buffer: &Buffer) -> Self {
+        Self::new(DevicePtr::from(buffer), buffer.len())
+    }
+}
+
+impl fmt::Display for DevicePtr {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:#x}", self.0)
+    }
+}
+
 impl Buffer {
     /// The virtual address the block is mapped at, which stays the same for the
     /// pool's life.
@@ -343,5 +423,24 @@ impl Allocator {
                 self.device.id()
             ))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_offset_past_the_end_of_the_address_space_is_refused() {
+        let end = DevicePtr::from_address(u64::MAX - 4);
+        assert_eq!(end.offset(4).unwrap().address(), u64::MAX);
+        assert!(end.offset(8).is_err());
+    }
+
+    #[test]
+    fn a_device_range_keeps_its_address_and_its_byte_count_apart() {
+        let range = DeviceRange::new(DevicePtr::from_address(0x1000), 24);
+        assert_eq!(range.ptr().address(), 0x1000);
+        assert_eq!(range.bytes(), 24);
     }
 }
