@@ -1404,9 +1404,8 @@ fn generate(
         }
         let best = top_logprobs(&row, 5);
         println!(
-            "generate: step {} of {steps}: position {position}, slot {slot}, seq_len {}, token \
+            "generate: step {step} of {steps}: position {position}, slot {slot}, seq_len {}, token \
              {chosen} ({source})",
-            step + 1,
             position.saturating_add(1)
         );
         for (token, logprob) in &best {
@@ -1414,12 +1413,12 @@ fn generate(
         }
         chosen_ids.push(chosen);
         if let Some(dir) = args.dump.as_deref() {
-            let file = dir.join(format!("logits_step_{:02}.npy", step + 1));
+            // The file carries the reference's own index, so a first difference names its file.
+            let file = dir.join(format!("logits_step_{step:02}.npy"));
             write_npy(&file, &row, 1, vocabulary)?;
             println!(
-                "dump: {} is step {}'s row, 1 x {vocabulary} f32",
-                file.display(),
-                step + 1
+                "dump: {} is step {step}'s row, 1 x {vocabulary} f32",
+                file.display()
             );
         }
         // The comparison is the measurement: a list that differs says nothing about where, and the
@@ -1431,9 +1430,9 @@ fn generate(
                 Some(want) => {
                     differed = true;
                     println!(
-                        "generate: FIRST DIFFERENCE at step {step} (position {position}): chose \
-                         {chosen}, the reference chose {want}; {} of {steps} steps agree before it",
-                        step
+                        "generate: FIRST DIFFERENCE at reference index {step} (position \
+                         {position}): chose {chosen}, the reference chose {want}; {step} of {steps} \
+                         ids agree before it"
                     );
                     println!("generate: step {step}'s top-5, on our row:");
                     for (token, logprob) in &best {
@@ -1510,11 +1509,11 @@ fn generate(
             let total = expected.len().min(steps);
             if differed {
                 println!(
-                    "generate: {agreed} of {total} steps agree with the reference before the first \
-                     difference; the steps after it were not run"
+                    "generate: {agreed} of {total} ids agree with the reference before the first \
+                     difference; the ids after it were not run"
                 );
             } else {
-                println!("generate: all {total} steps agree with the reference");
+                println!("generate: all {total} ids agree with the reference");
             }
         }
         None => println!(
