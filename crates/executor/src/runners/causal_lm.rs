@@ -1349,7 +1349,8 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
     fn purge(&mut self, generation: u64) {
         // The graphs go first, then their arena regions: `Captured` guarantees that order, and a
         // region released under a live executable would be reused by the next generation's
-        // capture while the old graph still addressed it.
+        // capture while the old graph still addressed it. Exactly this generation's graphs go - a
+        // released generation may be numbered either side of the serving one.
         let dropped = self.graphs.purge(generation);
         let dropped_count = dropped.len();
         let mut released = 0u64;
