@@ -3,7 +3,7 @@
 //! One call covers both halves because the batch's tokens are written exactly once and read in the
 //! same step: the scheduler's mechanism assigns each token a slot (`-1` for a token it does not
 //! persist), [`ops::kv::KvWrite`] scatters the projections into the pages — or, for an FP8 cache,
-//! [`ops::kv::KvQuantize`] divides by the page's own scale on the way in, the same tensor the read
+//! [`ops::kv::KvWriteScaled`] derives the page's own scale on the way in, the same tensor the read
 //! side multiplies back — and [`ops::attention::PagedAttention`] reads the pages each row addresses
 //! (specs/worker.md 9, "KV 写入" and "注意力"). Both operators are compiled per geometry, so the
 //! descriptor pins the element types, the head and page geometry and the mask variant, while the
@@ -12,7 +12,7 @@
 use ops::attention::dense::{DenseArgs, DenseAttention, DenseDescriptor};
 use ops::attention::sparse::{SparseArgs, SparseAttention, SparseDescriptor};
 use ops::attention::{Args, Descriptor, Mask, PagedAttention, Phase};
-use ops::kv::{self, Descriptor as KvDescriptor, KvQuantize, KvWrite};
+use ops::kv::{self, Descriptor as KvDescriptor, KvWrite, KvWriteScaled};
 use ops::{DType, PhaseKind, Shape, TensorView};
 
 use crate::capability::{KvGroup, KvPlanes, KvView, TokenBatch};
@@ -507,7 +507,7 @@ impl Attention {
             }
         }
         // Both writers address a token's row from the buffer pointer: `kv_write` scatters a row and
-        // `kv_quantize` reads one, and neither is handed a stride. A projection whose rows are
+        // `kv_write_scaled` reads one, and neither is handed a stride. A projection whose rows are
         // contiguous is what a layer's output is; a strided one would be read as packed rows and
         // land in the wrong slots, so it is refused here instead of silently.
         for (name, view) in [("key", key), ("value", value)] {
@@ -592,7 +592,7 @@ impl Attention {
         key: TensorView,
         value: TensorView,
     ) -> Result<()> {
-        let descriptor = self.quantize_descriptor(key.dtype);
+        let descriptor = self.scaled_write_descriptor(key.dtype);
         let rows = u64::from(self.kv_heads) * u64::from(self.head_dim);
         for (name, cache, scale, initialized, source) in [
             (
@@ -621,13 +621,16 @@ impl Attention {
                     ),
                 )
             })?;
-            f.operate::<KvQuantize>(
+            f.operate::<KvWriteScaled>(
                 &descriptor,
-                kv::QuantizeArgs {
+                kv::ScaledWriteArgs {
                     source: source.reshape(Shape::new(&[source.rows(), rows])),
                     slots: batch.slot_mapping,
+                    // The reader's own buffer: `attend` multiplies by `planes.key_scale`, so a
+                    // second allocation of the right shape would produce a cache that reads as
+                    // zeros with no error anywhere.
                     scales: scale,
-                    out: cache,
+                    cache,
                     initialized,
                 },
             )?;
@@ -708,8 +711,8 @@ impl Attention {
 
     /// The descriptor the quantizing cache write launches with: the projection's type, one plane's
     /// page scales and the geometry both share.
-    pub fn quantize_descriptor(&self, projection: DType) -> kv::QuantizeDescriptor {
-        kv::QuantizeDescriptor {
+    pub fn scaled_write_descriptor(&self, projection: DType) -> kv::ScaledWriteDescriptor {
+        kv::ScaledWriteDescriptor {
             dtype: projection,
             scale: DType::F32,
             page: self.page_size,
