@@ -134,6 +134,42 @@ impl ExpertSource {
     }
 }
 
+/// Why a tensor a ModelOpt checkpoint declares is declared here and not consumed.
+pub const CALIBRATED_CACHE_SCALE: &str = "a calibrated per-tensor FP8 cache scalar, declared by the \
+checkpoint's `kv_cache_quant_algo FP8`; the cache takes one scale per page and derives it from the \
+values it writes, and the reference's quantizer refuses a calibrated scalar for FP8";
+
+/// The tensors a checkpoint declares that this model knows about and deliberately does not consume.
+///
+/// A ModelOpt checkpoint quantized to NVFP4 with `kv_cache_quant_algo: FP8` carries, in every layer,
+/// `self_attn.k_proj.k_scale` and `self_attn.v_proj.v_scale` as F32 scalars. They calibrate a
+/// *per-tensor* FP8 K/V cache. This model's cache stores **one scale per page** and derives it from
+/// the values it writes (`uniserve/prefix_cache/mha.py:282-299`), and a calibrated scalar is
+/// inexpressible for an FP8 cache by the reference quantizer's own rule — `calibrated_scale` is
+/// refused unless the format is `nvfp4` (`uniserve/quantization/quantizer.py:63-70`). A per-tensor
+/// scalar for the whole cache would be a different layout with a different reader, and seeding one
+/// into a page's buffer would change nothing: a page whose initialized flag is clear takes the
+/// derived scale.
+///
+/// Returns the reason for such a name, and `None` for every other tensor — so a loader or an audit
+/// can say *declared, not consumed* rather than silently dropping two F32 tensors per layer, which is
+/// indistinguishable from never having seen them.
+pub fn declared_not_consumed(name: &str) -> Option<&'static str> {
+    let stripped = name.strip_prefix("model.").unwrap_or(name);
+    for suffix in [".self_attn.k_proj.k_scale", ".self_attn.v_proj.v_scale"] {
+        if let Some(prefix) = stripped.strip_suffix(suffix) {
+            // `layers.<index>`: the declaration is per layer, and a name outside the stack is not one.
+            let per_layer = prefix.strip_prefix("layers.").is_some_and(|index| {
+                !index.is_empty() && index.chars().all(|character| character.is_ascii_digit())
+            });
+            if per_layer {
+                return Some(CALIBRATED_CACHE_SCALE);
+            }
+        }
+    }
+    None
+}
+
 /// Every parameter of a Qwen3-MoE model, keyed by the model's path.
 ///
 /// Sparse layers contribute their router here and their experts through [`expert_sources`]. A tied
@@ -227,6 +263,41 @@ pub fn expert_sources(config: &Config) -> Vec<ExpertSource> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The declaration is per layer and in both directions: the model knows these names, must not
+    /// claim them, and must not treat any other tensor as one of them.
+    #[test]
+    fn the_calibrated_cache_scalars_are_declared_and_not_consumed() {
+        for layer in [0, 1, 47] {
+            for projection in ["k_proj.k_scale", "v_proj.v_scale"] {
+                for name in [
+                    format!("model.layers.{layer}.self_attn.{projection}"),
+                    // Without the prefix the stack is serialized under, the loader's fallback form.
+                    format!("layers.{layer}.self_attn.{projection}"),
+                ] {
+                    assert_eq!(
+                        declared_not_consumed(&name),
+                        Some(CALIBRATED_CACHE_SCALE),
+                        "{name}"
+                    );
+                }
+            }
+        }
+        assert!(CALIBRATED_CACHE_SCALE.contains("derives it"));
+        for name in [
+            "model.layers.3.self_attn.k_proj.weight",
+            "model.layers.3.self_attn.k_proj.input_scale",
+            "model.layers.3.self_attn.q_proj.k_scale",
+            "model.layers.3.self_attn.v_proj.weight_scale",
+            "model.layers.3.mlp.gate.weight",
+            "lm_head.weight",
+            // A name that carries the suffix outside the stack is not the declaration.
+            "self_attn.k_proj.k_scale",
+            "model.layers.x.self_attn.k_proj.k_scale",
+        ] {
+            assert_eq!(declared_not_consumed(name), None, "{name}");
+        }
+    }
     use crate::{Activation, Config};
     use nn::Shape;
 

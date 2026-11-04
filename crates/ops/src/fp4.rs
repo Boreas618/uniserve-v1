@@ -41,11 +41,19 @@ pub const SWIZZLE_ROWS: u64 = 128;
 pub const SWIZZLE_COLUMNS: u64 = 4;
 
 /// How a matrix's E4M3 block scales are stored.
+///
+/// The two are distinct statements, and confusing them costs a weight load: **`Linear` is the
+/// checkpoint's own layout** — what a calibrated file publishes — while `Swizzled128X4` is what a
+/// product's kernel reads when its program was compiled for it. The loader reads the first and
+/// transforms it into whichever the product asks for (`nn::weights::swizzled_scales`), so the same
+/// checkpoint serves either. Which one a product accepts is the **package's** decision and is not
+/// implied by this enum: `nvfp4_gemm/cute_dsl` serves `Swizzled128X4` only and refuses the other by
+/// name (`src/build.py:48`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum ScaleLayout {
-    /// `[rows, columns / 16]` row major: the layout CUTLASS's FP4 product reads.
+    /// `[rows, columns / 16]` row major, unpadded: the checkpoint's layout.
     Linear,
-    /// Rows padded to 128 and scale columns to 4, interleaved: the layout cuDNN reads.
+    /// Rows padded to 128 and scale columns to 4, interleaved: what a product compiled for it reads.
     Swizzled128X4,
 }
 

@@ -32,8 +32,7 @@
 //! accounted for between the two fixtures and these lines:
 //!
 //! - **The quantized export's family**: `nvfp4_gemm`, `nvfp4_quantize`, `gather_gemm_nvfp4`,
-//!   `route_gemm_nvfp4`, `act_and_mul_fp8`, `value_first_swiglu_fp8`, `kv_quantize` and
-//!   `expert_exchange`. Their descriptors carry the export's own choices — the block-scale dtype,
+//!   `route_gemm_nvfp4`, `act_and_mul_fp8`, `value_first_swiglu_fp8` and `expert_exchange`. Their descriptors carry the export's own choices — the block-scale dtype,
 //!   the expert packing, the exchange's ranks — and no NVFP4 shard exists in this workspace, so a
 //!   key here would be a guess about an artifact nobody has opened.
 //! - **The executor's path, not the model's**: `slot_commit` (its views are the sampler's state),
@@ -123,6 +122,28 @@ const PROJECTION_K: [u32; 3] = [HIDDEN, HEADS * HEAD_DIM, INTERMEDIATE];
 fn main() {
     let dtype = DType::BF16;
     let mut lines: Vec<(String, String)> = Vec::new();
+
+    // A model walk's print, when one is given, is merged in rather than restated: the rows a layer
+    // launches are the walk's statement (`Qwen3Moe::keys`), and this file may only add the executor's
+    // own — so a merged print is the file, and a difference between the two is visible as a row.
+    let mut arguments = std::env::args().skip(1);
+    let mut model_keys: Option<std::path::PathBuf> = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--model-keys" => match arguments.next() {
+                Some(path) => model_keys = Some(std::path::PathBuf::from(path)),
+                None => {
+                    eprintln!("--model-keys takes the path of a `qwen3-moe --example keys` print");
+                    return;
+                }
+            },
+            other => {
+                eprintln!("unknown argument {other}");
+                eprintln!("usage: qwen3_moe_keys [--model-keys PATH]");
+                return;
+            }
+        }
+    }
 
     // Attention, both phases of the slice.
     for phase in [Phase::Prefill, Phase::Decode] {
@@ -218,6 +239,39 @@ fn main() {
             heads: KV_HEADS,
             head_dim: HEAD_DIM,
             tile: kv_tile(HEAD_DIM),
+            pdl: PDL,
+        }),
+    ));
+
+    // A deployment that stores its pages as E4M3 reads them through the same attention program with
+    // one scale per page, and fills them with the write that derives that scale.
+    for phase in [ops::attention::Phase::Prefill, ops::attention::Phase::Decode] {
+        lines.push((
+            "paged_attention".to_owned(),
+            key(&ops::attention::Descriptor {
+                phase,
+                query: dtype,
+                key_value: DType::F8E4M3,
+                output: dtype,
+                head_dim: HEAD_DIM,
+                page_size: PAGE,
+                q_heads: HEADS,
+                kv_heads: KV_HEADS,
+                mask: ops::attention::Mask::Causal,
+                windowed: false,
+                max_kv_len: MAX_KV_LEN,
+            }),
+        ));
+    }
+    lines.push((
+        "kv_write_scaled".to_owned(),
+        key(&ops::kv::ScaledWriteDescriptor {
+            dtype,
+            scale: DType::F32,
+            page: PAGE,
+            heads: KV_HEADS,
+            head_dim: HEAD_DIM,
+            block: kv_tile(HEAD_DIM),
             pdl: PDL,
         }),
     ));
@@ -435,6 +489,28 @@ fn main() {
             pdl: PDL,
         }),
     ));
+
+    if let Some(path) = model_keys {
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let mut merged = 0;
+                for line in text.lines() {
+                    if line.starts_with('#') || line.trim().is_empty() {
+                        continue;
+                    }
+                    if let Some((operator, key)) = line.split_once('\t') {
+                        lines.push((operator.trim().to_owned(), key.trim().to_owned()));
+                        merged += 1;
+                    }
+                }
+                eprintln!("# {merged} rows merged from {}", path.display());
+            }
+            Err(error) => {
+                eprintln!("{}: {error}", path.display());
+                return;
+            }
+        }
+    }
 
     // One key per line, the same key once: a variant two layers launch is packaged once.
     lines.sort();

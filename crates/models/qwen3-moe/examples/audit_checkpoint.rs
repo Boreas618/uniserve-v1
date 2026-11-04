@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use qwen3_moe::Config;
-use qwen3_moe::weights::{expert_sources, parameter_sources};
+use qwen3_moe::weights::{declared_not_consumed, expert_sources, parameter_sources};
 
 fn main() -> ExitCode {
     let root = match root_argument() {
@@ -117,9 +117,28 @@ fn main() -> ExitCode {
         present.len(),
         resolved,
     );
+    // A name the model knows and deliberately does not consume is a decision, not a leftover: the
+    // judgement belongs in the code that names it, with its reason, so the report separates the two.
+    let mut declared: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut unjudged: Vec<&String> = Vec::new();
+    for name in &unclaimed {
+        match declared_not_consumed(name) {
+            Some(reason) => *declared.entry(reason).or_default() += 1,
+            None => unjudged.push(name),
+        }
+    }
+
     println!("# {by_fallback} resolved only through the loader's `model.`-prefix fallback");
-    println!("# {} present but unclaimed", unclaimed.len());
-    for name in unclaimed.iter().take(5) {
+    println!(
+        "# {} present but unclaimed: {} declared and not consumed, {} to judge",
+        unclaimed.len(),
+        declared.values().sum::<usize>(),
+        unjudged.len()
+    );
+    for (reason, count) in &declared {
+        println!("    {count} x declared, not consumed: {reason}");
+    }
+    for name in unjudged.iter().take(5) {
         println!("    {name}");
     }
     println!("# {} claimed but absent", absent.len());

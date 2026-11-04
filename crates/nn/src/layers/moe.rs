@@ -116,7 +116,12 @@ pub const TILE_ROWS: u32 = MMA_TILE.0;
 ///
 /// A whole number of sixteen-element scale blocks, as the layout requires, and small enough that a
 /// 2048-element row is walked in a handful of passes rather than materialized in one block.
-const ENCODE_CHUNK: u32 = 1024;
+/// Elements one activation-encoding program covers.
+///
+/// It is the encoder's block and therefore a key field of `nvfp4_quantize`, so a model that builds an
+/// [`crate::layers::Nvfp4Linear`] states it rather than choosing one: two deployments that disagreed
+/// would compile two programs for one launch site.
+pub const ENCODE_CHUNK: u32 = 1024;
 
 /// The encoder's chunk is a whole number of scale blocks; a chunk that were not would have a partial
 /// block with no scale to name it.
@@ -138,6 +143,137 @@ pub struct MoeGeometry {
     pub experts: u64,
     /// Rows per permutation tile.
     pub tile: u64,
+}
+
+impl MoeGeometry {
+    /// The router's top-k program.
+    ///
+    /// `renormalize` and `scale` are arguments rather than fields because they are the checkpoint's
+    /// routing convention — whether the kept weights are renormalized, and whether a learned scale
+    /// then multiplies them — and not the block's shape.
+    pub fn topk_descriptor(
+        &self,
+        scores: DType,
+        renormalize: bool,
+        scale: Option<DType>,
+    ) -> TopkDescriptor {
+        TopkDescriptor {
+            scores,
+            experts: self.experts as u32,
+            top: self.top as u32,
+            renormalize,
+            scale,
+        }
+    }
+
+    /// The descriptor that turns logical expert ids into this rank's weight rows.
+    pub fn map_descriptor(&self) -> GatherDescriptor {
+        GatherDescriptor {
+            experts: self.experts as u32,
+            top: self.top as u32,
+        }
+    }
+
+    /// The sort's descriptor, for a block whose rank holds `local_experts` experts.
+    ///
+    /// `local_experts` is an argument because the same block sorts for the dense case (every expert)
+    /// and for an expert-parallel rank (its own), and the two are different programs.
+    pub fn sort_descriptor(&self, local_experts: u32) -> sort::Descriptor {
+        sort::Descriptor {
+            experts: self.experts as u32,
+            top: self.top as u32,
+            local_experts,
+            tile_tokens: self.tile as u32,
+            scales: DType::F32,
+        }
+    }
+
+    /// The first product's descriptor over the dense packed stack.
+    pub fn gather_descriptor(&self, hidden: DType, activation: Activation) -> GatherGemmDescriptor {
+        GatherGemmDescriptor {
+            hidden: self.hidden as u32,
+            intermediate: self.intermediate as u32,
+            experts: self.experts as u32,
+            top: self.top as u32,
+            activation,
+            dtype: hidden,
+            tile: MMA_TILE,
+            cluster: MMA_CLUSTER,
+        }
+    }
+
+    /// The second product's descriptor over the dense packed stack.
+    pub fn route_descriptor(&self, hidden: DType) -> RouteGemmDescriptor {
+        RouteGemmDescriptor {
+            hidden: self.hidden as u32,
+            intermediate: self.intermediate as u32,
+            experts: self.experts as u32,
+            top: self.top as u32,
+            dtype: hidden,
+            tile: MMA_TILE,
+            cluster: MMA_CLUSTER,
+        }
+    }
+
+    /// The combine's descriptor: the routes summed in FP32 and rounded once to `output`.
+    pub fn combine_descriptor(&self, product: DType, output: DType) -> combine::Descriptor {
+        combine::Descriptor {
+            layout: combine::Layout::Permuted,
+            hidden: self.hidden as u32,
+            top: self.top as u32,
+            experts: self.experts as u32,
+            input: product,
+            scales: DType::F32,
+            output,
+        }
+    }
+
+    /// The first product's descriptor over an encoded stack: the block scale's element type and the
+    /// scale layout are the weights', so they are arguments.
+    ///
+    /// The grid is over *routes* — tokens × `top`, computed at launch — so this key covers every
+    /// route count and is not compiled per bucket.
+    pub fn gather_nvfp4_descriptor(
+        &self,
+        hidden: DType,
+        activation: Activation,
+        scale: DType,
+        layout: ScaleLayout,
+    ) -> GatherGemmNvfp4Descriptor {
+        GatherGemmNvfp4Descriptor {
+            hidden: self.hidden as u32,
+            intermediate: self.intermediate as u32,
+            experts: self.experts as u32,
+            top: self.top as u32,
+            activation,
+            dtype: hidden,
+            scale,
+            layout,
+            tile: MMA_TILE,
+            cluster: MMA_CLUSTER,
+        }
+    }
+
+    /// The second product's descriptor over an encoded stack, for the same reason and with the same
+    /// grid: routes, not rows.
+    pub fn route_nvfp4_descriptor(
+        &self,
+        hidden: DType,
+        scale: DType,
+        layout: ScaleLayout,
+    ) -> RouteGemmNvfp4Descriptor {
+        RouteGemmNvfp4Descriptor {
+            hidden: self.hidden as u32,
+            intermediate: self.intermediate as u32,
+            experts: self.experts as u32,
+            top: self.top as u32,
+            dtype: hidden,
+            scale,
+            layout,
+            tile: MMA_TILE,
+            cluster: MMA_CLUSTER,
+        }
+    }
 }
 
 /// The encoded step's launches, in the order it runs them. A buffer names the one that writes it.
@@ -1230,22 +1366,31 @@ impl Moe {
     /// The routing descriptor: the experts' softmax, the top-k, and whether the kept weights are
     /// renormalized. The scale's type is the model's — a calibrated router carries one.
     pub fn topk_descriptor(&self, scores: DType) -> TopkDescriptor {
-        TopkDescriptor {
+        self.geometry().topk_descriptor(
             scores,
-            experts: self.experts,
-            top: self.top,
-            renormalize: self.renormalize,
-            scale: self.scale.as_ref().map(Weight::dtype),
+            self.renormalize,
+            self.scale.as_ref().map(Weight::dtype),
+        )
+    }
+
+    /// The block's shape and its rank's expert window, as the value every descriptor is built from.
+    ///
+    /// The layer's descriptor methods delegate here, so an enumeration that has only a
+    /// configuration builds the same programs the loaded model launches.
+    pub fn geometry(&self) -> MoeGeometry {
+        MoeGeometry {
+            hidden: u64::from(self.hidden),
+            intermediate: u64::from(self.intermediate),
+            top: u64::from(self.top),
+            experts: u64::from(self.experts),
+            tile: u64::from(self.tile),
         }
     }
 
     /// The descriptor that turns logical expert ids into this rank's weight rows. It is launched
     /// only when the rank holds a subset of the experts.
     pub fn map_descriptor(&self) -> GatherDescriptor {
-        GatherDescriptor {
-            experts: self.experts,
-            top: self.top,
-        }
+        self.geometry().map_descriptor()
     }
 
     /// The sort's descriptor, for a block whose rank holds `local_experts` experts.
@@ -1254,40 +1399,17 @@ impl Moe {
     /// the dense block (every expert) and for an expert-parallel rank (its own), and the two are
     /// different programs.
     pub fn sort_descriptor(&self, local_experts: u32) -> sort::Descriptor {
-        sort::Descriptor {
-            experts: self.experts,
-            top: self.top,
-            local_experts,
-            tile_tokens: self.tile,
-            scales: DType::F32,
-        }
+        self.geometry().sort_descriptor(local_experts)
     }
 
     /// The first product's descriptor: the gated FC1 over the dense packed stack.
     pub fn gather_descriptor(&self, hidden: DType) -> GatherGemmDescriptor {
-        GatherGemmDescriptor {
-            hidden: self.hidden,
-            intermediate: self.intermediate,
-            experts: self.experts,
-            top: self.top,
-            activation: self.activation,
-            dtype: hidden,
-            tile: MMA_TILE,
-            cluster: MMA_CLUSTER,
-        }
+        self.geometry().gather_descriptor(hidden, self.activation)
     }
 
     /// The second product's descriptor: FC2 over the dense packed stack.
     pub fn route_descriptor(&self, hidden: DType) -> RouteGemmDescriptor {
-        RouteGemmDescriptor {
-            hidden: self.hidden,
-            intermediate: self.intermediate,
-            experts: self.experts,
-            top: self.top,
-            dtype: hidden,
-            tile: MMA_TILE,
-            cluster: MMA_CLUSTER,
-        }
+        self.geometry().route_descriptor(hidden)
     }
 
     /// The scratch one launch of the encoded products needs, for `routes` permuted rows — the exact
@@ -1357,6 +1479,19 @@ impl Moe {
         columns: u32,
         layout: ScaleLayout,
     ) -> QuantizeDescriptor {
+        Self::quantize_descriptor_of(input, columns, layout)
+    }
+
+    /// The encoder's descriptor, from the contraction length alone.
+    ///
+    /// The encoder's grid covers the rows in one launch — it is keyed by `columns`, not by a row
+    /// count — so it is not compiled per bucket, and every activation the deployment encodes shares
+    /// one program per width.
+    pub fn quantize_descriptor_of(
+        input: DType,
+        columns: u32,
+        layout: ScaleLayout,
+    ) -> QuantizeDescriptor {
         QuantizeDescriptor {
             input,
             columns,
@@ -1374,18 +1509,8 @@ impl Moe {
         scale: DType,
         layout: ScaleLayout,
     ) -> GatherGemmNvfp4Descriptor {
-        GatherGemmNvfp4Descriptor {
-            hidden: self.hidden,
-            intermediate: self.intermediate,
-            experts: self.experts,
-            top: self.top,
-            activation: self.activation,
-            dtype: hidden,
-            scale,
-            layout,
-            tile: MMA_TILE,
-            cluster: MMA_CLUSTER,
-        }
+        self.geometry()
+            .gather_nvfp4_descriptor(hidden, self.activation, scale, layout)
     }
 
     /// The second product's descriptor over an encoded stack.
@@ -1395,17 +1520,7 @@ impl Moe {
         scale: DType,
         layout: ScaleLayout,
     ) -> RouteGemmNvfp4Descriptor {
-        RouteGemmNvfp4Descriptor {
-            hidden: self.hidden,
-            intermediate: self.intermediate,
-            experts: self.experts,
-            top: self.top,
-            dtype: hidden,
-            scale,
-            layout,
-            tile: MMA_TILE,
-            cluster: MMA_CLUSTER,
-        }
+        self.geometry().route_nvfp4_descriptor(hidden, scale, layout)
     }
 
     /// The combine's descriptor: the routes summed in FP32 and rounded once to `output`.
@@ -1414,15 +1529,7 @@ impl Moe {
     /// one the combine's module is compiled for; it is a descriptor field so a chain that ever
     /// writes expanded rows names its own module instead of reading this one's buffer wrongly.
     pub fn combine_descriptor(&self, product: DType, output: DType) -> combine::Descriptor {
-        combine::Descriptor {
-            layout: combine::Layout::Permuted,
-            hidden: self.hidden,
-            top: self.top,
-            experts: self.experts,
-            input: product,
-            scales: DType::F32,
-            output,
-        }
+        self.geometry().combine_descriptor(product, output)
     }
 
     /// `out = Σ_routes weight · expert(hidden)` over packed experts.

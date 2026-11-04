@@ -113,18 +113,38 @@ impl Linear {
     /// every row count that reaches it. This is the same arithmetic `forward` runs — `forward` calls
     /// this — so an enumeration built on it cannot drift from what the model launches.
     pub fn descriptor(&self, input: DType, output: DType) -> Descriptor {
+        Self::descriptor_of(
+            self.k,
+            self.weight.dtype(),
+            self.order,
+            self.bias.is_some(),
+            input,
+            output,
+        )
+    }
+
+    /// The descriptor a dense product over `k` columns launches with, from the numbers alone.
+    ///
+    /// A deployment answers "what must be compiled?" before it opens a device, and this key reads the
+    /// contraction length, the weight's element type, the order, whether an epilogue adds a bias, and
+    /// the two element types — never the weight's values or its row count. [`Self::descriptor`] calls
+    /// it with a loaded layer's numbers, so an enumeration built on it cannot drift from the launch.
+    pub fn descriptor_of(
+        k: u32,
+        weight: DType,
+        order: WeightOrder,
+        bias: bool,
+        input: DType,
+        output: DType,
+    ) -> Descriptor {
         Descriptor {
             input,
-            weight: self.weight.dtype(),
+            weight,
             accumulate: ACCUMULATE,
             output,
-            order: self.order,
-            epilogue: if self.bias.is_some() {
-                Epilogue::Bias
-            } else {
-                Epilogue::None
-            },
-            k: self.k,
+            order,
+            epilogue: if bias { Epilogue::Bias } else { Epilogue::None },
+            k,
         }
     }
 
@@ -336,6 +356,22 @@ impl Nvfp4Linear {
     /// scales, computed on device by whoever produced the activation scale. The packed activation
     /// and its block scales are taken from the forward's arena.
     /// The descriptor of the activation encoding this projection runs first.
+    /// The encoder's descriptor, from the contraction length alone.
+    pub fn encode_descriptor_of(
+        input: DType,
+        columns: u32,
+        layout: ScaleLayout,
+        block: u32,
+    ) -> QuantizeDescriptor {
+        QuantizeDescriptor {
+            input,
+            columns,
+            layout,
+            block,
+            pdl: false,
+        }
+    }
+
     pub fn encode_descriptor(&self) -> QuantizeDescriptor {
         QuantizeDescriptor {
             input: self.input,
@@ -351,6 +387,34 @@ impl Nvfp4Linear {
     /// `m` is a key field here and not in [`Linear::descriptor`]: the product's grid is computed
     /// from the row count and the module is compiled per row count, which is why the deployment
     /// enumerates the bucket sizes the executor builds rather than an unbounded row count.
+    /// The packed product's descriptor, from the geometry alone.
+    ///
+    /// `m` is a key field here and not in [`Linear::descriptor_of`]: this product's grid is the row
+    /// count and the module is compiled per row count, which is why a deployment enumerates the
+    /// buckets its executor captures rather than an unbounded row count.
+    #[allow(clippy::too_many_arguments)]
+    pub fn descriptor_of(
+        m: u32,
+        n: u32,
+        k: u32,
+        layout: ScaleLayout,
+        bias: bool,
+        output: DType,
+    ) -> GemmDescriptor {
+        GemmDescriptor {
+            packed: DType::U8,
+            scale: DType::F8E4M3,
+            accumulate: ACCUMULATE,
+            output,
+            layout,
+            epilogue: if bias { Epilogue::Bias } else { Epilogue::None },
+            m,
+            n,
+            k,
+            pdl: false,
+        }
+    }
+
     pub fn descriptor(&self, m: u32, output: DType) -> GemmDescriptor {
         GemmDescriptor {
             packed: DType::U8,
@@ -368,6 +432,23 @@ impl Nvfp4Linear {
             k: self.k,
             pdl: false,
         }
+    }
+
+    /// The arena one launch of this projection carves for `rows` activation rows.
+    ///
+    /// Three regions, each aligned up like the arena's own grants: the packed activation
+    /// (`[rows, k/2]` bytes), the block scales in this layout's shape, and one FP32 row factor per
+    /// activation row. A plan that does not reserve them is an arena the launch writes past, so the
+    /// model's plan asks this rather than estimating.
+    pub fn scratch_bytes(&self, rows: u64) -> u64 {
+        let align = |bytes: u64| bytes.div_ceil(crate::forward::ALIGNMENT) * crate::forward::ALIGNMENT;
+        let values = align(rows * u64::from(self.k) / 2);
+        let scales = {
+            let shape = self.layout.shape(rows, u64::from(self.k));
+            align(shape.numel())
+        };
+        let token_scale = align(rows * 4);
+        values + scales + token_scale
     }
 
     pub fn forward(

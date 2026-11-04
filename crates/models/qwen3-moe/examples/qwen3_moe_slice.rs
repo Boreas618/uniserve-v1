@@ -36,11 +36,32 @@
 //! packages the fixture `notes/programs/qwen3-moe-keys.txt` names. Nothing here hard-codes a store
 //! root or a checkpoint, because the host that runs it is not the host that wrote it.
 //!
-//! What is deliberately *not* here: capture, buckets, the prefix cache's paging, request slots and
-//! the sampler. This is a numerics harness. Its results are for comparing against a reference, and
+//! `--generate N` on the decode stage continues the prompt: the prefill's own last row answers the
+//! token at position `count`, and every later token is a **one-row decode batch** appended to the
+//! cache the prefill filled, at the token's own position, walked by the same `CausalLm::forward` the
+//! prefill walks. The id is `nn::Sampler::greedy`'s - the path a request's zero-temperature row
+//! takes - and a sampler that cannot run is a refusal, not a host argmax standing in for it, because
+//! an id list cannot say which path chose it. `--greedy host` asks for the host argmax deliberately.
+//!
+//! `--expect <file>` compares the continuation against a reference's `ids` as it goes, with the
+//! reference's own `margins` beside ours when the file records them. `--divergence stop` ends the
+//! run at the first id that differs, which is what a cache-precision change on an id-exact chain
+//! owes; `--divergence report` keeps going and prints every difference with the margin it moved
+//! across, because a lossy weight representation moves ids where the choice was a tie and the gap
+//! is the number that separates one from a defect.
+//!
+//! A run measures a **pair**, and its first line states both halves: the representation the
+//! checkpoint declares, read from the checkpoint, and the deployment's cache page type, stated by
+//! `--kv-pages bf16|fp8`. Neither is a per-run switch for the other. The second line counts what the
+//! loader published by the element type each weight arrived in, beside what the checkpoint's index
+//! declares, and refuses a checkpoint whose packed tensors arrived as none.
+//!
+//! What is deliberately *not* here: capture, buckets, request slots, multi-request batching and the
+//! serve path. This is a numerics harness. Its results are for comparing against a reference, and
 //! its failures are for naming the operator and the key that produced them.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -49,8 +70,8 @@ use nn::{
     Arena, Backing, CausalLm, Checkpoint, DType, DevicePtr, Forward, PhaseKind, RetainedWeights,
     Sampler, SamplerState, Samples, Shape, TensorView, WeightKey, WeightLoader,
 };
-use ops::{Generation, KernelEntry};
-use qwen3_moe::{Config, LoadOptions, Partition, Plan, Run, Substage};
+use ops::{Generation, KernelEntry, ScaleLayout};
+use qwen3_moe::{Config, LoadOptions, Partition, Plan, Representation, Run, Substage};
 
 /// The checkpoint the reference was captured from, when `--checkpoint` does not name another.
 const DEFAULT_CHECKPOINT: &str = "/opt/uv/models/Qwen3-30B-A3B";
@@ -149,6 +170,65 @@ struct Args {
     /// The reference's greedy continuation, as JSON with an `ids` list: the run compares as it goes
     /// and stops at the first step that differs, which is the step the defect is in.
     expect: Option<PathBuf>,
+    /// The deployment's cache precision. It is a deployment fact and not a per-run switch: the
+    /// weights' precision comes from the checkpoint and cannot be overridden here.
+    kv_pages: KvPages,
+    /// What a difference from the reference means for this run.
+    divergence: Divergence,
+}
+
+/// What a run does at the first id that differs from the reference.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Divergence {
+    /// Stop there. A cache-precision change on an id-exact chain is a defect with a step index, and
+    /// the steps after the first difference measure nothing.
+    Stop,
+    /// Keep going and report every difference with its margin. A lossy weight representation moves
+    /// ids where the choice was a tie, so the run's question is how wide the margin was, not whether
+    /// an id changed.
+    Report,
+}
+
+fn load_declared<R: RetainedWeights>(
+    root: &Path,
+    checkpoint: &Checkpoint,
+    store: &mut R,
+) -> Result<(qwen3_moe::Qwen3Moe, Representation)> {
+    // The dispatch is the crate's: `load_checkpoint` reads the declaration, refuses one that
+    // quantizes a parameter this tree serves dense, and picks the entry point. The copy read here
+    // is the run's log line, and `run_stack` refuses a run whose two reads disagree.
+    let declared = Representation::read(root)?;
+    let mut loader = WeightLoader::new(checkpoint, store, None, None);
+    let model = qwen3_moe::load::load_checkpoint(
+        root,
+        Partition::single(),
+        &mut loader,
+        LoadOptions::default(),
+        // The argument is the **checkpoint's** block-scale layout and not the product's: a ModelOpt
+        // export writes `weight_scale` as `[rows, columns / 16]` row-major, the loader builds the
+        // swizzled 128x4 table the programs read once at load, and it refuses a checkpoint that
+        // already holds a converted table rather than swizzle it twice (`load.rs:562`).
+        ScaleLayout::Linear,
+    )?;
+    Ok((model, declared))
+}
+
+/// The element type of the paged cache's pages: the deployment's choice, stated by the run.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KvPages {
+    /// BF16 pages, the vertical slice's cache.
+    Bf16,
+    /// FP8 E4M3 pages with one scale per page.
+    Fp8,
+}
+
+impl fmt::Display for KvPages {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Bf16 => "bf16",
+            Self::Fp8 => "fp8",
+        })
+    }
 }
 
 /// Where a generated token id comes from.
@@ -189,6 +269,8 @@ impl Args {
         let mut generate = None;
         let mut greedy = Greedy::Sampler;
         let mut expect = None;
+        let mut kv_pages = KvPages::Bf16;
+        let mut divergence = Divergence::Stop;
         let mut words = std::env::args().skip(1);
         while let Some(word) = words.next() {
             let mut value = |name: &str| -> Result<String> {
@@ -243,6 +325,32 @@ impl Args {
                     })?);
                 }
                 "--expect" => expect = Some(PathBuf::from(value("--expect")?)),
+                "--divergence" => {
+                    let name = value("--divergence")?;
+                    divergence = match name.as_str() {
+                        "stop" => Divergence::Stop,
+                        "report" => Divergence::Report,
+                        other => {
+                            return Err(Failure::message(format!(
+                                "--divergence {other:?} names no behaviour; the behaviours are \
+                                 stop and report"
+                            )));
+                        }
+                    };
+                }
+                "--kv-pages" => {
+                    let name = value("--kv-pages")?;
+                    kv_pages = match name.as_str() {
+                        "bf16" => KvPages::Bf16,
+                        "fp8" => KvPages::Fp8,
+                        other => {
+                            return Err(Failure::message(format!(
+                                "--kv-pages {other:?} names no page type; the page types are bf16 \
+                                 and fp8"
+                            )));
+                        }
+                    };
+                }
                 "--greedy" => {
                     let name = value("--greedy")?;
                     greedy = match name.as_str() {
@@ -276,14 +384,15 @@ impl Args {
                         "qwen3_moe_slice --stage weights|embedding|block|decode \
                          [--checkpoint PATH] [--store PATH] [--device N] [--layer N] \
                          [--tokens ID,ID,...] [--dump DIR] [--reference DIR] \
-                         [--substage normalized|attended|mlp_out] [--from NN] [--routing] [--generate N] [--greedy sampler|host] [--expect FILE]",
+                         [--substage normalized|attended|mlp_out] [--from NN] [--routing] [--generate N] [--greedy sampler|host] [--expect FILE] [--divergence stop|report] [--kv-pages bf16|fp8]",
                     ));
                 }
                 other => {
                     return Err(Failure::message(format!(
                         "unknown argument `{other}`; expected --stage, --checkpoint, --store, \
                          --device, --layer, --tokens, --from, --substage, --routing, --scores, \
-                         --generate, --greedy, --expect, --dump or --reference"
+                         --generate, --greedy, --expect, --divergence, --kv-pages, --dump or \
+                         --reference"
                     )));
                 }
             }
@@ -353,6 +462,8 @@ impl Args {
             generate,
             greedy,
             expect,
+            kv_pages,
+            divergence,
         })
     }
 }
@@ -484,15 +595,25 @@ fn stage_weights(args: &Args) -> Result<()> {
     let config = Config::read(&args.checkpoint)?;
     let mut store = HostWeights::default();
     {
-        let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
-        let model = qwen3_moe::load(
-            &args.checkpoint,
-            Partition::single(),
-            &mut loader,
-            LoadOptions::default(),
-        )?;
+        let (model, declared) = load_declared(&args.checkpoint, &checkpoint, &mut store)?;
+        // The same pair the decode run prints, and it needs no device and no store: a checkpoint's
+        // load can be audited on the machine that holds it, which is the only place an NVFP4 export
+        // exists.
+        let (packed, kept) = representation_counts(&args.checkpoint);
+        let published = store
+            .by_dtype
+            .get(&DType::U8.to_string())
+            .map_or((0, 0), |entry| *entry);
+        let dense = store
+            .by_dtype
+            .iter()
+            .filter(|(dtype, _)| dtype.as_str() != DType::U8.to_string())
+            .map(|(_, (count, _))| *count)
+            .sum::<usize>();
+        check_representation(packed, kept, published.0, published.1, dense)?;
         println!(
-            "loaded: {} layers, hidden {}, {} experts of {} at top {}, {} parameters",
+            "loaded: {}, {} layers, hidden {}, {} experts of {} at top {}, {} parameters",
+            declared.summary(),
             config.num_hidden_layers,
             config.hidden_size,
             config.num_experts,
@@ -549,20 +670,19 @@ fn stage_embedding(args: &Args) -> Result<()> {
     //    missing package is reported as coverage rather than as the first operator to launch.
     // Only the operator this stage launches is required: a key the stage never calls must be
     // reported, not fatal, or a missing sampler program would read as a broken embedding.
-    let needed = needed_keys(&store_root, Stage::Embedding, false)?;
+    let needed = needed_keys(
+        &store_root,
+        Stage::Embedding,
+        false,
+        args.kv_pages,
+        Encoded::default(),
+    )?;
     let generation = load_generation(&device, &store_root, &needed)?;
 
-    // 3. Weights on the device, through the loader's own boundary.
+    // 3. Weights on the device, through the loader's own boundary, as the checkpoint declares
+    // itself: the declaration chooses the entry point, and the loader refuses a mismatch.
     let mut weights = DeviceWeights::new(&device, args.resident)?;
-    let model = {
-        let mut loader = WeightLoader::new(&checkpoint, &mut weights, None, None);
-        qwen3_moe::load(
-            &args.checkpoint,
-            Partition::single(),
-            &mut loader,
-            LoadOptions::default(),
-        )?
-    };
+    let (model, _) = load_declared(&args.checkpoint, &checkpoint, &mut weights)?;
 
     // 4. The arena: the plan's own sizes for one token, rounded up, plus the embedding's output.
     let plan = model.plan(DEFAULT_TOKENS)?;
@@ -646,16 +766,29 @@ fn decode_arena_bytes(
     page_size: u64,
     pages: u64,
     sampling: bool,
+    kv_pages: KvPages,
 ) -> qwen3_moe::Result<u64> {
     let layers = u64::try_from(config.num_hidden_layers).unwrap_or(0);
     let kv_heads = u64::try_from(config.num_key_value_heads).unwrap_or(0);
     let head_dim = u64::try_from(config.head_dim).unwrap_or(0);
-    // BF16 planes: one key and one value per layer, over the pages this batch touches.
+    // One key and one value per layer, over the pages this batch touches: two bytes a value in a
+    // BF16 page and one in an FP8 page, and an FP8 page carries an f32 scale of its own.
+    let element = match kv_pages {
+        KvPages::Bf16 => 2,
+        KvPages::Fp8 => 1,
+    };
     let plane = pages
         .saturating_mul(page_size)
         .saturating_mul(kv_heads)
         .saturating_mul(head_dim)
-        .saturating_mul(2);
+        .saturating_mul(element);
+    let scale_plane = match kv_pages {
+        KvPages::Bf16 => 0,
+        KvPages::Fp8 => layers
+            .saturating_mul(2)
+            .saturating_mul(pages)
+            .saturating_mul(4),
+    };
     let planes = layers.saturating_mul(2).saturating_mul(plane);
     let flags = layers
         .saturating_mul(2)
@@ -689,6 +822,7 @@ fn decode_arena_bytes(
     let mut total = 0_u64;
     for bytes in [
         planes,
+        scale_plane,
         flags,
         rows,
         metadata,
@@ -705,6 +839,33 @@ fn decode_arena_bytes(
 /// The stack over one prompt: `last = Some(layer)` stops after that layer and digests its output,
 /// `None` finishes the model and prints the last row's top-10.
 fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
+    // A run measures a pair - the checkpoint's representation and the deployment's cache precision -
+    // and a number that does not say which pair it measured cannot enter a table. The pair is the
+    // run's first line, read from the checkpoint and stated by the deployment, never overridden.
+    let declared = Representation::read(&args.checkpoint)?;
+    // A calibrated checkpoint keeps some tensors in the source dtype and packs the rest, so naming
+    // the representation is not the same as measuring it: the counts below come from the checkpoint's
+    // own index, where a packed projection appears as a `weight_scale_2` and a kept one does not.
+    let (packed, kept) = representation_counts(&args.checkpoint);
+    // The declaration of a calibrated export excludes forty-eight modules by name, and a first line
+    // that lists them is a first line nobody reads: the count is the fact, the list is in the file.
+    let named = match &declared {
+        Representation::Dense => "dense (nothing quantized)".to_owned(),
+        Representation::Nvfp4 {
+            excluded,
+            also_excluded,
+        } => format!(
+            "nvfp4, {} + {} module(s) kept in their own dtype",
+            excluded.len(),
+            also_excluded.len()
+        ),
+    };
+    println!(
+        "combination: checkpoint {} declares {named}; tensors packed {packed}, in their own dtype \
+         {kept}; kv pages {}",
+        args.checkpoint.display(),
+        args.kv_pages,
+    );
     let store_root = args.store.clone().ok_or_else(|| {
         Failure::message(
             "stage `decode` needs a program store: pass --store <path> or set UNISERVE_STORE",
@@ -743,19 +904,39 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     let _guard = device.enter()?;
     let stream = device.stream()?;
 
-    let needed = needed_keys(&store_root, Stage::Decode, args.generate.is_some())?;
+    let needed = needed_keys(
+        &store_root,
+        Stage::Decode,
+        args.generate.is_some(),
+        args.kv_pages,
+        Encoded {
+            declared: declared.is_encoded(),
+            tokens: Some(count),
+            generated: args.generate.map(|_| 1),
+        },
+    )?;
     let generation = load_generation(&device, &store_root, &needed)?;
 
     let mut weights = DeviceWeights::new(&device, args.resident)?;
-    let model = {
-        let mut loader = WeightLoader::new(&checkpoint, &mut weights, None, None);
-        qwen3_moe::load(
-            &args.checkpoint,
-            Partition::single(),
-            &mut loader,
-            LoadOptions::default(),
-        )?
-    };
+    let (model, loaded) = load_declared(&args.checkpoint, &checkpoint, &mut weights)?;
+    // What the model holds, by representation, beside what the index declares: a loader that fell
+    // back to a full-precision path for a packed tensor still prints the declaration and still reads
+    // as "NVFP4 ran", so the pair is the measurement and a mismatch is a refusal.
+    check_representation(
+        packed,
+        kept,
+        weights.packed,
+        weights.packed_bytes,
+        weights.dense,
+    )?;
+    if loaded != declared {
+        return Err(Failure::message(format!(
+            "the checkpoint declared {} before the load and {} during it: a declaration that \
+             changes between two reads is one this run cannot attribute",
+            declared.summary(),
+            loaded.summary()
+        )));
+    }
 
     // The arena, from the plan and the config's own cache geometry.
     let plan = model.plan(count)?;
@@ -768,6 +949,7 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
         page_size,
         pages,
         args.generate.is_some(),
+        args.kv_pages,
     )?;
     let allocator = weights.allocator();
     let reserve = usize::try_from(bytes).unwrap_or(usize::MAX);
@@ -827,21 +1009,36 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     let head_dim = u64::try_from(config.head_dim).unwrap_or(0);
     let plane = Shape::new(&[pages, page_size, kv_heads, head_dim]);
     let flag = Shape::new(&[pages, 1, 1, 1]);
+    // The page type is the deployment's, and it decides both the planes' element type and whether
+    // they carry a scale. An FP8 page's scale is one f32 per page and the writer maintains it - it
+    // is read for the growth rule and written back - so a plane that starts at zero has no page
+    // whose scale a reader could mistake for a settled one.
+    let page_dtype = match args.kv_pages {
+        KvPages::Bf16 => DType::BF16,
+        KvPages::Fp8 => DType::F8E4M3,
+    };
     let mut planes = Vec::with_capacity(config.num_hidden_layers);
     for _ in 0..config.num_hidden_layers {
+        let (key_scale, value_scale) = match args.kv_pages {
+            KvPages::Bf16 => (None, None),
+            KvPages::Fp8 => (
+                Some(zeroed_f32(&stream, &arena, flag)?),
+                Some(zeroed_f32(&stream, &arena, flag)?),
+            ),
+        };
         planes.push(KvPlanes {
-            key: arena.tensor(DType::BF16, plane)?,
-            value: arena.tensor(DType::BF16, plane)?,
+            key: arena.tensor(page_dtype, plane)?,
+            value: arena.tensor(page_dtype, plane)?,
             key_initialized: zeroed_i32(&stream, &arena, flag)?,
             value_initialized: zeroed_i32(&stream, &arena, flag)?,
-            key_scale: None,
-            value_scale: None,
+            key_scale,
+            value_scale,
         });
     }
     let groups = [KvGroup {
         block_tables,
         page_size: u32::try_from(page_size).unwrap_or(64),
-        dtype: DType::BF16,
+        dtype: page_dtype,
         layers: &planes,
     }];
     let cache = KvView { groups: &groups };
@@ -1331,6 +1528,14 @@ fn generate(
         Some(path) => Some(read_expectation(path, &args.tokens)?),
         None => None,
     };
+    // The reference's margin at a step, when the file records one: an id that moved says nothing
+    // about a defect unless the gap it moved across is known, and the file is where that gap lives.
+    let expected_margins = args
+        .expect
+        .as_deref()
+        .map(reference_margins)
+        .unwrap_or_default();
+    let mut differences: Vec<(usize, i32, i32, f64)> = Vec::new();
     let start = u64::from(batch.num_tokens);
     // The loop's arithmetic, stated once: step k appends the token at position `start + k`, writes
     // the slot of that same position and carries a sequence length one past it. A position or a
@@ -1429,17 +1634,36 @@ fn generate(
                 Some(want) if *want == chosen => agreed += 1,
                 Some(want) => {
                     differed = true;
-                    println!(
-                        "generate: FIRST DIFFERENCE at reference index {step} (position \
-                         {position}): chose {chosen}, the reference chose {want}; {step} of {steps} \
-                         ids agree before it"
-                    );
-                    println!("generate: step {step}'s top-5, on our row:");
-                    for (token, logprob) in &best {
-                        println!("  {token}\t{logprob:.6}");
+                    let ours = margin(&row);
+                    let theirs = expected_margins.get(step).copied();
+                    let shown = match theirs {
+                        Some(margin) => format!("{margin:.4}"),
+                        None => "not in the file".to_owned(),
+                    };
+                    match args.divergence {
+                        Divergence::Stop => {
+                            println!(
+                                "generate: FIRST DIFFERENCE at reference index {step} (position \
+                                 {position}): chose {chosen} with margin {ours:.4}, the reference \
+                                 chose {want} with margin {shown}; {step} of {steps} ids agree \
+                                 before it"
+                            );
+                            println!("generate: step {step}'s top-5, on our row:");
+                            for (token, logprob) in &best {
+                                println!("  {token}\t{logprob:.6}");
+                            }
+                            arena.release(mark);
+                            break;
+                        }
+                        Divergence::Report => {
+                            differences.push((step, chosen, *want, ours));
+                            println!(
+                                "generate: difference at reference index {step} (position \
+                                 {position}): chose {chosen} with margin {ours:.4}, the reference \
+                                 chose {want} with margin {shown}; continuing"
+                            );
+                        }
                     }
-                    arena.release(mark);
-                    break;
                 }
                 None => {}
             }
@@ -1507,13 +1731,38 @@ fn generate(
     match expected.as_deref() {
         Some(expected) => {
             let total = expected.len().min(steps);
-            if differed {
-                println!(
+            match args.divergence {
+                Divergence::Stop if differed => println!(
                     "generate: {agreed} of {total} ids agree with the reference before the first \
                      difference; the ids after it were not run"
-                );
-            } else {
-                println!("generate: all {total} ids agree with the reference");
+                ),
+                Divergence::Stop => println!("generate: all {total} ids agree with the reference"),
+                Divergence::Report => {
+                    println!(
+                        "generate: {} of {total} ids differ from the reference; each with the \
+                         margin it moved across:",
+                        differences.len()
+                    );
+                    for (step, ours, theirs, our_margin) in &differences {
+                        let their_margin = match expected_margins.get(*step) {
+                            Some(margin) => format!("{margin:.4}"),
+                            None => "not in the file".to_owned(),
+                        };
+                        println!(
+                            "  index {step}: ours {ours} (margin {our_margin:.4}), the reference \
+                             {theirs} (margin {their_margin})"
+                        );
+                    }
+                    let widest = differences
+                        .iter()
+                        .map(|(_, _, _, margin)| *margin)
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    println!(
+                        "generate: the widest margin at a difference is {widest:.4} - a difference \
+                         inside a margin is a tie and one outside it is a defect, and the reference's \
+                         own margins are what settle which"
+                    );
+                }
             }
         }
         None => println!(
@@ -1623,7 +1872,42 @@ fn check_continuation(
 
 #[cfg(test)]
 mod tests {
-    use super::{argmax_over, check_continuation, slot_for};
+    use std::path::Path;
+
+    use super::{argmax_over, check_continuation, needed_keys, slot_for, KvPages, Stage};
+
+    /// The store rows a run requires follow the deployment's page type: an fp8 cache asks for the
+    /// scale-deriving write and the fp8 reads, and a bf16 cache asks for neither, so neither
+    /// deployment is held up by the other one's program.
+    #[test]
+    fn the_required_rows_follow_the_page_type() {
+        let root = Path::new(".");
+        let bf16 = needed_keys(root, Stage::Decode, false, KvPages::Bf16).expect("the fixture");
+        let fp8 = needed_keys(root, Stage::Decode, false, KvPages::Fp8).expect("the fixture");
+        let names = |keys: &[(String, String)]| -> Vec<String> {
+            keys.iter().map(|(operator, _)| operator.clone()).collect()
+        };
+        let (bf16, fp8) = (names(&bf16), names(&fp8));
+        assert!(bf16.iter().any(|name| name == "kv_write"), "{bf16:?}");
+        assert!(
+            !bf16.iter().any(|name| name == "kv_write_scaled"),
+            "{bf16:?}"
+        );
+        assert!(fp8.iter().any(|name| name == "kv_write_scaled"), "{fp8:?}");
+        // The same operator twice: the fp8 deployment reads its own key/value type.
+        assert_eq!(
+            fp8.iter().filter(|name| *name == "paged_attention").count(),
+            2,
+            "{fp8:?}"
+        );
+        assert_eq!(
+            bf16.iter()
+                .filter(|name| *name == "paged_attention")
+                .count(),
+            2,
+            "{bf16:?}"
+        );
+    }
 
     /// The line a continuation's batch must satisfy, on the numbers a prompt of fifteen tokens
     /// produces: the first generated token is the one at position 15, its sequence length is 16, and
@@ -1686,6 +1970,105 @@ mod tests {
         assert!(refused.to_string().contains("no cache"), "{refused}");
     }
 
+    /// The committed reference carries both halves a difference is read with: the ids and, beside
+    /// them, the margin each was chosen by. The reader takes the file as it is, and step 19's margin
+    /// of exactly zero is the tie this lane argued about for a night.
+    #[test]
+    fn the_reference_continuation_carries_its_margins() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../notes/reference");
+        let file = dir.join("qwen3-greedy-32-margins.json");
+        let ids = super::read_expectation(&file, "").expect("the committed reference");
+        let margins = super::reference_margins(&file);
+        assert_eq!(ids.len(), 32, "{ids:?}");
+        assert_eq!(margins.len(), 32, "{margins:?}");
+        assert_eq!(ids[0], 151667);
+        assert_eq!(ids[19], 358);
+        assert_eq!(margins[19], 0.0, "the tie at step 19");
+        // A file with ids alone is a reference this run still compares against, and its margins read
+        // as absent rather than as zero.
+        let ids_only = dir.join("qwen3-greedy-32.json");
+        assert_eq!(
+            super::read_expectation(&ids_only, "")
+                .expect("its ids")
+                .len(),
+            32
+        );
+        assert!(super::reference_margins(&ids_only).is_empty());
+    }
+
+    /// A load that brought nothing through the representation the checkpoint declares is the
+    /// fallback, and it is refused rather than measured; a load that brought a representation the
+    /// checkpoint did not state is refused too.
+    #[test]
+    fn the_representation_pair_refuses_a_fallback_and_an_invention() {
+        assert!(
+            super::check_representation(74_835, 200, 0, 0, 37_000).is_err(),
+            "a declared packed checkpoint that published none"
+        );
+        assert!(
+            super::check_representation(0, 200, 3, 1_024, 37_000).is_err(),
+            "a dense checkpoint that published packed weights"
+        );
+        assert!(
+            super::check_representation(74_835, 200, 100, 4_096, 37_000).is_ok(),
+            "an encoded checkpoint whose pack came through the packed path"
+        );
+        assert!(
+            super::check_representation(0, 200, 0, 0, 40_000).is_ok(),
+            "a dense checkpoint"
+        );
+    }
+
+    /// An encoded deployment asks the store for its own products, per row count; a dense one asks
+    /// for none of them, so neither representation's gap can block the other's run.
+    #[test]
+    fn an_encoded_deployment_requires_its_own_rows() {
+        let root = Path::new(".");
+        let dense = super::needed_keys(
+            root,
+            Stage::Decode,
+            false,
+            KvPages::Bf16,
+            super::Encoded::default(),
+        )
+        .expect("the fixture");
+        assert!(
+            !dense.iter().any(|(operator, _)| operator.contains("nvfp4")),
+            "{dense:?}"
+        );
+        let encoded = super::needed_keys(
+            root,
+            Stage::Decode,
+            false,
+            KvPages::Bf16,
+            super::Encoded {
+                declared: true,
+                tokens: Some(15),
+                generated: Some(1),
+            },
+        )
+        .expect("the fixture");
+        let packed = encoded
+            .iter()
+            .filter(|(operator, _)| operator == "nvfp4_gemm")
+            .count();
+        // The product is compiled per row count: every `m_15` and `m_1` row the fixture names, and
+        // no row for a count this run will not launch.
+        assert_eq!(packed, 6, "{encoded:?}");
+        for operator in ["nvfp4_quantize", "gather_gemm_nvfp4", "route_gemm_nvfp4"] {
+            assert!(
+                encoded.iter().any(|(name, _)| name == operator),
+                "{operator} missing"
+            );
+        }
+        assert!(
+            !encoded
+                .iter()
+                .any(|(_, descriptor)| descriptor.contains("_m_7_")),
+            "a row count this run will not launch"
+        );
+    }
+
     /// The host tie rule: the first largest wins, which is the one the sampler's argmax takes.
     #[test]
     fn the_argmax_takes_the_first_largest() {
@@ -1719,6 +2102,101 @@ fn slot_for(position: u64, page_size: u64, block_table: &[i32]) -> Result<u64> {
     Ok(page
         .saturating_mul(page_size)
         .saturating_add(position % page_size))
+}
+
+/// Print what the loader brought through each representation, and refuse a load that contradicts the
+/// checkpoint's declaration.
+///
+/// The two numbers are in different units and the line says so: the index counts tensors and the
+/// loader publishes stacks, because an encoded expert block fuses every expert the router names into
+/// one publish per projection pair. What can be refused without the model's own structure is a load
+/// that brought *nothing* through the representation the checkpoint declares, which is the fallback
+/// that would otherwise read as NVFP4 having run.
+fn check_representation(
+    declared_packed: usize,
+    declared_kept: usize,
+    packed: usize,
+    packed_bytes: u64,
+    dense: usize,
+) -> Result<()> {
+    println!(
+        "representation: the index declares {declared_packed} packed tensors and {declared_kept} kept \
+         in their own dtype; the loader published {packed} packed weight(s) ({packed_bytes} bytes of \
+         E2M1) and {dense} full precision",
+    );
+    if declared_packed > 0 && packed == 0 {
+        return Err(Failure::message(format!(
+            "the checkpoint declares {declared_packed} packed E2M1 tensor(s) and the loader published \
+             none: every one of them arrived in a full-precision path, and a run at that model would \
+             measure a fallback and call it NVFP4"
+        )));
+    }
+    if declared_packed == 0 && packed > 0 {
+        return Err(Failure::message(format!(
+            "the checkpoint declares nothing packed and the loader published {packed} packed \
+             weight(s): the model holds a representation the checkpoint did not state"
+        )));
+    }
+    Ok(())
+}
+
+/// How many of a checkpoint's tensors are packed and how many kept in their own dtype.
+///
+/// A packed projection lists `weight_scale_2` beside its packed `weight`; a kept one lists only its
+/// tensor. The index is the checkpoint's own statement of what it holds, so the count is a
+/// measurement of the file rather than a restatement of its name.
+fn representation_counts(root: &Path) -> (usize, usize) {
+    let index =
+        std::fs::read_to_string(root.join("model.safetensors.index.json")).unwrap_or_default();
+    let mut names = 0_usize;
+    let mut packed = 0_usize;
+    let mut weights = 0_usize;
+    for name in index.split('"') {
+        if !name.ends_with(".weight") && !name.ends_with(".weight_scale_2") {
+            continue;
+        }
+        names += 1;
+        if name.ends_with(".weight_scale_2") {
+            packed += 1;
+        } else {
+            weights += 1;
+        }
+    }
+    // A tensor counted as packed still has its own `weight` entry, so what the representation kept
+    // is every plain weight without a packed sibling.
+    let _ = names;
+    (packed, weights.saturating_sub(packed))
+}
+
+/// The reference's margins, when its file records them under `margins`.
+fn reference_margins(path: &Path) -> Vec<f64> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let Some(at) = text.find("\"margins\"") else {
+        return Vec::new();
+    };
+    let Some(open) = text[at..].find('[').map(|offset| offset + at) else {
+        return Vec::new();
+    };
+    let Some(close) = text[open..].find(']').map(|offset| offset + open) else {
+        return Vec::new();
+    };
+    text[open + 1..close]
+        .split(',')
+        .filter_map(|part| part.trim().parse().ok())
+        .collect()
+}
+
+/// The gap between a row's best and its runner-up, in logit units.
+///
+/// A log-softmax subtracts one constant from a whole row, so the difference of two log-probabilities
+/// is the difference of the two logits: a margin of a thousandth says the choice was a tie and a
+/// margin of two says it was not.
+fn margin(row: &[f32]) -> f64 {
+    let best = top_logprobs(row, 2);
+    match best.as_slice() {
+        [first, second, ..] => first.1 - second.1,
+        _ => f64::NAN,
+    }
 }
 
 /// The largest value's first index, on the host.
@@ -2207,6 +2685,23 @@ fn zeroed_i32(stream: &platform::Stream, arena: &Arena, shape: Shape) -> Result<
     Ok(view)
 }
 
+/// A plane of `shape` f32 zeros.
+fn zeroed_f32(stream: &platform::Stream, arena: &Arena, shape: Shape) -> Result<TensorView> {
+    let view = arena.tensor(DType::F32, shape)?;
+    let zeros = vec![0_f32; usize::try_from(shape.numel()).unwrap_or(0)];
+    // SAFETY: `zeros` outlives the copy, which completes before the wait below.
+    unsafe {
+        platform::memcpy_async(
+            view.ptr.address(),
+            zeros.as_ptr() as u64,
+            std::mem::size_of_val(zeros.as_slice()),
+            stream,
+        )?;
+    }
+    stream.synchronize()?;
+    Ok(view)
+}
+
 /// Download `elements` f32 values.
 fn download_f32(stream: &platform::Stream, view: TensorView, elements: usize) -> Result<Vec<f32>> {
     let mut values = vec![0_f32; elements];
@@ -2233,7 +2728,13 @@ fn arena_bytes(plan: &qwen3_moe::Plan) -> u64 {
 }
 
 /// The (operator, key) pairs the fixture names for the slice, which is what the store must hold.
-fn needed_keys(store_root: &Path, stage: Stage, sampling: bool) -> Result<Vec<(String, String)>> {
+fn needed_keys(
+    store_root: &Path,
+    stage: Stage,
+    sampling: bool,
+    kv_pages: KvPages,
+    encoded: Encoded,
+) -> Result<Vec<(String, String)>> {
     let fixture =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../notes/programs/qwen3-moe-keys.txt");
     let text = std::fs::read_to_string(&fixture).map_err(|error| {
@@ -2253,6 +2754,27 @@ fn needed_keys(store_root: &Path, stage: Stage, sampling: bool) -> Result<Vec<(S
         let (Some(operator), Some(descriptor)) = (fields.next(), fields.next()) else {
             continue;
         };
+        // A cache this deployment does not select is not a missing program: the `kv_f8e4m3` rows
+        // belong to an fp8 deployment and the bf16 rows to a bf16 one, and a run must not be blocked
+        // by the other's gap.
+        let scaled = operator == "kv_write_scaled"
+            || descriptor.contains("kv_f8e4m3")
+            || descriptor.contains("kv_f8e5m2");
+        if scaled != (kv_pages == KvPages::Fp8) {
+            continue;
+        }
+        // An encoded checkpoint's programs are its own: a dense deployment must not be held up by
+        // them, and an NVFP4 one must not be able to load and then fail at its first product. The
+        // packed product is compiled per row count, so only the counts this run will launch are
+        // required - the prompt's, and one row when a continuation will follow it.
+        let packed_row = operator == "nvfp4_gemm"
+            && [encoded.tokens, encoded.generated]
+                .into_iter()
+                .flatten()
+                .any(|rows| descriptor.contains(&format!("_m_{rows}_")));
+        if encoded.declared != (packed_row || ENCODED_OPERATORS.contains(&operator)) {
+            continue;
+        }
         if !required(stage, operator, sampling) {
             continue;
         }
@@ -2275,6 +2797,11 @@ fn required(stage: Stage, operator: &str, sampling: bool) -> bool {
         Stage::Block | Stage::Decode => {
             MODEL_OPERATORS.contains(&operator)
                 || (sampling && SAMPLER_OPERATORS.contains(&operator))
+                // The scale-deriving write is an fp8 deployment's, and the encoded products are an
+                // NVFP4 checkpoint's; the filter above has already kept only the rows that
+                // deployment selects.
+                || operator == "kv_write_scaled"
+                || ENCODED_OPERATORS.contains(&operator)
         }
     }
 }
@@ -2286,6 +2813,21 @@ fn required(stage: Stage, operator: &str, sampling: bool) -> bool {
 /// log-probability of the chosen token is computed on the host from the same row, which keeps this
 /// list at two and keeps a missing `log_softmax` program out of the way of a token's id.
 const SAMPLER_OPERATORS: &[&str] = &["logits_shape", "argmax"];
+
+/// The operators an encoded checkpoint's step launches: the activation encoder, the packed product,
+/// and the two routed products whose grid is the sorted rows.
+const ENCODED_OPERATORS: &[&str] = &["nvfp4_quantize", "gather_gemm_nvfp4", "route_gemm_nvfp4"];
+
+/// What an encoded deployment asks the store for, and which row counts.
+#[derive(Clone, Copy, Default)]
+struct Encoded {
+    /// Whether the checkpoint declares an encoded representation.
+    declared: bool,
+    /// The prompt's row count, which the prefill's packed product is compiled for.
+    tokens: Option<u64>,
+    /// One row, which a continuation's step is compiled for, when one will run.
+    generated: Option<u64>,
+}
 
 /// The operators `Qwen3Moe`'s own forward launches, in the order a layer composes them.
 ///
@@ -2469,6 +3011,13 @@ struct DeviceWeights {
     pools: platform::Allocator,
     buffers: Vec<platform::Buffer>,
     bytes: u64,
+    /// Weights published as packed E2M1, which is what an NVFP4 checkpoint's projections arrive as.
+    packed: usize,
+    /// Weights published in a full-precision element type.
+    dense: usize,
+    /// Bytes published as packed E2M1: the measure that survives the loader fusing 128 experts into
+    /// one stack, because a fused stack is one publish of many tensors' bytes.
+    packed_bytes: u64,
 }
 
 impl DeviceWeights {
@@ -2508,6 +3057,9 @@ impl DeviceWeights {
             pools,
             buffers: Vec::new(),
             bytes: 0,
+            packed: 0,
+            dense: 0,
+            packed_bytes: 0,
         })
     }
 
@@ -2564,6 +3116,18 @@ impl RetainedWeights for DeviceWeights {
         self.bytes += bytes.len() as u64;
         self.buffers.push(buffer);
         let _ = key;
+        // What arrived, by the type it arrived in: a packed projection is published as the packed
+        // E2M1 bytes the programs read, and everything kept is published full precision. A loader
+        // that fell back would show up here as a packed tensor that never arrived packed, which is
+        // the one thing the checkpoint's own index cannot tell a run.
+        match dtype {
+            DType::U8 => {
+                self.packed += 1;
+                self.packed_bytes += bytes.len() as u64;
+            }
+            DType::BF16 | DType::F16 | DType::F32 => self.dense += 1,
+            _ => {}
+        }
         Ok(backing)
     }
 }

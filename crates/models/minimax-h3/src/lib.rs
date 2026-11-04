@@ -47,6 +47,7 @@ pub mod modulation;
 pub mod output;
 pub mod packing;
 pub mod partition;
+pub mod programs;
 pub mod positions;
 pub mod schedule;
 pub mod solver;

@@ -455,6 +455,7 @@ fn a_calibrated_nvfp4_matrix_is_loaded_as_its_three_fields() {
             None,
             Nvfp4Names::vllm(),
             ops::fp4::ScaleLayout::Linear,
+            ops::fp4::ScaleLayout::Linear,
             0.25,
         )
         .unwrap();
@@ -501,6 +502,7 @@ fn the_block_scales_must_have_the_layout_s_shape() {
             &WeightRequest::region("w_scale", 0, Shape::new(&[4, 4])),
             None,
             Nvfp4Names::vllm(),
+            ops::fp4::ScaleLayout::Swizzled128X4,
             ops::fp4::ScaleLayout::Swizzled128X4,
             0.25,
         )
@@ -1082,6 +1084,7 @@ fn a_calibrated_projection_is_read_in_the_spelling_its_export_wrote() {
                 None,
                 Nvfp4Names::vllm(),
                 ops::fp4::ScaleLayout::Linear,
+                ops::fp4::ScaleLayout::Linear,
                 0.25,
             )
             .unwrap();
@@ -1098,6 +1101,7 @@ fn a_calibrated_projection_is_read_in_the_spelling_its_export_wrote() {
                 &WeightRequest::region("p.up_proj.weight_scale", 0, Shape::new(&[4, 4])),
                 None,
                 Nvfp4Names::diffusers(),
+                ops::fp4::ScaleLayout::Linear,
                 ops::fp4::ScaleLayout::Linear,
                 0.25,
             )
