@@ -1069,6 +1069,7 @@ impl MainProcess {
             policy: policy.clone(),
             programs: programs.clone(),
             learned: BTreeMap::new(),
+            policy_requested: false,
             next: Vec::new(),
             policies: Vec::new(),
             stage: PrecopyStage::Modules(tasks),
@@ -1329,16 +1330,25 @@ impl MainProcess {
         // The candidate policy is instantiated on the current snapshot, and
         // every decision it would make is dry-run against the hard constraints
         // before anything switches (§4.4, §7.3 step 2).
-        let policies = match self.request_policy(&precopy.policy) {
-            Ok(policies) => policies,
-            Err(error) => {
-                return self.abandon_precopy(
-                    generation,
-                    UpdateFailure::Policy {
-                        error: format!("{error:#}"),
-                    },
-                    precopy.reply,
-                );
+        //
+        // Once per precopy, not once per install: the descriptor discovery loop comes back through
+        // here with a larger key set, and a policy build on each pass would certify the same
+        // program again on the scheduler's blocking thread, minutes at a time, while the update
+        // waits for a generation that only needs another kernel.
+        let policies = if precopy.policy_requested {
+            Vec::new()
+        } else {
+            match self.request_policy(&precopy.policy) {
+                Ok(policies) => policies,
+                Err(error) => {
+                    return self.abandon_precopy(
+                        generation,
+                        UpdateFailure::Policy {
+                            error: format!("{error:#}"),
+                        },
+                        precopy.reply,
+                    );
+                }
             }
         };
 
@@ -1349,7 +1359,10 @@ impl MainProcess {
         }
         let mut precopy = precopy;
         precopy.next = next;
-        precopy.policies = policies;
+        if !policies.is_empty() {
+            precopy.policies = policies;
+            precopy.policy_requested = true;
+        }
         precopy.stage = PrecopyStage::Executors(submissions);
         self.precopy = Some(precopy);
         Ok(())
@@ -2221,6 +2234,9 @@ struct Precopy {
     /// The descriptor keys the walk has taught this generation, by operator. The epoch's first
     /// generation has no serving generation to take them from (§7.3 step 2).
     learned: BTreeMap<String, Vec<String>>,
+    /// Whether every scheduler has already been asked for the candidate policy: the discovery loop
+    /// re-enters the stages, and the policy is prepared once.
+    policy_requested: bool,
     /// The generation built for each device, in `executors` order.
     next: Vec<Arc<Generation>>,
     /// The answers of every scheduler that is preparing the update's policy program. The build runs
