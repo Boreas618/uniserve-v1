@@ -816,6 +816,23 @@ impl Sampling {
     }
 }
 
+/// The refusal a provider that cannot apply a batch's cache units gives, over the allocation alone.
+///
+/// A batch that reads a fresh prefix carries none, and no provider needs anything for it; one that
+/// reuses a cached prefix carries the copies that put the prefix in its own pages, and a provider
+/// that dropped them would serve the wrong tokens. So the empty case is served by everyone and the
+/// non-empty one is refused by name until the provider holds a cache.
+fn apply_cache_units_unavailable(units: &[ipc::CacheUnitAllocation]) -> Result<()> {
+    if units.is_empty() {
+        return Ok(());
+    }
+    Err(Error::Unsupported(
+        "this runner's cache provider does not apply a batch's cache units, so a request reusing a \
+         cached prefix would read pages that were never copied"
+            .into(),
+    ))
+}
+
 /// What the runner needs from the block's resident KV cache to build a batch's `nn::KvView`.
 ///
 /// The cache is the memory owner's (8's resident pages and its block tables); the runner only
@@ -855,14 +872,7 @@ pub trait KvProvider: Send + Sync {
         stream: &platform::Stream,
     ) -> Result<()> {
         let _ = stream;
-        if units.is_empty() {
-            return Ok(());
-        }
-        Err(Error::Unsupported(
-            "this runner's cache provider does not apply a batch's cache units, so a request \
-             reusing a cached prefix would read pages that were never copied"
-                .into(),
-        ))
+        apply_cache_units_unavailable(units)
     }
 
     /// How many attention groups the model's layers index.
@@ -2509,6 +2519,30 @@ pub fn calls_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cache-unit seam's two decisions, over the allocation alone: a batch that reads a fresh
+    /// prefix passes through every provider, and one that reuses a leased one is refused by name by
+    /// a provider that holds no cache. The non-empty refusal is the state until the resident cache
+    /// applies the copies; what matters here is that it can never be a silent pass.
+    #[test]
+    fn a_provider_without_a_cache_serves_an_empty_allocation_and_refuses_a_prefix_copy() {
+        assert!(
+            apply_cache_units_unavailable(&[]).is_ok(),
+            "a batch reading a fresh prefix was refused"
+        );
+        let allocation = vec![ipc::CacheUnitAllocation {
+            request_pool_idx: 0,
+            group_id: 0,
+            unit_ids: vec![ipc::UnitId(7)],
+            copies: vec![(ipc::UnitId(3), ipc::UnitId(7))],
+        }];
+        let error = apply_cache_units_unavailable(&allocation)
+            .expect_err("a prefix copy was dropped without a word");
+        assert!(
+            error.to_string().contains("never copied"),
+            "the refusal does not say what would go wrong: {error}"
+        );
+    }
 
     /// A mechanism commit table of one row per call, column-major `[COMMIT_FIELDS][rows]`: the one
     /// column a fixture states is the row's destination slot, and the rest keep zero.
