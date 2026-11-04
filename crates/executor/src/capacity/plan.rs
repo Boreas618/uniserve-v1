@@ -27,7 +27,7 @@ use super::{
     ArenaCapacity, CacheCapacity, CacheDemand, RequestBounds, TokenBounds, call_window,
     request_tensor_window,
 };
-use crate::capacity::graph_storage_budget_bytes;
+use crate::capacity::{graph_storage_budget_bytes, graph_storage_bytes};
 use crate::config::Device;
 use crate::memory::prefix_cache::planes::{PlaneLayout, UnitColumn};
 use crate::memory::{CachePlan, LatentPlan};
@@ -404,6 +404,7 @@ pub fn token_plan(
     queue_depth: usize,
     width: u32,
     total_bytes: u64,
+    graph_bytes: u64,
     granularity: Option<u64>,
     group: &HostGroup,
     mut cache: impl FnMut(usize) -> Result<Option<Arc<CachePlan>>>,
@@ -445,6 +446,7 @@ pub fn token_plan(
         unit_overhead,
         request,
         total_bytes,
+        graph_bytes,
         granularity,
         group,
     )?;
@@ -460,10 +462,21 @@ pub fn token_plan(
 /// must be able to read it, and the answer states the width a batch's block
 /// table needs at that page size.
 pub fn plan_rank(facts: &RankFacts<'_>, report: Report, group: &HostGroup) -> Result<TokenPlan> {
+    // What the rank may plan into is what is LEFT: the weights are already on the device, so the
+    // pools fit into the free bytes and not into the device's total.
     let total_bytes = match facts.device {
-        // What the rank may plan into is what is LEFT: the weights are already on the device, so
-        // the pools fit into the free bytes and not into the device's total.
         Device::Cuda(index) => crate::capacity::device::available_bytes(index)?,
+        Device::Cpu => 0,
+    };
+    // The graph storage is the one figure that is a share of the DEVICE and not of what is left: a
+    // rank reserves two pools of address space at open, one per generation a preparation may hold,
+    // and books their mappings against the device's total.
+    let graph_bytes = match facts.device {
+        Device::Cuda(index) => graph_storage_bytes(
+            crate::capacity::device::total_bytes(index)? as i64,
+            true,
+            false,
+        ),
         Device::Cpu => 0,
     };
     let request = CapacityRequest {
@@ -499,6 +512,7 @@ pub fn plan_rank(facts: &RankFacts<'_>, report: Report, group: &HostGroup) -> Re
         facts.queue_depth,
         0,
         total_bytes,
+        graph_bytes,
         None,
         group,
         |size| {
@@ -600,15 +614,20 @@ impl TokenLayout {
 
     /// Fit the cache pool beside the fixed storage and agree its unit count.
     ///
-    /// The pool takes the grant left after the device share (10% of the
-    /// device, [`graph_storage_budget_bytes`]) and the fixed storage, in whole
-    /// units. Every rank reserves the share, whatever its graph policy: graph
+    /// The pool takes the grant left after the graph storage the rank reserved
+    /// (`graph_bytes`, [`crate::capacity::graph_storage_bytes`]) and the fixed
+    /// storage, in whole units. Every rank reserves that storage, whatever its
+    /// graph policy: graph
     /// capture grows into it, and so do the eager allocations warmup makes
     /// (operator workspaces such as an expert kernel's), which a rank that
     /// serves every call eagerly makes too. Graph padding
     /// takes no unit: padding rows read the sentinel unit and write no K/V.
     /// A configured token capacity sizes the pool instead. `total_bytes` is
-    /// the device's total storage, zero on CPU. `unit_overhead` is device
+    /// what the device has left to plan into, zero on CPU. `graph_bytes` is the
+    /// graph storage the rank reserved - two pools of the device's 10% when a
+    /// preparation may hold a second generation, which is what the pool reserves
+    /// at open, so no unit is fitted into storage the graphs will take - and
+    /// `unit_overhead` is device
     /// storage other owners keep per unit (unit index columns), charged with
     /// each unit. `granularity` is the device's allocation granularity, in
     /// whose granules a device pool splits its planes into segments; `None`
@@ -619,6 +638,7 @@ impl TokenLayout {
         unit_overhead: u64,
         request: &CapacityRequest,
         total_bytes: u64,
+        graph_bytes: u64,
         granularity: Option<u64>,
         group: &HostGroup,
     ) -> Result<CacheCapacity> {
@@ -628,7 +648,7 @@ impl TokenLayout {
             .iter()
             .map(|group| (group.block_size, group.units_per_page))
             .collect();
-        let share = graph_storage_budget_bytes(total_bytes as i64);
+        let share = graph_bytes;
         let reserved_units = share.div_ceil(unit_bytes)
             + self
                 .fixed
@@ -1017,6 +1037,7 @@ mod tests {
             1,
             /* width */ 64,
             TOTAL,
+            crate::capacity::graph_storage_budget_bytes(TOTAL as i64),
             None,
             &HostGroup::single(0),
             dense(geometry),
@@ -1086,6 +1107,7 @@ mod tests {
                 1,
                 64,
                 TOTAL,
+                crate::capacity::graph_storage_budget_bytes(TOTAL as i64),
                 None,
                 &HostGroup::single(0),
                 dense(geometry()),
