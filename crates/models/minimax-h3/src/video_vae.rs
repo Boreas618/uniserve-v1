@@ -319,7 +319,7 @@ pub fn rotary(config: &VideoVaeConfig) -> Result<(u32, [u32; 3])> {
     Ok((width, [share; 3]))
 }
 
-/// The cell-centre rotary coordinates of the transformer's token rows, as `[rows, 3]` FP32.
+/// The cell-centre rotary coordinates of the transformer's token rows, as `[3, rows]` FP32.
 ///
 /// Along an axis of `size`, row `i` sits at `2 * (i + 0.5) / size - 1`, in `[-1, 1)`: the reference's
 /// cell-centre grid (`video_vae.py`, `Transformer.forward`). The rows are the canvas's latent voxels in
@@ -959,8 +959,9 @@ impl VideoDecoder {
     /// Decode one clip's latent rows into the pixel block of every token.
     ///
     /// `latents` is `[voxels, latent_channels]` — one row per latent voxel, in the raster order the
-    /// caller's clip rows select — `positions` is `[rows, 3]` F32, the per-layout table [`positions`]
-    /// computes, and `out` is `[rows, out_channels · 4 · 16 · 16]`: one token's 3×4×16×16 pixel block,
+    /// caller's clip rows select — `positions` is `[3, rows]` F32, axis-major, the per-layout table
+    /// [`table_specs`] declares, and `out` is `[rows, out_channels · 4 · 16 · 16]`: one token's
+    /// 3×4×16×16 pixel block,
     /// which the caller scatters into the clip's raster. The rows are the voxels, then the register
     /// rows, then the trailing zero row.
     pub fn decode(
