@@ -85,7 +85,13 @@ def _top_k_kernel(
     above = 0
     for radix in tl.static_range(32 // RADIX):
         shift = 32 - RADIX * (radix + 1)
-        histogram = tl.zeros((BINS,), tl.int32)
+        # `2 * BINS` bins, bin `BINS` holding the lanes this pass does not match: a bin is the only
+        # mask a histogram has, so the unmatched lanes are folded into one of their own rather than
+        # dropped - dropped, the counts below are taken over the group and the numbers they feed
+        # (`matched - counted`) are taken over the row. The bin sits above every real bucket, so
+        # `higher` is exact for the bins a crossing is chosen from; the shape is a power of two
+        # because a tensor's is.
+        histogram = tl.zeros((2 * BINS,), tl.int32)
         matched = 0
         for start in range(0, vocabulary, STEP):
             lanes = start + columns
@@ -96,16 +102,16 @@ def _top_k_kernel(
                 match = live
             else:
                 match = ((keys >> (shift + RADIX)) == (prefix >> (shift + RADIX))) & live
-            buckets = (keys >> shift) & (BINS - 1)
-            histogram += tl.histogram(buckets, BINS, mask=match)
+            buckets = tl.where(match, (keys >> shift) & (BINS - 1), BINS)
+            histogram += tl.histogram(buckets, 2 * BINS)
             matched += tl.sum(match.to(tl.int32), axis=0)
 
         # The count of keys strictly above each bucket, descending from the
         # largest; the crossing bucket is the first one the width reaches.
         cumulative = tl.cumsum(histogram, axis=0)
         higher = matched - cumulative
-        bins = tl.arange(0, BINS)
-        crossing = tl.min(tl.where(higher < taken, bins, BINS), axis=0)
+        bins = tl.arange(0, 2 * BINS)
+        crossing = tl.min(tl.where((higher < taken) & (bins < BINS), bins, BINS), axis=0)
         counted = tl.sum(tl.where(bins <= crossing, histogram, 0), axis=0)
         above += matched - counted
         taken -= matched - counted
@@ -157,7 +163,11 @@ def _top_k_kernel(
     # never stored, so the padded network touches nothing outside the row.
     tl.debug_barrier()
     in_row = slots < live_width
-    pairs = tl.load(values_ptr + row * stride + slots, mask=in_row, other=-float("inf"))
+    # The buffers carry the descriptor's dtype - bf16 and f16 are declared - so the pair is widened
+    # before its bits are read: `_monotone` reads 32 bits of a float, and a 16-bit lane has none.
+    pairs = tl.load(values_ptr + row * stride + slots, mask=in_row, other=-float("inf")).to(
+        tl.float32
+    )
     identities = tl.load(ids_ptr + row * stride + slots, mask=in_row, other=0).to(tl.int64)
     # The key is packed into the high half of an int64 with its top bit taken off the key and put
     # back on the signed side: a monotone key of a positive logit has its top bit set, and shifting
