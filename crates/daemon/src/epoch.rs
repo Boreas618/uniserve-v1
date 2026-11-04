@@ -1163,17 +1163,24 @@ fn policy_arguments(config: &ServeConfig) -> toml::Table {
         refill_token_cost: Option<f64>,
     }
     let scheduler = &config.scheduler_config;
+    // The token bound this launch gives its workers, which is the same
+    // `max_num_batched_tokens` its `EngineSpec` states (§2.5): the policy's
+    // declared limits are these bounds, not a second opinion about them. A
+    // prefill chunk that the deployment states larger than its token bound is
+    // refused by the mechanism (`PolicyError::BadLimits`), never clamped here.
+    let token_bound = config
+        .max_num_batched_tokens
+        .map(|size| u32::try_from(size.get()).unwrap_or(u32::MAX));
     let arguments = Arguments {
         chunked_prefill_size: scheduler
             .chunked_prefill_size
-            .map(|size| u32::try_from(size.get()).unwrap_or(u32::MAX)),
+            .map(|size| u32::try_from(size.get()).unwrap_or(u32::MAX))
+            .or(token_bound),
         max_queued_requests: scheduler
             .max_queued_requests
             .map(|size| u32::try_from(size.get()).unwrap_or(u32::MAX)),
         max_batch: u32::try_from(scheduler.max_batch.get()).unwrap_or(u32::MAX),
-        max_num_batched_tokens: config
-            .max_num_batched_tokens
-            .map(|size| u32::try_from(size.get()).unwrap_or(u32::MAX)),
+        max_num_batched_tokens: token_bound,
         expected_speedup: config.speculative_config.expected_speedup,
         refill_token_cost: config.speculative_config.refill_token_cost,
     };
@@ -1558,6 +1565,46 @@ mod tests {
         assert_eq!(reported["processes"][0]["pid"], serde_json::json!(42));
         assert_eq!(reported["processes"][0]["generation"], serde_json::json!(4));
         assert_eq!(reported["processes"][0]["state"], "serving");
+    }
+
+    /// The policy's declared limits are the launch's own bounds: the token
+    /// bound the deployment gives its workers is the policy's
+    /// `max_num_batched_tokens`, and an unstated prefill chunk is that same
+    /// bound, so the policy's limits cannot disagree with the workers'
+    /// `BatchCapacity` (§4.4). A deployment that states a chunk larger than
+    /// its bound keeps its own value here — the mechanism refuses it
+    /// (`PolicyError::BadLimits`) rather than this code clamping it.
+    #[test]
+    fn the_policys_limits_are_the_launchs_own_token_bound() {
+        let mut config = ServeConfig::default();
+        config.max_num_batched_tokens = NonZeroUsize::new(8192);
+        config.scheduler_config.chunked_prefill_size = None;
+        let programs = FilledPrograms::of(&config);
+        assert_eq!(
+            programs.policy.arguments["max_num_batched_tokens"],
+            toml::Value::Integer(8192)
+        );
+        assert_eq!(
+            programs.policy.arguments["chunked_prefill_size"],
+            toml::Value::Integer(8192),
+            "an unstated chunk is the deployment's own token bound"
+        );
+
+        // A stated chunk above the bound is stated, not clamped: the
+        // mechanism's `BadLimits` is the refusal.
+        config.scheduler_config.chunked_prefill_size = NonZeroUsize::new(16384);
+        let programs = FilledPrograms::of(&config);
+        assert_eq!(
+            programs.policy.arguments["chunked_prefill_size"],
+            toml::Value::Integer(16384)
+        );
+
+        // A deployment that states no token bound states no limit, and the
+        // mechanism's ceilings are the workers' own.
+        let config = ServeConfig::default();
+        let programs = FilledPrograms::of(&config);
+        assert!(!programs.policy.arguments.contains_key("max_num_batched_tokens"));
+        assert!(!programs.policy.arguments.contains_key("chunked_prefill_size"));
     }
 
     /// Which layer a change moves on is decided by what it moves, never by
