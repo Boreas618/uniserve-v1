@@ -1197,8 +1197,9 @@ impl Denoiser {
             )?;
         }
 
-        // The rotary tables and the visibility of the one packed sequence.
-        let rotated = 48_u64;
+        // The rotary tables and the visibility of the one packed sequence. Each of the three axes
+        // rotates `rope_frequency_dim` channel pairs, and a factor table holds one column per pair.
+        let rotated = u64::from(self.config.transformer.rope_frequency_dim) * 3;
         let cosine = arena.tensor(DType::F32, Shape::new(&[tokens, rotated]))?;
         let sine = arena.tensor(DType::F32, Shape::new(&[tokens, rotated]))?;
         self.transformer
