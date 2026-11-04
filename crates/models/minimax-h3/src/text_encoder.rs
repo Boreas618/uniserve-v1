@@ -36,8 +36,7 @@
 //! projections would otherwise need a bias added once after the reduction.
 
 use nn::capability::{
-    Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, EncoderPrompt, ImageInput, ImageShape,
-    StateTable,
+    Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, EncoderPrompt, ImageShape, StateTable,
 };
 use nn::layers::{
     Attention, Embedding, GatedActivation, Linear, RmsNorm, Rotary, Rows, ScaledResidual, Sections,
@@ -402,7 +401,6 @@ struct Layer {
     /// The keys' per-head normalization.
     key_norm: Weight,
     rotary: Rotary,
-    attention: Attention,
     post_norm: RmsNorm,
     gate: Linear,
     up: Linear,
@@ -486,16 +484,6 @@ impl Layer {
             .map_err(Error::from)?
             .sectioned(sections)
             .map_err(Error::from)?,
-            attention: Attention::dense(
-                config.head_dim,
-                rank.query_heads,
-                rank.key_value_heads,
-                config.max_position_embeddings,
-                true,
-                None,
-                (config.head_dim as f32).sqrt().recip(),
-            )
-            .map_err(Error::from)?,
             post_norm: normalization(
                 loader,
                 &format!("{name}.post_attention_layernorm"),
@@ -541,10 +529,16 @@ impl Layer {
         reason = "the call carries the reference's recurrence: the carried update, the residual \
                   stream, the prompt's factor tables and the plan's buffers"
     )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the call carries the reference's recurrence, the prompt's factor tables, the \
+                  batch's attention descriptor and the plan's buffers"
+    )]
     fn forward(
         &self,
         encoder: &TextEncoder,
         f: &Forward,
+        attention: &Attention,
         offsets: TensorView,
         buffers: &Buffers,
         carried: Option<TensorView>,
@@ -586,7 +580,7 @@ impl Layer {
                 buffers.as_heads(buffers.rotated_key, heads.1, encoder.config.head_dim)?,
             )
             .map_err(Error::from)?;
-        self.attention
+        attention
             .attend_dense(
                 f,
                 buffers.as_heads(buffers.rotated_query, heads.0, encoder.config.head_dim)?,
@@ -1120,7 +1114,24 @@ impl TextEncoder {
                 .replace(f, hidden, buffers.features, prepared.destinations)?;
         }
 
-        // 3. The prompt's M-RoPE factors, once for the whole stack.
+        // 3. The prompt's M-RoPE factors, once for the whole stack, and the attention descriptor
+        //    whose key bound is the batch's own (the reference declares none).
+        if inputs.batch.max_kv_len == 0 {
+            return Err(invalid_input(
+                "the batch states no key bound its rows read".to_owned(),
+            ));
+        }
+        let attention = Attention::dense(
+            self.config.head_dim,
+            self.rank.query_heads,
+            self.rank.key_value_heads,
+            inputs.batch.max_kv_len,
+            true,
+            None,
+            (self.config.head_dim as f32).sqrt().recip(),
+        )
+        .map_err(Error::from)?;
+
         self.rotary
             .factors(f, prepared.positions, buffers.cosine, buffers.sine)
             .map_err(Error::from)?;
@@ -1133,6 +1144,7 @@ impl TextEncoder {
             layer.forward(
                 self,
                 f,
+                &attention,
                 offsets,
                 &buffers,
                 carried,
