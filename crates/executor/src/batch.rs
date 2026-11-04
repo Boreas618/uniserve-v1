@@ -20,7 +20,10 @@
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use ipc::PhaseId;
+use ipc::{
+    CacheTransfer, CallStatus, ComponentConfig, ErrorCode, MediaOutput, PhaseId, RankLatentLayout,
+    TimingCounters, TokenLogprob, WorkerInfo,
+};
 
 use crate::completion::Outcome;
 use crate::plan::{Bucket, Shape};
@@ -49,15 +52,80 @@ pub struct SampledToken {
     pub token: u32,
 }
 
-/// What one serving step produced: the tokens its sampling rows sampled (4.4).
+/// What one call of a batch produced, as the device produced it (4.4).
 ///
-/// The mechanism learns them from the batch's [`Submission`], builds the next step's input ids from
-/// them, and counts the tokens it emits. A step that samples nothing (a chunk of a prefill that
-/// samples no token, a warmup, a program-layer command) completes with an empty output.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// The mechanism's completion path reads exactly these values: what execution did. What the
+/// mechanism keeps is not here - the stop conditions it evaluates from the sampled token, the call's
+/// token budget, its cache window and its sampling rows are the plan's - so a device-side copy of a
+/// mechanism rule has nowhere to appear. The value leaves are `ipc`'s for the same reason a client's
+/// answer is: they are data a device produced and a caller consumes, not an envelope this crate
+/// defines.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CallCompletion {
+    /// The call this completion belongs to.
+    pub call: CallId,
+    /// Whether execution produced the call's products or failed it.
+    pub status: CallStatus,
+    /// The failure's kind, when `status` is an error and the device can name one.
+    pub error_code: Option<ErrorCode>,
+    /// The device's own account of the failure, when it has one.
+    pub error_message: Option<String>,
+    /// The tokens the sampler accepted, in the order it accepted them.
+    pub committed_tokens: Vec<u32>,
+    /// Each committed token's log-probabilities, in `committed_tokens` order.
+    pub token_logprobs: Vec<Vec<TokenLogprob>>,
+    /// Ranked candidates for each scored prompt position, in input order.
+    pub prompt_logprobs: Vec<Vec<TokenLogprob>>,
+    /// A token-denoising readout's candidate probabilities.
+    pub candidate_logprobs: Vec<f32>,
+    /// The cache extent execution initialized, rejected speculative positions included.
+    pub cache_computed_len: u32,
+    /// The accepted cache prefix a successor may read.
+    pub cache_visible_len: u32,
+    /// A denoising trajectory's next step.
+    pub step_index: u32,
+    /// The finished media artifact, when the call produced one.
+    pub media_output: Option<MediaOutput>,
+    /// The physical cache export, when the call publishes one.
+    pub cache_output: Option<CacheTransfer>,
+    /// The drafter's proposals after the last committed token.
+    pub draft_token_ids: Vec<u32>,
+    /// A video latent preparation's per-rank page layout.
+    pub latent_layouts: Vec<RankLatentLayout>,
+    /// The call's own measurements.
+    pub timing_counters: TimingCounters,
+}
+
+/// What one serving step produced (4.4).
+///
+/// The mechanism learns it from the batch's [`Submission`]: the sampled tokens build the next
+/// step's input ids and are the tokens it emits, and each call's [`CallCompletion`] is the record
+/// its requests advance on. A step that samples nothing (a chunk of a prefill that samples no
+/// token, a warmup, a program-layer command) completes with empty `tokens`.
+///
+/// `calls` is empty only for a batch no call of which reported anything, which is a lifecycle job,
+/// not a serving step: a runner that serves rows and leaves `calls` empty has not been wired to
+/// report them yet, and the mechanism's filler refuses such a report rather than advancing a slot's
+/// state on tokens nobody accounted for.
+#[derive(Clone, Debug, PartialEq)]
 pub struct BatchOutput {
     /// One entry per sampling row, in the order the batch's calls and rows name them.
     pub tokens: Vec<SampledToken>,
+    /// What each call of the batch reported, in the order the calls completed.
+    pub calls: Vec<CallCompletion>,
+    /// Whether this output ends the batch.
+    pub done: bool,
+}
+
+impl Default for BatchOutput {
+    /// An output that reports nothing: a lifecycle job's, or a shadow pass's.
+    fn default() -> Self {
+        Self {
+            tokens: Vec::new(),
+            calls: Vec::new(),
+            done: false,
+        }
+    }
 }
 
 /// One batch: one phase of one step, as the mechanism assembles it.
@@ -377,6 +445,39 @@ pub trait Batches: Send + Sync {
     /// A shadow batch never writes resident memory and never serves a request; its failure is the
     /// update's, which the main process reports as `PrecopyFailed`.
     fn shadow(&self, batch: Batch) -> Result<Submission>;
+
+    /// The pools this executor serves (4.2, 7.3): what the mechanism schedules against.
+    ///
+    /// The mechanism builds its `ExecutorInfo` from this and nothing else: a pool whose ranks, media
+    /// units, cache geometry or model length are absent here is a pool it refuses to serve rather
+    /// than one it assumes, because a scheduler that guesses a rank's cache makes the host KV path
+    /// disappear at runtime.
+    fn inventory(&self) -> &[Inventory];
+}
+
+/// One pool of the deployment an executor serves (4.2, 7.3).
+#[derive(Clone, Debug, Default)]
+pub struct Inventory {
+    /// The deployment's name for the pool, the identity the mechanism's `WorkerGroupId` carries.
+    pub group: String,
+    /// The pool's ranks in launch order, each with what it reported at handshake.
+    pub ranks: Vec<WorkerInfo>,
+    /// What the deployment launched the pool with; the ranks' reports do not carry it back.
+    pub placement: Placement,
+    /// The longest sequence the pool's model was built for: the attention descriptor's static bound
+    /// on the keys one row reads.
+    pub max_model_len: u32,
+}
+
+/// What a deployment launched one pool with (4.2).
+#[derive(Clone, Debug, Default)]
+pub struct Placement {
+    /// Unresolved physical batches the pool admits at once, counted as at least one.
+    pub queue_depth: usize,
+    /// Ranks the pool was launched with, counted as at least one.
+    pub ranks: usize,
+    /// The pool's components by name, each with its member ranks, parallel degrees and distribution.
+    pub components: std::collections::BTreeMap<String, ComponentConfig>,
 }
 
 /// What the device executor is doing, as the control thread's stall report and probe name it (2.4).
