@@ -7,6 +7,8 @@
 //!
 //! * [`Mode::Downsample`] pads `pad_left = kernel/2 - (kernel even)` on the left and `pad_right =
 //!   kernel/2` on the right, replicates, and convolves with stride `ratio`, one filter per channel.
+//!   Its output length is ATen's `floor((padded - kernel)/ratio) + 1`; the span need not divide, and
+//!   a length that differs from that floor is refused.
 //! * [`Mode::Upsample`] pads `pad = kernel/ratio - 1` on both sides, replicates, applies the
 //!   transposed convolution of stride `ratio` scaled by `ratio`, and crops `pad_left = pad·ratio +
 //!   (kernel - ratio)/2` from the front and `pad_right = pad·ratio + (kernel - ratio + 1)/2` from the
@@ -191,34 +193,19 @@ impl Op for AudioResample {
             ));
         }
 
-        // Each mode's length follows from the reference formula; a mismatch is a caller that built
-        // the wrong signal for this module, and is worth refusing here rather than cropping on device.
-        let expected = match descriptor.mode {
-            Mode::Upsample => width * ratio,
-            Mode::Downsample => {
-                let padded = width + u64::from(args.pad_left) + u64::from(args.pad_right);
-                if padded < kernel_size {
-                    return Err(Error::argument(
-                        Self::NAME,
-                        format!(
-                            "{width} samples with a pad of {} and {} are shorter than the filter",
-                            args.pad_left, args.pad_right
-                        ),
-                    ));
-                }
-                let span = padded - kernel_size;
-                if span % ratio != 0 {
-                    return Err(Error::argument(
-                        Self::NAME,
-                        format!(
-                            "{padded} padded samples and a filter of {kernel_size} do not stride by \
-                             {ratio} in whole steps"
-                        ),
-                    ));
-                }
-                span / ratio + 1
-            }
-        };
+        // Each mode's length follows from the reference's own formula; a mismatch is a caller that
+        // built the wrong signal for this module, and is worth refusing here rather than cropping on
+        // device.
+        let expected = expected_width(
+            Self::NAME,
+            descriptor.mode,
+            width,
+            kernel_size,
+            ratio,
+            args.pad,
+            args.pad_left,
+            args.pad_right,
+        )?;
         if out_width != expected {
             return Err(Error::argument(
                 Self::NAME,
@@ -281,6 +268,72 @@ impl Op for AudioResample {
     }
 }
 
+/// The output length each mode produces, from the reference module's own arithmetic.
+///
+/// `Mode::Upsample` returns `width · ratio`: the transposed convolution of the padded signal is
+/// `2 · pad · ratio + kernel - ratio` samples longer than that, and the crop takes exactly that much,
+/// which is why the crop is checked here rather than trusted.
+///
+/// `Mode::Downsample` returns ATen's `floor((padded - kernel) / ratio) + 1`. The span need not be a
+/// multiple of the ratio: the alias-free activation composes a 12-tap filter at ratio 2 over a
+/// padded span of `2L - 1`, and PyTorch floors that to `L` rather than refusing.
+#[allow(clippy::too_many_arguments)]
+fn expected_width(
+    operator: &'static str,
+    mode: Mode,
+    width: u64,
+    kernel: u64,
+    ratio: u64,
+    pad: u32,
+    pad_left: u32,
+    pad_right: u32,
+) -> Result<u64> {
+    match mode {
+        Mode::Upsample => {
+            // The crop must take exactly what the pad and the filter add, or the samples the output
+            // carries are not the ones the reference's crop keeps.
+            let crop = u64::from(pad_left) + u64::from(pad_right);
+            let expected_crop = 2 * u64::from(pad) * ratio + kernel - ratio;
+            if crop != expected_crop {
+                return Err(Error::argument(
+                    operator,
+                    format!(
+                        "an upsample of {width} samples with a pad of {pad} and a filter of {kernel} \
+                         crops {pad_left} from the front and {pad_right} from the end, {crop} in \
+                         all, where the transposed convolution adds {expected_crop}"
+                    ),
+                ));
+            }
+            Ok(width * ratio)
+        }
+        Mode::Downsample => {
+            // The downsampler pads by the filter's own half-widths and by nothing else; a caller
+            // that sets `pad` here is describing the *upsampler*'s pad and would be silently
+            // ignored, so it is refused instead.
+            if pad != 0 {
+                return Err(Error::argument(
+                    operator,
+                    format!(
+                        "a downsample pads by {pad_left} and {pad_right} and takes no other pad, \
+                         found {pad}"
+                    ),
+                ));
+            }
+            let padded = width + u64::from(pad_left) + u64::from(pad_right);
+            if padded < kernel {
+                return Err(Error::argument(
+                    operator,
+                    format!(
+                        "{width} samples with a pad of {pad_left} and {pad_right} are shorter than \
+                         the filter"
+                    ),
+                ));
+            }
+            Ok((padded - kernel) / ratio + 1)
+        }
+    }
+}
+
 /// A host extent as the `u32` a kernel parameter holds.
 fn u32_of(operator: &'static str, value: u64, what: &str) -> Result<u32> {
     u32::try_from(value).map_err(|_| {
@@ -321,6 +374,47 @@ mod tests {
             .to_string(),
             "mode_upsample_dtype_f32_channels_1536_kernel_12_ratio_6_block_256_pdl_false"
         );
+    }
+
+    #[test]
+    fn an_upsample_crops_exactly_what_the_transposed_convolution_adds() {
+        // ratio 2, 12 taps: the pad is `kernel/ratio - 1 = 5` on each side and the crop
+        // `2·5·2 + 12 - 2 = 30`, which is what leaves `width · ratio` samples.
+        let width = 100;
+        assert_eq!(
+            expected_width("audio_resample", Mode::Upsample, width, 12, 2, 5, 15, 15).unwrap(),
+            width * 2
+        );
+        // A crop that takes a different window is refused, not silently accepted.
+        assert!(expected_width("audio_resample", Mode::Upsample, width, 12, 2, 5, 14, 15).is_err());
+    }
+
+    #[test]
+    fn a_downsample_length_floors_where_the_span_does_not_divide() {
+        // The alias-free activation composes exactly this: a 12-tap filter at ratio 2 over a
+        // padded signal of 211 samples (`5` and `6` of pad on `2L = 200`), a span of 199.
+        // PyTorch floors to `L = 100`; a refusal of the span would reject the reference's own
+        // resampler.
+        assert_eq!(
+            expected_width("audio_resample", Mode::Downsample, 200, 12, 2, 0, 5, 6).unwrap(),
+            100
+        );
+        // A downsample describes its own pads and takes no other.
+        assert!(expected_width("audio_resample", Mode::Downsample, 200, 12, 2, 5, 5, 6).is_err());
+        // The floor is not a divisibility rule: `4 + 5 + 6 = 15` against a 12-tap filter is
+        // `floor(3 / 2) + 1 = 2` samples, and the reference accepts it.
+        assert_eq!(
+            expected_width("audio_resample", Mode::Downsample, 4, 12, 2, 0, 5, 6).unwrap(),
+            2
+        );
+        // The boundary is the filter's own length: a span of exactly 12 gives one sample …
+        assert_eq!(
+            expected_width("audio_resample", Mode::Downsample, 1, 12, 2, 0, 5, 6).unwrap(),
+            1
+        );
+        // … and a span below it has nothing to convolve, so it is refused rather than floored to
+        // zero.
+        assert!(expected_width("audio_resample", Mode::Downsample, 0, 12, 2, 0, 5, 6).is_err());
     }
 
     #[test]
