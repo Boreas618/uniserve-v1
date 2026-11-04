@@ -12,9 +12,17 @@ fmt:
 clippy:
     {{cargo}} clippy --workspace --all-targets -- -D warnings
 
-# Run Rust tests
-test-rust:
-    {{cargo}} test --workspace
+# The scheduling policy module the engine's and the daemon's tests serve with
+policy-wasm:
+    {{cargo}} build -p scheduling-policy-fcfs --target wasm32-unknown-unknown --release
+
+# Run Rust tests. The worlds the engine's integration tests build and the
+# daemon's simulated engines both serve a scheduling policy, and a policy is a
+# module this tree builds for wasm: without the variable those worlds have no
+# policy at all and every request they submit is refused. `policy-wasm` builds
+# it; the path follows `CARGO_TARGET_DIR` when one is set.
+test-rust: policy-wasm
+    SCHED_POLICY_WASM=${CARGO_TARGET_DIR:-target}/wasm32-unknown-unknown/release/scheduling_policy_fcfs.wasm {{cargo}} test --workspace
 
 # Build benchmarks without running
 bench-build:
