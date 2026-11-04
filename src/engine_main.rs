@@ -550,7 +550,9 @@ pub(crate) struct MainProcess {
     /// has not reached its first switchover admits nothing whatever the daemon has said: the epoch's
     /// first generation holds no kernel and no capture until the daemon's precopy fills it and the
     /// switchover warms it, and a batch admitted before then would reach a graph that does not
-    /// exist.
+    /// exist. The boundary is necessary and not sufficient: the warmup queues one capture per
+    /// device and runs them behind serving batches, so admission is owed to it as well
+    /// ([`Self::open_admission`]).
     serving: bool,
     /// Whether the epoch's first switchover has happened: the boundary the first batch is served
     /// at (§4.5, §7.3 step 3).
