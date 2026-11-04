@@ -358,11 +358,35 @@ fn stage_weights(args: &Args) -> Result<()> {
     let mut loader = WeightLoader::new(source, &mut store, stated, None);
     let encoder = TextEncoder::load(&mut loader, text, &Partition::single(), dtype)?;
     println!("loaded: text encoder at {}", encoder.dtype());
+    // Every region the load published, with its size: the device pool charges one block per region,
+    // and this is the only place the region set is known before a device is opened. It is written
+    // beside the page so the encode stage sizes its pool from a measurement rather than from a bound
+    // over the regions a key list cannot count.
+    let mut sizes: Vec<u64> = Vec::with_capacity(store.len());
+    for key in store.keys() {
+        let element = key.dtype.bytes().unwrap_or(0);
+        sizes.push(key.region.shape.numel().saturating_mul(element));
+    }
+    let total: u64 = sizes.iter().sum();
     println!(
-        "load: published {} weight regions on the host, {} retained layers",
+        "load: published {} weight regions on the host, {} retained layers, {} MiB",
         store.len(),
-        text.num_retained_layers
+        text.num_retained_layers,
+        total / (1 << 20)
     );
+    let written = args.out.join("text_encoder").join("weights.json");
+    if let Some(parent) = written.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| Failure::message(format!("{}: {error}", parent.display())))?;
+    }
+    let listed = sizes
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<String>>()
+        .join(", ");
+    std::fs::write(&written, format!("{{\n  \"sizes\": [{listed}]\n}}\n"))
+        .map_err(|error| Failure::message(format!("{}: {error}", written.display())))?;
+    println!("wrote   {}", written.display());
     drop(encoder);
     Ok(())
 }
@@ -862,26 +886,60 @@ fn stage_encode(args: &Args) -> Result<()> {
     // each of the regions the excess could be - and the pool's own published total is printed after
     // a successful load so the next size can be a measurement instead of a bound:
     // `--pool-mib` states it.
-    const REGION_EXCESS: u64 = 128;
-    let mut needed = index
-        + constant.max(1).next_multiple_of(granularity.max(1))
-        + granularity.max(1) * REGION_EXCESS;
+    //
+    // The measurement, when the weights stage of this same run wrote it: that file holds every
+    // region's size, so the device's charge - one rounded block per region - is computed rather than
+    // bounded. Otherwise the number below is what its name says.
+    const REGION_EXCESS: u64 = 512;
+    let measured = args.out.join("text_encoder").join("weights.json");
+    let from_regions = std::fs::read_to_string(&measured).ok().and_then(|text| {
+        let start = text.find("\"sizes\"")?;
+        let open = text[start..].find('[')? + start;
+        let close = text[open..].find(']')? + open;
+        let sizes: Vec<u64> = text[open + 1..close]
+            .split(',')
+            .filter_map(|item| item.trim().parse::<u64>().ok())
+            .collect();
+        (!sizes.is_empty()).then_some(sizes)
+    });
+    let mut needed = match &from_regions {
+        Some(sizes) => sizes
+            .iter()
+            .map(|bytes| bytes.max(&1).next_multiple_of(granularity.max(1)))
+            .sum::<u64>(),
+        None => {
+            index
+                + constant.max(1).next_multiple_of(granularity.max(1))
+                + granularity.max(1) * REGION_EXCESS
+        }
+    };
     if let Some(mib) = pool_mib {
         needed = mib.saturating_mul(1 << 20);
     }
-    println!(
-        "weights: {} tensors, {} MiB of the index plus {} MiB of constants and {} MiB of region \
-         excess, {} MiB blocks{}",
-        resident_keys.len(),
-        index / (1 << 20),
-        constant / (1 << 20),
-        granularity.max(1) * REGION_EXCESS / (1 << 20),
-        granularity,
-        match pool_mib {
-            Some(mib) => format!(", reserved at --pool-mib {mib}"),
-            None => String::new(),
-        }
-    );
+    match (&from_regions, pool_mib) {
+        (Some(sizes), _) => println!(
+            "weights: {} regions from {}, {} MiB in {} MiB blocks",
+            sizes.len(),
+            measured.display(),
+            needed >> 20,
+            granularity
+        ),
+        (None, Some(mib)) => println!(
+            "weights: {} tensors, {} MiB of the index, reserved at --pool-mib {mib} = {} MiB",
+            resident_keys.len(),
+            index / (1 << 20),
+            mib
+        ),
+        (None, None) => println!(
+            "weights: {} tensors, {} MiB of the index plus {} MiB of constants and {} MiB of region \
+             excess, {} MiB blocks",
+            resident_keys.len(),
+            index / (1 << 20),
+            constant / (1 << 20),
+            granularity.max(1) * REGION_EXCESS / (1 << 20),
+            granularity,
+        ),
+    }
     let mut weights = DeviceWeights::new(&device, needed)?;
     let encoder = {
         let mut loader = WeightLoader::new(source, &mut weights, stated, None);
