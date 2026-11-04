@@ -13,7 +13,7 @@ pub(crate) mod diffusion_gemma;
 mod error;
 pub mod media;
 mod omni;
-mod processor;
+pub(crate) mod processor;
 pub mod readout;
 mod request;
 mod sampling;

@@ -40,6 +40,7 @@ use tracing::{info, warn};
 use crate::engine::client::{EngineClient, EngineInfo, EngineState, StatsSink, SubmitError};
 use crate::engine::control::EngineControl;
 use crate::engine::hold::{HoldState, RequestHold};
+use crate::input::processor::LoadModel as _;
 use crate::input::media::MediaConnector;
 use crate::input::readout::ReadoutEncoder;
 use crate::input::video::{ProcessedVideo, VideoGenerationRequest, VideoService};
