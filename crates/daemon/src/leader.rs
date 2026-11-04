@@ -2043,12 +2043,16 @@ impl Replica {
         };
         let epochs = Arc::clone(driver.epochs());
         let generation = epochs.next_generation(crate::engine::control::ENGINE_GROUP, 0);
-        // The standby executes the serving engine's world: it claims the same
-        // scope's storage read-only and is promoted into it, so nothing is
-        // handed over while the serving engine runs (empty segments).
+        // The standby executes the serving engine's world: it maps that world's
+        // weights and its KV cache read-only, ready to be promoted into the same
+        // scope (§2.5). The engine's own account of its cache segments is what a
+        // successor maps, so the standby is told exactly what the serving engine
+        // holds — a standby with no segments maps none, and each of its rank
+        // groups would keep a standby of its own, a third copy of the device
+        // storage.
         spec.predecessor = Some(wire::Predecessor {
             world: spec.world,
-            segments: Vec::new(),
+            segments: serving.info().segments.clone(),
         });
         let build = crate::epoch::BuildConfig::of(&locked(&self.config));
         let sink = stats_sink(
