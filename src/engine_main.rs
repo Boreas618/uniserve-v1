@@ -1282,18 +1282,24 @@ impl MainProcess {
                 if listing.is_none() {
                     listing = Some(self.listing().map_err(invalid)?);
                 }
-                let declared = declared_keys(
+                let declared = built_keys(
                     listing.as_ref().expect("the listing was read above"),
                     &slot.op,
                     program,
                     &self.targets,
                 );
-                if declared.is_empty() && known.is_empty() {
-                    return Err(invalid(format!(
-                        "the package the daemon names for {} ({} revision {}) declares no \
-                         descriptor for this node's target {:?}",
-                        slot.op, program.backend, program.revision, self.targets
-                    )));
+                if declared.is_empty() {
+                    // The listing names the modules this host has *built*, not what the package
+                    // declares, so an empty answer is a host that built none yet - not a program
+                    // that covers nothing. The walk is the authority on which descriptors the
+                    // model needs, and it teaches them one capture at a time; the listing only
+                    // makes the first capture enough when the store already holds them.
+                    tracing::debug!(
+                        op = %slot.op,
+                        backend = %program.backend,
+                        revision = program.revision,
+                        "no module of this package is built yet: the walk will name its descriptors"
+                    );
                 }
                 keys = declared;
             }
@@ -2890,13 +2896,15 @@ fn unfinished(submissions: &[Submission], what: &str) -> Option<StageFailure> {
 
 /// The descriptor keys `generation` holds for `operator`: what a precopy must
 /// cover, and exactly what it never adds to (§7.3 step 2, §5.3).
-/// The descriptor keys a named package declares for this node's targets.
+/// The descriptor keys this host has already built for a named package, for this node's targets.
 ///
-/// The epoch's first generation has no serving generation to copy keys from, and the walk would
-/// otherwise learn one descriptor per capture: a package states every descriptor it was built for,
-/// so the keys come from it once. A module built for another target does not cover this node and is
-/// not claimed.
-fn declared_keys(
+/// The epoch's first generation has no serving generation to copy keys from, and without this the
+/// walk learns one descriptor per capture. What the Program Server lists is what it holds *built* -
+/// not what the package declares - so this accelerates a store that was built ahead of the epoch
+/// (every deployment whose programs were built offline) and answers nothing on a host that has built
+/// none yet, where the walk remains the source of truth. A module built for another target does not
+/// cover this node and is not claimed.
+fn built_keys(
     listing: &program_server::Listing,
     op: &str,
     program: &Program,
