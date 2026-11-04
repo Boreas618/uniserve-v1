@@ -37,96 +37,6 @@ use scheduling::guest::{
     Snapshot,
 };
 
-/// The mechanism's whole view of the policy: exactly what `policy.rs`'s
-/// [`PolicySlot`] offers, so nothing in the mechanism reaches past it.
-///
-/// Routing is not here. It runs on the control thread's own instance
-/// (`policy.rs`'s `RoutePolicy`), which no scheduler thread holds.
-///
-/// `fail` and `boundary` are the two hooks through which the switch reaches the
-/// policy (§7.3): a failure is reported once, with the state at the time of the
-/// failure, and the boundary is the only moment a policy is exchanged.
-pub(crate) trait Decisions {
-    /// The limits the policy declared at instantiation.
-    fn limits(&self) -> Limits;
-
-    /// Once per step: every event since the previous step, in order.
-    fn observe(&mut self, events: &[Event]) -> Result<(), PolicyError>;
-
-    /// Once per step: what this step does.
-    fn dispatch(&mut self, room: &Room) -> Result<Plan, PolicyError>;
-
-    /// When work does not fit the free storage: which objects to free, in order.
-    fn reclaim(&mut self, shortage: &Shortage) -> Result<Vec<Victim>, PolicyError>;
-
-    /// When a request is first called on a block: which replica runs it.
-    fn place(&mut self, call: &CallView, replicas: &[ReplicaView]) -> Result<usize, PolicyError>;
-
-    /// During an epoch's precopy: which pages to warm, in order.
-    fn warm(&mut self, room: &Room) -> Result<Vec<PageId>, PolicyError>;
-
-    /// Periodically: the placement of experts on ranks.
-    fn experts(&mut self, load: &ExpertLoad) -> Result<ExpertOrder, PolicyError>;
-
-    /// The policy failed: serve on under the previous policy and report it, or
-    /// fail the epoch when no previous policy is kept (§7.3).
-    ///
-    /// `state` is the mechanism's state at the moment of the failure: a revert
-    /// instantiates `previous` on it, so a policy that fails mid-epoch is
-    /// replaced by one that sees what actually exists.
-    fn fail(
-        &mut self,
-        error: &PolicyError,
-        state: &TrialState,
-    ) -> Result<PolicyReverted, PolicyError>;
-
-    /// The batch boundary: the stage a daemon asked for, applied where no batch
-    /// and no submission is in flight (§7.3 steps 3 to 6).
-    fn boundary(&mut self, state: &TrialState) -> Result<Option<PolicyReverted>, PolicyError>;
-}
-
-impl Decisions for PolicySlot {
-    fn limits(&self) -> Limits {
-        PolicySlot::limits(self)
-    }
-
-    fn observe(&mut self, events: &[Event]) -> Result<(), PolicyError> {
-        PolicySlot::observe(self, events)
-    }
-
-    fn dispatch(&mut self, room: &Room) -> Result<Plan, PolicyError> {
-        PolicySlot::dispatch(self, room)
-    }
-
-    fn reclaim(&mut self, shortage: &Shortage) -> Result<Vec<Victim>, PolicyError> {
-        PolicySlot::reclaim(self, shortage)
-    }
-
-    fn place(&mut self, call: &CallView, replicas: &[ReplicaView]) -> Result<usize, PolicyError> {
-        PolicySlot::place(self, call, replicas)
-    }
-
-    fn warm(&mut self, room: &Room) -> Result<Vec<PageId>, PolicyError> {
-        PolicySlot::warm(self, room)
-    }
-
-    fn experts(&mut self, load: &ExpertLoad) -> Result<ExpertOrder, PolicyError> {
-        PolicySlot::experts(self, load)
-    }
-
-    fn fail(
-        &mut self,
-        error: &PolicyError,
-        state: &TrialState,
-    ) -> Result<PolicyReverted, PolicyError> {
-        PolicySlot::fail(self, error, state)
-    }
-
-    fn boundary(&mut self, state: &TrialState) -> Result<Option<PolicyReverted>, PolicyError> {
-        PolicySlot::boundary(self, state)
-    }
-}
-
 /// The mechanism's validators, against the state at one moment (`policy.rs`'s
 /// [`Validators`]).
 ///
@@ -1124,20 +1034,15 @@ mod tests {
     }
 
     /// A fixed policy, standing in for `policy.rs`'s slot in the mechanism's
-    /// tests: it exercises the validators and the failure hooks without wasmtime
-    /// and without the switch.
+    /// tests: it hands the validators plans, victims, and failures without
+    /// wasmtime and without the switch.
     struct Static {
-        limits: Limits,
         plan: Plan,
         victims: Vec<Victim>,
         failures: usize,
     }
 
-    impl Decisions for Static {
-        fn limits(&self) -> Limits {
-            self.limits
-        }
-
+    impl Static {
         fn observe(&mut self, _events: &[Event]) -> Result<(), PolicyError> {
             Ok(())
         }
@@ -1213,7 +1118,6 @@ mod tests {
         }]);
         plan.admit = vec![RequestId(1)];
         let mut policy = Static {
-            limits: Limits::default(),
             plan,
             victims: Vec::new(),
             failures: 0,
