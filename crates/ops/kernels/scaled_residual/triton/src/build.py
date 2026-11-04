@@ -12,9 +12,9 @@ count is an int32 launch word.
 import _compile
 import scaled_residual as kernels
 
-#: The floating dtypes the rows, the parameters and the output may have, as Triton spells them in
-#: an argument signature.
-DTYPES = {"bf16": "bf16", "fp16": "fp16", "fp32": "fp32", "f32": "fp32"}
+#: The floating dtypes a descriptor prints, and the Triton spelling of each: the vocabulary is
+#: `DType`'s, and Triton spells FP16 `fp16` and FP32 `fp32`.
+DTYPES = {"bf16": "bf16", "f16": "fp16", "f32": "fp32"}
 
 
 def spec(fields, parameters, target):

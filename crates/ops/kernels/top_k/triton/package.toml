@@ -30,6 +30,6 @@ architectures = ["sm_100a", "sm_90a"]
 
 # `dtype_f32_vocabulary_151936_width_2048_ids_i32_pdl_false`.
 [kernel.descriptors]
-dimensions = { dtype = ["f32", "bf16", "fp16"], vocabulary = ["151936", "152064", "248320", "2048"], width = ["2048", "4096", "1024", "128"], ids = ["i32", "i64"], pdl = ["true", "false"] }
+dimensions = { dtype = ["f32", "bf16", "f16"], vocabulary = ["151936", "152064", "248320", "2048"], width = ["2048", "4096", "1024", "128"], ids = ["i32", "i64"], pdl = ["true", "false"] }
 
 [parameters]

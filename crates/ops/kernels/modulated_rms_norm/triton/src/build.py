@@ -17,7 +17,7 @@ import modulated_rms_norm as kernels
 
 #: The floating dtypes an activation, its weight and its modulation vectors may have, as Triton
 #: spells them in an argument signature.
-DTYPES = {"bf16": "bf16", "fp16": "fp16", "fp32": "fp32", "f32": "fp32"}
+DTYPES = {"bf16": "bf16", "f16": "fp16", "f32": "fp32"}
 
 #: The E4M3 output type, which carries one dequantization scale per row, as the descriptor's
 #: ``output`` prints it, and as Triton spells it in an argument signature.

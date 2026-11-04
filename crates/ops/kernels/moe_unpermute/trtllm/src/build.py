@@ -73,7 +73,7 @@ def distribution():
         roots.extend(pathlib.Path(one) for one in found.submodule_search_locations)
     # The Program Server's own Python environment pins FlashInfer even when this
     # script runs under another interpreter.
-    repository = pathlib.Path(__file__).resolve().parents[5]
+    repository = pathlib.Path(__file__).resolve().parents[6]
     roots.extend(repository.glob("crates/program-server/python/.venv/lib/python*/site-packages/flashinfer"))
     roots.extend(repository.glob(".venv/lib/python*/site-packages/flashinfer"))
     for root in roots:
