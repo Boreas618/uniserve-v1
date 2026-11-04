@@ -128,13 +128,15 @@ pub fn load(
                 Block::Decoder(Box::new(decoder))
             }
             Component::VideoDecoder => {
-                // The video decoder is sized by the canvas a request serves, and a `Block` can only
-                // be handed to a runner through a capability: its layers are complete, but until
-                // `Decoder` grows the layout methods a canvas-sized block cannot be placed, so a
-                // deployment that places one is refused here rather than served by a half-built
-                // block.
+                // The decoder's layers are complete and its layout is one tile - 1792 voxels on every
+                // canvas the checkpoint offers, because the checkpoint's 256-pixel tiles leave every
+                // tile the same size - so the block needs no capacity from the request. What is
+                // missing is the capability: `Decoder` declares only `decode`, and the tables that
+                // address a tile are keyed by the layout, so a block cannot be built into a `Block`
+                // (or handed to a runner) before `Decoder::layout_tables`/`prepare_layout` exist.
                 return Err(Error::Unsupported(format!(
-                    "the {} block has no construction yet, so it cannot be placed",
+                    "the {} block declares its tables per layout, and the Decoder capability has no \
+                     layout method to declare them with, so it cannot be placed",
                     component.name()
                 )));
             }
