@@ -2823,7 +2823,8 @@ fn apply_process_command(
                     kind: Some(report::Kind::Fault(proto::process::Fault {
                         kind: "policy_switchover".to_owned(),
                         reason: format!(
-                            "generation {generation} was not prepared on this main process"
+                            "switchover failed: generation {generation} was not prepared on \
+                             this main process"
                         ),
                         device: 0,
                     })),
@@ -2861,8 +2862,8 @@ fn apply_process_command(
                     kind: Some(report::Kind::Fault(proto::process::Fault {
                         kind: "policy_switchover".to_owned(),
                         reason: format!(
-                            "generation {generation} is not the policy this main process prepared \
-                             last"
+                            "switchover failed: generation {generation} is not the policy this \
+                             main process prepared last"
                         ),
                         device: 0,
                     })),
@@ -2883,7 +2884,10 @@ fn apply_process_command(
                 Err(reason) => Some(proto::process::Report {
                     kind: Some(report::Kind::Fault(proto::process::Fault {
                         kind: "policy_switchover".to_owned(),
-                        reason,
+                        // The policy states why; the fault states what it was
+                        // asked to do. A daemon log then says which command
+                        // failed without the reader inferring it from the class.
+                        reason: format!("switchover failed: {reason}"),
                         device: 0,
                     })),
                 }),
@@ -2922,7 +2926,9 @@ fn apply_process_command(
             Err(reason) => Some(proto::process::Report {
                 kind: Some(report::Kind::Fault(proto::process::Fault {
                     kind: "policy_revert".to_owned(),
-                    reason,
+                    // The operation, then the policy's own words, as a failed
+                    // switchover states them.
+                    reason: format!("revert failed: {reason}"),
                     device: 0,
                 })),
             }),
