@@ -55,7 +55,7 @@ use crate::storage::buffer::BufferPool;
 use crate::stream::Issue;
 use crate::transfer::exports::{self, Location};
 use crate::{Error, EventPool, Result, lock};
-use cuda::Event;
+use platform::Event;
 use ipc::CallId;
 use ipc::{BufferId, RequestKey, TensorRef};
 use std::collections::{HashMap, HashSet};

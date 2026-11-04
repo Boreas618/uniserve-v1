@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 
 use ::storage::protocol::Access;
 use ::storage::{Claim, Client, GpuLedger, Item, Key, Mode, Placement, Role, Scope, StorageRecord};
-use cuda::{DeviceId, Protection};
+use platform::{DeviceId, Protection};
 use ipc::StorageLaunch;
 use sha2::{Digest, Sha256};
 

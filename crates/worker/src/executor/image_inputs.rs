@@ -13,7 +13,7 @@
 
 use std::sync::{Arc, Weak};
 
-use cuda::DeviceId;
+use platform::DeviceId;
 use ipc::{CallKind, MediaCall};
 use tvm_ffi::Any;
 

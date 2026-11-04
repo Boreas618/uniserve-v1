@@ -48,7 +48,7 @@ use ::storage::manifest::weights::{Sources, Transfer};
 use ::storage::manifest::{self, Manifest, Space};
 use ::storage::protocol::{Access, LinkBandwidth, Priority, Region, Span};
 use ::storage::{Client, Key, Mode, Placement, StorageRecord, TensorRecord};
-use cuda::{Protection, Stream};
+use platform::{Protection, Stream};
 use sha2::{Digest, Sha256};
 
 use super::{
@@ -709,7 +709,7 @@ fn receiving_key(world: u64, key: &Key) -> Key {
 fn zero_created(
     storages: &[Arc<Storage>],
     created: &[Vec<(u64, u64)>],
-    device: cuda::DeviceId,
+    device: platform::DeviceId,
 ) -> Result<()> {
     let stream = Stream::new(device)?;
     for (storage, ranges) in storages.iter().zip(created) {
@@ -717,7 +717,7 @@ fn zero_created(
         for &(first, last) in ranges {
             // SAFETY: the bytes lie in a chunk this rank created and nothing
             // reads or writes them yet; the stream is synchronized below.
-            unsafe { cuda::memset_d8(base + first, 0, (last - first) as usize, &stream) }?;
+            unsafe { platform::memset_d8(base + first, 0, (last - first) as usize, &stream) }?;
         }
     }
     stream.synchronize()?;

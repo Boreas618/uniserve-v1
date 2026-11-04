@@ -51,7 +51,7 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use cuda::{DeviceAllocation, DeviceId, Function, Module, PinnedBuffer, Stream};
+use platform::{DeviceAllocation, DeviceId, Function, Module, PinnedBuffer, Stream};
 use ipc::FenceHistogram;
 
 use crate::{Error, Result, lock};
@@ -395,7 +395,7 @@ impl Fences {
                 // SAFETY: the switch holds `1 + components` words, and lives
                 // as long as the fences, past the fill.
                 unsafe {
-                    cuda::memset_d32(
+                    platform::memset_d32(
                         device.switches.address() + 4 * index as u64,
                         word,
                         1,
@@ -479,7 +479,7 @@ impl Fences {
         if crate::profiling::session::collectors::component_ranges_armed() {
             let capturing = borrowed
                 .capture_status()
-                .map_or(true, |status| status != cuda::CaptureStatus::None);
+                .map_or(true, |status| status != platform::CaptureStatus::None);
             crate::profiling::session::collectors::component_range(probe, capturing);
         }
         Ok(())
@@ -677,8 +677,8 @@ impl DeviceFences {
             }
             filled.as_mut_slice().fill(0);
             clock_out.as_mut_slice().fill(0);
-            cuda::memset_d32(counters.address(), 0, 4, &control)?;
-            cuda::memset_d32(cells.address(), 0, CELLS, &control)?;
+            platform::memset_d32(counters.address(), 0, 4, &control)?;
+            platform::memset_d32(cells.address(), 0, CELLS, &control)?;
         }
         control.synchronize()?;
         Ok(Self {
@@ -838,7 +838,7 @@ impl DeviceFences {
         unsafe { std::ptr::write_volatile(self.clock_out.as_ptr().cast::<u64>(), 0) };
         let mut out = self.clock_out.address();
         let mut parameters: [*mut c_void; 1] = [(&raw mut out).cast()];
-        let before = (realtime(), cuda::cupti::timestamp().unwrap_or(0));
+        let before = (realtime(), platform::cupti::timestamp().unwrap_or(0));
         let started = Instant::now();
         // SAFETY: the parameter is the kernel's; the word outlives it.
         unsafe { self.clock.launch(&self.control, 1, 1, &mut parameters)? };
@@ -863,7 +863,7 @@ impl DeviceFences {
             }
             std::hint::spin_loop();
         };
-        let after = (realtime(), cuda::cupti::timestamp().unwrap_or(0));
+        let after = (realtime(), platform::cupti::timestamp().unwrap_or(0));
         let sample = Alignment {
             device: self.device.0,
             gpu,
@@ -1060,8 +1060,8 @@ mod device_tests {
         fences.mark(&stream, 7, "decode", false)?;
 
         // The fork runs after the step's begin marker and before its end.
-        let begun = cuda::Event::new(cuda::EventFlags::default());
-        let ran = cuda::Event::new(cuda::EventFlags::default());
+        let begun = platform::Event::new(platform::EventFlags::default());
+        let ran = platform::Event::new(platform::EventFlags::default());
         fences.mark(&stream, 9, "decode", true)?;
         begun.record(&stream)?;
         fork.wait_event(&begun)?;
@@ -1131,7 +1131,7 @@ mod device_tests {
     fn capture_globally(
         stream: &Stream,
         issue: impl FnOnce(&Stream) -> Result<()>,
-    ) -> Result<cuda::GraphExec> {
+    ) -> Result<platform::GraphExec> {
         type Capture = unsafe extern "C" fn(*mut c_void, i32) -> i32;
         type Captured = unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> i32;
         type Destroy = unsafe extern "C" fn(*mut c_void) -> i32;
@@ -1145,7 +1145,7 @@ mod device_tests {
                 *driver.get::<Destroy>(b"cuGraphDestroy").unwrap(),
             )
         };
-        let context = cuda::PrimaryContext::retain(stream.device())?;
+        let context = platform::PrimaryContext::retain(stream.device())?;
         let _current = context.enter()?;
         let handle = stream.raw() as *mut c_void;
         let mut graph = std::ptr::null_mut();
@@ -1155,7 +1155,7 @@ mod device_tests {
             assert_eq!(begin(handle, 0), 0);
             issue(stream)?;
             assert_eq!(end(handle, &mut graph), 0, "the capture was invalidated");
-            let graph_exec = cuda::GraphExec::instantiate(stream.device(), graph as usize);
+            let graph_exec = platform::GraphExec::instantiate(stream.device(), graph as usize);
             assert_eq!(destroy(graph), 0);
             Ok(graph_exec?)
         }

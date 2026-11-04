@@ -78,7 +78,7 @@ use ::storage::protocol::{
     Allocation, ContextBytes, Event, Item, Link, LinkEnd, Move, Priority, Registered, Reply,
     Request, Role, TransferEnd,
 };
-use cuda::DeviceId;
+use platform::DeviceId;
 use rustix::event::{PollFd, PollFlags, poll};
 
 use contexts::{Booked, Booking, Bookings, Contexts, Hold};
@@ -105,7 +105,7 @@ pub struct Options {
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
-    Cuda(#[from] cuda::Error),
+    Cuda(#[from] platform::Error),
     #[error(transparent)]
     Storage(#[from] ::storage::client::Error),
     #[error(transparent)]
@@ -239,7 +239,7 @@ fn booked(gpus: &Gpus, measured: &[ContextBytes]) -> Result<Vec<Booked>, Error> 
     if identities.is_empty() {
         return Ok(Vec::new());
     }
-    let nvml = cuda::Nvml::init()?;
+    let nvml = platform::Nvml::init()?;
     identities
         .into_iter()
         .map(|(device, uuid)| {
@@ -647,7 +647,7 @@ impl Served {
             .ok_or_else(|| {
                 format!(
                     "GPU {} is not visible to the Transfer Server",
-                    cuda::DeviceUuid(gpu)
+                    platform::DeviceUuid(gpu)
                 )
             })
             .and_then(|(device, readers)| Ok((self.contexts.hold(device)?, device, readers)));
@@ -931,9 +931,9 @@ impl Side {
 pub(crate) fn storage_name(end: &LinkEnd) -> String {
     match end {
         LinkEnd::Host => "host".into(),
-        LinkEnd::Device { gpu } => cuda::DeviceUuid(*gpu).to_string(),
+        LinkEnd::Device { gpu } => platform::DeviceUuid(*gpu).to_string(),
         LinkEnd::Remote { endpoint, gpu } => match gpu {
-            Some(gpu) => format!("{endpoint} {}", cuda::DeviceUuid(*gpu)),
+            Some(gpu) => format!("{endpoint} {}", platform::DeviceUuid(*gpu)),
             None => format!("{endpoint} host"),
         },
     }
@@ -944,12 +944,12 @@ pub(crate) fn storage_name(end: &LinkEnd) -> String {
 /// size, rounded up to the device's granularity. The allocation's handle
 /// and mapping here are dropped; the descriptor alone keeps the storage.
 fn device_storage(
-    device: cuda::DeviceId,
+    device: platform::DeviceId,
     bytes: u64,
-    readers: &[cuda::DeviceId],
+    readers: &[platform::DeviceId],
 ) -> Result<(OwnedFd, u64), String> {
     let length = usize::try_from(bytes).map_err(|_| format!("{bytes} bytes overflow"))?;
-    let allocation = cuda::DeviceAllocation::retainable(device, length, readers)
+    let allocation = platform::DeviceAllocation::retainable(device, length, readers)
         .map_err(|error| format!("creating {bytes} bytes of device storage: {error}"))?;
     let descriptor = allocation
         .export_descriptor()

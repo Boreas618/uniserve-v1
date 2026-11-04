@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use cuda::HandleType;
+use platform::HandleType;
 use ipc::{CallKind, ComponentInfo};
 
 use super::computations::PageManifest;

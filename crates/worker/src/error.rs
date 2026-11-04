@@ -24,7 +24,7 @@ pub enum Error {
     },
     /// A CUDA driver or NCCL call failed.
     #[error(transparent)]
-    Cuda(#[from] cuda::Error),
+    Cuda(#[from] platform::Error),
     #[error("{0}")]
     Invalid(String),
     #[error("{0}")]
@@ -327,7 +327,7 @@ fn traceback(error: &Error) -> Option<String> {
 }
 
 /// The CUDA failure an error is, directly or as a shared failure.
-fn driver_failure(error: &Error) -> Option<&cuda::Error> {
+fn driver_failure(error: &Error) -> Option<&platform::Error> {
     match error {
         Error::Cuda(failure) => Some(failure),
         Error::Shared(shared) => driver_failure(shared),
@@ -336,7 +336,7 @@ fn driver_failure(error: &Error) -> Option<&cuda::Error> {
 }
 
 /// The code of a CUDA failure, by the result its call returned.
-fn driver_code(failure: &cuda::Error) -> ErrorCode {
+fn driver_code(failure: &platform::Error) -> ErrorCode {
     if failure.is_unrecoverable() {
         ErrorCode::FatalWorkerFailure
     } else if failure.is_out_of_memory() {
@@ -446,7 +446,7 @@ mod tests {
     #[test]
     fn driver_failures_are_classified_by_their_result_code() {
         let driver = |code, message| {
-            Error::Cuda(cuda::Error::Driver {
+            Error::Cuda(platform::Error::Driver {
                 call: "cuMemcpyBatchAsync_v2",
                 code,
                 name: "CUDA_ERROR",

@@ -37,7 +37,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use cuda::{CopyBatch, DeviceId, SourceOrder, Stream};
+use platform::{CopyBatch, DeviceId, SourceOrder, Stream};
 use tvm_ffi::Any;
 
 use super::plan::CachePlan;
