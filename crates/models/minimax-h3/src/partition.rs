@@ -450,6 +450,20 @@ impl Partition {
                     .to_owned(),
             ));
         }
+        // The two condition encoders are the `Denoiser` block's own half - it runs them in
+        // `prepare_conditioning`, once per request - so a rank that claims their directories must
+        // hold a DiT to run them, and a partition that claimed the VAEs with no denoiser would load
+        // weights nothing could use.
+        if self.blocks.contains(Component::LatentEncoder)
+            && !self.blocks.contains(Component::Transformer)
+            && !self.blocks.contains(Component::TransformerRef)
+        {
+            return Err(Error::config(
+                "a rank cannot hold the condition encoders without a denoiser: they are its \
+                 conditioning half"
+                    .to_owned(),
+            ));
+        }
         if self.text_rows == 0 || self.condition_rows == 0 {
             return Err(Error::config(
                 "a deployment's text and condition row capacities are positive".to_owned(),
@@ -558,6 +572,23 @@ mod tests {
         let partition = Partition::new(&config, 8, 8, 0).expect("eight ranks");
         assert_eq!(partition.denoiser_heads(56), 7);
         assert_eq!(partition.tensor_rank, 0);
+    }
+
+    #[test]
+    fn the_condition_encoders_cannot_be_placed_without_a_denoiser() {
+        // They are the denoiser's conditioning half, so a rank that claims their two checkpoint
+        // directories must hold the DiT that runs them; otherwise it loads weights nothing uses.
+        let config = config();
+        let mut alone = Partition::single();
+        alone.blocks = Components::of([Component::LatentEncoder]);
+        let error = alone.validate(&config).expect_err("no denoiser");
+        assert!(format!("{error}").contains("conditioning half"), "{error}");
+
+        // With a denoiser beside them the same partition validates, which is the placement the
+        // deployment actually uses.
+        let mut together = alone;
+        together.blocks = together.blocks.with(Component::Transformer);
+        together.validate(&config).expect("a denoiser beside them");
     }
 
     #[test]
