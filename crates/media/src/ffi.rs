@@ -191,7 +191,10 @@ pub(crate) struct OpenMuxer {
     pointer: *mut Muxer,
 }
 
-// SAFETY: the handle owns an AVFormatContext and the streams inside it. FFmpeg contexts have no thread affinity, and the session holding the handle is guarded by a Mutex whose every use takes the lock, so moving the handle between threads transfers exclusive ownership.
+// SAFETY: the handle owns an AVFormatContext and the streams inside it. FFmpeg
+// contexts have no thread affinity, and the session holding the handle is guarded
+// by a Mutex whose every use takes the lock, so moving the handle between threads
+// transfers exclusive ownership.
 unsafe impl Send for OpenMuxer {}
 
 impl OpenMuxer {
