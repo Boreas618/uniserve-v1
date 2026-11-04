@@ -908,7 +908,13 @@ impl CachePlanes {
     /// scales one. The values of segmented planes fill column by column: a
     /// fill's rows may not span a segment given back, which the driver
     /// refuses although no row touches it.
-    fn reset_units(&self, first: u32, count: u32, values: bool, stream: impl Issue) -> Result<()> {
+    pub(crate) fn reset_units(
+        &self,
+        first: u32,
+        count: u32,
+        values: bool,
+        stream: impl Issue,
+    ) -> Result<()> {
         if count == 0 {
             return Ok(());
         }
