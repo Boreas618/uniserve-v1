@@ -57,6 +57,7 @@ use ops::gemm::WeightOrder;
 use ops::rope::Rotation;
 
 use crate::config::{VisionActivation, VisionConfig};
+use crate::decoding::Buffer;
 use crate::positions::invalid;
 use crate::{Error, Result};
 
@@ -348,6 +349,45 @@ impl Buffers {
         let arena = Arena::new(DevicePtr::new(0), u64::MAX);
         Self::new(&arena, config, patches, dtype)?;
         Ok(arena.used())
+    }
+
+    /// The named plan of exactly the buffers [`Self::new`] reserves for one image.
+    ///
+    /// One line per reservation, in the same order, so a deployment row and an executor's name-keyed
+    /// arena read the same object. The caller prefixes each name with the image's index: the tower
+    /// runs once per image, in prompt order, so these are `images.len()` sets and never one set
+    /// multiplied by anything.
+    pub fn plan(config: &VisionConfig, patches: u32, dtype: nn::DType) -> Vec<Buffer> {
+        let rows = u64::from(patches);
+        let hidden = u64::from(config.hidden_size);
+        let intermediate = u64::from(config.intermediate_size);
+        let merge = u64::from(config.spatial_merge_size);
+        let blocks = rows / (merge * merge);
+        let width = u64::from(Geometry::merged_width(config));
+        let element = crate::text_encoder::element_of(dtype);
+        let mut plan = Vec::with_capacity(14);
+        let mut push = |name: &str, elements: u64| {
+            plan.push(Buffer {
+                name: name.to_owned(),
+                element,
+                elements,
+            });
+        };
+        push("hidden", rows * hidden);
+        push("normalized", rows * hidden);
+        push("query", rows * hidden);
+        push("key", rows * hidden);
+        push("value", rows * hidden);
+        push("rotated_query", rows * hidden);
+        push("rotated_key", rows * hidden);
+        push("attended", rows * hidden);
+        push("projected", rows * hidden);
+        push("gate", rows * intermediate);
+        push("activated", rows * intermediate);
+        push("down", rows * hidden);
+        push("merged", blocks * width);
+        push("merged_activated", blocks * width);
+        plan
     }
 
     /// `view`'s rows as `[patches, heads, head_dim]` for the attention and rotation operators.
