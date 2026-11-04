@@ -39,7 +39,7 @@ mod warmup;
 mod worker;
 
 pub use crate::core::{
-    EngineConfig, SchedulerHandle, WorkerGroupConfig, WorkerGroupRole, WorkerRank,
+    EngineConfig, RankFacts, SchedulerHandle, WorkerGroupConfig, WorkerGroupRole, WorkerRank,
 };
 pub use crate::deployment::Deployment;
 pub use crate::process_link::ProcessLink;
@@ -63,8 +63,8 @@ pub use crate::scheduler::submission::Submissions;
 pub use crate::scheduler::{
     Arrival, BatchCapacity, Candidate, DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH,
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_RUNNING_REQUESTS, DomainStats, EncoderStats,
-    ExecutionDomainStats, GeneralStats, GroupCache, PREFETCH_FLOOR_TOKENS, ParkedCache,
-    PolicyBytes, PolicyProgram, PolicyReverted, PolicySlot, PolicySource, PolicyUsage,
+    ExecutionDomainStats, GeneralStats, GroupCache, Limits, PREFETCH_FLOOR_TOKENS, ParkedCache,
+    Parameters, PolicyBytes, PolicyProgram, PolicyReverted, PolicySlot, PolicySource, PolicyUsage,
     PrefixCacheUsage, PrefixStats, ProgramSource, Progress, RoutePolicy, RouteTrial, Scheduler,
     SchedulerConfig, SchedulerStats, SchedulerStatsReporter, Stage, TimingStats, TrialState,
     Validators, WorkerStats, arrival_view, ceilings_of,
