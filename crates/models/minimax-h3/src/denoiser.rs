@@ -560,6 +560,30 @@ mod tests {
     }
 
     #[test]
+    fn a_raster_off_the_grid_snaps_up_to_it() {
+        let rule = layouts();
+        // 1340x770 is not a multiple of 32: the request renders the next legal raster, so two
+        // requests either side of a multiple share one layout rather than each carrying its own.
+        let (layout, _) = rule.layout(&request(121, 1340, 770)).unwrap();
+        assert_eq!((layout.video.height, layout.video.width), (48, 84));
+        assert_eq!(layout.video.height * 16, 768);
+        assert_eq!(layout.video.width * 16, 1344);
+    }
+
+    #[test]
+    fn a_layout_the_model_did_not_build_is_refused() {
+        let rule = layouts();
+        let (mut layout, _) = rule.layout(&request(121, 1344, 768)).unwrap();
+        // 24 latent frames is not a frame count a request snaps to: no rounding produces 5n + 2 = 24.
+        layout.video.frames = 24;
+        assert!(rule.packing_of(&layout).is_err());
+        // A prefix capacity that is not a whole attention unit is not this deployment's either.
+        let (mut layout, _) = rule.layout(&request(121, 1344, 768)).unwrap();
+        layout.text_rows = 100;
+        assert!(rule.packing_of(&layout).is_err());
+    }
+
+    #[test]
     fn the_noise_stream_counts_elements_not_rows() {
         let rule = layouts();
         let request = request(121, 1344, 768);
