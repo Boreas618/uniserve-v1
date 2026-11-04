@@ -101,6 +101,12 @@ const ROPE_THETA: f32 = 10_000.0;
 /// Elements one `rotary_factors` program handles (`launch::ROTARY_BLOCK`).
 const ROTARY_BLOCK: u32 = 256;
 
+/// Elements one `rows` program places (`nn::layers::rows::BLOCK`).
+const ROWS_BLOCK: u32 = 1024;
+
+/// The video VAE decoder's token width: `decoder_num_attention_heads · decoder_attention_head_dim`.
+const VAE_WIDTH: u32 = 32 * 64;
+
 /// Tokens one `qk_norm_rope` program handles (`launch::QK_NORM_TOKENS`).
 const QK_NORM_TOKENS: u32 = 1;
 
@@ -1051,6 +1057,43 @@ fn main() {
         .to_string(),
     );
 
+    // Placing the rows a tower contributes into the sequence that reserved them. Four call sites
+    // exist and each is in a layer of `crates/models/minimax-h3`, all of them at the layer crate's
+    // one element block (`nn::layers::rows::BLOCK`, 1024) and none on a dependent launch:
+    //
+    // - the text encoder's prompt reserves placeholder rows for its images and the tower's vision
+    //   rows *replace* them (`text_encoder.rs`, `Rows::replace`), at the language width;
+    // - a DeepStack tap *adds* a tower layer's rows into rows that already hold a residual
+    //   (`text_encoder.rs`, `Rows::add`), at the same width;
+    // - the denoiser scatters its packed video rows and its audio rows into the one sequence
+    //   (`denoiser.rs`, `Rows::replace`), at the transformer's hidden width — one key for both
+    //   modalities, because the operator reads only rows, columns and the index view;
+    // - the video VAE decoder starts its stream by placing the projected voxels, its register rows
+    //   and its zero row into the token rows (`video_vae.rs`, `Rows::replace`), at the decoder's
+    //   `decoder_num_attention_heads · decoder_attention_head_dim = 32 · 64` and in FP16.
+    //
+    // The merge that makes a language-width token out of a `2x2` block of patches is *not* here: it
+    // is a reshape of the contiguous `[patches, 1152]` hidden state into `[patches/4, 4608]`, so no
+    // rows are gathered and no program reads them.
+    for (dtype, mode, columns) in [
+        (DType::BF16, ops::rows::Mode::Replace, text_columns),
+        (DType::BF16, ops::rows::Mode::Add, text_columns),
+        (DType::BF16, ops::rows::Mode::Replace, HIDDEN),
+        (DType::F16, ops::rows::Mode::Replace, VAE_WIDTH),
+    ] {
+        push(
+            "rows",
+            ops::rows::Descriptor {
+                dtype,
+                mode,
+                columns,
+                block: ROWS_BLOCK,
+                pdl: PDL,
+            }
+            .to_string(),
+        );
+    }
+
     // Gaps this file does not fill, named rather than invented:
     // - `bias_add`: the channel list per call site follows the stage widths above, but the call sites
     //   are the decoder's and the video VAE's own composition, which is h3's to state.
@@ -1060,7 +1103,7 @@ fn main() {
     // - `embedding`, `act_and_mul`: the text encoder's shard rows and its gate/value strides are the
     //   layer's layout choices, not the config's.
     // - the five VSA operators, `gated_residual`, `frame_pad`/`frame_moments`/`frame_norm_pad`,
-    //   `position_interpolate`, `rope_apply`, `rows`, `paged_attention`: h3's packing and processor.
+    //   `position_interpolate`, `rope_apply`, `paged_attention`: h3's packing and processor.
 
     // One key per line, the same key once: a variant two layers launch is packaged once.
     lines.sort();
