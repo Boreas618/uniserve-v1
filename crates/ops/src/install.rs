@@ -114,6 +114,11 @@ const OPERATORS: &[&str] = &[
     <crate::gelu::Gelu as Op>::NAME,
     <crate::activation::Silu as Op>::NAME,
     <crate::adaptive_pool::AdaptivePool as Op>::NAME,
+    <crate::rows::Rows as Op>::NAME,
+    <crate::patchify::Patchify as Op>::NAME,
+    <crate::position::PositionInterpolate as Op>::NAME,
+    <crate::audio_activation::AudioActivation as Op>::NAME,
+    <crate::patch::Patch as Op>::NAME,
 ];
 
 /// `name`, interned, when this build has an operator by that name.

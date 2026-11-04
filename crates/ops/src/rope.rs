@@ -66,6 +66,15 @@ pub struct FactorsDescriptor {
     pub axes: u32,
     /// Rotated elements each axis owns, in axis order; only the first `axes` entries are read.
     pub sections: [u32; MAX_AXES],
+    /// Whether the axes interleave over the frequencies instead of cutting them in order.
+    ///
+    /// The default, a contiguous cut, gives axis `a` the next `sections[a]` frequencies. Qwen3-VL's
+    /// interleaved M-RoPE instead cycles the axes over the whole spectrum: frequency `j` reads axis
+    /// `j % axes` while `j < sections[axis] · axes` and axis 0 otherwise, so every axis keeps
+    /// frequencies from the whole range (see [`interleaved_axes`]). The two compile different
+    /// programs, and the field appears in the key only for the interleaved one, so every sectioned
+    /// key already published is unchanged.
+    pub interleaved: bool,
 }
 
 /// The most position axes a sectioned rotation reads.
@@ -89,6 +98,46 @@ impl fmt::Display for Sections<'_> {
     }
 }
 
+/// The axis each compact frequency reads under a contiguous cut: axis `a` takes the next
+/// `widths[a]` frequencies, in axis order.
+///
+/// `widths` are rotated elements per axis, as [`FactorsDescriptor::sections`] carries them, and the
+/// answer has one entry per *frequency* — half a section, because a frequency drives one rotation
+/// pair. It is the host statement of the rule the sectioned `rotary_factors` program applies, so a
+/// model and its test can agree with the kernel without a device call.
+pub fn section_axes(widths: &[u32]) -> Vec<u32> {
+    let mut axes = Vec::new();
+    for (axis, width) in widths.iter().enumerate() {
+        // A section of `w` rotated elements is `w / 2` frequencies.
+        axes.extend(std::iter::repeat_n(axis as u32, (*width / 2) as usize));
+    }
+    axes
+}
+
+/// The axis each compact frequency reads under interleaved M-RoPE (Qwen3-VL).
+///
+/// Frequency `j` reads axis `j % n` while `j < widths[axis] · n`, and axis 0 otherwise, where `n` is
+/// the number of axes: every axis keeps frequencies from the whole spectrum, each receives exactly
+/// its section width, and the frequencies a narrow section cannot claim fall to the first axis.
+/// `uniserve/nn/rope.py::_interleaved_axes` is the reference this transcribes.
+pub fn interleaved_axes(widths: &[u32]) -> Vec<u32> {
+    let count = widths.len() as u32;
+    if count == 0 {
+        return Vec::new();
+    }
+    let total: u32 = widths.iter().map(|width| width / 2).sum();
+    (0..total)
+        .map(|frequency| {
+            let axis = frequency % count;
+            if frequency < (widths[axis as usize] / 2) * count {
+                axis
+            } else {
+                0
+            }
+        })
+        .collect()
+}
+
 impl fmt::Display for FactorsDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut key = Key::new()
@@ -106,6 +155,10 @@ impl fmt::Display for FactorsDescriptor {
             key = key
                 .field("axes", self.axes)
                 .field("sections", Sections(&self.sections[..axes.min(MAX_AXES)]));
+            // The cut is the default, so only the interleaved variant names the choice.
+            if self.interleaved {
+                key = key.field("interleaved", true);
+            }
         }
         key.finish(formatter)
     }
@@ -186,6 +239,12 @@ impl Op for RotaryFactors {
                     format!("{} axes, at most {MAX_AXES}", descriptor.axes),
                 ));
             }
+        }
+        if descriptor.interleaved && descriptor.axes <= 1 {
+            return Err(Error::argument(
+                Self::NAME,
+                "interleaved axes need at least two of them: one axis has no cycle".to_owned(),
+            ));
         }
         let tokens = args.positions.numel() / axes;
         args.cosine

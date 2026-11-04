@@ -448,6 +448,7 @@ fn a_sectioned_rotation_names_its_axes_in_its_key() {
         pdl: false,
         axes: 1,
         sections: [0; ops::rope::MAX_AXES],
+        interleaved: false,
     };
     let key = ops::descriptor::key(&plain);
     assert!(
@@ -461,6 +462,7 @@ fn a_sectioned_rotation_names_its_axes_in_its_key() {
     let three = ops::rope::FactorsDescriptor {
         axes: 3,
         sections: [16, 24, 24, 0],
+        interleaved: false,
         columns: 64,
         ..plain
     };

@@ -212,6 +212,7 @@ fn main() {
             // One-dimensional positions: Qwen3 is text only, so no section is cut.
             axes: 1,
             sections: [0; MAX_AXES],
+            interleaved: false,
         }),
     ));
     lines.push((
