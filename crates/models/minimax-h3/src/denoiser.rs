@@ -2422,7 +2422,11 @@ mod tests {
     #[test]
     fn the_tables_are_the_layout_s_and_the_step_is_the_executor_s_to_write() {
         let rule = layouts();
-        let request = request(121, 1344, 768);
+        // A prompt of twelve rows, the configuration `write_state` is exercised with below: every
+        // write index then points into the text rows rather than at the zero row, so a table the
+        // model fills is filled with something other than the sentinel this test offers.
+        let mut request = request(121, 1344, 768);
+        request.text_tokens = 12;
         let (layout, packing) = rule.layout(&request).unwrap();
         let tables = rule.table_specs(&layout).unwrap();
         let names: Vec<_> = tables.iter().map(|table| table.name).collect();
