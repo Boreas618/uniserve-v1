@@ -25,6 +25,7 @@ use std::cell::Cell;
 use ops::{Generation, Stream};
 
 use crate::error::{Error, Result};
+use crate::exchange::ExchangeViews;
 use crate::group::Group;
 use crate::tensor::{DType, DevicePtr, Shape, TensorView};
 
@@ -127,9 +128,34 @@ pub struct Forward<'a> {
     pub arena: &'a Arena,
     /// The communicator of this rank's parallel group, when the block is partitioned.
     pub group: Option<&'a Group>,
+    /// The expert exchange's received views, when the block's experts are split across ranks.
+    pub exchange: Option<&'a ExchangeViews>,
 }
 
 impl<'a> Forward<'a> {
+    /// A forward with the resources every block needs and no partitioning.
+    pub fn new(stream: &'a Stream, kernels: &'a Generation, arena: &'a Arena) -> Self {
+        Self {
+            stream,
+            kernels,
+            arena,
+            group: None,
+            exchange: None,
+        }
+    }
+
+    /// The same forward over a parallel group.
+    pub fn with_group(mut self, group: &'a Group) -> Self {
+        self.group = Some(group);
+        self
+    }
+
+    /// The same forward over an expert exchange.
+    pub fn with_exchange(mut self, exchange: &'a ExchangeViews) -> Self {
+        self.exchange = Some(exchange);
+        self
+    }
+
     /// The kernels generation this forward launches against.
     pub fn kernels(&self) -> &Generation {
         self.kernels
