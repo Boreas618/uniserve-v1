@@ -166,11 +166,16 @@ extern "C" int32_t uniserve_paged_attention(const uniserve_paged_attention_call*
       !dtype_of(call->dtype_output, output_type)) {
     return refuse_call("paged_attention/trtllm serves bf16, fp16 and fp8 e4m3");
   }
-  const bool quantized = key_value_type == DATA_TYPE_E4M3;
-  if (quantized && (call->key_scale == nullptr || call->value_scale == nullptr)) {
-    return refuse_call("an fp8 cache needs its per-page key and value scales");
+  // An FP8 cache is a separate trade: the launch code reads one E4M3 block scale
+  // per sixteen elements of the head dimension per key, per head and per page,
+  // while the call carries one FP32 scale per page, so a call here cannot hand
+  // the kernel the scales it reads.
+  if (key_value_type == DATA_TYPE_E4M3) {
+    return refuse_call(
+        "paged_attention/trtllm serves an unquantized cache: trtllm-gen reads E4M3 block scales "
+        "per sixteen head elements and the call carries one scale per page");
   }
-  if (!quantized && (call->key_scale != nullptr || call->value_scale != nullptr)) {
+  if (call->key_scale != nullptr || call->value_scale != nullptr) {
     return refuse_call("an unquantized cache takes no scales");
   }
   if (call->out == nullptr || call->query == nullptr || call->key == nullptr ||
@@ -219,8 +224,8 @@ extern "C" int32_t uniserve_paged_attention(const uniserve_paged_attention_call*
   params.qPtr = const_cast<void*>(call->query);
   params.kPtr = const_cast<void*>(call->key);
   params.vPtr = const_cast<void*>(call->value);
-  params.kSfBasePtr = quantized ? call->key_scale : nullptr;
-  params.vSfBasePtr = quantized ? call->value_scale : nullptr;
+  params.kSfBasePtr = nullptr;
+  params.vSfBasePtr = nullptr;
   params.kvPageIdxPtr = const_cast<int32_t*>(call->page_table);
   params.seqLensKvPtr = const_cast<int32_t*>(call->seq_lens);
   params.oPtr = call->out;
