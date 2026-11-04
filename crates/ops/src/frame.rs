@@ -258,6 +258,17 @@ impl Op for FramePad {
 /// The largest message an entry writes into a call structure.
 const MESSAGE: usize = 512;
 
+/// The frame reduction the two frame operators' tolerance covers, in values.
+///
+/// `frame_moments` reduces `channels_per_group · pixels` values per frame and `frame_norm_pad`
+/// reduces the same ones. Both factors travel to the program as runtime scalars - they are a
+/// frame's shape, not a compilation's - so the descriptor cannot name the length and the tolerance
+/// is stated at a declared bound instead. The bound is a class the caller must stay inside, and
+/// nothing enforces it yet: a launch past it gets a tolerance stated for a shorter reduction than
+/// its own, which fails a correct kernel. The repair is a reduction class in the descriptor (the
+/// `max_tiles` pattern), which moves both operators' keys and is therefore not made here.
+pub const FRAME_REDUCTION: u64 = 1 << 16;
+
 /// The call structure of `frame_moments`, mirrored by the package's header.
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -419,9 +430,10 @@ impl Op for FrameMoments {
 
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
         // The moments reduce `channels_per_group · pixels` values in FP32 and are consumed in FP32:
-        // the bound is the reduction's own rounding, taken at the widest frame a launch can carry.
+        // the bound is the reduction's own rounding, taken at [`FRAME_REDUCTION`] - the class a
+        // caller must stay inside, which the descriptor cannot state and the launch does not check.
         let _ = descriptor;
-        Tolerance::rounding(1 << 16, DType::F32, DType::F32)
+        Tolerance::rounding(FRAME_REDUCTION, DType::F32, DType::F32)
     }
 }
 
@@ -753,8 +765,8 @@ impl Op for FrameNormPad {
 
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
         // The moments come from the same reduction as `frame_moments`; the normalization, the SiLU
-        // and the padded store round in FP32.
+        // and the padded store round in FP32. The reduction's bound is [`FRAME_REDUCTION`].
         let _ = descriptor;
-        Tolerance::rounding(1 << 16, DType::F32, DType::F32)
+        Tolerance::rounding(FRAME_REDUCTION, DType::F32, DType::F32)
     }
 }
