@@ -542,6 +542,22 @@ impl<'a> WeightLoader<'a> {
         })
     }
 
+    /// Borrow this loader for another checkpoint: the same store, the same conversion, a
+    /// different shard set.
+    ///
+    /// A pipeline's components each keep their own index in their own directory (`transformer/`,
+    /// `vae/`, `text_encoder/`), so a model crate opens one [`Checkpoint`] per component and reads
+    /// each through one loader. Retained storage stays the loader's, so a weight converted once for
+    /// one component is reused for another and never converted twice (specs/worker.md 8).
+    pub fn for_checkpoint<'b>(&'b mut self, checkpoint: &'b Checkpoint) -> WeightLoader<'b> {
+        WeightLoader {
+            checkpoint,
+            store: self.store,
+            dtype: self.dtype,
+            quantization: self.quantization,
+        }
+    }
+
     /// Load a calibrated NVFP4 matrix: its packed E2M1 values, its block scales and its tensor
     /// scale.
     ///

@@ -473,3 +473,52 @@ fn the_block_scales_must_have_the_layout_s_shape() {
     assert!(format!("{error}").contains("swizzled_128x4"), "{error}");
     assert!(store.published.is_empty());
 }
+
+/// A pipeline's components keep their indexes apart; one loader borrows another checkpoint and
+/// keeps the store, so the two components share the conversion path and its retained weights.
+#[test]
+fn a_loader_borrows_another_component_s_checkpoint_and_keeps_the_store() {
+    let root = tempfile::tempdir().unwrap();
+    let transformer = root.path().join("transformer");
+    let vae = root.path().join("vae");
+    std::fs::create_dir_all(&transformer).unwrap();
+    std::fs::create_dir_all(&vae).unwrap();
+    let scale = bf16(&[1.0, 2.0]);
+    shard(
+        &transformer,
+        "model.safetensors",
+        &[("weight", vec![2], scale.clone())],
+    );
+    shard(&vae, "model.safetensors", &[("weight", vec![2], scale)]);
+
+    let transformer = Checkpoint::open(&transformer).unwrap();
+    let vae = Checkpoint::open(&vae).unwrap();
+    let mut store = Recording::default();
+    let (first_ptr, again_ptr) = {
+        let mut loader = WeightLoader::new(&transformer, &mut store, Some(DType::F32), None);
+        let first = loader
+            .load(&WeightRequest::region("weight", 0, Shape::new(&[2])))
+            .unwrap();
+        assert_eq!(first.dtype(), DType::F32);
+        {
+            let mut vae_loader = loader.for_checkpoint(&vae);
+            let second = vae_loader
+                .load(&WeightRequest::region("weight", 0, Shape::new(&[2])))
+                .unwrap();
+            assert_eq!(second.dtype(), DType::F32);
+        }
+        // Read again through the first loader: the store answers, nothing is published a third
+        // time.
+        let again = loader
+            .load(&WeightRequest::region("weight", 0, Shape::new(&[2])))
+            .unwrap();
+        (first.view().ptr, again.view().ptr)
+    };
+
+    // Same tensor name, same bytes, two components: the keys differ by the file that holds them,
+    // and both are retained by the one store.
+    assert_eq!(store.published.len(), 2);
+    assert_ne!(store.published[0].0.files, store.published[1].0.files);
+    assert_eq!(store.published[0].1, store.published[1].1);
+    assert_eq!(again_ptr, first_ptr);
+}
