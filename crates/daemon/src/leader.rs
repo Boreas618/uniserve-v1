@@ -1402,6 +1402,11 @@ impl Leader {
                     failure.reason
                 ))
             })?;
+        // The programs moved in place; a parked standby prepared from the old
+        // ones is replaced (§2.5).
+        for replica in self.replicas.serving.borrow().iter() {
+            replica.restart_standby();
+        }
         Ok(Some(recorded))
     }
 
@@ -1924,6 +1929,19 @@ impl Replica {
                 );
             }
         });
+    }
+
+    /// Replaces the parked standby with one prepared from what the deployment
+    /// runs now: a program update moves the serving engine in place, and a
+    /// standby started before it holds the programs the update replaced. A
+    /// promoted standby would then serve kernels the epoch's record no longer
+    /// names, so the parked process is dropped and another started.
+    pub(crate) fn restart_standby(self: &Arc<Self>) {
+        // Dropping the parked client closes its control connection, which ends
+        // its process.
+        let replaced = { locked(&self.standby).take() };
+        drop(replaced);
+        self.start_standby();
     }
 
     /// Starts the standby that stands beside this replica's serving engine, if
