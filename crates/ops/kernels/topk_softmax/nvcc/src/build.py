@@ -117,6 +117,12 @@ def main():
         "--threads=1",
         f"-DUNISERVE_ITERATIONS={iterations}",
         f"-DUNISERVE_TOP={butterfly}",
+        # The descriptor's own numbers, so the kernel can refuse a call that
+        # arrives with a different expert count or a wider top-k: `experts` and
+        # `top` are launch arguments, and a cubin has no error channel, so the
+        # kernel traps instead of reducing over part of the vocabulary.
+        f"-DUNISERVE_EXPERTS={experts}",
+        f"-DUNISERVE_MAX_TOP={top}",
         "-o",
         str(out / "module.cubin"),
         str(package / "src" / "topk_softmax.cu"),
@@ -137,6 +143,23 @@ def main():
         "global_scratch_align": 1,
     }
     (out / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    # The constants this cubin was built with, beside it: a check compares them
+    # with its own flags and refuses a module built for another descriptor
+    # before it allocates anything, which is the only way to observe the guard
+    # in the kernel without a device. Kept out of `metadata.json`, whose fields
+    # the loader reads as the launch's own.
+    (out / "baked.json").write_text(
+        json.dumps(
+            {
+                "experts": experts,
+                "top": top,
+                "iterations": iterations,
+                "butterfly": butterfly,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
     print(
         json.dumps(
             {
@@ -145,6 +168,8 @@ def main():
                 "symbol": metadata["name"],
                 "iterations": iterations,
                 "butterfly": butterfly,
+                "experts": experts,
+                "max_top": top,
             }
         )
     )
