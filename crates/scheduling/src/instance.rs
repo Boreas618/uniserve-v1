@@ -23,8 +23,8 @@ use scheduling_guest::view::{
 use scheduling_guest::wire::{self, Call};
 use wasmtime::{Instance, Memory, Store, Trap, TypedFunc};
 
-use crate::error::PolicyError;
 use crate::Engine;
+use crate::error::PolicyError;
 
 /// Fuel one call may consume unless the mechanism gives another budget.
 ///
@@ -89,6 +89,20 @@ impl PolicyCost {
 
     fn index_of(call: Call) -> Option<usize> {
         Call::ALL.iter().position(|each| *each == call)
+    }
+}
+
+impl std::ops::Add for PolicyCost {
+    type Output = Self;
+
+    /// The calls of two spans of one policy's life, summed decision by
+    /// decision: an epoch that replaced its instance keeps what both were
+    /// asked, which is what makes "what this epoch's policy has cost" a
+    /// number and not the last instance's.
+    fn add(self, other: Self) -> Self {
+        Self {
+            calls: std::array::from_fn(|index| self.calls[index] + other.calls[index]),
+        }
     }
 }
 
