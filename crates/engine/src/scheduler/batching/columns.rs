@@ -313,6 +313,8 @@ pub(crate) fn columns(
     }
 
     // The table is column-major: one run of every column over the batch's rows.
+    // Column-major over the batch's calls: `ops::commit` reads `[column][row]`,
+    // and `commit::COMMIT_FIELDS` columns of one row each per call of the batch.
     let row_count = commit_rows.len();
     let mut commit = vec![0i64; commit::COMMIT_FIELDS * row_count];
     for (row, cells) in commit_rows.iter().enumerate() {
@@ -333,12 +335,8 @@ pub(crate) fn columns(
         rows,
         input_ids,
         slots,
-        // The sampler's parameters and the commit table are exec's to state
-        // (`M708`); filling them from a guess would change sampling silently
-        // rather than fail, so the batch is not submittable until they are set.
         parameters,
-        // Empty: the mechanism states no accepted progress yet (`M708`).
-        commit: Vec::new(),
+        commit,
         page_size: page.block_size,
         max_kv_len,
     })
@@ -398,10 +396,12 @@ mod tests {
     /// `slot`, writing the cache where `writes` says.
     fn placement(slot: u32, query_lens: &[u32], writes: &[bool]) -> RequestPlacement {
         let mut forward = ipc::ForwardBatch::default();
-        let mut seq_len = 8;
+        // `ForwardBatch::seq_lens` is a row's total attention length, cached
+        // prefix plus its own query, which is what the assembly states.
+        let mut prefix = 8;
         for (length, write) in query_lens.iter().zip(writes) {
-            forward.push(0, slot, seq_len, *length, *write);
-            seq_len += length;
+            forward.push(0, slot, prefix + length, *length, *write);
+            prefix += length;
         }
         RequestPlacement {
             worker: WorkerGroupId("w".to_owned()),
