@@ -79,6 +79,10 @@ mod preemption;
 mod run;
 mod speculation;
 pub(crate) mod submission;
+/// Policy modules as WebAssembly text, and the quiet one a caller drives the
+/// mechanism with (`testing` feature; never part of a serving build).
+#[cfg(feature = "testing")]
+pub(crate) mod testing;
 
 /// The mechanism's door to the executor this process launched.
 pub(crate) fn submissions(executor: Box<dyn Executor>) -> submission::Submissions {
