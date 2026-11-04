@@ -95,6 +95,17 @@ pub struct AdaLnCache {
     time_dim: u32,
 }
 
+/// A `[1, count]` index list as the flat `[count]` view the gather operator takes.
+///
+/// The operator's indices are one axis (`ops::logits::GatherArgs::rows`) while its output must be
+/// two - `[count, columns]` - because it derives the row count from `out`. `entries_of` writes
+/// `[1, groups]` to satisfy the output's shape, so the same bytes reach the layer and output
+/// gathers as a two-axis view: the stack's tenth launch refused exactly that (`expected 1 axes,
+/// found 2`). The arrangement is stated once, here, rather than at each of the three gathers.
+fn flat_rows(rows: TensorView) -> TensorView {
+    rows.reshape(Shape::new(&[rows.shape.numel()]))
+}
+
 impl AdaLnCache {
     /// Every checkpoint tensor the cache is built from, as complete names.
     ///
@@ -191,7 +202,7 @@ impl AdaLnCache {
         self.layers[0].dtype()
     }
 
-    /// The entry ids one step reads: `[groups]` i32, gathered from the entry table's `step` row.
+    /// The entry ids one step reads: `[1, groups]` i32, gathered from the entry table's `step` row.
     ///
     /// `step` is `[1]` i32 - the step index, which the executor writes - and `out` a `[1, groups]`
     /// i32 scratch view it overwrites with the entries.
@@ -216,12 +227,12 @@ impl AdaLnCache {
                 self.layers.len()
             ))
         })?;
-        Ok(gather_rows(f, table.view(), entries, out)?)
+        Ok(gather_rows(f, table.view(), flat_rows(entries), out)?)
     }
 
     /// The final normalization's modulation rows at these entries: `[groups, 2 · hidden_size]`.
     pub fn output(&self, f: &Forward, entries: TensorView, out: TensorView) -> Result<()> {
-        Ok(gather_rows(f, self.output.view(), entries, out)?)
+        Ok(gather_rows(f, self.output.view(), flat_rows(entries), out)?)
     }
 
     /// The columns one entry's modulation table holds: the three interval tags of six vectors.
