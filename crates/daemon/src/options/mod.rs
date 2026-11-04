@@ -185,6 +185,12 @@ pub struct ServeConfig {
     /// unset lets the daemon resolve it when it prepares the epoch.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub moe_runner_backend: Option<String>,
+    /// This host's Program Server socket (`program_server`), which the
+    /// daemon prepares an epoch's programs against (§5.1, §6.3); unset takes
+    /// the Program Server's default socket. A host-layer value: the daemon
+    /// reads it alone, and a change of it is a hot restart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub program_server: Option<PathBuf>,
     /// Concurrently resident requests, clamped to what the workers hold.
     pub max_running_requests: NonZeroUsize,
     /// Token work admitted in one scheduling step, 8192 when unset; token
@@ -255,6 +261,7 @@ impl Default for ServeConfig {
             prefill_attention_backend: None,
             decode_attention_backend: None,
             moe_runner_backend: None,
+            program_server: None,
             max_running_requests: positive(128),
             max_num_batched_tokens: None,
             mem_fraction_static: 0.7,
@@ -920,6 +927,9 @@ pub fn daemon_options_differ(current: &ServeConfig, target: &ServeConfig) -> boo
         || current.migration_config != target.migration_config
         || current.mm_processor_kwargs != target.mm_processor_kwargs
         || current.diffusion_generation_config != target.diffusion_generation_config
+        // Where this host's Program Server listens: the daemon reads it
+        // alone, and an epoch's programs are prepared against it (§5.1).
+        || current.program_server != target.program_server
 }
 
 /// The workers' always-on profiling (`profiling_config`): the fence

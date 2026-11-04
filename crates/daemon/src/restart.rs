@@ -166,6 +166,10 @@ pub(crate) struct Restarter {
     /// the engine instead of shutting it down, and leaves the service and
     /// the storage to the successor.
     pub(crate) handed_over: Arc<AtomicBool>,
+    /// The responses in flight, which a restart pauses at an engine event
+    /// boundary and hands to the successor (design §7.5.1), attached once
+    /// the HTTP server serves.
+    handoff: std::sync::Mutex<Option<Arc<crate::http::handoff::Handoff>>>,
 }
 
 impl Restarter {
@@ -191,7 +195,20 @@ impl Restarter {
             stated,
             accepting,
             handed_over: Arc::new(AtomicBool::new(false)),
+            handoff: std::sync::Mutex::new(None),
         })
+    }
+
+    /// The registry of the responses in flight, which the HTTP server
+    /// registers every handoffable response with.
+    pub(crate) fn attach_handoff(&self, handoff: Arc<crate::http::handoff::Handoff>) {
+        let mut slot = crate::leader::locked(&self.handoff);
+        *slot = Some(handoff);
+    }
+
+    /// The registry of the responses in flight, once the HTTP server serves.
+    pub(crate) fn handoff(&self) -> Option<Arc<crate::http::handoff::Handoff>> {
+        crate::leader::locked(&self.handoff).clone()
     }
 
     /// Restarts the daemon as `executable` (this daemon's own when `None`),
