@@ -39,7 +39,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use platform::{CopyBatch, DeviceId, SourceOrder, Stream};
 
-use super::plan::CachePlan;
+use super::plan::{CacheGroupPlan, CachePlan};
 use crate::memory::allocation::Backing;
 use crate::memory::allocation::ElementType;
 use crate::memory::allocation::{Storage, StorageView};
@@ -1154,6 +1154,144 @@ impl CachePlanes {
         Ok(self.num_units / plan.units_per_page)
     }
 
+    /// The columns a page of the pool is split into.
+    ///
+    /// A group's page holds `block_size = plane_bytes / row_bytes` tokens of
+    /// every layer in the group and occupies `units_per_page = layers / columns`
+    /// units; layer `k` of the group reads column `k % columns` of the page's
+    /// `k / columns`-th unit, so a layer occupies exactly one cell of a page.
+    pub fn columns(&self) -> u32 {
+        self.plan.columns
+    }
+
+    /// The units one page of `group` occupies, from the group's own layer count
+    /// over the pool's columns: a group whose layers share one column set has
+    /// one unit per page, a draft group of fewer layers than columns more.
+    pub fn units_per_page(&self, group: usize) -> Result<u32> {
+        let plan = self.group(group)?;
+        let columns = self.plan.columns;
+        if columns == 0 {
+            return Err(Error::Invariant("a cache pool holds no column".into()));
+        }
+        let derived = u32::try_from(plan.layers.len())
+            .map_err(|_| Error::Invariant("a cache group's layers overflow a u32".into()))?
+            / columns;
+        if derived == 0 {
+            return Err(Error::Invariant(format!(
+                "cache group {group} holds {} layers in {columns} columns, less than one page",
+                plan.layers.len()
+            )));
+        }
+        if plan.units_per_page != 0 && plan.units_per_page != derived {
+            return Err(Error::Invariant(format!(
+                "cache group {group} plans {} units per page, but {} layers in {columns} columns make {derived}",
+                plan.units_per_page,
+                plan.layers.len()
+            )));
+        }
+        Ok(derived)
+    }
+
+    /// The cell of a page layer `layer` of `group` occupies: column
+    /// `layer % columns`, unit `layer / columns`.
+    pub fn layer_cell(&self, group: usize, layer: usize) -> Result<(u32, u32)> {
+        let plan = self.group(group)?;
+        let columns = self.plan.columns;
+        if columns == 0 {
+            return Err(Error::Invariant("a cache pool holds no column".into()));
+        }
+        if layer >= plan.layers.len() {
+            return Err(Error::Invalid(format!(
+                "cache group {group} holds {} layers, not {layer}",
+                plan.layers.len()
+            )));
+        }
+        let column = (layer as u32) % columns;
+        let unit = (layer as u32) / columns;
+        if unit >= plan.units_per_page {
+            return Err(Error::Invariant(format!(
+                "layer {layer} of cache group {group} lies in unit {unit} of a page holding {}",
+                plan.units_per_page
+            )));
+        }
+        Ok((column, unit))
+    }
+
+    /// One layer's key scales as `[pages, 1, 1, 1]`, borrowed from the
+    /// per-cell scale plane: the cell `(layer % columns, layer / columns)` of
+    /// every page, strided by `units_per_page` elements. `None` for a dense
+    /// pool, whose planes hold no scale.
+    pub fn key_scale(&self, group: usize, layer: usize) -> Result<Option<StorageView>> {
+        self.layer_view(group, layer, 0, false)
+    }
+
+    /// One layer's value scales, as [`key_scale`](Self::key_scale).
+    pub fn value_scale(&self, group: usize, layer: usize) -> Result<Option<StorageView>> {
+        self.layer_view(group, layer, 1, false)
+    }
+
+    /// One layer's key "initialized" flags as `[pages, 1, 1, 1]`, borrowed from
+    /// the per-cell flag plane in the same cell as its scales.
+    pub fn key_initialized(&self, group: usize, layer: usize) -> Result<StorageView> {
+        self.layer_view(group, layer, 0, true)?
+            .ok_or_else(|| Error::Invariant("a cache pool always holds its flags".into()))
+    }
+
+    /// One layer's value "initialized" flags, as
+    /// [`key_initialized`](Self::key_initialized).
+    pub fn value_initialized(&self, group: usize, layer: usize) -> Result<StorageView> {
+        self.layer_view(group, layer, 1, true)?
+            .ok_or_else(|| Error::Invariant("a cache pool always holds its flags".into()))
+    }
+
+    /// The per-layer view of one plane: `[pages, 1, 1, 1]` over the layer's
+    /// cell, with one element per page and a page's stride of `units_per_page`
+    /// units. It borrows the plane's storage; nothing is copied.
+    fn layer_view(
+        &self,
+        group: usize,
+        layer: usize,
+        field: usize,
+        flags: bool,
+    ) -> Result<Option<StorageView>> {
+        let (column, unit) = self.layer_cell(group, layer)?;
+        let units_per_page = self.units_per_page(group)?;
+        let pages = i64::from(self.pages(group)?);
+        let (storage, dtype) = if flags {
+            (&self.initialized[field], ElementType::U8)
+        } else {
+            match &self.scales {
+                Some(scales) => (&scales[field], ElementType::F32),
+                None => return Ok(None),
+            }
+        };
+        if pages == 0 {
+            return Err(Error::Invariant(format!(
+                "cache group {group} holds no page"
+            )));
+        }
+        let cells = i64::from(column) * i64::from(self.num_units) + i64::from(unit);
+        let offset = usize::try_from(cells * dtype.bytes() as i64).map_err(|_| {
+            Error::Invariant("a per-layer plane view lies outside its storage".into())
+        })?;
+        StorageView::strided(
+            Arc::clone(storage) as Arc<dyn Backing>,
+            offset,
+            dtype,
+            &[pages, 1, 1, 1],
+            &[i64::from(units_per_page), 1, 1, 1],
+        )
+        .map(Some)
+    }
+
+    /// `group`'s plan, or the error naming the group.
+    fn group(&self, group: usize) -> Result<&CacheGroupPlan> {
+        self.plan
+            .groups
+            .get(group)
+            .ok_or_else(|| Error::Invalid(format!("cache group {group} is not in the plan")))
+    }
+
     /// The element type `group`'s planes hold, as a kernel operand type.
     ///
     /// A plane whose storage element no kernel operand describes is an error
@@ -1327,6 +1465,103 @@ impl UnitColumn {
         for &unit in units {
             self.planes.reset_units(unit, 1, false, stream)?;
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod layer_view_tests {
+    use super::*;
+
+    /// One group of `layers` layers with `units_per_page` units, at the widest
+    /// row a token of one layer occupies.
+    fn group(layers: usize, units_per_page: u32) -> CacheGroupPlan {
+        CacheGroupPlan {
+            window: None,
+            state: false,
+            draft: false,
+            block_size: 16,
+            units_per_page,
+            layers: (0..layers).map(|layer| format!("layers.{layer}")).collect(),
+            layer_ids: (0..layers as u32).collect(),
+            axis: super::super::plan::GroupAxis {
+                offset: 0,
+                total: layers as u32,
+            },
+            num_kv_heads: 1,
+            total_kv_heads: 1,
+            kv_head_offset: 0,
+            head_dim: 8,
+            dtype: ElementType::BF16,
+            compute_dtype: ElementType::BF16,
+        }
+    }
+
+    /// A pool of `groups` whose planes hold `num_units` cells per column, on
+    /// host storage: the layout is all these accessors read.
+    fn pool(
+        groups: Vec<CacheGroupPlan>,
+        columns: u32,
+        num_units: u32,
+        quantized: bool,
+    ) -> CachePlanes {
+        let cells = usize::try_from(u64::from(columns) * u64::from(num_units)).unwrap();
+        let [key, value] = [0, 1].map(|_| Storage::host(cells.max(1)));
+        CachePlanes {
+            plan: Arc::new(CachePlan {
+                columns,
+                plane_bytes: 16,
+                quantized,
+                unit_bytes: 16,
+                dtype: ipc::PrefixCacheDtype::BFloat16,
+                groups,
+                states: Vec::new(),
+                checkpoints: Vec::new(),
+            }),
+            device: None,
+            num_units,
+            segmenting: None,
+            values: [Arc::clone(&key), Arc::clone(&value)],
+            scales: quantized.then(|| [Storage::host(cells.max(1)), Storage::host(cells.max(1))]),
+            initialized: [Arc::clone(&key), Arc::clone(&value)],
+            fields: Vec::new(),
+        }
+    }
+
+    /// A layer with one column set per page: its unit is its page's only unit,
+    /// so every page of the pool is its own scale.
+    #[test]
+    fn a_group_of_one_column_set_has_one_cell_per_page() -> Result<()> {
+        let pool = pool(vec![group(2, 0)], 2, 8, true);
+        assert_eq!(pool.units_per_page(0)?, 1);
+        assert_eq!(pool.layer_cell(0, 1)?, (1, 0));
+
+        let view = pool.key_scale(0, 0)?.expect("an FP8 pool holds scales");
+        assert_eq!(view.shape(), &[8, 1, 1, 1]);
+        Ok(())
+    }
+
+    /// More layers than columns: a page holds two units, and a layer of the
+    /// second column set reads the page's second unit, not its first.
+    #[test]
+    fn a_layer_of_the_second_unit_reads_that_unit() -> Result<()> {
+        let pool = pool(vec![group(4, 0)], 2, 8, true);
+        assert_eq!(pool.units_per_page(0)?, 2);
+        assert_eq!(pool.layer_cell(0, 3)?, (1, 1));
+        assert_eq!(pool.pages(0)?, 4);
+
+        let second = pool.key_scale(0, 3)?.expect("an FP8 pool holds scales");
+        assert_eq!(second.shape(), &[4, 1, 1, 1]);
+        Ok(())
+    }
+
+    /// A dense pool holds no scale, and states so instead of inventing one.
+    #[test]
+    fn a_dense_pool_states_no_scale() -> Result<()> {
+        let pool = pool(vec![group(2, 0)], 2, 8, false);
+        assert!(pool.key_scale(0, 0)?.is_none());
+        assert!(pool.value_scale(0, 1)?.is_none());
+        assert_eq!(pool.key_initialized(0, 0)?.shape(), &[8, 1, 1, 1]);
         Ok(())
     }
 }
