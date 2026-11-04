@@ -1683,15 +1683,36 @@ impl MainProcess {
         // A switchover to a generation this process never prepared cannot succeed, and cutting the
         // devices over to try it costs a live graph rebuild to end where it started: it is refused
         // before any device is touched, and the generation that serves keeps serving.
-        if self.prepared.is_empty() {
+        //
+        // "Prepared nothing" and "prepared another" are the same refusal to the daemon and two
+        // different bugs in the log, so the reason names which one. The second is the state a lost
+        // `Precopied` reply leaves: the daemon gave up on a precopy that then completed, retried
+        // `/admin/config`, and now names a generation this process never built. Letting it through
+        // would move the scheduling policy to `generation` first, then fail on the devices, and
+        // report a device fault for a stale number.
+        let stale = self
+            .prepared
+            .iter()
+            .map(|built| built.number())
+            .find(|number| *number != generation);
+        let refused = if self.prepared.is_empty() {
+            Some(format!(
+                "a switchover to generation {generation}, which this process prepared nothing \
+                 for: the precopy that builds it either failed or never arrived"
+            ))
+        } else {
+            stale.map(|other| {
+                format!(
+                    "a switchover to generation {generation}, while this process holds generation \
+                     {other} prepared and never cut over: the precopy that builds {generation} \
+                     either failed or never arrived"
+                )
+            })
+        };
+        if let Some(reason) = refused {
             return Ok(ProgramStatus::PrecopyFailed {
                 generation,
-                failure: UpdateFailure::Precopy {
-                    reason: format!(
-                        "a switchover to generation {generation}, which this process prepared \
-                         nothing for: the precopy that builds it either failed or never arrived"
-                    ),
-                },
+                failure: UpdateFailure::Precopy { reason },
             });
         }
         self.switchover_policy(generation, step);
