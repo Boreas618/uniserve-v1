@@ -118,6 +118,7 @@ pub mod snake_beta;
 pub mod tensor;
 pub mod tolerance;
 pub mod twins;
+pub mod unpatchify;
 
 pub use descriptor::{Float, Key};
 pub use error::{Error, Result};
