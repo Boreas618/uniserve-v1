@@ -925,14 +925,194 @@ fn rows(view: TensorView) -> Result<TensorView> {
     Ok(view.reshape(Shape::new(&[rows, columns])))
 }
 
+/// The buffers one tile extent's encode works in, reserved once for a whole run of tiles.
+///
+/// A run's tiles are not uniform - the right and bottom edges of a grid are shorter - so a scratch holds
+/// one set per **distinct** tile extent and each call takes the set its own extent names. A set's buffers
+/// are then exactly the call's shape, which matters because a convolution writes the view it is handed:
+/// a sub-window of a larger buffer would be strided, and the convolution path takes a destination's
+/// address and shape, not its strides.
+pub struct EncoderScratch {
+    sets: Vec<(Extent, EncoderSet)>,
+}
+
+impl EncoderScratch {
+    /// The set a tile of this extent encodes in.
+    fn of(&self, extent: Extent) -> Result<&EncoderSet> {
+        self.sets
+            .iter()
+            .find(|(known, _)| *known == extent)
+            .map(|(_, set)| set)
+            .ok_or_else(|| {
+                Error::config(format!(
+                    "no encoder buffers were reserved for a {} by {} tile of {} frames",
+                    extent.height, extent.width, extent.frames
+                ))
+            })
+    }
+
+    /// How many distinct tile extents the scratch covers.
+    pub fn sets(&self) -> usize {
+        self.sets.len()
+    }
+}
+
+/// One tile extent's buffers: the input pad, the input convolution's output, a set per level and the
+/// moments convolution's output.
+struct EncoderSet {
+    padded: TensorView,
+    stream: TensorView,
+    levels: Vec<LevelSet>,
+    moments: TensorView,
+}
+
+/// One level's buffers: the pair its blocks alternate between, one working buffer the block reads back,
+/// its shortcut projection where the first block widens, and the pad and strided output where the level
+/// downsamples.
+///
+/// The pair is the level's **own** width, not the buffer the level was handed. Alternating with the
+/// incoming buffer instead reads a level's second block against its input width whenever the level widens
+/// it - which three of the six levels do - so a two-block level would write a wider value into a narrower
+/// view.
+struct LevelSet {
+    first: TensorView,
+    second: TensorView,
+    working: TensorView,
+    projected: Option<TensorView>,
+    pad: Option<TensorView>,
+    strided: Option<TensorView>,
+}
+
 impl VideoEncoder {
     /// Encode one raster into the posterior moments of its latent.
     ///
-    /// `pixels` is `[1, in_channels, frames, height, width]` FP32 — one tile of a clip, normalized by
-    /// [`normalize`] — and `out` is `[1, 2 · latent_channels, frames', height / 16, width / 16]`. The
-    /// caller tiles a clip as [`Grid`] states and stitches the tiles' latents; a band of latent rows
-    /// may be encoded on its own through [`Grid::band`].
+    /// One tile, with its buffers reserved for the call: a driver of several tiles reserves once with
+    /// [`Self::reserve`] and calls [`Self::encode_tile`] instead, or the arena carries one tile's buffers
+    /// per tile.
     pub fn encode(&self, f: &Forward, pixels: TensorView, out: TensorView) -> Result<()> {
+        let (_, _, frames, height, width) = extent(pixels)?;
+        let raster = Extent {
+            frames: u32::try_from(frames)
+                .map_err(|_| Error::config("too many frames".to_owned()))?,
+            height: u32::try_from(height).map_err(|_| Error::config("too tall".to_owned()))?,
+            width: u32::try_from(width).map_err(|_| Error::config("too wide".to_owned()))?,
+        };
+        let scratch = self.reserve(f, &[raster])?;
+        self.encode_tile(f, &scratch, pixels, out)
+    }
+
+    /// Reserve the buffers one run of tiles encodes in, one set per distinct tile extent.
+    ///
+    /// The arena never rewinds, so a driver that encodes a grid of tiles must reserve once and hand the
+    /// same scratch to every tile: a reservation inside the loop is multiplied by the tile count, and one
+    /// tile's buffers are most of a gigabyte at the served canvas. [`video_encoder_tile_arena`] states
+    /// what one set holds.
+    pub fn reserve(&self, f: &Forward, extents: &[Extent]) -> Result<EncoderScratch> {
+        if extents.is_empty() {
+            return Err(Error::config(
+                "an encoder run with no tile extent has nothing to reserve".to_owned(),
+            ));
+        }
+        let mut sets: Vec<(Extent, EncoderSet)> = Vec::new();
+        for extent in extents {
+            if sets.iter().any(|(known, _)| known == extent) {
+                continue;
+            }
+            sets.push((*extent, self.set(f, *extent)?));
+        }
+        Ok(EncoderScratch { sets })
+    }
+
+    /// The buffers one tile extent needs.
+    fn set(&self, f: &Forward, raster: Extent) -> Result<EncoderSet> {
+        let extents = self.stack.extents(raster);
+        let buffer = |channels: u64, extent: &Extent| -> Result<TensorView> {
+            Ok(f.arena().tensor(
+                DType::F32,
+                Shape::new(&[
+                    1,
+                    channels,
+                    u64::from(extent.frames),
+                    u64::from(extent.height),
+                    u64::from(extent.width),
+                ]),
+            )?)
+        };
+        let padded = f.arena().tensor(
+            DType::F32,
+            Shape::new(&[
+                1,
+                u64::from(self.stack.input_channels),
+                u64::from(raster.frames + 2),
+                u64::from(raster.height + 2),
+                u64::from(raster.width + 2),
+            ]),
+        )?;
+        let stream = buffer(u64::from(self.stack.widths[0]), &extents[0])?;
+        let mut levels = Vec::with_capacity(extents.len() - 1);
+        for index in 0..extents.len() - 1 {
+            let width = u64::from(self.stack.widths[index]);
+            let extent = &extents[index];
+            let next = &extents[index + 1];
+            let downsample = self.levels[index].downsample.is_some();
+            levels.push(LevelSet {
+                first: buffer(width, extent)?,
+                second: buffer(width, extent)?,
+                working: buffer(width, extent)?,
+                // The first block of a level widens from the previous level's width; later blocks add to
+                // their own width and project nothing.
+                projected: match self.levels[index]
+                    .blocks
+                    .first()
+                    .map(|block| block.shortcut.is_some())
+                {
+                    Some(true) => Some(buffer(width, extent)?),
+                    _ => None,
+                },
+                pad: match downsample {
+                    true => Some(f.arena().tensor(
+                        DType::F32,
+                        Shape::new(&[
+                            1,
+                            width,
+                            u64::from(extent.frames) + 2,
+                            u64::from(extent.height) + 1,
+                            u64::from(extent.width) + 1,
+                        ]),
+                    )?),
+                    false => None,
+                },
+                strided: match downsample {
+                    true => Some(buffer(width, next)?),
+                    false => None,
+                },
+            });
+        }
+        let latent = extents.last().copied().unwrap_or(raster);
+        let moments = buffer(2 * u64::from(self.stack.latent_channels), &latent)?;
+        Ok(EncoderSet {
+            padded,
+            stream,
+            levels,
+            moments,
+        })
+    }
+
+    /// Encode one tile into a reserved set of buffers.
+    ///
+    /// This is the entry point a driver of several tiles uses: it reserves once with [`Self::reserve`]
+    /// and hands the same scratch to every tile, which is the difference between one tile's buffers and
+    /// one tile's buffers times the grid. `pixels` is `[1, in_channels, frames, height, width]` FP32 -
+    /// one tile of a clip, normalized by [`normalize`] - and `out` is
+    /// `[1, 2 · latent_channels, frames', height / 16, width / 16]`. A tile whose extent was not reserved
+    /// is refused by name rather than read past the buffers.
+    pub fn encode_tile(
+        &self,
+        f: &Forward,
+        scratch: &EncoderScratch,
+        pixels: TensorView,
+        out: TensorView,
+    ) -> Result<()> {
         let (batch, channels, frames, height, width) = extent(pixels)?;
         if batch != 1 {
             return Err(Error::config(format!(
@@ -951,100 +1131,73 @@ impl VideoEncoder {
                 crate::config::CLIP_FRAMES
             )));
         }
-        let extents = self.stack.extents(Extent {
+        let raster = Extent {
             frames: u32::try_from(frames)
                 .map_err(|_| Error::config("too many frames".to_owned()))?,
             height: u32::try_from(height).map_err(|_| Error::config("too tall".to_owned()))?,
             width: u32::try_from(width).map_err(|_| Error::config("too wide".to_owned()))?,
-        });
+        };
+        let set = scratch.of(raster)?;
 
         // The input convolution reads padded pixels; it has no normalization of its own.
-        let padded = f.arena().tensor(
-            DType::F32,
-            Shape::new(&[batch, channels, frames + 2, height + 2, width + 2]),
-        )?;
-        FramePad::new(self.reflect).forward(f, pixels, padded, 1, 1, 2)?;
-        let first = u64::from(self.stack.widths[0]);
-        let mut hidden = f.arena().tensor(
-            DType::F32,
-            Shape::new(&[batch, first, frames, height, width]),
-        )?;
-        self.input.forward(f, padded, hidden)?;
+        FramePad::new(self.reflect).forward(f, pixels, set.padded, 1, 1, 2)?;
+        self.input.forward(f, set.padded, set.stream)?;
 
-        // The blocks alternate between two buffers: one holds the residual stream, the other the
-        // block's output, which the scaled addition folds back into the stream. A level's blocks all
-        // write the level's width, which is the next level's input width.
+        // A level's blocks alternate between its own pair of buffers, and the level's input is a third
+        // buffer it never writes: the first block reads the previous level's output, each later block
+        // reads the one before it, and every block writes the level's width.
+        let mut source = set.stream;
         for (index, level) in self.levels.iter().enumerate() {
-            let extent = extents[index];
-            let width = u64::from(self.stack.widths[index]);
-            let mut target = f.arena().tensor(
-                DType::F32,
-                Shape::new(&[
-                    batch,
-                    width,
-                    u64::from(extent.frames),
-                    u64::from(extent.height),
-                    u64::from(extent.width),
-                ]),
-            )?;
-            for block in &level.blocks {
-                self.block(f, block, hidden, target)?;
-                std::mem::swap(&mut hidden, &mut target);
+            let buffers = &set.levels[index];
+            for (at, block) in level.blocks.iter().enumerate() {
+                let target = match at % 2 {
+                    0 => buffers.first,
+                    _ => buffers.second,
+                };
+                self.block(f, block, source, target, buffers.working, buffers.projected)?;
+                source = target;
             }
             if let Some(downsample) = &level.downsample {
-                // The padding comes off the source's extents: two zero frames in front and one pixel
-                // after the bottom and the right edge, which is what halves an even extent exactly.
-                let next = extents[index + 1];
-                let padded = f.arena().tensor(
-                    DType::F32,
-                    Shape::new(&[
-                        batch,
-                        width,
-                        u64::from(extent.frames) + 2,
-                        u64::from(extent.height) + 1,
-                        u64::from(extent.width) + 1,
-                    ]),
-                )?;
-                FramePad::new(self.reflect).forward(f, hidden, padded, 0, 0, 2)?;
-                let mut strided = f.arena().tensor(
-                    DType::F32,
-                    Shape::new(&[
-                        batch,
-                        width,
-                        u64::from(next.frames),
-                        u64::from(next.height),
-                        u64::from(next.width),
-                    ]),
-                )?;
-                downsample.forward(f, padded, strided)?;
-                std::mem::swap(&mut hidden, &mut strided);
+                let (Some(pad), Some(strided)) = (buffers.pad, buffers.strided) else {
+                    return Err(Error::config(format!(
+                        "level {index} downsamples without the buffers for it"
+                    )));
+                };
+                FramePad::new(self.reflect).forward(f, source, pad, 0, 0, 2)?;
+                downsample.forward(f, pad, strided)?;
+                source = strided;
             }
         }
 
-        // The moment convolution writes `2 · latent_channels`; the one-by-one projection narrows it to
-        // the latent's own channels, which is the posterior the caller reads.
-        // The moment convolution writes `2 * latent_channels`; the one-by-one projection after it
-        // narrows that to the latent's own channels. The scratch is the moment extent, which is twice
-        // the output's channel count - sizing it from `out` would half it.
-        let mut moment_extent = out.shape.dims().to_vec();
-        moment_extent[1] = 2 * u64::from(self.stack.latent_channels);
-        let moments = f.arena().tensor(DType::F32, Shape::new(&moment_extent))?;
-        self.output.run(f, hidden, moments)?;
-        Ok(self.moments.forward(f, moments, out)?)
+        // The moment convolution writes `2 · latent_channels`; the one-by-one projection after it
+        // narrows that to the latent's own channels, which is the posterior the caller reads.
+        self.output.run(f, source, set.moments)?;
+        Ok(self.moments.forward(f, set.moments, out)?)
     }
 
     /// One residual block: two normalized convolutions, added to the input or its projection.
-    fn block(&self, f: &Forward, block: &Block, values: TensorView, out: TensorView) -> Result<()> {
-        let hidden = f.arena().tensor(DType::F32, values.shape)?;
-        block.first.run(f, values, hidden)?;
-        block.second.run(f, hidden, out)?;
-        let residual = match &block.shortcut {
-            Some(shortcut) => {
-                let projected = f.arena().tensor(DType::F32, values.shape)?;
+    fn block(
+        &self,
+        f: &Forward,
+        block: &Block,
+        values: TensorView,
+        out: TensorView,
+        working: TensorView,
+        projected: Option<TensorView>,
+    ) -> Result<()> {
+        block.first.run(f, values, working)?;
+        block.second.run(f, working, out)?;
+        let residual = match (&block.shortcut, projected) {
+            (Some(shortcut), Some(projected)) => {
                 shortcut.forward(f, values, projected)?;
                 projected
             }
-            None => values,
+            (Some(_), None) => {
+                return Err(Error::config(
+                    "a block that widens its input has no buffer to project it into".to_owned(),
+                ));
+            }
+            (None, _) => values,
         };
         // The reference groups the sum as `residual + (values + bias)` and adds the convolution's
         // bias in a pass of its own; cuDNN adds that bias in a pass of its own too, and IEEE addition
@@ -1454,13 +1607,18 @@ pub fn video_encoder_tile_arena(
     );
     for (index, level) in extents.iter().take(extents.len() - 1).enumerate() {
         let width = u64::from(stack.widths[index]);
-        push(format!("level{index}.stream"), width * pixels(level));
-        for block in 0..stack.blocks {
-            push(format!("level{index}.block{block}"), width * pixels(level));
+        let input = match index {
+            0 => u64::from(stack.widths[0]),
+            _ => u64::from(stack.widths[index - 1]),
+        };
+        // The pair a level's blocks alternate between, and the working buffer each block reads back.
+        push(format!("level{index}.first"), width * pixels(level));
+        push(format!("level{index}.second"), width * pixels(level));
+        push(format!("level{index}.working"), width * pixels(level));
+        // Only the first block of a level widens its input, and only when the level does.
+        if input != width {
+            push(format!("level{index}.projected"), width * pixels(level));
         }
-        // The first block of a level takes the previous level's width, so it is the one that projects
-        // its input; the rest add to their own width and need no projection.
-        push(format!("level{index}.projected"), width * pixels(level));
         let next = &extents[index + 1];
         if next.frames < level.frames || next.height < level.height || next.width < level.width {
             push(
@@ -1799,24 +1957,25 @@ mod tests {
             .zip(stack.spatial_strides.iter())
             .filter(|(temporal, spatial)| *temporal * *spatial > 1)
             .count();
-        // Two before the levels, two plus the level's blocks and its projection inside them, and the
-        // moments of the latent raster.
-        assert_eq!(
-            plan.len(),
-            2 + downsamplers * 2 + levels * (2 + stack.blocks as usize) + 1
-        );
+        // The input pad and the input convolution's output, then per level the pair its blocks alternate
+        // between, the block's working buffer, a projection where the level widens, and the pad and
+        // strided output where it downsamples; the moments of the latent raster close the list.
+        let widening = (1..levels)
+            .filter(|index| stack.widths[index - 1] != stack.widths[*index])
+            .count();
+        assert_eq!(plan.len(), 2 + levels * 3 + widening + downsamplers * 2 + 1);
         // Level 0 runs at the tile's pixels and the encoder's first width, and it is the entry a tiled
         // driver multiplies by its tile count.
-        let stream = plan
+        let first = plan
             .iter()
-            .find(|buffer| buffer.name == "level0.stream")
-            .expect("level 0's stream");
+            .find(|buffer| buffer.name == "level0.first")
+            .expect("level 0's first buffer");
         assert_eq!(
-            stream.elements,
+            first.elements,
             u64::from(stack.widths[0]) * 25 * 64 * 256,
             "level 0 is the tile's pixels at the first width"
         );
-        assert!(stream.elements > 100 * 1024 * 1024);
+        assert!(first.elements > 100 * 1024 * 1024);
     }
 
     #[test]
