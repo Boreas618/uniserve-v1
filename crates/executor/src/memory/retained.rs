@@ -543,9 +543,11 @@ impl Retained {
             .into_iter()
             .nth(index)
             .ok_or_else(|| Error::Interface("a retained weight names no storage".into()))?;
-        // A weight is retained HOST storage (`host_retainable`), which a rank maps as host memory
-        // registered with the device; only a device allocation is imported through the VMM, and a
-        // memfd handed to that path is not a CUDA shareable handle.
+        // A weight is published as a DEVICE block (`Storage::retainable`) and imported by its
+        // shareable handle, so a kernel reads it at a device address. The host branch is what a
+        // record published before that change still needs, and what the page pool and the link
+        // scratch use: host storage is mapped and registered with the device, never handed to the
+        // VMM import - a memfd is not a CUDA shareable handle.
         let storage = match record.placement {
             ::storage::Placement::Host { .. } => {
                 Storage::import_host(descriptor, record.bytes as usize, device)?
