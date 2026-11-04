@@ -935,10 +935,11 @@ mod tests {
     }
 
     /// An encoded expert step's buffers are the plan's to reserve: the arena is sized from the
-    /// plan, and the step writes past a plan that forgot them. So the plan states them when the
-    /// checkpoint's experts were read as NVFP4, and nothing when they were dense.
+    /// plan, and the step writes past a plan that forgot them. A dense deployment reserves its
+    /// routing prefix and its permuted pair — the combine indexes that pair through the sort's map on
+    /// either path — and an encoded one adds its activation planes and the products' scratch.
     #[test]
-    fn an_encoded_expert_step_is_planned_and_a_dense_one_is_not() {
+    fn an_encoded_expert_step_is_planned_and_a_dense_one_reserves_less() {
         let config = config();
         let partition = Partition::single();
         let dense = Plan::new(
@@ -949,7 +950,6 @@ mod tests {
             DType::BF16,
         )
         .unwrap();
-        assert_eq!(dense.moe, 0);
         let encoded = Plan::new(
             &config,
             &partition,
