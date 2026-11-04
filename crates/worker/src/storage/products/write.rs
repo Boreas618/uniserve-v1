@@ -6,7 +6,7 @@ use crate::storage::allocation::StorageView;
 use crate::stream::Issue;
 use crate::transfer::{Spans, copy_planner};
 use crate::{Error, Result};
-use cuda::SourceOrder;
+use platform::SourceOrder;
 use ipc::{BufferAllocation, BufferId, RequestKey, TensorRef};
 use std::collections::HashMap;
 use std::ops::Range;

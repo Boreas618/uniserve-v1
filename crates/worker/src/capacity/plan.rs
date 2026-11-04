@@ -678,7 +678,7 @@ pub(crate) fn slot_requirements(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use cuda::DeviceId;
+    use platform::DeviceId;
     use ipc::{DType, DimBound, ShapeBound};
 
     use super::*;

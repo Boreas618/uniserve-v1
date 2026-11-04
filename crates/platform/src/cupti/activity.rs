@@ -520,13 +520,12 @@ pub(crate) mod tests {
     }
 
     mod device {
-        use std::ffi::c_void;
         use std::time::Duration;
 
-        use libloading::Library;
-
         use super::super::*;
-        use crate::{DeviceAllocation, DeviceId, Event, EventFlags, GraphExec, memset_d32};
+        use crate::{
+            Capture, DeviceAllocation, DeviceId, Event, EventFlags, GraphExec, memset_d32,
+        };
 
         const FILL_BYTES: usize = 1 << 30;
 
@@ -563,33 +562,9 @@ pub(crate) mod tests {
             stream: &Stream,
             count: usize,
         ) -> Result<GraphExec> {
-            type Capture = unsafe extern "C" fn(*mut c_void, i32) -> i32;
-            type Captured = unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> i32;
-            type Destroy = unsafe extern "C" fn(*mut c_void) -> i32;
-            // SAFETY: loading the driver runs only its initializers; each
-            // type is its symbol's C prototype.
-            let (begin, end, destroy) = unsafe {
-                let driver = Box::leak(Box::new(Library::new("libcuda.so.1").unwrap()));
-                (
-                    *driver.get::<Capture>(b"cuStreamBeginCapture_v2").unwrap(),
-                    *driver.get::<Captured>(b"cuStreamEndCapture").unwrap(),
-                    *driver.get::<Destroy>(b"cuGraphDestroy").unwrap(),
-                )
-            };
-
-            let _context = stream.enter()?;
-            let mut graph = std::ptr::null_mut();
-            // SAFETY: the stream is live; `CU_STREAM_CAPTURE_MODE_THREAD_LOCAL`
-            // confines the capture to this thread, and the driver writes the
-            // captured graph, which is destroyed once instantiated.
-            unsafe {
-                assert_eq!(begin(stream.handle(), 1), 0);
-                fill(storage, stream, count)?;
-                assert_eq!(end(stream.handle(), &mut graph), 0);
-                let graph_exec = GraphExec::instantiate(stream.device(), graph as usize);
-                assert_eq!(destroy(graph), 0);
-                graph_exec
-            }
+            let capture = Capture::begin(stream)?;
+            fill(storage, stream, count)?;
+            capture.end()?.instantiate()
         }
 
         #[test]

@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use cuda::{DeviceGuard, Event, Stream};
+use platform::{DeviceGuard, Event, Stream};
 
 use super::{Notify, Retirement, Spans};
 use crate::stream::Issue;

@@ -4,7 +4,7 @@ use crate::transfer::{ACK_SLOTS, CLAIMED};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use cuda::{
+use platform::{
     CopyBatch, DeviceGuard, DeviceId, Event, EventFlags, PinnedBuffer, SourceOrder, Stream,
 };
 
