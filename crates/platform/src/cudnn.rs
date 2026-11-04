@@ -181,7 +181,12 @@ const CROSS_CORRELATION: i32 = 1;
 /// (often one configuration).
 const HEURISTIC_MODE_B: i32 = 1;
 
-/// The most engine configurations one heuristic query is asked to return.
+/// The most engine configurations a query keeps after reading them all.
+///
+/// The array handed to the library always holds one created descriptor per
+/// configuration the heuristic reported, never fewer: it is the *requested*
+/// count, and asking for part of a list is not how the library is written to
+/// work. This cap is applied to what is kept.
 const MAX_ENGINE_CONFIGS: usize = 32;
 
 /// The unique ids that tie the three tensors of the operation graph to the
@@ -286,19 +291,24 @@ impl Api {
         if status == STATUS_SUCCESS {
             return Ok(());
         }
+        Err(Error::Cudnn {
+            call,
+            code: status,
+            message: self.last_error(),
+        })
+    }
+
+    /// The library's text for the last call that failed.
+    fn last_error(&self) -> String {
         let mut message = [0 as c_char; 256];
         // SAFETY: the library writes at most `message.len()` bytes; the
         // buffer outlives the call.
         unsafe { (self.get_last_error)(message.as_mut_ptr(), message.len()) };
         // SAFETY: the library fills the buffer with a NUL-terminated string.
-        let text = unsafe { CStr::from_ptr(message.as_ptr()) }
+        unsafe { CStr::from_ptr(message.as_ptr()) }
             .to_str()
-            .unwrap_or("non-UTF-8 cuDNN error");
-        Err(Error::Cudnn {
-            call,
-            code: status,
-            message: text.to_owned(),
-        })
+            .unwrap_or("non-UTF-8 cuDNN error")
+            .to_owned()
     }
 
     /// Sets one attribute from `values`, whose C type the caller names.
@@ -353,7 +363,12 @@ impl Api {
         values: &mut [T],
         call: &'static str,
     ) -> Result<usize> {
-        let mut written = 0i64;
+        // cuDNN's element count is an in/out parameter: the library is told
+        // how many elements the array holds by `requestedElementCount` and
+        // how many it may write by this value, and it answers a `0` with a
+        // write of nothing — a full list read back as empty. `cuDNN_frontend`
+        // initialises it to `-1` before every read, and so does this.
+        let mut written = -1i64;
         // SAFETY: `values` has room for `values.len()` elements of the
         // attribute's documented C type, and both outlive the call; the
         // descriptor is live.
@@ -373,7 +388,9 @@ impl Api {
 
     /// Reads the element count of an attribute that holds a list.
     fn count(&self, descriptor: &Descriptor, attribute: i32, kind: i32) -> Result<usize> {
-        let mut written = 0i64;
+        // As in `get`: the count is in/out and starts at `-1`, which is what
+        // asks the library for the list's length rather than for nothing.
+        let mut written = -1i64;
         // SAFETY: an element count of zero asks for the list's length and
         // writes no element; the local outlives the call and the descriptor
         // is live.
@@ -1647,6 +1664,7 @@ impl Cudnn {
             self.api
                 .count(&mode_b, ATTR_ENGINEHEUR_RESULTS, TYPE_BACKEND_DESCRIPTOR)
         );
+        steps.extend(self.fill_variants(&graph, &mode_b, listed_b));
         let exhaustive = stage!(
             "engine heuristic: mode B, read up to eight configurations and their numerical notes",
             self.configs(&graph, 8, HEURISTIC_MODE_B, false)
@@ -1674,10 +1692,20 @@ impl Cudnn {
             ));
             return steps;
         }
-        let config = stage!(
-            "engine heuristic: read the first configuration",
-            Self::first_config(self.api, &heuristic, available)
+        let shortlist = stage!(
+            "engine heuristic: mode A, read every configuration it lists",
+            self.configs(&graph, MAX_ENGINE_CONFIGS, HEURISTIC_MODE_A, false)
         );
+        let Some(config) = shortlist.kept.into_iter().next() else {
+            steps.push((
+                format!(
+                    "engine heuristic: mode A listed {} configuration(s) and the library filled none",
+                    shortlist.returned
+                ),
+                Some(String::from("nothing filled")),
+            ));
+            return steps;
+        };
         let notes_a = stage!(
             "engine heuristic: mode A's first configuration's numerical notes",
             self.numerical_notes(&config)
@@ -1722,6 +1750,159 @@ impl Cudnn {
         steps
     }
 
+    /// The six readings of what a fill of `CUDNN_ATTR_ENGINEHEUR_RESULTS`
+    /// wants of the array it is handed, against one finalized `heuristic`
+    /// descriptor and one that no count query has touched, so the only
+    /// difference between them is the request.
+    ///
+    /// A diagnostic: it decides nothing and changes nothing. Each line says
+    /// the status, the element count the library answered, and how many slots
+    /// hold a handle afterwards, because those three separate the readings —
+    /// a list that is written but not counted looks like a list that was left
+    /// empty from the caller's side.
+    fn fill_variants(
+        &self,
+        graph: &Descriptor,
+        heuristic: &Descriptor,
+        listed: usize,
+    ) -> Vec<(String, Option<String>)> {
+        let mut steps = Vec::new();
+        // (name, requestedElementCount, slots, initial count, slots are null)
+        let variants: [(&str, i64, usize, i64, bool); 5] = [
+            (
+                "1 the code as it was: requested = the list's length, count starts at 0",
+                listed as i64,
+                listed.max(1),
+                0,
+                false,
+            ),
+            (
+                "2 the same request with the count initialised to the list's length",
+                listed as i64,
+                listed.max(1),
+                listed as i64,
+                false,
+            ),
+            (
+                "3 the counted descriptor, MAX_ENGINE_CONFIGS created slots requested",
+                MAX_ENGINE_CONFIGS as i64,
+                MAX_ENGINE_CONFIGS,
+                0,
+                false,
+            ),
+            (
+                "4 requested larger than the list: list + MAX_ENGINE_CONFIGS",
+                (listed + MAX_ENGINE_CONFIGS) as i64,
+                listed + MAX_ENGINE_CONFIGS,
+                0,
+                false,
+            ),
+            (
+                "5 null slots: the library creates the descriptors and writes their handles",
+                listed as i64,
+                listed.max(1),
+                -1,
+                true,
+            ),
+        ];
+        for (name, requested, slots, initial, nulls) in variants {
+            // A variant the library refuses is one reading of the contract that
+            // does not hold, which is exactly what the probe asks about: it is
+            // reported in its line, not counted as a refusal of the probe.
+            let line = match self.fill_once(heuristic, requested, slots, initial, nulls) {
+                Ok(line) => line,
+                Err(error) => format!("refused: {error}"),
+            };
+            steps.push((format!("engine heuristic fill {name}: {line}"), None));
+        }
+        // 6: a heuristic descriptor no count query has touched. It separates
+        // "the count query consumed the list", which variant 3 cannot, because
+        // 3 asks the descriptor that was counted.
+        let line = match Self::heuristic(self.api, graph, HEURISTIC_MODE_B).and_then(|fresh| {
+            self.fill_once(
+                &fresh,
+                MAX_ENGINE_CONFIGS as i64,
+                MAX_ENGINE_CONFIGS,
+                -1,
+                false,
+            )
+        }) {
+            Ok(line) => line,
+            Err(error) => format!("refused: {error}"),
+        };
+        steps.push((
+            format!("engine heuristic fill 6 a fresh descriptor, never counted, MAX_ENGINE_CONFIGS slots requested: {line}"),
+            None,
+        ));
+        steps
+    }
+
+    /// One fill of the heuristic's results with the slots and the initial
+    /// element count a variant names.
+    ///
+    /// `nulls` hands the library an array of empty slots, which is the reading
+    /// that it creates the descriptors itself; otherwise the slots are
+    /// descriptors created here, which is the reading that it fills them.
+    ///
+    /// Answers with the status and what the array holds afterwards; handles the
+    /// library wrote that this call did not create are destroyed, so a library
+    /// that creates or replaces descriptors does not leak through the probe.
+    fn fill_once(
+        &self,
+        heuristic: &Descriptor,
+        requested: i64,
+        slots: usize,
+        initial: i64,
+        nulls: bool,
+    ) -> Result<String> {
+        let mut ours = Vec::with_capacity(if nulls { 0 } else { slots });
+        if !nulls {
+            for _ in 0..slots {
+                ours.push(Descriptor::create(self.api, DESCRIPTOR_ENGINE_CONFIG)?);
+            }
+        }
+        let mine: Vec<Handle> = ours.iter().map(|descriptor| descriptor.raw).collect();
+        let mut handles: Vec<Handle> = if nulls {
+            vec![std::ptr::null_mut(); slots]
+        } else {
+            mine.clone()
+        };
+        let mut written = initial;
+        // SAFETY: every slot is either a descriptor this module created with
+        // `cudnnBackendCreateDescriptor` or a null the library may fill, which
+        // is what the call takes, and both the array and the slots outlive it.
+        let status = unsafe {
+            (self.api.backend_get_attribute)(
+                heuristic.raw,
+                ATTR_ENGINEHEUR_RESULTS,
+                TYPE_BACKEND_DESCRIPTOR,
+                requested,
+                &mut written,
+                handles.as_mut_ptr().cast(),
+            )
+        };
+        let mut replaced = 0usize;
+        for handle in &handles {
+            if handle.is_null() || mine.contains(handle) {
+                continue;
+            }
+            replaced += 1;
+            // SAFETY: a handle the library wrote into a slot this call handed
+            // it is a descriptor it created and handed over; destroyed once.
+            unsafe { (self.api.backend_destroy_descriptor)(*handle) };
+        }
+        let held = handles.iter().filter(|handle| !handle.is_null()).count();
+        Ok(format!(
+            "status {status}{}, wrote {written}, {held} of {} slots hold a handle, {replaced} of them new",
+            if status == STATUS_SUCCESS {
+                String::new()
+            } else {
+                format!(" ({})", self.api.last_error())
+            },
+            handles.len()
+        ))
+    }
+
     /// The engine heuristic descriptor of `graph` in `mode`, finalized.
     fn heuristic(api: &'static Api, graph: &Descriptor, mode: i32) -> Result<Descriptor> {
         let heuristic = Descriptor::create(api, DESCRIPTOR_ENGINE_HEURISTIC)?;
@@ -1742,29 +1923,6 @@ impl Cudnn {
         )?;
         api.finalize(&heuristic, "cudnnBackendFinalize")?;
         Ok(heuristic)
-    }
-
-    /// The first configuration the heuristic proposed.
-    fn first_config(
-        api: &'static Api,
-        heuristic: &Descriptor,
-        available: usize,
-    ) -> Result<Descriptor> {
-        let config = Descriptor::create(api, DESCRIPTOR_ENGINE_CONFIG)?;
-        let mut handles = [config.raw];
-        let written = api.get(
-            heuristic,
-            ATTR_ENGINEHEUR_RESULTS,
-            TYPE_BACKEND_DESCRIPTOR,
-            &mut handles,
-            "cudnnBackendGetAttribute",
-        )?;
-        if written == 0 || handles[0].is_null() {
-            return Err(Error::invalid(format!(
-                "cuDNN proposed {available} engine configurations and filled none"
-            )));
-        }
-        Ok(config)
     }
 
     /// The engine configurations cuDNN's heuristic proposes for `operation` in
@@ -1788,9 +1946,13 @@ impl Cudnn {
             kept: Vec::new(),
             dropped: Vec::new(),
         };
-        let wanted = returned.min(limit.clamp(1, MAX_ENGINE_CONFIGS));
-        let mut configs = Vec::with_capacity(wanted);
-        for _ in 0..wanted {
+        // One created engine-configuration descriptor per configuration the
+        // heuristic reported: the library fills the descriptors it is handed,
+        // and an array shorter than the list is a request it answers with
+        // nothing (`cudnn_frontend` reads the count first and asks for exactly
+        // that many, never fewer).
+        let mut configs = Vec::with_capacity(returned);
+        for _ in 0..returned {
             configs.push(Descriptor::create(self.api, DESCRIPTOR_ENGINE_CONFIG)?);
         }
         if configs.is_empty() {
@@ -1825,6 +1987,7 @@ impl Cudnn {
             }
             proposal.kept.push(config);
         }
+        proposal.kept.truncate(limit.clamp(1, MAX_ENGINE_CONFIGS));
         Ok(proposal)
     }
 

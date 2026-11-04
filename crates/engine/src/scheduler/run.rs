@@ -232,7 +232,17 @@ impl Scheduler {
             output: output::OutputSender::default(),
             policy: None,
             policy_report: None,
+            expert_load: None,
+            expert_order: None,
+            expert_asked: None,
+            expert_load_new: false,
+            policy_precopy: None,
+            policy_prepared: None,
+            policy_stage: None,
             recorder: mechanism::Recorder::default(),
+            pages: std::collections::BTreeMap::new(),
+            pages_seeded: false,
+            watchdog: mechanism::Watchdog::default(),
             step: 0,
             config,
             fatal: false,
@@ -307,23 +317,12 @@ impl Scheduler {
                 canvas.canvas_length, limits.max_num_batched_tokens
             ));
         }
-        if limits.policy != self.config.policy {
-            let mut waiting = Vec::from(std::mem::take(&mut self.waiting));
-            match limits.policy {
-                SchedulingPolicy::Fcfs => {
-                    waiting.sort_by(|a, b| a.queued_at.total_cmp(&b.queued_at))
-                }
-                SchedulingPolicy::Priority => waiting.sort_by(|a, b| {
-                    a.req
-                        .priority
-                        .cmp(&b.req.priority)
-                        .then(a.queued_at.total_cmp(&b.queued_at))
-                }),
-            }
-            self.waiting = waiting.into();
-        }
+        // The queue keeps no order of its own: the waiting requests are a
+        // membership set, and each step's admission order is its plan's
+        // `admit` list (design §4.4). A new `policy` therefore reorders
+        // nothing — the next plan does.
+        let graph_tiers = std::mem::take(&mut self.config.graph_tiers);
         self.config = SchedulerConfig {
-            policy: limits.policy,
             max_batch: limits.max_batch.max(1),
             max_num_batched_tokens: limits.max_num_batched_tokens.max(1),
             max_running_requests: limits.max_running_requests.max(1),
@@ -333,7 +332,7 @@ impl Scheduler {
             // The draft limit is the world's; the refill policy is a
             // scheduling choice.
             draft_tokens: self.config.draft_tokens,
-            refill: limits.refill,
+            graph_tiers,
         };
         tracing::info!(config = ?self.config, "the scheduler took new limits");
         Ok(())

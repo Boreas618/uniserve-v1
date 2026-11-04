@@ -188,6 +188,57 @@ fn strip_comments(text: &str) -> String {
     out
 }
 
+/// The closing brace of the block whose typedef ends with `, name;` in a list
+/// of names, as `} nvmlProcessInfo_v2_t, nvmlProcessInfo_t;` writes it.
+///
+/// Only a list of bare names counts: the text between the brace and the comma
+/// may hold identifiers, commas and whitespace, nothing else, so a call's
+/// argument list cannot be mistaken for a typedef's.
+fn names_before(text: &str, name: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(found) = text[from..].find(&format!(", {name};")) {
+        let comma = from + found;
+        if let Some(close) = text[..comma].rfind('}') {
+            let between = &text[close + 1..comma];
+            let bare = between.chars().all(|character| {
+                character.is_alphanumeric()
+                    || character == '_'
+                    || character == ','
+                    || character.is_whitespace()
+            });
+            if bare && !between.trim().is_empty() {
+                return Some(close);
+            }
+        }
+        from = comma + 2;
+    }
+    None
+}
+
+/// Whether `header` declares a function called `symbol`.
+///
+/// The name must stand alone — the character before it is not part of a longer
+/// identifier — and be followed by `(`, which every prototype does. A typo or a
+/// wrong version suffix in a name the crate binds fails at load, loudly; this
+/// catches it before a machine has to.
+pub(crate) fn declares(header: &str, symbol: &str) -> Option<bool> {
+    let text = text(header)?;
+    let pattern = format!("{symbol}(");
+    let mut from = 0;
+    while let Some(found) = text[from..].find(&pattern) {
+        let at = from + found;
+        let boundary = text[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|before| !(before.is_alphanumeric() || before == '_'));
+        if boundary {
+            return Some(true);
+        }
+        from = at + symbol.len();
+    }
+    Some(false)
+}
+
 /// Whether `header` could be read at all.
 pub(crate) fn found(header: &str) -> bool {
     text(header).is_some()
@@ -293,12 +344,19 @@ fn block(text: &str, name: &str) -> Option<(Kind, String)> {
     // Name;`, whose tag differs from the name the caller knows.
     let close = match text.find(&format!("}} {name};")) {
         Some(close) => close,
-        None => {
-            // CUDA's headers version their typedefs: the structure closes
-            // with `} CUmemLocation_v1;`, and the name the caller knows is the
-            // alias declared after it.
-            return block(text, alias_target(text, name)?);
-        }
+        None => match names_before(text, name) {
+            // A typedef may close with several names in one list — `}
+            // nvmlProcessInfo_v2_t, nvmlProcessInfo_t;` — and the name the
+            // caller knows need not be the first. The brace before the list
+            // closes the block.
+            Some(close) => close,
+            None => {
+                // CUDA's headers version their typedefs: the structure closes
+                // with `} CUmemLocation_v1;`, and the name the caller knows is
+                // the alias declared after it.
+                return block(text, alias_target(text, name)?);
+            }
+        },
     };
     let open = matching_open_brace(text, close)?;
     // The line the brace stands on says what kind of block it opens.
