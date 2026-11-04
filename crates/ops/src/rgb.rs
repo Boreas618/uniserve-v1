@@ -11,7 +11,10 @@
 //! quantize(scaled) = round_half_to_even(clamp(scaled, 0, 255))        as u8
 //! ```
 //!
-//! **The arithmetic is FP32 throughout**, whatever the input's element type: the reference converts
+//! **The arithmetic is FP32 throughout**, whatever the input's element type — the decoders emit
+//! f16 (the video VAE's raster is `float16`, `uniserve/models/minimax_h3/output.py`'s own state
+//! buffer type), so f16 is the element type this operator is declared for, with bf16 and f32
+//! accepted because the arithmetic is the same either way: the reference converts
 //! its normalized pixels to `float32` before the de-normalization and the clamp (`uniserve/media/
 //! pixels.py`, `quantize_image_hwc`), and the same order matters here — a BF16 multiply then a BF16
 //! add would round twice inside a range of 255 worth of bytes.
@@ -126,7 +129,7 @@ fn strides_of(operator: &'static str, name: &str, view: &TensorView) -> Result<[
 /// One compilation of `rgb_bytes`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Descriptor {
-    /// Element type of the normalized input raster.
+    /// Element type of the normalized input raster: the decoder's own (f16, bf16 or f32).
     pub dtype: DType,
     /// Channels: it must be [`CHANNELS`], the constants' length.
     pub channels: u32,
@@ -184,11 +187,11 @@ impl Op for RgbBytes {
                 ),
             ));
         }
-        if !matches!(descriptor.dtype, DType::F32 | DType::BF16) {
+        if !matches!(descriptor.dtype, DType::F32 | DType::BF16 | DType::F16) {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "expected an f32 or bf16 raster, the descriptor says {}",
+                    "expected an f16, bf16 or f32 raster, the descriptor says {}",
                     descriptor.dtype
                 ),
             ));
