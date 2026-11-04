@@ -749,6 +749,37 @@ fn stage_denoise(args: &Args) -> Result<()> {
     );
     std::fs::write(directory.join("case.json"), case)
         .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
+    // The arrangement, stated beside the case in the object the reference's producer writes too
+    // (`dump_denoiser.py`, `denoiser/layout.json`). The trajectory files hold the latents, whose
+    // shapes do not depend on the packed row count: two sides running different layouts write
+    // files of the same shape and different trajectories, which a comparator can only report as an
+    // arithmetic difference. This statement is what lets it refuse the pair instead
+    // (`compare_trajectory.py`), and the line below prints the same numbers for a reader.
+    let arrangement = format!(
+        "{{\"frames\": {frames}, \"canvas\": [{}, {}], \"text_rows\": {}, \
+         \"condition_rows\": {}, \"video_rows\": {}, \"audio_rows\": {}, \"packed_rows\": {}}}\n",
+        canvas.height,
+        canvas.width,
+        packing.text_rows,
+        packing.condition_rows,
+        packing.video_rows,
+        packing.audio_rows,
+        packing.padded_tokens,
+    );
+    std::fs::write(directory.join("layout.json"), arrangement)
+        .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
+    // The wording is the reference producer's own, so the two logs can be read side by side
+    // (`dump_denoiser.py`, the same line): a reader comparing two arrangements should not have to
+    // allow for two spellings of one statement.
+    println!(
+        "layout  {} packed rows = {} video + {} audio + {} text + {} condition \
+         ({frames} frames, {evaluations} of {num_steps} evaluations)",
+        packing.padded_tokens,
+        packing.video_rows,
+        packing.audio_rows,
+        packing.text_rows,
+        packing.condition_rows,
+    );
     write_h3t(
         &directory.join("text_features.h3t"),
         &[text_rows, hidden],

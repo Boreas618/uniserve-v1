@@ -14,9 +14,14 @@ What it does and does not decide:
   against the reference's own error floor (the video decoder's is 1.007e-3 relative, the
   sampler's is set by the arithmetic - see ``notes/h3/stage3.md``).
 * It refuses a pair it cannot interpret: an index on one side and not the other, a shape or
-  element type that differs, or a trajectory that did not move between two evaluations on
-  either side. A draw is a valid tensor and a plausible one; a trajectory that equals its
-  own draw is not a page.
+  element type that differs, a trajectory that did not move between two evaluations on
+  either side, or two sides whose layout statements disagree. A draw is a valid tensor and a
+  plausible one; a trajectory that equals its own draw is not a page. And the trajectory
+  files hold latents, whose shapes do not depend on the packed row count, so two sides that
+  ran different layouts write files of the same shape - a difference between them would be
+  reported as arithmetic while its cause is the arrangement. Both producers state the layout
+  they ran in ``denoiser/layout.json``, and the table prints the two statements above its
+  rows.
 
 Usage::
 
@@ -52,6 +57,72 @@ from dump_tables import (
 MODALITIES = ("video", "audio")
 
 EVALUATION = re.compile(r"^latents_(?P<modality>[a-z]+)_e(?P<index>\d+)\.h3t$")
+
+# The arrangement both sides must state: the packed rows and the segments they are made of. The
+# trajectory files hold the latents, whose shapes do not depend on the row count, so two sides that
+# ran different layouts write files of the same shape and different trajectories. Without this
+# statement the page reports an arithmetic difference whose cause is an arrangement, which is why a
+# pair that does not state it, or states two different ones, is refused rather than reported.
+LAYOUT_FIELDS = (
+    "frames",
+    "canvas",
+    "text_rows",
+    "condition_rows",
+    "video_rows",
+    "audio_rows",
+    "packed_rows",
+)
+
+
+def layout(directory: pathlib.Path, side: str) -> dict[str, object]:
+    """The layout ``side`` states it ran, refused by name when it states none."""
+    path = directory / "layout.json"
+    if not path.is_file():
+        raise SystemExit(
+            f"the {side} states no layout: {path} is absent, so the pair cannot be shown to have"
+            " run the same packed rows; a tree produced before the producers wrote `layout.json`"
+            " is not comparable with one after them, and one produced at the smallest layout is"
+            " not comparable with one produced at the case's"
+        )
+    try:
+        stated = json.loads(path.read_text())
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"{path} is not JSON: {error}") from error
+    missing = [name for name in LAYOUT_FIELDS if name not in stated]
+    if missing:
+        raise SystemExit(
+            f"{path} omits {', '.join(missing)}; a layout statement carries"
+            f" {', '.join(LAYOUT_FIELDS)}"
+        )
+    return stated
+
+
+def arrangements(ref: pathlib.Path, got: pathlib.Path) -> tuple[dict, dict]:
+    """Both sides' layout statements, refused when they are not the same arrangement."""
+    theirs = layout(ref, "reference")
+    ours = layout(got, "this side")
+    differ = [name for name in LAYOUT_FIELDS if theirs[name] != ours[name]]
+    if differ:
+        raise SystemExit(
+            "the two sides ran different layouts, so a difference between their trajectories"
+            " would measure the arrangement and not the arithmetic: "
+            + "; ".join(
+                f"{name}: this side {ours[name]}, reference {theirs[name]}"
+                for name in differ
+            )
+        )
+    return theirs, ours
+
+
+def layout_line(side: str, stated: dict[str, object]) -> str:
+    """One layout statement as a line a reader compares with the other side's."""
+    height, width = stated["canvas"]
+    return (
+        f"layout  {side:<9} {stated['packed_rows']} packed rows = {stated['video_rows']} video"
+        f" + {stated['audio_rows']} audio + {stated['text_rows']} text"
+        f" + {stated['condition_rows']} condition ({stated['frames']} frames,"
+        f" canvas {height}x{width})"
+    )
 
 
 def evaluations(root: pathlib.Path) -> dict[tuple[str, int], pathlib.Path]:
@@ -151,6 +222,7 @@ def movement(previous: np.ndarray, current: np.ndarray) -> float:
 
 def compare(ref: pathlib.Path, got: pathlib.Path) -> dict[str, object]:
     """Pair two trees and report every evaluation, refusing what it cannot interpret."""
+    their_layout, our_layout = arrangements(ref, got)
     theirs, ours = evaluations(ref), evaluations(got)
     missing_ours = sorted(set(theirs) - set(ours))
     missing_theirs = sorted(set(ours) - set(theirs))
@@ -167,6 +239,7 @@ def compare(ref: pathlib.Path, got: pathlib.Path) -> dict[str, object]:
     report: dict[str, object] = {
         "ref": str(ref),
         "got": str(got),
+        "layout": {"ref": their_layout, "got": our_layout},
         "modalities": {},
     }
     for modality in MODALITIES:
@@ -228,9 +301,16 @@ def compare(ref: pathlib.Path, got: pathlib.Path) -> dict[str, object]:
 
 def table(report: dict[str, object]) -> str:
     """The report as the table a caller reads."""
+    # The arrangement first: a reader who sees two different row counts on the first two lines has
+    # already been told what a difference below them is about.
     lines = [
-        "modality  evaluation  rel_l2       max_abs      cosine   exact  elements"
+        layout_line(name, report["layout"][side])
+        for side, name in (("ref", "reference"), ("got", "this side"))
     ]
+    lines.append("")
+    lines.append(
+        "modality  evaluation  rel_l2       max_abs      cosine   exact  elements"
+    )
     for modality, rows in report["modalities"].items():
         for row in rows:
             lines.append(
@@ -270,6 +350,19 @@ def self_test() -> int:
         ref, got = root / "ref", root / "got"
         ref.mkdir()
         got.mkdir()
+        # Both producers state the layout they ran; the trees here are small, so the numbers are
+        # the shape of the statement and not a request's.
+        stated = {
+            "frames": 22,
+            "canvas": [256, 256],
+            "text_rows": 4,
+            "condition_rows": 0,
+            "video_rows": 4,
+            "audio_rows": 0,
+            "packed_rows": 8,
+        }
+        for side in (ref, got):
+            (side / "layout.json").write_text(json.dumps(stated) + "\n")
         rng = np.random.default_rng(0)
         sample = rng.standard_normal((4, 8)).astype(np.float32)
         for index in range(3):
@@ -302,6 +395,17 @@ def self_test() -> int:
             ),
             ("three evaluations paired", len(rows) == 3),
             ("movement is reported, not zero", rows[1]["ref_moved"] > 0.0),
+            (
+                "the layout both sides ran is in the report",
+                report["layout"]["got"]["packed_rows"] == stated["packed_rows"]
+                and report["layout"]["ref"]["text_rows"] == stated["text_rows"],
+            ),
+            (
+                "and its line names the segments",
+                layout_line("this side", stated)
+                == "layout  this side 8 packed rows = 4 video + 0 audio + 4 text + 0 condition"
+                " (22 frames, canvas 256x256)",
+            ),
         ]
         # A non-finite element is refused by name rather than reported as a number.
         broken = sample.copy()
@@ -365,6 +469,42 @@ def self_test() -> int:
                 (
                     "a trajectory that did not move is refused",
                     "neither side moved" in str(error),
+                )
+            )
+
+        # Two sides that ran different layouts are refused by the field that differs, because the
+        # files they wrote have the same shape and a difference between them would read as
+        # arithmetic.
+        (got / "layout.json").write_text(
+            json.dumps(
+                dict(stated, condition_rows=192, packed_rows=200),
+            )
+            + "\n"
+        )
+        try:
+            compare(ref, got)
+            checks.append(("a differing layout is refused", False))
+        except SystemExit as error:
+            checks.append(
+                (
+                    "a differing layout is refused",
+                    "different layouts" in str(error)
+                    and "condition_rows: this side 192, reference 0"
+                    in str(error)
+                    and "packed_rows: this side 200, reference 8" in str(error),
+                )
+            )
+        # A side that states no layout is refused by name: an unstated arrangement is the case the
+        # whole check exists for, and assuming it equal is what produced a wrong page.
+        (got / "layout.json").unlink()
+        try:
+            compare(ref, got)
+            checks.append(("an unstated layout is refused", False))
+        except SystemExit as error:
+            checks.append(
+                (
+                    "an unstated layout is refused",
+                    "states no layout" in str(error),
                 )
             )
     for name, passed in checks:
