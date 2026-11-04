@@ -1248,13 +1248,10 @@ impl SchedulerHandle {
         self.commands.discard_policy();
     }
 
-    /// §12's cost counters for this scheduler's policy: the calls it has made
-    /// and the fuel they consumed, or a timeout when the scheduler does not
-    /// answer.
-    pub fn policy_usage(
-        &self,
-    ) -> crossbeam_channel::Receiver<Option<crate::scheduler::PolicyUsage>> {
-        self.commands.policy_usage()
+    /// The step this scheduler reached and §12's cost counters for its policy,
+    /// or a timeout when the scheduler does not answer.
+    pub fn progress(&self) -> crossbeam_channel::Receiver<crate::scheduler::Progress> {
+        self.commands.progress()
     }
 
     /// Asks this scheduler for the policy failure it recorded since the last

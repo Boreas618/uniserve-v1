@@ -357,57 +357,53 @@ impl Routing {
     /// The epoch's counters for the daemons' `/metrics` (`wire::Metrics`),
     /// additive per epoch as the message promises (§2.3).
     ///
-    /// `steps` is the epoch's steps — the ranks step together, so it is the
-    /// largest count any rank reached — and `batches` counts every batch every
-    /// rank finalized, which is larger because a step submits a batch per
-    /// (phase, component). `tokens` sums the tokens the workers' forwards
-    /// carried, `queue` is each rank's waiting depth, and `policy_fuel` and
-    /// `policy_calls` come from the policy instances (§12). The device's
-    /// counters and the allocators' figures are not this thread's: they come
-    /// with the executor's `counters()` and the allocators' reports.
+    /// `steps` is the epoch's steps — a scheduler takes one per policy step, and
+    /// the ranks step together, so it is the largest count any rank reached —
+    /// while `batches` counts every batch every rank finalized, which is larger
+    /// because a step submits one batch per (phase, component). `tokens` sums
+    /// the tokens the workers' forwards carried, `queue` is each rank's waiting
+    /// depth, and `policy_fuel` and `policy_calls` come from the policy
+    /// instances (§12). The device's counters and the allocators' figures are
+    /// not this thread's: they come with the executor's `counters()` and the
+    /// allocators' reports.
     fn metrics(&self) -> wire::Metrics {
         let mut metrics = wire::Metrics::default();
+        let mut usage = self.route_usage();
         for (index, slot) in self.slots.iter().enumerate() {
+            if let Ok(progress) = slot
+                .handle
+                .progress()
+                .recv_timeout(std::time::Duration::from_millis(200))
+            {
+                metrics.steps = metrics.steps.max(progress.step);
+                if let Some(cost) = progress.usage {
+                    usage.calls += cost.calls;
+                    usage.fuel += cost.fuel;
+                }
+            }
             let stats = slot.handle.stats();
-            let finalized = stats.general.steps.load(Ordering::Relaxed);
-            metrics.steps = metrics.steps.max(finalized);
-            metrics.batches += finalized;
-            let tokens: u64 = crate::lock(&stats.worker.forward_mode_tokens)
+            metrics.batches += stats.general.steps.load(Ordering::Relaxed);
+            metrics.tokens += crate::lock(&stats.worker.forward_mode_tokens)
                 .values()
-                .sum();
-            metrics.tokens += tokens;
+                .sum::<u64>();
             metrics.queue.push(wire::QueueDepth {
                 rank: index as u32,
                 depth: u32::try_from(stats.general.pending.load(Ordering::Relaxed))
                     .unwrap_or(u32::MAX),
             });
         }
-        let usage = self.policy_usage();
         metrics.policy_fuel = usage.fuel;
         metrics.policy_calls = usage.calls;
         metrics
     }
 
-    /// §12's cost counters for the epoch's policy: every scheduler's, and the
-    /// control thread's own route instance.
-    fn policy_usage(&self) -> PolicyUsage {
-        let mut usage = PolicyUsage::default();
-        for slot in &self.slots {
-            if let Ok(Some(scheduler)) = slot
-                .handle
-                .policy_usage()
-                .recv_timeout(std::time::Duration::from_millis(200))
-            {
-                usage.calls += scheduler.calls;
-                usage.fuel += scheduler.fuel;
-            }
+    /// §12's cost counters for the control thread's own route instance, which
+    /// serves under the same epoch policy as the schedulers'.
+    fn route_usage(&self) -> PolicyUsage {
+        match crate::lock(&self.route).instance.as_ref() {
+            Some(route) => route.usage(),
+            None => PolicyUsage::default(),
         }
-        if let Some(route) = crate::lock(&self.route).instance.as_ref() {
-            let route = route.usage();
-            usage.calls += route.calls;
-            usage.fuel += route.fuel;
-        }
-        usage
     }
 
     /// The policy failures the daemons must be told of (§7.3), in the order
