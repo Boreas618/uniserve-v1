@@ -185,5 +185,4 @@ mod tests {
         assert_eq!(observer.numerical_faults(2, since), 2);
         assert!(observer.rates(3, since, Duration::from_secs(60)).is_none());
     }
-
 }
