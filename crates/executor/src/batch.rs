@@ -704,11 +704,6 @@ impl Submission {
         (Arc::clone(&self.state), self.id)
     }
 
-    /// Completes this submission with `outcome`, if something else did not already.
-    pub(crate) fn complete(&self, outcome: Outcome<BatchOutput>) {
-        Arc::clone(&self.state).finish(outcome);
-    }
-
     /// Waits until the submission completed and answers its outcome.
     pub fn wait(&self) -> Outcome<BatchOutput> {
         let mut outcome = lock(&self.state.outcome);

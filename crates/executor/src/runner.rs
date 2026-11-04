@@ -78,7 +78,13 @@ pub trait Runner: Send {
 
     /// Switches to `generation` at a batch boundary: from the next batch on, `submit` serves with
     /// its kernels and graphs. The runner keeps the previous generation for a revert (7.3).
-    fn switchover(&mut self, generation: u64);
+    ///
+    /// A generation this runner did not prepare is refused by name: the daemon asks for the
+    /// cut-over only after `precopy` built the generation, so a switchover that finds nothing to
+    /// switch to is the two disagreeing about what was prepared - and the alternative, taking the
+    /// generation's number with no kernels and no graphs behind it, would serve an empty
+    /// generation that answers every later batch with "no graph for this bucket".
+    fn switchover(&mut self, generation: u64) -> Result<()>;
 
     /// Reverts a generation (7.3 step 4).
     ///
