@@ -96,14 +96,13 @@ pub(crate) struct Adopted {
     /// The request's identity, as the deployment named it.
     pub(crate) request_id: String,
     /// When the successor took the response's engine stream over, as
-    /// `CLOCK_MONOTONIC` nanoseconds: the predecessor's pause ends here.
+    /// `CLOCK_MONOTONIC` nanoseconds.
     ///
-    /// This is the moment the engine serves the request to the successor, not
-    /// the moment the successor writes the response's next event. §7.5.1
-    /// measures a response's pause as the time between those two, and this
-    /// record stops at the first of them (§12 leaves the pause unmeasured);
-    /// the successor's serving path would have to record the second, which it
-    /// cannot do before it has written the first body frame.
+    /// This is the moment the engine serves the request to the successor, which
+    /// is what the predecessor's `pause_ms` in `Paused::decide` runs to. It is
+    /// not §7.5.1's pause, which ends when the successor writes the response's
+    /// next event: the successor's own `handoff adopted` record carries that,
+    /// and [`adopted`] writes it from the serving path.
     pub(crate) at_ns: u64,
     /// When the predecessor stopped the socket, as `CLOCK_MONOTONIC`
     /// nanoseconds.
@@ -142,12 +141,13 @@ impl Paused {
     /// it, and the rest resume here.
     ///
     /// Also writes the predecessor's handoff records — one `handoff stream`
-    /// line per response it froze, with the successor's process id and the
-    /// time to the successor's takeover of the response's engine stream, and
-    /// one `handoff streams adopted` line after the last of them — which the
-    /// deployment's restart test parses. That time is a lower bound of the
-    /// pause §7.5.1 defines: the successor has not written anything yet when
-    /// it reports ([`Adopted::at_ns`]).
+    /// line per response it froze, with the successor's process id and this
+    /// process's own view of the pause, which runs to the successor's takeover
+    /// of the response's engine stream ([`Adopted::at_ns`]), and one
+    /// `handoff streams adopted` line after the last of them — which the
+    /// deployment's restart test parses. This is the shorter of the two views:
+    /// §7.5.1's pause, which ends when the successor writes the response's next
+    /// event, is the successor's [`adopted`] record.
     pub(crate) fn decide(self, adopted: &[Taken], successor_pid: u32) {
         let decided_at = crate::http::handoff::now_ns();
         for frozen in self.frozen {
@@ -305,7 +305,6 @@ pub(crate) fn adopt(
             }
         }
     }
-    adopted(&taken);
     queue(taken);
     Adoption { streams }
 }
@@ -409,32 +408,32 @@ fn take_over(
     })
 }
 
-/// Records that a successor took each adopted response's engine stream over.
+/// Records that this process is serving one handed-over response, at the moment
+/// it has written the predecessor's bytes and is about to write the response's
+/// first event of its own.
 ///
 /// The record is one log line whose message is `handoff adopted ` and one JSON
-/// object, which the deployment's restart test parses. Its `pause_ms` runs from
-/// the predecessor's freeze to that takeover, so it understates the pause
-/// §7.5.1 defines by the time the successor needs to write the response's next
-/// event — see [`Adopted::at_ns`].
-pub(crate) fn adopted(adopted: &[Adopted]) {
-    for response in adopted {
-        info!(
-            request_id = %response.request_id,
-            frozen_at_ns = response.frozen_at_ns,
-            at_ns = response.at_ns,
-            "handed-over response adopted"
-        );
-        info!(
-            "handoff adopted {}",
-            serde_json::json!({
-                "request_id": response.request_id,
-                "pid": std::process::id(),
-                "at_ns": response.at_ns,
-                "frozen_at_ns": response.frozen_at_ns,
-                "pause_ms": response.at_ns.saturating_sub(response.frozen_at_ns) / 1_000_000,
-            })
-        );
-    }
+/// object, which the deployment's restart test parses. Exactly one is written
+/// per handed-over response, by the process that serves it, so `at_ns` is
+/// §7.5.1 step 4's moment and `pause_ms` is the response's pause as §7.5.1
+/// defines it. The predecessor's `pause_ms` is its own, shorter view
+/// ([`Adopted::at_ns`]) and the artifact does not read it.
+pub(crate) fn adopted(request_id: &str, frozen_at_ns: u64) {
+    let at_ns = crate::http::handoff::now_ns();
+    info!(
+        request_id,
+        frozen_at_ns, at_ns, "a handed-over response is served here"
+    );
+    info!(
+        "handoff adopted {}",
+        serde_json::json!({
+            "request_id": request_id,
+            "pid": std::process::id(),
+            "at_ns": at_ns,
+            "frozen_at_ns": frozen_at_ns,
+            "pause_ms": at_ns.saturating_sub(frozen_at_ns) / 1_000_000,
+        })
+    );
 }
 
 /// Records that a successor finished writing one adopted response.

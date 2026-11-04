@@ -347,17 +347,23 @@ async fn serve_on(
     for stream in crate::restart::streams::take_adopted() {
         let app = app.clone();
         tokio::spawn(async move {
-            crate::restart::streams::adopted(std::slice::from_ref(&stream));
             let request_id = stream.request_id.clone();
+            let frozen_at_ns = stream.frozen_at_ns;
+            let adopted = request_id.clone();
             let ended = request_id.clone();
-            // The record names the response, which ends with its last frame
-            // and not with the connection the successor keeps serving
-            // (design §7.5.1).
+            // The adoption is recorded here and nowhere else: this process
+            // serves the response, and the moment §7.5.1 step 4 names is the
+            // one before its first frame of its own. The record of the
+            // response's end names the response, not the connection this
+            // process may go on serving.
             let error = conn::adopt(
                 stream.descriptor,
                 stream.http,
                 stream.body,
                 app,
+                move || {
+                    crate::restart::streams::adopted(&adopted, frozen_at_ns);
+                },
                 move || {
                     crate::restart::streams::finished(&ended);
                 },

@@ -105,6 +105,10 @@ pub(crate) async fn serve(
 
 /// Continues one response in flight on a socket the predecessor handed over.
 ///
+/// `started` is called once, before the response's first frame of this
+/// process's own — after the predecessor's bytes are out — and `finished` once,
+/// after the last frame and the body's terminator.
+///
 /// The predecessor wrote the response head and ended its ownership at a frame
 /// boundary, so this process writes the body bytes it produced and the socket
 /// did not take (`http.unwritten`, framed as the predecessor frames them: they
@@ -118,6 +122,7 @@ pub(crate) async fn adopt(
     http: proto::handoff::Http,
     mut body: crate::http::stream::ResponseStream,
     app: Router,
+    started: impl FnOnce(),
     finished: impl FnOnce(),
 ) -> anyhow::Result<()> {
     let io = socket_of(descriptor).context("taking over a handed connection")?;
@@ -127,8 +132,18 @@ pub(crate) async fn adopt(
     connection.written = http.written;
     connection.frames = http.frames;
     connection.write(&http.unwritten, None).await?;
+    // The predecessor's bytes are out and the next frame is this process's own:
+    // §7.5.1's pause ends here. A body with nothing left is at its end, so it
+    // reports the same moment before the terminator rather than not at all.
+    let mut started = Some(started);
     while let Some(frame) = body.next_frame().await {
+        if let Some(started) = started.take() {
+            started();
+        }
         connection.write_frame(&frame, http.chunked, None).await?;
+    }
+    if let Some(started) = started.take() {
+        started();
     }
     if http.chunked {
         connection.write(b"0\r\n\r\n", None).await?;
@@ -1797,9 +1812,20 @@ mod tests {
         };
         let ended = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = std::sync::Arc::clone(&ended);
-        let adopted = tokio::spawn(adopt(descriptor, http, body, app(), move || {
-            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }));
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recorded = std::sync::Arc::clone(&started);
+        let adopted = tokio::spawn(adopt(
+            descriptor,
+            http,
+            body,
+            app(),
+            move || {
+                recorded.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+            move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        ));
 
         let response = client.read_response().await;
         assert_eq!(response.status, 200);
@@ -1807,6 +1833,11 @@ mod tests {
         // The client sends nothing: these bytes came from the predecessor.
         let ahead = client.read_response().await;
         assert_eq!(ahead.body, "hello");
+        assert_eq!(
+            started.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a response with no frame left is still recorded as adopted, once"
+        );
         assert_eq!(
             ended.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -1858,7 +1889,22 @@ mod tests {
             chunked: true,
             content_length: None,
         };
-        let adopted = tokio::spawn(adopt(descriptor, http, body, app(), || {}));
+        let recorded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let going_on = std::sync::Arc::clone(&recorded);
+        let ended = std::sync::Arc::clone(&recorded);
+        let adopted = tokio::spawn(adopt(
+            descriptor,
+            http,
+            body,
+            app(),
+            move || going_on.store(true, std::sync::atomic::Ordering::SeqCst),
+            move || {
+                assert!(
+                    ended.load(std::sync::atomic::Ordering::SeqCst),
+                    "a response is recorded as adopted before it is recorded as ended"
+                );
+            },
+        ));
 
         let response = client.read_response().await;
         assert_eq!(response.body, "data: a\n\n");
@@ -2000,7 +2046,7 @@ mod tests {
             chunked: true,
             content_length: None,
         };
-        let adopted = tokio::spawn(adopt(descriptor, http, body, app(), || {}));
+        let adopted = tokio::spawn(adopt(descriptor, http, body, app(), || {}, || {}));
         frames.send(Bytes::from_static(b"data: c\n\n")).unwrap();
         drop(frames);
 
