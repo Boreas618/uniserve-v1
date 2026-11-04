@@ -28,6 +28,7 @@
 //!   daemon.
 
 pub mod engine;
+pub mod epoch;
 pub mod experts;
 pub mod http;
 pub mod input;
