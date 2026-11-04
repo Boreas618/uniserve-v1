@@ -204,12 +204,22 @@ struct HostWeights {
     published: Vec<Published>,
     bytes: u64,
     by_dtype: BTreeMap<String, (usize, u64)>,
+    /// The bytes of the weights this store actually keeps, capped: the binding pass validates every
+    /// parameter and reads none of them back, and the model is tens of gigabytes, so keeping them all
+    /// would need the host's memory to load the checkpoint — which is the device's job, not a
+    /// validation pass's.
+    kept: u64,
 }
 
-/// One published weight: its key as the loader saw it, and the bytes it keeps alive.
+/// The bytes this store keeps, which is all a binding pass needs: the loader checks a weight against
+/// the model's request before publishing it, and nothing reads the published copy without a device.
+const HOST_KEEP_BYTES: u64 = 256 << 20;
+
+/// One published weight: its key as the loader saw it, and the bytes when they were kept.
 struct Published {
     key: String,
-    _bytes: Vec<u8>,
+    bytes: u64,
+    _kept: Option<Vec<u8>>,
 }
 
 impl RetainedWeights for HostWeights {
@@ -236,26 +246,32 @@ impl RetainedWeights for HostWeights {
                 bytes.len()
             )));
         }
-        let mut kept = bytes.to_vec();
-        kept.truncate(usize::try_from(expected).unwrap_or(bytes.len()));
         let entry = self.by_dtype.entry(dtype.to_string()).or_insert((0, 0));
         entry.0 += 1;
         entry.1 += expected;
         self.bytes += expected;
-        let address = DevicePtr::new(kept.as_ptr() as u64);
+        // The view is built before the bytes are dropped or kept, so the loader's own fit check
+        // (`Backing::view`) runs either way.
+        Backing::new(DevicePtr::new(bytes.as_ptr() as u64), expected).view(dtype, shape)?;
+        let kept = if self.kept.saturating_add(expected) <= HOST_KEEP_BYTES {
+            self.kept += expected;
+            let mut copy = bytes.to_vec();
+            copy.truncate(usize::try_from(expected).unwrap_or(bytes.len()));
+            Some(copy)
+        } else {
+            None
+        };
+        // A store that kept nothing still has to answer an address: the binding pass never launches,
+        // so the region is never read, and its size is the weight's own.
+        let address = kept
+            .as_ref()
+            .map_or(bytes.as_ptr() as u64, |copy| copy.as_ptr() as u64);
         self.published.push(Published {
             key: key.to_string(),
-            _bytes: kept,
+            bytes: expected,
+            _kept: kept,
         });
-        Backing::new(address, expected)
-            .view(dtype, shape)
-            .map(|_| ())?;
-        let last = self
-            .published
-            .last()
-            .map(|published| published._bytes.as_ptr() as u64)
-            .unwrap_or(0);
-        Ok(Backing::new(DevicePtr::new(last), expected))
+        Ok(Backing::new(DevicePtr::new(address), expected))
     }
 }
 
@@ -295,8 +311,12 @@ fn stage_weights(args: &Args) -> Result<()> {
         store.bytes
     );
     if let Some(first) = store.published.first() {
-        println!("  first key: {}", first.key);
+        println!("  first key: {} ({} bytes)", first.key, first.bytes);
     }
+    println!(
+        "  kept {} bytes of them: the pass validates, it does not read back",
+        store.kept
+    );
     for (dtype, (count, bytes)) in &store.by_dtype {
         println!("  {dtype}: {count} weights, {bytes} bytes");
     }
@@ -683,10 +703,35 @@ fn required(stage: Stage, operator: &str) -> bool {
     match stage {
         Stage::Weights => false,
         Stage::Embedding => operator == "embedding",
-        // A block launches everything the model's layer calls, so every fixture key is required.
-        Stage::Block | Stage::Decode => true,
+        // The model's own operators: the fixture also keys the executor's path and the sampling
+        // chain, neither of which this stage calls -- and requiring them would report a missing
+        // sampler program as a missing kernel for the decoder.
+        Stage::Block | Stage::Decode => MODEL_OPERATORS.contains(&operator),
     }
 }
+
+/// The operators `Qwen3Moe`'s own forward launches, in the order a layer composes them.
+///
+/// The fixture's remaining keys belong to the executor (the cache, the slot commit, the gathers) and
+/// to the sampling chain, which this harness computes on the host from the logits row.
+const MODEL_OPERATORS: &[&str] = &[
+    "embedding",
+    "gemm",
+    "rms_norm",
+    "add_rms_norm",
+    "rotary_factors",
+    "qk_norm_rope",
+    "kv_write",
+    "paged_attention",
+    "topk_softmax",
+    "expert_gather",
+    "moe_sort",
+    "gather_gemm",
+    "route_gemm",
+    "moe_unpermute",
+    "logits_gather",
+    "vocab_unpad",
+];
 
 /// Load every kernel the fixture names from `root`, failing with the complete list of what is
 /// missing rather than at the first launch.
