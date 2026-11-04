@@ -230,6 +230,25 @@ impl CacheDescription {
 }
 
 impl CachePlan {
+    /// Bytes one unit's state snapshot occupies: its checkpoint blocks plus the index vector
+    /// the copies select them by (design 4.5).
+    ///
+    /// A snapshot is Scratch, reserved once at pool construction and never allocated during a
+    /// step, so the figure is stated where the pools are planned: it is what the scratch pool has
+    /// to hold beside the shadow region. Zero for a model that keeps no state per unit, which is
+    /// what makes a deployment without one pay nothing.
+    pub fn state_snapshot_bytes(&self) -> u64 {
+        let rows: u32 = self
+            .checkpoints
+            .iter()
+            .map(|checkpoint| checkpoint.planes)
+            .sum();
+        if rows == 0 || !self.groups.iter().any(|group| group.state) {
+            return 0;
+        }
+        u64::from(rows) * self.plane_bytes + u64::from(rows) * 8
+    }
+
     /// Plan the unit pool a model describes.
     ///
     /// # Errors
