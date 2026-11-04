@@ -1520,10 +1520,6 @@ impl Cudnn {
             "operation graph: ops, finalize",
             Operation::graph(self.api, &forward, None)
         );
-        stage!(
-            "operation graph with the deprecated handle attribute, finalize",
-            Operation::graph(self.api, &forward, Some(&self.handle)).map(|_| ())
-        );
 
         let heuristic = stage!(
             "engine heuristic: mode A, operation graph, finalize",
@@ -1557,7 +1553,23 @@ impl Cudnn {
             format!("execution plan: {workspace_bytes} bytes of workspace"),
             None,
         ));
-        let _ = stage!(
+        // The two deprecated handle attributes are asked last, and their
+        // refusal is recorded without ending the walk: a library that answers
+        // `CUDNN_STATUS_DEPRECATED` for them is telling us the same thing as
+        // one that accepts them.
+        macro_rules! alternative {
+            ($name:expr, $call:expr) => {
+                match $call {
+                    Ok(_) => steps.push((String::from($name), None)),
+                    Err(error) => steps.push((String::from($name), Some(error.to_string()))),
+                }
+            };
+        }
+        alternative!(
+            "operation graph with the deprecated handle attribute, finalize",
+            Operation::graph(self.api, &forward, Some(&self.handle))
+        );
+        alternative!(
             "execution plan with the deprecated handle attribute, finalize",
             self.execution_plan(&config, Some(&self.handle))
         );
