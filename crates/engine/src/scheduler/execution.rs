@@ -523,6 +523,13 @@ impl Scheduler {
             return None;
         };
         self.step += 1;
+        // The pages that appeared and went since the previous step, then
+        // everything else that changed, in the order it happened, closed before
+        // this step's dispatch. The room, the live state, and the plan's checks
+        // are all read after it: a page announced now is a page this step's
+        // plan may name, so the validators must already see it.
+        self.pump_page_changes();
+        self.recorder.close();
         let room = self.room();
         let live = self.live();
         // A resident request that has not advanced within the policy's timeout
@@ -531,11 +538,6 @@ impl Scheduler {
         if let Some(request) = self.watchdog.starved(&live, now, policy.limits().timeout) {
             return self.policy_failed(policy, PolicyError::Starved { request });
         }
-        // The pages that appeared and went, then everything else that changed
-        // since the previous step, in the order it happened, closed before this
-        // step's dispatch.
-        self.pump_page_changes();
-        self.recorder.close();
         let events = self.recorder.take();
         if let Err(error) = policy.observe(&events) {
             return self.policy_failed(policy, error);
