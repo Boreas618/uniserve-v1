@@ -1,0 +1,34 @@
+# The rescale_fp8_blocks operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the
+# compile driver the Program Server runs for one descriptor and target).
+#
+# One program walks one FP8 KV block: decode each E4M3 code under the block's
+# old scale through the logical cache dtype, re-encode against the grown scale
+# and clamp to the E4M3 finite range. Scales are the caller's to commit.
+
+op = "rescale_fp8_blocks"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/rescale_fp8_blocks.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+# `dtype_bf16_width_32768`.
+[kernel.descriptors]
+dimensions = { dtype = ["bf16", "fp16", "fp32"], width = ["8192", "16384", "32768", "65536"] }

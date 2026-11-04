@@ -62,8 +62,8 @@ pub(crate) struct WorkerBackend {
     /// How the last such join ended, until the service takes it.
     joined: Option<std::result::Result<(bool, bool), WorkerError>>,
     /// The control thread's counts of driver calls that waited for the
-    /// device when the last batch result left ([`cuda::cupti::blocking::Calls`]).
-    control_calls: cuda::cupti::blocking::Calls,
+    /// device when the last batch result left ([`platform::cupti::blocking::Calls`]).
+    control_calls: platform::cupti::blocking::Calls,
 }
 
 /// What serves a rank's components and the storage it owns: the rank's storage
@@ -141,7 +141,7 @@ impl WorkerBackend {
             lifecycle_jobs: HashSet::new(),
             joining: None,
             joined: None,
-            control_calls: cuda::cupti::blocking::Calls::default(),
+            control_calls: platform::cupti::blocking::Calls::default(),
         })
     }
 
@@ -351,7 +351,7 @@ impl WorkerBackend {
     pub(crate) fn transfer_stream(
         &self,
         device: crate::ffi::MemoryKind,
-    ) -> Result<Option<cuda::Stream>> {
+    ) -> Result<Option<platform::Stream>> {
         if !matches!(device, crate::ffi::MemoryKind::Cuda(_)) {
             return Ok(None);
         }
@@ -392,7 +392,7 @@ impl WorkerBackend {
         &mut self,
         start: proto::profile::SessionStart,
         rank: u32,
-        device: Option<cuda::DeviceId>,
+        device: Option<platform::DeviceId>,
     ) -> Result<serde_json::Value> {
         if let Some(session) = &self.session {
             return Err(Error::Invalid(format!(

@@ -9,7 +9,7 @@
 //! ([`GraphPool`]), of its own, so that no graph's activations share its blocks
 //! and its addresses stay fixed while graphs address it.
 
-use cuda::DeviceId;
+use platform::DeviceId;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 

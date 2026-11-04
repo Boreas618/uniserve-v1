@@ -10,7 +10,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use cuda::Stream;
+use platform::Stream;
 use ipc::CallId;
 use ipc::{BufferId, RequestKey, Wake};
 

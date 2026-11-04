@@ -888,15 +888,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cuda"
-version = "2.0.0"
-dependencies = [
- "libc",
- "libloading",
- "thiserror",
-]
-
-[[package]]
 name = "daachorse"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -913,7 +904,6 @@ dependencies = [
  "bytes",
  "clap",
  "criterion",
- "cuda",
  "engine",
  "expect-test",
  "fastokens",
@@ -931,6 +921,7 @@ dependencies = [
  "minijinja",
  "minijinja-contrib",
  "models",
+ "platform",
  "prometheus-client",
  "prost",
  "proto",
@@ -2544,8 +2535,8 @@ dependencies = [
 name = "nixl"
 version = "2.0.0"
 dependencies = [
- "cuda",
  "libloading",
+ "platform",
  "thiserror",
 ]
 
@@ -2808,6 +2799,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
+name = "platform"
+version = "2.0.0"
+dependencies = [
+ "libc",
+ "libloading",
+ "thiserror",
+]
+
+[[package]]
 name = "plotters"
 version = "0.3.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2971,6 +2971,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "program-server"
+version = "2.0.0"
+dependencies = [
+ "clap",
+ "libc",
+ "prost",
+ "prost-build",
+ "protox",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "toml",
+ "tracing",
 ]
 
 [[package]]
@@ -3944,10 +3962,10 @@ version = "2.0.0"
 dependencies = [
  "anyhow",
  "clap",
- "cuda",
  "libc",
  "mooncake_store",
  "nixl",
+ "platform",
  "rustix",
  "serde",
  "serde_json",
@@ -5567,13 +5585,13 @@ dependencies = [
  "base64 0.22.1",
  "bytemuck",
  "crossbeam-channel",
- "cuda",
  "indexmap 2.14.0",
  "ipc",
  "libc",
  "libloading",
  "models",
  "nvtx",
+ "platform",
  "png",
  "proto",
  "pyo3-ffi",

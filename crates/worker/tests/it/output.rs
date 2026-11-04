@@ -21,7 +21,7 @@ fn buffer(words: &[i64]) -> Result<OutputBuffer> {
 
 /// Seal a host buffer, on no stream.
 fn seal(buffer: &mut OutputBuffer) -> Result<()> {
-    buffer.seal::<&cuda::Stream>(&[], &EventPool::default())?;
+    buffer.seal::<&platform::Stream>(&[], &EventPool::default())?;
     Ok(())
 }
 

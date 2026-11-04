@@ -7,7 +7,7 @@
 
 use std::ops::Range;
 
-use cuda::{CopyBatch, DeviceId, PitchedBatch, SourceOrder, Stream, StridedCopy, memcpy_async};
+use platform::{CopyBatch, DeviceId, PitchedBatch, SourceOrder, Stream, StridedCopy, memcpy_async};
 
 use crate::ffi::{DType, MemoryKind};
 use crate::storage::allocation::StorageView;
@@ -383,7 +383,7 @@ mod tests {
     #[test]
     #[ignore = "requires a CUDA device"]
     fn a_page_across_the_columns_of_planes_given_back_in_part_copies() -> Result<()> {
-        use cuda::{HandleType, PinnedBuffer, memset_d8};
+        use platform::{HandleType, PinnedBuffer, memset_d8};
 
         let device = DeviceId(0);
         let stream = Stream::new(device)?;
