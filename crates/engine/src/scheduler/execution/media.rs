@@ -588,7 +588,12 @@ impl Scheduler {
     /// every other placed call holds its component exclusively. Media
     /// reading, encoding and muxing calls also place tasks on host task
     /// pools.
-    pub(in crate::scheduler) fn media_demand(&self, request: RequestKey, media_call: MediaCall, units: u32) -> Demand {
+    pub(in crate::scheduler) fn media_demand(
+        &self,
+        request: RequestKey,
+        media_call: MediaCall,
+        units: u32,
+    ) -> Demand {
         let component = self.media_component(media_call);
         let placed_component = component.as_ref().and_then(|component| {
             self.placement
@@ -751,7 +756,11 @@ impl Scheduler {
     /// that choice: a request already placed on the component is checked only
     /// against its owning worker's queue, and one resident on a candidate
     /// worker for another component only against that worker's queue.
-    pub(in crate::scheduler) fn call_has_queue_capacity(&self, request: RequestKey, media_call: MediaCall) -> bool {
+    pub(in crate::scheduler) fn call_has_queue_capacity(
+        &self,
+        request: RequestKey,
+        media_call: MediaCall,
+    ) -> bool {
         self.info
             .media_components
             .get(&media_call)
@@ -775,7 +784,11 @@ impl Scheduler {
     /// decode round always claims the whole capacity. The capacity counts as
     /// one when the component is not measured in media units or the request
     /// is not yet placed on it.
-    pub(in crate::scheduler) fn call_units(&self, state: &MediaFlowState, media_call: MediaCall) -> u32 {
+    pub(in crate::scheduler) fn call_units(
+        &self,
+        state: &MediaFlowState,
+        media_call: MediaCall,
+    ) -> u32 {
         let width = || {
             self.media_component(media_call)
                 .as_deref()
