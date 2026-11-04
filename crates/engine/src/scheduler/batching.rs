@@ -303,13 +303,28 @@ impl Scheduler {
                 break;
             }
             let refill = views::phase_kind(phase) == Some(PhaseKind::Refill);
-            if !self.can_schedule_next(id) {
+            // A media request lives in the media flow's own state, which the
+            // token rule cannot read: `can_schedule_next` finds no token state
+            // for it and would refuse every media call of the epoch.
+            let ready = if self.running_media.contains_key(&id) {
+                self.media_can_schedule_next(id)
+            } else {
+                self.can_schedule_next(id)
+            };
+            if !ready {
                 continue;
             }
+            // A media request's terminal intent lives in its own state; a
+            // request in neither map is one this pass must not serve.
             let cancelled = self
                 .running
                 .get(&id)
                 .map(|state| state.terminal_intent.is_terminal())
+                .or_else(|| {
+                    self.running_media
+                        .get(&id)
+                        .map(|state| state.terminal_intent.is_terminal())
+                })
                 .unwrap_or(true);
             if cancelled {
                 continue;
