@@ -144,7 +144,16 @@ def test_the_profile_states_each_cell_without_precision_flags() -> None:
     for name, cell in _CELLS.items():
         point = raw["benchmarks"][name]
         assert point["server"] in raw["servers"]
+        # The point requests the name its server serves.
+        command = raw["servers"][point["server"]]["command"]
+        served = command[command.index("--served-model-name") + 1]
+        assert served == point["model"], name
         assert point["video"]["task"] == cell.task
+        # W1 targets 16:9; W3 and W4 resolve their canvas from the condition
+        # media they are sent.
+        assert point["video"]["aspect_ratio"] == (
+            "16:9" if cell.task == "t2va" else "auto"
+        )
         assert point["video"]["media_dir"] == (
             f"artifacts/minimax_h3/check/{cell.directory}"
         )
