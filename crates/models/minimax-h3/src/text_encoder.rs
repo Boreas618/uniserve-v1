@@ -1873,12 +1873,16 @@ mod tests {
             merge,
         )
         .expect("positions");
-        // The first run's patches sit on coordinates `(0, i, j)` around origin 0, and the first
-        // run leaves the origin three merged rows further (max(4, 6) / 2); the timestamp token
-        // then takes the origin, and the second run starts from the origin the timestamp left.
-        assert_eq!(coordinates[1], [0, 0, 0]);
-        assert_eq!(coordinates[7], [3, 3, 3]);
-        assert_eq!(coordinates[8][0], 4);
+        // One clock serves all three axes: a coordinate is the origin plus the patch's merged row
+        // and column. The prompt's first token takes origin 0, the first run's patches sit at
+        // `(1 + i, 1 + j)` because that token left origin 1, the run advances it by
+        // `max(4, 6) / 2 = 3` to 4, the timestamp takes 4 and leaves 5, and the second run starts
+        // there.
+        assert_eq!(coordinates[0], [0, 0, 0]);
+        assert_eq!(coordinates[1], [1, 1, 1]);
+        assert_eq!(coordinates[6], [1, 2, 3]);
+        assert_eq!(coordinates[7], [4, 4, 4]);
+        assert_eq!(coordinates[8], [5, 5, 5]);
     }
 
     #[test]
@@ -1941,10 +1945,16 @@ mod tests {
             merge,
         )
         .expect("positions");
-        assert_eq!(coordinates[2], [0, 0, 0]);
-        assert_eq!(coordinates[5], [0, 1, 1]);
-        assert_eq!(coordinates[7][0], 3);
-        assert_eq!(coordinates[12][0], 6);
+        // The clock again: two text tokens leave origin 2, the image's four merged rows sit at
+        // `(2 + i, 2 + j)`, the block advances by `max(4, 4) / 2 = 2` to 4, its timestamp takes 4
+        // and leaves 5, the video's first run sits there, advances to 7, its timestamp leaves 8,
+        // and the second run starts at 8.
+        assert_eq!(coordinates[1], [1, 1, 1]);
+        assert_eq!(coordinates[2], [2, 2, 2]);
+        assert_eq!(coordinates[5], [2, 3, 3]);
+        assert_eq!(coordinates[6], [4, 4, 4]);
+        assert_eq!(coordinates[7], [5, 5, 5]);
+        assert_eq!(coordinates[12], [8, 8, 8]);
     }
 
     #[test]
