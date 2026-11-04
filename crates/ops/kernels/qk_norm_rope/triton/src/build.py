@@ -1,109 +1,104 @@
 """The qk_norm_rope package's compile script: one descriptor -> one module.
 
-A descriptor is the row dtype, the head width, the Q and K head counts, the
-factor table dtype, the rounding recipe and the row layout. The kernel's domains
-and rotary axes are the head's single full-head domain and single axis, as
-Qwen3-MoE's rotary projection asks for one normalization weight per tensor and
-one split-half factor pair. Programs own complete token/head rows, so outputs
-may alias their sources.
+A descriptor is the queries' and the output's element type, the head width, the
+query and key head counts, the rotation's pairing, the epsilon's bit pattern,
+the tokens one program normalizes, the program's block and the dependent-launch
+flag — plus, only where they differ from the full-width weighted form, the width
+of the rotation and the absence of a learned scale. The token count stays a
+runtime value.
 """
+
+import struct
 
 import _compile
 import qk_norm_rope as kernels
 
-#: The floating dtypes of Q, K, their weights and their outputs.
-DTYPES = {"bf16": "bf16", "fp16": "fp16", "fp32": "fp32"}
+#: Element types of the queries, keys and their normalized outputs.
+DTYPES = {"bf16": "bf16", "f16": "fp16", "f32": "fp32"}
 
-#: The factor table dtypes.
-FACTORS = {"fp32": "fp32", "bf16": "bf16"}
-
-#: Token/head row layouts: rows are [tokens, heads, dim] with a unit feature
-#: stride, so the token stride is heads * dim and the head stride is dim.
-LAYOUTS = {"tokens_heads": True}
+#: The two pairings a rotation takes.
+ROTATIONS = {"half": False, "interleaved": True}
 
 
-def rows_per_program(block):
-    """Rows one program covers: about 2048 features per tile, at most 16."""
-    return min(16, max(1, 2048 // block))
+def float_of(bits):
+    """The float a descriptor's hexadecimal bit pattern names."""
+    return struct.unpack("<f", struct.pack("<I", int(bits, 16)))[0]
 
 
 def spec(fields, parameters, target):
     """The compilation of one qk_norm_rope descriptor."""
-    dtype = "*" + DTYPES[fields["dtype"]]
-    factors = "*" + FACTORS[fields["factors"]]
-    dim = int(fields["head_dim"])
-    q_heads = int(fields["q_heads"])
-    k_heads = int(fields["k_heads"])
-    if fields["layout"] not in LAYOUTS:
-        raise SystemExit(f"layout {fields['layout']} has no kernel in this package")
-    block = 1 << (dim - 1).bit_length()
-    rows = rows_per_program(block)
-    stepwise = fields["rounding"] == "stepwise"
-    pdl = _compile.capability(target) >= 100
-    # One full-head RMS domain per tensor, one split-half rotary axis over the
-    # complete head: starts at feature 0, ends at the head width.
-    q_strides = (q_heads * dim, dim)
-    k_strides = (k_heads * dim, dim)
-    # The compact factor table of one token and axis per row of `dim / 2`
-    # factors, contiguous.
-    factor_stride = dim // 2
+    head_dim = int(fields["head_dim"])
+    # A key names `rotated` only when the rotation is narrower than the head, and
+    # `affine` only when the normalization has no learned scale.
+    rotated = int(fields.get("rotated", head_dim))
+    affine = fields.get("affine", "true") == "true"
+    if rotated % 2 or rotated > head_dim or rotated == 0:
+        raise SystemExit(f"a rotation of {rotated} channels of a {head_dim} channel head")
+    # The turned pairs in tiles of a power of two: 96 channels turn 48 pairs.
+    pair_lanes = 1 << (rotated // 2 - 1).bit_length()
+    pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
+
+    signature = {
+        "query_ptr": "*" + DTYPES[fields["dtype"]],
+        "key_ptr": "*" + DTYPES[fields["dtype"]],
+    }
+    if affine:
+        signature["q_weight_ptr"] = "*" + DTYPES[fields["dtype"]]
+        signature["k_weight_ptr"] = "*" + DTYPES[fields["dtype"]]
+    signature["cosine_ptr"] = "*fp32"
+    signature["sine_ptr"] = "*fp32"
+    signature["q_out_ptr"] = "*" + DTYPES[fields["output"]]
+    signature["k_out_ptr"] = "*" + DTYPES[fields["output"]]
+    signature["tokens"] = "i64"
+    signature["epsilon"] = "fp32"
+    signature["pdl"] = "i32"
+    signature["Q_HEADS"] = "constexpr"
+    signature["K_HEADS"] = "constexpr"
+    signature["DIM"] = "constexpr"
+    signature["ROTATED"] = "constexpr"
+    signature["PAIRS"] = "constexpr"
+    signature["ROWS"] = "constexpr"
+    signature["INTERLEAVED"] = "constexpr"
+    if affine:
+        signature["AFFINE"] = "constexpr"
+    signature["PDL"] = "constexpr"
+    if rotated != head_dim:
+        # A narrowed program's call names how many channels turn; the module
+        # compiled its own width from the key, so the word is the call's.
+        signature["rotated"] = "u32"
+
+    constexprs = {
+        "Q_HEADS": int(fields["q_heads"]),
+        "K_HEADS": int(fields["k_heads"]),
+        "DIM": head_dim,
+        "ROTATED": rotated,
+        "PAIRS": pair_lanes,
+        "ROWS": int(fields["rows"]),
+        "INTERLEAVED": ROTATIONS[fields["rotation"]],
+        "PDL": pdl,
+    }
+    if affine:
+        constexprs["AFFINE"] = True
+
+    # The arguments decide the program: weights and a width word are ports.
+    if affine:
+        kernel = (
+            kernels._qk_norm_rope_kernel
+            if rotated == head_dim
+            else kernels._qk_norm_rope_narrowed_kernel
+        )
+    else:
+        kernel = (
+            kernels._qk_norm_rope_unweighted_kernel
+            if rotated == head_dim
+            else kernels._qk_norm_rope_unweighted_narrowed_kernel
+        )
+
     return {
-        "kernel": kernels._qk_norm_rope_kernel,
-        "signature": {
-            "q": dtype,
-            "k": dtype,
-            "q_weights": (dtype,),
-            "k_weights": (dtype,),
-            "cosines": (factors,),
-            "sines": (factors,),
-            "q_out": dtype,
-            "k_out": dtype,
-            "q_rows": "i32",
-            "k_rows": "i32",
-            "Q_HEADS": "constexpr",
-            "K_HEADS": "constexpr",
-            "Q_STRIDES": "constexpr",
-            "K_STRIDES": "constexpr",
-            "Q_OUT_STRIDES": "constexpr",
-            "K_OUT_STRIDES": "constexpr",
-            "DIM": "constexpr",
-            "DOMAIN_STARTS": "constexpr",
-            "DOMAIN_ENDS": "constexpr",
-            "AXIS_STARTS": "constexpr",
-            "AXIS_ROTATED": "constexpr",
-            "FACTOR_STRIDES": "constexpr",
-            "EPS": "constexpr",
-            "BLOCK": "constexpr",
-            "ROWS": "constexpr",
-            "PDL": "constexpr",
-            "HALVES": "constexpr",
-            "STEPWISE": "constexpr",
-        },
-        "constexprs": {
-            "Q_HEADS": q_heads,
-            "K_HEADS": k_heads,
-            "Q_STRIDES": q_strides,
-            "K_STRIDES": k_strides,
-            "Q_OUT_STRIDES": q_strides,
-            "K_OUT_STRIDES": k_strides,
-            "DIM": dim,
-            "DOMAIN_STARTS": (0,),
-            "DOMAIN_ENDS": (dim,),
-            "AXIS_STARTS": (0,),
-            "AXIS_ROTATED": (dim,),
-            "FACTOR_STRIDES": (factor_stride,),
-            "EPS": float(parameters["eps"]),
-            "BLOCK": block,
-            "ROWS": rows,
-            "PDL": pdl,
-            "HALVES": False,
-            "STEPWISE": stepwise,
-        },
-        "options": {
-            "num_warps": 4,
-            "launch_pdl": pdl,
-            "enable_fp_fusion": not stepwise,
-        },
+        "kernel": kernel,
+        "signature": signature,
+        "constexprs": constexprs,
+        "options": {"num_warps": 4, "launch_pdl": pdl},
     }
 
 

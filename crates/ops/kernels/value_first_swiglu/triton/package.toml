@@ -1,0 +1,42 @@
+# The value_first_swiglu operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
+# driver the Program Server runs for one descriptor and target).
+#
+# The descriptor is the packed gating's own: the element type, the output row
+# width (the packed row holds twice as many), the tile one program walks, the
+# packed row stride, and whether the packed bias is added and each program's
+# largest magnitude recorded. The key is the one
+# `ValueFirstSwigluDescriptor`'s `Display` prints, e.g.
+# `dtype_bf16_width_3072_block_4096_input_stride_6144_bias_true_absmax_false`.
+#
+# The packed row stride is the row width times a whole number: the projection
+# writes both halves into one buffer, often beside other projections. The values
+# narrow to the keys `model` publishes.
+
+op = "value_first_swiglu"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/value_first_swiglu.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+[kernel.descriptors]
+dimensions = { dtype = ["bf16", "f16", "f32"], width = ["1024", "1536", "2048", "3072", "4096", "6144", "7168", "8192", "12288", "16384"], block = ["1024", "2048", "4096", "8192", "32768"], input_stride = ["2048", "3072", "4096", "4608", "6144", "8192", "9216", "12288", "14336", "16384", "18432", "21504", "24576", "28672", "32768", "36864", "43008", "49152", "57344", "65536", "73728", "98304", "131072"], bias = ["true", "false"], absmax = ["true", "false"] }
+
+[parameters]

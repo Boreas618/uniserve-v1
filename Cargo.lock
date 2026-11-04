@@ -922,7 +922,9 @@ dependencies = [
  "minijinja",
  "minijinja-contrib",
  "models",
+ "ops",
  "platform",
+ "program-server",
  "prometheus-client",
  "prost",
  "proto",
@@ -1182,11 +1184,14 @@ dependencies = [
  "crossbeam-channel",
  "daemon",
  "engine",
+ "executor",
  "fnv",
  "ipc",
  "libc",
  "models",
+ "nn",
  "png",
+ "program-server",
  "proto",
  "scheduling",
  "serde",
@@ -1227,6 +1232,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d817e038c30374a4bcb22f94d0a8a0e216958d4c3dcde369b1439fec4bdda6e6"
 dependencies = [
  "cc",
+]
+
+[[package]]
+name = "executor"
+version = "2.0.0"
+dependencies = [
+ "bytemuck",
+ "indexmap 2.14.0",
+ "ipc",
+ "libc",
+ "libloading",
+ "nn",
+ "nvtx",
+ "ops",
+ "platform",
+ "proto",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "storage",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2030,6 +2061,8 @@ name = "ipc"
 version = "2.0.0"
 dependencies = [
  "libc",
+ "program-server",
+ "prost",
  "proto",
  "rmp-serde",
  "serde",
@@ -2038,6 +2071,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
+ "toml",
 ]
 
 [[package]]
@@ -2461,6 +2495,18 @@ name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
+
+[[package]]
+name = "minimax-h3"
+version = "2.0.0"
+dependencies = [
+ "nn",
+ "ops",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
 
 [[package]]
 name = "miniz_oxide"
@@ -3043,6 +3089,7 @@ version = "2.0.0"
 dependencies = [
  "clap",
  "libc",
+ "ops",
  "prost",
  "prost-build",
  "protox",
@@ -3700,6 +3747,13 @@ dependencies = [
 
 [[package]]
 name = "scheduling-policy-fcfs"
+version = "2.0.0"
+dependencies = [
+ "scheduling-guest",
+]
+
+[[package]]
+name = "scheduling-policy-fixture"
 version = "2.0.0"
 dependencies = [
  "scheduling-guest",
@@ -4683,10 +4737,17 @@ dependencies = [
  "clap",
  "daemon",
  "engine",
+ "executor",
+ "ipc",
  "libc",
  "libloading",
  "mimalloc",
+ "nn",
+ "ops",
+ "platform",
  "program-server",
+ "proto",
+ "qwen3-moe",
  "rustix",
  "storage",
  "storage-server",

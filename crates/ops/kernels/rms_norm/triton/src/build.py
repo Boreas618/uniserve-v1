@@ -11,7 +11,7 @@ import rms_norm as kernels
 
 #: The floating dtypes a row, its weight and its output may have, as Triton
 #: spells them in an argument signature.
-DTYPES = {"bf16": "bf16", "fp16": "fp16", "fp32": "fp32"}
+DTYPES = {"bf16": "bf16", "fp16": "fp16", "fp32": "fp32", "f32": "fp32"}
 
 
 def warps_of(tile):

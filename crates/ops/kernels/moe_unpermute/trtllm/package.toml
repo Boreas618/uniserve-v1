@@ -1,0 +1,34 @@
+# The moe_unpermute operator's trtllm-gen backend: design 5.2's program package.
+#
+# One native module per descriptor: trtllm-gen's combine kernel compiled out of
+# the FlashInfer distribution this package depends on, with this package's C entry
+# in front of it (the operator's `moe::combine::Call`). One program per token
+# reads its routes through `expanded_to_permuted`, scales each in FP32 and rounds
+# once into the output.
+
+op = "moe_unpermute"
+backend = "trtllm"
+
+[toolchain]
+kind = "nvcc"
+version = "13.0.48"
+packages = [{ name = "flashinfer-python", version = "0.6.18" }]
+
+[module]
+form = "native"
+entries = { launch = "uniserve_moe_unpermute" }
+
+[source]
+kind = "cuda"
+files = ["src/build.py", "src/entry.cpp", "src/entry.h"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_100f"]
+
+# `hidden_2048_top_8_experts_128_input_bf16_scales_f32_output_bf16`.
+[kernel.descriptors]
+dimensions = { hidden = ["2048", "7168", "4096"], top = ["8", "4", "2"], experts = ["128", "256", "64"], input = ["bf16", "f16"], scales = ["f32", "bf16", "f16"], output = ["bf16", "f16"] }
+
+[parameters]
