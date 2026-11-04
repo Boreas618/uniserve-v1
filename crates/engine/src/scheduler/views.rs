@@ -32,23 +32,31 @@
 //! recorded for its cache resume (the control thread's routing table, not the
 //! scheduler's).
 //!
-//! # What today's state cannot tell a view
+//! # What a scheduler cannot tell a view
 //!
-//! These features are reported as the values below until the owning subsystem
-//! exposes them; each is also in the module's open points on the board:
+//! - `Room::graph_tiers` and `Room::warming` are the mechanism's: it holds the
+//!   build config's captured tiers and the precopy's claimed order. It builds
+//!   the facts with [`room_facts`], fills those two, and turns them into the
+//!   `Room` with [`room_view`]; [`room`] leaves both empty.
+//! - `Snapshot::ranks` and a trial's `arrival` need the ranks' load, which the
+//!   routing table on the control thread holds and a scheduler does not: a
+//!   scheduler knows one rank's load, its own. [`trial_state`] therefore trips
+//!   `place` and not `route`; [`trial_state_with_ranks`] takes the ranks and
+//!   trips both.
+//! - `PageView::last_used` is informational: the block pool keeps an allocation
+//!   order, not use timestamps. A policy keeps its own LRU from `Cached`, `Hit`
+//!   and `Freed`.
 //!
-//! - `Room::graph_tiers`: the scheduler holds no captured-tier list; a worker
-//!   fits a batch into its captured graphs itself. Empty.
-//! - `Room::warming`: `warming::Warming::reserved` is private to its module, so
-//!   the claimed precopy order cannot be read here. Empty.
-//! - `PageView::last_used`: the block pool keeps an allocation order, not use
-//!   timestamps. `Nanos(0)`.
-//! - `Snapshot::encodings`: `EncoderCacheManager` exposes no entry list.
-//!   Empty, so no encoding is ever a live `EncodingId`.
-//! - host KV pages (`PageView::on_host`): the offload manager exposes no page
-//!   list. Empty, so no `PageId` is a live host page.
-//! - `ExpertLoad`: no routed-token counters reach the scheduler. `None`.
-//! - a media request's phase: `VideoGraph` keeps its own cursor. `None`.
+//! These report nothing until the subsystem that owns them exposes them, and
+//! are open items on the board:
+//!
+//! - `Snapshot::encodings`: `EncoderCacheManager` lists no entries, so no
+//!   encoding is ever a live `EncodingId`.
+//! - host KV pages (`PageView::on_host`): the offload manager lists no pages,
+//!   so no `PageId` is a live host page.
+//! - a media request's phase: `VideoGraph` keeps its own cursor.
+//! - `ExpertLoad`: no routed-token counters reach the scheduler, so `experts`
+//!   is skipped rather than asked about a load nobody measured.
 
 use std::collections::{HashMap, HashSet};
 
@@ -581,12 +589,21 @@ fn free_slots(scheduler: &Scheduler) -> usize {
 }
 
 /// This step's room.
+///
+/// The captured graph tiers and the precopy's warming order are the
+/// mechanism's, not the scheduler's; it builds the facts, fills those two, and
+/// turns them into the `Room` with `room_view`.
 pub(crate) fn room(scheduler: &Scheduler, step: u64) -> Room {
+    room_view(room_facts(scheduler, step))
+}
+
+/// The facts of this step's room.
+pub(crate) fn room_facts(scheduler: &Scheduler, step: u64) -> RoomFacts {
     let page_tokens = scheduler
         .storage
         .cache()
         .map_or(1, |cache| cache.coordinator.max_block_size());
-    room_view(RoomFacts {
+    RoomFacts {
         step,
         kv_units: scheduler.storage.free_units() as u64,
         slots: free_slots(scheduler),
@@ -613,7 +630,7 @@ pub(crate) fn room(scheduler: &Scheduler, step: u64) -> Room {
         capacity_units: scheduler.storage.capacity_units() as u64,
         // `warming::Warming::reserved` is private to its module.
         warming: Vec::new(),
-    })
+    }
 }
 
 /// The storage the mechanism finds short right now, for `reclaim`.
@@ -638,15 +655,13 @@ fn next_phase(scheduler: &Scheduler, state: &RequestState, id: RequestId) -> Opt
         CallKind::Forward(ForwardMode::TokenDenoising) if state.req.is_readout() => {
             PhaseKind::Readout
         }
-        // A prefill chunk of a prompt the request already computed is a refill
-        // of its draft cache. The gap is a fact of the request's state; whether
-        // the refill is worth running is the policy's (`Plan::refill`), so the
-        // view names the phase and `refill_tokens` names the cost.
-        CallKind::Forward(ForwardMode::Prefill)
-            if state.num_computed_prompt_tokens as usize >= state.prompt_tokens
-                && refill_gap(scheduler, state).is_some() =>
-        {
-            PhaseKind::Refill
+        // A refill chunk is the policy's decision alone (`Plan::refill`), and
+        // the mechanism builds its call: the request's phase is the serving
+        // phase it needs next, and its draft gap appears in `refill_tokens`.
+        // `PhaseKind::Refill` stays in the phase table as the kind of the call
+        // the mechanism builds, not as a phase a request sits in.
+        CallKind::Forward(ForwardMode::Prefill) if refill_gap(scheduler, state).is_some() => {
+            PhaseKind::Decode
         }
         other => call_phase(other),
     };
@@ -1128,6 +1143,46 @@ pub(crate) fn snapshot(scheduler: &Scheduler, step: u64, recorded: &RecordedTabl
     }
 }
 
+/// The first request the mechanism is still to admit.
+fn first_queued(scheduler: &Scheduler) -> Option<RequestId> {
+    scheduler
+        .waiting
+        .front()
+        .map(|state| state.req.request_id)
+        .or_else(|| {
+            scheduler
+                .waiting_media
+                .front()
+                .map(|pending| pending.request.request_id)
+        })
+}
+
+/// A token request's view, by id, when the scheduler holds it.
+fn request_of(scheduler: &Scheduler, id: RequestId, standing: Standing) -> Option<RequestView> {
+    if let Some(state) = scheduler
+        .waiting
+        .iter()
+        .find(|state| state.req.request_id == id)
+    {
+        return Some(request(scheduler, state, standing, &Recorded::default()));
+    }
+    if let Some(state) = scheduler.running.get(&id) {
+        return Some(request(scheduler, state, standing, &Recorded::default()));
+    }
+    scheduler
+        .waiting_media
+        .iter()
+        .find(|pending| pending.request.request_id == id)
+        .map(|pending| {
+            diffusion_request(
+                &pending.request,
+                standing,
+                pending.queued_at,
+                &Recorded::default(),
+            )
+        })
+}
+
 /// The requests waiting for admission, in the mechanism's own order.
 pub(crate) fn queued(scheduler: &Scheduler) -> Vec<ViewRequestId> {
     scheduler
@@ -1152,11 +1207,42 @@ pub(crate) fn live(scheduler: &Scheduler, step: u64, recorded: &RecordedTable) -
     Live::of(&snapshot(scheduler, step, recorded), queued(scheduler))
 }
 
+/// A queued request and the ranks, for `route`: the first request the
+/// mechanism is still to admit, and the ranks it may be routed to.
+pub(crate) fn arrival(
+    scheduler: &Scheduler,
+    ranks: Vec<RankView>,
+) -> Option<(RequestView, Vec<RankView>)> {
+    let id = first_queued(scheduler)?;
+    let view = request_of(scheduler, id, Standing::Queued)?;
+    Some((view, ranks))
+}
+
+/// A resident request's next call on a block and the replicas that may run it,
+/// for `place`: the first resident request that has a next call and a replica.
+pub(crate) fn placement(scheduler: &Scheduler) -> Option<(CallView, Vec<ReplicaView>)> {
+    for id in &scheduler.running_order {
+        let Some(state) = scheduler.running.get(id) else {
+            continue;
+        };
+        let Some(kind) = scheduler.peek_next_call_variant(*id) else {
+            continue;
+        };
+        let key = RequestKey::new(scheduler.engine_id, *id, state.request_epoch);
+        if let Some(call) = call(scheduler, key, kind) {
+            return Some(call);
+        }
+    }
+    None
+}
+
 /// The trial state of this moment: the snapshot, the room, and the decisions
 /// the scheduler faces without more context.
 ///
 /// [`TrialState`] is `policy.rs`'s: the switch owns the type it hands to a
-/// candidate, and this module builds its contents.
+/// candidate, and this module builds its contents. The rank views are the
+/// routing table's (the control thread's), so `route` is trialled only by
+/// [`trial_state_with_ranks`]; a scheduler knows one rank's load, its own.
 pub(crate) fn trial_state(
     scheduler: &Scheduler,
     step: u64,
@@ -1167,7 +1253,29 @@ pub(crate) fn trial_state(
         room: room(scheduler, step),
         shortage: shortage_now(scheduler),
         arrival: None,
-        call: None,
+        call: placement(scheduler),
+        expert_load: expert_load_of(scheduler),
+    }
+}
+
+/// The trial state of this moment, with the ranks the routing table holds: the
+/// state routing is decided on, for the trial that asks `route` too (§7.3).
+pub(crate) fn trial_state_with_ranks(
+    scheduler: &Scheduler,
+    step: u64,
+    recorded: &RecordedTable,
+    ranks: Vec<RankView>,
+) -> TrialState {
+    let call = placement(scheduler);
+    let arrival = arrival(scheduler, ranks.clone());
+    let mut snapshot = snapshot(scheduler, step, recorded);
+    snapshot.ranks = ranks;
+    TrialState {
+        snapshot,
+        room: room(scheduler, step),
+        shortage: shortage_now(scheduler),
+        arrival,
+        call,
         expert_load: expert_load_of(scheduler),
     }
 }
@@ -1325,6 +1433,58 @@ mod tests {
             assert_eq!(phase_call(phase), Some(call), "{call:?} -> {phase:?}");
             assert_eq!(call_phase_id(call), phase_id(phase));
         }
+    }
+
+    #[test]
+    fn an_epoch_offers_the_phases_its_workers_serve() {
+        let mut info = WorkerInfo::default();
+        info.components = vec![ipc::ComponentInfo {
+            name: "model".into(),
+            outputs: Vec::new(),
+        }];
+        info.supported_calls
+            .push(CallKind::Media(MediaCall::Denoising));
+        info.media_components
+            .insert(MediaCall::Denoising, "denoiser".into());
+
+        let phases = phases(&info);
+        let kinds: Vec<PhaseKind> = phases.iter().map(|phase| phase.kind).collect();
+        // Prefill and decode are served, so a refill chunk of a decoding request
+        // is served too; a kind no worker reports is absent.
+        assert!(kinds.contains(&PhaseKind::Prefill));
+        assert!(kinds.contains(&PhaseKind::Decode));
+        assert!(kinds.contains(&PhaseKind::Refill));
+        assert!(kinds.contains(&PhaseKind::Denoise));
+        assert!(!kinds.contains(&PhaseKind::ImageDecode));
+
+        // A phase's id is its kind's, and its block is the component the worker
+        // binds for that call.
+        let blocks = blocks(&info);
+        for phase in &phases {
+            assert_eq!(phase.id, phase_id(phase.kind));
+        }
+        let denoise = phases
+            .iter()
+            .find(|phase| phase.kind == PhaseKind::Denoise)
+            .expect("the worker serves denoising");
+        assert_eq!(Some(denoise.block), block_id(&blocks, "denoiser"));
+        let prefill = phases
+            .iter()
+            .find(|phase| phase.kind == PhaseKind::Prefill)
+            .expect("the worker serves prefill");
+        assert_eq!(Some(prefill.block), block_id(&blocks, "model"));
+    }
+
+    #[test]
+    fn a_wall_clock_instant_becomes_a_monotonic_one() {
+        let now = nanos_at(crate::clock::now_unix_secs());
+        let monotonic = Nanos(crate::clock::now_monotonic_us() * 1_000);
+        assert!(
+            now.0.abs_diff(monotonic.0) < 1_000_000_000,
+            "{now:?} is not within a second of {monotonic:?}"
+        );
+        // A time before the process started is the clock's zero, not a wrap.
+        assert_eq!(nanos_at(0.0), Nanos(0));
     }
 
     #[test]
