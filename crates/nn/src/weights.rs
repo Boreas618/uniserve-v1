@@ -1153,6 +1153,17 @@ impl<'a> WeightLoader<'a> {
     /// takes the reciprocal. A zero, a negative or a non-finite scale is refused here rather than
     /// encoded at the wrong magnitude.
     fn activation_reciprocal(&self, request: &WeightRequest) -> Result<f32> {
+        Ok(1.0 / self.tensor_scale(request)?)
+    }
+
+    /// One tensor's single positive scale, as the checkpoint states it.
+    ///
+    /// Both tensor scales a calibrated NVFP4 export writes — the weight's `weight_scale_2` and the
+    /// activation's `input_scale` — are one positive float each, and a loader that synthesized one
+    /// would encode at an invented magnitude. A projection reads its weight's scale to build the
+    /// product's `alpha` and its activation's to build the encoder's operand, so the reading is
+    /// public and the reciprocals are its callers'.
+    pub fn tensor_scale(&self, request: &WeightRequest) -> Result<f32> {
         let tensor = self.checkpoint.read(&request.tensor)?;
         if tensor.shape.numel() != 1 || !tensor.dtype.is_float() {
             return Err(Error::weight(
@@ -1171,7 +1182,7 @@ impl<'a> WeightLoader<'a> {
                 format!("a tensor scale of {scale} is not a positive number"),
             ));
         }
-        Ok(1.0 / scale)
+        Ok(scale)
     }
 
     /// Load the encoded fields of a whole expert stack: `experts` experts, each contributing

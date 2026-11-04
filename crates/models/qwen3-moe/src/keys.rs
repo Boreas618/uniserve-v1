@@ -97,7 +97,7 @@ impl Qwen3Moe {
             capacity,
             buckets,
             self.experts_encoded(),
-            false,
+            self.projections_packed(),
         )
     }
 }

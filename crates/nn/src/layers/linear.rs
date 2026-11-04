@@ -434,6 +434,23 @@ impl Nvfp4Linear {
         }
     }
 
+    /// The arena one launch of this projection carves for `rows` activation rows.
+    ///
+    /// Three regions, each aligned up like the arena's own grants: the packed activation
+    /// (`[rows, k/2]` bytes), the block scales in this layout's shape, and one FP32 row factor per
+    /// activation row. A plan that does not reserve them is an arena the launch writes past, so the
+    /// model's plan asks this rather than estimating.
+    pub fn scratch_bytes(&self, rows: u64) -> u64 {
+        let align = |bytes: u64| bytes.div_ceil(crate::forward::ALIGNMENT) * crate::forward::ALIGNMENT;
+        let values = align(rows * u64::from(self.k) / 2);
+        let scales = {
+            let shape = self.layout.shape(rows, u64::from(self.k));
+            align(shape.numel())
+        };
+        let token_scale = align(rows * 4);
+        values + scales + token_scale
+    }
+
     pub fn forward(
         &self,
         f: &Forward,

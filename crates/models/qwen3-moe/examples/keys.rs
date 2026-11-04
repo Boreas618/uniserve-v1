@@ -42,6 +42,9 @@ struct Deployment {
     dtype: DType,
     /// The row counts the executor captures, which the dense packed product is compiled per entry of.
     buckets: Vec<u32>,
+    /// The representation the caller states, when the checkpoint cannot: `None` is the checkpoint's
+    /// own statement or, on a dense checkpoint, no statement at all.
+    quantization: Option<Representation>,
 }
 
 fn main() -> ExitCode {
@@ -56,6 +59,7 @@ fn main() -> ExitCode {
         page: 64,
         dtype: DType::BF16,
         buckets: Vec::new(),
+        quantization: None,
     };
     let number = |value: Option<String>, name: &str| -> Result<usize, String> {
         value
@@ -100,6 +104,16 @@ fn main() -> ExitCode {
                     Err(_) => return usage("--capacity takes a row count that fits u32"),
                 },
                 Err(message) => return usage(&message),
+            },
+            "--quantization" => match arguments.next().as_deref() {
+                Some("bf16") => deployment.quantization = Some(Representation::Dense),
+                Some("nvfp4") => deployment.quantization = Some(Representation::Nvfp4 {
+                    excluded: Vec::new(),
+                    also_excluded: Vec::new(),
+                }),
+                other => {
+                    return usage(&format!("--quantization takes bf16 or nvfp4, not {other:?}"));
+                }
             },
             "--page" => match number(arguments.next(), "--page") {
                 Ok(value) => match u32::try_from(value) {
@@ -152,9 +166,34 @@ fn run(root: &Path, deployment: &Deployment) -> Result<(), String> {
     // The checkpoint's own declaration says which representation its weights are in, and that is
     // what decides whether the encoded programs are named at all — read from metadata, like the
     // configuration.
-    let representation = Representation::read(root)
+    let declared = Representation::read(root)
         .map_err(|error| format!("{}: {error}", root.display()))?;
-    let packed = representation.is_encoded();
+    // The rule that keeps a stated representation honest: a checkpoint that declares one cannot be
+    // overridden — its own metadata is the ground truth and a flag that disagrees is a refusal —
+    // while a checkpoint that declares nothing leaves the flag as the only statement there is, and
+    // the header says which of the two it was.
+    let (packed, source) = match (&declared, &deployment.quantization) {
+        (Representation::Dense, Some(stated)) => (stated.is_encoded(), "flag (the checkpoint declares nothing)"),
+        (declared, Some(stated)) if declared.is_encoded() != stated.is_encoded() => {
+            return Err(format!(
+                "the checkpoint declares {} and --quantization says {}: its own metadata is the ground \
+                 truth, and a flag that disagrees with it is not a deployment",
+                if declared.is_encoded() { "NVFP4" } else { "no quantization" },
+                if stated.is_encoded() { "NVFP4" } else { "none" },
+            ));
+        }
+        (declared, _) => (declared.is_encoded(), "declaration"),
+    };
+    // A packed projection's product is compiled per row count, so without the executor's buckets the
+    // rows cannot be named — and a row at an invented `m` would build a store for a forward the
+    // executor never forms. The products are left out and the omission is printed.
+    let projections_packed = packed && !deployment.buckets.is_empty();
+    if packed && deployment.buckets.is_empty() {
+        println!(
+            "# no --buckets: the dense packed products are named for no row count, because a forward \
+             no bucket holds is an error rather than an eager fallback"
+        );
+    }
     let keys = qwen3_moe::keys::keys(
         &config,
         &partition,
@@ -164,7 +203,7 @@ fn run(root: &Path, deployment: &Deployment) -> Result<(), String> {
         deployment.capacity,
         &deployment.buckets,
         packed,
-        packed,
+        projections_packed,
     )
     .map_err(|error| format!("enumerating keys: {error}"))?;
     if keys.is_empty() {
@@ -174,7 +213,7 @@ fn run(root: &Path, deployment: &Deployment) -> Result<(), String> {
     // without inferring it from the keys. The comment is skipped by every fixture reader.
     println!(
         "# deployment: tensor_parallel {} tensor_rank {} expert_parallel {} expert_rank {} \
-         cache {} capacity {} page {} buckets {}",
+         cache {} capacity {} page {} buckets {} quantization {} ({})",
         deployment.tensor_parallel,
         deployment.tensor_rank,
         deployment.expert_parallel,
@@ -197,6 +236,8 @@ fn run(root: &Path, deployment: &Deployment) -> Result<(), String> {
                 .collect::<Vec<_>>()
                 .join(",")
         },
+        if packed { "nvfp4" } else { "bf16" },
+        source,
     );
     for (operator, key) in keys {
         println!("{operator}\t{key}");
