@@ -43,7 +43,11 @@ pub(super) trait World {
 }
 
 /// What the mechanism executes through.
-pub(crate) struct Submissions {
+///
+/// Public because a scheduler is built with one: `Scheduler::new` takes a
+/// `Submissions`, and a deployment outside this crate chooses the arm it runs
+/// on — `new` over a launched executor, `over_batches` over its own devices.
+pub struct Submissions {
     path: Path,
 }
 
@@ -89,7 +93,7 @@ struct Pending {
 }
 
 impl Submissions {
-    pub(super) fn new(executor: Box<dyn Executor>) -> Self {
+    pub fn new(executor: Box<dyn Executor>) -> Self {
         Self {
             path: Path::Workers(executor),
         }
@@ -102,7 +106,7 @@ impl Submissions {
     /// guessed one, for the same reason `ExecutorInfo::from_inventory` refuses
     /// a pool that states no rank or no longest sequence — a mechanism that
     /// assumes a rank's cache makes the host KV path disappear at runtime.
-    pub(crate) fn over_batches(batches: Arc<dyn Batches>) -> anyhow::Result<Submissions> {
+    pub fn over_batches(batches: Arc<dyn Batches>) -> anyhow::Result<Submissions> {
         let info = ExecutorInfo::from_inventory(batches.inventory())?;
         anyhow::ensure!(
             !info.workers.is_empty(),

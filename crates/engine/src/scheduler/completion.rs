@@ -283,3 +283,150 @@ impl BatchReport {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use executor::batch::{BatchOutput, CallCompletion as DeviceCompletion, CallId as DeviceCallId};
+    use executor::completion::Outcome;
+    use ipc::CallStatus;
+
+    /// What one device call reports, with `device_us` of its own so a report's
+    /// timing can be told from silence.
+    fn device_call(index: u64, committed: &[u32], device_us: u64) -> DeviceCompletion {
+        DeviceCompletion {
+            call: DeviceCallId(index),
+            status: CallStatus::Ok,
+            error_code: None,
+            error_message: None,
+            committed_tokens: committed.to_vec(),
+            token_logprobs: Vec::new(),
+            prompt_logprobs: Vec::new(),
+            candidate_logprobs: Vec::new(),
+            cache_computed_len: 0,
+            cache_visible_len: 0,
+            step_index: 0,
+            media_output: None,
+            cache_output: None,
+            draft_token_ids: Vec::new(),
+            latent_layouts: Vec::new(),
+            timing_counters: TimingCounters {
+                device_us,
+                ..TimingCounters::default()
+            },
+        }
+    }
+
+    /// The names the mechanism gave a batch's calls: one per call, in the
+    /// batch's order.
+    fn submitted(count: usize) -> Vec<(RequestKey, CallId)> {
+        (0..count)
+            .map(|index| {
+                (
+                    RequestKey::new(1, ipc::RequestId(index as u64 + 1), 0),
+                    CallId::new(9, index as u32),
+                )
+            })
+            .collect()
+    }
+
+    fn output(calls: Vec<DeviceCompletion>, done: bool) -> Outcome<BatchOutput> {
+        Outcome::Success(BatchOutput {
+            tokens: Vec::new(),
+            calls,
+            done,
+        })
+    }
+
+    /// A device reports a batch's calls in the order they finished; the
+    /// mechanism files each under the name it gave that call, so a report's
+    /// order never decides which request a completion advances.
+    #[test]
+    fn a_reports_calls_are_named_through_the_batch_that_was_submitted() {
+        let calls = submitted(2);
+        let report = BatchReport::from_output(
+            4,
+            output(vec![device_call(1, &[7], 3), device_call(0, &[5], 4)], true),
+            &calls,
+        )
+        .expect("a device's report is read");
+        assert_eq!(report.batch_id, 4);
+        assert!(report.done);
+        assert_eq!(report.calls.len(), 2);
+        assert_eq!(report.calls[0].request_key, calls[0].0);
+        assert_eq!(report.calls[0].call_id, calls[0].1);
+        assert_eq!(report.calls[0].committed_tokens, vec![5]);
+        assert_eq!(report.calls[1].request_key, calls[1].0);
+        assert_eq!(report.calls[1].call_id, calls[1].1);
+        assert_eq!(report.calls[1].committed_tokens, vec![7]);
+        assert_eq!(report.timing.device_us, 7);
+        assert!(report.command_results.is_empty());
+    }
+
+    /// A call the batch does not have is refused, not filed against a
+    /// neighbour: the executor numbers calls by their index into `Batch.calls`.
+    #[test]
+    fn a_call_the_batch_does_not_have_is_refused() {
+        let error = BatchReport::from_output(
+            4,
+            output(vec![device_call(2, &[7], 0)], false),
+            &submitted(2),
+        )
+        .expect_err("a call index outside the batch is a broken report");
+        assert!(
+            format!("{error}").contains("of 2 the batch submitted"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_call_reported_twice_is_refused() {
+        let error = BatchReport::from_output(
+            4,
+            output(vec![device_call(0, &[1], 0), device_call(0, &[2], 0)], false),
+            &submitted(1),
+        )
+        .expect_err("one call reports once");
+        assert!(format!("{error}").contains("twice"), "{error}");
+    }
+
+    /// A batch with calls whose report carries none is a runner that serves
+    /// rows and reports nothing: the mechanism refuses it rather than advance a
+    /// call's state on tokens nobody accounted for.
+    #[test]
+    fn a_serving_batch_that_reports_no_call_is_refused() {
+        let error = BatchReport::from_output(4, output(Vec::new(), true), &submitted(2))
+            .expect_err("silence is not a completion");
+        assert!(
+            format!("{error}").contains("no call reported"),
+            "{error}"
+        );
+    }
+
+    /// A lifecycle batch carries no call and completes by reporting nothing:
+    /// that is the one report silence is right for.
+    #[test]
+    fn a_batch_of_commands_completes_with_no_call() {
+        let report = BatchReport::from_output(4, output(Vec::new(), true), &[])
+            .expect("a lifecycle batch reports no call");
+        assert!(report.calls.is_empty());
+        assert!(report.command_results.is_empty());
+        assert!(report.done);
+    }
+
+    /// A device that fails a batch fails it for the mechanism: the batch is
+    /// not reported as complete with nothing in it.
+    #[test]
+    fn a_failed_batch_is_an_error() {
+        let error = BatchReport::from_output(
+            4,
+            Outcome::Failed(std::sync::Arc::new(executor::Error::State("device gone"))),
+            &submitted(1),
+        )
+        .expect_err("a failed batch is not a completion");
+        assert!(format!("{error}").contains("batch 4 failed"), "{error}");
+        let cancelled = BatchReport::from_output(4, Outcome::Cancelled, &submitted(1))
+            .expect_err("a cancelled batch is not a completion");
+        assert!(format!("{cancelled}").contains("cancelled"), "{cancelled}");
+    }
+}

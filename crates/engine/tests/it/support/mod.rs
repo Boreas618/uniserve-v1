@@ -66,7 +66,7 @@ pub(crate) fn scheduler_with(
         }
     };
     let mut scheduler = Scheduler::new(
-        executor,
+        engine::Submissions::new(executor),
         special_tokens,
         config,
         ModelDtype::BFloat16,
