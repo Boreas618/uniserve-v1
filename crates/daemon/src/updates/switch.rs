@@ -217,7 +217,8 @@ impl Switch {
     /// A switch of epoch `previous` (launch generation `previous_generation`)
     /// to epoch `target`, whose record is `record`, with the target's
     /// children started at `spawn_generation` — above every live generation
-    /// of the group and rank, the serving epoch's standby included.
+    /// of the group and rank, the serving epoch's standby included —
+    /// retiring `discarded`, the worlds an earlier switch dropped.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         epochs: Arc<Epochs>,
@@ -231,6 +232,7 @@ impl Switch {
         nodes: Vec<Node>,
         start: Start,
         requests: String,
+        discarded: Vec<u64>,
     ) -> Self {
         let mut record = record;
         record.status = Status::Precopy;
@@ -250,7 +252,7 @@ impl Switch {
             build: start.build,
             requests,
             phase: Phase::Preparing,
-            retire: Vec::new(),
+            retire: discarded,
             parked: BTreeSet::new(),
             promoted: BTreeSet::new(),
             drained: BTreeSet::new(),
@@ -354,12 +356,10 @@ impl Switch {
         }
         let retire = std::mem::take(&mut self.retire);
         for node in &self.nodes {
-            if let Err(reason) = roster.claim(
-                &node.host,
-                self.target,
-                &self.scopes(node),
-                if node.rank == 0 { &retire } else { &[] },
-            ) {
+            // A claim retires storage on the node it is made on, so every
+            // node is told the same worlds.
+            if let Err(reason) = roster.claim(&node.host, self.target, &self.scopes(node), &retire)
+            {
                 self.retire = retire;
                 self.failed(
                     roster,
@@ -623,7 +623,10 @@ impl Switch {
 
     /// A child of `generation` says what build it runs.
     fn hello(&mut self, roster: &mut impl Roster, host: String, generation: u64, build: String) {
-        if !self.is_target(generation) {
+        // The build is a precondition of promoting the target, not of a
+        // replacement of a target that already serves.
+        if !matches!(self.phase, Phase::Preparing | Phase::Promoting) || !self.is_target(generation)
+        {
             return;
         }
         match &self.build {
@@ -984,6 +987,7 @@ mod tests {
             nodes(),
             start(),
             "unix:/run/requests.sock".to_owned(),
+            Vec::new(),
         );
         (epochs, switch)
     }
@@ -1120,6 +1124,52 @@ mod tests {
         assert!(switch.pause().is_some());
     }
 
+    /// A world an earlier switch dropped is retired by the next switch's
+    /// claim on every node: a claim retires storage on the node it is made
+    /// on, so passing it to one node would leave the others holding it.
+    #[test]
+    fn a_discarded_world_is_retired_on_every_node() {
+        let (epochs, mut switch) = setup();
+        let mut roster = Fake::default();
+        switch.start(&mut roster);
+        roster.scripted = vec![report_event(
+            "n0",
+            6,
+            report(process::report::Kind::PrecopyFailed(
+                process::PrecopyFailed {
+                    reason: "no storage".to_owned(),
+                },
+            )),
+        )];
+        switch.advance(&mut roster);
+        assert_eq!(switch.discarded(), &[12]);
+
+        let discarded = switch.discarded().to_vec();
+        let mut next = Switch::new(
+            Arc::clone(&epochs),
+            Update::new(8, Deployment::of(ServeConfig::default())),
+            13,
+            record(),
+            12,
+            6,
+            8,
+            "engine:0".to_owned(),
+            nodes(),
+            start(),
+            "unix:/run/requests.sock".to_owned(),
+            discarded,
+        );
+        let mut roster = Fake::default();
+        next.start(&mut roster);
+        assert_eq!(roster.claims.len(), 2);
+        assert!(
+            roster
+                .claims
+                .iter()
+                .all(|(_, world, _, retire)| *world == 13 && retire == &[12])
+        );
+    }
+
     /// A failed precopy drops the target, retires its world through the next
     /// claim, and leaves the serving epoch alone: the update reverts with no
     /// failure, so applying it again needs no `force`.
@@ -1223,6 +1273,7 @@ mod tests {
             nodes(),
             start(),
             "unix:/run/requests.sock".to_owned(),
+            Vec::new(),
         );
         let mut roster = Fake::default();
         switch.start(&mut roster);
@@ -1455,6 +1506,22 @@ mod tests {
         );
     }
 
+    /// A child of another build that connects after the target serves is a
+    /// replacement's, not a precondition of the promotion: it must not drop a
+    /// serving epoch.
+    #[test]
+    fn a_build_mismatch_after_promotion_does_not_drop_a_serving_epoch() {
+        let (_epochs, mut switch) = setup();
+        let mut roster = Fake::default();
+        serve_target(&mut roster, &mut switch);
+        roster.stops.clear();
+        roster.scripted = vec![hello("n0", 7, "9.9.9+other")];
+        switch.advance(&mut roster);
+        assert_eq!(switch.phase(), Phase::Probation);
+        assert!(roster.stops.is_empty());
+        assert!(switch.failure().is_none());
+    }
+
     /// A commit records the target as serving once it acknowledges, stops the
     /// old generation, purges its programs and retires its storage.
     #[test]
@@ -1557,6 +1624,7 @@ mod tests {
             nodes(),
             start(),
             "unix:/run/requests.sock".to_owned(),
+            Vec::new(),
         );
         let mut roster = Fake::default();
         switch.start(&mut roster);
