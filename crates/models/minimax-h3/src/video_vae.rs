@@ -708,6 +708,17 @@ pub fn folded_input(
 }
 
 impl VideoDecoder {
+    /// Every checkpoint tensor the video decoder reads, by name.
+    ///
+    /// The decoder is a component whose names were already data ([`sources`] maps each parameter to
+    /// the checkpoint key that fills it), so this list is that mapping's other column rather than a
+    /// second spelling of it: the 585 names are the export's 583 `decoder.*` and the two
+    /// `post_quant_conv.*` the input affine is folded from. A checkpoint that lacks one is refused by
+    /// block and name before a byte is read.
+    pub fn keys(config: &VideoVaeConfig) -> crate::Result<Vec<String>> {
+        Ok(crate::audio_vae::tensor_keys(&sources(config)?))
+    }
+
     /// Read the 36 layers and the head of the checkpoint's decoder.
     pub fn load(
         config: &VideoVaeConfig,
@@ -1723,6 +1734,39 @@ pub(crate) mod tests {
         let table = positions(&clip).expect("positions");
         assert_eq!(clip.rows(), 7 * 256 + 5);
         assert_eq!(table.len() as u64, clip.rows() * 3);
+    }
+
+    #[test]
+    fn the_video_decoders_keys_ask_the_export_and_nothing_else() {
+        let config = video_config();
+        let keys = VideoDecoder::keys(&config).expect("the decoder's keys");
+        // The export's own number: `vae/` holds 703 names, the decoder's 585 are the 583 under
+        // `decoder.` plus the two `post_quant_conv.` tensors its input affine is folded from, and the
+        // encoder reads the remaining 118. A checkpoint that lacks one is refused by block and name.
+        assert_eq!(keys.len(), 585);
+        let mut unique = keys.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), keys.len(), "no tensor is named twice");
+        assert!(
+            keys.iter()
+                .any(|key| key == "decoder.transformer_blocks.35.ff.net.0.proj.weight"),
+            "the last layer's projection is asked for"
+        );
+        assert!(
+            keys.iter().any(|key| key == "post_quant_conv.weight"),
+            "the folded input affine's tensor is asked for"
+        );
+        let encoder = crate::encoding::VideoEncoder::keys(&config).expect("the encoder's keys");
+        assert!(
+            encoder.iter().all(|key| !keys.contains(key)),
+            "the two halves read disjoint tensors, or one block would be binding another's weight"
+        );
+        assert_eq!(
+            keys.len() + encoder.len(),
+            703,
+            "together they are every name in `vae/`, with none unread"
+        );
     }
 
     #[test]
