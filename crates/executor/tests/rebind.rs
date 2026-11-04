@@ -37,6 +37,8 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use executor::captured::Captured;
+use executor::graph::Graphs;
+use executor::plan::{Bucket, Shape as PlanShape, Variant};
 use executor::runners::causal_lm::Recording;
 use nn::forward::Forward;
 use ops::{
@@ -524,5 +526,181 @@ fn a_revert_after_a_recapture_replays_the_serving_generation_bitwise() {
         reference,
         "the rebind reached the serving generation's graph: its parameters are one executable's, \
          not the template's, which is what makes a revert possible after a program update"
+    );
+}
+
+/// A commit must not end an executable a bucket it did not prepare still serves from.
+///
+/// The sequence is item 5's: generation 1 serves two buckets, generation 2 rebinds one of them and
+/// leaves the other alone, the switchover serves generation 2, and the commit purges generation 1.
+/// The rebound bucket's generation-1 capture is what generation 2 replaced, so it goes; the
+/// untouched bucket's capture is the only program it has, so it stays and its batch still replays.
+///
+/// This is the arm that fails as *"every request in it fails after Commit"*: the table would answer
+/// `select` for that bucket with nothing, and the runner would have no graph to launch.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn a_commit_keeps_the_capture_an_unprepared_bucket_still_serves_from() {
+    let device = Device::new(DEVICE).expect("a CUDA device");
+    let mut allocator =
+        Allocator::new(&device, Arc::new(Allowance::default())).expect("an allocator");
+    allocator
+        .reserve(PoolKind::Graph, 1 << 20)
+        .expect("reserve the graph pool");
+    let stream = Stream::new(DEVICE).expect("a stream");
+    let image = std::fs::read(cubin()).expect("the compiled probe kernels");
+    let kernel = |symbol: &str| -> Arc<Kernel> {
+        Arc::new(
+            Kernel::load_cubin(&device, &image, CubinMetadata::named(symbol))
+                .unwrap_or_else(|error| panic!("loading {symbol}: {error}")),
+        )
+    };
+    let arena = nn::Arena::new(DevicePtr::new(0), 0);
+    let descriptor = ProbeDescriptor {
+        words: WORDS as u32,
+    };
+    let key = descriptor::key(&descriptor);
+    // Two buckets, each with its own activation, as two shapes' plans have.
+    let prepared_bucket = Bucket::decode(WORDS as u32, Variant::DecodeGreedy);
+    let untouched_bucket = Bucket::decode(2 * WORDS as u32, Variant::DecodeGreedy);
+    let prepared_buffer = allocator
+        .allocate(PoolKind::Graph, BYTES)
+        .expect("the prepared bucket's activation");
+    let untouched_buffer = allocator
+        .allocate(PoolKind::Graph, BYTES)
+        .expect("the untouched bucket's activation");
+    let view = |buffer: &Buffer| {
+        TensorView::new(
+            DevicePtr::new(buffer.address()),
+            DType::I32,
+            Shape::new(&[WORDS as u64]),
+        )
+    };
+    let capture_bucket = |generation: u64, buffer: &Buffer, symbol: &str, value: u32| {
+        let (template, nodes) = capture(
+            &stream,
+            &Generation::new(
+                generation,
+                [KernelEntry::keyed(
+                    Probe::NAME,
+                    key.clone(),
+                    kernel(symbol),
+                )],
+            ),
+            &arena,
+            &descriptor,
+            ProbeArgs {
+                data: view(buffer),
+                count: WORDS as u32,
+                value,
+            },
+        );
+        Captured::new(template, nodes, vec![kernel(symbol)]).expect("a captured bucket")
+    };
+
+    let mut graphs = Graphs::new();
+    // Generation 1 captures both buckets.
+    graphs.insert(
+        prepared_bucket,
+        1,
+        capture_bucket(1, &prepared_buffer, "probe_exact", CAPTURED),
+    );
+    graphs.insert(
+        untouched_bucket,
+        1,
+        capture_bucket(1, &untouched_buffer, "probe_exact", CAPTURED),
+    );
+    // Generation 2 rebinds the prepared one and prepares nothing for the other.
+    let (walked_template, walked_nodes) = capture(
+        &stream,
+        &Generation::new(
+            2,
+            [KernelEntry::keyed(
+                Probe::NAME,
+                key.clone(),
+                kernel("probe_equivalent"),
+            )],
+        ),
+        &arena,
+        &descriptor,
+        ProbeArgs {
+            data: view(&prepared_buffer),
+            count: WORDS as u32,
+            value: WALKED,
+        },
+    );
+    // The prepared generation's executable is instantiated from a `Graph` of its own, as the runner's
+    // rebind path does when no serving template is shared.
+    let walked_template = Arc::new(walked_template);
+    let rebound = Captured::from_template(
+        Arc::clone(&walked_template),
+        walked_nodes.clone(),
+        vec![kernel("probe_equivalent")],
+    )
+    .expect("the prepared generation's bucket");
+    let mut params = Vec::new();
+    for (_, _, launch) in &walked_nodes {
+        for node in launch {
+            if node.kind().expect("a node kind") == GraphNodeKind::Kernel {
+                params.push(
+                    walked_template
+                        .kernel_node_params(node)
+                        .expect("a kernel node's parameters"),
+                );
+            }
+        }
+    }
+    rebound
+        .rebind_launch(Probe::NAME, 0, &params)
+        .expect("the prepared generation is rebound");
+    graphs.insert(prepared_bucket, 2, rebound);
+
+    // The commit: generation 1 is purged.
+    let released = graphs.purge(1);
+    assert!(
+        released.contains(&prepared_bucket),
+        "the bucket generation 2 replaced kept its generation-1 capture, which nothing serves from"
+    );
+    assert!(
+        !released.contains(&untouched_bucket),
+        "the purge released the capture an unprepared bucket still serves from: every request in \
+         that bucket fails after the commit"
+    );
+    assert!(
+        graphs.holds(untouched_bucket),
+        "the table no longer holds the untouched bucket, so its arena region would be released \
+         under a graph that still addresses it"
+    );
+
+    // Serving generation 2 afterwards: both buckets answer, and the untouched one answers with the
+    // program it captured.
+    let untouched_shape = PlanShape::decode(WORDS as u32, Variant::DecodeGreedy);
+    let (bucket, served) = graphs
+        .select(&untouched_shape, 2)
+        .expect("the unprepared bucket still serves under the committed generation");
+    assert_eq!(bucket, untouched_bucket, "the smallest bucket that accepts the shape serves");
+    // SAFETY: the fill lies inside the allocation the served graph addresses.
+    unsafe { memset_d32(untouched_buffer.address(), 0, WORDS, &stream) }
+        .expect("zero the activation");
+    served.launch(&stream).expect("the served graph replays");
+    assert_eq!(
+        words(&stream, untouched_buffer.address()),
+        vec![CAPTURED; WORDS],
+        "the bucket the update did not prepare still runs the program it captured"
+    );
+
+    let prepared_shape = PlanShape::decode(WORDS as u32, Variant::DecodeGreedy);
+    let (bucket, served) = graphs
+        .select(&prepared_shape, 2)
+        .expect("the prepared bucket serves under the committed generation");
+    assert_eq!(bucket, prepared_bucket);
+    // SAFETY: as above, for the prepared bucket's allocation.
+    unsafe { memset_d32(prepared_buffer.address(), 0, WORDS, &stream) }
+        .expect("zero the activation");
+    served.launch(&stream).expect("the rebound graph replays");
+    assert_eq!(
+        words(&stream, prepared_buffer.address()),
+        vec![WALKED; WORDS],
+        "after the commit the prepared bucket runs the generation it switched over to"
     );
 }
