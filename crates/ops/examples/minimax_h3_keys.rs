@@ -557,18 +557,31 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
     );
     // The VSA branch's own attention: one program per tile size, and the key extent (tiles per
     // segment per layout) is a declared bound outside the key.
-    push(
-        "sparse_attention",
-        ops::attention::sparse::SparseDescriptor {
-            block: 64,
-            dtype: deployment,
-            output: deployment,
-            head_dim: HEAD_DIM,
-            lse: false,
-            keys: 65_536,
-        }
-        .to_string(),
-    );
+    //
+    // The FP32 form is not listed, and the reason is a programs gap named in
+    // `notes/h3/kernel-cells-audit.md`: every `sparse_attention` backend refuses it at its entry -
+    // `sm90` and `sm100` accept BF16 only (`sm100`'s `attention.cu` refuses and then casts its
+    // operands to `__nv_bfloat16*`), and `sm120` accepts BF16 and FP16 - because the kernel is the
+    // vendor's block-sparse pass, written for 16-bit operands. A row for it would build (the element
+    // type never reaches those build scripts) and no launch could use it, so a store built from this
+    // list would fail on a key no task binds: `t2va`, `fl2va` and `ref2va` all attend densely. A
+    // sparse deployment that states FP32 stops at its launch with `no kernel for operator
+    // sparse_attention descriptor ...`, which is the same fact at the moment it can be acted on.
+    // One row: the BF16 pass's. See the note above for why the FP32 pass emits none.
+    if deployment == DType::BF16 {
+        push(
+            "sparse_attention",
+            ops::attention::sparse::SparseDescriptor {
+                block: 64,
+                dtype: deployment,
+                output: deployment,
+                head_dim: HEAD_DIM,
+                lse: false,
+                keys: 65_536,
+            }
+            .to_string(),
+        );
+    }
     // The DiT's row mapping: one key for every raster, because the program reads the canvas as a
     // launch word. A canvas is a multiple of the model's own step and the VAE compresses it 16x, so
     // every latent side a served canvas produces is even — that check is the operator's, at launch.
