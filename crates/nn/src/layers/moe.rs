@@ -334,26 +334,51 @@ pub fn encoded_bytes(
 /// Every path through this block starts here, so a plan that covers the expert step but not the
 /// prefix leaves the first launch of every routed layer writing past its region.
 pub fn routing_bytes(tokens: u64, geometry: MoeGeometry, dtype: DType) -> Result<u64> {
-    let MoeGeometry {
-        top, experts, tile, ..
-    } = geometry;
+    Ok(router_bytes(tokens, geometry, dtype)?.saturating_add(sort_bytes(tokens, geometry)?))
+}
+
+/// The bytes the replicated router reserves for `tokens` rows: its scores over the whole expert
+/// vocabulary, and the kept ids, weights and expert-mapped ids of each route.
+///
+/// This half is the same on every path — a rank routes whole tokens the same way whether the experts
+/// live on one rank or over a group — so the exchange states it once for its own row count and the
+/// sort's half separately at the height it receives.
+pub fn router_bytes(tokens: u64, geometry: MoeGeometry, dtype: DType) -> Result<u64> {
+    let MoeGeometry { top, experts, .. } = geometry;
     let width_bytes = dtype
         .bytes()
         .ok_or_else(|| Error::shape("Moe", format!("{dtype} has no byte size")))?;
-    let tiles = ops::moe::max_tiles(tokens, top, experts, tile);
-    let routes = ops::moe::max_permuted_rows(tokens, top, experts, tile);
     let mut total: u64 = 0;
     for bytes in [
         tokens * experts * width_bytes, // the router's scores
         tokens * top * 4,               // its kept ids, i32
         tokens * top * 4,               // the route weights, f32
         tokens * top * 4,               // the expert-mapped ids, i32
-        tiles * 4,                      // each tile's expert
-        tiles * 4,                      // each tile's live rows
-        tokens * top * 4,               // the permuted row of each expanded route
-        routes * 4,                     // the expanded row of each permuted position
-        4,                              // the padded row count
-        4,                              // the non-empty tile count
+    ] {
+        total = total.saturating_add(bytes.next_multiple_of(ALIGNMENT));
+    }
+    Ok(total)
+}
+
+/// The bytes the permutation's metadata reserves for `tokens` rows over `geometry.experts` experts:
+/// each tile's expert and live-row count, the two route maps, and the two counters.
+///
+/// The exchange sizes this half at the rows it **receives** and over the experts this rank holds, so
+/// the same six terms appear twice on an expert-parallel path with different numbers in them.
+pub fn sort_bytes(tokens: u64, geometry: MoeGeometry) -> Result<u64> {
+    let MoeGeometry {
+        top, experts, tile, ..
+    } = geometry;
+    let tiles = ops::moe::max_tiles(tokens, top, experts, tile);
+    let routes = ops::moe::max_permuted_rows(tokens, top, experts, tile);
+    let mut total: u64 = 0;
+    for bytes in [
+        tiles * 4,        // each tile's expert
+        tiles * 4,        // each tile's live rows
+        tokens * top * 4, // the permuted row of each expanded route
+        routes * 4,       // the expanded row of each permuted position
+        4,                // the padded row count
+        4,                // the non-empty tile count
     ] {
         total = total.saturating_add(bytes.next_multiple_of(ALIGNMENT));
     }
@@ -400,6 +425,124 @@ pub fn step_bytes(
         dense_bytes(tokens, geometry, dtype)?
     };
     Ok(routing.saturating_add(expert))
+}
+
+/// An expert-parallel deployment's plan inputs: the group's rank count, and the tokens per rank the
+/// exchange carries.
+///
+/// `capacity` is a **load-time** input, not a request property: the plan is built when the model loads
+/// and bound to the deployment's capacity, which is what lets it reserve an exchange worst case at all.
+/// A request is admitted within that bound, and a batch larger than it is a deployment error rather
+/// than a buffer that grows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Group {
+    /// Ranks among which the experts are divided.
+    pub ranks: u64,
+    /// Tokens one rank's exchange carries.
+    pub capacity: u64,
+}
+
+impl Group {
+    /// The rows a rank is sent: every rank's capacity, one after another.
+    ///
+    /// The exchange hands a rank its own `capacity` tokens first and then its peers', so the rows this
+    /// rank sorts over are the whole group's, not its own batch's.
+    pub fn received(&self) -> u64 {
+        self.ranks.saturating_mul(self.capacity)
+    }
+}
+
+/// The permuted rows an expert-parallel rank sorts over, for a group and the block's geometry.
+///
+/// The rows are the **received** ones, over the experts the rank holds: the group's tokens are
+/// permuted by the expert that takes them, and this rank sees only those its own `experts / ranks`
+/// tiles own. That product, not the single-rank one, is what the step's buffers are shaped by.
+pub fn exchanged_rows(tokens: u64, geometry: MoeGeometry, group: Group) -> Result<u64> {
+    let local = local_experts(geometry, group)?;
+    if group.capacity == 0 {
+        return Err(Error::shape(
+            "Moe",
+            "an expert-parallel group carries no rows: a capacity of zero is a deployment that \
+             never stated what its exchange holds, and the plan cannot reserve an unknown worst case"
+                .to_owned(),
+        ));
+    }
+    let received = group.received();
+    if tokens > group.capacity {
+        return Err(Error::shape(
+            "Moe",
+            format!(
+                "{tokens} tokens against an exchange capacity of {}: the capacity is the plan's, and \
+                 a batch larger than it is a deployment that cannot be served",
+                group.capacity
+            ),
+        ));
+    }
+    Ok(ops::moe::max_permuted_rows(
+        received,
+        geometry.top,
+        local,
+        geometry.tile,
+    ))
+}
+
+/// The experts one rank holds, refusing a group that does not divide the vocabulary.
+fn local_experts(geometry: MoeGeometry, group: Group) -> Result<u64> {
+    if group.ranks == 0 || geometry.experts == 0 {
+        return Err(Error::shape(
+            "Moe",
+            "an expert-parallel group needs a rank count and a vocabulary".to_owned(),
+        ));
+    }
+    if !geometry.experts.is_multiple_of(group.ranks) {
+        return Err(Error::shape(
+            "Moe",
+            format!(
+                "{} experts do not divide into {} ranks",
+                geometry.experts, group.ranks
+            ),
+        ));
+    }
+    Ok(geometry.experts / group.ranks)
+}
+
+/// The bytes one expert-parallel routed layer's step reserves for `tokens` rows of a group.
+///
+/// The single-rank [`step_bytes`] is not this size, and the difference is not a constant: a rank sorts
+/// over `ranks · capacity` rows of the experts it holds, so the permutation's worst case changes with
+/// the group. Four parts, each named:
+///
+/// - the **router**, at the batch's own height over the whole vocabulary: every rank routes whole
+///   tokens the same way, so this half is the single-rank path's ([`router_bytes`]);
+/// - the **sort's metadata**, at the received height over the rank's own experts ([`sort_bytes`]);
+/// - the **gated rows and the products**, at the received height ([`dense_bytes`]'s two terms);
+/// - the **combined rows**, one per received token, which no single-rank path has.
+pub fn exchanged_bytes(
+    tokens: u64,
+    geometry: MoeGeometry,
+    group: Group,
+    dtype: DType,
+) -> Result<u64> {
+    let width_bytes = dtype
+        .bytes()
+        .ok_or_else(|| Error::shape("Moe", format!("{dtype} has no byte size")))?;
+    let local = local_experts(geometry, group)?;
+    let received = group.received();
+    let rows = exchanged_rows(tokens, geometry, group)?;
+    let received_geometry = MoeGeometry {
+        experts: local,
+        ..geometry
+    };
+    let mut total = router_bytes(tokens, geometry, dtype)?;
+    for bytes in [
+        sort_bytes(received, received_geometry)?,
+        rows * geometry.intermediate * width_bytes, // FC1's gated rows
+        rows * geometry.hidden * width_bytes,       // FC2's permuted products
+        received * geometry.hidden * width_bytes,   // the combined rows, in receive order
+    ] {
+        total = total.saturating_add(bytes.next_multiple_of(ALIGNMENT));
+    }
+    Ok(total)
 }
 
 /// The expert stacks a block multiplies.
@@ -1906,6 +2049,89 @@ pub(super) mod tests {
             encoded_scratch_bytes(15_360, 2048, 768),
             995_348,
             "the products' scratch, both entries' preambles included"
+        );
+    }
+
+    /// An expert-parallel step is its own reservation, and the difference from the single-rank one is
+    /// not a constant: a rank sorts the whole group's rows over the experts it holds, and it keeps one
+    /// combined row per received token that no single-rank path has.
+    #[test]
+    fn the_exchanged_step_reserves_the_received_rows_and_the_combined_ones() {
+        let geometry = MoeGeometry {
+            hidden: 2048,
+            intermediate: 768,
+            top: 8,
+            experts: 128,
+            tile: 128,
+        };
+        // Decode: the single-rank plan reserves a tile per route, which is far more than a group of
+        // 120 received rows over 16 experts each needs.
+        let decode = Group {
+            ranks: 8,
+            capacity: 15,
+        };
+        assert_eq!(decode.received(), 120);
+        assert_eq!(
+            exchanged_rows(15, geometry, decode).expect("the decode's rows"),
+            2_944
+        );
+        let small = exchanged_bytes(15, geometry, decode, DType::BF16).expect("the decode's step");
+        assert!(
+            small
+                < step_bytes(15, geometry, ScaleLayout::Linear, DType::BF16, true)
+                    .expect("the encoded single-rank step"),
+            "{small} is not below the single-rank reservation"
+        );
+        // Prefill: the same group over a full batch is the case the single-rank plan gets wrong.
+        let prefill = Group {
+            ranks: 8,
+            capacity: 1_024,
+        };
+        let rows = exchanged_rows(1_024, geometry, prefill).expect("the prefill's rows");
+        assert_eq!(rows, 67_456);
+        let single = step_bytes(1_024, geometry, ScaleLayout::Linear, DType::BF16, false)
+            .expect("the single-rank step");
+        let exchanged =
+            exchanged_bytes(1_024, geometry, prefill, DType::BF16).expect("the exchanged step");
+        // The combined rows alone are 8 192 tokens of hidden width.
+        let combined = 8_192 * 2048 * 2;
+        assert!(
+            exchanged > single + combined,
+            "{exchanged} does not hold the single-rank step {single} plus {combined}"
+        );
+        // Eight ranks divide the vocabulary; five do not, and a group of zero ranks or zero capacity
+        // is a deployment that stated nothing.
+        for group in [
+            Group {
+                ranks: 5,
+                capacity: 1_024,
+            },
+            Group {
+                ranks: 0,
+                capacity: 15,
+            },
+            Group {
+                ranks: 8,
+                capacity: 0,
+            },
+        ] {
+            assert!(
+                exchanged_bytes(15, geometry, group, DType::BF16).is_err(),
+                "{group:?} was accepted"
+            );
+        }
+        // A batch larger than the group's capacity is not served by a bigger buffer.
+        assert!(
+            exchanged_bytes(
+                16,
+                geometry,
+                Group {
+                    ranks: 8,
+                    capacity: 15
+                },
+                DType::BF16
+            )
+            .is_err()
         );
     }
 
