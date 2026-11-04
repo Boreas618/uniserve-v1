@@ -63,6 +63,18 @@
 //! convolution (the audio decoder's depthwise alias-free resamplers, which
 //! design §9 fuses into kernel programs) is not served by this binding.
 //!
+//! # Alignment
+//!
+//! cuDNN 9 requires every tensor descriptor to declare the alignment of the
+//! storage it will be pointed at, and proposes the engines that are valid for
+//! it; a descriptor without one is refused at `cudnnBackendFinalize` with
+//! `CUDNN_STATUS_BAD_PARAM`. [`Tensor::contiguous`] declares 16 bytes — what
+//! every device allocation of this crate and every torch storage provide —
+//! and [`Tensor::with_alignment`] states a smaller one for a view into the
+//! middle of a row. [`Cudnn::run`] refuses an address that is not aligned the
+//! way the plan's tensors declare, so a wrong declaration is an error here
+//! rather than a misaligned read on the device.
+//!
 //! # Streams and graphs
 //!
 //! Every call enters the device's primary context on the calling thread, so
@@ -83,6 +95,11 @@ const LIBCUDNN: &str = "libcudnn.so.9";
 /// `cudnnStatus_t`.
 type Status = i32;
 const STATUS_SUCCESS: Status = 0;
+
+/// The alignment [`Tensor::contiguous`] declares: every device allocation of
+/// this crate and every torch storage is at least this aligned, and cuDNN's
+/// engines that vectorize want it.
+const DEFAULT_ALIGNMENT: i64 = 16;
 
 /// `cudnnBackendDescriptorType_t`: the kinds of descriptor this module
 /// creates.
@@ -126,6 +143,7 @@ const ATTR_OPERATION_CONVOLUTION_BWD_DATA_DX: i32 = 710;
 const ATTR_OPERATION_CONVOLUTION_BWD_DATA_DY: i32 = 711;
 const ATTR_OPERATIONGRAPH_HANDLE: i32 = 800;
 const ATTR_OPERATIONGRAPH_OPS: i32 = 801;
+const ATTR_TENSOR_BYTE_ALIGNMENT: i32 = 900;
 const ATTR_TENSOR_DATA_TYPE: i32 = 901;
 const ATTR_TENSOR_DIMENSIONS: i32 = 902;
 const ATTR_TENSOR_STRIDES: i32 = 903;
@@ -377,6 +395,13 @@ pub struct Tensor {
     pub dims: Vec<i64>,
     pub strides: Vec<i64>,
     pub dtype: DataType,
+    /// The alignment of the tensor's base address in bytes, which the
+    /// descriptor declares to cuDNN: the storage the operation is handed must
+    /// be aligned to it. Every device allocation this crate makes and every
+    /// torch storage are at least 16-byte aligned, which is what
+    /// [`Tensor::contiguous`] declares; a view into the middle of an element
+    /// boundary is not, and says so with [`Tensor::with_alignment`].
+    pub byte_alignment: i64,
 }
 
 impl Tensor {
@@ -391,7 +416,16 @@ impl Tensor {
             dims,
             strides,
             dtype,
+            byte_alignment: DEFAULT_ALIGNMENT,
         }
+    }
+
+    /// The same tensor, with the alignment of its storage declared as
+    /// `bytes`: cuDNN uses it to choose engines that may vectorize, so it
+    /// must be what the address really is — never more.
+    pub fn with_alignment(mut self, bytes: i64) -> Self {
+        self.byte_alignment = bytes;
+        self
     }
 
     /// The number of dimensions: `N` and `C` plus the spatial ones.
@@ -411,6 +445,12 @@ impl Tensor {
                 "a convolution tensor of rank {} has {} strides",
                 self.dims.len(),
                 self.strides.len()
+            )));
+        }
+        if self.byte_alignment < 1 || !(self.byte_alignment as u64).is_power_of_two() {
+            return Err(Error::invalid(format!(
+                "a convolution tensor's alignment is a power of two of at least one byte, not {}",
+                self.byte_alignment
             )));
         }
         if self.dims.iter().any(|&dim| dim <= 0) {
@@ -560,6 +600,15 @@ impl Convolution {
     /// The number of spatial dimensions.
     pub fn rank(&self) -> usize {
         self.x.rank().saturating_sub(2)
+    }
+
+    /// The alignment each of the three tensors' addresses declares.
+    pub(crate) fn alignment(&self) -> ConvolutionAlignment {
+        ConvolutionAlignment {
+            x: self.x.byte_alignment,
+            w: self.w.byte_alignment,
+            y: self.y.byte_alignment,
+        }
     }
 
     /// The bytes each of the three tensors spans, for checking the caller's
@@ -723,6 +772,16 @@ pub struct ConvolutionBytes {
     pub x: u64,
     pub w: u64,
     pub y: u64,
+}
+
+/// The alignment each of a convolution's operand addresses declares to cuDNN,
+/// in bytes: a descriptor whose tensor declares 16 bytes is only usable with
+/// an address that is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ConvolutionAlignment {
+    pub x: i64,
+    pub w: i64,
+    pub y: i64,
 }
 
 /// The engine that runs a convolution: cuDNN's global index for it, which is
@@ -994,6 +1053,16 @@ impl Operation {
             call,
         )?;
         api.set_one(&descriptor, ATTR_TENSOR_UNIQUE_ID, TYPE_INT64, &uid, call)?;
+        // cuDNN 9 requires every tensor to declare the alignment of its
+        // storage: an engine config it proposes is only valid for an address
+        // aligned that way.
+        api.set_one(
+            &descriptor,
+            ATTR_TENSOR_BYTE_ALIGNMENT,
+            TYPE_INT64,
+            &tensor.byte_alignment,
+            call,
+        )?;
         api.finalize(&descriptor, "cudnnBackendFinalize")?;
         Ok(descriptor)
     }
@@ -1018,6 +1087,7 @@ pub struct ConvolutionPlan {
     engine: Engine,
     workspace_bytes: usize,
     bytes: ConvolutionBytes,
+    alignment: ConvolutionAlignment,
     device: DeviceId,
     // Held only for their lifetime: the plan refers to the engine
     // configuration it was built from, which the heuristic's operation graph
@@ -1205,6 +1275,7 @@ impl Cudnn {
             engine: recorded,
             workspace_bytes,
             bytes: convolution.bytes(),
+            alignment: convolution.alignment(),
             device: self.device,
             _config: chosen,
             _operation: operation,
@@ -1234,10 +1305,10 @@ impl Cudnn {
             )));
         }
         let bytes = plan.bytes;
-        for (name, range, needed) in [
-            ("input", args.x, bytes.x),
-            ("filter", args.w, bytes.w),
-            ("output", args.y, bytes.y),
+        for (name, range, needed, alignment) in [
+            ("input", args.x, bytes.x, plan.alignment.x),
+            ("filter", args.w, bytes.w, plan.alignment.w),
+            ("output", args.y, bytes.y, plan.alignment.y),
         ] {
             if range.ptr().address() == 0 {
                 return Err(Error::invalid(format!(
@@ -1249,6 +1320,18 @@ impl Cudnn {
                     "the convolution's {name} spans {} bytes, its tensor needs {needed}",
                     range.bytes()
                 )));
+            }
+            // The descriptor declares the alignment the plan's engines were
+            // chosen for, so an address that is not aligned that way is
+            // refused here rather than read wrongly on the device.
+            if alignment > 1 {
+                let address = range.ptr().address();
+                if address % alignment as u64 != 0 {
+                    return Err(Error::invalid(format!(
+                        "the convolution's {name} address {address:#x} is not aligned to the \
+                         {alignment} bytes its tensor declares"
+                    )));
+                }
             }
         }
         if args.workspace.ptr().address() == 0 && plan.workspace_bytes > 0 {
@@ -1620,6 +1703,24 @@ mod tests {
             .check()
             .expect_err("two paddings for three dimensions");
         assert!(error.to_string().contains("3 padding values"), "{error}");
+    }
+
+    #[test]
+    fn a_tensor_declares_the_alignment_of_its_storage() {
+        let tensor = Tensor::contiguous(vec![1, 6, 512], DataType::F32);
+        assert_eq!(tensor.byte_alignment, 16, "a device allocation's alignment");
+        assert!(tensor.check().is_ok());
+
+        // A view at an element boundary declares the element's own alignment,
+        // which an engine that vectorizes then knows it cannot use.
+        assert!(tensor.clone().with_alignment(4).check().is_ok());
+
+        let mut wrong = tensor;
+        wrong.byte_alignment = 3;
+        let error = wrong
+            .check()
+            .expect_err("three bytes is not a power of two");
+        assert!(error.to_string().contains("power of two"), "{error}");
     }
 
     #[test]
