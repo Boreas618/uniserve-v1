@@ -394,6 +394,19 @@ fn stage_decode(args: &Args) -> Result<()> {
     //    the reference's three separate steps.
     let component = checkpoint.component(VAE)?;
     let (width, dtype, weight, bias) = folded_input(component, &config.video_vae)?;
+    // The latent container is 16-bit by the precision rule (`specs/worker.md` 9: the video VAE
+    // decoder is FP16, and the reference's own decoder is called with FP16 latents), so an export
+    // whose VAE is another width would write bytes labelled 16-bit from a buffer of another width -
+    // a decode reading half a tensor, and a page of nonsense rather than an error. Naming the export
+    // here is the difference between a refusal and a wrong number.
+    if dtype != DType::F16 {
+        return Err(Failure::message(format!(
+            "the export's video VAE is {dtype}, and this stage's latent container is {H3T_F16} \
+             (float16): the checkpoint's own representation is the one the precision rule keeps, so \
+             this harness refuses rather than writes a container of another width"
+        )));
+    }
+    let container = element_of(dtype)?;
     let latent_channels = u64::from(config.video_vae.latent_channels);
     let mut weights = DeviceWeights::new(&device, 0)?;
     let (decoder, positions, rows) = {
@@ -500,7 +513,7 @@ fn stage_decode(args: &Args) -> Result<()> {
                     u64::from(args.latent_height),
                     u64::from(args.latent_width),
                 ],
-                H3T_F16,
+                container,
             )?,
             false,
         ),
@@ -582,7 +595,7 @@ fn stage_decode(args: &Args) -> Result<()> {
             u64::from(args.latent_height),
             u64::from(args.latent_width),
         ],
-        H3T_F16,
+        container,
         &latent_bytes,
     )?;
     write_h3t(
@@ -593,13 +606,14 @@ fn stage_decode(args: &Args) -> Result<()> {
     )?;
     let case = format!(
         "{{\"canvas\": {{\"height\": {}, \"width\": {}}}, \"latent_frames\": {}, \
-         \"latent_height\": {}, \"latent_width\": {}, \"latent_dtype\": \"f16\", \
+         \"latent_height\": {}, \"latent_width\": {}, \"latent_dtype\": \"{}\", \
          \"latents\": \"{}\", \"tiles\": {}, \"position_rows\": {}}}\n",
         height,
         width_px,
         canvas.frames,
         args.latent_height,
         args.latent_width,
+        dtype,
         if generated { "generated" } else { "supplied" },
         tiles.len(),
         rows,
