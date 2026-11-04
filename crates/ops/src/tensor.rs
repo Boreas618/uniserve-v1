@@ -43,6 +43,31 @@ impl std::fmt::Debug for DevicePtr {
     }
 }
 
+impl fmt::Display for Shape {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, dim) in self.dims().iter().enumerate() {
+            if index > 0 {
+                formatter.write_str("x")?;
+            }
+            write!(formatter, "{dim}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for Strides {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let strides = self.as_slice();
+        for (index, stride) in strides.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str("x")?;
+            }
+            write!(formatter, "{stride}")?;
+        }
+        Ok(())
+    }
+}
+
 impl std::fmt::Display for DevicePtr {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "0x{:x}", self.0)
