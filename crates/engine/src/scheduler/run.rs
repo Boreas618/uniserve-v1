@@ -235,6 +235,7 @@ impl Scheduler {
             output: output::OutputSender::default(),
             policy: None,
             policy_report: None,
+            shadow_pass: None,
             serving: tokio::sync::watch::Sender::new(false),
             generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             expert_load: None,
@@ -762,6 +763,10 @@ impl Scheduler {
             }
 
             let progressed = self.step_nonblocking();
+            // An update's shadow pass is answered once the step that ran it has
+            // ended (§7.3 step 2): the answer never claims a comparison the
+            // step has not finished.
+            self.settle_shadow();
             if !self.fatal && !progressed {
                 self.park_for_progress();
             }
