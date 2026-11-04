@@ -877,6 +877,10 @@ impl LeaderService {
             engines,
             next_engine,
             stops,
+            // The command channel is the daemon's, not the service's: the
+            // successor makes its own ends when it resumes (`ProcessCommands`).
+            commands: _,
+            reports: _,
         } = self;
         let (listener_descriptor, unix, address) = listener.hand_over();
         let mut descriptors = vec![listener_descriptor];

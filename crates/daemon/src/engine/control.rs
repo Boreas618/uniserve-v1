@@ -203,6 +203,11 @@ impl EngineControl {
 
     /// The request socket's address, which an engine attaches to
     /// (`EngineClient::attach`).
+    /// The host this control's engines run on.
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
     pub fn request_address(&self) -> &str {
         &self.request_address
     }
