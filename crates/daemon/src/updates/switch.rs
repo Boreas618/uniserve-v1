@@ -1539,6 +1539,37 @@ mod tests {
         );
     }
 
+    /// The previous epoch's promoted standby is that epoch's serving process:
+    /// its exit during the preparing is the serving epoch's death, so the
+    /// standby promotion takes over and the target is dropped.
+    #[test]
+    fn a_promoted_standbys_exit_is_the_previous_epochs() {
+        let epochs = Arc::new(Epochs::new());
+        let mut switch = Switch::new(
+            Arc::clone(&epochs),
+            Update::new(7, Deployment::of(ServeConfig::default())),
+            12,
+            record(),
+            11,
+            5,
+            7,
+            "engine:0".to_owned(),
+            nodes(),
+            start(),
+            "unix:/run/requests.sock".to_owned(),
+        );
+        let mut roster = Fake::default();
+        switch.start(&mut roster);
+        // The serving epoch's standby was promoted at 6, then died.
+        roster.scripted = vec![exit_event("n0", 6)];
+        switch.advance(&mut roster);
+
+        assert_eq!(switch.phase(), Phase::Abandoned);
+        assert!(switch.promotion_due());
+        assert_eq!(switch.discarded(), &[12]);
+        assert!(roster.serves.is_empty());
+    }
+
     /// A serving main process that exits during the preparing hands the
     /// failure domain to the standby promotion instead of reverting the
     /// update.
