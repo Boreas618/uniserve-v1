@@ -1,5 +1,11 @@
-//! The KV slot each query token of a call writes (design §9: the mechanism
-//! writes the batch in the layout the kernels read).
+//! The batch column values the mechanism computes (design §9: the mechanism
+//! writes the batch in the layout the kernels read): the KV slot each query
+//! token writes, and the forward row whose hidden state feeds `logits()`.
+//!
+//! Everything else the kernels read is a fact of the calls the mechanism
+//! builds, which it can state as it builds them; these two are computed from a
+//! request's block table and from the batch's rows, so they live here as pure
+//! functions the assembly calls once per call.
 //!
 //! A request's KV lives in physical cache units. One logical page of a cache
 //! group holds `block_size` tokens and occupies `units_per_page` units
@@ -75,6 +81,40 @@ pub(crate) fn slot_mapping(
     Some(slots)
 }
 
+/// For each call of `calls`, in order, the forward row whose hidden state feeds
+/// the call's `logits()`: the last row the call occupies, when the call has
+/// consumer slots that draw from it.
+///
+/// A row is one query interval of `forward`, grouped by call in scheduling
+/// order (`ForwardBatch::call_indices`). Sampling reads the interval's last
+/// token, so the row to read is the last row carrying the call's index; a call
+/// with no consumer slots samples nothing and states -1, as a row that no call
+/// reads does.
+///
+/// `None` when a call that has consumer slots occupies no row: the batch would
+/// ask a kernel to sample a row it does not have.
+pub(crate) fn logits_rows(calls: &[ipc::Call], forward: &ipc::ForwardBatch) -> Option<Vec<i64>> {
+    let mut last_row: Vec<Option<u32>> = vec![None; calls.len()];
+    for (row, call_index) in forward.call_indices.iter().enumerate() {
+        let call_index = usize::try_from(*call_index).ok()?;
+        if call_index >= calls.len() {
+            return None;
+        }
+        last_row[call_index] = Some(u32::try_from(row).ok()?);
+    }
+    calls
+        .iter()
+        .zip(last_row)
+        .map(|(call, row)| {
+            if call.consumer_slots.is_empty() {
+                return Some(-1);
+            }
+            // A sampling call must occupy at least one row.
+            Some(i64::from(row?))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,5 +180,53 @@ mod tests {
             ..table()
         };
         assert_eq!(slot_mapping(&empty, page(), 8..9), None);
+    }
+
+    /// A call of `kind` with the consumer slots a sampling call has.
+    fn call(kind: ipc::CallKind, samples: bool) -> ipc::Call {
+        let mut call = ipc::Call::new(
+            ipc::RequestKey::new(1, ipc::RequestId(1), 1),
+            ipc::CallId::new(1, 0),
+            kind,
+        );
+        call.consumer_slots = if samples { vec![0] } else { Vec::new() };
+        call
+    }
+
+    #[test]
+    fn a_sampling_call_reads_its_last_row() {
+        let calls = [
+            call(ipc::CallKind::Forward(ipc::ForwardMode::Prefill), true),
+            call(ipc::CallKind::Forward(ipc::ForwardMode::Decode), true),
+            call(
+                ipc::CallKind::Transfer(ipc::TransferMode::CacheExport),
+                false,
+            ),
+        ];
+        // Call 0 has rows 0 and 1, call 1 has row 2, the transfer has none.
+        let mut forward = ipc::ForwardBatch::default();
+        forward.push(0, 4, 12, 8, true);
+        forward.push(0, 4, 20, 8, true);
+        forward.push(1, 5, 30, 1, true);
+
+        assert_eq!(logits_rows(&calls, &forward), Some(vec![1, 2, -1]));
+    }
+
+    #[test]
+    fn a_sampling_call_without_a_row_is_a_fault() {
+        // Call 1 samples but no row carries it.
+        let calls = [
+            call(ipc::CallKind::Forward(ipc::ForwardMode::Prefill), true),
+            call(ipc::CallKind::Forward(ipc::ForwardMode::Decode), true),
+        ];
+        let mut forward = ipc::ForwardBatch::default();
+        forward.push(0, 4, 12, 8, true);
+
+        assert_eq!(logits_rows(&calls, &forward), None);
+
+        // A row that names no call in the batch is a fault too.
+        let mut stray = ipc::ForwardBatch::default();
+        stray.push(7, 4, 12, 8, true);
+        assert_eq!(logits_rows(&calls, &stray), None);
     }
 }
