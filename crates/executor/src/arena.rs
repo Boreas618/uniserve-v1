@@ -18,7 +18,7 @@
 //! Captures run largest first (see [`crate::plan::Buckets::capture_order`]), so a smaller bucket's
 //! plan reuses the mapped blocks of a larger one instead of growing the pool.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use platform::{Allocator, Buffer, DevicePtr};
@@ -31,11 +31,14 @@ use crate::{Error, Result};
 pub struct StreamId(pub usize);
 
 /// Where one bucket's activations live in a pool.
+///
+/// The plan is the extent of the bucket's static allocations, not their list: `nn::Arena` hands
+/// out addresses in the order the forward reserves them, and every capture and every replay of a
+/// bucket walks the same sequence, so the addresses are the same each time. What the pool has to
+/// remember is how far a bucket reaches, to map that much of its range and to check it fits.
 #[derive(Clone, Debug, Default)]
 pub struct Plan {
-    /// The byte offset of each allocation from the pool's base, in allocation order.
-    offsets: Vec<u64>,
-    /// The bytes the bucket's plan uses.
+    /// The bytes the bucket's plan uses, from the pool's base.
     bytes: u64,
 }
 
@@ -45,36 +48,23 @@ impl Plan {
         self.bytes
     }
 
-    /// The pool offset of the allocation with this ordinal.
-    pub fn offset(&self, ordinal: usize) -> Option<u64> {
-        self.offsets.get(ordinal).copied()
-    }
-
-    /// How many allocations the plan holds.
-    pub fn len(&self) -> usize {
-        self.offsets.len()
-    }
-
     /// Whether the plan holds no allocation.
     pub fn is_empty(&self) -> bool {
-        self.offsets.is_empty()
+        self.bytes == 0
     }
 }
 
-/// The pool of one stream: its reserved range, how much of it is mapped, and each bucket's plan.
+/// What one stream's pool holds: its reserved range, and the plans of its buckets.
 struct Pool {
     buffer: Buffer,
-    mapped: u64,
     plans: HashMap<Bucket, Plan>,
 }
 
 /// Every graph pool of one runner, by stream.
 pub struct Pools {
     allocator: Arc<Allocator>,
-    /// The bytes each stream's range reserves.
-    bytes: u64,
-    /// The device bytes every pool's mappings are booked against (4.1).
-    budget: u64,
+    /// The pool's reservation per stream and every mapping's booking.
+    ledger: Ledger,
     pools: HashMap<StreamId, Pool>,
 }
 
@@ -91,74 +81,145 @@ pub struct PoolMetrics {
     pub budget: u64,
 }
 
+/// The books of a runner's graph pools: the reservation per stream, each bucket's planned extent,
+/// and how much of each pool is mapped.
+///
+/// No driver call happens here, so the two facts item 5 asserts - `mapped <= budget` and a purged
+/// generation's bytes coming back - are decided in one place and can be checked without a device.
+/// [`Pools`] maps and unmaps exactly what these books say.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Ledger {
+    /// The bytes each stream's range reserves.
+    reservation: u64,
+    /// The device bytes every mapping is booked against (4.1).
+    budget: u64,
+    streams: BTreeMap<StreamId, StreamBooks>,
+}
+
+/// One stream's books: what its plans need and what is mapped of them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct StreamBooks {
+    mapped: u64,
+    /// The extent of each planned bucket.
+    extents: BTreeMap<Bucket, u64>,
+}
+
+impl Ledger {
+    fn new(reservation: u64, budget: u64) -> Self {
+        Self {
+            reservation,
+            budget,
+            streams: BTreeMap::new(),
+        }
+    }
+
+    /// Books a new stream's reserved range, refusing a reservation the device budget cannot hold
+    /// beside the streams already reserved (4.1: a booking past the budget fails, it does not wait).
+    fn open(&mut self, stream: StreamId) -> Result<()> {
+        if self.streams.contains_key(&stream) {
+            return Ok(());
+        }
+        let reserved = self
+            .reservation
+            .saturating_mul(self.streams.len() as u64 + 1);
+        if reserved > self.budget {
+            return Err(Error::Resource(format!(
+                "a graph pool of {} bytes on stream {stream:?} would reserve {reserved} bytes of a {}-byte budget",
+                self.reservation, self.budget
+            )));
+        }
+        self.streams.insert(stream, StreamBooks::default());
+        Ok(())
+    }
+
+    /// Books `bucket`'s extent on `stream` and answers the bytes that must be mapped for it.
+    fn note(&mut self, stream: StreamId, bucket: Bucket, bytes: u64) -> Result<u64> {
+        if bytes > self.reservation {
+            return Err(Error::Invalid(format!(
+                "bucket {bucket} needs {bytes} bytes, the pool reserves {}",
+                self.reservation
+            )));
+        }
+        let books = self
+            .streams
+            .get_mut(&stream)
+            .ok_or_else(|| Error::State("the graph pool was not opened".into()))?;
+        books.extents.insert(bucket, bytes);
+        let needed = books.extents.values().copied().max().unwrap_or(0);
+        let map = needed.saturating_sub(books.mapped);
+        books.mapped = books.mapped.max(needed);
+        Ok(map)
+    }
+
+    /// Books `bucket`'s release on `stream` and answers the bytes that must be unmapped: the pool
+    /// shrinks to the largest extent it still plans.
+    fn release(&mut self, stream: StreamId, bucket: Bucket) -> u64 {
+        let Some(books) = self.streams.get_mut(&stream) else {
+            return 0;
+        };
+        if books.extents.remove(&bucket).is_none() {
+            return 0;
+        }
+        let kept = books.extents.values().copied().max().unwrap_or(0);
+        let unmap = books.mapped.saturating_sub(kept);
+        books.mapped = kept;
+        unmap
+    }
+
+    /// Books a stream's whole release.
+    fn close(&mut self, stream: StreamId) -> u64 {
+        self.streams.remove(&stream).map_or(0, |books| books.mapped)
+    }
+
+    fn mapped(&self) -> u64 {
+        self.streams.values().map(|books| books.mapped).sum()
+    }
+
+    fn metrics(&self) -> PoolMetrics {
+        PoolMetrics {
+            streams: self.streams.len(),
+            reserved: self.reservation * self.streams.len() as u64,
+            mapped: self.mapped(),
+            budget: self.budget,
+        }
+    }
+}
+
 impl Pools {
     /// Reserves `bytes` of virtual address space per stream, on demand.
     ///
     /// The range is reserved, not mapped: physical blocks are mapped as a bucket's plan needs them
-    /// and booked against the device budget then. A reservation past the budget fails here.
-    /// `bytes` is each stream's reservation and `budget` the device bytes every mapping is booked
-    /// against (`capacity::graph_storage_budget_bytes`); the two are kept apart because a metric
-    /// that reported the reservation as the budget would pass every invariant by construction.
+    /// and booked against the device budget then. `bytes` is each stream's reservation and `budget`
+    /// the device bytes every mapping is booked against (`capacity::graph_storage_budget_bytes`);
+    /// the two are kept apart because a metric that reported the reservation as the budget would
+    /// pass every invariant by construction.
     pub fn new(allocator: Arc<Allocator>, bytes: u64, budget: u64) -> Self {
         Self {
             allocator,
-            bytes,
-            budget,
+            ledger: Ledger::new(bytes, budget),
             pools: HashMap::new(),
         }
     }
 
     /// The bytes each stream's range reserves.
     pub fn reserved(&self) -> u64 {
-        self.bytes
+        self.ledger.reservation
     }
 
     /// The bytes mapped over every pool.
     pub fn mapped(&self) -> u64 {
-        self.pools.values().map(|pool| pool.mapped).sum()
+        self.ledger.mapped()
     }
 
     /// What this runner's graph pools hold and what they may hold (4.1, item 5's mapped-bytes
     /// invariant): the bytes reserved per stream, the bytes mapped over them, and the device
     /// budget they are booked against.
     ///
-    /// `mapped <= budget` holds by construction: a reservation past the budget fails here and a
-    /// plan past the reservation fails in [`Pools::record`], so two generations' graphs coexisting
-    /// cannot overrun the device.
+    /// `mapped <= budget` holds by construction: a reservation past the budget is refused in
+    /// [`Ledger::open`] and a plan past the reservation in [`Ledger::note`], so two generations'
+    /// graphs coexisting cannot overrun the device.
     pub fn metrics(&self) -> PoolMetrics {
-        PoolMetrics {
-            streams: self.pools.len(),
-            reserved: self.bytes * self.pools.len() as u64,
-            mapped: self.mapped(),
-            budget: self.budget,
-        }
-    }
-
-    /// Gives back the region of `bucket` on `stream` once its graph is gone (7.3's purge).
-    ///
-    /// The plan goes first, then the pool shrinks its mapping to the largest remaining plan, so a
-    /// purged generation returns its bytes to the budget rather than holding them until the
-    /// executor closes. Answers the bytes unmapped.
-    pub fn release_bucket(&mut self, stream: StreamId, bucket: Bucket) -> Result<u64> {
-        let Some(pool) = self.pools.get_mut(&stream) else {
-            return Ok(0);
-        };
-        if pool.plans.remove(&bucket).is_none() {
-            return Ok(0);
-        }
-        let extent = pool
-            .plans
-            .values()
-            .map(|plan| plan.bytes)
-            .max()
-            .unwrap_or(0);
-        if extent >= pool.mapped {
-            return Ok(0);
-        }
-        pool.buffer.unmap(pool.mapped - extent)?;
-        let released = pool.mapped - extent;
-        pool.mapped = extent;
-        Ok(released)
+        self.ledger.metrics()
     }
 
     /// The plan of `bucket` on `stream`, if it was captured.
@@ -191,27 +252,40 @@ impl Pools {
         offsets: Vec<u64>,
         bytes: u64,
     ) -> Result<()> {
-        if bytes > self.bytes {
-            return Err(Error::Invalid(format!(
-                "bucket {bucket} needs {bytes} bytes, the pool reserves {}",
-                self.bytes
-            )));
-        }
+        let map = self.ledger.note(stream, bucket, bytes)?;
         let pool = self.pool(stream)?;
-        // The plan's extent is what must be mapped, so map up to it and book it.
-        if bytes > pool.mapped {
-            pool.buffer.map(bytes)?;
-            pool.mapped = bytes;
+        if map > 0 {
+            // The plan's extent is what must be mapped, so map up to it; the allocator books it
+            // against the device budget before the mapping exists.
+            pool.buffer.map(map)?;
         }
         pool.plans.insert(bucket, Plan { offsets, bytes });
         Ok(())
     }
 
+    /// Gives back the region of `bucket` on `stream` once its graph is gone (7.3's purge).
+    ///
+    /// The plan goes first, then the pool shrinks its mapping to the largest remaining plan, so a
+    /// purged generation returns its bytes to the budget rather than holding them until the
+    /// executor closes. Answers the bytes unmapped.
+    pub fn release_bucket(&mut self, stream: StreamId, bucket: Bucket) -> Result<u64> {
+        let unmap = self.ledger.release(stream, bucket);
+        let Some(pool) = self.pools.get_mut(&stream) else {
+            return Ok(0);
+        };
+        pool.plans.remove(&bucket);
+        if unmap > 0 {
+            pool.buffer.unmap(unmap)?;
+        }
+        Ok(unmap)
+    }
+
     /// Releases every plan and the pool's mappings of one stream (an executor close).
     pub fn release(&mut self, stream: StreamId) -> Result<()> {
+        let unmap = self.ledger.close(stream);
         if let Some(mut pool) = self.pools.remove(&stream) {
-            if pool.mapped > 0 {
-                pool.buffer.unmap(pool.mapped)?;
+            if unmap > 0 {
+                pool.buffer.unmap(unmap)?;
             }
         }
         Ok(())
@@ -228,12 +302,12 @@ impl Pools {
 
     fn pool(&mut self, stream: StreamId) -> Result<&mut Pool> {
         if !self.pools.contains_key(&stream) {
-            let buffer = self.allocator.reserve(self.bytes)?;
+            self.ledger.open(stream)?;
+            let buffer = self.allocator.reserve(self.ledger.reservation)?;
             self.pools.insert(
                 stream,
                 Pool {
                     buffer,
-                    mapped: 0,
                     plans: HashMap::new(),
                 },
             );
@@ -248,9 +322,95 @@ impl std::fmt::Debug for Pools {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Pools")
-            .field("bytes", &self.bytes)
+            .field("bytes", &self.ledger.reservation)
             .field("mapped", &self.mapped())
             .field("streams", &self.pools.len())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plan::Variant;
+
+    /// A capture shape of `rows` decode rows.
+    fn bucket(rows: u32) -> Bucket {
+        Bucket {
+            variant: Variant::DecodeGreedy,
+            rows,
+            tokens: 1,
+        }
+    }
+
+    #[test]
+    fn a_reservation_past_the_device_budget_is_refused_before_it_maps() {
+        let mut ledger = Ledger::new(1000, 1500);
+        ledger.open(StreamId(0)).expect("the first stream fits");
+        let refused = ledger.open(StreamId(1));
+        assert!(
+            refused.is_err(),
+            "1000 + 1000 bytes past a 1500-byte budget"
+        );
+        // The refusal leaves the books as they were, so nothing is reserved twice.
+        assert_eq!(ledger.metrics().streams, 1);
+    }
+
+    #[test]
+    fn a_plan_maps_only_the_bytes_it_adds_and_never_past_the_reservation() {
+        let mut ledger = Ledger::new(1000, 4000);
+        ledger.open(StreamId(0)).expect("a stream fits");
+        assert_eq!(ledger.note(StreamId(0), bucket(1), 800).expect("fits"), 800);
+        // A smaller bucket lives inside the mapped range: nothing new is mapped.
+        assert_eq!(ledger.note(StreamId(0), bucket(2), 300).expect("fits"), 0);
+        assert_eq!(ledger.mapped(), 800);
+        assert!(ledger.note(StreamId(0), bucket(3), 2000).is_err());
+    }
+
+    #[test]
+    fn a_purged_bucket_returns_its_bytes_and_the_pool_shrinks_to_what_it_still_plans() {
+        let mut ledger = Ledger::new(1000, 4000);
+        ledger.open(StreamId(0)).expect("a stream fits");
+        ledger.note(StreamId(0), bucket(1), 800).expect("fits");
+        ledger.note(StreamId(0), bucket(2), 600).expect("fits");
+        assert_eq!(ledger.mapped(), 800);
+        // Purging the largest plan shrinks the mapping to the next one.
+        assert_eq!(ledger.release(StreamId(0), bucket(1)), 200);
+        assert_eq!(ledger.mapped(), 600);
+        // Purging a bucket that was never planned gives nothing back.
+        assert_eq!(ledger.release(StreamId(0), bucket(9)), 0);
+        assert_eq!(ledger.release(StreamId(0), bucket(2)), 600);
+        assert_eq!(ledger.mapped(), 0);
+    }
+
+    #[test]
+    fn two_generations_capture_inside_one_mapped_range() {
+        let mut ledger = Ledger::new(1000, 4000);
+        ledger.open(StreamId(0)).expect("a stream fits");
+        // The old generation's plan, then the new generation's plan of the same bucket: the
+        // second capture reuses the mapped range instead of mapping beside it.
+        ledger.note(StreamId(0), bucket(1), 900).expect("fits");
+        ledger.note(StreamId(0), bucket(1), 900).expect("fits");
+        assert_eq!(ledger.mapped(), 900);
+        assert!(ledger.metrics().mapped <= ledger.metrics().budget);
+    }
+
+    #[test]
+    fn a_pool_that_closes_gives_all_of_its_bytes_back() {
+        let mut ledger = Ledger::new(1000, 4000);
+        ledger.open(StreamId(0)).expect("a stream fits");
+        ledger.open(StreamId(1)).expect("a second stream fits");
+        ledger.note(StreamId(0), bucket(1), 700).expect("fits");
+        ledger.note(StreamId(1), bucket(1), 400).expect("fits");
+        assert_eq!(ledger.close(StreamId(0)), 700);
+        assert_eq!(
+            ledger.metrics(),
+            PoolMetrics {
+                streams: 1,
+                reserved: 1000,
+                mapped: 400,
+                budget: 4000,
+            }
+        );
     }
 }
