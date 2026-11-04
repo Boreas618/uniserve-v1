@@ -57,6 +57,34 @@ impl GatedActivation {
         self.activation
     }
 
+    /// The descriptor one gated activation of `width` channels launches, stated without a device.
+    ///
+    /// The two row strides are launch values a walk reads from the scratch layout, and `elements` is
+    /// the output's element count — the descriptor's `wide` form is a second program, so it is part of
+    /// the key and not a heuristic.
+    pub fn descriptor_of(
+        dtype: DType,
+        width: u64,
+        activation: Activation,
+        gate_stride: u64,
+        value_stride: u64,
+        elements: u64,
+        stepwise: bool,
+    ) -> Result<activation::ActAndMulDescriptor> {
+        Ok(activation::ActAndMulDescriptor {
+            dtype,
+            width: u32::try_from(width)
+                .map_err(|_| Error::shape("GatedActivation", "a row wider than a u32".to_owned()))?,
+            block: BLOCK,
+            activation,
+            gate_stride,
+            value_stride,
+            wide: elements >= u64::from(u32::MAX),
+            pdl: PDL,
+            stepwise,
+        })
+    }
+
     /// `out = act(gate) · value`.
     ///
     /// `gate` and `value` have `out`'s extents; their rows may be strided (the halves of one packed
@@ -70,19 +98,15 @@ impl GatedActivation {
         out: TensorView,
     ) -> Result<()> {
         let width = out.shape.last();
-        let descriptor = activation::ActAndMulDescriptor {
-            dtype: out.dtype,
-            width: u32::try_from(width).map_err(|_| {
-                Error::shape("GatedActivation", "a row wider than a u32".to_owned())
-            })?,
-            block: BLOCK,
-            activation: self.activation,
-            gate_stride: gate.strides.get(0),
-            value_stride: value.strides.get(0),
-            wide: out.shape.numel() >= u64::from(u32::MAX),
-            pdl: PDL,
-            stepwise: self.stepwise,
-        };
+        let descriptor = Self::descriptor_of(
+            out.dtype,
+            width,
+            self.activation,
+            gate.strides.get(0),
+            value.strides.get(0),
+            out.shape.numel(),
+            self.stepwise,
+        )?;
         let args = activation::ActAndMulArgs { gate, value, out };
 
         f.operate::<activation::ActAndMul>(&descriptor, args)
@@ -375,6 +399,24 @@ impl Gelu {
         self.approximation
     }
 
+    /// The descriptor one GELU over rows of `columns` channels launches, stated without a device.
+    ///
+    /// The approximation is part of the key: the checkpoint's blocks and its merger use two different
+    /// ones, which are two programs.
+    pub fn descriptor_of(
+        dtype: DType,
+        columns: u32,
+        approximate: ops::gelu::Approximation,
+    ) -> ops::gelu::Descriptor {
+        ops::gelu::Descriptor {
+            dtype,
+            columns,
+            block: BLOCK,
+            approximate,
+            pdl: PDL,
+        }
+    }
+
     /// `out = gelu(x)` over the rows.
     pub fn forward(&self, f: &Forward, x: TensorView, out: TensorView) -> Result<()> {
         if x.shape.rank() != 2 || x.shape != out.shape {
@@ -385,13 +427,7 @@ impl Gelu {
         }
         let columns = u32::try_from(x.shape.last())
             .map_err(|_| Error::shape("Gelu", "more columns than a descriptor holds".to_owned()))?;
-        let descriptor = ops::gelu::Descriptor {
-            dtype: x.dtype,
-            columns,
-            block: BLOCK,
-            approximate: self.approximation,
-            pdl: PDL,
-        };
+        let descriptor = Self::descriptor_of(x.dtype, columns, self.approximation);
         f.operate::<ops::gelu::Gelu>(&descriptor, ops::gelu::Args { x, out })
     }
 }

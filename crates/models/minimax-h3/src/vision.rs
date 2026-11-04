@@ -677,6 +677,95 @@ pub struct VisionTower {
 }
 
 impl VisionTower {
+    /// The programs one tower call launches, from the configuration and the deployment's element type.
+    ///
+    /// `sequence` is the largest patch grid the deployment serves: it is the dense attention's key
+    /// bound, which every call of one grid shares. Everything else is the config's — including the two
+    /// GELUs, which are two programs because the tower's blocks approximate and its merger does not.
+    pub fn programs(
+        config: &VisionConfig,
+        dtype: nn::DType,
+        sequence: u32,
+    ) -> Result<Vec<(String, String)>> {
+        use crate::programs::Programs;
+        use ops::attention::dense::DenseAttention;
+        use ops::gelu::Gelu as GeluOp;
+        use ops::gemm::Gemm;
+        use ops::norm::LayerNorm as LayerNormOp;
+        use ops::position::PositionInterpolate as PositionOp;
+        use ops::residual::ScaledResidual as ResidualOp;
+        use ops::rope::RopeApply;
+
+        let hidden = config.hidden_size;
+        let head_dim = Geometry::head_dim(config)?;
+        let heads = config.num_heads;
+        let merged = Geometry::merged_width(config);
+        let mut programs = Programs::default();
+
+        // Every projection of the tower — the patch embedding, the four of each block, the two of each
+        // merger — carries a bias, which is its own epilogue.
+        programs.launch::<Gemm>(&Linear::descriptor_of(
+            hidden,
+            dtype,
+            WeightOrder::NxK,
+            true,
+            dtype,
+            dtype,
+        ));
+
+        // The two layer normalizations: the blocks' at the tower's width and the mergers' at a merged
+        // row's.
+        programs.launch::<LayerNormOp>(&LayerNorm::descriptor_of(dtype, hidden, true));
+        programs.launch::<LayerNormOp>(&LayerNorm::descriptor_of(dtype, merged, true));
+
+        // The learned table resampled onto the request's grid, and the residual that adds it.
+        programs.launch::<PositionOp>(&PositionInterpolate::new(
+            dtype,
+            u64::from(hidden),
+            Geometry::position_grid(config)?,
+        )?
+        .descriptor());
+        programs.launch::<ResidualOp>(&ScaledResidual::descriptor_of(dtype, u64::from(hidden), false)?);
+
+        // The patch rotation, then one bidirectional attention per grid.
+        programs.launch::<RopeApply>(
+            &Rotate::new(u64::from(head_dim), u64::from(heads), Rotation::Half)?
+                .descriptor(dtype, dtype),
+        );
+        let attention = Attention::dense(
+            head_dim,
+            heads,
+            heads,
+            sequence,
+            false,
+            None,
+            (head_dim as f32).sqrt().recip(),
+        )
+        .map_err(Error::from)?;
+        programs.launch::<DenseAttention>(&attention.dense_descriptor(
+            dtype, dtype, dtype, sequence, true,
+        ));
+
+        // The blocks' approximated GELU over the feed-forward's rows, and the merger's exact one over a
+        // merged row.
+        programs.launch::<GeluOp>(&Gelu::descriptor_of(
+            dtype,
+            config.intermediate_size,
+            // The checkpoint states one activation for the blocks; the merger's is the exact GELU by
+            // construction, which is why the tower loads two different layers.
+            match config.hidden_act {
+                VisionActivation::GeluTanh => ops::gelu::Approximation::Tanh,
+            },
+        ));
+        programs.launch::<GeluOp>(&Gelu::descriptor_of(
+            dtype,
+            merged,
+            ops::gelu::Approximation::Exact,
+        ));
+
+        Ok(programs.finish())
+    }
+
     /// The tower of `config`, reading the checkpoint through `loader`.
     ///
     /// `dtype` is the activation element type the loading boundary chose: the checkpoint's own
@@ -1065,6 +1154,36 @@ fn half_bits(value: f32) -> u16 {
 
 #[cfg(test)]
 mod tests {
+
+    /// The tower's programs are its config's: one product (every projection carries a bias), two
+    /// layer normalizations (the blocks' width and a merged row's), the resample of its learned table,
+    /// one residual, the patch rotation, one bidirectional attention, and two GELUs — the blocks'
+    /// approximation and the merger's exact form are two programs.
+    #[test]
+    fn the_tower_states_its_programs_from_its_config() {
+        let config = crate::config::tests_support::released_config().text_encoder.vision;
+        let programs = VisionTower::programs(&config, nn::DType::BF16, 4096)
+            .expect("the tower's programs");
+        let count = |operator: &str| {
+            programs
+                .iter()
+                .filter(|(name, _)| name == operator)
+                .count()
+        };
+        assert_eq!(count("gemm"), 1);
+        assert_eq!(count("layer_norm"), 2);
+        assert_eq!(count("position_interpolate"), 1);
+        assert_eq!(count("scaled_residual"), 1);
+        assert_eq!(count("rope_apply"), 1);
+        assert_eq!(count("dense_attention"), 1);
+        assert_eq!(count("gelu"), 2);
+        assert!(
+            programs
+                .iter()
+                .any(|(name, key)| name == "gemm" && key.contains("epilogue_bias")),
+            "the tower's projections carry biases: {programs:?}"
+        );
+    }
     use super::*;
 
     /// The released vision tower's configuration.
