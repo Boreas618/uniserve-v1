@@ -32,6 +32,7 @@ class TaskName(StrEnum):
     """Identifies the request and validation contract for a benchmark point."""
 
     TEXT = "text"
+    GSM8K = "gsm8k"
     T2I = "t2i"
     I2I = "i2i"
     I2T = "i2t"
