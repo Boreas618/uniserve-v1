@@ -226,3 +226,70 @@ pub(crate) fn scatter_args(
         snapshot,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn group(columns: u32, units_per_page: u32, layers: usize) -> CacheGroupPlan {
+        CacheGroupPlan {
+            window: None,
+            state: true,
+            draft: false,
+            block_size: 64,
+            units_per_page,
+            layers: (0..layers).map(|layer| format!("layer.{layer}")).collect(),
+            layer_ids: (0..layers as u32).collect(),
+            axis: crate::memory::prefix_cache::plan::GroupAxis {
+                offset: 0,
+                total: columns,
+            },
+            num_kv_heads: 0,
+            total_kv_heads: 0,
+            kv_head_offset: 0,
+            head_dim: 0,
+            dtype: crate::memory::allocation::ElementType::U8,
+            compute_dtype: crate::memory::allocation::ElementType::U8,
+        }
+    }
+
+    fn checkpoint(first_plane: u32, planes: u32) -> Checkpoint {
+        Checkpoint {
+            first_plane,
+            planes,
+            fields: Vec::new(),
+        }
+    }
+
+    /// A page's planes map to the pool's cells the way the retained manifest addresses them:
+    /// `column * num_units + unit`, one run per storage field, in plane order.
+    #[test]
+    fn a_pages_planes_map_to_their_cells_in_field_runs() -> Result<()> {
+        // Two columns and one unit per page: a page holds two planes, one per column, and the
+        // next two planes belong to the second field.
+        let group = group(2, 1, 2);
+        let cells = page_cells(&group, 2, 8, &checkpoint(0, 4), &[5])?;
+        assert_eq!(
+            cells,
+            vec![
+                (0, vec![0 * 8 + 5, 1 * 8 + 5]),
+                (1, vec![0 * 8 + 5, 1 * 8 + 5]),
+            ]
+        );
+        Ok(())
+    }
+
+    /// A page of two units asks the two units it was given, so a checkpoint that needs more
+    /// planes than the page's units and fields hold is refused rather than wrapped.
+    #[test]
+    fn a_page_naming_fewer_units_than_its_planes_need_is_refused() {
+        let group = group(2, 2, 4);
+        // Four planes span two units of two columns; one unit cannot hold the second half.
+        assert!(page_cells(&group, 2, 8, &checkpoint(0, 4), &[3]).is_err());
+        // Two units hold the page's first field's four planes.
+        assert_eq!(
+            page_cells(&group, 2, 8, &checkpoint(0, 4), &[3, 4]).expect("two units"),
+            vec![(0, vec![0 * 8 + 3, 1 * 8 + 3, 0 * 8 + 4, 1 * 8 + 4])]
+        );
+    }
+}
