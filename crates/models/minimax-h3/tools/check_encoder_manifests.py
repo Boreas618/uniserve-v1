@@ -197,8 +197,12 @@ def text_calls(text: dict) -> list[Call]:
                 "dtype": "bf16",
                 "width": str(ffn),
                 "block": "1024",
-                "gate_stride": str(2 * ffn),
-                "value_stride": str(2 * ffn),
+                # The gate and the up projection are two separate `[tokens, intermediate]`
+                # buffers (`text_encoder.rs`, the layer's forward), not one interleaved one: the
+                # stride is the intermediate width, and a `2 * ffn` here named a program the code
+                # never launches.
+                "gate_stride": str(ffn),
+                "value_stride": str(ffn),
                 "activation": "silu",
                 "wide": "false",
                 "pdl": "false",
@@ -330,32 +334,98 @@ def _row_tile(columns: int) -> str:
     return str(1 << (columns - 1).bit_length())
 
 
-def keys(calls: list[Call]) -> int:
-    """Print the fixture's lines: each completed call's operator name and its exact key.
+def called_keys(calls: list[Call]) -> tuple[list[tuple[str, str]], list[str]]:
+    """The fixture lines these calls need, and the calls this tool cannot express.
 
     A call that does not carry every field its operator's `Display` writes names no key, and is
-    reported as such rather than printed short: a partial key in the store's fixture would be a
-    line that compiles nothing.
+    reported rather than printed short: a partial key in the store's fixture would be a line that
+    compiles nothing.
     """
-    printed = 0
+    lines: list[tuple[str, str]] = []
+    unknown: list[str] = []
     for package, fields, reason in calls:
         order = KEY_FIELDS.get(package)
         if order is None:
-            print(
-                f"  NOT EMITTED {package}: this tool does not model its field set [{reason}]"
+            unknown.append(
+                f"NOT EMITTED {package}: this tool does not model its field set [{reason}]"
             )
             continue
         missing = [field for field in order if field not in fields]
         if missing:
-            print(
-                f"  NOT EMITTED {package}: the call omits {', '.join(missing)} [{reason}]"
+            unknown.append(
+                f"NOT EMITTED {package}: the call omits {', '.join(missing)} [{reason}]"
             )
             continue
         operator = package.split("/")[0]
         key = "_".join(f"{field}_{fields[field]}" for field in order)
+        lines.append((operator, key))
+    return lines, unknown
+
+
+def keys(calls: list[Call]) -> int:
+    """Print the fixture's lines: each completed call's operator name and its exact key."""
+    lines, unknown = called_keys(calls)
+    for line in unknown:
+        print(f"  {line}")
+    for operator, key in lines:
         print(f"{operator}\t{key}")
-        printed += 1
-    return printed
+    return len(lines)
+
+
+def against(sections: list[tuple[str, list[Call]]], path: pathlib.Path) -> int:
+    """Ask the store's list whether it holds every program the calls name.
+
+    This is the check that found the store a stage short: two lists, each
+    internally consistent and one missing a row the other had. The dangerous
+    direction is a key a call names and the fixture lacks - the forward binds a
+    program the store cannot launch - and it is a failure. The other direction
+    is not: the fixture holds every stage's rows, so a row nothing here calls
+    belongs to another stage.
+
+    The verdict covers the calls whose key this tool derives and states both
+    counts, because a partial verdict that called itself complete would be the
+    same disease in the instrument that exists to find it.
+    """
+    if not path.is_file():
+        print(f"no {path}", file=sys.stderr)
+        return 2
+    listed: set[tuple[str, str]] = set()
+    for index, line in enumerate(path.read_text().splitlines(), 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        parts = stripped.split("\t")
+        if len(parts) != 2:
+            print(f"{path}:{index}: not `operator<TAB>key`", file=sys.stderr)
+            return 2
+        listed.add((parts[0], parts[1]))
+
+    called: list[tuple[str, str, str]] = []
+    unexpressed = 0
+    for name, calls in sections:
+        lines, gaps = called_keys(calls)
+        called.extend((name, operator, key) for operator, key in lines)
+        for gap in gaps:
+            print(f"  not expressed {name}: {gap}", file=sys.stderr)
+            unexpressed += 1
+
+    missing = [
+        (name, operator, key)
+        for name, operator, key in called
+        if (operator, key) not in listed
+    ]
+    print(
+        f"fixture {path}: {len(listed)} rows; expressed {len(called)} of"
+        f" {len(called) + unexpressed} calls, {unexpressed} name no key this"
+        " tool derives"
+    )
+    for name, operator, key in missing:
+        print(f"  MISSING {name}: {operator} {key}")
+    print(
+        f"{len(called) - len(missing)} of {len(called)} called keys are in the"
+        f" fixture, {len(missing)} missing"
+    )
+    return 1 if missing else 0
 
 
 def report(name: str, calls: list[Call], kernels: pathlib.Path) -> int:
@@ -388,6 +458,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default="/opt/uv/models/MiniMax-H3")
     parser.add_argument("--kernels", default="crates/ops/kernels")
+    parser.add_argument(
+        "--against",
+        type=pathlib.Path,
+        default=None,
+        help=(
+            "after the manifests, ask the store's list (`notes/programs/minimax-h3-keys.txt`) "
+            "whether it holds every program these calls name"
+        ),
+    )
     parser.add_argument(
         "--keys",
         action="store_true",
@@ -432,7 +511,11 @@ def main() -> int:
     print(
         f"{checked} descriptor calls checked, {total} with no declared program"
     )
-    return 1 if total else 0
+    code = 1 if total else 0
+    if arguments.against is not None:
+        print()
+        code = against(sections, arguments.against) or code
+    return code
 
 
 if __name__ == "__main__":
