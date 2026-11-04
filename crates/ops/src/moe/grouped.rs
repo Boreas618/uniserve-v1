@@ -34,7 +34,7 @@ use std::fmt;
 
 use crate::descriptor::Key;
 use crate::fp4::ScaleLayout;
-use crate::kernel::{Arguments, Kernel, LaunchGrid, NativeCall};
+use crate::kernel::{Kernel, NativeCall};
 use crate::platform::Stream;
 use crate::tensor::{DType, Shape, TensorView};
 use crate::tolerance::Tolerance;
@@ -663,6 +663,194 @@ pub struct GatherGemmNvfp4Args {
     pub num_non_exiting_tiles: TensorView,
     /// `[routes, intermediate]` the gated product.
     pub out: TensorView,
+    /// `[bytes]` U8: scratch for the program's own bookkeeping. A hint rather than a requirement: the
+    /// program computes the size its tactic needs and grows it itself when this view is short, because
+    /// the size is the artifact's and not something `ops` can restate.
+    pub workspace: TensorView,
+}
+
+/// Check the scratch view both encoded products carry.
+///
+/// A workspace is bytes the program uses for its own bookkeeping. It is a *hint*: the program knows
+/// the size its tactic needs and allocates its own when this view is short, because that size belongs
+/// to the artifact rather than to `ops`. What this refuses is a view that is not plain bytes, or one
+/// of no bytes at all — an empty scratch would make every launch pay for an allocation that a caller
+/// could have sized once.
+fn check_workspace(operator: &'static str, workspace: TensorView) -> Result<()> {
+    workspace.require_rank(operator, 1)?;
+    if workspace.dtype != DType::U8 {
+        return Err(Error::argument(
+            operator,
+            format!("expected u8 workspace bytes, found {}", workspace.dtype),
+        ));
+    }
+    if workspace.numel() == 0 {
+        return Err(Error::argument(
+            operator,
+            "a workspace of no bytes: the program would allocate its own on every launch",
+        ));
+    }
+    Ok(())
+}
+
+/// One encoded FC1 launch, as the trtllm-gen batched-GEMM entry reads it.
+///
+/// The call is a plain structure of pointers and extents rather than a packed argument list, because
+/// a native module's entry takes one: `uniserve_gather_gemm_nvfp4(call, stream)`. The descriptors'
+/// choices that are *compiled* into the program — the tile, the cluster, the activation, the block
+/// scale layout — travel as well, since the entry checks the call against the module it was built as
+/// and refuses a mismatch by name rather than launching a kernel with another tactic's assumptions.
+pub struct GatherNvfp4Call {
+    /// `[routes, hidden]`: the gathered activations.
+    pub hidden: *const c_void,
+    /// `[experts, 2·intermediate, hidden/2]` U8: two E2M1 codes a byte.
+    pub weights: *const c_void,
+    /// The block scales, one per sixteen elements of the contraction.
+    pub scales: *const c_void,
+    /// `[experts, 2]` f32: the reciprocals of the experts' tensor scales, per projection.
+    pub global_scale: *const c_void,
+    /// `[tokens, top]` i32: the experts each token's routes selected.
+    pub ids: *const i32,
+    /// `[tiles]` i32: the expert a tile's rows belong to.
+    pub tile_to_expert: *const i32,
+    /// `[tiles]` i32: the local row limit of that tile.
+    pub tile_to_limit: *const i32,
+    /// `[routes]` i32: the gathered row of each route.
+    pub permuted_to_expanded: *const i32,
+    /// `[1]` i32: the number of tiles that have work.
+    pub num_non_exiting_tiles: *const i32,
+    /// `[routes, intermediate]`: the gated product.
+    pub out: *mut c_void,
+    /// The scratch the program may use; the entry grows it itself when it is short.
+    pub workspace: *mut c_void,
+    /// Bytes of `workspace`.
+    pub workspace_bytes: i64,
+    /// Rows of the activations: the token count.
+    pub tokens: i64,
+    /// Rows of the gated product: the permuted row count, padded to whole tiles.
+    pub routes: i64,
+    /// The contraction length.
+    pub hidden_size: i64,
+    /// The expert width of one half of the gated product.
+    pub intermediate: i64,
+    /// Experts the weight stack holds.
+    pub experts: i64,
+    /// Routes per token.
+    pub top: i64,
+    /// The compiled MMA tile, rows by columns.
+    pub tile_m: i64,
+    pub tile_n: i64,
+    /// The compiled cluster, rows by columns.
+    pub cluster_m: i64,
+    pub cluster_n: i64,
+    /// The element type of the activations and the output, as `DType::as_i64`.
+    pub dtype: i64,
+    /// A NUL-terminated refusal, when the entry returns nonzero.
+    pub error: [u8; 512],
+}
+
+/// The offsets of [`GatherNvfp4Call`] its header mirrors, stated once for the test below.
+pub struct GatherNvfp4CallLayout {
+    pub size: usize,
+    pub global_scale: usize,
+    pub workspace: usize,
+    pub workspace_bytes: usize,
+    pub dtype: usize,
+    pub error: usize,
+}
+
+impl GatherNvfp4Call {
+    /// The offsets the C header must agree with.
+    pub const LAYOUT: GatherNvfp4CallLayout = GatherNvfp4CallLayout {
+        size: 696,
+        global_scale: 24,
+        workspace: 88,
+        workspace_bytes: 96,
+        dtype: 184,
+        error: 192,
+    };
+}
+
+impl NativeCall for GatherNvfp4Call {
+    fn message(&self) -> Option<&str> {
+        let end = self.error.iter().position(|&byte| byte == 0)?;
+        std::str::from_utf8(&self.error[..end]).ok()
+    }
+}
+
+/// One encoded FC2 launch, as the trtllm-gen batched-GEMM entry reads it.
+pub struct RouteNvfp4Call {
+    /// `[routes, intermediate]`: the gated product FC1 produced.
+    pub hidden: *const c_void,
+    /// `[experts, hidden, intermediate/2]` U8: two E2M1 codes a byte.
+    pub weights: *const c_void,
+    /// The block scales, one per sixteen elements of the contraction.
+    pub scales: *const c_void,
+    /// `[experts, 1]` f32: the reciprocal of each expert's tensor scale.
+    pub global_scale: *const c_void,
+    /// `[routes]` i32: the expert each row belongs to.
+    pub ids: *const i32,
+    /// `[tiles]` i32: the expert a tile's rows belong to.
+    pub tile_to_expert: *const i32,
+    /// `[tiles]` i32: the local row limit of that tile.
+    pub tile_to_limit: *const i32,
+    /// `[routes]` i32: the gathered row of each route.
+    pub permuted_to_expanded: *const i32,
+    /// `[1]` i32: the number of tiles that have work.
+    pub num_non_exiting_tiles: *const i32,
+    /// `[routes, hidden]`: the contracted rows.
+    pub out: *mut c_void,
+    /// The scratch the program may use; the entry grows it itself when it is short.
+    pub workspace: *mut c_void,
+    /// Bytes of `workspace`.
+    pub workspace_bytes: i64,
+    /// Rows of the gated product and of the output: the padded route count.
+    pub routes: i64,
+    /// The contraction length: the expert width of FC1.
+    pub hidden_size: i64,
+    /// The output width.
+    pub intermediate: i64,
+    /// Experts the weight stack holds.
+    pub experts: i64,
+    /// The compiled MMA tile, rows by columns.
+    pub tile_m: i64,
+    pub tile_n: i64,
+    /// The compiled cluster, rows by columns.
+    pub cluster_m: i64,
+    pub cluster_n: i64,
+    /// The element type of the activations and the output, as `DType::as_i64`.
+    pub dtype: i64,
+    /// A NUL-terminated refusal, when the entry returns nonzero.
+    pub error: [u8; 512],
+}
+
+impl RouteNvfp4Call {
+    /// The offsets the C header must agree with.
+    pub const LAYOUT: RouteNvfp4CallLayout = RouteNvfp4CallLayout {
+        size: 680,
+        global_scale: 24,
+        workspace: 88,
+        workspace_bytes: 96,
+        dtype: 168,
+        error: 176,
+    };
+}
+
+/// The offsets of [`RouteNvfp4Call`] its header mirrors.
+pub struct RouteNvfp4CallLayout {
+    pub size: usize,
+    pub global_scale: usize,
+    pub workspace: usize,
+    pub workspace_bytes: usize,
+    pub dtype: usize,
+    pub error: usize,
+}
+
+impl NativeCall for RouteNvfp4Call {
+    fn message(&self) -> Option<&str> {
+        let end = self.error.iter().position(|&byte| byte == 0)?;
+        std::str::from_utf8(&self.error[..end]).ok()
+    }
 }
 
 /// The routed first matrix over a packed, block-scaled expert stack.
@@ -807,55 +995,38 @@ impl Op for GatherGemmNvfp4 {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let (_, intermediate, routes) = Self::validate(descriptor, &args)?;
-
-        // The activation is compiled into the program (it is in the key), so no launch value names
-        // it; what a launch carries is the geometry the grid and the addressing need.
-        let mut arguments = Arguments::new();
-        arguments
-            .view(args.hidden)
-            .view(args.weights)
-            .view(args.scales)
-            .view(args.global_scale)
-            .view(args.ids)
-            .view(args.tile_to_expert)
-            .view(args.tile_to_limit)
-            .view(args.permuted_to_expanded)
-            .view(args.num_non_exiting_tiles)
-            .view(args.out)
-            .u32(descriptor.hidden)
-            .u32(descriptor.intermediate)
-            .u32(descriptor.experts)
-            .u32(descriptor.top)
-            .u32(u32::try_from(routes).unwrap_or(u32::MAX))
-            .u32(descriptor.tile.0)
-            .u32(descriptor.tile.1)
-            .u32(descriptor.cluster.0)
-            .u32(descriptor.cluster.1);
-        // One block per (expert tile, column tile) of the gated product, the geometry the package
-        // compiled for: the tile and cluster are the descriptor's, so the grid is a function of the
-        // problem rather than of a backend's tactic.
-        // Axis 0 is the *tile buffer's* count, a launch-fixed geometry: one block per tile the sort
-        // could produce, each returning immediately when its index is past the live count on the
-        // device. Reading `num_non_exiting_tiles` here would be a host read of a device value, and
-        // `[1]` means the launch would always compute one tile.
-        let tiles = args
-            .tile_to_expert
-            .shape
-            .dims()
-            .first()
-            .copied()
-            .unwrap_or(1)
-            .max(1);
-        kernel.launch(
-            LaunchGrid::new([
-                tiles,
-                (2 * intermediate).div_ceil(u64::from(descriptor.tile.1)),
-                1,
-            ])?,
-            &mut arguments,
-            stream,
-        )
+        let (hidden, intermediate, routes) = Self::validate(descriptor, &args)?;
+        check_workspace(Self::NAME, args.workspace)?;
+        let tokens = args.hidden.rows();
+        let mut call = GatherNvfp4Call {
+            hidden: address(args.hidden.ptr) as usize as *const c_void,
+            weights: address(args.weights.ptr) as usize as *const c_void,
+            scales: address(args.scales.ptr) as usize as *const c_void,
+            global_scale: address(args.global_scale.ptr) as usize as *const c_void,
+            ids: address(args.ids.ptr) as usize as *const i32,
+            tile_to_expert: address(args.tile_to_expert.ptr) as usize as *const i32,
+            tile_to_limit: address(args.tile_to_limit.ptr) as usize as *const i32,
+            permuted_to_expanded: address(args.permuted_to_expanded.ptr) as usize as *const i32,
+            num_non_exiting_tiles: address(args.num_non_exiting_tiles.ptr) as usize as *const i32,
+            out: address(args.out.ptr) as usize as *mut c_void,
+            workspace: address(args.workspace.ptr) as usize as *mut c_void,
+            workspace_bytes: to_i64(Self::NAME, args.workspace.numel())?,
+            tokens: to_i64(Self::NAME, tokens)?,
+            routes: to_i64(Self::NAME, routes)?,
+            hidden_size: to_i64(Self::NAME, hidden)?,
+            intermediate: to_i64(Self::NAME, intermediate)?,
+            experts: to_i64(Self::NAME, u64::from(descriptor.experts))?,
+            top: to_i64(Self::NAME, u64::from(descriptor.top))?,
+            tile_m: i64::from(descriptor.tile.0),
+            tile_n: i64::from(descriptor.tile.1),
+            cluster_m: i64::from(descriptor.cluster.0),
+            cluster_n: i64::from(descriptor.cluster.1),
+            dtype: dtype_code(descriptor.dtype),
+            error: [0; 512],
+        };
+        // SAFETY: `GatherNvfp4Call` is the structure this package's entry declares, and its layout is
+        // pinned by the offsets above and by the test below.
+        unsafe { kernel.native(&mut call, stream) }
     }
 
     fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
@@ -1077,6 +1248,9 @@ pub struct RouteGemmNvfp4Args {
     /// `[routes, hidden]` the contracted rows, one per route: the `top` repeats are combined by
     /// `moe_unpermute`, not here.
     pub out: TensorView,
+    /// `[bytes]` U8: scratch for the program's own bookkeeping, as FC1's is — a hint the program grows
+    /// itself when it is short.
+    pub workspace: TensorView,
 }
 
 /// FC2 of an encoded, block-scaled expert block.
@@ -1179,44 +1353,34 @@ impl Op for RouteGemmNvfp4 {
             }
         }
 
-        let mut arguments = Arguments::new();
-        arguments
-            .view(args.hidden)
-            .view(args.weights)
-            .view(args.scales)
-            .view(args.global_scale)
-            .view(args.ids)
-            .view(args.tile_to_expert)
-            .view(args.tile_to_limit)
-            .view(args.permuted_to_expanded)
-            .view(args.num_non_exiting_tiles)
-            .view(args.out)
-            .u32(descriptor.hidden)
-            .u32(descriptor.intermediate)
-            .u32(descriptor.experts)
-            .u32(descriptor.top)
-            .u32(u32::try_from(routes).unwrap_or(u32::MAX))
-            .u32(descriptor.tile.0)
-            .u32(descriptor.tile.1)
-            .u32(descriptor.cluster.0)
-            .u32(descriptor.cluster.1);
-        // Axis 0 is the *tile buffer's* count, a launch-fixed geometry: one block per tile the sort
-        // could produce, each returning immediately when its index is past the live count on the
-        // device. Reading `num_non_exiting_tiles` here would be a host read of a device value, and
-        // `[1]` means the launch would always compute one tile.
-        let tiles = args
-            .tile_to_expert
-            .shape
-            .dims()
-            .first()
-            .copied()
-            .unwrap_or(1)
-            .max(1);
-        kernel.launch(
-            LaunchGrid::new([tiles, hidden.div_ceil(u64::from(descriptor.tile.1)), 1])?,
-            &mut arguments,
-            stream,
-        )
+        check_workspace(Self::NAME, args.workspace)?;
+        let mut call = RouteNvfp4Call {
+            hidden: address(args.hidden.ptr) as usize as *const c_void,
+            weights: address(args.weights.ptr) as usize as *const c_void,
+            scales: address(args.scales.ptr) as usize as *const c_void,
+            global_scale: address(args.global_scale.ptr) as usize as *const c_void,
+            ids: address(args.ids.ptr) as usize as *const i32,
+            tile_to_expert: address(args.tile_to_expert.ptr) as usize as *const i32,
+            tile_to_limit: address(args.tile_to_limit.ptr) as usize as *const i32,
+            permuted_to_expanded: address(args.permuted_to_expanded.ptr) as usize as *const i32,
+            num_non_exiting_tiles: address(args.num_non_exiting_tiles.ptr) as usize as *const i32,
+            out: address(args.out.ptr) as usize as *mut c_void,
+            workspace: address(args.workspace.ptr) as usize as *mut c_void,
+            workspace_bytes: to_i64(Self::NAME, args.workspace.numel())?,
+            routes: to_i64(Self::NAME, routes)?,
+            hidden_size: to_i64(Self::NAME, intermediate)?,
+            intermediate: to_i64(Self::NAME, hidden)?,
+            experts: to_i64(Self::NAME, experts)?,
+            tile_m: i64::from(descriptor.tile.0),
+            tile_n: i64::from(descriptor.tile.1),
+            cluster_m: i64::from(descriptor.cluster.0),
+            cluster_n: i64::from(descriptor.cluster.1),
+            dtype: dtype_code(descriptor.dtype),
+            error: [0; 512],
+        };
+        // SAFETY: `RouteNvfp4Call` is the structure this package's entry declares, and its layout is
+        // pinned by the offsets declared beside it and by the test below.
+        unsafe { kernel.native(&mut call, stream) }
     }
 
     fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
@@ -1278,6 +1442,7 @@ mod nvfp4_launch_tests {
             permuted_to_expanded: table(DType::I32, &[32]),
             num_non_exiting_tiles: table(DType::I32, &[1]),
             out: table(DType::BF16, &[32, 768]),
+            workspace: table(DType::U8, &[4096]),
         }
     }
 
@@ -1324,5 +1489,40 @@ mod nvfp4_launch_tests {
         args.scales = table(DType::F8E4M3, &[127, 1536, 128]);
         let error = GatherGemmNvfp4::validate(&fc1(), &args).unwrap_err();
         assert!(format!("{error}").contains("do not cover"));
+    }
+}
+
+#[cfg(test)]
+mod nvfp4_call_layout_tests {
+    use super::*;
+
+    /// The two encoded calls' offsets, as the C headers that mirror them must state them.
+    ///
+    /// A call structure is read by a compiled entry, so a field at the wrong offset is a corrupted
+    /// launch rather than a failed one; this test is the Rust side of the pair `header.h`'s
+    /// `static_assert`s are the other half of.
+    #[test]
+    fn the_encoded_calls_are_the_size_and_shape_their_headers_state() {
+        assert_eq!(std::mem::size_of::<GatherNvfp4Call>(), 696);
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, hidden), 0);
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, weights), 8);
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, scales), 16);
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, global_scale), 24);
+        assert_eq!(
+            std::mem::offset_of!(GatherNvfp4Call, num_non_exiting_tiles),
+            72
+        );
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, workspace), 88);
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, workspace_bytes), 96);
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, dtype), 184);
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, error), 192);
+
+        assert_eq!(std::mem::size_of::<RouteNvfp4Call>(), 680);
+        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, hidden), 0);
+        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, global_scale), 24);
+        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, workspace), 88);
+        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, workspace_bytes), 96);
+        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, dtype), 168);
+        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, error), 176);
     }
 }
