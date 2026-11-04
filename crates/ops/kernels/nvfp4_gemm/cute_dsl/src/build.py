@@ -40,8 +40,16 @@ def spec(fields, parameters, target):
     m = int(fields["m"])
     n = int(fields["n"])
     k = int(fields["k"])
-    if fields["layout"] != "linear":
-        raise SystemExit(f"the {fields['layout']} activation scale layout is not served")
+    if fields["scale"] != "f8e4m3":
+        # The block scales are the checkpoint's E4M3 values, one byte per sixteen
+        # elements of the contraction. Any other byte type names a buffer this
+        # module would misread, so it is refused by name.
+        raise SystemExit(f"the {fields['scale']} block scales are not served")
+    if fields["layout"] != "swizzled_128x4":
+        # The atom both scale fields are read in. A row-major matrix needs a
+        # conversion pass the kernel does not have, so it is refused rather than
+        # decoded as if it were the atom.
+        raise SystemExit(f"the {fields['layout']} scale layout is not served")
     if fields["epilogue"] != "none":
         raise SystemExit(f"the {fields['epilogue']} epilogue is not served")
     if m % TILE_MN[0] != 0 or n % TILE_MN[1] != 0 or k % (MMA_INST_SHAPE_K * 4) != 0:

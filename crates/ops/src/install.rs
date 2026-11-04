@@ -52,6 +52,8 @@ const OPERATORS: &[&str] = &[
     <crate::block_copy::CacheBlockSnapshot as Op>::NAME,
     <crate::block_copy::CacheBlockScatter as Op>::NAME,
     <crate::commit::SlotCommit as Op>::NAME,
+    <crate::transpose::Transpose as Op>::NAME,
+    <crate::segments::VsaScores as Op>::NAME,
     <crate::conv::Conv3d as Op>::NAME,
     <crate::conv::Conv1d as Op>::NAME,
     <crate::conv::ConvTranspose1d as Op>::NAME,
@@ -85,6 +87,7 @@ const OPERATORS: &[&str] = &[
     <crate::sampler::LogitsShape as Op>::NAME,
     <crate::sampler::TopK as Op>::NAME,
     <crate::sampler::FilterCandidates as Op>::NAME,
+    <crate::sampler::CandidateOrder as Op>::NAME,
     <crate::sampler::InverseCdf as Op>::NAME,
     <crate::sampler::ArgMax as Op>::NAME,
     <crate::sampler::LogSoftmax as Op>::NAME,
@@ -126,6 +129,7 @@ const OPERATORS: &[&str] = &[
     <crate::sequence_append::SequenceAppend as Op>::NAME,
     <crate::rope::RopeApply as Op>::NAME,
     <crate::pcm::PcmInterleave as Op>::NAME,
+    <crate::rgb::RgbBytes as Op>::NAME,
 ];
 
 /// `name`, interned, when this build has an operator by that name.

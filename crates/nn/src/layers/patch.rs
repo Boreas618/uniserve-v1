@@ -7,17 +7,18 @@
 //!
 //! The layer holds the channel count and the latent's rows and columns, which a request's layout
 //! fixes; the frame count is a launch value, so a short clip and a long one differ in the arguments
-//! rather than in the compiled program. Both directions move elements and are exact.
+//! rather than in the compiled program. The move is exact.
+//!
+//! The layer is the transformer's *input* mapping only: a latent becomes the rows it reads. The
+//! inverse — rows back to a planar raster — is [`super::UnpatchifyVideo`], the generic operator the
+//! decoder calls, so there is one program for the inverse and not two.
 
 use ops::TensorView;
-use ops::patch::{self, Mode, Patch as PatchOp};
+use ops::patch::{self, Patch as PatchOp};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
 use crate::layers::launch::PDL;
-
-/// Which way the mapping is applied.
-pub use ops::patch::Mode as PatchMode;
 
 /// The elements one patch program walks along a row.
 const BLOCK: u32 = patch::BLOCK;
@@ -67,42 +68,41 @@ impl Patch {
         })
     }
 
-    /// The channels one packed row holds four of.
+    /// The channels a packed row carries four values of.
     pub const fn channels(&self) -> u32 {
         self.channels
     }
 
-    /// Map the latent `[channels, frames, height, width]` and the packed rows
-    /// `[frames · height/2 · width/2, channels · 4]` into each other.
+    /// Pack the latent `[channels, frames, height, width]` into the rows
+    /// `[frames · height/2 · width/2, channels · 4]` the transformer reads.
     ///
-    /// `mode` says which side is read: [`PatchMode::Patchify`] reads the latent and writes the rows —
-    /// the transformer's input — and [`PatchMode::Unpatchify`] reads the rows and writes the latent,
-    /// its exact inverse. `frames` is the latent's frame count; it travels as a launch value so a
-    /// clip of another length replays a captured step instead of compiling again, and the latent's
-    /// own extent must agree with it.
+    /// `frames` is the latent's frame count; it travels as a launch value so a clip of another
+    /// length replays a captured step instead of compiling again, and the latent's own extent must
+    /// agree with it. The inverse of this mapping is [`super::UnpatchifyVideo::forward`].
     pub fn forward(
         &self,
         f: &Forward,
         latent: TensorView,
         rows: TensorView,
         frames: u64,
-        mode: Mode,
     ) -> Result<()> {
         let frames = self.check_frames(latent, frames)?;
-        let (x, out) = match mode {
-            Mode::Patchify => (latent, rows),
-            Mode::Unpatchify => (rows, latent),
-        };
         let descriptor = patch::Descriptor {
             dtype: latent.dtype,
             channels: self.channels,
             height: self.height,
             width: self.width,
-            mode,
             block: BLOCK,
             pdl: PDL,
         };
-        f.operate::<PatchOp>(&descriptor, patch::Args { x, out, frames })
+        f.operate::<PatchOp>(
+            &descriptor,
+            patch::Args {
+                x: latent,
+                out: rows,
+                frames,
+            },
+        )
     }
 
     /// The frames the call maps, once the latent agrees with the layout and the caller.

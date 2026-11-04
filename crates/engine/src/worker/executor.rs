@@ -288,6 +288,12 @@ impl WorkerExecutor {
                 .map(|worker| (worker.0.clone(), worker.1.info().clone()))
                 .collect(),
         )?;
+        // The attention descriptor's static bound is the launch's, not a
+        // report: every group of the deployment was started for the same
+        // longest sequence.
+        executor_info.max_model_len = workers
+            .first()
+            .map_or(0, |(_, worker)| worker.process_args().max_model_len);
         // Each rank reports the buffer bytes it backs.
         executor_info.rank_buffer_bytes = workers
             .iter()
@@ -764,6 +770,9 @@ impl WorkerExecutor {
             input_transfers: inputs,
             cache_inputs,
             page_offloads: batch.page_offloads.clone(),
+            // The columns are the mechanism's statement to an in-process
+            // executor; a worker projection carries no device layout.
+            columns: None,
         }
         .into_protocol(collective_seq)?;
 

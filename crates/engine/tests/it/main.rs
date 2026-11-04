@@ -7,6 +7,7 @@ mod cache_storage;
 mod canvas;
 mod control_plane;
 mod encoder_outputs;
+mod error_taxonomy;
 mod expert_rebalance;
 mod image_ipc;
 mod media_occupancy;

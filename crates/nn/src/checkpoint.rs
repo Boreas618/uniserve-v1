@@ -1,8 +1,15 @@
 //! A checkpoint: its safetensors shards, the tensors they hold, and the identity of every file.
 //!
 //! The loader never converts a checkpoint's weights in place and never holds a whole shard in host
-//! memory: each shard is mapped read-only with `memmap2`, the safetensors crate reads its header,
-//! and one tensor's bytes are copied when a weight is converted. A shard is mapped for the life of
+//! memory: each shard is mapped read-only with `memmap2`, [`read_header`] reads its header — eight
+//! bytes of length, the JSON body, and each tensor's `{dtype, shape, data_offsets}` — and one
+//! tensor's bytes are copied when a weight is converted.
+//!
+//! The header reader is ours and not a crate's because the dtype set is the **format's**, while a
+//! crate's `Dtype` enum is a subset of it: a calibrated NVFP4 export stores its block scales as
+//! `F8_E4M3`, and a reader that cannot name that cannot open the model. Every dtype name our
+//! operators speak is mapped onto an operator ABI [`DType`], and any other name is refused at open,
+//! with the name and the tensor in the message, rather than reach a launch that would misread it. A shard is mapped for the life of
 //! the [`Checkpoint`], which is the model's life; the mapping costs virtual address space, not
 //! resident memory.
 //!
@@ -181,6 +188,10 @@ pub struct HostTensor {
 /// read as the components its subdirectories hold.
 pub struct Checkpoint {
     root: PathBuf,
+    /// Every root this checkpoint's tensors came from, in precedence order; one entry unless it was
+    /// opened over several roots ([`Checkpoint::open_roots`]). A missing tensor names them, because
+    /// a union that spans an export and a base is where "not found" costs the most to chase.
+    roots: Vec<PathBuf>,
     files: Vec<CheckpointFile>,
     tensors: BTreeMap<String, TensorLocation>,
     components: BTreeMap<String, Checkpoint>,
@@ -217,32 +228,17 @@ impl Checkpoint {
                 source,
             })?;
             let identity = FileIdentity::of(&path)?;
-            let (header, metadata) =
-                safetensors::SafeTensors::read_metadata(&map).map_err(|source| {
-                    Error::Safetensors {
-                        path: path.clone(),
-                        source,
-                    }
-                })?;
-            // `read_metadata` answers the length of the JSON header alone; the payload starts
-            // after the 8-byte little-endian length that precedes it.
-            let header = u64::try_from(header + 8).map_err(|_| Error::Checkpoint {
-                path: path.clone(),
-                problem: "the header is larger than u64::MAX bytes".to_owned(),
-            })?;
-            for (name, info) in metadata.tensors() {
-                let dtype = dtype_of(path.as_path(), info.dtype)?;
-                let shape = shape_of(path.as_path(), &name, &info.shape)?;
-                let (start, end) = info.data_offsets;
+            let (header, entries) = read_header(&path, &map)?;
+            for (name, entry) in entries {
                 if locations
                     .insert(
                         name.clone(),
                         TensorLocation {
                             file: file_index,
-                            tensor: name,
-                            dtype,
-                            shape,
-                            bytes: (start as u64, end as u64),
+                            tensor: name.clone(),
+                            dtype: entry.dtype,
+                            shape: entry.shape,
+                            bytes: entry.offsets,
                         },
                     )
                     .is_some()
@@ -263,10 +259,64 @@ impl Checkpoint {
 
         Ok(Self {
             root: root.to_path_buf(),
+            roots: vec![root.to_path_buf()],
             files,
             tensors: locations,
             components: BTreeMap::new(),
         })
+    }
+
+    /// Open `roots` as **one** checkpoint: the first root's tensors shadow the later ones'.
+    ///
+    /// A deployment that ships a delta export over a base is one checkpoint whose file set spans
+    /// both, so the union is per tensor and not per component: components are enumerated in each
+    /// root as [`Checkpoint::open`] already does; a component present in several roots is one
+    /// unioned component whose tensors come from the earliest root that holds each name; a
+    /// component that only a later root holds is that root's; and the same shadowing applies at the
+    /// top level, where an export's tensor replaces the base's.
+    ///
+    /// A shadowed tensor is expected and is **not** a byte comparison: a delta export legitimately
+    /// differs from the base it was trained from, and refusing the difference would refuse the
+    /// deployment. Two roots of *one* root's shard set disagreeing is still an error, because that
+    /// is a malformed checkpoint and no precedence can say which is meant.
+    ///
+    /// [`Checkpoint::root`] answers the first root: the export's, which is the one a log names.
+    pub fn open_roots(roots: &[&Path]) -> Result<Self> {
+        let mut roots = roots.iter();
+        let first = roots.next().ok_or_else(|| Error::Checkpoint {
+            path: PathBuf::new(),
+            problem: "a checkpoint needs at least one root".to_owned(),
+        })?;
+        let mut held = Self::open(first)?;
+        for root in roots {
+            held = held.merge(Self::open(root)?);
+        }
+        Ok(held)
+    }
+
+    /// The union of `self` (earlier, shadowing) and `later`, as [`Checkpoint::open_roots`] defines
+    /// it. File indices of the later root are rebased onto the union's file list, so a tensor
+    /// location keeps naming the shard it was read from.
+    fn merge(mut self, later: Self) -> Self {
+        let base = self.files.len();
+        self.roots.extend(later.roots);
+        for (name, mut location) in later.tensors {
+            // The earlier root wins: a name the union already holds keeps its own bytes.
+            if self.tensors.contains_key(&name) {
+                continue;
+            }
+            location.file += base;
+            self.tensors.insert(name, location);
+        }
+        self.files.extend(later.files);
+        for (name, component) in later.components {
+            let union = match self.components.remove(&name) {
+                Some(held) => held.merge(component),
+                None => component,
+            };
+            self.components.insert(name, union);
+        }
+        self
     }
 
     /// Open a pipeline root: one component per subdirectory that holds a shard set.
@@ -302,13 +352,15 @@ impl Checkpoint {
         }
         Ok(Self {
             root: root.to_path_buf(),
+            roots: vec![root.to_path_buf()],
             files: Vec::new(),
             tensors: BTreeMap::new(),
             components,
         })
     }
 
-    /// The directory this checkpoint was opened with.
+    /// The directory this checkpoint was opened with — and, for a union of roots, the **first** of
+    /// them: the export's, which is the one a log names.
     ///
     /// A pipeline's components are opened under it, so a model's `load()` can reach each component
     /// without a second copy of the path being threaded through the engine.
@@ -390,10 +442,25 @@ impl Checkpoint {
 
     /// Read the tensor named `name` into host memory.
     pub fn read(&self, name: &str) -> Result<HostTensor> {
-        let location = self
-            .tensors
-            .get(name)
-            .ok_or_else(|| Error::MissingTensor(name.to_owned()))?;
+        let location = self.tensors.get(name).ok_or_else(|| {
+            if self.roots.len() == 1 {
+                return Error::MissingTensor(name.to_owned());
+            }
+            // A union that spans several roots is where a bare "not found" is least useful: the
+            // caller needs to know what was searched, and in which order precedence ran.
+            let tried = self
+                .roots
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Error::Checkpoint {
+                path: self.root.clone(),
+                problem: format!(
+                    "no root holds a tensor `{name}`; searched, in precedence order: {tried}"
+                ),
+            }
+        })?;
         Ok(HostTensor {
             dtype: location.dtype,
             shape: location.shape,
@@ -497,20 +564,120 @@ struct IndexFile {
     weight_map: BTreeMap<String, String>,
 }
 
-/// The operator ABI element type of a safetensors dtype.
-fn dtype_of(path: &Path, dtype: safetensors::Dtype) -> Result<DType> {
-    use safetensors::Dtype as Safe;
-    Ok(match dtype {
-        Safe::U8 => DType::U8,
-        Safe::I32 => DType::I32,
-        Safe::I64 => DType::I64,
-        Safe::F16 => DType::F16,
-        Safe::BF16 => DType::BF16,
-        Safe::F32 => DType::F32,
+/// One tensor as a shard's header states it.
+struct HeaderTensor {
+    dtype: DType,
+    shape: Shape,
+    /// The byte range of the tensor inside the payload, which starts after the header.
+    offsets: (u64, u64),
+}
+
+/// One header entry as the format states it.
+#[derive(serde::Deserialize)]
+struct RawTensor {
+    dtype: String,
+    shape: Vec<usize>,
+    data_offsets: (u64, u64),
+}
+
+/// Read one shard's header: the byte length of the header (its JSON body plus the eight-byte
+/// length that precedes it) and every tensor it names.
+///
+/// The format is eight little-endian bytes of JSON length, that many bytes of JSON, then the
+/// payload. The JSON is an object of tensor name to `{dtype, shape, data_offsets}`, with an optional
+/// `__metadata__` entry that carries no tensor — accepted and ignored, as the format says.
+///
+/// **This is the crate's job done here**, deliberately: `safetensors` 0.3.3's `Dtype` has no FP8 or
+/// FP4 variant, so a shard carrying `F8_E4M3` — which a calibrated NVFP4 checkpoint's block scales
+/// are — fails in the crate's own deserialization, before any lookup. The dtype set is a property of
+/// the format, and the format's names are mapped here onto what our operators speak (specs/worker.md
+/// 9, `DType`); a name outside that set is refused with the name in the message rather than read as
+/// something it is not.
+fn read_header(path: &Path, bytes: &[u8]) -> Result<(u64, Vec<(String, HeaderTensor)>)> {
+    let length = bytes.get(..8).ok_or_else(|| Error::Checkpoint {
+        path: path.to_path_buf(),
+        problem: "a shard begins with eight bytes of header length".to_owned(),
+    })?;
+    let mut word = [0_u8; 8];
+    word.copy_from_slice(length);
+    let json_length = u64::from_le_bytes(word);
+    let header = json_length
+        .checked_add(8)
+        .filter(|end| *end <= bytes.len() as u64)
+        .ok_or_else(|| Error::Checkpoint {
+            path: path.to_path_buf(),
+            problem: format!(
+                "a {json_length}-byte header does not fit a {}-byte shard",
+                bytes.len()
+            ),
+        })?;
+    let payload = bytes.len() as u64 - header;
+    let body =
+        std::str::from_utf8(&bytes[8..header as usize]).map_err(|error| Error::Checkpoint {
+            path: path.to_path_buf(),
+            problem: format!("the header is not UTF-8: {error}"),
+        })?;
+    let parsed: BTreeMap<String, serde_json::Value> =
+        serde_json::from_str(body).map_err(|error| Error::Checkpoint {
+            path: path.to_path_buf(),
+            problem: format!("the header is not valid JSON: {error}"),
+        })?;
+
+    let mut tensors = Vec::with_capacity(parsed.len());
+    for (name, value) in parsed {
+        // The format's optional metadata block is an object of strings, not a tensor.
+        if name == "__metadata__" {
+            continue;
+        }
+        let raw: RawTensor = serde_json::from_value(value).map_err(|error| Error::Checkpoint {
+            path: path.to_path_buf(),
+            problem: format!("tensor `{name}` is not {{dtype, shape, data_offsets}}: {error}"),
+        })?;
+        let dtype = dtype_of(path, &name, &raw.dtype)?;
+        let shape = shape_of(path, &name, &raw.shape)?;
+        let (start, end) = raw.data_offsets;
+        if start > end || end > payload {
+            return Err(Error::Checkpoint {
+                path: path.to_path_buf(),
+                problem: format!(
+                    "tensor `{name}` claims bytes {start}..{end} of a {payload}-byte payload"
+                ),
+            });
+        }
+        tensors.push((
+            name,
+            HeaderTensor {
+                dtype,
+                shape,
+                offsets: (start, end),
+            },
+        ));
+    }
+    Ok((header, tensors))
+}
+
+/// The operator ABI element type a safetensors dtype **name** states.
+///
+/// The whole set our operators speak is accepted, FP8 and FP4 included; a name that is not in the
+/// set — the format's `BOOL`, `I8`, `U16`, F6 and F8_E5M2 among them, and any future one — is
+/// refused by name here, at open, rather than reaching a launch that would misread its bytes.
+fn dtype_of(path: &Path, tensor: &str, name: &str) -> Result<DType> {
+    Ok(match name {
+        "U8" => DType::U8,
+        "I16" => DType::I16,
+        "I32" => DType::I32,
+        "I64" => DType::I64,
+        "F16" => DType::F16,
+        "BF16" => DType::BF16,
+        "F32" => DType::F32,
+        "F8_E4M3" => DType::F8E4M3,
+        "F4_E2M1" | "F4" => DType::F4E2M1,
         other => {
             return Err(Error::Checkpoint {
                 path: path.to_path_buf(),
-                problem: format!("element type {other:?} has no operator ABI type yet"),
+                problem: format!(
+                    "tensor `{tensor}` is `{other}`, which the operator ABI has no type for"
+                ),
             });
         }
     })

@@ -38,24 +38,24 @@ const WEIGHT_KEY_DOMAIN: &[u8] = b"uniserve-retained-weight\0";
 pub trait WeightStorage: Send + Sync {
     /// The bytes already retained under `key`, mapped read-only, or `None` when the Storage Server
     /// holds none.
-    fn fetch(&self, key: &[u8; 32]) -> Result<Option<Backing>>;
+    fn fetch(&self, device: platform::DeviceId, key: &[u8; 32]) -> Result<Option<Backing>>;
 
     /// Store `bytes` under `key` and answer the read-only region they are mapped at.
     ///
     /// Storing a key twice is the caller's error; a store may publish it again or answer the region
     /// it already holds.
-    fn store(&self, key: &[u8; 32], bytes: &[u8]) -> Result<Backing>;
+    fn store(&self, device: platform::DeviceId, key: &[u8; 32], bytes: &[u8]) -> Result<Backing>;
 }
 
 /// A shared storage, as two owners of one rank's client use it: the store itself and whatever else
 /// the rank maps weights through.
 impl<S: WeightStorage + ?Sized> WeightStorage for std::sync::Arc<S> {
-    fn fetch(&self, key: &[u8; 32]) -> Result<Option<Backing>> {
-        (**self).fetch(key)
+    fn fetch(&self, device: platform::DeviceId, key: &[u8; 32]) -> Result<Option<Backing>> {
+        (**self).fetch(device, key)
     }
 
-    fn store(&self, key: &[u8; 32], bytes: &[u8]) -> Result<Backing> {
-        (**self).store(key, bytes)
+    fn store(&self, device: platform::DeviceId, key: &[u8; 32], bytes: &[u8]) -> Result<Backing> {
+        (**self).store(device, key, bytes)
     }
 }
 
@@ -81,17 +81,26 @@ pub fn retained_key(weight: &WeightKey) -> [u8; 32] {
 /// serves.
 pub struct WeightStore<S: WeightStorage> {
     storage: S,
+    /// The device this store's weights are mapped on. A `Backing` is one device's address, so a
+    /// rank that serves two devices holds one store per device: the storage is the same client.
+    device: platform::DeviceId,
     /// Every weight this rank has mapped, by storage key.
     mapped: BTreeMap<[u8; 32], Backing>,
 }
 
 impl<S: WeightStorage> WeightStore<S> {
-    /// A store over `storage`, with nothing mapped yet.
-    pub fn new(storage: S) -> Self {
+    /// A store over `storage` that maps every weight on `device`, with nothing mapped yet.
+    pub fn new(storage: S, device: platform::DeviceId) -> Self {
         Self {
             storage,
+            device,
             mapped: BTreeMap::new(),
         }
+    }
+
+    /// The device this store maps on.
+    pub fn device(&self) -> platform::DeviceId {
+        self.device
     }
 
     /// How many weights this rank holds, for the metrics report and for tests.
@@ -112,8 +121,10 @@ impl<S: WeightStorage> WeightStore<S> {
         }
         let Some(backing) = self
             .storage
-            .fetch(&storage_key)
-            .map_err(|error| Error::State(format!("mapping retained weight {key}: {error}").leak()))?
+            .fetch(self.device, &storage_key)
+            .map_err(|error| {
+                Error::State(format!("mapping retained weight {key}: {error}").leak())
+            })?
         else {
             return Ok(None);
         };
@@ -169,7 +180,7 @@ impl<S: WeightStorage> RetainedWeights for WeightStore<S> {
         }
         let backing = self
             .storage
-            .store(&storage_key, bytes)
+            .store(self.device, &storage_key, bytes)
             .map_err(|error| nn::Error::Unsupported(format!("publishing weight {key}: {error}")))?;
         self.mapped.insert(storage_key, backing);
         Ok(backing)
@@ -181,8 +192,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use nn::{FileIdentity, WeightLayout};
     use nn::weights::WeightRegion;
+    use nn::{FileIdentity, WeightLayout};
 
     use super::*;
 
@@ -204,7 +215,7 @@ mod tests {
     }
 
     impl WeightStorage for FakeStorage {
-        fn fetch(&self, key: &[u8; 32]) -> Result<Option<Backing>> {
+        fn fetch(&self, _device: platform::DeviceId, key: &[u8; 32]) -> Result<Option<Backing>> {
             self.fetches.fetch_add(1, Ordering::Relaxed);
             Ok(self.published.lock().unwrap().get(key).map(|bytes| {
                 let _ = bytes;
@@ -212,12 +223,14 @@ mod tests {
             }))
         }
 
-        fn store(&self, key: &[u8; 32], bytes: &[u8]) -> Result<Backing> {
+        fn store(
+            &self,
+            _device: platform::DeviceId,
+            key: &[u8; 32],
+            bytes: &[u8],
+        ) -> Result<Backing> {
             self.stores.fetch_add(1, Ordering::Relaxed);
-            self.published
-                .lock()
-                .unwrap()
-                .insert(*key, bytes.to_vec());
+            self.published.lock().unwrap().insert(*key, bytes.to_vec());
             Ok(Backing::new(
                 ops::DevicePtr::new(self.address()),
                 bytes.len() as u64,
@@ -225,13 +238,25 @@ mod tests {
         }
     }
 
-    /// The identity of a checkpoint file the test writes once per name, so two names are two
-    /// checkpoint files and the same name is one file read twice (`FileIdentity::of` is the only
-    /// constructor, and it derives the identity from the file itself).
+    /// The identity of a checkpoint file, as a Hugging Face cache stores it.
+    ///
+    /// A file under `blobs/` is identified by its name alone, so the fixture states identity
+    /// without waiting for a write to settle: `FileIdentity::of` gives a file younger than a second
+    /// an identity that matches no later read, and a checkpoint under test must not depend on that.
     fn identity(name: &str) -> FileIdentity {
-        let directory = std::env::temp_dir().join("uniserve-weight-key-tests");
+        let directory = std::env::temp_dir()
+            .join("uniserve-weight-key-tests")
+            .join("blobs");
         std::fs::create_dir_all(&directory).expect("a temporary directory");
-        let path = directory.join(name);
+        // A blob's name is a 64-digit hexadecimal content hash; the content is the fixture's own.
+        let digest: String = name
+            .bytes()
+            .flat_map(|byte| format!("{byte:02x}").into_bytes())
+            .map(char::from)
+            .take(64)
+            .collect();
+        let blob = format!("{digest:0<64}");
+        let path = directory.join(blob);
         if !path.exists() {
             std::fs::write(&path, name).expect("a temporary checkpoint file");
         }
@@ -299,7 +324,7 @@ mod tests {
 
     #[test]
     fn a_published_weight_is_a_hit_and_asks_the_storage_once() {
-        let mut store = WeightStore::new(FakeStorage::default());
+        let mut store = WeightStore::new(FakeStorage::default(), platform::DeviceId(0));
         let weight = key("blob:aaa", DType::BF16, "model.layers.0.mlp.up");
         let bytes = vec![0_u8; 4 * 8 * 2];
         let published = store
@@ -321,12 +346,12 @@ mod tests {
         let bytes = vec![0_u8; 4 * 8 * 2];
 
         // Another rank of the deployment publishes it first.
-        let mut other = WeightStore::new(Shared(Arc::clone(&storage)));
+        let mut other = WeightStore::new(Shared(Arc::clone(&storage)), platform::DeviceId(0));
         other
             .publish(&weight, DType::BF16, ops::Shape::new(&[4, 8]), &bytes)
             .expect("a well-formed weight");
 
-        let mut mine = WeightStore::new(Shared(Arc::clone(&storage)));
+        let mut mine = WeightStore::new(Shared(Arc::clone(&storage)), platform::DeviceId(0));
         assert!(mine.retained(&weight).expect("a hit").is_some());
         assert!(mine.retained(&weight).expect("a hit").is_some());
         assert_eq!(storage.fetches.load(Ordering::Relaxed), 1);
@@ -335,7 +360,7 @@ mod tests {
 
     #[test]
     fn a_weight_nothing_published_is_a_miss_that_is_not_remembered() {
-        let mut store = WeightStore::new(FakeStorage::default());
+        let mut store = WeightStore::new(FakeStorage::default(), platform::DeviceId(0));
         let weight = key("blob:aaa", DType::BF16, "model.layers.0.mlp.up");
         assert!(store.retained(&weight).expect("a miss").is_none());
         assert!(store.retained(&weight).expect("a miss").is_none());
@@ -346,7 +371,7 @@ mod tests {
 
     #[test]
     fn publishing_under_a_key_of_another_element_type_is_refused() {
-        let mut store = WeightStore::new(FakeStorage::default());
+        let mut store = WeightStore::new(FakeStorage::default(), platform::DeviceId(0));
         let weight = key("blob:aaa", DType::BF16, "model.layers.0.mlp.up");
         let error = store
             .publish(&weight, DType::F32, ops::Shape::new(&[4, 8]), &[0_u8; 128])
@@ -357,7 +382,7 @@ mod tests {
 
     #[test]
     fn publishing_a_byte_count_the_shape_does_not_state_is_refused() {
-        let mut store = WeightStore::new(FakeStorage::default());
+        let mut store = WeightStore::new(FakeStorage::default(), platform::DeviceId(0));
         let weight = key("blob:aaa", DType::BF16, "model.layers.0.mlp.up");
         let error = store
             .publish(&weight, DType::BF16, ops::Shape::new(&[4, 8]), &[0_u8; 7])
@@ -368,7 +393,7 @@ mod tests {
 
     #[test]
     fn publishing_the_same_weight_twice_answers_the_region_it_holds() {
-        let mut store = WeightStore::new(FakeStorage::default());
+        let mut store = WeightStore::new(FakeStorage::default(), platform::DeviceId(0));
         let weight = key("blob:aaa", DType::BF16, "model.layers.0.mlp.up");
         let bytes = vec![0_u8; 4 * 8 * 2];
         let first = store
@@ -385,12 +410,17 @@ mod tests {
     struct Shared(std::sync::Arc<FakeStorage>);
 
     impl WeightStorage for Shared {
-        fn fetch(&self, key: &[u8; 32]) -> Result<Option<Backing>> {
-            self.0.fetch(key)
+        fn fetch(&self, _device: platform::DeviceId, key: &[u8; 32]) -> Result<Option<Backing>> {
+            self.0.fetch(platform::DeviceId(0), key)
         }
 
-        fn store(&self, key: &[u8; 32], bytes: &[u8]) -> Result<Backing> {
-            self.0.store(key, bytes)
+        fn store(
+            &self,
+            _device: platform::DeviceId,
+            key: &[u8; 32],
+            bytes: &[u8],
+        ) -> Result<Backing> {
+            self.0.store(platform::DeviceId(0), key, bytes)
         }
     }
 }

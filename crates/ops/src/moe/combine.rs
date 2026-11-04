@@ -231,6 +231,11 @@ impl Op for MoeUnpermute {
         }
     }
 
+    /// A token's `top` routed rows are summed into one, so the reduction length is `top`.
+    ///
+    /// Each route's row is already the expert's own product; unpermuting adds `top` of them per token
+    /// in FP32 and rounds once into the output's dtype, which is `dot(top, F32, output)` and nothing
+    /// else — no activation touches the sum, so no envelope term is needed.
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
         Tolerance::dot(u64::from(descriptor.top), DType::F32, descriptor.output)
     }
