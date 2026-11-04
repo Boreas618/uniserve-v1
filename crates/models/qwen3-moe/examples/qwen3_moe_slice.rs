@@ -250,6 +250,15 @@ impl Args {
                 "--routing dumps one layer's routing, so it belongs to --stage block",
             ));
         }
+        // A router reads its layer's *input state*. Above layer 0 that state is only in hand when
+        // it comes from the reference: our own is whatever the prefix produced, and asking layer 1's
+        // router about the embedding would answer a question about a model nobody runs.
+        if routing && layer > 0 && from != Some(layer) {
+            return Err(Failure::message(format!(
+                "--routing --layer {layer} needs --from {layer}: the router reads that layer's own \
+                 input state, and ours above layer 0 exists only after running the prefix"
+            )));
+        }
         if from.is_some() && reference.is_none() {
             return Err(Failure::message(
                 "--from reads the reference's own state, so it needs --reference <dir>",
