@@ -862,6 +862,10 @@ pub trait KvProvider: Send + Sync {
 
 /// A causal language model's runner: one block's decode and prefill phases.
 pub struct CausalLmRunner<M: CausalLm> {
+    /// The buckets whose graph launched kernels and recorded no node table, so a rebind has no
+    /// node to address. A capture records it (the sink is the only source of the table) and a
+    /// programme update that would rebind one of these buckets is refused by name in `precopy`.
+    unannotated: std::collections::BTreeSet<Bucket>,
     /// The executor's name for this runner.
     id: RunnerId,
     /// The phases it serves, in scheduler order.
@@ -1008,6 +1012,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             previous: None,
             next: None,
             buckets,
+            unannotated: std::collections::BTreeSet::new(),
             graphs: Graphs::new(),
             pools: None,
             counters: None,
@@ -1182,6 +1187,18 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
             if !same {
                 changed.push((operator, key.to_owned()));
             }
+        }
+        if !changed.is_empty() && !self.unannotated.is_empty() {
+            // A rebind needs a graph node to set the new kernel's parameters on. A bucket whose
+            // capture reported no node table has none, so the update would quietly do nothing:
+            // every batch would keep launching the old kernel while the generation claimed the new
+            // one. The capture records the fact; the refusal belongs here, where an update asks.
+            return Err(Error::Invariant(format!(
+                "the serving graphs of buckets {:?} recorded no node table, so the {} changed \
+                 kernel(s) cannot be rebound onto them: the operator launches are not annotated",
+                self.unannotated.iter().collect::<Vec<_>>(),
+                changed.len()
+            )));
         }
         // A launch `next` adds is a change too: its bucket has nothing to compare it against, and
         // only a recapture can serve it (4.5).
@@ -1504,20 +1521,25 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let template = capture.end()?;
         // The node table comes from the capture sink, and the template is the record of what was
         // actually launched: the two can only be compared here. A graph that launched kernels and
-        // reported no node table is a graph nothing can rebind and whose launches nothing counts,
-        // so a program-layer update would silently do nothing - it is refused by name instead.
-        if nodes.is_empty() {
-            let launched = template
-                .nodes()?
-                .into_iter()
-                .filter(|node| matches!(node.kind(), Ok(platform::GraphNodeKind::Kernel)))
-                .count();
-            if launched > 0 {
-                return Err(Error::Invariant(format!(
-                    "the capture of {bucket} launched {launched} kernels and reported no node \
-                     table: the operator launches are not annotated, so nothing can rebind it"
-                )));
-            }
+        // reported no node table serves batches correctly but cannot be rebound, because there is
+        // no node to set the new kernel's parameters on. It is recorded rather than refused - a
+        // programme update is what needs it, and `precopy` refuses there by name instead of letting
+        // the update silently do nothing.
+        let launched = template
+            .nodes()?
+            .into_iter()
+            .filter(|node| matches!(node.kind(), Ok(platform::GraphNodeKind::Kernel)))
+            .count();
+        if nodes.is_empty() && launched > 0 {
+            self.unannotated.insert(bucket);
+            tracing::error!(
+                %bucket,
+                launched,
+                "a capture launched kernels and reported no node table: a programme update that \
+                 needs to rebind this bucket will be refused"
+            );
+        } else {
+            self.unannotated.remove(&bucket);
         }
         Ok(Walked { template, nodes })
     }
