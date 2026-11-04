@@ -184,9 +184,16 @@ fn require(
 /// The refiner between them reads the encoder's `[rows, text_dim]` features and projects them with
 /// the **DiT's** `token_refiner.input`, so a mixed pair is one gemm whose activation is the encoder's
 /// type and whose weight is the DiT's - a cell no backend can serve (`cuBLASLt refused an argument`),
-/// and one that surfaces deep inside a forward rather than at the boundary that composed it. With
-/// `dtype = "auto"` nothing is converted, so the two must already agree; a deployment that states a
-/// type gets one conversion at load instead, which is what an explicit `dtype` is for.
+/// and one that surfaces deep inside a forward rather than at the boundary that composed it.
+///
+/// **The reference converts instead**: `conditioning.py:165` is
+/// `hidden = self.input(hidden.to(self.input.weight.dtype))`, one cast of the features before the
+/// projection. This crate's refiner has one element type for the weight and the activation (the
+/// `scaled_add`/`gemm` rule: no mixed cells), so the cast cannot be expressed today and a mixed pair
+/// is refused here. When a convert exists, the reference's line is what to implement, and this
+/// refusal becomes the cast's precondition rather than a limit. `dtype = "auto"` converts nothing, so
+/// the two must already agree; a deployment that states a type gets one conversion at load, which is
+/// what an explicit `dtype` is for.
 pub fn refiner_types(text_encoder: nn::DType, dit: nn::DType, dit_directory: &str) -> Result<()> {
     if text_encoder == dit {
         return Ok(());
@@ -255,22 +262,44 @@ pub fn stored_dtype(checkpoint: &nn::Checkpoint, component: &str) -> Result<nn::
 /// checkpoint is one file set per pipeline: an export that continues a base release is opened by
 /// the engine as one checkpoint spanning both, so this function never learns about bases.
 ///
-/// Nothing is converted at load unless the deployment says so: with the design's `dtype = "auto"`
-/// each block keeps the representation its weights are stored in ([`stored_dtype`]), and each layer
-/// declares the precision it computes in (specs/worker.md 1). The representation is a fact about the
-/// export - BF16 throughout a released checkpoint, FP32 throughout another export of the same model
-/// - so no component's type is decided here.
+/// `dtype` is the deployment's element type: `Some` converts every weight once as it is published,
+/// and the retained key names the conversion, so a deployment over an export of another type is
+/// legal and its keys say what it did. `None` is the design's `auto`: each block keeps the
+/// representation its weights are stored in ([`stored_dtype`]), and each layer declares the
+/// precision it computes in (specs/worker.md 1). Under `auto` nothing converts, so a component of
+/// two floating-point types is refused here rather than mixed in a forward.
 ///
 /// A block this build cannot construct is refused with [`Error::Unsupported`], naming it, rather
 /// than omitted: a deployment that places one must fail at load, not on the device.
 pub fn load(
     checkpoint: &nn::Checkpoint,
     partition: Partition,
+    dtype: Option<nn::DType>,
     loader: &mut nn::weights::WeightLoader<'_>,
 ) -> Result<MinimaxH3> {
     let (layout, sidecars) = sidecars(checkpoint)?;
     let config = Config::normalize(&layout, &sidecars)?;
     partition.validate(&config)?;
+    // The deployment's element type, for the parts this function builds itself: a stated type is
+    // what every weight is converted to, and `None` is each component's own representation.
+    let deployment = |component: Component| -> Result<nn::DType> {
+        match dtype {
+            Some(stated) => Ok(stated),
+            None => stored_dtype(checkpoint, component.directories()[0]),
+        }
+    };
+    // With no stated type every component this rank places must have **one** floating-point type,
+    // because nothing converts and a component of two makes a forward mix them: the timestep
+    // embedding's second projection over the first is the cell that stopped a run, and it was a
+    // bf16 weight beside f32 activations. A deployment that states a type converts each weight once,
+    // and its retained key names the conversion, so the mixed export is legal only that way.
+    if dtype.is_none() {
+        for component in partition.blocks.iter() {
+            for directory in component.directories() {
+                stored_dtype(checkpoint, directory)?;
+            }
+        }
+    }
     // Two components, one number: the refiner spans the text encoder and the DiT, so their stored
     // types must agree before a single weight is read.
     if partition.blocks.contains(Component::TextEncoder) {
@@ -281,8 +310,8 @@ pub fn load(
             };
             if placed {
                 refiner_types(
-                    stored_dtype(checkpoint, Component::TextEncoder.directories()[0])?,
-                    stored_dtype(checkpoint, dit.directory())?,
+                    deployment(Component::TextEncoder)?,
+                    deployment(Component::Transformer)?,
                     dit.directory(),
                 )?;
             }
@@ -357,7 +386,7 @@ pub fn load(
                 // The text encoder's representation is the checkpoint's, like every other block's:
                 // `TextEncoder::load` converts to whatever it is handed, so a constant here would
                 // be the one conversion in the load that no file states.
-                let dtype = stored_dtype(checkpoint, component.directories()[0])?;
+                let dtype = deployment(Component::TextEncoder)?;
                 let mut shards = loader.reborrow(source)?;
                 let encoder = Arc::new(TextEncoder::load(
                     &mut shards,
@@ -442,7 +471,7 @@ pub fn load(
                 // deviations, uploaded once as the two `[3]` weights the byte step reads. It reads and
                 // writes the video decoder's rasters, so it holds their element type - the decoder's,
                 // which is the checkpoint's, not a constant here.
-                let dtype = stored_dtype(checkpoint, Component::VideoDecoder.directories()[0])?;
+                let dtype = deployment(Component::VideoDecoder)?;
                 let bytes = |values: [f32; 3]| -> Vec<u8> {
                     values
                         .iter()
