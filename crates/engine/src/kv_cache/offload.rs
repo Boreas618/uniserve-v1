@@ -838,6 +838,7 @@ impl KvOffloadManager {
         keys: &[Vec<Key>],
         device: usize,
         limit: usize,
+        min_deepening: usize,
     ) -> Option<usize> {
         if let Some(pins) = self.pins.get(&request) {
             if pins.device != device || pins.worker != *worker || pins.limit != limit {
@@ -852,8 +853,14 @@ impl KvOffloadManager {
         if limit <= device || keys.len() != pools.groups.len() {
             return Some(device);
         }
-        // L3 can only matter when the pages could reach a prefetch.
-        let look_up = limit - device >= PREFETCH_MIN_TOKENS;
+        // A deepening shorter than the caller's floor is not worth a host
+        // read at all: the caller's act would spend the read and keep nothing
+        // it asked for. L3 can only matter when the deepening could reach the
+        // floor the act needs.
+        if limit - device < min_deepening {
+            return Some(device);
+        }
+        let look_up = limit - device >= PREFETCH_MIN_TOKENS.max(min_deepening);
         let ranks = pools.ranks();
         let mut groups = Vec::with_capacity(pools.groups.len());
         for (index, (group, keys)) in pools.groups.iter().zip(keys).enumerate() {
@@ -2125,7 +2132,7 @@ mod tests {
         let keys = kv_offload.page_keys(&text, &prompt, None, 512);
         let mut boundary = None;
         poll_until(&mut kv_offload, |kv_offload| {
-            boundary = kv_offload.admission(RequestId(1), &text, &keys, 0, 512);
+            boundary = kv_offload.admission(RequestId(1), &text, &keys, 0, 512, 0);
             boundary.is_some()
         });
         assert_eq!(boundary, Some(512));
@@ -2192,7 +2199,7 @@ mod tests {
         // Every boundary past 384 lacks its window: the walk passes them.
         let mut boundary = None;
         poll_until(&mut kv_offload, |kv_offload| {
-            boundary = kv_offload.admission(RequestId(2), &text, &keys, 0, 640);
+            boundary = kv_offload.admission(RequestId(2), &text, &keys, 0, 640, 0);
             boundary.is_some()
         });
         assert_eq!(boundary, Some(384));

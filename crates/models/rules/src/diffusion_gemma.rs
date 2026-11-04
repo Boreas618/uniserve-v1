@@ -468,7 +468,7 @@ mod tests {
             soft_tokens: u32,
         }
         let fixture: Fixture = serde_json::from_str(include_str!(
-            "../../../tests/python/fixtures/diffusion_gemma_image_tokens.json"
+            "../../../../tests/python/fixtures/diffusion_gemma_image_tokens.json"
         ))
         .unwrap();
         let budget = PatchBudget {

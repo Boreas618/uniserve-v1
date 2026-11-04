@@ -45,6 +45,11 @@ pub struct EngineControl {
     host: String,
     /// The deployment the engines serve.
     deployment: String,
+    /// This node's Program Server socket, which every engine process is told
+    /// where to resolve an epoch's policy modules from (§5.3, §7.3); `None`
+    /// leaves an engine with no policy store, and it refuses every policy
+    /// precopy with a reason rather than serving without one.
+    program_server: Option<PathBuf>,
     next_engine: AtomicU64,
     /// Engine handoffs can connect in any order. Reading and assigning
     /// their greetings is serialized; each client keeps its buffered reader.
@@ -64,6 +69,7 @@ impl EngineControl {
         processes: String,
         host: String,
         deployment: String,
+        program_server: Option<PathBuf>,
     ) -> anyhow::Result<Self> {
         // A socket a stopped daemon left behind is replaced.
         let _ = std::fs::remove_file(socket);
@@ -83,6 +89,7 @@ impl EngineControl {
             processes,
             host,
             deployment,
+            program_server,
             next_engine: AtomicU64::new(1),
             incoming: std::sync::Mutex::new(BTreeMap::new()),
         })
@@ -443,6 +450,22 @@ impl EngineControl {
         );
 
         let executable = executable.to_owned();
+        // The engine resolves an epoch's policy modules through this node's
+        // Program Server, so the socket travels with the rest of what starts
+        // it (§5.3, §7.3).
+        let mut arguments = vec![
+            "engine".to_owned(),
+            "--requests".to_owned(),
+            self.request_address.clone(),
+            "--processes".to_owned(),
+            self.processes.clone(),
+            "--engine".to_owned(),
+            engine.to_string(),
+        ];
+        if let Some(program_server) = &self.program_server {
+            arguments.push("--program-server".to_owned());
+            arguments.push(program_server.display().to_string());
+        }
         control.send(&process::Upstream {
             kind: Some(upstream::Kind::Request(process::Request {
                 id: 1,
@@ -452,15 +475,7 @@ impl EngineControl {
                     rank: 0,
                     generation: engine,
                     executable,
-                    arguments: vec![
-                        "engine".to_owned(),
-                        "--requests".to_owned(),
-                        self.request_address.clone(),
-                        "--processes".to_owned(),
-                        self.processes.clone(),
-                        "--engine".to_owned(),
-                        engine.to_string(),
-                    ],
+                    arguments,
                     ..process::Spawn::default()
                 })),
             })),
@@ -634,6 +649,7 @@ mod tests {
             format!("unix:{}", socket.display()),
             "rank-0".into(),
             "model".into(),
+            None,
         )
         .unwrap();
         let mut pending = None;

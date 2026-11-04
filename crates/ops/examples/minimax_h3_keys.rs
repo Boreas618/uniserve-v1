@@ -428,6 +428,50 @@ fn main() {
             );
         }
     }
+    // The two `unpatchify_video` geometries the decoder needs: the latents and the decoder's own
+    // output. The token grid is the request's -- its clip length and its canvas -- so it is a launch
+    // value, and the keys name only the channels, the patch and the affine form.
+    for (channels, patch, affine) in [(24u32, (1u32, 2u32, 2u32), true), (3, (4, 16, 16), false)] {
+        push(
+            "unpatchify_video",
+            ops::unpatchify::Descriptor {
+                dtype: DType::F16,
+                channels,
+                patch_frames: patch.0,
+                patch_height: patch.1,
+                patch_width: patch.2,
+                affine,
+                block: 1024,
+                pdl: PDL,
+            }
+            .to_string(),
+        );
+    }
+    // The register prefix and the zero tail around the caller's rows.
+    push(
+        "sequence_append",
+        ops::sequence_append::Descriptor {
+            dtype: DType::BF16,
+            width: HIDDEN,
+            registers: 4,
+            tail: 12,
+            block: ops::sequence_append::BLOCK,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
+    // The seam between two decoded tiles, five voxels of overlap along the height.
+    push(
+        "cross_fade",
+        ops::cross_fade::Descriptor {
+            dtype: DType::F16,
+            extent: 5,
+            axis: 2,
+            block: ops::cross_fade::BLOCK,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
     // The audio decoder's fused BigVGAN block, at the decoder's own rate and taps.
     push(
         "audio_activation",

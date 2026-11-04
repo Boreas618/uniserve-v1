@@ -20,26 +20,24 @@
 //!
 //! Both instances — each scheduler thread's and the control thread's — come
 //! from one program and switch together (§4.4: "两者是同一个 program，一起换代").
-//! The control thread's instance sees every rank's `Arrived`, `Emitted` and
-//! `Finished` through a [`RouteFeed`], so a policy that tracks per-tenant usage
-//! routes on what each rank actually served.
+//! The control thread's instance is told every rank's `Arrived`, `Emitted` and
+//! `Finished` as the control thread sees them, so a policy that tracks
+//! per-tenant usage routes on what each rank actually served.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-use crossbeam_channel::{Receiver, Sender};
 use scheduling::guest::decision::{Plan, Room, Shortage, Victim};
 use scheduling::guest::event::Event;
 use scheduling::guest::ids::PageId;
 use scheduling::guest::limits::{Limits, Parameters};
-use scheduling::guest::policy::Init;
+use scheduling::guest::policy::Instantiation;
 use scheduling::guest::view::{
-    CallView, ExpertLoad, ExpertOrder, RankView, ReplicaView, RequestView, Snapshot,
+    CallView, ExpertLoad, ExpertOrder, RankView, ReplicaView, RequestState, RequestView, Snapshot,
 };
 use scheduling::guest::wire::Call;
 use scheduling::{Engine, PolicyError, PolicyInstance, PolicyModule};
 use serde::{Deserialize, Serialize};
-
-use crate::scheduler::SchedulerConfig;
 
 /// A policy program's identity and arguments (§5.1): the backend the
 /// configuration names, the revision the Program Server numbered the package
@@ -56,6 +54,10 @@ pub struct PolicyProgram {
     pub revision: u32,
     /// The policy's arguments, from the deployment configuration (§7.7).
     pub arguments: Parameters,
+    /// The arguments as the daemon stated them, one TOML value each, which is
+    /// what the Program Server resolves the module with: the server fills the
+    /// package's defaults for the ones the deployment leaves out.
+    pub stated: std::collections::BTreeMap<String, String>,
 }
 
 impl PolicyProgram {
@@ -106,7 +108,38 @@ impl PolicyProgram {
             backend,
             revision,
             arguments: parameters,
+            stated: arguments.clone(),
         })
+    }
+
+    /// The program as the Program Server names it (§5.1): the backend, the
+    /// revision, and the stated arguments as TOML.
+    pub fn to_server_program(&self) -> Result<program_server::Program, PolicyError> {
+        let mut arguments = toml::Table::new();
+        for (name, value) in &self.stated {
+            arguments.insert(name.clone(), argument::<toml::Value>(value, name)?);
+        }
+        Ok(program_server::Program {
+            backend: self.backend.clone(),
+            revision: self.revision,
+            arguments,
+        })
+    }
+
+    /// The program a daemon's `Precopy` states for the scheduling policy
+    /// (§7.3 step 2): its `program` field, as the process interface carries it.
+    ///
+    /// The wire form is the Program Server's own `Program` — a backend, a
+    /// revision and the arguments as TOML text — so nothing about a program is
+    /// decided here: a name the interface does not have is refused, as it is by
+    /// [`Self::from_arguments`].
+    pub fn from_program(program: &proto::process::Program) -> Result<Self, PolicyError> {
+        let arguments: std::collections::BTreeMap<String, String> = program
+            .arguments
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        Self::from_arguments(program.backend.clone(), program.revision, &arguments)
     }
 }
 
@@ -116,46 +149,6 @@ fn argument<T: serde::de::DeserializeOwned>(value: &str, name: &str) -> Result<T
     toml::from_str(&format!("value = {value}")).map_err(|error| PolicyError::Load {
         message: format!("the policy argument `{name} = {value}` does not parse: {error}"),
     })
-}
-
-/// The policy a scheduler configuration states, before the daemon names the
-/// revision it installed (§5.1).
-///
-/// The arguments are the configuration's scheduling values, so the policy sees
-/// the deployment's own limits and applies its own defaults only where the
-/// configuration states none.
-pub fn program_of(config: &SchedulerConfig) -> PolicyProgram {
-    PolicyProgram {
-        backend: backend_name(config.policy).to_owned(),
-        revision: 0,
-        arguments: parameters_of(config),
-    }
-}
-
-/// The backend name of a scheduling policy word, as `scheduler_config.policy`
-/// spells it and the Program Server's store names it.
-pub fn backend_name(policy: proto::request::SchedulingPolicy) -> &'static str {
-    match policy {
-        proto::request::SchedulingPolicy::Fcfs => "fcfs",
-        proto::request::SchedulingPolicy::Priority => "priority",
-    }
-}
-
-/// The policy's arguments from the scheduler configuration (§7.7: the
-/// `scheduler_config` fields and the `speculative_config` decision values).
-pub fn parameters_of(config: &SchedulerConfig) -> Parameters {
-    Parameters {
-        chunked_prefill_size: Some(token_count(config.chunked_prefill_size)),
-        max_queued_requests: config.max_queued_requests,
-        max_batch: Some(config.max_batch),
-        max_num_batched_tokens: Some(token_count(config.max_num_batched_tokens)),
-        // The policy states its own deepening floor and starvation deadline;
-        // the build config only bounds them (`ceilings_of`).
-        prefetch_min_tokens: None,
-        timeout: None,
-        expected_speedup: config.refill.expected_speedup,
-        refill_token_cost: config.refill.token_cost,
-    }
 }
 
 /// The build config's hard bounds on what one step may be given to run (§4.4):
@@ -206,17 +199,28 @@ pub fn ceilings_of(capacity: BatchCapacity) -> Limits {
     }
 }
 
+/// The process's WASM engine: one engine for every policy instance the main
+/// process runs, the scheduler threads' and the control thread's.
+///
+/// An engine holds the compiler and its configuration, not a module's state; a
+/// failure to build it is the deployment's, and every precopy reports it the
+/// same way.
+pub(crate) fn process_engine() -> Result<&'static Engine, PolicyError> {
+    static ENGINE: OnceLock<Result<Engine, String>> = OnceLock::new();
+    match ENGINE.get_or_init(|| Engine::new().map_err(|error| error.to_string())) {
+        Ok(engine) => Ok(engine),
+        Err(message) => Err(PolicyError::Load {
+            message: message.clone(),
+        }),
+    }
+}
+
 /// The build config's smallest prefix-hit deepening (§4.4: a host hit that
 /// deepens the device hit by fewer tokens is not prefetched).
 ///
 /// It is a build-config value, so a policy's `prefetch_min_tokens` may be above
 /// it but not below it (`scheduling`'s check of the policy's limits).
 pub const PREFETCH_FLOOR_TOKENS: u32 = 256;
-
-/// `tokens` as the interface's token field, saturating instead of wrapping.
-fn token_count(tokens: usize) -> u32 {
-    u32::try_from(tokens).unwrap_or(u32::MAX)
-}
 
 /// Where the switch resolves a policy program's module (§5.1, §5.3).
 ///
@@ -229,58 +233,124 @@ pub trait PolicySource: Send + Sync {
     fn bytes(&self, program: &PolicyProgram) -> Result<Vec<u8>, PolicyError>;
 }
 
-/// The Program Server's module store, read by path (§5.3).
+/// The Program Server's client, as the source of a policy's module (§5.3,
+/// §7.3 step 2).
 ///
-/// A policy's module path is
-/// `scheduling/<backend>/<revision>/<target>/<descriptor>` below the store's
-/// root, the layout every program's modules use. Open point: `<target>` names
-/// the host the Program Server precompiled the module for (§5.1), not the source
-/// format, and `<descriptor>` is a policy package's single module rather than a
-/// kernel's per-descriptor set; the spelling below follows the design's order
-/// and shrinks to the Program Server's published layout once it is posted.
-#[derive(Clone, Debug)]
-pub struct PolicyStore {
-    root: PathBuf,
+/// The daemon names a program by backend, revision and arguments, never by
+/// content: this asks the host's Program Server to `resolve` it — the store's
+/// copy, or a build of it when the store misses it — for the baseline target
+/// this engine pinned at start, under the `scheduling` operator's single
+/// descriptor ([`program_server::manifest::POLICY_DESCRIPTOR`]).
+///
+/// One connection is kept and reused: a precopy is the only caller, and it
+/// runs on a thread of its own, so the lock is never held across a step.
+#[derive(Debug)]
+pub struct ProgramSource {
+    socket: PathBuf,
+    target: program_server::Target,
+    client: std::sync::Mutex<Option<program_server::Client>>,
 }
 
-impl PolicyStore {
-    /// A store rooted at `root`, the directory the Program Server shares.
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
-    }
+/// The operator a scheduling policy's program fills (§5.2).
+const POLICY_OP: &str = "scheduling";
 
-    /// The store's root directory.
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
-    /// The path of the module `program` resolves to.
+impl ProgramSource {
+    /// A source that resolves programs through the Program Server listening on
+    /// `socket`, for the target this host's engine precompiles for.
     ///
-    /// A policy package compiles to one module per revision rather than one per
-    /// descriptor, so the descriptor segment is the package's single `default`
-    /// one.
-    pub fn module_path(&self, program: &PolicyProgram) -> PathBuf {
-        self.root
-            .join("scheduling")
-            .join(&program.backend)
-            .join(program.revision.to_string())
-            .join("wasm32")
-            .join("default")
-            .join("module.wasm")
+    /// A host without a baseline target has no Program Server artifacts to
+    /// load, which is a precopy failure like any other.
+    pub fn connect(socket: impl Into<PathBuf>) -> Result<Self, PolicyError> {
+        let name = Engine::target().ok_or_else(|| PolicyError::Load {
+            message: format!(
+                "no baseline wasm target for this host (architecture {}): its Program Server \
+                 precompiles none",
+                std::env::consts::ARCH
+            ),
+        })?;
+        Ok(Self {
+            socket: socket.into(),
+            target: program_server::Target::new(name),
+            client: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// The socket the source asks.
+    pub fn socket(&self) -> &Path {
+        &self.socket
+    }
+
+    /// With `self`'s connection open, for the caller to resolve through.
+    fn with_client<T>(
+        &self,
+        ask: impl FnOnce(&mut program_server::Client) -> Result<T, PolicyError>,
+    ) -> Result<T, PolicyError> {
+        let mut client = crate::lock(&self.client);
+        if client.is_none() {
+            *client = Some(
+                program_server::Client::connect(&self.socket).map_err(|error| {
+                    PolicyError::Load {
+                        message: format!(
+                            "cannot reach the Program Server at {}: {error}",
+                            self.socket.display()
+                        ),
+                    }
+                })?,
+            );
+        }
+        let client = client.as_mut().ok_or_else(|| PolicyError::Load {
+            message: "the Program Server connection was closed".to_owned(),
+        })?;
+        let answer = ask(client);
+        if answer.is_err() {
+            // A failed exchange may leave the stream out of step; the next
+            // precopy opens a new one.
+            *crate::lock(&self.client) = None;
+        }
+        answer
     }
 }
 
-impl PolicySource for PolicyStore {
+impl PolicySource for ProgramSource {
     fn bytes(&self, program: &PolicyProgram) -> Result<Vec<u8>, PolicyError> {
-        let path = self.module_path(program);
-        std::fs::read(&path).map_err(|error| PolicyError::Load {
+        let server_program = program.to_server_program()?;
+        let module = self.with_client(|client| {
+            client
+                .resolve(
+                    POLICY_OP,
+                    &server_program,
+                    &self.target,
+                    program_server::manifest::POLICY_DESCRIPTOR,
+                    &mut |_| {},
+                )
+                .map_err(|error| PolicyError::Load {
+                    message: format!(
+                        "the Program Server did not resolve the {}/{} policy for {}: {error}",
+                        program.backend, program.revision, self.target
+                    ),
+                })
+        })?;
+        let mut file = module
+            .files
+            .into_iter()
+            .find(|file| file.name == program_server::source::MODULE_WASM)
+            .ok_or_else(|| PolicyError::Load {
+                message: format!(
+                    "the {}/{} policy's module carries no {}",
+                    program.backend,
+                    program.revision,
+                    program_server::source::MODULE_WASM
+                ),
+            })?
+            .file;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|error| PolicyError::Load {
             message: format!(
-                "cannot read the {}/{} policy module at {}: {error}",
-                program.backend,
-                program.revision,
-                path.display()
+                "cannot read the {}/{} policy module: {error}",
+                program.backend, program.revision
             ),
-        })
+        })?;
+        Ok(bytes)
     }
 }
 
@@ -398,6 +468,83 @@ pub struct Candidate {
     program: PolicyProgram,
     module: PolicyModule,
     instance: PolicyInstance,
+    /// The guest calls the trial made, which the counters carry once the
+    /// candidate is adopted.
+    calls: u64,
+    /// The snapshot the instance was instantiated on: the state its own
+    /// knowledge starts from, which the mechanism seeds the recorder with when
+    /// the candidate starts serving (§4.4).
+    state: Snapshot,
+}
+
+/// What an epoch's policy has cost so far, in the two counters `Metrics`
+/// carries for it (design §12's deterministic proxy for per-step cost).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PolicyUsage {
+    /// Guest calls made since the epoch's policy first served, a precopy's
+    /// trial included.
+    pub calls: u64,
+    /// Fuel those calls consumed, summed over every instance the epoch's policy
+    /// has had: a switchover carries its predecessor's total forward, so the
+    /// counters only ever grow.
+    pub fuel: u64,
+}
+
+/// What one scheduler tells the control thread's counters on a statistics tick:
+/// the step it reached, and what its policy has cost (§12).
+///
+/// The step is the epoch's own count — the scheduler takes one per policy step
+/// (`Scheduler::policy_step`) — so the engine's largest is the epoch's step
+/// count, while each batch a step submits is counted separately by the batch
+/// counters.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Progress {
+    /// The step this scheduler reached; zero before its first policy step.
+    pub step: u64,
+    /// The calls and fuel of the scheduler's policy, or `None` before its first
+    /// switchover.
+    pub usage: Option<PolicyUsage>,
+}
+
+/// The running cost of the instance a slot serves, and of the ones it replaced.
+#[derive(Debug, Default)]
+struct Cost {
+    calls: u64,
+    /// Fuel of the instances that stopped serving, and of the trials whose
+    /// candidates were adopted.
+    spent: u64,
+}
+
+impl Cost {
+    /// Counts one call into `instance` around `call`.
+    fn call<T>(
+        &mut self,
+        instance: &mut PolicyInstance,
+        call: impl FnOnce(&mut PolicyInstance) -> Result<T, PolicyError>,
+    ) -> Result<T, PolicyError> {
+        self.calls += 1;
+        call(instance)
+    }
+
+    /// The counters as they stand, the serving instance's fuel included.
+    fn usage(&self, instance: &PolicyInstance) -> PolicyUsage {
+        PolicyUsage {
+            calls: self.calls,
+            fuel: self.spent + instance.fuel_consumed(),
+        }
+    }
+
+    /// An instance stops serving: its fuel stays in the total.
+    fn replace(&mut self, instance: &PolicyInstance) {
+        self.spent += instance.fuel_consumed();
+    }
+
+    /// A trial's calls are counted when its candidate is adopted: they are
+    /// calls the epoch's policy made, whether or not it goes on serving under
+    /// that program. Its fuel is already inside the instance's own total.
+    fn trial(&mut self, calls: u64) {
+        self.calls += calls;
+    }
 }
 
 impl Candidate {
@@ -417,8 +564,10 @@ impl Candidate {
 /// to serve under.
 #[derive(Clone, Debug)]
 pub struct PolicyReverted {
-    /// The scheduler whose instance failed; `None` for the control thread's
-    /// route instance.
+    /// The scheduler whose instance failed; `None` while the scheduler thread
+    /// reports it, since a scheduler does not know its index, and `None` for the
+    /// control thread's route instance. The control thread names the scheduler
+    /// it took a report from.
     pub scheduler: Option<usize>,
     /// The program that failed.
     pub program: PolicyProgram,
@@ -433,14 +582,78 @@ pub struct PolicyReverted {
     pub fatal: bool,
 }
 
-/// What a scheduler thread's policy slot hears from outside its own rank.
-#[derive(Clone, Default)]
-pub struct PolicyPorts {
-    /// The scheduler index this slot serves, named in a revert report.
-    pub scheduler: Option<usize>,
-    /// The control thread's route instance, fed this rank's arrivals,
-    /// emissions and completions.
-    pub route: Option<RouteFeed>,
+impl PolicyReverted {
+    /// The report as the process interface carries it (§7.3).
+    ///
+    /// A scheduler thread does not know its index, so it reports `None` and the
+    /// control thread names it; the control thread's own instance is absent
+    /// (`None`) on the wire as well (§7.3).
+    pub fn to_process(&self) -> proto::process::PolicyReverted {
+        proto::process::PolicyReverted {
+            scheduler: self.scheduler.map(|index| index as u32),
+            backend: self.program.backend.clone(),
+            revision: self.program.revision,
+            reason: self.reason.clone(),
+            fatal: self.fatal,
+        }
+    }
+}
+
+/// A request that has just reached the main process, as the control thread
+/// sees it before any scheduler does: what the `route` decision orders by
+/// (§4.4).
+///
+/// The features are read from the submitted request and the routing table, not
+/// from a scheduler's state: the request is not on a scheduler yet.
+#[derive(Clone, Debug)]
+pub struct Arrival {
+    /// The request's identity.
+    pub id: ipc::RequestId,
+    /// The priority the request carries.
+    pub priority: i32,
+    /// Whether it is token generation or media work.
+    pub class: scheduling::guest::view::RequestClass,
+    /// Tokens of its prompt.
+    pub prompt_tokens: u32,
+    /// Tokens it already generated on the epochs that served it before.
+    pub generated_tokens: u32,
+    /// Tokens it may still generate.
+    pub remaining_tokens: u32,
+    /// Whether it resumes from its generated tokens.
+    pub migratable: bool,
+    /// The rank its stored cache was resumed from, when it resumes one; the
+    /// policy returns it and the mechanism skips routing the request.
+    pub cache_rank: Option<usize>,
+    /// When it reached the main process, on the mechanism's clock.
+    pub arrived_at: scheduling::guest::time::Nanos,
+}
+
+/// The view of a request that has just arrived (`Event::Arrived`): nothing has
+/// happened to it yet, so every feature but the submitted ones is empty.
+pub fn arrival_view(arrival: &Arrival) -> RequestView {
+    RequestView {
+        id: scheduling::guest::ids::RequestId(arrival.id.0),
+        state: RequestState::Queued,
+        phase: None,
+        priority: arrival.priority,
+        arrived_at: arrival.arrived_at,
+        admitted_at: None,
+        prompt_tokens: arrival.prompt_tokens,
+        generated_tokens: arrival.generated_tokens,
+        cached_prefix_tokens: 0,
+        prefilled_tokens: 0,
+        cached_pages: 0,
+        last_emitted_at: None,
+        class: arrival.class,
+        waiting_transfer: false,
+        next_tokens: 0,
+        reservation_units: 0,
+        prefetch_tokens: 0,
+        refill_tokens: None,
+        remaining_tokens: arrival.remaining_tokens,
+        migratable: arrival.migratable,
+        cache_rank: arrival.cache_rank,
+    }
 }
 
 /// One scheduler thread's policy instance and the switch that replaces it
@@ -461,23 +674,23 @@ pub struct PolicySlot {
     /// The module and program of the policy a revert puts back. `None` before
     /// the first switchover and after a revert: no older policy exists then.
     previous: Option<(PolicyProgram, PolicyModule)>,
-    /// The instance and module a precopy prepared, put in by the switchover.
-    candidate: Option<(PolicyProgram, PolicyModule, PolicyInstance)>,
+    /// The instance, module and state a precopy prepared, put in by the
+    /// switchover.
+    candidate: Option<Candidate>,
     /// The stage asked for and not yet applied, applied at the next boundary.
     pending: Option<Stage>,
-    ports: PolicyPorts,
+    /// The snapshot the serving instance was instantiated on: the state its own
+    /// knowledge starts from (§4.4).
+    state: Snapshot,
+    /// What this scheduler's policy has cost (§12).
+    cost: Cost,
 }
 
 impl PolicySlot {
     /// The slot a first switchover puts in place from the candidate its precopy
     /// prepared: §7.3's policy for a fresh epoch, whose precopy ran before any
     /// policy served.
-    pub fn from_candidate(
-        engine: &Engine,
-        ceilings: Limits,
-        candidate: Candidate,
-        ports: PolicyPorts,
-    ) -> Self {
+    pub fn from_candidate(engine: &Engine, ceilings: Limits, candidate: Candidate) -> Self {
         Self {
             engine: engine.clone(),
             ceilings,
@@ -487,7 +700,8 @@ impl PolicySlot {
             previous: None,
             candidate: None,
             pending: None,
-            ports,
+            state: candidate.state,
+            cost: Cost::default(),
         }
     }
 
@@ -503,11 +717,10 @@ impl PolicySlot {
         program: PolicyProgram,
         state: &TrialState,
         ceilings: &Limits,
-        ports: PolicyPorts,
     ) -> Result<Self, PolicyError> {
         let init = init_of(&program, state);
         let module = PolicyModule::load(engine, &source.bytes(&program)?)?;
-        let instance = module.instantiate(&init, ceilings)?;
+        let instance = module.instantiate(&init.state, &init.parameters, ceilings)?;
         Ok(Self {
             engine: engine.clone(),
             ceilings: *ceilings,
@@ -517,8 +730,16 @@ impl PolicySlot {
             previous: None,
             candidate: None,
             pending: None,
-            ports,
+            state: init.state,
+            cost: Cost::default(),
         })
+    }
+
+    /// The snapshot the serving instance was instantiated on: the state the
+    /// policy knows, which the mechanism's recorder is seeded from when this
+    /// instance starts serving (§4.4).
+    pub fn instantiated_on(&self) -> &Snapshot {
+        &self.state
     }
 
     /// The program the slot serves now.
@@ -532,31 +753,22 @@ impl PolicySlot {
         self.instance.limits()
     }
 
-    /// Fuel every call into the serving instance has consumed, which is §12's
-    /// per-step policy cost when the mechanism takes it around a step.
-    pub fn fuel_consumed(&self) -> u64 {
-        self.instance.fuel_consumed()
-    }
-
     /// `observe`: every event since the previous step, in order (§4.4).
-    ///
-    /// The rank's arrivals, emissions and completions also feed the control
-    /// thread's route instance, so routing sees the usage the policy sees.
     pub fn observe(&mut self, events: &[Event]) -> Result<(), PolicyError> {
-        if let Some(route) = &self.ports.route {
-            route.feed(events);
-        }
-        self.instance.observe(events)
+        let (instance, cost) = (&mut self.instance, &mut self.cost);
+        cost.call(instance, |instance| instance.observe(events))
     }
 
     /// `dispatch`: this step's plan (§4.4).
     pub fn dispatch(&mut self, room: &Room) -> Result<Plan, PolicyError> {
-        self.instance.dispatch(room)
+        let (instance, cost) = (&mut self.instance, &mut self.cost);
+        cost.call(instance, |instance| instance.dispatch(room))
     }
 
     /// `reclaim`: which objects to free, in order, for a shortage (§4.4).
     pub fn reclaim(&mut self, shortage: &Shortage) -> Result<Vec<Victim>, PolicyError> {
-        self.instance.reclaim(shortage)
+        let (instance, cost) = (&mut self.instance, &mut self.cost);
+        cost.call(instance, |instance| instance.reclaim(shortage))
     }
 
     /// `place`: which replica runs a request's first call on a block (§4.4).
@@ -565,17 +777,26 @@ impl PolicySlot {
         call: &CallView,
         replicas: &[ReplicaView],
     ) -> Result<usize, PolicyError> {
-        self.instance.place(call, replicas)
+        let (instance, cost) = (&mut self.instance, &mut self.cost);
+        cost.call(instance, |instance| instance.place(call, replicas))
     }
 
     /// `warm`: which pages to warm, in order, during an epoch's precopy (§4.4).
     pub fn warm(&mut self, room: &Room) -> Result<Vec<PageId>, PolicyError> {
-        self.instance.warm(room)
+        let (instance, cost) = (&mut self.instance, &mut self.cost);
+        cost.call(instance, |instance| instance.warm(room))
     }
 
     /// `experts`: the placement of experts on ranks (§4.4).
     pub fn experts(&mut self, load: &ExpertLoad) -> Result<ExpertOrder, PolicyError> {
-        self.instance.experts(load)
+        let (instance, cost) = (&mut self.instance, &mut self.cost);
+        cost.call(instance, |instance| instance.experts(load))
+    }
+
+    /// The calls this scheduler's policy has made and the fuel they consumed
+    /// (§12's cost counters, for `Metrics.policy_fuel`/`policy_calls`).
+    pub fn usage(&self) -> PolicyUsage {
+        self.cost.usage(&self.instance)
     }
 
     /// §7.3 step 2: instantiate `program` on `state` and ask it every decision
@@ -607,33 +828,41 @@ impl PolicySlot {
             call,
             expert_load,
         } = state;
-        let init = Init {
+        let init = Instantiation {
             parameters: program.arguments.clone(),
             state: snapshot,
         };
         let module = PolicyModule::load(engine, &source.bytes(&program)?)?;
-        let mut instance = module.instantiate(&init, ceilings)?;
+        let mut instance = module.instantiate(&init.state, &init.parameters, ceilings)?;
 
         // Every decision of §4.4's table once, on the state that exists now and
-        // without executing any of it.
+        // without executing any of it. The calls are the trial's cost, counted
+        // once the candidate is adopted.
+        let mut calls = 0;
         let plan = instance.dispatch(&room)?;
+        calls += 1;
         validators.plan(&plan)?;
         if let Some(shortage) = &shortage {
             let victims = instance.reclaim(shortage)?;
+            calls += 1;
             validators.victims(shortage, &victims)?;
         }
         if let Some((request, ranks)) = &arrival {
             let index = instance.route(request, ranks)?;
+            calls += 1;
             validators.route(request, ranks, index)?;
         }
         if let Some((call, replicas)) = &call {
             let index = instance.place(call, replicas)?;
+            calls += 1;
             validators.place(call, replicas, index)?;
         }
         let pages = instance.warm(&room)?;
+        calls += 1;
         validators.warm(&pages)?;
         if let Some(load) = &expert_load {
             let order = instance.experts(load)?;
+            calls += 1;
             validators.experts(load, &order)?;
         }
 
@@ -641,6 +870,8 @@ impl PolicySlot {
             program,
             module,
             instance,
+            calls,
+            state: init.state,
         })
     }
 
@@ -650,7 +881,8 @@ impl PolicySlot {
     /// switchover: only a later precopy's result can be the one the daemon's
     /// switchover means.
     pub fn adopt(&mut self, candidate: Candidate) {
-        self.candidate = Some((candidate.program, candidate.module, candidate.instance));
+        self.cost.trial(candidate.calls);
+        self.candidate = Some(candidate);
     }
 
     /// A precopy on the calling thread: [`Self::prepare`] and [`Self::adopt`].
@@ -729,16 +961,15 @@ impl PolicySlot {
     /// A switchover without a prepared candidate leaves the serving policy in
     /// place: the daemon's precopy failed and the update is discarded.
     fn switch_over(&mut self) {
-        let Some((program, module, instance)) = self.candidate.take() else {
-            tracing::warn!(
-                scheduler = ?self.ports.scheduler,
-                "a policy switchover arrived without a policy prepared by a precopy"
-            );
+        let Some(candidate) = self.candidate.take() else {
+            tracing::warn!("a policy switchover arrived without a policy prepared by a precopy");
             return;
         };
-        let replaced_program = std::mem::replace(&mut self.program, program);
-        let replaced_module = std::mem::replace(&mut self.module, module);
-        let _ = std::mem::replace(&mut self.instance, instance);
+        let replaced_program = std::mem::replace(&mut self.program, candidate.program);
+        let replaced_module = std::mem::replace(&mut self.module, candidate.module);
+        let replaced = std::mem::replace(&mut self.instance, candidate.instance);
+        self.state = candidate.state;
+        self.cost.replace(&replaced);
         // §7.3 step 5: the replaced module stays until the next precopy, which
         // replaces it; committing therefore keeps it, and a revert finds it.
         self.previous = Some((replaced_program, replaced_module));
@@ -763,10 +994,12 @@ impl PolicySlot {
             ));
         };
         let init = init_of(&program, state);
-        let instance = module.instantiate(&init, &self.ceilings)?;
+        let instance = module.instantiate(&init.state, &init.parameters, &self.ceilings)?;
         let _ = std::mem::replace(&mut self.program, program);
         let _ = std::mem::replace(&mut self.module, module);
-        let _ = std::mem::replace(&mut self.instance, instance);
+        let replaced = std::mem::replace(&mut self.instance, instance);
+        self.state = init.state;
+        self.cost.replace(&replaced);
         Ok(())
     }
 
@@ -784,7 +1017,7 @@ impl PolicySlot {
         state: &TrialState,
     ) -> Result<PolicyReverted, PolicyError> {
         let report = PolicyReverted {
-            scheduler: self.ports.scheduler,
+            scheduler: None,
             program: self.program.clone(),
             reason: error.to_string(),
             fatal: false,
@@ -795,46 +1028,63 @@ impl PolicySlot {
 }
 
 /// The instantiation message of `program` on `state`.
-fn init_of(program: &PolicyProgram, state: &TrialState) -> Init {
-    Init {
+fn init_of(program: &PolicyProgram, state: &TrialState) -> Instantiation {
+    Instantiation {
         parameters: program.arguments.clone(),
         state: state.snapshot.clone(),
     }
 }
 
-/// One scheduler thread's feed into the control thread's route instance.
+/// The mechanism's validation of the control thread's only decision.
 ///
-/// §4.4: the route instance "也收到各 rank 的 `Arrived`、`Emitted` 与 `Finished`",
-/// so a policy that tracks per-tenant usage routes on the same usage it would
-/// have seen had it judged every step itself.
-#[derive(Clone)]
-pub struct RouteFeed(Sender<Event>);
+/// The route instance answers `route` alone: a plan, victims, a placement, a
+/// warm list and an expert order are a scheduler thread's decisions, judged
+/// there. A route decision must name a rank that is alive.
+pub struct RouteTrial;
 
-impl RouteFeed {
-    /// A feed and the control thread's end of it.
-    ///
-    /// Unbounded because dropping an event would leave the route instance with
-    /// a view of usage that never happened; the events are proportional to
-    /// state changes, and the control thread drains them whenever it routes a
-    /// request.
-    pub fn channel() -> (Self, Receiver<Event>) {
-        let (sender, receiver) = crossbeam_channel::unbounded();
-        (Self(sender), receiver)
+impl Validators for RouteTrial {
+    fn plan(&self, _plan: &Plan) -> Result<(), PolicyError> {
+        Ok(())
     }
 
-    /// Forwards the three event kinds routing sees; every other kind is the
-    /// policy's own state, not a rank's usage.
-    fn feed(&self, events: &[Event]) {
-        for event in events {
-            if matches!(
-                event,
-                Event::Arrived { .. } | Event::Emitted { .. } | Event::Finished { .. }
-            ) && self.0.send(event.clone()).is_err()
-            {
-                tracing::error!("the route policy's control thread stopped taking ranking events");
-                return;
-            }
+    fn victims(&self, _shortage: &Shortage, _victims: &[Victim]) -> Result<(), PolicyError> {
+        Ok(())
+    }
+
+    fn route(
+        &self,
+        _request: &RequestView,
+        ranks: &[RankView],
+        index: usize,
+    ) -> Result<(), PolicyError> {
+        match ranks.get(index) {
+            Some(rank) if rank.alive => Ok(()),
+            Some(_) => Err(PolicyError::invalid(
+                Call::Route,
+                format!("route chose rank {index}, which is not alive"),
+            )),
+            None => Err(PolicyError::invalid(
+                Call::Route,
+                format!("route chose rank {index} of {} ranks", ranks.len()),
+            )),
         }
+    }
+
+    fn place(
+        &self,
+        _call: &CallView,
+        _replicas: &[ReplicaView],
+        _index: usize,
+    ) -> Result<(), PolicyError> {
+        Ok(())
+    }
+
+    fn warm(&self, _pages: &[PageId]) -> Result<(), PolicyError> {
+        Ok(())
+    }
+
+    fn experts(&self, _load: &ExpertLoad, _order: &ExpertOrder) -> Result<(), PolicyError> {
+        Ok(())
     }
 }
 
@@ -850,8 +1100,12 @@ pub struct RoutePolicy {
     module: PolicyModule,
     instance: PolicyInstance,
     previous: Option<(PolicyProgram, PolicyModule)>,
-    candidate: Option<(PolicyProgram, PolicyModule, PolicyInstance)>,
-    feed: Receiver<Event>,
+    candidate: Option<Candidate>,
+    /// The snapshot the serving instance was instantiated on: the state its own
+    /// knowledge starts from (§4.4).
+    state: Snapshot,
+    /// What the control thread's policy has cost (§12).
+    cost: Cost,
 }
 
 impl RoutePolicy {
@@ -863,11 +1117,10 @@ impl RoutePolicy {
         program: PolicyProgram,
         state: &TrialState,
         ceilings: &Limits,
-        feed: Receiver<Event>,
     ) -> Result<Self, PolicyError> {
         let init = init_of(&program, state);
         let module = PolicyModule::load(engine, &source.bytes(&program)?)?;
-        let instance = module.instantiate(&init, ceilings)?;
+        let instance = module.instantiate(&init.state, &init.parameters, ceilings)?;
         Ok(Self {
             engine: engine.clone(),
             ceilings: *ceilings,
@@ -876,8 +1129,32 @@ impl RoutePolicy {
             instance,
             previous: None,
             candidate: None,
-            feed,
+            state: init.state,
+            cost: Cost::default(),
         })
+    }
+
+    /// The route instance an epoch's first switchover installs from the
+    /// candidate its precopy prepared.
+    pub fn from_candidate(engine: &Engine, ceilings: Limits, candidate: Candidate) -> Self {
+        Self {
+            engine: engine.clone(),
+            ceilings,
+            program: candidate.program,
+            module: candidate.module,
+            instance: candidate.instance,
+            previous: None,
+            candidate: None,
+            state: candidate.state,
+            cost: Cost::default(),
+        }
+    }
+
+    /// The snapshot the serving instance was instantiated on: the state the
+    /// policy knows, which the mechanism's recorder is seeded from when this
+    /// instance starts serving (§4.4).
+    pub fn instantiated_on(&self) -> &Snapshot {
+        &self.state
     }
 
     /// The program the route instance runs.
@@ -885,17 +1162,14 @@ impl RoutePolicy {
         &self.program
     }
 
-    /// Applies every event the rank schedulers reported since the last call, in
-    /// the order they happened.
-    pub fn observe(&mut self) -> Result<(), PolicyError> {
-        let mut events = Vec::new();
-        while let Ok(event) = self.feed.try_recv() {
-            events.push(event);
-        }
+    /// `observe`: every event the control thread saw since the last call, in
+    /// the order it happened.
+    pub fn observe(&mut self, events: &[Event]) -> Result<(), PolicyError> {
         if events.is_empty() {
             return Ok(());
         }
-        self.instance.observe(&events)
+        let (instance, cost) = (&mut self.instance, &mut self.cost);
+        cost.call(instance, |instance| instance.observe(events))
     }
 
     /// `route`: the index in `ranks` of the rank that serves a new request.
@@ -904,7 +1178,14 @@ impl RoutePolicy {
         request: &RequestView,
         ranks: &[RankView],
     ) -> Result<usize, PolicyError> {
-        self.instance.route(request, ranks)
+        let (instance, cost) = (&mut self.instance, &mut self.cost);
+        cost.call(instance, |instance| instance.route(request, ranks))
+    }
+
+    /// The calls this instance has made and the fuel they consumed (§12's cost
+    /// counters, for `Metrics.policy_fuel`/`policy_calls`).
+    pub fn usage(&self) -> PolicyUsage {
+        self.cost.usage(&self.instance)
     }
 
     /// §7.3 step 2 for the control thread's instance: instantiate `program` on
@@ -926,21 +1207,26 @@ impl RoutePolicy {
     ) -> Result<Candidate, PolicyError> {
         let init = init_of(&program, state);
         let module = PolicyModule::load(engine, &source.bytes(&program)?)?;
-        let mut instance = module.instantiate(&init, ceilings)?;
+        let mut instance = module.instantiate(&init.state, &init.parameters, ceilings)?;
+        let mut calls = 0;
         if let Some((request, ranks)) = &state.arrival {
             let index = instance.route(request, ranks)?;
+            calls += 1;
             validators.route(request, ranks, index)?;
         }
         Ok(Candidate {
             program,
             module,
             instance,
+            calls,
+            state: init.state,
         })
     }
 
     /// Keeps a candidate a precopy prepared, for the switchover to put in.
     pub fn adopt(&mut self, candidate: Candidate) {
-        self.candidate = Some((candidate.program, candidate.module, candidate.instance));
+        self.cost.trial(candidate.calls);
+        self.candidate = Some(candidate);
     }
 
     /// A precopy on the calling thread: [`Self::prepare`] and [`Self::adopt`].
@@ -965,13 +1251,15 @@ impl RoutePolicy {
 
     /// §7.3 step 3 for the control thread's instance.
     pub fn switchover(&mut self) {
-        let Some((program, module, instance)) = self.candidate.take() else {
+        let Some(candidate) = self.candidate.take() else {
             tracing::warn!("a route policy switchover arrived without a prepared instance");
             return;
         };
-        let replaced_program = std::mem::replace(&mut self.program, program);
-        let replaced_module = std::mem::replace(&mut self.module, module);
-        let _ = std::mem::replace(&mut self.instance, instance);
+        let replaced_program = std::mem::replace(&mut self.program, candidate.program);
+        let replaced_module = std::mem::replace(&mut self.module, candidate.module);
+        let replaced = std::mem::replace(&mut self.instance, candidate.instance);
+        self.state = candidate.state;
+        self.cost.replace(&replaced);
         self.previous = Some((replaced_program, replaced_module));
     }
 
@@ -990,10 +1278,11 @@ impl RoutePolicy {
             ));
         };
         let init = init_of(&program, state);
-        let instance = module.instantiate(&init, &self.ceilings)?;
+        let instance = module.instantiate(&init.state, &init.parameters, &self.ceilings)?;
         let _ = std::mem::replace(&mut self.program, program);
         let _ = std::mem::replace(&mut self.module, module);
-        let _ = std::mem::replace(&mut self.instance, instance);
+        let replaced = std::mem::replace(&mut self.instance, instance);
+        self.cost.replace(&replaced);
         Ok(())
     }
 
@@ -1027,7 +1316,6 @@ mod tests {
     use serde::Serialize;
 
     use scheduling::guest::decision::{Plan, Shortage, Storage, Victim};
-    use scheduling::guest::event::{End, Event};
     use scheduling::guest::ids::{PageId, RequestId};
     use scheduling::guest::time::Nanos;
     use scheduling::guest::view::{ExpertLoad, ExpertOrder, RankView, RequestClass, RequestState};
@@ -1172,6 +1460,7 @@ mod tests {
             backend: backend.to_owned(),
             revision,
             arguments: Parameters::default(),
+            stated: Default::default(),
         }
     }
 
@@ -1251,6 +1540,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_route_trial_refuses_an_index_that_names_no_live_rank() {
+        let ranks = vec![
+            RankView {
+                index: 0,
+                in_flight: 2,
+                alive: true,
+            },
+            RankView {
+                index: 1,
+                in_flight: 0,
+                alive: false,
+            },
+        ];
+        let (request, _) = state().arrival.unwrap();
+        assert!(RouteTrial.route(&request, &ranks, 0).is_ok());
+        let dead = RouteTrial.route(&request, &ranks, 1).unwrap_err();
+        assert!(
+            matches!(
+                dead,
+                PolicyError::Malformed {
+                    call: Call::Route,
+                    ..
+                }
+            ),
+            "a dead rank is a bad decision, got {dead}"
+        );
+        let outside = RouteTrial.route(&request, &ranks, 2).unwrap_err();
+        assert!(
+            matches!(
+                outside,
+                PolicyError::Malformed {
+                    call: Call::Route,
+                    ..
+                }
+            ),
+            "an index outside the ranks is a bad decision, got {outside}"
+        );
+    }
+
     /// A `Validators` that accepts every answer unless told otherwise.
     #[derive(Default)]
     struct Checks {
@@ -1310,7 +1639,6 @@ mod tests {
             program("a", 1),
             &state(),
             &ceilings(),
-            PolicyPorts::default(),
         )
         .expect("the toy policy installs")
     }
@@ -1355,7 +1683,6 @@ mod tests {
             program("a", 1),
             &state(),
             &ceilings(),
-            PolicyPorts::default(),
         );
         assert!(matches!(installed, Err(PolicyError::BadLimits { .. })));
     }
@@ -1630,6 +1957,31 @@ mod tests {
     }
 
     #[test]
+    fn the_program_a_precopy_states_is_the_program_the_policy_runs() {
+        // The wire form is the Program Server's `Program`: a name, a revision,
+        // and each argument as its TOML text. Nothing about the program is
+        // decided by the mechanism on the way.
+        let stated = proto::process::Program {
+            backend: "priority".to_owned(),
+            revision: 7,
+            arguments: [
+                ("max_batch".to_owned(), "32".to_owned()),
+                ("timeout".to_owned(), "5".to_owned()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let program = PolicyProgram::from_program(&stated).expect("the program parses");
+        assert_eq!(program.backend, "priority");
+        assert_eq!(program.revision, 7);
+        assert_eq!(program.arguments.max_batch, Some(32));
+        assert_eq!(
+            program.arguments.timeout,
+            Some(scheduling::guest::time::Nanos(5))
+        );
+    }
+
+    #[test]
     fn a_program_argument_this_build_does_not_name_is_refused() {
         let arguments = [("chunked_prefill_size_v2".to_owned(), "2048".to_owned())]
             .into_iter()
@@ -1639,61 +1991,14 @@ mod tests {
     }
 
     #[test]
-    fn the_route_feed_carries_arrivals_emissions_and_completions_only() {
-        let (feed, received) = RouteFeed::channel();
-        let mut slot = PolicySlot::install(
-            &Engine::new().expect("an engine"),
-            &source(&Toy::default()),
-            program("a", 1),
-            &state(),
-            &ceilings(),
-            PolicyPorts {
-                scheduler: Some(0),
-                route: Some(feed),
-            },
-        )
-        .expect("the toy policy installs");
-        let arrived = Event::Arrived {
-            request: RequestView {
-                id: RequestId(3),
-                ..state().arrival.expect("a request").0
-            },
-        };
-        let events = vec![
-            arrived.clone(),
-            Event::Stepped {
-                step: 1,
-                duration: scheduling::guest::time::Duration(1),
-            },
-            Event::Emitted {
-                request: RequestId(3),
-                tokens: 1,
-                at: Nanos(2),
-            },
-            Event::Finished {
-                request: RequestId(3),
-                end: End::Completed,
-            },
-        ];
-        slot.observe(&events).expect("the policy observes");
-        let forwarded: Vec<Event> = received.try_iter().collect();
-        assert_eq!(forwarded.len(), 3);
-        assert!(matches!(forwarded[0], Event::Arrived { .. }));
-        assert!(matches!(forwarded[1], Event::Emitted { .. }));
-        assert!(matches!(forwarded[2], Event::Finished { .. }));
-    }
-
-    #[test]
     fn the_route_instance_prepares_switches_and_reverts_like_a_scheduler_slot() {
         let engine = Engine::new().expect("an engine");
-        let (_feed, received) = RouteFeed::channel();
         let mut route = RoutePolicy::install(
             &engine,
             &source(&Toy::default()),
             program("a", 1),
             &state(),
             &ceilings(),
-            received,
         )
         .expect("the toy policy installs");
         let (request, ranks) = state().arrival.expect("a request");
@@ -1717,12 +2022,34 @@ mod tests {
     }
 
     #[test]
-    fn the_store_names_a_policy_module_by_backend_revision_target_and_descriptor() {
-        let store = PolicyStore::new("/programs");
-        let path = store.module_path(&program("fcfs", 7));
-        assert_eq!(
-            path,
-            std::path::Path::new("/programs/scheduling/fcfs/7/wasm32/default/module.wasm")
-        );
+    fn a_program_resolves_with_the_arguments_the_deployment_stated() {
+        // The Program Server resolves a program by backend, revision and the
+        // arguments that were stated; it fills the package's defaults for the
+        // rest, so the source carries exactly what the daemon named.
+        let arguments = std::collections::BTreeMap::from([
+            ("max_batch".to_owned(), "16".to_owned()),
+            ("timeout".to_owned(), "\"5s\"".to_owned()),
+        ]);
+        let built = PolicyProgram::from_arguments("fcfs", 7, &arguments)
+            .expect("the arguments are the policy's");
+        let server = built
+            .to_server_program()
+            .expect("the arguments are TOML values");
+        assert_eq!(server.backend, "fcfs");
+        assert_eq!(server.revision, 7);
+        assert_eq!(server.arguments["max_batch"].as_integer(), Some(16));
+        assert_eq!(server.arguments["timeout"].as_str(), Some("5s"));
+        assert_eq!(server.arguments.len(), 2);
+    }
+
+    #[test]
+    fn a_host_without_a_baseline_target_has_no_program_server_artifacts() {
+        // `ProgramSource::connect` names the target the engine precompiles for;
+        // a host that has none cannot resolve a policy at all, and says so
+        // instead of loading the module for another host.
+        match ProgramSource::connect("/tmp/none.sock") {
+            Ok(source) => assert_eq!(source.socket(), std::path::Path::new("/tmp/none.sock")),
+            Err(error) => assert!(error.to_string().contains("architecture"), "{error}"),
+        }
     }
 }

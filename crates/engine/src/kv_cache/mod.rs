@@ -201,6 +201,13 @@ struct PoolInner {
     free_count: usize,
     /// Published pages keyed by their first unit.
     pages: HashMap<u32, PublishedPage>,
+    /// The pages published since the last drain, in the order they were
+    /// published, as their first unit and token count: the step's `Cached`
+    /// events.
+    published_log: Vec<(u32, u32)>,
+    /// First units of the pages that went since the last drain, in the order
+    /// they went: the step's `Freed` events.
+    freed_log: Vec<u32>,
     /// First units of every published page copy of a hash. Copies differ by
     /// group, source worker or, after a hash collision, by tokens.
     hash_to_pages: HashMap<u64, Vec<u32>>,
@@ -291,6 +298,7 @@ impl PoolInner {
         let Some(page) = self.pages.remove(&head) else {
             return;
         };
+        self.freed_log.push(head);
         for unit in page.units.iter() {
             let meta = &mut self.meta[unit.0 as usize];
             meta.published = None;
@@ -482,6 +490,8 @@ impl BlockPool {
             fq_tail: None,
             free_count: 0,
             pages: HashMap::new(),
+            published_log: Vec::new(),
+            freed_log: Vec::new(),
             hash_to_pages: HashMap::new(),
             stats: BlockPoolStats {
                 total: (num_units - 1 - scratch) as usize,
@@ -1010,6 +1020,8 @@ impl BlockPool {
             },
         );
         inner.hash_to_pages.entry(hash).or_default().push(head);
+        let tokens = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
+        inner.published_log.push((head, tokens));
         if resume.is_none() {
             inner.stats.pages_stored += 1;
         }
@@ -1111,6 +1123,41 @@ impl BlockPool {
             })
             .map(|(&head, _)| head)
             .collect();
+        self.take_idle(&mut inner, heads)
+    }
+
+    /// Takes exactly the pages the named units belong to out of the free
+    /// queue, the way [`Self::acquire_idle_from`] takes a range of it.
+    ///
+    /// A policy names pages to offload by unit, and the mechanism must move
+    /// those pages and no others: asking for a range would pull in every idle
+    /// page that follows.
+    pub(crate) fn acquire_idle_units(&self, units: &[u32]) -> Vec<IdlePage> {
+        let mut inner = lock(&self.inner);
+        let end = inner.withdrawn.min(inner.meta.len() as u32);
+        let wanted: Vec<u32> = units.iter().copied().filter(|unit| *unit < end).collect();
+        if wanted.is_empty() {
+            return Vec::new();
+        }
+        let heads: Vec<u32> = inner
+            .pages
+            .iter()
+            .filter(|(_, page)| {
+                page.aliases.contains(&None)
+                    && page.units.iter().any(|unit| wanted.contains(&unit.0))
+                    && page.units.iter().all(|unit| {
+                        let meta = &inner.meta[unit.0 as usize];
+                        meta.state == UnitState::Cached && meta.ref_cnt == 0
+                    })
+            })
+            .map(|(&head, _)| head)
+            .collect();
+        self.take_idle(&mut inner, heads)
+    }
+
+    /// Pins the named pages, takes their units out of the free queue, and
+    /// returns them idle: the second half of both acquisitions above.
+    fn take_idle(&self, inner: &mut PoolInner, heads: Vec<u32>) -> Vec<IdlePage> {
         let mut idle = Vec::with_capacity(heads.len());
         for head in heads {
             let Some(page) = inner.pages.get(&head) else {
@@ -1140,6 +1187,35 @@ impl BlockPool {
         }
         inner.stats.free = inner.free_count;
         idle
+    }
+
+    /// Drains the pages that appeared and went since the last call: their
+    /// first units, in the order it happened.
+    ///
+    /// A page exists for a request only from its publication to its removal,
+    /// and the policy mirrors that from these two lists — one `Cached` and one
+    /// `Freed` event each — so no step has to walk the cache to learn what it
+    /// holds.
+    pub(crate) fn take_page_changes(&self) -> (Vec<(u32, u32)>, Vec<u32>) {
+        let mut inner = lock(&self.inner);
+        (
+            std::mem::take(&mut inner.published_log),
+            std::mem::take(&mut inner.freed_log),
+        )
+    }
+
+    /// The units of the published page whose first unit is `head`, when it
+    /// still exists.
+    pub(crate) fn page_units(&self, head: u32) -> Option<Vec<u32>> {
+        lock(&self.inner)
+            .pages
+            .get(&head)
+            .map(|page| page.units.iter().map(|unit| unit.0).collect())
+    }
+
+    /// Whether a published page exists whose first unit is `head`.
+    pub(crate) fn holds_page(&self, head: u32) -> bool {
+        lock(&self.inner).pages.contains_key(&head)
     }
 
     /// Returns the number of published prefix pages, referenced or not.
@@ -1679,6 +1755,10 @@ pub(crate) struct PrefixLookup {
     /// Leading prompt tokens acquired from the prefix cache. A final
     /// partial page is copied before the resumed computation appends to it.
     pub(crate) cached_tokens: usize,
+    /// The first unit of every page the hit acquired, in logical order and
+    /// group by group: the pages a policy is told were hit, so its LRU places
+    /// them where the mechanism used them.
+    pub(crate) matched_pages: Vec<u32>,
     /// Leading prompt tokens whose draft cache was acquired from the prefix
     /// cache with them; at most `cached_tokens`, zero without a draft
     /// cache.
@@ -1688,6 +1768,9 @@ pub(crate) struct PrefixLookup {
 /// Read-only prefix-cache probe result across every cache group.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct PrefixHit {
+    /// The first unit of every page the hit covers, group by group, in logical
+    /// order: the pages the mechanism re-uses, which a policy's LRU orders by.
+    pub(crate) matched_pages: Vec<u32>,
     /// Leading prompt tokens every required group can reuse, including a
     /// stored partial tail when the group's computation permits it.
     pub(crate) cached_tokens: usize,
@@ -2491,9 +2574,17 @@ impl PrefixCacheCoordinator {
                 .filter(|(tail, _)| tail.is_some_and(|tail| tail.cached))
                 .map(|(_, shape)| shape.units_per_page)
                 .sum::<usize>();
+        // The pages the hit covers, group by group: admission names them to the
+        // policy, whose LRU places them where the mechanism used them.
+        let matched_pages = selection
+            .pages
+            .iter()
+            .flat_map(|(_, pages)| pages.iter().map(|(head, _)| head.0))
+            .collect();
         PrefixHit {
             cached_tokens: selection.tokens,
             cached_free_units,
+            matched_pages,
         }
     }
 
@@ -2539,6 +2630,7 @@ impl PrefixCacheCoordinator {
         let mut result = PrefixLookup {
             page_hashes: hashes,
             cached_tokens: 0,
+            matched_pages: Vec::new(),
             draft_tokens: 0,
         };
         if !cache_read && scope.resume.is_none() {
@@ -2646,6 +2738,11 @@ impl PrefixCacheCoordinator {
                 result.draft_tokens = references.len() * table.shape.block_size;
             }
             table.start_page = start;
+            for reference in &references {
+                if let Some(head) = reference.units().first() {
+                    result.matched_pages.push(head.0);
+                }
+            }
             table
                 .pages
                 .extend(references.into_iter().map(|page| TablePage {

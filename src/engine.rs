@@ -10,7 +10,9 @@
 //! gave this process ends when the daemon, and every daemon a hot restart
 //! handed its processes to, ended.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Args;
@@ -31,6 +33,11 @@ pub(crate) struct EngineArgs {
     /// The identity the daemon started the engine under.
     #[arg(long)]
     pub engine: u64,
+    /// The Program Server's socket on this node, where the epoch's scheduling
+    /// policy modules are resolved (design §5.3, §7.3). Without it a `Precopy`
+    /// of a policy is refused and the epoch serves none.
+    #[arg(long)]
+    pub program_server: Option<PathBuf>,
 }
 
 /// Runs the `engine` command with its `args`, logging under `log`, and ends
@@ -42,6 +49,27 @@ pub(crate) fn run(args: &EngineArgs, lifeline: Option<i32>, log: &LogLevels) -> 
         log.log_level.as_deref(),
         log.log_level_http.as_deref(),
     );
-    engine::run_engine(&args.requests, &args.processes, args.engine)?;
+    // The epoch's claims name no program store yet (`EngineSpec` has none), so
+    // this is where a program's module comes from: the Program Server's client
+    // on this node, which resolves a program's backend, revision and arguments
+    // to the module it precompiled for this host.
+    let policies: Option<Arc<dyn engine::PolicySource + Send + Sync>> =
+        match args.program_server.as_deref() {
+            Some(socket) => {
+                tracing::info!(
+                    socket = %socket.display(),
+                    "a scheduling policy's module is resolved through this node's Program Server"
+                );
+                Some(Arc::new(engine::ProgramSource::connect(socket)?))
+            }
+            None => {
+                tracing::info!(
+                    "no Program Server is stated for this epoch: a policy precopy will be refused \
+                     with the reason, and the epoch serves no policy"
+                );
+                None
+            }
+        };
+    engine::run_engine(&args.requests, &args.processes, args.engine, policies)?;
     Ok(ExitCode::SUCCESS)
 }
