@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use ::storage::Key;
 use ::storage::protocol::{PageShape, Reply, Request};
-use cuda::{CopyBatch, DeviceAttribute, DeviceId, SourceOrder, Stream};
+use platform::{CopyBatch, DeviceAttribute, DeviceId, SourceOrder, Stream};
 use ipc::{PageCopy, PagePoolInfo};
 use sha2::{Digest, Sha256};
 

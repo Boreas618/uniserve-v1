@@ -17,7 +17,7 @@ use std::ops::{Deref, Range};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
-use cuda::Stream;
+use platform::Stream;
 use ipc::{CacheTransfer, Locator, Wake};
 use tvm_ffi::{Any, AnyView};
 

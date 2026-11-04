@@ -112,17 +112,17 @@ impl<E: Into<WorkerError>> From<E> for Failure {
 /// communicators with its peers, or its device contexts.
 ///
 /// The driver names its storage for the process
-/// ([`cuda::shm::remove_event_storage`]); NCCL's names are random,
+/// ([`platform::shm::remove_event_storage`]); NCCL's names are random,
 /// and those still linked among this process's mappings are its own
-/// ([`cuda::shm::NcclSegments`]). Removing a name leaves every
+/// ([`platform::shm::NcclSegments`]). Removing a name leaves every
 /// mapping of the object, this process's and those its peers opened, valid
 /// until they end. The removal is best effort: the worker ends whatever it
 /// finds.
 fn release_names() {
     // SAFETY: getuid and getpid have no preconditions.
     let (uid, pid) = unsafe { (libc::getuid(), libc::getpid()) };
-    let _ = cuda::shm::remove_event_storage(uid, pid as u32);
-    if let Ok(segments) = cuda::shm::NcclSegments::mapped_by(None) {
+    let _ = platform::shm::remove_event_storage(uid, pid as u32);
+    if let Ok(segments) = platform::shm::NcclSegments::mapped_by(None) {
         let _ = segments.remove();
     }
 }
@@ -229,7 +229,7 @@ fn run(
     // context's interprocess events only when the context is destroyed, not
     // when the process exits: the contexts are destroyed here.
     // SAFETY: as above, nothing in the process uses a device after this.
-    match unsafe { cuda::PrimaryContext::reset_all() } {
+    match unsafe { platform::PrimaryContext::reset_all() } {
         Ok(devices) => tracing::debug!(?devices, "destroyed the device contexts"),
         Err(error) => {
             let error = Failure::from(crate::Error::from(error));

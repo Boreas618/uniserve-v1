@@ -19,7 +19,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use cuda::{DeviceId, Stream};
+use platform::{DeviceId, Stream};
 use ipc::CallKind;
 use serde::Deserialize;
 

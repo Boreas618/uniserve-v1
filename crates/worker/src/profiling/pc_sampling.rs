@@ -25,9 +25,9 @@
 
 use std::sync::{Mutex, OnceLock};
 
-use cuda::PrimaryContext;
-use cuda::cupti::activity::KindsHold;
-use cuda::cupti::pc_sampling::PcSampler;
+use platform::PrimaryContext;
+use platform::cupti::activity::KindsHold;
+use platform::cupti::pc_sampling::PcSampler;
 
 use crate::{Error, Result};
 

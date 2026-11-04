@@ -203,10 +203,10 @@ impl Local {
 }
 
 fn available_devices() -> anyhow::Result<Vec<u32>> {
-    let nvml = cuda::Nvml::init()?;
+    let nvml = platform::Nvml::init()?;
     let mut available = Vec::new();
-    for ordinal in 0..cuda::DeviceId::count()? {
-        if nvml.is_idle(cuda::DeviceId(ordinal))? {
+    for ordinal in 0..platform::DeviceId::count()? {
+        if nvml.is_idle(platform::DeviceId(ordinal))? {
             available.push(ordinal as u32);
         }
     }

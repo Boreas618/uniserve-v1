@@ -10,7 +10,7 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use cuda::DeviceId;
+use platform::DeviceId;
 use tvm_ffi::tvm_ffi_sys::dlpack::{DLDataType, DLDataTypeCode, DLDevice, DLDeviceType, DLTensor};
 use tvm_ffi::{Any, Tensor};
 

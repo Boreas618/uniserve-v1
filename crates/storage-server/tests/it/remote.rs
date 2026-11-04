@@ -217,7 +217,7 @@ mod device {
         FabricExport, FabricHandle, Link, LinkEnd, Priority, Span, TransferEnd,
     };
     use ::storage::{Access, Client};
-    use cuda::{DeviceAllocation, DeviceId, HandleType, ShareableHandle};
+    use platform::{DeviceAllocation, DeviceId, HandleType, ShareableHandle};
 
     use super::{endpoint, first_difference, rdma_host, sequence};
     use crate::server::{FORKING, head, host, key, memfd, scope, tensor, worker};
@@ -369,7 +369,7 @@ mod device {
         // Once the tasks ended and their exposures with them, neither
         // Transfer Server holds a GPU's context: NVML lists neither on a GPU
         // either used.
-        let nvml = cuda::Nvml::init().unwrap();
+        let nvml = platform::Nvml::init().unwrap();
         let pids =
             [&source_host, &destination_host].map(|host| transfer_pid(&host.socket, None) as u32);
         let deadline = Instant::now() + std::time::Duration::from_secs(10);

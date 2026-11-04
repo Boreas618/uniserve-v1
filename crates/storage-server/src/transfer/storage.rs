@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use ::storage::protocol::LinkEnd;
-use cuda::{DeviceId, PeerMapping, ShareableHandle};
+use platform::{DeviceId, PeerMapping, ShareableHandle};
 
 use super::contexts::Contexts;
 use super::devices::Gpus;
@@ -121,7 +121,7 @@ impl Mapped {
             (_, Some((device, _))) => Ok(*device),
             (LinkEnd::Device { gpu }, None) => Err(format!(
                 "GPU {} is not visible to the Transfer Server",
-                cuda::DeviceUuid(*gpu)
+                platform::DeviceUuid(*gpu)
             )),
             (LinkEnd::Host, None) => Err("host storage lies on no GPU".into()),
             (LinkEnd::Remote { .. }, None) => {

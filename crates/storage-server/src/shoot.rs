@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, poll};
 
-use cuda::{DeviceUuid, Nvml};
+use platform::{DeviceUuid, Nvml};
 
 /// How long a victim may take to leave every GPU it held.
 const DEADLINE: Duration = Duration::from_secs(60);
@@ -172,8 +172,8 @@ impl ShootDowns {
 
 /// Whether the GPU with `uuid` lists process `pid`, through this process's
 /// one NVML session, opened at the first query.
-fn listed(uuid: [u8; 16], pid: i32) -> cuda::Result<bool> {
-    static NVML: std::sync::OnceLock<cuda::Result<Nvml>> = std::sync::OnceLock::new();
+fn listed(uuid: [u8; 16], pid: i32) -> platform::Result<bool> {
+    static NVML: std::sync::OnceLock<platform::Result<Nvml>> = std::sync::OnceLock::new();
     let nvml = NVML
         .get_or_init(Nvml::init)
         .as_ref()
