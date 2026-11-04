@@ -194,6 +194,18 @@ impl Leader {
         }
     }
 
+    /// Ends every replica's parked standby (§2.5).
+    ///
+    /// A daemon that hands the deployment to a successor calls this before the
+    /// handoff: the successor numbers and starts its own standbys, and a parked
+    /// process of the old daemon would otherwise keep a second engine's memory
+    /// on the device for a deployment that never knew it was there.
+    pub(crate) async fn end_standbys(&self) {
+        for replica in self.replicas() {
+            replica.end_standby().await;
+        }
+    }
+
     /// Stops every replica and its workers.
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         for replica in self.replicas() {
@@ -2156,13 +2168,14 @@ impl Replica {
     ///
     /// # Errors
     ///
-    /// Fails when the blocking shutdown task does not complete, which happens
-    /// only if it panics or its runtime is shutting down.
-    pub(crate) async fn shutdown(&self) -> anyhow::Result<()> {
-        // A parked standby is a process of its own: the daemon ends it first,
-        // so nothing of this replica's stays on the device after the daemon is
-        // gone. Dropping its client closes the control connection, which its
-        // engine treats as the end of the process.
+    /// Ends the parked standby this replica keeps, if it has one (§2.5).
+    ///
+    /// A standby is a process of its own: ending it here means nothing of this
+    /// replica's stays on the device after the daemon is gone, and a successor
+    /// daemon starts its own instead of adopting a process it never numbered.
+    /// Dropping the client closes the control connection, which the standby's
+    /// engine treats as the end of the process.
+    pub(crate) async fn end_standby(&self) {
         let standby = { locked(&self.standby).take() };
         if let Some(standby) = standby {
             if let Err(error) = tokio::task::spawn_blocking(move || standby.client.shutdown()).await
@@ -2170,6 +2183,12 @@ impl Replica {
                 warn!("the standby's shutdown did not complete: {error}");
             }
         }
+    }
+
+    /// Fails when the blocking shutdown task does not complete, which happens
+    /// only if it panics or its runtime is shutting down.
+    pub(crate) async fn shutdown(&self) -> anyhow::Result<()> {
+        self.end_standby().await;
         let hold = self.hold();
         let client = hold.client();
         hold.close("the daemon is shutting down");
