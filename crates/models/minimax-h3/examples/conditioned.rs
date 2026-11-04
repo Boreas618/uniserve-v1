@@ -532,18 +532,53 @@ fn encode(args: &Args) -> Result<(), String> {
     // component for a single type here would refuse the export the model is designed to load.
     let deployment: Option<DType> = None;
     let mut published = 0_u64;
+    let mut tensors = 0_u64;
     for component in partition.blocks.iter() {
         for directory in component.directories() {
-            published += stored_bytes(&checkpoint, directory)?;
+            let (bytes, count) = stored_bytes(&checkpoint, directory)?;
+            published += bytes;
+            tensors += count;
         }
     }
-    // A conversion at load stores one weight per element in the deployment's type, and the folded
-    // input affine publishes a composed table beside the weights: half again is the margin the
-    // decoder's harness keeps, and it is stated rather than discovered.
-    let resident = (published + published / 2).max(1 << 30);
+    // The pool this partition's load gives out of, in three terms rather than a margin:
+    //
+    // * every byte the directories it places hold, which is an **upper bound** - a fold replaces
+    //   tensors with the products it composes, so the load retains less than the index states;
+    // * one rounded block per published region, at the device's allocation granularity: the pool
+    //   charges a block per publish, so a stage of 600 small tensors pays 600 blocks;
+    // * one tensor of the deployment's type when a stated type converts - the largest single one,
+    //   since the conversion reads a weight and publishes it before the next is read. At `auto`
+    //   nothing converts and this term is zero.
+    //
+    // A pool that cannot give out one more buffer stops the run as a model defect, so the number has
+    // to be derived rather than padded: "half again" was 20 GiB of padding here.
+    const BLOCK: u64 = 2 << 20;
+    let conversion = match deployment {
+        Some(_) => {
+            let mut largest = 0_u64;
+            for component in partition.blocks.iter() {
+                for directory in component.directories() {
+                    let source = checkpoint.component(directory).map_err(show)?;
+                    for name in source.names() {
+                        if let Some(location) = source.tensor(name) {
+                            largest =
+                                largest.max(location.bytes.1.saturating_sub(location.bytes.0));
+                        }
+                    }
+                }
+            }
+            largest
+        }
+        None => 0,
+    };
+    let resident = (published + tensors * BLOCK + conversion).max(1 << 30);
     println!(
-        "weights: {} MiB stored for this partition, {} MiB reserved",
+        "weights: {} MiB stored in {} tensors for this partition, plus {} MiB of blocks and {} MiB \
+         of conversion: {} MiB reserved",
         published >> 20,
+        tensors,
+        (tensors * BLOCK) >> 20,
+        conversion >> 20,
         resident >> 20
     );
     let mut weights = DeviceWeights::new(&device, resident)?;
@@ -976,15 +1011,17 @@ fn encode(args: &Args) -> Result<(), String> {
 
 /// The bytes one component's tensors occupy in the checkpoint, which is what the weights pool must
 /// hold before any conversion.
-fn stored_bytes(checkpoint: &Checkpoint, directory: &str) -> Result<u64, String> {
+fn stored_bytes(checkpoint: &Checkpoint, directory: &str) -> Result<(u64, u64), String> {
     let source = checkpoint.component(directory).map_err(show)?;
     let mut bytes = 0_u64;
+    let mut tensors = 0_u64;
     for name in source.names() {
         if let Some(location) = source.tensor(name) {
             bytes += location.bytes.1.saturating_sub(location.bytes.0);
+            tensors += 1;
         }
     }
-    Ok(bytes)
+    Ok((bytes, tensors))
 }
 
 /// The deployment's element type, as the loaded block reports it.
