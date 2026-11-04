@@ -91,6 +91,7 @@ pub mod norm;
 pub mod op;
 pub mod phase;
 pub mod platform;
+pub mod residual;
 pub mod rope;
 pub mod sampler;
 pub mod segments;
