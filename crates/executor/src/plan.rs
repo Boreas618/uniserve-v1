@@ -38,6 +38,14 @@ pub enum Variant {
     PrefillWrite,
     /// Prefill rows of host tokens that also project each row's last hidden state.
     PrefillOutput,
+    /// One encode of prompt rows: the text model's and the vision tower's outputs, kept as the
+    /// conditioning the denoiser reads.
+    Encode,
+    /// One denoising step of one latent layout: the diffusion model's velocity, applied to the
+    /// latents in place (a request's steps are one batch each, never a loop inside a batch).
+    Denoise,
+    /// One clip decoded from latents into a raster.
+    Decode,
 }
 
 impl Variant {
@@ -48,7 +56,19 @@ impl Variant {
             Self::DecodeSampled => "decode_sampled",
             Self::PrefillWrite => "prefill_write",
             Self::PrefillOutput => "prefill_output",
+            Self::Encode => "encode",
+            Self::Denoise => "denoise",
+            Self::Decode => "decode",
         }
+    }
+
+    /// Whether this variant is a media computation rather than a causal-LM forward.
+    ///
+    /// The two families never share a bucket: a media bucket carries an [`Extent`] the language
+    /// model has no use for, and a causal-LM runner refuses one by name rather than serving it
+    /// from a graph shaped for another computation.
+    pub const fn media(self) -> bool {
+        matches!(self, Self::Encode | Self::Denoise | Self::Decode)
     }
 
     /// Whether a bucket of this variant picks each row's token by taking the largest candidate
@@ -114,11 +134,16 @@ impl Shape {
     }
 
     /// The smallest capture size this forward can be served at: itself.
+    ///
+    /// A `Shape` states a causal-LM forward - rows and tokens - so its bucket holds no media
+    /// extent; a media computation is sized by [`Bucket::denoise`] or [`Bucket::clip`], which have
+    /// no `Shape` and are planned rather than admitted as rows.
     pub const fn bucket(self) -> Bucket {
         Bucket {
             rows: self.rows,
             tokens: self.tokens,
             variant: self.variant,
+            extent: Extent::None,
         }
     }
 }
@@ -133,6 +158,29 @@ impl fmt::Display for Shape {
     }
 }
 
+/// What a media bucket's computation is sized by, where a causal-LM bucket is sized by tokens
+/// alone.
+///
+/// The language model's four variants leave it `None`, so their buckets are `(variant, rows,
+/// tokens)` exactly as before and no causal-LM path reads this field. A media bucket states the
+/// shape its graph is captured for: a denoising step is one latent layout, a decode is one clip.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum Extent {
+    /// No media extent: a causal-LM bucket, sized by its tokens.
+    None,
+    /// One denoising step's latent layout (`nn::capability::Layout`).
+    Latents(nn::capability::Layout),
+    /// One decoded clip's raster.
+    Clip {
+        /// Frames in the clip.
+        frames: u32,
+        /// Raster rows of a frame.
+        height: u32,
+        /// Raster columns of a frame.
+        width: u32,
+    },
+}
+
 /// A captured size: the rows and tokens a bucket's graph holds, and what it computes.
 ///
 /// Buckets are ordered by size, variant first, then rows, then tokens, so that the smallest
@@ -143,6 +191,8 @@ pub struct Bucket {
     pub variant: Variant,
     pub rows: u32,
     pub tokens: u32,
+    /// A media computation's extent, and [`Extent::None`] for the four causal-LM variants.
+    pub extent: Extent,
 }
 
 impl Bucket {
@@ -152,16 +202,67 @@ impl Bucket {
             variant,
             rows,
             tokens: rows,
+            extent: Extent::None,
         }
     }
 
-    /// A prefill bucket of `rows` rows holding `tokens` tokens.
+    /// A prefill or encode bucket of `rows` rows holding `tokens` tokens.
+    ///
+    /// An encode is the one media computation whose size is a row count and a token count: a
+    /// prompt's text rows and the vision tower's tokens, so it is the one whose bucket needs no
+    /// extent of its own.
     pub const fn prefill(rows: u32, tokens: u32, variant: Variant) -> Self {
         Self {
             variant,
             rows,
             tokens,
+            extent: Extent::None,
         }
+    }
+
+    /// A denoising bucket: one step over `rows` requests of one `layout`.
+    ///
+    /// The layout is the extent because it *is* the size of the work: a step's velocity is one
+    /// tensor per canvas, and two layouts of the same row count are different graphs.
+    pub const fn denoise(rows: u32, layout: nn::capability::Layout) -> Self {
+        Self {
+            variant: Variant::Denoise,
+            rows,
+            tokens: 0,
+            extent: Extent::Latents(layout),
+        }
+    }
+
+    /// A decode bucket: one clip of `frames` raster frames at `height` by `width`.
+    pub const fn clip(frames: u32, height: u32, width: u32) -> Self {
+        Self {
+            variant: Variant::Decode,
+            rows: 1,
+            tokens: 0,
+            extent: Extent::Clip {
+                frames,
+                height,
+                width,
+            },
+        }
+    }
+
+    /// Whether this bucket is a causal-LM forward, and the refusal when it is not.
+    ///
+    /// The two families are refused by name rather than served from one another's graphs: a
+    /// causal-LM runner that was handed a media bucket would replay a graph shaped for a latent
+    /// canvas over token rows, and a catalogue typo would read as wrong tokens rather than as the
+    /// mistake it is.
+    pub fn causal_lm(self) -> Result<()> {
+        if self.extent == Extent::None && !self.variant.media() {
+            return Ok(());
+        }
+        Err(Error::Invariant(format!(
+            "bucket {self} is a {} computation of extent {:?}, and a causal-LM runner serves none \
+             of it",
+            self.variant.name(),
+            self.extent
+        )))
     }
 
     /// The shape a forward of this bucket has when the bucket is exactly full.
@@ -184,7 +285,29 @@ impl Bucket {
 
 impl fmt::Display for Bucket {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.shape().fmt(formatter)
+        match self.extent {
+            Extent::None => self.shape().fmt(formatter),
+            Extent::Latents(layout) => write!(
+                formatter,
+                "{}/{} rows/{} latents {}x{}x{}{}",
+                self.variant,
+                self.rows,
+                layout.video.frames,
+                layout.video.height,
+                layout.video.width,
+                layout.video.channels,
+                if layout.audio.is_some() { " with audio" } else { "" }
+            ),
+            Extent::Clip {
+                frames,
+                height,
+                width,
+            } => write!(
+                formatter,
+                "{}/{} clip {frames}x{height}x{width}",
+                self.variant, self.rows
+            ),
+        }
     }
 }
 
@@ -389,6 +512,71 @@ impl Buckets {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two families are refused by name rather than served from one another's graphs: a media
+    /// bucket states an extent a causal-LM forward has no use for, and a media variant is never a
+    /// causal-LM variant - a catalogue that mixed them must fail where the batch is planned, not
+    /// serve tokens shaped by a graph captured for a canvas.
+    #[test]
+    fn a_media_bucket_is_sized_by_its_extent_and_refused_by_a_causal_lm_runner() {
+        let layout = nn::capability::Layout {
+            video: nn::capability::LatentShape {
+                channels: 16,
+                frames: 13,
+                height: 60,
+                width: 34,
+            },
+            audio: None,
+            text_rows: 256,
+            condition_rows: 0,
+            condition_elements: 0,
+        };
+        let denoise = Bucket::denoise(1, layout);
+        assert_eq!(denoise.variant, Variant::Denoise);
+        assert_eq!(denoise.extent, Extent::Latents(layout));
+        assert!(Variant::Denoise.media());
+
+        let clip = Bucket::clip(48, 768, 1344);
+        assert_eq!(clip.variant, Variant::Decode);
+        assert_eq!(clip.rows, 1, "one clip per call is the bound");
+        assert!(Variant::Decode.media());
+
+        for bucket in [denoise, clip] {
+            let refusal = bucket
+                .causal_lm()
+                .expect_err("a causal-LM runner serves no media bucket");
+            let message = refusal.to_string();
+            assert!(
+                message.contains(bucket.variant.name()),
+                "the refusal names the computation: {message}"
+            );
+        }
+
+        let decode = Bucket::decode(8, Variant::DecodeGreedy);
+        assert_eq!(decode.extent, Extent::None);
+        assert!(!Variant::DecodeGreedy.media());
+        decode.causal_lm().expect("a decode bucket is a causal-LM bucket");
+
+        // Two layouts of one row count are two graphs, and the message states the canvas rather
+        // than a token count nobody holds.
+        let other = Bucket::denoise(
+            1,
+            nn::capability::Layout {
+                video: nn::capability::LatentShape {
+                    channels: 16,
+                    frames: 25,
+                    height: 60,
+                    width: 34,
+                },
+                ..layout
+            },
+        );
+        assert_ne!(other, denoise);
+        assert!(
+            other.to_string().contains("25"),
+            "the display states the canvas: {other}"
+        );
+    }
 
     /// Every shape a scheduler can hand in is planned into the **smallest** captured bucket that
     /// holds it, derived independently by brute force over the captured set: a larger bucket still

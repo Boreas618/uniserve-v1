@@ -1241,7 +1241,12 @@ impl<M: CausalLm> CausalLmRunner<M> {
 
     /// The shape of the bucket a batch is served from.
     fn bucket_for(&self, shape: &Shape) -> Result<Bucket> {
-        self.buckets.require(shape)
+        let bucket = self.buckets.require(shape)?;
+        // A media bucket is refused by name rather than replayed: its graph is shaped for a latent
+        // canvas or a raster, and a catalogue that mixed the two families must read as the mistake
+        // it is, not as wrong tokens (`plan::Bucket::causal_lm`).
+        bucket.causal_lm()?;
+        Ok(bucket)
     }
 }
 

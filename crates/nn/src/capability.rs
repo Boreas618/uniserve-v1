@@ -452,7 +452,10 @@ pub enum VideoTask {
 }
 
 /// The latent layout a denoiser prepares for one request.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+///
+/// Ordered and hashed as a plain value of numbers: it is a bucket's extent (`executor::plan::Extent`),
+/// and a captured graph is keyed by the bucket it holds.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Layout {
     /// The video latent tensor.
     pub video: LatentShape,
@@ -473,7 +476,7 @@ pub struct Layout {
 }
 
 /// The extents of one latent tensor.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct LatentShape {
     /// Channels of the latent space.
     pub channels: u32,
