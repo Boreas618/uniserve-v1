@@ -1993,6 +1993,29 @@ mod tests {
         assert!(super::reference_margins(&ids_only).is_empty());
     }
 
+    /// A load that brought nothing through the representation the checkpoint declares is the
+    /// fallback, and it is refused rather than measured; a load that brought a representation the
+    /// checkpoint did not state is refused too.
+    #[test]
+    fn the_representation_pair_refuses_a_fallback_and_an_invention() {
+        assert!(
+            super::check_representation(74_835, 200, 0, 0, 37_000).is_err(),
+            "a declared packed checkpoint that published none"
+        );
+        assert!(
+            super::check_representation(0, 200, 3, 1_024, 37_000).is_err(),
+            "a dense checkpoint that published packed weights"
+        );
+        assert!(
+            super::check_representation(74_835, 200, 100, 4_096, 37_000).is_ok(),
+            "an encoded checkpoint whose pack came through the packed path"
+        );
+        assert!(
+            super::check_representation(0, 200, 0, 0, 40_000).is_ok(),
+            "a dense checkpoint"
+        );
+    }
+
     /// An encoded deployment asks the store for its own products, per row count; a dense one asks
     /// for none of them, so neither representation's gap can block the other's run.
     #[test]
