@@ -531,12 +531,14 @@ impl EpochPlan {
             //
             // This class keeps no paged key/value cache: the package holds no cache view and no
             // page table, and the one cache in it is the denoiser's AdaLN modulation table, which
-            // is model memory the weight loader allocates (4.1's retained weights), not a pool a
-            // batch fills. So a media deployment's resident pool is zero - a pool figure of zero is
-            // not reserved, which is the honest answer and not a special case - and the only
-            // figure a binding still states is the state group's snapshot, when the denoiser
-            // allocates one, which the cache plan answers. Until the runners exist nothing can bind
-            // a `MiniMaxH3` model, and the update and serving paths must not pretend otherwise.
+            // is model memory the weight loader allocates (4.1's retained weights). So the resident
+            // pool holds no KV units for it - but it is not empty either: a model's state tables
+            // book there, sized at plan time from the layouts the checkpoint declares
+            // (`Encoder::state_tables` and the denoiser's own), filled at the load and retired with
+            // the generation, never allocated on the request path. The state group's snapshot, when
+            // the denoiser allocates one, comes from the cache plan beside it. Until the runners
+            // exist nothing can bind a `MiniMaxH3` model, and the update and serving paths must not
+            // pretend otherwise.
             "MiniMaxH3ModularPipeline" => bail!(
                 "{} declares model class {class}: the deployment selects MiniMaxH3ModularPipeline \
                  and its runners (encoder, denoiser, decoder) are not built into this process, so \
