@@ -321,6 +321,11 @@ impl MainProcess {
         let modules = blocking.lane::<Install>(BlockingKind::ModuleLoad)?;
         let programs = Arc::new(Mutex::new(Client::connect(build.program_server())?));
 
+        // §2.4's watchdog exists before any device command: `start`'s own commands are bounded by
+        // the same stall bound as every command the control thread issues afterwards.
+        let watchdog = Watchdog::new(build.watchdog_timeout())?;
+        let update = HotUpdate::new(epoch.generation);
+
         let mut executors = Vec::with_capacity(build.devices().len());
         let mut generations = Vec::with_capacity(build.devices().len());
         for device in build.devices() {
@@ -332,9 +337,14 @@ impl MainProcess {
             // storage sized. Then §4.5's warmup runs every captured bucket once, so the first
             // request does not pay for a capture. Nothing is serving yet, so the control thread
             // waits here; `serve` never does (§2.4).
-            completed(executor.set_shadow()?.wait())
+            // A device that cannot map its shadow region or warm up never serves: both are the
+            // same stall bound as any other command, and the process fails its start rather than
+            // serving without them.
+            let shadow = executor.set_shadow()?;
+            device_command(&watchdog, device, "shadow region", shadow)
                 .with_context(|| format!("mapping the shadow region of device {}", device.0))?;
-            completed(executor.warmup()?.wait())
+            let warmup = executor.warmup()?;
+            device_command(&watchdog, device, "warmup", warmup)
                 .with_context(|| format!("warming up device {}", device.0))?;
             executors.push(executor);
             generations.push(generation);
@@ -351,8 +361,6 @@ impl MainProcess {
             Vec::new()
         };
 
-        let update = HotUpdate::new(epoch.generation);
-        let watchdog = Watchdog::new(build.watchdog_timeout())?;
 
         Ok(Self {
             control,
@@ -934,10 +942,22 @@ impl MainProcess {
     fn switchover(&mut self, generation: u64, step: Option<u64>) -> Result<ProgramStatus> {
         switchover_policy(&mut self.schedulers, generation, step)?;
         for executor in &self.executors {
-            if let Err(error) = completed(executor.switchover(generation)?.wait()) {
-                bail!("switching device {}: {error}", executor.device().0);
+            let device = executor.device();
+            let submission = executor.switchover(generation)?;
+            if let Err(error) = device_command(&self.watchdog, device, "switchover", submission) {
+                // A device that did not cut over would leave this node serving two generations at
+                // once, so §7.3 step 4's revert runs on every device: the generation that served
+                // before the update is the one serving after it.
+                tracing::error!(%error, "cutting over failed; reverting the update");
+                let failure = UpdateFailure::Device {
+                    device: u32::try_from(device.0).unwrap_or_default(),
+                    error: error.to_string(),
+                    batch: None,
+                };
+                return Ok(self.revert(generation, failure));
             }
         }
+        // The state machine records the cut-over only when every device serves the new generation.
         self.update.switchover(generation, Instant::now())?;
         Ok(ProgramStatus::Switched { generation })
     }
@@ -966,21 +986,16 @@ impl MainProcess {
         }
         let current = self.update.current();
         for executor in &self.executors {
+            let device = executor.device();
             match executor.switchover(current) {
                 Ok(submission) => {
-                    if let Err(error) = completed(submission.wait()) {
-                        tracing::error!(
-                            %error,
-                            device = executor.device().0,
-                            "reverting a device's generation failed"
-                        );
+                    if let Err(error) = device_command(&self.watchdog, device, "revert", submission) {
+                        tracing::error!(%error, "reverting a device's generation failed");
                     }
                 }
-                Err(error) => tracing::error!(
-                    %error,
-                    device = executor.device().0,
-                    "queueing a device's revert failed"
-                ),
+                Err(error) => {
+                    tracing::error!(%error, "queueing a device's revert failed");
+                }
             }
         }
         ProgramStatus::Reverted {
@@ -1001,8 +1016,20 @@ impl MainProcess {
             scheduler.policy_mut().request(Stage::Purge, generation)?;
         }
         for executor in &self.executors {
-            if let Err(error) = completed(executor.purge(generation)?.wait()) {
-                bail!("purging device {}: {error}", executor.device().0);
+            let device = executor.device();
+            let submission = executor.purge(generation)?;
+            if let Err(error) = device_command(&self.watchdog, device, "purge", submission) {
+                // The generation still serves nothing, so a purge that did not finish leaks its
+                // storage rather than breaking correctness: it is reported and the epoch serves on.
+                let failure = UpdateFailure::Device {
+                    device: u32::try_from(device.0).unwrap_or_default(),
+                    error: error.to_string(),
+                    batch: None,
+                };
+                return Ok(ProgramStatus::Failed {
+                    generation,
+                    failure,
+                });
             }
         }
         self.update.purged(generation)?;
@@ -1510,6 +1537,29 @@ fn completed<T>(outcome: Outcome<T>) -> Result<()> {
     }
 }
 
+/// Waits on one device command, and no longer than §2.4's stall bound.
+///
+/// The control thread issues a handful of device commands of its own - the switchover, a revert and
+/// a purge - and none of them may hold it indefinitely: a device that has not answered by half the
+/// watchdog timeout is stalled, and a stall is a failure the epoch reports rather than something the
+/// control thread waits out.
+fn device_command(
+    watchdog: &Watchdog,
+    device: platform::DeviceId,
+    what: &str,
+    submission: Submission,
+) -> Result<()> {
+    match submission.wait_timeout(watchdog.stall_bound()) {
+        Some(Outcome::Success(_)) => Ok(()),
+        Some(Outcome::Failed(error)) => bail!("the {what} of device {} failed: {error}", device.0),
+        Some(Outcome::Cancelled) => bail!("the {what} of device {} was cancelled", device.0),
+        None => bail!(
+            "the {what} of device {} did not finish within the stall bound",
+            device.0
+        ),
+    }
+}
+
 /// The handshake with the daemon, which answers with the epoch this node serves
 /// (`specs/worker.md` §2.3).
 ///
@@ -1595,6 +1645,104 @@ impl Placement {
             // attention program's workspace is the load config's; neither is ours to guess, so the
             // model's own defaults stand until the loader takes them from the build config.
             load_options: qwen3_moe::LoadOptions::default(),
+        })
+    }
+}
+
+/// The captured bucket set the epoch's runners are bound to (§4.5), and the same sizes as the
+/// capacity plan needs them.
+///
+/// A bucket set is fixed when the executor is bound, so a batch whose shape no bucket holds is a
+/// configuration error found at startup and never a scheduling surprise at the first odd-sized
+/// batch. The set comes from the build config's graph sizes, or from the deployment's catalog when
+/// they are unset, and every size is clamped to what the batch plan actually admits: a bucket larger
+/// than the batch bound would be captured and never used.
+struct GraphPlan {
+    /// What each runner captures, ascending.
+    buckets: executor::plan::Buckets,
+    /// Decode row counts, as the capacity plan sizes the decode graph pools.
+    decode: Vec<usize>,
+    /// Prefill token counts, as the capacity plan sizes the prefill graph pools.
+    prefill: Vec<usize>,
+    /// Media flow shapes `(tokens, latent)`.
+    flow: Vec<(usize, usize)>,
+}
+
+impl GraphPlan {
+    /// The plan for a deployment whose batch plan admits `rows` rows and `tokens` tokens.
+    ///
+    /// The sizes are the deployment's, or the executor's catalog where it names none, and every one
+    /// above the bound is dropped: a bucket is captured for each size, so a size no batch can fill
+    /// would cost a graph and its pool forever. Nothing fits is refused here, at startup. `sampled`
+    /// also captures the sampling variants, which a deployment that samples needs and one that
+    /// serves logits only does not pay for.
+    fn of(
+        graphs: &daemon::options::CudaGraphOptions,
+        rows: usize,
+        tokens: usize,
+        sampled: bool,
+    ) -> Result<Self> {
+        if graphs.policy == proto::request::GraphPolicy::Off {
+            return Ok(Self {
+                buckets: executor::plan::Buckets::default(),
+                decode: Vec::new(),
+                prefill: Vec::new(),
+                flow: Vec::new(),
+            });
+        }
+        let (rows, tokens) = (
+            u32::try_from(rows).context("a batch wider than u32::MAX rows")?,
+            u32::try_from(tokens).context("a batch longer than u32::MAX tokens")?,
+        );
+        let decode = graphs
+            .decode_batch_sizes
+            .as_ref()
+            .map(|sizes| sizes.iter().map(|size| size.get()).collect::<Vec<u32>>());
+        let prefill = graphs
+            .prefill_token_sizes
+            .as_ref()
+            .map(|sizes| sizes.iter().map(|size| size.get()).collect::<Vec<u32>>());
+        let buckets = executor::plan::Buckets::for_batch(
+            decode.as_deref(),
+            prefill.as_deref(),
+            rows,
+            tokens,
+            sampled,
+        )?;
+        // The capacity plan sizes the pools from the sizes the buckets were captured at, so the two
+        // cannot disagree about what the epoch captures.
+        let decode: Vec<usize> = decode
+            .unwrap_or_else(executor::plan::decode_catalog)
+            .into_iter()
+            .filter(|size| *size != 0 && *size <= rows)
+            .map(|size| size as usize)
+            .collect();
+        let prefill: Vec<usize> = prefill
+            .unwrap_or_else(executor::plan::prefill_catalog)
+            .into_iter()
+            .filter(|size| *size != 0 && *size <= tokens)
+            .map(|size| size as usize)
+            .collect();
+        let flow = graphs
+            .flow_shapes
+            .as_ref()
+            .map(|shapes| {
+                shapes
+                    .iter()
+                    .map(|shape| (shape.0[0] as usize, shape.0[1] as usize))
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                executor::plan::FLOW_CATALOG
+                    .into_iter()
+                    .map(|(height, width)| (height as usize, width as usize))
+                    .collect()
+            });
+        Ok(Self {
+            buckets,
+            decode,
+            prefill,
+            flow,
         })
     }
 }
