@@ -1,14 +1,17 @@
-//! The element types device buffers hold: the one dtype type this crate and
-//! the layers above it use, with the code each bound library gives it.
+//! The element types device buffers hold: the library-facing element type,
+//! with the code each bound library gives it.
 //!
-//! Design 4.2 spells the type `DType` and makes it the element type of a
-//! tensor view; the driver, cuBLASLt, cuDNN and NCCL each spell their own
-//! code for the same thing, which is what this type answers with. There is no
-//! second dtype type in the crate: a library that needs a code asks this one.
+//! This is the type a kernel, a collective, a matrix product or a convolution
+//! is told its buffers hold. The layers above (design 4.2's `DType`, the
+//! element type of `ops`' tensor views) keep their own richer type and map to
+//! this one where they cross into the platform: the driver, cuBLASLt, cuDNN
+//! and NCCL each spell a code for an element type, which is all this crate
+//! needs to know about it. There is no second library-facing type in the
+//! crate: a binding that needs a code asks this one.
 
 /// The element type of a device buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum DType {
+pub enum DataType {
     F64,
     F32,
     F16,
@@ -24,7 +27,7 @@ pub enum DType {
     U8,
 }
 
-impl DType {
+impl DataType {
     /// The element's size in bytes.
     pub fn bytes(self) -> usize {
         match self {
@@ -120,15 +123,15 @@ fn libm_half_ulp(bits: u32) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::DType;
+    use super::DataType;
 
     #[test]
     fn a_type_reports_its_size_and_binary_identity() {
-        assert_eq!(DType::F64.bytes(), 8);
-        assert_eq!(DType::F32.bytes(), 4);
-        assert_eq!(DType::Bf16.bytes(), 2);
-        assert_eq!(DType::I8.bytes(), 1);
-        assert_eq!(DType::U64.bytes(), 8);
+        assert_eq!(DataType::F64.bytes(), 8);
+        assert_eq!(DataType::F32.bytes(), 4);
+        assert_eq!(DataType::Bf16.bytes(), 2);
+        assert_eq!(DataType::I8.bytes(), 1);
+        assert_eq!(DataType::U64.bytes(), 8);
     }
 
     /// The library codes are the binding's contract with the driver, cuBLASLt,
@@ -136,22 +139,22 @@ mod tests {
     /// compile error.
     #[test]
     fn a_type_reports_each_librarys_code() {
-        assert_eq!(DType::F32.cuda(), 0);
-        assert_eq!(DType::F64.cuda(), 1);
-        assert_eq!(DType::Bf16.cuda(), 14);
-        assert_eq!(DType::I32.cuda(), 10);
-        assert_eq!(DType::U8.cuda(), 8);
-        assert_eq!(DType::F8E4M3.cuda(), 28);
+        assert_eq!(DataType::F32.cuda(), 0);
+        assert_eq!(DataType::F64.cuda(), 1);
+        assert_eq!(DataType::Bf16.cuda(), 14);
+        assert_eq!(DataType::I32.cuda(), 10);
+        assert_eq!(DataType::U8.cuda(), 8);
+        assert_eq!(DataType::F8E4M3.cuda(), 28);
 
-        assert_eq!(DType::F32.cudnn(), 0);
-        assert_eq!(DType::Bf16.cudnn(), 9);
-        assert_eq!(DType::U8.cudnn(), 6);
-        assert_eq!(DType::I64.cudnn(), -1);
+        assert_eq!(DataType::F32.cudnn(), 0);
+        assert_eq!(DataType::Bf16.cudnn(), 9);
+        assert_eq!(DataType::U8.cudnn(), 6);
+        assert_eq!(DataType::I64.cudnn(), -1);
 
-        assert_eq!(DType::F32.nccl(), 7);
-        assert_eq!(DType::Bf16.nccl(), 9);
-        assert_eq!(DType::I8.nccl(), 0);
-        assert_eq!(DType::I16.nccl(), -1);
+        assert_eq!(DataType::F32.nccl(), 7);
+        assert_eq!(DataType::Bf16.nccl(), 9);
+        assert_eq!(DataType::I8.nccl(), 0);
+        assert_eq!(DataType::I16.nccl(), -1);
     }
 
     /// The bound of design §7.3 is `γₙ = n·u/(1 − n·u)` with this `u`; its
@@ -159,16 +162,16 @@ mod tests {
     /// uses.
     #[test]
     fn a_type_reports_its_unit_round_off() {
-        assert_eq!(DType::F32.unit_round_off(), 2f64.powi(-24));
-        assert_eq!(DType::F64.unit_round_off(), 2f64.powi(-53));
-        assert_eq!(DType::Bf16.unit_round_off(), 2f64.powi(-8));
-        assert_eq!(DType::F16.unit_round_off(), 2f64.powi(-11));
-        assert_eq!(DType::I32.unit_round_off(), 0.0);
+        assert_eq!(DataType::F32.unit_round_off(), 2f64.powi(-24));
+        assert_eq!(DataType::F64.unit_round_off(), 2f64.powi(-53));
+        assert_eq!(DataType::Bf16.unit_round_off(), 2f64.powi(-8));
+        assert_eq!(DataType::F16.unit_round_off(), 2f64.powi(-11));
+        assert_eq!(DataType::I32.unit_round_off(), 0.0);
 
         // γₙ stays below one for a reduction of a hundred million terms in
         // FP32, which is why the bound is usable at the lengths a kernel sums.
         let n = 100_000_000.0;
-        let u = DType::F32.unit_round_off();
+        let u = DataType::F32.unit_round_off();
         assert!(n * u / (1.0 - n * u) < 6.0);
     }
 }
