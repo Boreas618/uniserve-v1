@@ -436,3 +436,43 @@ fn an_operator_is_found_by_the_name_its_programs_are_filed_under() {
         );
     }
 }
+
+#[test]
+fn a_sectioned_rotation_names_its_axes_in_its_key() {
+    let plain = ops::rope::FactorsDescriptor {
+        dtype: ops::DType::F32,
+        positions: ops::DType::I32,
+        columns: 64,
+        block: 1024,
+        scale: ops::Float::from(1_000_000.0_f32),
+        pdl: false,
+        axes: 1,
+        sections: [0; ops::rope::MAX_AXES],
+    };
+    let key = ops::descriptor::key(&plain);
+    assert!(
+        !key.contains("axes"),
+        "{key} names no axis for one-dimensional positions"
+    );
+    assert!(!key.contains("sections"), "{key} carries no section");
+
+    // M-RoPE's cut of a 128-element head into (time, height, width) exported as 128 elements, and
+    // the same head with a different cut: both are compiled variants of their own.
+    let three = ops::rope::FactorsDescriptor {
+        axes: 3,
+        sections: [16, 24, 24, 0],
+        columns: 64,
+        ..plain
+    };
+    let sectioned = ops::descriptor::key(&three);
+    assert_ne!(sectioned, key);
+    assert!(sectioned.contains("axes_3"), "{sectioned}");
+    assert!(sectioned.contains("sections_16-24-24"), "{sectioned}");
+
+    let other = ops::descriptor::key(&ops::rope::FactorsDescriptor {
+        sections: [32, 32, 0, 0],
+        axes: 2,
+        ..three
+    });
+    assert_ne!(other, sectioned, "the cut is part of the compilation");
+}
