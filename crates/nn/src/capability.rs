@@ -228,11 +228,8 @@ pub struct EncoderInputs<'a> {
     pub batch: TokenBatch,
     /// The images of a multimodal tower, empty for a text-only encoder.
     pub images: &'a [ImageInput],
-    /// The per-request tables [`Denoiser::state_tables`] named for this layout, in that order.
+    /// The encoder's tables for this layout, in [`Encoder::state_tables`]' order.
     pub state: &'a [TensorView],
-    /// The per-layout constants [`Denoiser::layout_tables`] named for this layout, in that order:
-    /// values that depend on the layout and nothing of the request.
-    pub tables: &'a [TensorView],
     /// The rows an encoder reports back for its caller's inspection, in the model's order.
     ///
     /// Diagnostics are outputs of the encode and never an input of the model's mathematics: a
@@ -240,28 +237,34 @@ pub struct EncoderInputs<'a> {
     pub diagnostics: &'a [TensorView],
 }
 
-/// One image a multimodal tower reads: its pixels, its patch grid and its own rotary clock.
+/// One image a multimodal tower reads: its pixels.
 ///
-/// Everything here is the image's, not a request's: two images of one request carry their own
-/// grids, tables and row counts. The tables are the model's, prepared per image on the host because
-/// a tower's positions are a patch grid — cheap to evaluate once, and the same for every request
-/// that brings an image of that size.
+/// The image's geometry and its tables are the **layout's**, not the image's: two images of one
+/// grid need the same tap tables, and the executor cannot produce any of them. They are therefore
+/// [`Encoder::state_tables`]' and reach the encode through [`EncoderInputs::state`], while this
+/// value carries only what the caller decoded.
 #[derive(Clone, Copy)]
 pub struct ImageInput {
     /// `[tokens, pixels]` packed patches, or `[channels, height, width]` rasters.
     pub pixels: TensorView,
-    /// The patch grid's three extents: time, rows, columns.
-    pub grid_shape: [u32; 3],
-    /// `[merged_rows, 4]` i32: the four taps each merged row reads of a tower's table.
-    pub position_index: TensorView,
-    /// `[merged_rows, 4]` f32: those taps' weights, normalized by the caller.
-    pub position_weight: TensorView,
-    /// `[time + 1]` i32: the first merged row of each frame's run, plus the total.
-    pub lengths: TensorView,
-    /// `[patches, head_dim / 2]` f32: the cosine of each patch's rotation phase.
-    pub cosine: TensorView,
-    /// `[patches, head_dim / 2]` f32: the sine of each patch's rotation phase.
-    pub sine: TensorView,
+}
+
+/// One image's patch grid, as a layout names it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ImageShape {
+    /// The grid's three extents: time, rows, columns, in patches.
+    pub grid: [u32; 3],
+}
+
+/// The shape of one encode: the rows it fills and the grids it merges.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct EncoderLayout {
+    /// The packed rows the encode fills.
+    pub rows: u32,
+    /// The token rows that feed it.
+    pub tokens: u32,
+    /// The images it merges, in request order.
+    pub images: Vec<ImageShape>,
 }
 
 /// What an encoder writes.
@@ -470,7 +473,28 @@ pub struct DecodedMedia {
 }
 
 /// A tower that turns inputs into conditioning (a text encoder, a vision tower, a video encoder).
+///
+/// The protocol is the denoiser's, in the denoiser's words: the model says what shape an encode
+/// has, which tables that shape needs and writes their host bytes; the executor allocates and
+/// uploads them. A tower's per-grid tables (its rotary clocks, its tap tables, the prompt rows its
+/// images replace) are mathematics the executor cannot reproduce, and they are the same for every
+/// request of one shape.
 pub trait Encoder {
+    /// The shape an encode of `batch`'s rows and `images`' grids has.
+    fn layout(&self, batch: &TokenBatch, images: &[ImageShape]) -> EncoderLayout;
+
+    /// The tables an encode of `layout` reads, in [`Self::prepare_state`]'s order.
+    ///
+    /// Deterministic for a layout, so the executor keys storage by `(layout, name)` and shares one
+    /// set between every request of that shape.
+    fn state_tables(&self, layout: &EncoderLayout) -> Vec<StateTable>;
+
+    /// Write the host bytes of each table of `layout`, in [`Self::state_tables`]' order.
+    ///
+    /// `out[i]` is `state_tables(layout)[i]`'s bytes, row-major in its element type, already the
+    /// right length; the executor uploads it. No allocation, no synchronization, no read-back.
+    fn prepare_state(&self, layout: &EncoderLayout, out: &mut [Vec<u8>]) -> Result<()>;
+
     /// Encode `inputs` into `out`.
     fn encode(&self, f: &Forward, inputs: EncoderInputs<'_>, out: EncoderOutputs) -> Result<()>;
 }

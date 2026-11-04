@@ -51,8 +51,9 @@ pub mod weights;
 
 pub use capability::{
     BatchRow, BatchRows, CausalLm, ConditionRole, ConditionShape, Conditioning, DecodedMedia,
-    Decoder, Denoiser, Encoder, EncoderInputs, EncoderOutputs, ImageInput, KvGroup, KvPlanes,
-    KvView, Latents, Layout, RowKind, Seed, StateTable, Step, TokenBatch, VideoRequest, VideoTask,
+    Decoder, Denoiser, Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, ImageInput,
+    ImageShape, KvGroup, KvPlanes, KvView, Latents, Layout, RowKind, Seed, StateTable, Step,
+    TokenBatch, VideoRequest, VideoTask,
 };
 pub use checkpoint::{Checkpoint, CheckpointFile, FileIdentity, TensorLocation};
 pub use error::{Error, Result};
