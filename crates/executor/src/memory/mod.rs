@@ -78,7 +78,7 @@ pub struct MemoryRequest<'a> {
     /// The request slots the rank keeps.
     pub request_pool_size: u32,
     /// The devices the product store's arenas live on.
-    pub devices: Vec<crate::tensor::MemoryKind>,
+    pub devices: Vec<crate::memory::allocation::MemoryKind>,
     /// The bytes of one product store entry.
     pub max_feature_bytes: u64,
     /// The relay entries per request slot.

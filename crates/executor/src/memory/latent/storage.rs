@@ -11,7 +11,8 @@ use platform::{DeviceId, Stream, memset_d8};
 
 use crate::memory::allocation::{Storage, StorageView};
 use crate::memory::retained::{ExclusiveSpec, ExclusiveStorage};
-use crate::tensor::{Backing, DType};
+use crate::memory::allocation::Backing;
+use crate::memory::allocation::ElementType;
 use crate::transfer::Spans;
 use crate::{Error, Result};
 
@@ -28,7 +29,7 @@ pub struct LatentPlan {
     /// Values per latent unit.
     pub latent_width: usize,
     /// The element type of latent values.
-    pub dtype: DType,
+    pub dtype: ElementType,
 }
 
 impl LatentPlan {
@@ -44,7 +45,7 @@ impl LatentPlan {
         }
         if !matches!(
             self.dtype,
-            DType::F16 | DType::BF16 | DType::F32 | DType::F64
+            ElementType::F16 | ElementType::BF16 | ElementType::F32 | ElementType::F64
         ) {
             return Err(Error::Invalid(
                 "latent storage must use a floating dtype".into(),
@@ -138,7 +139,7 @@ impl LatentStorage {
         };
         let dtype = plan.dtype;
         let bytes =
-            |shape: &[i64], dtype: DType| shape.iter().product::<i64>() as usize * dtype.bytes();
+            |shape: &[i64], dtype: ElementType| shape.iter().product::<i64>() as usize * dtype.bytes();
         let bank_shape = plan.bank_shape();
         let page_bytes = bytes(&bank_shape, dtype);
         let (banks, created) = allocate_banks(device, page_bytes, name, storage)?;
@@ -164,7 +165,7 @@ impl LatentStorage {
     }
 
     /// The element type of latent values.
-    pub(crate) fn dtype(&self) -> DType {
+    pub(crate) fn dtype(&self) -> ElementType {
         self.pages.dtype()
     }
 
@@ -233,7 +234,7 @@ mod tests {
             num_pages: 4,
             page_units: 2,
             latent_width: 3,
-            dtype: DType::F32,
+            dtype: ElementType::F32,
         };
         let storage = LatentStorage::allocate(
             &plan,

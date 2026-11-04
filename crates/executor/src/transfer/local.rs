@@ -14,7 +14,7 @@ use super::read::{self, NativeRead, Read, ReadCall};
 use super::transport::{ExportView, Transport, producer, read_destination, within};
 use super::{ByteReservation, ReadReservation, Spans};
 use crate::stream::Issue;
-use crate::tensor::MemoryKind;
+use crate::memory::allocation::MemoryKind;
 use crate::{Error, Result, lock};
 
 impl Transport {

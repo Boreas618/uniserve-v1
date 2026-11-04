@@ -29,7 +29,7 @@ use platform::{DeviceId, Protection};
 use sha2::{Digest, Sha256};
 
 use crate::memory::allocation::Storage;
-use crate::tensor::Backing;
+use crate::memory::allocation::Backing;
 use crate::{Error, Result, lock};
 
 /// One exclusive device storage an owner needs.

@@ -3,7 +3,8 @@
 use super::*;
 use crate::memory::allocation::StorageView;
 use crate::stream::Issue;
-use crate::tensor::{DType, MemoryKind};
+use crate::memory::allocation::ElementType;
+use crate::memory::allocation::{MemoryKind};
 use crate::transfer::{ReadRef, Spans, Transports, fetch};
 use crate::{Error, Result};
 use ipc::{TensorRef, TensorTransfer, subtract_region};
@@ -233,7 +234,7 @@ impl ProductStore {
             .locations
             .first()
             .ok_or_else(|| Error::Invalid("tensor transfer has no locations".into()))
-            .and_then(|location| DType::parse(&location.dtype))?;
+            .and_then(|location| ElementType::parse(&location.dtype))?;
         if destination.dtype() != source_dtype {
             if existing.is_none() {
                 lock(&buffer).released = true;

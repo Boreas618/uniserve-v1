@@ -33,7 +33,8 @@ use super::{
 use crate::memory::allocation::Storage;
 use crate::stream::EventPool;
 use crate::stream::Issue;
-use crate::tensor::{DType, MemoryKind};
+use crate::memory::allocation::ElementType;
+use crate::memory::allocation::{MemoryKind};
 use crate::{Error, Result, lock};
 
 /// A transfer mechanism.
@@ -599,14 +600,14 @@ pub(super) fn read_destination(
         }
         None => locator.shape.clone(),
     };
-    destination.validate_destination(&shape, DType::parse(&locator.dtype)?, device)?;
+    destination.validate_destination(&shape, ElementType::parse(&locator.dtype)?, device)?;
     Ok(destination.clone())
 }
 
 /// The byte offset and length of whole leading rows of a shared export;
 /// `region`'s leading range is in logical coordinates.
 pub(super) fn row_span(locator: &Locator, region: Option<&[Range<u64>]>) -> Result<(usize, usize)> {
-    let element = DType::parse(&locator.dtype)?.bytes() as u64;
+    let element = ElementType::parse(&locator.dtype)?.bytes() as u64;
     let shape = &locator.shape;
     let rows = shape.first().copied().unwrap_or(1);
     let row_bytes = element * shape.iter().skip(1).product::<u64>();

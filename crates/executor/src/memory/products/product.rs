@@ -3,7 +3,8 @@
 use super::*;
 use crate::memory::allocation::StorageView;
 use crate::memory::buffer::BufferBinding;
-use crate::tensor::{DType, MemoryKind};
+use crate::memory::allocation::ElementType;
+use crate::memory::allocation::{MemoryKind};
 use crate::transfer::{ReadRef, Retirement};
 use crate::{Error, Result};
 use ipc::{BufferId, DimBound, TensorRef};
@@ -113,8 +114,8 @@ impl ProductBuffer {
 }
 
 /// The element type of a protocol product dtype.
-pub(super) fn product_dtype(dtype: ipc::DType) -> Result<DType> {
-    Ok(DType::from(dtype))
+pub(super) fn product_dtype(dtype: ipc::DType) -> Result<ElementType> {
+    Ok(ElementType::from(dtype))
 }
 
 /// Static extents and the device-actual axis at its bound; a scalar product
@@ -139,7 +140,7 @@ pub(super) fn elements(shape: &[u64]) -> Result<u64> {
         .ok_or_else(|| Error::Invalid("tensor extent overflows".into()))
 }
 
-pub(super) fn shape_bytes(shape: &[u64], dtype: DType) -> Result<u64> {
+pub(super) fn shape_bytes(shape: &[u64], dtype: ElementType) -> Result<u64> {
     elements(shape)?
         .checked_mul(dtype.bytes() as u64)
         .ok_or_else(|| Error::Invalid("buffer tensor shape has an invalid byte extent".into()))

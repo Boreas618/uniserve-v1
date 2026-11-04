@@ -212,13 +212,11 @@ mod tests {
         Limits::new([lane; 4])
     }
 
-    fn run_one(pool: &Arc<HostPool<Probe>>, runs: &Arc<AtomicUsize>) -> Result<()> {
-        let task = pool.reserve()?;
-        task.configure(Probe {
+    fn run_one(lane: &Lane<Probe>, runs: &Arc<AtomicUsize>) -> Result<()> {
+        lane.admit(Probe {
             runs: Arc::clone(runs),
             input: Arc::new(()),
         })?;
-        task.submit()?;
         let deadline = Instant::now() + Duration::from_secs(10);
         while runs.load(Ordering::SeqCst) == 0 {
             assert!(Instant::now() < deadline, "the lane did not run its task");
@@ -264,7 +262,13 @@ mod tests {
         let threads = ThreadPool::new(limits());
         let lane = threads.lane::<Probe>(BlockingKind::Reclaim)?;
         threads.abort();
-        assert!(lane.reserve().is_err());
+        assert!(
+            lane.admit(Probe {
+                runs: Arc::new(AtomicUsize::new(0)),
+                input: Arc::new(()),
+            })
+            .is_err()
+        );
         assert!(threads.close().is_empty());
         Ok(())
     }

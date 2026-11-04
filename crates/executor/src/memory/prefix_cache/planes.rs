@@ -45,7 +45,8 @@ use crate::memory::retained::{
     ExclusiveSpec, ExclusiveStorage, Retained, SegmentPart, SegmentedSpec,
 };
 use crate::stream::{Issue, RowFill};
-use crate::tensor::{Backing, DType};
+use crate::memory::allocation::Backing;
+use crate::memory::allocation::ElementType;
 use crate::{Error, Result};
 
 /// The two K/V fields, in storage order.
@@ -997,7 +998,7 @@ impl CachePlanes {
                 StorageView::contiguous(
                     Arc::clone(&self.values[field]) as Arc<dyn Backing>,
                     0,
-                    DType::U8,
+                    ElementType::U8,
                     &[columns, units, self.plan.plane_bytes as i64],
                 )?,
             ));
@@ -1007,7 +1008,7 @@ impl CachePlanes {
                     StorageView::contiguous(
                         Arc::clone(&scales[field]) as Arc<dyn Backing>,
                         0,
-                        DType::F32,
+                        ElementType::F32,
                         &[columns, units],
                     )?,
                 ));
@@ -1017,7 +1018,7 @@ impl CachePlanes {
                 StorageView::contiguous(
                     Arc::clone(&self.initialized[field]) as Arc<dyn Backing>,
                     0,
-                    DType::Bool,
+                    ElementType::Bool,
                     &[columns, units],
                 )?,
             ));
@@ -1108,7 +1109,7 @@ impl CachePlanes {
         StorageView::contiguous(
             Arc::clone(&scales[field]) as Arc<dyn Backing>,
             (self.cell(column, unit) * 4) as usize,
-            DType::F32,
+            ElementType::F32,
             &[1, 1, 1, 1],
         )
     }

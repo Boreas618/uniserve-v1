@@ -23,7 +23,8 @@ use crate::memory::prefix_cache::conversion::{
     ConversionRequest, ConversionScratch, PageConversion,
 };
 use crate::memory::{CachePlanes, GroupTable, UnitColumn};
-use crate::tensor::{Backing, DType};
+use crate::memory::allocation::Backing;
+use crate::memory::allocation::ElementType;
 use crate::transfer::fetch;
 use crate::transfer::read::{Read, ReadRef};
 use crate::transfer::{Notify, Retirement, Spans, Transports, notify};
@@ -84,7 +85,7 @@ impl ImportWorkspace {
     }
 
     /// A contiguous scratch view at `offset` bytes.
-    fn view(&self, offset: u64, dtype: DType, shape: &[i64]) -> Result<Spans> {
+    fn view(&self, offset: u64, dtype: ElementType, shape: &[i64]) -> Result<Spans> {
         Spans::single(StorageView::contiguous(
             Arc::clone(self.scratch.storage()) as Arc<dyn Backing>,
             offset as usize,
@@ -190,7 +191,7 @@ impl ImportCopy {
                 head..head + u64::from(target.num_kv_heads),
                 0..u64::from(target.head_dim),
             ];
-            let source_dtype = DType::parse(
+            let source_dtype = ElementType::parse(
                 &first
                     .locations
                     .first()
@@ -199,7 +200,7 @@ impl ImportCopy {
             )?;
 
             let mut direct = source_dtype == target.dtype;
-            let scale_heads = if source_dtype == DType::F8E4M3 {
+            let scale_heads = if source_dtype == ElementType::F8E4M3 {
                 let groups = group
                     .tensors
                     .get(2)
@@ -263,7 +264,7 @@ struct GroupCopy<'a> {
     axes: [Range<u64>; 3],
     /// Source KV heads per scale group (0 for unquantized sources).
     scale_heads: u64,
-    source_dtype: DType,
+    source_dtype: ElementType,
 }
 
 impl GroupCopy<'_> {
@@ -488,7 +489,7 @@ impl GroupCopy<'_> {
                 ];
                 let destination = workspace.view(
                     20 * elements,
-                    DType::F32,
+                    ElementType::F32,
                     &[pages as i64, 2, layers, groups as i64],
                 )?;
                 reads.extend(self.fetch(2, &destination, &region, locators)?);
@@ -506,7 +507,7 @@ impl GroupCopy<'_> {
                 scales: workspace.scales,
                 group: self.index,
                 source_dtype: self.source_dtype,
-                compute_dtype: DType::parse(&backend.export.compute_dtype)?,
+                compute_dtype: ElementType::parse(&backend.export.compute_dtype)?,
                 count,
                 offset,
                 source_offset,

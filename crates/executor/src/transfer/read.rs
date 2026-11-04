@@ -31,7 +31,9 @@ use crate::host::HostTask;
 use crate::memory::allocation::{Storage, StorageView};
 use crate::stream::EventPool;
 use crate::stream::Issue;
-use crate::tensor::{Backing, DType, MemoryKind};
+use crate::memory::allocation::Backing;
+use crate::memory::allocation::ElementType;
+use crate::memory::allocation::{MemoryKind};
 use crate::{Error, Result, lock};
 
 pub(crate) type BorrowedReads = Mutex<Option<HashMap<usize, Weak<Read>>>>;
@@ -656,7 +658,7 @@ pub(super) fn payload(
     offset: usize,
     locator: &Locator,
 ) -> Result<Spans> {
-    let dtype: DType = DType::parse(&locator.dtype)?;
+    let dtype: ElementType = ElementType::parse(&locator.dtype)?;
     let shape: Vec<i64> = locator.shape.iter().map(|&extent| extent as i64).collect();
     Spans::single(StorageView::contiguous(backing, offset, dtype, &shape)?)
 }

@@ -29,7 +29,8 @@ use sha2::{Digest, Sha256};
 
 use crate::memory::allocation::{Storage, StorageView};
 use crate::memory::retained::Retained;
-use crate::tensor::{Backing, DType};
+use crate::memory::allocation::Backing;
+use crate::memory::allocation::ElementType;
 use crate::{Error, Result};
 
 /// The version of the page encoding above: pages of another version are
@@ -62,7 +63,7 @@ fn pool_pages(pages: BankPages) -> u64 {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BankPages {
     /// The element type of the values.
-    pub(crate) dtype: DType,
+    pub(crate) dtype: ElementType,
     /// The values one page holds.
     pub(crate) page_values: u32,
     /// The most pages one trajectory occupies.
@@ -316,7 +317,7 @@ impl LatentHostPool {
         StorageView::contiguous(
             storage as Arc<dyn Backing>,
             (slot * pool.page_bytes) as usize,
-            DType::U8,
+            ElementType::U8,
             &[pool.page_bytes as i64],
         )
     }

@@ -53,7 +53,7 @@ use crate::memory::allocation::StorageView;
 use crate::memory::buffer::BufferPool;
 use crate::stream::EventPool;
 use crate::stream::Issue;
-use crate::tensor::MemoryKind;
+use crate::memory::allocation::MemoryKind;
 use crate::transfer::exports::{self, Location};
 use crate::{Error, Result, lock};
 use ipc::CallId;

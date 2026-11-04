@@ -44,7 +44,6 @@ pub mod keys;
 pub mod memory;
 pub mod parallel;
 pub mod stream;
-pub mod tensor;
 pub mod transfer;
 pub mod watchdog;
 

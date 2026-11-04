@@ -7,7 +7,8 @@ use platform::{CopyBatch, DeviceId, SourceOrder, Stream, memset_d32};
 use super::{BlockTableUpdate, GroupShape};
 use crate::memory::allocation::{Storage, StorageView};
 use crate::stream::{Fill, Issue};
-use crate::tensor::{Backing, DType};
+use crate::memory::allocation::Backing;
+use crate::memory::allocation::ElementType;
 use crate::{Error, Result};
 
 /// Byte alignment of each carved table inside the shared allocation.
@@ -101,7 +102,7 @@ impl BlockTableStorage {
         };
         let backing = || Arc::clone(&storage) as Arc<dyn Backing>;
         let view = |index: usize, shape: &[i64]| {
-            StorageView::contiguous(backing(), offsets[index], DType::I32, shape)
+            StorageView::contiguous(backing(), offsets[index], ElementType::I32, shape)
         };
         let (rows_i, tables_i, width_i) = (i64::from(rows), i64::from(tables), i64::from(width));
 

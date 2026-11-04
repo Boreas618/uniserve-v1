@@ -35,7 +35,9 @@ use super::{ACK_SLOTS, ACKNOWLEDGED, ByteReservation, CLAIMED, Spans, copy_plann
 use crate::memory::allocation::{Residency, Storage, StorageView};
 use crate::stream::EventPool;
 use crate::stream::Issue;
-use crate::tensor::{Backing, DType, MemoryKind};
+use crate::memory::allocation::Backing;
+use crate::memory::allocation::ElementType;
+use crate::memory::allocation::{MemoryKind};
 use crate::{Error, Result, lock};
 use handle::AllocationHandle;
 use pool::VmmPool;
@@ -744,7 +746,7 @@ impl CudaRead {
             _ => map()?,
         };
 
-        let dtype = DType::parse(&self.locator.dtype)?;
+        let dtype = ElementType::parse(&self.locator.dtype)?;
         if storage_offsets_bytes
             .iter()
             .any(|offset| offset % dtype.bytes() as u64 != 0)

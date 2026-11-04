@@ -23,12 +23,254 @@ use std::sync::{Arc, Mutex, Weak};
 
 use std::os::fd::OwnedFd;
 
-use crate::tensor::{Backing, DType, MemoryKind, contiguous_strides};
 use crate::{Error, Result, lock};
 use platform::{
     DeviceAllocation, DeviceId, HostRegistration, PeerMapping, PinnedBuffer, Protection,
     SegmentedMapping, ShareableHandle, Strided,
 };
+
+/// The element type of storage.
+///
+/// The set is the one checkpoints and kernels use: the floating-point types a
+/// `dtype` or `quantization` can name, the integer types a kernel reads for
+/// What a storage plane holds.
+///
+/// Wider than the kernel ABI on purpose: storage carries initialized flags
+/// (`Bool`), block-table indices (`I32`/`I64`), scale planes (`F32`) and
+/// checkpoint element types that no kernel operand describes. Every
+/// kernel-facing dtype in an `ops`/`nn` call is [`ops::DType`], and
+/// [`ElementType::to_ops`] is the only bridge between the two, so a `Bool`
+/// flag or an `F64` scale plane can never silently become `U8` or `F32` in a
+/// kernel argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ElementType {
+    Bool,
+    U8,
+    I8,
+    I16,
+    I32,
+    I64,
+    U32,
+    F16,
+    BF16,
+    F32,
+    F64,
+    F8E4M3,
+    F8E5M2,
+}
+
+impl ElementType {
+    /// Storage width of one element in bytes.
+    pub fn bytes(self) -> usize {
+        match self {
+            Self::Bool | Self::U8 | Self::I8 | Self::F8E4M3 | Self::F8E5M2 => 1,
+            Self::I16 | Self::F16 | Self::BF16 => 2,
+            Self::I32 | Self::U32 | Self::F32 => 4,
+            Self::I64 | Self::F64 => 8,
+        }
+    }
+
+    /// The name a configuration, a checkpoint index or a descriptor key
+    /// spells this type with.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Bool => "bool",
+            Self::U8 => "uint8",
+            Self::I8 => "int8",
+            Self::I16 => "int16",
+            Self::I32 => "int32",
+            Self::I64 => "int64",
+            Self::U32 => "uint32",
+            Self::F16 => "float16",
+            Self::BF16 => "bfloat16",
+            Self::F32 => "float32",
+            Self::F64 => "float64",
+            Self::F8E4M3 => "float8_e4m3fn",
+            Self::F8E5M2 => "float8_e5m2",
+        }
+    }
+
+    /// The type a name spells, or `None` for a name this crate does not serve.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name.trim_start_matches("torch.") {
+            "bool" => Self::Bool,
+            "uint8" => Self::U8,
+            "int8" => Self::I8,
+            "int16" => Self::I16,
+            "int32" => Self::I32,
+            "int64" => Self::I64,
+            "uint32" => Self::U32,
+            "float16" => Self::F16,
+            "bfloat16" => Self::BF16,
+            "float32" => Self::F32,
+            "float64" => Self::F64,
+            "float8_e4m3fn" => Self::F8E4M3,
+            "float8_e5m2" => Self::F8E5M2,
+            _ => return None,
+        })
+    }
+
+    /// The type a name spells, failing for any other.
+    pub fn parse(name: &str) -> Result<Self> {
+        Self::from_name(name)
+            .ok_or_else(|| crate::Error::Invalid(format!("unknown element type {name:?}")))
+    }
+}
+
+/// The storage element type of a request message's dtype.
+impl From<ipc::DType> for ElementType {
+    fn from(dtype: ipc::DType) -> Self {
+        match dtype {
+            ipc::DType::U8 => Self::U8,
+            ipc::DType::I16 => Self::I16,
+            ipc::DType::I32 => Self::I32,
+            ipc::DType::I64 => Self::I64,
+            ipc::DType::F16 => Self::F16,
+            ipc::DType::BF16 => Self::BF16,
+            ipc::DType::F32 => Self::F32,
+        }
+    }
+}
+
+impl ElementType {
+    /// The kernel operand type of this storage element, when one describes it.
+    ///
+    /// `None` for the storage-only elements: an initialized flag, an 8- or
+    /// 16-bit integer, an unsigned index, a double, or the second FP8 spelling
+    /// a checkpoint uses. A view handed to a kernel must go through this, so a
+    /// storage type no kernel reads never becomes a silently wrong operand.
+    pub fn to_ops(self) -> Option<ops::DType> {
+        match self {
+            Self::U8 => Some(ops::DType::U8),
+            Self::I32 => Some(ops::DType::I32),
+            Self::I64 => Some(ops::DType::I64),
+            Self::F16 => Some(ops::DType::F16),
+            Self::BF16 => Some(ops::DType::BF16),
+            Self::F32 => Some(ops::DType::F32),
+            Self::F8E4M3 => Some(ops::DType::F8E4M3),
+            Self::Bool | Self::I8 | Self::I16 | Self::U32 | Self::F64 | Self::F8E5M2 => None,
+        }
+    }
+
+    /// The storage element a kernel operand type is stored as, when a storage
+    /// plane can hold it.
+    ///
+    /// `None` for [`ops::DType::F4E2M1`]: a packed 4-bit operand exists only as
+    /// a kernel operand. Screen storage counts bytes as elements times a whole
+    /// element size, so a plane of packed nibbles would silently halve every
+    /// byte count it feeds; such a plane is declared as its container bytes
+    /// with the packed dtype named in the descriptor instead.
+    pub fn from_kernel(dtype: ops::DType) -> Option<Self> {
+        Some(match dtype {
+            ops::DType::U8 => Self::U8,
+            ops::DType::I32 => Self::I32,
+            ops::DType::I64 => Self::I64,
+            ops::DType::F16 => Self::F16,
+            ops::DType::BF16 => Self::BF16,
+            ops::DType::F32 => Self::F32,
+            ops::DType::F8E4M3 => Self::F8E4M3,
+            ops::DType::F4E2M1 => return None,
+        })
+    }
+}
+
+/// The message dtype of a storage element type, for the element types messages
+/// carry.
+impl TryFrom<ElementType> for ipc::DType {
+    type Error = crate::Error;
+
+    fn try_from(dtype: ElementType) -> Result<Self> {
+        Ok(match dtype {
+            ElementType::U8 => Self::U8,
+            ElementType::I16 => Self::I16,
+            ElementType::I32 => Self::I32,
+            ElementType::I64 => Self::I64,
+            ElementType::F16 => Self::F16,
+            ElementType::BF16 => Self::BF16,
+            ElementType::F32 => Self::F32,
+            other => {
+                return Err(crate::Error::Unsupported(format!(
+                    "{} has no message dtype",
+                    other.name()
+                )));
+            }
+        })
+    }
+}
+
+/// Storage a view can borrow: a device buffer, a host allocation or a segment
+/// of either. Implementors keep the bytes valid and unmoved for as long as the
+/// value is alive.
+
+/// Where a storage lives: the host, page-locked host storage, or a device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MemoryKind {
+    Host,
+    /// Page-locked host storage, readable by CUDA copies.
+    PinnedHost,
+    Cuda(DeviceId),
+}
+
+impl MemoryKind {
+    /// The CUDA device of device storage.
+    pub fn cuda(self) -> Option<DeviceId> {
+        match self {
+            Self::Cuda(device) => Some(device),
+            Self::Host | Self::PinnedHost => None,
+        }
+    }
+
+    /// The locator spelling of transfer peers (`cuda:<ordinal>`, or `cpu` for
+    /// host storage of either kind), which consumers read back with
+    /// [`Self::from_locator`].
+    pub fn locator_name(self) -> String {
+        match self {
+            Self::Cuda(device) => format!("cuda:{}", device.0),
+            Self::Host | Self::PinnedHost => "cpu".to_owned(),
+        }
+    }
+
+    /// The storage kind a transfer locator names; `cpu` is plain host storage.
+    pub fn from_locator(locator: &str) -> Result<Self> {
+        if locator == "cpu" {
+            return Ok(Self::Host);
+        }
+        match locator.strip_prefix("cuda:") {
+            Some(ordinal) => ordinal
+                .parse::<i32>()
+                .map(|ordinal| Self::Cuda(DeviceId(ordinal)))
+                .map_err(|_| {
+                    crate::Error::Invalid(format!("transfer locator {locator:?} names no device"))
+                }),
+            None => Err(crate::Error::Invalid(format!(
+                "transfer locator {locator:?} names no storage kind"
+            ))),
+        }
+    }
+}
+
+pub trait Backing: Send + Sync + 'static {
+    fn device(&self) -> MemoryKind;
+    /// Base address: a device pointer for CUDA storage, a host pointer
+    /// otherwise.
+    fn address(&self) -> u64;
+    /// Length of the allocation in bytes.
+    fn bytes(&self) -> usize;
+    /// The most bytes one copy may address in this storage: the length of a
+    /// segment of storage mapped in segments that are unmapped apart, where
+    /// the driver refuses a copy whose range holds an unmapped segment.
+    fn copy_span(&self) -> u64 {
+        u64::MAX
+    }
+}
+
+pub fn contiguous_strides(shape: &[i64]) -> Vec<i64> {
+    let mut strides = vec![1; shape.len()];
+    for axis in (0..shape.len().saturating_sub(1)).rev() {
+        strides[axis] = strides[axis + 1] * shape[axis + 1];
+    }
+    strides
+}
 
 /// One allocation owned by the worker: device storage, page-locked or
 /// pageable host storage, or a mapping of storage another process exported.
@@ -657,7 +899,7 @@ impl Backing for Storage {
 pub struct StorageView {
     storage: Arc<dyn Backing>,
     offset: usize,
-    dtype: DType,
+    dtype: ElementType,
     shape: Vec<i64>,
     strides: Vec<i64>,
 }
@@ -687,7 +929,7 @@ impl StorageView {
     pub fn contiguous(
         storage: Arc<dyn Backing>,
         offset: usize,
-        dtype: DType,
+        dtype: ElementType,
         shape: &[i64],
     ) -> Result<Self> {
         Self::strided(storage, offset, dtype, shape, &contiguous_strides(shape))
@@ -696,7 +938,7 @@ impl StorageView {
     pub(crate) fn strided(
         storage: Arc<dyn Backing>,
         offset: usize,
-        dtype: DType,
+        dtype: ElementType,
         shape: &[i64],
         strides: &[i64],
     ) -> Result<Self> {
@@ -729,7 +971,7 @@ impl StorageView {
     }
 
     /// A whole allocation viewed as `[len / dtype.bytes()]` elements.
-    pub fn whole(storage: Arc<dyn Backing>, dtype: DType) -> Result<Self> {
+    pub fn whole(storage: Arc<dyn Backing>, dtype: ElementType) -> Result<Self> {
         let elements = storage.bytes() / dtype.bytes();
         Self::contiguous(storage, 0, dtype, &[elements as i64])
     }
@@ -748,7 +990,7 @@ impl StorageView {
         self.storage.device()
     }
 
-    pub fn dtype(&self) -> DType {
+    pub fn dtype(&self) -> ElementType {
         self.dtype
     }
 
@@ -941,10 +1183,14 @@ mod tests {
     #[test]
     fn views_stay_inside_their_allocation() -> Result<()> {
         let storage: Arc<dyn Backing> = Storage::host(64);
-        assert!(StorageView::contiguous(Arc::clone(&storage), 0, DType::F32, &[4, 4]).is_ok());
-        assert!(StorageView::contiguous(Arc::clone(&storage), 4, DType::F32, &[4, 4]).is_err());
+        assert!(
+            StorageView::contiguous(Arc::clone(&storage), 0, ElementType::F32, &[4, 4]).is_ok()
+        );
+        assert!(
+            StorageView::contiguous(Arc::clone(&storage), 4, ElementType::F32, &[4, 4]).is_err()
+        );
 
-        let rows = StorageView::contiguous(Arc::clone(&storage), 0, DType::I64, &[8])?;
+        let rows = StorageView::contiguous(Arc::clone(&storage), 0, ElementType::I64, &[8])?;
         assert_eq!(rows.narrow(0, 0, 3)?.byte_len()?, 24);
         assert!(rows.narrow(0, 0, 9).is_err());
         Ok(())
@@ -954,7 +1200,7 @@ mod tests {
     fn regions_select_and_transposes_address_the_same_elements() -> Result<()> {
         let storage: Arc<dyn Backing> = Storage::host(4 * 6 * 4);
         let base = storage.address();
-        let grid = StorageView::contiguous(Arc::clone(&storage), 0, DType::F32, &[4, 6])?;
+        let grid = StorageView::contiguous(Arc::clone(&storage), 0, ElementType::F32, &[4, 6])?;
 
         let window = grid.region(&[1..3, 2..5])?;
         assert_eq!(window.shape(), &[2, 3]);
@@ -969,7 +1215,7 @@ mod tests {
             (column.shape(), column.strides()),
             (&[4_i64][..], &[6_i64][..])
         );
-        let transposed = StorageView::strided(storage, 0, DType::F32, &[6, 4], &[1, 6])?;
+        let transposed = StorageView::strided(storage, 0, ElementType::F32, &[6, 4], &[1, 6])?;
         assert_eq!(transposed.shape(), &[6, 4]);
         // A transposed view addresses the same bytes: one contiguous interval.
         assert_eq!(transposed.intervals(), vec![base..base + 96]);
@@ -980,15 +1226,76 @@ mod tests {
     #[test]
     fn dtype_names_round_trip() -> Result<()> {
         for dtype in [
-            DType::Bool,
-            DType::U8,
-            DType::BF16,
-            DType::F8E4M3,
-            DType::F64,
+            ElementType::Bool,
+            ElementType::U8,
+            ElementType::BF16,
+            ElementType::F8E4M3,
+            ElementType::F64,
         ] {
-            assert_eq!(DType::parse(dtype.name())?, dtype);
+            assert_eq!(ElementType::parse(dtype.name())?, dtype);
         }
-        assert!(DType::parse("complex64").is_err());
+        assert!(ElementType::parse("complex64").is_err());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod element_type_tests {
+    use super::ElementType;
+
+    /// The eight element types the kernel ABI describes, and the six storage
+    /// carries that no kernel operand names.
+    const KERNEL: [ElementType; 7] = [
+        ElementType::U8,
+        ElementType::I32,
+        ElementType::I64,
+        ElementType::F16,
+        ElementType::BF16,
+        ElementType::F32,
+        ElementType::F8E4M3,
+    ];
+    const STORAGE_ONLY: [ElementType; 6] = [
+        ElementType::Bool,
+        ElementType::I8,
+        ElementType::I16,
+        ElementType::U32,
+        ElementType::F64,
+        ElementType::F8E5M2,
+    ];
+
+    #[test]
+    fn only_the_kernel_element_types_reach_a_kernel_operand() {
+        for element in KERNEL {
+            assert!(
+                element.to_ops().is_some(),
+                "{element:?} is a kernel element type"
+            );
+        }
+        for element in STORAGE_ONLY {
+            assert!(
+                element.to_ops().is_none(),
+                "{element:?} has no kernel operand type and must not become one"
+            );
+        }
+    }
+
+    #[test]
+    fn every_storable_kernel_element_type_round_trips_and_packed_fp4_has_no_plane() {
+        let storable = [
+            ops::DType::U8,
+            ops::DType::I32,
+            ops::DType::I64,
+            ops::DType::F16,
+            ops::DType::BF16,
+            ops::DType::F32,
+            ops::DType::F8E4M3,
+        ];
+        for dtype in storable {
+            let element = ElementType::from_kernel(dtype)
+                .unwrap_or_else(|| panic!("{dtype:?} is a storage element too"));
+            assert_eq!(element.to_ops(), Some(dtype), "{dtype:?} must round-trip");
+        }
+        // A packed 4-bit operand is a kernel operand only: no plane of it exists.
+        assert_eq!(ElementType::from_kernel(ops::DType::F4E2M1), None);
     }
 }

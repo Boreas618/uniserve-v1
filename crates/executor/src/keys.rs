@@ -27,7 +27,7 @@ use std::path::Path;
 use sha2::{Digest as _, Sha256};
 use storage::Key;
 
-use crate::tensor::DType;
+use crate::memory::allocation::ElementType as StorageElement;
 
 /// Domain tag of retained weights, so a key of one kind never equals a key of
 /// another kind with the same inputs.
@@ -164,7 +164,7 @@ fn now_ns() -> i128 {
 /// §8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ElementType<'a> {
-    pub dtype: DType,
+    pub dtype: StorageElement,
     /// The quantization method the checkpoint declares or the configuration
     /// names, as SGLang spells it (`fp8`, `modelopt_fp4`, ...); `None` for a
     /// dense load.
@@ -199,7 +199,7 @@ pub struct KvLayout {
     /// Tokens one page holds.
     pub page_tokens: u32,
     /// Element type of a page's entries.
-    pub element: DType,
+    pub element: StorageElement,
 }
 
 /// The epoch's split shape: how the model's tensors and sequence are divided
@@ -320,12 +320,12 @@ mod tests {
     fn representation() -> Representation<'static> {
         Representation {
             element: ElementType {
-                dtype: DType::BF16,
+                dtype: StorageElement::BF16,
                 quantization: None,
             },
             kv: KvLayout {
                 page_tokens: 64,
-                element: DType::BF16,
+                element: StorageElement::BF16,
             },
         }
     }
@@ -369,7 +369,7 @@ mod tests {
             weight_key(
                 std::slice::from_ref(&file),
                 ElementType {
-                    dtype: DType::F32,
+                    dtype: StorageElement::F32,
                     quantization: None,
                 },
                 "row-parallel",
@@ -378,7 +378,7 @@ mod tests {
             weight_key(
                 std::slice::from_ref(&file),
                 ElementType {
-                    dtype: DType::BF16,
+                    dtype: StorageElement::BF16,
                     quantization: Some("fp8"),
                 },
                 "row-parallel",
@@ -457,7 +457,7 @@ mod tests {
                 TokenPrefix([1; 32]),
                 &Representation {
                     element: ElementType {
-                        dtype: DType::BF16,
+                        dtype: StorageElement::BF16,
                         quantization: Some("modelopt_fp4"),
                     },
                     ..representation
@@ -487,7 +487,7 @@ mod tests {
                 &Representation {
                     kv: KvLayout {
                         page_tokens: 64,
-                        element: DType::F8E4M3,
+                        element: StorageElement::F8E4M3,
                     },
                     ..representation
                 },

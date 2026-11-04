@@ -26,7 +26,8 @@ use super::{Spans, Transports, copy_planner};
 use crate::memory::allocation::{Storage, StorageView};
 use crate::memory::{CachePlanes, GroupTable, TransferBases, UnitAccesses};
 use crate::stream::Issue;
-use crate::tensor::{Backing, DType};
+use crate::memory::allocation::Backing;
+use crate::memory::allocation::ElementType;
 use crate::{Error, Result};
 
 /// The pages a token interval touches: `(absolute page, offset, length)`.
@@ -410,7 +411,7 @@ fn export_group(
                 let source = Spans::single(StorageView::contiguous(
                     storage as Arc<dyn Backing>,
                     0,
-                    DType::F32,
+                    ElementType::F32,
                     &[pages.len() as i64, 1, i64::from(columns), 1],
                 )?)?;
                 let offset = [
@@ -530,8 +531,8 @@ mod tests {
                 total_kv_heads: heads as u32,
                 kv_head_offset: 0,
                 head_dim: dims as u32,
-                dtype: DType::F8E4M3,
-                compute_dtype: DType::BF16,
+                dtype: ElementType::F8E4M3,
+                compute_dtype: ElementType::BF16,
             }],
             states: Vec::new(),
             checkpoints: Vec::new(),
@@ -704,8 +705,8 @@ mod tests {
                     total_kv_heads: 2,
                     kv_head_offset: 0,
                     head_dim,
-                    dtype: DType::BF16,
-                    compute_dtype: DType::BF16,
+                    dtype: ElementType::BF16,
+                    compute_dtype: ElementType::BF16,
                 }],
                 states: Vec::new(),
                 checkpoints: Vec::new(),
