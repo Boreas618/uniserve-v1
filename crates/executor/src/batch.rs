@@ -78,6 +78,14 @@ pub struct CallOutput {
     pub prompt_logprobs: Vec<Vec<ipc::TokenLogprob>>,
     /// A token-denoising readout's candidate log-probabilities, in its own candidate order.
     pub candidate_logprobs: Vec<f32>,
+    /// The finished artifact and its storage lifetime, when the call produced one.
+    pub media_output: Option<ipc::MediaOutput>,
+    /// The physical cache export, when the call publishes one.
+    pub cache_output: Option<ipc::CacheTransfer>,
+    /// The drafter's proposals after the last committed token.
+    pub draft_token_ids: Vec<u32>,
+    /// A video latent preparation's per-rank page layout.
+    pub latent_layouts: Vec<ipc::RankLatentLayout>,
 }
 
 impl CallOutput {
@@ -96,6 +104,12 @@ impl CallOutput {
             token_logprobs: Vec::new(),
             prompt_logprobs: Vec::new(),
             candidate_logprobs: Vec::new(),
+            // A text call produces no artifact, publishes no export, drafts no token and lays out
+            // no latent page: the mechanism reads these as empty, which is what happened.
+            media_output: None,
+            cache_output: None,
+            draft_token_ids: Vec::new(),
+            latent_layouts: Vec::new(),
         }
     }
 }
