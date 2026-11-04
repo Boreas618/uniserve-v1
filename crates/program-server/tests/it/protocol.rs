@@ -206,6 +206,8 @@ fn a_module_comes_back_with_its_files_over_their_descriptors() {
                             name: "module.cubin".into(),
                             size: "the cubin bytes".len() as u64,
                         }],
+                        entry: String::new(),
+                        metadata: "metadata.json".into(),
                     })),
                 },
                 &[OwnedFd::from(file)],
@@ -227,6 +229,8 @@ fn a_module_comes_back_with_its_files_over_their_descriptors() {
     assert_eq!(module.files.len(), 1);
     assert_eq!(module.files[0].name, "module.cubin");
     assert_eq!(module.files[0].size, "the cubin bytes".len() as u64);
+    assert_eq!(module.metadata.as_deref(), Some("metadata.json"));
+    assert_eq!(module.entry, None);
     let mut bytes = Vec::new();
     let mut file = &module.files[0].file;
     file.seek(SeekFrom::Start(0)).unwrap();

@@ -130,11 +130,17 @@ pub struct ModuleFile {
     pub file: std::fs::File,
 }
 
-/// A module the Program Server resolved: its form and its files.
+/// A module the Program Server resolved: its form, its files, and what the
+/// main process needs to launch it (design sections 4.2 and 5.3).
 #[derive(Debug)]
 pub struct Module {
     pub form: ModuleForm,
     pub files: Vec<ModuleFile>,
+    /// A cubin module's launch metadata, as the metadata JSON's file name
+    /// among [`Self::files`].
+    pub metadata: Option<String>,
+    /// A native module's C entry symbol, which its package declares.
+    pub entry: Option<String>,
 }
 
 /// One module a listing names.
@@ -622,7 +628,12 @@ impl Client {
                             })
                         })
                         .collect::<Result<Vec<_>>>()?;
-                    return Ok(Module { form, files });
+                    return Ok(Module {
+                        form,
+                        files,
+                        metadata: (!resolved.metadata.is_empty()).then_some(resolved.metadata),
+                        entry: (!resolved.entry.is_empty()).then_some(resolved.entry),
+                    });
                 }
                 wire::server_message::Message::Refused(refused) => {
                     return Err(refused_error(refused));
