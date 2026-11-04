@@ -1691,6 +1691,65 @@ mod tests {
         );
     }
 
+    /// The successor writes the byte stream the predecessor left: the bytes
+    /// it did not write first, then its own frames, then the terminator, and
+    /// it serves the next request on the connection.
+    #[tokio::test]
+    async fn an_adopted_response_continues_the_byte_stream() {
+        let (frames, produced) = mpsc::unbounded_channel();
+        let body = ResponseStream::start(
+            Box::new(TestSession {
+                frames: produced,
+                ended: false,
+            }),
+            false,
+        );
+        // The predecessor wrote the head and one frame, and produced one more
+        // frame that the socket did not take.
+        let (server, client) = pair();
+        let Either::Right(mut predecessor) = server else {
+            unreachable!("a socket pair is a Unix stream")
+        };
+        let mut client = TestClient::new(client);
+        let written = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n9\r\ndata: a\n\n\r\n";
+        predecessor
+            .write_all(written)
+            .await
+            .expect("the predecessor's bytes");
+        let descriptor = predecessor
+            .as_fd()
+            .try_clone_to_owned()
+            .expect("a duplicate of the socket");
+
+        let unwritten = b"9\r\ndata: b\n\n\r\n".to_vec();
+        let http = handoff::Http {
+            keep_alive: true,
+            unwritten: unwritten.clone(),
+            read_ahead: Vec::new(),
+            written: written.len() as u64,
+            frames: 1,
+            chunked: true,
+            content_length: None,
+        };
+        let adopted = tokio::spawn(adopt(descriptor, http, body, app()));
+        frames.send(Bytes::from_static(b"data: c\n\n")).unwrap();
+        drop(frames);
+
+        let response = client.read_response().await;
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, "data: a\n\ndata: b\n\ndata: c\n\n");
+
+        // The connection is kept alive and the successor serves on it.
+        client.send(head("GET /hello HTTP/1.1", "").as_bytes()).await;
+        let next = client.read_response().await;
+        assert_eq!(next.body, "hello");
+        drop(client);
+        adopted
+            .await
+            .expect("the adopting task")
+            .expect("an adopted connection ends quietly");
+    }
+
     /// A pause reaches the connection while the kernel refuses the response:
     /// the bytes it did not accept travel to the successor, and the process is
     /// not held by a client that does not read.
