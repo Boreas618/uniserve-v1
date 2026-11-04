@@ -73,6 +73,7 @@
 //!
 //! They are added to this generator the hour the model names those numbers; nothing else waits.
 
+use minimax_h3::SPLIT_HALF;
 use nn::layers::tiles::{
     ELEMENTWISE_BLOCK, EMBEDDING_TOKENS, LOGITS_BLOCK, PDL, POSITION_BLOCK, QK_NORM_TOKENS,
     ROTARY_BLOCK, ROTATE_BLOCK, ROWS_BLOCK, UNPATCHIFY_BLOCK, row_tile,
@@ -351,9 +352,12 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
     // of the head's rotated columns, and the per-head normalization fused with it.
     //
     // `attention.py` normalizes every query and key head with a *learned* RMSNorm (`affine`) and
-    // rotates the leading 96 channels with neox RoPE over (time, height, width). The table lists one
-    // row per partition: the whole head count, and the Ulysses-2 shard the same block binds at half
-    // the query and key heads.
+    // rotates the leading 96 channels over (time, height, width) **split-half** - its own words
+    // ("its leading 96 channels split-half", `attention.py:94-96`), and what the fused operator does
+    // (`_rope.py:157`, `:258`: `_rotate(part, cosine, sine, "split")`). A neox pairing would rotate
+    // adjacent pairs and give different numbers from the same table, which no shape refuses. The
+    // table lists one row per partition: the whole head count, and the Ulysses-2 shard the same
+    // block binds at half the query and key heads.
     for heads in [HEADS, HEADS / 2] {
         push(
             "qk_norm_rope",
@@ -363,8 +367,9 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
                 head_dim: HEAD_DIM,
                 q_heads: heads,
                 k_heads: heads,
-                // "neox RoPE": adjacent pairs rotate together.
-                rotation: ops::rope::Rotation::Interleaved,
+                // The model's own convention, not a restatement of it: coordinate `i` pairs with
+                // `i + rotated / 2` (`_rope.py:48`).
+                rotation: SPLIT_HALF,
                 epsilon: ops::Float::from(NORM_EPSILON),
                 rotated: ROTATED,
                 rows: QK_NORM_TOKENS,

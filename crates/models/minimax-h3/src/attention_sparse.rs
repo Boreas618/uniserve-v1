@@ -1,4 +1,4 @@
-use nn::layers::{Linear, Rotary, Rotation, Sections, SegmentAttention, SegmentTables, VsaTiles};
+use nn::layers::{Linear, Rotary, Sections, SegmentAttention, SegmentTables, VsaTiles};
 use nn::weights::{Weight, WeightLoader, WeightRequest};
 use nn::{Forward, Shape, TensorView};
 use ops::gemm::WeightOrder;
@@ -95,7 +95,7 @@ impl Sparse {
             local_heads,
             local_heads,
             config.qk_norm_eps,
-            Rotation::Half,
+            crate::SPLIT_HALF,
             1.0,
         )?
         .partial(rotated)?

@@ -54,7 +54,6 @@ use nn::layers::{Attention, Gelu, LayerNorm, Linear, PositionInterpolate, Rotate
 use nn::weights::{WeightLoader, WeightRequest};
 use nn::{Arena, DevicePtr, Forward, Shape, TensorView, Weight};
 use ops::gemm::WeightOrder;
-use ops::rope::Rotation;
 
 use crate::config::{VisionActivation, VisionConfig};
 use crate::decoding::Buffer;
@@ -799,7 +798,7 @@ impl VisionTower {
             position_grid,
             heads,
             head_dim,
-            rotate: Rotate::new(u64::from(head_dim), u64::from(heads), Rotation::Half)
+            rotate: Rotate::new(u64::from(head_dim), u64::from(heads), crate::SPLIT_HALF)
                 .map_err(Error::from)?,
             layers,
             merger: Merger::load(loader, &format!("{PREFIX}.merger"), config, false)?,
