@@ -242,6 +242,7 @@ def tower_calls(vision: dict, dtype: str) -> list[Call]:
     heads = vision["num_heads"]
     head_dim = hidden // heads
     ffn = vision["intermediate_size"]
+    merge = vision["spatial_merge_size"]
     calls: list[Call] = [
         (
             "layer_norm/triton",
@@ -284,6 +285,19 @@ def tower_calls(vision: dict, dtype: str) -> list[Call]:
             "gelu/triton",
             {"dtype": dtype, "columns": str(ffn), "approximate": "tanh"},
             "vision.rs: the MLP's activation",
+        ),
+        (
+            # The merger's activation is a **different** GELU from the MLP's: the reference builds
+            # `nn.GELU()` there and `gelu_pytorch_tanh` in the blocks (`vision.rs:49`), so the key
+            # differs in `approximate` as well as in width - `merge² · hidden` before the first
+            # projection, which is 4608 for this tower against the MLP's 4304.
+            "gelu/triton",
+            {
+                "dtype": dtype,
+                "columns": str(merge * merge * hidden),
+                "approximate": "exact",
+            },
+            "vision.rs: the patch merger's activation",
         ),
     ]
     return calls
