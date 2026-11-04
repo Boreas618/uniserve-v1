@@ -658,7 +658,10 @@ impl MainProcess {
                 ),
             }
         }
-        ProgramStatus::Reverted { generation }
+        ProgramStatus::Reverted {
+            generation,
+            reason: failure.reason(),
+        }
     }
 
     /// §7.3 step 6: release the generation before the serving one, once its last
