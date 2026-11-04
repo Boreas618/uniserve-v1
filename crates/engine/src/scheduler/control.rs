@@ -537,6 +537,20 @@ impl Scheduler {
     /// process named it: the stage then waits for that step and refuses to apply
     /// at any other.
     fn request_stage(&mut self, stage: Stage, answer: Option<handle::StageAnswer>, at: Option<u64>) {
+        // One stage owns the next boundary. A second one is refused with the
+        // first's name rather than replacing it: replacing it would drop the
+        // first caller's answer, and applying both would change the serving
+        // policy twice on one boundary.
+        if let Some((waiting, _, _)) = &self.policy_stage {
+            let waiting = *waiting;
+            if let Some(answer) = answer {
+                answer.send(Err(format!(
+                    "a {} is already waiting for the boundary that applies it",
+                    stage_name(waiting)
+                )));
+            }
+            return;
+        }
         if stage == Stage::Switchover {
             self.take_prepared_policy();
             if self.policy_prepared.is_none() {
