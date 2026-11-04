@@ -605,6 +605,36 @@ impl PrefixCache {
         column.recycle(units, stream)
     }
 
+    /// Reset the given units of every group on `stream`: values and flags
+    /// zero, scales one, so a later import converts those pages again.
+    ///
+    /// The engine releases the units a prefix cache no longer holds as a set,
+    /// so the set may be scattered and out of order; each run of consecutive
+    /// units becomes one fill per column, so a scattered release costs what its
+    /// runs cost and not what its units cost. Unit zero is the block tables'
+    /// sentinel and is refused.
+    pub fn reset_units(&mut self, units: &[u32], stream: impl Issue) -> Result<()> {
+        let mut units = units.to_vec();
+        units.sort_unstable();
+        units.dedup();
+        if units.first() == Some(&0) {
+            return Err(Error::Invalid(
+                "unit zero is the block tables' sentinel and cannot be reset".to_owned(),
+            ));
+        }
+        let mut start = 0;
+        while start < units.len() {
+            let mut end = start + 1;
+            while end < units.len() && units[end] == units[end - 1] + 1 {
+                end += 1;
+            }
+            self.planes
+                .reset_units(units[start], (end - start) as u32, true, stream)?;
+            start = end;
+        }
+        Ok(())
+    }
+
     /// Clear released slots' rows on `stream` (ordered after every batch
     /// that read them) and forget them on the host.
     pub fn release_slots(&mut self, slots: &[u32], stream: impl Issue) -> Result<()> {
