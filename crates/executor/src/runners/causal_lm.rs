@@ -487,6 +487,34 @@ fn commit_descriptor(
     }
 }
 
+/// Every `slot_commit` descriptor a runner of `buckets` can launch, one per distinct block.
+///
+/// The commit is a runner-owned operator: no model calls it, so the epoch's program set does not
+/// contain it unless the runner asks. Its descriptor carries the vocabulary and the launch block
+/// (the smallest power of two covering the bucket's rows) while the table's capacity is the largest
+/// bucket's rows for every bucket, so the keys a deployment needs are one per power of two its
+/// buckets reach - eight for the default catalog.
+pub fn commit_descriptors(
+    buckets: &Buckets,
+    vocabulary: u32,
+) -> Vec<ops::commit::CommitDescriptor> {
+    let capacity = buckets
+        .iter()
+        .map(|bucket| u64::from(bucket.rows))
+        .max()
+        .unwrap_or(1);
+    let mut blocks: Vec<u32> = buckets
+        .iter()
+        .map(|bucket| commit_block(bucket.rows))
+        .collect();
+    blocks.sort_unstable();
+    blocks.dedup();
+    blocks
+        .into_iter()
+        .map(|block| commit_descriptor(capacity, block, vocabulary))
+        .collect()
+}
+
 /// The commit table the device reads, from the mechanism's `[COMMIT_FIELDS, rows]` i64 table.
 ///
 /// The device table is `[COMMIT_FIELDS, capacity]` i32: the staged rows fill its first `rows`
@@ -2188,6 +2216,26 @@ mod tests {
         // A table of the wrong length is refused rather than read past its end.
         assert!(commit_table(&staged[..rows], rows, capacity).is_err());
         Ok(())
+    }
+
+    /// The runner's own operator needs one key per block its buckets reach, not one per bucket:
+    /// the table's capacity is the largest bucket's rows for every bucket, so eight blocks cover
+    /// the default catalog's rows.
+    #[test]
+    fn the_commit_keys_are_one_per_block() {
+        let buckets = Buckets::causal_lm(&[1, 2, 4, 8, 16, 32, 64, 128], &[64, 128], false);
+        let descriptors = commit_descriptors(&buckets, 1_024);
+        let blocks: Vec<u32> = descriptors.iter().map(|descriptor| descriptor.block).collect();
+        assert_eq!(blocks, vec![1, 2, 4, 8, 16, 32, 64, 128]);
+        // One capacity for all of them: the largest bucket's rows, which is the table's stride.
+        for descriptor in &descriptors {
+            assert_eq!(descriptor.stride, 128);
+            assert_eq!(descriptor.vocab, 1_024);
+            assert_eq!(descriptor.index, DType::I32);
+        }
+        // A catalog whose rows are all small needs one key.
+        let small = Buckets::causal_lm(&[1, 3], &[4], false);
+        assert_eq!(commit_descriptors(&small, 1_024).len(), 1);
     }
 
     /// A warm pose's commit table is inert and complete: every column is present, no row names a
