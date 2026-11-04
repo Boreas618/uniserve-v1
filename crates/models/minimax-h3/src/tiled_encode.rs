@@ -179,8 +179,11 @@ impl ClipEncoder {
     /// overwrites row `r - 2`'s, which nothing reads again. One more block holds a tile whose fade is
     /// both ways, because the second fade reads the first's result. A run's first tile row has nothing
     /// above it, so its tiles blend only to the left; a run's first tile has nothing at all to blend
-    /// against, and its block reaches the raster through a blend of `extent` 1, whose only position
-    /// has weight `0 / 1` in the element type and so reproduces the block exactly.
+    /// against, and its block reaches the raster through a blend of `extent` 1. That position takes
+    /// weight one on the **previous** source and zero on the current one
+    /// (`cross_fade.py`: `previous[along - extent + i] · (1 - i/extent) + current[i] · (i/extent)`),
+    /// so the pass-through is exact because the same block is passed as both sources - not because a
+    /// blend of one position ignores one of them.
     pub fn encode(
         &self,
         f: &Forward,
@@ -240,7 +243,10 @@ impl ClipEncoder {
         }
         let handed = f.arena().tensor(DType::F32, block)?;
 
-        // A blend of one position whose weight is `0 / 1`: the block passes through unchanged.
+        // A blend of one position, given the same block twice: weight one on the previous source and
+        // zero on the current one, so `decoded · 1 + decoded · 0` places it unchanged. Passing two
+        // different blocks here would place the previous one, which is why the call below repeats
+        // its view.
         let place = CrossFade::new(DType::F32, 1, 2).map_err(Error::from)?;
 
         for (index, tile) in plan.tiles.iter().enumerate() {
@@ -293,6 +299,8 @@ impl ClipEncoder {
                         .forward(f, Some(left), decoded, placed)?;
                 }
                 (None, None) => {
+                    // The same view twice: at `extent` 1 the previous source carries the whole
+                    // weight, so a differing pair would write `decoded`'s neighbour instead.
                     place.forward(f, Some(decoded), decoded, placed)?;
                 }
             }
