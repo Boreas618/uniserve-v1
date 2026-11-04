@@ -435,6 +435,19 @@ def _prefix_queries(base_url: str) -> float:
     )
 
 
+def _requests_running(base_url: str) -> float:
+    """The requests the schedulers serve now.
+
+    The gauge is ``uniserve:num_requests_running``, reported every second.
+    """
+    text = httpx.get(f"{base_url}/metrics", timeout=10).text
+    return sum(
+        float(line.rsplit(" ", 1)[1])
+        for line in text.splitlines()
+        if line.startswith("uniserve:num_requests_running")
+    )
+
+
 def _wait_until(predicate, timeout_s: float, what: str) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -1076,6 +1089,10 @@ def _restart_while_streaming(
         [len(re.findall(r"\d+", "".join(read))) for read in reads],
     )
 
+    # A one-body chat response in flight at a further restart is written by
+    # its successor too, whole (design 7.5.1: every response in flight moves).
+    _restart_with_a_json_body(base_url, name, log, successors)
+
     # The old daemon exits once its requests ended; the engine and its
     # workers are the same processes throughout.
     _wait_until(
@@ -1173,6 +1190,87 @@ def _restart_while_streaming(
         120,
         "the daemon on the previous address did not exit",
     )
+
+
+#: The prompt of the one-body request the restart test hands over: long enough
+#: that its generation is certainly in flight when the restart pauses it.
+JSON_PROMPT = (
+    "Count from 1 to 1500, separated by commas and spaces. "
+    "Write only the numbers."
+)
+
+
+def _restart_with_a_json_body(
+    base_url: str, name: str, log: Path, successors: list[int]
+) -> None:
+    """A non-streaming chat body in flight across a restart is written whole.
+
+    The body is one response built from a collector's state, so a field lost in
+    the crossing is silent: the request still answers 200 with a response that
+    parses. What catches it is the records — the successor adopted the request
+    and finished it — together with a body whose text is a contiguous count and
+    whose usage adds up.
+    """
+    bodies: list[dict] = []
+    failures: list[BaseException] = []
+
+    def collect() -> None:
+        try:
+            bodies.append(_chat(base_url, name, JSON_PROMPT, tokens=8192))
+        except BaseException as error:  # noqa: BLE001 - a failure is the test's
+            failures.append(error)
+
+    request = threading.Thread(target=collect)
+    request.start()
+    # The restart pauses what the engine serves, so it is issued only once the
+    # one-body request is being served: the schedulers say so, not a sleep.
+    _wait_until(
+        lambda: _requests_running(base_url) >= 1,
+        120,
+        "the one-body request was never served",
+    )
+    restarted = _admin(base_url, "restart")
+    assert restarted.status_code == 200, restarted.text
+    successor = restarted.json()["result"]["pid"]
+    successors.append(successor)
+    request.join(timeout=1800)
+    assert not failures, failures
+    assert bodies, "the one-body request answered nothing"
+    body = bodies[0]
+    assert body["choices"][0]["finish_reason"] not in (None, "migratable"), body
+    text = body["choices"][0]["message"]["content"]
+    numbers = [int(word) for word in re.findall(r"\d+", text)]
+    assert numbers == list(range(1, len(numbers) + 1)), text[:400]
+    assert len(numbers) > 100, text[:400]
+    usage = body["usage"]
+    assert usage["prompt_tokens"] > 0, usage
+    assert usage["completion_tokens"] >= len(numbers), usage
+    assert (
+        usage["total_tokens"]
+        == usage["prompt_tokens"] + usage["completion_tokens"]
+    ), usage
+
+    # The records name that request: frozen here, adopted by the successor at
+    # the pause it measured, and finished there.
+    _wait_until(
+        lambda: len(_handoff_records(log)["finished"]) >= 1,
+        300,
+        "the successor did not finish the handed-over body",
+    )
+    records = _handoff_records(log)
+    frozen = records["frozen"]
+    adopted = records["adopted"]
+    finished = records["finished"]
+    assert len(frozen) == 1, frozen
+    assert frozen[0]["adopted"], frozen
+    assert frozen[0]["successor_pid"] == successor, frozen
+    assert frozen[0]["pause_ms"] >= 0, frozen
+    assert [record["request_id"] for record in adopted] == [
+        frozen[0]["request_id"]
+    ], (adopted, frozen)
+    assert adopted[0]["pid"] == successor, adopted
+    assert finished[0]["pid"] == successor, finished
+    assert finished[0]["at_ns"] > adopted[0]["at_ns"], (adopted, finished)
 
 
 def _storage_pid(runtime: Path) -> int:
