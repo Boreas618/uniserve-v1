@@ -293,10 +293,7 @@ def main() -> int:
         f"in {tuple(x.shape)} filter {tuple(weight.shape)} out {tuple(out_shape)}, "
         f"{taps} taps"
     )
-    print(
-        f"max |out - exact| = {worst:.6g}, "
-        f"largest value {largest:.6g}"
-    )
+    print(f"max |out - exact| = {worst:.6g}, largest value {largest:.6g}")
     print(
         f"operator's bound {fp32:.3g} relative; with TF32 permitted {tf32:.3g}"
     )

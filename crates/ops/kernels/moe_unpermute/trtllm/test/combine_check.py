@@ -32,6 +32,7 @@ The reference accumulates in the operator's order and rounds once; rows are comp
 """
 
 import argparse
+import os
 import ctypes
 import math
 import pathlib
@@ -39,7 +40,57 @@ import sys
 
 import torch
 
-DTYPES = {"bf16": (4, torch.bfloat16), "f16": (3, torch.float16), "f32": (5, torch.float32)}
+DTYPES = {
+    "bf16": (4, torch.bfloat16),
+    "f16": (3, torch.float16),
+    "f32": (5, torch.float32),
+}
+
+
+#: The fixture's descriptor: the cell this package serves, and the module a no-argument run uses.
+FIXTURE_KEY = "hidden_2048_top_8_experts_128_input_bf16_scales_f32_output_bf16"
+
+
+def find_module(op, backend, key):
+    """The directory holding `module.so` for a descriptor, so a bare run needs no argument.
+
+    Searched in the order a caller is likely to have it: `$UNISERVE_PROGRAM_STORE` or
+    `$UNISERVE_MODULE_DIR` if set, then a store under the working tree (`.local/`, `artifacts/`,
+    `target/`), then the cache. Failing that the message names the argument instead of guessing.
+    """
+    roots = [
+        pathlib.Path(value)
+        for value in (
+            os.environ.get("UNISERVE_PROGRAM_STORE"),
+            os.environ.get("UNISERVE_MODULE_DIR"),
+            os.environ.get("UNISERVE_STORE"),
+        )
+        if value
+    ]
+    here = pathlib.Path.cwd()
+    roots += [
+        here / ".local",
+        here / "artifacts",
+        here / "target",
+        pathlib.Path.home() / ".cache/uniserve",
+    ]
+    patterns = (
+        f"**/modules/{op}/{backend}/*/sm_*/{key}/module.so",
+        f"**/{op}/{backend}/*/sm_*/{key}/module.so",
+        f"**/{op}/**/{key}/module.so",
+    )
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for pattern in patterns:
+            for hit in sorted(
+                root.glob(pattern.format(op=op, backend=backend, key=key))
+            ):
+                return hit.parent
+    raise SystemExit(
+        f"no module for {op} {key} was found under {[str(root) for root in roots]}: pass the "
+        f"directory `resolve` hands a runner, or set $UNISERVE_PROGRAM_STORE"
+    )
 
 
 class Call(ctypes.Structure):
@@ -81,8 +132,19 @@ def bound(top, output_roundoff):
     return 2.0 * gamma(top, 2.0**-24) * math.sqrt(top) + output_roundoff
 
 
-def run(entry, stream, *, tokens, top, hidden, input_dtype, scales_dtype, output_dtype, dropped,
-        seed=0):
+def run(
+    entry,
+    stream,
+    *,
+    tokens,
+    top,
+    hidden,
+    input_dtype,
+    scales_dtype,
+    output_dtype,
+    dropped,
+    seed=0,
+):
     """One launch and the operator's reference; `dropped` is a set of `(token, route)` to skip."""
     torch.manual_seed(seed)
     device = torch.device("cuda")
@@ -91,19 +153,22 @@ def run(entry, stream, *, tokens, top, hidden, input_dtype, scales_dtype, output
     out_code, out_element = DTYPES[output_dtype]
 
     routes_rows = tokens * top
-    routes = (torch.randn(routes_rows, hidden, dtype=torch.float32, device=device) * 0.5).to(
-        in_element
-    )
-    scales = (torch.randn(tokens, top, dtype=torch.float32, device=device) * 0.5).to(
-        scales_element
-    )
+    routes = (
+        torch.randn(routes_rows, hidden, dtype=torch.float32, device=device)
+        * 0.5
+    ).to(in_element)
+    scales = (
+        torch.randn(tokens, top, dtype=torch.float32, device=device) * 0.5
+    ).to(scales_element)
     # A permutation of the expanded rows, so a kernel that read `t · top + k` instead of the map
     # would read the wrong route on almost every entry.
     permuted = torch.randperm(routes_rows, device=device).to(torch.int32)
     mapping = permuted.reshape(tokens, top).clone()
     for token, route in dropped:
         mapping[token, route] = -1
-    out = torch.full((tokens, hidden), float("nan"), dtype=out_element, device=device)
+    out = torch.full(
+        (tokens, hidden), float("nan"), dtype=out_element, device=device
+    )
     routes_before, scales_before = routes.clone(), scales.clone()
 
     call = Call(
@@ -123,10 +188,16 @@ def run(entry, stream, *, tokens, top, hidden, input_dtype, scales_dtype, output
     status = entry(ctypes.byref(call), stream)
     if status != 0:
         message = call.error.decode("utf-8", "replace").rstrip("\x00")
-        raise SystemExit(f"the module refused the call with status {status}: {message}")
+        raise SystemExit(
+            f"the module refused the call with status {status}: {message}"
+        )
 
-    if not torch.equal(routes, routes_before) or not torch.equal(scales, scales_before):
-        raise SystemExit("the module wrote into its inputs; the combine writes only `out`")
+    if not torch.equal(routes, routes_before) or not torch.equal(
+        scales, scales_before
+    ):
+        raise SystemExit(
+            "the module wrote into its inputs; the combine writes only `out`"
+        )
 
     # The operator's sum, in route order, in FP32, rounded once.
     total = torch.zeros(tokens, hidden, dtype=torch.float32, device=device)
@@ -134,13 +205,23 @@ def run(entry, stream, *, tokens, top, hidden, input_dtype, scales_dtype, output
         row = mapping[:, route].to(torch.int64)
         visible = row >= 0
         safe = row.clamp_min(0)
-        product = routes[safe].to(torch.float32) * scales[:, route].to(torch.float32)[:, None]
-        total = total + torch.where(visible[:, None], product, torch.zeros_like(product))
+        product = (
+            routes[safe].to(torch.float32)
+            * scales[:, route].to(torch.float32)[:, None]
+        )
+        total = total + torch.where(
+            visible[:, None], product, torch.zeros_like(product)
+        )
     expected = total.to(out_element)
 
     got = out.to(torch.float32)
     want = expected.to(torch.float32)
-    rounding = 2.0 ** {torch.bfloat16: -8, torch.float16: -11, torch.float32: -24}[out_element]
+    rounding = (
+        2.0
+        ** {torch.bfloat16: -8, torch.float16: -11, torch.float32: -24}[
+            out_element
+        ]
+    )
     relative = bound(top, rounding)
     allowed = relative * want.abs()
     error = (got - want).abs()
@@ -161,7 +242,9 @@ def run(entry, stream, *, tokens, top, hidden, input_dtype, scales_dtype, output
         f"bound rtol {relative:.3e}"
     )
     if violations:
-        position = int((~(error[~empty] <= allowed[~empty])).reshape(-1).nonzero()[0])
+        position = int(
+            (~(error[~empty] <= allowed[~empty])).reshape(-1).nonzero()[0]
+        )
         raise SystemExit(
             f"{violations} of {int((~empty).sum()) * hidden} combined values are outside the bound; "
             f"first at {position}"
@@ -171,7 +254,20 @@ def run(entry, stream, *, tokens, top, hidden, input_dtype, scales_dtype, output
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("module", type=pathlib.Path, help="the module directory resolve hands a runner")
+    parser.add_argument(
+        "module",
+        type=pathlib.Path,
+        nargs="?",
+        default=None,
+        help="the module directory `resolve` hands a runner; omitted, the fixture's own module is "
+        "found under $UNISERVE_PROGRAM_STORE or a store in the working tree",
+    )
+    parser.add_argument(
+        "--expect-key",
+        default=FIXTURE_KEY,
+        help="the descriptor key the module directory must carry — a check that silently ran "
+        "another descriptor's module would otherwise pass as evidence for this one",
+    )
     parser.add_argument("--tokens", type=int, default=256)
     parser.add_argument("--top", type=int, default=8)
     parser.add_argument("--hidden", type=int, default=2048)
@@ -184,7 +280,19 @@ def main() -> int:
         raise SystemExit(
             "this module is a compiled native library: it needs the device it was built for"
         )
-    library = ctypes.CDLL(str(options.module / "module.so"))
+    module = options.module or find_module(
+        "moe_unpermute", "trtllm", options.expect_key
+    )
+    if options.expect_key and module.name != options.expect_key:
+        raise SystemExit(
+            f"{module} is not the descriptor this check measures: it carries "
+            f"{module.name!r}, and --expect-key says {options.expect_key!r}"
+        )
+    if not (module / "module.so").is_file():
+        raise SystemExit(
+            f"{module} holds no module.so, so there is nothing to call"
+        )
+    library = ctypes.CDLL(str(module / "module.so"))
     entry = library.uniserve_moe_unpermute
     entry.argtypes = [ctypes.POINTER(Call), ctypes.c_void_p]
     entry.restype = ctypes.c_int32
@@ -192,8 +300,12 @@ def main() -> int:
 
     tokens, top, hidden = options.tokens, options.top, options.hidden
     shapes = dict(
-        tokens=tokens, top=top, hidden=hidden, input_dtype=options.input,
-        scales_dtype=options.scales, output_dtype=options.output,
+        tokens=tokens,
+        top=top,
+        hidden=hidden,
+        input_dtype=options.input,
+        scales_dtype=options.scales,
+        output_dtype=options.output,
     )
     checked = 0
     # A rank that holds every route but one per token, and one token that holds none.
@@ -207,10 +319,18 @@ def main() -> int:
     checked += run(entry, stream, dropped=set(), **shapes)
     # Only the middle routes dropped, so the skip cannot fall at the ends of the loop.
     checked += run(
-        entry, stream, dropped={(token, route) for token in range(tokens)
-                                for route in range(1, top - 1, 2)}, **shapes
+        entry,
+        stream,
+        dropped={
+            (token, route)
+            for token in range(tokens)
+            for route in range(1, top - 1, 2)
+        },
+        **shapes,
     )
-    print(f"ok: {checked} combined values over three route patterns, within dot(top)'s bound")
+    print(
+        f"ok: {checked} combined values over three route patterns, within dot(top)'s bound"
+    )
     return 0
 
 
