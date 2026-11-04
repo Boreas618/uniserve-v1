@@ -650,6 +650,10 @@ pub struct GatherGemmNvfp4Args {
     /// `[tokens, hidden/16]` the activations' block scales, one per sixteen elements of the
     /// contraction, of the descriptor's `scale` type in its `layout`.
     pub hidden_scale: TensorView,
+    /// `[tokens]` f32: the encoder's per-token scale factor. The artifact's FP4 kernels carry one
+    /// beside the block scales (`Bb16tokFp32`), and it is the product's `perTokenScales` argument:
+    /// a caller that passes the block scales alone leaves the kernel reading a null table.
+    pub hidden_token_scale: TensorView,
     /// `[experts, 2·intermediate, hidden/2]` U8: two E2M1 codes a byte along the contraction.
     pub weights: TensorView,
     /// `[experts, ...]` the block scales in the descriptor's layout, one per sixteen elements.
@@ -717,6 +721,8 @@ pub struct GatherNvfp4Call {
     pub hidden: *const c_void,
     /// The activations' block scales.
     pub hidden_scale: *const c_void,
+    /// `[tokens]` f32: the encoder's per-token scale factor.
+    pub hidden_token_scale: *const c_void,
     /// `[experts, 2·intermediate, hidden/2]` U8: two E2M1 codes a byte.
     pub weights: *const c_void,
     /// The block scales, one per sixteen elements of the contraction.
@@ -769,6 +775,7 @@ pub struct GatherNvfp4Call {
 pub struct GatherNvfp4CallLayout {
     pub size: usize,
     pub hidden_scale: usize,
+    pub hidden_token_scale: usize,
     pub global_scale: usize,
     pub global_scale_gate: usize,
     pub workspace: usize,
@@ -780,14 +787,15 @@ pub struct GatherNvfp4CallLayout {
 impl GatherNvfp4Call {
     /// The offsets the C header must agree with.
     pub const LAYOUT: GatherNvfp4CallLayout = GatherNvfp4CallLayout {
-        size: 712,
+        size: 720,
         hidden_scale: 8,
-        global_scale: 32,
-        global_scale_gate: 40,
-        workspace: 96,
-        workspace_bytes: 104,
-        dtype: 192,
-        error: 200,
+        hidden_token_scale: 16,
+        global_scale: 40,
+        global_scale_gate: 48,
+        workspace: 104,
+        workspace_bytes: 112,
+        dtype: 200,
+        error: 208,
     };
 }
 
@@ -804,6 +812,8 @@ pub struct RouteNvfp4Call {
     pub hidden: *const c_void,
     /// The rows' block scales.
     pub hidden_scale: *const c_void,
+    /// `[routes]` f32: the encoder's per-token scale factor.
+    pub hidden_token_scale: *const c_void,
     /// `[experts, hidden, intermediate/2]` U8: two E2M1 codes a byte.
     pub weights: *const c_void,
     /// The block scales, one per sixteen elements of the contraction.
@@ -849,13 +859,14 @@ pub struct RouteNvfp4Call {
 impl RouteNvfp4Call {
     /// The offsets the C header must agree with.
     pub const LAYOUT: RouteNvfp4CallLayout = RouteNvfp4CallLayout {
-        size: 688,
+        size: 696,
         hidden_scale: 8,
-        global_scale: 32,
-        workspace: 88,
-        workspace_bytes: 96,
-        dtype: 168,
-        error: 176,
+        hidden_token_scale: 16,
+        global_scale: 40,
+        workspace: 96,
+        workspace_bytes: 104,
+        dtype: 176,
+        error: 184,
     };
 }
 
@@ -863,6 +874,7 @@ impl RouteNvfp4Call {
 pub struct RouteNvfp4CallLayout {
     pub size: usize,
     pub hidden_scale: usize,
+    pub hidden_token_scale: usize,
     pub global_scale: usize,
     pub workspace: usize,
     pub workspace_bytes: usize,
@@ -929,6 +941,18 @@ impl GatherGemmNvfp4 {
                 format!(
                     "expected {} activation block scales, found {}",
                     descriptor.scale, args.hidden_scale.dtype
+                ),
+            ));
+        }
+        args.hidden_token_scale
+            .require_shape(Self::NAME, Shape::new(&[tokens]))?;
+        if args.hidden_token_scale.dtype != DType::F32 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "expected one f32 per-token scale, found {}: the artifact's FP4 kernels read the \
+                     encoder's per-token factor beside the block scales",
+                    args.hidden_token_scale.dtype
                 ),
             ));
         }
@@ -1078,6 +1102,7 @@ impl Op for GatherGemmNvfp4 {
         let mut call = GatherNvfp4Call {
             hidden: address(args.hidden.ptr) as usize as *const c_void,
             hidden_scale: address(args.hidden_scale.ptr) as usize as *const c_void,
+            hidden_token_scale: address(args.hidden_token_scale.ptr) as usize as *const c_void,
             weights: address(args.weights.ptr) as usize as *const c_void,
             scales: address(args.scales.ptr) as usize as *const c_void,
             global_scale: address(args.global_scale.ptr) as usize as *const c_void,
@@ -1315,6 +1340,8 @@ pub struct RouteGemmNvfp4Args {
     /// The rows' block scales, one per sixteen elements of the contraction, of the descriptor's
     /// `scale` type in its `layout`.
     pub hidden_scale: TensorView,
+    /// `[routes]` f32: the encoder's per-token scale factor, beside the block scales.
+    pub hidden_token_scale: TensorView,
     /// `[experts, hidden, intermediate/2]` U8: two E2M1 codes a byte along the contraction.
     pub weights: TensorView,
     /// The block scales, one per sixteen elements of the contraction and one row per output row.
@@ -1407,6 +1434,17 @@ impl Op for RouteGemmNvfp4 {
                 ),
             ));
         }
+        args.hidden_token_scale
+            .require_shape(Self::NAME, Shape::new(&[routes]))?;
+        if args.hidden_token_scale.dtype != DType::F32 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "expected one f32 per-token scale per route, found {}",
+                    args.hidden_token_scale.dtype
+                ),
+            ));
+        }
         let row_blocks = intermediate.div_ceil(u64::from(crate::fp4::BLOCK_ELEMENTS));
         let covered: u64 = args.hidden_scale.shape.dims().iter().product();
         if covered < routes * row_blocks {
@@ -1483,6 +1521,7 @@ impl Op for RouteGemmNvfp4 {
         let mut call = RouteNvfp4Call {
             hidden: address(args.hidden.ptr) as usize as *const c_void,
             hidden_scale: address(args.hidden_scale.ptr) as usize as *const c_void,
+            hidden_token_scale: address(args.hidden_token_scale.ptr) as usize as *const c_void,
             weights: address(args.weights.ptr) as usize as *const c_void,
             scales: address(args.scales.ptr) as usize as *const c_void,
             global_scale: address(args.global_scale.ptr) as usize as *const c_void,
@@ -1561,6 +1600,7 @@ mod nvfp4_launch_tests {
         GatherGemmNvfp4Args {
             hidden: table(DType::U8, &[3, 1024]),
             hidden_scale: table(DType::F8E4M3, &[3, 128]),
+            hidden_token_scale: table(DType::F32, &[3]),
             weights: table(DType::U8, &[128, 1536, 1024]),
             scales: table(DType::F8E4M3, &[128, 1536, 128]),
             global_scale: table(DType::F32, &[2, 128]),
@@ -1631,13 +1671,13 @@ mod nvfp4_call_layout_tests {
     /// `static_assert`s are the other half of.
     #[test]
     fn the_encoded_calls_are_the_size_and_shape_their_headers_state() {
-        assert_eq!(std::mem::size_of::<GatherNvfp4Call>(), 704);
+        assert_eq!(std::mem::size_of::<GatherNvfp4Call>(), 720);
         assert_eq!(std::mem::offset_of!(GatherNvfp4Call, hidden), 0);
         assert_eq!(std::mem::offset_of!(GatherNvfp4Call, weights), 8);
         assert_eq!(std::mem::offset_of!(GatherNvfp4Call, scales), 16);
         assert_eq!(std::mem::offset_of!(GatherNvfp4Call, global_scale), 24);
-        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, global_scale_gate), 32);
-        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, ids), 40);
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, global_scale_gate), 48);
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, ids), 56);
         assert_eq!(
             std::mem::offset_of!(GatherNvfp4Call, num_non_exiting_tiles),
             72
