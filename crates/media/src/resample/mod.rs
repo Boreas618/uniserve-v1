@@ -7,6 +7,10 @@
 //! arithmetic, not merely a similar filter, so the results agree with the
 //! reference on the §10 check set.
 
+mod bicubic;
+mod lanczos;
+mod sinc;
+
 use crate::Result;
 
 /// Resizes an RGB24 image with Pillow's LANCZOS filter.
@@ -21,14 +25,14 @@ use crate::Result;
 ///
 /// [`crate::Error::Plan`] when the dimensions are zero or `src` does not hold
 /// `height * width * 3` bytes.
-pub fn lanclos_resize(
+pub fn lanczos_resize(
     src: &[u8],
     width: u32,
     height: u32,
     out_width: u32,
     out_height: u32,
 ) -> Result<Vec<u8>> {
-    todo!("builder02: resample module")
+    lanczos::lanczos_resize(src, width, height, out_width, out_height)
 }
 
 /// Resamples planar float audio with torchaudio's sinc interpolation.
@@ -51,7 +55,7 @@ pub fn sinc_resample(
     orig_freq: u32,
     new_freq: u32,
 ) -> Result<Vec<f32>> {
-    todo!("builder02: resample module")
+    sinc::sinc_resample(input, channels, length, orig_freq, new_freq)
 }
 
 /// Resizes a planar 8-bit image with torchvision's antialiased bicubic filter.
@@ -74,7 +78,7 @@ pub fn bicubic_antialias_u8(
     out_height: u32,
     out_width: u32,
 ) -> Result<Vec<u8>> {
-    todo!("builder02: resample module")
+    bicubic::bicubic_antialias_u8(src, channels, height, width, out_height, out_width)
 }
 
 /// Resizes a planar float32 image with torch's antialiased bicubic filter.
@@ -95,5 +99,8 @@ pub fn bicubic_antialias_f32(
     out_height: u32,
     out_width: u32,
 ) -> Result<Vec<f32>> {
-    todo!("builder02: resample module")
+    bicubic::bicubic_antialias_f32(src, channels, height, width, out_height, out_width)
 }
+
+#[cfg(test)]
+mod tests;

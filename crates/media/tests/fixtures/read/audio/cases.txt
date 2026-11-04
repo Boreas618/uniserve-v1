@@ -1,0 +1,3 @@
+stereo stereo.wav 44100 100 800 291 16000
+mono mono.wav 22050 0 500 1000 44100
+noop noop.wav 48000 50 300 300 48000

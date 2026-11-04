@@ -1,0 +1,2 @@
+scaled clip.mp4 8 16 12 3 2
+native clip.mp4 10 32 24 5 0

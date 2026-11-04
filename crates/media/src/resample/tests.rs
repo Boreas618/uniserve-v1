@@ -9,7 +9,17 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{bicubic_antialias, lanczos_resize, sinc_resample};
+use super::{bicubic_antialias_f32, bicubic_antialias_u8, lanczos_resize, sinc_resample};
+
+/// The float32 samples of little-endian bytes.
+fn floats(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
+        .collect()
+}
 
 /// The committed reference fixtures.
 fn fixtures() -> PathBuf {
@@ -35,7 +45,10 @@ fn cases(kind: &str) -> Vec<Case> {
         cases.push(Case {
             input: std::fs::read(directory.join(format!("{name}.in"))).unwrap(),
             expected: std::fs::read(directory.join(format!("{name}.out"))).unwrap(),
-            fields: fields[1..].iter().map(|value| value.parse().unwrap()).collect(),
+            fields: fields[1..]
+                .iter()
+                .map(|value| value.parse().unwrap())
+                .collect(),
             name,
         });
     }
@@ -94,7 +107,7 @@ fn bicubic_matches_torchvision() {
             case.fields[3],
             case.fields[4],
         );
-        let actual = bicubic_antialias(
+        let actual = bicubic_antialias_u8(
             &case.input,
             channels,
             height as u32,
@@ -114,15 +127,15 @@ fn bicubic_matches_torchvision() {
 #[test]
 fn bicubic_resizes_to_the_same_size_as_a_copy() {
     let source: Vec<u8> = (0..(2 * 3 * 4)).map(|value| value as u8 * 3).collect();
-    let actual = bicubic_antialias(&source, 2, 3, 4, 3, 4).unwrap();
+    let actual = bicubic_antialias_u8(&source, 2, 3, 4, 3, 4).unwrap();
     assert_eq!(actual, source);
 }
 
 #[test]
 fn bicubic_refuses_a_mismatched_extent() {
     let source = vec![0u8; 3 * 4 * 5 - 1];
-    assert!(bicubic_antialias(&source, 3, 4, 5, 8, 10).is_err());
-    assert!(bicubic_antialias(&[], 0, 4, 5, 8, 10).is_err());
+    assert!(bicubic_antialias_u8(&source, 3, 4, 5, 8, 10).is_err());
+    assert!(bicubic_antialias_u8(&[], 0, 4, 5, 8, 10).is_err());
 }
 
 #[test]
@@ -138,16 +151,8 @@ fn sinc_matches_torchaudio() {
             case.fields[2] as u32,
             case.fields[3],
         );
-        let input: Vec<f32> = case
-            .input
-            .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
-            .collect();
-        let expected: Vec<f32> = case
-            .expected
-            .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
-            .collect();
+        let input = floats(&case.input);
+        let expected = floats(&case.expected);
         let actual = sinc_resample(&input, channels, length, orig, new).unwrap();
         assert_eq!(
             actual.len(),
@@ -177,4 +182,47 @@ fn sinc_refuses_a_mismatched_extent() {
     let input = vec![0.0f32; 19];
     assert!(sinc_resample(&input, 2, 10, 16_000, 8_000).is_err());
     assert!(sinc_resample(&input, 1, 19, 0, 8_000).is_err());
+}
+
+#[test]
+fn bicubic_f32_matches_torch() {
+    // torch accumulates the float32 convolution in its vectorized order; this
+    // module accumulates in tap order. The reference's weights are float32, so
+    // the values differ only by a few rounding steps.
+    const TOLERANCE: f32 = 1e-6;
+    for case in cases("bicubic_f32") {
+        let (channels, height, width, out_height, out_width) = (
+            case.fields[0],
+            case.fields[1],
+            case.fields[2],
+            case.fields[3],
+            case.fields[4],
+        );
+        let input = floats(&case.input);
+        let expected = floats(&case.expected);
+        let actual = bicubic_antialias_f32(
+            &input,
+            channels,
+            height as u32,
+            width as u32,
+            out_height as u32,
+            out_width as u32,
+        )
+        .unwrap();
+        assert_eq!(actual.len(), expected.len());
+        for (index, (value, reference)) in actual.iter().zip(&expected).enumerate() {
+            assert!(
+                (value - reference).abs() <= TOLERANCE,
+                "bicubic_f32 case {} sample {index}: {value} against {reference}",
+                case.name
+            );
+        }
+    }
+}
+
+#[test]
+fn bicubic_f32_resizes_to_the_same_size_as_a_copy() {
+    let source: Vec<f32> = (0..(2 * 3 * 4)).map(|value| value as f32 / 16.0).collect();
+    let actual = bicubic_antialias_f32(&source, 2, 3, 4, 3, 4).unwrap();
+    assert_eq!(actual, source);
 }

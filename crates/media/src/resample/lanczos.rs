@@ -79,7 +79,9 @@ fn filter(input: usize, output: usize) -> Filter {
         raw.clear();
         let mut total = 0.0;
         for index in 0..count {
-            let weight = lanczos_filter((index + start) as f64 - center + 0.5) * inverse_scale;
+            // The filter's support widens with the downscaling factor: the
+            // reference scales the filter's argument, not its value.
+            let weight = lanczos_filter(((index + start) as f64 - center + 0.5) * inverse_scale);
             raw.push(weight);
             total += weight;
         }
@@ -118,6 +120,10 @@ fn quantize(weight: f64) -> i32 {
 /// `horizontal` resamples each row of an `input_width`-wide image into
 /// `output_width`; otherwise each column of an `input_height`-tall image into
 /// `output_height`. `channels` samples are interleaved per position.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one pass needs both extents, the channel count and the axis"
+)]
 fn pass(
     filter: &Filter,
     source: &[u8],
@@ -159,9 +165,9 @@ fn pass(
                 for channel in 0..channels {
                     let mut sum = ROUNDING_BIAS;
                     for (index, weight) in weights.iter().enumerate() {
-                        let sample =
-                            source[(start + index) * input_width * channels + column * channels + channel]
-                                as i64;
+                        let sample = source
+                            [(start + index) * input_width * channels + column * channels + channel]
+                            as i64;
                         sum += sample * i64::from(*weight);
                     }
                     out_row[column * channels + channel] = clip8(sum);
@@ -191,7 +197,7 @@ fn clip8(sum: i64) -> u8 {
 ///
 /// Returns [`Error::Plan`] when a dimension is zero or the input is not
 /// `width * height * 3` bytes.
-pub fn lanczos_resize(
+pub(super) fn lanczos_resize(
     source: &[u8],
     width: u32,
     height: u32,
@@ -205,9 +211,7 @@ pub fn lanczos_resize(
         out_height as usize,
     );
     if width == 0 || height == 0 || out_width == 0 || out_height == 0 {
-        return Err(Error::Plan(
-            "an image raster must be positive".to_owned(),
-        ));
+        return Err(Error::Plan("an image raster must be positive".to_owned()));
     }
     if source.len() != width * height * 3 {
         return Err(Error::Plan(format!(

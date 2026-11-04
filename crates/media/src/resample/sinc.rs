@@ -38,7 +38,7 @@ const ROLLOFF: f64 = 0.99;
 ///
 /// Returns [`Error::Plan`] when a rate is zero, a channel count is zero, or
 /// the input is not `channels * length` samples.
-pub fn sinc_resample(
+pub(super) fn sinc_resample(
     input: &[f32],
     channels: usize,
     length: usize,
