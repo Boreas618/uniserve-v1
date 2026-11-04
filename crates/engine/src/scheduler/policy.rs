@@ -566,13 +566,11 @@ impl PolicyReverted {
     /// The report as the process interface carries it (§7.3).
     ///
     /// A scheduler thread does not know its index, so it reports `None` and the
-    /// control thread names it; the control thread's own instance is `None` as
-    /// well. The wire field has no presence yet, so the control thread's
-    /// instance is [`CONTROL_THREAD`] until it does, and this is the one place
-    /// that decides it.
+    /// control thread names it; the control thread's own instance is absent
+    /// (`None`) on the wire as well (§7.3).
     pub fn to_process(&self) -> proto::process::PolicyReverted {
         proto::process::PolicyReverted {
-            scheduler: self.scheduler.map_or(CONTROL_THREAD, |index| index as u32),
+            scheduler: self.scheduler.map(|index| index as u32),
             backend: self.program.backend.clone(),
             revision: self.program.revision,
             reason: self.reason.clone(),
@@ -580,10 +578,6 @@ impl PolicyReverted {
         }
     }
 }
-
-/// The wire's name for the control thread's own policy instance, whose report
-/// names no scheduler; it becomes an absent field when the message has presence.
-pub const CONTROL_THREAD: u32 = u32::MAX;
 
 /// A request that has just reached the main process, as the control thread
 /// sees it before any scheduler does: what the `route` decision orders by

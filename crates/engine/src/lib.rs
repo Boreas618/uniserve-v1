@@ -58,10 +58,10 @@ pub use crate::handle::{
 pub use crate::kv_cache::{HostCacheSize, IndexedPage};
 pub use crate::scheduler::SpecialTokenIds;
 pub use crate::scheduler::{
-    Arrival, BatchCapacity, CONTROL_THREAD, Candidate, DEFAULT_CHUNKED_PREFILL_SIZE,
-    DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_RUNNING_REQUESTS, DomainStats,
-    EncoderStats, ExecutionDomainStats, GeneralStats, GroupCache, PREFETCH_FLOOR_TOKENS,
-    ParkedCache, PolicyBytes, PolicyProgram, PolicyReverted, PolicySlot, PolicySource, PolicyUsage,
+    Arrival, BatchCapacity, Candidate, DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH,
+    DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_RUNNING_REQUESTS, DomainStats, EncoderStats,
+    ExecutionDomainStats, GeneralStats, GroupCache, PREFETCH_FLOOR_TOKENS, ParkedCache,
+    PolicyBytes, PolicyProgram, PolicyReverted, PolicySlot, PolicySource, PolicyUsage,
     PrefixCacheUsage, PrefixStats, ProgramSource, RoutePolicy, RouteTrial, Scheduler,
     SchedulerConfig, SchedulerStats, SchedulerStatsReporter, Stage, TimingStats, TrialState,
     Validators, WorkerStats, arrival_view, ceilings_of,

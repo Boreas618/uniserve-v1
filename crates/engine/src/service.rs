@@ -2886,8 +2886,12 @@ mod tests {
         proto::process::Command {
             kind: Some(proto::process::command::Kind::Precopy(
                 proto::process::Precopy {
+                    generation: 0,
                     kernels,
                     policy: Some(program()),
+                    // The engine numbers the generation (§7.3); a field the
+                    // message may still carry is not what decides it.
+                    ..Default::default()
                 },
             )),
         }
@@ -2984,6 +2988,58 @@ mod tests {
             policy.calls(),
             vec!["precopy", "switchover", "commit", "revert", "purge"]
         );
+    }
+
+    #[test]
+    fn a_precopy_of_a_program_the_engine_prepared_answers_its_generation() {
+        use proto::process::report::Kind;
+
+        let policy = Recording::default();
+        let generations = Mutex::new(Generations::default());
+        let store = store();
+        let mut run = |command| apply_process_command(&policy, &generations, Some(&store), command);
+
+        match answered(run(precopy(Vec::new()))) {
+            Kind::Precopied(precopied) => assert_eq!(precopied.generation, 1),
+            other => panic!("a precopy is answered by Precopied, not {other:?}"),
+        }
+        // The same program again: the same generation, and nothing prepared.
+        match answered(run(precopy(Vec::new()))) {
+            Kind::Precopied(precopied) => assert_eq!(precopied.generation, 1),
+            other => panic!("a repeated precopy is answered by Precopied, not {other:?}"),
+        }
+        // A program with another revision is a generation of its own.
+        let other = proto::process::Command {
+            kind: Some(proto::process::command::Kind::Precopy(
+                proto::process::Precopy {
+                    generation: 0,
+                    kernels: Vec::new(),
+                    policy: Some(proto::process::Program {
+                        backend: "fcfs".to_owned(),
+                        revision: 4,
+                        arguments: Default::default(),
+                    }),
+                    ..Default::default()
+                },
+            )),
+        };
+        match answered(run(other)) {
+            Kind::Precopied(precopied) => assert_eq!(precopied.generation, 2),
+            other => panic!("a new program is answered by Precopied, not {other:?}"),
+        }
+        assert_eq!(policy.calls(), vec!["precopy", "precopy"]);
+
+        // A purge drops generation 1's modules, so preparing that program
+        // again takes a generation of its own rather than naming a program
+        // whose module no longer exists.
+        match answered(run(purge(1))) {
+            Kind::Purged(purged) => assert_eq!(purged.generation, 1),
+            other => panic!("a purge is answered by Purged, not {other:?}"),
+        }
+        match answered(run(precopy(Vec::new()))) {
+            Kind::Precopied(precopied) => assert_eq!(precopied.generation, 3),
+            other => panic!("a precopy after a purge is answered by Precopied, not {other:?}"),
+        }
     }
 
     #[test]
