@@ -123,6 +123,28 @@ fn main() {
     let dtype = DType::BF16;
     let mut lines: Vec<(String, String)> = Vec::new();
 
+    // A model walk's print, when one is given, is merged in rather than restated: the rows a layer
+    // launches are the walk's statement (`Qwen3Moe::keys`), and this file may only add the executor's
+    // own — so a merged print is the file, and a difference between the two is visible as a row.
+    let mut arguments = std::env::args().skip(1);
+    let mut model_keys: Option<std::path::PathBuf> = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--model-keys" => match arguments.next() {
+                Some(path) => model_keys = Some(std::path::PathBuf::from(path)),
+                None => {
+                    eprintln!("--model-keys takes the path of a `qwen3-moe --example keys` print");
+                    return;
+                }
+            },
+            other => {
+                eprintln!("unknown argument {other}");
+                eprintln!("usage: qwen3_moe_keys [--model-keys PATH]");
+                return;
+            }
+        }
+    }
+
     // Attention, both phases of the slice.
     for phase in [Phase::Prefill, Phase::Decode] {
         let descriptor = AttentionDescriptor {
@@ -467,6 +489,28 @@ fn main() {
             pdl: PDL,
         }),
     ));
+
+    if let Some(path) = model_keys {
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let mut merged = 0;
+                for line in text.lines() {
+                    if line.starts_with('#') || line.trim().is_empty() {
+                        continue;
+                    }
+                    if let Some((operator, key)) = line.split_once('\t') {
+                        lines.push((operator.trim().to_owned(), key.trim().to_owned()));
+                        merged += 1;
+                    }
+                }
+                eprintln!("# {merged} rows merged from {}", path.display());
+            }
+            Err(error) => {
+                eprintln!("{}: {error}", path.display());
+                return;
+            }
+        }
+    }
 
     // One key per line, the same key once: a variant two layers launch is packaged once.
     lines.sort();
