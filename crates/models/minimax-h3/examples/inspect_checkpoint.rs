@@ -50,12 +50,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sidecars = Sidecars::read(&root, None, &layout)?;
     let config = Config::normalize(&layout, &sidecars)?;
 
+    // The checkpoint's depth and the depth the encoder runs are two numbers: the last retained
+    // layer's raw hidden state is the prompt, with the final norm removed.
     println!(
-        "text encoder: {} layers, hidden {}, {} query heads, {} key/value heads",
+        "text encoder: {} of {} layers retained, hidden {}, {} query heads, {} key/value heads, \
+         head width {}",
+        config.text_encoder.num_retained_layers,
         config.text_encoder.num_checkpoint_layers,
         config.text_encoder.hidden_size,
         config.text_encoder.num_attention_heads,
-        config.text_encoder.num_key_value_heads
+        config.text_encoder.num_key_value_heads,
+        config.text_encoder.head_dim
+    );
+    // The vision tower is a different head width in the same checkpoint: its rotary spectrum is
+    // keyed on that width halved, not on the language stack's head width.
+    let vision = &config.text_encoder.vision;
+    println!(
+        "vision tower: {} blocks, hidden {}, {} heads, head width {}, patch {} x {} x {}, merge {}",
+        vision.depth,
+        vision.hidden_size,
+        vision.num_heads,
+        vision.hidden_size / vision.num_heads,
+        vision.temporal_patch_size,
+        vision.patch_size,
+        vision.patch_size,
+        vision.spatial_merge_size
     );
     for (dit, denoiser) in &config.denoisers {
         println!(
