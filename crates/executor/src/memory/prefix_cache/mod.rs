@@ -20,7 +20,7 @@
 
 mod access;
 pub(super) mod block_tables;
-pub(crate) mod conversion;
+pub mod conversion;
 pub(crate) mod host;
 mod imports;
 mod manifest;
@@ -30,7 +30,7 @@ pub mod scratch;
 mod transfers;
 
 pub(crate) use access::UnitAccesses;
-pub(crate) use conversion::Unimported;
+pub use conversion::Unimported;
 use imports::Imports;
 pub use imports::PendingImport;
 pub(crate) use transfers::TransferBases;
