@@ -361,7 +361,14 @@ fn copy_file(source: &Path, destination: &Path) -> Result<()> {
 /// Copies the package's tuning data into the build's workspace (design section
 /// 5.4): tuning data is part of the revision and travels with the module it
 /// was measured for, so the main process gets it from the same `resolve`.
-fn copy_tuning(package: &PackageSource, key: &str, target: &Target, dir: &Workspace) -> Result<()> {
+/// Answers the names it copied, relative to the workspace.
+fn copy_tuning(
+    package: &PackageSource,
+    key: &str,
+    target: &Target,
+    dir: &Workspace,
+) -> Result<Vec<String>> {
+    let mut copied = Vec::new();
     for declared in &package.manifest.tuning {
         let relative = declared.replace(crate::manifest::DESCRIPTOR_PLACEHOLDER, key);
         let source = package.file(&relative);
@@ -373,8 +380,9 @@ fn copy_tuning(package: &PackageSource, key: &str, target: &Target, dir: &Worksp
             ));
         }
         copy_file(&source, &dir.path().join(&relative))?;
+        copied.push(relative);
     }
-    Ok(())
+    Ok(copied)
 }
 
 /// Checks that a cubin module's metadata JSON names the kernel to launch.
@@ -918,7 +926,7 @@ impl Source for WasmSource {
                     .map_err(|error| package.failure_with_log(key, target, error, &log))?;
                 find_wasm(dir.path())?
             }
-            None => build_wasm_crate(package, key, target, dir, &log)?,
+            None => build_wasm_crate(package, key, target, dir, &log, toolchain.max_jobs())?,
         };
 
         // Precompile it for this host's CPU: a policy is loaded into the
@@ -930,6 +938,15 @@ impl Source for WasmSource {
                 .into(),
         })?;
         let output = dir.path().join(MODULE_WASM);
+        // A script may write the raw module under the output's own name; move
+        // it aside so the precompiler does not overwrite its input.
+        let raw = if raw == output {
+            let aside = dir.path().join("policy.raw.wasm");
+            std::fs::rename(&raw, &aside)?;
+            aside
+        } else {
+            raw
+        };
         let job = ToolJob::new(precompiler, &package.root, &log)
             .argument("--wasm")
             .argument(&raw)
@@ -948,10 +965,9 @@ impl Source for WasmSource {
                 ),
             ));
         }
-        copy_tuning(package, key, target, dir)?;
-        Ok(Built {
-            files: vec![MODULE_WASM.to_owned()],
-        })
+        let mut files = vec![MODULE_WASM.to_owned()];
+        files.extend(copy_tuning(package, key, target, dir)?);
+        Ok(Built { files })
     }
 }
 
@@ -964,6 +980,7 @@ fn build_wasm_crate(
     target: &Target,
     dir: &Workspace,
     log: &Path,
+    max_jobs: usize,
 ) -> Result<PathBuf> {
     let cargo = crate::toolchain::find_program("cargo").ok_or_else(|| Error::Toolchain {
         kind: ToolchainKind::Wasm,
@@ -979,7 +996,7 @@ fn build_wasm_crate(
         .argument("--target-dir")
         .argument(&target_directory)
         .environment(package.environment(key, target, dir));
-    crate::toolchain::execute(&job, 1)
+    crate::toolchain::execute(&job, max_jobs)
         .map_err(|error| package.failure_with_log(key, target, error, log))?;
     find_wasm(&target_directory.join("wasm32-unknown-unknown").join("release"))
 }
@@ -1072,5 +1089,168 @@ impl Source for ExecutableSource {
         Ok(Built {
             files: collect(dir.path())?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::toolchain::{ToolchainConfig, Toolchains};
+
+    /// The toolchains of a host that has none: the `None` toolchain always
+    /// exists, so a source that compiles nothing can be built anywhere.
+    fn nothing() -> ToolchainConfig {
+        ToolchainConfig {
+            nvcc: None,
+            python: PathBuf::from("/nonexistent/python"),
+            wasm: None,
+            max_jobs: 1,
+        }
+    }
+
+    /// A vendor package carrying one cubin and one metadata JSON per
+    /// descriptor, as `CubinSource` reads it (design 5.3).
+    fn vendor_package(directory: &Path, metadata: Option<&str>) {
+        std::fs::create_dir_all(directory.join("cubin")).unwrap();
+        std::fs::write(directory.join("cubin/dtype_bf16.cubin"), b"a cubin").unwrap();
+        std::fs::write(
+            directory.join("cubin/dtype_bf16.json"),
+            br#"{"name": "vendor"}"#,
+        )
+        .unwrap();
+        let metadata = metadata.map_or(String::new(), |name| {
+            format!("metadata = \"{name}\"\n")
+        });
+        std::fs::write(
+            directory.join("package.toml"),
+            format!(
+                r#"
+op = "vendor"
+backend = "cubin"
+
+[toolchain]
+kind = "none"
+version = ""
+
+[module]
+form = "cubin"
+{metadata}
+[source]
+kind = "cubin"
+files = ["cubin/{{descriptor}}.cubin", "cubin/{{descriptor}}.json"]
+
+[kernel]
+architectures = ["sm_100a"]
+
+[kernel.descriptors]
+keys = ["dtype_bf16"]
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_vendor_cubin_is_stored_under_the_names_ops_loads_it_by() {
+        let directory = tempfile::tempdir().unwrap();
+        vendor_package(directory.path(), Some("launch.json"));
+        let manifest = Manifest::load(directory.path()).unwrap();
+        let source = CubinSource::new(directory.path().to_path_buf(), manifest);
+        let workspace = Workspace::new().unwrap();
+        let toolchains = Toolchains::discover(&nothing()).unwrap();
+
+        let built = source
+            .build(
+                "vendor",
+                "dtype_bf16",
+                &Target::new("sm_100a"),
+                toolchains.get(ToolchainKind::None).unwrap(),
+                &workspace,
+            )
+            .unwrap();
+
+        assert_eq!(built.files, vec!["launch.json", "module.cubin"]);
+        assert_eq!(
+            std::fs::read(workspace.path().join("module.cubin")).unwrap(),
+            b"a cubin"
+        );
+        assert_eq!(
+            std::fs::read(workspace.path().join("launch.json")).unwrap(),
+            br#"{"name": "vendor"}"#
+        );
+    }
+
+    #[test]
+    fn a_vendor_cubin_without_its_metadata_does_not_build() {
+        let directory = tempfile::tempdir().unwrap();
+        vendor_package(directory.path(), None);
+        let manifest = Manifest::load(directory.path()).unwrap();
+        let source = CubinSource::new(directory.path().to_path_buf(), manifest);
+        let workspace = Workspace::new().unwrap();
+        let toolchains = Toolchains::discover(&nothing()).unwrap();
+
+        let error = source
+            .build(
+                "vendor",
+                "dtype_bf16",
+                &Target::new("sm_100a"),
+                toolchains.get(ToolchainKind::None).unwrap(),
+                &workspace,
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("dtype_bf16.json"),
+            "the error names the missing metadata: {error}"
+        );
+    }
+
+    #[test]
+    fn a_triton_package_without_a_compile_script_does_not_build() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("kernel.py"), "").unwrap();
+        std::fs::write(
+            directory.path().join("package.toml"),
+            r#"
+op = "rms_norm"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["kernel.py"]
+
+[kernel]
+architectures = ["sm_100a"]
+
+[kernel.descriptors]
+keys = ["dtype_bf16"]
+"#,
+        )
+        .unwrap();
+        let manifest = Manifest::load(directory.path()).unwrap();
+        let source = TritonSource::new(directory.path().to_path_buf(), manifest);
+        let workspace = Workspace::new().unwrap();
+        let toolchains = Toolchains::discover(&nothing()).unwrap();
+
+        let error = source
+            .build(
+                "rms_norm",
+                "dtype_bf16",
+                &Target::new("sm_100a"),
+                toolchains.get(ToolchainKind::None).unwrap(),
+                &workspace,
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("compile script"),
+            "the error says a Triton package needs its compile script: {error}"
+        );
     }
 }
