@@ -222,6 +222,16 @@ pub struct TopKDescriptor {
     pub pdl: bool,
 }
 
+/// The bitonic network a candidate count is compiled to: the next power of two at or above it.
+///
+/// One function on purpose. It is the only place the padding is derived, so the key a store builds
+/// (`TopKDescriptor`'s display) and the width a program is compiled to (`src/build.py` reading the
+/// key) cannot disagree - and a caller that needs the number, such as a plan sizing a store, gets it
+/// from here rather than rounding for itself.
+pub fn network_width(width: u32) -> u32 {
+    width.next_power_of_two()
+}
+
 impl fmt::Display for TopKDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         // `vocabulary` and the live `width` are absent on purpose: the program takes both as runtime
@@ -229,7 +239,7 @@ impl fmt::Display for TopKDescriptor {
         // network. What the key names is the network: the live count padded to a power of two.
         Key::new()
             .field("dtype", self.dtype)
-            .field("width", self.width.next_power_of_two())
+            .field("width", network_width(self.width))
             .field("ids", self.ids)
             .field("pdl", self.pdl)
             .finish(formatter)
