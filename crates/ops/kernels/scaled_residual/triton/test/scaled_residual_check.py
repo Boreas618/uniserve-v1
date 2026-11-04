@@ -110,9 +110,9 @@ def check(case, device):
     )
     got = hidden.cpu().double()
     difference = (got - expected).abs()
-    declared_outside = (difference > rounding * expected.abs()).sum().item()
-    scaled_outside = (difference > rounding * terms).sum().item()
-    largest = (difference / expected.abs().clamp(min=1e-30)).max().item()
+    declared_outside = (~(difference <= rounding * expected.abs())).sum().item()
+    scaled_outside = (~(difference <= rounding * terms)).sum().item()
+    largest = (difference / expected.abs().clamp(min=1e-30)).nan_to_num(nan=float("inf")).max().item()
     deciding = (
         declared_outside if case["bound"] == "declared" else scaled_outside
     )
@@ -121,7 +121,7 @@ def check(case, device):
         f"{block}, {case['dtype']}, bias {str(case['update_bias']).lower()}, "
         f"{'per-channel' if case['per_channel'] else 'one factor'} scale"
         f"{', interpreter cast truncated' if case['truncate'] else ''} — "
-        f"max absolute {difference.max().item():.3e}, max relative {largest:.3e}, "
+        f"max absolute {difference.nan_to_num(nan=float('inf')).max().item():.3e}, max relative {largest:.3e}, "
         f"declared {declared_outside} outside, on the terms' magnitudes "
         f"{scaled_outside} outside"
     )

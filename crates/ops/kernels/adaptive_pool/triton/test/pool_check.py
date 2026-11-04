@@ -134,7 +134,8 @@ def main() -> int:
         got = out.double()
         allowed = absolute + relative * expected.abs()
         difference = (got - expected).abs()
-        wrong = difference > allowed
+        # A difference that is not a number is never inside a bound: `>` says otherwise.
+        wrong = ~(difference <= allowed)
         window = max(-(-width // output), 1)
         print(
             f"{arguments.dtype}, {heads} heads of {width} pooled to {output} "

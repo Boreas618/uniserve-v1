@@ -77,12 +77,12 @@ def truncate(values, dtype):
 def compare(name, got, expected, floor, relative, deciding_bound):
     """Count the elements outside each bound and give the line that reports them."""
     difference = (got - expected).abs()
-    declared_outside = (difference > relative * expected.abs()).sum().item()
-    scaled_outside = (difference > relative * expected.abs() + floor).sum().item()
-    largest = (difference / expected.abs().clamp(min=1e-30)).max().item()
+    declared_outside = (~(difference <= relative * expected.abs())).sum().item()
+    scaled_outside = (~(difference <= relative * expected.abs() + floor)).sum().item()
+    largest = (difference / expected.abs().clamp(min=1e-30)).nan_to_num(nan=float("inf")).max().item()
     deciding = declared_outside if deciding_bound == "declared" else scaled_outside
     line = (
-        f"  {name}: max absolute {difference.max().item():.3e}, max relative "
+        f"  {name}: max absolute {difference.nan_to_num(nan=float('inf')).max().item():.3e}, max relative "
         f"{largest:.3e}, declared {declared_outside} of {expected.numel()} outside, "
         f"with the operands' floor {scaled_outside} outside"
     )
