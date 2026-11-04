@@ -874,6 +874,16 @@ def _restart_while_streaming(
     assert successor != old_daemon
     before_restart = len(read)
 
+    # The successor serves the same deployment, so it holds the same programs'
+    # server: a deployment reaches its scheduling policy only through it, and
+    # the successor reads the configuration the old process served rather than
+    # a command line of its own (design 7.5).
+    inherited = httpx.get(f"{base_url}/admin/config", timeout=60.0).json()
+    assert program_server_option()[1] in inherited["config"], (
+        "the successor did not inherit the programs' server: "
+        f"{inherited['config'][:2000]}"
+    )
+
     # New requests are served while the old daemon finishes the count.
     for _ in range(3):
         reply = _chat(base_url, name, "Say hello.")
