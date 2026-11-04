@@ -541,6 +541,160 @@ impl Op for QkNormRope {
     }
 }
 
+/// One compilation of `rope_apply`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct RopeApplyDescriptor {
+    /// Element type of the input.
+    pub dtype: DType,
+    /// Element type of the rotated output.
+    pub output: DType,
+    /// Elements per head.
+    pub head_dim: u32,
+    /// Heads per token.
+    pub heads: u32,
+    /// How the rotation pairs the elements of a head.
+    pub rotation: Rotation,
+    /// The channels of each head that rotate: the first `rotated`, the rest pass through.
+    ///
+    /// `rotated == head_dim` is the whole head and keeps the key it always had; a narrower rotation
+    /// names its width.
+    pub rotated: u32,
+    /// Tokens one program handles.
+    pub rows: u32,
+    /// The head tile one program loads at a time.
+    pub block: u32,
+    /// Launch with programmatic dependent launch.
+    pub pdl: bool,
+}
+
+impl fmt::Display for RopeApplyDescriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let key = Key::new()
+            .field("dtype", self.dtype)
+            .field("output", self.output)
+            .field("head_dim", self.head_dim)
+            .field("heads", self.heads)
+            .field("rotation", self.rotation)
+            .field("rows", self.rows)
+            .field("block", self.block)
+            .field("pdl", self.pdl);
+        // Written after `pdl`, like `qk_norm_rope`'s, and only for a narrower rotation.
+        let key = if self.rotated == self.head_dim {
+            key
+        } else {
+            key.field("rotated", self.rotated)
+        };
+        key.finish(formatter)
+    }
+}
+
+/// The arguments of `rope_apply`.
+#[derive(Clone, Copy)]
+pub struct RopeApplyArgs {
+    /// `[tokens, heads, head_dim]`: the values to rotate.
+    pub x: TensorView,
+    /// `[tokens, rotated/2]` FP32: the cosine factors of each token's position.
+    pub cosine: TensorView,
+    /// `[tokens, rotated/2]` FP32: the sine factors of each token's position.
+    pub sine: TensorView,
+    /// `[tokens, heads, head_dim]`, in the descriptor's output type.
+    pub out: TensorView,
+}
+
+/// The rotary rotation alone: no normalization, and the unit-modulus scale is in the tables.
+///
+/// A vision tower rotates its queries and keys without the per-head RMS norm that a text decoder
+/// fuses into [`QkNormRope`], and a host may prepare the cosine and sine tables itself (one image's
+/// positions are cheap to evaluate), so the operator takes the tables as views rather than
+/// positions and frequencies. The rotation is the same program shape: a head's first `rotated`
+/// channels rotate in the descriptor's pairing, the rest pass through, and the arithmetic is FP32
+/// with one rounding into the output type.
+pub struct RopeApply;
+
+impl Op for RopeApply {
+    const NAME: &'static str = "rope_apply";
+
+    type Descriptor = RopeApplyDescriptor;
+    type Args<'a> = RopeApplyArgs;
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let head_dim = u64::from(descriptor.head_dim);
+        if descriptor.rotated == 0
+            || descriptor.rotated > descriptor.head_dim
+            || !descriptor.rotated.is_multiple_of(2)
+        {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "a rotation of {} channels of a {} channel head: expected an even count in \
+                     1..=head_dim",
+                    descriptor.rotated, descriptor.head_dim
+                ),
+            ));
+        }
+        let pairs = u64::from(descriptor.rotated) / 2;
+        let heads = u64::from(descriptor.heads);
+        args.x.require_rank(Self::NAME, 3)?;
+        let tokens = args.x.shape.dim(0);
+        args.x
+            .require_shape(Self::NAME, Shape::new(&[tokens, heads, head_dim]))?;
+        args.out
+            .require_shape(Self::NAME, Shape::new(&[tokens, heads, head_dim]))?;
+        if args.out.dtype != descriptor.output {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "expected {} outputs, found {}",
+                    descriptor.output, args.out.dtype
+                ),
+            ));
+        }
+        for (name, table) in [("cosine", &args.cosine), ("sine", &args.sine)] {
+            table.require_row(Self::NAME, DType::F32, pairs)?;
+            if table.rows() != tokens {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!("{tokens} token rows but {} {name} rows", table.rows()),
+                ));
+            }
+        }
+
+        let programs = tokens.div_ceil(u64::from(descriptor.rows));
+        let mut arguments = Arguments::new();
+        arguments
+            .view(args.x)
+            .view(args.cosine)
+            .view(args.sine)
+            .view(args.out)
+            .u64(tokens)
+            .flag(descriptor.pdl);
+        // A full rotation's arguments end at `pdl`; a partial one names how many channels rotate.
+        if descriptor.rotated != descriptor.head_dim {
+            arguments.u32(descriptor.rotated);
+        }
+        kernel.launch(LaunchGrid::linear(programs)?, &mut arguments, stream)
+    }
+
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
+        let _ = stream;
+        RopeApplyArgs {
+            out: twins.shadow_of(args.out),
+            ..args
+        }
+    }
+
+    fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
+        // The tables arrive already evaluated, so the call costs the two-term rotation: one product
+        // and one subtraction or addition, then the store rounds into the output type.
+        Tolerance::rounding(2, DType::F32, descriptor.output)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -605,6 +759,32 @@ mod tests {
                 "{rotated} must be rejected"
             );
         }
+    }
+
+    fn apply(rotated: u32) -> RopeApplyDescriptor {
+        RopeApplyDescriptor {
+            dtype: DType::BF16,
+            output: DType::BF16,
+            head_dim: 128,
+            heads: 16,
+            rotation: Rotation::Interleaved,
+            rotated,
+            rows: 1,
+            block: 128,
+            pdl: false,
+        }
+    }
+
+    #[test]
+    fn applying_a_full_rotation_names_no_width_and_a_partial_one_does() {
+        assert_eq!(
+            apply(128).to_string(),
+            "dtype_bf16_output_bf16_head_dim_128_heads_16_rotation_interleaved_rows_1_block_128_pdl_false"
+        );
+        assert_eq!(
+            apply(96).to_string(),
+            "dtype_bf16_output_bf16_head_dim_128_heads_16_rotation_interleaved_rows_1_block_128_pdl_false_rotated_96"
+        );
     }
 
     #[test]
