@@ -30,10 +30,12 @@ use std::fmt;
 
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::{self, Stream};
-use crate::tensor::{DType, DevicePtr, Shape, TensorView};
+use crate::platform::Stream;
+use crate::tensor::{DType, Shape, TensorView};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
+
+use super::row_stride;
 
 /// The warps one thread block of `topk_softmax` holds.
 ///
@@ -133,7 +135,10 @@ impl Op for TopkSoftmax {
         if descriptor.experts == 0 || descriptor.experts > MAX_EXPERTS {
             return Err(Error::Unsupported {
                 operator: Self::NAME,
-                problem: format!("{} experts are outside 1..={MAX_EXPERTS}", descriptor.experts),
+                problem: format!(
+                    "{} experts are outside 1..={MAX_EXPERTS}",
+                    descriptor.experts
+                ),
             });
         }
         if descriptor.top == 0 || descriptor.top > MAX_TOP || u64::from(descriptor.top) > experts {
@@ -147,7 +152,8 @@ impl Op for TopkSoftmax {
             .require_shape(Self::NAME, Shape::new(&[tokens, experts]))?;
         args.scores
             .require_row(Self::NAME, descriptor.scores, experts)?;
-        args.ids.require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
+        args.ids
+            .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
         args.weights
             .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
         if args.ids.dtype != DType::I32 {
@@ -227,7 +233,10 @@ impl Op for TopkSoftmax {
         // The softmax's maximum, its `expf` (one ulp of FP32), the butterfly sum and the divide cost
         // at most a few `u` on top of the reduction's own `γₙ`; the ids are exact.
         let rounding = Tolerance::rounding(reduction, accumulate, DType::F32);
-        Tolerance::new(rounding.atol, (f64::from(rounding.rtol) + 4.0 * accumulate.unit_roundoff()) as f32)
+        Tolerance::new(
+            rounding.atol,
+            (f64::from(rounding.rtol) + 4.0 * accumulate.unit_roundoff()) as f32,
+        )
     }
 }
 
@@ -262,7 +271,8 @@ impl Op for ExpertGather {
         let top = u64::from(descriptor.top);
         let tokens = args.ids.rows();
 
-        args.ids.require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
+        args.ids
+            .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
         args.out
             .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
         args.map.require_shape(Self::NAME, Shape::new(&[experts]))?;
@@ -322,19 +332,6 @@ fn cubin_metadata<'k>(
         )));
     }
     Ok(metadata)
-}
-
-/// The elements between consecutive rows of a view.
-fn row_stride(view: &TensorView) -> u64 {
-    if view.strides.rank() >= 2 {
-        view.strides.get(view.strides.rank() - 2)
-    } else {
-        0
-    }
-}
-
-fn address(pointer: DevicePtr) -> u64 {
-    platform::address(pointer)
 }
 
 fn to_i64(operator: &'static str, value: u64) -> Result<i64> {
