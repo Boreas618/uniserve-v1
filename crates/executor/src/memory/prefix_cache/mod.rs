@@ -27,8 +27,11 @@ mod manifest;
 pub(super) mod plan;
 pub(crate) mod planes;
 pub mod scratch;
+pub mod state;
 mod transfers;
 
+use self::state::{ScatterOp, SnapshotOp};
+pub use self::state::{Snapshot, StatePlanes};
 pub(crate) use access::UnitAccesses;
 pub use conversion::Unimported;
 use imports::Imports;
@@ -632,6 +635,173 @@ impl PrefixCache {
                 .reset_units(units[start], (end - start) as u32, true, stream)?;
             start = end;
         }
+        Ok(())
+    }
+
+    /// The state group's index: the one group whose pages hold state checkpoints.
+    fn state_group(&self) -> Result<usize> {
+        let plan = self.plan();
+        let mut groups = plan.groups.iter().enumerate().filter(|(_, g)| g.state);
+        let (index, _) = groups.next().ok_or_else(|| {
+            Error::Invalid("the cache plan holds no state group to copy".to_owned())
+        })?;
+        if groups.next().is_some() {
+            return Err(Error::Invariant(
+                "the cache plan holds two state groups".to_owned(),
+            ));
+        }
+        Ok(index)
+    }
+
+    /// Blocks one state page's copy names: the planes of every resident layer's checkpoint.
+    pub fn state_snapshot_rows(&self) -> Result<u32> {
+        self.state_group()?;
+        Ok(self
+            .plan()
+            .checkpoints
+            .iter()
+            .map(|checkpoint| checkpoint.planes)
+            .sum())
+    }
+
+    /// One layer's checkpoint planes, as the block copy reads them.
+    pub fn state_planes(&self, group: u32, layer: u32) -> Result<StatePlanes> {
+        let index = group;
+        let group = self
+            .plan()
+            .groups
+            .get(index as usize)
+            .ok_or_else(|| Error::Invalid(format!("the cache plan holds no group {group}")))?;
+        let checkpoint = self
+            .plan()
+            .checkpoints
+            .get(layer as usize)
+            .ok_or_else(|| Error::Invalid(format!("no layer {layer} keeps a checkpoint")))?;
+        if !group.state {
+            return Err(Error::Invalid(format!(
+                "group {index} does not hold state checkpoints"
+            )));
+        }
+        Ok(StatePlanes {
+            width: self.plan().plane_bytes,
+            planes: checkpoint.planes,
+        })
+    }
+
+    /// Copies the state checkpoints of `units` (one page's units) into `snapshot`, one launch per
+    /// run of planes in one storage field, in plane order.
+    ///
+    /// The page's index vector is written to the device on `stream` first, so the launches that
+    /// follow read it without a host read between them.
+    pub fn snapshot_state(
+        &self,
+        generation: &ops::Generation,
+        page: u32,
+        units: &[u32],
+        snapshot: &mut Snapshot,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.copy_state(generation, page, units, snapshot, stream, true)
+    }
+
+    /// Writes `snapshot`'s blocks into the state checkpoints of `units`: the scatter an import
+    /// runs last, after the values arrived.
+    pub fn scatter_state(
+        &self,
+        generation: &ops::Generation,
+        page: u32,
+        units: &[u32],
+        snapshot: &mut Snapshot,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.copy_state(generation, page, units, snapshot, stream, false)
+    }
+
+    fn copy_state(
+        &self,
+        generation: &ops::Generation,
+        page: u32,
+        units: &[u32],
+        snapshot: &mut Snapshot,
+        stream: &Stream,
+        snapshot_direction: bool,
+    ) -> Result<()> {
+        let group_index = self.state_group()?;
+        let plan = self.plan();
+        let group = &plan.groups[group_index];
+        let columns = plan.columns;
+        let width = plan.plane_bytes;
+        let units_held = self.planes.units();
+        if self.planes.device_of().is_none() {
+            return Err(Error::Invalid(
+                "a state page's block copy runs on a device pool".to_owned(),
+            ));
+        }
+        // Every layer's planes in order, one run per field: the whole index vector is written
+        // once, so each launch only names its own rows of it.
+        let mut runs: Vec<(usize, Vec<i64>)> = Vec::new();
+        for checkpoint in &plan.checkpoints {
+            runs.extend(state::page_cells(
+                group, columns, units_held, checkpoint, units,
+            )?);
+        }
+        let total: u32 = runs.iter().map(|(_, cells)| cells.len() as u32).sum();
+        if total == 0 {
+            return Ok(());
+        }
+        if total > snapshot.rows() {
+            return Err(Error::Invalid(format!(
+                "a state page of {total} blocks does not fit the snapshot's {} rows",
+                snapshot.rows()
+            )));
+        }
+        let cells: Vec<i64> = runs
+            .iter()
+            .flat_map(|(_, cells)| cells.iter().copied())
+            .collect();
+        snapshot.write_blocks(&cells, stream)?;
+        let cells_per_field = u64::from(units_held) * u64::from(columns);
+        // One descriptor for every run: the field's block-major shape is the pool's, not the
+        // page's, and the index vector names which of those blocks this copy takes.
+        let descriptor = state::descriptor(
+            u32::try_from(cells_per_field).map_err(|_| {
+                Error::Invariant("a cache field holds more planes than a launch names".to_owned())
+            })?,
+            width,
+        );
+        let mut row = 0u32;
+        for (field, blocks) in &runs {
+            let count = blocks.len() as u32;
+            let storage = self.planes.value_storage(*field)?;
+            let field_view = ops::TensorView::new(
+                ops::DevicePtr::new(crate::memory::allocation::Backing::address(
+                    storage.as_ref(),
+                )),
+                ops::DType::U8,
+                ops::Shape::new(&[cells_per_field, width]),
+            );
+            let blocks_view = snapshot.blocks_view(row, count)?;
+            let snapshot_view = snapshot.view(row, count)?;
+            if snapshot_direction {
+                let kernel = generation.op::<SnapshotOp>(&descriptor)?;
+                <state::SnapshotOp as ops::Op>::launch(
+                    kernel,
+                    &descriptor,
+                    state::snapshot_args(field_view, blocks_view, snapshot_view),
+                    stream,
+                )?;
+            } else {
+                let kernel = generation.op::<ScatterOp>(&descriptor)?;
+                <state::ScatterOp as ops::Op>::launch(
+                    kernel,
+                    &descriptor,
+                    state::scatter_args(field_view, blocks_view, snapshot_view),
+                    stream,
+                )?;
+            }
+            row += count;
+        }
+        tracing::debug!(page, blocks = total, "copied a state page's checkpoints");
         Ok(())
     }
 
