@@ -35,6 +35,7 @@
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/dict.h>
 #include <libavutil/error.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/mem.h>
@@ -790,7 +791,12 @@ struct UsvMuxer {
     Buffer buffer;
 };
 
-/* Adds an output stream whose parameters match `input`'s stream `index`. */
+/* Adds an output stream whose parameters match `input`'s stream `index`,
+ * the way PyAV's add_stream_from_template does: the template's parameters are
+ * round-tripped through a codec context (so the output stream holds a codec's
+ * parameters, not the demuxer's), the codec tag is reset for remuxing, the
+ * time base and the properties that are not derived from a codec context are
+ * mirrored, and the muxer numbers the track. */
 static int muxer_template_stream(UsvMuxer *muxer, AVFormatContext *input,
                                  int index, AVStream **stream) {
     AVStream *source = input->streams[index];
@@ -798,14 +804,33 @@ static int muxer_template_stream(UsvMuxer *muxer, AVFormatContext *input,
     if (!target) {
         return fail("creating an MP4 stream failed");
     }
-    target->time_base = source->time_base;
-    int code = avcodec_parameters_copy(target->codecpar, source->codecpar);
-    if (code < 0) {
-        return fail_averror("copying stream parameters", code);
+    const AVCodec *codec = avcodec_find_encoder(source->codecpar->codec_id);
+    if (!codec) {
+        codec = avcodec_find_decoder(source->codecpar->codec_id);
     }
-    /* The MP4 muxer writes its own codec tag. */
-    target->codecpar->codec_tag = 0;
-    target->id = source->id;
+    AVCodecContext *context = avcodec_alloc_context3(codec);
+    if (!context) {
+        return fail("out of memory copying a stream's parameters");
+    }
+    int code = avcodec_parameters_to_context(context, source->codecpar);
+    if (code < 0) {
+        avcodec_free_context(&context);
+        return fail_averror("reading a stream's parameters", code);
+    }
+    context->codec_tag = 0;
+    target->time_base = source->time_base;
+    context->time_base = source->time_base;
+    code = avcodec_parameters_from_context(target->codecpar, context);
+    avcodec_free_context(&context);
+    if (code < 0) {
+        return fail_averror("writing a stream's parameters", code);
+    }
+    target->start_time = source->start_time;
+    target->duration = source->duration;
+    target->disposition = source->disposition;
+    if (av_dict_copy(&target->metadata, source->metadata, 0) < 0) {
+        return fail("copying a stream's metadata failed");
+    }
     *stream = target;
     return USV_OK;
 }
@@ -1269,159 +1294,4 @@ done:
     avcodec_free_context(&context);
     close_input_memory(&input);
     return code;
-}
-
-/* ---- inspection ---------------------------------------------------------- */
-
-typedef struct {
-    int32_t has_video;
-    int32_t width;
-    int32_t height;
-    int32_t video_frames;
-    int32_t frame_rate_num;
-    int32_t frame_rate_den;
-    int32_t has_audio;
-    int32_t audio_channels;
-    int32_t audio_rate;
-    int32_t reserved;
-    int64_t audio_samples;
-    int64_t duration_us;
-    int64_t video_duration_us;
-} UsvMediaInfo;
-
-static int decode_video_frames(AVFormatContext *input, int index,
-                               int64_t *frames, int64_t *duration_us) {
-    const AVCodec *decoder = NULL;
-    int stream = av_find_best_stream(input, AVMEDIA_TYPE_VIDEO, index, -1,
-                                     &decoder, 0);
-    if (stream < 0 || !decoder) {
-        return fail("an inspected file has no video decoder");
-    }
-    AVCodecContext *context = avcodec_alloc_context3(decoder);
-    AVFrame *frame = av_frame_alloc();
-    AVPacket *packet = av_packet_alloc();
-    if (!context || !frame || !packet) {
-        avcodec_free_context(&context);
-        av_frame_free(&frame);
-        av_packet_free(&packet);
-        return fail("out of memory inspecting a video stream");
-    }
-    int code = avcodec_parameters_to_context(
-        context, input->streams[stream]->codecpar);
-    if (code >= 0) {
-        code = avcodec_open2(context, decoder, NULL);
-    }
-    if (code < 0) {
-        avcodec_free_context(&context);
-        av_frame_free(&frame);
-        av_packet_free(&packet);
-        return fail_averror("opening the video decoder", code);
-    }
-    int64_t count = 0;
-    int64_t last = 0;
-    AVRational time_base = input->streams[stream]->time_base;
-    for (;;) {
-        int status = av_read_frame(input, packet);
-        if (status == AVERROR_EOF) {
-            break;
-        }
-        if (status < 0) {
-            code = fail_averror("reading the inspected video stream", status);
-            goto done;
-        }
-        if (packet->stream_index != stream) {
-            av_packet_unref(packet);
-            continue;
-        }
-        status = avcodec_send_packet(context, packet);
-        av_packet_unref(packet);
-        if (status < 0 && status != AVERROR(EAGAIN)) {
-            continue;
-        }
-        for (;;) {
-            status = avcodec_receive_frame(context, frame);
-            if (status == AVERROR(EAGAIN) || status == AVERROR_EOF) {
-                break;
-            }
-            if (status < 0) {
-                break;
-            }
-            count++;
-            if (frame->pts != AV_NOPTS_VALUE) {
-                last = frame->pts;
-            }
-            av_frame_unref(frame);
-        }
-    }
-    avcodec_send_packet(context, NULL);
-    for (;;) {
-        int status = avcodec_receive_frame(context, frame);
-        if (status < 0) {
-            break;
-        }
-        count++;
-        if (frame->pts != AV_NOPTS_VALUE) {
-            last = frame->pts;
-        }
-        av_frame_unref(frame);
-    }
-    *frames = count;
-    *duration_us = av_rescale_q(last, time_base, (AVRational){1, 1000000});
-    code = USV_OK;
-done:
-    avcodec_free_context(&context);
-    av_frame_free(&frame);
-    av_packet_free(&packet);
-    return code;
-}
-
-int usv_media_inspect(const uint8_t *data, size_t size, UsvMediaInfo *info) {
-    MemoryReader reader;
-    AVFormatContext *input = NULL;
-    memset(info, 0, sizeof(*info));
-    int code = open_input_memory(data, size, &input, &reader);
-    if (code != USV_OK) {
-        return code;
-    }
-    info->duration_us = input->duration > 0
-                            ? av_rescale(input->duration, 1000000, AV_TIME_BASE)
-                            : 0;
-
-    int video = av_find_best_stream(input, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
-    if (video >= 0) {
-        AVStream *stream = input->streams[video];
-        info->has_video = 1;
-        info->width = stream->codecpar->width;
-        info->height = stream->codecpar->height;
-        AVRational rate = stream->avg_frame_rate;
-        if (rate.num <= 0 || rate.den <= 0) {
-            rate = stream->r_frame_rate;
-        }
-        info->frame_rate_num = rate.num;
-        info->frame_rate_den = rate.den;
-        int64_t frames = 0;
-        int64_t video_duration_us = 0;
-        if (decode_video_frames(input, video, &frames, &video_duration_us) !=
-            USV_OK) {
-            close_input_memory(&input);
-            return USV_ERROR;
-        }
-        info->video_frames = (int32_t)frames;
-        info->video_duration_us = video_duration_us;
-    }
-
-    int audio = av_find_best_stream(input, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
-    if (audio >= 0) {
-        AVStream *stream = input->streams[audio];
-        info->has_audio = 1;
-        info->audio_channels = stream->codecpar->ch_layout.nb_channels;
-        info->audio_rate = stream->codecpar->sample_rate;
-        info->audio_samples =
-            stream->duration > 0
-                ? av_rescale_q(stream->duration, stream->time_base,
-                               (AVRational){1, info->audio_rate})
-                : 0;
-    }
-    close_input_memory(&input);
-    return USV_OK;
 }

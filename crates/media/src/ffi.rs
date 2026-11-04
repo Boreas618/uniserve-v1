@@ -16,26 +16,6 @@ pub(crate) struct Muxer {
     _private: [u8; 0],
 }
 
-/// What an encoded file holds, as its streams declare it and its packets
-/// decode.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct MediaInfo {
-    pub(crate) has_video: i32,
-    pub(crate) width: i32,
-    pub(crate) height: i32,
-    pub(crate) video_frames: i32,
-    pub(crate) frame_rate_num: i32,
-    pub(crate) frame_rate_den: i32,
-    pub(crate) has_audio: i32,
-    pub(crate) audio_channels: i32,
-    pub(crate) audio_rate: i32,
-    pub(crate) reserved: i32,
-    pub(crate) audio_samples: i64,
-    pub(crate) duration_us: i64,
-    pub(crate) video_duration_us: i64,
-}
-
 /// One audio track decoded to planar float at its stream's declared rate and
 /// layout.
 pub(crate) struct DecodedAudio {
@@ -101,7 +81,6 @@ unsafe extern "C" {
         planar: *mut *mut f32,
         samples: *mut i64,
     ) -> c_int;
-    fn usv_media_inspect(data: *const u8, size: usize, info: *mut MediaInfo) -> c_int;
 }
 
 /// The shim's message for the failure it just reported on this thread.
@@ -332,14 +311,4 @@ pub(crate) fn decode_audio(data: &[u8]) -> Result<DecodedAudio> {
         samples: samples as usize,
         planar: values,
     })
-}
-
-/// Reads an encoded file's stream properties and decoded frame count.
-pub(crate) fn inspect(data: &[u8]) -> Result<MediaInfo> {
-    let mut info = MediaInfo::default();
-    // SAFETY: `data` outlives the call and `info` is a writable struct of the
-    // shim's own layout.
-    let code = unsafe { usv_media_inspect(data.as_ptr(), data.len(), &mut info) };
-    check(code)?;
-    Ok(info)
 }

@@ -48,6 +48,13 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib={name}");
     }
     println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
+    // The runtime's own `bin/ffmpeg` is the default reference-video decoder:
+    // the same installation that provides the codecs provides the external
+    // program, so a deployment needs no other media tooling on its path.
+    println!(
+        "cargo:rustc-env=UNISERVE_MEDIA_RUNTIME={}",
+        prefix.display()
+    );
 }
 
 /// The installation the crate is built against.
