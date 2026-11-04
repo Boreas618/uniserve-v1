@@ -31,6 +31,24 @@ use crate::{Error, Result};
 /// The mark that makes a module directory a committed module.
 pub const COMMITTED: &str = ".committed";
 
+/// Numbers the staging directories one process makes, so two publishes beside
+/// each other never share one.
+static STAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The longest a module path's last segment may be, in bytes.
+///
+/// A descriptor key is the last segment of a module's path (design section 5.3: every module sits
+/// under `<operator>/<backend>/<revision>/<target>/<descriptor key>`), so a key must be one file
+/// name, and this is the filesystem's own cap rather than a policy: a longer name has no directory
+/// to live in, whatever the store would like. Publishing stages under a name of its own, short and
+/// independent of the key, so the key's length is the only thing measured here.
+///
+/// A key that reaches this bound is a design smell even when it fits: it usually names values that
+/// are launch arguments rather than properties of the problem — a stride the caller varies, a
+/// capacity it chooses — and the fix belongs in the descriptor, not in the store, which is why this
+/// bound refuses only what cannot be stored.
+pub const DESCRIPTOR_NAME_LIMIT: usize = 255;
+
 /// The path of one module in the store: pure names, no content.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ModulePath {
@@ -70,6 +88,17 @@ impl ModulePath {
                     format!("{name} {value:?} is not one path component"),
                 )));
             }
+        }
+        if path.descriptor.len() > DESCRIPTOR_NAME_LIMIT {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "the descriptor key is {} bytes and a module path segment holds at most \
+                     {DESCRIPTOR_NAME_LIMIT}: {}",
+                    path.descriptor.len(),
+                    path.descriptor
+                ),
+            )));
         }
         Ok(path)
     }
@@ -192,14 +221,23 @@ impl Store {
             ))
         })?;
         std::fs::create_dir_all(parent)?;
+        // The staged name carries no part of the key: a key may be as long as a
+        // file name allows, and a staging name that embedded it would quietly
+        // lower that bound by the length of a suffix.
         let staged = parent.join(format!(
-            ".{}.staged-{}",
-            path.descriptor,
-            std::process::id()
+            ".staged-{}-{}",
+            std::process::id(),
+            STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         if staged.exists() {
             std::fs::remove_dir_all(&staged)?;
         }
+        // A publish that died between its staging and its rename leaves a
+        // directory no reader treats as a module and no later publish reuses, so
+        // the leftovers of a previous run are swept here. Only another process's
+        // are swept: this process's live ones are beside them and must be left
+        // alone.
+        sweep_other_staging(parent)?;
         std::fs::create_dir_all(&staged)?;
         for name in files {
             let source = workspace.join(name);
@@ -354,6 +392,47 @@ fn directories(path: &Path) -> Result<Vec<PathBuf>> {
     }
     directories.sort();
     Ok(directories)
+}
+
+/// Removes staging directories a previous process left beside a publish.
+///
+/// Publishing stages under `.staged-<pid>-<n>` and renames it into place, so a
+/// crash between the two leaves a directory that is invisible to a reader and
+/// never reused. A pid in the name is what says whether that process is still
+/// running: this one's staged directories are live and are left alone.
+fn sweep_other_staging(parent: &Path) -> Result<()> {
+    // Whether a process is alive is a fact this only knows how to ask for on a
+    // host with `/proc`. Without one, every other staging directory looks dead,
+    // and sweeping a live peer's would corrupt its publish — so a host that
+    // cannot answer the question keeps the leftovers instead.
+    if !Path::new("/proc").is_dir() {
+        return Ok(());
+    }
+    let mine = format!(".staged-{}-", std::process::id());
+    for entry in std::fs::read_dir(parent)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(".staged-") || name.starts_with(&mine) {
+            continue;
+        }
+        // A second server may be publishing into the same root, and its staging
+        // directory is as live as this one's. The name says which process made
+        // it; only a process that is gone leaves work to sweep.
+        let pid = name
+            .trim_start_matches(".staged-")
+            .split('-')
+            .next()
+            .and_then(|pid| pid.parse::<u32>().ok());
+        let Some(pid) = pid else { continue };
+        if Path::new(&format!("/proc/{pid}")).exists() {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 /// Flushes a directory's entries, so a rename into it survives a crash.

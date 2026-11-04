@@ -151,6 +151,34 @@ impl Function {
         )
     }
 
+    /// The parameters of this kernel's signature, in declaration order, as the
+    /// driver declares them (`cuFuncGetParamInfo`).
+    ///
+    /// [`Function::launch_ex`] takes one pointer per parameter, so a launch
+    /// needs no more than the order it already has. This is for callers that
+    /// must describe an entry point *outside* this process — a native
+    /// package's manifest, a launch recorded for another process to replay —
+    /// where copying a C declaration by hand is how a signature drifts from
+    /// the code that loads it.
+    ///
+    /// The driver reports no count: it answers past the last parameter with
+    /// `CUDA_ERROR_INVALID_VALUE`, which ends the walk. A kernel with no
+    /// parameters answers with an empty list.
+    pub fn parameters(&self) -> Result<Vec<ParamInfo>> {
+        let _context = self.device.enter()?;
+        let mut parameters = Vec::new();
+        while let Some(parameter) = param_at(self.raw, parameters.len())? {
+            parameters.push(parameter);
+        }
+        Ok(parameters)
+    }
+
+    /// One parameter of the signature by index, and `None` past the last.
+    pub fn parameter(&self, index: usize) -> Result<Option<ParamInfo>> {
+        let _context = self.device.enter()?;
+        param_at(self.raw, index)
+    }
+
     /// Sets one of the function's attributes, such as the largest dynamic
     /// shared-memory size it may be launched with.
     pub fn set_attribute(&self, attribute: FunctionAttribute, value: i32) -> Result<()> {
@@ -163,6 +191,49 @@ impl Function {
             "cuFuncSetAttribute",
         )
     }
+}
+
+/// One parameter of a kernel's signature, as the driver declares it.
+///
+/// `offset` is where the parameter's value sits in the packed layout a
+/// captured kernel node stores, and `size` the bytes it occupies there. A
+/// launcher that passes one pointer per parameter never needs the offset; a
+/// caller that publishes a signature for another process to build parameters
+/// from does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParamInfo {
+    offset: usize,
+    size: usize,
+}
+
+impl ParamInfo {
+    /// The parameter's byte offset in the packed layout of a kernel node.
+    pub const fn offset(&self) -> usize {
+        self.offset
+    }
+
+    /// The bytes the parameter's value occupies.
+    pub const fn size(&self) -> usize {
+        self.size
+    }
+}
+
+/// One parameter of `function`'s signature by index, or `None` past the last.
+///
+/// The caller is in the function's context: the driver answers a function
+/// handle only there, and reports the end of the signature as
+/// `CUDA_ERROR_INVALID_VALUE` rather than as a count.
+pub(crate) fn param_at(function: Handle, index: usize) -> Result<Option<ParamInfo>> {
+    let driver = driver::driver()?;
+    let (mut offset, mut size) = (0usize, 0usize);
+    // SAFETY: the function is live while its library is; the driver writes
+    // the parameter's layout to the two locals.
+    let status = unsafe { (driver.func_get_param_info)(function, index, &mut offset, &mut size) };
+    if status == driver::CUDA_ERROR_INVALID_VALUE {
+        return Ok(None);
+    }
+    driver.check(status, "cuFuncGetParamInfo")?;
+    Ok(Some(ParamInfo { offset, size }))
 }
 
 /// One launch's configuration: the grid and block dimensions, the dynamic

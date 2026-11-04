@@ -22,7 +22,7 @@
 //! around the attention (design 4.3). With one rank the exchange is absent and every view is the
 //! rank's own.
 
-use nn::layers::{Attention, Linear, PackedSwiGlu, RmsNorm, ScaledResidual, UlyssesExchange};
+use nn::layers::{Attention, GatedActivation, Linear, RmsNorm, ScaledResidual, UlyssesExchange};
 use nn::weights::{Weight, WeightLoader, WeightRequest};
 use nn::{Forward, Shape, TensorView};
 use ops::gemm::WeightOrder;
@@ -56,7 +56,9 @@ pub struct RefinerBlock {
     output: Linear,
     gate_up: Linear,
     down: Linear,
-    swiglu: PackedSwiGlu,
+    /// The stepwise gated activation, as the reference's refiner asks for
+    /// (`conditioning.py:75-80`, `Rounding.STEPWISE`).
+    gated: GatedActivation,
     attention: Attention,
     /// The identity add of the attention and feed-forward residuals.
     residual: ScaledResidual,
@@ -147,7 +149,7 @@ impl RefinerBlock {
             output: Linear::new(output, None, WeightOrder::NxK)?,
             gate_up: Linear::new(gate_up, None, WeightOrder::NxK)?,
             down: Linear::new(down, None, WeightOrder::NxK)?,
-            swiglu: PackedSwiGlu::new(None)?,
+            gated: GatedActivation::new(ops::activation::Activation::Silu).with_stepwise(),
             attention,
             residual: identity(loader)?,
             exchange: exchange(partition),
@@ -199,7 +201,8 @@ impl RefinerBlock {
         // Feed-forward: normalize, project the packed value and gate halves, gate, project back.
         self.norm2.forward(f, hidden, rows.normed)?;
         self.gate_up.forward(f, rows.normed, rows.packed)?;
-        self.swiglu.forward(f, rows.packed, rows.ffn, None)?;
+        let (value, gate) = crate::transformer::projection_halves(rows.packed);
+        self.gated.forward(f, gate, value, rows.ffn)?;
         self.down.forward(f, rows.ffn, rows.update)?;
         self.residual.forward(f, hidden, rows.update)?;
         Ok(())
@@ -207,11 +210,7 @@ impl RefinerBlock {
 
     /// The query, key and value the attention reads: `[rows, local_heads, head_dim]` over the whole
     /// sequence.
-    fn exchange<'a>(
-        &self,
-        f: &Forward,
-        rows: &'a Rows,
-    ) -> Result<(TensorView, TensorView, TensorView)> {
+    fn exchange(&self, f: &Forward, rows: &Rows) -> Result<(TensorView, TensorView, TensorView)> {
         match &self.exchange {
             None => Ok((rows.query_normed, rows.key_normed, rows.value)),
             Some(exchange) => {
@@ -228,7 +227,7 @@ impl RefinerBlock {
     }
 
     /// Put the attended head shards back together into this rank's rows.
-    fn gather<'a>(&self, f: &Forward, attended: TensorView, rows: &'a Rows) -> Result<TensorView> {
+    fn gather(&self, f: &Forward, attended: TensorView, rows: &Rows) -> Result<TensorView> {
         match &self.exchange {
             None => Ok(attended),
             Some(exchange) => {

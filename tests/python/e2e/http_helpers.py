@@ -126,8 +126,32 @@ def worker_executable() -> Path:
     return Path(sys.executable).parent / "uniserve"
 
 
+def log_tail(log_path: Path | None, lines: int = 40) -> str:
+    """The last `lines` lines of a server's log, marked, for a failure message.
+
+    The log lives on the host that ran the server, so a failure whose message
+    does not carry it costs a round trip to read; the tail is what usually names
+    the cause. A missing or unreadable file says so rather than failing.
+    """  # noqa: D205
+    if log_path is None:
+        return ""
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return f"\n(server log: no file at {log_path})"
+    except OSError as error:
+        return f"\n(server log unreadable at {log_path}: {error})"
+    tail = "\n".join(text.splitlines()[-lines:])
+    return (
+        f"\n--- server log tail ({log_path}) ---\n{tail}\n--- end of tail ---"
+    )
+
+
 def wait_health(
-    base_url: str, process: subprocess.Popen[str], timeout_s: float
+    base_url: str,
+    process: subprocess.Popen[str],
+    timeout_s: float,
+    log_path: Path | None = None,
 ) -> None:
     deadline = time.monotonic() + scaled(timeout_s)
     last_error: str | None = None
@@ -135,6 +159,7 @@ def wait_health(
         if process.poll() is not None:
             raise RuntimeError(
                 f"server exited early with code {process.returncode}"
+                f"{log_tail(log_path)}"
             )
         try:
             response = httpx.get(f"{base_url}/health", timeout=2.0)
@@ -148,8 +173,19 @@ def wait_health(
         time.sleep(1.0)
     raise TimeoutError(
         f"server did not become healthy within {timeout_s}s; last error: "
-        f"{last_error}"
+        f"{last_error}{log_tail(log_path)}"
     )
+
+
+def _serves_a_deployment(args: list[str]) -> bool:
+    """Whether `args` starts a deployment: the `serve` subcommand of the one
+    executable.
+
+    The subcommand is the second word. `uniserve program-server serve` and
+    `uniserve storage serve` are other commands: `serve` is theirs too, and they
+    take no deployment options.
+    """  # noqa: D205
+    return len(args) > 1 and args[1] == "serve"
 
 
 def start_server(
@@ -157,14 +193,17 @@ def start_server(
 ) -> subprocess.Popen[str]:
     """Start `args` in a session of its own, its output to `log_path`.
 
-    A `serve` command that sizes no host KV cache
-    (``kv_cache_config.host_*``) holds `HOST_CACHE_GIB` of it, and every
-    `serve` command adds `E2E_SET`.
+    A deployment that sizes no host KV cache (``kv_cache_config.host_*``) holds
+    `HOST_CACHE_GIB` of it, and every deployment adds `E2E_SET`.
     """
-    sized = any("kv_cache_config.host_" in arg for arg in args)
-    if "serve" in args and not sized:
-        args = [*args, "--set", f"kv_cache_config.host_gib={HOST_CACHE_GIB}"]
-    if "serve" in args:
+    if _serves_a_deployment(args):
+        sized = any("kv_cache_config.host_" in arg for arg in args)
+        if not sized:
+            args = [
+                *args,
+                "--set",
+                f"kv_cache_config.host_gib={HOST_CACHE_GIB}",
+            ]
         for assignment in E2E_SET:
             args = [*args, "--set", assignment]
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -382,7 +421,7 @@ def server_process(
         env["CUDA_VISIBLE_DEVICES"] = granted
     process = start_server(args, log_path, env)
     try:
-        wait_health(base_url, process, timeout_s)
+        wait_health(base_url, process, timeout_s, log_path)
         yield process
     finally:
         stop_server(process)

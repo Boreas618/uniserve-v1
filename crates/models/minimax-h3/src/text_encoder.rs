@@ -1211,6 +1211,9 @@ fn write_state(
     let mut cosine = Vec::new();
     let mut sine = Vec::new();
     let mut lengths = Vec::new();
+    // The tables are one run over the prompt's blocks, in prompt order, so a block's rows sit after
+    // its predecessors' and the check below counts against the running total, not the block's own.
+    let mut covered = 0_usize;
     for (grid, patches) in plan.grids.iter().zip(&plan.images) {
         let [time, height, width] = *grid;
         let (step_index, step_weight) = positions::position_samples(side, height, width, merge)?;
@@ -1235,13 +1238,14 @@ fn write_state(
             sine.extend_from_slice(&step_sine);
         }
         lengths.extend_from_slice(&positions::vision_lengths(time, height, width)?);
-        let expected = *patches as usize;
-        if index.len() != expected * positions::POSITION_TAPS as usize
-            || weight.len() != expected * positions::POSITION_TAPS as usize
-            || cosine.len() != expected * columns
+        covered += *patches as usize;
+        if index.len() != covered * positions::POSITION_TAPS as usize
+            || weight.len() != covered * positions::POSITION_TAPS as usize
+            || cosine.len() != covered * columns
+            || sine.len() != covered * columns
         {
             return Err(Error::config(format!(
-                "the tables of {grid:?} cover {} patches, {expected} expected",
+                "the tables through the {grid:?} grid cover {} patches, {covered} expected",
                 cosine.len() / columns
             )));
         }
@@ -1309,7 +1313,12 @@ fn table_specs(
     let tokens = u64::from(rows);
     let patch_rows: u64 = patches.iter().map(|patches| u64::from(*patches)).sum();
     let steps: u64 = time.iter().map(|time| u64::from(*time) + 1).sum();
-    let columns = u64::from(config.head_dim / 2);
+    // The tower rotates on its own head width, which is not the language model's: the checkpoint
+    // states 1152 elements over 16 heads, so the factors carry 36 frequencies rather than the text
+    // stack's 64. The division is total here (this function reports nothing) and any configuration
+    // that does not divide is refused by `write_state`, which derives the same width through
+    // `Geometry::head_dim`.
+    let tower_columns = u64::from(config.vision.hidden_size / config.vision.num_heads.max(1) / 2);
     let table =
         |name: &'static str, dtype: nn::DType, shape: Shape| StateTable { name, dtype, shape };
     let mut tables = vec![
@@ -1338,12 +1347,12 @@ fn table_specs(
         tables.push(table(
             "vision_cosine",
             nn::DType::F32,
-            Shape::new(&[patch_rows, columns]),
+            Shape::new(&[patch_rows, tower_columns]),
         ));
         tables.push(table(
             "vision_sine",
             nn::DType::F32,
-            Shape::new(&[patch_rows, columns]),
+            Shape::new(&[patch_rows, tower_columns]),
         ));
         tables.push(table(
             "vision_lengths",
@@ -1653,9 +1662,9 @@ mod tests {
     fn four_ranks_split_the_heads_the_intermediate_width_and_the_vocabulary() {
         let config = config();
         let partition = Partition {
-            ulysses_degree: 1,
             tensor_parallel: 4,
             tensor_rank: 2,
+            ..Partition::single()
         };
         let rank = Rank::new(&config, &partition).expect("four ranks");
         assert_eq!(rank.query_heads, 16);
@@ -1679,15 +1688,14 @@ mod tests {
     fn a_degree_that_does_not_split_the_heads_is_refused() {
         let config = config();
         let partition = Partition {
-            ulysses_degree: 1,
             tensor_parallel: 3,
-            tensor_rank: 0,
+            ..Partition::single()
         };
         assert!(Rank::new(&config, &partition).is_err());
         let out_of_range = Partition {
-            ulysses_degree: 1,
             tensor_parallel: 4,
             tensor_rank: 4,
+            ..Partition::single()
         };
         assert!(Rank::new(&config, &out_of_range).is_err());
     }
@@ -1865,12 +1873,88 @@ mod tests {
             merge,
         )
         .expect("positions");
-        // The first run's patches sit on coordinates `(0, i, j)` around origin 0, and the first
-        // run leaves the origin three merged rows further (max(4, 6) / 2); the timestamp token
-        // then takes the origin, and the second run starts from the origin the timestamp left.
-        assert_eq!(coordinates[1], [0, 0, 0]);
-        assert_eq!(coordinates[7], [3, 3, 3]);
-        assert_eq!(coordinates[8][0], 4);
+        // One clock serves all three axes: a coordinate is the origin plus the patch's merged row
+        // and column. The prompt's first token takes origin 0, the first run's patches sit at
+        // `(1 + i, 1 + j)` because that token left origin 1, the run advances it by
+        // `max(4, 6) / 2 = 3` to 4, the timestamp takes 4 and leaves 5, and the second run starts
+        // there.
+        assert_eq!(coordinates[0], [0, 0, 0]);
+        assert_eq!(coordinates[1], [1, 1, 1]);
+        assert_eq!(coordinates[6], [1, 2, 3]);
+        assert_eq!(coordinates[7], [4, 4, 4]);
+        assert_eq!(coordinates[8], [5, 5, 5]);
+    }
+
+    #[test]
+    fn a_prompt_with_an_image_and_a_video_puts_both_in_one_table_run() {
+        let config = config();
+        let merge = config.vision.spatial_merge_size;
+        // An image block of 4x4 after two text tokens, a comma, then a two-step 4x4 video: two
+        // runs of four placeholders, behind its own text tokens.
+        let ids = [
+            7, 8, IMAGE, IMAGE, IMAGE, IMAGE, 9, VIDEO, VIDEO, VIDEO, VIDEO, 10, VIDEO, VIDEO,
+            VIDEO, VIDEO, 11,
+        ];
+        let tokens = ids.len() as u32;
+        let layout = EncoderLayout {
+            rows: tokens,
+            tokens,
+            images: vec![
+                ImageShape { grid: [1, 4, 4] },
+                ImageShape { grid: [2, 4, 4] },
+            ],
+        };
+        // The tables are one run over the prompt's blocks: sixteen patches of image, then the
+        // video's thirty-two, in that order.
+        let tables = table_specs(&config, tokens, &[16, 32], &[1, 2], 12);
+        let mut out = tables.iter().map(buffer_for).collect::<Vec<_>>();
+        write_state(&config, &ids, &layout, &mut out).expect("a prompt with an image and a video");
+
+        // Four placeholders of an image, then four per temporal patch of the video: twelve merged
+        // rows on twelve placeholders, in prompt order.
+        let destinations = (0..12).map(|row| i32_at(&out[1], row)).collect::<Vec<_>>();
+        assert_eq!(destinations, vec![2, 3, 4, 5, 7, 8, 9, 10, 12, 13, 14, 15]);
+        // Both calls' rows are in the same tables: forty-eight patches of taps, factors and
+        // sequence lengths, the image's one single-step sequence first. The factors carry the
+        // tower's own head width, not the language model's.
+        let tower_head = Geometry::head_dim(&config.vision).expect("a head width");
+        assert_eq!(out[2].len(), 48 * positions::POSITION_TAPS as usize * 4);
+        assert_eq!(out[4].len(), 48 * (tower_head / 2) as usize * 4);
+        let lengths = (0..5).map(|row| i32_at(&out[6], row)).collect::<Vec<_>>();
+        assert_eq!(lengths, vec![0, 16, 0, 16, 32]);
+
+        // The blocks are consumed in prompt order, so the video's two runs come after the image's
+        // and each block advances the origin: the image leaves 2, its timestamp takes 3, the video
+        // leaves 5, and its own timestamp leaves 6 for the second run.
+        let (images, videos) = run_grids(
+            &ids,
+            &[[1, 4, 4], [2, 4, 4]],
+            config.image_token_id,
+            config.video_token_id,
+            merge,
+        )
+        .expect("runs");
+        assert_eq!(images, vec![[1, 4, 4]]);
+        assert_eq!(videos, vec![[1, 4, 4], [1, 4, 4]]);
+        let coordinates = positions::rope_index(
+            &ids,
+            &images,
+            &videos,
+            config.image_token_id,
+            config.video_token_id,
+            merge,
+        )
+        .expect("positions");
+        // The clock again: two text tokens leave origin 2, the image's four merged rows sit at
+        // `(2 + i, 2 + j)`, the block advances by `max(4, 4) / 2 = 2` to 4, its timestamp takes 4
+        // and leaves 5, the video's first run sits there, advances to 7, its timestamp leaves 8,
+        // and the second run starts at 8.
+        assert_eq!(coordinates[1], [1, 1, 1]);
+        assert_eq!(coordinates[2], [2, 2, 2]);
+        assert_eq!(coordinates[5], [2, 3, 3]);
+        assert_eq!(coordinates[6], [4, 4, 4]);
+        assert_eq!(coordinates[7], [5, 5, 5]);
+        assert_eq!(coordinates[12], [8, 8, 8]);
     }
 
     #[test]
@@ -1955,12 +2039,23 @@ mod tests {
             &[[1, 24, 24], [4, 16, 16]],
         )
         .expect("a prompt with two images");
+        let merge = config.vision.spatial_merge_size;
+        // The prompt's rows are the capacity the caller asked for; each image's patch rows are its
+        // grid's patches, and its merged rows are the 2 by 2 blocks of each time step.
         assert_eq!(plan.rows, 4096);
-        assert_eq!(plan.images, [576, 1024]);
-        assert_eq!(plan.merged, 144 + 256);
-        assert_eq!(plan.deepstack, 3);
-        assert_eq!(plan.hidden, 5120);
-        assert_eq!(plan.head_dim, 128);
+        assert_eq!(plan.images, [24 * 24, 4 * 16 * 16]);
+        assert_eq!(
+            plan.merged,
+            (24 / merge) * (24 / merge) + 4 * (16 / merge) * (16 / merge)
+        );
+        // One DeepStack tap per checkpoint layer the tower taps, and the width and head width the text
+        // config states rather than a number this file owns.
+        assert_eq!(
+            plan.deepstack,
+            config.vision.deepstack_visual_indexes.len() as u32
+        );
+        assert_eq!(plan.hidden, config.hidden_size);
+        assert_eq!(plan.head_dim, config.head_dim);
     }
 
     #[test]

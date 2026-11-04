@@ -367,6 +367,8 @@ impl Scheduler {
             logical_position: 0,
             cache_visible_len: 0,
             cache_computed_len: 0,
+            // A request draws its first token at position zero of its stream.
+            sampling_position: 0,
             next_token: next_token.0,
             num_generated_tokens: generated,
             image_id: u32::try_from(images).unwrap_or(u32::MAX),
@@ -444,7 +446,7 @@ impl Scheduler {
                 .ok_or(MediaOutputError::Unserved(product.call))?;
             let (_, bound, info) = self
                 .placement
-                .component_candidates(self.executor.as_ref(), CallKind::Media(product.call), name)
+                .component_candidates(&self.executor, CallKind::Media(product.call), name)
                 .next()
                 .ok_or_else(|| MediaOutputError::Unplaced(name.clone()))?;
             let component = info
@@ -583,7 +585,7 @@ impl Scheduler {
                 .flatten();
             let candidates = self
                 .placement
-                .component_candidates(self.executor.as_ref(), CallKind::Media(call), &component)
+                .component_candidates(&self.executor, CallKind::Media(call), &component)
                 .filter(|(worker, _, _)| {
                     admissible.is_none_or(|encoders| encoders.contains(*worker))
                         && self.executor.is_ready(worker)
@@ -709,12 +711,24 @@ impl Scheduler {
             );
             return;
         }
+        let id = request.request_id;
         self.queue_media(PendingMedia {
             request,
             graph,
             event_tx,
             queued_at,
         });
+        // The policy sees a media request as it arrived, exactly as it sees a
+        // token request's arrival: nothing has happened to it yet, so every
+        // feature but the submitted ones is empty. Without this the policy has
+        // no view of a media request at all - not its class, its prompt or its
+        // reservation - and cannot plan its work.
+        if let Some(view) = views::requests(self, self.recorder.recorded())
+            .into_iter()
+            .find(|view| view.id.0 == id.0)
+        {
+            self.recorder.record(views::arrived(view));
+        }
     }
 
     /// Queues `pending` for admission: a request that resumes a stored
@@ -952,6 +966,18 @@ impl Scheduler {
             }) {
                 state.terminal_intent.finish(FinishReason::Cancelled);
             }
+            // A media request the mechanism admits is announced exactly as a
+            // token one is (`admit_running`): the policy's queue is its own, so
+            // an admission it is not told of is a name it offers in `admit`
+            // again, and one the mechanism then refuses as "not queued". The
+            // watchdog's deadline starts here for the same reason it does
+            // there - a resident request that never advances is a policy
+            // failure, media included.
+            let admitted_at =
+                scheduling::guest::Nanos(crate::clock::now_monotonic_us().saturating_mul(1_000));
+            let request = scheduling::guest::RequestId(id.0);
+            self.recorder.admitted(request, admitted_at);
+            self.watchdog.admitted(request, admitted_at);
             self.running_media.insert(id, state);
             self.running_order.push(id);
             // A resumed request's stored trajectory is pinned while its
@@ -1350,6 +1376,11 @@ impl Scheduler {
 
     /// Refuses one queued request the plan rejected, whether it waits as a
     /// token request or as a media one.
+    ///
+    /// The policy named it, and the mechanism still tells it the request ended:
+    /// the queue it keeps is the policy's own, and an end it is not told of
+    /// leaves a name behind that a later view change makes admissible again —
+    /// which the mechanism would then refuse as "not queued".
     fn reject_queued(&mut self, id: ipc::RequestId) {
         if let Some(position) = self
             .waiting
@@ -1357,6 +1388,7 @@ impl Scheduler {
             .position(|state| state.req.request_id == id)
             && let Some(state) = self.waiting.remove(position)
         {
+            self.announce_end(id, scheduling::guest::event::End::Rejected);
             let _ = state.output.events.event_tx.send(Event::Rejected {
                 kind: RejectionKind::Overloaded,
                 message: "the scheduling policy rejected the request as over capacity".into(),
@@ -1368,10 +1400,11 @@ impl Scheduler {
             .position(|pending| pending.request.request_id == id)
             && let Some(pending) = self.waiting_media.remove(position)
         {
+            self.announce_end(id, scheduling::guest::event::End::Rejected);
             let _ = pending.event_tx.send(Event::Rejected {
-                    kind: RejectionKind::Overloaded,
-                    message: "the scheduling policy rejected the request as over capacity".into(),
-                });
+                kind: RejectionKind::Overloaded,
+                message: "the scheduling policy rejected the request as over capacity".into(),
+            });
         }
     }
 
@@ -1421,6 +1454,11 @@ impl Scheduler {
                     let Some(st) = self.waiting.pop_front() else {
                         break;
                     };
+                    // The mechanism ends a request the policy still queues, so
+                    // it says so: a policy learns a request from `Arrived` and
+                    // an end from this, and a name it is not told has gone is
+                    // one it offers in `admit` again (§4.4).
+                    self.announce_end(st.req.request_id, scheduling::guest::event::End::Rejected);
                     let _ = st.output.events.event_tx.send(Event::Rejected {
                         kind: RejectionKind::Invalid,
                         message: "request exceeds total KV capacity".into(),
@@ -1507,6 +1545,7 @@ impl Scheduler {
                     let Some(st) = self.waiting.pop_front() else {
                         break;
                     };
+                    self.announce_end(st.req.request_id, scheduling::guest::event::End::Rejected);
                     let _ = st.output.events.event_tx.send(Event::Rejected {
                         kind: RejectionKind::Invalid,
                         message: "request exceeds total KV capacity".into(),
@@ -1564,7 +1603,7 @@ impl Scheduler {
         let cache = self.storage.cache()?;
         self.placement
             .worker_candidates(
-                self.executor.as_ref(),
+                &self.executor,
                 &self.info,
                 CallKind::Forward(ForwardMode::Prefill),
             )
@@ -1675,12 +1714,20 @@ impl Scheduler {
         self.placement
             .affinity
             .insert((request_key, target.1), target.0);
-        st.allocations = Some(RequestAllocations {
-            request_slot,
-            prefix_cache,
-            latent: None,
-            buffers: HashMap::new(),
-        });
+        if st
+            .allocations
+            .replace(RequestAllocations {
+                request_slot,
+                prefix_cache,
+                latent: None,
+                buffers: HashMap::new(),
+            })
+            .is_none()
+        {
+            // The request holds a pool row from now until its execution ends,
+            // which is what `Room::slots` counts without walking the residents.
+            self.rows_held = self.rows_held.saturating_add(1);
+        }
 
         // Queue latency is finalized at the same timestamp exposed through the
         // public scheduling event.

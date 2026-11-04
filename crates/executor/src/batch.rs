@@ -20,11 +20,10 @@
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use ipc::PhaseId;
+use ipc::{CallStatus, ComponentConfig, ErrorCode, PhaseId, TimingCounters, WorkerInfo};
 
 use crate::completion::Outcome;
 use crate::plan::{Bucket, Shape};
-use crate::stream::recorded;
 use crate::{Error, Result, lock};
 
 /// The scheduling mechanism's name for one submission: monotonic in the order the mechanism made
@@ -40,24 +39,116 @@ pub struct BatchId(pub u64);
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct CallId(pub u64);
 
-/// One sampled token, as a serving step produces it (4.4).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SampledToken {
-    /// The call the token was sampled for.
+/// One call's completion, as the device half of 4.4 states it.
+///
+/// A batch advances a set of calls and each of them gets one entry here, whether or not it sampled
+/// a token, because the mechanism's completion path is per call. A call this executor refuses never
+/// reaches this type: [`Batches::submit`](crate::Batches::submit) answers `Error::Invalid`
+/// synchronously for a batch it cannot serve, so an entry here is what execution did, and a
+/// [`CallStatus::Error`] entry is always a device failure.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CallOutput {
+    /// The call the batch advanced.
     pub call: CallId,
-    /// The token id the bucket's sampler wrote for that call.
-    pub token: u32,
+    /// Whether execution performed the call.
+    pub status: CallStatus,
+    /// Why it failed, when it did: the class the mechanism acts on (`NumericalFault` fails the
+    /// rows that computed non-finite logits, `InputError` rejects the request with this rank's
+    /// message, `ResourceError` fails the call).
+    pub error_code: Option<ErrorCode>,
+    /// What this rank said about a refused input, when it refused one.
+    pub error_message: Option<String>,
+    /// The tokens the sampler accepted for this call, in the order the call's sampling rows took
+    /// them. A call whose rows sampled nothing (a prefill chunk that ends no prompt, a padded row)
+    /// has none, which is not the same as a failure.
+    pub tokens: Vec<u32>,
+    /// The slot's committed count for a text call; a latent trajectory reports its own step here
+    /// once `ops::commit` gains a per-slot step column, and until then this field is the commit
+    /// count for every call kind.
+    ///
+    /// It is read from the commit table's sampling position, which a text slot advances once per
+    /// committed token and a latent slot advances once per denoising step.
+    pub step_index: u32,
+    /// The cache extent execution initialized, rejected speculative positions included: the slot's
+    /// logical position after the commit.
+    pub cache_computed_len: u32,
+    /// The accepted prefix a successor may read: the slot's sampling position after the commit.
+    pub cache_visible_len: u32,
+    /// The log-probability of each accepted token, aligned with [`CallOutput::tokens`].
+    ///
+    /// Empty unless the deployment planned logprob buckets (4.5): producing them costs a
+    /// full-vocabulary softmax on every sampling step and its `[rows, vocabulary]` buffer, so a
+    /// deployment that serves without clients asking for them plans the plain buckets and every
+    /// call reports this empty. **Empty means "not planned", never "zero".**
+    pub token_logprobs: Vec<f32>,
+    /// Ranked log-probabilities for each scored prompt position, in input order.
+    pub prompt_logprobs: Vec<Vec<ipc::TokenLogprob>>,
+    /// A token-denoising readout's candidate log-probabilities, in its own candidate order.
+    pub candidate_logprobs: Vec<f32>,
+    /// The finished artifact and its storage lifetime, when the call produced one.
+    pub media_output: Option<ipc::MediaOutput>,
+    /// The physical cache export, when the call publishes one.
+    pub cache_output: Option<ipc::CacheTransfer>,
+    /// The drafter's proposals after the last committed token.
+    pub draft_token_ids: Vec<u32>,
+    /// A video latent preparation's per-rank page layout.
+    pub latent_layouts: Vec<ipc::RankLatentLayout>,
 }
 
-/// What one serving step produced: the tokens its sampling rows sampled (4.4).
+impl CallOutput {
+    /// A completed call that sampled `tokens` and stands at `step_index`, from the slot state
+    /// `state` the commit table left.
+    pub fn completed(call: CallId, tokens: Vec<u32>, state: RowState) -> Self {
+        Self {
+            call,
+            status: CallStatus::Ok,
+            error_code: None,
+            error_message: None,
+            tokens,
+            step_index: state.step_index,
+            cache_computed_len: state.cache_computed_len,
+            cache_visible_len: state.cache_visible_len,
+            token_logprobs: Vec::new(),
+            prompt_logprobs: Vec::new(),
+            candidate_logprobs: Vec::new(),
+            // A text call produces no artifact, publishes no export, drafts no token and lays out
+            // no latent page: the mechanism reads these as empty, which is what happened.
+            media_output: None,
+            cache_output: None,
+            draft_token_ids: Vec::new(),
+            latent_layouts: Vec::new(),
+        }
+    }
+}
+
+/// Where the commit table left one call's slot, as the completion reads it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RowState {
+    /// The slot's trajectory position: the denoising trajectory's next step.
+    pub step_index: u32,
+    /// The cache extent execution initialized, rejected speculative positions included.
+    pub cache_computed_len: u32,
+    /// The accepted prefix a successor may read.
+    pub cache_visible_len: u32,
+}
+
+/// What one serving step produced (4.4).
 ///
-/// The mechanism learns them from the batch's [`Submission`], builds the next step's input ids from
-/// them, and counts the tokens it emits. A step that samples nothing (a chunk of a prefill that
-/// samples no token, a warmup, a program-layer command) completes with an empty output.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// The mechanism learns it from the batch's [`Submission`], builds the next step's input ids from
+/// the tokens, and folds the timing into the statistics of the calls' domain. A step that samples
+/// nothing (a chunk of a prefill that ends no prompt, a warmup, a program-layer command) completes
+/// with no call and nothing measured.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct BatchOutput {
-    /// One entry per sampling row, in the order the batch's calls and rows name them.
-    pub tokens: Vec<SampledToken>,
+    /// One entry per call the batch advanced, in the order the batch named them.
+    pub calls: Vec<CallOutput>,
+    /// What the batch measured, in the segments this executor can observe.
+    ///
+    /// `queued_us` is the wait from the mechanism's submission to this device thread starting the
+    /// batch, `device_us` the replay's launch to the stream's completion, and `host_us` the rest of
+    /// the step on the host. `copy_us` is zero in-process and states a fact rather than a
+    /// measurement: nothing is transferred for the completion, since the mechanism reads it here.
+    pub timing: TimingCounters,
 }
 
 /// One batch: one phase of one step, as the mechanism assembles it.
@@ -81,6 +172,10 @@ pub struct Batch {
     pub generation: u64,
 }
 
+/// The commit table's own definition, so a producer outside this crate writes its rows against
+/// the columns and modes the kernels read instead of a copy of them.
+pub use ops::commit;
+
 /// The host columns of one batch, in the layout the phase's kernels read.
 ///
 /// The mechanism writes these from the request state it owns; the executor stages them into the
@@ -89,6 +184,23 @@ pub struct Batch {
 /// the mechanism. The runner pads to the bucket it serves and never reorders what the mechanism
 /// wrote; a padded row carries `slot_mapping = -1` and a commit slot below zero, so it writes no
 /// cache page and keeps no token state.
+///
+/// # The three counts
+///
+/// Every column here follows exactly one of three counts, and a column compared with the wrong one
+/// is a mis-sized batch:
+///
+/// - **tokens** ([`BatchColumns::tokens`]): `input_ids` and the `[tokens]` columns of `rows` —
+///   positions, slot mapping;
+/// - **rows** ([`BatchColumns::rows`]): the sequences. `slots`, `parameters` and the `[rows]`
+///   columns of `rows` — lengths, query offsets, the sampling rows — are one entry per row, and a
+///   call may own several: a verification of three candidates is one call with three rows, and a
+///   call's `BatchRow::rows` span names them;
+/// - **calls** ([`BatchColumns::calls`]): the commit table, one row per call, because a call states
+///   once how its step advances the slot's device state however many rows it evaluated.
+///
+/// A mechanism that fills these columns and an executor that stages them both read this, so the
+/// rule is stated once; [`BatchColumns::check`] enforces it before a launch.
 #[derive(Clone, Default, Debug)]
 pub struct BatchColumns {
     /// The rows and their calls, as the model reads them: positions, slot mapping, lengths, query
@@ -112,7 +224,17 @@ pub struct BatchColumns {
 
 impl BatchColumns {
     /// The number of rows (sequences) the columns describe.
+    ///
+    /// A row is one sequence's query, which is not the same as a call: a verify batch carries
+    /// several rows for one call, and the per-row columns (`slots`, `parameters`) are as long as
+    /// the rows. `rows.calls` counts the calls instead, which sized the sampler's views to one row
+    /// when a call held three.
     pub fn rows(&self) -> usize {
+        self.rows.rows()
+    }
+
+    /// The calls the columns describe.
+    pub fn calls(&self) -> usize {
         self.rows.calls.len()
     }
 
@@ -123,29 +245,43 @@ impl BatchColumns {
 
     /// Whether every column has the length its field promises for `shape`, so that a mis-sized
     /// batch fails before a launch rather than after one.
+    ///
+    /// Three counts, not one: `input_ids` is as long as the batch's tokens, `slots` and
+    /// `parameters` as long as its rows — the sequences, which is `[rows]` in every per-row column
+    /// and what [`BatchColumns::rows`] answers — and `commit` is one row per *call*, since a call
+    /// states once how the step advances its slot however many rows it evaluated. A verify batch
+    /// of three candidates is one call and three rows, and comparing the per-row columns with the
+    /// call count refuses it.
     pub fn check(&self, shape: &Shape) -> Result<()> {
         let tokens = self.rows.tokens();
-        let rows = self.rows.calls.len();
+        // Two counts, and a column belongs to one of them: `slots`, `parameters`, `seq_lens` and
+        // `logits_rows` are per **row** (a verify or branch call carries several rows for one call),
+        // while the commit table states one row per **call** (`crates/engine`'s `columns.rs`).
+        // Sizing one against the other refuses a valid multi-row call and lets a wrong commit table
+        // through.
+        let rows = self.rows();
+        let calls = self.calls();
+        let parameters = ops::sampler::PARAMETER_COLUMNS as usize;
         for (name, actual, expected) in [
+            ("positions", self.rows.positions.len(), tokens),
+            ("slot_mapping", self.rows.slot_mapping.len(), tokens),
             ("input_ids", self.input_ids.len(), tokens),
+            ("seq_lens", self.rows.seq_lens.len(), rows),
+            ("logits_rows", self.rows.logits_rows.len(), rows),
             ("slots", self.slots.len(), rows),
+            ("parameters", self.parameters.len(), rows * parameters),
             (
-                "parameters",
-                self.parameters.len(),
-                rows * ops::sampler::PARAMETER_COLUMNS as usize,
+                "commit",
+                self.commit.len(),
+                ops::commit::COMMIT_FIELDS * calls,
             ),
         ] {
             if actual != expected {
                 return Err(Error::Invalid(format!(
-                    "{name} has {actual} entries, the batch has {rows} rows and {tokens} tokens"
+                    "{name} has {actual} entries, the batch has {rows} rows, {calls} calls and \
+                     {tokens} tokens"
                 )));
             }
-        }
-        if self.commit.len() % rows.max(1) != 0 {
-            return Err(Error::Invalid(format!(
-                "commit has {} entries, not a whole number of columns over {rows} rows",
-                self.commit.len()
-            )));
         }
         if tokens > shape.tokens as usize || rows > shape.rows as usize {
             return Err(Error::Invalid(format!(
@@ -244,19 +380,46 @@ pub enum Job {
         /// The generation the rebind is for.
         generation: u64,
     },
-    /// A storage owner's recorded issue work, performed on its stream in submission order.
-    Issue {
-        /// The recorded copies, fills, fences and waits.
-        work: std::sync::Arc<std::sync::Mutex<recorded::Batch>>,
-    },
-    /// A job whose only work is the wait for the events the event pool deferred work on.
-    After {
-        /// The events whose completion the job establishes.
-        events: Vec<Arc<platform::Event>>,
-    },
 }
 
 impl Job {
+    /// What this job is doing, for the report of a failed submission.
+    ///
+    /// The device thread knows the job it was performing and the caller does not, and the failure
+    /// crosses a thread boundary as a bare error, so the description is written where the job is
+    /// performed and carried beside that error.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Replay {
+                bucket,
+                generation,
+                batch,
+                ..
+            } => format!(
+                "replaying batch {} from the bucket of {} tokens and {} rows of generation {generation}",
+                batch.0, bucket.tokens, bucket.rows
+            ),
+            Self::Capture { bucket, generation, .. } => format!(
+                "capturing the bucket of {} tokens and {} rows of generation {generation}",
+                bucket.tokens, bucket.rows
+            ),
+            Self::Rebind { bucket, generation, .. } => format!(
+                "rebinding the bucket of {} tokens and {} rows of generation {generation}",
+                bucket.tokens, bucket.rows
+            ),
+            Self::Shadow {
+                operator,
+                key,
+                bucket,
+                generation,
+                ..
+            } => format!(
+                "shadowing {operator} {key} in the bucket of {} tokens and {} rows of generation {generation}",
+                bucket.tokens, bucket.rows
+            ),
+        }
+    }
+
     /// What kind of job this is, for the watchdog's report.
     pub fn kind(&self) -> JobKind {
         match self {
@@ -264,8 +427,6 @@ impl Job {
             Self::Capture { .. } => JobKind::Capture,
             Self::Rebind { .. } => JobKind::Rebind,
             Self::Shadow { .. } => JobKind::Shadow,
-            Self::Issue { .. } => JobKind::Issue,
-            Self::After { .. } => JobKind::After,
         }
     }
 
@@ -284,7 +445,6 @@ impl Job {
             | Self::Capture { runner, .. }
             | Self::Rebind { runner, .. }
             | Self::Shadow { runner, .. } => Some(*runner),
-            Self::Issue { .. } | Self::After { .. } => None,
         }
     }
 }
@@ -338,20 +498,6 @@ impl std::fmt::Debug for Job {
                 .field("bucket", bucket)
                 .field("generation", generation)
                 .finish(),
-            Self::Issue { work } => formatter
-                .debug_struct("Issue")
-                .field(
-                    "work",
-                    &work
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .is_empty(),
-                )
-                .finish(),
-            Self::After { events } => formatter
-                .debug_struct("After")
-                .field("events", &events.len())
-                .finish(),
         }
     }
 }
@@ -373,6 +519,122 @@ pub trait Batches: Send + Sync {
     /// A shadow batch never writes resident memory and never serves a request; its failure is the
     /// update's, which the main process reports as `PrecopyFailed`.
     fn shadow(&self, batch: Batch) -> Result<Submission>;
+
+    /// The pools this executor serves (4.2, 7.3): what the mechanism schedules against.
+    ///
+    /// The mechanism builds its `ExecutorInfo` from this and nothing else, so a pool whose ranks,
+    /// cache geometry or model length is absent here is a pool it refuses to serve rather than one
+    /// it assumes: a scheduler that guesses a rank's cache makes the host KV path disappear at
+    /// runtime. An executor that states none cannot be served in process, and the mechanism says so
+    /// when it builds its info.
+    fn inventory(&self) -> &[Inventory] {
+        &[]
+    }
+}
+
+/// One pool of the deployment an executor serves (4.2, 7.3).
+#[derive(Clone, Debug, Default)]
+pub struct Inventory {
+    /// The deployment's name for the pool, the identity the mechanism's `WorkerGroupId` carries.
+    pub group: String,
+    /// The pool's ranks in launch order, each with what it reported at handshake.
+    pub ranks: Vec<WorkerInfo>,
+    /// What the deployment launched the pool with; the ranks' reports do not carry it back.
+    pub placement: Placement,
+    /// The longest sequence the pool's model was built for: the attention descriptor's static bound
+    /// on the keys one row reads.
+    pub max_model_len: u32,
+}
+
+/// What a deployment launched one pool with (4.2).
+#[derive(Clone, Debug, Default)]
+pub struct Placement {
+    /// Unresolved physical batches the pool admits at once, counted as at least one.
+    pub queue_depth: usize,
+    /// Ranks the pool was launched with, counted as at least one.
+    pub ranks: usize,
+    /// The pool's components by name, each with its member ranks, parallel degrees and distribution.
+    pub components: std::collections::BTreeMap<String, ComponentConfig>,
+}
+
+/// The mechanism's `Batches` over a rank's devices (2.4, 4.4): a batch goes to the device whose
+/// runners serve its phase.
+///
+/// A rank's executors are its devices, and a device's runners are the blocks of the model placed
+/// on it; the mechanism addresses a batch by phase, not by device. This is the one place that
+/// translation happens, so a scheduler never needs to know how many devices a rank holds. It is a
+/// plain route on purpose: the phase list is fixed at spawn, so no lock, no schedule, no retry.
+pub struct Executors {
+    executors: Vec<Arc<crate::device::Executor>>,
+}
+
+impl Executors {
+    /// The rank's devices, in the order they were spawned.
+    ///
+    /// Every phase a batch can name must be served by exactly one of them; a rank that spawns two
+    /// devices serving one phase is refused, because a batch could go to either and the two would
+    /// disagree about the model's state.
+    pub fn new(executors: Vec<crate::device::Executor>) -> Result<Self> {
+        Self::shared(executors.into_iter().map(Arc::new).collect())
+    }
+
+    /// The rank's devices, as the handles the rest of the process already holds.
+    ///
+    /// A main process holds one handle per device from the moment it spawns them: the control
+    /// thread reads their running jobs for the stall rule and their counters for the metrics,
+    /// and a scheduler submits through the same handles. Sharing them rather than moving them in
+    /// keeps one device one owner, and the phase check is the same one [`Executors::new`] makes.
+    pub fn shared(executors: Vec<Arc<crate::device::Executor>>) -> Result<Self> {
+        let mut served: Vec<PhaseId> = Vec::new();
+        for executor in &executors {
+            for phase in executor.phases() {
+                if served.contains(phase) {
+                    return Err(Error::Invalid(format!(
+                        "two devices of this rank serve phase {phase:?}"
+                    )));
+                }
+                served.push(*phase);
+            }
+        }
+        Ok(Self { executors })
+    }
+
+    /// The device that serves `phase`.
+    fn route(&self, phase: PhaseId) -> Result<&Arc<crate::device::Executor>> {
+        self.executors
+            .iter()
+            .find(|executor| executor.serves(phase))
+            .ok_or_else(|| {
+                Error::Invalid(format!(
+                    "no device of this rank serves phase {phase:?}; its {} device(s) serve {:?}",
+                    self.executors.len(),
+                    self.executors
+                        .iter()
+                        .flat_map(|executor| executor.phases().iter().copied())
+                        .collect::<Vec<_>>()
+                ))
+            })
+    }
+
+    /// How many devices the rank hands batches to.
+    pub fn len(&self) -> usize {
+        self.executors.len()
+    }
+
+    /// Whether the rank has no device at all.
+    pub fn is_empty(&self) -> bool {
+        self.executors.is_empty()
+    }
+}
+
+impl Batches for Executors {
+    fn submit(&self, batch: Batch) -> Result<Submission> {
+        self.route(batch.phase)?.submit(batch)
+    }
+
+    fn shadow(&self, batch: Batch) -> Result<Submission> {
+        self.route(batch.phase)?.shadow(batch)
+    }
 }
 
 /// What the device executor is doing, as the control thread's stall report and probe name it (2.4).
@@ -402,8 +664,8 @@ pub enum JobKind {
     Revert,
     /// Releasing an old generation's graphs (7.3 step 6).
     Purge,
-    /// A storage job: the copies, fills and fences a storage owner recorded.
-    Issue,
+    /// Releasing a prepared generation that never served (an abandoned precopy, 7.3 step 2).
+    Discard,
     /// A job that only waits for the events it was given.
     After,
 }
@@ -422,7 +684,7 @@ impl JobKind {
             Self::Switchover => "switchover",
             Self::Revert => "revert",
             Self::Purge => "purge",
-            Self::Issue => "issue",
+            Self::Discard => "discard",
             Self::After => "after",
         }
     }
@@ -443,6 +705,9 @@ pub struct Submission {
 
 pub(crate) struct SubmissionState {
     outcome: Mutex<Option<Outcome<BatchOutput>>>,
+    /// What the submission was doing when it failed, written where the failure happened: the
+    /// caller cannot know it, and an error alone does not say which bucket or operator broke.
+    failure: Mutex<Option<String>>,
     ready: Condvar,
 }
 
@@ -451,6 +716,7 @@ impl Submission {
     pub fn completed(id: SubmissionId, outcome: Outcome<BatchOutput>) -> Self {
         let state = Arc::new(SubmissionState {
             outcome: Mutex::new(Some(outcome)),
+            failure: Mutex::new(None),
             ready: Condvar::new(),
         });
         Self { id, state }
@@ -460,6 +726,7 @@ impl Submission {
     pub(crate) fn pending(id: SubmissionId) -> (Self, Arc<SubmissionState>) {
         let state = Arc::new(SubmissionState {
             outcome: Mutex::new(None),
+            failure: Mutex::new(None),
             ready: Condvar::new(),
         });
         (
@@ -479,11 +746,6 @@ impl Submission {
     /// The state the queue completes, and the submission's number.
     pub(crate) fn parts(&self) -> (Arc<SubmissionState>, SubmissionId) {
         (Arc::clone(&self.state), self.id)
-    }
-
-    /// Completes this submission with `outcome`, if something else did not already.
-    pub(crate) fn complete(&self, outcome: Outcome<BatchOutput>) {
-        Arc::clone(&self.state).finish(outcome);
     }
 
     /// Waits until the submission completed and answers its outcome.
@@ -522,9 +784,25 @@ impl Submission {
     pub fn outcome(&self) -> Option<Outcome<BatchOutput>> {
         lock(&self.state.outcome).clone()
     }
+
+    /// What the submission was doing when it failed, when it did.
+    ///
+    /// The device thread writes it where the failure happens - the job it was performing and the
+    /// bucket, generation or operator that named it - because the caller holds only the bare error.
+    pub fn failure_label(&self) -> Option<String> {
+        lock(&self.state.failure).clone()
+    }
 }
 
 impl SubmissionState {
+    /// Records what this submission was doing when it failed, for the report that reads it.
+    pub(crate) fn note_failure(&self, label: String) {
+        let mut slot = lock(&self.failure);
+        if slot.is_none() {
+            *slot = Some(label);
+        }
+    }
+
     /// Completes the submission with `outcome`; the first completion wins.
     pub(crate) fn finish(self: Arc<Self>, outcome: Outcome<BatchOutput>) {
         let mut slot = lock(&self.outcome);

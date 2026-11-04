@@ -61,6 +61,11 @@ use crate::engine::hold::Kept;
 use crate::leader::{Leader, Replica, UpdateError, locked, stats_sink};
 use crate::options::{PreviousWorld, RollbackOptions, ServeConfig};
 
+// The epoch layer owns these three definitions; the API and the leader still
+// name them as `crate::worlds::{…}` until their `use` lines move to
+// `crate::updates` in builder02's routing commit.
+pub(crate) use crate::updates::change::{Applied, ApplyRequest, InFlight};
+
 mod change;
 pub(crate) mod group;
 mod redistribution;
@@ -76,62 +81,6 @@ pub(crate) struct Commit {
     retire: Vec<u64>,
     nodes: Option<Vec<String>>,
     pub(crate) pending: Vec<u64>,
-}
-
-/// How the requests in flight at a promotion continue when the new world
-/// computes other numerics than the one they ran on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InFlight {
-    /// Each continues with the state it reached, which the new world reads
-    /// as its own; the pages it writes afterwards reach no shared tier.
-    #[default]
-    Keep,
-    /// Each computes its state again from its tokens, exactly.
-    Recompute,
-}
-
-/// A change of the deployment's configuration (`PUT /admin/config`).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct ApplyRequest {
-    /// Update this independent replica. Without an index, a deployment
-    /// update advances through replicas as each trial is committed.
-    pub replica: Option<usize>,
-    /// The whole target configuration as TOML, as `--config` reads it;
-    /// `None` takes the current one.
-    pub config: Option<String>,
-    /// `PATH=VALUE` assignments over that configuration, as `--set` states
-    /// them.
-    pub set: Vec<String>,
-    pub in_flight: InFlight,
-    /// Report the plan and change nothing.
-    pub dry_run: bool,
-    /// Apply a configuration a rollback marked unavailable.
-    pub force: bool,
-}
-
-/// What an apply changed.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Applied {
-    /// The target is the current configuration.
-    Unchanged,
-    /// The schedulers took the new limits at their next step, or the daemon
-    /// reads the options that changed from its next request on.
-    InPlace(serde_json::Value),
-    /// The plan of a dry run, which changed nothing.
-    Planned(serde_json::Value),
-    /// The daemon's own options or executable change: a hot restart of the
-    /// daemon with the target configuration applies them. When the change
-    /// also changes what a world executes, the daemon's successor applies
-    /// `then`, the same change, which then changes the world alone: the
-    /// orchestrator changes before what it orchestrates.
-    Daemon {
-        config: Box<ServeConfig>,
-        executable: Option<String>,
-        then: Option<Box<ApplyRequest>>,
-    },
-    /// A new world executes on trial.
-    World(serde_json::Value),
 }
 
 /// The previous world a trial keeps.
@@ -1299,6 +1248,13 @@ impl Leader {
         }
         let current = locked(&replicas[0].config).clone();
         let (target, stated, update) = resolve(&current, &request)?;
+        // A change of what the main processes build is the epoch layer's
+        // (§7.4): one switch for the deployment, before any worlds work. The
+        // program layer's and the host layer's paths stay below until their
+        // own switches replace them.
+        if let Some(applied) = self.apply_epoch(&current, &target, request.dry_run)? {
+            return Ok(applied);
+        }
         let count = if target.moe_config.expert_parallel {
             1
         } else {
@@ -1341,6 +1297,7 @@ impl Leader {
                     return Ok(applied);
                 }
                 Applied::Planned(report) | Applied::InPlace(report) => reports.push(report),
+                applied @ Applied::Epoch(_) => return Ok(applied),
                 Applied::Unchanged => {}
             }
         }
@@ -1359,9 +1316,88 @@ impl Leader {
         })
     }
 
+    /// The epoch layer's arm of [`Leader::apply`]: a change that starts main
+    /// processes which differ in what they build is a switch between epochs
+    /// (`specs/worker.md` §7.4), and the two deployments alone decide it. It
+    /// answers `Ok(None)` when the change is another layer's — the host path,
+    /// the programs, or nothing.
+    ///
+    /// The change this builds is the switch's whole input: the serving epoch
+    /// and its launch generation, the epoch the target becomes, one spawn
+    /// generation for the deployment (above every rank's standby, §2.5), the
+    /// target's executable and the arguments every engine process of this
+    /// daemon starts with.
+    fn apply_epoch(
+        &self,
+        current: &ServeConfig,
+        target: &ServeConfig,
+        dry_run: bool,
+    ) -> Result<Option<Applied>, UpdateError> {
+        let previous = crate::epoch::Deployment::of(current.clone());
+        let next = crate::epoch::Deployment::of(target.clone());
+        if crate::epoch::layer(&previous, &next) != crate::epoch::Layer::Epoch {
+            return Ok(None);
+        }
+        let epochs = self.updates.epochs();
+        let (previous_epoch, serving) = epochs.serving().ok_or_else(|| {
+            UpdateError::Refused("no epoch serves: there is nothing to switch from".to_owned())
+        })?;
+        let previous_generation = serving.generation.ok_or_else(|| {
+            UpdateError::Refused("the serving epoch names no launch generation".to_owned())
+        })?;
+        // The deployment's argv comes from its leader node's control: the
+        // arguments an engine process of this daemon starts with are the
+        // same for every host (the daemon's sockets travel with them).
+        let replicas = self.replicas();
+        let control = replicas[0].control.get().ok_or(UpdateError::NoEngine)?;
+        // One number for the whole deployment: every rank's counter is
+        // advanced, and the highest is the generation each child of the epoch
+        // is spawned at, so none collides with a rank's standby (§2.5). A dry
+        // run advances the counters too and reports the number the switch
+        // would use; the counters are monotone, not a promise.
+        let group = crate::engine::control::ENGINE_GROUP;
+        let spawn_generation = (0..u64::from(target.nnodes.get()))
+            .map(|rank| epochs.next_generation(group, rank))
+            .max()
+            .unwrap_or(0);
+        let target_epoch = previous_epoch + 1;
+        // The epoch's own build config is written once, and the launch file
+        // every process of it reads names that path (§2.3). The world is the
+        // epoch's identity, which the switch claims.
+        control
+            .write_build_config(target_epoch, &next.build_config)
+            .map_err(UpdateError::Failed)?;
+        let mut spec = target.engine_spec().map_err(UpdateError::Failed)?;
+        spec.world = target_epoch;
+        let change = crate::updates::epoch::EpochChange {
+            previous: previous_epoch,
+            target: target_epoch,
+            // The update's number is the epoch it creates: epochs only grow.
+            update: crate::epoch::Update::new(target_epoch, next.clone()),
+            group: group.to_owned(),
+            start: control
+                .epoch_start(&spec, spawn_generation)
+                .map_err(UpdateError::Failed)?,
+            previous_generation,
+            spawn_generation,
+        };
+        self.updates.apply(&previous, &next, change, dry_run)
+    }
+
     /// Commits the executing trial and releases its previous world.
     pub async fn commit(&self) -> Result<serde_json::Value, UpdateError> {
         let _replacing = self.replicas.replacing.lock().await;
+        // A running epoch switch is the update in flight: its commit is a
+        // command to the target's processes, and the switch records the
+        // decision when every one of them acknowledges (§7.4).
+        if locked(&self.replicas.commit).is_none() && self.updates.running() {
+            if self.updates.commit() {
+                return Ok(self
+                    .updates
+                    .report()
+                    .unwrap_or_else(|| serde_json::json!({})));
+            }
+        }
         if locked(&self.replicas.commit).is_none() {
             if locked(&self.replicas.group).is_some() {
                 group::decide_commit(&self.replicas).await?;
@@ -1375,6 +1411,14 @@ impl Leader {
     /// Restores the previous world of the executing trial.
     pub async fn rollback(&self, reason: String) -> Result<serde_json::Value, UpdateError> {
         let _replacing = self.replicas.replacing.lock().await;
+        if locked(&self.replicas.commit).is_none() && self.updates.running() {
+            if self.updates.rollback(&reason) {
+                return Ok(self
+                    .updates
+                    .report()
+                    .unwrap_or_else(|| serde_json::json!({})));
+            }
+        }
         if locked(&self.replicas.commit).is_some() {
             return Err(UpdateError::Refused(
                 "commit is decided; finish the pending commit".into(),
@@ -1458,7 +1502,12 @@ impl Leader {
     }
 }
 
-fn resolve(
+/// Resolves `request` against the serving configuration `current`: the target
+/// configuration, the fields the request stated and the target's update
+/// options, which [`crate::epoch::layer`] and the update entry decide on. The
+/// admin API resolves a change here before it routes it, so the target an
+/// operator sees planned is the target the leader applies.
+pub(crate) fn resolve(
     current: &ServeConfig,
     request: &ApplyRequest,
 ) -> Result<
@@ -1609,6 +1658,9 @@ pub(crate) async fn complete_commit(
                 break;
             }
             Ok(Applied::InPlace(_) | Applied::Unchanged) => {}
+            // The epoch layer answers the deployment's changes itself, before
+            // a replica is asked; a replica cannot start an epoch.
+            Ok(Applied::Epoch(_)) => break,
             Ok(Applied::Daemon { .. } | Applied::Planned(_)) => {
                 locked(&registry.pending).clear();
                 committed["rollout_error"] = "the next replica requires a deployment update".into();
@@ -2222,9 +2274,10 @@ impl Replica {
             (done, task)
         };
         let start_spec = spec.clone();
+        let start_build = crate::epoch::BuildConfig::of(&target);
         let prepared = async {
             let successor = Arc::new(
-                tokio::task::spawn_blocking(move || control.start(start_spec, sink))
+                tokio::task::spawn_blocking(move || control.start(start_spec, &start_build, sink))
                     .await
                     .context("the successor's start did not complete")?
                     .context("the successor world did not start")?,
@@ -2979,10 +3032,14 @@ pub(crate) async fn rollback(
                 retire: vec![trial.world],
                 ..trial.previous_spec.clone()
             };
-            let started = tokio::task::spawn_blocking(move || control.start(spec, sink))
-                .await
-                .context("the previous world's start did not complete")
-                .and_then(|started| started.context("the previous world did not start"));
+            // The previous world's epoch: the replica's configuration is
+            // still the previous one, the trial having not been committed.
+            let previous_build = crate::epoch::BuildConfig::of(&locked(&replica.config));
+            let started =
+                tokio::task::spawn_blocking(move || control.start(spec, &previous_build, sink))
+                    .await
+                    .context("the previous world's start did not complete")
+                    .and_then(|started| started.context("the previous world did not start"));
             let started = match started {
                 Ok(started) => Arc::new(started),
                 Err(error) => {

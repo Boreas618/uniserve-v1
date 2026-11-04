@@ -22,6 +22,8 @@ serde_json.workspace = true
 serde_with.workspace = true
 thiserror.workspace = true
 thiserror-ext.workspace = true
+# The control link publishes the daemon's commands as a watch channel.
+tokio.workspace = true
 tracing.workspace = true
 # Builds the deterministic serving tokenizer of the test fixtures.
 tokenizers = { workspace = true, optional = true }

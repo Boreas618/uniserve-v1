@@ -206,6 +206,7 @@ impl Scheduler {
             .collect();
         for id in queued {
             if let Some(st) = self.remove_waiting(id) {
+                self.announce_end(id, scheduling::guest::event::End::Migratable);
                 let _ = st.output.events.event_tx.send(Event::Migratable {
                     cause: MigrationCause::Loss,
                     denoised_steps: 0,
@@ -217,6 +218,10 @@ impl Scheduler {
         // that held their trajectories failed, and the previous world
         // computes them again from what they name.
         while let Some(pending) = self.waiting_media.pop_front() {
+            self.announce_end(
+                pending.request.request_id,
+                scheduling::guest::event::End::Migratable,
+            );
             let _ = pending.event_tx.send(Event::Migratable {
                 cause: MigrationCause::Loss,
                 denoised_steps: 0,

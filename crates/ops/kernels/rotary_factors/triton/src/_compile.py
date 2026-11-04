@@ -70,6 +70,27 @@ def parse_key(key, dimensions):
     return fields
 
 
+def fields_of(key, manifest):
+    """The descriptor's fields, against whichever of the package's shapes fits.
+
+    A package may declare one table of dimensions or several, one per key shape:
+    an operator prints some fields only for the variant that has them (a narrowed
+    rotation names its width, a sectioned one its axes), so a key is read against
+    each shape in turn and the first that covers it answers.
+    """
+    described = manifest["kernel"]["descriptors"]
+    shapes = described if isinstance(described, list) else [described]
+    for shape in shapes:
+        if not shape.get("dimensions"):
+            continue
+        try:
+            return parse_key(key, shape["dimensions"])
+        except SystemExit:
+            continue
+    named = [sorted(shape.get("dimensions", {})) for shape in shapes]
+    raise SystemExit(f"{key}: no declared shape covers it (shapes: {named})")
+
+
 def compile_one(package, target, key, out, spec):
     """Compile descriptor ``key`` of ``package`` for ``target`` into ``out``.
 
@@ -79,7 +100,7 @@ def compile_one(package, target, key, out, spec):
     compilation options.
     """
     manifest = tomllib.loads((package / "package.toml").read_text())
-    fields = parse_key(key, manifest["kernel"]["descriptors"]["dimensions"])
+    fields = fields_of(key, manifest)
     described = spec(fields, manifest.get("parameters", {}), target)
     compiled = triton.compile(
         ASTSource(
@@ -96,7 +117,15 @@ def compile_one(package, target, key, out, spec):
     metadata = next(
         path for name, path in compiled.metadata_group.items() if name.endswith(".json")
     )
-    (out / "metadata.json").write_text(Path(metadata).read_text())
+    # The module states the parameters it takes at launch, in order and with their types, so `ops`
+    # can compare the operator's packed words against them and refuse a disagreement by name instead
+    # of leaving it to the driver. Triton drops a kernel's constexprs from its parameters, and so is
+    # this list: the signature the source was compiled from names them too, marked `"constexpr"`.
+    written = json.loads(Path(metadata).read_text())
+    written["signature"] = {
+        name: ty for name, ty in described["signature"].items() if ty != "constexpr"
+    }
+    (out / "metadata.json").write_text(json.dumps(written))
     print(json.dumps({"descriptor": key, "target": target, "symbol": compiled.name}))
 
 

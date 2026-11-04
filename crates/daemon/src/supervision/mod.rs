@@ -19,6 +19,7 @@
 mod claims;
 
 pub(crate) use claims::restart_earlier;
+pub(crate) mod roster;
 mod service;
 mod supervisor;
 
@@ -71,9 +72,109 @@ pub struct DaemonOptions {
     pub join_timeout: Duration,
 }
 
+/// The daemon's downward path to the main processes its service supervises,
+/// and the reports they send up (§2.3, §7.3): the daemon commands a main
+/// process and reads its `Report`s without holding its connection, which the
+/// service owns.
+///
+/// A clone of this shares the same ends: one reporter’s queue, so one
+/// consumer at a time.
+#[derive(Clone)]
+pub struct ProcessCommands {
+    /// Commands, by the engine whose main process is to execute them.
+    commands: std::sync::mpsc::Sender<(u64, proto::process::Command)>,
+    /// Every report a main process sent, by the engine that sent it.
+    reports: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<(u64, proto::process::Report)>>>,
+}
+
+impl std::fmt::Debug for ProcessCommands {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ProcessCommands")
+    }
+}
+
+impl ProcessCommands {
+    /// The two ends of the daemon's command channel: the daemon's, and the
+    /// service's — the commands it drains each round, and the reports it
+    /// fills.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn channel() -> (
+        Self,
+        std::sync::mpsc::Receiver<(u64, proto::process::Command)>,
+        std::sync::mpsc::Sender<(u64, proto::process::Report)>,
+    ) {
+        let (commands, commands_rx) = std::sync::mpsc::channel();
+        let (reports, reports_rx) = std::sync::mpsc::channel();
+        (
+            Self {
+                commands,
+                reports: Arc::new(std::sync::Mutex::new(reports_rx)),
+            },
+            commands_rx,
+            reports,
+        )
+    }
+
+    /// Sends `command` to engine `engine`'s main process.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the service stopped: nothing would carry the command.
+    pub fn send(&self, engine: u64, command: proto::process::Command) -> anyhow::Result<()> {
+        self.commands
+            .send((engine, command))
+            .map_err(|_| anyhow::anyhow!("the daemon's service stopped"))
+    }
+
+    /// The next report a main process sent, with the engine that sent it,
+    /// waiting at most `timeout` for one.
+    pub fn report(&self, timeout: Duration) -> Option<(u64, proto::process::Report)> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let reports = self
+                .reports
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match reports.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(report) => return Some(report),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return None,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+            }
+        }
+    }
+}
+
 /// A running daemon. Dropping it stops its service and ends every process
 /// it supervises.
 pub struct Daemon {
+    /// The command channel to the main processes this node's daemon
+    /// supervises; `None` on a member daemon, which supervises none.
+    commands: Option<ProcessCommands>,
+    /// The epoch layer's ends of the service on the leader: its requests
+    /// down, and the peers and exits up. `None` on a member. Taken once, by
+    /// the adapter; behind a lock because a `Daemon` is shared between the
+    /// HTTP threads and the channel ends are not themselves `Sync`.
+    link: std::sync::Mutex<Option<roster::EpochLink>>,
+    /// A clone of the requests channel inside `link`, kept for the processes
+    /// this daemon starts itself: the frontend is spawned and commanded
+    /// through the node's service too, and its channel must not be the epoch
+    /// layer's to take (§2.1, §2.3).
+    requests: Option<
+        std::sync::mpsc::Sender<(
+            proto::process::Request,
+            std::sync::mpsc::Sender<proto::process::Reply>,
+        )>,
+    >,
+    /// The peers that greeted as the frontend, taken once: the part of the
+    /// daemon that starts the frontend addresses its commands to that peer, and
+    /// the greeting stream itself belongs to the epoch layer (§2.1, §2.3).
+    frontend_greeted: std::sync::Mutex<Option<std::sync::mpsc::Receiver<u64>>>,
+    /// The processes this node supervises, which the service keeps current
+    /// (§2.3): the epoch layer and `GET /admin/config` read them.
+    table: Option<service::ProcessTable>,
+    /// One token per thing the epoch layer has to read, so the thread that
+    /// advances the switch waits instead of polling.
+    awake: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     /// The process socket engines connect to, on the leader.
     address: Option<String>,
     /// The leader's socket file, removed once its service ends.
@@ -118,7 +219,8 @@ impl Daemon {
             wake: wake_reader,
         };
 
-        let (address, thread) = if options.node_rank == 0 {
+        let (served, thread, commands, link, requests, frontend_greeted, awake, table) =
+            if options.node_rank == 0 {
             let (joins, members) = join_members(&options)?;
             let leader_address = leader_address(&options, &members);
             // Engines may run on any joined node. A deployment with a
@@ -144,11 +246,58 @@ impl Daemon {
             // Storage Server too: their Transfer Servers read its storage.
             let local = local(&options, leader_address, joins.is_some())?;
             let host = options.host.clone();
+            let (commands, commands_rx) = std::sync::mpsc::channel();
+            let (reports, reports_rx) = std::sync::mpsc::channel();
+            let (requests, requests_rx) = std::sync::mpsc::channel();
+            let (greetings, greetings_rx) = std::sync::mpsc::channel();
+            let (frontend_greetings, frontend_greeted) = std::sync::mpsc::channel();
+            let (exits, exits_rx) = std::sync::mpsc::channel();
+            let (activity, awake) = std::sync::mpsc::channel();
+            // The processes this node supervises, which the service keeps
+            // current and the admin API reports (§2.3, §7.4).
+            let table: service::ProcessTable = Default::default();
+            let published = Arc::clone(&table);
             let thread = std::thread::Builder::new()
                 .name("daemon".into())
-                .spawn(move || service::serve_leader(&host, local, listener, joins, members, &stop))
+                .spawn(move || {
+                    service::serve_leader(
+                        &host,
+                        local,
+                        listener,
+                        joins,
+                        members,
+                        commands_rx,
+                        reports,
+                        requests_rx,
+                        greetings,
+                        Some(frontend_greetings),
+                        exits,
+                        activity,
+                        published,
+                        &stop,
+                    )
+                })
                 .context("starting the daemon's service")?;
-            (Some((address, socket)), thread)
+            let commands = ProcessCommands {
+                commands,
+                reports: Arc::new(std::sync::Mutex::new(reports_rx)),
+            };
+            let link = Some(roster::EpochLink {
+                requests: requests.clone(),
+                greetings: greetings_rx,
+                exits: exits_rx,
+                commands: commands.clone(),
+            });
+            (
+                Some((address, socket)),
+                thread,
+                Some(commands),
+                link,
+                Some(requests),
+                Some(frontend_greeted),
+                Some(awake),
+                Some(table),
+            )
         } else {
             let leader = join_leader(&options)?;
             let address = leader.local_ip();
@@ -157,10 +306,16 @@ impl Daemon {
                 .name("daemon".into())
                 .spawn(move || service::serve_member(local, leader, &stop))
                 .context("starting the daemon's service")?;
-            (None, thread)
+            (None, thread, None, None, None, None, None, None)
         };
-        let (address, socket) = address.unzip();
+        let (address, socket) = served.unzip();
         Ok(Self {
+            commands,
+            table,
+            requests,
+            frontend_greeted: std::sync::Mutex::new(frontend_greeted),
+            link: std::sync::Mutex::new(link),
+            awake: std::sync::Mutex::new(awake),
             address,
             socket: socket.flatten(),
             requested,
@@ -192,12 +347,57 @@ impl Daemon {
             handoff: Arc::clone(&handoff),
             wake: wake_reader,
         };
+        let (commands, commands_rx) = std::sync::mpsc::channel();
+        let (reports, reports_rx) = std::sync::mpsc::channel();
+        let (requests, requests_rx) = std::sync::mpsc::channel();
+        let (greetings, greetings_rx) = std::sync::mpsc::channel();
+        let (frontend_greetings, frontend_greeted) = std::sync::mpsc::channel();
+        let (exits, exits_rx) = std::sync::mpsc::channel();
+        let (activity, awake) = std::sync::mpsc::channel();
+        let table: service::ProcessTable = Default::default();
+        let published = Arc::clone(&table);
+        let leader = matches!(handed, HandedService::Leader { .. });
+        let node = host.clone();
         let thread = std::thread::Builder::new()
             .name("daemon".into())
-            .spawn(move || service::resume(host, handed, descriptors, &stop))
+            .spawn(move || {
+                service::resume(
+                    node,
+                    handed,
+                    descriptors,
+                    commands_rx,
+                    reports,
+                    requests_rx,
+                    greetings,
+                    Some(frontend_greetings),
+                    exits,
+                    activity,
+                    published,
+                    &stop,
+                )
+            })
             .context("starting the daemon's service")?;
+        let commands = leader.then_some(ProcessCommands {
+            commands,
+            reports: Arc::new(std::sync::Mutex::new(reports_rx)),
+        });
+        let link = match (&commands, leader) {
+            (Some(commands), true) => Some(roster::EpochLink {
+                requests: requests.clone(),
+                greetings: greetings_rx,
+                exits: exits_rx,
+                commands: commands.clone(),
+            }),
+            _ => None,
+        };
         let (address, socket) = address.unzip();
         Ok(Self {
+            table: leader.then_some(table),
+            requests: leader.then_some(requests),
+            frontend_greeted: std::sync::Mutex::new(leader.then_some(frontend_greeted)),
+            link: std::sync::Mutex::new(link),
+            awake: std::sync::Mutex::new(leader.then_some(awake)),
+            commands,
             address,
             socket: socket.flatten(),
             requested,
@@ -230,6 +430,102 @@ impl Daemon {
             .join()
             .map_err(|_| anyhow::anyhow!("the daemon's service panicked"))??
             .context("the daemon's service stopped before it handed over")
+    }
+
+    /// The command channel to the main processes this node's daemon
+    /// supervises; `None` on a member, which supervises none here.
+    pub fn commands(&self) -> Option<ProcessCommands> {
+        self.commands.clone()
+    }
+
+    /// The peers that greet as the frontend on this node, taken once: the
+    /// daemon that starts the frontend needs the peer its commands go to, and
+    /// the epoch layer's greeting stream is the epoch layer's. `None` on a
+    /// member daemon, and `None` again once taken.
+    pub(crate) fn frontend_greeted(&self) -> Option<std::sync::mpsc::Receiver<u64>> {
+        self.frontend_greeted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// The requests channel down to this node's service, for the processes the
+    /// daemon starts itself rather than through the epoch layer: a spawn, a
+    /// command and the answer to each (§2.1, §2.3).
+    ///
+    /// `None` on a member daemon, which answers no request for a process of its
+    /// own. It is a clone of the channel inside [`Self::epoch_link`], so a
+    /// caller that takes both gets two independent senders over one service.
+    pub fn requests(
+        &self,
+    ) -> Option<
+        std::sync::mpsc::Sender<(
+            proto::process::Request,
+            std::sync::mpsc::Sender<proto::process::Reply>,
+        )>,
+    > {
+        self.requests.clone()
+    }
+
+    /// The epoch layer's ends of this node's service: `None` on a member
+    /// daemon, and once taken, `None` again — one adapter owns them.
+    pub(crate) fn epoch_link(&self) -> Option<roster::EpochLink> {
+        self.link
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// The epoch layer of `deployment`: the driver the update entry and the
+    /// adapter share, over `epochs` and this node's service (§7.4, §2.5).
+    /// `None` on a member daemon, which commands no deployment's processes.
+    pub(crate) fn updates(
+        &self,
+        epochs: Arc<crate::epoch::Epochs>,
+        deployment: String,
+    ) -> Option<(
+        Arc<crate::updates::driver::Driver>,
+        std::sync::mpsc::Receiver<()>,
+    )> {
+        let link = self.epoch_link()?;
+        let awake = self
+            .awake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()?;
+        // The epoch records report the node's processes: the service writes
+        // them into this table as they start and end, and the epoch layer's
+        // roster adds what each launch is (§2.3, §7.4).
+        if let Some(table) = &self.table {
+            epochs.attach_processes(Arc::clone(table));
+        }
+        let roster = roster::ProcessRoster::new(epochs.clone(), deployment, Vec::new(), link);
+        Some((
+            Arc::new(crate::updates::driver::Driver::new(
+                epochs,
+                Box::new(roster),
+            )),
+            awake,
+        ))
+    }
+
+    /// Advances the epoch layer whenever the service reports something, until
+    /// the service ends: a switch ends on acknowledgements, so the thread
+    /// that owns the epoch layer must be woken by the reports, never by a
+    /// clock.
+    pub(crate) fn advance_epochs(
+        updates: Arc<crate::updates::driver::Driver>,
+        awake: std::sync::mpsc::Receiver<()>,
+    ) -> anyhow::Result<()> {
+        std::thread::Builder::new()
+            .name("epoch".into())
+            .spawn(move || {
+                while awake.recv().is_ok() {
+                    updates.advance();
+                }
+            })
+            .context("starting the epoch layer's thread")?;
+        Ok(())
     }
 
     /// The leader's process socket, which engines connect to; `None` on a
@@ -528,5 +824,95 @@ mod tests {
         unsafe { libc::waitpid(spawned.pid as libc::pid_t, &mut status, 0) };
         assert!(libc::WIFSIGNALED(status));
         successor.stop().unwrap();
+    }
+}
+
+#[cfg(test)]
+impl ProcessCommands {
+    /// The ends an epoch-layer test needs: the commands the adapter sends
+    /// down to a peer, and the way a test plays a peer's reports up.
+    pub(crate) fn pair() -> (
+        Self,
+        std::sync::mpsc::Receiver<(u64, proto::process::Command)>,
+        std::sync::mpsc::Sender<(u64, proto::process::Report)>,
+    ) {
+        let (commands, sent) = std::sync::mpsc::channel();
+        let (reports, received) = std::sync::mpsc::channel();
+        (
+            Self {
+                commands,
+                reports: Arc::new(std::sync::Mutex::new(received)),
+            },
+            sent,
+            reports,
+        )
+    }
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+    use proto::process::{Report, report};
+
+    /// The daemon's channel carries a command down to the service's end and
+    /// a main process's report up to the daemon's: the one downward path a
+    /// command has (§2.3), and the one upward path a report has.
+    #[test]
+    fn a_command_goes_down_to_the_service_and_a_report_comes_up() {
+        let (commands, commands_rx) = std::sync::mpsc::channel();
+        let (reports, reports_rx) = std::sync::mpsc::channel();
+        let processes = ProcessCommands {
+            commands,
+            reports: Arc::new(std::sync::Mutex::new(reports_rx)),
+        };
+
+        let command = proto::process::Command {
+            kind: Some(proto::process::command::Kind::Commit(
+                proto::process::Commit {},
+            )),
+        };
+        processes.send(7, command).expect("the service runs");
+
+        // The service's end reads the command with the engine it is for.
+        let (engine, command) = commands_rx.recv().unwrap();
+        assert_eq!(engine, 7);
+        assert!(matches!(
+            command.kind,
+            Some(proto::process::command::Kind::Commit(_))
+        ));
+
+        // The report a main process sent reaches the daemon with its engine.
+        reports
+            .send((
+                7,
+                Report {
+                    kind: Some(report::Kind::Committed(proto::process::Committed {})),
+                },
+            ))
+            .unwrap();
+        let (engine, report) = processes
+            .report(Duration::from_secs(1))
+            .expect("the report arrives");
+        assert_eq!(engine, 7);
+        assert!(matches!(report.kind, Some(report::Kind::Committed(_))));
+
+        // A service that stopped fails the command instead of dropping it,
+        // and no report waits forever.
+        drop(commands_rx);
+        assert!(
+            processes
+                .send(
+                    7,
+                    proto::process::Command {
+                        kind: Some(proto::process::command::Kind::Commit(
+                            proto::process::Commit {}
+                        )),
+                    }
+                )
+                .is_err(),
+            "a stopped service cannot carry a command"
+        );
+        drop(reports);
+        assert!(processes.report(Duration::from_millis(10)).is_none());
     }
 }

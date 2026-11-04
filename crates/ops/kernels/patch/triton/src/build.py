@@ -39,15 +39,12 @@ def spec(fields, parameters, target):
             "width": "i32",
             "block": "i32",
             "pdl": "i32",
-            "PATCHIFY": "constexpr",
             "BLOCK": "constexpr",
         },
-        "constexprs": {
-            # This package fills the patching direction only; the inverse is
-            # `unpatchify_video`, which has its own descriptor and package.
-            "PATCHIFY": True,
-            "BLOCK": block,
-        },
+        # This package fills the patching direction only; the inverse is
+        # `unpatchify_video`, which has its own descriptor and package. The module
+        # declares no mode, so none is passed.
+        "constexprs": {"BLOCK": block},
         "options": {
             "num_warps": warps_of(block),
             "launch_pdl": fields["pdl"] == "true",

@@ -37,8 +37,9 @@ pub fn set_sink(sink: Option<&mut (dyn Sink + 'static)>) {
 
 /// Whether a sink is installed on this thread.
 ///
-/// The layer that launches asks before it builds a descriptor key: every launch of a serving step
-/// passes the question, while a capture is the exception, and the key is a formatted string.
+/// A launch that would report itself asks this first: [`launched`] already returns at once when no
+/// sink is installed, but its caller formats the descriptor key beforehand, and that is an
+/// allocation on the serving path for a capture that is not happening.
 pub fn installed() -> bool {
     SINK.with(|cell| cell.get().is_some())
 }

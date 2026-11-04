@@ -111,7 +111,7 @@ impl Geometry {
         }
         // The learned table bounds nothing: it is resampled to whatever grid an image has
         // (`PositionEmbedding.interpolate`), and the processor's own pixel cap is far above the
-        // table's entry count - H3's 768x1280 keyframe is 48x80 patches against a 48x48 table.
+        // table's entry count - H3's 768x1344 keyframe is 48x84 patches against a 48x48 table.
         let patches = u64::from(time) * u64::from(height) * u64::from(width);
         let sequence = u64::from(height) * u64::from(width);
         let patches = u32::try_from(patches).map_err(|_| {
@@ -1077,21 +1077,39 @@ mod tests {
     #[test]
     fn one_image_is_one_time_step_of_whole_merge_blocks() {
         let config = config();
+        let merge = config.spatial_merge_size;
         let geometry = Geometry::of(&config, [1, 24, 24]).expect("a 24x24 patch grid");
-        assert_eq!(geometry.patches, 576);
-        assert_eq!(geometry.merged, 144);
-        assert_eq!(geometry.sequence, 576);
-        assert_eq!(Geometry::tubelet(&config), 1536);
-        assert_eq!(Geometry::merged_width(&config), 4608);
+        // A patch is one 16x16 pixel block, so a 24 by 24 patch grid is 24 * 24 of them, merged in
+        // 2 by 2 blocks, with one sequence position per patch of the grid.
+        assert_eq!(geometry.patches, 24 * 24);
+        assert_eq!(geometry.merged, (24 / merge) * (24 / merge));
+        assert_eq!(geometry.sequence, geometry.patches);
+        // The tubelet is a patch's channels with its temporal depth, and a merged row is the merged
+        // block's features - the two numbers the tower's first and last projections see.
+        let patch = config.patch_size;
+        assert_eq!(
+            Geometry::tubelet(&config),
+            config.in_channels * config.temporal_patch_size * patch * patch
+        );
+        assert_eq!(
+            Geometry::merged_width(&config),
+            config.hidden_size * merge * merge
+        );
     }
 
     #[test]
     fn a_video_block_keeps_one_sequence_per_time_step() {
         let config = config();
+        let merge = config.spatial_merge_size;
         let geometry = Geometry::of(&config, [4, 16, 16]).expect("four time steps");
-        assert_eq!(geometry.patches, 1024);
-        assert_eq!(geometry.merged, 256);
-        assert_eq!(geometry.sequence, 256);
+        // Four time steps of a 16 by 16 patch grid: every patch is a row, and the merged rows are the
+        // 2 by 2 blocks of each step.
+        assert_eq!(geometry.patches, 4 * 16 * 16);
+        assert_eq!(geometry.merged, 4 * (16 / merge) * (16 / merge));
+        // The attention sequence is one step's **patches**, not its merged rows: the tower attends
+        // over patch rows and merges afterwards, so a video block runs four sequences of 16 * 16.
+        assert_eq!(geometry.sequence, 16 * 16);
+        assert_eq!(geometry.sequence, geometry.patches / geometry.time);
     }
 
     #[test]
@@ -1119,13 +1137,16 @@ mod tests {
     #[test]
     fn a_grid_larger_than_the_position_table_is_resampled_not_refused() {
         let config = config();
-        // The table is 48 x 48 entries; H3's own 768x1280 keyframe is 48 x 80 patches, and the
+        // The table is 48 x 48 entries; the served 768x1344 canvas is 48 x 84 patches, and the
         // processor's pixel cap allows far more, so the grid is never bounded by the table.
         assert!(Geometry::of(&config, [1, 48, 48]).is_ok());
-        let keyframe = Geometry::of(&config, [1, 48, 80]).expect("a 768x1280 keyframe");
-        assert_eq!(keyframe.patches, 3840);
-        assert_eq!(keyframe.merged, 960);
-        assert_eq!(keyframe.sequence, 3840);
+        let merge = config.spatial_merge_size;
+        let keyframe = Geometry::of(&config, [1, 48, 84]).expect("a 768x1344 keyframe");
+        // One time step of a 48 by 84 patch grid, merged 2 by 2: the numbers a 768p 16:9 frame gives.
+        assert_eq!(keyframe.patches, 48 * 84);
+        assert_eq!(keyframe.merged, (48 / merge) * (84 / merge));
+        assert_eq!(keyframe.sequence, 48 * 84);
+        assert_eq!(keyframe.sequence, keyframe.patches / keyframe.time);
         assert!(Geometry::of(&config, [1, 256, 256]).is_ok());
     }
 

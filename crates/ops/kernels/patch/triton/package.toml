@@ -1,13 +1,12 @@
 # The patch operator's Triton backend: design 5.2's program package.
 #
-# One cubin per descriptor: the diffusion transformer's packed rows against its latent, in
-# the direction the descriptor names. The move is a permutation of elements — a `1×2×2`
-# patch's four values per channel, either gathered into a row or scattered back — so the
-# operator's tolerance is exact and the kernel does no arithmetic at all.
+# One cubin per descriptor: the diffusion transformer's latent packed into its rows. The move is
+# a permutation of elements — a `1×2×2` patch's four values per channel, gathered into one row —
+# so the operator's tolerance is exact and the kernel does no arithmetic at all.
 #
-# The frame count is a launch value, not a field: one program serves every request of a
-# geometry. The direction is not a descriptor value: unpatchify is its own operator.
-# the other way round.
+# One direction, because the operator has one: the inverse raster is `unpatchify_video`, whose
+# package owns that direction. The frame count is a launch value, not a field, so one program
+# serves every request of a geometry.
 
 op = "patch"
 backend = "triton"
@@ -31,6 +30,8 @@ architectures = ["sm_100a", "sm_90a"]
 
 [kernel.descriptors]
 # The latents of the H3 deployment's decoding resolutions: one key per geometry.
+# The geometry pairs are the fixture's own: every (height, width) an evaluation decodes, not
+# their cross product. A key cannot name a mode, because the operator has no mode to name.
 dimensions = { dtype = ["bf16", "f16", "f32"], channels = ["24"], height = ["30", "40", "42", "48", "52", "62", "64", "84", "96"], width = ["26", "30", "40", "42", "48", "52", "64"], block = ["1024"], pdl = ["false", "true"] }
 
 [parameters]

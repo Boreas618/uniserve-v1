@@ -23,7 +23,11 @@
 //! - **a third capture while two are live**: the pool holds three executables'
 //!   worth of graphs without a second reservation.
 //!
-//! Run it on a GPU host, alone on the device:
+//! A second probe answers the question a purge asks of the same structures: which generation's
+//! graphs a purge may release, and whether the generation that still serves keeps its own. See
+//! `a_purge_keeps_the_graph_a_live_generation_still_serves`.
+//!
+//! Run them on a GPU host, alone on the device:
 //!
 //! ```text
 //! cargo test -p executor --test graph_pools -- --ignored --test-threads=1
@@ -32,13 +36,17 @@
 //! It needs `nvcc` on `PATH`, and `UNISERVE_PROBE_ARCH` names the architecture
 //! it compiles for (default `sm_100a`).
 
+#![allow(
+    clippy::expect_used,
+    reason = "a probe's prerequisite failure must fail the test, not be handled"
+)]
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use platform::{
-    Allocator, Budget, Buffer, Capture, CaptureMode, Device, DeviceId, Function, GraphExec,
+    Allocator, Budget, Buffer, Capture, CaptureMode, Device, DeviceId, Function, Graph, GraphExec,
     LaunchConfig, Library, PinnedBuffer, PoolKind, Result, Stream, memcpy_async, memset_d32,
 };
 
@@ -61,8 +69,7 @@ impl Budget for Allowance {
 
 /// Compiles the probe's two generations of one kernel into a cubin.
 fn cubin() -> PathBuf {
-    let source =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/generations.cu");
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/generations.cu");
     let output = std::env::temp_dir().join(format!("generations-{}.cubin", std::process::id()));
     let arch = std::env::var("UNISERVE_PROBE_ARCH").unwrap_or_else(|_| "sm_100a".to_owned());
     let status = Command::new("nvcc")
@@ -81,12 +88,7 @@ fn cubin() -> PathBuf {
 ///
 /// `data` and `value` must outlive the capture: the driver records their
 /// addresses as the node's arguments, and the graph is replayed from them.
-fn capture(
-    stream: &Stream,
-    kernel: &Function,
-    data: &mut u64,
-    value: &mut u32,
-) -> GraphExec {
+fn capture(stream: &Stream, kernel: &Function, data: &mut u64, value: &mut u32) -> GraphExec {
     let mut count = WORDS as i32;
     let mut parameters: [*mut c_void; 3] = [
         (data as *mut u64).cast(),
@@ -102,9 +104,11 @@ fn capture(
         )
         .expect("launch inside the capture");
     recording.record().expect("record the launch's node");
-    recording.end().expect("end the capture").instantiate().expect(
-        "instantiate the graph - failing here means two generations cannot share the pool",
-    )
+    recording
+        .end()
+        .expect("end the capture")
+        .instantiate()
+        .expect("instantiate the graph - failing here means two generations cannot share the pool")
 }
 
 /// Replays `graph` and answers the buffer's words.
@@ -204,4 +208,121 @@ fn two_generations_share_one_graph_pool() {
         0,
         "a freed buffer still counts against the graph pool"
     );
+}
+
+/// Launches `kernel` inside one capture and answers the recorded graph.
+///
+/// [`Captured`] instantiates its own executable from the template, so the probe hands it the
+/// graph rather than an executable: what a purge drops and what a live generation replays must be
+/// the same object's two halves.
+fn capture_graph(stream: &Stream, kernel: &Function, data: &mut u64, value: &mut u32) -> Graph {
+    let mut count = WORDS as i32;
+    let mut parameters: [*mut c_void; 3] = [
+        (data as *mut u64).cast(),
+        (&raw mut count).cast(),
+        (value as *mut u32).cast(),
+    ];
+    let mut recording = Capture::begin(stream, CaptureMode::Relaxed).expect("begin a capture");
+    kernel
+        .launch_ex(
+            stream,
+            &LaunchConfig::new([1, 1, 1], [WORDS as u32, 1, 1]),
+            &mut parameters,
+        )
+        .expect("launch inside the capture");
+    recording.record().expect("record the launch's node");
+    recording.end().expect("end the capture")
+}
+
+/// A purge releases a generation's own graphs and keeps one a live generation still serves.
+///
+/// This is the predicate `Purge` decides on: `CausalLmRunner::purge` releases a bucket's arena plan
+/// only where `Graphs::holds` is false, because one plan per bucket is shared by every generation's
+/// graph of it. A purge that answered `false` while another generation held the bucket would hand
+/// that generation's mapped pages to the next capture - the defect `ee66bb268` fixed - and a purge
+/// that dropped the live generation's executable would leave it serving a graph that no longer
+/// exists. Both halves are visible here: the surviving generation replays *its own* arithmetic
+/// after the purge, and the bucket is free only once the last generation's graph is discarded.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn a_purge_keeps_the_graph_a_live_generation_still_serves() {
+    use executor::captured::Captured;
+    use executor::graph::Graphs;
+    use executor::plan::{Bucket, Variant};
+
+    let device = Device::new(DEVICE).expect("a CUDA device");
+    let allowance = Arc::new(Allowance::default());
+    let mut allocator = Allocator::new(&device, allowance).expect("an allocator");
+    allocator
+        .reserve(PoolKind::Graph, RESERVATION)
+        .expect("reserve the graph pool");
+    let buffer: Buffer = allocator
+        .allocate(PoolKind::Graph, BYTES)
+        .expect("one activation buffer");
+    let data = buffer.address();
+    let stream = Stream::new(DEVICE).expect("a stream");
+    let image = std::fs::read(cubin()).expect("the compiled probe kernel");
+    let library = Library::load(&device, &image).expect("load the probe kernel");
+    let serving_kernel = library.kernel("generation_0").expect("generation_0");
+    let precopied_kernel = library.kernel("generation_1").expect("generation_1");
+
+    // SAFETY: the fill lies inside the allocation.
+    unsafe { memset_d32(data, 0, WORDS, &stream) }.expect("zero the buffer");
+
+    // Two generations' graphs of one bucket, each with its own arithmetic: `generation_0` adds its
+    // value once and `generation_1` twice, so a replay says which generation it belongs to.
+    let bucket = Bucket::decode(1, Variant::DecodeGreedy);
+    let mut address = data;
+    let mut serving_value = 1u32;
+    let serving = Captured::new(
+        capture_graph(&stream, &serving_kernel, &mut address, &mut serving_value),
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("the serving generation's graph");
+    let mut precopied_value = 10u32;
+    let precopied = Captured::new(
+        capture_graph(&stream, &precopied_kernel, &mut address, &mut precopied_value),
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("the precopied generation's graph");
+
+    let mut graphs = Graphs::new();
+    graphs.insert(bucket, 1, serving);
+    graphs.insert(bucket, 2, precopied);
+    assert!(graphs.holds(bucket), "the bucket was captured twice");
+
+    // The serving generation's batch finished last, so its purge runs while generation 2 is still
+    // waiting to switch over.
+    assert_eq!(
+        graphs.purge(1),
+        vec![bucket],
+        "the purge did not name the generation it released"
+    );
+    assert!(
+        graphs.holds(bucket),
+        "a purge reported the bucket free while generation 2 still serves its graph"
+    );
+    let live = graphs
+        .captured(bucket, 2)
+        .expect("the live generation's graph went with the purge");
+    assert_eq!(
+        replay(&stream, live.exec(), data),
+        vec![2; WORDS],
+        "the live generation's graph no longer adds its own value twice"
+    );
+    assert!(
+        graphs.captured(bucket, 1).is_none(),
+        "the purged generation's graph is still held"
+    );
+
+    // The generation that never switched over is discarded; only now is the bucket free.
+    assert_eq!(graphs.discard(2), vec![bucket], "the discard named no bucket");
+    assert!(
+        !graphs.holds(bucket),
+        "the bucket is still held after every generation's graph was released"
+    );
+
+    allocator.free(buffer);
 }

@@ -94,8 +94,30 @@ impl Scheduler {
                 self.inflight.pending_submissions.push_back(batch);
                 continue;
             }
+            // An update may have asked this step's batches to run in shadow too:
+            // the same work against the world whose kernels are being compared,
+            // submitted beside the serving one (7.3 step 2). The copy is made
+            // only when an update asked, and before the serving submit takes the
+            // batch.
+            let shadow = self.shadow_generation();
+            let shadow_batch = shadow.map(|_| batch.clone());
             match self.executor.submit(batch) {
-                Ok(()) => progressed = true,
+                Ok(()) => {
+                    progressed = true;
+                    // A wall or a full queue is not the pass's failure: the
+                    // batch stays with the step and the next one tries again,
+                    // as the serving submit does. A refused pass is answered at
+                    // once, because waiting will not shadow it.
+                    if let (Some(generation), Some(shadow_batch)) = (shadow, shadow_batch) {
+                        match self.executor.shadow(shadow_batch, generation) {
+                            Ok(()) => self.note_shadowed(),
+                            Err(ExecutorSubmitError::Failed(error)) => {
+                                self.shadow_failed(format!("{error:#}"));
+                            }
+                            Err(ExecutorSubmitError::WouldBlock(_)) => {}
+                        }
+                    }
+                }
                 Err(ExecutorSubmitError::WouldBlock(batch)) => {
                     blocked_workers.extend(targets);
                     held_products.extend(batch_products(&batch));
@@ -220,6 +242,11 @@ impl Scheduler {
             return false;
         };
         let answered = kv_offload.poll();
+        // Nothing pinned means nothing to sweep, so a step gathers no live set
+        // to find that out (design §4.4).
+        if !kv_offload.holds() {
+            return answered;
+        }
         let waiting: HashSet<RequestId> = self
             .waiting
             .iter()
@@ -241,19 +268,20 @@ impl Scheduler {
         // A retiring request keeps its entries because
         // `Placement::batch_workers` finds the destinations of its `Finish`
         // and `Free` commands through them.
-        let live: HashSet<RequestId> = self
-            .running
-            .keys()
-            .chain(self.running_media.keys())
-            .chain(self.retiring_requests.keys())
-            .copied()
-            .collect();
+        let running = &self.running;
+        let running_media = &self.running_media;
+        let retiring = &self.retiring_requests;
+        let live = |request: &ipc::RequestId| {
+            running.contains_key(request)
+                || running_media.contains_key(request)
+                || retiring.contains_key(request)
+        };
         self.placement
             .affinity
-            .retain(|(request, _), _| live.contains(&request.request_id));
+            .retain(|(request, _), _| live(&request.request_id));
         self.placement
             .decode_affinity
-            .retain(|(request, _), _| live.contains(&request.request_id));
+            .retain(|(request, _), _| live(&request.request_id));
 
         let mut blocked_workers = HashSet::new();
         progressed |= self.dispatch_submissions(&mut blocked_workers);
@@ -390,9 +418,22 @@ impl Scheduler {
             }
         };
         let live = self.live();
-        if let Err(error) = mechanism::validate_victims(&shortage, &victims, &live) {
-            let _ = self.policy_failed(policy, error);
-            return;
+        match mechanism::validate_victims(&shortage, &victims, &live) {
+            Ok(()) => {}
+            Err(mechanism::VictimError::Invalid(error)) => {
+                let _ = self.policy_failed(policy, error);
+                return;
+            }
+            Err(mechanism::VictimError::Vanished(message)) => {
+                // Nothing of this step can free a page or end a request between
+                // the observation the policy answered from and this call, so a
+                // victim that is gone means the mechanism let go of it without
+                // recording that it did: an invariant of its own, never the
+                // policy's decision (§4.4's taxonomy).
+                self.policy = Some(policy);
+                self.invariant_broken(&message);
+                return;
+            }
         }
         self.policy = Some(policy);
         for victim in &victims {
@@ -493,8 +534,7 @@ impl Scheduler {
         let floor = self
             .policy
             .as_ref()
-            .map_or(0, |policy| policy.limits().prefetch_min_tokens)
-            as usize;
+            .map_or(0, |policy| policy.limits().prefetch_min_tokens) as usize;
         let Some(state) = self.running.get(&id) else {
             return;
         };
@@ -542,15 +582,40 @@ impl Scheduler {
             return None;
         };
         self.step += 1;
+        // The kernels this step's batches serve on, read once: a switchover
+        // that completes mid-step must not split one step across two worlds
+        // (4.2, 7.3).
+        let generation = self.serving_generation();
+        self.executor.set_generation(generation);
         // The pages that appeared and went since the previous step, then
         // everything else that changed, in the order it happened, closed before
         // this step's dispatch. The room, the live state, and the plan's checks
         // are all read after it: a page announced now is a page this step's
         // plan may name, so the validators must already see it.
         self.pump_page_changes();
+        // Every request the mechanism holds is stated to the policy here, and
+        // `close` emits an `Updated` for the ones whose view moved: a policy's
+        // state is append-only, so a phase it is never told about is a phase it
+        // does not have, and an admitted request it never hears of again is one
+        // it can never plan work for. The filter is `close`'s, not this loop's,
+        // so a step whose requests did not move tells the policy nothing.
+        for view in views::requests(self, self.recorder.recorded()) {
+            self.recorder.update(view);
+        }
         self.recorder.close();
+        // The policy's knowledge and the mechanism's own must be the same set,
+        // and the run of silent divergence that cost four caller runs is why
+        // this is checked at all: a request the mechanism holds and the policy
+        // never heard of is one it cannot plan work for, and a request the
+        // policy still holds after the mechanism ended it is one it offers in
+        // `admit` and the mechanism refuses as "not queued" - a policy
+        // failure, which stops the epoch.
+        #[cfg(debug_assertions)]
+        self.assert_policy_in_sync();
         let room = self.room();
-        let live = self.live();
+        // The starvation rule names only a request the watchdog tracks, so the
+        // step states those views and not a view of every resident.
+        let live = views::watching(self, self.recorder.recorded());
         // A resident request that has not advanced within the policy's timeout
         // is the policy's failure, not the request's (design §4.4).
         let now = scheduling::guest::Nanos(crate::clock::now_monotonic_us().saturating_mul(1_000));
@@ -566,12 +631,10 @@ impl Scheduler {
         // setup that applies it (§7.6). No load means nothing to decide, not a
         // zero one: the executor has published no routed tokens yet.
         let experts_due = self.expert_load_new
-            || self
-                .expert_asked
-                .is_none_or(|asked| self.step.saturating_sub(asked) >= Self::EXPERT_REBALANCE_STEPS);
-        if experts_due
-            && let Some(load) = views::expert_load_of(self)
-        {
+            || self.expert_asked.is_none_or(|asked| {
+                self.step.saturating_sub(asked) >= Self::EXPERT_REBALANCE_STEPS
+            });
+        if experts_due && let Some(load) = views::expert_load_of(self) {
             let order = match policy.experts(&load) {
                 Ok(order) => order,
                 Err(error) => return self.policy_failed(policy, error),
@@ -587,17 +650,72 @@ impl Scheduler {
             Ok(plan) => plan,
             Err(error) => return self.policy_failed(policy, error),
         };
-        // The plan's admission is the mechanism's own act, bounded by the hard
-        // limits as it goes, and it runs before the plan is checked: a request
-        // the plan admits is resident for the work the same plan gives it, which
-        // is what lets one plan both admit and run a request (§4.4).
-        self.admit_plan(&plan);
+        // The admission the plan states is checked against the queue the policy
+        // was given, and applied before the rest of the plan is checked: a
+        // request the plan admits is resident for the work the same plan gives
+        // it, which is what lets one plan both admit and run a request (§4.4).
+        // Applying it first would make its own names unqueued.
         let live = self.live();
-        if let Err(error) = mechanism::validate_plan(&plan, &room, &live) {
+        if let Err(error) = mechanism::validate_admission(&plan, &live) {
+            return self.policy_failed(policy, error);
+        }
+        self.admit_plan(&plan);
+        // The rest is read against the state admission has left: the pages are
+        // the scheduler's own table borrowed for the check (design §4.4).
+        let live = self.live();
+        if let Err(error) = mechanism::validate_after_admission(&plan, &room, &live) {
             return self.policy_failed(policy, error);
         }
         self.policy = Some(policy);
         Some(plan)
+    }
+
+    /// Asserts that the policy knows exactly the requests the mechanism holds.
+    ///
+    /// A policy's state is append-only and it learns requests only from this
+    /// mechanism's events, so the two sets are one fact. The mechanism holds a
+    /// request from its submission (`waiting`/`waiting_media`) through its
+    /// residence (`running`/`running_media`) to its end, and every one of those
+    /// transitions is announced (`Arrived`, `Admitted`, `Finished`). A step
+    /// boundary is the one place both are complete: nothing is mid-transition
+    /// there.
+    ///
+    /// Debug builds only: it is a statement about the mechanism's bookkeeping,
+    /// not a decision the mechanism makes.
+    #[cfg(debug_assertions)]
+    fn assert_policy_in_sync(&self) {
+        // The policy's ids and the mechanism's name the same request; the two
+        // newtypes are the interface's, so the sets are compared in the
+        // interface's.
+        let guest = |id: u64| scheduling::guest::RequestId(id);
+        let held: std::collections::BTreeSet<scheduling::guest::RequestId> = self
+            .waiting
+            .iter()
+            .map(|state| guest(state.req.request_id.0))
+            .chain(
+                self.waiting_media
+                    .iter()
+                    .map(|pending| guest(pending.request.request_id.0)),
+            )
+            .chain(self.running.keys().map(|id| guest(id.0)))
+            .chain(self.running_media.keys().map(|id| guest(id.0)))
+            .collect();
+        let told: std::collections::BTreeSet<scheduling::guest::RequestId> =
+            self.recorder.known().collect();
+        for id in held.difference(&told) {
+            debug_assert!(
+                false,
+                "the policy was never told of request {}: the mechanism holds it, so nothing can                          plan its work",
+                id.0
+            );
+        }
+        for id in told.difference(&held) {
+            debug_assert!(
+                false,
+                "the policy still holds request {}: the mechanism ended it without saying so",
+                id.0
+            );
+        }
     }
 
     /// Ends the step's accounting: the step number, and the policy's per-step
@@ -632,8 +750,18 @@ impl Scheduler {
                 self.policy = Some(policy);
             }
             Err(fatal) => {
-                tracing::error!(reason = %fatal, "the policy failed and cannot be reverted");
-                self.fail(format!("the scheduling policy failed: {fatal}"));
+                // Both failures are named: the one that ended the policy, which
+                // is what the daemon and a reader of the log need first, and the
+                // failed takeover that leaves the epoch with no policy at all.
+                tracing::error!(
+                    reason = %error,
+                    takeover = %fatal,
+                    "the policy failed and cannot be reverted"
+                );
+                self.fail(format!(
+                    "the scheduling policy failed with `{error}`, and no previous policy can \
+                     take over: {fatal}"
+                ));
                 self.policy = Some(policy);
             }
         }
@@ -699,7 +827,7 @@ impl Scheduler {
         }
     }
 
-    fn live(&self) -> mechanism::Live {
+    fn live(&self) -> mechanism::Live<'_> {
         let mut live = mechanism::Live {
             queue: self
                 .waiting
@@ -711,13 +839,16 @@ impl Scheduler {
                         .map(|pending| scheduling::guest::RequestId(pending.request.request_id.0)),
                 )
                 .collect(),
+            // The page table is the scheduler's own, kept current by the page
+            // delta: a step borrows it rather than copying every page it holds.
+            pages: std::borrow::Cow::Borrowed(&self.pages),
             ..mechanism::Live::default()
         };
         for request in views::requests(self, self.recorder.recorded()) {
             live.requests.insert(request.id, request);
         }
         for page in &self.pages {
-            live.pages.insert(*page.0, page.1.clone());
+            live.pages.to_mut().insert(*page.0, page.1.clone());
         }
         for entry in views::encodings(self) {
             live.encodings.insert(entry.id, entry);
@@ -725,6 +856,14 @@ impl Scheduler {
         for phase in views::phases(&self.info) {
             live.phases.insert(phase.id, phase);
         }
+        // What the policy was told is the recorder's own account of it: the
+        // snapshot it was instantiated with, plus every page, encoder entry and
+        // request announced since, less what it was told is gone. A reclaim is
+        // judged against that, not against the mechanism's table, which may
+        // have moved on since the policy last heard.
+        live.told_pages = std::borrow::Cow::Borrowed(self.recorder.announced_pages());
+        live.told_encodings = std::borrow::Cow::Borrowed(self.recorder.announced_encodings());
+        live.told_requests = std::borrow::Cow::Borrowed(self.recorder.announced_requests());
         live
     }
 
@@ -775,8 +914,10 @@ impl Scheduler {
     }
 
     /// The expert placement the policy last answered, taken by the point that
-    /// applies it: the executor's world setup (§7.6). Taking it once is the
-    /// handoff, so a placement is applied once.
+    /// applies it: the executor's world setup (§7.6), which commits it with
+    /// `Executor::commit_experts` — the executor's own method for retaining an
+    /// expert order. Taking it once is the handoff, so a placement is applied
+    /// once; the mechanism keeps no second copy.
     pub(super) fn take_expert_order(&mut self) -> Option<scheduling::guest::ExpertOrder> {
         self.expert_order.take()
     }

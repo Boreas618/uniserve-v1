@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use crate::allocator::DevicePtr;
 use crate::driver::{ContextScope, Handle, driver, in_context};
 use crate::event::Event;
 use crate::{DeviceId, Error, PrimaryContext, Result};
@@ -27,6 +28,35 @@ pub enum CaptureStatus {
     /// Capture began but was invalidated; `cuStreamEndCapture` must still run.
     Invalidated,
 }
+
+/// The condition that releases a stream's wait on a 32-bit flag
+/// (`CUstreamWaitValue_flags`).
+///
+/// The remaining operations the driver offers are left out on purpose:
+/// `CU_STREAM_WAIT_VALUE_NOR` needs a device capability query and is
+/// deprecated in favour of the memory-operation API, and
+/// `CU_STREAM_WAIT_VALUE_FLUSH` is for remote writes over a fabric, which this
+/// crate does not carry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitValue {
+    /// Releases when `(int32_t)(flag - value) >= 0`
+    /// (`CU_STREAM_WAIT_VALUE_GEQ`): a cyclic comparison that ignores
+    /// wraparound, so a flag that passes the value and wraps still releases the
+    /// wait rather than blocking it forever.
+    AtLeast,
+    /// Releases when the flag equals `value` (`CU_STREAM_WAIT_VALUE_EQ`).
+    Equal,
+    /// Releases when any bit of `value` is set in the flag
+    /// (`CU_STREAM_WAIT_VALUE_AND`).
+    AnyBitSet,
+}
+
+/// `CU_STREAM_WAIT_VALUE_GEQ`.
+pub(crate) const CU_STREAM_WAIT_VALUE_GEQ: u32 = 0x0;
+/// `CU_STREAM_WAIT_VALUE_EQ`.
+pub(crate) const CU_STREAM_WAIT_VALUE_EQ: u32 = 0x1;
+/// `CU_STREAM_WAIT_VALUE_AND`.
+pub(crate) const CU_STREAM_WAIT_VALUE_AND: u32 = 0x2;
 
 /// A handle to a CUDA stream this process created, or to one borrowed from
 /// another owner.
@@ -276,6 +306,60 @@ impl Stream {
         driver.check(
             unsafe { (driver.stream_wait_event)(self.raw, handle.raw(), flags) },
             "cuStreamWaitEvent",
+        )
+    }
+
+    /// Writes `value` into the 32-bit flag at `address` in stream order
+    /// (`cuStreamWriteValue32`).
+    ///
+    /// This is how one stream tells another that the work before this point is
+    /// done, without a host round trip. The write fences before it — the
+    /// driver's `__threadfence_system` equivalent, scoped to the stream — so a
+    /// stream that waits on the flag observes every write this stream issued
+    /// before it. There is no weaker mode to ask for: the driver's
+    /// `CU_STREAM_WRITE_VALUE_NO_MEMORY_BARRIER` is not supported by the
+    /// entry point this crate resolves (`cuda.h`, `CUstreamWriteValue_flags`).
+    ///
+    /// `address` is device memory of this stream's device or host memory mapped
+    /// into it, and it must hold a 32-bit aligned value that stays valid until
+    /// the write runs — for a captured graph, until every replay does.
+    pub fn write_value32(&self, address: DevicePtr, value: u32) -> Result<()> {
+        let driver = driver()?;
+        // SAFETY: the caller keeps the flag valid until the write runs, and the
+        // stream owns the ordering of its own work.
+        driver.check(
+            unsafe { (driver.stream_write_value32)(self.raw, address.address(), value, 0) },
+            "cuStreamWriteValue32",
+        )
+    }
+
+    /// Holds later work on this stream until the 32-bit flag at `address`
+    /// satisfies `kind` against `value` (`cuStreamWaitValue32`).
+    ///
+    /// Work ordered after this call does not run, and its reads do not observe
+    /// the flag's writer's writes, until the condition holds. A waiting stream
+    /// blocks on the device: nothing on the host polls, and the flag may be
+    /// written by a kernel or by another stream's [`Stream::write_value32`].
+    ///
+    /// `address` must hold a 32-bit aligned value that stays valid until the
+    /// wait is satisfied; a wait whose flag is never written blocks the stream
+    /// for as long as the stream lives.
+    ///
+    /// A wait captured into a graph must have its flag written by something
+    /// outside that graph's own replay: a graph whose only writer is a node of
+    /// the same graph blocks on its first replay, and every replay after it.
+    pub fn wait_value32(&self, address: DevicePtr, value: u32, kind: WaitValue) -> Result<()> {
+        let flags = match kind {
+            WaitValue::AtLeast => CU_STREAM_WAIT_VALUE_GEQ,
+            WaitValue::Equal => CU_STREAM_WAIT_VALUE_EQ,
+            WaitValue::AnyBitSet => CU_STREAM_WAIT_VALUE_AND,
+        };
+
+        let driver = driver()?;
+        // SAFETY: the caller keeps the flag valid until the wait is satisfied.
+        driver.check(
+            unsafe { (driver.stream_wait_value32)(self.raw, address.address(), value, flags) },
+            "cuStreamWaitValue32",
         )
     }
 

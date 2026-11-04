@@ -376,12 +376,12 @@ impl WorkerGroup {
     /// it, replaced with `relaunch` and woken by `failure_wake`.
     ///
     /// Each rank validated the report it built; the group registers each
-    /// rank's incarnation as the rank it launched. The group takes rank 0's report:
-    /// the ranks derive every shared capacity (block size, request slots,
-    /// cache units) collectively before they report, so the reports differ
-    /// only in the fields reconciled here. The muxer must run on the engine's
-    /// host, and the ranks' cache regions must cover every layer's KV heads
-    /// without a gap. Once all checks pass, no rank's startup may be
+    /// rank's incarnation as the rank it launched. The group's report is
+    /// `inventory::pool_info`: rank 0's, with every value the ranks state
+    /// jointly reconciled, which is the same derivation a deployment served in
+    /// process gets from its executor. The muxer must run on the engine's host,
+    /// and the ranks' cache regions must cover every layer's KV heads without a
+    /// gap (`pool_info` refuses a gap). Once all checks pass, no rank's startup may be
     /// cancelled and every rank this process started must still be running.
     fn from_ranks(
         process_args: WorkerProcessArgs,
@@ -395,113 +395,14 @@ impl WorkerGroup {
         anyhow::ensure!(!workers.is_empty(), "need >= 1 worker");
         let n = workers.len();
 
-        // Rank 0's report becomes the group's. A rank's host latent and
-        // encoder pools are its own reports, which the executor keeps rank
-        // by rank (`ExecutorInfo::rank_latents`, `rank_encoders`).
-        let mut info = workers[0].info().clone();
-        info.latent_pool = None;
-        info.encoder_pool = None;
-
-        // A rank's product storage follows the components it holds, which an
-        // asymmetric placement makes rank-specific: a rank that executes or
-        // reads a component backs the whole allocation of its products, and
-        // a rank that does neither backs nothing. The executor places media
-        // buffers rank by rank from each rank's own report
-        // (`ExecutorInfo::rank_buffer_bytes`). The runtime's shared pool is
-        // one layout every rank holds, so the group reports the smallest
-        // nonzero pool, which no rank that holds products falls short of.
-        info.buffer_pool_bytes = workers
+        // The pool's agreed report is one derivation for both ways of serving
+        // a deployment: this path reads it from the ranks' startup reports and
+        // the in-process path from what the executor publishes (`ExecutorInfo::from_inventory`).
+        let ranks = workers
             .iter()
-            .map(|worker| worker.info().buffer_pool_bytes)
-            .filter(|bytes| *bytes > 0)
-            .min()
-            .unwrap_or(0);
-
-        // A rank's transfer entries follow the products it imports, which
-        // its components set; the group holds what its narrowest rank does.
-        info.transfer_tickets = workers
-            .iter()
-            .map(|worker| worker.info().transfer_tickets)
-            .min()
-            .unwrap_or(info.transfer_tickets);
-
-        // A rank states the shapes the engine warms, and the image
-        // denoiser's image-unconditional prefix, only for what it holds: the
-        // image denoiser's ranks its image shapes and that prefix, a diffusion
-        // LM's ranks its step rows, every other rank none. The group's are
-        // those its stating ranks agree on.
-        let mut image_warmups = Vec::new();
-        let mut captured_images = None;
-        let mut captured_latents = None;
-        let mut image_capacity = None;
-        let mut diffusion_lm_step_rows = 0;
-        let mut image_unconditional = None;
-        let mut image_encoders = std::collections::BTreeMap::new();
-        for (rank, worker) in workers.iter().enumerate() {
-            let stated = worker.info();
-            // Each image encoder's output, as the ranks holding it state it.
-            for (name, output) in stated.image_encoders.iter() {
-                anyhow::ensure!(
-                    image_encoders
-                        .insert(name.clone(), *output)
-                        .is_none_or(|known| known == *output),
-                    "physical rank {rank} states another {name} encoder output than another rank"
-                );
-            }
-            if let Some(tokens) = &stated.image_unconditional_token_ids {
-                anyhow::ensure!(
-                    image_unconditional
-                        .as_ref()
-                        .is_none_or(|known| known == tokens),
-                    "physical rank {rank} states another image-unconditional prefix than another denoiser rank"
-                );
-                image_unconditional = Some(tokens.clone());
-            }
-            if !stated.image_warmups.is_empty() {
-                anyhow::ensure!(
-                    image_warmups.is_empty() || image_warmups == stated.image_warmups,
-                    "physical rank {rank} states other image warmup shapes than another denoiser rank"
-                );
-                image_warmups.clone_from(&stated.image_warmups);
-            }
-            if let Some(shapes) = &stated.captured_images {
-                anyhow::ensure!(
-                    captured_images.as_ref().is_none_or(|known| known == shapes),
-                    "physical rank {rank} states other captured image steps than another denoiser rank"
-                );
-                captured_images = Some(shapes.clone());
-            }
-            if let Some(sizes) = &stated.captured_latents {
-                anyhow::ensure!(
-                    captured_latents.as_ref().is_none_or(|known| known == sizes),
-                    "physical rank {rank} states other captured latent image sizes than another \
-                     latent encoder rank"
-                );
-                captured_latents = Some(sizes.clone());
-            }
-            if let Some(capacity) = stated.image_capacity {
-                anyhow::ensure!(
-                    image_capacity.is_none_or(|known| known == capacity),
-                    "physical rank {rank} states another image capacity than another image rank"
-                );
-                image_capacity = Some(capacity);
-            }
-            if stated.diffusion_lm_step_rows > 0 {
-                anyhow::ensure!(
-                    diffusion_lm_step_rows == 0
-                        || diffusion_lm_step_rows == stated.diffusion_lm_step_rows,
-                    "physical rank {rank} states other diffusion LM step rows than another rank"
-                );
-                diffusion_lm_step_rows = stated.diffusion_lm_step_rows;
-            }
-        }
-        info.image_warmups = image_warmups;
-        info.captured_images = captured_images;
-        info.captured_latents = captured_latents;
-        info.image_capacity = image_capacity;
-        info.diffusion_lm_step_rows = diffusion_lm_step_rows;
-        info.image_unconditional_token_ids = image_unconditional;
-        info.image_encoders = Box::new(image_encoders);
+            .map(|worker| worker.info().clone())
+            .collect::<Vec<_>>();
+        let info = crate::executor::inventory::pool_info(&ranks)?;
 
         refuse_shared_storage_off_engine_host(
             &process_args.host,
@@ -516,63 +417,6 @@ impl WorkerGroup {
         // `total_kv_heads` by the ranks storing it. Overlapping regions are
         // allowed; a gap is not. The group reports the union of its ranks'
         // layers, which bounds exports.
-        if let Some(cache) = &mut info.prefix_cache {
-            let regions: Vec<_> = workers
-                .iter()
-                .filter_map(|worker| worker.info().prefix_cache.as_ref())
-                .collect();
-            // Every rank describes the same cache groups in one order; the
-            // coverage below reads group `index` of each.
-            anyhow::ensure!(
-                regions
-                    .iter()
-                    .all(|region| region.groups.len() == cache.groups.len()),
-                "physical ranks report different cache groups"
-            );
-            let mut owners = BTreeMap::new();
-            for (index, group) in cache.groups.iter_mut().enumerate() {
-                let mut layers: BTreeMap<u32, Vec<(u32, u32)>> = BTreeMap::new();
-                for region in &regions {
-                    let local = &region.groups[index];
-                    for layer in &local.layer_ids {
-                        layers.entry(*layer).or_default().push((
-                            local.kv_head_offset,
-                            local.kv_head_offset + local.num_kv_heads,
-                        ));
-                    }
-                }
-                for (layer, mut heads) in layers {
-                    anyhow::ensure!(
-                        *owners.entry(layer).or_insert(index) == index,
-                        "worker cache layer {layer} belongs to two cache groups"
-                    );
-                    heads.sort_unstable();
-                    let mut covered = 0;
-                    for (start, end) in heads {
-                        anyhow::ensure!(
-                            start <= covered,
-                            "worker cache regions leave a logical head gap"
-                        );
-                        covered = covered.max(end);
-                    }
-                    anyhow::ensure!(
-                        covered == group.total_kv_heads,
-                        "worker cache regions do not cover the heads of layer {layer}"
-                    );
-                }
-                group.layer_ids = owners
-                    .iter()
-                    .filter(|(_, owner)| **owner == index)
-                    .map(|(layer, _)| *layer)
-                    .collect();
-            }
-            anyhow::ensure!(
-                owners.keys().copied().eq(0..owners.len() as u32),
-                "worker cache regions do not cover every logical cache layer"
-            );
-        }
-
-        // Keep startup cancellation attached until every deployment group
         // is ready; expert peers may still be preparing their resources.
         for worker in &mut workers {
             worker.check_worker("WorkerGroup readiness")?;

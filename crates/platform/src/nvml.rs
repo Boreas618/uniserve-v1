@@ -17,7 +17,7 @@ type NvmlReturn = i32;
 type NvmlDevice = *mut c_void;
 
 /// `nvmlReturn_t.NVML_SUCCESS`, compared with the header by
-/// [`tests::the_nvml_constants_are_the_headers`].
+/// `tests::the_nvml_constants_are_the_headers`.
 const NVML_SUCCESS: NvmlReturn = 0;
 /// `nvmlReturn_t.NVML_ERROR_INSUFFICIENT_SIZE`, the status a process query
 /// answers when the caller's array is too short.
@@ -34,7 +34,7 @@ const NVML_VALUE_NOT_AVAILABLE: u64 = u64::MAX;
 
 /// `nvmlProcessInfo_t` (v2), returned by the `_v3` process queries; its layout
 /// is compared with `nvml.h` by
-/// [`tests::the_nvml_structures_are_sized_by_the_headers`].
+/// `tests::the_nvml_structures_are_sized_by_the_headers`.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct ProcessInfo {
@@ -45,7 +45,7 @@ struct ProcessInfo {
 }
 
 /// `nvmlMemory_v2_t`, whose layout is compared with `nvml.h` by
-/// [`tests::the_nvml_structures_are_sized_by_the_headers`].
+/// `tests::the_nvml_structures_are_sized_by_the_headers`.
 #[repr(C)]
 #[derive(Default)]
 struct RawMemory {

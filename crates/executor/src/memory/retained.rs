@@ -237,6 +237,10 @@ struct State {
     written: BTreeSet<Key>,
     /// Every tensor the worker uses, which its startup retains.
     used: BTreeSet<Key>,
+    /// The weights this rank has mapped, by device and key: a repeated fetch
+    /// answers the mapping it already holds rather than mapping the region
+    /// twice.
+    weights: BTreeMap<(i32, Key), Arc<Storage>>,
     /// A standby worker's exclusive storages, until it is promoted; `None`
     /// for a worker that takes write access at once.
     standby: Option<Standby>,
@@ -313,6 +317,7 @@ impl Retained {
                 gpus: BTreeMap::new(),
                 written: BTreeSet::new(),
                 used: BTreeSet::new(),
+                weights: BTreeMap::new(),
                 standby: launch.standby.then(Standby::default),
                 inherited: Vec::new(),
             }),
@@ -506,6 +511,48 @@ impl Retained {
             }
         }
         Ok(())
+    }
+
+    /// The bytes already retained under `key`, mapped read-only on `device`,
+    /// or `None` when the server holds nothing under it.
+    ///
+    /// `key` is a weight's §8 key and nothing else is mixed in: the bytes
+    /// outlive the world that wrote them, so their record carries no segment
+    /// and no world, and a rank that finds them answers the region another rank
+    /// published rather than publishing its own. A miss is not an error - it is
+    /// the loader's cue to convert the checkpoint and store it.
+    ///
+    /// One mapping per (device, key): a repeated fetch answers the region the
+    /// first one mapped, so a rank that serves two GPUs maps a shared weight
+    /// once on each and never twice on one.
+    pub(crate) fn weight(&self, device: DeviceId, key: Key) -> Result<Option<Arc<Storage>>> {
+        let mut state = lock(&self.state);
+        if let Some(storage) = state.weights.get(&(device.0, key)) {
+            return Ok(Some(Arc::clone(storage)));
+        }
+        let got = state
+            .client
+            .get(vec![key], Mode::Read, Vec::new())
+            .map_err(|error| storage_error("taking a retained weight", error))?;
+        let Some(tensor) = got.tensors.iter().find(|tensor| tensor.key == key) else {
+            return Ok(None);
+        };
+        let index = tensor.storage as usize;
+        let (record, descriptor) = got
+            .storages
+            .into_iter()
+            .nth(index)
+            .ok_or_else(|| Error::Interface("a retained weight names no storage".into()))?;
+        let storage = Storage::import(
+            descriptor,
+            record.bytes as usize,
+            device,
+            &[],
+            Protection::ReadOnly,
+        )?;
+        state.used.insert(key);
+        state.weights.insert((device.0, key), Arc::clone(&storage));
+        Ok(Some(storage))
     }
 
     /// Release the scope's read-only tensors the worker does not bind
@@ -959,6 +1006,107 @@ impl ExclusiveStorage for &Retained {
         segments: &[usize],
     ) -> Result<()> {
         self.create_segments(spec, storage, segments)
+    }
+}
+
+impl crate::memory::weights::WeightStorage for Retained {
+    /// A weight's bytes, mapped read-only on `device`; `None` when the server
+    /// holds nothing under `key`.
+    fn fetch(&self, device: DeviceId, key: &[u8; 32]) -> Result<Option<nn::Backing>> {
+        let Some(storage) = self.weight(device, Key(*key))? else {
+            return Ok(None);
+        };
+        Ok(Some(nn::Backing::new(
+            ops::DevicePtr::new(storage.address()),
+            storage.bytes() as u64,
+        )))
+    }
+
+    /// Publish `bytes` under `key` and answer the region they are mapped at.
+    ///
+    /// The bytes outlive the world that stores them, so their record carries no
+    /// segment and no world and lies on the host the server retains; the
+    /// mapping a store answers is the same read-only one a fetch would find,
+    /// so a second store of the same key republishes rather than failing.
+    fn granularity(&self, device: DeviceId) -> Result<usize> {
+        Ok(platform::HandleType::Descriptor.granularity(device)?)
+    }
+
+    fn store(
+        &self,
+        device: DeviceId,
+        key: &[u8; 32],
+        bytes: &[u8],
+        allocation: usize,
+    ) -> Result<nn::Backing> {
+        if bytes.is_empty() {
+            return Err(Error::Invalid("a weight holds no bytes".into()));
+        }
+        // The store rounds a weight's true length up to the granule the import needs; a length that
+        // is not such a multiple would be refused by the driver, so it is refused here by name.
+        let granularity = self.granularity(device)?;
+        if allocation < bytes.len() || allocation % granularity != 0 {
+            return Err(Error::Invariant(format!(
+                "a weight of {} bytes cannot be retained in an allocation of {allocation} bytes, \
+                 which is not a multiple of the {granularity}-byte granularity",
+                bytes.len()
+            )));
+        }
+        let mut state = lock(&self.state);
+        let gpu = state.gpu(device)?;
+        let (staging, descriptor) = Storage::host_retainable(device, allocation)?;
+        // SAFETY: the staging storage holds at least `bytes.len()` writable bytes
+        // and the source slice is that long; the server imports the mapping when
+        // the record below is published.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                staging.address() as *mut u8,
+                bytes.len(),
+            );
+        }
+        // The allocation is a whole number of the driver's granules, so the record
+        // states the allocation's length: the server imports exactly that. The
+        // tensor states the weight's true length, and the tail of the last granule
+        // is never read.
+        let record = ::storage::StorageRecord {
+            placement: Placement::Host { numa_node: None },
+            segment: None,
+            bytes: staging.bytes() as u64,
+            fabric: None,
+        };
+        let tensor = ::storage::TensorRecord {
+            key: Key(*key),
+            name: format!(
+                "weight-{}",
+                key.iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            ),
+            storage: 0,
+            offset: 0,
+            dtype: "uint8".into(),
+            shape: vec![bytes.len() as u64],
+            strides: vec![1],
+            access: Access::ReadOnly,
+        };
+        state
+            .client
+            .put(
+                vec![tensor],
+                &[(record, std::os::fd::AsFd::as_fd(&descriptor))],
+            )
+            .map_err(|error| storage_error("publishing a retained weight", error))?;
+        drop(state);
+        let Some(storage) = self.weight(device, Key(*key))? else {
+            return Err(Error::Interface(
+                "a published weight was not found under its own key".into(),
+            ));
+        };
+        Ok(nn::Backing::new(
+            ops::DevicePtr::new(storage.address()),
+            storage.bytes() as u64,
+        ))
     }
 }
 
