@@ -353,8 +353,11 @@ fn a_request_that_does_not_fit_a_slot_waits_for_one() {
             while let Ok(event) = events.try_recv() {
                 match event {
                     Event::TextToken { .. } | Event::TextTokens { .. } => served[index] = true,
-                    Event::Rejected { .. } | Event::Error { .. } => {
-                        panic!("request {} was refused, not queued", index + 1)
+                    refused @ (Event::Rejected { .. } | Event::Error { .. }) => {
+                        panic!(
+                            "request {} was refused, not queued: {refused:?}",
+                            index + 1
+                        )
                     }
                     _ => {}
                 }
