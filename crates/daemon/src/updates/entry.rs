@@ -347,6 +347,20 @@ impl Leader {
         let replicas = self.replicas();
         let current = locked(&replicas[0].config).clone();
         let (target, stated, _update) = resolve(&current, &request)?;
+        // One update at a time (§7.2, §7.4), whichever layer the change is
+        // the other's: while a switch runs or a program update is on
+        // probation, the `served` spec and the records this entry would read
+        // belong to that update. A dry run answers without touching them.
+        if !request.dry_run
+            && let Some(update) = crate::updates::in_flight(
+                self.updates.running(),
+                self.epochs().program_update().is_some(),
+            )
+        {
+            return Err(UpdateError::Refused(format!(
+                "another update is in flight: {update}"
+            )));
+        }
         // A change of what the main processes build is the epoch layer's
         // (§7.4): one switch for the deployment, decided before either of the
         // other two layers looks at the change.
@@ -431,17 +445,6 @@ impl Leader {
         let next = crate::epoch::Deployment::of(target.clone());
         if crate::epoch::layer(&previous, &next) != crate::epoch::Layer::Epoch {
             return Ok(None);
-        }
-        // One update at a time (§7.2): a program update on probation is the
-        // record of what serves, so an epoch switch over it is refused by
-        // name, before the build config is written or a child is started.
-        if let Some(in_flight) = crate::updates::in_flight(
-            self.updates.running(),
-            self.epochs().program_update().is_some(),
-        ) {
-            return Err(UpdateError::Refused(format!(
-                "another update is in flight: {in_flight}"
-            )));
         }
         // One main process per node and one launch file per process: the file
         // names its peers' request addresses, which this daemon does not know
