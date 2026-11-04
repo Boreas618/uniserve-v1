@@ -608,6 +608,33 @@ mod tests {
         movable::<Communicator>();
     }
 
+    /// `ncclUniqueId` is a 128-byte opaque token in `nccl.h`, and this crate
+    /// passes it to NCCL by value and compares it between ranks, so its size is
+    /// the contract: a larger `UniqueId` would be a different rendezvous value
+    /// than the other ranks hold.
+    ///
+    /// `ncclConfig_t` is the other structure the header offers and this crate
+    /// never builds one: `ncclCommSplit` is called with a null config (the
+    /// defaults) and `ncclCommInitRankConfig` is not called at all, so there is
+    /// no attribute encoding here to compare. A crate that starts passing a
+    /// config owes this test that structure's size and its attribute offsets.
+    #[test]
+    fn the_nccl_structures_are_sized_by_the_headers() {
+        use crate::header::struct_size;
+        let ours = std::mem::size_of::<super::UniqueId>();
+        assert_eq!(ours, 128, "ncclUniqueId is 128 bytes in nccl.h");
+        match struct_size("nccl.h", "ncclUniqueId") {
+            Some(header) => assert_eq!(
+                header, ours,
+                "nccl.h lays ncclUniqueId out in {header} bytes, this crate in {ours}"
+            ),
+            None => eprintln!(
+                "skipped: nccl.h does not let ncclUniqueId be laid out here, so the crate's \
+                 {ours} bytes for it went uncompared"
+            ),
+        }
+    }
+
     /// The one constant this crate takes from `nccl.h` is compared with it: a
     /// split is only correct if the "not in this group" colour is the header's.
     #[test]
