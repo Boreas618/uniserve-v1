@@ -6,7 +6,7 @@ use crate::driver::{ContextScope, Handle, driver, in_context};
 use crate::event::Event;
 use crate::{DeviceId, Error, PrimaryContext, Result};
 
-const CU_STREAM_NON_BLOCKING: u32 = 1;
+pub(crate) const CU_STREAM_NON_BLOCKING: u32 = 1;
 const CU_EVENT_WAIT_EXTERNAL: u32 = 1;
 
 /// What keeps a stream's (and its events') CUDA context alive.

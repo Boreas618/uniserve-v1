@@ -838,7 +838,7 @@ fn single_rank_communicators_run_collectives() {
                 data.address(),
                 data.address(),
                 4,
-                platform::DType::I32,
+                platform::DataType::I32,
                 ReduceOp::Min,
                 &stream,
             )
@@ -848,7 +848,7 @@ fn single_rank_communicators_run_collectives() {
                 data.address(),
                 data.address(),
                 4,
-                platform::DType::I32,
+                platform::DataType::I32,
                 0,
                 &stream,
             )
@@ -1532,4 +1532,28 @@ fn tensor_maps_encode_tiled_descriptors() {
         TensorMap::encode_tiled(&rank_zero),
         Err(Error::InvalidArgument(_))
     ));
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn a_healthy_context_reports_no_sticky_error() {
+    let _driver = exclusive_driver();
+    let context = PrimaryContext::retain(DEVICE).unwrap();
+    assert!(context.sticky_error().unwrap().is_none());
+    // A second probe answers from the stream the context already owns.
+    assert!(context.sticky_error().unwrap().is_none());
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn the_sticky_error_probe_does_not_wait_for_queued_work() {
+    let _driver = exclusive_driver();
+    let context = PrimaryContext::retain(DEVICE).unwrap();
+    let stream = Stream::new(DEVICE).unwrap();
+    // The stream is held inside a host function, so any call that waited for
+    // its queued work would not return; the probe answers at once.
+    let release = block(&stream);
+    assert!(context.sticky_error().unwrap().is_none());
+    release.send(()).unwrap();
+    stream.synchronize().unwrap();
 }
