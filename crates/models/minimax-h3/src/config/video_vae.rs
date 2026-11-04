@@ -248,6 +248,7 @@ mod tests {
         assert_eq!(config.clip_latents(), 5);
         assert_eq!(config.final_clip_latents(), 2);
         assert_eq!(config.spatial_padding_mode, SpatialPadding::Reflect);
+        // The parsing keeps every statistic the sidecar declares, one per entry of its array.
         assert_eq!(config.latents_mean.len(), 4);
     }
 

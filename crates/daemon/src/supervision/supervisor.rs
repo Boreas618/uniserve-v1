@@ -333,6 +333,22 @@ impl Supervisor {
 }
 
 impl Supervisor {
+    /// The processes this node supervises now, named as `hand_over` names
+    /// them and without giving any of them up: what the daemon's process
+    /// table reports to the admin API (§2.3, §7.4).
+    pub(crate) fn live(&self) -> Vec<HandedProcess> {
+        self.children
+            .iter()
+            .map(|((engine, group, rank, generation), supervised)| HandedProcess {
+                engine: *engine,
+                group: group.clone(),
+                rank: *rank,
+                generation: *generation,
+                pid: supervised.child.id(),
+            })
+            .collect()
+    }
+
     /// Hands every process and reservation to this daemon's successor in a
     /// hot restart, which goes on with them ([`Supervisor::adopt`]): their
     /// keys, and a pidfd for each process followed by each reservation's

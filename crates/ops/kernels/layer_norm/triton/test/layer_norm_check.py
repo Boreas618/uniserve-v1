@@ -74,6 +74,15 @@ def absolute_floor(weight, bias, dtype):
     return UNIT_ROUNDOFF[dtype] * scale.max().item()
 
 
+def truncate(values):
+    """The reference as Triton's interpreter stores it: one ulp low, not rounded.
+
+    The `bf16` significand is eight bits, so the value is truncated on its own mantissa.
+    """
+    bits = values.view(torch.int64)
+    return (bits & ~((1 << 45) - 1)).view(torch.float64)
+
+
 def check(case, device):
     """Normalize one matrix and compare every element against the exact rows."""
     import layer_norm as kernels
@@ -125,16 +134,22 @@ def check(case, device):
     if case["truncate"]:
         # Triton's interpreter truncates a narrow store instead of rounding to nearest
         # even, one ulp low; the reference is truncated the same way so that what the run
-        # compares is the arithmetic and not the interpreter's cast.
-        bits = expected.float().view(torch.int32)
-        expected = (bits & ~0xFFFF).view(torch.float32).to(dtype).double()
+        # compares is the arithmetic and not the interpreter's cast. The truncation is of
+        # the value's own mantissa: rounding it to `f32` first would step values across a
+        # boundary the kernel's arithmetic stays below.
+        expected = truncate(expected)
     got = out.cpu().double()
     difference = (got - expected).abs()
     relative = bound(columns, case["dtype"]) * expected.abs()
     floor = absolute_floor(weight, bias, case["dtype"])
-    declared_outside = (difference > relative).sum().item()
-    scaled_outside = (difference > relative + floor).sum().item()
-    largest = (difference / expected.abs().clamp(min=1e-30)).max().item()
+    declared_outside = (~(difference <= relative)).sum().item()
+    scaled_outside = (~(difference <= relative + floor)).sum().item()
+    largest = (
+        (difference / expected.abs().clamp(min=1e-30))
+        .nan_to_num(nan=float("inf"))
+        .max()
+        .item()
+    )
     deciding = (
         declared_outside if case["bound"] == "declared" else scaled_outside
     )
@@ -143,7 +158,7 @@ def check(case, device):
         f"{case['tile']}, {case['dtype']}, "
         f"bias {str(case['bias']).lower()}"
         f"{', interpreter cast truncated' if case['truncate'] else ''} — "
-        f"max absolute {difference.max().item():.3e}, max relative {largest:.3e}, "
+        f"max absolute {difference.nan_to_num(nan=float('inf')).max().item():.3e}, max relative {largest:.3e}, "
         f"declared bound {bound(columns, case['dtype']):.3e} "
         f"({declared_outside} outside), with the {floor:.3e} absolute floor the operands "
         f"imply ({scaled_outside} outside)"
@@ -230,13 +245,17 @@ def main() -> int:
             f"a tile of {arguments.tile} lanes cannot cover a row of "
             f"{arguments.columns}: the program reduces over the tile"
         )
+    if not arguments.interpreter and not torch.cuda.is_available():
+        # A host without a device takes the interpreter: a check must run where it lands.
+        print(
+            "no GPU on this host: running through Triton's interpreter instead",
+            file=sys.stderr,
+        )
+        arguments.interpreter = True
     if arguments.interpreter:
         import os
 
         os.environ["TRITON_INTERPRET"] = "1"
-    elif not torch.cuda.is_available():
-        print("no GPU on this host: this check needs one", file=sys.stderr)
-        return 1
 
     key = (
         f"dtype_{arguments.dtype}_columns_{arguments.columns}"

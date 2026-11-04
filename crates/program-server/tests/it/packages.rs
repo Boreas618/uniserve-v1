@@ -539,3 +539,71 @@ fn the_convolutions_are_one_source_in_three_packages() {
         );
     }
 }
+
+/// Operators that are one computation with one difference share one check script, and each
+/// set of packages must carry the same bytes of it: whoever edits the reference, the
+/// interpreter's truncation or a case edits every copy, or they diverge and one operator's
+/// evidence quietly stops being the others'.
+#[test]
+fn a_family_of_operators_shares_one_check() {
+    const FAMILIES: [(&str, &[&str]); 6] = [
+        (
+            "triton/test/row_norm_check.py",
+            &["rms_norm", "add_rms_norm"],
+        ),
+        ("triton/test/softmax_check.py", &["softmax", "log_softmax"]),
+        (
+            "triton/test/swiglu_check.py",
+            &["swiglu", "value_first_swiglu"],
+        ),
+        (
+            "triton/test/modulation_check.py",
+            &["modulated_rms_norm", "gated_residual"],
+        ),
+        (
+            "triton/test/fused_row_norm_check.py",
+            &["scaled_residual_rms_norm", "scaled_residual_layer_norm"],
+        ),
+        (
+            "triton/test/sampling_check.py",
+            &[
+                "logits_gather",
+                "vocab_unpad",
+                "logits_shape",
+                "filter_candidates",
+                "inverse_cdf",
+                "argmax",
+                "logprob_gather",
+                "top_k",
+            ],
+        ),
+    ];
+    for (shared, operators) in FAMILIES {
+        let scripts: Vec<String> = operators
+            .iter()
+            .map(|op| {
+                let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../ops/kernels")
+                    .join(op)
+                    .join(shared);
+                std::fs::read_to_string(&path).unwrap_or_else(|error| {
+                    panic!("{op}'s check is not readable at {}: {error}", path.display())
+                })
+            })
+            .collect();
+        for (index, script) in scripts.iter().enumerate().skip(1) {
+            assert!(
+                script == &scripts[0],
+                "{shared} differs between {} and {}",
+                operators[0],
+                operators[index]
+            );
+        }
+        for op in operators {
+            assert!(
+                scripts[0].contains("--op") && scripts[0].contains(op),
+                "{shared} does not name {op} on its command line"
+            );
+        }
+    }
+}

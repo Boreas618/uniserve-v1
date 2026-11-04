@@ -512,10 +512,14 @@ impl EngineControl {
             .placement
             .as_ref()
             .context("the engine spec states no placement")?;
-        anyhow::ensure!(
-            !placement.devices.is_empty(),
-            "the placement names no device for this rank"
-        );
+        // The devices are the deployment's own: each host's ranks are on the
+        // ordinals the engine's shorthand gives them (`0..` in rank order), or
+        // on the order `placement_config.devices` names, which
+        // `EngineConfig::from_spec` has already folded into the ranks. Reading
+        // them from the ranks is the one account: a config that states no
+        // order still gives this node's ranks their devices, and a rank on
+        // `cpu` is refused here rather than in the child.
+        let devices = local_devices(&self.host, spec)?;
         anyhow::ensure!(
             placement.queue_depth > 0,
             "the placement's queue_depth is zero for this rank"
@@ -545,7 +549,7 @@ impl EngineControl {
             processes: self.processes.clone(),
             engine,
             program_server: program_server.display().to_string(),
-            devices: placement.devices.clone(),
+            devices,
             group: ENGINE_GROUP.to_owned(),
             rank: 0,
             deployment: self.deployment.clone(),
@@ -1499,4 +1503,51 @@ mod tests {
         assert_eq!(failure.kind, "policy_reverted");
         assert!(failure.reason.contains("priority"), "{}", failure.reason);
     }
+}
+
+/// The CUDA ordinals `host`'s ranks serve, in rank order and without repeats.
+///
+/// A deployment that states no `placement_config.devices` still gives each
+/// host's ranks the ordinals the engine's shorthand numbers them from zero; one
+/// that does state an order has already had it folded into the ranks by
+/// [`engine::EngineConfig::from_spec`]. Reading the ranks is the one account of
+/// both, and it is what the launch file states as the devices of this node's
+/// process (§2.3, §7.4).
+///
+/// # Errors
+///
+/// Fails when the spec does not resolve to an engine configuration, when a rank
+/// of `host` does not run on a CUDA device, or when no rank of the deployment
+/// runs on `host`.
+fn local_devices(host: &str, spec: &wire::EngineSpec) -> anyhow::Result<Vec<u32>> {
+    let config = engine::EngineConfig::from_spec(spec)?;
+    let mut devices = Vec::new();
+    for group in &config.worker_groups {
+        for rank in &group.ranks {
+            if rank.host != host {
+                continue;
+            }
+            let ordinal = rank
+                .device
+                .strip_prefix("cuda:")
+                .with_context(|| {
+                    format!(
+                        "host {host} runs a rank on {:?}: a main process serves CUDA devices",
+                        rank.device
+                    )
+                })?
+                .parse::<u32>()
+                .with_context(|| {
+                    format!("the device ordinal of rank {:?} does not parse", rank.device)
+                })?;
+            if !devices.contains(&ordinal) {
+                devices.push(ordinal);
+            }
+        }
+    }
+    anyhow::ensure!(
+        !devices.is_empty(),
+        "the placement names no device for this rank: no rank of the deployment runs on {host}"
+    );
+    Ok(devices)
 }
