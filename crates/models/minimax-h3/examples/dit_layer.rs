@@ -50,7 +50,7 @@ use minimax_h3::modulation::{self, AdaLnCache, Groups, Projections};
 use minimax_h3::packing;
 use minimax_h3::partition::Partition;
 use minimax_h3::schedule::{Modality, Schedule};
-use minimax_h3::transformer::{ROTATED_AXES, Transformer};
+use minimax_h3::transformer::{Transformer, rotated_axes};
 // The block's capability methods: `draw_noise`, `layout`, `state_tables` and the rest are the
 // trait's, and the stage that drives the whole block calls them the way the executor does.
 use nn::capability::Denoiser as _;
@@ -1125,9 +1125,15 @@ fn stage_block(args: &Args) -> Result<()> {
     // 7. The inputs: the packed rows' rotary, the row table, the step, and the tokens themselves.
     let positions = transpose_positions(&stream, &arena, &tables.position_ids, tokens)?;
     // A factor table holds one column per rotated pair, not per rotated channel: `rotated_width()`
-    // counts channels (three axes of 32) and `Rotary::factors` reads `rotated / 2`.
-    let cosine = arena.tensor(DType::F32, Shape::new(&[tokens, rotated_width() / 2]))?;
-    let sine = arena.tensor(DType::F32, Shape::new(&[tokens, rotated_width() / 2]))?;
+    // counts channels (three axes of `2 * rope_freq_dim`) and the rotation reads `rotated / 2`.
+    let cosine = arena.tensor(
+        DType::F32,
+        Shape::new(&[tokens, rotated_width(&config) / 2]),
+    )?;
+    let sine = arena.tensor(
+        DType::F32,
+        Shape::new(&[tokens, rotated_width(&config) / 2]),
+    )?;
     stack.factors(&forward, positions, cosine, sine)?;
     let rows = upload_i32(&stream, &arena, Shape::new(&[tokens]), &tables.groups)?;
     // The evaluation the stack runs: the schedule's first, which is also the row the modulation
@@ -1347,9 +1353,12 @@ fn cache_projections(f: &Forward, projections: &Projections, memory: &AdaLnMemor
     Ok(())
 }
 
-/// The rotary width of one row: the three axes' shares of a head.
-fn rotated_width() -> u64 {
-    ROTATED_AXES.iter().map(|axis| u64::from(*axis)).sum()
+/// The rotary width of one row: the three axes' shares of a head, from the checkpoint's own count.
+fn rotated_width(config: &minimax_h3::config::TransformerConfig) -> u64 {
+    rotated_axes(config)
+        .iter()
+        .map(|axis| u64::from(*axis))
+        .sum()
 }
 
 /// A deterministic input in the deployment's own element type: the same bytes on every host, so a

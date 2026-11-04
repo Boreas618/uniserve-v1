@@ -380,11 +380,20 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
             .to_string(),
         );
     }
-    // The factors those two operators read: the DiT's three equal axes of 32 rotated elements (96
-    // in all, so a 48-column table), and the text encoder's Qwen3-VL M-RoPE, whose three unequal
-    // sections (48, 40, 40 of the head's 128 rotated elements) grow at three rates over (time,
-    // height, width) and make a 64-column table.
-    for (rotated, per_axis) in [(ROTATED, [ROTATED / ROPE_AXES; 3]), (128, [48, 40, 40])] {
+    // The factors those two operators read, and the two are not the same cut:
+    //
+    // - **The DiT's** is three equal blocks of 32 rotated elements (96 in all, a 48-column table).
+    //   The reference hands its rotary **one axis spanning the whole head** (`attention.py:94-105`,
+    //   `axis_dims=(head_dim,)`), so the same `rope_freq_dim` frequencies serve each coordinate
+    //   axis and the three axes' factors are contiguous blocks - box 0 is time, box 1 height, box 2
+    //   width. A cycle would give the second and third axes the first axis's frequencies.
+    // - **The text encoder's** is Qwen3-VL's M-RoPE: three unequal sections (48, 40, 40 of the
+    //   head's 128 rotated elements) whose frequencies cycle over (time, height, width), a
+    //   64-column table.
+    for (rotated, per_axis, interleaved) in [
+        (ROTATED, [ROTATED / ROPE_AXES; 3], false),
+        (128, [48, 40, 40], true),
+    ] {
         push(
             "rotary_factors",
             ops::rope::FactorsDescriptor {
@@ -408,8 +417,8 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
                     sections[2] = per_axis[2];
                     sections
                 },
-                // H3's text encoder is Qwen3-VL: its M-RoPE cycles the axes over the frequencies.
-                interleaved: true,
+                // The DiT cuts the spectrum into blocks; the encoder's M-RoPE cycles it.
+                interleaved,
             }
             .to_string(),
         );
