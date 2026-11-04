@@ -21,6 +21,7 @@
 
 use crate::platform::{Allocator, Buffer, PoolKind, Stream};
 use crate::tensor::{DType, DevicePtr, Shape, TensorView};
+use crate::tolerance::Tolerance;
 use crate::{Error, Result, platform};
 
 /// The alignment every twin buffer starts at.
@@ -47,6 +48,7 @@ pub struct Twins {
     buffer: Buffer,
     cursor: u64,
     pairs: Vec<Twin>,
+    tolerance: Option<Tolerance>,
     failure: Option<Error>,
 }
 
@@ -64,6 +66,7 @@ impl Twins {
             buffer,
             cursor: 0,
             pairs: Vec::new(),
+            tolerance: None,
             failure: None,
         })
     }
@@ -161,7 +164,22 @@ impl Twins {
     pub fn reset(&mut self) {
         self.cursor = 0;
         self.pairs.clear();
+        self.tolerance = None;
         self.failure = None;
+    }
+
+    /// Record how far the shadowed launch's real and shadow results may differ.
+    ///
+    /// The operator's own type is the only place its tolerance is known (`Op::tolerance`), so the
+    /// layer that shadows the launch records it here and the harness that compares the twins reads
+    /// it back: the comparison then never needs the operator's type.
+    pub fn set_tolerance(&mut self, tolerance: Tolerance) {
+        self.tolerance = Some(tolerance);
+    }
+
+    /// The tolerance of the launch whose twins this region holds, if one was recorded.
+    pub fn tolerance(&self) -> Option<Tolerance> {
+        self.tolerance
     }
 
     /// A buffer of `shape` elements of `dtype`, from the region.
