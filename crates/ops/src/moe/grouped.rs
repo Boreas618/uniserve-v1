@@ -429,8 +429,18 @@ impl Op for RouteGemm {
                 ),
             ));
         }
-        args.out
-            .require_shape(Self::NAME, Shape::new(&[expanded, hidden]))?;
+        // The output is the expanded routes' product, and a caller that keeps one buffer for the
+        // whole step may hand more rows than this launch writes: the kernel writes exactly
+        // `expanded` of them, so a longer buffer is not an error, only a bigger reservation.
+        if args.out.rows() < expanded {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the output holds {} rows and this launch writes {expanded}",
+                    args.out.rows()
+                ),
+            ));
+        }
         args.out.require_row(Self::NAME, descriptor.dtype, hidden)?;
 
         let mut call = RouteCall {

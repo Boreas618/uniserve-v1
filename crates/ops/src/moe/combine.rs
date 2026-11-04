@@ -65,7 +65,11 @@ impl fmt::Display for Descriptor {
 pub struct UnpermuteArgs {
     /// `[tokens · top, hidden]` every route's expert product.
     pub routes: TensorView,
-    /// `[tokens, top]` i32: expanded route of each `(token, route)` pair, `-1` when absent.
+    /// `[tokens, top]` i32: the permuted row of each `(token, route)` pair, `-1` when absent.
+    ///
+    /// The module reads `routes` as the **permuted** buffer through this map. The dense `route_gemm`
+    /// writes the other convention - one row per expanded route - so a dense deployment's combine
+    /// needs a module compiled for expanded input, and the layout is not yet a descriptor field.
     pub expanded_to_permuted: TensorView,
     /// `[tokens, top]` route weights, in the descriptor's scale dtype.
     pub scales: TensorView,
