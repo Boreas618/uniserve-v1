@@ -146,10 +146,7 @@ impl ThreadPool {
 
     /// The kinds whose lane exists.
     pub fn kinds(&self) -> Vec<BlockingKind> {
-        lock(&self.lanes)
-            .iter()
-            .map(|(kind, _)| *kind)
-            .collect()
+        lock(&self.lanes).iter().map(|(kind, _)| *kind).collect()
     }
 
     /// Stops admission on every lane without joining work that may wait on a
