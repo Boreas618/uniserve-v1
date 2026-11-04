@@ -140,7 +140,6 @@ struct Takeover {
     listener: HandedListener,
     replicas: Vec<ReplicaHandoff>,
     adapters: std::collections::BTreeMap<String, crate::leader::Adapter>,
-    pending: std::collections::VecDeque<(usize, crate::updates::change::ApplyRequest)>,
     service: HandedService,
     service_descriptors: usize,
     admin: HandedAdmin,
@@ -363,7 +362,6 @@ impl Restarter {
                     listener,
                     replicas,
                     adapters: crate::leader::locked(&leader.replicas.adapters).clone(),
-                    pending: crate::leader::locked(&leader.replicas.pending).clone(),
                     service,
                     service_descriptors: service_count,
                     admin: admin.hand_over(),
@@ -662,7 +660,6 @@ async fn prepared_successor(
         listener,
         replicas,
         adapters,
-        pending,
         service,
         service_descriptors,
         admin,
@@ -780,7 +777,6 @@ async fn prepared_successor(
     }
 
     *crate::leader::locked(&leader.replicas.adapters) = adapters;
-    *crate::leader::locked(&leader.replicas.pending) = pending;
     let retire = Arc::new(AtomicBool::new(false));
     let admin = Admin::resume(shutdown.clone(), Arc::clone(&retire), admin);
     admin.record(

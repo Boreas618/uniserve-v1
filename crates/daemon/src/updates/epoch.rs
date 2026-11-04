@@ -64,7 +64,7 @@ pub(crate) struct EpochChange {
 /// Returns `Ok(None)` when `epoch::layer` answers `Host`, `Program` or
 /// `None`, so the caller takes its other path; `Ok(Some(Applied::Planned))`
 /// under `dry_run`, having started nothing and written nothing; and
-/// `Ok(Some(Applied::World))` with the switch's first report once the
+/// `Ok(Some(Applied::Epoch))` with the switch's first report once the
 /// target's main processes are asked to start, the switch itself kept in
 /// `running` for the caller to advance, commit or revert.
 ///
