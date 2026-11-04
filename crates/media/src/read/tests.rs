@@ -116,6 +116,8 @@ fn video_cases() -> Vec<VideoCase> {
                 frame_rate: values[0],
                 canvas: (values[1], values[2]),
                 frames: values[3],
+                // These clips' plans cover every frame they decode.
+                vae_frames: values[3],
                 start_frame: values[4],
             },
             expected: std::fs::read(directory.join(format!("{name}.out"))).unwrap(),
@@ -355,7 +357,7 @@ fn conditions_take_a_reference_video_and_an_image_into_one_product() {
             samples: 0..0,
         },
     ];
-    read_conditions(
+    let decoded = read_conditions(
         &ffmpeg(),
         &conditions,
         &mut ConditionProducts {
@@ -366,6 +368,73 @@ fn conditions_take_a_reference_video_and_an_image_into_one_product() {
     .unwrap();
     assert_eq!(pixels[..video_rows * 3], video.expected[..]);
     assert_eq!(pixels[video_rows * 3..], image.expected[..]);
+    let video_decoded = decoded[0].as_ref().unwrap();
+    assert_eq!(video_decoded.clip, video.clip);
+    assert_eq!(video_decoded.pixels, video.expected);
+    assert!(decoded[1].is_none());
+}
+
+#[test]
+fn conditions_take_a_reference_videos_encoded_prefix_and_return_every_frame() {
+    // The `native` case decodes five frames; a model may consume fewer of
+    // them and still pack patches from the rest.
+    let case = &video_cases()[1];
+    assert_eq!(case.clip.frames, 5);
+    let mut clip = case.clip;
+    clip.vae_frames = 3;
+    let area = clip.canvas.0 as usize * clip.canvas.1 as usize;
+    let rows = clip.vae_frames as usize * area;
+    let file = std::fs::File::open(&case.file).unwrap();
+    let mut pixels = vec![0u8; rows * 3];
+    let decoded = read_conditions(
+        &ffmpeg(),
+        &[ConditionRead {
+            source: ConditionSource::File(&file),
+            image: None,
+            video: Some(clip),
+            audio: None,
+            pixels: 0..rows,
+            samples: 0..0,
+        }],
+        &mut ConditionProducts {
+            pixels: Some(&mut pixels),
+            samples: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(pixels[..], case.expected[..rows * 3]);
+    let decoded = decoded[0].as_ref().unwrap();
+    assert_eq!(decoded.clip, clip);
+    assert_eq!(decoded.pixels, case.expected);
+    assert_eq!(decoded.pixels.len(), case.clip.frames as usize * area * 3);
+}
+
+#[test]
+fn conditions_refuse_an_encoded_prefix_longer_than_the_decoded_clip() {
+    let case = &video_cases()[0];
+    let mut clip = case.clip;
+    clip.vae_frames = clip.frames + 1;
+    let area = clip.canvas.0 as usize * clip.canvas.1 as usize;
+    let mut pixels = vec![0u8; clip.vae_frames as usize * area * 3];
+    let file = std::fs::File::open(&case.file).unwrap();
+    assert!(
+        read_conditions(
+            &ffmpeg(),
+            &[ConditionRead {
+                source: ConditionSource::File(&file),
+                image: None,
+                video: Some(clip),
+                audio: None,
+                pixels: 0..clip.vae_frames as usize * area,
+                samples: 0..0,
+            }],
+            &mut ConditionProducts {
+                pixels: Some(&mut pixels),
+                samples: None,
+            },
+        )
+        .is_err()
+    );
 }
 
 #[test]

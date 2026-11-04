@@ -21,7 +21,7 @@ use crate::Result;
 use crate::codec::{self, Rgb24Frames};
 use crate::config::MediaConfig;
 use crate::mux::MuxSession;
-use crate::read::{ConditionProducts, ConditionRead};
+use crate::read::{ConditionProducts, ConditionRead, DecodedVideo};
 
 /// The main process's media runner: encoders, muxers and readers.
 ///
@@ -164,6 +164,9 @@ impl MediaRunner {
 
     /// Decodes a request's conditions into its products.
     ///
+    /// Returns each reference video's decoded frames, in request order, for
+    /// the vision packer; see [`crate::read::read_conditions`].
+    ///
     /// # Errors
     ///
     /// The errors of [`crate::read::read_conditions`].
@@ -171,7 +174,7 @@ impl MediaRunner {
         &self,
         conditions: &[ConditionRead<'_>],
         products: &mut ConditionProducts<'_>,
-    ) -> Result<()> {
+    ) -> Result<Vec<Option<DecodedVideo>>> {
         crate::read::read_conditions(Path::new(&self.config.ffmpeg), conditions, products)
     }
 

@@ -71,12 +71,25 @@ pub struct VideoClip {
     pub frame_rate: u32,
     /// The clip's `(width, height)` canvas.
     pub canvas: (u32, u32),
-    /// Kept frames, starting at `start_frame`: the encoded frames the
-    /// condition's pixel rows cover (the reference's `vae_frames`, which may be
-    /// fewer than the frames the decoded clip holds).
+    /// Kept frames, starting at `start_frame`, that the decode produces.
     pub frames: u32,
+    /// The leading decoded frames the condition's pixel rows cover (the
+    /// reference's `vae_frames`): at most `frames`. The frames past this
+    /// prefix are still decoded and returned, because the vision packer reads
+    /// them.
+    pub vae_frames: u32,
     /// First kept frame in the video's own rate.
     pub start_frame: u32,
+}
+
+/// A reference video's decoded frames and the clip they were decoded for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecodedVideo {
+    /// The clip the frames were decoded for.
+    pub clip: VideoClip,
+    /// `[clip.frames, height, width, 3]` RGB24: every decoded frame, not only
+    /// the `vae_frames` the condition's pixel rows took.
+    pub pixels: Vec<u8>,
 }
 
 /// Where one condition's encoded media comes from.
@@ -294,7 +307,8 @@ pub fn read_audio(source: &[u8], plan: &AudioPlan, out: &mut [f32]) -> Result<()
 /// The frames are resampled to the clip's frame rate, the start frames
 /// skipped, then scaled per frame with LANCZOS to the clip's canvas (the scale
 /// follows the trim, so it never sees a skipped frame). Writes
-/// `[frames, height, width, 3]` uint8 RGB.
+/// `[clip.frames, height, width, 3]` uint8 RGB: every decoded frame, of which
+/// the first `vae_frames` fill the condition's pixel rows.
 ///
 /// # Errors
 ///
@@ -379,7 +393,7 @@ fn extents(condition: &ConditionRead<'_>) -> (usize, usize) {
     let pixels = if let Some(image) = condition.image {
         image.window.2 as usize * image.window.3 as usize
     } else if let Some(clip) = condition.video {
-        clip.frames as usize * clip.canvas.0 as usize * clip.canvas.1 as usize
+        clip.vae_frames as usize * clip.canvas.0 as usize * clip.canvas.1 as usize
     } else {
         0
     };
@@ -430,17 +444,20 @@ fn check_ranges(ranges: &[Range<usize>], rows: usize, name: &str) -> Result<()> 
 ///
 /// Every reference video's FFmpeg decode runs on a thread of its own from the
 /// start, beside the library's decoders on this thread: each image and audio
-/// track in request order, then each video's frames once they arrived.
+/// track in request order, then each video's frames once they arrived. A
+/// video's first `vae_frames` frames fill its pixel rows; all `frames` frames
+/// are returned, because the vision packer reads the frames past the product.
 ///
 /// # Errors
 ///
 /// [`crate::Error::Plan`] when the conditions exceed a product, leave it
-/// unfilled, or decode to another extent; the readers' own errors otherwise.
+/// unfilled, decode to another extent, or a video's `vae_frames` exceeds its
+/// `frames`; the readers' own errors otherwise.
 pub fn read_conditions(
     ffmpeg: &Path,
     conditions: &[ConditionRead<'_>],
     products: &mut ConditionProducts<'_>,
-) -> Result<()> {
+) -> Result<Vec<Option<DecodedVideo>>> {
     let mut pixels = products.pixels.as_deref_mut();
     let mut samples = products.samples.as_deref_mut();
 
@@ -451,6 +468,13 @@ pub fn read_conditions(
     let mut declared_pixels = Vec::new();
     let mut declared_samples = Vec::new();
     for condition in conditions {
+        if let Some(clip) = condition.video
+            && clip.vae_frames > clip.frames
+        {
+            return Err(Error::Plan(
+                "a reference video's encoded frames exceed its decoded frames".to_owned(),
+            ));
+        }
         let (wanted_pixels, wanted_samples) = extents(condition);
         if condition.pixels.len() != wanted_pixels {
             return Err(Error::Plan(
@@ -504,7 +528,7 @@ pub fn read_conditions(
         None => {}
     }
 
-    std::thread::scope(|scope| -> Result<()> {
+    std::thread::scope(|scope| -> Result<Vec<Option<DecodedVideo>>> {
         // Start every reference video first, so its FFmpeg pass runs beside
         // the library's decoders.
         let mut videos = Vec::with_capacity(conditions.len());
@@ -559,17 +583,30 @@ pub fn read_conditions(
         }
 
         // The videos' frames arrive after the library's decoders; copy each
-        // into its pixel rows.
+        // video's encoded prefix into its pixel rows and hand the whole
+        // buffer back.
+        let mut decoded = Vec::with_capacity(conditions.len());
         for (condition, handle) in conditions.iter().zip(videos) {
-            let Some(handle) = handle else { continue };
+            let Some(handle) = handle else {
+                decoded.push(None);
+                continue;
+            };
             let frames = handle.join().map_err(|_| {
                 Error::Codec("a reference video's decoding thread failed".to_owned())
             })??;
+            let clip = condition
+                .video
+                .ok_or_else(|| Error::Codec("a video condition has no clip".to_owned()))?;
             let product = pixels
                 .as_deref_mut()
                 .ok_or_else(|| Error::Plan("a condition's pixels have no product".to_owned()))?;
-            product[condition.pixels.start * 3..condition.pixels.end * 3].copy_from_slice(&frames);
+            product[condition.pixels.start * 3..condition.pixels.end * 3]
+                .copy_from_slice(&frames[..condition.pixels.len() * 3]);
+            decoded.push(Some(DecodedVideo {
+                clip,
+                pixels: frames,
+            }));
         }
-        Ok(())
+        Ok(decoded)
     })
 }
