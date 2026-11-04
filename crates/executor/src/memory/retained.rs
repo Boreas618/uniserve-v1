@@ -284,7 +284,7 @@ impl Retained {
     /// launch `generation`, to the server `launch` names. A standby worker
     /// (`StorageLaunch::standby`) maps exclusive storages without taking
     /// write access.
-    pub(crate) fn connect(
+    pub fn connect(
         launch: &StorageLaunch,
         group: &str,
         rank: u32,
@@ -729,7 +729,7 @@ impl Retained {
 
     /// Park a standby worker once it warmed up: its exclusive storages
     /// become read-only, so it writes none of them until it is promoted.
-    pub(crate) fn park(&self) -> Result<()> {
+    pub fn park(&self) -> Result<()> {
         let state = lock(&self.state);
         let Some(standby) = &state.standby else {
             return Ok(());
@@ -749,7 +749,7 @@ impl Retained {
     /// by the server), and make the mappings writable at unchanged
     /// addresses, which its captured graphs address. Fails for a worker
     /// that is not a standby.
-    pub(crate) fn promote(&self) -> Result<()> {
+    pub fn promote(&self) -> Result<()> {
         let mut state = lock(&self.state);
         let standby = state
             .standby
@@ -771,7 +771,7 @@ impl Retained {
     }
 
     /// Whether the worker stands by, not yet promoted.
-    pub(crate) fn standing_by(&self) -> bool {
+    pub fn standing_by(&self) -> bool {
         lock(&self.state).standby.is_some()
     }
 

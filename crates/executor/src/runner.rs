@@ -67,6 +67,15 @@ pub trait Runner: Send {
     /// and the kernels they held. It runs after the last batch of the old generation completed.
     fn purge(&mut self, generation: u64);
 
+    /// What this runner's graph pools hold and what they may hold (4.1, item 5's invariant).
+    ///
+    /// A runner without graph pools answers zeroes. The figures feed
+    /// `FromEngine.metrics` through the executor's counters, so the delivery test can assert
+    /// `mapped <= budget` while both generations' graphs exist.
+    fn pool_metrics(&self) -> crate::arena::PoolMetrics {
+        crate::arena::PoolMetrics::default()
+    }
+
     /// Performs one job this runner returned from `submit` or `precopy`, on the device executor's
     /// thread, when the executor reaches it in submission order.
     ///
