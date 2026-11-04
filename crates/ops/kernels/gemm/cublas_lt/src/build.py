@@ -46,7 +46,9 @@ def parse(descriptor: str) -> dict[str, str]:
 
 def definitions(fields: dict[str, str]) -> list[str]:
     """The `-D` definitions of one descriptor."""
-    required = {"input", "weight", "accumulate", "output", "order", "epilogue", "k"}
+    # No contraction length: cublasLt takes `m`, `n` and `k` with the call, so one module of a
+    # given type set and order serves every weight shape.
+    required = {"input", "weight", "accumulate", "output", "order", "epilogue"}
     missing = required - fields.keys()
     if missing:
         raise SystemExit(f"the descriptor names no {sorted(missing)}")
