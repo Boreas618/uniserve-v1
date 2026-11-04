@@ -2451,6 +2451,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             ));
         };
         let rows = u64::from(bucket.rows);
+        refuse_mixed_sampling(bucket.variant, self.staging.parameters(bucket.rows as usize))?;
         let gathered = arena.tensor(
             self.geometry.hidden_dtype,
             ops::Shape::new(&[rows, u64::from(self.geometry.hidden)]),
@@ -2803,9 +2804,99 @@ pub fn calls_output(
     Ok(output)
 }
 
+/// Refuses a decode batch whose rows disagree with the bucket's sampling path.
+///
+/// A bucket's variant fixes the sampler launch sequence for every row: [`Variant::DecodeGreedy`]
+/// argmaxes each row's penalized logits and [`Variant::DecodeSampled`] draws one token per row from
+/// its distribution. Neither sequence can serve a row of the other class - a draw cannot produce a
+/// greedy token (the candidates are ordered by token id before the inverse CDF, so a draw selects an
+/// id, not the largest logit), and an argmax is not what a row that states a temperature asked for.
+///
+/// Which requests share a batch is the batcher's decision, so the composition is not the executor's
+/// to change: it states that the batch it was handed cannot be served, naming the row and the
+/// bucket, rather than serving a token the request did not ask for. Prefill buckets are exempt - a
+/// prompt-ending greedy row inside a drawing prefill bucket is ordinary, and its first token is the
+/// host argmax of the row's kept logits (`greedy_first_tokens`).
+fn refuse_mixed_sampling(variant: Variant, parameters: &[f32]) -> Result<()> {
+    if !variant.is_decode() {
+        return Ok(());
+    }
+    let columns = ops::sampler::PARAMETER_COLUMNS as usize;
+    let temperature = ops::sampler::TEMPERATURE as usize;
+    let rows = parameters.len() / columns;
+    for (row, stated) in parameters.chunks_exact(columns).enumerate() {
+        let greedy_row = stated[temperature] == 0.0;
+        if greedy_row == variant.greedy() {
+            continue;
+        }
+        return Err(Error::Invariant(format!(
+            "a batch is homogeneous in its sampling path: the {} bucket holds {rows} row(s) and row \
+             {row} states temperature {}, so its token is {} and this bucket has no launch sequence \
+             for it",
+            variant.name(),
+            stated[temperature],
+            if greedy_row {
+                "the argmax of its penalized logits"
+            } else {
+                "drawn from its distribution"
+            },
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A decode batch is homogeneous in its sampling path: a row of the other class is refused by
+    /// name rather than served by a launch sequence that cannot produce its token. A prefill bucket
+    /// is exempt, because a prompt-ending greedy row is ordinary there.
+    #[test]
+    fn a_decode_bucket_refuses_a_row_of_the_other_sampling_class() {
+        let columns = ops::sampler::PARAMETER_COLUMNS as usize;
+        let temperature = ops::sampler::TEMPERATURE as usize;
+        // One row a stated temperature, the rest of its columns the reference values: 8 floats a row,
+        // as the executor writes them.
+        let rows = |stated: &[f32]| {
+            stated
+                .iter()
+                .flat_map(|stated| {
+                    let mut row = vec![1.0_f32; columns];
+                    row[temperature] = *stated;
+                    row
+                })
+                .collect::<Vec<f32>>()
+        };
+
+        assert!(
+            refuse_mixed_sampling(Variant::DecodeGreedy, &rows(&[0.0, 0.0])).is_ok(),
+            "two greedy rows were refused by a greedy bucket"
+        );
+        assert!(
+            refuse_mixed_sampling(Variant::DecodeSampled, &rows(&[0.7, 1.0])).is_ok(),
+            "two sampled rows were refused by a sampling bucket"
+        );
+        assert!(
+            refuse_mixed_sampling(Variant::PrefillOutput, &rows(&[0.0, 0.7])).is_ok(),
+            "a prompt-ending greedy row was refused inside a drawing prefill bucket"
+        );
+
+        let error = refuse_mixed_sampling(Variant::DecodeSampled, &rows(&[0.7, 0.0]))
+            .expect_err("a greedy row was drawn from in a sampling bucket");
+        let text = error.to_string();
+        assert!(
+            text.contains("decode_sampled") && text.contains("row 1"),
+            "the refusal names neither the bucket nor the row: {text}"
+        );
+
+        let error = refuse_mixed_sampling(Variant::DecodeGreedy, &rows(&[0.5]))
+            .expect_err("a sampled row was argmaxed in a greedy bucket");
+        assert!(
+            error.to_string().contains("decode_greedy"),
+            "the refusal does not name the bucket: {error}"
+        );
+    }
 
     /// The cache-unit seam's two decisions, over the allocation alone: a batch that reads a fresh
     /// prefix passes through every provider, and one that reuses a leased one is refused by name by
