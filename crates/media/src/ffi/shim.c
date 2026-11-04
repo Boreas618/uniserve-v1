@@ -93,14 +93,20 @@ static int fail_plan(const char *format, ...) {
 
 typedef struct {
     uint8_t *data;
+    /* Bytes the buffer holds: the high-water mark of the muxer's writes, or
+     * the accumulated samples of a decode. */
     size_t size;
     size_t capacity;
+    /* Where the next write lands. The MP4 muxer seeks back to rewrite box
+     * sizes, so an output buffer is written at this position, not appended. */
+    size_t position;
 } Buffer;
 
 static void buffer_free(Buffer *buffer) {
     av_freep(&buffer->data);
     buffer->size = 0;
     buffer->capacity = 0;
+    buffer->position = 0;
 }
 
 static int buffer_reserve(Buffer *buffer, size_t extra) {
@@ -134,15 +140,54 @@ void usv_free(void *pointer) { av_free(pointer); }
 
 /* ---- AVIO over memory ---------------------------------------------------- */
 
+/* Writes at the buffer's position, extending it and zero-filling a gap when
+ * the muxer seeks past the end (as it does for the boxes it reserves). */
 static int write_packet(void *opaque, const uint8_t *data, int size) {
     Buffer *buffer = opaque;
     if (size <= 0) {
         return 0;
     }
-    if (buffer_append(buffer, data, (size_t)size) != USV_OK) {
-        return AVERROR(ENOMEM);
+    size_t end = buffer->position + (size_t)size;
+    if (end > buffer->size) {
+        if (buffer_reserve(buffer, end - buffer->size) != USV_OK) {
+            return AVERROR(ENOMEM);
+        }
+        if (buffer->position > buffer->size) {
+            memset(buffer->data + buffer->size, 0, buffer->position - buffer->size);
+        }
+        buffer->size = end;
     }
+    memcpy(buffer->data + buffer->position, data, (size_t)size);
+    buffer->position = end;
     return size;
+}
+
+/* The seek the MP4 muxer needs: it writes the movie box after the media and
+ * then rewrites the sizes it reserved at the front. */
+static int64_t seek_output(void *opaque, int64_t offset, int whence) {
+    Buffer *buffer = opaque;
+    int64_t base;
+    switch (whence & ~AVSEEK_FORCE) {
+        case SEEK_SET:
+            base = 0;
+            break;
+        case SEEK_CUR:
+            base = (int64_t)buffer->position;
+            break;
+        case SEEK_END:
+            base = (int64_t)buffer->size;
+            break;
+        case AVSEEK_SIZE:
+            return (int64_t)buffer->size;
+        default:
+            return AVERROR(EINVAL);
+    }
+    int64_t wanted = base + offset;
+    if (wanted < 0) {
+        return AVERROR(EINVAL);
+    }
+    buffer->position = (size_t)wanted;
+    return wanted;
 }
 
 /* Opens an MP4 output context that writes into `buffer`, whose bytes the
@@ -159,7 +204,7 @@ static int open_output_memory(AVFormatContext **output, Buffer *buffer) {
         return fail("out of memory allocating an MP4 I/O buffer");
     }
     AVIOContext *io = avio_alloc_context(io_buffer, IO_BLOCK, 1, buffer, NULL,
-                                         write_packet, NULL);
+                                         write_packet, seek_output);
     if (!io) {
         av_free(io_buffer);
         avformat_free_context(context);
