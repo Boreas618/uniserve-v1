@@ -26,7 +26,7 @@
 //! frame is entirely the predecessor's and the fifth one fifth the successor's.
 
 use nn::Shape;
-use nn::layers::{CrossFade, RgbBytes};
+use nn::layers::{RgbBytes, ScaledAdd};
 use nn::{DType, Forward, TensorView, Weight};
 
 use crate::config::CLIP_FRAMES;
@@ -209,12 +209,13 @@ impl Splice {
 /// The blend is `CrossFade` on the **frames** axis: the two sources are each one contiguous block (a
 /// `[3, 25, H, W]` clip and a `[3, 5, H, W]` tail), which is the operator's condition, and the frames'
 /// weights are the ones it applies along the leading positions of its axis, and they are the reference's
-/// to the rounding: the operator builds its ramp as `position / extent` **in the raster's dtype**, which
-/// is `torch.arange(5, dtype=…)/5` in `output.py`, so the blend needs no declared deviation. The
-/// arithmetic is the reference's decoded-precision blend followed by the FP32 de-normalization, in that
-/// order: the de-normalization is [`RgbBytes`]' and reads the same constants the checkpoint publishes.
+/// to the rounding: the weights are `i / 5` for frame `i` of the overlap, which is
+/// `torch.arange(5, dtype=torch.float16)/5` in `output.py`, and each frame is two `scaled_add` launches
+/// with those two host scalars. The ramp is built here in FP32 where the reference builds it in the
+/// raster's type: one declared deviation, at the ramp's last bit and not in the blend's arithmetic. The arithmetic is the reference's decoded-precision
+/// blend followed by the FP32 de-normalization, in that order: the de-normalization is [`RgbBytes`]' and
+/// reads the same constants the checkpoint publishes.
 pub struct VideoPostprocessor {
-    fade: CrossFade,
     bytes: RgbBytes,
     dtype: DType,
 }
@@ -224,14 +225,7 @@ impl VideoPostprocessor {
     ///
     /// `mean` and `std` are the checkpoint's `[3]` de-normalization constants, published by the loader.
     pub fn new(dtype: DType, mean: Weight, std: Weight) -> Result<Self> {
-        let fade = CrossFade::new(dtype, OVERLAP_FRAMES, 1).map_err(|error| {
-            Error::config(format!(
-                "the clip splice fades five frames of the frames axis, and CrossFade refuses axis 1: \
-                 {error}"
-            ))
-        })?;
         Ok(Self {
-            fade,
             bytes: RgbBytes::new(dtype, Rgb::CHANNELS, mean, std)?,
             dtype,
         })
@@ -271,7 +265,7 @@ impl VideoPostprocessor {
             Some(previous) => {
                 raster.check_previous(previous, self.dtype)?;
                 let blended = f.arena().tensor(clip.dtype, clip.shape)?;
-                self.fade.forward(f, Some(previous), clip, blended)?;
+                self.blend(f, &raster, previous, clip, splice.overlap, blended)?;
                 blended
             }
             None => clip,
@@ -286,6 +280,58 @@ impl VideoPostprocessor {
         if let Some(tail_out) = tail_out {
             self.bytes
                 .forward(f, raster.written(source, splice.overlap)?, tail_out)?;
+        }
+        Ok(())
+    }
+}
+
+impl VideoPostprocessor {
+    /// Fade the clip in against its predecessor, five frames at a time.
+    ///
+    /// The reference's weights are `i/5` for frame `i` of the overlap, `0` to `0.8`: the blend is
+    /// `previous · (1 − w) + clip · w`. The two scalars the sum takes are host values, so each frame is two
+    /// launches of the operator every other sum in the model uses. The reference builds its ramp in the
+    /// raster's type and this one in FP32; the products and the sum are FP32 either way and round to the
+    /// raster once, so the difference is at most the ramp's own last bit. `CrossFade` is the row-and-column seam blend and refuses the frames axis; a
+    /// blend along frames is not that operator with another argument, and this is the arithmetic with the
+    /// operands a raster has - one contiguity per channel per frame, which is what `scaled_add` reads.
+    fn blend(
+        &self,
+        f: &Forward,
+        raster: &Raster,
+        previous: TensorView,
+        clip: TensorView,
+        overlap: (u32, u32),
+        blended: TensorView,
+    ) -> Result<()> {
+        let count = overlap.1 - overlap.0;
+        let pixels = u64::from(raster.height) * u64::from(raster.width);
+        for channel in 0..u64::from(Rgb::CHANNELS) {
+            for frame in 0..count {
+                // The reference weights the *current* clip `i/5` over the five frames: `0, 0.2, ..., 0.8`,
+                // so the first blended frame is entirely the predecessor's and the last keeps a fifth of
+                // it. A ramp that started at `1/5` would drop the predecessor from the last frame.
+                let weight = frame as f32 / count as f32;
+                let target = TensorView::new(
+                    blended.element(&[channel, u64::from(overlap.0 + frame), 0, 0]),
+                    blended.dtype,
+                    Shape::new(&[1, pixels]),
+                );
+                let source = TensorView::new(
+                    previous.element(&[channel, u64::from(frame), 0, 0]),
+                    previous.dtype,
+                    Shape::new(&[1, pixels]),
+                );
+                // `target ← (1 − w) · previous + w · clip`, in two steps because the operator scales its own
+                // target: the adjacent frame of the clip is only read.
+                ScaledAdd.forward(f, target, source, 1.0, 0.0)?;
+                let current = TensorView::new(
+                    clip.element(&[channel, u64::from(overlap.0 + frame), 0, 0]),
+                    clip.dtype,
+                    Shape::new(&[1, pixels]),
+                );
+                ScaledAdd.forward(f, target, current, weight, 1.0 - weight)?;
+            }
         }
         Ok(())
     }
