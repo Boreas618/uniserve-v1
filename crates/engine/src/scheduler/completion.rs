@@ -27,8 +27,8 @@
 use std::sync::Arc;
 
 use ipc::{
-    CacheTransfer, CallId, CallStatus, ErrorCode, ForwardStats, MediaOutput, RankLatentLayout,
-    RequestKey, SharedMedia, SharedMediaError, TimingCounters, TokenLogprob,
+    CallId, CallStatus, ErrorCode, ForwardStats, RankLatentLayout, RequestKey, SharedMedia,
+    SharedMediaError, TimingCounters, TokenLogprob,
 };
 
 use crate::executor::{BatchResult, CallResult};
@@ -63,10 +63,6 @@ pub(crate) struct CallCompletion {
     pub prompt_logprobs: Vec<Vec<TokenLogprob>>,
     /// A token-denoising readout's candidate probabilities.
     pub candidate_logprobs: Vec<f32>,
-    /// The finished artifact and its external storage lifetime, when produced.
-    pub media_output: Option<MediaOutput>,
-    /// The physical cache export, when the call publishes one.
-    pub cache_output: Option<CacheTransfer>,
     /// The drafter's proposals after the last committed token.
     pub draft_token_ids: Vec<u32>,
     /// A video latent preparation's per-rank page layout.
@@ -100,8 +96,6 @@ impl CallCompletion {
             token_logprobs: output.token_logprobs,
             prompt_logprobs: output.prompt_logprobs,
             candidate_logprobs: output.candidate_logprobs,
-            media_output: output.media_output,
-            cache_output: output.cache_output,
             draft_token_ids: output.draft_token_ids,
             latent_layouts: output.latent_layouts,
             media: result.media,
@@ -157,8 +151,6 @@ impl CallCompletion {
             token_logprobs,
             prompt_logprobs: output.prompt_logprobs,
             candidate_logprobs: output.candidate_logprobs,
-            media_output: output.media_output,
-            cache_output: output.cache_output,
             draft_token_ids: output.draft_token_ids,
             latent_layouts: output.latent_layouts,
             media: Ok(None),
