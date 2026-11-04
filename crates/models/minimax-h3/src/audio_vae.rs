@@ -333,6 +333,8 @@ pub struct Source {
 pub enum Tensor {
     /// One tensor under one key.
     Region(String),
+    /// Several checkpoint tensors that fill one parameter, in order (the fused query-key-value bias).
+    Parts(Vec<String>),
     /// A weight-normalized convolution: `value` holds the weight's extents and `gain` one magnitude
     /// per output channel. `nn::WeightLoader::weight_norm` folds the pair once at load, so no layer
     /// below carries it (specs/worker.md 9, the BigVGAN row).

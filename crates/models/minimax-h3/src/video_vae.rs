@@ -279,6 +279,39 @@ impl Tiles {
     }
 }
 
+/// The cell-centre rotary coordinates of the transformer's token rows, as `[rows, 3]` FP32.
+///
+/// Along an axis of `size`, row `i` sits at `2 * (i + 0.5) / size - 1`, in `[-1, 1)`: the reference's
+/// cell-centre grid (`video_vae.py`, `Transformer.forward`). The rows are the canvas's latent voxels in
+/// raster order — frame, then row, then column — followed by the register tokens and the trailing zero
+/// token, whose coordinates are all zero because they are not placed in space.
+///
+/// The table is a per-layout constant: the runner uploads it once per captured graph
+/// (`notes/h3/runner-interface.md` 2.1, `video_positions`).
+pub fn positions(canvas: &Canvas) -> Result<Vec<f32>> {
+    if canvas.frames == 0 || canvas.height == 0 || canvas.width == 0 {
+        return Err(Error::config(
+            "a decoder canvas of no frame, row or column has no position".to_owned(),
+        ));
+    }
+    let axis = |index: u32, size: u32| -> f32 {
+        2.0 * ((f64::from(index) + 0.5) / f64::from(size)) as f32 - 1.0
+    };
+    let mut table = Vec::with_capacity(canvas.rows() as usize * 3);
+    for frame in 0..canvas.frames {
+        let f = axis(frame, canvas.frames);
+        for row in 0..canvas.height {
+            let h = axis(row, canvas.height);
+            for column in 0..canvas.width {
+                table.extend_from_slice(&[f, h, axis(column, canvas.width)]);
+            }
+        }
+    }
+    let trailing = (u64::from(canvas.registers) + u64::from(canvas.tail)) as usize;
+    table.resize(table.len() + trailing * 3, 0.0);
+    Ok(table)
+}
+
 /// The tile extent of the checkpoint's decoder, in output pixels.
 pub const TILE_PIXELS: u32 = 256;
 
@@ -458,6 +491,55 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_position_table_is_the_cell_centre_grid_of_the_raster() {
+        let config = video_config();
+        let canvas = Canvas {
+            frames: 2,
+            height: 2,
+            width: 3,
+            registers: 4,
+            tail: 1,
+        };
+        let table = positions(&canvas).expect("positions");
+        assert_eq!(table.len() as u64, canvas.rows() * 3);
+        // Frame axis of two: -0.5, 0.5. Row axis of two: -0.5, 0.5. Column axis of three: -2/3, 0,
+        // 2/3. Rows are frame-major, then row, then column.
+        let expected = [
+            [-0.5, -0.5, -2.0 / 3.0],
+            [-0.5, -0.5, 0.0],
+            [-0.5, -0.5, 2.0 / 3.0],
+            [-0.5, 0.5, -2.0 / 3.0],
+            [-0.5, 0.5, 0.0],
+            [-0.5, 0.5, 2.0 / 3.0],
+            [0.5, -0.5, -2.0 / 3.0],
+            [0.5, -0.5, 0.0],
+            [0.5, -0.5, 2.0 / 3.0],
+            [0.5, 0.5, -2.0 / 3.0],
+            [0.5, 0.5, 0.0],
+            [0.5, 0.5, 2.0 / 3.0],
+        ];
+        for (row, values) in expected.iter().enumerate() {
+            for (axis, value) in values.iter().enumerate() {
+                assert!(
+                    (table[row * 3 + axis] - value).abs() < 1e-6,
+                    "row {row} axis {axis}: {} vs {value}",
+                    table[row * 3 + axis]
+                );
+            }
+        }
+        // Every coordinate is inside [-1, 1).
+        assert!(table.iter().all(|value| (-1.0..1.0).contains(value)));
+        // The register tokens and the trailing zero token are not placed: their rows are zeros.
+        let trailing = table.len() - 5 * 3;
+        assert!(table[trailing..].iter().all(|value| *value == 0.0));
+        // The checkpoint's clip canvas: 7 latent frames of 16x16 voxels, four registers, one tail.
+        let clip = Canvas::clip(&config, 16, 16);
+        let table = positions(&clip).expect("positions");
+        assert_eq!(table.len() as u64, clip.rows() * 3);
+        assert_eq!(clip.rows(), 7 * 256 + 5);
+    }
+
+    #[test]
     fn the_weight_table_names_every_parameter_of_the_checkpoint() {
         let table = sources(&video_config()).expect("the decoder's parameters");
         // 36 layers of sixteen parameters, plus the post-quantization pair, the input pair, the
@@ -477,8 +559,9 @@ pub(crate) mod tests {
             .iter()
             .map(|source| match &source.tensor {
                 crate::audio_vae::Tensor::Region(tensor) => tensor.clone(),
-                crate::audio_vae::Tensor::Normalized { .. } => {
-                    panic!("the video decoder folds no weight norm")
+                crate::audio_vae::Tensor::Normalized { .. }
+                | crate::audio_vae::Tensor::Parts(_) => {
+                    panic!("the video decoder folds no weight norm and fuses no tensor")
                 }
             })
             .collect();
