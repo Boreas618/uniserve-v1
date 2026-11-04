@@ -54,16 +54,16 @@ impl BiasAdd {
         if shape.rank() < 3 {
             return Err(Error::shape(
                 "BiasAdd",
-                format!(
-                    "{:?} is not [batch, channels, *spatial]",
-                    shape.dims()
-                ),
+                format!("{:?} is not [batch, channels, *spatial]", shape.dims()),
             ));
         }
         let channels = u32::try_from(shape.dim(1)).map_err(|_| {
             Error::shape(
                 "BiasAdd",
-                format!("{} channels are wider than a descriptor holds", shape.dim(1)),
+                format!(
+                    "{} channels are wider than a descriptor holds",
+                    shape.dim(1)
+                ),
             )
         })?;
         let descriptor = bias::Descriptor {
@@ -104,7 +104,10 @@ fn merged(name: &'static str, view: TensorView) -> Result<TensorView> {
     if shape.rank() < 3 {
         return Err(Error::shape(
             "BiasAdd",
-            format!("{name} is {:?}, [batch, channels, *spatial] expected", shape.dims()),
+            format!(
+                "{name} is {:?}, [batch, channels, *spatial] expected",
+                shape.dims()
+            ),
         ));
     }
     if shape.rank() == 3 {
