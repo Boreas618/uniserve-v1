@@ -14,6 +14,13 @@
 //! logprobs + tokens                → logprob_gather → logp [rows] f32                    (when asked)
 //! ```
 //!
+//! A greedy row takes the second of two launch sequences instead, and only its first step:
+//!
+//! ```text
+//! logits [rows, vocabulary]        → logits_shape   → shaped [rows, vocabulary] f32
+//! shaped                           → argmax         → tokens [rows]                     (the id is the column)
+//! ```
+//!
 //! The order of the arena reservations below is that sequence, so a captured bucket's plan is
 //! static: the same layers on the same extents reserve the same addresses on capture and on every
 //! replay.
@@ -66,7 +73,7 @@ pub struct SamplerState {
     /// `[slots, vocabulary]` i32: how many times each slot has already seen each token.
     pub counts: TensorView,
     /// `[rows, PARAMETER_COLUMNS]` f32: temperature, top-k width, top-p, min-p, repetition,
-    /// frequency and presence in [`ops::logits::PARAMETER_COLUMNS`] order.
+    /// frequency and presence in [`ops::sampler::PARAMETER_COLUMNS`] order.
     pub parameters: TensorView,
     /// `[rows]` i32: the slot each row belongs to.
     pub slots: TensorView,
@@ -190,6 +197,13 @@ impl Sampler {
     /// `logits` is `[rows, vocabulary]` in the head's output dtype; `draws` is `[rows]` f32 in
     /// `[0, 1)` from the executor. The step's working set comes from the forward's arena, so the
     /// call is inside a captured bucket's plan.
+    ///
+    /// The candidates reach [`InverseCdf`] in descending logit order, which is the order
+    /// [`TopK`] writes and [`FilterCandidates`] preserves. The reference reorders them by token id
+    /// first (`uniserve/sampling/top_k.py:307-314`), so a fixed draw selects the same token there and
+    /// may select another one here until that reordering is an operator of its own; the distribution
+    /// over draws is the same either way. Greedy rows do not go through this method at all — see
+    /// [`Self::greedy`].
     pub fn forward(
         &self,
         f: &Forward,
@@ -200,25 +214,7 @@ impl Sampler {
     ) -> Result<()> {
         let vocabulary = u64::from(self.vocabulary);
         let width = u64::from(self.width);
-        logits
-            .require_row("Sampler", logits.dtype, vocabulary)
-            .map_err(Error::from)?;
-        let rows = logits.rows();
-        if rows == 0 {
-            return Err(Error::shape(
-                "Sampler",
-                "a sampling step has at least one row".to_owned(),
-            ));
-        }
-        if !matches!(logits.dtype, DType::F32 | DType::BF16 | DType::F16) {
-            return Err(Error::shape(
-                "Sampler",
-                format!(
-                    "{} logits are not a shape the shaper reads: f32, bf16 or f16",
-                    logits.dtype
-                ),
-            ));
-        }
+        let rows = self.check(logits, state, samples)?;
         draws
             .require_shape("Sampler", Shape::new(&[rows]))
             .map_err(Error::from)?;
@@ -227,81 +223,6 @@ impl Sampler {
                 "Sampler",
                 format!("expected f32 draws, found {}", draws.dtype),
             ));
-        }
-        if samples.tokens.dtype != self.tokens {
-            return Err(Error::shape(
-                "Sampler",
-                format!(
-                    "expected {} tokens, found {}",
-                    self.tokens, samples.tokens.dtype
-                ),
-            ));
-        }
-        samples
-            .tokens
-            .require_shape("Sampler", Shape::new(&[rows]))
-            .map_err(Error::from)?;
-        if let Some(logprobabilities) = samples.logprobabilities {
-            logprobabilities
-                .require_shape("Sampler", Shape::new(&[rows]))
-                .map_err(Error::from)?;
-            if logprobabilities.dtype != DType::F32 {
-                return Err(Error::shape(
-                    "Sampler",
-                    format!(
-                        "expected f32 log-probabilities, found {}",
-                        logprobabilities.dtype
-                    ),
-                ));
-            }
-        }
-        state
-            .parameters
-            .require_shape("Sampler", Shape::new(&[rows, u64::from(PARAMETER_COLUMNS)]))
-            .map_err(Error::from)?;
-        if state.parameters.dtype != DType::F32 {
-            return Err(Error::shape(
-                "Sampler",
-                format!("expected f32 parameters, found {}", state.parameters.dtype),
-            ));
-        }
-        state
-            .slots
-            .require_shape("Sampler", Shape::new(&[rows]))
-            .map_err(Error::from)?;
-        state
-            .counts
-            .require_row("Sampler", DType::I32, vocabulary)
-            .map_err(Error::from)?;
-        if state.counts.rows() != u64::from(self.slots) {
-            return Err(Error::shape(
-                "Sampler",
-                format!(
-                    "{} count rows for {} slots",
-                    state.counts.rows(),
-                    self.slots
-                ),
-            ));
-        }
-        match (self.extras, state.extras) {
-            (0, None) | (_, Some(_)) => {}
-            (extras, None) => {
-                return Err(Error::shape(
-                    "Sampler",
-                    format!("the sampler reads {extras} extra tokens and the state has none"),
-                ));
-            }
-        }
-        if let Some(extras) = state.extras {
-            extras
-                .require_shape("Sampler", Shape::new(&[rows, u64::from(self.extras)]))
-                .map_err(Error::from)?;
-            if extras.dtype != DType::I32 {
-                return Err(Error::shape(
-                    "Sampler",
-                    format!("expected i32 extra tokens, found {}", extras.dtype),
-                ));
-            }
         }
 
         let arena = f.arena();
@@ -419,27 +340,195 @@ impl Sampler {
         Ok(())
     }
 
-    /// The greedy token of each row of `values`: the index of the largest candidate.
+    /// What both sampling paths read: the logit rows, the request state, and the outputs.
     ///
-    /// A row without a positive temperature is sampled through the same draw path with a draw of
-    /// zero, which selects its first candidate; this call is for diagnostics and for a caller that
-    /// wants the index rather than the token.
-    pub fn argmax(&self, f: &Forward, values: TensorView, out: TensorView) -> Result<()> {
-        let rows = values.rows();
-        values
-            .require_row("Sampler", values.dtype, u64::from(self.width))
+    /// [`Self::forward`] calls this and then checks its draws; [`Self::greedy`] calls it and launches.
+    /// It is private because the two paths are the whole of this layer's interface — a caller does not
+    /// choose a half-step — but it is one method so the two paths cannot disagree about what a valid
+    /// step is.
+    fn check(&self, logits: TensorView, state: &SamplerState, samples: &Samples) -> Result<u64> {
+        let vocabulary = u64::from(self.vocabulary);
+        logits
+            .require_row("Sampler", logits.dtype, vocabulary)
             .map_err(Error::from)?;
-        out.require_shape("Sampler", Shape::new(&[rows]))
+        let rows = logits.rows();
+        if rows == 0 {
+            return Err(Error::shape(
+                "Sampler",
+                "a sampling step has at least one row".to_owned(),
+            ));
+        }
+        if !matches!(logits.dtype, DType::F32 | DType::BF16 | DType::F16) {
+            return Err(Error::shape(
+                "Sampler",
+                format!(
+                    "{} logits are not a shape the shaper reads: f32, bf16 or f16",
+                    logits.dtype
+                ),
+            ));
+        }
+        if samples.tokens.dtype != self.tokens {
+            return Err(Error::shape(
+                "Sampler",
+                format!(
+                    "expected {} tokens, found {}",
+                    self.tokens, samples.tokens.dtype
+                ),
+            ));
+        }
+        samples
+            .tokens
+            .require_shape("Sampler", Shape::new(&[rows]))
             .map_err(Error::from)?;
-        let descriptor = ArgMaxDescriptor {
-            dtype: values.dtype,
-            width: self.width,
-            ids: DType::I32,
+        if let Some(logprobabilities) = samples.logprobabilities {
+            logprobabilities
+                .require_shape("Sampler", Shape::new(&[rows]))
+                .map_err(Error::from)?;
+            if logprobabilities.dtype != DType::F32 {
+                return Err(Error::shape(
+                    "Sampler",
+                    format!(
+                        "expected f32 log-probabilities, found {}",
+                        logprobabilities.dtype
+                    ),
+                ));
+            }
+        }
+        state
+            .parameters
+            .require_shape("Sampler", Shape::new(&[rows, u64::from(PARAMETER_COLUMNS)]))
+            .map_err(Error::from)?;
+        if state.parameters.dtype != DType::F32 {
+            return Err(Error::shape(
+                "Sampler",
+                format!("expected f32 parameters, found {}", state.parameters.dtype),
+            ));
+        }
+        state
+            .slots
+            .require_shape("Sampler", Shape::new(&[rows]))
+            .map_err(Error::from)?;
+        state
+            .counts
+            .require_row("Sampler", DType::I32, vocabulary)
+            .map_err(Error::from)?;
+        if state.counts.rows() != u64::from(self.slots) {
+            return Err(Error::shape(
+                "Sampler",
+                format!(
+                    "{} count rows for {} slots",
+                    state.counts.rows(),
+                    self.slots
+                ),
+            ));
+        }
+        match (self.extras, state.extras) {
+            (0, None) | (_, Some(_)) => {}
+            (extras, None) => {
+                return Err(Error::shape(
+                    "Sampler",
+                    format!("the sampler reads {extras} extra tokens and the state has none"),
+                ));
+            }
+        }
+        if let Some(extra) = state.extras {
+            extra
+                .require_shape("Sampler", Shape::new(&[rows, u64::from(self.extras)]))
+                .map_err(Error::from)?;
+            if extra.dtype != DType::I32 {
+                return Err(Error::shape(
+                    "Sampler",
+                    format!("expected i32 extra tokens, found {}", extra.dtype),
+                ));
+            }
+        }
+
+        Ok(rows)
+    }
+
+    /// Take each row's largest shaped logit as its token, and report its log-probability when
+    /// `samples` carries one.
+    ///
+    /// This is the reference's greedy step (`torch.max` over the shaped row, `uniserve/sampling/
+    /// greedy.py`), for the rows whose temperature is zero. It runs the same shaper as [`Self::forward`]
+    /// and nothing else: no candidate set, no cutoffs, no draw. It is a separate launch sequence
+    /// rather than a branch inside `forward`, because the executor's buckets are homogeneous in the
+    /// path their rows take and a bucket's captured plan is one of the two.
+    pub fn greedy(
+        &self,
+        f: &Forward,
+        logits: TensorView,
+        state: &SamplerState,
+        samples: &Samples,
+    ) -> Result<()> {
+        let rows = self.check(logits, state, samples)?;
+        let vocabulary = u64::from(self.vocabulary);
+        let arena = f.arena();
+        let shaped = arena.tensor(DType::F32, Shape::new(&[rows, vocabulary]))?;
+
+        let shape = ShapeDescriptor {
+            dtype: logits.dtype,
+            vocabulary: self.vocabulary,
+            block: self.block,
+            extras: self.extras,
+            divide: true,
             pdl: launch::PDL,
         };
-        let args = ArgMaxArgs { values, out };
+        let args = ShapeArgs {
+            logits,
+            counts: state.counts,
+            slots: state.slots,
+            parameters: state.parameters,
+            extras: state.extras,
+            out: shaped,
+        };
 
-        f.operate::<ArgMax>(&descriptor, args)
+        f.operate::<LogitsShape>(&shape, args)?;
+
+        // The column of a dense vocabulary row is the token id, so the index is the token.
+        let argmax = ArgMaxDescriptor {
+            dtype: DType::F32,
+            width: self.vocabulary,
+            ids: self.tokens,
+            pdl: launch::PDL,
+        };
+        let args = ArgMaxArgs {
+            values: shaped,
+            out: samples.tokens,
+        };
+
+        f.operate::<ArgMax>(&argmax, args)?;
+
+        if let Some(logprobabilities) = samples.logprobabilities {
+            let softmax = LogSoftmaxDescriptor {
+                dtype: DType::F32,
+                columns: self.vocabulary,
+                tile: self.block,
+                pdl: launch::PDL,
+            };
+            let logprobs = arena.tensor(DType::F32, Shape::new(&[rows, vocabulary]))?;
+            let args = LogSoftmaxArgs {
+                x: shaped,
+                out: logprobs,
+            };
+
+            f.operate::<LogSoftmax>(&softmax, args)?;
+
+            let gather = LogprobDescriptor {
+                columns: self.vocabulary,
+                ids: self.tokens,
+                pdl: launch::PDL,
+            };
+            let args = LogprobArgs {
+                logprobabilities: logprobs,
+                tokens: samples.tokens,
+                out: logprobabilities,
+            };
+
+            f.operate::<LogprobGather>(&gather, args)?;
+        }
+
+        Ok(())
     }
 
     /// The bound the sampled tokens' distributions are compared with: the shaping and filtering
