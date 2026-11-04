@@ -529,7 +529,7 @@ fn stage_block(args: &Args) -> Result<()> {
     stack.factors(&forward, positions, cosine, sine)?;
     let rows = upload_i32(&stream, &arena, Shape::new(&[tokens]), &tables.groups)?;
     let step = upload_i32(&stream, &arena, Shape::new(&[1]), &[0])?;
-    let input = pseudo_rows(&stream, &arena, tokens, hidden)?;
+    let (input, input_bytes) = pseudo_rows(&stream, &arena, tokens, hidden)?;
 
     // 8. The forward. `--layers` layers, in place, at step 0 of the schedule.
     let total = u32::try_from(tokens).unwrap_or(u32::MAX);
@@ -547,27 +547,38 @@ fn stage_block(args: &Args) -> Result<()> {
     )?;
     stream.synchronize()?;
 
-    // 9. What ran, written where `compare_blocks` reads it. The input goes with the output so a
-    //    reference producer can run the same arithmetic on the same numbers.
+    // 9. What ran, written where `compare_blocks` reads it.
+    //
+    // The input goes out first and from the host's own copy, because the forward overwrites the view
+    // it was handed: reading that buffer afterwards would write the output into both files, and a
+    // reference producer would then run today's blocks on our output and call the result a
+    // comparison. The two payloads are also required to differ - two byte-identical files mean the
+    // forward wrote nothing, which is a silent failure the exit code would otherwise pass.
     let directory = args.out.join("denoiser");
     std::fs::create_dir_all(&directory)
         .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
-    let payload = download_bf16(
-        &stream,
-        input,
-        usize::try_from(tokens * hidden).unwrap_or(0),
-    )?;
     write_h3t(
         &directory.join("stack_in.h3t"),
         &[tokens, hidden],
         4,
-        &payload,
+        &input_bytes,
     )?;
+    let output_bytes = download_bf16(
+        &stream,
+        input,
+        usize::try_from(tokens * hidden).unwrap_or(0),
+    )?;
+    if output_bytes == input_bytes {
+        return Err(Failure::message(
+            "the stack wrote nothing: `stack_out` is byte-identical to `stack_in`, so the forward \
+             left its input in place",
+        ));
+    }
     write_h3t(
         &directory.join("stack_out.h3t"),
         &[tokens, hidden],
         4,
-        &payload,
+        &output_bytes,
     )?;
     let case = format!(
         "{{\"task\": \"t2va\", \"width\": {}, \"height\": {}, \"frames\": {}, \"text_tokens\": {}, \
@@ -708,7 +719,7 @@ fn pseudo_rows(
     arena: &Arena,
     rows: u64,
     columns: u64,
-) -> Result<TensorView> {
+) -> Result<(TensorView, Vec<u8>)> {
     let count = usize::try_from(rows * columns).unwrap_or(0);
     let mut bytes = Vec::with_capacity(count * 2);
     let mut state = 0x2545_f491_4f6c_dd1d_u64;
@@ -716,9 +727,12 @@ fn pseudo_rows(
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
-        // A bf16 in [-0.5, 0.5): the top half of an f32 in [-1, 1), which keeps every row finite and
-        // the values inside the ranges attention and the norms are defined for.
-        let value = ((state >> 40) as f32 / (1_u64 << 24) as f32) - 1.0;
+        // A bf16 in `[-1, 1)`: twenty-five bits of the state scaled by 2^24 and shifted down, so the
+        // draw is a ramp over a symmetric interval. Symmetry matters here rather than being tidy -
+        // a one-sided draw would leave every sign-dependent path of the block (the gated
+        // feed-forward's two halves, the norms' shifts) exercised on one side only, and both sides
+        // of the comparison would agree on an untested range.
+        let value = ((state >> 39) as f32) / ((1_u64 << 24) as f32) - 1.0;
         bytes.extend_from_slice(&half_of(value).to_le_bytes());
     }
     let tensor = arena.tensor(DType::BF16, Shape::new(&[rows, columns]))?;
@@ -732,7 +746,7 @@ fn pseudo_rows(
         )?;
     }
     stream.synchronize()?;
-    Ok(tensor)
+    Ok((tensor, bytes))
 }
 
 /// A BF16 holding the high half of `value`, rounded to nearest even.
