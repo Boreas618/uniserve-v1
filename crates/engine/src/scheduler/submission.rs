@@ -211,17 +211,24 @@ impl Submissions {
 
     /// Runs `batch`'s paired forwards without serving them (7.3 step 2).
     ///
-    /// The failure of a shadow batch is the world update's, which the main
-    /// process reports; the mechanism keeps the submission alive and reads
-    /// nothing from it. Unused until the update path submits one: the door is
-    /// here so that the arm is complete, not so that a caller can be invented.
-    #[allow(dead_code)]
-    pub(super) fn shadow(&mut self, batch: ExecutionBatch) -> Result<(), ExecutorSubmitError> {
+    /// Runs `batch`'s paired forwards for `generation` too, without serving
+    /// them (7.3 step 2).
+    ///
+    /// The batch is one the step already submitted for serving: it carries the
+    /// serving generation, and the shadow runs on another. A shadow batch never
+    /// writes resident memory and never serves a request, and its failure is the
+    /// world update's, which the main process reports — the arm keeps the
+    /// submission alive and reads nothing from it.
+    pub(super) fn shadow(
+        &mut self,
+        batch: ExecutionBatch,
+        generation: u64,
+    ) -> Result<(), ExecutorSubmitError> {
         match &mut self.path {
             Path::Workers(_) => Err(ExecutorSubmitError::Failed(anyhow::anyhow!(
                 "a worker-process executor shadows a world on its workers, not through this door"
             ))),
-            Path::InProcess(arm) => arm.shadow(batch),
+            Path::InProcess(arm) => arm.shadow(batch, generation),
         }
     }
 
@@ -389,11 +396,17 @@ impl InProcess {
             })
     }
 
-    #[allow(dead_code)]
-    fn shadow(&mut self, batch: ExecutionBatch) -> Result<(), ExecutorSubmitError> {
-        // A shadow batch has no call of its own to report: the passes are the
-        // world update's paired forwards, served on the generation cells.
-        let (device, _) = self.describe(&batch).map_err(ExecutorSubmitError::Failed)?;
+    fn shadow(
+        &mut self,
+        batch: ExecutionBatch,
+        generation: u64,
+    ) -> Result<(), ExecutorSubmitError> {
+        // A shadow batch reports nothing of its own: the passes are the world
+        // update's paired forwards, compared by each operator's tolerance on the
+        // generation they name.
+        let (device, _) = self
+            .describe_with(&batch, generation)
+            .map_err(ExecutorSubmitError::Failed)?;
         let submission = self
             .batches
             .shadow(device)
@@ -434,6 +447,18 @@ impl InProcess {
     fn describe(
         &self,
         batch: &ExecutionBatch,
+    ) -> anyhow::Result<(DeviceBatch, Vec<(ipc::RequestKey, ipc::CallId)>)> {
+        self.describe_with(batch, self.generation)
+    }
+
+    /// The batch as the executor reads it, on generation `generation`.
+    ///
+    /// The serving path stamps the generation the step read; a shadow batch
+    /// names the world whose kernels it compares against, which is another.
+    fn describe_with(
+        &self,
+        batch: &ExecutionBatch,
+        generation: u64,
     ) -> anyhow::Result<(DeviceBatch, Vec<(ipc::RequestKey, ipc::CallId)>)> {
         let columns = batch.columns.clone().ok_or_else(|| {
             anyhow::anyhow!(
@@ -477,7 +502,7 @@ impl InProcess {
             calls: (0..calls.len() as u64).map(DeviceCallId).collect(),
             shape,
             columns,
-            generation: self.generation,
+            generation,
         };
         Ok((device, calls))
     }
