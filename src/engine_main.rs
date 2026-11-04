@@ -105,7 +105,7 @@ use executor::memory::Memory;
 use executor::watchdog::{Running, Watchdog};
 use crate::engine_plan::EpochPlan;
 use daemon::epoch::BuildConfig;
-use engine::{Scheduler, Stage};
+use engine::{SchedulerHandle, Stage};
 use ipc::{ProgramCommand, ProgramStatus, UpdateFailure};
 use ops::{Generation, KernelEntry};
 use program_server::program::Programs;
@@ -262,7 +262,10 @@ pub(crate) fn run(
 /// owners that must outlive them.
 pub(crate) struct MainProcess {
     control: Control,
-    schedulers: Vec<engine::Scheduler>,
+    /// This node's schedulers, one per DP rank. The handle is the interface: each scheduler's thread
+    /// owns the instance, so every call the control thread makes goes through the handle and the
+    /// command channel carries the mutation (§2.4).
+    schedulers: Vec<engine::SchedulerHandle>,
     executors: Vec<Executor>,
     memory: Option<Memory>,
     blocking: ThreadPool,
@@ -276,6 +279,14 @@ pub(crate) struct MainProcess {
     programs: Arc<Mutex<Client>>,
     /// The precopy between serve passes, if one is in flight (§7.3 step 2).
     precopy: Option<Precopy>,
+    /// The generations the last precopy built and the switchover has not taken:
+    /// one per device, in `executors` order. A revert drops them, because the
+    /// generation they hold never serves.
+    prepared: Vec<Arc<Generation>>,
+    /// The generations serving before the current ones, kept through probation so
+    /// a revert can serve them again (§7.3 step 4). Their graphs stay in the
+    /// executors either way; this is the process's own record of what to serve.
+    retired: Vec<Arc<Generation>>,
     /// The generation each device serves now, in `executors` order.
     generations: Vec<Arc<Generation>>,
     /// What this node resolves a module for (§5.3).
@@ -364,7 +375,7 @@ impl MainProcess {
         // This node's schedulers, one thread per DP rank, each handing its batches to the executors
         // above through `executor::Batches` (§2.4, §4.4). A node that holds none keeps an empty list
         // and serves only what its peers' schedulers ask of it.
-        let schedulers: Vec<Scheduler> = Vec::new();
+        let schedulers: Vec<engine::SchedulerHandle> = Vec::new();
 
         Ok(Self {
             control,
@@ -377,6 +388,8 @@ impl MainProcess {
             watchdog,
             programs,
             precopy: None,
+            prepared: Vec::new(),
+            retired: Vec::new(),
             generations,
             targets: plan.targets().to_vec(),
         })
@@ -543,7 +556,7 @@ impl MainProcess {
                         anyhow::anyhow!("a submission did not convert: {error}")
                     })?;
                     let rank = self.route(&request);
-                    let Some(scheduler) = self.schedulers.get_mut(rank) else {
+                    let Some(scheduler) = self.schedulers.get(rank) else {
                         bail!("a request was routed to rank {rank}, which holds no scheduler");
                     };
                     scheduler.submit(request)?;
@@ -834,7 +847,7 @@ impl MainProcess {
                 // resident requests, sent to every rank of the group that holds
                 // them (§7.3 step 2).
                 let mut batches = Vec::new();
-                for scheduler in &mut self.schedulers {
+                for scheduler in &self.schedulers {
                     batches.extend(scheduler.shadow(generation)?);
                 }
                 let mut shadow = Vec::with_capacity(batches.len());
@@ -872,7 +885,11 @@ impl MainProcess {
                     }
                 }
 
-                self.generations = std::mem::take(&mut precopy.next);
+                // The generations built here are *prepared*, not serving: `generations` is what each
+                // device serves now, and a precopy that finished is not serving until the switchover
+                // (§7.3 steps 2 and 3). They wait here, so a descriptor lookup still reads the
+                // serving generation and a revert has nothing to undo.
+                self.prepared = std::mem::take(&mut precopy.next);
                 self.update.precopied(generation)?;
                 self.answer(precopy.reply, ProgramStatus::Precopied { generation });
                 Ok(())
@@ -896,7 +913,7 @@ impl MainProcess {
         // The candidate policy is instantiated on the current snapshot, and
         // every decision it would make is dry-run against the hard constraints
         // before anything switches (§4.4, §7.3 step 2).
-        if let Err(error) = precopy_policy(&mut self.schedulers, &precopy.policy) {
+        if let Err(error) = precopy_policy(&self.schedulers, &precopy.policy) {
             return self.abandon_precopy(
                 generation,
                 UpdateFailure::Policy {
@@ -926,7 +943,7 @@ impl MainProcess {
         failure: UpdateFailure,
         reply: Option<u32>,
     ) -> Result<()> {
-        discard_policy(&mut self.schedulers);
+        discard_policy(&self.schedulers);
         // The executors already rebound or recaptured this generation's graphs, and a generation
         // that never serves must give its captures back (§7.3 step 2): `purge` releases what is
         // older than the serving generation, which a discarded one is not, so the executor drops it
@@ -962,7 +979,7 @@ impl MainProcess {
     /// §7.3 step 3: cut over at the batch boundary whose step the scheduler put
     /// the command at; an expert group's ranks switch at the same step.
     fn switchover(&mut self, generation: u64, step: Option<u64>) -> Result<ProgramStatus> {
-        switchover_policy(&mut self.schedulers, generation, step)?;
+        switchover_policy(&self.schedulers, generation, step)?;
         for executor in &self.executors {
             let device = executor.device();
             let submission = executor.switchover(generation)?;
@@ -979,8 +996,14 @@ impl MainProcess {
                 return Ok(self.revert(generation, failure));
             }
         }
-        // The state machine records the cut-over only when every device serves the new generation.
+        // The state machine records the cut-over only when every device serves the new generation,
+        // and the process's record of what serves follows it.
         self.update.switchover(generation, Instant::now())?;
+        if self.prepared.is_empty() {
+            tracing::warn!(generation, "a switchover found no prepared generation");
+        } else {
+            self.retired = std::mem::replace(&mut self.generations, std::mem::take(&mut self.prepared));
+        }
         Ok(ProgramStatus::Switched { generation })
     }
 
@@ -988,7 +1011,10 @@ impl MainProcess {
     /// until its purge.
     fn commit(&mut self, generation: u64) -> Result<ProgramStatus> {
         self.update.commit(generation)?;
-        commit_policy(&mut self.schedulers, generation)?;
+        // Probation ended in a commit, so the generation before the update can never serve again.
+        // Its graphs and kernels live until the purge, which is the executor's book to keep.
+        self.retired.clear();
+        commit_policy(&self.schedulers, generation)?;
         Ok(ProgramStatus::Committed { generation })
     }
 
@@ -1003,9 +1029,15 @@ impl MainProcess {
                 failure,
             };
         }
-        if let Err(error) = revert_policy(&mut self.schedulers, generation) {
+        if let Err(error) = revert_policy(&self.schedulers, generation) {
             tracing::error!(%error, "reverting the scheduling policy failed");
         }
+        // The generation that served before the update serves again, and the one built for the
+        // update keeps nothing: its kernels are released and its captures are never taken over.
+        if !self.retired.is_empty() {
+            self.generations = std::mem::take(&mut self.retired);
+        }
+        self.prepared.clear();
         let current = self.update.current();
         for executor in &self.executors {
             let device = executor.device();
@@ -1034,7 +1066,7 @@ impl MainProcess {
         if let Err(error) = self.update.request_purge(generation) {
             bail!("purging generation {generation}: {error}");
         }
-        for scheduler in &mut self.schedulers {
+        for scheduler in &self.schedulers {
             scheduler.policy_mut().request(Stage::Purge, generation)?;
         }
         for executor in &self.executors {
@@ -1079,7 +1111,7 @@ impl MainProcess {
     /// daemon addresses commands to the main process, and the mechanism keeps
     /// the rank of every request it accepted.
     fn request_command(&mut self, command: proto::request::wire::Command) -> Result<()> {
-        match self.schedulers.as_mut_slice() {
+        match self.schedulers.as_slice() {
             [scheduler] => scheduler.command(command),
             [] => bail!("a request command arrived at a node that holds no scheduler"),
             schedulers => bail!(
@@ -1095,7 +1127,7 @@ impl MainProcess {
         &mut self,
         command: proto::request::wire::EngineCommand,
     ) -> Result<Option<UpdateFailure>> {
-        for scheduler in &mut self.schedulers {
+        for scheduler in &self.schedulers {
             scheduler.engine_command(&command)?;
         }
         Ok(None)
@@ -1202,7 +1234,7 @@ impl MainProcess {
 /// The state a candidate is admitted on is the scheduler's - the live objects, the
 /// step's room and the shortage the mechanism faces - so the scheduler takes the
 /// program and prepares it, and this side never holds a slot.
-fn precopy_policy(schedulers: &mut [Scheduler], policy: &Program) -> Result<()> {
+fn precopy_policy(schedulers: &[engine::SchedulerHandle], policy: &Program) -> Result<()> {
     for scheduler in schedulers {
         scheduler.precopy_policy(policy)?;
     }
@@ -1215,7 +1247,11 @@ fn precopy_policy(schedulers: &mut [Scheduler], policy: &Program) -> Result<()> 
 /// `step` is the boundary the epoch's schedulers agreed on, which only the
 /// scheduler node can name; `None` means the command came from the daemon, which
 /// does not choose a boundary, so each scheduler switches at its own next one.
-fn switchover_policy(schedulers: &mut [Scheduler], _generation: u64, _step: Option<u64>) -> Result<()> {
+fn switchover_policy(
+    schedulers: &[engine::SchedulerHandle],
+    _generation: u64,
+    _step: Option<u64>,
+) -> Result<()> {
     for scheduler in schedulers {
         scheduler.policy_mut().request(Stage::Switchover);
     }
@@ -1224,7 +1260,7 @@ fn switchover_policy(schedulers: &mut [Scheduler], _generation: u64, _step: Opti
 
 /// §7.3 step 5's policy half: probation ended in a commit, so the candidate is
 /// the serving instance and the previous one is gone.
-fn commit_policy(schedulers: &mut [Scheduler], _generation: u64) -> Result<()> {
+fn commit_policy(schedulers: &[engine::SchedulerHandle], _generation: u64) -> Result<()> {
     for scheduler in schedulers {
         scheduler.policy_mut().request(Stage::Commit);
     }
@@ -1233,7 +1269,7 @@ fn commit_policy(schedulers: &mut [Scheduler], _generation: u64) -> Result<()> {
 
 /// §7.3 step 4's policy half: the previous policy module serves again from the
 /// next batch boundary, and the candidate is dropped at it.
-fn revert_policy(schedulers: &mut [Scheduler], _generation: u64) -> Result<()> {
+fn revert_policy(schedulers: &[engine::SchedulerHandle], _generation: u64) -> Result<()> {
     for scheduler in schedulers {
         scheduler.policy_mut().request(Stage::Revert);
     }
@@ -1242,7 +1278,7 @@ fn revert_policy(schedulers: &mut [Scheduler], _generation: u64) -> Result<()> {
 
 /// A discarded generation's policy slot: the candidate never serves (§7.3 step 2,
 /// a precopy that failed).
-fn discard_policy(schedulers: &mut [Scheduler]) {
+fn discard_policy(schedulers: &[engine::SchedulerHandle]) {
     for scheduler in schedulers {
         scheduler.policy_mut().discard();
     }
