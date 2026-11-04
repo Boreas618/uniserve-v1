@@ -950,18 +950,27 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
     // `hidden_size 1152`, `num_heads 16` — so `head_dim 72` — 27 blocks, `num_position_embeddings
     // 2304` (a 48 × 48 learned table), `patch_size 16`, `temporal_patch_size 2`, and both weight and
     // bias on every LayerNorm (the checkpoint's `model.visual.*.norm{1,2}.bias` entries). Its MLP
-    // activation is `gelu_pytorch_tanh` over `intermediate_size 4304`.
-    push(
-        "gelu",
-        ops::gelu::Descriptor {
-            dtype: deployment,
-            columns: 4304,
-            block: ELEMENTWISE_BLOCK,
-            approximate: ops::gelu::Approximation::Tanh,
-            pdl: PDL,
-        }
-        .to_string(),
-    );
+    // **Two activations, not one.** A block's MLP takes `gelu_pytorch_tanh` over
+    // `intermediate_size` 4304; a patch merger takes a plain `nn.GELU()`, the exact `erf` form, over
+    // the merged row `hidden_size · spatial_merge_size²` = 1152 · 4 = 4608 (`vision.rs` builds
+    // `Gelu::tanh()` and `Gelu::exact()` for those two sites, and its own header says so). The rows
+    // differ in `columns` *and* in `approximate`, so one row cannot cover both.
+    for (columns, approximate) in [
+        (4304_u32, ops::gelu::Approximation::Tanh),
+        (4608_u32, ops::gelu::Approximation::Exact),
+    ] {
+        push(
+            "gelu",
+            ops::gelu::Descriptor {
+                dtype: deployment,
+                columns,
+                block: ELEMENTWISE_BLOCK,
+                approximate,
+                pdl: PDL,
+            }
+            .to_string(),
+        );
+    }
 
     // ---- The vision tower's products, all BF16 against FP32 accumulation with no epilogue.
     //
