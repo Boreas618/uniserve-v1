@@ -689,8 +689,8 @@ pub fn audio_sources(config: &crate::AudioVaeConfig) -> Result<Vec<crate::audio_
 
 use nn::Forward;
 use nn::layers::{
-    AdaptivePool, Attention, Conv1d, Conv3d, ConvGeometry, FrameMoments, FrameNormPad, FramePad,
-    GatedActivation, LayerNorm, Linear, Posterior, ScaledAdd, Snake, Transpose, WeightOrder,
+    Activation, AdaptivePool, Attention, Conv1d, Conv3d, ConvGeometry, FrameMoments, FrameNormPad,
+    FramePad, GatedActivation, LayerNorm, Linear, Posterior, ScaledAdd, Snake, Transpose, WeightOrder,
 };
 use nn::weights::{Weight, WeightLoader, WeightRequest};
 use nn::{DType, Shape, Strides, TensorView};
@@ -1603,6 +1603,121 @@ struct GeGlu {
 }
 
 impl AudioEncoder {
+    /// The programs the audio encoder launches, from the configuration and the deployment's longest
+    /// track.
+    ///
+    /// **FP32 throughout and no dtype argument**: the encoder's convolutions, its Snake activations and
+    /// its whole attention are the design's declared FP32 rows, not the checkpoint's representation.
+    /// `samples` states the residual units' reach: each unit's output is one operator, so its width is
+    /// `inner · samples` and a longer track is a different program.
+    pub fn programs(
+        config: &crate::AudioVaeConfig,
+        samples: &[u32],
+    ) -> Result<Vec<(String, String)>> {
+        use crate::programs::Programs;
+        use ops::activation::ActAndMul as ActAndMulOp;
+        use ops::attention::dense::DenseAttention;
+        use ops::conv::Conv1d as Conv1dOp;
+        use ops::gemm::Gemm;
+        use ops::norm::LayerNorm as LayerNormOp;
+        use ops::adaptive_pool::AdaptivePool as PoolOp;
+        use ops::residual::ScaledAdd as ScaledAddOp;
+        use ops::snake::Snake as SnakeOp;
+        use ops::transpose::Transpose as TransposeOp;
+
+        let dtype = DType::F32;
+        // The widths the encoder runs at: `encoder_dim`, doubled per stage, and the final width that
+        // the tail Snake and the output convolution read.
+        let mut widths = Vec::new();
+        let mut width = config.encoder_dim;
+        for _ in &config.encoder_rates {
+            widths.push(width);
+            width = width
+                .checked_mul(2)
+                .ok_or_else(|| Error::config("the encoder's widths overflow".to_owned()))?;
+        }
+        widths.push(width);
+        widths.sort_unstable();
+        widths.dedup();
+        let channels = config.latent_channels;
+        let mut programs = Programs::default();
+
+        // Every convolution of the encoder: the input, each unit's two, each stage's widening one and
+        // the output. The window, the stride, the dilation and the bias travel with the call.
+        programs.launch::<Conv1dOp>(&Conv1d::descriptor_of(
+            dtype,
+            dtype,
+            true,
+            dtype,
+            crate::audio_vae::geometry(7, 1, 3)?,
+            false,
+        ));
+        // One Snake per channel width it runs at.
+        for channels in &widths {
+            programs.launch::<SnakeOp>(&Snake::descriptor_of(dtype, u64::from(*channels)));
+        }
+
+        // The projection: three layer normalizations, four dense products, the attention, the pool and
+        // the transpose that hands the latent features to the moments convolution.
+        for columns in [width, channels] {
+            programs.launch::<LayerNormOp>(&LayerNorm::descriptor_of(dtype, columns, true));
+        }
+        programs.launch::<Gemm>(&Linear::descriptor_of(
+            channels,
+            dtype,
+            WeightOrder::NxK,
+            true,
+            dtype,
+            dtype,
+        ));
+        let head_dim = (width / config.num_attention_heads.max(1)).max(1);
+        let attention = Attention::dense(
+            head_dim,
+            config.num_attention_heads,
+            config.num_attention_heads,
+            LONGEST_TRACK,
+            false,
+            None,
+            1.0 / (head_dim as f32).sqrt(),
+        )?;
+        programs.launch::<DenseAttention>(&attention.dense_descriptor(
+            dtype, dtype, dtype, LONGEST_TRACK, true,
+        ));
+        programs.launch::<PoolOp>(
+            &AdaptivePool::new(
+                u64::from(config.num_attention_heads),
+                u64::from(width / config.num_attention_heads.max(1)),
+                u64::from(channels),
+            )?
+            .descriptor(dtype),
+        );
+        programs.launch::<TransposeOp>(&Transpose::new(dtype)?.descriptor());
+
+        // The GeGLU's gated product: the reference's normalized tanh-GELU gate.
+        programs.launch::<ActAndMulOp>(&GatedActivation::descriptor_of(
+            dtype,
+            u64::from(2 * channels),
+            Activation::GeluTanh,
+            u64::from(2 * channels),
+            u64::from(2 * channels),
+            u64::from(2 * channels),
+            false,
+        )?);
+
+        // Each residual unit's output is one addition over the whole unit, so its width is the inner
+        // channel count times the track's samples.
+        for samples in samples {
+            for inner in &widths {
+                let columns = u64::from(*inner) * u64::from(*samples);
+                if let Ok(descriptor) = ScaledAdd.descriptor(dtype, dtype, columns) {
+                    programs.launch::<ScaledAddOp>(&descriptor);
+                }
+            }
+        }
+
+        Ok(programs.finish())
+    }
+
     /// The latent frames `samples` samples encode to: `ceil(samples / hop)`.
     ///
     /// This is the reference's rule (`encoding.py:244`) and the reason it is a ceiling is the pad its
@@ -2328,6 +2443,53 @@ impl GeGlu {
 
 #[cfg(test)]
 mod tests {
+
+    /// The audio encoder states its programs from its own configuration: one convolution, one Snake per
+    /// channel width it runs at, the projection's two normalizations and its pool, the FP32 attention,
+    /// the GeGLU, and the residual of each unit at its own width times the track's samples.
+    #[test]
+    fn the_audio_encoder_states_its_programs_from_its_config() {
+        let config = crate::audio_vae::tests::audio_config();
+        let programs =
+            AudioEncoder::programs(&config, &[44_100]).expect("the audio encoder's programs");
+        let count = |operator: &str| {
+            programs
+                .iter()
+                .filter(|(name, _)| name == operator)
+                .count()
+        };
+        assert_eq!(count("conv1d"), 1, "one program whatever the window or stride");
+        assert_eq!(count("adaptive_pool"), 1);
+        assert_eq!(count("transpose"), 1);
+        assert_eq!(count("act_and_mul"), 1);
+        assert_eq!(count("gemm"), 1);
+        assert_eq!(count("dense_attention"), 1);
+        assert_eq!(count("layer_norm"), 2);
+
+        // One Snake per channel width: `encoder_dim` doubled per stage, plus the tail's width.
+        let mut widths = Vec::new();
+        let mut width = config.encoder_dim;
+        for _ in &config.encoder_rates {
+            widths.push(width);
+            width *= 2;
+        }
+        widths.push(width);
+        widths.sort_unstable();
+        widths.dedup();
+        assert_eq!(count("snake"), widths.len(), "{programs:?}");
+
+        // Every launch of the encoder is FP32: the design's declared rows, not the checkpoint's type.
+        for (operator, key) in &programs {
+            assert!(
+                key.contains("f32") || operator == "scaled_add" || operator == "act_and_mul",
+                "{operator} {key} is not FP32"
+            );
+        }
+
+        // A longer track is another residual program, because the unit's whole output is its width.
+        let longer = AudioEncoder::programs(&config, &[88_200]).expect("a longer track");
+        assert_ne!(longer, programs);
+    }
     use super::*;
     use crate::video_vae::tests::video_config;
 

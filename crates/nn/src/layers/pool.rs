@@ -53,6 +53,19 @@ impl AdaptivePool {
         })
     }
 
+    /// The descriptor one pool launch takes: the head geometry and the element type. The head and
+    /// width counts are the module's, so a walk states them from the config.
+    pub fn descriptor(&self, dtype: ops::DType) -> adaptive_pool::Descriptor {
+        adaptive_pool::Descriptor {
+            dtype,
+            heads: self.heads,
+            width: self.width,
+            output: self.output,
+            block: BLOCK,
+            pdl: PDL,
+        }
+    }
+
     /// The pool's output width: the latent channels the encoder's head produces.
     pub const fn output(&self) -> u32 {
         self.output
@@ -67,14 +80,7 @@ impl AdaptivePool {
                 format!("{:?} into {:?}", x.shape.dims(), out.shape.dims()),
             ));
         }
-        let descriptor = adaptive_pool::Descriptor {
-            dtype: x.dtype,
-            heads: self.heads,
-            width: self.width,
-            output: self.output,
-            block: BLOCK,
-            pdl: PDL,
-        };
+        let descriptor = self.descriptor(x.dtype);
         f.operate::<AdaptivePoolOp>(&descriptor, adaptive_pool::Args { x, out })
     }
 }

@@ -453,6 +453,17 @@ impl Snake {
         Ok(Self { channels })
     }
 
+    /// The descriptor one Snake launch takes: the element type and the channel count, which is the
+    /// length of every frequency. The samples per channel travel with the call.
+    pub fn descriptor_of(dtype: ops::DType, channels: u64) -> ops::snake::Descriptor {
+        ops::snake::Descriptor {
+            dtype,
+            channels: u32::try_from(channels).unwrap_or(u32::MAX),
+            block: BLOCK,
+            pdl: PDL,
+        }
+    }
+
     /// `out = snake(x, alpha)` over `[rows, channels, width]`.
     ///
     /// `alpha` is `[channels]` in the activation's element type; the signal is row-major in and out.
@@ -483,14 +494,7 @@ impl Snake {
                 ),
             ));
         }
-        let descriptor = ops::snake::Descriptor {
-            dtype: x.dtype,
-            channels: u32::try_from(self.channels).map_err(|_| {
-                Error::shape("Snake", "more channels than a descriptor holds".to_owned())
-            })?,
-            block: BLOCK,
-            pdl: PDL,
-        };
+        let descriptor = Self::descriptor_of(x.dtype, self.channels);
         f.operate::<ops::snake::Snake>(&descriptor, ops::snake::Args { x, alpha, out })
     }
 }
