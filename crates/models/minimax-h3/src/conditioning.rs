@@ -40,6 +40,8 @@ pub struct Documents {
     pub cu_seq_lens_q: TensorView,
     /// The key boundaries: each document's text rows accumulated, so a padding row is no key.
     pub cu_seq_lens_k: TensorView,
+    /// The longest key run of any document: the last entry of `cu_seq_lens_k`, as a launch value.
+    pub key_rows: u32,
 }
 
 /// One refined document block: pre-normalized attention and a value-first SwiGLU.
@@ -182,6 +184,8 @@ impl RefinerBlock {
             value,
             Some(visible.cu_seq_lens_q),
             Some(visible.cu_seq_lens_k),
+            // One document per request over packed rows: every query sees the whole key set.
+            visible.key_rows,
             rows.attended,
         )?;
         let attended = self.gather(f, rows.attended, &rows)?;

@@ -49,6 +49,11 @@ pub struct Visible {
     pub cu_seq_lens_q: TensorView,
     /// `[tokens + 1]` int32: the keys every query sees, accumulated from zero.
     pub cu_seq_lens_k: TensorView,
+    /// The longest run of key rows any query attends: the last entry of `cu_seq_lens_k`.
+    ///
+    /// The attention descriptor needs it as a launch value, and it is a property of the layout's
+    /// visibility rather than of the rows, so it travels beside the two tables.
+    pub key_rows: u32,
 }
 
 /// The rotary factor tables of one forward, `[tokens, rotated / 2]` FP32 each.
@@ -188,6 +193,9 @@ impl Dense {
             value,
             Some(visible.cu_seq_lens_q),
             Some(visible.cu_seq_lens_k),
+            // Every query attends the whole key set in one sequence: the longest key run is the
+            // number of used key rows, which `Visible` states.
+            visible.key_rows,
             scratch.attended,
         )?;
         let attended = match &self.exchange {
