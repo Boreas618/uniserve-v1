@@ -355,6 +355,7 @@ mod tests {
                     rollback_s: None,
                     queue_depth: 4,
                     world_size: 1,
+                    standby: false,
                 },
                 environment: HashMap::new(),
             },

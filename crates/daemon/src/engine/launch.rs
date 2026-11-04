@@ -80,6 +80,13 @@ pub(crate) struct Launch {
     /// The number of ranks in this process's world, of which this group's rank
     /// is one.
     pub world_size: u32,
+    /// Whether this process starts as the serving process's standby (§2.5): it
+    /// claims its scope's storage read-only, parks once it is prepared, and is
+    /// promoted in place when the serving process of its failure domain fails.
+    /// The role is stated here because a standby that claimed writable storage
+    /// would give the scope two writers.
+    #[serde(default)]
+    pub standby: bool,
 }
 
 /// The path of one engine process's launch file.
@@ -188,6 +195,7 @@ mod tests {
             rollback_s: None,
             queue_depth: 4,
             world_size: 1,
+            standby: false,
         }
     }
 
@@ -238,6 +246,7 @@ mod tests {
             "rollback_s",
             "queue_depth",
             "world_size",
+            "standby",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -252,6 +261,7 @@ mod tests {
         assert_eq!(value["devices"], json!([0, 1]));
         assert_eq!(value["queue_depth"], json!(4));
         assert_eq!(value["world_size"], json!(1));
+        assert_eq!(value["standby"], json!(false));
 
         // The mirror reads back what the writer wrote.
         let read: Launch =
