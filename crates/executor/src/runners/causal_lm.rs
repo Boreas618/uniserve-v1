@@ -209,19 +209,23 @@ impl Staging {
         // rows of the batch's device columns and not tokens, so padding never widens a call's range
         // past the row axis: a prefilling bucket has four rows and sixty-four tokens.
         self.rows.query_offsets.truncate(rows + 1);
+        if self.rows.query_offsets.is_empty() {
+            return Err(Error::Invariant(format!(
+                "the batch states no query offsets for its {rows} rows"
+            )));
+        }
         if tokens < bucket_tokens {
-            *self
-                .rows
-                .query_offsets
-                .last_mut()
-                .expect("a batch states its rows' offsets") = bucket_tokens as i32;
+            if let Some(last) = self.rows.query_offsets.last_mut() {
+                *last = bucket_tokens as i32;
+            }
         }
         while self.rows.query_offsets.len() <= bucket_rows {
-            let end = *self
+            let end = self
                 .rows
                 .query_offsets
                 .last()
-                .expect("a batch states its rows' offsets");
+                .copied()
+                .ok_or_else(|| Error::Invariant("the batch states no query offsets".into()))?;
             self.rows.query_offsets.push(end);
         }
         let mut owned = self.rows.calls.last().map(|call| call.rows.end).unwrap_or(0);
