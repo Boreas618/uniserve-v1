@@ -32,6 +32,7 @@ itself is provable on a host with no checkpoint, no device and no store.
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import pathlib
 import re
@@ -80,6 +81,32 @@ def evaluations(root: pathlib.Path) -> dict[tuple[str, int], pathlib.Path]:
             " an empty directory is a stage that did not reach its first evaluation"
         )
     return found
+
+
+def written(path: pathlib.Path) -> str:
+    """When the file was last written, as UTC, so a page can say whether it came from one run.
+
+    A stage writes its trajectory over seconds; a file whose time is far from its neighbours' came
+    from another run, and a comparison that pairs it is comparing two tips. The number below is a
+    fact about the file, not an inference about the run.
+    """
+    stamp = path.stat().st_mtime
+    return datetime.datetime.fromtimestamp(stamp, datetime.UTC).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+
+def non_finite(tensor: object) -> int:
+    """How many of a tensor's elements are not finite.
+
+    `dump_tables.load` answers a torch tensor, so the count uses torch's own predicate where the
+    tensor has one: a numpy ufunc on a torch tensor goes through an array-wrap path that numpy
+    deprecates, and the warning would land on a page that is meant to be read for its numbers.
+    """
+    isfinite = getattr(tensor, "isfinite", None)
+    if isfinite is not None:
+        return int((~isfinite()).sum())
+    return int((~np.isfinite(np.asarray(tensor))).sum())
 
 
 def metrics(got: np.ndarray, ref: np.ndarray) -> dict[str, object]:
@@ -170,14 +197,19 @@ def compare(ref: pathlib.Path, got: pathlib.Path) -> dict[str, object]:
                 ("reference", reference),
                 ("this side", candidate),
             ):
-                finite = np.isfinite(tensor)
-                if not bool(finite.all()):
+                broken = non_finite(tensor)
+                if broken:
                     raise SystemExit(
-                        f"{modality} e{index}: the {side} holds"
-                        f" {int((~finite).sum())} of {finite.size} non-finite elements;"
-                        " that is a broken launch rather than a number to compare"
+                        f"{modality} e{index}: the {side} holds {broken} non-finite"
+                        " elements; that is a broken launch rather than a number to"
+                        " compare"
                     )
-            row = {"evaluation": index, **metrics(candidate, reference)}
+            row = {
+                "evaluation": index,
+                **metrics(candidate, reference),
+                "ref_written": written(theirs[(modality, index)]),
+                "got_written": written(ours[(modality, index)]),
+            }
             if index > keys[0]:
                 row["ref_moved"] = movement(previous["ref"], reference)
                 row["got_moved"] = movement(previous["got"], candidate)
@@ -363,6 +395,17 @@ def main(argv: list[str]) -> int:
         )
     report = compare(args.ref, args.got)
     print(table(report))
+    # The two trees' write times, so a page states whether each trajectory came from one run.
+    for side in ("ref", "got"):
+        times = sorted(
+            row[f"{side}_written"]
+            for rows in report["modalities"].values()
+            for row in rows
+        )
+        if times:
+            print(
+                f"{side} written  {times[0]} .. {times[-1]}  ({len(times)} files)"
+            )
     if args.out is not None:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(json.dumps(report, indent=2) + "\n")
