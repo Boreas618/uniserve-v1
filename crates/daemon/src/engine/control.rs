@@ -879,6 +879,14 @@ fn prepare_at(
         programs: requests,
         descriptors: descriptors.to_vec(),
     };
+    // Before the connect, not after it: a daemon that blocks opening the
+    // socket names the host it was reaching from this line alone, and the
+    // server it never reached logs nothing at all.
+    tracing::info!(
+        host = %server.host,
+        socket = %server.socket.display(),
+        "connecting to a Program Server"
+    );
     let mut client = program_server::Client::connect(&server.socket).with_context(|| {
         format!(
             "connecting to the Program Server of {} at {}",
