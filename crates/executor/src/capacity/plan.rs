@@ -418,20 +418,28 @@ pub fn token_plan(
     })?;
 
     // The cache's fixed storage beside its units: block tables, import scratch
-    // and one unit index column per stream the computations over the cache
-    // bind.
+    // and the request-slot banks. Every unit index column is charged with each
+    // unit instead, because the unit count is not known until the pool is
+    // fitted - so no column may be charged here as well.
     let fixed = crate::memory::prefix_cache::PrefixCache::fixed_bytes(
         &plan,
         0,
         layout.info().request_slots,
         width,
         layout.info().max_unresolved_calls as usize,
-        COMPUTATION_COLUMNS,
+        0,
     )?;
     layout.reserve(request.device, fixed);
 
-    // Every unit column holds one index per unit, charged with each unit.
-    let unit_overhead = COMPUTATION_COLUMNS as u64 * UnitColumn::bytes(1);
+    // Every unit index column holds one index per unit and is charged with each
+    // unit: the import workers' columns and the streams the computations over
+    // the cache bind. Charging them here and not in the fixed figure is what
+    // keeps a unit's bytes the same whether the pool is fitted before or after
+    // its size is known.
+    let workers = crate::memory::prefix_cache::PrefixCache::import_workers(
+        layout.info().max_unresolved_calls as usize,
+    ) as u64;
+    let unit_overhead = (workers + COMPUTATION_COLUMNS as u64) * UnitColumn::bytes(1);
     layout.fit_cache(
         &plan,
         unit_overhead,
@@ -1055,6 +1063,45 @@ mod tests {
         assert!(units(&deep) < units(&shallow));
         assert!(
             deep.cache.as_ref().unwrap().unit_bytes > shallow.cache.as_ref().unwrap().unit_bytes
+        );
+    }
+
+    /// Every stream column is charged once per unit: a rank that admits more
+    /// imports fits fewer units of the same grant, and its fixed figure does not
+    /// grow by the same bytes - the columns follow the unit count, not the
+    /// tables.
+    #[test]
+    fn more_import_workers_hold_fewer_units_of_the_same_grant() {
+        let plan = |calls: usize| {
+            let mut request = request();
+            request.max_batch_calls = calls;
+            token_plan(
+                &request,
+                report(),
+                &facts(),
+                1,
+                64,
+                TOTAL,
+                None,
+                &HostGroup::single(0),
+                dense(geometry()),
+            )
+            .expect("the device has room for this cache")
+        };
+        let narrow = plan(1);
+        let wide = plan(16);
+        let units = |plan: &Plan| plan.info.prefix_cache.as_ref().unwrap().num_units;
+        assert!(
+            units(&wide) < units(&narrow),
+            "a rank admitting 16 calls fits {} units, one admitting 1 fits {}: the import \
+             workers' columns are not charged per unit",
+            units(&wide),
+            units(&narrow)
+        );
+        assert_eq!(
+            wide.fixed_device_bytes[&Device::Cuda(DeviceId(0))],
+            narrow.fixed_device_bytes[&Device::Cuda(DeviceId(0))],
+            "a per-unit column was charged into the fixed figure instead of the units"
         );
     }
 
