@@ -52,22 +52,79 @@ struct TreePackage {
     descriptor: String,
 }
 
-/// Finds the first package of `crates/ops/kernels` whose source is of `kind`,
-/// in the order the tree names its operators.
+/// The operators the Qwen3-MoE slice names, in the order its fixture lists
+/// them; empty when the generated fixture is absent.
+fn slice_operators() -> Vec<String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.local/qwen3-moe-keys.txt");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut operators = Vec::new();
+    for line in text.lines() {
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        if let Some((operator, _)) = line.split_once('\t')
+            && !operators
+                .iter()
+                .any(|known: &String| known == operator.trim())
+        {
+            operators.push(operator.trim().to_owned());
+        }
+    }
+    operators
+}
+
+/// The package of `crates/ops/kernels` whose source is of `kind` and whose
+/// operator the slice names first, so a witness builds the kernel a deployment
+/// needs rather than whichever backend the tree lists first; when the slice's
+/// fixture is absent, the first package of that kind.
 fn tree_package(kind: &str) -> Option<TreePackage> {
+    let slice = slice_operators();
+    let packages = tree_packages(kind);
+    for operator in &slice {
+        if let Some(package) = packages
+            .iter()
+            .find(|package| &package.op == operator)
+            .map(repackage)
+        {
+            return Some(package);
+        }
+    }
+    packages.into_iter().next()
+}
+
+/// A package of `tree_packages`, by value, so the caller can own it.
+fn repackage(package: &TreePackage) -> TreePackage {
+    TreePackage {
+        directory: package.directory.clone(),
+        op: package.op.clone(),
+        backend: package.backend.clone(),
+        descriptor: package.descriptor.clone(),
+    }
+}
+
+/// Every package of `crates/ops/kernels` whose source is of `kind`, in the
+/// order the tree names its operators.
+fn tree_packages(kind: &str) -> Vec<TreePackage> {
+    let mut found = Vec::new();
     let root = repository().join("crates/ops/kernels");
-    let mut operators = std::fs::read_dir(&root)
-        .ok()?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.is_dir())
-        .collect::<Vec<_>>();
-    operators.sort();
-    for operator in operators {
-        let mut backends = std::fs::read_dir(&operator)
-            .ok()?
+    let mut operators = match std::fs::read_dir(&root) {
+        Ok(entries) => entries
             .filter_map(|entry| entry.ok().map(|entry| entry.path()))
             .filter(|path| path.is_dir())
-            .collect::<Vec<_>>();
+            .collect::<Vec<_>>(),
+        Err(_) => return found,
+    };
+    operators.sort();
+    for operator in operators {
+        let mut backends = match std::fs::read_dir(&operator) {
+            Ok(entries) => entries
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .filter(|path| path.is_dir())
+                .collect::<Vec<_>>(),
+            Err(_) => continue,
+        };
         backends.sort();
         for backend in backends {
             let manifest = backend.join("package.toml");
@@ -93,7 +150,7 @@ fn tree_package(kind: &str) -> Option<TreePackage> {
             let Some(descriptor) = descriptor_key(&text) else {
                 continue;
             };
-            return Some(TreePackage {
+            found.push(TreePackage {
                 directory: backend,
                 op: op.to_owned(),
                 backend: backend_name.to_owned(),
@@ -101,7 +158,7 @@ fn tree_package(kind: &str) -> Option<TreePackage> {
             });
         }
     }
-    None
+    found
 }
 
 /// One descriptor a package covers, as the packages declare them: a list of
