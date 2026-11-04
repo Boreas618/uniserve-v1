@@ -332,6 +332,53 @@ impl EpochPlan {
     }
 }
 
+/// What this rank advertises of itself: the report the capacity plan is made against (§2.3, §4).
+///
+/// A causal-language rank states one component - the model's single block - the two forward calls
+/// it serves, and the three identities that name this process. It publishes no products (`logits`
+/// returns through the batch, not as an exported tensor), so no device product is exported and no
+/// media component is routed: the deployment is one class of computation, and saying otherwise
+/// would make the engine reserve storage for exports that never happen.
+pub(crate) fn rank_report(device: DeviceId) -> Result<executor::capacity::Report> {
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos() as u64);
+    Ok(executor::capacity::Report {
+        endpoint: ipc::WorkerEndpoint {
+            host: host_name()?,
+            // The address space this rank's tensors live in: one main process, one pid.
+            address_space: std::process::id().to_string(),
+            // This process's start, which the engine compares to notice a relaunched rank.
+            incarnation: format!("{at}"),
+        },
+        device_exports: false,
+        fabric_handles: platform::HandleType::probe(device)? == platform::HandleType::Fabric,
+        supported_calls: vec![
+            ipc::CallKind::Forward(ipc::ForwardMode::Prefill),
+            ipc::CallKind::Forward(ipc::ForwardMode::Decode),
+        ],
+        media_components: std::collections::BTreeMap::new(),
+        components: vec![ipc::ComponentInfo {
+            name: "backbone".to_owned(),
+            outputs: Vec::new(),
+        }],
+    })
+}
+
+/// This host's name, as `gethostname(2)` gives it: the report's host identity (§2.3).
+fn host_name() -> Result<String> {
+    let mut name = [0_u8; 256];
+    // SAFETY: gethostname writes at most `name.len()` bytes into `name`.
+    if unsafe { libc::gethostname(name.as_mut_ptr().cast(), name.len()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("reading the host name");
+    }
+    let length = name
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(name.len());
+    String::from_utf8(name[..length].to_vec()).context("the host name is not UTF-8")
+}
+
 /// The page size the resident cache was planned with, checked against the model's (§4.5, §8).
 ///
 /// The model states the page it reads; the capacity plan states the page it could afford, and the
