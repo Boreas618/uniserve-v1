@@ -949,10 +949,14 @@ impl Queue {
             });
         }
         let workspace = crate::source::Workspace::new()?;
-        let built =
-            package
-                .source
-                .build(&job.path.op, &job.path.descriptor, toolchain, &workspace)?;
+        let target = Target::new(job.path.target.clone());
+        let built = package.source.build(
+            &job.path.op,
+            &job.path.descriptor,
+            &target,
+            toolchain,
+            &workspace,
+        )?;
         if built.files.is_empty() {
             return Err(Error::Build {
                 op: job.path.op.clone(),
