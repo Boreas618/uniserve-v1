@@ -71,7 +71,7 @@ pub use crate::scheduler::{
 };
 pub use crate::service::{continuation_slot, run_engine, serve_requests};
 #[cfg(feature = "testing")]
-pub use crate::scheduler::testing::packaged_policy;
+pub use crate::scheduler::testing::{packaged_module, packaged_policy};
 #[cfg(feature = "testing")]
 pub use crate::sim::{
     BatchEvent, ContextLog, ContextWrite, Pace, SimEngine, SimExecutor, SimSpeculation,
