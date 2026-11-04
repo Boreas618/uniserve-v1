@@ -27,6 +27,8 @@ Operators, in the order the data meets them:
 - `inverse_cdf` — the draw: order the candidates by token id, take the inclusive cumulative
   sum, pick the lowest id whose share the draw reaches. A token id, so exact.
 - `argmax` — the greedy token: the largest value's index, the lowest index among ties.
+- `logprob_gather` — one token's log-probability per row, read out of the FP32 row
+  `log_softmax` produced. Values move, so the comparison is exact.
 
 Every case is chosen so a wrong stride, a wrong vocabulary offset or a missing rule shows:
 gathered rows that repeat and come out of order, an unpadded width below the gathered width,
@@ -76,6 +78,7 @@ OPERATORS = (
     "filter_candidates",
     "inverse_cdf",
     "argmax",
+    "logprob_gather",
 )
 
 
@@ -459,9 +462,48 @@ def run_argmax(case):
     return failures
 
 
+def columns_mid(flags):
+    """A column near the middle of the vocabulary, for a scattered token list."""
+    return max(flags.columns // 2, 0)
+
+
 def math_log(value):
     """`log` of a scalar, in torch, so the reference stays in one library."""
     return torch.log(torch.tensor(float(value))).double()
+
+
+def run_logprob_gather(case):
+    """Report one token's log-probability per row and compare it exactly."""
+    import logprob_gather as kernels
+
+    generator = torch.Generator().manual_seed(case["seed"])
+    rows, columns = case["rows"], case["columns"]
+    logprobabilities = -torch.rand(rows, columns, generator=generator).float()
+    if case["masked"]:
+        # A dropped candidate's log-probability is `-inf`; the gather must copy it rather
+        # than repair it or turn it into a zero.
+        logprobabilities[0, columns - 1] = float("-inf")
+    tokens = torch.tensor(list(case["tokens"])[:rows], dtype=torch.int32)
+    if case["edges"]:
+        # The first and the last column, and the same token twice in different rows.
+        tokens[0] = 0
+        tokens[-1] = columns - 1
+        if rows > 2:
+            tokens[1] = columns - 1
+    out = torch.full((rows,), float("nan"), dtype=torch.float32)
+
+    kernels._logprob_gather_kernel[(rows,)](
+        logprobabilities, tokens, out, rows, columns
+    )
+
+    expected = logprobabilities.cpu()[torch.arange(rows), tokens.long()]
+    failures, line = compare_exact("out", out.cpu(), expected)
+    print(
+        f"{'exact' if failures == 0 else 'FAIL'}: logprob_gather, {case['label']} — "
+        f"{rows} rows of {columns}, tokens {tokens.tolist()[:4]}"
+    )
+    print(line)
+    return failures
 
 
 RUNNERS = {
@@ -471,6 +513,7 @@ RUNNERS = {
     "filter_candidates": run_filter_candidates,
     "inverse_cdf": run_inverse_cdf,
     "argmax": run_argmax,
+    "logprob_gather": run_logprob_gather,
 }
 
 
@@ -604,6 +647,27 @@ def cases(operator, flags):
                 "seed": 3,
             },
         ]
+    if operator == "logprob_gather":
+        return [
+            {
+                "label": "the vocabulary row, tokens spread across it",
+                "rows": 4,
+                "columns": flags.columns,
+                "tokens": (0, columns_mid(flags), 1, 3),
+                "edges": True,
+                "masked": False,
+                "seed": 1,
+            },
+            {
+                "label": "a dropped candidate's -inf, gathered as it stands",
+                "rows": 2,
+                "columns": 64,
+                "tokens": (63, 5),
+                "edges": False,
+                "masked": True,
+                "seed": 2,
+            },
+        ]
     if operator == "argmax":
         return [
             {
@@ -679,6 +743,8 @@ def descriptor_key(operator, flags):
         return f"width_{flags.width}_ids_i32_tokens_i32_pdl_{pdl}"
     if operator == "argmax":
         return f"dtype_{flags.dtype}_width_{flags.width}_ids_i32_pdl_{pdl}"
+    if operator == "logprob_gather":
+        return f"columns_{flags.columns}_ids_i32_pdl_{pdl}"
     return (
         f"dtype_{flags.dtype}_vocabulary_{flags.vocabulary}_block_{flags.block}"
         f"_extras_{flags.extras}_divide_{flags.divide}_pdl_{pdl}"
