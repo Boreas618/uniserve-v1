@@ -784,6 +784,9 @@ impl MainProcess {
             if let Some(failure) = self.watch(&running)? {
                 return Ok(Some(failure));
             }
+            if let Some(failure) = self.watch_schedulers()? {
+                return Ok(Some(failure));
+            }
         }
     }
 
@@ -1686,6 +1689,28 @@ impl MainProcess {
         }
         self.serving = true;
         Ok(())
+    }
+
+    /// A scheduler thread that stopped ends the epoch's service, and the epoch says so.
+    ///
+    /// With no scheduler no batch is formed, so no job runs and no job can stall: the stall rule
+    /// reports nothing and every request waits for a batch that will never be planned. The reason
+    /// the thread stopped is its own - a policy that trapped or ran out of fuel is the usual one
+    /// (§4.4) - and the update's decision table decides whether that ends the epoch or reverts the
+    /// update on probation (§7.3 step 4).
+    fn watch_schedulers(&mut self) -> Result<Option<UpdateFailure>> {
+        for (rank, scheduler) in self.schedulers.iter().enumerate() {
+            if !scheduler.is_dead() {
+                continue;
+            }
+            let failure = UpdateFailure::Policy {
+                error: scheduler
+                    .failure()
+                    .unwrap_or_else(|| format!("the scheduler of rank {rank} stopped")),
+            };
+            return self.failure(failure);
+        }
+        Ok(None)
     }
 
     /// Parks every scheduler, keeping what each parks with for the resume.
