@@ -2125,6 +2125,10 @@ impl MainProcess {
                  has answered: the Program Server, a device or a scheduler is the one to look at"
             );
         }
+        // What the stage was waiting on, read before the stage is taken out: a bound that named
+        // `no stage` because the driver had already replaced it would say nothing at all, which is
+        // the opposite of what the line is for.
+        let pending = pending_work(&precopy.stage, &self.executors);
         let stage = std::mem::replace(&mut precopy.stage, PrecopyStage::Done);
 
         match stage {
@@ -2196,7 +2200,6 @@ impl MainProcess {
                 // that has stood past twice the watchdog's stall bound is failed here by name,
                 // saying what never answered. Serving keeps what it had; the update does not.
                 if precopy.since.elapsed() > self.watchdog.stall_bound() * 2 {
-                    let pending = pending_work(&precopy.stage, &self.executors);
                     return self.abandon_precopy(
                         generation,
                         UpdateFailure::Precopy {
