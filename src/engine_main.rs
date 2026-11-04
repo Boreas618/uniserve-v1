@@ -172,6 +172,10 @@ pub(crate) struct MainProcess {
     schedulers: Vec<engine::Scheduler>,
     executors: Vec<Executor>,
     memory: Memory,
+    /// The epoch's record, as the daemon's welcome stated it: the model class
+    /// the epoch serves and the statuses the daemon reads back at
+    /// `GET /admin/config` (§2.3, §7.3).
+    record: EpochRecord,
     blocking: ThreadPool,
     /// The blocking lane module loads run on (§2.4, §7.3 step 2).
     modules: Lane<Install>,
@@ -202,7 +206,7 @@ impl MainProcess {
         )?;
         // The request interface's handshake: this process says who it is, and
         // the daemon answers with the engine spec and the epoch record (§2.3).
-        let record = handshake(&mut control, args)?;
+        let record = handshake(&mut control, args, &build)?;
 
         let model = load_model(
             record.model_class(),
@@ -227,8 +231,8 @@ impl MainProcess {
             executors.push(Executor::spawn(
                 device,
                 runners,
-                build.streams(device)?,
                 build.events(),
+                build.graph(device)?,
             )?);
             generations.push(generation);
         }
@@ -247,6 +251,7 @@ impl MainProcess {
             schedulers,
             executors,
             memory,
+            record,
             blocking,
             modules,
             update,
@@ -616,7 +621,7 @@ impl MainProcess {
             reply,
             policy,
             next: Vec::new(),
-            stage: Stage::Modules(tasks),
+            stage: PrecopyStage::Modules(tasks),
         });
         Ok(())
     }
@@ -629,17 +634,17 @@ impl MainProcess {
             return Ok(());
         };
         let generation = precopy.generation;
-        let stage = std::mem::replace(&mut precopy.stage, Stage::Done);
+        let stage = std::mem::replace(&mut precopy.stage, PrecopyStage::Done);
 
         match stage {
-            Stage::Modules(tasks) => {
+            PrecopyStage::Modules(tasks) => {
                 let mut loaded = Vec::with_capacity(tasks.len());
                 for task in &tasks {
                     match task.outcome() {
                         None => {
                             // A build is still running: the tasks keep their
                             // results and the lane keeps its capacity.
-                            precopy.stage = Stage::Modules(tasks);
+                            precopy.stage = PrecopyStage::Modules(tasks);
                             self.precopy = Some(precopy);
                             return Ok(());
                         }
@@ -666,11 +671,11 @@ impl MainProcess {
                 }
                 self.after_modules(precopy, loaded)
             }
-            Stage::Executors(submissions) => {
+            PrecopyStage::Executors(submissions) => {
                 if let Some(failure) = unfinished(&submissions, "preparing this node's devices") {
                     match failure {
                         StageFailure::Pending => {
-                            precopy.stage = Stage::Executors(submissions);
+                            precopy.stage = PrecopyStage::Executors(submissions);
                             self.precopy = Some(precopy);
                             return Ok(());
                         }
@@ -704,15 +709,15 @@ impl MainProcess {
                     };
                     shadow.push(executor.submit(batch.batch)?);
                 }
-                precopy.stage = Stage::Shadow(shadow);
+                precopy.stage = PrecopyStage::Shadow(shadow);
                 self.precopy = Some(precopy);
                 Ok(())
             }
-            Stage::Shadow(submissions) => {
+            PrecopyStage::Shadow(submissions) => {
                 if let Some(failure) = unfinished(&submissions, "a shadow batch") {
                     match failure {
                         StageFailure::Pending => {
-                            precopy.stage = Stage::Shadow(submissions);
+                            precopy.stage = PrecopyStage::Shadow(submissions);
                             self.precopy = Some(precopy);
                             return Ok(());
                         }
@@ -731,7 +736,7 @@ impl MainProcess {
                 self.answer(precopy.reply, ProgramStatus::Precopied { generation });
                 Ok(())
             }
-            Stage::Done => Ok(()),
+            PrecopyStage::Done => Ok(()),
         }
     }
 
@@ -767,7 +772,7 @@ impl MainProcess {
         }
         let mut precopy = precopy;
         precopy.next = next;
-        precopy.stage = Stage::Executors(submissions);
+        precopy.stage = PrecopyStage::Executors(submissions);
         self.precopy = Some(precopy);
         Ok(())
     }
@@ -804,7 +809,7 @@ impl MainProcess {
                 bail!("switching device {}: {error}", executor.device().0);
             }
         }
-        self.update.switchover(generation)?;
+        self.update.switchover(generation, Instant::now())?;
         Ok(ProgramStatus::Switched { generation })
     }
 
@@ -919,31 +924,52 @@ impl MainProcess {
     }
 
     /// Sends the engine's counters to the daemon, one report a second and a
-    /// final flush when the process ends.
+    /// final flush when the process ends (`specs/worker.md` §2.3).
     ///
     /// Sources: sched owns `steps`, `batches`, `tokens`, `policy_fuel` and
-    /// `policy_calls`; the executor owns `kernel_launches`, `device_ns` and
-    /// each rank's queue depth. Neither publishes counters yet (the executor
-    /// offers `watchdog` and `probe` only), so every field is reported as zero
-    /// rather than estimated: an honest zero the daemon can graph, not a guess.
+    /// `policy_calls`; the executor owns `kernel_launches`, `device_ns`, each
+    /// rank's queue depth and the device's mapped pools. The scheduler
+    /// counters stay zero until the scheduler handle states them (§7.3's seam,
+    /// M505); they are reported as an honest zero rather than a guess.
     fn send_metrics(&mut self) {
+        let mut kernel_launches = 0_u64;
+        let mut device_ns = 0_u64;
+        let mut queue = Vec::with_capacity(self.executors.len());
+        let mut memory = Vec::with_capacity(self.executors.len());
+        for (rank, executor) in self.executors.iter().enumerate() {
+            let counters = executor.counters();
+            kernel_launches += counters.kernel_launches;
+            device_ns += counters.device_ns;
+            // The jobs in flight on this device: what the control thread's
+            // watchdog polls, and the depth the daemon graphs.
+            queue.push(proto::request::wire::QueueDepth {
+                rank: rank as u32,
+                depth: executor.watchdog().jobs.len() as u32,
+            });
+            // The device's pools: the arena books every mapped byte against the
+            // budget §4.1 and §8 state, so a device never maps more than its
+            // budget allows.
+            if let Some(pools) = executor.pool_metrics() {
+                memory.push(proto::request::wire::DeviceMemory {
+                    device: executor.device().0 as u32,
+                    budget: pools.budget,
+                    pools: vec![proto::request::wire::PoolMemory {
+                        pool: "graph".to_owned(),
+                        mapped: pools.mapped,
+                    }],
+                });
+            }
+        }
         let metrics = proto::request::wire::Metrics {
             steps: 0,
             batches: 0,
             tokens: 0,
-            kernel_launches: 0,
-            device_ns: 0,
-            queue: self
-                .executors
-                .iter()
-                .enumerate()
-                .map(|(rank, _)| proto::request::wire::QueueDepth {
-                    rank: rank as u32,
-                    depth: 0,
-                })
-                .collect(),
+            kernel_launches,
+            device_ns,
+            queue,
             policy_fuel: 0,
             policy_calls: 0,
+            memory,
         };
         if let Err(error) = self
             .control
@@ -1058,13 +1084,17 @@ impl HostAction for Install {
             .programs
             .lock()
             .map_err(|_| executor::Error::State("the Program Server client was poisoned".into()))?;
-        let prepared = client.prepare(&self.request, &mut |progress| {
-            tracing::debug!(
-                path = %progress.path,
-                state = ?progress.state,
-                "building a module for the new generation"
-            );
-        })?;
+        let prepared = client
+            .prepare(&self.request, &mut |progress| {
+                tracing::debug!(
+                    path = %progress.path,
+                    state = ?progress.state,
+                    "building a module for the new generation"
+                );
+            })
+            .map_err(|error| {
+                executor::Error::State(format!("building the new generation: {error}"))
+            })?;
 
         let mut entries = Vec::new();
         for chosen in &prepared.programs {
@@ -1082,20 +1112,27 @@ impl HostAction for Install {
                 .flat_map(|descriptor| descriptor.keys.iter().cloned())
                 .collect();
             for key in keys {
-                let module = client.resolve(
-                    &chosen.slot.op,
-                    &chosen.program,
-                    &self.target,
-                    &key,
-                    &mut |progress| {
-                        tracing::debug!(
-                            path = %progress.path,
-                            state = ?progress.state,
-                            "resolving a module of the new generation"
-                        );
-                    },
-                )?;
-                if let Some(entry) = ops::install(&self.device, operator, &key, module)? {
+                let module = client
+                    .resolve(
+                        &chosen.slot.op,
+                        &chosen.program,
+                        &self.target,
+                        &key,
+                        &mut |progress| {
+                            tracing::debug!(
+                                path = %progress.path,
+                                state = ?progress.state,
+                                "resolving a module of the new generation"
+                            );
+                        },
+                    )
+                    .map_err(|error| {
+                        executor::Error::State(format!(
+                            "resolving {} for {key}: {error}",
+                            chosen.slot.op
+                        ))
+                    })?;
+                if let Some(entry) = ops::install(&self.device, operator, &key, &module)? {
                     entries.push(entry);
                 }
             }
@@ -1121,11 +1158,11 @@ struct Precopy {
     policy: Program,
     /// The generation built for each device, in `executors` order.
     next: Vec<Arc<Generation>>,
-    stage: Stage,
+    stage: PrecopyStage,
 }
 
 /// The stage a precopy is in.
-enum Stage {
+enum PrecopyStage {
     /// The module-load lane builds, resolves and installs each device's
     /// kernels.
     Modules(Vec<Arc<HostTask<Install>>>),
