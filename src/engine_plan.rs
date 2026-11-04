@@ -445,7 +445,7 @@ impl EpochPlan {
         &self,
         weights: &mut dyn nn::RetainedWeights,
         storage: &mut dyn executor::memory::retained::ExclusiveStorage,
-    ) -> Result<(Arc<qwen3_moe::Qwen3Moe>, Memory)> {
+    ) -> Result<(Arc<qwen3_moe::Qwen3Moe>, Memory, ipc::WorkerInfo)> {
         let placement = &self.placement;
         let class = architectural_class(&self.checkpoint)?;
         match class.as_str() {
@@ -468,8 +468,8 @@ impl EpochPlan {
                     &mut loader,
                     placement.load_options,
                 )?;
-                let memory = self.open_memory(&model, storage)?;
-                Ok((Arc::new(model), memory))
+                let (memory, info) = self.open_memory(&model, storage)?;
+                Ok((Arc::new(model), memory, info))
             }
             other => bail!(
                 "{} declares model class {other}, which this build cannot serve",
@@ -490,7 +490,7 @@ impl EpochPlan {
         &self,
         model: &qwen3_moe::Qwen3Moe,
         storage: &mut dyn executor::memory::retained::ExclusiveStorage,
-    ) -> Result<Memory> {
+    ) -> Result<(Memory, ipc::WorkerInfo)> {
         let device = *self
             .devices
             .first()
@@ -551,7 +551,7 @@ impl EpochPlan {
         let pools = executor::device::Executor::open(device, &graph)?;
         let stream = platform::Stream::new(device)
             .with_context(|| format!("creating device {}'s stream", device.0))?;
-        executor::memory::open_memory(
+        let memory = executor::memory::open_memory(
             executor::memory::OpenMemory {
                 plan: &planned.plan,
                 // A causal-language rank keeps no per-slot bank: its per-request state is the KV
@@ -569,11 +569,27 @@ impl EpochPlan {
             },
             storage,
         )
-        .map_err(|error| error).context("opening the rank's resident memory")
+        .map_err(|error| error)
+        .context("opening the rank's resident memory")?;
+        // The plan's own account of this rank is what the scheduler is told about its pool: the
+        // capacities it fitted, the cache it holds and where it is. It is the same `WorkerInfo` the
+        // deployment's other ranks report, so the scheduler plans against one description of a
+        // rank rather than a second one derived here.
+        Ok((memory, planned.plan.info.clone()))
+    }
+
+    /// Requests this rank's scheduler may have in flight (launch: `scheduling.max_running_requests`).
+    pub(crate) fn queue_depth(&self) -> usize {
+        self.queue_depth
+    }
+
+    /// The ranks of this process's group; one process holds one pool, so it is the deployment's.
+    pub(crate) fn world_size(&self) -> usize {
+        self.world_size
     }
 
     /// The keys a row reads at most: the cache's bound, from the epoch's context length.
-    fn max_kv_len(&self, model: &qwen3_moe::Qwen3Moe) -> Result<u32> {
+    pub(crate) fn max_kv_len(&self, model: &qwen3_moe::Qwen3Moe) -> Result<u32> {
         match self.build.max_model_len {
             Some(length) => Ok(length.get()),
             None => u32::try_from(model.config().max_position_embeddings)
