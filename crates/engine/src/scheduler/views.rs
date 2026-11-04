@@ -1130,16 +1130,83 @@ fn replica_facts(
     kind: CallKind,
 ) -> Vec<(ReplicaView, crate::WorkerGroupId, String)> {
     let executor = scheduler.executor.as_ref();
-    let info = &scheduler.info;
+    candidate_facts(
+        scheduler,
+        request,
+        kind,
+        scheduler
+            .placement
+            .worker_candidates(executor, &scheduler.info, kind),
+    )
+}
+
+/// Every candidate replica of `request`'s call of `kind` that serves the named
+/// component: a media call, whose candidates are the workers binding that
+/// component rather than the text path's.
+pub(crate) fn component_replicas(
+    scheduler: &Scheduler,
+    request: RequestKey,
+    kind: CallKind,
+    component: &str,
+) -> Vec<ReplicaView> {
+    component_facts(scheduler, request, kind, component)
+        .into_iter()
+        .map(|(view, _, _)| view)
+        .collect()
+}
+
+/// The workers [`component_replicas`] offers, in the same order and of the same
+/// length: the mechanism's half of a named component's placement decision.
+pub(crate) fn component_targets(
+    scheduler: &Scheduler,
+    request: RequestKey,
+    kind: CallKind,
+    component: &str,
+) -> Vec<(crate::WorkerGroupId, String)> {
+    component_facts(scheduler, request, kind, component)
+        .into_iter()
+        .map(|(_, worker, bound)| (worker, bound))
+        .collect()
+}
+
+/// Every candidate replica of a named component's call, as views.
+fn component_facts(
+    scheduler: &Scheduler,
+    request: RequestKey,
+    kind: CallKind,
+    component: &str,
+) -> Vec<(ReplicaView, crate::WorkerGroupId, String)> {
+    let executor = scheduler.executor.as_ref();
+    candidate_facts(
+        scheduler,
+        request,
+        kind,
+        scheduler
+            .placement
+            .component_candidates(executor, kind, component),
+    )
+}
+
+/// One replica view per candidate of `request`'s call, with the worker and
+/// component it names.
+///
+/// The candidates are the caller's list — a call kind's, or a named component's
+/// — so a policy's index and the mechanism's worker resolve against the same
+/// list, and the decode-stage filter is applied once, here, for every list.
+fn candidate_facts<'a>(
+    scheduler: &'a Scheduler,
+    request: RequestKey,
+    kind: CallKind,
+    candidates: impl Iterator<Item = (&'a crate::WorkerGroupId, &'a str, &'a WorkerInfo)>,
+) -> Vec<(ReplicaView, crate::WorkerGroupId, String)> {
+    let executor = scheduler.executor.as_ref();
     let table = world_blocks(executor);
     let decode_stage = matches!(
         kind,
         CallKind::Forward(ForwardMode::Decode | ForwardMode::Verify)
             | CallKind::Transfer(TransferMode::CacheInstall)
     );
-    scheduler
-        .placement
-        .worker_candidates(executor, info, kind)
+    candidates
         .filter(|(id, _, _)| !decode_stage || !scheduler.placement.prefill_groups.contains(*id))
         .enumerate()
         .map(|(index, (worker, bound, worker_info))| {
