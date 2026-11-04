@@ -580,6 +580,33 @@ fn stage_decode(args: &Args) -> Result<()> {
             true,
         ),
     };
+    // What the input *was*, when it was supplied: a decode of a stale trajectory file is a page no
+    // run produced, and the file's own size and modification time are what say so - the harness cannot
+    // know which run wrote it, and a name alone does not age.
+    let provenance = match &args.latents {
+        Some(path) => {
+            let metadata = std::fs::metadata(path)
+                .map_err(|error| Failure::message(format!("{}: {error}", path.display())))?;
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |elapsed| elapsed.as_secs());
+            println!(
+                "latents: {} - {} bytes, modified {} s after the epoch",
+                path.display(),
+                metadata.len(),
+                modified
+            );
+            format!(
+                "\"latents_source\": {{\"path\": \"{}\", \"bytes\": {}, \"modified_s\": {}}}, ",
+                path.display(),
+                metadata.len(),
+                modified
+            )
+        }
+        None => String::new(),
+    };
     let tiles = Tiles::of(&config.video_vae, &canvas)?.tiles(&config.video_vae, &canvas);
     let packed = pack_latents(&latent_bytes, &tiles, &canvas)?;
     let voxels: u64 = tiles.iter().map(|tile| tile.canvas.voxels()).sum();
@@ -674,7 +701,7 @@ fn stage_decode(args: &Args) -> Result<()> {
     let case = format!(
         "{{\"canvas\": {{\"height\": {}, \"width\": {}}}, \"latent_frames\": {}, \
          \"latent_height\": {}, \"latent_width\": {}, \"latent_dtype\": \"{}\", \
-         \"latents\": \"{}\", \"tiles\": {}, \"position_rows\": {}}}\n",
+         \"latents\": \"{}\", {provenance}\"tiles\": {}, \"position_rows\": {}}}\n",
         height,
         width_px,
         canvas.frames,
