@@ -334,7 +334,7 @@ pub(crate) mod tests {
     use std::sync::Mutex;
 
     use crate::{
-        Capture, DeviceAllocation, Function, Graph, LaunchConfig, Library, Result, Stream,
+        Capture, Device, DeviceAllocation, Function, Graph, LaunchConfig, Library, Result, Stream,
     };
 
     /// CUPTI is process-wide: its device tests run one at a time.
@@ -358,7 +358,7 @@ pub(crate) mod tests {
 
     impl Spin {
         pub(crate) fn load(stream: &Stream) -> Result<Self> {
-            let library = Library::load(stream.device(), SPIN.as_bytes())?;
+            let library = Library::load(&Device::new(stream.device())?, SPIN.as_bytes())?;
             let function = library.kernel("spin")?;
             Ok(Self {
                 _library: library,

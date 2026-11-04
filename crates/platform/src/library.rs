@@ -13,7 +13,7 @@ use std::ffi::CString;
 
 use crate::driver::{self, Handle};
 use crate::launch::Function;
-use crate::{DeviceId, Error, PrimaryContext, Result, reclaim};
+use crate::{Device, DeviceId, Error, PrimaryContext, Result, reclaim};
 
 /// A module of one device loaded as a library (`CUlibrary`).
 ///
@@ -42,12 +42,12 @@ impl Library {
     /// Fails with the driver's status when the image is not a valid library
     /// for the device — an empty image, another architecture's cubin, or PTX
     /// the driver cannot compile.
-    pub fn load(device: DeviceId, image: &[u8]) -> Result<Self> {
+    pub fn load(device: &Device, image: &[u8]) -> Result<Self> {
         if image.is_empty() {
             return Err(Error::invalid("a library image is empty"));
         }
 
-        let context = PrimaryContext::retain(device)?;
+        let context = PrimaryContext::retain(device.id())?;
         // PTX text reaches the driver as a C string; a binary image's size
         // comes from its ELF headers, and the appended NUL lies outside them.
         let mut code = Vec::with_capacity(image.len() + 1);
@@ -79,7 +79,7 @@ impl Library {
         Ok(Self {
             raw,
             context,
-            device,
+            device: device.id(),
         })
     }
 

@@ -3,6 +3,7 @@
 //! `cargo test -p cuda -- --ignored`.
 
 use std::collections::BTreeSet;
+use std::ffi::c_void;
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard, PoisonError, mpsc};
@@ -11,10 +12,12 @@ use std::time::Duration;
 
 use platform::nccl::{Communicator, DataType, ReduceOp, UniqueId};
 use platform::{
-    Capture, CaptureStatus, CopyBatch, DeviceAllocation, DeviceAttribute, DeviceId, Error, Event,
-    EventFlags, HandleType, Nvml, PeerMapping, PinnedBuffer, PrimaryContext, Protection,
-    SegmentedMapping, ShareableHandle, SourceOrder, Stream, Strided, StridedCopy, VirtualPool,
-    memcpy_async, memset_2d_d8, memset_d8, memset_d32, reclaim,
+    Capture, CaptureStatus, Cluster, CopyBatch, Device, DeviceAllocation, DeviceAttribute,
+    DeviceId, Error, Event, EventFlags, FunctionAttribute, HandleType, Interleave,
+    KernelNodeParams, L2Promotion, LaunchConfig, Library, Nvml, OobFill, PeerMapping, PinnedBuffer,
+    PrimaryContext, Protection, SegmentedMapping, ShareableHandle, SourceOrder, Stream, Strided,
+    StridedCopy, Swizzle, TensorDataType, TensorMap, TensorMapSpec, VirtualPool, memcpy_async,
+    memset_2d_d8, memset_d8, memset_d32, reclaim,
 };
 
 const DEVICE: DeviceId = DeviceId(0);
@@ -1003,4 +1006,469 @@ fn a_captured_graph_reads_remapped_storage_without_changing_shared_bytes() {
         assert_eq!(read(&host), vec![7; bytes]);
     }
     drop(creator);
+}
+
+/// PTX text of the kernels the launch, capture and rebind tests use.
+///
+/// `report` writes, for each block, its three grid coordinates, the first
+/// thread's three coordinates and the dynamic shared-memory size the driver
+/// allocated for the launch, seven 32-bit words per block; only thread 0 of a
+/// block stores, so a block of more than one thread still writes once.
+///
+/// `write` stores one value per thread, so a launch covers a contiguous run of
+/// words and a rebinding test can tell whose work ran.
+const KERNELS: &str = "\
+.version 8.0\n\
+.target sm_90\n\
+.address_size 64\n\
+.visible .entry report(.param .u64 out)\n\
+{\n\
+    .reg .u64 %rd<4>;\n\
+    .reg .u32 %r<13>;\n\
+    .reg .pred %p;\n\
+    ld.param.u64 %rd1, [out];\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ctaid.y;\n\
+    mov.u32 %r3, %ctaid.z;\n\
+    mov.u32 %r4, %tid.x;\n\
+    mov.u32 %r5, %tid.y;\n\
+    mov.u32 %r6, %tid.z;\n\
+    mov.u32 %r7, %dynamic_smem_size;\n\
+    mov.u32 %r8, %nctaid.x;\n\
+    mov.u32 %r9, %nctaid.y;\n\
+    mad.lo.u32 %r10, %r9, %r3, %r2;\n\
+    mad.lo.u32 %r10, %r8, %r10, %r1;\n\
+    mul.wide.u32 %rd2, %r10, 28;\n\
+    add.u64 %rd2, %rd1, %rd2;\n\
+    setp.eq.u32 %p, %r4, 0;\n\
+    @%p st.global.u32 [%rd2], %r1;\n\
+    add.u64 %rd3, %rd2, 4;\n\
+    @%p st.global.u32 [%rd3], %r2;\n\
+    add.u64 %rd3, %rd2, 8;\n\
+    @%p st.global.u32 [%rd3], %r3;\n\
+    add.u64 %rd3, %rd2, 12;\n\
+    @%p st.global.u32 [%rd3], %r4;\n\
+    add.u64 %rd3, %rd2, 16;\n\
+    @%p st.global.u32 [%rd3], %r5;\n\
+    add.u64 %rd3, %rd2, 20;\n\
+    @%p st.global.u32 [%rd3], %r6;\n\
+    add.u64 %rd3, %rd2, 24;\n\
+    @%p st.global.u32 [%rd3], %r7;\n\
+    ret;\n\
+}\n\
+.visible .entry write(.param .u64 out, .param .u32 value)\n\
+{\n\
+    .reg .u64 %rd<3>;\n\
+    .reg .u32 %r<3>;\n\
+    ld.param.u64 %rd1, [out];\n\
+    ld.param.u32 %r1, [value];\n\
+    mov.u32 %r2, %tid.x;\n\
+    mul.wide.u32 %rd2, %r2, 4;\n\
+    add.u64 %rd2, %rd1, %rd2;\n\
+    st.global.u32 [%rd2], %r1;\n\
+    ret;\n\
+}\n";
+
+/// The words of `buffer`, read after the writing stream was synchronized.
+fn words(buffer: &PinnedBuffer) -> Vec<u32> {
+    read(buffer)
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+        .collect()
+}
+
+/// A library of [`KERNELS`] on device 0.
+fn kernels(device: &Device) -> Library {
+    Library::load(device, KERNELS.as_bytes()).unwrap()
+}
+
+/// A binary library image (a fatbin, so it loads on any device the PTX was
+/// compiled for) contains NUL bytes, which the driver reads by the image's own
+/// headers; it loads and its kernel runs.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn libraries_load_a_binary_image_and_launch_its_kernel() {
+    let _driver = exclusive_driver();
+    let device = Device::new(DEVICE).unwrap();
+    assert!(matches!(
+        Library::load(&device, &[]),
+        Err(Error::InvalidArgument(_))
+    ));
+
+    let library =
+        Library::load(&device, include_bytes!("../fixtures/add_constant.fatbin")).unwrap();
+    let add_constant = library.kernel("add_constant").unwrap();
+    let stream = Stream::new(DEVICE).unwrap();
+    let storage = DeviceAllocation::linear(DEVICE, 32).unwrap();
+    let host = PinnedBuffer::new(DEVICE, 32).unwrap();
+
+    // SAFETY: the fill and the copy lie inside the allocation; the launch's
+    // parameters are the kernel's, and the value they point at outlives it.
+    unsafe { memset_d32(storage.address(), 1, 8, &stream) }.unwrap();
+    let mut out = storage.address();
+    let mut value = 2u32;
+    let mut parameters: [*mut c_void; 2] = [(&raw mut out).cast(), (&raw mut value).cast()];
+    add_constant
+        .launch_ex(
+            &stream,
+            &LaunchConfig::new([1, 1, 1], [8, 1, 1]),
+            &mut parameters,
+        )
+        .unwrap();
+    // SAFETY: the copy reads the allocation into the pinned buffer of the same
+    // size.
+    unsafe { memcpy_async(host.address(), storage.address(), 32, &stream) }.unwrap();
+    stream.synchronize().unwrap();
+
+    assert_eq!(words(&host), vec![3; 8]);
+}
+
+/// One launch carries a three-dimensional grid and block, the dynamic
+/// shared-memory size its program asks for, a thread-block cluster with its
+/// scheduling policy, programmatic dependent launch and cooperative launch;
+/// the kernel sees each of them.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn launch_ex_carries_the_grid_shared_memory_and_launch_attributes() {
+    let _driver = exclusive_driver();
+    let device = Device::new(DEVICE).unwrap();
+    let library = kernels(&device);
+    let report = library.kernel("report").unwrap();
+    // Above 48 KiB a launch needs the function's attribute raised first.
+    report
+        .set_attribute(FunctionAttribute::MaxDynamicSharedMemory, 64 << 10)
+        .unwrap();
+
+    let stream = Stream::new(DEVICE).unwrap();
+    let blocks = 8;
+    let storage = DeviceAllocation::linear(DEVICE, 7 * 4 * blocks as usize).unwrap();
+    let host = PinnedBuffer::new(DEVICE, 7 * 4 * blocks as usize).unwrap();
+    let mut out = storage.address();
+    let mut parameters: [*mut c_void; 1] = [(&raw mut out).cast()];
+
+    let config = LaunchConfig {
+        grid: [2, 2, 2],
+        block: [2, 1, 1],
+        shared_memory: 64 << 10,
+        ..LaunchConfig::default()
+    };
+    // SAFETY: the allocation holds one seven-word record per block; the
+    // parameter is the kernel's and outlives the launch.
+    unsafe { memset_d8(storage.address(), 0xff, 7 * 4 * blocks as usize, &stream) }.unwrap();
+    report.launch_ex(&stream, &config, &mut parameters).unwrap();
+    // SAFETY: the copy reads the allocation into the pinned buffer.
+    unsafe {
+        memcpy_async(
+            host.address(),
+            storage.address(),
+            7 * 4 * blocks as usize,
+            &stream,
+        )
+    }
+    .unwrap();
+    stream.synchronize().unwrap();
+
+    let observed = words(&host);
+    for block in 0..blocks as u32 {
+        let record = &observed[block as usize * 7..][..7];
+        let (x, y, z) = (block % 2, block / 2 % 2, block / 4);
+        assert_eq!(
+            record,
+            [x, y, z, 0, 0, 0, 64 << 10],
+            "block {block} reports its launch"
+        );
+    }
+
+    // Programmatic dependent launch and cooperative launch are attributes of
+    // the same launch call; a single block executes each.
+    for config in [
+        LaunchConfig {
+            grid: [1, 1, 1],
+            block: [1, 1, 1],
+            pdl: true,
+            ..LaunchConfig::default()
+        },
+        LaunchConfig {
+            grid: [1, 1, 1],
+            block: [1, 1, 1],
+            cooperative: true,
+            ..LaunchConfig::default()
+        },
+    ] {
+        // SAFETY: as above; the record at the allocation's start is inside it.
+        unsafe { memset_d8(storage.address(), 0xff, 28, &stream) }.unwrap();
+        report.launch_ex(&stream, &config, &mut parameters).unwrap();
+        // SAFETY: as above.
+        unsafe { memcpy_async(host.address(), storage.address(), 28, &stream) }.unwrap();
+        stream.synchronize().unwrap();
+        assert_eq!(words(&host)[..7], [0, 0, 0, 0, 0, 0, 0], "{config:?}");
+    }
+
+    // A cluster is one launch attribute more; it needs a compute capability
+    // that has clusters (sm_90 and later), which is every device this branch
+    // targets.
+    if device.architecture().0 >= 9 {
+        let config = LaunchConfig {
+            grid: [2, 2, 1],
+            block: [1, 1, 1],
+            cluster: Some(Cluster::new([2, 1, 1])),
+            ..LaunchConfig::default()
+        };
+        // SAFETY: four records of seven words lie in the allocation.
+        unsafe { memset_d8(storage.address(), 0xff, 4 * 28, &stream) }.unwrap();
+        report.launch_ex(&stream, &config, &mut parameters).unwrap();
+        // SAFETY: as above.
+        unsafe { memcpy_async(host.address(), storage.address(), 4 * 28, &stream) }.unwrap();
+        stream.synchronize().unwrap();
+        for (block, record) in words(&host).chunks_exact(7).enumerate() {
+            let block = block as u32;
+            assert_eq!(
+                record,
+                [block % 2, block / 2, 0, 0, 0, 0, 0],
+                "block {block} of a clustered launch"
+            );
+        }
+    }
+}
+
+/// Capture records the node each launch adds: nothing before the first launch,
+/// one node per launch after it, and the graph replays them in order.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn capture_records_the_node_of_each_launch() {
+    let _driver = exclusive_driver();
+    let device = Device::new(DEVICE).unwrap();
+    let library = kernels(&device);
+    let write = library.kernel("write").unwrap();
+    let stream = Stream::new(DEVICE).unwrap();
+    let storage = DeviceAllocation::linear(DEVICE, 32).unwrap();
+    let host = PinnedBuffer::new(DEVICE, 32).unwrap();
+    let mut out = storage.address();
+
+    let mut capture = Capture::begin(&stream).unwrap();
+    assert!(capture.record().unwrap().is_empty(), "no operation yet");
+
+    let mut first = 7u32;
+    let mut parameters: [*mut c_void; 2] = [(&raw mut out).cast(), (&raw mut first).cast()];
+    write
+        .launch_ex(
+            &stream,
+            &LaunchConfig::new([1, 1, 1], [8, 1, 1]),
+            &mut parameters,
+        )
+        .unwrap();
+    assert_eq!(capture.record().unwrap().len(), 1, "the first launch");
+
+    let mut second = 9u32;
+    let mut parameters: [*mut c_void; 2] = [(&raw mut out).cast(), (&raw mut second).cast()];
+    write
+        .launch_ex(
+            &stream,
+            &LaunchConfig::new([1, 1, 1], [8, 1, 1]),
+            &mut parameters,
+        )
+        .unwrap();
+    assert_eq!(capture.record().unwrap().len(), 1, "the second launch");
+
+    let graph = capture.end().unwrap();
+    assert_eq!(graph.node_count().unwrap(), 2);
+    assert_eq!(graph.nodes().unwrap().len(), 2);
+
+    let executable = graph.instantiate().unwrap();
+    executable.launch(&stream).unwrap();
+    // SAFETY: the copy reads the allocation into the pinned buffer.
+    unsafe { memcpy_async(host.address(), storage.address(), 32, &stream) }.unwrap();
+    stream.synchronize().unwrap();
+    assert_eq!(
+        words(&host),
+        vec![9; 8],
+        "both captured launches ran in order"
+    );
+}
+
+/// Rebinding replaces a captured kernel node's function, grid, block, dynamic
+/// shared memory and arguments; the executable then runs the new work, while
+/// the template node is unchanged.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn rebinding_changes_a_kernel_node_function_and_arguments() {
+    let _driver = exclusive_driver();
+    let device = Device::new(DEVICE).unwrap();
+    let library = kernels(&device);
+    let write = library.kernel("write").unwrap();
+    let report = library.kernel("report").unwrap();
+    let stream = Stream::new(DEVICE).unwrap();
+    let storage = DeviceAllocation::linear(DEVICE, 32).unwrap();
+    let host = PinnedBuffer::new(DEVICE, 32).unwrap();
+    let mut out = storage.address();
+
+    let mut capture = Capture::begin(&stream).unwrap();
+    let mut value = 7u32;
+    let mut parameters: [*mut c_void; 2] = [(&raw mut out).cast(), (&raw mut value).cast()];
+    write
+        .launch_ex(
+            &stream,
+            &LaunchConfig::new([1, 1, 1], [8, 1, 1]),
+            &mut parameters,
+        )
+        .unwrap();
+    let _ = capture.record().unwrap();
+    let graph = capture.end().unwrap();
+    let node = graph.nodes().unwrap().remove(0);
+    let executable = graph.instantiate().unwrap();
+
+    // The report kernel takes one argument and one block of two threads, none
+    // of which the captured node had.
+    let parameters: [*mut c_void; 1] = [(&raw mut out).cast()];
+    let params = KernelNodeParams {
+        function: &report,
+        grid: [1, 1, 1],
+        block: [2, 1, 1],
+        shared_memory: 0,
+        parameters: &parameters,
+    };
+    executable
+        .set_kernel_node_params(node.clone(), &params)
+        .unwrap();
+
+    executable.launch(&stream).unwrap();
+    // SAFETY: the copy reads the allocation into the pinned buffer.
+    unsafe { memcpy_async(host.address(), storage.address(), 32, &stream) }.unwrap();
+    stream.synchronize().unwrap();
+    assert_eq!(
+        words(&host)[..7],
+        [0, 0, 0, 0, 0, 0, 0],
+        "the rebound function ran with its new grid"
+    );
+
+    // The template still holds the captured node, so a second executable of it
+    // runs the original work.
+    let original = graph.instantiate().unwrap();
+    original.launch(&stream).unwrap();
+    // SAFETY: as above.
+    unsafe { memcpy_async(host.address(), storage.address(), 32, &stream) }.unwrap();
+    stream.synchronize().unwrap();
+    assert_eq!(words(&host), vec![7; 8], "the template node is unchanged");
+}
+
+/// Recapture rebuilds a graph from a new capture, so a program whose node
+/// count changed gets a new executable; the previous one keeps replaying what
+/// it captured.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn recapture_builds_an_executable_of_the_new_capture() {
+    let _driver = exclusive_driver();
+    let device = Device::new(DEVICE).unwrap();
+    let library = kernels(&device);
+    let write = library.kernel("write").unwrap();
+    let stream = Stream::new(DEVICE).unwrap();
+    let storage = DeviceAllocation::linear(DEVICE, 32).unwrap();
+    let host = PinnedBuffer::new(DEVICE, 32).unwrap();
+    let mut out = storage.address();
+
+    let mut capture = Capture::begin(&stream).unwrap();
+    let mut one = 1u32;
+    let mut parameters: [*mut c_void; 2] = [(&raw mut out).cast(), (&raw mut one).cast()];
+    write
+        .launch_ex(
+            &stream,
+            &LaunchConfig::new([1, 1, 1], [8, 1, 1]),
+            &mut parameters,
+        )
+        .unwrap();
+    capture.record().unwrap();
+    let before = capture.end().unwrap();
+    let before_exec = before.instantiate().unwrap();
+    assert_eq!(before.node_count().unwrap(), 1);
+
+    let mut capture = Capture::begin(&stream).unwrap();
+    let mut two = 2u32;
+    let mut three = 3u32;
+    for value in [&mut two, &mut three] {
+        let mut parameters: [*mut c_void; 2] = [(&raw mut out).cast(), (&raw mut *value).cast()];
+        write
+            .launch_ex(
+                &stream,
+                &LaunchConfig::new([1, 1, 1], [8, 1, 1]),
+                &mut parameters,
+            )
+            .unwrap();
+        capture.record().unwrap();
+    }
+    let after = capture.end().unwrap();
+    assert_eq!(after.node_count().unwrap(), 2);
+    let after_exec = after.instantiate().unwrap();
+
+    before_exec.launch(&stream).unwrap();
+    after_exec.launch(&stream).unwrap();
+    // SAFETY: the copy reads the allocation into the pinned buffer.
+    unsafe { memcpy_async(host.address(), storage.address(), 32, &stream) }.unwrap();
+    stream.synchronize().unwrap();
+    assert_eq!(
+        words(&host),
+        vec![3; 8],
+        "the recaptured executable ran, and the earlier one still replays"
+    );
+}
+
+/// A tensor map encodes the layout a TMA kernel moves: the driver accepts a
+/// rank-1 and a rank-2 description of device storage, and the description is
+/// checked against its rank before the driver sees it.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn tensor_maps_encode_tiled_descriptors() {
+    let _driver = exclusive_driver();
+    // The device's retained context is what the allocation belongs to.
+    let _device = Device::new(DEVICE).unwrap();
+    let storage = DeviceAllocation::linear(DEVICE, 4096).unwrap();
+
+    let rank_one = TensorMapSpec {
+        data_type: TensorDataType::Float32,
+        global_address: storage.address(),
+        global_dim: &[64],
+        global_strides: &[],
+        box_dim: &[4],
+        element_strides: &[1],
+        interleave: Interleave::None,
+        swizzle: Swizzle::None,
+        l2_promotion: L2Promotion::None,
+        oob_fill: OobFill::None,
+    };
+    let encoded = TensorMap::encode_tiled(&rank_one).unwrap();
+    assert!(
+        encoded.as_bytes().iter().any(|byte| *byte != 0),
+        "the driver encoded the descriptor"
+    );
+
+    let strides = [16 * 4];
+    let rank_two = TensorMapSpec {
+        data_type: TensorDataType::Float32,
+        global_address: storage.address(),
+        global_dim: &[16, 16],
+        global_strides: &strides,
+        box_dim: &[4, 4],
+        element_strides: &[1, 1],
+        interleave: Interleave::None,
+        swizzle: Swizzle::B128,
+        l2_promotion: L2Promotion::B128,
+        oob_fill: OobFill::NanRequestZeroFma,
+    };
+    TensorMap::encode_tiled(&rank_two).unwrap();
+
+    let missing_stride = TensorMapSpec {
+        global_strides: &[16, 32],
+        ..rank_two
+    };
+    assert!(matches!(
+        TensorMap::encode_tiled(&missing_stride),
+        Err(Error::InvalidArgument(_))
+    ));
+    let rank_zero = TensorMapSpec {
+        global_dim: &[],
+        ..rank_one
+    };
+    assert!(matches!(
+        TensorMap::encode_tiled(&rank_zero),
+        Err(Error::InvalidArgument(_))
+    ));
 }
