@@ -206,7 +206,11 @@ def _precompiler() -> Path:
 def _build_store(store: Path, target: str, python: Path | None) -> None:
     """Builds a module for every kernel key the deployment launches.
 
-    The modules go into `store`.
+    `store` is ``build_fixtures``'s store, which it fills in its own shape: the
+    installed package sources under ``<store>/packages`` and the prepared
+    modules under ``<store>/modules``. The directory a Program Server serves is
+    the second of those — a store root holds the modules, not the store's
+    parent.
 
     ``build_fixtures`` (``crates/program-server/examples``) is the store's own
     producer: for each ``operator<TAB>key`` line it installs the operator's
@@ -275,14 +279,15 @@ def program_server(tmp_path_factory: pytest.TempPathFactory):
     binary = require_uniserve_binary()
     work = tmp_path_factory.mktemp("program-server")
     socket = work / "program-server.sock"
-    packages = work / "packages"
-    packages.mkdir()
-    store = work / "store"
-    store.mkdir()
     log = work / "program-server.log"
     target = os.environ.get("UNISERVE_PROGRAM_TARGET", "sm_100a")
     interpreter = _repository() / ".venv" / "bin" / "python"
-    _build_store(store, target, interpreter if interpreter.exists() else None)
+    built = work / "programs"
+    _build_store(built, target, interpreter if interpreter.exists() else None)
+    # The builder's two directories are the two the server is given: installed
+    # sources for a rebuild, prepared modules for what it serves.
+    packages = built / "packages"
+    store = built / "modules"
     command = [
         str(binary),
         "program-server",
