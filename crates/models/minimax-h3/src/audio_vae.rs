@@ -367,11 +367,14 @@ pub fn audio_arena(
     );
     push("projected".to_owned(), u64::from(config.latent_dim), length);
     push("input".to_owned(), u64::from(config.decoder_dim), length);
+    // The stage list the decoder itself builds, so the plan cannot disagree with the code about a
+    // channel count or a rate: both read this one derivation.
+    let stages = stages(config)?;
     let mut channels = u64::from(config.decoder_dim);
-    for (index, rate) in config.decoder_rates.iter().enumerate() {
-        channels /= 2;
+    for (index, stage) in stages.iter().enumerate() {
+        channels = u64::from(stage.channels_out);
         length = length
-            .checked_mul(u64::from(*rate))
+            .checked_mul(u64::from(stage.rate))
             .ok_or_else(|| Error::config("an audio length overflows".to_owned()))?;
         push(format!("stage{index}.upsampled"), channels, length);
         push(format!("stage{index}.sum"), channels, length);
@@ -1450,16 +1453,43 @@ pub(crate) mod tests {
         // signal.
         assert_eq!(plan.len(), 3 + 6 * config.decoder_rates.len() + 2);
         // The lengths follow the rates, so the last stage's buffers cover `frames · Π rates` samples.
-        let longest = config
-            .decoder_rates
+        let longest = stages(&config)
+            .expect("stages")
             .iter()
-            .try_fold(u64::from(frames), |length, rate| {
-                length.checked_mul(u64::from(*rate))
+            .try_fold(u64::from(frames), |length, stage| {
+                length.checked_mul(u64::from(stage.rate))
             })
             .expect("the rates");
         assert_eq!(longest, u64::from(frames) * 800);
         let mono = plan.last().expect("the mono signal");
         assert_eq!(mono.elements, u64::from(PCM_CHANNELS) * longest);
+        // The plan's per-stage channels and lengths are the decoder's own stage list, walked once -
+        // the same derivation `forward` reserves from, so a channel count cannot drift between them.
+        for (index, stage) in stages(&config).expect("stages").iter().enumerate() {
+            let entries: Vec<&crate::decoding::Buffer> = plan
+                .iter()
+                .filter(|buffer| buffer.name.starts_with(&format!("stage{index}.")))
+                .collect();
+            assert_eq!(entries.len(), 6, "stage {index} reserves six buffers");
+            for buffer in entries {
+                // `[2, channels, length]` f32, with the length already multiplied by every rate up to
+                // and including this stage's.
+                let length = stages(&config)
+                    .expect("stages")
+                    .iter()
+                    .take(index + 1)
+                    .try_fold(u64::from(frames), |length, stage| {
+                        length.checked_mul(u64::from(stage.rate))
+                    })
+                    .expect("the rates");
+                assert_eq!(
+                    buffer.elements,
+                    u64::from(PCM_CHANNELS) * u64::from(stage.channels_out) * length,
+                    "{}",
+                    buffer.name
+                );
+            }
+        }
         // Every buffer is named once, and the total is the sum of what the walk reserves.
         let mut names: Vec<&str> = plan.iter().map(|buffer| buffer.name.as_str()).collect();
         let count = names.len();
