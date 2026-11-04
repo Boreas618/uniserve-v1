@@ -545,18 +545,19 @@ pub trait KvProvider: Send + Sync {
     /// The plane views of `group`'s layers, in model order.
     fn planes(&self, group: usize) -> Result<Vec<nn::KvPlanes>>;
 
-    /// The per-page scales of `group`'s planes, for a quantized cache.
-    fn scales(&self, group: usize) -> Option<(TensorView, TensorView)>;
-
-    /// A scratch page set of `pages` pages for `group`, its table over `slots` (`block_table`'s
-    /// order and `-1` rule), and its planes.
+    /// A scratch page set of `pages` pages for `group`, and its table over `slots`
+    /// (`block_table`'s order and `-1` rule).
+    ///
+    /// The planes carry their own scales, as the resident ones do: an FP8 group's scratch pages are
+    /// FP8 pages with a scale each, so the paired forward's kernels read a page set shaped exactly
+    /// like the one they serve.
     fn scratch(
         &self,
         group: usize,
         slots: &[i32],
         pages: u32,
         stream: &platform::Stream,
-    ) -> Result<(TensorView, Vec<nn::KvPlanes>, Option<(TensorView, TensorView)>)>;
+    ) -> Result<(TensorView, Vec<nn::KvPlanes>)>;
 }
 
 /// A causal language model's runner: one block's decode and prefill phases.
@@ -1393,8 +1394,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
                     tables.push(self.kv.block_table(group, slots, &self.stream)?);
                 }
                 Some(pages) => {
-                    let (table, planes, scale) = self.kv.scratch(group, slots, pages, &self.stream)?;
-                    let _ = scale;
+                    let (table, planes) = self.kv.scratch(group, slots, pages, &self.stream)?;
                     layers.push(planes);
                     tables.push(table);
                 }
