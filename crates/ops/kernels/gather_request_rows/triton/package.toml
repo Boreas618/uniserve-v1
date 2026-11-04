@@ -1,0 +1,36 @@
+# The gather_request_rows operator's Triton backend.
+#
+# One launch fills a call's fixed-capacity attention metadata for rows of any
+# length (prefill chunks, verification, padded graph buckets) from the request
+# slots' installed block tables: each table's selected start pages, the block
+# tables, every token's cache slot, and the shared lengths and offsets.
+op = "gather_request_rows"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "triton"
+
+[source]
+kind = "triton"
+files = ["src/gather_request_rows.py", "src/build.py", "src/_compile.py"]
+
+architectures = ["sm_100a", "sm_90a"]
+target = "arch"
+
+# `tables_1_request_width_640_slots_256_rows_4095`.
+[descriptors]
+tables = ["1"]
+request_width = ["640"]
+slots = ["256"]
+# The call's row capacity; the host column array's section length is one more.
+rows = ["127", "255", "511", "1023", "2047", "4095"]
+
+[parameters]
+block = 256
+tokens = 8192

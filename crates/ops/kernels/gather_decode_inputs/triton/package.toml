@@ -1,0 +1,43 @@
+# The gather_decode_inputs operator's Triton backend.
+#
+# One launch fills a decode call's attention metadata from resident request
+# state: each request's input token, position, cache length, query length, its
+# block table's entries and every token's cache slot, padding rows included so
+# the launch can be captured in a decode graph of any row bucket.
+op = "gather_decode_inputs"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "triton"
+
+[source]
+kind = "triton"
+files = ["src/gather_decode_inputs.py", "src/build.py", "src/_compile.py"]
+
+architectures = ["sm_100a", "sm_90a"]
+target = "arch"
+
+# `tables_1_request_width_640_slots_256_rows_64`.
+[descriptors]
+# Numerical tables the metadata describes; one full-attention table here.
+tables = ["1"]
+# Pages one slot's resident table row holds: ceil(max_model_len / page size).
+request_width = ["640"]
+# Slot capacity of the request-slot banks.
+slots = ["256"]
+# The captured decode row bucket: the kernel's power-of-two row block.
+rows = ["1", "2", "4", "8", "16", "32", "64", "128", "256"]
+
+[parameters]
+# Table cells one program copies.
+block = 256
+# Values one per request slot in the resident request state rows.
+request_fields = 1
+# Tokens one call's slot mapping spans.
+tokens = 256

@@ -1,0 +1,38 @@
+# The rms_norm operator's Triton backend.
+#
+# One program normalizes one last-axis row of FP32 statistics and rounds once
+# into the output dtype. A module covers one (dtype, width, layout, target):
+# the row geometry, the row width and the epsilon are compile-time values of
+# the kernel, and programmatic dependent launch follows the target's compute
+# capability.
+op = "rms_norm"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "triton"
+
+[source]
+kind = "triton"
+files = ["src/rms_norm.py", "src/build.py", "src/_compile.py"]
+
+# The architectures a module is built for; the module path's target is the
+# architecture itself (`target = "arch"`).
+architectures = ["sm_100a", "sm_90a"]
+target = "arch"
+
+# The descriptor dimensions this package covers and the values of each. The
+# key names every dimension: `dtype_bf16_width_2048_layout_contiguous`.
+[descriptors]
+dtype = ["bf16", "fp16", "fp32"]
+width = ["768", "2048", "4096", "6144"]
+layout = ["contiguous"]
+
+[parameters]
+# The normalization epsilon the model loads with (`rms_norm_eps`).
+eps = 1e-06

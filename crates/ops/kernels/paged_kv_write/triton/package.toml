@@ -1,0 +1,38 @@
+# The paged_kv_write operator's Triton backend.
+#
+# One program scatters a tile-wide slice of one token's flattened [heads, dim]
+# row into its physical slot, optionally marking the block it landed in as
+# initialized. The cache geometry, the page count and the source strides are
+# compile-time values of the kernel, so a module covers one KV layout.
+op = "paged_kv_write"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "triton"
+
+[source]
+kind = "triton"
+files = ["src/paged_kv_write.py", "src/build.py", "src/_compile.py"]
+
+architectures = ["sm_100a", "sm_90a"]
+target = "arch"
+
+# `dtype_bf16_heads_4_head_dim_128_block_size_64_pages_4096_flags_blocks_layout_contiguous`.
+[descriptors]
+dtype = ["bf16", "fp16", "fp32"]
+heads = ["4", "8"]
+head_dim = ["128"]
+block_size = ["16", "64", "128"]
+pages = ["1024", "4096", "16384", "65536"]
+flags = ["blocks", "none"]
+layout = ["contiguous"]
+
+[parameters]
+# Elements one program scatters: the kernel's column tile.
+tile = 256
