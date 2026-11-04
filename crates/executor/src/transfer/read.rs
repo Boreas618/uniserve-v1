@@ -28,12 +28,12 @@ use super::{
 };
 use crate::completion::Outcome;
 use crate::host::HostTask;
+use crate::memory::allocation::Backing;
+use crate::memory::allocation::ElementType;
+use crate::memory::allocation::MemoryKind;
 use crate::memory::allocation::{Storage, StorageView};
 use crate::stream::EventPool;
 use crate::stream::Issue;
-use crate::memory::allocation::Backing;
-use crate::memory::allocation::ElementType;
-use crate::memory::allocation::{MemoryKind};
 use crate::{Error, Result, lock};
 
 pub(crate) type BorrowedReads = Mutex<Option<HashMap<usize, Weak<Read>>>>;

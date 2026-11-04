@@ -18,14 +18,15 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
-use ipc::PhaseId;
+use ipc::{PhaseId, TimingCounters};
 use nn::{CausalLm, Forward, KvView, SamplerState, Samples, TokenBatch};
 use ops::{DType, Generation, TensorView};
 use platform::DeviceId;
 
 use crate::arena::{Pools, PoolMetrics, StreamId};
-use crate::batch::{Batch, BatchColumns, BatchOutput, CallId, Job, Jobs, SampledToken};
+use crate::batch::{Batch, BatchColumns, BatchOutput, CallId, CallOutput, Job, Jobs, RowState};
 use crate::captured::Captured;
 use crate::graph::Graphs;
 use crate::plan::{Bucket, Buckets, Shape};
@@ -404,6 +405,9 @@ struct Columns {
     /// `[tokens]` i32 the input ids, which the model embeds into the forward's hidden states.
     input_ids: Column,
     slot_mapping: Column,
+    /// `[tokens]` i32 the paired forward's cache slots: the same tokens, addressed in the scratch
+    /// set's numbering, so a shadow walk writes no resident page (7.3).
+    scratch_slots: Column,
     seq_lens: Column,
     query_offsets: Column,
     logits_rows: Column,
@@ -434,6 +438,7 @@ impl Columns {
             positions: Column::new(device, DType::I32, tokens)?,
             input_ids: Column::new(device, DType::I32, tokens)?,
             slot_mapping: Column::new(device, DType::I32, tokens)?,
+            scratch_slots: Column::new(device, DType::I32, tokens)?,
             seq_lens: Column::new(device, DType::I32, rows)?,
             query_offsets: Column::new(device, DType::I32, rows + 1)?,
             logits_rows: Column::new(device, DType::I32, rows)?,
@@ -585,6 +590,11 @@ struct CommitColumns {
     capacity: u64,
     /// The launch's block, which must cover every row of the largest bucket.
     block: u32,
+    /// The slots the per-slot state columns address.
+    slots: u32,
+    /// `[slots]` i32 the per-slot trajectory positions, read back after a replay: the commit kernel
+    /// advances them, so only the device knows where a call's slot stands.
+    readback: platform::PinnedBuffer,
 }
 
 impl CommitColumns {
@@ -604,6 +614,11 @@ impl CommitColumns {
             future: Column::new(device, DType::I32, u64::from(slots.max(1)))?,
             capacity,
             block: commit_block(rows),
+            slots: slots.max(1),
+            readback: platform::PinnedBuffer::new(
+                device,
+                2 * slots.max(1) as usize * std::mem::size_of::<i32>(),
+            )?,
         };
         // The roles a decode step leaves inert hold their starting values; only `table` is written
         // again per batch.
@@ -625,6 +640,38 @@ impl CommitColumns {
         let zeros_u8 = vec![0_u8; slots.max(1) as usize];
         columns.predicates.write(&zeros_u8)?;
         Ok(columns)
+    }
+
+    /// The slots the per-slot state columns address.
+    fn slots(&self) -> usize {
+        self.slots as usize
+    }
+
+    /// The device address of the per-slot trajectory positions.
+    fn sampling_ptr(&self) -> ops::DevicePtr {
+        self.sampling.device.ptr
+    }
+
+    /// The device address of the per-slot logical positions: the cache extent execution
+    /// initialized.
+    fn logical_ptr(&self) -> ops::DevicePtr {
+        self.logical.device.ptr
+    }
+
+
+    /// The bytes the readback buffer holds, which bounds what one copy may read.
+    fn readback_len(&self) -> usize {
+        self.readback.len()
+    }
+
+    /// The host address a readback copies the trajectory positions into.
+    fn readback_address(&self) -> u64 {
+        self.readback.address()
+    }
+
+    /// The host side of the readback, as the positions the copy filled.
+    fn readback_ptr(&self) -> *const u8 {
+        self.readback.as_ptr()
     }
 
     /// Writes the staged commit table - `[COMMIT_FIELDS, rows]` i64, column-major - as the i32 table
@@ -1014,11 +1061,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
 
     /// The shape of the bucket a batch is served from.
     fn bucket_for(&self, shape: &Shape) -> Result<Bucket> {
-        self.buckets.select(shape).ok_or_else(|| {
-            Error::Invalid(format!(
-                "no captured bucket holds {shape}: the bucket plan and the batch disagree"
-            ))
-        })
+        self.buckets.require(shape)
     }
 }
 
@@ -1304,10 +1347,12 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         if self
             .previous
             .as_ref()
-            .is_some_and(|previous| previous.number() < generation)
+            .is_some_and(|previous| previous.number() <= generation)
         {
-            // The last `Arc` of the old generation drops here; every kernel whose graph was
-            // rebound or destroyed unloads its library with it (7.3's purge).
+            // The last `Arc` of the purged generation drops here; every kernel whose graph was
+            // rebound or destroyed unloads its library with it (7.3's purge). The generation a
+            // revert kept is named by the purge too - it is the *newer* of the two then - so the
+            // test is "this generation or an older one", not "older than this".
             self.previous = None;
         }
     }
@@ -1331,13 +1376,16 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                         "no graph of bucket {bucket} in generation {generation}"
                     ))
                 })?;
+                let launched = Instant::now();
                 captured.launch(&stream)?;
                 if let Some(counters) = &self.counters {
                     counters.launches(captured.kernel_nodes());
                 }
                 // The sampled tokens are read back now, before the submission completes: the
-                // mechanism builds the next step's input ids from them (4.4).
-                self.read_sampled(*bucket)
+                // mechanism builds the next step's input ids from them (4.4). The wait covers the
+                // replay as well, which is why the launch's instant is what the device segment is
+                // measured from.
+                self.read_sampled(*bucket, launched)
             }
             Job::Capture {
                 bucket, generation, ..
@@ -1539,9 +1587,17 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// Walks one bucket's forward with two kernels of `operator`: `previous`'s on the real outputs
     /// and `next`'s on the twins (7.3).
     ///
-    /// The paired forward runs over the batch's own columns but a scratch KV: every page it writes
-    /// is a scratch page, so the new kernel cannot touch a page a serving request reads. The
-    /// model's `Forward::operate` does the branch, once, for every layer alike.
+    /// The paired forward runs over a scratch KV: every page it writes is a scratch page, so the
+    /// new kernel cannot touch a page a serving request reads. The model's `Forward::operate` does
+    /// the branch, once, for every layer alike.
+    ///
+    /// Its columns are the ones the bucket has staged. A shadow job the mechanism submits right
+    /// after a batch stages that batch, so the comparison runs on served work; a precopy-driven
+    /// shadow job has no batch staged, and this stages a warm pose instead - the same bucket, the
+    /// same launches, every slot `-1` so the cache write is inert. Both are sound for a kernel
+    /// comparison (each operator is compared on the inputs its old kernel saw), and the warm one is
+    /// what a precopy can have: the update is checked before the generation that would serve it has
+    /// served anything.
     fn walk_paired(
         &mut self,
         bucket: Bucket,
@@ -1559,23 +1615,27 @@ impl<M: CausalLm> CausalLmRunner<M> {
             }
         }
         self.upload(bucket)?;
+        // Every row writes its own scratch pages: the paired forward must not write a resident one.
+        let pages = bucket
+            .tokens
+            .div_ceil(self.geometry.page_size.max(1))
+            .max(1);
+        self.upload_scratch_slots(bucket, pages)?;
         let base = self.pool()?.base(self.stream_id())?;
         let arena = nn::Arena::new(
             ops::DevicePtr::new(base.address()),
             self.pool()?.reserved(),
         );
-        let batch = self.token_batch(bucket)?;
+        let batch = self.token_batch_with(
+            bucket,
+            self.columns.scratch_slots.extent(0..u64::from(bucket.tokens)),
+        )?;
         let shadow = nn::forward::Shadow::new(operator, key, previous, twins);
         let forward = Forward::new(&stream, next, &arena).with_shadow(shadow);
         let hidden = arena.tensor(
             self.geometry.hidden_dtype,
             ops::Shape::new(&[u64::from(bucket.tokens), u64::from(self.geometry.hidden)]),
         )?;
-        // Every row writes its own scratch page: the paired forward must not write a resident one.
-        let pages = bucket
-            .tokens
-            .div_ceil(self.geometry.page_size.max(1))
-            .max(1);
         let slots: Vec<i32> = self.staging.slots(bucket.rows as usize).to_vec();
         let ids = self.input_ids(bucket);
         self.with_kv(&slots, Some(pages), |cache| {
@@ -1604,13 +1664,17 @@ impl<M: CausalLm> CausalLmRunner<M> {
         )))
     }
 
-    /// Reads the bucket's sampled token ids back and names the call each belongs to (4.4).
+    /// Reads the step's device results back and states what each call did (4.4).
     ///
-    /// The sampling step wrote one `i32` per sampling row into the bucket's plan; the readback
-    /// copies them into the runner's pinned buffer after the replay's stream completed, and the
-    /// batch's columns say which call each row belongs to. A bucket that samples nothing, or a
-    /// batch whose rows all end no prompt, answers with no token.
-    fn read_sampled(&mut self, bucket: Bucket) -> Result<BatchOutput> {
+    /// Two columns come back after the replay's stream completed: the sampled token ids the
+    /// sampling step wrote (one `i32` per sampling row) and the commit table's per-slot trajectory
+    /// position, which the commit kernel advanced. `launched` is the instant the replay was issued,
+    /// so the device segment is measured from the launch to this wait and the host segment from
+    /// there to the output.
+    ///
+    /// A bucket that samples nothing answers with an empty output: nothing was measured and no call
+    /// produced a token.
+    fn read_sampled(&mut self, bucket: Bucket, launched: Instant) -> Result<BatchOutput> {
         let Some(samples) = self.bucket_samples.borrow().get(&bucket).copied() else {
             return Ok(BatchOutput::default());
         };
@@ -1621,8 +1685,15 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 "the sampler's readback buffer is smaller than the bucket".into(),
             ));
         }
+        let slots = self.commit.slots();
+        if 2 * slots * std::mem::size_of::<i32>() > self.commit.readback_len() {
+            return Err(Error::Invariant(
+                "the commit table's readback buffer is smaller than the slot count".into(),
+            ));
+        }
         // SAFETY: the sampled ids are `rows` i32 in the bucket's plan and the readback buffer is
-        // this runner's pinned memory of at least that size; the stream has completed.
+        // this runner's pinned memory of at least that size, as is the table's `[slots]` i32; the
+        // stream has completed.
         unsafe {
             platform::memcpy_async(
                 self.columns.readback.address(),
@@ -1630,21 +1701,76 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 bytes,
                 &self.stream,
             )?;
+            // The two per-slot lengths the completion reports: the logical position execution
+            // initialized and the sampling position a successor may read.
+            platform::memcpy_async(
+                self.commit.readback_address(),
+                self.commit.logical_ptr().address(),
+                slots * std::mem::size_of::<i32>(),
+                &self.stream,
+            )?;
+            platform::memcpy_async(
+                self.commit.readback_address() + (slots * std::mem::size_of::<i32>()) as u64,
+                self.commit.sampling_ptr().address(),
+                slots * std::mem::size_of::<i32>(),
+                &self.stream,
+            )?;
         }
-        // The one synchronization of a step's host boundary: the replay and the copy are ordered on
-        // the runner's stream, so this wait covers both, and it is what the mechanism waits on to
-        // build the next step's input ids.
+        // The one synchronization of a step's host boundary: the replay and the copies are ordered
+        // on the runner's stream, so this wait covers all of them, and it is what the mechanism
+        // waits on to build the next step's input ids.
         self.stream.synchronize()?;
-        // SAFETY: the copy above filled `rows` i32 of pinned host memory with the sampled ids.
-        let ids: &[i32] = unsafe {
-            std::slice::from_raw_parts(self.columns.readback.as_ptr().cast::<i32>(), rows)
+        let device_us = launched.elapsed().as_micros() as u64;
+        let host_start = Instant::now();
+        // SAFETY: the copies above filled `rows` i32 with the sampled ids and `slots` i32 with the
+        // table's trajectory positions.
+        let (ids, logical, sampling) = unsafe {
+            (
+                std::slice::from_raw_parts(self.columns.readback.as_ptr().cast::<i32>(), rows),
+                std::slice::from_raw_parts(self.commit.readback_ptr().cast::<i32>(), slots),
+                std::slice::from_raw_parts(
+                    (self.commit.readback_ptr() as usize + slots * std::mem::size_of::<i32>())
+                        as *const i32,
+                    slots,
+                ),
+            )
         };
-        sampled_output(
+        let row_slots = self.staging.slots(rows);
+        let mut states = Vec::with_capacity(rows);
+        for slot in row_slots {
+            // A padded row names no slot, so the commit table states nothing about it.
+            states.push(if *slot < 0 {
+                RowState::default()
+            } else {
+                let at = *slot as usize;
+                RowState {
+                    // For text the slot's trajectory position is the number of tokens it has
+                    // committed, which the table keeps in the sampling column; a latent
+                    // trajectory advances the same column one step at a time.
+                    step_index: length_at(sampling, at),
+                    cache_computed_len: length_at(logical, at),
+                    cache_visible_len: length_at(sampling, at),
+                }
+            });
+        }
+        let calls = calls_output(
             ids,
             self.staging.logits_rows(),
             self.staging.batch_rows(),
             self.staging.calls(),
-        )
+            &states,
+        )?;
+        Ok(BatchOutput {
+            calls,
+            timing: TimingCounters {
+                // The device thread states the wait it saw; the runner issues nothing before it.
+                queued_us: 0,
+                device_us,
+                // Nothing is transferred for a completion in-process: the mechanism reads it here.
+                copy_us: 0,
+                host_us: host_start.elapsed().as_micros() as u64,
+            },
+        })
     }
 
     /// Uploads the staged batch into the device columns the captured graphs address.
@@ -1716,6 +1842,28 @@ impl<M: CausalLm> CausalLmRunner<M> {
         Ok(())
     }
 
+    /// Stages the paired forward's cache slots: the batch's own tokens, addressed in the scratch
+    /// page set's numbering.
+    ///
+    /// A slot is flat over one plane's pages, and the scratch set gives row `r` the pages
+    /// `r · pages .. (r + 1) · pages`, which is what its block table states; so the new kernel's
+    /// writes land in the row's own scratch pages and never in a page a served request reads (7.3).
+    fn upload_scratch_slots(&mut self, bucket: Bucket, pages: u32) -> Result<()> {
+        let rows = bucket.rows as usize;
+        let tokens = bucket.tokens as usize;
+        let batch = self.staging.batch_rows();
+        let mapping = crate::shadow::scratch_slot_mapping(
+            &batch.positions[..tokens],
+            &batch.query_offsets[..rows + 1],
+            &batch.slot_mapping[..tokens],
+            pages,
+            self.geometry.page_size,
+        )?;
+        encode_i32(&mut self.encoded, &mapping);
+        self.columns.scratch_slots.write(&self.encoded)?;
+        self.columns.scratch_slots.upload(&self.stream)
+    }
+
     /// The bucket's extent of the input ids, which the forward embeds before the stack.
     fn input_ids(&self, bucket: Bucket) -> TensorView {
         self.columns.input_ids.extent(0..u64::from(bucket.tokens))
@@ -1723,9 +1871,18 @@ impl<M: CausalLm> CausalLmRunner<M> {
 
     /// The device-side `TokenBatch` of `bucket`: the bucket's extent of each column.
     fn token_batch(&self, bucket: Bucket) -> Result<TokenBatch> {
+        self.token_batch_with(
+            bucket,
+            self.columns.slot_mapping.extent(0..bucket.tokens as u64),
+        )
+    }
+
+    /// The batch with `slot_mapping` in place of the served batch's cache slots: what a paired
+    /// forward passes so its writes land in scratch pages (7.3).
+    fn token_batch_with(&self, bucket: Bucket, slot_mapping: TensorView) -> Result<TokenBatch> {
         Ok(TokenBatch {
             positions: self.columns.positions.extent(0..bucket.tokens as u64),
-            slot_mapping: self.columns.slot_mapping.extent(0..bucket.tokens as u64),
+            slot_mapping,
             seq_lens: self.columns.seq_lens.extent(0..bucket.rows as u64),
             query_offsets: self.columns.query_offsets.extent(0..bucket.rows as u64 + 1),
             logits_rows: self.columns.logits_rows.extent(0..bucket.rows as u64),
@@ -2043,17 +2200,27 @@ impl ops::capture::Sink for Recording {
     }
 }
 
-/// Names each sampled row's call: the step's output in the mechanism's order (4.4).
+/// The non-negative length a per-slot table column holds for `slot`, or zero when the table has no
+/// such slot: a length is never negative, and a padded row names no slot at all.
+fn length_at(column: &[i32], slot: usize) -> u32 {
+    column.get(slot).copied().unwrap_or(0).max(0) as u32
+}
+
+/// Names each call's tokens and trajectory position: the step's output in the mechanism's order
+/// (4.4).
 ///
 /// `sampling_rows` are the batch rows a token is sampled for, in batch order; `calls` name the row
-/// ranges of the batch. A sampling row outside every call is an invariant violation: the
-/// mechanism's columns and its calls disagree about the batch.
-pub fn sampled_output(
+/// ranges of the batch, and `steps` carry the same length as `calls`: the trajectory position the
+/// commit table left each call's slot at. A call with no sampling row still gets an entry - it
+/// advanced, it just ended no prompt - and a sampling row outside every call is an invariant
+/// violation, because the mechanism's columns and its calls would then disagree about the batch.
+pub fn calls_output(
     ids: &[i32],
     sampling_rows: &[i32],
     rows: &nn::BatchRows,
     calls: &[CallId],
-) -> Result<BatchOutput> {
+    states: &[RowState],
+) -> Result<Vec<CallOutput>> {
     if ids.len() < sampling_rows.len() {
         return Err(Error::Invariant(format!(
             "the bucket sampled {} rows and the batch names {}",
@@ -2061,7 +2228,18 @@ pub fn sampled_output(
             sampling_rows.len()
         )));
     }
-    let mut tokens = Vec::with_capacity(sampling_rows.len());
+    if states.len() != calls.len() {
+        return Err(Error::Invariant(format!(
+            "the batch names {} rows and {} commit positions",
+            calls.len(),
+            states.len()
+        )));
+    }
+    let mut output: Vec<CallOutput> = calls
+        .iter()
+        .zip(states)
+        .map(|(call, state)| CallOutput::completed(*call, Vec::new(), *state))
+        .collect();
     for (index, row) in sampling_rows.iter().copied().enumerate() {
         // `logits_rows` names the token row that feeds `logits`; a negative entry is a row that
         // samples nothing (a padded row, or a prefill chunk that ends no prompt).
@@ -2077,17 +2255,12 @@ pub fn sampled_output(
             .ok_or_else(|| {
                 Error::Invariant(format!("no call of the batch owns sampling row {row}"))
             })?;
-        let call = calls.get(position).copied().ok_or_else(|| {
-            Error::Invariant(format!(
-                "the batch names no call id for its row {position}"
-            ))
+        let entry = output.get_mut(position).ok_or_else(|| {
+            Error::Invariant(format!("the batch names no call id for its row {position}"))
         })?;
-        tokens.push(SampledToken {
-            call,
-            token: ids[index] as u32,
-        });
+        entry.tokens.push(ids[index] as u32);
     }
-    Ok(BatchOutput { tokens })
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -2335,35 +2508,59 @@ mod sampled_output_tests {
         }
     }
 
-    /// The step's output names each sampled row's call, in the batch's row order, whatever order
-    /// the mechanism listed the calls in.
+    /// The step's output names every call of the batch, and each call's tokens are its own rows'
+    /// samples in row order, whatever order the mechanism listed the calls in.
     #[test]
     fn sampled_rows_are_named_by_their_calls() {
         let batch = rows(&[(0, 0..1), (1, 1..2)]);
-        let output = sampled_output(&[111, 222], &[1, 0], &batch, &[CallId(7), CallId(9)])
-            .expect("both rows belong to a call");
+        let output = calls_output(
+            &[111, 222],
+            &[1, 0],
+            &batch,
+            &[CallId(7), CallId(9)],
+            &[
+                RowState { step_index: 3, cache_computed_len: 3, cache_visible_len: 3 },
+                RowState { step_index: 4, cache_computed_len: 4, cache_visible_len: 4 },
+            ],
+        )
+        .expect("both rows belong to a call");
         assert_eq!(
-            output.tokens,
+            output,
             vec![
-                SampledToken {
-                    call: CallId(9),
-                    token: 222
-                },
-                SampledToken {
-                    call: CallId(7),
-                    token: 111
-                },
+                CallOutput::completed(
+                    CallId(7),
+                    vec![111],
+                    RowState { step_index: 3, cache_computed_len: 3, cache_visible_len: 3 },
+                ),
+                CallOutput::completed(
+                    CallId(9),
+                    vec![222],
+                    RowState { step_index: 4, cache_computed_len: 4, cache_visible_len: 4 },
+                ),
             ]
         );
     }
 
-    /// A batch with no sampling row produces no token: a prefill chunk that samples nothing and a
-    /// bucket whose rows are all padding.
+    /// A call whose rows sample nothing still completes: it advanced, it just ended no prompt. A
+    /// bucket with no sampling row states no call and measures nothing.
     #[test]
-    fn a_batch_that_samples_nothing_produces_no_tokens() {
-        let output = sampled_output(&[], &[-1], &rows(&[(0, 0..4)]), &[CallId(1)])
-            .expect("no sampling rows");
-        assert!(output.tokens.is_empty());
+    fn a_call_that_samples_nothing_still_completes() {
+        let output = calls_output(
+            &[],
+            &[-1],
+            &rows(&[(0, 0..4)]),
+            &[CallId(1)],
+            &[RowState { step_index: 7, cache_computed_len: 4, cache_visible_len: 4 }],
+        )
+        .expect("no sampling rows");
+        assert_eq!(
+            output,
+            vec![CallOutput::completed(
+                CallId(1),
+                Vec::new(),
+                RowState { step_index: 7, cache_computed_len: 4, cache_visible_len: 4 }
+            )]
+        );
     }
 
     /// A sampling row outside every call, or fewer sampled ids than sampling rows, is an invariant
@@ -2371,7 +2568,12 @@ mod sampled_output_tests {
     #[test]
     fn a_row_no_call_owns_is_refused() {
         let batch = rows(&[(0, 0..1)]);
-        sampled_output(&[5], &[3], &batch, &[CallId(1)]).expect_err("row 3 belongs to no call");
-        sampled_output(&[], &[0], &batch, &[CallId(1)]).expect_err("no id was sampled for row 0");
+        calls_output(&[5], &[3], &batch, &[CallId(1)], &[RowState::default()])
+            .expect_err("row 3 belongs to no call");
+        calls_output(&[], &[0], &batch, &[CallId(1)], &[RowState::default()])
+            .expect_err("no id was sampled for row 0");
+        calls_output(&[5], &[0], &batch, &[CallId(1)], &[])
+            .expect_err("one call, no trajectory position");
     }
+
 }
