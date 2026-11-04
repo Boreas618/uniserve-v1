@@ -347,6 +347,26 @@ impl Leader {
         let replicas = self.replicas();
         let current = locked(&replicas[0].config).clone();
         let (target, stated, _update) = resolve(&current, &request)?;
+        // A target that reverted with a failure is unavailable until it is
+        // applied with `force` (§7.2, §7.3 step 4), whichever layer would
+        // apply it: the epoch layer's switch and the program layer both end
+        // by recording the update here.
+        if !request.force
+            && let Some(failure) = self
+                .updates
+                .epochs()
+                .unavailable(&crate::epoch::Deployment::of(target.clone()))
+        {
+            return Err(UpdateError::Refused(format!(
+                "the configuration reverted with a failure ({}); apply it again with force",
+                failure.reason
+            )));
+        }
+        // The same mark carried across a handover: a predecessor daemon that
+        // adopted it kept it in the replica's state, not in an update record.
+        if !request.force {
+            replicas[0].available(&target, request.force)?;
+        }
         // One update at a time (§7.2, §7.4), whichever layer the change is
         // the other's: while a switch runs or a program update is on
         // probation, the `served` spec and the records this entry would read
@@ -598,6 +618,24 @@ impl Leader {
             deployment_gpus(nodes).into()
         });
         status["ledgers"] = ledgers;
+        // A revert's mark lives with the epoch layer's last update; the
+        // replicas' own marks are the ones a handover carried in.
+        if let Some(update) = self.updates.epochs().update()
+            && let Some(failure) = update.unavailable()
+        {
+            let mut marks = status["unavailable"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            if !marks.iter().any(|mark| mark["reason"] == failure.reason) {
+                marks.push(serde_json::json!({
+                    "digest": digest(&update.target.config).unwrap_or_default(),
+                    "update": update.number,
+                    "reason": failure.reason,
+                }));
+            }
+            status["unavailable"] = marks.into();
+        }
         status
     }
 }

@@ -107,6 +107,11 @@ impl Driver {
         };
         running.advance(roster);
         if matches!(running.phase(), Phase::Purged | Phase::Abandoned) {
+            // The update that ended is the deployment's last, reverted or
+            // committed: the epoch layer keeps it, so applying the same
+            // target again asks for `force` (§7.2, §7.3 step 4) and the
+            // status reports why it was unavailable.
+            self.epochs.set_update(running.update().clone());
             *switch = None;
         }
     }
