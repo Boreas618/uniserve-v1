@@ -87,6 +87,9 @@ pub struct SimExecutor {
     ledgers: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
     /// The simulator thread; `None` once the executor is closed.
     handle: Option<JoinHandle<()>>,
+    /// The simulator's stop flag: set before the thread is joined, so that a
+    /// batch waiting for a permit cannot hold the join open.
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Requests admitted by a submitted batch whose `Finish` has not been
     /// acknowledged through `poll`.
     admissions: HashSet<ipc::RequestKey>,
@@ -129,6 +132,7 @@ impl SimExecutor {
         let latent_pools = engine.latent_pools.clone();
         let encoder_pools = engine.encoder_pools.clone();
         let results_on_wait = engine.results_on_wait;
+        let stop = std::sync::Arc::clone(&engine.stop);
         let depth = placement.queue_depth.max(1);
         let (to_worker, jobs) = crossbeam_channel::unbounded();
         let (results_tx, from_worker) = crossbeam_channel::unbounded();
@@ -197,6 +201,7 @@ impl SimExecutor {
             throttles: None,
             ledgers: None,
             handle: Some(handle),
+            stop,
             admissions: HashSet::new(),
             products: HashSet::new(),
             held: None,
@@ -334,6 +339,9 @@ impl SimExecutor {
 
     /// Closes the simulated physical worker.
     fn shutdown(&mut self) -> anyhow::Result<()> {
+        // A batch waiting for its permit would otherwise never return, and
+        // the join below would wait for it forever.
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
         let _ = self.to_worker.send(Job::Shutdown);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
@@ -954,6 +962,10 @@ pub struct SimEngine {
     /// Permits for batches: each batch executes only after taking one, or
     /// once the sender is dropped ([`SimEngine::pace`]).
     pace: Option<Receiver<()>>,
+    /// Set when the executor that drives this simulator shuts down: a batch
+    /// waiting for a permit gives up instead of holding the thread its
+    /// executor joins on.
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Admitted requests by id, removed when a `Finish` for the same request
     /// key executes.
     requests: HashMap<RequestId, SimRequestState>,
@@ -1120,6 +1132,7 @@ impl SimEngine {
             speculation: None,
             predicated_release: None,
             pace: None,
+            stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             requests: HashMap::new(),
             refused: HashMap::new(),
             latent_pools: Vec::new(),
@@ -2214,11 +2227,23 @@ impl SimEngine {
     /// earlier calls, and whatever the failing call applied before the error
     /// keep their effects on request state.
     fn execute(&mut self, batch: ExecutionBatch) -> anyhow::Result<BatchOutput> {
-        // A paced simulator waits for its permit; a dropped sender frees it.
-        if let Some(pace) = &self.pace
-            && pace.recv().is_err()
-        {
-            self.pace = None;
+        // A paced simulator waits for its permit; a dropped sender frees it,
+        // and so does its executor's shutdown, so that a batch waiting for a
+        // permit cannot hold the thread the executor joins on.
+        if let Some(pace) = self.pace.clone() {
+            loop {
+                if self.stop.load(std::sync::atomic::Ordering::Acquire) {
+                    anyhow::bail!("the simulator stopped while a batch waited for its permit");
+                }
+                match pace.recv_timeout(std::time::Duration::from_millis(20)) {
+                    Ok(()) => break,
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                        self.pace = None;
+                        break;
+                    }
+                }
+            }
         }
         // `SimExecutor::submit` validated the batch.
         let batch_id = batch.id;
