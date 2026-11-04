@@ -219,6 +219,17 @@ impl Leader {
     }
 
     pub(crate) fn engine_handoff(&self) -> anyhow::Result<Vec<EngineHandoff>> {
+        // A handover passes the serving engine, its world and the
+        // configuration to the successor, not the update in progress: an
+        // epoch switch's children and phases or a program trial's record do
+        // not cross it, so the handover waits for the update to end
+        // (`specs/worker.md` §7.5, one update at a time).
+        if let Some(update) = crate::updates::in_flight(
+            self.updates.running(),
+            self.epochs().program_update().is_some(),
+        ) {
+            anyhow::bail!("{update}: a daemon handover waits until the update ends");
+        }
         self.replicas()
             .iter()
             .map(|replica| replica.engine_handoff())
