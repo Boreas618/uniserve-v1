@@ -281,6 +281,52 @@ pub enum OobFill {
 mod tests {
     use super::*;
 
+    /// The discriminants of the description's enums are `cuda.h`'s
+    /// `CUtensorMap*` codes, passed to the driver unchanged: a wrong one is a
+    /// refused encode or a differently swizzled read, never a compile error.
+    #[test]
+    fn the_description_codes_are_the_headers() {
+        crate::header::assert_constants(
+            "cuda.h",
+            &[
+                ("CU_TENSOR_MAP_INTERLEAVE_NONE", Interleave::None as i64),
+                ("CU_TENSOR_MAP_INTERLEAVE_16B", Interleave::B16 as i64),
+                ("CU_TENSOR_MAP_INTERLEAVE_32B", Interleave::B32 as i64),
+                ("CU_TENSOR_MAP_SWIZZLE_NONE", Swizzle::None as i64),
+                ("CU_TENSOR_MAP_SWIZZLE_32B", Swizzle::B32 as i64),
+                ("CU_TENSOR_MAP_SWIZZLE_64B", Swizzle::B64 as i64),
+                ("CU_TENSOR_MAP_SWIZZLE_128B", Swizzle::B128 as i64),
+                (
+                    "CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B",
+                    Swizzle::B128Atom32 as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B_FLIP_8B",
+                    Swizzle::B128Atom32Flip8 as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_SWIZZLE_128B_ATOM_64B",
+                    Swizzle::B128Atom64 as i64,
+                ),
+                ("CU_TENSOR_MAP_L2_PROMOTION_NONE", L2Promotion::None as i64),
+                ("CU_TENSOR_MAP_L2_PROMOTION_L2_64B", L2Promotion::B64 as i64),
+                (
+                    "CU_TENSOR_MAP_L2_PROMOTION_L2_128B",
+                    L2Promotion::B128 as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_L2_PROMOTION_L2_256B",
+                    L2Promotion::B256 as i64,
+                ),
+                ("CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE", OobFill::None as i64),
+                (
+                    "CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA",
+                    OobFill::NanRequestZeroFma as i64,
+                ),
+            ],
+        );
+    }
+
     /// A description whose arrays do not match its rank is the caller's
     /// mistake, named before the driver sees it; the checks below therefore
     /// need no device.

@@ -514,3 +514,59 @@ pub(crate) fn in_context<T>(
     let scope = ContextScope::enter(context)?;
     operation(scope.driver)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every driver constant this crate passes is compared with `cuda.h`: a
+    /// wrong one is a refused call or, worse, an attribute the driver reads as
+    /// a different attribute.
+    #[test]
+    fn the_driver_constants_are_the_headers() {
+        crate::header::assert_constants(
+            "cuda.h",
+            &[
+                ("CUDA_SUCCESS", CUDA_SUCCESS as i64),
+                ("CUDA_ERROR_INVALID_VALUE", CUDA_ERROR_INVALID_VALUE as i64),
+                ("CUDA_ERROR_NOT_READY", CUDA_ERROR_NOT_READY as i64),
+                (
+                    "CU_MEM_LOCATION_TYPE_DEVICE",
+                    CU_MEM_LOCATION_TYPE_DEVICE as i64,
+                ),
+                (
+                    "CU_MEM_ALLOCATION_TYPE_PINNED",
+                    CU_MEM_ALLOCATION_TYPE_PINNED as i64,
+                ),
+                (
+                    "CU_MEM_ACCESS_FLAGS_PROT_READ",
+                    CU_MEM_ACCESS_FLAGS_PROT_READ as i64,
+                ),
+                (
+                    "CU_MEM_ACCESS_FLAGS_PROT_READWRITE",
+                    CU_MEM_ACCESS_FLAGS_PROT_READWRITE as i64,
+                ),
+                (
+                    "CU_MEMCPY_OPERAND_TYPE_POINTER",
+                    CU_MEMCPY_OPERAND_TYPE_POINTER as i64,
+                ),
+                (
+                    "CU_LAUNCH_ATTRIBUTE_COOPERATIVE",
+                    CU_LAUNCH_ATTRIBUTE_COOPERATIVE as i64,
+                ),
+                (
+                    "CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION",
+                    CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION as i64,
+                ),
+                (
+                    "CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE",
+                    CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE as i64,
+                ),
+                (
+                    "CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION",
+                    CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION as i64,
+                ),
+            ],
+        );
+    }
+}

@@ -288,14 +288,18 @@ struct HeuristicResult {
 /// The most results one search returns.
 const HEURISTIC_RESULTS: usize = 8;
 
-const PREFERENCE_WORKSPACE_SIZE: i32 = 0; // CUBLASLT_WORKSPACE_SIZE
+// `cublasLt.h`'s numbers, each named after its enumerator; the unit test
+// `the_attribute_numbers_are_the_headers` compares every one of them with the
+// header itself, because a wrong number here is a wrong computation or a
+// refused call, never a compile error.
+const PREFERENCE_WORKSPACE_SIZE: i32 = 1; // CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES
 const DESC_TRANSA: i32 = 3; // CUBLASLT_MATMUL_DESC_TRANSA
 const DESC_TRANSB: i32 = 4; // CUBLASLT_MATMUL_DESC_TRANSB
 const DESC_EPILOGUE: i32 = 7; // CUBLASLT_MATMUL_DESC_EPILOGUE
 const DESC_BIAS_POINTER: i32 = 8; // CUBLASLT_MATMUL_DESC_BIAS_POINTER
-const DESC_BIAS_DATA_TYPE: i32 = 11; // CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE
-const LAYOUT_BATCH_COUNT: i32 = 2; // CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT
-const LAYOUT_BATCH_STRIDE: i32 = 3; // CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET
+const DESC_BIAS_DATA_TYPE: i32 = 26; // CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE
+const LAYOUT_BATCH_COUNT: i32 = 5; // CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT
+const LAYOUT_BATCH_STRIDE: i32 = 6; // CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET
 
 /// The cuBLASLt entry points this module uses, resolved once per process.
 struct Api {
@@ -830,6 +834,42 @@ impl Drop for Preference {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every attribute number this binding passes to cuBLASLt is compared
+    /// with `cublasLt.h`: the workspace preference was 0, which is the search
+    /// mode attribute, and every heuristic call was refused for it. A wrong
+    /// number here is never a compile error.
+    #[test]
+    fn the_attribute_numbers_are_the_headers() {
+        crate::header::assert_constants(
+            "cublasLt.h",
+            &[
+                (
+                    "CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES",
+                    PREFERENCE_WORKSPACE_SIZE as i64,
+                ),
+                ("CUBLASLT_MATMUL_DESC_TRANSA", DESC_TRANSA as i64),
+                ("CUBLASLT_MATMUL_DESC_TRANSB", DESC_TRANSB as i64),
+                ("CUBLASLT_MATMUL_DESC_EPILOGUE", DESC_EPILOGUE as i64),
+                (
+                    "CUBLASLT_MATMUL_DESC_BIAS_POINTER",
+                    DESC_BIAS_POINTER as i64,
+                ),
+                (
+                    "CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE",
+                    DESC_BIAS_DATA_TYPE as i64,
+                ),
+                (
+                    "CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT",
+                    LAYOUT_BATCH_COUNT as i64,
+                ),
+                (
+                    "CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET",
+                    LAYOUT_BATCH_STRIDE as i64,
+                ),
+            ],
+        );
+    }
 
     #[test]
     fn a_recorded_algorithm_round_trips_through_its_tuning_bytes() {

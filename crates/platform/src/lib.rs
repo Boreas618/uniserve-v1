@@ -41,6 +41,8 @@ mod dtype;
 mod error;
 mod event;
 mod graph;
+#[cfg(test)]
+mod header;
 mod launch;
 mod library;
 mod memory;
