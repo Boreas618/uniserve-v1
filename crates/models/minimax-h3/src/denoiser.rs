@@ -97,6 +97,39 @@ impl Layouts {
         })
     }
 
+    /// The layout a request is laid out in, without packing it.
+    ///
+    /// The capability asks for a layout and cannot refuse one, so this snaps the request the way
+    /// [`Layouts::layout`] does and takes the deployment's prefix capacities. A request whose
+    /// packing is then refused is one the runner never asks for: the packing is the same function
+    /// of the same values, and the runner must lay the request out before it captures anything.
+    pub fn cover(&self, request: &VideoRequest<'_>) -> Layout {
+        let frames = frames_of(request);
+        let canvas = canvas_of(request).unwrap_or(Canvas {
+            short_edge: 768,
+            aspect: (16, 9),
+            width: 1344,
+            height: 768,
+        });
+        let raster = packing::latent_raster(&canvas).expect("a snapped canvas has a latent raster");
+        Layout {
+            video: LatentShape {
+                channels: self.config.transformer.video_channels,
+                frames: packing::video_latent_frames(frames).unwrap_or(2),
+                height: raster.height,
+                width: raster.width,
+            },
+            audio: Some(LatentShape {
+                channels: self.config.transformer.audio_channels,
+                frames: packing::audio_latent_frames(frames),
+                height: 1,
+                width: 1,
+            }),
+            text_rows: self.arrangement.text_rows,
+            condition_rows: self.arrangement.condition_rows,
+        }
+    }
+
     /// The arrangement this rule serves.
     pub const fn arrangement(&self) -> Arrangement {
         self.arrangement
@@ -177,7 +210,7 @@ impl Layouts {
     /// Sorted by name, so the order is a property of the layout alone and two requests of one shape
     /// share one set. Every table is one the forward reads; none is a host value the executor would
     /// otherwise have to pass through a launch.
-    pub fn state_tables(&self, layout: &Layout) -> Result<Vec<StateTable>> {
+    pub fn table_specs(&self, layout: &Layout) -> Result<Vec<StateTable>> {
         let packing = self.packing_of(layout)?;
         let rows = u64::from(packing.padded_tokens);
         let video = u64::from(packing.video_rows);
@@ -252,14 +285,14 @@ impl Layouts {
     /// per request, before the capture it will replay. `text_tokens` is the prompt's row count,
     /// which the media clock starts at; a prompt that does not fit the layout's capacity is
     /// refused here rather than captured.
-    pub fn prepare_state(
+    pub fn write_state(
         &self,
-        request: &VideoRequest,
-        text_tokens: u32,
+        request: &VideoRequest<'_>,
         layout: &Layout,
         out: &mut [Vec<u8>],
     ) -> Result<()> {
         let packing = self.packing_of(layout)?;
+        let text_tokens = request.text_tokens;
         if text_tokens > layout.text_rows {
             return Err(Error::config(format!(
                 "a prompt of {text_tokens} rows does not fit a text capacity of {}",
@@ -296,7 +329,7 @@ impl Layouts {
         // One sequence: every query row sees the used key rows and no query sees a padding row.
         let queries = [0, rows as i32];
         let keys = [0, tables.used as i32];
-        let specs = self.state_tables(layout)?;
+        let specs = self.table_specs(layout)?;
         for (name, bytes) in [
             ("audio_indices", integers(&audio_indices)),
             ("video_indices", integers(&video_indices)),
@@ -535,6 +568,162 @@ pub struct Denoiser {
     /// The schedule's entry times as their sinusoidal embedding, `[entries, frequency_dim]` FP32.
     frequencies: Weight,
     evaluations: u32,
+}
+
+/// A model error as the capability's.
+fn flattened(error: Error) -> nn::Error {
+    nn::Error::Weight {
+        tensor: "minimax-h3".to_owned(),
+        problem: error.to_string(),
+    }
+}
+
+/// The capability surface the executor binds: layouts, tables, and the step.
+///
+/// Every method delegates to the inherent one, so the model's own API stays the one the tests and
+/// the runner's documentation read.
+impl nn::capability::Denoiser for Denoiser {
+    fn layout(&self, request: &VideoRequest<'_>) -> Layout {
+        self.rules.cover(request)
+    }
+
+    fn draw_noise(
+        &self,
+        f: &Forward,
+        seed: nn::capability::Seed,
+        layout: Layout,
+        out: nn::capability::Latents,
+    ) -> nn::Result<()> {
+        // One stream per request, addressed by element: conditions first, then video, then audio.
+        // The video's first element is the number of elements the conditions' own draws occupy, and
+        // `nn::Layout` does not state it yet: a row capacity cannot stand in for it, because rows
+        // and elements differ by modality. Refusing is the only correct answer until it does.
+        let _ = (layout, seed);
+        return Err(flattened(Error::Unsupported(
+            "the initial noise cannot be addressed without Layout::condition_elements: the \
+             request's condition draws occupy elements before the video's first one, and a row \
+             capacity cannot produce that count"
+                .to_owned(),
+        )));
+        #[allow(unreachable_code)]
+        let channels = u64::from(layout.video.channels);
+        let video_elements = u64::from(layout.video.frames)
+            * u64::from(layout.video.height)
+            * u64::from(layout.video.width)
+            * channels;
+        let video_offset = 0_u64;
+        let audio_offset = video_offset + video_elements;
+        let noise = nn::Noise::new();
+        noise.draw(
+            f,
+            out.video,
+            nn::NoiseKey::Scalar(seed.0),
+            0,
+            0,
+            video_offset,
+        )?;
+        if let Some(audio) = out.audio {
+            noise.draw(f, audio, nn::NoiseKey::Scalar(seed.0), 0, 1, audio_offset)?;
+        }
+        Ok(())
+    }
+
+    fn prepare_latents<'a>(
+        &self,
+        f: &Forward,
+        cond: nn::capability::Conditioning<'a>,
+        out: nn::capability::Latents,
+    ) -> nn::Result<()> {
+        // The schedule's start: unit noise for the released and distilled grids, a scaled draw for
+        // a parallel-decoding student.
+        self.solver
+            .start(f, Modality::Video, out.video)
+            .map_err(flattened)?;
+        if let Some(audio) = out.audio {
+            self.solver
+                .start(f, Modality::Audio, audio)
+                .map_err(flattened)?;
+        }
+        let _ = cond;
+        Ok(())
+    }
+
+    fn denoise<'a>(
+        &self,
+        f: &Forward,
+        step: nn::Step,
+        latents: nn::capability::Latents,
+        cond: nn::capability::Conditioning<'a>,
+    ) -> nn::Result<()> {
+        Denoiser::denoise(self, f, &step, latents, cond).map_err(flattened)
+    }
+
+    fn evaluations(&self) -> u32 {
+        self.evaluations
+    }
+
+    fn constant_tables(&self) -> Vec<StateTable> {
+        Denoiser::constant_tables(self)
+    }
+
+    fn prepare_constants(&self, f: &Forward, out: &[TensorView]) -> nn::Result<()> {
+        Denoiser::prepare_constants(self, f, out).map_err(flattened)
+    }
+
+    fn layout_tables(&self, _layout: &Layout) -> Vec<StateTable> {
+        // Every table this denoiser reads is a request's: the layout's are its packing's, which the
+        // model derives rather than stores.
+        Vec::new()
+    }
+
+    fn prepare_layout(&self, _layout: &Layout, out: &mut [Vec<u8>]) -> nn::Result<()> {
+        if out.is_empty() {
+            Ok(())
+        } else {
+            Err(flattened(Error::config(format!(
+                "the H3 denoiser has no layout tables; {} buffers were offered",
+                out.len()
+            ))))
+        }
+    }
+
+    fn state_tables(&self, layout: &Layout) -> Vec<StateTable> {
+        self.rules.table_specs(layout).unwrap_or_default()
+    }
+
+    fn prepare_state(
+        &self,
+        request: &VideoRequest<'_>,
+        layout: &Layout,
+        out: &mut [Vec<u8>],
+    ) -> nn::Result<()> {
+        self.rules
+            .write_state(request, layout, out)
+            .map_err(flattened)
+    }
+
+    fn prepare_evaluation(&self, index: u32, out: &mut [Vec<u8>]) -> nn::Result<()> {
+        // The one table a replay changes: the step the stack gathers its modulation at.
+        if index >= self.evaluations {
+            return Err(flattened(Error::config(format!(
+                "evaluation {index} is outside the {} this schedule has",
+                self.evaluations
+            ))));
+        }
+        let Some(buffer) = out.first_mut() else {
+            return Err(flattened(Error::config(
+                "no step buffer was offered".to_owned(),
+            )));
+        };
+        if buffer.len() != 4 {
+            return Err(flattened(Error::config(format!(
+                "the step table is {} bytes, not one i32",
+                buffer.len()
+            ))));
+        }
+        buffer.copy_from_slice(&(index as i32).to_le_bytes());
+        Ok(())
+    }
 }
 
 /// The state tables of a request, in the order [`Layouts::state_tables`] sorts them.
@@ -935,7 +1124,7 @@ mod tests {
     fn the_tables_are_the_layout_s_and_the_step_is_last() {
         let rule = layouts();
         let (layout, packing) = rule.layout(&request(121, 1344, 768)).unwrap();
-        let tables = rule.state_tables(&layout).unwrap();
+        let tables = rule.table_specs(&layout).unwrap();
         let names: Vec<_> = tables.iter().map(|table| table.name).collect();
         assert_eq!(
             names,
@@ -970,14 +1159,14 @@ mod tests {
         let rule = layouts();
         let request = request(121, 1344, 768);
         let (layout, _) = rule.layout(&request).unwrap();
-        let tables = rule.state_tables(&layout).unwrap();
+        let tables = rule.table_specs(&layout).unwrap();
         let mut out: Vec<Vec<u8>> = tables
             .iter()
             .map(|table| {
                 vec![0_u8; (table.shape.numel() as usize) * table.dtype.bytes().unwrap() as usize]
             })
             .collect();
-        rule.prepare_state(&request, 12, &layout, &mut out).unwrap();
+        rule.write_state(&request, &layout, &mut out).unwrap();
         // A prompt of 12 rows is text, so every write index points into the text rows and every
         // generated row takes the prefix's zero row.
         let prefix: Vec<i32> = decode_i32(&out[6]);
@@ -1058,14 +1247,14 @@ mod tests {
         let rule = layouts();
         let request = request(121, 1344, 768);
         let (layout, _) = rule.layout(&request).unwrap();
-        let tables = rule.state_tables(&layout).unwrap();
+        let tables = rule.table_specs(&layout).unwrap();
         let mut out: Vec<Vec<u8>> = tables
             .iter()
             .map(|table| {
                 vec![0_u8; table.shape.numel() as usize * table.dtype.bytes().unwrap() as usize]
             })
             .collect();
-        let refused = rule.prepare_state(&request, 129, &layout, &mut out);
+        let refused = rule.write_state(&request, &layout, &mut out);
         assert!(refused.is_err());
     }
 
