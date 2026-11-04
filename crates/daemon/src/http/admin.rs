@@ -735,6 +735,19 @@ async fn program_update(
         // The change itself is refused; the world path answers it the same way.
         return Ok(None);
     };
+    // A change the epoch or host layer outranks is not the program layer's,
+    // and deciding that here keeps a host-layer change from needing a Program
+    // Server at all: only `None` and `Program` reach the prepare below, the
+    // first because a prepared program reveals what the config alone cannot.
+    if matches!(
+        crate::epoch::layer(
+            &crate::epoch::Deployment::of(current.clone()),
+            &crate::epoch::Deployment::of(target.clone()),
+        ),
+        crate::epoch::Layer::Epoch | crate::epoch::Layer::Host
+    ) {
+        return Ok(None);
+    }
     let epochs = leader.epochs();
     let number = admin.running_number();
     let planned = match leader.apply_programs(number, &target, true, request.force).await {
