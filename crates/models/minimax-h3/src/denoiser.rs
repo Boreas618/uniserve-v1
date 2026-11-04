@@ -2657,6 +2657,24 @@ impl Denoiser {
                 video.dtype, dtype
             )));
         }
+        // The trajectory is FP32 and the stack is the deployment's, which is the same type only at a
+        // deployment that states FP32. The boundary is crossed twice per evaluation - into the packed
+        // rows at the input projection, back out at the head - and neither crossing exists as an
+        // operation: `patch` and `unpatchify_video` carry one element type, and a product of an FP32
+        // activation with a weight of another type is a pair no backend here can execute (cuBLASLt
+        // cannot mix operands, and the reference's own provider takes the same-type branch of
+        // `torch.mm` for this call, which refuses two dtypes: `_linear.py` hands it an FP32
+        // activation against the checkpoint's BF16 weight, `cublas.py`'s `out.dtype == x.dtype` path).
+        // So a stack of another type is refused here, by name, rather than at the first launch with a
+        // message about a missing kernel - the two are the same gap and this one says what is missing.
+        if dtype != DType::F32 {
+            return Err(Error::config(format!(
+                "the sampler's trajectory is FP32 and this deployment's stack computes in {dtype}: \
+                 the crossing needs a two-type pack and unpack and a product of an FP32 activation \
+                 with a {dtype} weight, and neither exists - a deployment that states FP32 runs \
+                 this path, a stack of another type does not yet"
+            )));
+        }
         let arena = f.arena();
 
         // The packed rows: every row gathers its prefix source, so a generated row reads the zero
