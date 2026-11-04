@@ -114,7 +114,7 @@ pub(crate) fn epoch_arm(
     switch.start(roster);
     let report = report(&switch);
     *running = Some(switch);
-    Ok(Some(Applied::World(report)))
+    Ok(Some(Applied::Epoch(report)))
 }
 
 /// The target epoch's record: what builds it and which programs fill it,
@@ -417,8 +417,8 @@ mod tests {
         )
         .expect("the epoch layer runs")
         .expect("the epoch layer owns the change");
-        let Applied::World(report) = applied else {
-            panic!("an epoch change reports a world, got {applied:?}");
+        let Applied::Epoch(report) = applied else {
+            panic!("an epoch change reports an epoch, got {applied:?}");
         };
         assert_eq!(report["change"], "epoch");
         assert_eq!(report["phase"], "preparing");

@@ -26,8 +26,8 @@ use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use proto::request::ModelDtype;
 pub use program_server::{PhaseKind, Program, ProgramSlot};
+use proto::request::ModelDtype;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -64,7 +64,6 @@ pub mod operators {
     pub const EXPERT_EXCHANGE: &str = ops::moe::ExpertExchange::NAME;
 }
 
-
 /// The key an epoch's programs are stored under: the operator, and the
 /// phase when the configuration fills it per phase (§5.2). Programs and
 /// slots are `crates/program-server`'s types, which the daemon, the main
@@ -95,7 +94,9 @@ pub fn program_from_wire(wire: proto::process::Program) -> Program {
             .arguments
             .into_iter()
             .map(|(key, value)| {
-                let value = value.parse::<toml::Value>().unwrap_or(toml::Value::String(value));
+                let value = value
+                    .parse::<toml::Value>()
+                    .unwrap_or(toml::Value::String(value));
                 (key, value)
             })
             .collect(),
@@ -535,10 +536,12 @@ impl Epochs {
     }
 
     /// The launch generation to start `group`'s rank `rank` in (§2.5,
-    /// §7.4): one more than the highest launch generation this daemon knows
-    /// for it, which is the one it allocated last or the one the process
-    /// table records for that group and rank, so a standby of a serving
-    /// process is `serving + 1`.
+    /// §7.4): one more than the highest launch generation this daemon knows,
+    /// which is the one it allocated last for that group and rank or the one
+    /// the process table records — for any group and rank. A standby of a
+    /// serving process is `serving + 1`, and a rank or group without a process
+    /// yet still allocates above every number the deployment has used, so one
+    /// number names one launch across the deployment.
     ///
     /// This is the one place a generation is allocated: a caller that
     /// computed one itself would launch two processes under one number.
@@ -546,7 +549,6 @@ impl Epochs {
         let runnning = self
             .processes()
             .iter()
-            .filter(|process| process.group == group && process.rank == rank)
             .map(|process| process.generation)
             .max()
             .unwrap_or(0);
@@ -742,7 +744,9 @@ fn process_report(process: &ManagedProcess) -> Value {
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// The operator names the epoch record keys its kernel programs by (§5.1,
@@ -1071,15 +1075,17 @@ mod tests {
             ("mem_fraction_static", |config: &mut ServeConfig| {
                 config.mem_fraction_static = 0.5
             }),
-            ("speculative_config.num_draft_tokens", |config: &mut ServeConfig| {
-                config.speculative_config.num_draft_tokens = 4
-            }),
+            (
+                "speculative_config.num_draft_tokens",
+                |config: &mut ServeConfig| config.speculative_config.num_draft_tokens = 4,
+            ),
             ("moe_config.microbatches", |config: &mut ServeConfig| {
                 config.moe_config.microbatches = NonZeroU32::new(2).unwrap()
             }),
-            ("profiling_config.graph_pc_sampling", |config: &mut ServeConfig| {
-                config.profiling_config.graph_pc_sampling = true
-            }),
+            (
+                "profiling_config.graph_pc_sampling",
+                |config: &mut ServeConfig| config.profiling_config.graph_pc_sampling = true,
+            ),
         ];
         // The program backends (§7.7 backend row) and the program parameters
         // (§7.7 parameter row).
@@ -1087,21 +1093,26 @@ mod tests {
             ("scheduler_config.policy", |config: &mut ServeConfig| {
                 config.scheduler_config.policy = proto::request::SchedulingPolicy::Priority
             }),
-            ("scheduler_config.chunked_prefill_size", |config: &mut ServeConfig| {
-                config.scheduler_config.chunked_prefill_size = NonZeroUsize::new(2048)
-            }),
+            (
+                "scheduler_config.chunked_prefill_size",
+                |config: &mut ServeConfig| {
+                    config.scheduler_config.chunked_prefill_size = NonZeroUsize::new(2048)
+                },
+            ),
             ("scheduler_config.max_batch", |config: &mut ServeConfig| {
                 config.scheduler_config.max_batch = NonZeroUsize::new(8).unwrap()
             }),
             ("max_num_batched_tokens", |config: &mut ServeConfig| {
                 config.max_num_batched_tokens = NonZeroUsize::new(4096)
             }),
-            ("speculative_config.expected_speedup", |config: &mut ServeConfig| {
-                config.speculative_config.expected_speedup = Some(2.5)
-            }),
-            ("speculative_config.refill_token_cost", |config: &mut ServeConfig| {
-                config.speculative_config.refill_token_cost = Some(0.5)
-            }),
+            (
+                "speculative_config.expected_speedup",
+                |config: &mut ServeConfig| config.speculative_config.expected_speedup = Some(2.5),
+            ),
+            (
+                "speculative_config.refill_token_cost",
+                |config: &mut ServeConfig| config.speculative_config.refill_token_cost = Some(0.5),
+            ),
             ("attention_backend", |config: &mut ServeConfig| {
                 config.attention_backend = "flashinfer".to_owned()
             }),
@@ -1117,9 +1128,10 @@ mod tests {
             ("moe_runner_backend", |config: &mut ServeConfig| {
                 config.moe_runner_backend = Some("cutlass".to_owned())
             }),
-            ("flashinfer_config.workspace_size", |config: &mut ServeConfig| {
-                config.flashinfer_config.workspace_size = 1 << 30
-            }),
+            (
+                "flashinfer_config.workspace_size",
+                |config: &mut ServeConfig| config.flashinfer_config.workspace_size = 1 << 30,
+            ),
         ];
 
         let base = Deployment::of(ServeConfig::default());
@@ -1127,21 +1139,37 @@ mod tests {
 
         for (what, change) in host_frontend.iter().chain(host_daemon.iter()) {
             let next = Deployment::of(set(*change));
-            assert_eq!(layer(&base, &next), Layer::Host, "{what} reads the host layer");
+            assert_eq!(
+                layer(&base, &next),
+                Layer::Host,
+                "{what} reads the host layer"
+            );
         }
         for (what, change) in &epoch {
             let next = Deployment::of(set(*change));
-            assert_eq!(layer(&base, &next), Layer::Epoch, "{what} builds a new epoch");
+            assert_eq!(
+                layer(&base, &next),
+                Layer::Epoch,
+                "{what} builds a new epoch"
+            );
         }
         for (what, change) in &program {
             let next = Deployment::of(set(*change));
-            assert_eq!(layer(&base, &next), Layer::Program, "{what} moves the programs");
+            assert_eq!(
+                layer(&base, &next),
+                Layer::Program,
+                "{what} moves the programs"
+            );
         }
 
         // Only the epoch layer's values build the main process: the host
         // layer's and the program layer's leave the build config equal
         // (§7.7).
-        for (what, change) in host_frontend.iter().chain(host_daemon.iter()).chain(program.iter()) {
+        for (what, change) in host_frontend
+            .iter()
+            .chain(host_daemon.iter())
+            .chain(program.iter())
+        {
             assert_eq!(
                 BuildConfig::of(&set(*change)),
                 base.build_config,
@@ -1236,7 +1264,10 @@ mod tests {
             &programs.kernels[&KernelKey::phase(operators::PAGED_ATTENTION, PhaseKind::Prefill)];
         let decode =
             &programs.kernels[&KernelKey::phase(operators::PAGED_ATTENTION, PhaseKind::Decode)];
-        assert_eq!((prefill.backend.as_str(), decode.backend.as_str()), ("fa4", "trtllm"));
+        assert_eq!(
+            (prefill.backend.as_str(), decode.backend.as_str()),
+            ("fa4", "trtllm")
+        );
         assert!(
             !programs
                 .kernels
@@ -1244,13 +1275,32 @@ mod tests {
             "a per-phase fill covers no whole operator"
         );
 
-        // One stated backend for both phases fills the operator once.
+        // One backend for both phases fills the operator once, whether the
+        // operator states it or both phases state the same one; an unstated
+        // phase falls back to `attention_backend`, which the split above
+        // keeps as a phase of its own.
         let mut one = ServeConfig::default();
-        one.prefill_attention_backend = Some("fa4".to_owned());
+        one.attention_backend = "fa4".to_owned();
         let programs = FilledPrograms::of(&one);
         assert_eq!(
             programs.kernels[&KernelKey::all(operators::PAGED_ATTENTION)].backend,
             "fa4"
+        );
+        assert!(
+            !programs.kernels.contains_key(&KernelKey::phase(
+                operators::PAGED_ATTENTION,
+                PhaseKind::Prefill
+            )),
+            "one backend covers every phase of the operator"
+        );
+        let mut agreed = ServeConfig::default();
+        agreed.prefill_attention_backend = Some("fa4".to_owned());
+        agreed.decode_attention_backend = Some("fa4".to_owned());
+        let programs = FilledPrograms::of(&agreed);
+        assert_eq!(
+            programs.kernels[&KernelKey::all(operators::PAGED_ATTENTION)].backend,
+            "fa4",
+            "phases that agree collapse to the operator's slot"
         );
 
         // A stated grouped expert GEMM program fills both of its operators.
@@ -1273,7 +1323,11 @@ mod tests {
     fn an_update_keeps_the_first_failure_and_is_unavailable_with_it() {
         let mut update = Update::new(1, Deployment::of(ServeConfig::default()));
         update.commit();
-        assert_eq!(update.unavailable(), None, "a committed update is available");
+        assert_eq!(
+            update.unavailable(),
+            None,
+            "a committed update is available"
+        );
 
         let mut update = Update::new(2, Deployment::of(ServeConfig::default()));
         let first = Failure {
@@ -1414,7 +1468,9 @@ mod tests {
         );
         epochs.record(2, second);
         assert_eq!(
-            epochs.serving().map(|(epoch, record)| (epoch, record.status)),
+            epochs
+                .serving()
+                .map(|(epoch, record)| (epoch, record.status)),
             Some((1, Status::Probation))
         );
 
