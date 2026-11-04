@@ -40,13 +40,44 @@ import torch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
+#: The family's other packages, so the harness finds its siblings wherever it is run.
+SIBLINGS = (
+    "rms_norm",
+    "add_rms_norm",
+)
+
+for _sibling in SIBLINGS:
+    _source = (
+        pathlib.Path(__file__).resolve().parents[3]
+        / _sibling
+        / "triton"
+        / "src"
+    )
+    if _source.is_dir() and str(_source) not in sys.path:
+        sys.path.insert(0, str(_source))
+
 #: The output types' unit roundoff, as `DType::unit_roundoff` gives it.
 UNIT_ROUNDOFF = {"f16": 2.0**-11, "bf16": 2.0**-8, "f32": 2.0**-24}
 
-TORCH_TYPES = {"f16": torch.float16, "bf16": torch.bfloat16, "f32": torch.float32}
+TORCH_TYPES = {
+    "f16": torch.float16,
+    "bf16": torch.bfloat16,
+    "f32": torch.float32,
+}
 
 #: The operators this script runs, and the extra roundings each adds to the reduction.
 OPERATORS = {"rms_norm": 0, "add_rms_norm": 1}
+
+
+def default_op():
+    """The operator this copy belongs to, from the package it is kept in.
+
+    Each package holds the same bytes, so the default cannot come from the file; it comes
+    from where the file sits, and a run with no arguments checks the operator whose package
+    was invoked.
+    """
+    package = pathlib.Path(__file__).resolve().parents[2].name
+    return package if package in OPERATORS else OPERATORS[0]
 
 
 def gamma(reduction):
@@ -78,9 +109,18 @@ def compare(name, got, expected, floor, relative, deciding_bound):
     """Count the elements outside each bound and give the line that reports them."""
     difference = (got - expected).abs()
     declared_outside = (~(difference <= relative * expected.abs())).sum().item()
-    scaled_outside = (~(difference <= relative * expected.abs() + floor)).sum().item()
-    largest = (difference / expected.abs().clamp(min=1e-30)).nan_to_num(nan=float("inf")).max().item()
-    deciding = declared_outside if deciding_bound == "declared" else scaled_outside
+    scaled_outside = (
+        (~(difference <= relative * expected.abs() + floor)).sum().item()
+    )
+    largest = (
+        (difference / expected.abs().clamp(min=1e-30))
+        .nan_to_num(nan=float("inf"))
+        .max()
+        .item()
+    )
+    deciding = (
+        declared_outside if deciding_bound == "declared" else scaled_outside
+    )
     line = (
         f"  {name}: max absolute {difference.nan_to_num(nan=float('inf')).max().item():.3e}, max relative "
         f"{largest:.3e}, declared {declared_outside} of {expected.numel()} outside, "
@@ -127,7 +167,12 @@ def check(operator, case):
             expected_out = truncate(expected_out, dtype)
         relative = bound(columns, case["dtype"], OPERATORS[operator])
         outside, line = compare(
-            "out", out.cpu().double(), expected_out, 0.0, relative, case["bound"]
+            "out",
+            out.cpu().double(),
+            expected_out,
+            0.0,
+            relative,
+            case["bound"],
         )
         lines = [line]
     else:
@@ -164,7 +209,9 @@ def check(operator, case):
             expected_residual = truncate(expected_residual, dtype)
         relative = bound(columns, case["dtype"], OPERATORS[operator])
         # The residual is a sum of two operands, so its rounding is of their magnitudes.
-        residual_floor = UNIT_ROUNDOFF[case["dtype"]] * (exact_x.abs() + exact_r.abs())
+        residual_floor = UNIT_ROUNDOFF[case["dtype"]] * (
+            exact_x.abs() + exact_r.abs()
+        )
         outside, residual_line = compare(
             "residual",
             residual_out.cpu().double(),
@@ -174,7 +221,12 @@ def check(operator, case):
             case["bound"],
         )
         out_outside, out_line = compare(
-            "out", out.cpu().double(), expected_out, 0.0, relative, case["bound"]
+            "out",
+            out.cpu().double(),
+            expected_out,
+            0.0,
+            relative,
+            case["bound"],
         )
         outside += out_outside
         lines = [residual_line, out_line]
@@ -191,7 +243,11 @@ def check(operator, case):
 
 def cases(flags):
     """The cases one run checks, cheapest and most diverse first."""
-    common = {"dtype": flags.dtype, "eps": flags.eps, "pdl": flags.pdl == "true"}
+    common = {
+        "dtype": flags.dtype,
+        "eps": flags.eps,
+        "pdl": flags.pdl == "true",
+    }
     return [
         {
             **common,
@@ -231,7 +287,7 @@ def cases(flags):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--op", choices=sorted(OPERATORS), default="rms_norm")
+    parser.add_argument("--op", choices=sorted(OPERATORS), default=default_op())
     parser.add_argument("--dtype", choices=sorted(TORCH_TYPES), default="bf16")
     parser.add_argument("--columns", type=int, default=2048)
     parser.add_argument("--tile", type=int, default=2048)
@@ -256,13 +312,17 @@ def main() -> int:
         parser.error(
             f"a tile of {arguments.tile} lanes cannot cover a row of {arguments.columns}"
         )
+    if not arguments.interpreter and not torch.cuda.is_available():
+        # A host without a device takes the interpreter: a check must run where it lands.
+        print(
+            "no GPU on this host: running through Triton's interpreter instead",
+            file=sys.stderr,
+        )
+        arguments.interpreter = True
     if arguments.interpreter:
         import os
 
         os.environ["TRITON_INTERPRET"] = "1"
-    elif not torch.cuda.is_available():
-        print("no GPU on this host: this check needs one", file=sys.stderr)
-        return 1
 
     key = (
         f"dtype_{arguments.dtype}_columns_{arguments.columns}"

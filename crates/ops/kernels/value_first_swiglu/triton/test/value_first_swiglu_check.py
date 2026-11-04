@@ -160,7 +160,12 @@ def check(scenario, case, device):
     difference = (got - expected).abs()
     allowed = ROUNDINGS * UNIT_ROUNDOFF[case["dtype"]] * expected.abs()
     outside = (~(difference <= allowed)).sum().item()
-    largest = (difference / expected.abs().clamp(min=1e-30)).nan_to_num(nan=float("inf")).max().item()
+    largest = (
+        (difference / expected.abs().clamp(min=1e-30))
+        .nan_to_num(nan=float("inf"))
+        .max()
+        .item()
+    )
 
     magnitude_failures = 0
     if case["absmax"]:
@@ -222,13 +227,17 @@ def main() -> int:
             f"a packed row of stride {arguments.input_stride} holds no room for "
             f"{arguments.width} values and {arguments.width} gates"
         )
+    if not arguments.interpreter and not torch.cuda.is_available():
+        # A host without a device takes the interpreter: a check must run where it lands.
+        print(
+            "no GPU on this host: running through Triton's interpreter instead",
+            file=sys.stderr,
+        )
+        arguments.interpreter = True
     if arguments.interpreter:
         import os
 
         os.environ["TRITON_INTERPRET"] = "1"
-    elif not torch.cuda.is_available():
-        print("no GPU on this host: this check needs one", file=sys.stderr)
-        return 1
 
     key = (
         f"dtype_{arguments.dtype}_width_{arguments.width}_block_{arguments.block}"

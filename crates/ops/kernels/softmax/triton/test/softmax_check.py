@@ -43,6 +43,22 @@ import torch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
+#: The family's other packages, so the harness finds its siblings wherever it is run.
+SIBLINGS = (
+    "softmax",
+    "log_softmax",
+)
+
+for _sibling in SIBLINGS:
+    _source = (
+        pathlib.Path(__file__).resolve().parents[3]
+        / _sibling
+        / "triton"
+        / "src"
+    )
+    if _source.is_dir() and str(_source) not in sys.path:
+        sys.path.insert(0, str(_source))
+
 #: The output types' unit roundoff, as `DType::unit_roundoff` gives it.
 UNIT_ROUNDOFF = {"f16": 2.0**-11, "bf16": 2.0**-8, "f32": 2.0**-24}
 
@@ -57,6 +73,17 @@ OPERATORS = {"softmax": 0, "log_softmax": 1}
 
 #: The widest tile `log_softmax`'s build steps a row in, from its `build.py`.
 LANES = 4096
+
+
+def default_op():
+    """The operator this copy belongs to, from the package it is kept in.
+
+    Each package holds the same bytes, so the default cannot come from the file; it comes
+    from where the file sits, and a run with no arguments checks the operator whose package
+    was invoked.
+    """
+    package = pathlib.Path(__file__).resolve().parents[2].name
+    return package if package in OPERATORS else next(iter(OPERATORS))
 
 
 def gamma(reduction):
@@ -86,7 +113,12 @@ def compare(name, got, expected, floor, relative, deciding_bound):
     scaled_outside = (
         (~(difference <= relative * expected.abs() + floor)).sum().item()
     )
-    largest = (difference / expected.abs().clamp(min=1e-30)).nan_to_num(nan=float("inf")).max().item()
+    largest = (
+        (difference / expected.abs().clamp(min=1e-30))
+        .nan_to_num(nan=float("inf"))
+        .max()
+        .item()
+    )
     deciding = (
         declared_outside if deciding_bound == "declared" else scaled_outside
     )
@@ -203,7 +235,7 @@ def cases(flags):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--op", choices=sorted(OPERATORS), default="softmax")
+    parser.add_argument("--op", choices=sorted(OPERATORS), default=default_op())
     parser.add_argument("--dtype", choices=sorted(TORCH_TYPES), default="f32")
     parser.add_argument("--columns", type=int, default=2048)
     parser.add_argument("--tile", type=int, default=2048)
@@ -227,13 +259,17 @@ def main() -> int:
         parser.error(
             f"a tile of {arguments.tile} lanes cannot cover a row of {arguments.columns}"
         )
+    if not arguments.interpreter and not torch.cuda.is_available():
+        # A host without a device takes the interpreter: a check must run where it lands.
+        print(
+            "no GPU on this host: running through Triton's interpreter instead",
+            file=sys.stderr,
+        )
+        arguments.interpreter = True
     if arguments.interpreter:
         import os
 
         os.environ["TRITON_INTERPRET"] = "1"
-    elif not torch.cuda.is_available():
-        print("no GPU on this host: this check needs one", file=sys.stderr)
-        return 1
 
     key = (
         f"dtype_{arguments.dtype}_columns_{arguments.columns}"

@@ -176,7 +176,9 @@ def run(scenario, device):
     )
     # Only the element in front of each view is a guard; the rest of its buffer is the
     # state the step is meant to write.
-    guards_before = {name: base.flatten()[0].item() for name, base in guards.items()}
+    guards_before = {
+        name: base.flatten()[0].item() for name, base in guards.items()
+    }
 
     kernels._slot_commit_kernel[(1,)](
         columns,
@@ -300,13 +302,17 @@ def main() -> int:
         help="run through Triton's interpreter instead of a device",
     )
     arguments = parser.parse_args()
+    if not arguments.interpreter and not torch.cuda.is_available():
+        # A host without a device takes the interpreter: a check must run where it lands.
+        print(
+            "no GPU on this host: running through Triton's interpreter instead",
+            file=sys.stderr,
+        )
+        arguments.interpreter = True
     if arguments.interpreter:
         import os
 
         os.environ["TRITON_INTERPRET"] = "1"
-    elif not torch.cuda.is_available():
-        print("no GPU on this host: this check needs one", file=sys.stderr)
-        return 1
 
     device = "cpu" if arguments.interpreter else "cuda"
     failures = 0
