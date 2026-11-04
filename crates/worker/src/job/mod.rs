@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
-use cuda::{DeviceId, Event};
+use platform::{DeviceId, Event};
 use ipc::Wake;
 
 use crate::ffi::Interpreter;

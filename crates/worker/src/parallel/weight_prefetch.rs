@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use cuda::{CopyBatch, DeviceAllocation, DeviceId, PeerMapping, SourceOrder, Stream, memcpy_async};
+use platform::{CopyBatch, DeviceAllocation, DeviceId, PeerMapping, SourceOrder, Stream, memcpy_async};
 use indexmap::IndexMap;
 use ipc::ComponentWeights;
 use tvm_ffi::{Any, AnyView};
@@ -925,7 +925,7 @@ impl HostWeights {
 mod tests {
     use super::*;
     use crate::parallel::host::{HostGroup, Rendezvous, STARTUP_TIMEOUT};
-    use cuda::{PinnedBuffer, memset_d8};
+    use platform::{PinnedBuffer, memset_d8};
     use std::net::TcpListener;
 
     #[test]

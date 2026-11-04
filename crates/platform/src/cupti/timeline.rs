@@ -439,10 +439,7 @@ mod tests {
                     let timeline = Timeline::start(mode, sink)?;
                     // The retained source is instantiated under the mode
                     // that all of this executable's launches will use.
-                    // SAFETY: with_captured_graph keeps the source live,
-                    // and this test is its sole owner and submitter.
-                    let executable =
-                        unsafe { crate::GraphExec::instantiate(stream.device(), source)? };
+                    let executable = source.instantiate()?;
                     for replay in 0..replays {
                         executable.launch(&stream)?;
                         if replay % 128 == 127 {

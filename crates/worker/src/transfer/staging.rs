@@ -26,7 +26,7 @@ impl Staging {
     pub(crate) fn reserve(
         &mut self,
         retained: &Retained,
-        device: cuda::DeviceId,
+        device: platform::DeviceId,
         page: Page,
         mut rank: Rank,
     ) -> Result<Option<(Rank, Key)>> {

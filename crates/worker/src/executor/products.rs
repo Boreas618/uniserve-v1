@@ -36,7 +36,7 @@ use crate::stream::{CUDAStream, Issue};
 use crate::transfer::exports::{self, Location};
 use crate::transfer::{SharedMapping, SharedRead, TransportKind, Transports};
 use crate::{Error, Result};
-use cuda::Stream;
+use platform::Stream;
 use ipc::{
     Batch as BatchPlan, BufferAllocation, BufferId, Call, CallId, CallKind, MediaCall, RequestKey,
     TensorExport, TensorRef, TransferHandle, TransferTransport, WorkerInfo,
