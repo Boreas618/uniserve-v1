@@ -275,35 +275,32 @@ impl Buckets {
         Ok(Self::causal_lm(&decode, &prefill, sampled))
     }
 
-    /// The default catalog of a causal-language rank: the deployment's graph options, or the
-    /// rank's own sizes where an option leaves them unset.
+    /// The bucket set of an epoch that fixes no batch bound of its own: the configured sizes, or the
+    /// catalog where the config names none, and no size dropped.
     ///
-    /// The sizes are the ones the reference deployment captures: every decode batch size from one
-    /// row to 32 and then in eights to 128, and prefill chunks of 4 tokens up to 32, 16 up to 256,
-    /// 32 up to 512, 64 up to 4096 and 512 up to 16384. They are captured every warmup, so a
-    /// deployment that serves shorter prompts states its own and captures less.
-    ///
-    /// `sampled` captures a sampled decode bucket beside every greedy one: a request that samples
-    /// needs one, and the mechanism cannot serve it from a greedy graph.
-    pub fn default_causal_lm(rows: Option<&[u32]>, tokens: Option<&[u32]>, sampled: bool) -> Self {
-        const DECODE: [u32; 32] = [
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-            24, 25, 26, 27, 28, 29, 30, 31, 32,
-        ];
-        const DECODE_STEP: [u32; 12] = [40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128];
-        let default_rows: Vec<u32> = DECODE.into_iter().chain(DECODE_STEP).collect();
-        let default_tokens: Vec<u32> = (4..=32)
-            .step_by(4)
-            .chain((48..=256).step_by(16))
-            .chain((288..=512).step_by(32))
-            .chain((576..=4096).step_by(64))
-            .chain((4608..=16384).step_by(512))
-            .collect();
-        Self::causal_lm(
-            rows.unwrap_or(&default_rows),
-            tokens.unwrap_or(&default_tokens),
-            sampled,
-        )
+    /// This is the set an epoch captures; the bound it implies - the largest decode rows and the
+    /// largest prefill tokens - is what the capacity plan and the scheduler admit, so the buckets
+    /// come first and the batch bound follows them rather than the other way round.
+    pub fn default_causal_lm(decode: Option<&[u32]>, prefill: Option<&[u32]>, sampled: bool) -> Self {
+        let decode = decode.map_or_else(decode_catalog, <[u32]>::to_vec);
+        let prefill = prefill.map_or_else(prefill_catalog, <[u32]>::to_vec);
+        // A zero size names no bucket; a plan that states one is not a plan to refuse, only a size
+        // to drop, since the rest of the set still serves.
+        let decode: Vec<u32> = decode.into_iter().filter(|size| *size != 0).collect();
+        let prefill: Vec<u32> = prefill.into_iter().filter(|size| *size != 0).collect();
+        Self::causal_lm(&decode, &prefill, sampled)
+    }
+
+    /// The largest decode row count and prefill token count the set captures, which is the batch
+    /// bound its captures imply.
+    pub fn bounds(&self) -> (u32, u32) {
+        let mut rows = 0;
+        let mut tokens = 0;
+        for bucket in self.iter() {
+            rows = rows.max(bucket.rows);
+            tokens = tokens.max(bucket.tokens);
+        }
+        (rows, tokens)
     }
 
     /// Every bucket, ascending by size.
@@ -502,5 +499,19 @@ mod tests {
             variant: Variant::DecodeGreedy,
         };
         assert_eq!(greedy.select(&shape), sampled.select(&shape));
+    }
+
+    /// The set an epoch captures implies the batch bound it admits: the largest decode rows and the
+    /// largest prefill tokens, which is what the capacity plan and the scheduler read.
+    #[test]
+    fn the_bounds_are_what_the_set_captures() {
+        let buckets = Buckets::default_causal_lm(Some(&[1, 8]), Some(&[0, 64, 256]), true);
+        assert_eq!(buckets.bounds(), (8, 256));
+        // A zero size names no bucket, and an epoch that configures no size takes the catalog.
+        assert!(!buckets.contains(&Bucket::prefill(8, 0, Variant::PrefillWrite)));
+        let catalog = Buckets::default_causal_lm(None, None, false);
+        let (rows, tokens) = catalog.bounds();
+        assert_eq!(rows, decode_catalog().into_iter().max().expect("a catalog"));
+        assert_eq!(tokens, prefill_catalog().into_iter().max().expect("a catalog"));
     }
 }
