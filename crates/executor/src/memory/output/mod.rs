@@ -93,8 +93,12 @@ pub struct OutputBuffer {
     devices: Vec<DeviceEvents>,
     sealed: bool,
     copies_finished: bool,
+    /// The batch's rows will never all be observed (a failed or cancelled
+    /// batch), so its lease may retire without them. Read by [`Self::retired`],
+    /// which decides when the pool recycles the storage; [`Self::abandon`] is
+    /// the only writer, and the runner that fails a batch is the caller it
+    /// waits for - no consumer of [`OutputPool`] exists in this tree yet.
     abandoned: bool,
-    readers: usize,
     timing_events: bool,
     reserved: Instant,
     started: Option<Instant>,
@@ -128,7 +132,6 @@ impl OutputBuffer {
             sealed: false,
             copies_finished: false,
             abandoned: false,
-            readers: 0,
             timing_events: timing,
             reserved: Instant::now(),
             started: None,
@@ -535,22 +538,16 @@ impl OutputBuffer {
         self.abandoned = true;
     }
 
-    pub(crate) fn retain_reader(&mut self) -> Result<()> {
-        self.storage()?;
-        self.readers += 1;
-        Ok(())
-    }
-
-    pub(crate) fn release_reader(&mut self) -> Result<()> {
-        self.readers = self
-            .readers
-            .checked_sub(1)
-            .ok_or_else(|| Error::Invariant("output CPU reader count underflow".into()))?;
-        Ok(())
-    }
-
+    /// Whether the pool may recycle this lease's storage.
+    ///
+    /// Two facts hold it: every copy into the words has finished, and either
+    /// every row was observed or the batch was abandoned. A CPU reader does not
+    /// hold it and does not need to: [`Self::readback`] copies the words into
+    /// host storage before any reader sees them, and every borrow of this buffer
+    /// is taken behind its own mutex, so a reader cannot be reading the lease's
+    /// storage while the pool recycles it.
     fn retired(&self) -> bool {
-        self.copies_finished && (self.remaining == 0 || self.abandoned) && self.readers == 0
+        self.copies_finished && (self.remaining == 0 || self.abandoned)
     }
 
     fn require_open(&self) -> Result<()> {
