@@ -1,0 +1,6 @@
+pattern pattern.png 13 11 0 0 13 11 0
+crop crop.png 12 4 1 1 9 2 0
+same same.png 6 4 1 1 4 2 0
+rotated rotated.jpeg 7 9 0 0 7 9 8
+upside upside.jpeg 9 7 1 1 7 5 8
+mirrored mirrored.jpeg 4 6 0 0 4 6 8

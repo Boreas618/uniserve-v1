@@ -1061,6 +1061,13 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
                     let _ = answer.send(Some(accepted.scheduler));
                 }
             }
+            Some(from_engine::Kind::Metrics(metrics)) => {
+                // The main process's counters for the frontend's `/metrics`
+                // (design §2.3): nothing serves them from the daemon while the
+                // application is still here; delivery item 2/4 wires them into
+                // the metrics registry.
+                let _ = metrics;
+            }
             Some(from_engine::Kind::Stats(report)) => {
                 match SchedulerStats::decode(&report.snapshot) {
                     Ok(snapshot) => stats(
@@ -1258,6 +1265,23 @@ impl EventStream {
         self.on_finish = Some(Box::new(on_finish));
     }
 
+    /// The request's identity in the engine that serves it.
+    pub fn id(&self) -> RequestId {
+        self.id
+    }
+
+    /// The events its consumer took in all, as the engine counts them.
+    pub fn consumed(&self) -> u64 {
+        self.consumed
+    }
+
+    /// Gives the request's event stream up without cancelling the request:
+    /// the engine's next consumer takes it over from the position this one
+    /// reached (design §7.5.1 step 4).
+    pub fn hand_over(&mut self) {
+        self.open = false;
+    }
+
     /// Receives the next event; `None` once the request ended.
     pub async fn recv(&mut self) -> Option<Event> {
         let event = self.events.recv().await;
@@ -1271,6 +1295,20 @@ impl EventStream {
     /// Receives the next event; the same as [`Self::recv`].
     pub async fn next(&mut self) -> Option<Event> {
         self.recv().await
+    }
+
+    /// Polls the next event, registering `cx`'s waker; the same stream
+    /// [`Self::recv`] offers.
+    ///
+    /// A response driven from a poll loop reads its request's events one at a
+    /// time this way (design §7.5.1): it must not hold a future across a pause.
+    pub fn poll_recv(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Event>> {
+        let event = std::task::ready!(self.events.poll_recv(cx));
+        match &event {
+            Some(event) => self.observe(event),
+            None => self.finish(),
+        }
+        std::task::Poll::Ready(event)
     }
 
     /// Receives the next event without waiting.
