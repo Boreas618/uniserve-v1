@@ -17,6 +17,32 @@
 //! cannot call it. If a value here and the layer crate's disagree, the layer crate is right and
 //! this file follows it. Candidate widths and the sampler's extras are the slice's own request
 //! state (`crates/nn/src/layers/sampler.rs`, `Sampler::new`).
+//!
+//! **Which side launches a row.** A row exists because a call site launches that key, never because
+//! a kernel exists. Two families make up this file:
+//!
+//! - **the model's**, which `Qwen3Moe::keys()` reproduces from the layers' own descriptor
+//!   accessors (`crates/models/qwen3-moe/src/keys.rs`); if this generator and that walk disagree,
+//!   the walk is right;
+//! - **the executor's**, whose geometry is request and scheduling state the model does not hold:
+//!   the sampler's chain and the logits gathers. Those are keyed where the executor compiles its
+//!   plans, and the rows here are its list, not this file's invention.
+//!
+//! Gaps this file does not fill, named rather than invented, so that the 85 declared operators are
+//! accounted for between the two fixtures and these lines:
+//!
+//! - **The quantized export's family**: `nvfp4_gemm`, `nvfp4_quantize`, `gather_gemm_nvfp4`,
+//!   `route_gemm_nvfp4`, `act_and_mul_fp8`, `value_first_swiglu_fp8`, `kv_quantize` and
+//!   `expert_exchange`. Their descriptors carry the export's own choices — the block-scale dtype,
+//!   the expert packing, the exchange's ranks — and no NVFP4 shard exists in this workspace, so a
+//!   key here would be a guess about an artifact nobody has opened.
+//! - **The executor's path, not the model's**: `slot_commit` (its views are the sampler's state),
+//!   `attention_gather_rows`, `attention_gather_decode_inputs`, `page_conversion`,
+//!   `cache_block_snapshot`, `cache_block_scatter` and `cache_copy_region` (the page geometry and
+//!   the block shapes are the executor's scheduling), and `paged_attention`, whose decode attention
+//!   is trtllm-gen. These are keyed where the executor compiles its own plans.
+//! - `logprob_gather`, `logits_gather`, `vocab_unpad` and the sampler's chain are above: they are the
+//!   slice's, and the widths are its request state.
 
 use ops::attention::{Descriptor as AttentionDescriptor, Mask, Phase};
 use ops::moe;
@@ -54,8 +80,17 @@ const MMA_CLUSTER: (u32, u32) = (1, 1);
 /// Permuted rows per tile of the expert sort (`layers/moe.rs`, `Moe::new`'s tile).
 const SORT_TILE: u32 = 128;
 
+/// Lanes one `softmax` program walks at a time: a chunk of the candidate row.
+const SOFTMAX_TILE: u32 = 8192;
+
 /// The candidate width the slice's sampler keeps per row (`Sampler::new`'s `width`).
-const CANDIDATE_WIDTH: u32 = 2048;
+///
+/// It is the **vocabulary**, not a top-k bound: a request may ask for any top-k it likes, so the
+/// runner builds the sampler with a candidate buffer as wide as the vocabulary — a narrower one
+/// would silently sample a different set (`crates/executor/src/engine_plan.rs`, the one place a
+/// runner's geometry is stated). A deployment that narrowed it would change these keys, which is
+/// why the width is a descriptor field at all.
+const CANDIDATE_WIDTH: u32 = VOCABULARY;
 
 /// Extra counted tokens a sampling row carries in the slice's request state.
 const EXTRAS: u32 = 0;
@@ -67,9 +102,14 @@ const KV_HEADS: u32 = 4;
 const HEAD_DIM: u32 = 128;
 const EXPERTS: u32 = 128;
 const TOP: u32 = 8;
+/// One expert's intermediate width, as the checkpoint's `moe_intermediate_size` states it: the
+/// descriptor field of both expert products means this number, not the gated product's width. The
+/// first product contracts `hidden` into `2 · intermediate` and fuses the gate, so its *output* is
+/// `intermediate` wide; the launch multiplies by two internally and the key never names the
+/// doubled width. `a7b390915` corrected the fixture row that had it wrong; this is the generator
+/// that would have put it back.
 const INTERMEDIATE: u32 = 768;
 /// FC1's fused output width: the gate and up projections side by side.
-const FUSED: u32 = 2 * INTERMEDIATE;
 const VOCABULARY: u32 = 151936;
 const PAGE: u32 = 64;
 const MAX_KV_LEN: u32 = 40960;
@@ -131,7 +171,7 @@ fn main() {
         "gather_gemm".to_owned(),
         key(&moe::grouped::GatherGemmDescriptor {
             hidden: HIDDEN,
-            intermediate: FUSED,
+            intermediate: INTERMEDIATE,
             experts: EXPERTS,
             top: TOP,
             activation: moe::grouped::Activation::Silu,
@@ -178,18 +218,19 @@ fn main() {
         }),
     ));
 
-    // Normalization, rotation and the embedding.
-    for columns in [HIDDEN, HEAD_DIM] {
-        lines.push((
-            "rms_norm".to_owned(),
-            key(&ops::norm::RmsNormDescriptor {
-                dtype,
-                columns,
-                tile: row_tile(columns),
-                pdl: PDL,
-            }),
-        ));
-    }
+    // Normalization, rotation and the embedding. One `rms_norm` width: the model's three
+    // normalizations are all `[hidden]` — the output norm and every layer's two pre-norms. A head's
+    // 128 features are normalized inside `qk_norm_rope`, which is a program of its own, so a
+    // 128-wide `rms_norm` is a module nothing launches.
+    lines.push((
+        "rms_norm".to_owned(),
+        key(&ops::norm::RmsNormDescriptor {
+            dtype,
+            columns: HIDDEN,
+            tile: row_tile(HIDDEN),
+            pdl: PDL,
+        }),
+    ));
     lines.push((
         "add_rms_norm".to_owned(),
         key(&ops::norm::AddRmsNormDescriptor {
@@ -206,8 +247,10 @@ fn main() {
             positions: DType::I32,
             columns: HEAD_DIM / 2,
             block: ROTARY_BLOCK,
-            // Qwen3's rope theta is 1e6, from the checkpoint's configuration.
-            scale: Float::from(1_000_000.0_f32),
+            // The layer's scale, not the rope base: `Rotary` multiplies every angle by 1.0 and the
+            // frequencies table carries Qwen3's 1e6 base, so a key that named the base would compile
+            // the same program under a name no layer asks for.
+            scale: Float::from(1.0_f32),
             pdl: PDL,
             // One-dimensional positions: Qwen3 is text only, so no section is cut.
             axes: 1,
@@ -287,8 +330,11 @@ fn main() {
     ));
     lines.push((
         "logits_shape".to_owned(),
+        // The logits are the runner's buffer, and it allocates them in FP32 whatever the model's
+        // activations are (`causal_lm.rs`: the plan's `logits_dtype`), so this row is the one place
+        // the sampler chain's element type is not the model's.
         key(&ops::sampler::ShapeDescriptor {
-            dtype,
+            dtype: DType::F32,
             vocabulary: VOCABULARY,
             block: row_tile(VOCABULARY),
             extras: EXTRAS,
@@ -338,8 +384,25 @@ fn main() {
         "argmax".to_owned(),
         key(&ops::sampler::ArgMaxDescriptor {
             dtype: DType::F32,
-            width: CANDIDATE_WIDTH,
+            // Greedy reads the row the head shaped, so the width is the vocabulary and not the
+            // candidate width the top-k chain keeps (`nn::Sampler::greedy` passes `self.vocabulary`).
+            width: VOCABULARY,
             ids: DType::I32,
+            pdl: PDL,
+        }),
+    ));
+    lines.push((
+        // The candidates' probabilities: the general selection's step between the top-k program and
+        // the filters, over the candidate width rather than the vocabulary.
+        "softmax".to_owned(),
+        // The tile is a chunk of the row, not the row: the program walks the width in tiles and
+        // keeps a running maximum and denominator, which is what lets the candidate width be the
+        // vocabulary. Its sibling `log_softmax` takes the row-sized step because its kernel derives
+        // its own tile from the same number.
+        key(&ops::norm::SoftmaxDescriptor {
+            dtype: DType::F32,
+            columns: CANDIDATE_WIDTH,
+            tile: SOFTMAX_TILE,
             pdl: PDL,
         }),
     ));

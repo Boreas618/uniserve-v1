@@ -119,6 +119,16 @@ impl Partition {
         (first, rows)
     }
 
+    /// The width of this rank's vocabulary shard as the head stores and computes it.
+    ///
+    /// The head multiplies a whole number of eight-row tiles per rank, so a shard shorter than its
+    /// tile is stored padded; the vocabulary's own last rank can be short, and then the padding is
+    /// what the shard's rows are rounded up to. The same width is the head's output width and the
+    /// width of one rank's block in the gathered logits matrix.
+    pub fn padded_vocabulary_shard(&self, vocab_size: usize) -> usize {
+        self.vocabulary_shard(vocab_size).1.next_multiple_of(8)
+    }
+
     /// The experts this rank owns, as a half-open range of the checkpoint's expert ids.
     pub fn expert_range(&self, config: &crate::Config) -> std::ops::Range<usize> {
         let per_rank = config.num_experts / self.expert_parallel;

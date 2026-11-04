@@ -129,11 +129,32 @@ impl EngineControl {
     /// reports that its start failed.
     pub fn start(
         &self,
-        mut spec: wire::EngineSpec,
+        spec: wire::EngineSpec,
         build: &crate::epoch::BuildConfig,
         stats: StatsSink,
     ) -> anyhow::Result<EngineClient> {
         let engine = self.next_engine.fetch_add(1, Ordering::Relaxed);
+        self.start_at(spec, engine, build, stats)
+    }
+
+    /// [`EngineControl::start`] under a number the caller allocated.
+    ///
+    /// A standby's number comes from the epoch layer's one allocator
+    /// ([`crate::epoch::Epochs::next_generation`]), which also numbers the
+    /// launches an epoch switch starts; two counters for one identity would
+    /// drift the day a standby exists, so the standby path does not use
+    /// `next_engine`.
+    ///
+    /// # Errors
+    ///
+    /// As [`EngineControl::start`].
+    pub fn start_at(
+        &self,
+        mut spec: wire::EngineSpec,
+        engine: u64,
+        build: &crate::epoch::BuildConfig,
+        stats: StatsSink,
+    ) -> anyhow::Result<EngineClient> {
         // A spec of no world starts a world of its own, which takes the
         // identity of its first engine; an engine that replaces a lost one
         // goes on with its world.
@@ -564,6 +585,10 @@ impl EngineControl {
             rollback_s: None,
             queue_depth: placement.queue_depth,
             world_size,
+            // A process that starts beside its predecessor is the serving
+            // process's standby (§2.5): the spec states the predecessor and
+            // the child has to know the role before it claims storage.
+            standby: spec.predecessor.is_some(),
         })
     }
 
@@ -598,7 +623,6 @@ impl EngineControl {
         engine: u64,
     ) -> anyhow::Result<crate::updates::switch::Start> {
         let launch = self.launch(spec, engine)?;
-        let path = launch::write(&self.runtime, engine, &launch)?;
         let executable = spec
             .workers
             .as_ref()
@@ -607,7 +631,7 @@ impl EngineControl {
         Ok(crate::updates::switch::Start {
             build: own_executable(&executable).then(|| proto::BUILD.to_owned()),
             executable,
-            arguments: Self::arguments(&path),
+            launch,
             environment: std::collections::HashMap::new(),
         })
     }
@@ -1342,17 +1366,27 @@ mod tests {
 
         let start = control.epoch_start(&spec, 9).unwrap();
         assert_eq!(start.build, Some(proto::BUILD.to_owned()));
-        assert_eq!(start.arguments[0], "engine");
-        assert_eq!(start.arguments[1], "--launch");
-        let written: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(&start.arguments[2]).expect("the launch file"),
-        )
-        .expect("its JSON");
-        assert_eq!(written["engine"], 9);
-        assert_eq!(written["world"], 3);
-        assert_eq!(written["processes"], "unix:/run/processes.sock");
-        assert_eq!(written["queue_depth"], 4);
-        assert_eq!(written["world_size"], 1);
+        // The file is the adapter's to write for the process it starts; the
+        // start carries its contents, with this process's generation.
+        assert_eq!(start.launch.engine, 9);
+        assert_eq!(start.launch.world, 3);
+        assert_eq!(start.launch.processes, "unix:/run/processes.sock");
+        assert_eq!(start.launch.requests, control.request_address());
+        assert_eq!(start.launch.queue_depth, 4);
+        assert_eq!(start.launch.world_size, 1);
+
+        // The launch states whether the child stands by (§2.5): a standby has
+        // to know the role before it claims storage, and a serving child must
+        // not read the file as one.
+        assert!(!start.launch.standby);
+        spec.predecessor = Some(wire::Predecessor {
+            world: 3,
+            segments: Vec::new(),
+        });
+        let standby = control.epoch_start(&spec, 10).unwrap();
+        assert!(standby.launch.standby);
+        assert_eq!(standby.launch.world, 3);
+        spec.predecessor = None;
 
         spec.workers.as_mut().unwrap().executable = "/opt/uniserve-b".to_owned();
         let other = control.epoch_start(&spec, 9).unwrap();

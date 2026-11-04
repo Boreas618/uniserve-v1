@@ -5,8 +5,8 @@
 //! all-reduces the result when it has a group (specs/worker.md 9, "词嵌入"): the sum over ranks is
 //! the token's embedding.
 
-use ops::TensorView;
 use ops::embedding::{self, Descriptor, Embedding as EmbeddingOp};
+use ops::{DType, TensorView};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -79,6 +79,23 @@ impl Embedding {
         self.rows != self.vocabulary
     }
 
+    /// The descriptor [`Self::forward`] launches with, for an output of `out` and ids of `ids`.
+    ///
+    /// The token count is not in it — the ids' length is a launch value — so a request space
+    /// enumerates one descriptor per pair of element types, and the row count of the table comes
+    /// from the layer's shard.
+    pub fn descriptor(&self, out: DType, ids: DType) -> Descriptor {
+        Descriptor {
+            dtype: out,
+            ids,
+            hidden: self.hidden,
+            first: self.first,
+            rows: self.rows,
+            block: EMBEDDING_TOKENS,
+            pdl: PDL,
+        }
+    }
+
     /// `out = embed(ids)`, all-reduced across the shard's ranks.
     pub fn forward(&self, f: &Forward, ids: TensorView, out: TensorView) -> Result<()> {
         let hidden = u64::from(self.hidden);
@@ -96,15 +113,7 @@ impl Embedding {
                 format!("{} ids but {} embedding rows", ids.numel(), out.rows()),
             ));
         }
-        let descriptor = Descriptor {
-            dtype: out.dtype,
-            ids: ids.dtype,
-            hidden: self.hidden,
-            first: self.first,
-            rows: self.rows,
-            block: EMBEDDING_TOKENS,
-            pdl: PDL,
-        };
+        let descriptor = self.descriptor(out.dtype, ids.dtype);
         let args = embedding::Args {
             ids,
             weight: self.weight.view(),

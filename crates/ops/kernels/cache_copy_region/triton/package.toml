@@ -1,0 +1,55 @@
+# The cache_copy_region operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one architecture of
+# `[kernel.architectures]`, built by `src/build.py`.
+#
+# This is the prefix cache's second conversion step: a span of K/V an importing rank decoded into
+# FP32 goes into the destination page's units, each layer's rows into its own unit, in the pool's
+# stored element type, and the column's initialized flag is raised.
+#
+# The key names the field, the pool's own geometry (`columns`, `units_per_page`, `plane_bytes`,
+# `heads`, `head_dim`), the stored element type and whether the destination stores FP8. The *span* is
+# not in the key: the token count, the page offset and the unit ids are launch words, so one module
+# serves every import size.
+#
+# Both halves are here, and both run one program per (column, unit slot) -- grid
+# `(columns, units_per_page, 1)`. An FP8 destination grows the unit's scale to cover the span and
+# rescales the unit's resident values first (`uniserve/prefix_cache/mha.py:257-304`: one amax over the
+# whole span, floored at 1e-12, ceiling 448.0, growth only when the cell is initialized). A grid with a
+# token axis could not do that: every token's program would compute its own partial amax and race
+# several scales into one cell, which is a different tensor rather than a different last bit.
+
+op = "cache_copy_region"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/cache_copy_region.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a", "sm_100f"]
+
+# `field_key_columns_48_units_per_page_1_plane_bytes_65536_heads_4_head_dim_128_element_bf16_scaled_false`.
+#
+# `plane_bytes` is the pool's unit size (`block_size · heads · head_dim · element bytes`), so it and
+# `heads`/`head_dim`/`element` are one geometry stated twice; both are in the key because both are
+# launch arithmetic the kernel performs and neither is derivable from the other at compile time.
+#
+# `element = f8e4m3` with `scaled = true` is the FP8 pool; every other combination of the two is
+# refused by the compile script rather than built, because a dense pool stores the values themselves
+# and an FP8 one is the scaled pool.
+[kernel.descriptors]
+dimensions = { field = ["key", "value"], columns = ["1", "8", "16", "48"], units_per_page = ["1", "2", "4"], plane_bytes = ["32768", "65536", "131072"], heads = ["4", "8"], head_dim = ["128", "64"], element = ["bf16", "f16", "f8e4m3"], scaled = ["false", "true"] }
+
+[parameters]

@@ -8,13 +8,6 @@ use crate::config::TransformerConfig;
 use crate::partition::Partition;
 use crate::{Error, Result};
 
-/// Whether the engine can compose the compression branch of VSA.
-///
-/// False until `vsa_compress_pooled` exists: the reference's branch 3 is a dense masked softmax over
-/// live tiles, and the placeholder in [`Sparse::forward`] is not it. Flipping this to true is part of
-/// the same commit that swaps the call, so the two can never disagree.
-pub const COMPRESSION_COMPOSED: bool = false;
-
 /// One layer's sparse attention: four projections, the tile preparation, and both attentions.
 pub struct Sparse {
     /// The query, key and value projections, `[inner, hidden]` each.
@@ -35,8 +28,6 @@ pub struct Sparse {
     pub tiles: VsaTiles,
     /// The fine attention over the selected tiles of the rows, in the checkpoint's dtype.
     pub fine: SegmentAttention,
-    /// The compression over the pooled tiles, written in the rows' dtype from FP32 arithmetic.
-    pub compressed: SegmentAttention,
     /// Heads of the whole model, and the heads this rank holds.
     pub heads: u32,
     pub local_heads: u32,
@@ -44,34 +35,42 @@ pub struct Sparse {
     pub head_dim: u32,
     /// Rows of one tile.
     pub tile_rows: u32,
-    /// `[tiles]` int32, all one: every pooled tile is a single valid row for the compression.
-    pub ones: Weight,
 }
 
 impl Sparse {
+    /// Every checkpoint tensor one layer's sparse attention reads, as complete names.
+    ///
+    /// The gate compression's projection is the fourth of the fused matrix the query, key and value
+    /// come from (`attention.py:139`), so it is one more weight than the dense branch reads.
+    pub fn keys(index: u32) -> Vec<String> {
+        let prefix = format!("transformer_blocks.{index}.attn");
+        [
+            "norm_q.weight",
+            "norm_k.weight",
+            "to_q.weight",
+            "to_k.weight",
+            "to_v.weight",
+            "to_gate_compress.weight",
+            "to_out.0.weight",
+        ]
+        .iter()
+        .map(|suffix| format!("{prefix}.{suffix}"))
+        .collect()
+    }
+
     /// Read layer `index`'s sparse attention of a DiT partition.
     ///
-    /// Refuses while [`COMPRESSION_COMPOSED`] is false: see the module documentation.
+    #[allow(clippy::too_many_arguments)]
     pub fn load(
         index: u32,
         config: &TransformerConfig,
         rows: u32,
         rotated_axes: &[u32],
         tile_rows: u32,
+        tile_bound: u32,
         partition: &Partition,
         loader: &mut WeightLoader<'_>,
     ) -> Result<Self> {
-        if !COMPRESSION_COMPOSED {
-            return Err(Error::Unsupported(
-                "H3's VSA compression branch is a dense masked softmax over every live tile \
-                 (uniserve/nn/attention/vsa/segments.py:466-479) and needs the op \
-                 `vsa_compress_pooled` (pooled scores, pooled values and each tile's live size in, \
-                 the rows' dtype out); without it a sparse layer would fold a compression that \
-                 averages only the selected tiles, so a sparse checkpoint is refused rather than \
-                 served as a different model"
-                    .to_owned(),
-            ));
-        }
         let prefix = format!("transformer_blocks.{index}.attn");
         let hidden = u64::from(config.hidden_size);
         let head = u64::from(config.head_dim);
@@ -86,11 +85,15 @@ impl Sparse {
         let query_gain = gain(loader, &format!("{prefix}.norm_q.weight"), head)?;
         let key_gain = gain(loader, &format!("{prefix}.norm_k.weight"), head)?;
         let frequencies = frequencies(loader, config, rotated)?;
+        // The rotation reads *this rank's* heads: under Ulysses the sequence is split across ranks
+        // and each holds `heads / degree` of them (`Partition::denoiser_heads`), so a descriptor that
+        // named the global count would refuse its own query view at any degree above one.
+        let local_heads = partition.denoiser_heads(config.num_attention_heads);
         let rotary = Rotary::new(
             frequencies,
             config.head_dim,
-            config.num_attention_heads,
-            config.num_attention_heads,
+            local_heads,
+            local_heads,
             config.qk_norm_eps,
             Rotation::Half,
             1.0,
@@ -108,31 +111,19 @@ impl Sparse {
             )));
         }
         let local_heads = partition.denoiser_heads(config.num_attention_heads);
+        // The compression reduces over every key tile of the layout, so the layer states the
+        // deployment's own tile bound once (`Layouts::tiles_bound`) and the score matrix is sized by
+        // it rather than guessed from a layout at launch.
         let tiles = VsaTiles::new(tile_rows, local_heads, config.head_dim, config.qk_norm_eps)?
             .with_norm()
-            .with_rotation(rotated)?;
+            .with_rotation(rotated)?
+            .with_tile_bound(tile_bound)?;
         let fine = SegmentAttention::new(
             u64::from(tile_rows),
             u64::from(local_heads),
             head,
             u64::from(rows),
             nn::DType::BF16,
-        )?;
-        // One pooled row per tile, so the compression's block is one; its arithmetic is FP32 and
-        // its result is written in the rows' dtype, which is what the gate reads.
-        let compressed = SegmentAttention::new(
-            1,
-            u64::from(local_heads),
-            head,
-            u64::from(rows / tile_rows),
-            nn::DType::BF16,
-        )?;
-        let tile_count = rows / tile_rows;
-        let ones = loader.constant(
-            &format!("transformer.vsa.ones.{tile_count}"),
-            nn::DType::I32,
-            Shape::new(&[u64::from(tile_count)]),
-            &vec![1u8; tile_count as usize * 4],
         )?;
         Ok(Self {
             query: projection(loader, &format!("{prefix}.to_q.weight"), inner, hidden)?,
@@ -150,12 +141,10 @@ impl Sparse {
             rotary,
             tiles,
             fine,
-            compressed,
             heads: config.num_attention_heads,
             local_heads,
             head_dim: config.head_dim,
             tile_rows,
-            ones,
         })
     }
 
@@ -253,25 +242,15 @@ impl Sparse {
         self.fine
             .forward(f, query, key, value, &tables, scratch.fine)?;
 
-        // PLACEHOLDER for branch 3: the reference's compression is a dense masked softmax over every
-        // *live* tile (`vsa/segments.py:466-473`) and this attends only the selected ones, so it is
-        // not equal to it. Unreachable while `COMPRESSION_COMPOSED` is false; replaced by the
-        // `vsa_compress_pooled` call in the commit that makes it true.
-        //
-        // The compression reads one pooled row per tile with the same selection, in FP32, and
-        // writes the rows' dtype; the gate then weights it into the fine rows.
-        let pooled_tables = SegmentTables {
-            indices: scratch.indices,
-            counts: scratch.counts,
-            // Every pooled tile is one valid row, so the valid sizes are all one.
-            sizes: self.ones.view(),
-        };
-        self.compressed.forward(
+        // Branch 3: one compression per (head, query tile) from the pooled scores and values, a
+        // dense softmax over every *live* key tile in FP32 with one rounding to the rows' dtype. A
+        // tile whose rows are all invalid is masked out of the softmax rather than zeroed - a zeroed
+        // pooled value under a live score would still take weight and scale the others down.
+        self.tiles.compress(
             f,
-            scratch.pooled_query,
-            scratch.pooled_key,
+            scratch.scores,
             scratch.pooled_value,
-            &pooled_tables,
+            sizes,
             scratch.compressed,
         )?;
         // The compression is folded into the fine rows, in place, and one binding names both the
@@ -355,9 +334,11 @@ impl Scratch {
             indices: arena.tensor(nn::DType::I32, Shape::new(&[heads, tiles64, tiles64]))?,
             counts: arena.tensor(nn::DType::I32, Shape::new(&[heads, tiles64]))?,
             fine: arena.tensor(dtype, Shape::new(&[rows, inner]))?,
+            // `[heads, tiles, width]`: what `compress` writes and what the gate step reads, one row
+            // per (head, query tile) - every row of a query tile compresses to the same vector.
             compressed: arena.tensor(
                 dtype,
-                Shape::new(&[tiles64, heads, u64::from(layer.head_dim)]),
+                Shape::new(&[heads, tiles64, u64::from(layer.head_dim)]),
             )?,
         })
     }

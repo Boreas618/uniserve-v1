@@ -35,7 +35,7 @@ use tracing::{info, warn};
 
 use crate::engine::client::{EngineClient, EngineState};
 use crate::leader::{Leader, Replica, UpdateError, locked};
-use crate::worlds::Rates;
+use crate::observe::Rates;
 
 /// The span before a session's start its baseline step time averages.
 pub const BASELINE: Duration = Duration::from_secs(60);
@@ -351,7 +351,7 @@ impl Replica {
 impl Profiles {
     /// Read the workers' progress of `session` from the statistics they
     /// reported, and the guard's measure.
-    fn progress(&self, session: &mut Session, observer: &crate::worlds::Observer) {
+    fn progress(&self, session: &mut Session, observer: &crate::observe::Observer) {
         let (steps, bytes, ended) = observer.profile(session.id);
         session.steps = steps;
         session.bytes_written = bytes;

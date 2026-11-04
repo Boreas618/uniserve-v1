@@ -264,13 +264,6 @@ impl BatchColumns {
 
     /// Whether every column has the length its field promises for `shape`, so that a mis-sized
     /// batch fails before a launch rather than after one.
-    ///
-    /// Three counts, not one: `input_ids` is as long as the batch's tokens, `slots` and
-    /// `parameters` as long as its rows — the sequences, which is `[rows]` in every per-row column
-    /// and what [`BatchColumns::rows`] answers — and `commit` is one row per *call*, since a call
-    /// states once how the step advances its slot however many rows it evaluated. A verify batch
-    /// of three candidates is one call and three rows, and comparing the per-row columns with the
-    /// call count refuses it.
     pub fn check(&self, shape: &Shape) -> Result<()> {
         let tokens = self.rows.tokens();
         // Two counts, and a column belongs to one of them: `slots`, `parameters`, `seq_lens` and

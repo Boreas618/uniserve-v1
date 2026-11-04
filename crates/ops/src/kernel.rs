@@ -68,10 +68,47 @@ pub struct CubinMetadata {
     pub launch_pdl: bool,
     /// Launch cooperatively.
     pub launch_cooperative_grid: bool,
-    /// Global scratch bytes the kernel needs, handed to it as its last parameter.
+    /// The parameters the program takes at launch, in order, as the module records them.
+    ///
+    /// Triton drops constexprs from this list, which is what makes it the authority a launch is
+    /// checked against: the operator packs one word per entry here, plus the global scratch when the
+    /// module declares one.
+    pub signature: Vec<Parameter>,
+    /// Global scratch bytes the kernel needs, handed to it as one of its last parameters.
     pub global_scratch_size: u64,
     /// The alignment global scratch must have.
     pub global_scratch_align: u64,
+    /// Profile scratch bytes the kernel needs, handed to it after the global scratch.
+    ///
+    /// Triton's launcher passes the address whatever the size; a launch that runs no profiler passes
+    /// null and the kernel never reads it.
+    pub profile_scratch_size: u64,
+    /// The alignment profile scratch must have.
+    pub profile_scratch_align: u64,
+}
+
+/// One parameter of a kernel's runtime signature.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Parameter {
+    /// The parameter's name in the compiled program, for error text.
+    pub name: String,
+    /// Its type as the module records it: `*bf16`, `*i32`, `i32`, `fp32`, ...
+    pub ty: String,
+}
+
+impl Parameter {
+    /// Read from a string, as the module records one.
+    fn named(name: &str, ty: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            ty: ty.to_owned(),
+        }
+    }
+
+    /// Whether the driver reads a device address out of this parameter.
+    pub fn is_pointer(&self) -> bool {
+        self.ty.starts_with('*')
+    }
 }
 
 impl CubinMetadata {
@@ -89,8 +126,11 @@ impl CubinMetadata {
             num_ctas: 1,
             launch_pdl: false,
             launch_cooperative_grid: false,
+            signature: Vec::new(),
             global_scratch_size: 0,
             global_scratch_align: 1,
+            profile_scratch_size: 0,
+            profile_scratch_align: 1,
         }
     }
 
@@ -114,8 +154,19 @@ impl CubinMetadata {
             num_ctas: fields.integer("num_ctas").unwrap_or(1).max(1) as u32,
             launch_pdl: fields.boolean("launch_pdl").unwrap_or(false),
             launch_cooperative_grid: fields.boolean("launch_cooperative_grid").unwrap_or(false),
+            signature: fields
+                .object("signature")
+                .map(|signature| {
+                    signature
+                        .iter()
+                        .map(|(name, value)| Parameter::named(name, value.as_type()))
+                        .collect()
+                })
+                .unwrap_or_default(),
             global_scratch_size: fields.integer("global_scratch_size").unwrap_or(0),
             global_scratch_align: fields.integer("global_scratch_align").unwrap_or(0),
+            profile_scratch_size: fields.integer("profile_scratch_size").unwrap_or(0),
+            profile_scratch_align: fields.integer("profile_scratch_align").unwrap_or(0),
         })
     }
 
@@ -182,11 +233,24 @@ pub struct Arguments {
         reason = "the driver reads the words through pointers, so each word keeps its address"
     )]
     words: Vec<Box<u64>>,
+    /// For each word, whether the driver reads a device address out of it.
+    kinds: Vec<Word>,
     /// The global scratch address, for a kernel whose metadata asks for one.
     scratch: Option<DevicePtr>,
     /// The word the scratch address is read from at launch.
     scratch_slot: Box<u64>,
+    /// The word the profile scratch address is read from at launch.
+    profile_slot: Box<u64>,
     parameters: Vec<*mut c_void>,
+}
+
+/// What the driver reads out of one packed parameter.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Word {
+    /// A device address.
+    Pointer,
+    /// A scalar value, in the low bytes of the word.
+    Scalar,
 }
 
 impl Arguments {
@@ -197,7 +261,7 @@ impl Arguments {
 
     /// A device address.
     pub fn pointer(&mut self, pointer: DevicePtr) -> &mut Self {
-        self.word(platform::address(pointer))
+        self.packed(Word::Pointer, platform::address(pointer))
     }
 
     /// The address a tensor view starts at.
@@ -262,25 +326,114 @@ impl Arguments {
             _ => {}
         }
 
+        self.check(metadata)?;
         self.parameters.clear();
         self.parameters.extend(
             self.words
                 .iter_mut()
                 .map(|word| word.as_mut() as *mut u64 as *mut c_void),
         );
-        if let Some(scratch) = self.scratch {
-            // The scratch address is a value the driver reads at launch, exactly like the packed
-            // words above; keeping it in the same `words` vector would misplace it among the
-            // kernel's own parameters, so it is passed through a slot of its own.
-            *self.scratch_slot = platform::address(scratch);
+        if metadata.is_some() {
+            // A cubin module takes two parameters after its own signature, which the compiler's
+            // launcher appends and its PTX declares whatever their size is: the global scratch
+            // address and the profile scratch address. They are values the driver reads at launch,
+            // exactly like the packed words above, so they are passed through slots of their own that
+            // outlive this call.
+            *self.scratch_slot = self.scratch.map(platform::address).unwrap_or(0);
+            *self.profile_slot = 0;
             self.parameters
                 .push(self.scratch_slot.as_mut() as *mut u64 as *mut c_void);
+            self.parameters
+                .push(self.profile_slot.as_mut() as *mut u64 as *mut c_void);
         }
         Ok(&mut self.parameters)
     }
 
+    /// Whether a signature entry is one of the two scratch addresses the compiler appends.
+    fn is_scratch(name: &str) -> bool {
+        matches!(name, "global_scratch" | "profile_scratch")
+    }
+
+    /// Refuse a parameter list that disagrees with the program's own signature.
+    ///
+    /// The driver reads one value per parameter at the address it is handed, so a list that is short,
+    /// long, or has a scalar where the program reads a pointer is not a near miss: the launch dies in
+    /// the driver, or reads a device address it was never given, and neither names the operator. A
+    /// module that records no signature (one built without Triton's metadata) is launched as before.
+    fn check(&self, metadata: Option<&CubinMetadata>) -> Result<()> {
+        let Some(metadata) = metadata.filter(|metadata| !metadata.signature.is_empty()) else {
+            return Ok(());
+        };
+        // `parameters` appends the global and the profile scratch address after the packed words, so
+        // the launch passes two more words than the operator packed, whatever the scratch sizes are.
+        //
+        // The signature is held to the packed words alone, with any entry naming one of those two
+        // addresses left out. A module the compiler builds today names neither: `_embedding_kernel`'s
+        // signature is its seven parameters and `global_scratch_size`/`profile_scratch_size` are
+        // separate fields, so its nine-parameter PTX is those seven plus the two appended here. A
+        // module whose metadata does name them states two entries this operator never packs, and
+        // filtering keeps that from being counted twice. Either way the count is "what the operator
+        // states", which is the only thing it can be held to.
+        let declared: Vec<&Parameter> = metadata
+            .signature
+            .iter()
+            .filter(|parameter| !Self::is_scratch(&parameter.name))
+            .collect();
+        let expected = declared.len();
+        let supplied = self.kinds.len();
+        if expected != supplied {
+            return Err(Error::Metadata(format!(
+                "{} declares {expected} parameters ({}) and the operator packed {supplied} ({})",
+                metadata.name,
+                Self::describe(&metadata.signature),
+                Self::describe_packed(&self.kinds),
+            )));
+        }
+        for (position, (parameter, word)) in declared.iter().zip(&self.kinds).enumerate() {
+            if parameter.is_pointer() != (*word == Word::Pointer) {
+                return Err(Error::Metadata(format!(
+                    "{} parameter {position} `{}` is `{}` and the operator packed a {} there",
+                    metadata.name,
+                    parameter.name,
+                    parameter.ty,
+                    match word {
+                        Word::Pointer => "device address",
+                        Word::Scalar => "scalar",
+                    }
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The parameters of a signature, for error text.
+    fn describe(signature: &[Parameter]) -> String {
+        signature
+            .iter()
+            .map(|parameter| format!("`{}`: {}", parameter.name, parameter.ty))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// The packed words, for error text.
+    fn describe_packed(kinds: &[Word]) -> String {
+        kinds
+            .iter()
+            .map(|word| match word {
+                Word::Pointer => "address".to_owned(),
+                Word::Scalar => "scalar".to_owned(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     fn word(&mut self, value: u64) -> &mut Self {
+        self.packed(Word::Scalar, value)
+    }
+
+    fn packed(&mut self, kind: Word, value: u64) -> &mut Self {
         self.words.push(Box::new(value));
+        self.kinds.push(kind);
         self
     }
 }
@@ -478,12 +631,24 @@ struct MetadataFields<'a> {
     fields: Vec<(&'a str, Scalar<'a>)>,
 }
 
-/// One scalar value of the metadata JSON.
+/// One value of the metadata JSON.
 enum Scalar<'a> {
     String(&'a str),
     Number(f64),
     Bool(bool),
+    Object(MetadataFields<'a>),
+    /// An array, a null, or anything else `ops` reads nothing out of.
     Other,
+}
+
+impl Scalar<'_> {
+    /// The type text of a signature entry, which the module records as a string.
+    fn as_type(&self) -> &str {
+        match self {
+            Self::String(text) => text,
+            _ => "?",
+        }
+    }
 }
 
 impl<'a> MetadataFields<'a> {
@@ -505,6 +670,18 @@ impl<'a> MetadataFields<'a> {
             Some(Scalar::Number(value)) if *value >= 0.0 => Some(*value as u64),
             _ => None,
         }
+    }
+
+    fn object(&self, name: &str) -> Option<&MetadataFields<'a>> {
+        match self.field(name) {
+            Some(Scalar::Object(fields)) => Some(fields),
+            _ => None,
+        }
+    }
+
+    /// The fields in the order the module wrote them, which is a parameter's position.
+    fn iter(&self) -> impl Iterator<Item = (&'a str, &Scalar<'a>)> {
+        self.fields.iter().map(|(key, value)| (*key, value))
     }
 
     fn boolean(&self, name: &str) -> Option<bool> {
@@ -573,10 +750,7 @@ impl<'a> JsonReader<'a> {
                 self.skip_nested(b'[', b']')?;
                 Ok(Scalar::Other)
             }
-            Some(b'{') => {
-                self.skip_nested(b'{', b'}')?;
-                Ok(Scalar::Other)
-            }
+            Some(b'{') => Ok(Scalar::Object(self.object()?)),
             Some(byte) if byte == b'-' || byte.is_ascii_digit() => {
                 let start = self.bytes;
                 while let Some(byte) = self.peek() {
@@ -667,5 +841,94 @@ impl<'a> JsonReader<'a> {
         while self.peek().is_some_and(|byte| byte.is_ascii_whitespace()) {
             self.bytes += 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Arguments, CubinMetadata, DevicePtr};
+
+    /// The metadata Triton writes beside a cubin, cut to the fields a launch reads.
+    fn metadata(record: &str) -> CubinMetadata {
+        CubinMetadata::parse(record.as_bytes()).expect("the metadata parses")
+    }
+
+    #[test]
+    fn a_module_takes_its_own_parameters_and_then_the_two_scratch_addresses() {
+        let module = metadata(r#"{"name":"_kernel","num_warps":4}"#);
+        let mut arguments = Arguments::new();
+        arguments.pointer(DevicePtr::new(0x1000)).u32(7);
+        // The program's two parameters, then the global and the profile scratch address Triton's
+        // launcher appends and its PTX declares whatever their size is.
+        assert_eq!(arguments.parameters(Some(&module)).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn a_signature_that_names_its_scratch_is_not_counted_twice() {
+        // Triton 3.7's metadata records the two scratch addresses inside the signature, and the launch
+        // appends those two slots itself. A module of two parameters therefore takes two packed
+        // words, not four: counting the named entries again refused every module built that way.
+        let module = metadata(
+            r#"{"name":"_kernel","signature":{"x":"*bf16","rows":"i32","global_scratch":"*i8","profile_scratch":"*i8"}}"#,
+        );
+        let mut arguments = Arguments::new();
+        arguments.pointer(DevicePtr::new(0x1000)).u32(7);
+        assert_eq!(arguments.parameters(Some(&module)).unwrap().len(), 4);
+        let mut long = Arguments::new();
+        long.pointer(DevicePtr::new(0x1000)).u32(7).u32(1);
+        let error = long.parameters(Some(&module)).unwrap_err().to_string();
+        assert!(error.contains("declares 2 parameters"), "{error}");
+        assert!(error.contains("packed 3"), "{error}");
+    }
+
+    #[test]
+    fn the_parameter_list_must_hold_one_word_per_parameter() {
+        let module =
+            metadata(r#"{"name":"_kernel","signature":{"x":"*bf16","rows":"i32","eps":"fp32"}}"#);
+        let mut short = Arguments::new();
+        short.pointer(DevicePtr::new(0x1000)).u32(7);
+        let error = short.parameters(Some(&module)).unwrap_err().to_string();
+        assert!(error.contains("_kernel"), "{error}");
+        assert!(error.contains("declares 3 parameters"), "{error}");
+        assert!(error.contains("packed 2"), "{error}");
+        assert!(error.contains("`eps`: fp32"), "{error}");
+    }
+
+    #[test]
+    fn a_scalar_where_the_program_reads_an_address_is_refused_by_position() {
+        let module = metadata(r#"{"name":"_kernel","signature":{"x":"*bf16","rows":"i32"}}"#);
+        let mut arguments = Arguments::new();
+        arguments.u64(0).u32(7);
+        let error = arguments.parameters(Some(&module)).unwrap_err().to_string();
+        assert!(error.contains("parameter 0 `x` is `*bf16`"), "{error}");
+        assert!(error.contains("scalar"), "{error}");
+    }
+
+    #[test]
+    fn global_scratch_is_a_value_the_caller_supplies_and_its_absence_is_refused() {
+        let module =
+            metadata(r#"{"name":"_kernel","signature":{"x":"*bf16"},"global_scratch_size":4096}"#);
+        let mut arguments = Arguments::new();
+        arguments.pointer(DevicePtr::new(0x1000));
+        arguments.scratch(Some(DevicePtr::new(0x2000)));
+        // One declared parameter and the two scratch addresses.
+        assert_eq!(arguments.parameters(Some(&module)).unwrap().len(), 3);
+
+        let mut without = Arguments::new();
+        without.pointer(DevicePtr::new(0x1000));
+        let error = without.parameters(Some(&module)).unwrap_err().to_string();
+        assert!(error.contains("global scratch"), "{error}");
+    }
+
+    #[test]
+    fn a_matching_list_packs_one_address_per_word() {
+        let module =
+            metadata(r#"{"name":"_kernel","signature":{"x":"*fp32","out":"*fp32","rows":"i64"}}"#);
+        let mut arguments = Arguments::new();
+        arguments
+            .pointer(DevicePtr::new(0x1000))
+            .pointer(DevicePtr::new(0x2000))
+            .u64(4);
+        assert_eq!(arguments.parameters(Some(&module)).unwrap().len(), 5);
     }
 }

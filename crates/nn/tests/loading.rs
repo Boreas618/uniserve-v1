@@ -8,7 +8,7 @@
 #![cfg(test)]
 use std::path::Path;
 
-use nn::weights::{RetainedWeights, WeightRequest};
+use nn::weights::{Nvfp4Names, RetainedWeights, WeightRequest};
 use nn::{Checkpoint, DType, DevicePtr, Shape, WeightKey, WeightLayout, WeightLoader};
 
 /// The bytes of `values` as BF16.
@@ -452,6 +452,8 @@ fn a_calibrated_nvfp4_matrix_is_loaded_as_its_three_fields() {
         .nvfp4(
             &WeightRequest::region("w", 0, Shape::new(&[4, 32])),
             &WeightRequest::region("w_scale", 0, Shape::new(&[4, 4])),
+            None,
+            Nvfp4Names::vllm(),
             ops::fp4::ScaleLayout::Linear,
             0.25,
         )
@@ -497,6 +499,8 @@ fn the_block_scales_must_have_the_layout_s_shape() {
         .nvfp4(
             &WeightRequest::region("w", 0, Shape::new(&[4, 32])),
             &WeightRequest::region("w_scale", 0, Shape::new(&[4, 4])),
+            None,
+            Nvfp4Names::vllm(),
             ops::fp4::ScaleLayout::Swizzled128X4,
             0.25,
         )
@@ -508,6 +512,8 @@ fn the_block_scales_must_have_the_layout_s_shape() {
 /// An expert stack is its experts' encoded tensors concatenated in the operator's reading order —
 /// expert-major, up before gate — and its tensor scales become one reciprocal per expert **and
 /// projection**, because the checkpoint gives each expert's up and gate their own `weight_scale_2`.
+/// The scales are published the other way round: one packed table per projection, which is what the
+/// batched-GEMM entry reads and what the checkpoint itself says a tensor at a time.
 #[test]
 fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection() {
     let directory = tempfile::tempdir().unwrap();
@@ -556,7 +562,10 @@ fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection
                 "experts",
                 &["up", "gate"],
                 2,
+                Nvfp4Names::vllm(),
+                nn::ValueLayout::Plain,
                 ops::fp4::ScaleLayout::Linear,
+                false,
             )
             .unwrap()
     };
@@ -567,7 +576,7 @@ fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection
     assert_eq!(
         stack.global_scale.shape().dims(),
         &[2, 2],
-        "two experts, and one scalar per projection within each"
+        "one packed table per projection, of two experts each"
     );
     assert_eq!(stack.global_scale.dtype(), DType::F32);
     // The store received the values in reading order, then the scales, then the reciprocals.
@@ -584,8 +593,8 @@ fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection
         .collect();
     assert_eq!(
         reciprocals,
-        [2.0, 2.0, 1.0, 1.0],
-        "1 / (0.5 · (e + 1)), expert-major and then projection-major"
+        [2.0, 1.0, 2.0, 1.0],
+        "1 / (0.5 · (e + 1)) as one packed row per projection: up's two experts, then gate's"
     );
 
     // A second load of the same checkpoint publishes nothing: the three keys hit the store.
@@ -597,7 +606,10 @@ fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection
                 "experts",
                 &["up", "gate"],
                 2,
+                Nvfp4Names::vllm(),
+                nn::ValueLayout::Plain,
                 ops::fp4::ScaleLayout::Linear,
+                false,
             )
             .unwrap()
     };
@@ -657,7 +669,10 @@ fn a_stack_needs_every_expert_to_agree_on_its_geometry() {
             "experts",
             &["up"],
             2,
+            Nvfp4Names::vllm(),
+            nn::ValueLayout::Plain,
             ops::fp4::ScaleLayout::Linear,
+            false,
         )
         .expect_err("two experts of different shapes are not one stack");
     assert!(
@@ -1013,7 +1028,10 @@ fn a_stack_keeps_the_checkpoint_s_e4m3_block_scales() {
             "experts",
             &["up", "gate"],
             2,
+            Nvfp4Names::vllm(),
+            nn::ValueLayout::Plain,
             ops::fp4::ScaleLayout::Linear,
+            false,
         )
         .unwrap();
     assert_eq!(
@@ -1024,4 +1042,442 @@ fn a_stack_keeps_the_checkpoint_s_e4m3_block_scales() {
     assert_eq!(stack.values.dtype(), DType::U8);
     assert_eq!(stack.scales.shape().dims(), &[2, 4, 4]);
     assert_eq!(stack.global_scale.shape().dims(), &[2, 2]);
+}
+
+/// A calibrated projection is read in the spelling its export wrote: the same numbers are `weight`
+/// and `weight_scale_2` in one toolchain's checkpoint and `weight_packed` and `weight_tensor_scale`
+/// in another's, so the vocabulary is the loading boundary's statement about its own checkpoint.
+#[test]
+fn a_calibrated_projection_is_read_in_the_spelling_its_export_wrote() {
+    let directory = tempfile::tempdir().unwrap();
+    let directory = directory.path();
+    let values: Vec<u8> = (0..128).map(|byte| byte as u8).collect();
+    let scales: Vec<u8> = (0..16).map(|byte| 0x30 + byte).collect();
+    shard_typed(
+        directory,
+        "model.safetensors",
+        &[
+            ("p.up_proj.weight", DType::U8, vec![4, 32], values),
+            ("p.up_proj.weight_scale", DType::U8, vec![4, 4], scales),
+        ],
+    );
+    let checkpoint = Checkpoint::open(directory).unwrap();
+    let mut store = Recording::default();
+
+    // vLLM's spelling: the packed values are `weight` and the block scales `weight_scale`.
+    {
+        let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+        let quantized = loader
+            .nvfp4(
+                &WeightRequest::region("p.up_proj.weight", 0, Shape::new(&[4, 32])),
+                &WeightRequest::region("p.up_proj.weight_scale", 0, Shape::new(&[4, 4])),
+                None,
+                Nvfp4Names::vllm(),
+                ops::fp4::ScaleLayout::Linear,
+                0.25,
+            )
+            .unwrap();
+        assert_eq!(quantized.packed.dtype(), DType::U8);
+    }
+
+    // The same checkpoint read as the other export's spelling: the name it asks for is the one it
+    // says it expected, so a wrong vocabulary is a loading-boundary error and not a silent zero.
+    {
+        let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+        let error = loader
+            .nvfp4(
+                &WeightRequest::region("p.up_proj.weight_packed", 0, Shape::new(&[4, 32])),
+                &WeightRequest::region("p.up_proj.weight_scale", 0, Shape::new(&[4, 4])),
+                None,
+                Nvfp4Names::diffusers(),
+                ops::fp4::ScaleLayout::Linear,
+                0.25,
+            )
+            .expect_err("a checkpoint in the other export's spelling");
+        let text = format!("{error}");
+        assert!(text.contains("weight_packed"), "{text}");
+        assert!(text.contains("diffusers ModelOpt"), "{text}");
+    }
+}
+
+/// A stack names its fields with the export's own suffixes: the same experts read as one stack in
+/// each spelling, and the vocabulary is not a property of the layout the scales arrive in.
+#[test]
+fn a_calibrated_stack_names_its_fields_with_its_exports_suffixes() {
+    let directory = tempfile::tempdir().unwrap();
+    let directory = directory.path();
+    let values: Vec<u8> = (0..256).map(|byte| byte as u8).collect();
+    let scales: Vec<u8> = (0..32).map(|byte| 0x30 + byte).collect();
+    let tensor_scale: Vec<u8> = 1.0_f32.to_le_bytes().to_vec();
+    let mut tensors: Vec<(String, DType, Vec<u64>, Vec<u8>)> = Vec::new();
+    for expert in 0..2 {
+        for (field, dtype, shape, bytes) in [
+            ("weight_packed", DType::U8, vec![4, 32], values.clone()),
+            ("weight_scale", DType::U8, vec![4, 4], scales.clone()),
+            (
+                "weight_tensor_scale",
+                DType::F32,
+                vec![1],
+                tensor_scale.clone(),
+            ),
+        ] {
+            tensors.push((
+                format!("experts.{expert}.up_proj.{field}"),
+                dtype,
+                shape,
+                bytes,
+            ));
+        }
+    }
+    let borrowed: Vec<(&str, DType, Vec<u64>, Vec<u8>)> = tensors
+        .iter()
+        .map(|(name, dtype, shape, bytes)| (name.as_str(), *dtype, shape.clone(), bytes.clone()))
+        .collect();
+    shard_typed(directory, "model.safetensors", &borrowed);
+    let checkpoint = Checkpoint::open(directory).unwrap();
+    let mut store = Recording::default();
+    let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+
+    let stack = loader
+        .nvfp4_stack(
+            "layer.0.mlp.experts.up",
+            "experts",
+            &["up"],
+            2,
+            Nvfp4Names::diffusers(),
+            nn::ValueLayout::Plain,
+            ops::fp4::ScaleLayout::Linear,
+            false,
+        )
+        .expect("an export that states weight_packed and weight_tensor_scale loads as such");
+    assert_eq!(stack.values.shape().dims(), &[2, 4, 32]);
+    assert_eq!(stack.global_scale.shape().dims(), &[1, 2]);
+
+    // Read as the other spelling the stack asks for names this checkpoint does not have, and the
+    // refusal names the field and the export it expected.
+    let other = {
+        let mut store = Recording::default();
+        let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+        loader
+            .nvfp4_stack(
+                "layer.0.mlp.experts.up",
+                "experts",
+                &["up"],
+                2,
+                Nvfp4Names::vllm(),
+                nn::ValueLayout::Plain,
+                ops::fp4::ScaleLayout::Linear,
+                false,
+            )
+            .expect_err("a diffusers checkpoint read as vLLM's spelling")
+    };
+    let text = format!("{other}");
+    assert!(text.contains("experts.0.up_proj.weight"), "{text}");
+    assert!(text.contains("vLLM ModelOpt"), "{text}");
+}
+
+/// A host store answers the weights a model needs with no device, so a loading audit — which
+/// programs a request space names, which keys the layers build — costs no GPU time.
+#[test]
+fn a_host_store_retains_weights_and_answers_the_first_region() {
+    let mut store = nn::HostStore::new();
+    assert!(store.is_empty());
+    let key = |tensor: &str| WeightKey {
+        files: Vec::new(),
+        dtype: DType::BF16,
+        layout: WeightLayout::ROW_MAJOR,
+        region: nn::weights::WeightRegion {
+            tensors: vec![tensor.to_owned()],
+            start: 0,
+            shape: Shape::new(&[4, 32]),
+            stride: None,
+        },
+    };
+    let bytes: Vec<u8> = (0..256).map(|byte| byte as u8).collect();
+    let first = store
+        .publish(&key("w"), DType::BF16, Shape::new(&[4, 32]), &bytes)
+        .expect("a host store publishes");
+    assert_eq!(first.bytes(), 256);
+    // A view carved from it names the bytes the store kept.
+    let view = nn::TensorView::new(first.address(), DType::BF16, Shape::new(&[4, 32]));
+    assert_eq!(view.rows(), 4);
+    // The same key again answers the first region rather than a second buffer.
+    let again = store
+        .publish(&key("w"), DType::BF16, Shape::new(&[4, 32]), &bytes)
+        .expect("a repeated publish answers the first region");
+    assert_eq!(again.address(), first.address());
+    assert_eq!(store.len(), 1);
+    assert_eq!(
+        store
+            .retained(&key("w"))
+            .unwrap()
+            .map(|held| held.address()),
+        Some(first.address())
+    );
+    assert!(store.retained(&key("other")).unwrap().is_none());
+}
+
+/// A load that reads part of a checkpoint reports the rest by name, so a wrong number can be traced
+/// to the tensors nobody asked for rather than to the ones that loaded. A pipeline qualifies its
+/// components, because two components may hold one name each.
+#[test]
+fn a_reading_names_the_tensors_a_load_never_asked_for() {
+    let directory = tempfile::tempdir().unwrap();
+    shard(
+        directory.path(),
+        "model.safetensors",
+        &[
+            ("a", vec![2], bf16(&[1.0, 2.0])),
+            ("b", vec![2], bf16(&[3.0, 4.0])),
+            ("c", vec![2], bf16(&[5.0, 6.0])),
+        ],
+    );
+    let checkpoint = Checkpoint::open(directory.path()).unwrap();
+    checkpoint.read("a").unwrap();
+    let reading = checkpoint.reading();
+    assert_eq!(reading.read, ["a"]);
+    assert_eq!(reading.unread, ["b", "c"]);
+    assert!(!reading.is_complete());
+
+    // Reading the rest completes it: the report is the claims' complement, not a snapshot of one
+    // moment of the load.
+    checkpoint.read("b").unwrap();
+    checkpoint.read("c").unwrap();
+    assert!(checkpoint.reading().is_complete());
+
+    // A pipeline root answers with its components' names qualified, and a component that was not
+    // read is reported whole.
+    let root = tempfile::tempdir().unwrap();
+    let transformer = root.path().join("transformer");
+    let vae = root.path().join("vae");
+    std::fs::create_dir_all(&transformer).unwrap();
+    std::fs::create_dir_all(&vae).unwrap();
+    shard(
+        &transformer,
+        "model.safetensors",
+        &[("weight", vec![2], bf16(&[1.0, 2.0]))],
+    );
+    shard(
+        &vae,
+        "model.safetensors",
+        &[("weight", vec![2], bf16(&[3.0, 4.0]))],
+    );
+    let pipeline = Checkpoint::open(root.path()).unwrap();
+    pipeline
+        .component("transformer")
+        .unwrap()
+        .read("weight")
+        .unwrap();
+    let reading = pipeline.reading();
+    assert_eq!(reading.read, ["transformer/weight"]);
+    assert_eq!(reading.unread, ["vae/weight"]);
+    assert!(!reading.is_complete());
+}
+
+/// A shuffled stack's values are the shard's rows permuted inside 32-row blocks — the reference's
+/// `srcToDstBlk32RowMap` in closed form — applied once at load, with the published layout naming the
+/// arrangement so a product cannot read one for the other.
+#[test]
+fn a_shuffled_stack_permutes_its_values_rows_at_load() {
+    let directory = tempfile::tempdir().unwrap();
+    let directory = directory.path();
+    // One expert, 64 rows by 32 columns — two 32-row blocks, so the block boundary is covered — with
+    // 16 packed bytes and two block scales a row.
+    let expert = |prefix: &str| {
+        let mut values = Vec::new();
+        for row in 0..64u8 {
+            values.extend(std::iter::repeat_n(row, 16));
+        }
+        vec![
+            (
+                format!("{prefix}.weight_packed"),
+                DType::U8,
+                vec![64, 16],
+                values,
+            ),
+            (
+                format!("{prefix}.weight_scale"),
+                DType::F8E4M3,
+                vec![64, 2],
+                vec![0x38; 128],
+            ),
+            (
+                format!("{prefix}.weight_tensor_scale"),
+                DType::F32,
+                vec![1],
+                0.5f32.to_le_bytes().to_vec(),
+            ),
+        ]
+    };
+    let mut tensors = expert("experts.0.up_proj");
+    tensors.extend(expert("experts.0.gate_proj"));
+    let views: Vec<(&str, DType, Vec<u64>, Vec<u8>)> = tensors
+        .iter()
+        .map(|(name, dtype, shape, bytes)| (name.as_str(), *dtype, shape.clone(), bytes.clone()))
+        .collect();
+    shard_typed(directory, "model.safetensors", &views);
+
+    let checkpoint = Checkpoint::open(directory).unwrap();
+    let mut store = Recording::default();
+    {
+        let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+        loader
+            .nvfp4_stack(
+                "layer.0.mlp.experts.up_gate",
+                "experts",
+                &["up", "gate"],
+                1,
+                Nvfp4Names::diffusers(),
+                nn::ValueLayout::Shuffled {
+                    epilogue_tile_m: 128,
+                },
+                ops::fp4::ScaleLayout::Linear,
+                false,
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        store.published[0].0.layout,
+        WeightLayout::NVFP4_VALUES_SHUFFLED,
+        "the published values name the arrangement they are in"
+    );
+
+    // Destination row `d` holds source row `(d / 32) · 32 + (d % 8) · 4 + (d % 32) / 8`: within its
+    // block the interleave of four eight-row groups, and the block wherever it was.
+    let published = &store.published[0].1;
+    for destination in 0..64usize {
+        let within = destination % 32;
+        let source = (destination / 32) * 32 + (within % 8) * 4 + within / 8;
+        assert_eq!(
+            published[destination * 16],
+            source as u8,
+            "row {destination} should hold source row {source}"
+        );
+    }
+
+    // A row count that is not a whole number of 32-row blocks has no such arrangement, and the
+    // refusal names both numbers.
+    let short = tempfile::tempdir().unwrap();
+    let short_directory = short.path();
+    let rows = 30u8;
+    let mut tensors = Vec::new();
+    for projection in ["up_proj", "gate_proj"] {
+        let mut values = Vec::new();
+        for row in 0..rows {
+            values.extend(std::iter::repeat_n(row, 16));
+        }
+        tensors.push((
+            format!("experts.0.{projection}.weight_packed"),
+            DType::U8,
+            vec![u64::from(rows), 16],
+            values,
+        ));
+        tensors.push((
+            format!("experts.0.{projection}.weight_scale"),
+            DType::F8E4M3,
+            vec![u64::from(rows), 2],
+            vec![0x38; usize::from(rows) * 2],
+        ));
+        tensors.push((
+            format!("experts.0.{projection}.weight_tensor_scale"),
+            DType::F32,
+            vec![1],
+            0.5f32.to_le_bytes().to_vec(),
+        ));
+    }
+    let views: Vec<(&str, DType, Vec<u64>, Vec<u8>)> = tensors
+        .iter()
+        .map(|(name, dtype, shape, bytes)| (name.as_str(), *dtype, shape.clone(), bytes.clone()))
+        .collect();
+    shard_typed(short_directory, "model.safetensors", &views);
+    let short_checkpoint = Checkpoint::open(short_directory).unwrap();
+    let error = {
+        let mut store = Recording::default();
+        let mut loader = WeightLoader::new(&short_checkpoint, &mut store, None, None);
+        loader
+            .nvfp4_stack(
+                "layer.0.mlp.experts.up_gate",
+                "experts",
+                &["up", "gate"],
+                1,
+                Nvfp4Names::diffusers(),
+                nn::ValueLayout::Shuffled {
+                    epilogue_tile_m: 128,
+                },
+                ops::fp4::ScaleLayout::Linear,
+                false,
+            )
+            .expect_err("a 30-row matrix has no 32-row arrangement")
+    };
+    assert!(format!("{error}").contains("32-row blocks"), "{error}");
+}
+
+/// The products read their weight scales swizzled, and an export holds them linear: the loader
+/// builds the 128x4 table once at load — rows padded to 128, scale columns to 4, each tile laid out
+/// so a thread block's scales are contiguous — rather than a step paying for it.
+#[test]
+fn a_swizzled_scale_table_is_built_from_the_shards_linear_one() {
+    let directory = tempfile::tempdir().unwrap();
+    let directory = directory.path();
+    // One expert, 128 rows by 32 columns: sixteen packed bytes and two block scales a row.
+    let mut values = Vec::new();
+    let mut scales = Vec::new();
+    for row in 0..128u8 {
+        values.extend(std::iter::repeat_n(row, 16));
+        scales.extend_from_slice(&[row, row.wrapping_add(1)]);
+    }
+    let views: Vec<(&str, DType, Vec<u64>, Vec<u8>)> = vec![
+        (
+            "experts.0.down_proj.weight_packed",
+            DType::U8,
+            vec![128, 16],
+            values,
+        ),
+        (
+            "experts.0.down_proj.weight_scale",
+            DType::F8E4M3,
+            vec![128, 2],
+            scales,
+        ),
+        (
+            "experts.0.down_proj.weight_tensor_scale",
+            DType::F32,
+            vec![1],
+            0.5f32.to_le_bytes().to_vec(),
+        ),
+    ];
+    shard_typed(directory, "model.safetensors", &views);
+
+    let checkpoint = Checkpoint::open(directory).unwrap();
+    let mut store = Recording::default();
+    {
+        let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+        loader
+            .nvfp4_stack(
+                "layer.0.mlp.experts.down",
+                "experts",
+                &["down"],
+                1,
+                Nvfp4Names::diffusers(),
+                nn::ValueLayout::Shuffled {
+                    epilogue_tile_m: 128,
+                },
+                ops::fp4::ScaleLayout::Swizzled128X4,
+                false,
+            )
+            .unwrap();
+    }
+    // Two scale columns pad to four, and 128 rows are one tile: 128 × 4 bytes.
+    let (key, bytes, ..) = &store.published[1];
+    assert_eq!(key.layout, WeightLayout::NVFP4_SCALES_SWIZZLED);
+    assert_eq!(bytes.len(), 128 * 4);
+    // Row `r`'s column-0 scale lands at `(r % 32) * 16 + ((r % 128) / 32) * 4`, and the tile's two
+    // padding columns are zero. Row 1's own scale value is 1; row 32's is 32, in the next group of
+    // thirty-two rows.
+    assert_eq!(bytes[16], 1);
+    assert_eq!(bytes[4], 32);
+    // Columns 2 and 3 of the tile are the padding: no block exists there, and a zero scale on a
+    // block that does not exist is what the artifact's own interleave writes.
+    assert_eq!(bytes[2], 0, "a padding column is a zero scale");
+    assert_eq!(bytes[3], 0, "a padding column is a zero scale");
 }

@@ -427,7 +427,10 @@ impl Op for PagedAttention {
         let kv_heads = u64::from(descriptor.kv_heads);
         let page_size = u64::from(descriptor.page_size);
 
-        let tokens = args.query.rows();
+        // The token count is the first extent of a `[tokens, heads, head_dim]` query; `rows()` is
+        // the product of every extent but the last and would count tokens times heads, refusing a
+        // launch whose own views agree (the defect `qk_norm_rope` had).
+        let tokens = args.query.shape.dim(0);
         args.query
             .require_shape(Self::NAME, Shape::new(&[tokens, q_heads, head_dim]))?;
         args.query
@@ -479,6 +482,12 @@ impl Op for PagedAttention {
                 ));
             }
         }
+
+        for (name, view) in [("query", args.query), ("out", args.out)] {
+            check_vector_alignment(Self::NAME, name, &view)?;
+        }
+        check_vector_alignment(Self::NAME, "key", &args.key)?;
+        check_vector_alignment(Self::NAME, "value", &args.value)?;
 
         args.page_table.require_rank(Self::NAME, 2)?;
         if args.page_table.dtype != DType::I32 {
@@ -637,6 +646,57 @@ impl Op for PagedAttention {
             Phase::Decode => 1,
         };
 
+        // The compiled programs load their operands in 16-byte units and assert it: the cute
+        // kernel's `tensorptr<bf16, gmem, align16>` and trtllm-gen's vectorized loads both refuse a
+        // pointer that is not 16-byte aligned or a step that is not a multiple of 8 elements of a
+        // 2-byte type. A host-side placement defect that breaks either surfaces here, by name,
+        // rather than as a warp fault inside a kernel with no operand named in it.
+        let element_bytes = descriptor.query.bytes().unwrap_or(2).max(2);
+        let unit = 16 / element_bytes.max(1);
+        for (name, view) in [
+            ("query", args.query),
+            ("key", args.key),
+            ("value", args.value),
+            ("out", args.out),
+        ] {
+            if !address(view.ptr).is_multiple_of(16) {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!(
+                        "the compiled program loads {name} in 16-byte units; its first address \
+                         {:#x} is not a multiple of 16",
+                        address(view.ptr)
+                    ),
+                ));
+            }
+            for axis in 0..view.strides.rank() {
+                let step = view.strides.get(axis);
+                if axis + 1 != view.strides.rank() && !step.is_multiple_of(unit) {
+                    return Err(Error::argument(
+                        Self::NAME,
+                        format!(
+                            "the compiled program steps {name} axis {axis} in 16-byte units; its \
+                             stride {step} is not a multiple of {unit} elements"
+                        ),
+                    ));
+                }
+            }
+        }
+        for (name, view) in [("page_table", args.page_table), ("seq_lens", args.seq_lens)] {
+            if !address(view.ptr).is_multiple_of(16) {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!(
+                        "the compiled program reads {name} in 16-byte units; its first address \
+                         {:#x} is not a multiple of 16",
+                        address(view.ptr)
+                    ),
+                ));
+            }
+        }
+
+        trace(descriptor, &args);
+
         let mut call = Call {
             out: address(args.out.ptr) as usize as *mut c_void,
             query: address(args.query.ptr) as usize as *const c_void,
@@ -712,22 +772,190 @@ fn quantized(dtype: DType) -> bool {
     matches!(dtype, DType::F8E4M3 | DType::F4E2M1)
 }
 
-/// The elements between consecutive rows of a view.
+/// The elements between consecutive rows of a `[rows, heads, dim]` view.
+///
+/// Every attention program takes a row's stride and a head's stride as separate launch values, so an
+/// axis is named here by its distance from the last one — element last, head second to last, row
+/// third to last — and never by its index in a rank-2 view. The distinction is not cosmetic: reading
+/// the head axis as the row axis states `head_dim` where the program expects `heads * head_dim`, and
+/// one element where it expects `head_dim`, which walks every head of a row two bytes into the row
+/// and breaks the sixteen-byte vector loads the sm100 programs are compiled for.
 pub(super) fn row_stride(view: &TensorView) -> u64 {
-    if view.strides.rank() >= 2 {
-        view.strides.get(view.strides.rank() - 2)
-    } else {
-        0
-    }
+    axis_stride(view, 2)
 }
 
 /// The elements between consecutive heads of a `[rows, heads, dim]` view.
 pub(super) fn head_stride(view: &TensorView) -> u64 {
-    if view.strides.rank() >= 2 {
-        view.strides.get(view.strides.rank() - 2 + 1)
-    } else {
-        0
+    axis_stride(view, 1)
+}
+
+/// The stride of the axis `from_last` positions from the last, or `0` when the view has no such axis.
+fn axis_stride(view: &TensorView, from_last: usize) -> u64 {
+    let rank = view.strides.rank();
+    match rank.checked_sub(from_last + 1) {
+        Some(axis) => view.strides.get(axis),
+        None => 0,
     }
+}
+
+/// The alignment every attention program's descriptor states for its tensor pointers.
+///
+/// The sm100 programs are compiled with `gmemalign16` and take `i64` strides, so an operand's base and
+/// every axis they walk must fall on a whole sixteen-byte unit.
+pub(super) const ATTENTION_ALIGNMENT: u64 = 16;
+
+/// Refuse an operand the tensor-core programs cannot address.
+///
+/// Their descriptors state a sixteen-byte-aligned tensor pointer (`gmemalign16`) and take the strides
+/// of the axes they walk, so every address they form must be a whole number of sixteen-byte units:
+/// the base, and each stride of an axis that is not the vectorized last one. A view carved at an odd
+/// element offset, or with a stride that is not a whole unit, faults inside the kernel with no word
+/// about which operand — a warp misaligned address and a program counter — so it is refused here
+/// instead, by name.
+pub(super) fn check_vector_alignment(
+    operator: &'static str,
+    name: &str,
+    view: &TensorView,
+) -> Result<()> {
+    // A four-bit element type packs two elements a byte, so "sixteen bytes" is not a whole number of
+    // its elements and the packages that read one state their own alignment.
+    let Some(bytes) = view.dtype.bytes().filter(|bytes| *bytes > 0) else {
+        return Ok(());
+    };
+    if !ATTENTION_ALIGNMENT.is_multiple_of(bytes) {
+        return Ok(());
+    }
+    let unit = ATTENTION_ALIGNMENT / bytes;
+    let address = platform::address(view.ptr);
+    if !address.is_multiple_of(ATTENTION_ALIGNMENT) {
+        return Err(Error::argument(
+            operator,
+            format!(
+                "the {name} starts at {address:#x}, which is not {} bytes aligned",
+                ATTENTION_ALIGNMENT
+            ),
+        ));
+    }
+    let rank = view.strides.rank();
+    for axis in 0..rank.saturating_sub(1) {
+        let stride = view.strides.get(axis);
+        if !stride.is_multiple_of(unit) {
+            return Err(Error::argument(
+                operator,
+                format!(
+                    "the {name} has a stride of {stride} elements on axis {axis}, which is not a \
+                     whole number of {unit}-element ({}-byte) units",
+                    ATTENTION_ALIGNMENT
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Write the launch's operands and derived steps to standard error, when
+/// `UNISERVE_ATTENTION_TRACE` is set and non-empty.
+///
+/// A fault inside a tensor-core kernel names a program counter, a grid and a warp, and nothing about
+/// the operand behind it. The sm100 programs are compiled for sixteen-byte tensor pointers and take
+/// their strides as `i64` divided by eight, so one operand that is not a whole unit of sixteen bytes
+/// — in its first address or in a step the program walks — is a warp misaligned address with no
+/// operand in the message. This table is the launch's own answer to that: every operand's address,
+/// element type, extents and steps with the unit verdict of each, the two steps the host derives
+/// from a view's axes, and the steps a contiguous `[tokens, heads, dim]` layout would make them.
+///
+/// A diagnostic, off unless asked for: the launch reads the variable and otherwise pays nothing.
+fn trace(descriptor: &Descriptor, args: &Args) {
+    if std::env::var_os("UNISERVE_ATTENTION_TRACE").is_none_or(|value| value.is_empty()) {
+        return;
+    }
+    let unit = descriptor
+        .query
+        .bytes()
+        .map_or(1, |bytes| ATTENTION_ALIGNMENT / bytes.max(1));
+    let heads = u64::from(descriptor.q_heads);
+    let dim = u64::from(descriptor.head_dim);
+    eprintln!(
+        "attention trace: {:?} batch {} tokens {} heads {}/{}x{} page_size {} max_kv_len {} \
+         causal {} window_left {} scale {:e}",
+        descriptor.phase,
+        args.page_table.shape.dim(0),
+        args.query.shape.dim(0),
+        descriptor.q_heads,
+        descriptor.kv_heads,
+        descriptor.head_dim,
+        descriptor.page_size,
+        descriptor.max_kv_len,
+        args.causal,
+        args.window_left,
+        args.scale,
+    );
+    for (name, view) in [
+        ("query", args.query),
+        ("key", args.key),
+        ("value", args.value),
+        ("out", args.out),
+        ("page_table", args.page_table),
+        ("seq_lens", args.seq_lens),
+        ("cum_seq_lens_q", args.cum_seq_lens_q),
+        ("workspace", args.workspace),
+    ] {
+        trace_operand(name, view, unit);
+    }
+    for (name, scale) in [
+        ("key_scale", args.key_scale),
+        ("value_scale", args.value_scale),
+    ] {
+        if let Some(scale) = scale {
+            trace_operand(name, scale, unit);
+        }
+    }
+    // The table's width against the bound the module was compiled for: one comes from the request's
+    // own view, the other from `max_kv_len / page_size`, and a disagreement is a finding of its own.
+    let width = args
+        .page_table
+        .shape
+        .dim(args.page_table.shape.rank().saturating_sub(1));
+    let derived = u64::from(descriptor.max_kv_len) / u64::from(descriptor.page_size).max(1);
+    eprintln!(
+        "attention trace: page table width {width}, max_kv_len/page_size {derived}{}",
+        if width == derived {
+            " (agree)"
+        } else {
+            " DIFFER"
+        }
+    );
+    eprintln!(
+        "attention trace: steps passed query ({}, {}) out ({}, {}) | contiguous ({}, {})",
+        row_stride(&args.query),
+        head_stride(&args.query),
+        row_stride(&args.out),
+        head_stride(&args.out),
+        heads * dim,
+        dim,
+    );
+}
+
+/// One operand's address, extents and steps, with the verdict of each step; see [`trace`].
+fn trace_operand(name: &str, view: TensorView, unit: u64) {
+    let first = platform::address(view.ptr);
+    let mut steps = String::new();
+    for axis in 0..view.strides.rank() {
+        let step = view.strides.get(axis);
+        // The last axis is the element axis and is read contiguously by design.
+        let verdict = if axis + 1 == view.strides.rank() || step.is_multiple_of(unit) {
+            ""
+        } else {
+            " NOT-A-WHOLE-UNIT"
+        };
+        steps.push_str(&format!(" {axis}:{step}{verdict}"));
+    }
+    eprintln!(
+        "attention trace: {name:<14} {} at {first:#x} aligned16 {} shape {:?} steps{steps}",
+        view.dtype,
+        first.is_multiple_of(ATTENTION_ALIGNMENT),
+        view.shape.dims(),
+    );
 }
 
 pub(super) fn address(pointer: DevicePtr) -> u64 {
@@ -890,5 +1118,48 @@ mod tests {
         assert!(long.allows(1.0, 1.0));
         // A dropped history window changes the output by far more than the bound.
         assert!(!long.allows(0.0, 1.0));
+    }
+
+    /// A `[tokens, heads, dim]` view states its row stride and its head stride, not the two strides
+    /// nearest the last axis: 32 heads of 128 elements put the next token 4096 elements on, and the
+    /// next head 128. Reading the head axis as the row axis is what the launch cannot recover from,
+    /// because the program then walks heads two bytes apart and its vector loads fault.
+    #[test]
+    fn a_rows_strides_are_the_rows_and_not_the_head() {
+        let view = TensorView::new(
+            DevicePtr::new(0x1_0000),
+            DType::BF16,
+            Shape::new(&[15, 32, 128]),
+        );
+        assert_eq!(row_stride(&view), 4096);
+        assert_eq!(head_stride(&view), 128);
+    }
+
+    /// The eighteen-byte and four-byte cases: a view whose base or whose walked stride is not a whole
+    /// sixteen-byte unit is refused before the launch, naming the operand.
+    #[test]
+    fn a_misaligned_operand_is_refused_by_name() {
+        let ok = TensorView::new(
+            DevicePtr::new(0x1_0000),
+            DType::BF16,
+            Shape::new(&[15, 32, 128]),
+        );
+        check_vector_alignment("test", "query", &ok).unwrap();
+
+        let odd_base = TensorView::new(
+            DevicePtr::new(0x1_0002),
+            DType::BF16,
+            Shape::new(&[15, 32, 128]),
+        );
+        let refusal = check_vector_alignment("test", "query", &odd_base).unwrap_err();
+        assert!(
+            format!("{refusal}").contains("16 bytes aligned"),
+            "{refusal}"
+        );
+
+        // A row of 100 elements of bf16 is 200 bytes: every second row starts four bytes off.
+        let narrow = TensorView::new(DevicePtr::new(0x1_0000), DType::BF16, Shape::new(&[4, 100]));
+        let refusal = check_vector_alignment("test", "key", &narrow).unwrap_err();
+        assert!(format!("{refusal}").contains("stride of 100"), "{refusal}");
     }
 }

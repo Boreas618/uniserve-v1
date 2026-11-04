@@ -4,7 +4,15 @@
 The protocol is ``notes/h3/diagnosis.md``: both implementations write one
 ``.npy`` per (block, tensor name) under their own directory, and this script
 matches them by relative path and reports, per tensor, the relative L2 error,
-the maximum absolute difference and the cosine similarity.
+the maximum absolute difference, the cosine similarity and whether the two are
+element-for-element identical.
+
+``exact`` is the column that settles an index table. The error columns normalize
+both sides to float64, so a table of row indices that differs in one entry reads
+as a rel_l2 near zero - the same magnitude as rounding noise on a float tensor -
+while an index that is off by one addresses a different row and the computation
+downstream is a different one. A table of positions, destinations, lengths,
+segment starts, tags or row counts passes only when ``exact`` is ``yes``.
 
 Usage::
 
@@ -27,11 +35,14 @@ import numpy as np
 EPS = 1e-12
 
 
-def metrics(got: np.ndarray, ref: np.ndarray) -> dict[str, float]:
+def metrics(got: np.ndarray, ref: np.ndarray) -> dict[str, object]:
     """Relative L2, maximum absolute difference and cosine similarity.
 
     Both arrays are flattened as float64 so that a difference in element type
-    (BF16 against FP32) is measured as the numbers it represents.
+    (BF16 against FP32) is measured as the numbers it represents. ``exact`` is
+    computed on those same values and is the verdict for integer tables: two
+    index tables are equal or they are not, and a tolerance on them is a
+    different question from the one being asked.
     """
     a = np.asarray(got, dtype=np.float64).ravel()
     b = np.asarray(ref, dtype=np.float64).ravel()
@@ -48,10 +59,13 @@ def metrics(got: np.ndarray, ref: np.ndarray) -> dict[str, float]:
     )
     return {
         "rel_l2": float(np.linalg.norm(difference)) / denominator,
-        "max_abs": float(np.max(np.abs(difference))) if difference.size else 0.0,
+        "max_abs": float(np.max(np.abs(difference)))
+        if difference.size
+        else 0.0,
         "cosine": cosine,
         "elements": float(difference.size),
         "ref_norm": norm_b,
+        "exact": bool(np.array_equal(a, b)),
     }
 
 
@@ -80,7 +94,9 @@ def compare(ref: pathlib.Path, got: pathlib.Path) -> dict[str, object]:
             missing.append(name)
             continue
         try:
-            tensors[name] = metrics(np.load(got_files[name]), np.load(ref_files[name]))
+            tensors[name] = metrics(
+                np.load(got_files[name]), np.load(ref_files[name])
+            )
         except ValueError as error:  # shape mismatch is a finding, not a crash
             failed[name] = str(error)
     for name in sorted(got_files):
@@ -98,17 +114,25 @@ def _table(result: dict[str, object]) -> str:
     """A readable table: one line per tensor, largest relative error first."""
     tensors: dict[str, dict[str, float]] = result["tensors"]  # type: ignore[assignment]
     ordered = sorted(tensors.items(), key=lambda item: -item[1]["rel_l2"])
-    lines = [f"{'tensor':<48}{'rel_l2':>12}{'max_abs':>14}{'cosine':>12}"]
+    lines = [
+        f"{'tensor':<48}{'rel_l2':>12}{'max_abs':>14}{'cosine':>12}{'exact':>7}"
+    ]
     for name, values in ordered:
         lines.append(
             f"{name:<48}{values['rel_l2']:>12.3e}"
             f"{values['max_abs']:>14.3e}{values['cosine']:>12.6f}"
+            f"{'yes' if values['exact'] else 'no':>7}"
         )
     if result["missing_in_got"]:
         lines.append("")
-        lines.append("not dumped by the Rust side: " + ", ".join(result["missing_in_got"]))
+        lines.append(
+            "not dumped by the Rust side: "
+            + ", ".join(result["missing_in_got"])
+        )
     if result["only_in_got"]:
-        lines.append("only in the Rust dump: " + ", ".join(result["only_in_got"]))
+        lines.append(
+            "only in the Rust dump: " + ", ".join(result["only_in_got"])
+        )
     for name, error in result["shape_mismatch"].items():  # type: ignore[union-attr]
         lines.append(f"shape mismatch {name}: {error}")
     return "\n".join(lines)
@@ -131,11 +155,18 @@ def self_test() -> int:
     failures = 0
     for name, (got, expected_rel, expected_cos) in cases.items():
         result = metrics(got, reference)
-        if expected_rel is not None and abs(result["rel_l2"] - expected_rel) > 1e-6:
-            print(f"self-test {name}: rel_l2 {result['rel_l2']} != {expected_rel}")
+        if (
+            expected_rel is not None
+            and abs(result["rel_l2"] - expected_rel) > 1e-6
+        ):
+            print(
+                f"self-test {name}: rel_l2 {result['rel_l2']} != {expected_rel}"
+            )
             failures += 1
         if abs(result["cosine"] - expected_cos) > 1e-5 and name != "zero_ref":
-            print(f"self-test {name}: cosine {result['cosine']} != {expected_cos}")
+            print(
+                f"self-test {name}: cosine {result['cosine']} != {expected_cos}"
+            )
             failures += 1
         if name == "identical" and result["max_abs"] != 0.0:
             print(f"self-test {name}: max_abs {result['max_abs']} != 0")
@@ -149,7 +180,9 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--ref", type=pathlib.Path, help="reference dump tree")
     parser.add_argument("--got", type=pathlib.Path, help="Rust dump tree")
     parser.add_argument("--out", type=pathlib.Path, help="report.json to write")
-    parser.add_argument("--self-test", action="store_true", help="check the harness itself")
+    parser.add_argument(
+        "--self-test", action="store_true", help="check the harness itself"
+    )
     arguments = parser.parse_args(argv)
     if arguments.self_test:
         return self_test()

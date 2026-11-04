@@ -32,12 +32,14 @@ def spec(fields, parameters, target):
             "gate_ptr": dtype,
             "row_indices_ptr": "*" + fields["indices"],
             "gate_row_stride": "i32",
-            "ELEMENTS": "constexpr",
+            # The row count is the one thing a request changes: the operator appends it
+            # as its last scalar, so the program multiplies it by the width it was
+            # compiled for instead of holding an element count of its own.
+            "rows": "i64",
             "WIDTH": "constexpr",
             "BLOCK": "constexpr",
         },
         "constexprs": {
-            "ELEMENTS": int(fields["elements"]),
             "WIDTH": int(fields["width"]),
             "BLOCK": BLOCK,
         },

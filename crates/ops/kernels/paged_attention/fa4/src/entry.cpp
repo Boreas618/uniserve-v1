@@ -20,6 +20,7 @@
 #include "entry.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 
@@ -104,6 +105,53 @@ extern "C" int32_t uniserve_paged_attention(const uniserve_paged_attention_call*
   // FA4's page table is the request's pages in order; its width is the longest
   // sequence the compiled configuration was sized for.
   const int64_t max_pages = (call->max_kv_len + call->page_size - 1) / call->page_size;
+
+  // The vendor's kernel asserts 16-byte alignment on every tensor pointer and a step divisible by
+  // eight elements, and a placement defect that breaks either faults inside the kernel with no
+  // operand named. One switch turns the call into evidence: every field the pass reads, and the
+  // alignment of each pointer, on stderr before the launch.
+  if (std::getenv("UNISERVE_ATTENTION_TRACE") != nullptr) {
+    std::fprintf(stderr,
+                 "paged_attention fa4: tokens=%lld batch=%lld max_q_len=%lld max_kv_len=%lld "
+                 "num_pages=%lld page_size=%lld q_heads=%lld kv_heads=%lld head_dim=%lld\n",
+                 static_cast<long long>(call->tokens), static_cast<long long>(call->batch),
+                 static_cast<long long>(call->max_q_len), static_cast<long long>(call->max_kv_len),
+                 static_cast<long long>(call->num_pages), static_cast<long long>(call->page_size),
+                 static_cast<long long>(call->q_heads), static_cast<long long>(call->kv_heads),
+                 static_cast<long long>(call->head_dim));
+    std::fprintf(stderr,
+                 "  q=%p(%llu) k=%p(%llu) v=%p(%llu) o=%p(%llu) page_table=%p(%llu) "
+                 "seq_lens=%p(%llu) cu_seqlens_q=%p(%llu)\n",
+                 call->query, static_cast<unsigned long long>(
+                                 reinterpret_cast<uintptr_t>(call->query) % 16),
+                 call->key, static_cast<unsigned long long>(
+                                reinterpret_cast<uintptr_t>(call->key) % 16),
+                 call->value, static_cast<unsigned long long>(
+                                  reinterpret_cast<uintptr_t>(call->value) % 16),
+                 call->out, static_cast<unsigned long long>(
+                                reinterpret_cast<uintptr_t>(call->out) % 16),
+                 static_cast<const void*>(call->page_table),
+                 static_cast<unsigned long long>(
+                     reinterpret_cast<uintptr_t>(call->page_table) % 16),
+                 static_cast<const void*>(call->seq_lens),
+                 static_cast<unsigned long long>(
+                     reinterpret_cast<uintptr_t>(call->seq_lens) % 16),
+                 static_cast<const void*>(call->cum_seq_lens_q),
+                 static_cast<unsigned long long>(
+                     reinterpret_cast<uintptr_t>(call->cum_seq_lens_q) % 16));
+    std::fprintf(stderr,
+                 "  strides: q(tokens=%lld heads=%lld) kv(page=%lld tokens=%lld heads=%lld) "
+                 "o(tokens=%lld heads=%lld) page_table_row=%lld\n",
+                 static_cast<long long>(call->q_stride_tokens),
+                 static_cast<long long>(call->q_stride_heads),
+                 static_cast<long long>(call->kv_stride_page),
+                 static_cast<long long>(call->kv_stride_tokens),
+                 static_cast<long long>(call->kv_stride_heads),
+                 static_cast<long long>(call->o_stride_tokens),
+                 static_cast<long long>(call->o_stride_heads),
+                 static_cast<long long>(max_pages));
+    std::fflush(stderr);
+  }
 
   flash_attn_paged_Tensor_mQ_t query{};
   query.data = const_cast<void*>(call->query);

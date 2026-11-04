@@ -16,14 +16,14 @@ import triton
 import triton.language as tl
 
 
-@triton.jit(do_not_specialize=["gate_row_stride"])
+@triton.jit(do_not_specialize=["gate_row_stride", "rows"])
 def _gated_residual_kernel(
     hidden_ptr,
     update_ptr,
     gate_ptr,
     row_indices_ptr,
     gate_row_stride,
-    ELEMENTS: tl.constexpr,  # noqa: N803
+    rows,
     WIDTH: tl.constexpr,  # noqa: N803
     BLOCK: tl.constexpr,  # noqa: N803
 ):
@@ -34,7 +34,7 @@ def _gated_residual_kernel(
     residual sum, and ``update`` receives the sum.
     """
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < ELEMENTS
+    mask = offsets < rows * WIDTH
     row = offsets // WIDTH
     columns = offsets % WIDTH
     modulation_row = tl.load(row_indices_ptr + row, mask=mask, other=0)
