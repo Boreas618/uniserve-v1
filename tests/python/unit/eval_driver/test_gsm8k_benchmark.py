@@ -483,6 +483,9 @@ def test_only_the_checkpoint_and_kv_cache_dtype_differ_between_cells() -> None:
         assert not any(
             value.startswith(("dtype=", "quantization=")) for value in command
         )
+        # `--executable` must replace the whole deployment, so the profile
+        # cannot pin one implementation's worker binary.
+        assert "--worker-executable" not in command
 
 
 def test_a_host_may_point_the_cells_at_a_local_split(
