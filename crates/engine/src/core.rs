@@ -1219,6 +1219,7 @@ impl SchedulerHandle {
             config.data_parallel_size
         );
         let info = crate::executor::ExecutorInfo::from_inventory(batches.inventory())?;
+        Self::check_pools(&config, &info)?;
         let runtime = info.runtime_info()?;
         Self::check_rows(&runtime, config.max_running_requests)?;
         let tokens = config.control_tokens();
@@ -1272,6 +1273,38 @@ impl SchedulerHandle {
             "the workers hold {request_rows} request rows, but {max_running_requests} running \
              requests need {needed_rows}"
         );
+        Ok(())
+    }
+
+    /// Refuses a config whose pools are not the ones the executor reports.
+    ///
+    /// A scheduler configured for a pool the executor does not serve, or for a
+    /// rank count it does not serve, would place calls on ranks it does not
+    /// have; the config and the executor are two statements of one deployment,
+    /// so they are compared before anything runs.
+    fn check_pools(
+        config: &EngineConfig,
+        info: &crate::executor::ExecutorInfo,
+    ) -> anyhow::Result<()> {
+        for group in &config.worker_groups {
+            anyhow::ensure!(
+                info.workers.iter().any(|(served, _)| *served == group.id),
+                "the config names the pool {}, which the executor does not serve",
+                group.id.0
+            );
+            // `from_inventory` states every pool's launched rank count; an
+            // executor that reports none places the pool on one rank.
+            let served = info
+                .placements
+                .get(&group.id)
+                .map_or(1, |placement| placement.ranks);
+            anyhow::ensure!(
+                served as usize == group.ranks.len(),
+                "the config places {} ranks of pool {}, but the executor serves {served}",
+                group.ranks.len(),
+                group.id.0
+            );
+        }
         Ok(())
     }
 
