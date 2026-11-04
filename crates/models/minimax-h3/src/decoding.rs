@@ -39,10 +39,10 @@ pub const CLIP_OUTPUT_FRAMES: u32 = 25;
 pub const OVERLAP_FRAMES: u32 = 5;
 
 /// The first frame of a clip's overlap tail, within its own 25 decoded frames.
-pub const TAIL_START: u32 = TAIL_START_OF(OVERLAP_FRAMES);
+pub const TAIL_START: u32 = tail_start_of(OVERLAP_FRAMES);
 
 /// The first frame of a tail of `overlap` frames: the clip's native output less the tail.
-const fn TAIL_START_OF(overlap: u32) -> u32 {
+const fn tail_start_of(overlap: u32) -> u32 {
     CLIP_OUTPUT_FRAMES - overlap
 }
 
@@ -80,7 +80,7 @@ impl Clip {
 /// Every clip covers a 17-frame body; the last clip adds the five-frame tail, so the number of clips
 /// is `(frames - 5) / 17`.
 pub fn clips(frames: u32) -> Result<Vec<Clip>> {
-    if frames < CLIP_FRAMES + CLIP_LATENTS || (frames - CLIP_LATENTS) % CLIP_FRAMES != 0 {
+    if frames < CLIP_FRAMES + CLIP_LATENTS || !(frames - CLIP_LATENTS).is_multiple_of(CLIP_FRAMES) {
         return Err(Error::config(format!(
             "an H3 video of {frames} frames is not {CLIP_FRAMES}n + {CLIP_LATENTS}"
         )));
@@ -173,7 +173,7 @@ pub fn video_arena(
     let grid = tiles.tiles(config, canvas);
     let ffn = u64::from(config.decoder_ffn_mult);
     let (rotated, _) = crate::video_vae::rotary(config)?;
-    let rows = u64::from(canvas.rows()) * grid.len() as u64;
+    let rows = canvas.rows() * grid.len() as u64;
     let columns = u64::from(config.decoder_num_attention_heads)
         * u64::from(config.decoder_attention_head_dim);
     let (height, width_px) = canvas.pixels(config);
@@ -188,7 +188,7 @@ pub fn video_arena(
         Buffer {
             name: "projected",
             element: "f16",
-            elements: u64::from(canvas.voxels()) * grid.len() as u64 * columns,
+            elements: canvas.voxels() * grid.len() as u64 * columns,
         },
         Buffer {
             name: "normalized",
@@ -293,6 +293,24 @@ pub struct ClipDecoder {
     /// The raster's frames: a latent frame decodes to `temporal` of them, and every tile spans them
     /// all.
     frames: u32,
+}
+
+/// The device views one clip's decode reads and writes, as the caller uploaded and reserved them.
+///
+/// One latent view and one position table per tile of the clip, one token buffer for the whole clip,
+/// and the two rasters the tiles are stitched into.
+#[derive(Clone, Copy, Debug)]
+pub struct Scene<'a> {
+    /// Tile `i`'s latent voxel rows, `[voxels, latent_channels]`, in tile order.
+    pub latents: &'a [TensorView],
+    /// Tile `i`'s rotary table, `[3, rows]` axis-major, in tile order.
+    pub positions: &'a [TensorView],
+    /// One buffer for the clip, `[tiles · rows, out_channels · temporal · spatial²]`.
+    pub tokens: TensorView,
+    /// The clip's raster as decoded: read as a neighbour, never written by a blend.
+    pub decoded: TensorView,
+    /// The clip's raster as stitched: the blends' destination.
+    pub blended: TensorView,
 }
 
 impl ClipDecoder {
@@ -436,12 +454,15 @@ impl ClipDecoder {
         f: &Forward,
         decoder: &crate::video_vae::VideoDecoder,
         tiles: &[Tile],
-        latents: &[TensorView],
-        positions: &[TensorView],
-        tokens: TensorView,
-        decoded: TensorView,
-        blended: TensorView,
+        scene: Scene<'_>,
     ) -> Result<()> {
+        let Scene {
+            latents,
+            positions,
+            tokens,
+            decoded,
+            blended,
+        } = scene;
         check_clip(tiles, latents.len(), positions.len(), tokens.shape)?;
         let mut start = 0_u64;
         for (index, tile) in tiles.iter().enumerate() {

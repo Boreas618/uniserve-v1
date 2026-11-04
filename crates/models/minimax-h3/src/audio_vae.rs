@@ -139,7 +139,7 @@ impl Resample {
             kernel,
             pad: kernel / ratio - 1,
             pad_left: (kernel / ratio - 1) * ratio + (kernel - ratio) / 2,
-            pad_right: (kernel / ratio - 1) * ratio + (kernel - ratio + 1) / 2,
+            pad_right: (kernel / ratio - 1) * ratio + (kernel - ratio).div_ceil(2),
         })
     }
 
@@ -712,7 +712,7 @@ pub(crate) mod tests {
         assert_eq!(samples_per_latent(&config), 800);
         assert_eq!(latent_frames(&config, 800).expect("one frame"), 1);
         assert_eq!(latent_frames(&config, 801).expect("two frames"), 2);
-        assert_eq!(latent_frames(&config, 0).is_err(), true);
+        assert!(latent_frames(&config, 0).is_err());
         assert_eq!(track_samples(&config, 5), 4000);
         // A five-second track at 32 kHz.
         let samples = 5 * 32000;
