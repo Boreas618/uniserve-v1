@@ -47,6 +47,7 @@ use nn::{Arena, DevicePtr, Forward, Shape, TensorView, Weight};
 use ops::activation::Activation;
 use ops::gemm::WeightOrder;
 use ops::rope::Rotation;
+use std::sync::Arc;
 
 use crate::config::TextEncoderConfig;
 use crate::load::Component;
@@ -817,7 +818,7 @@ impl TextEncoder {
     pub fn into_block(self) -> (BlockName, Block) {
         (
             BlockName::new(Component::TextEncoder.name()),
-            Block::Encoder(Box::new(self)),
+            Block::Encoder(Arc::new(self)),
         )
     }
 

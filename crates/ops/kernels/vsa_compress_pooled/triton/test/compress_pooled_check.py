@@ -29,6 +29,7 @@ The cases, each a property the already-observed defects of this family would bre
 
 import argparse
 import importlib.util
+import pathlib
 
 import torch
 
@@ -42,7 +43,8 @@ BLOCK = 8
 
 def load_kernel(package):
     """The package's kernel, imported from its source directory."""
-    path = f"{package}/src/vsa_compress_pooled.py"
+    del package  # the check's own location is the package's, wherever it is run from
+    path = pathlib.Path(__file__).resolve().parents[1] / "src" / "vsa_compress_pooled.py"
     spec = importlib.util.spec_from_file_location("compress_pooled_kernel", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
