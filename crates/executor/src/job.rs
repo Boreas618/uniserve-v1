@@ -442,6 +442,7 @@ mod tests {
             columns: BatchColumns::default(),
             generation: 1,
             cache_units: Vec::new(),
+            block_tables: Vec::new(),
         }
     }
 
