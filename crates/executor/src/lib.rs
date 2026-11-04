@@ -16,9 +16,14 @@
 //!   makes them writable again at the same addresses, so captured graphs stay
 //!   valid (§8).
 
+pub mod completion;
+pub mod config;
 pub mod error;
 pub mod keys;
+pub mod memory;
+pub mod stream;
 pub mod tensor;
+pub mod transfer;
 
 pub use error::{Error, Failure, Result};
 
@@ -32,4 +37,19 @@ pub(crate) fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, 
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Keep `value`, and every resource it owns, until the process exits.
+///
+/// An aborted close, or a release whose device completion is unknown, cannot
+/// tell when device work, a DMA engine or a peer rank stops addressing what
+/// `value` owns: releasing it could hand storage, a mapping or a stream that is
+/// still in use to a new owner. The value is leaked instead, and process exit
+/// returns its resources to the driver.
+#[expect(
+    clippy::mem_forget,
+    reason = "resources whose last device access is unknown must outlive it"
+)]
+pub(crate) fn leak<T>(value: T) {
+    std::mem::forget(value);
 }
