@@ -21,10 +21,10 @@ use crate::layers::Rotation;
 use crate::layers::launch::PDL;
 
 /// Tokens one rotation program handles.
-const ROWS: u32 = 8;
+pub const ROWS: u32 = 8;
 
 /// Head elements one program loads at a time.
-const BLOCK: u32 = 128;
+pub const BLOCK: u32 = 128;
 
 /// The rotation of a vision tower's queries or keys.
 #[derive(Clone, Copy)]

@@ -57,20 +57,33 @@ impl RmsNorm {
     /// The row count is not in it: rows are a launch value, and a normalization is compiled per
     /// column count and element type.
     pub fn descriptor(&self, input: ops::DType) -> RmsNormDescriptor {
-        RmsNormDescriptor {
-            dtype: input,
-            columns: self.columns,
-            tile: row_tile(self.columns),
-            pdl: PDL,
-        }
+        Self::descriptor_of(self.columns, input)
     }
 
     /// The descriptor [`Self::forward_with_residual`] launches with, for an input of `input`.
     pub fn add_descriptor(&self, input: ops::DType) -> AddRmsNormDescriptor {
+        Self::add_descriptor_of(self.columns, input)
+    }
+
+    /// The descriptor the fused residual-add and normalization launches with, from the width alone.
+    pub fn add_descriptor_of(columns: u32, input: ops::DType) -> AddRmsNormDescriptor {
         AddRmsNormDescriptor {
             dtype: input,
-            columns: self.columns,
-            tile: row_tile(self.columns),
+            columns,
+            tile: row_tile(columns),
+            pdl: PDL,
+        }
+    }
+
+    /// The descriptor a normalization over `columns` channels launches with, from the width alone.
+    ///
+    /// The row count is a launch value, and the tile follows the width, so a deployment that has only
+    /// a configuration states this program exactly.
+    pub fn descriptor_of(columns: u32, input: ops::DType) -> RmsNormDescriptor {
+        RmsNormDescriptor {
+            dtype: input,
+            columns,
+            tile: row_tile(columns),
             pdl: PDL,
         }
     }

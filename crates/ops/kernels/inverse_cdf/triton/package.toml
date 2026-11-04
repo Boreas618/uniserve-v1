@@ -27,8 +27,11 @@ script = "src/build.py"
 target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
-# `width_2048_ids_i32_tokens_i32_pdl_false`.
+# `width_151936_tile_8192_ids_i32_tokens_i32_pdl_false`.
+#
+# The width and the tile are both compilation fields: the width is the deployment's candidate
+# bound, and the tile is the chunk its program walks the row in.
 [kernel.descriptors]
-dimensions = { width = ["2048", "4096", "1024", "128"], ids = ["i32", "i64"], tokens = ["i32", "i64"], pdl = ["true", "false"] }
+dimensions = { width = ["128", "1024", "2048", "4096", "151936"], tile = ["2048", "4096", "8192"], ids = ["i32", "i64"], tokens = ["i32", "i64"], pdl = ["true", "false"] }
 
 [parameters]

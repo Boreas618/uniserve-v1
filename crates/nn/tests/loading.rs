@@ -455,6 +455,7 @@ fn a_calibrated_nvfp4_matrix_is_loaded_as_its_three_fields() {
             None,
             Nvfp4Names::vllm(),
             ops::fp4::ScaleLayout::Linear,
+            ops::fp4::ScaleLayout::Linear,
             0.25,
         )
         .unwrap();
@@ -501,6 +502,7 @@ fn the_block_scales_must_have_the_layout_s_shape() {
             &WeightRequest::region("w_scale", 0, Shape::new(&[4, 4])),
             None,
             Nvfp4Names::vllm(),
+            ops::fp4::ScaleLayout::Swizzled128X4,
             ops::fp4::ScaleLayout::Swizzled128X4,
             0.25,
         )
@@ -579,8 +581,9 @@ fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection
         "one packed table per projection, of two experts each"
     );
     assert_eq!(stack.global_scale.dtype(), DType::F32);
-    // The store received the values in reading order, then the scales, then the reciprocals.
-    assert_eq!(store.published.len(), 3);
+    // The store received the values in reading order, then the scales, then the reciprocals, then
+    // the stack's encode scale.
+    assert_eq!(store.published.len(), 4);
     assert_eq!(store.published[0].1, expected);
     assert_eq!(store.published[0].0.layout, WeightLayout::NVFP4_VALUES);
     assert_eq!(store.published[2].0.layout, WeightLayout::ROW_MAJOR);
@@ -596,8 +599,15 @@ fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection
         [2.0, 1.0, 2.0, 1.0],
         "1 / (0.5 · (e + 1)) as one packed row per projection: up's two experts, then gate's"
     );
+    // The neutral encode scale is one value per stack, published so the encoder reads a device
+    // operand: a stack that encodes nothing multiplies by one.
+    let (key, bytes, dtype, shape, _) = &store.published[3];
+    assert_eq!(key.layout, WeightLayout::ROW_MAJOR);
+    assert_eq!(*dtype, DType::F32);
+    assert_eq!(shape.dims(), &[1]);
+    assert_eq!(bytes, &1.0_f32.to_le_bytes());
 
-    // A second load of the same checkpoint publishes nothing: the three keys hit the store.
+    // A second load of the same checkpoint publishes nothing: the four keys hit the store.
     let again = {
         let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
         loader
@@ -614,7 +624,7 @@ fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection
             .unwrap()
     };
     assert_eq!(again.values.shape().dims(), stack.values.shape().dims());
-    assert_eq!(store.published.len(), 3, "the retained regions were reused");
+    assert_eq!(store.published.len(), 4, "the retained regions were reused");
 }
 
 /// A stack whose experts disagree on their geometry is refused rather than read as one stack.
@@ -1074,6 +1084,7 @@ fn a_calibrated_projection_is_read_in_the_spelling_its_export_wrote() {
                 None,
                 Nvfp4Names::vllm(),
                 ops::fp4::ScaleLayout::Linear,
+                ops::fp4::ScaleLayout::Linear,
                 0.25,
             )
             .unwrap();
@@ -1091,6 +1102,7 @@ fn a_calibrated_projection_is_read_in_the_spelling_its_export_wrote() {
                 None,
                 Nvfp4Names::diffusers(),
                 ops::fp4::ScaleLayout::Linear,
+                ops::fp4::ScaleLayout::Linear,
                 0.25,
             )
             .expect_err("a checkpoint in the other export's spelling");
@@ -1106,8 +1118,10 @@ fn a_calibrated_projection_is_read_in_the_spelling_its_export_wrote() {
 fn a_calibrated_stack_names_its_fields_with_its_exports_suffixes() {
     let directory = tempfile::tempdir().unwrap();
     let directory = directory.path();
-    let values: Vec<u8> = (0..256).map(|byte| byte as u8).collect();
-    let scales: Vec<u8> = (0..32).map(|byte| 0x30 + byte).collect();
+    // A `[4, 32]` packed weight is 128 bytes — two E2M1 codes a byte along a contraction of 64 —
+    // and its linear block scales are one byte per sixteen elements, sixteen of them.
+    let values: Vec<u8> = (0..128).map(|byte| byte as u8).collect();
+    let scales: Vec<u8> = (0..16).map(|byte| 0x30 + byte).collect();
     let tensor_scale: Vec<u8> = 1.0_f32.to_le_bytes().to_vec();
     let mut tensors: Vec<(String, DType, Vec<u64>, Vec<u8>)> = Vec::new();
     for expert in 0..2 {
@@ -1471,13 +1485,29 @@ fn a_swizzled_scale_table_is_built_from_the_shards_linear_one() {
     let (key, bytes, ..) = &store.published[1];
     assert_eq!(key.layout, WeightLayout::NVFP4_SCALES_SWIZZLED);
     assert_eq!(bytes.len(), 128 * 4);
-    // Row `r`'s column-0 scale lands at `(r % 32) * 16 + ((r % 128) / 32) * 4`, and the tile's two
-    // padding columns are zero. Row 1's own scale value is 1; row 32's is 32, in the next group of
-    // thirty-two rows.
-    assert_eq!(bytes[16], 1);
-    assert_eq!(bytes[4], 32);
+    // A source row moves twice, and the table must show both moves composed. The values are
+    // published shuffled, and the scales are read beside the row, so the same arrangement applies to
+    // them: within its block of thirty-two rows a source row goes to `(r % 4) * 8 + (r % 32) / 4`
+    // — sixteen lanes of eight rows, the reference's `srcToDstBlk32RowMap` — and the artifact's
+    // `computeSFIndex` then puts that row's scale group at
+    // `(row % 32) * 16 + ((row % 128) / 32) * 4`. Asserting the composite over every row states
+    // both formulas at once; asserting a probe would go green on either one alone.
+    for source in 0..128_u64 {
+        let within = source % 32;
+        let row = (source / 32) * 32 + (within % 4) * 8 + within / 4;
+        let at = ((row % 32) * 16 + ((row % 128) / 32) * 4) as usize;
+        assert_eq!(bytes[at], source as u8, "row {source}'s first scale");
+        assert_eq!(
+            bytes[at + 1],
+            source.wrapping_add(1) as u8,
+            "row {source}'s second scale"
+        );
+    }
     // Columns 2 and 3 of the tile are the padding: no block exists there, and a zero scale on a
     // block that does not exist is what the artifact's own interleave writes.
-    assert_eq!(bytes[2], 0, "a padding column is a zero scale");
-    assert_eq!(bytes[3], 0, "a padding column is a zero scale");
+    for (at, value) in bytes.iter().enumerate() {
+        if at % 4 >= 2 {
+            assert_eq!(*value, 0, "a padding column is a zero scale at {at}");
+        }
+    }
 }

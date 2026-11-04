@@ -30,9 +30,9 @@ use std::time::Duration;
 
 use prost::Message as _;
 use proto::process::{
-    self, Answered, Downstream, Event, Exit, Exited, Forwarded, FromMember, Hello, LedgerReport,
-    Node, NodesKnown, Reply, Request, Spawned, Stopped, ToMember, TransfersThrottled, Upstream,
-    Welcome, downstream, event, from_member, hello, reply, request, to_member, upstream,
+    self, Answered, Downstream, Event, Exit, Exited, Forwarded, FromMember, Hello, Interface,
+    LedgerReport, Node, NodesKnown, Reply, Request, Spawned, Stopped, ToMember, TransfersThrottled,
+    Upstream, Welcome, downstream, event, from_member, hello, reply, request, to_member, upstream,
 };
 use proto::{Connection, Handed, Listener};
 
@@ -425,6 +425,10 @@ pub(crate) fn serve_leader(
             nodes,
             engines: HashMap::new(),
             next_engine: 1,
+            clients: HashMap::new(),
+            next_client: 1,
+            process_links: HashMap::new(),
+            request_links: HashMap::new(),
             stops: HashMap::new(),
             commands,
             reports,
@@ -452,6 +456,19 @@ pub(crate) struct LeaderService {
     nodes: Vec<Node>,
     engines: HashMap<u64, EngineConnection>,
     next_engine: u64,
+    /// Peers of the process socket that are not processes of the deployment -
+    /// the daemon's own client, and the clients a main process's workers open.
+    /// They are served and never numbered, so no command can be addressed to
+    /// one of them (§2.3).
+    clients: HashMap<u64, EngineConnection>,
+    next_client: u64,
+    /// The connection each engine's process link is on, by engine number: the
+    /// one link that receives that engine's commands, and the reason a second
+    /// process link for the same number is refused (§2.3).
+    process_links: HashMap<u64, u64>,
+    /// The connection each engine's request link is on, by engine number. It
+    /// never receives a command, and a second request link is refused.
+    request_links: HashMap<u64, u64>,
     /// Stops of an engine, by its request id, awaiting the members'
     /// answers.
     stops: HashMap<(u64, u64), PendingStop>,
@@ -500,6 +517,10 @@ pub(crate) fn run_leader(
         mut nodes,
         mut engines,
         mut next_engine,
+        mut clients,
+        mut next_client,
+        mut process_links,
+        mut request_links,
         mut stops,
         commands,
         reports,
@@ -527,6 +548,10 @@ pub(crate) fn run_leader(
                 nodes,
                 engines,
                 next_engine,
+                clients,
+                next_client,
+                process_links,
+                request_links,
                 stops,
                 commands,
                 reports,
@@ -545,6 +570,12 @@ pub(crate) fn run_leader(
             return Ok(None);
         }
         while let Some(connection) = listener.try_accept()? {
+            // The arrival numbering skips the numbers main processes state:
+            // an engine a launch named owns its number for the deployment's
+            // life, and a later arrival must not be given it.
+            while engines.contains_key(&next_engine) {
+                next_engine += 1;
+            }
             engines.insert(
                 next_engine,
                 EngineConnection {
@@ -609,6 +640,17 @@ pub(crate) fn run_leader(
             }
         }
 
+        // The main processes that stated an engine number this round, by the
+        // number their arrival gave them: applied once their hellos are read.
+        let mut renumbered: Vec<(u64, u64)> = Vec::new();
+        // Peers that stated no engine number and hold none: the daemon's own
+        // client of this socket, and the clients a main process's workers open.
+        // Nothing addresses them, so they are kept out of the numbered registry
+        // and served for what they ask (§2.3).
+        let mut unkeyed: Vec<u64> = Vec::new();
+        // The request links that greeted this round, by the number they state:
+        // filed beside the clients, because a command never goes down one.
+        let mut request_links_new: Vec<(u64, u64)> = Vec::new();
         // Engines: their hellos and requests; a closed engine takes its
         // processes on every node with it.
         for (&engine, peer) in &mut engines {
@@ -616,9 +658,54 @@ pub(crate) fn run_leader(
                 if !peer.welcomed {
                     match peer.connection.try_recv::<Hello>() {
                         Ok(Some(hello)) => {
-                            let refusal = refusal(&hello, |peer| {
+                            // A main process says which of its links this is and
+                            // which engine it serves (§2.3): its process link
+                            // takes the epoch's commands, its request link
+                            // carries the epoch's requests, and a client of the
+                            // socket is neither.
+                            let (stated, link) = match &hello.peer {
+                                Some(hello::Peer::Engine(engine)) => (
+                                    Some(engine.engine).filter(|number| *number != 0),
+                                    engine.interface(),
+                                ),
+                                _ => (None, Interface::Unspecified),
+                            };
+                            let mut refusal = refusal(&hello, |peer| {
                                 matches!(peer, hello::Peer::Engine(_) | hello::Peer::Frontend(_))
                             });
+                            if refusal.is_none() {
+                                refusal = match (link, stated) {
+                                    // A link that receives commands must say
+                                    // which engine's commands it receives.
+                                    (Interface::Process, None) => Some(
+                                        "a process link states no engine number: no command could                                          be addressed to it"
+                                            .to_owned(),
+                                    ),
+                                    // A process has one command link. A second
+                                    // one is a deployment fault, and the first
+                                    // keeps the commands it is serving.
+                                    (Interface::Process, Some(number)) => {
+                                        process_links.get(&number).map(|held| {
+                                            format!(
+                                                "engine {number} already has its process link on \
+                                                 connection {held}; this connection states the \
+                                                 same engine"
+                                            )
+                                        })
+                                    }
+                                    // A process has one request link.
+                                    (Interface::Requests, Some(number)) => {
+                                        request_links.get(&number).map(|held| {
+                                            format!(
+                                                "engine {number} already has its request link on \
+                                                 connection {held}; this connection states the \
+                                                 same engine"
+                                            )
+                                        })
+                                    }
+                                    _ => None,
+                                };
+                            }
                             let welcome = Welcome {
                                 major: proto::PROTOCOL_MAJOR,
                                 minor: proto::PROTOCOL_MINOR,
@@ -631,20 +718,64 @@ pub(crate) fn run_leader(
                                 break;
                             }
                             let frontend = matches!(hello.peer, Some(hello::Peer::Frontend(_)));
-                            tracing::info!(engine, build = %hello.build, frontend, "a process connected");
+                            tracing::info!(
+                                engine,
+                                stated = stated.unwrap_or(0),
+                                interface = link.as_str_name(),
+                                build = %hello.build,
+                                frontend,
+                                "a process connected"
+                            );
                             if frontend && let Some(frontend_greetings) = &frontend_greetings {
                                 let _ = frontend_greetings.send(engine);
                             }
+                            // Three kinds of peer reach this point: a process's
+                            // command link, which the epoch addresses by number
+                            // and which is filed under it; a process's request
+                            // link, which never receives a command and so is
+                            // kept out of the numbered registry; and a client of
+                            // the socket, which is served for its queries and
+                            // holds no number at all.
+                            if frontend {
+                                // The frontend is commanded by the epoch layer
+                                // like a main process, and is filed by whatever
+                                // number it arrived with (§2.1).
+                            } else {
+                                match (link, stated) {
+                                    // Only a process link takes a number: it is
+                                    // the connection a command goes down.
+                                    (Interface::Process, Some(number)) => {
+                                        // Reserved as the link is read, so that a
+                                        // second process link for the same
+                                        // engine in this same round is refused
+                                        // rather than displacing the first.
+                                        process_links.insert(number, engine);
+                                        renumbered.push((engine, number));
+                                    }
+                                    (Interface::Requests, Some(number)) => {
+                                        request_links_new.push((engine, number));
+                                    }
+                                    // Everything else - a worker's client, the
+                                    // daemon's own client, a link that states a
+                                    // number but not the interface that would
+                                    // make it a command target - is served and
+                                    // never numbered.
+                                    _ => unkeyed.push(engine),
+                                }
+                            }
                             // The epoch layer binds this connection to the
                             // launch it started when the peer's first report
-                            // names the launch generation (§2.5).
-                            let _ = greetings.send((
-                                engine,
-                                Greeting {
-                                    build: hello.build.clone(),
-                                    frontend,
-                                },
-                            ));
+                            // names the launch generation (§2.5). A client
+                            // sends no report, and takes no greeting.
+                            if frontend || link == Interface::Process {
+                                let _ = greetings.send((
+                                    stated.unwrap_or(engine),
+                                    Greeting {
+                                        build: hello.build.clone(),
+                                        frontend,
+                                    },
+                                ));
+                            }
                             let _ = wake.send(());
                             peer.welcomed = true;
                             continue;
@@ -691,6 +822,44 @@ pub(crate) fn run_leader(
                 }
             }
         }
+        // Clients of the process socket: the daemon's own, and the ones a main
+        // process's workers open. They ask (a device inventory, a storage
+        // ledger) and are answered; they are never commanded, and a client
+        // that goes takes nothing with it.
+        let mut gone = Vec::new();
+        for (&client, peer) in &mut clients {
+            loop {
+                match peer.connection.try_recv::<Upstream>() {
+                    Ok(Some(Upstream {
+                        kind: Some(upstream::Kind::Request(request)),
+                    })) => {
+                        if let Some(reply) = route(
+                            EPOCH_ENGINE,
+                            &request,
+                            host,
+                            &mut local,
+                            &mut members,
+                            &nodes,
+                            &mut stops,
+                        ) && peer.connection.send(&downstream_reply(reply)).is_err()
+                        {
+                            gone.push(client);
+                            break;
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(_) => {
+                        gone.push(client);
+                        break;
+                    }
+                }
+            }
+        }
+        for client in gone {
+            clients.remove(&client);
+        }
+
         for engine in closed {
             engines.remove(&engine);
             stops.retain(|&(owner, _), _| owner != engine);
@@ -778,6 +947,64 @@ pub(crate) fn run_leader(
             }
         }
 
+        // The clients leave the numbered registry before any command is read:
+        // a command names a launch's engine, and a client that happened to
+        // arrive first must not be the connection it names.
+        for (arrived, number) in request_links_new.drain(..) {
+            if let Some(peer) = engines.remove(&arrived) {
+                let client = next_client;
+                next_client += 1;
+                request_links.insert(number, arrived);
+                tracing::info!(
+                    client,
+                    engine = number,
+                    "a request link is not a command target"
+                );
+                clients.insert(client, peer);
+            }
+        }
+        for arrived in unkeyed.drain(..) {
+            if let Some(peer) = engines.remove(&arrived) {
+                let client = next_client;
+                next_client += 1;
+                tracing::info!(
+                    client,
+                    engine = arrived,
+                    "a client of the process socket is not a process of the deployment"
+                );
+                clients.insert(client, peer);
+            }
+        }
+
+        // The numbers main processes stated take effect before this round's
+        // commands go down, so a command the epoch layer sends right after a
+        // process reported itself ready already reaches that process.
+        for (arrived, number) in renumbered.drain(..) {
+            let Some(connection) = engines.remove(&arrived) else {
+                continue;
+            };
+            if let Some(displaced) = engines.remove(&number) {
+                // Nothing addresses a peer that states no number: it is a
+                // worker's client or a client of this interface, and the
+                // number is the main process's.
+                let fresh = next_engine;
+                next_engine += 1;
+                engines.insert(fresh, displaced);
+                tracing::info!(
+                    engine = fresh,
+                    stated = number,
+                    "a peer was moved off the number a main process states"
+                );
+            }
+            engines.insert(number, connection);
+            process_links.insert(number, arrived);
+            tracing::info!(
+                engine = number,
+                arrived,
+                "a main process is numbered by the engine it states"
+            );
+        }
+
         // This node's exits, to the engines that started the processes and
         // to the epoch layer, whose switch reads them (§7.3, §7.4).
         for (engine, exit) in local.supervisor.exits() {
@@ -791,6 +1018,7 @@ pub(crate) fn run_leader(
         let mut descriptors = vec![listener.descriptor(), stop.wake.as_raw_fd()];
         descriptors.extend(joins.iter().flat_map(Joins::descriptors));
         descriptors.extend(engines.values().map(|peer| peer.connection.descriptor()));
+        descriptors.extend(clients.values().map(|peer| peer.connection.descriptor()));
         descriptors.extend(members.iter().map(|member| member.connection.descriptor()));
         wait(&descriptors, EXIT_POLL_INTERVAL);
         stop.drain();
@@ -1053,6 +1281,15 @@ impl LeaderService {
             nodes,
             engines,
             next_engine,
+            // A client of the process socket is a query in flight, not state:
+            // the successor serves its own, and a predecessor's client is
+            // closed with the predecessor's process.
+            clients: _,
+            next_client: _,
+            // The link maps are derived from the connections that are handed
+            // over: the successor's first look at a greeted peer files it.
+            process_links: _,
+            request_links: _,
             stops,
             // The command channel is the daemon's, not the service's: the
             // successor makes its own ends when it resumes (`ProcessCommands`).
@@ -1206,6 +1443,10 @@ pub(crate) fn resume(
                     nodes,
                     engines: adopted_engines,
                     next_engine,
+                    clients: HashMap::new(),
+                    next_client: 1,
+                    process_links: HashMap::new(),
+                    request_links: HashMap::new(),
                     stops,
                     commands,
                     reports,

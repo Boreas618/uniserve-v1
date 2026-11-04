@@ -243,6 +243,14 @@ pub struct WeightRequest {
     pub layout: WeightLayout,
     /// The logical extents after conversion.
     pub shape: Shape,
+    /// The element type this tensor is read as whatever the deployment states, when it has one.
+    ///
+    /// A representation the model pins per tensor - the reference keeps a timestep embedding in
+    /// FP32 and a modulation projection in BF16 at every preset (`weights.py:186-224`) - cannot be
+    /// expressed by the loader's policy, which is one value for every weight it reads. A pin wins
+    /// over the policy, and it is part of the retained key: two loaders of one checkpoint that read
+    /// one tensor at two types retain two different weights.
+    pub pinned: Option<DType>,
 }
 
 impl WeightRequest {
@@ -258,6 +266,7 @@ impl WeightRequest {
             tensor,
             layout: WeightLayout::ROW_MAJOR,
             shape,
+            pinned: None,
         }
     }
 
@@ -274,6 +283,7 @@ impl WeightRequest {
             tensor,
             layout: WeightLayout::ROW_MAJOR,
             shape,
+            pinned: None,
         }
     }
 
@@ -289,7 +299,14 @@ impl WeightRequest {
             source: WeightSource::Parts { parts, shape },
             layout,
             shape,
+            pinned: None,
         }
+    }
+
+    /// The same request read as `dtype`, whatever the loader's policy states.
+    pub fn pinned(mut self, dtype: DType) -> Self {
+        self.pinned = Some(dtype);
+        self
     }
 
     /// The same request in another layout.
@@ -803,7 +820,7 @@ impl<'a> WeightLoader<'a> {
 
         let files = self.identities(&names)?;
         let source_dtype = self.checkpoint_dtype(&names)?;
-        let dtype = self.target_dtype(&names)?;
+        let dtype = self.target_dtype(&names, request.pinned)?;
         let region = WeightRegion {
             tensors: names.clone(),
             start,
@@ -1004,20 +1021,26 @@ impl<'a> WeightLoader<'a> {
     /// deployment that asks to quantize a BF16 checkpoint at load does it with the
     /// `nvfp4_quantize` operator on the device, which is where the reference encodes too.
     ///
-    /// `values` is `[rows, columns / 2]` U8 (two E2M1 codes a byte), `scales` holds the block
-    /// scales in the layout `ops::fp4::ScaleLayout::shape(rows, columns)` names, in whatever
+    /// `file` is the arrangement the checkpoint stores its block scales in and `product` the one the
+    /// deployment's kernels read; when the two differ the table is permuted here, and
+    /// [`QuantizedWeight::layout`] states the product's. `values` is `[rows, columns / 2]` U8 (two
+    /// E2M1 codes a byte), `scales` holds the block scales in `file`'s arrangement, in whatever
     /// one-byte type the checkpoint stores them (`F8_E4M3`, or `U8` where the export says so;
     /// [`QuantizedWeight::scales`]`.dtype()` is that type, unchanged), and `global_scale` is the
     /// reciprocal of the checkpoint's FP32 tensor
     /// scale, the scalar `nvfp4_quantize` takes. The product op's `alpha` is the two tensor
     /// scales' product, which the runner copies into one device scalar once at load.
+    // The two arrangements are separate arguments on purpose: one is the file's statement, the other
+    // the deployment's, and naming both is what keeps a caller from passing one for the other.
+    #[allow(clippy::too_many_arguments)]
     pub fn nvfp4(
         &mut self,
         values: &WeightRequest,
         scales: &WeightRequest,
         input_scale: Option<&WeightRequest>,
         names: Nvfp4Names,
-        layout: ScaleLayout,
+        file: ScaleLayout,
+        product: ScaleLayout,
         global_scale: f32,
     ) -> Result<QuantizedWeight> {
         // The requests name the fields, so their absence is where a wrong vocabulary shows up: a
@@ -1043,25 +1066,31 @@ impl<'a> WeightLoader<'a> {
         }
         let rows = values.shape.numel() / values.shape.last();
         let columns = values.shape.last() * 2;
-        let expected = layout.shape(rows, columns);
+        let expected = file.shape(rows, columns);
         if scales.shape != expected {
             return Err(Error::weight(
                 &scales.tensor,
                 format!(
-                    "the {layout} block scales of a [{rows}, {columns}] matrix are {:?}, not {:?}",
+                    "the {file} block scales of a [{rows}, {columns}] matrix are {:?}, not {:?}",
                     expected.dims(),
                     scales.shape.dims()
                 ),
             ));
         }
-        let scale_layout = match layout {
+        if file == ScaleLayout::Swizzled128X4 && product == ScaleLayout::Linear {
+            return Err(Error::weight(
+                &scales.tensor,
+                "a swizzled file rewritten into the linear table is a permutation this loader does \
+                 not have: a calibrated export stores its block scales linear"
+                    .to_owned(),
+            ));
+        }
+        let product_layout = match product {
             ScaleLayout::Linear => WeightLayout::NVFP4_SCALES_LINEAR,
             ScaleLayout::Swizzled128X4 => WeightLayout::NVFP4_SCALES_SWIZZLED,
         };
         let mut values_request = values.clone().with_layout(WeightLayout::NVFP4_VALUES);
-        let mut scales_request = scales.clone().with_layout(scale_layout);
         values_request.shape = Shape::new(&[rows, columns / 2]);
-        scales_request.shape = expected;
         let packed = self.load(&values_request)?;
         if packed.dtype() != DType::U8 {
             return Err(Error::weight(
@@ -1069,8 +1098,66 @@ impl<'a> WeightLoader<'a> {
                 format!("packed E2M1 values are U8 bytes, not {}", packed.dtype()),
             ));
         }
-        let scales = self.load(&scales_request)?;
-        block_scale_dtype(&scales_request.tensor, scales.dtype())?;
+        // The file's arrangement and the product's are two statements, and the permutation between
+        // them happens here once: a kernel must never read a table under a claim it does not meet.
+        let scales = if file == product {
+            let mut request = scales.clone().with_layout(product_layout);
+            request.shape = expected;
+            let loaded = self.load(&request)?;
+            block_scale_dtype(&request.tensor, loaded.dtype())?;
+            loaded
+        } else {
+            let bytes = self.checkpoint.read(&scales.tensor)?;
+            let dtype = block_scale_dtype(&scales.tensor, bytes.dtype)?;
+            let blocks = file.columns(columns);
+            // The request may name a column block of a row-parallel matrix, so the rows are gathered
+            // at its stride before the permutation: permuting the file's first `rows · blocks`
+            // elements instead would publish another rank's scales under this rank's key.
+            let (start, stride) = match &scales.source {
+                WeightSource::Region { start, .. } => (*start, blocks),
+                WeightSource::Strided {
+                    start, row_stride, ..
+                } => (*start, *row_stride),
+                WeightSource::Parts { .. } => {
+                    return Err(Error::weight(
+                        &scales.tensor,
+                        "block scales gathered from fused parts have no single row stride".to_owned(),
+                    ));
+                }
+            };
+            let mut linear = Vec::with_capacity((rows * blocks) as usize);
+            for row in 0..rows {
+                let first = start + row * stride;
+                let end = first + blocks;
+                let end = usize::try_from(end).unwrap_or(usize::MAX);
+                let first = usize::try_from(first).unwrap_or(usize::MAX);
+                let row_bytes = bytes.bytes.get(first..end).ok_or_else(|| {
+                    Error::weight(
+                        &scales.tensor,
+                        format!("elements {first}..{end} of a row are past the tensor's {blocks}-block rows"),
+                    )
+                })?;
+                linear.extend_from_slice(row_bytes);
+            }
+            let arranged = swizzled_scales(&linear, rows, blocks);
+            let shape = product.shape(rows, columns);
+            let files = self.identities(std::slice::from_ref(&scales.tensor))?;
+            self.publish_computed(
+                WeightKey {
+                    files,
+                    dtype,
+                    layout: product_layout,
+                    region: WeightRegion {
+                        tensors: std::iter::once(format!("{}__nvfp4_scales", scales.tensor)).collect(),
+                        start: 0,
+                        shape,
+                        stride: None,
+                    },
+                },
+                shape,
+                &arranged,
+            )?
+        };
         let input_scale = match input_scale {
             None => None,
             Some(request) => {
@@ -1083,10 +1170,9 @@ impl<'a> WeightLoader<'a> {
                 let reciprocal = self.activation_reciprocal(request)?;
                 let shape = Shape::new(&[1]);
                 let bytes = reciprocal.to_le_bytes();
-                let files = self.identities(&[
-                    request.tensor.clone(),
-                    format!("{}__nvfp4_input_scale", request.tensor),
-                ])?;
+                // The activation's reciprocal is computed from one file: the suffix names the
+                // published piece, not a tensor the checkpoint holds, so it is not an identity.
+                let files = self.identities(std::slice::from_ref(&request.tensor))?;
                 Some(
                     self.publish_computed(
                         WeightKey {
@@ -1114,7 +1200,7 @@ impl<'a> WeightLoader<'a> {
             packed,
             scales,
             global_scale,
-            layout,
+            layout: product,
             input_scale,
         })
     }
@@ -1153,6 +1239,17 @@ impl<'a> WeightLoader<'a> {
     /// takes the reciprocal. A zero, a negative or a non-finite scale is refused here rather than
     /// encoded at the wrong magnitude.
     fn activation_reciprocal(&self, request: &WeightRequest) -> Result<f32> {
+        Ok(1.0 / self.tensor_scale(request)?)
+    }
+
+    /// One tensor's single positive scale, as the checkpoint states it.
+    ///
+    /// Both tensor scales a calibrated NVFP4 export writes — the weight's `weight_scale_2` and the
+    /// activation's `input_scale` — are one positive float each, and a loader that synthesized one
+    /// would encode at an invented magnitude. A projection reads its weight's scale to build the
+    /// product's `alpha` and its activation's to build the encoder's operand, so the reading is
+    /// public and the reciprocals are its callers'.
+    pub fn tensor_scale(&self, request: &WeightRequest) -> Result<f32> {
         let tensor = self.checkpoint.read(&request.tensor)?;
         if tensor.shape.numel() != 1 || !tensor.dtype.is_float() {
             return Err(Error::weight(
@@ -1171,7 +1268,7 @@ impl<'a> WeightLoader<'a> {
                 format!("a tensor scale of {scale} is not a positive number"),
             ));
         }
-        Ok(1.0 / scale)
+        Ok(scale)
     }
 
     /// Load the encoded fields of a whole expert stack: `experts` experts, each contributing
@@ -1629,9 +1726,12 @@ impl<'a> WeightLoader<'a> {
     }
 
     /// The element type the weight is retained as.
-    fn target_dtype(&self, names: &[String]) -> Result<DType> {
+    fn target_dtype(&self, names: &[String], pinned: Option<DType>) -> Result<DType> {
         let checkpoint = self.checkpoint_dtype(names)?;
-        let dtype = self.dtype.unwrap_or(checkpoint);
+        // A pin is the model's statement about this tensor; the policy is the deployment's about
+        // every tensor it reads. The pin wins, because a representation the reference fixes at
+        // every preset is not a property of the deployment.
+        let dtype = pinned.or(self.dtype).unwrap_or(checkpoint);
         // A representation that is not converted (BF16 kept as BF16, a packed NVFP4 field of
         // bytes kept as bytes) is read as it is; only a stated change goes through `convert`.
         if dtype == checkpoint {
@@ -1995,6 +2095,68 @@ fn f32_to_half(value: f32) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The block-scale arrangement is the launcher's `computeSFIndex`: a permutation of the
+    /// checkpoint's row-major table into the 128x4 layout, padded with zeros.
+    ///
+    /// Three properties, and the third is the one that catches a skipped arrangement: the values
+    /// survive exactly once each; the result is not the padded row-major table, so an arrangement that
+    /// never ran fails here rather than passing as "the same numbers"; and one index follows the
+    /// reference's own arithmetic
+    /// (`(column % 4) + (column / 4) * 512 + (row % 32) * 16 + ((row % 128) / 32) * 4 +
+    /// (row / 128) * (128 * padded_columns)`), so a bijection that moved the right values to the wrong
+    /// places is not mistaken for the layout the products read.
+    ///
+    /// The shapes keep `rows * blocks` inside a byte, because the table is bytes: `(56, 4)` pads the
+    /// rows only and `(8, 8)` pads both axes.
+    ///
+    /// **The padding is a zero, so the data starts at one.** "Every scale survives exactly once" is
+    /// counted over non-zero entries here, and a table carrying a genuine zero would be one short —
+    /// which is the caller's obligation, not the assertion's: a zero scale is a block the file says is
+    /// empty, indistinguishable in the arranged table from a hole, so a test of this bijection uses
+    /// values a checkpoint would never write as padding.
+    #[test]
+    fn the_block_scales_are_permuted_into_the_laid_out_table() {
+        for (rows, blocks) in [(56_u64, 4_u64), (8, 8)] {
+            let linear: Vec<u8> = (1..=rows * blocks).map(|value| value as u8).collect();
+            let swizzled = swizzled_scales(&linear, rows, blocks);
+            let padded_rows = rows.div_ceil(128) * 128;
+            let padded_columns = blocks.div_ceil(4) * 4;
+            assert_eq!(
+                swizzled.len() as u64,
+                padded_rows * padded_columns,
+                "the table is padded to 128 rows and 4 columns"
+            );
+
+            let mut present: Vec<u8> = swizzled.iter().copied().filter(|value| *value != 0).collect();
+            let mut expected = linear.clone();
+            present.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(present, expected, "every scale survives exactly once");
+
+            let mut row_major = vec![0_u8; (padded_rows * padded_columns) as usize];
+            for row in 0..rows {
+                for column in 0..blocks {
+                    row_major[(row * padded_columns + column) as usize] =
+                        linear[(row * blocks + column) as usize];
+                }
+            }
+            assert_ne!(
+                swizzled, row_major,
+                "an arrangement that never ran is the row-major table"
+            );
+        }
+
+        // One index from the formula, at a row inside the first thirty-two and a column past the
+        // first group of four: the values are `row * blocks + column`, so this one is 5 * 8 + 6.
+        let (rows, blocks) = (128_u64, 8_u64);
+        let linear: Vec<u8> = (1..=rows * blocks).map(|value| value as u8).collect();
+        let swizzled = swizzled_scales(&linear, rows, blocks);
+        let index = 594_usize;
+        // The data starts at one so that a genuine zero cannot be mistaken for the table's padding;
+        // the pinned value is therefore `row * blocks + column + 1`, not the position itself.
+        assert_eq!(swizzled[index], (5 * blocks + 6 + 1) as u8);
+    }
 
     #[test]
     fn half_round_trips_the_values_a_checkpoint_holds() {

@@ -18,10 +18,15 @@ use ops::fp4::ScaleLayout;
 use qwen3_moe::weights::ExpertSource;
 use tempfile::TempDir;
 
-/// Two experts, a `4 × 32` contraction: two E2M1 codes a byte along the contraction (a 16-byte
+/// Two experts, a `32 × 32` contraction: two E2M1 codes a byte along the contraction (a 16-byte
 /// packed row) and two scale blocks of sixteen per row.
+///
+/// The rows are a whole shuffle block on purpose. A deployment arranges the values in the product's
+/// row order, and that arrangement permutes blocks of thirty-two rows, so a fixture with fewer rows
+/// than one block cannot be published in the deployment's own layout — the loader refuses it, which
+/// is the check `a_stack_smaller_than_one_shuffle_block_is_refused` states.
 const EXPERTS: u32 = 2;
-const ROWS: u64 = 4;
+const ROWS: u64 = 32;
 const CONTRACTION: u64 = 32;
 const BLOCK_ELEMENTS: u64 = 16;
 
@@ -43,8 +48,9 @@ impl Tensor<'_> {
         match dtype {
             "U8" => 1,
             "F8_E4M3" => 1,
+            "BF16" => 2,
             "F32" => 4,
-            _ => panic!("the fixture uses U8, F8_E4M3 and F32 only"),
+            _ => panic!("the fixture uses U8, F8_E4M3, BF16 and F32 only"),
         }
     }
 }
@@ -228,12 +234,13 @@ fn a_two_expert_encoded_stack_is_joined_expert_major_with_its_three_fields() {
     // ModelOpt export stores it as E4M3, and a loader that relabelled it U8 would hide which byte
     // the kernel decodes.
     assert_eq!(stack.scales.view.dtype, DType::F8E4M3);
-    // One tensor scale per (expert, projection), in the reading order the stack fuses: a checkpoint
-    // carries one `weight_scale_2` per projection tensor, so the two halves of `up_gate` generally
-    // differ and a kernel that used one for both would be wrong by their ratio.
+    // One tensor scale per (projection, expert). A checkpoint carries one `weight_scale_2` per
+    // projection tensor, so the two halves of `up_gate` generally differ and a kernel that used one
+    // for both would be wrong by their ratio; the published table is projection-major because the
+    // batched entry reads one packed row per projection.
     assert_eq!(
         stack.global_scale.view.shape.dims(),
-        &[u64::from(EXPERTS), 2]
+        &[2, u64::from(EXPERTS)]
     );
     let published = store
         .published
@@ -247,9 +254,10 @@ fn a_two_expert_encoded_stack_is_joined_expert_major_with_its_three_fields() {
         .iter()
         .map(|word| f32::from_le_bytes(*word))
         .collect();
-    // The fixture's tensor scales, expert-major and projection-minor: 1, 2 for expert 0's up and
-    // gate, then 17, 18 for expert 1's — published as their reciprocals.
-    let expected: Vec<f32> = [1.0_f32, 2.0, 17.0, 18.0].iter().map(|s| 1.0 / s).collect();
+    // The shard states the tensor scales in its own reading order — 1 and 2 for expert 0's up and
+    // gate, then 17 and 18 for expert 1's — and the published table is their reciprocals,
+    // projection-major: up's two experts, then gate's.
+    let expected: Vec<f32> = [1.0_f32, 17.0, 2.0, 18.0].iter().map(|s| 1.0 / s).collect();
     assert_eq!(reciprocals.len(), expected.len());
     for (found, want) in reciprocals.iter().zip(&expected) {
         assert!(
@@ -366,4 +374,302 @@ fn the_dense_request_names_one_tensor_and_the_encoded_one_names_three() {
         encoded.up.global_scale,
         "model.layers.0.mlp.experts.0.up_proj.weight_scale_2"
     );
+}
+
+/// A whole tiny model whose **attention projections are packed** and whose router, norms and
+/// vocabulary are not — the checkpoint a calibrated export of this architecture states, one layer
+/// deep and small enough to write by hand.
+///
+/// The expert stacks need 128 rows to be published in the product's own arrangement, and a packed
+/// projection needs its contraction whole sixteen-element blocks, so the smallest geometry that can
+/// carry both is 128 wide with 128 experts' worth of intermediate.
+const PACKED_HIDDEN: u64 = 128;
+const PACKED_VOCABULARY: u64 = 256;
+const PACKED_HEAD_DIM: u64 = 8;
+const PACKED_EXPERTS: u64 = 2;
+
+/// The block scale a linear table holds at `index`, nonzero so that padding stays distinguishable.
+fn scale_byte(index: u64) -> u8 {
+    (index % 255 + 1) as u8
+}
+
+fn packed_model_shard() -> TempDir {
+    let dir = TempDir::new().unwrap_or_else(|error| panic!("a temporary directory: {error}"));
+    let config = format!(
+        r#"{{
+            "architectures": ["Qwen3MoeForCausalLM"],
+            "vocab_size": {PACKED_VOCABULARY},
+            "hidden_size": {PACKED_HIDDEN},
+            "intermediate_size": {PACKED_HIDDEN},
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": {PACKED_HEAD_DIM},
+            "hidden_act": "silu",
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 1000000.0,
+            "max_position_embeddings": 128,
+            "tie_word_embeddings": false,
+            "num_experts": {PACKED_EXPERTS},
+            "num_experts_per_tok": 1,
+            "moe_intermediate_size": {PACKED_HIDDEN},
+            "norm_topk_prob": true,
+            "decoder_sparse_step": 1,
+            "mlp_only_layers": [],
+            "quantization_config": {{
+                "config_groups": {{"group_0": {{
+                    "weights": {{"num_bits": 4, "type": "float", "group_size": 16}},
+                    "targets": ["Linear"]}}}},
+                "ignore": ["model.layers.0.mlp.gate"]}},
+            "attention_bias": false
+        }}"#
+    );
+    std::fs::write(dir.path().join("config.json"), config)
+        .unwrap_or_else(|error| panic!("the fixture config: {error}"));
+
+    // Every tensor the model reads, in the checkpoint's own spelling. A packed projection carries
+    // four: the pair, the block scales, the weight's tensor scale and the activation's.
+    let bf16 = |elements: u64| vec![0u8; (elements * 2) as usize];
+    let mut owned: Vec<(String, Vec<u64>, String, Vec<u8>)> = vec![
+        (
+            "model.embed_tokens.weight".to_owned(),
+            vec![PACKED_VOCABULARY, PACKED_HIDDEN],
+            "BF16".to_owned(),
+            bf16(PACKED_VOCABULARY * PACKED_HIDDEN),
+        ),
+        (
+            "lm_head.weight".to_owned(),
+            vec![PACKED_VOCABULARY, PACKED_HIDDEN],
+            "BF16".to_owned(),
+            bf16(PACKED_VOCABULARY * PACKED_HIDDEN),
+        ),
+        (
+            "model.norm.weight".to_owned(),
+            vec![PACKED_HIDDEN],
+            "BF16".to_owned(),
+            bf16(PACKED_HIDDEN),
+        ),
+    ];
+    for norm in ["input_layernorm", "post_attention_layernorm"] {
+        owned.push((
+            format!("model.layers.0.{norm}.weight"),
+            vec![PACKED_HIDDEN],
+            "BF16".to_owned(),
+            bf16(PACKED_HIDDEN),
+        ));
+    }
+    for norm in ["q_norm", "k_norm"] {
+        owned.push((
+            format!("model.layers.0.self_attn.{norm}.weight"),
+            vec![PACKED_HEAD_DIM],
+            "BF16".to_owned(),
+            bf16(PACKED_HEAD_DIM),
+        ));
+    }
+    owned.push((
+        "model.layers.0.mlp.gate.weight".to_owned(),
+        vec![PACKED_EXPERTS, PACKED_HIDDEN],
+        "BF16".to_owned(),
+        bf16(PACKED_EXPERTS * PACKED_HIDDEN),
+    ));
+
+    // The four attention projections, packed: `q` and `o` contract over the hidden width, `k` and `v`
+    // over it too, and every one of them is a whole number of sixteen-element blocks.
+    let mut packed_tensor = |name: String, rows: u64, columns: u64, seed: u8| {
+        owned.push((
+            format!("{name}.weight"),
+            vec![rows, columns / 2],
+            "U8".to_owned(),
+            vec![seed; (rows * columns / 2) as usize],
+        ));
+        // The block scales identify their own position, so a region read from the wrong rank or with
+        // the wrong stride changes the *set* of published bytes and not only their order.
+        owned.push((
+            format!("{name}.weight_scale"),
+            vec![rows, columns / 16],
+            "F8_E4M3".to_owned(),
+            (0..rows * columns / 16).map(scale_byte).collect(),
+        ));
+        owned.push((
+            format!("{name}.weight_scale_2"),
+            Vec::new(),
+            "F32".to_owned(),
+            f32::from(seed).to_le_bytes().to_vec(),
+        ));
+        owned.push((
+            format!("{name}.input_scale"),
+            Vec::new(),
+            "F32".to_owned(),
+            f32::from(seed).to_le_bytes().to_vec(),
+        ));
+    };
+    let query = 4 * PACKED_HEAD_DIM;
+    let key_value = 2 * PACKED_HEAD_DIM;
+    packed_tensor(
+        "model.layers.0.self_attn.q_proj".to_owned(),
+        query,
+        PACKED_HIDDEN,
+        3,
+    );
+    packed_tensor(
+        "model.layers.0.self_attn.k_proj".to_owned(),
+        key_value,
+        PACKED_HIDDEN,
+        5,
+    );
+    packed_tensor(
+        "model.layers.0.self_attn.v_proj".to_owned(),
+        key_value,
+        PACKED_HIDDEN,
+        7,
+    );
+    packed_tensor(
+        "model.layers.0.self_attn.o_proj".to_owned(),
+        PACKED_HIDDEN,
+        query,
+        11,
+    );
+    for expert in 0..PACKED_EXPERTS {
+        for (projection, rows, columns, seed) in [
+            ("gate", PACKED_HIDDEN, PACKED_HIDDEN, 13u8),
+            ("up", PACKED_HIDDEN, PACKED_HIDDEN, 17u8),
+            ("down", PACKED_HIDDEN, PACKED_HIDDEN, 19u8),
+        ] {
+            packed_tensor(
+                format!("model.layers.0.mlp.experts.{expert}.{projection}_proj"),
+                rows,
+                columns,
+                seed,
+            );
+        }
+    }
+
+    let borrowed: Vec<Tensor<'_>> = owned
+        .iter()
+        .map(|(name, shape, dtype, bytes)| Tensor {
+            name,
+            shape: shape.clone(),
+            dtype,
+            bytes: bytes.clone(),
+        })
+        .collect();
+    write_shard(dir.path(), &borrowed);
+    dir
+}
+
+#[test]
+fn a_whole_calibrated_checkpoint_loads_its_projections_packed_and_its_router_dense() {
+    let dir = packed_model_shard();
+    let checkpoint = Checkpoint::open(dir.path()).expect("the shard opens");
+    let mut store = Retaining::default();
+    let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+    let partition = qwen3_moe::Partition::new(&qwen3_moe::Config::read(dir.path()).expect("the config"), 1, 0, 1, 0)
+        .expect("one rank");
+    let model = qwen3_moe::load::load_checkpoint(
+        dir.path(),
+        partition,
+        &mut loader,
+        qwen3_moe::LoadOptions::default(),
+        ops::fp4::ScaleLayout::Linear,
+    )
+    .expect("the calibrated checkpoint loads");
+
+    // The walk states both: the projections' product once per bucket, and the experts' products which
+    // carry no row count.
+    let keys = model
+        .keys(nn::DType::BF16, 0, &[1, 15])
+        .expect("the deployment's programs");
+    let named: Vec<&str> = keys.iter().map(|(operator, _)| operator.as_str()).collect();
+    // `q` is `[2 · head_dim, hidden]`, `o` is `[hidden, 2 · head_dim]`, and `k` and `v` are one
+    // geometry between them — so three packed products per bucket, and no dense MLP's at all.
+    assert_eq!(
+        named.iter().filter(|operator| **operator == "nvfp4_gemm").count(),
+        3 * 2,
+        "three attention geometries at two buckets, and no dense MLP's: {named:?}"
+    );
+    assert!(named.contains(&"nvfp4_quantize"), "{named:?}");
+    assert!(named.contains(&"gather_gemm_nvfp4"), "{named:?}");
+    assert!(named.contains(&"route_gemm_nvfp4"), "{named:?}");
+    assert!(named.contains(&"topk_softmax"), "the router is dense: {named:?}");
+}
+
+/// The published block scales of `projection` at `rank`, in the product's arrangement, as the store
+/// was handed them.
+fn published_scales(store: &Retaining, projection: &str) -> Vec<u8> {
+    let mut found: Vec<&Vec<u8>> = store
+        .published
+        .iter()
+        .filter(|(key, ..)| {
+            key.layout == nn::weights::WeightLayout::NVFP4_SCALES_SWIZZLED
+                && key
+                    .region
+                    .tensors
+                    .iter()
+                    .any(|tensor| tensor.contains(projection))
+        })
+        .map(|(_, bytes, ..)| bytes)
+        .collect();
+    assert_eq!(found.len(), 1, "one published table for {projection}");
+    found.remove(0).clone()
+}
+
+/// A row-parallel packed projection is read from **this rank's columns of the file**, and the table
+/// the store receives is that rank's scales permuted — not rank 0's, and not the row-major padding of
+/// them, which is what a skipped permutation or an off-by-one stride would publish.
+#[test]
+fn a_rank_one_packed_projection_reads_its_own_columns() {
+    let dir = packed_model_shard();
+    let config = qwen3_moe::Config::read(dir.path()).expect("the fixture config");
+    let mut tables = Vec::new();
+    for rank in [0_usize, 1] {
+        let checkpoint = Checkpoint::open(dir.path()).expect("the shard opens");
+        let mut store = Retaining::default();
+        let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+        let partition = qwen3_moe::Partition::new(&config, 2, rank, 1, 0).expect("a rank of two");
+        qwen3_moe::load::load_checkpoint(
+            dir.path(),
+            partition,
+            &mut loader,
+            qwen3_moe::LoadOptions::default(),
+            ops::fp4::ScaleLayout::Linear,
+        )
+        .expect("the calibrated checkpoint loads at this rank");
+        // `o_proj` is row-parallel: the file is `[hidden, query]` and this rank takes `query / 2`
+        // columns, so its scales are one block of every two in each row.
+        tables.push(published_scales(&store, "o_proj"));
+    }
+
+    let rows = PACKED_HIDDEN;
+    let file_blocks = (4 * PACKED_HEAD_DIM) / 16;
+    for (rank, table) in tables.iter().enumerate() {
+        // The padded 128x4 table: `rows` padded to 128, this rank's one block padded to four.
+        assert_eq!(table.len() as u64, rows.div_ceil(128) * 128 * 4, "rank {rank}'s table size");
+
+        let mut published: Vec<u8> = table.iter().copied().filter(|byte| *byte != 0).collect();
+        let mut expected: Vec<u8> = (0..rows)
+            .map(|row| scale_byte(row * file_blocks + rank as u64))
+            .collect();
+        published.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(published, expected, "rank {rank} publishes exactly its own block scales");
+
+        let mut row_major = vec![0_u8; table.len()];
+        for row in 0..rows {
+            row_major[(row * 4) as usize] = scale_byte(row * file_blocks + rank as u64);
+        }
+        assert_ne!(
+            *table, row_major,
+            "rank {rank} publishes the permuted table, not the row-major one"
+        );
+    }
+    assert_ne!(tables[0], tables[1], "the two ranks read different columns");
+}
+
+/// The permutation's test data is one-based on purpose, and this is where that is stated: the table
+/// is zero-padded, so a value of zero means a hole rather than a scale, and every value is shifted by
+/// one so that no genuine scale can be mistaken for padding.
+#[test]
+fn the_permutation_test_data_starts_at_one() {
+    assert_eq!(scale_byte(0), 1, "the first scale is one, not zero");
+    assert!(scale_byte(254) != 0 && scale_byte(255) == 1, "the pattern wraps away from zero");
 }

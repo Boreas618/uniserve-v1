@@ -3,11 +3,28 @@
 //! Run it with
 //!
 //! ```text
-//! cargo run -p ops --example minimax_h3_keys
+//! cargo run -p minimax-h3 --example minimax_h3_keys
 //! ```
 //!
 //! The output is `notes/programs/minimax-h3-keys.txt`: what a kernel program must package for
 //! `crates/models/minimax-h3`, so no package has to guess a variant.
+//!
+//! ## Regenerating the list, and its second opinion
+//!
+//! The list and the check that reads it back are one recipe, because a list regenerated without its
+//! check is a list nobody has asked whether it is complete:
+//!
+//! ```text
+//! cargo run -q -p minimax-h3 --example minimax_h3_keys > notes/programs/minimax-h3-keys.txt
+//! .venv/bin/python crates/models/minimax-h3/tools/check_encoder_manifests.py \
+//!     --against notes/programs/minimax-h3-keys.txt
+//! ```
+//!
+//! The second command is a host-side set difference in one direction only: it asks whether every key
+//! the encoders' descriptor calls name is in the list, and names the ones that are not. Rows the
+//! encoders do not call belong to other stages and are not failures. It also states how many calls
+//! it could express, so a green cannot be read as complete coverage of a stage whose field sets the
+//! tool does not model.
 //!
 //! ## Where the numbers come from
 //!
@@ -34,10 +51,10 @@
 //! (`diffusers/models/autoencoders/autoencoder_kl_minimax_h3_audio.py:457-470`). The encoder doubles
 //! from `encoder_dim` at each of its five rates, so its `Snake` runs at 128 through 2048.
 //!
-//! The tile and block constants belong to the layer crate, which `ops` sits below and cannot call;
-//! they are mirrored here the way the Qwen3 fixture mirrors them
-//! (`crates/nn/src/layers/mod.rs`, module `launch`; `ops::residual::RESIDUAL_BLOCK`,
-//! `ops::noise::NOISE_BLOCK`). If the layer crate and this file disagree, the layer crate is right.
+//! The tile and block constants belong to the layer crate, and this program reads them: it lives in
+//! the model crate so that `nn` is a dependency, and every tile below is `nn::layers::tiles::*` or
+//! an `ops::*_BLOCK` the package owns. A constant restated here would make the fixture agree with
+//! this file and leave the layers free to disagree with both.
 //!
 //! ## What is deliberately not here yet
 //!
@@ -56,18 +73,18 @@
 //!
 //! They are added to this generator the hour the model names those numbers; nothing else waits.
 
+use minimax_h3::SPLIT_HALF;
+use nn::layers::tiles::{
+    ELEMENTWISE_BLOCK, EMBEDDING_TOKENS, LOGITS_BLOCK, PDL, POSITION_BLOCK, QK_NORM_TOKENS,
+    ROTARY_BLOCK, ROTATE_BLOCK, ROWS_BLOCK, UNPATCHIFY_BLOCK, row_tile,
+};
 use ops::DType;
 use ops::modulation::ModulatedRmsNormDescriptor;
 use ops::noise::NoiseDescriptor;
 use ops::residual::{ScaledResidualDescriptor, WeightedRmsNormDescriptor};
 
-/// Whether the layers' descriptors are the programmatic-dependent-launch variants.
-const PDL: bool = false;
-
-/// Elements one elementwise program handles: `snake`, `snake_beta`, `phased_residual`, `philox_noise`.
-const ELEMENTWISE_BLOCK: u32 = 1024;
-
-/// Samples one `audio_resample` program produces (`crates/nn/src/layers/`'s resampler tile).
+/// Samples one `audio_resample` program produces: the package's `block` dimension, which the
+/// reference's resampler takes as its hop (`crates/ops/kernels/audio_resample/*/package.toml`).
 const RESAMPLE_BLOCK: u32 = 256;
 
 /// The audio VAE decoder's initial width (`decoder_dim`).
@@ -91,23 +108,22 @@ const ACTIVATION_KERNEL: u32 = 12;
 /// The transformer's hidden width (`hidden_size`).
 const HIDDEN: u32 = 5376;
 
+/// The DiT's timestep embedding width, `time_dim` (`checkpoint/config.json`): the AdaLN cache's
+/// tables and the one cast that narrows the timestep activation into them are this wide.
+const TIME_DIM: u32 = 2688;
+
 /// The rotary geometry: 16 frequencies per position axis over three axes (time, height, width),
 /// so the leading 96 channels of each 128-channel head rotate and the trailing 32 do not.
 const ROPE_FREQ_DIM: u32 = 16;
 const ROPE_AXES: u32 = 3;
 const ROTATED: u32 = ROPE_FREQ_DIM * ROPE_AXES * 2;
 
-/// Elements one `rotary_factors` program handles (`launch::ROTARY_BLOCK`).
-const ROTARY_BLOCK: u32 = 256;
-
-/// Elements one `rows` program places: the layer's own `BLOCK` in `crates/nn/src/layers/rows.rs`.
-const ROWS_BLOCK: u32 = 1024;
-
 /// The video VAE decoder's token width: `decoder_num_attention_heads · decoder_attention_head_dim`.
 const VAE_WIDTH: u32 = 32 * 64;
 
-/// Tokens one `qk_norm_rope` program handles (`launch::QK_NORM_TOKENS`).
-const QK_NORM_TOKENS: u32 = 1;
+/// The video VAE decoder feed-forward's packed width (`decoders.md`: the `mlp` buffer is
+/// `[rows, 8192]`).
+const VAE_MLP: u32 = 8192;
 
 /// The attention projections' inner width, `num_attention_heads · attention_head_dim = 7168`: the
 /// contraction length of the output projection (`attention.py`'s `RowParallelLinear(inner, hidden)`).
@@ -148,13 +164,36 @@ const MODULATION_CHUNKS: u32 = 6;
 /// The transformer's normalizer epsilon (`norm_eps`, `qk_norm_eps`).
 const NORM_EPSILON: f32 = 1e-5;
 
-/// The row width a row-wise kernel loads at a time: the width rounded up to a power of two
-/// (`crates/nn/src/layers/mod.rs::row_tile`).
-fn row_tile(columns: u32) -> u32 {
-    columns.max(1).next_power_of_two()
-}
+/// The activation element types a deployment may state. `dtype = "auto"` means the checkpoint's own
+/// representation (BF16 for the DiT, the text stack, the conditioner and the sampler), and a
+/// deployment that states FP32 makes every one of those programs a different key - the descriptor
+/// carries the element type, and a store holding one set cannot serve the other.
+const DEPLOYMENTS: [DType; 2] = [DType::BF16, DType::F32];
+
+/// The element types a video VAE may be stored and run in: FP16 at `dtype = "auto"`, FP32 where the
+/// deployment states it. Its programs are the ones the *checkpoint's* representation decides, which is
+/// the opposite of the stack above - so these rows carry both and nothing else about them moves.
+const VAES: [DType; 2] = [DType::F16, DType::F32];
 
 fn main() {
+    // One pass per deployment dtype, then the union: a row whose key the deployment does not decide -
+    // a table that is FP32 by the reference's own arithmetic, a widening, a convolution - is emitted
+    // by both passes and appears once after the dedup below. A row that *is* the deployment's appears
+    // twice, once per element type, which is the point.
+    let mut lines: Vec<(String, String)> = Vec::new();
+    for deployment in DEPLOYMENTS {
+        lines.extend(rows(deployment));
+    }
+    // One key per line, the same key once: a variant two layers launch is packaged once.
+    lines.sort();
+    lines.dedup();
+    for (operator, descriptor) in lines {
+        println!("{operator}\t{descriptor}");
+    }
+}
+
+/// Every row one deployment's dtype asks for.
+fn rows(deployment: DType) -> Vec<(String, String)> {
     let mut lines: Vec<(String, String)> = Vec::new();
     let mut push = |operator: &str, descriptor: String| {
         lines.push((operator.to_owned(), descriptor));
@@ -250,20 +289,36 @@ fn main() {
     // `transformer.py`). The three lengths are the attention projections' `hidden_size`,
     // the output projection's `heads · head_dim = 7168`, and the feed-forward's `ffn_dim = 14336`.
     for k in [HIDDEN, HEADS_TIMES_HEAD_DIM, FFN] {
-        push(
-            "gemm",
-            ops::gemm::Descriptor {
-                input: DType::BF16,
-                weight: DType::BF16,
-                accumulate: DType::F32,
-                output: DType::BF16,
-                order: ops::gemm::WeightOrder::NxK,
-                epilogue: ops::gemm::Epilogue::None,
-                k,
-            }
-            .to_string(),
-        );
+        for epilogue in [ops::gemm::Epilogue::None, ops::gemm::Epilogue::Bias] {
+            push(
+                "gemm",
+                ops::gemm::Descriptor {
+                    input: deployment,
+                    weight: deployment,
+                    accumulate: DType::F32,
+                    output: deployment,
+                    order: ops::gemm::WeightOrder::NxK,
+                    epilogue,
+                    k,
+                }
+                .to_string(),
+            );
+        }
     }
+
+    // The sampler's input projection at a stated FP32 is the diagonal below (`k = HIDDEN`, all
+    // three types FP32). At `dtype = "auto"` it asks for an FP32 activation over a BF16 weight, and
+    // that cell has no row: no program can compute it. cuBLASLt takes one type per operand and a
+    // mixed pair is not among its legal combinations, so the cell built (this backend's manifest
+    // declares `input` and `weight` as independent lists and its build script never compiles the
+    // element type) and would be refused by `cublasLtMatmulAlgoGetHeuristic` before any pointer was
+    // read. `ops::gemm::Descriptor` lets the two types differ, which is why the row existed.
+    //
+    // The deployment's crossings are a named gap, not a row: `auto`'s sample is FP32 and its stack
+    // BF16, so a sampler run at `auto` needs an element-type crossing at `patch` and at
+    // `unpatchify_video` (one doc in `notes/h3/kernel-cells-audit.md` §5), and until those carry an
+    // input and an output type, `auto` stops at the first crossing by name. A stated FP32 deployment
+    // is complete.
 
     // The audio encoder is FP32 throughout (`Model.forward` casts, and the whole autoencoder runs in
     // FP32): its pre-block contracts at the latent width for the fused q/k/v and the shortcut, at
@@ -276,89 +331,165 @@ fn main() {
         AUDIO_LATENT_CHANNELS,
         2 * AUDIO_LATENT_CHANNELS,
     ] {
+        for epilogue in [ops::gemm::Epilogue::None, ops::gemm::Epilogue::Bias] {
+            push(
+                "gemm",
+                ops::gemm::Descriptor {
+                    input: DType::F32,
+                    weight: DType::F32,
+                    accumulate: DType::F32,
+                    output: DType::F32,
+                    order: ops::gemm::WeightOrder::NxK,
+                    epilogue,
+                    k,
+                }
+                .to_string(),
+            );
+        }
+    }
+
+    // The DiT's rotation: three position axes of 32 rotated elements each, cut into three sections
+    // of the head's rotated columns, and the per-head normalization fused with it.
+    //
+    // `attention.py` normalizes every query and key head with a *learned* RMSNorm (`affine`) and
+    // rotates the leading 96 channels over (time, height, width) **split-half** - its own words
+    // ("its leading 96 channels split-half", `attention.py:94-96`), and what the fused operator does
+    // (`_rope.py:157`, `:258`: `_rotate(part, cosine, sine, "split")`). A neox pairing would rotate
+    // adjacent pairs and give different numbers from the same table, which no shape refuses. The
+    // table lists one row per partition: the whole head count, and the Ulysses-2 shard the same
+    // block binds at half the query and key heads.
+    for heads in [HEADS, HEADS / 2] {
         push(
-            "gemm",
-            ops::gemm::Descriptor {
-                input: DType::F32,
-                weight: DType::F32,
-                accumulate: DType::F32,
-                output: DType::F32,
-                order: ops::gemm::WeightOrder::NxK,
-                epilogue: ops::gemm::Epilogue::None,
-                k,
+            "qk_norm_rope",
+            ops::rope::QkNormRopeDescriptor {
+                dtype: deployment,
+                output: deployment,
+                head_dim: HEAD_DIM,
+                q_heads: heads,
+                k_heads: heads,
+                // The model's own convention, not a restatement of it: coordinate `i` pairs with
+                // `i + rotated / 2` (`_rope.py:48`).
+                rotation: SPLIT_HALF,
+                epsilon: ops::Float::from(NORM_EPSILON),
+                rotated: ROTATED,
+                rows: QK_NORM_TOKENS,
+                block: row_tile(HEAD_DIM).min(1024),
+                affine: true,
+                pdl: PDL,
+            }
+            .to_string(),
+        );
+    }
+    // The factors those two operators read, and the two are not the same cut:
+    //
+    // - **The DiT's** is three equal blocks of 32 rotated elements (96 in all, a 48-column table).
+    //   The reference hands its rotary **one axis spanning the whole head** (`attention.py:94-105`,
+    //   `axis_dims=(head_dim,)`), so the same `rope_freq_dim` frequencies serve each coordinate
+    //   axis and the three axes' factors are contiguous blocks - box 0 is time, box 1 height, box 2
+    //   width. A cycle would give the second and third axes the first axis's frequencies.
+    // - **The text encoder's** is Qwen3-VL's M-RoPE: three unequal sections (48, 40, 40 of the
+    //   head's 128 rotated elements) whose frequencies cycle over (time, height, width), a
+    //   64-column table.
+    for (rotated, per_axis, interleaved) in [
+        (ROTATED, [ROTATED / ROPE_AXES; 3], false),
+        (128, [48, 40, 40], true),
+    ] {
+        push(
+            "rotary_factors",
+            ops::rope::FactorsDescriptor {
+                dtype: DType::F32,
+                positions: DType::I32,
+                columns: rotated / 2,
+                block: ROTARY_BLOCK,
+                // The layer's scale, not the rope base: every H3 `Rotary` is built with 1.0 and the
+                // 1e4 base lives in the frequencies table the host fills.
+                scale: ops::Float::from(1.0_f32),
+                pdl: PDL,
+                axes: ROPE_AXES,
+                // A section is *rotated elements* per axis, not frequencies: three axes of 32
+                // elements sum to the 96 the DiT's head rotates, and passing the frequency count
+                // (16) would describe a different head - the descriptor `attention.rs` builds says
+                // 32 each. The encoder's sections are unequal for the same reason it uses M-RoPE.
+                sections: {
+                    let mut sections = [0; ops::rope::MAX_AXES];
+                    sections[0] = per_axis[0];
+                    sections[1] = per_axis[1];
+                    sections[2] = per_axis[2];
+                    sections
+                },
+                // The DiT cuts the spectrum into blocks; the encoder's M-RoPE cycles it.
+                interleaved,
             }
             .to_string(),
         );
     }
 
-    // ---- The DiT's rotation: three position axes of 16 frequencies each, cut into three sections
-    // of the head's rotated columns, and the per-head normalization fused with it.
+    // ---- The row gathers: `nn::layers::gather_rows` binds `logits_gather` with the gathered width
+    // in its key, so every place the DiT gathers whole rows is a cell of this operator.
     //
-    // `attention.py` normalizes every query and key head with a *learned* RMSNorm (`affine`) and
-    // rotates the leading 96 channels with neox RoPE over (time, height, width).
-    push(
-        "rotary_factors",
-        ops::rope::FactorsDescriptor {
-            dtype: DType::F32,
-            positions: DType::I32,
-            columns: ROTATED / 2,
-            block: ROTARY_BLOCK,
-            // The layer's scale, not the rope base: every H3 `Rotary` is built with 1.0 and the
-            // 1e4 base lives in the frequencies table the host fills.
-            scale: ops::Float::from(1.0_f32),
-            pdl: PDL,
-            axes: ROPE_AXES,
-            sections: {
-                let mut sections = [0; ops::rope::MAX_AXES];
-                sections[0] = ROPE_FREQ_DIM;
-                sections[1] = ROPE_FREQ_DIM;
-                sections[2] = ROPE_FREQ_DIM;
-                sections
-            },
-            // H3's text encoder is Qwen3-VL: its M-RoPE cycles the axes over the frequencies.
-            interleaved: true,
-        }
-        .to_string(),
-    );
-    push(
-        "qk_norm_rope",
-        ops::rope::QkNormRopeDescriptor {
-            dtype: DType::BF16,
-            output: DType::BF16,
-            head_dim: HEAD_DIM,
-            q_heads: HEADS,
-            k_heads: HEADS,
-            // "neox RoPE": adjacent pairs rotate together.
-            rotation: ops::rope::Rotation::Interleaved,
-            epsilon: ops::Float::from(NORM_EPSILON),
-            rotated: ROTATED,
-            rows: QK_NORM_TOKENS,
-            block: row_tile(HEAD_DIM).min(1024),
-            affine: true,
-            pdl: PDL,
-        }
-        .to_string(),
-    );
+    // The video's and the audio's hidden rows (four times per evaluation), the conditioner's prefix
+    // rows once per request, the per-layer modulation table at `18 * hidden`, the final norm's at
+    // `2 * hidden`, and the three narrow i32 gathers: each row's group tag, the coefficient, and the
+    // step-to-entry table.
+    // The two modulation tables are the **deployment's** type, not FP32: at `dtype = "auto"` the AdaLN
+    // cache narrows the FP32 timestep pair into the modulation projections' type once per evaluation
+    // (`scaled_add` at `time_dim`), so the tables those projections build are the stack's own BF16 -
+    // that is the whole point of the narrowing. Only the two i32 gathers and the solver's coefficient
+    // are pinned.
+    for (dtype, columns) in [
+        (deployment, HIDDEN),
+        (deployment, 18 * HIDDEN),
+        (deployment, 2 * HIDDEN),
+        // The solver's step coefficient: `[steps, 1]` FP32, gathered at the evaluation the
+        // executor's `step` table names, so one staging word serves every step (`solver.rs`).
+        (DType::F32, 1),
+        (DType::I32, 1),
+        (DType::I32, 2),
+        (DType::I32, 4),
+    ] {
+        push(
+            "logits_gather",
+            ops::logits::GatherDescriptor {
+                dtype,
+                columns,
+                block: LOGITS_BLOCK,
+                pdl: PDL,
+            }
+            .to_string(),
+        );
+    }
 
     // ---- The transformer's per-row programs, at `hidden_size`.
-    push(
-        "modulated_rms_norm",
-        ModulatedRmsNormDescriptor {
-            dtype: DType::BF16,
-            output: DType::BF16,
-            indices: DType::I32,
-            width: HIDDEN,
-            block: row_tile(HIDDEN),
-            epsilon: ops::Float::from(NORM_EPSILON),
-            // The modulation vectors are `[rows, hidden]`: their row stride is the width.
-            gate_stride: u64::from(HIDDEN),
-            shift_stride: u64::from(HIDDEN),
-            scale_stride: u64::from(HIDDEN),
-            update: true,
-            retain: false,
-        }
-        .to_string(),
-    );
+    //
+    // The DiT's three modulated norms, each from its own call site in `transformer.rs`. The six
+    // modulation vectors are cut from a `[rows, 18 · hidden]` table, so a vector's row stride is
+    // `6 · hidden` (32256); the attention norm folds no gate and passes no update, the MLP norm
+    // folds the sixth vector's gate, the block's update **and** retains the gated sum (the block's
+    // second residual reads it after the down projection has overwritten `update`), and the output
+    // norm reads a `[rows, 2 · hidden]` table instead, stride `2 · hidden` (10752) with neither.
+    for (gate_stride, shift_stride, scale_stride, update, retain) in [
+        (0_u32, 6 * HIDDEN, 6 * HIDDEN, false, false),
+        (6 * HIDDEN, 6 * HIDDEN, 6 * HIDDEN, true, true),
+        (0, 2 * HIDDEN, 2 * HIDDEN, false, false),
+    ] {
+        push(
+            "modulated_rms_norm",
+            ModulatedRmsNormDescriptor {
+                dtype: deployment,
+                output: deployment,
+                indices: DType::I32,
+                width: HIDDEN,
+                block: row_tile(HIDDEN),
+                epsilon: ops::Float::from(NORM_EPSILON),
+                gate_stride: u64::from(gate_stride),
+                shift_stride: u64::from(shift_stride),
+                scale_stride: u64::from(scale_stride),
+                update,
+                retain,
+            }
+            .to_string(),
+        );
+    }
     // The gated residual that closes each block: `hidden + gate[i] · update`. The block's
     // modulation table is `[rows, 6 · hidden]` and the gate is the sixth chunk of a row
     // (`transformer.rs`'s `chunks(modulation, width, 3)`, which takes the last of the three MLP
@@ -367,7 +498,7 @@ fn main() {
     push(
         "gated_residual",
         ops::modulation::GatedResidualDescriptor {
-            dtype: DType::BF16,
+            dtype: deployment,
             indices: DType::I32,
             width: HIDDEN,
             gate_stride: u64::from(MODULATION_CHUNKS) * u64::from(HIDDEN),
@@ -376,20 +507,22 @@ fn main() {
     );
     // The solver's step flattens the latent to `[elements, 1]` and steps it by one scalar, so the
     // residual's width there is one column and the kernel's `WIDTH` is one.
+    for dtype in [deployment, DType::F32] {
+        push(
+            "scaled_residual",
+            ScaledResidualDescriptor {
+                dtype,
+                columns: 1,
+                block: ops::residual::RESIDUAL_BLOCK,
+                update_bias: false,
+            }
+            .to_string(),
+        );
+    }
     push(
         "scaled_residual",
         ScaledResidualDescriptor {
-            dtype: DType::BF16,
-            columns: 1,
-            block: ops::residual::RESIDUAL_BLOCK,
-            update_bias: false,
-        }
-        .to_string(),
-    );
-    push(
-        "scaled_residual",
-        ScaledResidualDescriptor {
-            dtype: DType::BF16,
+            dtype: deployment,
             columns: HIDDEN,
             block: ops::residual::RESIDUAL_BLOCK,
             update_bias: false,
@@ -399,7 +532,7 @@ fn main() {
     push(
         "weighted_rms_norm",
         WeightedRmsNormDescriptor {
-            dtype: DType::BF16,
+            dtype: deployment,
             columns: HIDDEN,
             tile: row_tile(HIDDEN),
             absmax: false,
@@ -412,9 +545,9 @@ fn main() {
     push(
         "dense_attention",
         ops::attention::dense::DenseDescriptor {
-            query: DType::BF16,
-            key_value: DType::BF16,
-            output: DType::BF16,
+            query: deployment,
+            key_value: deployment,
+            output: deployment,
             head_dim: HEAD_DIM,
             q_heads: HEADS,
             kv_heads: HEADS,
@@ -427,50 +560,84 @@ fn main() {
     );
     // The VSA branch's own attention: one program per tile size, and the key extent (tiles per
     // segment per layout) is a declared bound outside the key.
-    push(
-        "sparse_attention",
-        ops::attention::sparse::SparseDescriptor {
-            block: 64,
-            dtype: DType::BF16,
-            output: DType::BF16,
-            head_dim: HEAD_DIM,
-            lse: false,
-            keys: 65_536,
-        }
-        .to_string(),
-    );
+    //
+    // The FP32 form is not listed, and the reason is a programs gap named in
+    // `notes/h3/kernel-cells-audit.md`: every `sparse_attention` backend refuses it at its entry -
+    // `sm90` and `sm100` accept BF16 only (`sm100`'s `attention.cu` refuses and then casts its
+    // operands to `__nv_bfloat16*`), and `sm120` accepts BF16 and FP16 - because the kernel is the
+    // vendor's block-sparse pass, written for 16-bit operands. A row for it would build (the element
+    // type never reaches those build scripts) and no launch could use it, so a store built from this
+    // list would fail on a key no task binds: `t2va`, `fl2va` and `ref2va` all attend densely. A
+    // sparse deployment that states FP32 stops at its launch with `no kernel for operator
+    // sparse_attention descriptor ...`, which is the same fact at the moment it can be acted on.
+    // One row: the BF16 pass's. See the note above for why the FP32 pass emits none.
+    if deployment == DType::BF16 {
+        push(
+            "sparse_attention",
+            ops::attention::sparse::SparseDescriptor {
+                // The checkpoint's `vsa_tile_size`, read by the model's sparse launch; the layer
+                // takes the tile as a construction argument, so no crate owns it as a constant.
+                block: 64,
+                dtype: deployment,
+                output: deployment,
+                head_dim: HEAD_DIM,
+                lse: false,
+                keys: 65_536,
+            }
+            .to_string(),
+        );
+    }
     // The DiT's row mapping: one key for every raster, because the program reads the canvas as a
     // launch word. A canvas is a multiple of the model's own step and the VAE compresses it 16x, so
     // every latent side a served canvas produces is even — that check is the operator's, at launch.
-    push(
-        "patch",
-        ops::patch::Descriptor {
-            dtype: DType::BF16,
-            block: ops::patch::BLOCK,
-            pdl: PDL,
-        }
-        .to_string(),
-    );
-    // The two `unpatchify_video` forms the decoder needs: the latents, whose per-channel scale and
-    // bias denormalize, and the decoder's own output, which does not. The token grid, the channels
-    // and the patch are the request's and travel at launch, so the two forms are the whole set.
-    for affine in [true, false] {
+    // Two element types: the stack's own BF16 rows, and the FP32 latent the sampler patchifies -
+    // `Denoiser::denoise` holds its sample in the latent's type for the whole trajectory, so the
+    // first patch and the last unpatchify of every evaluation cross at FP32.
+    for dtype in [deployment, DType::F32] {
         push(
-            "unpatchify_video",
-            ops::unpatchify::Descriptor {
-                dtype: DType::F16,
-                affine,
-                block: 1024,
+            "patch",
+            ops::patch::Descriptor {
+                dtype,
+                block: ops::patch::BLOCK,
                 pdl: PDL,
             }
             .to_string(),
         );
     }
+    // The two `unpatchify_video` forms the decoder needs: the latents, whose per-channel scale and
+    // bias denormalize, and the decoder's own output, which does not. The token grid, the channels
+    // and the patch are the request's and travel at launch, so the two forms are the whole set.
+    for vae in VAES {
+        for affine in [true, false] {
+            push(
+                "unpatchify_video",
+                ops::unpatchify::Descriptor {
+                    dtype: vae,
+                    affine,
+                    block: UNPATCHIFY_BLOCK,
+                    pdl: PDL,
+                }
+                .to_string(),
+            );
+        }
+    }
+    // The sampler's own crossing: the velocity is FP32 like the sample it advances, so the head's
+    // output unpatchifies without the decoder's per-channel denormalization.
+    push(
+        "unpatchify_video",
+        ops::unpatchify::Descriptor {
+            dtype: DType::F32,
+            affine: false,
+            block: UNPATCHIFY_BLOCK,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
     // The register prefix and the zero tail around the caller's rows.
     push(
         "sequence_append",
         ops::sequence_append::Descriptor {
-            dtype: DType::BF16,
+            dtype: deployment,
             width: HIDDEN,
             registers: 4,
             tail: 12,
@@ -480,23 +647,25 @@ fn main() {
         .to_string(),
     );
     // The seam between two decoded tiles, five voxels of overlap along the height.
-    push(
-        "cross_fade",
-        ops::cross_fade::Descriptor {
-            dtype: DType::F16,
-            extent: 5,
-            axis: 2,
-            block: ops::cross_fade::BLOCK,
-            pdl: PDL,
-        }
-        .to_string(),
-    );
+    for vae in VAES {
+        push(
+            "cross_fade",
+            ops::cross_fade::Descriptor {
+                dtype: vae,
+                extent: 5,
+                axis: 2,
+                block: ops::cross_fade::BLOCK,
+                pdl: PDL,
+            }
+            .to_string(),
+        );
+    }
     // The latent reorder: the video decoder writes channel-first and the media stage reads
     // channel-last, so one strided copy moves the block. Two rows, because the two consumers work in
     // different precisions — the VAE's latent is FP32 (its native precision) and the VSA compose's
     // pooled block is BF16 — and the key names the element type and nothing else: the strides are
     // launch values, so one program serves every clip geometry.
-    for dtype in [DType::F32, DType::BF16] {
+    for dtype in [DType::F32, deployment] {
         push(
             "copy_block",
             ops::copy_block::Descriptor {
@@ -519,25 +688,36 @@ fn main() {
         .to_string(),
     );
     // The audio decoder's fused BigVGAN block, at the decoder's own rate and taps.
-    push(
-        "audio_activation",
-        ops::audio_activation::Descriptor {
-            dtype: DType::F32,
-            channels: DECODER_DIM,
-            kernel: ACTIVATION_KERNEL,
-            ratio: ACTIVATION_RATIO,
-            block: 1024,
-            pdl: PDL,
-        }
-        .to_string(),
-    );
+    //
+    // One launch per block activation, and each stage's blocks run at the stage's own width: the
+    // seven widths are 1024, 512, 256, 128, 64, 32 and 16 (`audio_vae.py`'s decoder widths), while
+    // the taps, the ratio and the program's block are the same at every stage (`ACTIVATION_*`), so
+    // the key differs only in its width. A single row at the first width would describe one of the
+    // seven launches and leave six without a program.
+    for channels in [1024_u32, 512, 256, 128, 64, 32, 16] {
+        push(
+            "audio_activation",
+            ops::audio_activation::Descriptor {
+                dtype: DType::F32,
+                channels,
+                kernel: ACTIVATION_KERNEL,
+                ratio: ACTIVATION_RATIO,
+                // The decoder's widest stage, which is the model's own number
+                // (`AudioDecoder`'s channel schedule), not a layer constant: `nn`'s
+                // `AudioActivation` takes the block as a construction argument.
+                block: 1024,
+                pdl: PDL,
+            }
+            .to_string(),
+        );
+    }
     // The timestep embedding's activation, over the transformer's hidden width.
     push(
         "silu",
         ops::activation::SiluDescriptor {
-            dtype: DType::BF16,
+            dtype: deployment,
             columns: HIDDEN,
-            block: 1024,
+            block: ELEMENTWISE_BLOCK,
             pdl: PDL,
         }
         .to_string(),
@@ -546,23 +726,58 @@ fn main() {
     push(
         "scaled_add",
         ops::residual::ScaledAddDescriptor {
-            target: DType::BF16,
+            target: deployment,
             source: DType::F32,
             columns: HIDDEN,
-            block: 1024,
+            block: ops::residual::RESIDUAL_BLOCK,
         }
         .to_string(),
     );
+    // **The widening**: `Transformer::wide` turns the stack's own BF16 rows into the FP32 the head's
+    // floor computes in - `target <- 1 * source + 0 * target`, so the target is never read and an
+    // uninitialised buffer is the right operand (`transformer.rs`, `denoise_arena`'s `*.wide`).
+    // Three widths: the patchified rows before the video input projection (96 columns), the hidden
+    // rows before the output projection (5376), and the audio latent's own rows before the audio
+    // input projection (32) - the one projection whose input is narrower than a patch.
+    // The AdaLN cache's narrowing at `dtype = "auto"`: the reference casts the timestep activation to
+    // the weight's type before the modulation projections (`weights.py:210-224`), so the cache is BF16
+    // while the timestep pair arrives FP32 - one cast of `[groups, time_dim = 2688]`, and a
+    // `ScaledAdd` with `alpha = 1, beta = 0` is that cast. Nothing at a stated FP32 deployment
+    // narrows here, so only the pass whose deployment is narrower emits the row.
+    if deployment != DType::F32 {
+        push(
+            "scaled_add",
+            ops::residual::ScaledAddDescriptor {
+                target: deployment,
+                source: DType::F32,
+                columns: TIME_DIM,
+                block: ops::residual::RESIDUAL_BLOCK,
+            }
+            .to_string(),
+        );
+    }
+    for columns in [32, 96, HIDDEN] {
+        push(
+            "scaled_add",
+            ops::residual::ScaledAddDescriptor {
+                target: DType::F32,
+                source: deployment,
+                columns,
+                block: ops::residual::RESIDUAL_BLOCK,
+            }
+            .to_string(),
+        );
+    }
     // The conditioner's anchoring mix runs over `[condition rows, video_channels * 4]`, which is
     // narrower than any hidden width, in the conditioner's own dtype and in the trace path's.
-    for (target, source) in [(DType::F32, DType::F32), (DType::BF16, DType::BF16)] {
+    for (target, source) in [(DType::F32, DType::F32), (deployment, deployment)] {
         push(
             "scaled_add",
             ops::residual::ScaledAddDescriptor {
                 target,
                 source,
                 columns: 96,
-                block: 1024,
+                block: ops::residual::RESIDUAL_BLOCK,
             }
             .to_string(),
         );
@@ -578,18 +793,23 @@ fn main() {
         }
         .to_string(),
     );
-    push(
-        "philox_noise",
-        NoiseDescriptor {
-            dtype: DType::BF16,
-            block: ops::noise::NOISE_BLOCK,
-            // The initial latent noise: one standard normal sample per element, its stream keyed by
-            // the request's seed as a launch scalar (the model has no key view to upload).
-            kind: ops::noise::NoiseKind::Normal,
-            source: ops::noise::KeySource::Scalar,
-        }
-        .to_string(),
-    );
+    // The initial latent noise, in both element types: the request's draw is FP32 because the
+    // reference's sample is (it refuses any other), and the conditioning path draws its own
+    // conditions in the trace type.
+    for dtype in [deployment, DType::F32] {
+        push(
+            "philox_noise",
+            NoiseDescriptor {
+                dtype,
+                block: ops::noise::NOISE_BLOCK,
+                // One standard normal sample per element, its stream keyed by the request's seed as
+                // a launch scalar (the model has no key view to upload).
+                kind: ops::noise::NoiseKind::Normal,
+                source: ops::noise::KeySource::Scalar,
+            }
+            .to_string(),
+        );
+    }
 
     // ---- The audio encoder's head pool, and the video path's last step.
     //
@@ -610,16 +830,18 @@ fn main() {
     );
     // The video path's last step: the VAE's raster is `float16`
     // (`uniserve/models/minimax_h3/output.py`'s own state buffer), three channels, packed bytes.
-    push(
-        "rgb_bytes",
-        ops::rgb::Descriptor {
-            dtype: DType::F16,
-            channels: 3,
-            block: ops::rgb::BLOCK,
-            pdl: PDL,
-        }
-        .to_string(),
-    );
+    for vae in VAES {
+        push(
+            "rgb_bytes",
+            ops::rgb::Descriptor {
+                dtype: vae,
+                channels: 3,
+                block: ops::rgb::BLOCK,
+                pdl: PDL,
+            }
+            .to_string(),
+        );
+    }
 
     // ---- The text encoder (Qwen3-VL, `text_encoder/config.json`): its norms and its two audited
     // activations. `hidden_size 5120` for the language model, `intermediate_size` 25600 gated, and
@@ -631,7 +853,7 @@ fn main() {
     push(
         "rms_norm",
         ops::norm::RmsNormDescriptor {
-            dtype: DType::BF16,
+            dtype: deployment,
             columns: text_columns,
             tile: text_columns.next_power_of_two(),
             pdl: PDL,
@@ -641,7 +863,7 @@ fn main() {
     push(
         "add_rms_norm",
         ops::norm::AddRmsNormDescriptor {
-            dtype: DType::BF16,
+            dtype: deployment,
             columns: text_columns,
             tile: text_columns.next_power_of_two(),
             pdl: PDL,
@@ -665,7 +887,7 @@ fn main() {
     push(
         "layer_norm",
         ops::norm::LayerNormDescriptor {
-            dtype: DType::BF16,
+            dtype: deployment,
             columns: 1152,
             tile: 1152_u32.next_power_of_two(),
             bias: true,
@@ -673,6 +895,23 @@ fn main() {
         }
         .to_string(),
     );
+    // The video encoder's four levels normalize in FP32 at their own channel counts
+    // (`encoding.rs`: 128, 256, 512 and 1024), each with the tile its width's next power of two is.
+    // These are `ref2va`'s keys - the encoder block is the one path a `t2va` request never touches -
+    // and they are listed because a deployment builds one store for every task it serves.
+    for columns in [128_u32, 256, 512, 1024] {
+        push(
+            "layer_norm",
+            ops::norm::LayerNormDescriptor {
+                dtype: DType::F32,
+                columns,
+                tile: columns.next_power_of_two(),
+                bias: true,
+                pdl: PDL,
+            }
+            .to_string(),
+        );
+    }
     // Its 2-D rotary turns each head's leading half against the trailing half (`Rotation::Half`,
     // `vision.rs`'s `Rotate::new(head_dim, heads, Rotation::Half)`), 8 rows and 128 lanes per program
     // (`nn::layers::rotate`'s own constants); the whole 72-element head rotates, so no narrower
@@ -680,13 +919,13 @@ fn main() {
     push(
         "rope_apply",
         ops::rope::RopeApplyDescriptor {
-            dtype: DType::BF16,
-            output: DType::BF16,
+            dtype: deployment,
+            output: deployment,
             head_dim: 72,
             heads: 16,
             rotation: ops::rope::Rotation::Half,
             rows: 8,
-            block: 128,
+            block: ROTATE_BLOCK,
             pdl: PDL,
             rotated: 72,
         }
@@ -698,10 +937,10 @@ fn main() {
     push(
         "position_interpolate",
         ops::position::Descriptor {
-            dtype: DType::BF16,
+            dtype: deployment,
             channels: 1152,
             in_side: 48,
-            block: 1024,
+            block: POSITION_BLOCK,
             pdl: PDL,
         }
         .to_string(),
@@ -715,7 +954,7 @@ fn main() {
     push(
         "gelu",
         ops::gelu::Descriptor {
-            dtype: DType::BF16,
+            dtype: deployment,
             columns: 4304,
             block: ELEMENTWISE_BLOCK,
             approximate: ops::gelu::Approximation::Tanh,
@@ -737,10 +976,10 @@ fn main() {
         push(
             "gemm",
             ops::gemm::Descriptor {
-                input: DType::BF16,
-                weight: DType::BF16,
+                input: deployment,
+                weight: deployment,
                 accumulate: DType::F32,
-                output: DType::BF16,
+                output: deployment,
                 order: ops::gemm::WeightOrder::NxK,
                 epilogue: ops::gemm::Epilogue::None,
                 k,
@@ -756,9 +995,9 @@ fn main() {
     push(
         "dense_attention",
         ops::attention::DenseDescriptor {
-            query: DType::BF16,
-            key_value: DType::BF16,
-            output: DType::BF16,
+            query: deployment,
+            key_value: deployment,
+            output: deployment,
             head_dim: 72,
             q_heads: 16,
             kv_heads: 16,
@@ -776,7 +1015,7 @@ fn main() {
     push(
         "scaled_residual",
         ops::residual::ScaledResidualDescriptor {
-            dtype: DType::BF16,
+            dtype: deployment,
             columns: 1152,
             block: ELEMENTWISE_BLOCK,
             update_bias: false,
@@ -825,6 +1064,10 @@ fn main() {
         "frame_moments",
         ops::frame::FrameMomentsDescriptor {
             dtype: DType::F32,
+            // The encoder's widest frame: four channels per group over a 1344x768 raster. The class
+            // is a declared bound and not a compilation, so it does not reach the key - the launch
+            // refuses a frame outside it.
+            reduction: ops::frame::frame_reduction_class(4, 1344 * 768),
             epsilon: ops::descriptor::Float::from(1e-6_f32),
         }
         .to_string(),
@@ -838,6 +1081,7 @@ fn main() {
             "frame_norm_pad",
             ops::frame::FrameNormPadDescriptor {
                 dtype: DType::F32,
+                reduction: ops::frame::frame_reduction_class(4, 1344 * 768),
                 channels_last: false,
                 centered: false,
                 single_pixel,
@@ -846,6 +1090,56 @@ fn main() {
         );
     }
 
+    // ---- The text stack's attention, at its own geometry.
+    //
+    // The language layers are a 64-head network with 8 key/value heads (GQA) of 128 elements each,
+    // and the fused normalization-plus-rotation runs at those same head counts: `nn`'s `Attention`
+    // builds both descriptors from the heads the partition gives it, so the whole count and the
+    // Ulysses-2 shard are two calls of the same block rather than two code paths. Every key here is
+    // bound by a `t2va` request's first stage, which is why they belong in the list even though no
+    // DiT stage binds them.
+    for heads in [64_u32, 32] {
+        push(
+            "dense_attention",
+            ops::attention::dense::DenseDescriptor {
+                query: deployment,
+                key_value: deployment,
+                output: deployment,
+                head_dim: 128,
+                q_heads: heads,
+                kv_heads: heads / 8,
+                mask: ops::attention::Mask::Dense,
+                windowed: false,
+                // A prompt's token count is a launch value, not part of the key: the bound below is
+                // the text capacity's own, and the reference masks query rows past the prompt.
+                max_kv_len: 4096,
+                cu_seq_lens: true,
+            }
+            .to_string(),
+        );
+        push(
+            "qk_norm_rope",
+            ops::rope::QkNormRopeDescriptor {
+                dtype: deployment,
+                output: deployment,
+                head_dim: 128,
+                q_heads: heads,
+                k_heads: heads / 8,
+                // Qwen3-VL pairs `x[i]` with `x[i + d/2]` over the whole head, and its RMS floor is
+                // the network's own 1e-6 (`config.json`'s `rms_norm_eps`), unlike the DiT's.
+                rotation: ops::rope::Rotation::Half,
+                // The literal is `f32` on purpose: the config's `rms_norm_eps` reaches the
+                // descriptor as a 32-bit float, and a 64-bit literal would name a different key.
+                epsilon: ops::Float::from(1.0e-6_f32),
+                rotated: 128,
+                rows: 1,
+                block: ROTATE_BLOCK,
+                affine: true,
+                pdl: PDL,
+            }
+            .to_string(),
+        );
+    }
     // ---- The text encoder's MLP and its token embedding, and the two packed gated activations.
     //
     // The language layers' MLP is a `GatedActivation` over two *separate* contiguous projections —
@@ -856,9 +1150,9 @@ fn main() {
     push(
         "act_and_mul",
         ops::activation::ActAndMulDescriptor {
-            dtype: DType::BF16,
+            dtype: deployment,
             width: 25600,
-            block: 1024,
+            block: ELEMENTWISE_BLOCK,
             activation: ops::activation::Activation::Silu,
             gate_stride: 25600,
             value_stride: 25600,
@@ -868,19 +1162,49 @@ fn main() {
         }
         .to_string(),
     );
+    // The DiT's block MLP, whose halves are packed beside each other in one `[rows, 2 · 14336]`
+    // projection: both row strides are twice the width, and the reference rounds each row's output
+    // to the activation's dtype as it goes, so the site declares the stepwise form.
+    push(
+        "act_and_mul",
+        ops::activation::ActAndMulDescriptor {
+            dtype: deployment,
+            width: 14336,
+            block: ELEMENTWISE_BLOCK,
+            activation: ops::activation::Activation::Silu,
+            gate_stride: 2 * 14336,
+            value_stride: 2 * 14336,
+            wide: false,
+            pdl: PDL,
+            stepwise: true,
+        }
+        .to_string(),
+    );
     // The two packed forms: the DiT's block MLP and the conditioning projection both contract to
     // `ffn_dim 14336` in BF16 from a packed `[rows, 2 · width]` row, and the video VAE decoder's to
     // its own `mlp` width 8192 in FP16 (`decoders.md`'s arena: `mlp [rows, 8192]`). The row stride is
     // twice the width because the two halves are packed beside each other, and no call site passes a
     // bias.
-    for (dtype, width) in [(DType::BF16, 14336_u32), (DType::F16, 8192)] {
+    push(
+        "value_first_swiglu",
+        ops::activation::ValueFirstSwigluDescriptor {
+            dtype: deployment,
+            width: 14336,
+            block: ELEMENTWISE_BLOCK,
+            input_stride: 2 * 14336,
+            bias: false,
+            absmax: false,
+        }
+        .to_string(),
+    );
+    for vae in VAES {
         push(
             "value_first_swiglu",
             ops::activation::ValueFirstSwigluDescriptor {
-                dtype,
-                width,
-                block: 1024,
-                input_stride: 2 * u64::from(width),
+                dtype: vae,
+                width: VAE_MLP,
+                block: ELEMENTWISE_BLOCK,
+                input_stride: 2 * u64::from(VAE_MLP),
                 bias: false,
                 absmax: false,
             }
@@ -893,12 +1217,12 @@ fn main() {
     push(
         "embedding",
         ops::embedding::Descriptor {
-            dtype: DType::BF16,
+            dtype: deployment,
             ids: DType::I32,
             hidden: 5120,
             first: 0,
             rows: 151936,
-            block: 8,
+            block: EMBEDDING_TOKENS,
             pdl: PDL,
         }
         .to_string(),
@@ -1044,7 +1368,7 @@ fn main() {
     push(
         "vsa_compress_pooled",
         ops::segments::CompressPooledDescriptor::new(
-            DType::BF16,
+            deployment,
             HEADS,
             HEAD_DIM,
             VSA_MAX_TILES,
@@ -1061,7 +1385,7 @@ fn main() {
     push(
         "vsa_prepare_tiles",
         ops::segments::PrepareTilesDescriptor {
-            dtype: DType::BF16,
+            dtype: deployment,
             heads: HEADS,
             width: HEAD_DIM,
             rotated: ROTATED,
@@ -1084,7 +1408,7 @@ fn main() {
     push(
         "vsa_zero_padding",
         ops::segments::ZeroPaddingDescriptor {
-            dtype: DType::BF16,
+            dtype: deployment,
             heads: HEADS,
             tile_rows: VSA_TILE_ROWS,
             width: HEAD_DIM,
@@ -1092,11 +1416,22 @@ fn main() {
         }
         .to_string(),
     );
+    // The selection, one launch per sparse layer over the same tile extents the scores hold: those
+    // extents are the deployment's tile *bound* (what the sparse scratch allocates for the scores,
+    // the indices and the counts), and the sparsity only decides which tiles the keep table names.
+    // So `block` is a class like the compression's `max_tiles`, not a per-request count.
+    push(
+        "vsa_select_tiles",
+        ops::segments::SelectTilesDescriptor {
+            block: VSA_MAX_TILES.next_power_of_two(),
+        }
+        .to_string(),
+    );
     // The compressed gated tiles that give back the sparse rows.
     push(
         "vsa_add_gated_tiles",
         ops::segments::AddGatedTilesDescriptor {
-            dtype: DType::BF16,
+            dtype: deployment,
             tile_rows: VSA_TILE_ROWS,
             width: HEAD_DIM,
             block_rows: VSA_BLOCK_ROWS,
@@ -1138,10 +1473,12 @@ fn main() {
     // is a reshape of the contiguous `[patches, 1152]` hidden state into `[patches/4, 4608]`, so no
     // rows are gathered and no program reads them.
     for (dtype, mode, columns) in [
-        (DType::BF16, ops::rows::Mode::Replace, text_columns),
-        (DType::BF16, ops::rows::Mode::Add, text_columns),
-        (DType::BF16, ops::rows::Mode::Replace, HIDDEN),
-        (DType::F16, ops::rows::Mode::Replace, VAE_WIDTH),
+        (deployment, ops::rows::Mode::Replace, text_columns),
+        (deployment, ops::rows::Mode::Add, text_columns),
+        (deployment, ops::rows::Mode::Replace, HIDDEN),
+        // The voxel rows' own width, at the VAE's representation rather than the stack's.
+        (VAES[0], ops::rows::Mode::Replace, VAE_WIDTH),
+        (VAES[1], ops::rows::Mode::Replace, VAE_WIDTH),
     ] {
         push(
             "rows",
@@ -1167,19 +1504,14 @@ fn main() {
     //   decide the key, and they are how the block folds its residual — the layer's, not the config's.
     // - `paged_attention`: the decode attention is trtllm-gen, and its key follows the executor's
     //   page geometry (page size, pages per sequence), which is scheduling and not the model's.
-    // - `vsa_select_tiles`: the number of key tiles one query tile may select is the deployment's
-    //   sparsity choice; `vsa_prepare_tiles`, `vsa_scores`, `vsa_add_gated_tiles` and
-    //   `vsa_zero_padding` are above, because their geometry is the checkpoint's.
+    // - `vsa_select_tiles` is above with the other four tile passes: its block is the tile bound's
+    //   power of two, which the deployment allocates, and `attention_sparse.rs` launches it once per
+    //   sparse layer of every evaluation.
     // - `softmax`, `swiglu`, `scaled_residual_rms_norm`, `scaled_residual_layer_norm`,
     //   `vsa_compose_gated_rows`: declared, and nothing in either model's code calls them yet, so
     //   there is no geometry to key. They are named here rather than left to be found: the first two
     //   belong to the sampler's chain and the Qwen3 slice, the two residuals to a stream that folds
     //   its normalization in one launch, and the composition to the VSA chain's last step.
 
-    // One key per line, the same key once: a variant two layers launch is packaged once.
-    lines.sort();
-    lines.dedup();
-    for (operator, descriptor) in lines {
-        println!("{operator}\t{descriptor}");
-    }
+    lines
 }

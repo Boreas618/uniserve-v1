@@ -53,8 +53,15 @@
 //! request continues, is retried with different parameters, or fails is the executor's decision, not
 //! a numerical one.
 
-/// Lanes one `softmax` program walks at a time: a chunk of the row, not the row.
-const SOFTMAX_TILE: u32 = 8192;
+/// Lanes one candidate program walks at a time: a chunk of the row, not the row.
+///
+/// Both programs that walk a row of candidates - the distribution and the draw - take it, so a
+/// candidate width may be the whole vocabulary without either holding a row in registers.
+const CANDIDATE_TILE: u32 = 8192;
+/// The lanes one `top_k` pass reads: the only size that operator's key names, since the vocabulary
+/// and the kept count are launch scalars. Smaller than the candidate tile because an ordering pass
+/// holds two planes and a nibble's ranks at once.
+const TOP_TILE: u32 = 2048;
 
 use ops::norm::{Softmax, SoftmaxArgs, SoftmaxDescriptor};
 use ops::sampler::{
@@ -113,6 +120,8 @@ pub struct Candidates {
     pub ordered_ids: TensorView,
     /// `[rows]` i32: 1 when the row's candidates form a usable distribution.
     pub valid: TensorView,
+    /// `[rows, 4 · width + 2 · TOP_K_BINS]` i32: the ordering's scratch, which `top_k` fills.
+    pub scratch: TensorView,
 }
 
 impl Candidates {
@@ -126,6 +135,7 @@ impl Candidates {
             ordered_values: arena.tensor(DType::F32, Shape::new(&[rows, width]))?,
             ordered_ids: arena.tensor(DType::I32, Shape::new(&[rows, width]))?,
             valid: arena.tensor(DType::I32, Shape::new(&[rows]))?,
+            scratch: arena.tensor(DType::I32, ops::sampler::top_k_workspace(rows, width))?,
         })
     }
 }
@@ -267,6 +277,7 @@ impl Sampler {
             logits: candidates.shaped,
             values: candidates.values,
             ids: candidates.ids,
+            workspace: candidates.scratch,
         };
 
         f.operate::<TopK>(&top, args)?;
@@ -358,12 +369,21 @@ impl Sampler {
         }
     }
 
-    /// The candidate set: the `width` largest of each row.
+    /// The candidate set: the row's `width` candidates in descending score order.
+    ///
+    /// What the emission owes, because every later step reads it as an order rather than a set: each
+    /// row's first `width` lanes hold that row's candidates, `values` never increases along the row,
+    /// ties are ordered by ascending token id (a draw must not depend on which of two equal scores a
+    /// program happened to meet first), and the lanes past `width` in the buffers are not written.
+    /// `filter_candidates` reads the largest at lane 0 and the request's own `top_k` at index
+    /// `top_k - 1`, and `candidate_order` then sorts by id — so an emission that is a set and not an
+    /// order silently changes what a request draws.
     pub fn top_descriptor(&self) -> TopKDescriptor {
         TopKDescriptor {
             dtype: DType::F32,
             vocabulary: self.vocabulary,
             width: self.width,
+            tile: TOP_TILE,
             ids: DType::I32,
             pdl: launch::PDL,
         }
@@ -373,6 +393,7 @@ impl Sampler {
     pub fn filter_descriptor(&self) -> FilterDescriptor {
         FilterDescriptor {
             width: self.width,
+            tile: CANDIDATE_TILE,
             ids: DType::I32,
             pdl: launch::PDL,
         }
@@ -391,22 +412,26 @@ impl Sampler {
     /// The candidates' distribution.
     ///
     /// The tile is a **chunk of the row**, not the row: the program walks the width in tiles of
-    /// `SOFTMAX_TILE` lanes and keeps only a running maximum and a running denominator, so the
+    /// `CANDIDATE_TILE` lanes and keeps only a running maximum and a running denominator, so the
     /// candidate width may be the whole vocabulary. A tile derived from the width would ask for one
     /// register per candidate.
     pub fn softmax_descriptor(&self) -> SoftmaxDescriptor {
         SoftmaxDescriptor {
             dtype: DType::F32,
             columns: self.width,
-            tile: SOFTMAX_TILE,
+            tile: CANDIDATE_TILE,
             pdl: launch::PDL,
         }
     }
 
     /// One inverse-CDF draw per row, over the ordered candidates.
+    ///
+    /// The tile is a chunk of the row, as the distribution's is: the draw walks the candidates in
+    /// tiles and keeps a running cumulative, so the width may be the whole vocabulary.
     pub fn draw_descriptor(&self) -> InverseCdfDescriptor {
         InverseCdfDescriptor {
             width: self.width,
+            tile: CANDIDATE_TILE,
             ids: DType::I32,
             tokens: self.tokens,
             pdl: launch::PDL,

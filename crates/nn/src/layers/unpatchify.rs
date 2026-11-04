@@ -18,7 +18,7 @@ use crate::forward::Forward;
 use crate::layers::launch::PDL;
 
 /// The elements one program writes.
-const BLOCK: u32 = 1024;
+pub const BLOCK: u32 = 1024;
 
 /// The packed-token to planar-raster mapping of a video decoder.
 #[derive(Clone, Copy)]

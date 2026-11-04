@@ -15,13 +15,21 @@
 // Two kernels, because the tile metadata of every expert must be known before a
 // single permutation index can be written:
 //
-//   1. `sort_metadata_kernel` — one block. Counts the routes per local expert,
-//      writes `tile_to_expert`, `tile_to_limit`, `total_padded_tokens` and
-//      `num_non_exiting_tiles`, and fills `expanded_to_permuted` with -1, the
-//      value a route this rank does not hold keeps.
+//   1. `sort_metadata_kernel` — one block. Counts the routes per local expert
+//      and writes `tile_to_expert`, `tile_to_limit`, `total_padded_tokens` and
+//      `num_non_exiting_tiles`. It writes neither permutation map.
 //   2. `sort_permutation_kernel` — one block per local expert. Each block
 //      recomputes the counts (they are the block's own prefix over experts),
-//      then walks the routes in order and writes its expert's permuted rows.
+//      then walks the routes in order and writes its expert's permuted rows:
+//      both `expanded_to_permuted[route]` and `permuted_to_expanded[row]` for
+//      every route that matches, and -1 into `permuted_to_expanded` for the rows
+//      of its last tile past its live ones.
+//
+// So a route outside this rank's local window has an entry in neither map, and
+// no reader walks one: the combine runs after the exchange, over the rows a rank
+// was sent, and the GEMMs are bounded by `tile_to_limit`. A reader that ever
+// needs the window case to be explicit must ask the call for a prefill, because
+// the block structure gives no way to tell "unmatched" from "written later".
 //
 // The counts are recomputed rather than carried in a scratch buffer because the
 // call structure has none: `ops::moe::sort::Call` hands the module exactly the

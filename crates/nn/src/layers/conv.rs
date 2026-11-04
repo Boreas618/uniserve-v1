@@ -137,6 +137,31 @@ impl Conv3d {
             self.tf32,
         )
     }
+
+    /// The descriptor a three-dimensional convolution's launch, stated from its geometry and element types alone.
+    ///
+    /// A deployment answers "which programs must be compiled for me?" before any weight exists, so
+    /// the construction stays beside the launch it describes rather than being restated by the walk.
+    #[allow(clippy::too_many_arguments)]
+    pub fn descriptor_of(
+        input: DType,
+        weight: DType,
+        bias: bool,
+        output: DType,
+        geometry: ConvGeometry,
+        tf32: bool,
+    ) -> Descriptor {
+        Descriptor {
+            input,
+            weight,
+            output,
+            geometry: geometry.descriptor(),
+            bias,
+            tf32,
+            rank: 3,
+            transposed: false,
+        }
+    }
 }
 
 /// A one-dimensional convolution (the audio decoder's convolutions).
@@ -198,6 +223,31 @@ impl Conv1d {
             self.tf32,
         )
     }
+
+    /// The descriptor a one-dimensional convolution's launch, stated from its geometry and element types alone.
+    ///
+    /// A deployment answers "which programs must be compiled for me?" before any weight exists, so
+    /// the construction stays beside the launch it describes rather than being restated by the walk.
+    #[allow(clippy::too_many_arguments)]
+    pub fn descriptor_of(
+        input: DType,
+        weight: DType,
+        bias: bool,
+        output: DType,
+        geometry: ConvGeometry,
+        tf32: bool,
+    ) -> Descriptor {
+        Descriptor {
+            input,
+            weight,
+            output,
+            geometry: geometry.descriptor(),
+            bias,
+            tf32,
+            rank: 1,
+            transposed: false,
+        }
+    }
 }
 
 /// A one-dimensional transposed convolution (the audio decoder's upsampling).
@@ -258,6 +308,31 @@ impl ConvTranspose1d {
             true,
             self.tf32,
         )
+    }
+
+    /// The descriptor a transposed one-dimensional convolution's launch, stated from its geometry and element types alone.
+    ///
+    /// A deployment answers "which programs must be compiled for me?" before any weight exists, so
+    /// the construction stays beside the launch it describes rather than being restated by the walk.
+    #[allow(clippy::too_many_arguments)]
+    pub fn descriptor_of(
+        input: DType,
+        weight: DType,
+        bias: bool,
+        output: DType,
+        geometry: ConvGeometry,
+        tf32: bool,
+    ) -> Descriptor {
+        Descriptor {
+            input,
+            weight,
+            output,
+            geometry: geometry.descriptor(),
+            bias,
+            tf32,
+            rank: 1,
+            transposed: true,
+        }
     }
 }
 

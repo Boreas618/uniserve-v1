@@ -43,10 +43,6 @@ use crate::model::assets::{
 };
 use crate::tokenizer::HuggingFaceTokenizer;
 
-/// The checkpoint's files and their JSON metadata are the frontend's
-/// (`frontend::model::assets`): both processes read the same checkpoint.
-
-
 /// Model-provided sampling defaults. `None` remains distinct from an explicit zero.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SamplingDefaults {

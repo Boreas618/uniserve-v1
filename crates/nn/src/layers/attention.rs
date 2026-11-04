@@ -3,7 +3,7 @@
 //! One call covers both halves because the batch's tokens are written exactly once and read in the
 //! same step: the scheduler's mechanism assigns each token a slot (`-1` for a token it does not
 //! persist), [`ops::kv::KvWrite`] scatters the projections into the pages — or, for an FP8 cache,
-//! [`ops::kv::KvQuantize`] divides by the page's own scale on the way in, the same tensor the read
+//! [`ops::kv::KvWriteScaled`] derives the page's own scale on the way in, the same tensor the read
 //! side multiplies back — and [`ops::attention::PagedAttention`] reads the pages each row addresses
 //! (specs/worker.md 9, "KV 写入" and "注意力"). Both operators are compiled per geometry, so the
 //! descriptor pins the element types, the head and page geometry and the mask variant, while the
@@ -12,10 +12,10 @@
 use ops::attention::dense::{DenseArgs, DenseAttention, DenseDescriptor};
 use ops::attention::sparse::{SparseArgs, SparseAttention, SparseDescriptor};
 use ops::attention::{Args, Descriptor, Mask, PagedAttention, Phase};
-use ops::kv::{self, Descriptor as KvDescriptor, KvQuantize, KvWrite};
+use ops::kv::{self, Descriptor as KvDescriptor, KvWrite, KvWriteScaled};
 use ops::{DType, PhaseKind, Shape, TensorView};
 
-use crate::capability::{KvView, TokenBatch};
+use crate::capability::{KvGroup, KvPlanes, KvView, TokenBatch};
 use crate::error::{Error, Result};
 use crate::forward::Forward;
 use crate::layers::launch::{PDL, kv_tile};
@@ -475,9 +475,12 @@ impl Attention {
                 self.backend
             )));
         }
+        // One selection for both halves: the layer's index names its planes once, and the read is
+        // handed what the write was handed.
         let planes = cache.planes(group, layer)?;
+        let group_view = cache.group(group)?;
         self.write(f, batch, planes, key, value)?;
-        self.attend(f, batch, cache, group, query, out, workspace)
+        self.attend(f, batch, group_view, planes, query, out, workspace)
     }
 
     /// Write the batch's keys and values into `planes`; slots of `-1` write nothing.
@@ -504,7 +507,7 @@ impl Attention {
             }
         }
         // Both writers address a token's row from the buffer pointer: `kv_write` scatters a row and
-        // `kv_quantize` reads one, and neither is handed a stride. A projection whose rows are
+        // `kv_write_scaled` reads one, and neither is handed a stride. A projection whose rows are
         // contiguous is what a layer's output is; a strided one would be read as packed rows and
         // land in the wrong slots, so it is refused here instead of silently.
         for (name, view) in [("key", key), ("value", value)] {
@@ -589,7 +592,7 @@ impl Attention {
         key: TensorView,
         value: TensorView,
     ) -> Result<()> {
-        let descriptor = self.quantize_descriptor(key.dtype);
+        let descriptor = self.scaled_write_descriptor(key.dtype);
         let rows = u64::from(self.kv_heads) * u64::from(self.head_dim);
         for (name, cache, scale, initialized, source) in [
             (
@@ -618,13 +621,16 @@ impl Attention {
                     ),
                 )
             })?;
-            f.operate::<KvQuantize>(
+            f.operate::<KvWriteScaled>(
                 &descriptor,
-                kv::QuantizeArgs {
+                kv::ScaledWriteArgs {
                     source: source.reshape(Shape::new(&[source.rows(), rows])),
                     slots: batch.slot_mapping,
+                    // The reader's own buffer: `attend` multiplies by `planes.key_scale`, so a
+                    // second allocation of the right shape would produce a cache that reads as
+                    // zeros with no error anywhere.
                     scales: scale,
-                    out: cache,
+                    cache,
                     initialized,
                 },
             )?;
@@ -705,8 +711,8 @@ impl Attention {
 
     /// The descriptor the quantizing cache write launches with: the projection's type, one plane's
     /// page scales and the geometry both share.
-    pub fn quantize_descriptor(&self, projection: DType) -> kv::QuantizeDescriptor {
-        kv::QuantizeDescriptor {
+    pub fn scaled_write_descriptor(&self, projection: DType) -> kv::ScaledWriteDescriptor {
+        kv::ScaledWriteDescriptor {
             dtype: projection,
             scale: DType::F32,
             page: self.page_size,
@@ -717,18 +723,25 @@ impl Attention {
         }
     }
 
-    /// Read the cache and write this batch's attended output.
+    /// Read one layer's cached keys and values and write this batch's attended output.
+    ///
+    /// The planes are the caller's *selection* — a layer's own, chosen once by [`Self::forward`] from
+    /// the index the model runs. They arrive as a value rather than as a cache and an index so that a
+    /// reader cannot derive a different layer's plane here: every plane of a group has its geometry,
+    /// so a reader that took the first one answers a plausible number from the wrong layer, which is
+    /// the shape of the defect this signature removes. The group travels for the page table and the
+    /// page size, which are the group's and not a layer's.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the design's attention call carries the batch, the cache, the group index, the \
-                  query, the output and the program's workspace"
+        reason = "the design's attention call carries the batch, the group's geometry, the layer's \
+                  planes, the query, the output and the program's workspace"
     )]
     pub fn attend(
         &self,
         f: &Forward,
         batch: &TokenBatch,
-        cache: &KvView<'_>,
-        group: usize,
+        group: &KvGroup<'_>,
+        planes: &KvPlanes,
         query: TensorView,
         out: TensorView,
         workspace: TensorView,
@@ -736,14 +749,12 @@ impl Attention {
         // The batch's own parts are read by pointer arithmetic inside the programs, so they are
         // checked against each other once here, before any of them is addressed.
         batch.check()?;
-        let planes = cache.planes(group, 0)?;
-        let group_view = cache.group(group)?;
-        if group_view.page_size != self.page_size || batch.page_size != self.page_size {
+        if group.page_size != self.page_size || batch.page_size != self.page_size {
             return Err(Error::shape(
                 "Attention::attend",
                 format!(
                     "the layer is built for {} tokens per page, the cache and batch have {} and {}",
-                    self.page_size, group_view.page_size, batch.page_size
+                    self.page_size, group.page_size, batch.page_size
                 ),
             ));
         }
@@ -774,7 +785,7 @@ impl Attention {
         }
         // The page table is the cache's and it carries one row per sequence of this batch.
         self.check_page_table(
-            group_view.block_tables,
+            group.block_tables,
             batch.query_offsets.numel().saturating_sub(1),
         )?;
         let descriptor = self.descriptor(phase, query.dtype, planes.key.dtype, out.dtype);
@@ -790,7 +801,7 @@ impl Attention {
             value: planes.value,
             key_scale,
             value_scale,
-            page_table: group_view.block_tables,
+            page_table: group.block_tables,
             seq_lens: batch.seq_lens,
             cum_seq_lens_q: batch.query_offsets,
             out,
@@ -804,14 +815,31 @@ impl Attention {
     }
 }
 
-/// The per-page scale a plane's call carries: exactly one when the plane is FP8.
+/// The per-page scale a plane's call carries: a table with **one entry per page** when the plane is
+/// FP8, and absent otherwise.
 ///
-/// An FP8 plane without its scale would be read unnormalized and a scaled plane of another type
-/// would multiply a scale the cache never divided by, so both mismatches are refused here rather
-/// than at the launch.
+/// An FP8 plane without its scale would be read unnormalized, a scaled plane of another type would
+/// multiply a scale the cache never divided by, and a *scalar* where the page table belongs would
+/// scale every page of the sequence by one number — the last is the quiet one, since it type-checks,
+/// launches, and answers a plausible tensor. The write divides each page by the page's own FP32
+/// scale, so the reader's operand is a table of the same length: the pages of the plane in F32.
 fn page_scale(plane: TensorView, scale: Option<TensorView>) -> Result<Option<TensorView>> {
     match (plane.dtype == ops::DType::F8E4M3, scale) {
-        (true, Some(scale)) => Ok(Some(scale)),
+        (true, Some(scale)) => {
+            let pages = plane.shape.dim(0);
+            if scale.dtype != ops::DType::F32 || scale.shape.numel() != pages {
+                return Err(Error::shape(
+                    "Attention::attend",
+                    format!(
+                        "an FP8 plane of {pages} pages carries {pages} F32 page scales; the operand \
+                         is {} of {} element(s)",
+                        scale.dtype,
+                        scale.shape.numel()
+                    ),
+                ));
+            }
+            Ok(Some(scale))
+        }
         (true, None) => Err(Error::shape(
             "Attention::attend",
             "an FP8 cache plane needs its per-page scale".to_owned(),
@@ -838,6 +866,44 @@ mod tests {
     use ops::{DType, DevicePtr, Shape};
 
     use super::*;
+
+    /// The reader's scale operand is a page table, not a number: the write divides each page by its
+    /// own scale, so a reader holding one scalar would scale the whole sequence by it — a wrong
+    /// answer that type-checks and launches.
+    #[test]
+    fn a_page_scale_table_has_one_entry_per_page() {
+        let pages = 16_u64;
+        let plane = |dtype| {
+            TensorView::new(
+                DevicePtr::new(0x1_0000),
+                dtype,
+                Shape::new(&[pages, 64, 8, 128]),
+            )
+        };
+        let scale = |elements: u64, dtype| {
+            TensorView::new(DevicePtr::new(0x2_0000), dtype, Shape::new(&[elements]))
+        };
+
+        assert!(page_scale(plane(DType::F8E4M3), Some(scale(pages, DType::F32))).is_ok());
+        assert!(page_scale(plane(DType::F8E4M3), None).is_err(), "no scale at all");
+        assert!(
+            page_scale(plane(DType::F8E4M3), Some(scale(1, DType::F32))).is_err(),
+            "one scalar where a page table belongs"
+        );
+        assert!(
+            page_scale(plane(DType::F8E4M3), Some(scale(pages - 1, DType::F32))).is_err(),
+            "a table short of the plane's pages"
+        );
+        assert!(
+            page_scale(plane(DType::F8E4M3), Some(scale(pages, DType::BF16))).is_err(),
+            "page scales are FP32"
+        );
+        assert!(
+            page_scale(plane(DType::BF16), Some(scale(pages, DType::F32))).is_err(),
+            "a plane of the projection's own type carries no scale"
+        );
+        assert!(page_scale(plane(DType::BF16), None).is_ok());
+    }
 
     #[test]
     fn a_paged_layer_pins_the_page_geometry() {

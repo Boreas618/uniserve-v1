@@ -587,8 +587,13 @@ impl Cost {
     /// A trial's calls are counted when its candidate is adopted: they are
     /// calls the epoch's policy made, whether or not it goes on serving under
     /// that program. Its fuel is already inside the instance's own total.
-    fn trial(&mut self, calls: u64) {
-        self.calls += calls;
+    ///
+    /// The instance is the record, not a count taken beside it: its
+    /// instantiation, the limits it read and every decision the trial asked
+    /// are all in its cost, so `calls` and the sum of the instances'
+    /// decisions are the same number by construction.
+    fn trial(&mut self, instance: &PolicyInstance) {
+        self.calls += instance.cost().each().map(|(_, calls)| calls).sum::<u64>();
     }
 }
 
@@ -742,7 +747,7 @@ impl PolicySlot {
         // candidate's are (§12): a counter that dropped them would report an
         // epoch whose first policy never called the guest.
         let mut cost = Cost::default();
-        cost.trial(candidate.calls);
+        cost.trial(&candidate.instance);
         Self {
             engine: engine.clone(),
             ceilings,
@@ -941,7 +946,7 @@ impl PolicySlot {
     /// switchover: only a later precopy's result can be the one the daemon's
     /// switchover means.
     pub fn adopt(&mut self, candidate: Candidate) {
-        self.cost.trial(candidate.calls);
+        self.cost.trial(&candidate.instance);
         self.candidate = Some(candidate);
     }
 
@@ -1200,7 +1205,7 @@ impl RoutePolicy {
         // Its trial's calls are the epoch's policy's, as a scheduler's first
         // policy counts them (§12).
         let mut cost = Cost::default();
-        cost.trial(candidate.calls);
+        cost.trial(&candidate.instance);
         Self {
             engine: engine.clone(),
             ceilings,
@@ -1293,7 +1298,7 @@ impl RoutePolicy {
 
     /// Keeps a candidate a precopy prepared, for the switchover to put in.
     pub fn adopt(&mut self, candidate: Candidate) {
-        self.cost.trial(candidate.calls);
+        self.cost.trial(&candidate.instance);
         self.candidate = Some(candidate);
     }
 
@@ -1985,6 +1990,59 @@ mod tests {
         match ProgramSource::connect("/tmp/none.sock") {
             Ok(source) => assert_eq!(source.socket(), std::path::Path::new("/tmp/none.sock")),
             Err(error) => assert!(error.to_string().contains("architecture"), "{error}"),
+        }
+    }
+}
+
+/// Each package the tree ships is a deployment's policy module, and its
+/// `[parameters]` table is the argument set `Precopy` delivers as TOML text
+/// (§5.1, §7.7). A parameter whose spelling this build cannot read fails every
+/// deployment that names that package, and it fails at the first `Precopy`
+/// rather than anywhere the deployment's configuration could be blamed.
+#[cfg(test)]
+mod shipped_packages {
+    use super::PolicyProgram;
+
+    #[test]
+    fn every_package_states_arguments_this_build_reads() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .unwrap_or_else(|| panic!("crates/engine lives two levels below the workspace root"));
+        for package in [
+            "crates/scheduling/policies/fcfs/package.toml",
+            "crates/scheduling/policies/priority/package.toml",
+            "crates/ops/program-fixtures/policy/package.toml",
+        ] {
+            let path = root.join(package);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            let parsed: toml::Value = text.parse().unwrap_or_else(|error| {
+                // A parse error at 1:1 on a package that is valid in the tree
+                // means the run read an empty file: name the path and its size
+                // rather than leave the reader to guess which copy it was.
+                panic!(
+                    "{}: {error} ({} bytes, read from {})",
+                    package,
+                    text.len(),
+                    path.display()
+                )
+            });
+            let backend = parsed
+                .get("backend")
+                .and_then(toml::Value::as_str)
+                .unwrap_or_else(|| panic!("{package} names no backend"));
+            let mut arguments = std::collections::BTreeMap::new();
+            for (name, value) in parsed
+                .get("parameters")
+                .and_then(toml::Value::as_table)
+                .into_iter()
+                .flatten()
+            {
+                arguments.insert(name.clone(), value.to_string());
+            }
+            PolicyProgram::from_arguments(backend, 0, &arguments)
+                .unwrap_or_else(|error| panic!("{package}: {error}"));
         }
     }
 }

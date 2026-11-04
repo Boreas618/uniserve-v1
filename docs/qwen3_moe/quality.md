@@ -88,6 +88,10 @@ The commands run from the checkout with the environment of the installation inst
 cargo build --release
 export VIRTUAL_ENV=$PWD/.venv
 .venv/bin/python -m uniserve_eval --config uniserve_eval/qwen3_moe.toml plan qwen3-moe-gsm8k --executable "$PWD/target/release/uniserve"
+# The FP8 KV cell's provider name differs by implementation: the baseline's
+# `torch` provider does not exist in the rewrite, whose FP8 planes its own
+# attention layer reads. The profile reads this variable for that cell only.
+export UNISERVE_QWEN3_FP8_ATTENTION_BACKEND=auto
 for cell in qwen3-moe-gsm8k-bf16 qwen3-moe-gsm8k-nvfp4 qwen3-moe-gsm8k-bf16-fp8-kv; do
   .venv/bin/python -m uniserve_eval --config uniserve_eval/qwen3_moe.toml run "$cell" --executable "$PWD/target/release/uniserve" --output-root artifacts/qwen3_moe/gsm8k-candidate || break
 done
@@ -96,11 +100,11 @@ for cell in qwen3-moe-gsm8k-bf16 qwen3-moe-gsm8k-nvfp4 qwen3-moe-gsm8k-bf16-fp8-
 done
 ```
 
-The pre-flight prints `1319 gsm8k-00000 gsm8k-01318`. The baseline suite runs its three cells serially, one server at a time. The candidate builds the root package's `target/release/uniserve`, installs the environment from the same checkout, names that binary with `--executable`, and runs the same three cells by name, also serially, each writing only its own `<point>` directory. `run` refuses a non-empty result directory, so the baseline and candidate roots are separate and a rerun needs a fresh one. The candidate run uses the same profile and may differ from the baseline only in `--executable` and `--output-root`; both runs use the `torch` attention provider for the FP8 KV cell.
+The pre-flight prints `1319 gsm8k-00000 gsm8k-01318`. The baseline suite runs its three cells serially, one server at a time. The candidate builds the root package's `target/release/uniserve`, installs the environment from the same checkout, names that binary with `--executable`, and runs the same three cells by name, also serially, each writing only its own `<point>` directory. `run` refuses a non-empty result directory, so the baseline and candidate roots are separate and a rerun needs a fresh one. The candidate run uses the same profile and may differ from the baseline only in `--executable`, `--output-root`, and — for the FP8 KV cell alone — the name the loading path is given for its attention: `torch` on the baseline, `auto` on the candidate. A provider is a name in one implementation's registry, so the two runs cannot name the same one: `torch` is the baseline's only reader of per-block FP8 pages, and the rewrite reads those planes in its own attention layer and takes `attention_backend` as a loading-path name.
 
 ## Results
 
-The baselines of all three cells are measured on today's implementation; every candidate cell is pending. A baseline is a measurement of one side, not a comparison: no interval and no verdict is claimed until a candidate cell has run on the same checkpoint, sample set and settings.
+The baselines of all three cells are measured on today's implementation; every candidate cell is pending. The FP8 KV cell is held rather than pending: `kv_write_scaled` has no kernel package, so the store cannot build it, and the cell runs once that package exists. A held cell is not a passed one and is not counted as a confirmation. A baseline is a measurement of one side, not a comparison: no interval and no verdict is claimed until a candidate cell has run on the same checkpoint, sample set and settings.
 
 | Cell | Commit | Requests | Correct | Accuracy | `decided_by_marker` / `decided_by_boxed` / `unparseable` |
 | --- | --- | --- | --- | --- | --- |

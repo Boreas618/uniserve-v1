@@ -49,7 +49,8 @@ extern "C" int32_t uniserve_route_gemm(const uniserve_route_call* call, void* st
   }
   // The wrapper's `n` is the output width (the model's hidden size, which the
   // call names `width`) and its `k` the contraction length (the intermediate
-  // width); the routes are the expanded rows.
+  // width); the rows are permuted in and out, so the wrapper's `m` and its output
+  // row count are both the permuted height.
   return cute_dsl_route_gemm_wrapper(
       &module(),
       const_cast<void*>(call->rows),
@@ -63,6 +64,6 @@ extern "C" int32_t uniserve_route_gemm(const uniserve_route_call* call, void* st
       call->width,
       call->intermediate,
       call->experts,
-      call->expanded_rows,
+      call->permuted_rows,
       reinterpret_cast<cudaStream_t>(stream));
 }
