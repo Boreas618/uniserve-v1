@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """Run one adaptive_pool module on a GPU and check it against the two reductions.
 
-    python pool_check.py
-    python pool_check.py --dtype bf16 --heads 16 --width 256 --output 64
-    python pool_check.py --heads 8 --width 8 --output 16
+    python pool_check.py python pool_check.py --dtype bf16 --heads 16 --width
+    256 --output 64 python pool_check.py --heads 8 --width 8 --output 16
 
-The package's Triton source is launched through Triton's own launcher, which is the
-code the store's module is compiled from. The head count, the width, the pooled width
-and the block are all constexprs of the launched kernel, so a run can choose a
-geometry no descriptor declares — which the third example above does: with more
-outputs than inputs, `floor(i·width/output)` and `ceil((i+1)·width/output)` give an
-empty window at every position and the pool must take one input position per output,
-repeating it. That is the degenerate case, and it is checked on purpose.
+The package's Triton source is launched through Triton's own launcher, which is
+the code the store's module is compiled from. The head count, the width, the
+pooled width and the block are all constexprs of the launched kernel, so a run
+can choose a geometry no descriptor declares — which the third example above
+does: with more outputs than inputs, `floor(i·width/output)` and
+`ceil((i+1)·width/output)` give an empty window at every position and the pool
+must take one input position per output, repeating it. That is the degenerate
+case, and it is checked on purpose.
 
 The reference is the model's own two steps: the mean over heads, then
-`torch.nn.functional.adaptive_avg_pool1d` over the width. The bound is the operator's:
-`rounding(heads · ceil(width/output), F32, dtype)` — the statistical bound for one
-FP32 accumulation rounded once — with its absolute envelope `64 · u_out`, which is
-what an output element near zero needs when a window's terms cancel.
+`torch.nn.functional.adaptive_avg_pool1d` over the width. The bound is the
+operator's: `rounding(heads · ceil(width/output), F32, dtype)` — the
+statistical bound for one FP32 accumulation rounded once — with its absolute
+envelope `64 · u_out`, which is what an output element near zero needs when a
+window's terms cancel.
 """
 
 import argparse
@@ -62,8 +63,9 @@ def launch(dtype, heads, width, output, block, rows, pdl, seed=0):
     x = torch.randn(rows, heads, width, generator=generator).to(
         device=device, dtype=TORCH_TYPES[dtype]
     )
-    # The attended values of a projection are bounded in practice; a plain normal keeps
-    # the comparison about the accumulation rather than about a designed distribution.
+    # The attended values of a projection are bounded in practice; a plain
+    # normal keeps the comparison about the accumulation rather than about a
+    # designed distribution.
     out = torch.empty((rows, output), dtype=TORCH_TYPES[dtype], device=device)
     total = rows * output
     window = max(-(-width // output), 1)
@@ -105,9 +107,11 @@ def main() -> int:
 
     cases = [
         (arguments.heads, arguments.width, arguments.output),
-        # The degenerate pool: more outputs than inputs, every window one position.
+        # The degenerate pool: more outputs than inputs, every window one
+        # position.
         (arguments.heads, 8, 16),
-        # A width the pooled width divides evenly, so every window is the same length.
+        # A width the pooled width divides evenly, so every window is the same
+        # length.
         (arguments.heads, 256, 64),
     ]
     failures = 0
@@ -121,11 +125,11 @@ def main() -> int:
             arguments.rows,
             arguments.pdl,
         )
-        averaged = x.double().mean(dim=1, keepdim=True)
-        expected = functional.adaptive_avg_pool1d(
-            averaged.transpose(1, 2), output
-        ).transpose(1, 2)
-        expected = expected.reshape(arguments.rows, output)
+        # The model's two steps: the mean over heads, then the pool along the
+        # width. `adaptive_avg_pool1d` reads a two-dimensional input as
+        # (channels, length), which is exactly the row and width here.
+        averaged = x.double().mean(dim=1)
+        expected = functional.adaptive_avg_pool1d(averaged, output)
         relative, absolute = bound(heads, width, output, arguments.dtype)
         got = out.double()
         allowed = absolute + relative * expected.abs()

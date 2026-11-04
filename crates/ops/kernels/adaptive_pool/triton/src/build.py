@@ -56,8 +56,11 @@ def spec(fields, parameters, target):
             "HEADS": heads,
             "WIDTH": width,
             "OUTPUT": output,
-            # The longest window the descriptor allows; a shorter one is masked.
-            "WINDOW": -(-width // output),
+            # The longest window the descriptor can give. `ceil(width / output)` is
+            # one short when the width does not divide: the window is
+            # `ceil((i+1)·width/output) - floor(i·width/output)`, whose two roundings
+            # can add a position (24 pooled to 7 gives windows of four and five).
+            "WINDOW": -(-width // output) + 1,
             "BLOCK": block,
             "PDL": pdl,
         },
