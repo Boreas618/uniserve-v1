@@ -266,6 +266,12 @@ impl Config {
         (0..self.num_hidden_layers).any(|layer| !self.sparse(layer))
     }
 
+    /// Whether any layer routes tokens to experts, which is what makes an encoded expert step part
+    /// of the plan.
+    pub fn has_sparse_layers(&self) -> bool {
+        (0..self.num_hidden_layers).any(|layer| self.sparse(layer))
+    }
+
     /// Whether `layer` routes tokens to experts.
     pub fn sparse(&self, layer: usize) -> bool {
         self.num_experts > 0

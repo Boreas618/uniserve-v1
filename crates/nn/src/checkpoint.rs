@@ -26,10 +26,11 @@
 //! - a file whose status-change time is younger than one second may still be written again under the
 //!   same clock tick, so its identity is unique to this read and matches no later load.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use memmap2::Mmap;
@@ -179,6 +180,24 @@ pub struct HostTensor {
     pub bytes: Vec<u8>,
 }
 
+/// What a load asked a checkpoint for, and what it left alone.
+///
+/// Both lists are in name order, so a report can be diffed between two loads.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Reading {
+    /// The tensors a `read` asked for.
+    pub read: Vec<String>,
+    /// The tensors of the same set that no `read` asked for.
+    pub unread: Vec<String>,
+}
+
+impl Reading {
+    /// Whether every tensor the checkpoint holds was asked for.
+    pub fn is_complete(&self) -> bool {
+        self.unread.is_empty()
+    }
+}
+
 /// A checkpoint: its mapped shards and the tensors they hold, or a pipeline's components.
 ///
 /// A flat checkpoint is one shard set; a *pipeline* root holds one subdirectory per component
@@ -195,6 +214,9 @@ pub struct Checkpoint {
     files: Vec<CheckpointFile>,
     tensors: BTreeMap<String, TensorLocation>,
     components: BTreeMap<String, Checkpoint>,
+    /// The tensors a `read` has asked this checkpoint for, so [`Checkpoint::reading`] can answer the
+    /// other half of the question: what the load never touched.
+    read: Mutex<BTreeSet<String>>,
 }
 
 impl Checkpoint {
@@ -263,6 +285,7 @@ impl Checkpoint {
             files,
             tensors: locations,
             components: BTreeMap::new(),
+            read: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -356,6 +379,7 @@ impl Checkpoint {
             files: Vec::new(),
             tensors: BTreeMap::new(),
             components,
+            read: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -461,11 +485,61 @@ impl Checkpoint {
                 ),
             }
         })?;
+        if let Ok(mut read) = self.read.lock() {
+            read.insert(name.to_owned());
+        }
         Ok(HostTensor {
             dtype: location.dtype,
             shape: location.shape,
             bytes: self.bytes(location)?.to_vec(),
         })
+    }
+
+    /// What a load has asked this checkpoint for, and what it has left alone.
+    ///
+    /// A component of a multi-component export legitimately reads a subset of what its shards hold —
+    /// a video VAE's per-layer `scale1`/`scale2`, a tied head, the calibration fields of a layer the
+    /// model runs dense — so a non-empty [`Reading::unread`] is a **report and never a refusal**. It
+    /// answers the one question a half-read export leaves open: when the numbers are wrong, which
+    /// tensors did nobody ask for. It is device-free: it needs the claims the index states, not the
+    /// tensors' values.
+    ///
+    /// A pipeline root holds no tensors of its own, so its answer is its components', each name
+    /// qualified `component/name` — two components may hold one name each.
+    pub fn reading(&self) -> Reading {
+        if !self.components.is_empty() {
+            let mut reading = Reading::default();
+            for (name, component) in &self.components {
+                let one = component.reading();
+                reading.read.extend(
+                    one.read
+                        .into_iter()
+                        .map(|tensor| format!("{name}/{tensor}")),
+                );
+                reading.unread.extend(
+                    one.unread
+                        .into_iter()
+                        .map(|tensor| format!("{name}/{tensor}")),
+                );
+            }
+            reading.read.sort();
+            reading.unread.sort();
+            return reading;
+        }
+        let read = self
+            .read
+            .lock()
+            .map(|held| held.clone())
+            .unwrap_or_default();
+        let mut answer = Reading::default();
+        for name in self.tensors.keys() {
+            if read.contains(name) {
+                answer.read.push(name.clone());
+            } else {
+                answer.unread.push(name.clone());
+            }
+        }
+        answer
     }
 
     /// Borrow the bytes of `location` inside its mapped shard.

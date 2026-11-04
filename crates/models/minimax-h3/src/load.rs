@@ -7,6 +7,14 @@
 //! rank holds are the [`Partition`]'s, so this module only builds them, and registers each under the
 //! name its runner addresses: the capability's name, not the checkpoint directory's.
 //!
+//! ## What the caller gets back
+//!
+//! [`MinimaxH3`]: the blocks the executor serves, and the same components behind them as handles.
+//! A block is boxed as `Arc<dyn Encoder>` or `Arc<dyn Decoder>` and those traits publish no
+//! descriptors, so a deployment that can answer "which programs must be compiled for me?" can only
+//! answer it from the concrete components - and that is what the handles are for. They are the same
+//! values the blocks hold, so the weights exist once.
+//!
 //! ## Testing
 //!
 //! A load publishes every tensor through `nn::weights::RetainedWeights`, which only the executor
@@ -23,11 +31,12 @@
 //! (specs/worker.md 1, 9).
 
 use nn::{Block, BlockName};
+use std::sync::Arc;
 
 use crate::audio_vae::AudioDecoder;
 use crate::checkpoint::{Dit, Layout, Sidecars};
 use crate::config::Config;
-use crate::denoiser::{Denoiser, Layouts};
+use crate::denoiser::{ConditionEncoders, Denoiser, Layouts};
 use crate::schedule::Schedule;
 use crate::text_encoder::TextEncoder;
 use crate::transformer::StudentHeads;
@@ -36,6 +45,108 @@ use crate::{Error, Partition, Result};
 /// The block type is the partition's; re-exported here because a block and its loading are read
 /// together, and the layers beside them name their block this way.
 pub use crate::partition::Component;
+
+/// A loaded deployment: the blocks this rank serves, and the components they were built from.
+///
+/// The runner needs the first and only the first: [`MinimaxH3::into_model`] hands it over and the
+/// executor serves each block by the capability it implements. The second is what makes the
+/// deployment able to answer for itself: a block is boxed as `Arc<dyn Encoder>` and the trait does
+/// not publish descriptors, so the model's programs can only be enumerated from the components
+/// before they are erased - `keys` walks these handles, and nothing else in the crate reads them.
+///
+/// Every handle is the *same* value the block holds, not a copy: the component is constructed once,
+/// shared by the model and by the walk, and the weights exist once.
+pub struct MinimaxH3 {
+    model: nn::Model,
+    text_encoder: Option<Arc<TextEncoder>>,
+    transformer: Option<Arc<Denoiser>>,
+    transformer_ref: Option<Arc<Denoiser>>,
+    video_postprocessor: Option<Arc<crate::output::VideoPostprocessor>>,
+    video_decoder: Option<Arc<crate::video_vae::VideoDecoder>>,
+    audio_decoder: Option<Arc<AudioDecoder>>,
+}
+
+impl std::fmt::Debug for MinimaxH3 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MinimaxH3")
+            .field("model", &self.model)
+            .field(
+                "text_encoder",
+                &self.text_encoder.as_ref().map(|_| "TextEncoder"),
+            )
+            .field(
+                "transformer",
+                &self.transformer.as_ref().map(|_| "Denoiser"),
+            )
+            .field(
+                "transformer_ref",
+                &self.transformer_ref.as_ref().map(|_| "Denoiser"),
+            )
+            .field(
+                "video_postprocessor",
+                &self
+                    .video_postprocessor
+                    .as_ref()
+                    .map(|_| "VideoPostprocessor"),
+            )
+            .field(
+                "video_decoder",
+                &self.video_decoder.as_ref().map(|_| "VideoDecoder"),
+            )
+            .field(
+                "audio_decoder",
+                &self.audio_decoder.as_ref().map(|_| "AudioDecoder"),
+            )
+            .finish()
+    }
+}
+
+impl MinimaxH3 {
+    /// The blocks this rank serves, as the executor consumes them.
+    pub fn model(&self) -> &nn::Model {
+        &self.model
+    }
+
+    /// The blocks, consuming the deployment: what a runner is handed once nothing else needs to
+    /// enumerate the deployment's programs.
+    pub fn into_model(self) -> nn::Model {
+        self.model
+    }
+
+    /// The text encoder, when this rank places it.
+    pub fn text_encoder(&self) -> Option<&Arc<TextEncoder>> {
+        self.text_encoder.as_ref()
+    }
+
+    /// The base DiT partition, when this rank places it.
+    pub fn transformer(&self) -> Option<&Arc<Denoiser>> {
+        self.transformer.as_ref()
+    }
+
+    /// The reference DiT partition, when this rank places it.
+    ///
+    /// A deployment places at most one of the two (`Partition::validate` refuses both), so exactly
+    /// one of this and [`MinimaxH3::transformer`] is `Some` when a denoiser is placed at all.
+    pub fn transformer_ref(&self) -> Option<&Arc<Denoiser>> {
+        self.transformer_ref.as_ref()
+    }
+
+    /// The weightless post-processing block, when this rank places it.
+    pub fn video_postprocessor(&self) -> Option<&Arc<crate::output::VideoPostprocessor>> {
+        self.video_postprocessor.as_ref()
+    }
+
+    /// The video decoder, when this rank places it.
+    pub fn video_decoder(&self) -> Option<&Arc<crate::video_vae::VideoDecoder>> {
+        self.video_decoder.as_ref()
+    }
+
+    /// The audio decoder, when this rank places it.
+    pub fn audio_decoder(&self) -> Option<&Arc<AudioDecoder>> {
+        self.audio_decoder.as_ref()
+    }
+}
 
 /// Load the deployment this rank places.
 ///
@@ -54,21 +165,43 @@ pub fn load(
     checkpoint: &nn::Checkpoint,
     partition: Partition,
     loader: &mut nn::weights::WeightLoader<'_>,
-) -> Result<nn::Model> {
+) -> Result<MinimaxH3> {
     let (layout, sidecars) = sidecars(checkpoint)?;
     let config = Config::normalize(&layout, &sidecars)?;
     partition.validate(&config)?;
 
+    // The two condition encoders are the denoiser block's half, and they are loaded before the
+    // loop because a block is boxed as it is built: the partition places `transformer` before
+    // `latent_encoder`, so by the time the encoders' own component is reached the denoiser is a
+    // `Block::Denoiser` and the concrete block that holds them is out of reach. A deployment whose
+    // tasks carry no conditions places none.
+    let mut encoders = if partition.blocks.contains(Component::LatentEncoder) {
+        Some(ConditionEncoders::load(&config, checkpoint, loader)?)
+    } else {
+        None
+    };
+
     let mut blocks = Vec::new();
+    let mut text_encoder: Option<Arc<TextEncoder>> = None;
+    let mut transformer: Option<Arc<Denoiser>> = None;
+    let mut transformer_ref: Option<Arc<Denoiser>> = None;
+    let mut video_postprocessor: Option<Arc<crate::output::VideoPostprocessor>> = None;
+    let mut video_decoder: Option<Arc<crate::video_vae::VideoDecoder>> = None;
+    let mut audio_decoder: Option<Arc<AudioDecoder>> = None;
     for component in partition.blocks.iter() {
         let block = match component {
             Component::TextEncoder => {
                 let source = checkpoint.component("text_encoder")?;
                 let dtype = component.activation();
                 let mut shards = loader.reborrow(source)?;
-                let encoder =
-                    TextEncoder::load(&mut shards, &config.text_encoder, &partition, dtype)?;
-                Block::Encoder(Box::new(encoder))
+                let encoder = Arc::new(TextEncoder::load(
+                    &mut shards,
+                    &config.text_encoder,
+                    &partition,
+                    dtype,
+                )?);
+                text_encoder = Some(Arc::clone(&encoder));
+                Block::Encoder(encoder)
             }
             Component::Transformer | Component::TransformerRef => {
                 let dit = match component {
@@ -94,6 +227,22 @@ pub fn load(
                 // reach, over every canvas the DiT offers and every legal frame count.
                 let rows = Layouts::new(denoiser.clone(), arrangement)?.rows_bound()?;
                 let source = checkpoint.component(dit.directory())?;
+                // Every tensor this partition's denoiser reads, asked of the block itself: `load`
+                // states no name of its own. A name the checkpoint lacks is refused here rather
+                // than surfacing as a read error deep in `Denoiser::load`, so the report names the
+                // block, its directory and every absent tensor at once.
+                let keys = Denoiser::keys(denoiser);
+                let missing = crate::checkpoint::absent(&keys, |key| source.tensor(key).is_some());
+                if !missing.is_empty() {
+                    return Err(Error::checkpoint(format!(
+                        "the {} block asks {} tensors and {} of them are not in {}/: {}",
+                        component.name(),
+                        keys.len(),
+                        missing.len(),
+                        dit.directory(),
+                        missing.join(", ")
+                    )));
+                }
                 let mut shards = loader.reborrow(source)?;
                 // A parallel-decoding student stacks one head per fine interval; the boundary that
                 // owns the checkpoint fuses them into one head per evaluation block and publishes
@@ -109,7 +258,7 @@ pub fn load(
                 } else {
                     None
                 };
-                let denoiser = Denoiser::load(
+                let mut denoiser = Denoiser::load(
                     denoiser.clone(),
                     arrangement,
                     rows,
@@ -117,15 +266,55 @@ pub fn load(
                     &mut shards,
                     heads,
                 )?;
-                Block::Denoiser(Box::new(denoiser))
+                // The encoders are this block's conditioning half. Only one DiT partition can be
+                // placed on a rank (`Partition::validate` refuses both), so at most one arm takes
+                // them; `attach_encoders` refuses a second attach as well.
+                if let Some(encoders) = encoders.take() {
+                    denoiser.attach_encoders(encoders)?;
+                }
+                let denoiser = Arc::new(denoiser);
+                match dit {
+                    Dit::Base => transformer = Some(Arc::clone(&denoiser)),
+                    Dit::Reference => transformer_ref = Some(Arc::clone(&denoiser)),
+                }
+                Block::Denoiser(denoiser)
+            }
+            Component::VideoPostprocessor => {
+                // Weightless: the splice's only constants are the reference's ImageNet means and standard
+                // deviations, uploaded once as the two `[3]` weights the byte step reads.
+                let dtype = Component::VideoDecoder.activation();
+                let bytes = |values: [f32; 3]| -> Vec<u8> {
+                    values
+                        .iter()
+                        .flat_map(|value| value.to_ne_bytes())
+                        .collect()
+                };
+                let shape = nn::Shape::new(&[3]);
+                let mean = loader.constant(
+                    "video_postprocessor.pixel_mean",
+                    nn::DType::F32,
+                    shape,
+                    &bytes(crate::output::PIXEL_MEAN),
+                )?;
+                let std = loader.constant(
+                    "video_postprocessor.pixel_std",
+                    nn::DType::F32,
+                    shape,
+                    &bytes(crate::output::PIXEL_STD),
+                )?;
+                let postprocessor =
+                    Arc::new(crate::output::VideoPostprocessor::new(dtype, mean, std)?);
+                video_postprocessor = Some(Arc::clone(&postprocessor));
+                nn::Block::Decoder(postprocessor)
             }
             Component::AudioDecoder => {
                 // The audio decoder has no layout tables - every table it reads is a weight bound
                 // at load - so it constructs from its own component and its sidecar alone.
                 let source = checkpoint.component("audio_vae")?;
                 let mut shards = loader.reborrow(source)?;
-                let decoder = AudioDecoder::load(&config.audio_vae, &mut shards)?;
-                Block::Decoder(Box::new(decoder))
+                let decoder = Arc::new(AudioDecoder::load(&config.audio_vae, &mut shards)?);
+                audio_decoder = Some(Arc::clone(&decoder));
+                Block::Decoder(decoder)
             }
             Component::VideoDecoder => {
                 // One block serves every canvas: the tile grid is arithmetic on a request's raster,
@@ -181,28 +370,23 @@ pub fn load(
                 // A VAE directory holds both halves; the decoder reads its own keys from it.
                 let source = checkpoint.component(component.directories()[0])?;
                 let mut shards = loader.reborrow(source)?;
-                let decoder = crate::video_vae::VideoDecoder::load(
+                let decoder = Arc::new(crate::video_vae::VideoDecoder::load(
                     &config.video_vae,
                     canvas,
                     attention,
                     dtype,
                     input,
                     &mut shards,
-                )?;
-                Block::Decoder(Box::new(decoder))
+                )?);
+                video_decoder = Some(Arc::clone(&decoder));
+                Block::Decoder(decoder)
             }
             Component::LatentEncoder => {
-                // Both condition encoders are written to the reference (`VideoEncoder::encode` and
-                // `AudioEncoder`), and neither is the text tower: `nn::Encoder` takes a token batch,
-                // an image shape and a prompt, while these take pixels `[1, 3, frames, height,
-                // width]` and raw samples `[1, 1, samples]`. `nn::model::Block` has no kind for a
-                // condition encoder, so a deployment that places this component is refused by name
-                // rather than served by a block that would misdescribe itself as a text tower.
-                return Err(Error::Unsupported(format!(
-                    "the {} block holds the two condition encoders, which need an nn condition-encoder \
-                     capability that does not exist; `Encoder` is the text tower's interface",
-                    component.name()
-                )));
+                // No block of its own: the two condition encoders are the `denoiser` block's
+                // conditioning half, loaded above and attached when that block is built. This
+                // component names the two checkpoint directories they read from, and `validate`
+                // requires a DiT beside it.
+                continue;
             }
         };
         // The runner addresses a block by the capability it serves, not by the checkpoint's
@@ -210,7 +394,21 @@ pub fn load(
         blocks.push((BlockName::new(component.block()), block));
     }
 
-    Ok(nn::Model::new(blocks))
+    // A conditioned deployment is served as the checkpoint states it: the encoders are attached to
+    // the denoiser block, and `prepare_conditioning` writes a condition's audio rows and its visual
+    // rows from them. What a runner must not do is offer a conditioned request to a deployment that
+    // places no encoder - `Denoiser::places_encoders` answers that, and `encode_media` refuses a
+    // request that carries media it holds no encoder for.
+
+    Ok(MinimaxH3 {
+        model: nn::Model::new(blocks),
+        text_encoder,
+        transformer,
+        transformer_ref,
+        video_postprocessor,
+        video_decoder,
+        audio_decoder,
+    })
 }
 
 /// The checkpoint's pipeline layout and its sidecar documents.

@@ -29,6 +29,6 @@ target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 [kernel.descriptors]
-dimensions = { dtype = ["bf16", "f16", "f32"], columns = ["16", "32", "64", "128", "256", "512", "1024", "2048"], tile = ["16", "32", "64", "128", "256", "512", "1024", "2048"], pdl = ["true", "false"] }
+dimensions = { dtype = ["bf16", "f16", "f32"], columns = ["16", "32", "64", "128", "256", "512", "1024", "2048", "151936"], tile = ["16", "32", "64", "128", "256", "512", "1024", "2048", "8192"], pdl = ["true", "false"] }
 
 [parameters]

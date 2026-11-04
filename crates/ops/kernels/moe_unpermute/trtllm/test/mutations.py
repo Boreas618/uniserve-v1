@@ -28,6 +28,7 @@ built for, and says so in one sentence.
 
 import argparse
 import importlib.util
+import os
 import pathlib
 import shutil
 import subprocess
@@ -149,6 +150,9 @@ def build(copy: pathlib.Path, out: pathlib.Path) -> None:
         capture_output=True,
         text=True,
         check=False,
+        # nvcc writes its intermediates into `TMPDIR`; the mutant's own directory is certain to
+        # exist and be writable for the length of the build, which a shared temporary tree is not.
+        env={**os.environ, "TMPDIR": str(copy.parent)},
     )
     if built.returncode != 0:
         raise SystemExit(f"building {copy.name} failed:\n{built.stderr[-4000:]}")

@@ -94,6 +94,30 @@ pub struct AdaLnCache {
 }
 
 impl AdaLnCache {
+    /// Every checkpoint tensor the cache is built from, as complete names.
+    ///
+    /// The cache's tables are derived at load from these projections; the names are the ones
+    /// [`AdaLnCache::load`] requests. `norm_out.linear` is the output table, which is a different
+    /// tensor from the stack's own `norm_out.norm.weight`.
+    pub fn keys(config: &crate::config::TransformerConfig) -> Vec<String> {
+        let mut keys = Vec::new();
+        for name in [
+            "time_embedder.linear_1",
+            "time_embedder.linear_2",
+            "norm_out.linear",
+        ] {
+            keys.push(format!("{name}.weight"));
+            keys.push(format!("{name}.bias"));
+        }
+        for index in 0..config.num_hidden_layers {
+            keys.push(format!(
+                "transformer_blocks.{index}.adaln_proj.linear.weight"
+            ));
+            keys.push(format!("transformer_blocks.{index}.adaln_proj.linear.bias"));
+        }
+        keys
+    }
+
     /// The cache over `layers`' tables, the final normalization's, and the entry table.
     ///
     /// `layers` holds one `[entries, 18 · hidden_size]` table per transformer layer, `output` the
@@ -376,18 +400,21 @@ impl Projections {
             )));
         }
         let arena = f.arena();
+        // The intermediates are the tables' own element type, not FP32: the reference casts each
+        // activation to the weight's type before every projection (`adaln_cache.py:128`), so a wider
+        // running value would hand the next projection a number the checkpoint never produced. The
+        // embedding stays FP32 - it is the one input the model computes rather than reads, and the
+        // reference leaves it so until the first projection reads it.
+        let dtype = output_out.dtype;
         let hidden = arena.tensor(
-            nn::DType::F32,
+            dtype,
             Shape::new(&[groups, u64::from(self.time_hidden_dim)]),
         )?;
         let activated = arena.tensor(
-            nn::DType::F32,
+            dtype,
             Shape::new(&[groups, u64::from(self.time_hidden_dim)]),
         )?;
-        let time = arena.tensor(
-            nn::DType::F32,
-            Shape::new(&[groups, u64::from(self.time_dim)]),
-        )?;
+        let time = arena.tensor(dtype, Shape::new(&[groups, u64::from(self.time_dim)]))?;
         let linear = |weights: &(Weight, Weight)| {
             nn::layers::Linear::new(weights.0, Some(weights.1), nn::layers::WeightOrder::NxK)
         };

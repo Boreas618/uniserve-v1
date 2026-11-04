@@ -837,7 +837,11 @@ pub struct Condition {
 /// request's keyframes lead its references as the SGLang layout holds them.
 /// A one-frame reference is an image; a longer one is a video, with its
 /// soundtrack when it carries audio; a reference without pixels is audio.
-pub fn condition_segments(conditions: &[Condition], canvas: &Canvas) -> Result<Vec<Segment>> {
+pub fn condition_segments(
+    conditions: &[Condition],
+    canvas: &Canvas,
+    clip: crate::encoding::Clip,
+) -> Result<Vec<Segment>> {
     let mut keyframes = Vec::new();
     let mut references = Vec::new();
     for (index, condition) in conditions.iter().enumerate() {
@@ -845,11 +849,12 @@ pub fn condition_segments(conditions: &[Condition], canvas: &Canvas) -> Result<V
             None => None,
             Some(frame) => {
                 let raster = latent_raster(&frame.canvas)?;
-                let frames = if frame.num_frames == 1 {
-                    1
-                } else {
-                    video_latent_frames(frame.num_frames)?
-                };
+                // The condition's latent count is the **encoder's** clip rule, one statement of
+                // it: `ceil(frames / 17) * latents - token_drop`, a still being one frame and one
+                // latent frame with no repeat. It is not the generated timeline's rule
+                // ([`video_latent_frames`]), which agrees with it only on an aligned count: a
+                // 30-frame reference is 7 latent frames and 12 by the generated rule.
+                let frames = clip.latent_frames(frame.num_frames)?;
                 Some(Visual { frames, raster })
             }
         };
@@ -2211,7 +2216,7 @@ mod tests {
                 audio_samples: 0,
             },
         ];
-        let segments = condition_segments(&conditions, &target).expect("four conditions");
+        let segments = condition_segments(&conditions, &target, clip()).expect("four conditions");
         // Keyframes first in request order, then the references in request order: the audio track
         // is condition 0 and the reference video condition 2.
         let kinds: Vec<_> = segments.iter().map(|segment| segment.kind).collect();
@@ -2249,7 +2254,7 @@ mod tests {
             }),
             audio_samples: 0,
         };
-        let segments = condition_segments(&[image], &target).expect("an image");
+        let segments = condition_segments(&[image], &target, clip()).expect("an image");
         assert_eq!(segments[0].kind, SegmentKind::Image);
         assert_eq!(segments[0].visual.expect("pixels").frames, 1);
 
@@ -2257,7 +2262,7 @@ mod tests {
             audio_samples: 800,
             ..image
         };
-        assert!(condition_segments(&[with_audio], &target).is_err());
+        assert!(condition_segments(&[with_audio], &target, clip()).is_err());
 
         let off_canvas = Condition {
             role: Role::FirstFrame,
@@ -2272,7 +2277,47 @@ mod tests {
             }),
             audio_samples: 0,
         };
-        assert!(condition_segments(&[off_canvas], &target).is_err());
+        assert!(condition_segments(&[off_canvas], &target, clip()).is_err());
+    }
+
+    /// The shipped checkpoint's clip: 17 frames a clip, five latent frames each, three dropped.
+    fn clip() -> crate::encoding::Clip {
+        crate::encoding::Clip {
+            frames: CLIP_FRAMES,
+            latents: CLIP_LATENTS,
+            token_drop: 3,
+        }
+    }
+
+    #[test]
+    fn a_reference_clip_counts_by_the_encoder_s_rule_and_not_the_generated_one() {
+        // The reference cuts a condition into 17-frame clips and drops the last one's tail, so a
+        // 30-frame reference is 7 latent frames. The generated rule refuses that count, and rounding
+        // it up to 39 frames would give 12 - five latent rows a condition does not have.
+        let target = canvas();
+        let count = |num_frames| {
+            let condition = Condition {
+                role: Role::Reference,
+                frame: Some(Frame {
+                    canvas: target,
+                    num_frames,
+                }),
+                audio_samples: 0,
+            };
+            condition_segments(&[condition], &target, clip())
+                .expect("a referenced clip")
+                .remove(0)
+                .visual
+                .expect("pixels")
+                .frames
+        };
+        assert_eq!(count(30), 7);
+        assert_eq!(count(39), video_latent_frames(39).expect("aligned"));
+        // On an aligned count the two rules agree, which is the property that keeps them from
+        // drifting: 17n + 5 frames are 5n + 2 latent frames either way.
+        assert_eq!(count(124), video_latent_frames(124).expect("aligned"));
+        // A still is one frame and one latent frame, with no repeat to the clip count.
+        assert_eq!(count(1), 1);
     }
 
     #[test]

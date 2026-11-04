@@ -1,81 +1,62 @@
-"""Putting each row's candidates in ascending token order: the Triton source of
-the ``candidate_order`` operator.
+"""Candidate ordering: the Triton source of the ``candidate_order`` operator.
 
-The operator is a permutation and nothing else, and its purpose is determinism:
-the reference orders the candidates by token id before an inverse-CDF draw so a
-draw depends on the random value and not on the order a top-k program happened
-to produce.
+One program orders one row's candidates into ascending token id, which is the order the reference's
+inverse-CDF draw needs: it draws deterministically for a fixed random value only if the candidate
+order does not depend on the order the top-k program produced
+(``uniserve/sampling/top_k.py:307-314``).
 
-Each program owns one row and computes, for every candidate, the number of
-candidates that come before it — a rank — then writes that candidate at its
-rank. The order is **ascending id, ties by source position**: a real row never
-repeats a token id, but the rule is written down and implemented so a duplicated
-id is a decided outcome rather than an accident of the sort.
+The permutation is by **id**, never by value, and entry ``k`` of a row's output is the input
+candidate with the ``k``-th smallest id. Ties in an id cannot occur within a row (a row holds distinct
+tokens), so the rule is a total order on each row.
 
-Width is a **launch** value, not a compiled one (a request's selection depth
-varies), so the kernel walks the row in tiles of ``TILE`` twice: once over the
-candidates it writes and once over the candidates it compares against. Any width
-is served by the same module; a row wider than one tile costs more passes, and a
-row of a handful of candidates costs one.
+Neither the row count nor the candidate count is compiled in. The grid names the rows and the launch
+hands the width, so one module serves a request whatever top-k produced; the program walks the row in
+tiles of ``BLOCK`` and, for each element, counts the elements that precede it — the count is its rank,
+and writing at the rank is the permutation.
 """
 
 import triton
 import triton.language as tl
 
 
-@triton.jit
-def _pdl_prologue(PDL: tl.constexpr):
-    """Wait for the preceding grid, then release the next one."""
-    if PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
-
-
 @triton.jit(do_not_specialize=["rows", "width"])
 def _candidate_order_kernel(
-    values,
-    ids,
-    ordered_values,
-    ordered_ids,
+    values_ptr,
+    ids_ptr,
+    ordered_values_ptr,
+    ordered_ids_ptr,
     rows,
     width,
-    TILE: tl.constexpr,
-    PDL: tl.constexpr,
+    BLOCK: tl.constexpr,  # noqa: N803
 ):
-    """Write one row's candidates in ascending id order.
+    """Order one row's candidates by token id.
 
-    Grid: ``[rows]``. ``values``/``ordered_values`` share the values' element
-    type; ``ids``/``ordered_ids`` share the ids'.
+    ``values`` and ``ids`` are ``[rows, width]`` row-major, ``ordered_values`` and ``ordered_ids`` the
+    same shapes to write. ``rows`` is unused beyond naming the grid's extent and is kept because the
+    operator packs it; ``width`` is this row's candidate count. Grid: (rows,).
     """
-    _pdl_prologue(PDL)
     row = tl.program_id(0).to(tl.int64)
-    if row >= rows:
-        return
     base = row * width
-
-    index = tl.arange(0, TILE)
-    # The candidates are written at the rank their comparisons give them; the
-    # comparison pass below visits the same row tile by tile.
-    for write_start in range(0, width, TILE):
-        position = write_start + index
-        writing = position < width
-        candidate = tl.load(ids + base + position, mask=writing, other=0).to(tl.int64)
-        value = tl.load(values + base + position, mask=writing, other=0.0)
-
-        rank = tl.zeros([TILE], tl.int32)
-        for read_start in range(0, width, TILE):
-            other_position = read_start + index
-            reading = other_position < width
-            other = tl.load(ids + base + other_position, mask=reading, other=0).to(tl.int64)
-            before = other[None, :] < candidate[:, None]
-            # Equal ids are ordered by where they arrived: the earlier candidate
-            # keeps the lower rank, so the permutation is total.
-            tie = (other[None, :] == candidate[:, None]) & (
-                other_position[None, :] < position[:, None]
+    tiles = tl.cdiv(width, BLOCK)
+    for tile in range(tiles):
+        columns = tile * BLOCK + tl.arange(0, BLOCK)
+        inside = columns < width
+        values = tl.load(values_ptr + base + columns, mask=inside, other=0.0)
+        ids = tl.load(ids_ptr + base + columns, mask=inside, other=0)
+        rank = tl.zeros([BLOCK], tl.int32)
+        for other in range(tiles):
+            other_columns = other * BLOCK + tl.arange(0, BLOCK)
+            other_inside = other_columns < width
+            other_ids = tl.load(
+                ids_ptr + base + other_columns, mask=other_inside, other=0
             )
-            counted = (before | tie) & reading[None, :] & writing[:, None]
+            earlier_id = other_ids[None, :] < ids[:, None]
+            same_id_earlier = (other_ids[None, :] == ids[:, None]) & (
+                other_columns[None, :] < columns[:, None]
+            )
+            counted = (earlier_id | same_id_earlier) & (
+                other_inside[None, :] & inside[:, None]
+            )
             rank += tl.sum(counted.to(tl.int32), axis=1)
-
-        destination = base + rank.to(tl.int64)
-        tl.store(ordered_values + destination, value, mask=writing)
-        tl.store(ordered_ids + destination, candidate, mask=writing)
+        tl.store(ordered_values_ptr + base + rank, values, mask=inside)
+        tl.store(ordered_ids_ptr + base + rank, ids, mask=inside)

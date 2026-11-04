@@ -1163,3 +1163,287 @@ mod scores_tests {
         assert!(wide.rtol > narrow.rtol);
     }
 }
+
+/// One compilation of `vsa_compress_pooled`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct CompressPooledDescriptor {
+    /// Element type of the compressed rows: the attention's own, which the gate adds to.
+    pub dtype: DType,
+    /// Heads per row.
+    pub heads: u32,
+    /// Features per head: the width one program sums.
+    pub width: u32,
+    /// The bound on the key tiles one query tile's softmax reduces over: the deployment's own tile
+    /// count, and the reduction length its tolerance is written against.
+    pub max_tiles: u32,
+    /// Lanes one program holds for the weighted sum of features, rounded up to a power of two.
+    pub block: u32,
+    /// Whether the module was compiled for programmatic dependent launch.
+    pub pdl: bool,
+}
+
+impl CompressPooledDescriptor {
+    /// The descriptor of one pooled compression.
+    ///
+    /// The scores and the pooled values are FP32 and only the result narrows: `vsa_prepare_tiles`
+    /// pools in FP32 and the reference's softmax runs in FP32, so a descriptor naming a narrower
+    /// operand would describe a program that narrows before the softmax and biases every weight.
+    pub fn new(
+        dtype: DType,
+        heads: u32,
+        width: u32,
+        max_tiles: u32,
+        block: u32,
+        pdl: bool,
+    ) -> Self {
+        Self {
+            dtype,
+            heads,
+            width,
+            max_tiles,
+            block,
+            pdl,
+        }
+    }
+}
+
+impl fmt::Display for CompressPooledDescriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Key::new()
+            .field("dtype", self.dtype)
+            .field("heads", self.heads)
+            .field("width", self.width)
+            .field("max_tiles", self.max_tiles)
+            .field("block", self.block)
+            .field("pdl", self.pdl)
+            .finish(formatter)
+    }
+}
+
+/// The arguments of `vsa_compress_pooled`.
+#[derive(Clone, Copy)]
+pub struct CompressPooledArgs {
+    /// `[heads, query tiles, tiles]` FP32: the pooled similarities, in `vsa_scores`' layout.
+    pub scores: TensorView,
+    /// `[tiles, heads, width]` FP32: the pooled value rows, in `vsa_prepare_tiles`' layout.
+    pub values: TensorView,
+    /// `[tiles]` i32: the live rows of each key tile.
+    ///
+    /// A tile of no live rows is invisible to the softmax — its score is masked, not merely zeroed —
+    /// because a zeroed pooled value under a live score would still take weight and scale the sum
+    /// of the others down.
+    pub sizes: TensorView,
+    /// `[heads, query tiles, width]` in the descriptor's element type: each query tile's
+    /// tile-weighted mean of the pooled value rows, which `vsa_add_gated_tiles` gates and adds.
+    pub out: TensorView,
+}
+
+/// The compression branch of VSA: each query tile's softmax over the live key tiles weights their
+/// pooled values.
+///
+/// The reference (`uniserve/nn/attention/vsa/segments.py:466-479`) is
+/// `weights = scores.masked_fill(sizes <= 0, -inf).softmax(-1)` over the key tiles, then
+/// `compressed = weights @ pooled_value` in FP32 and one rounding to the rows' element type. Its
+/// result is per (head, query tile) and is the same for every row of the tile, which is why the
+/// output carries no row axis: the gate step broadcasts it.
+///
+/// Without this operator the sparse branch has no compression and a sparse checkpoint would have to
+/// be served as a different model — a dense masked softmax over every live tile — which is why the
+/// model refuses one until it exists.
+pub struct VsaCompressPooled;
+
+impl Op for VsaCompressPooled {
+    const NAME: &'static str = "vsa_compress_pooled";
+
+    type Descriptor = CompressPooledDescriptor;
+    type Args<'a> = CompressPooledArgs;
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let heads = u64::from(descriptor.heads);
+        let width = u64::from(descriptor.width);
+        if heads == 0 || width == 0 {
+            return Err(Error::argument(
+                Self::NAME,
+                "a compression needs at least one head of at least one feature".to_owned(),
+            ));
+        }
+        if !matches!(descriptor.dtype, DType::BF16 | DType::F16 | DType::F32) {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the compression is written as the attention's rows, not {}",
+                    descriptor.dtype
+                ),
+            ));
+        }
+        if args.scores.dtype != DType::F32 || args.values.dtype != DType::F32 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the pooled scores and values are FP32, the views say {} and {}",
+                    args.scores.dtype, args.values.dtype
+                ),
+            ));
+        }
+        args.scores.require_rank(Self::NAME, 3)?;
+        args.values.require_rank(Self::NAME, 3)?;
+        if args.scores.shape.dim(0) != heads || args.values.shape.dim(1) != heads {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the scores are [{}, _, _] and the values [_, {}, _], the descriptor's {heads} \
+                     heads",
+                    args.scores.shape.dim(0),
+                    args.values.shape.dim(1)
+                ),
+            ));
+        }
+        if args.values.shape.dim(2) != width {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the pooled values carry {} features, the descriptor's {width}",
+                    args.values.shape.dim(2)
+                ),
+            ));
+        }
+        let query_tiles = args.scores.shape.dim(1);
+        let tiles = args.scores.shape.dim(2);
+        if args.values.shape.dim(0) != tiles {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "{} key tiles of scores against {} of pooled values",
+                    tiles,
+                    args.values.shape.dim(0)
+                ),
+            ));
+        }
+        if tiles > u64::from(descriptor.max_tiles) {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "{tiles} key tiles beyond the {} this module was accepted for",
+                    descriptor.max_tiles
+                ),
+            ));
+        }
+        args.sizes.require_shape(Self::NAME, Shape::new(&[tiles]))?;
+        args.sizes.require_row(Self::NAME, DType::I32, tiles)?;
+        args.out
+            .require_shape(Self::NAME, Shape::new(&[heads, query_tiles, width]))?;
+        if args.out.dtype != descriptor.dtype {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the compression is {} and the view says {}",
+                    descriptor.dtype, args.out.dtype
+                ),
+            ));
+        }
+        // The gate step reads one contiguous `[heads, query tiles, width]` matrix, so this operator
+        // writes exactly that layout and no other.
+        if args.out.strides != crate::tensor::Strides::row_major(args.out.shape) {
+            return Err(Error::argument(
+                Self::NAME,
+                "the compression is written row-major".to_owned(),
+            ));
+        }
+        if u64::from(descriptor.block) < width.next_power_of_two() {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the descriptor's {} lanes cannot hold the {width}-feature sum",
+                    descriptor.block
+                ),
+            ));
+        }
+
+        let mut arguments = Arguments::new();
+        arguments
+            .view(args.scores)
+            .view(args.values)
+            .view(args.sizes)
+            .view(args.out)
+            .i32(query_tiles as i32)
+            .i32(tiles as i32)
+            .flag(descriptor.pdl);
+        // One program per (head, query tile): it reduces the key tiles and writes one row.
+        kernel.launch(
+            LaunchGrid::new([query_tiles, heads, 1])?,
+            &mut arguments,
+            stream,
+        )
+    }
+
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
+        let _ = stream;
+        CompressPooledArgs {
+            out: twins.shadow_of(args.out),
+            ..args
+        }
+    }
+
+    fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
+        // Two reductions in one program: the softmax over the key tiles and the weighted sum of the
+        // features, both accumulated in FP32 with one rounding to the rows' element type. The
+        // softmax's weights are a scale of positive terms and the sum is of bounded weights, so the
+        // bound is the standard one over the longer reduction — the tile bound — with FP32
+        // accumulation and the output's own rounding.
+        Tolerance::dot(
+            u64::from(descriptor.max_tiles.max(descriptor.width)),
+            DType::F32,
+            descriptor.dtype,
+        )
+    }
+}
+
+#[cfg(test)]
+mod compress_pooled_tests {
+    use super::*;
+
+    #[test]
+    fn the_key_names_the_geometry_the_tile_bound_and_the_lanes() {
+        let descriptor = CompressPooledDescriptor::new(DType::BF16, 56, 128, 4_096, 128, false);
+        assert_eq!(
+            descriptor.to_string(),
+            "dtype_bf16_heads_56_width_128_max_tiles_4096_block_128_pdl_false"
+        );
+    }
+
+    #[test]
+    fn the_bound_follows_the_tile_bound_and_the_output_rounding() {
+        let narrow = VsaCompressPooled::tolerance(&CompressPooledDescriptor::new(
+            DType::F32,
+            56,
+            128,
+            1_024,
+            128,
+            false,
+        ));
+        let wide = VsaCompressPooled::tolerance(&CompressPooledDescriptor::new(
+            DType::F32,
+            56,
+            128,
+            8_192,
+            128,
+            false,
+        ));
+        assert!(wide.rtol > narrow.rtol);
+        // The output's rounding is in the bound: a narrower result type cannot share it.
+        let narrowed = VsaCompressPooled::tolerance(&CompressPooledDescriptor::new(
+            DType::BF16,
+            56,
+            128,
+            1_024,
+            128,
+            false,
+        ));
+        assert!(narrowed.rtol > narrow.rtol);
+    }
+}

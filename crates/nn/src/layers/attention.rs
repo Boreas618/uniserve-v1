@@ -121,6 +121,14 @@ impl Attention {
         self.max_kv_len
     }
 
+    /// Whether this attention masks each query to its own past.
+    ///
+    /// The paged backend is always causal; the dense and FP32 backends state it at construction
+    /// and it is part of their descriptor, because a causal mask and a dense one are two programs.
+    pub const fn causal(&self) -> bool {
+        self.causal
+    }
+
     /// Dense attention over a packed sequence: the language encoder, a cross-attention, the video
     /// block's attention without the cache.
     ///
@@ -151,21 +159,25 @@ impl Attention {
 
     /// The FP32 dense attention of the `ref2va` audio encoder and the sparse compression branch:
     /// the same call, with cuBLASLt SGEMM and a softmax kernel inside the package.
+    ///
+    /// The FP32 paths read a whole sequence at once, so their mask is dense and carries no history
+    /// window; `causal` states the mask the model's attention declares, and the two are different
+    /// programs. The audio encoder's attention is causal.
     pub fn fp32(
         head_dim: u32,
         q_heads: u32,
         kv_heads: u32,
         max_seq_len: u32,
+        causal: bool,
         scale: f32,
     ) -> Result<Self> {
-        // The FP32 paths read a whole sequence at once, so their mask is dense.
         Self::dense_of(
             AttentionBackend::Fp32,
             head_dim,
             q_heads,
             kv_heads,
             max_seq_len,
-            false,
+            causal,
             None,
             scale,
         )
@@ -549,15 +561,7 @@ impl Attention {
             }
             return self.write_quantized(f, batch, planes, key, value);
         }
-        let descriptor = KvDescriptor {
-            dtype: key.dtype,
-            kv: planes.key.dtype,
-            page: self.page_size,
-            heads: self.kv_heads,
-            head_dim: self.head_dim,
-            tile: kv_tile(self.head_dim),
-            pdl: PDL,
-        };
+        let descriptor = self.write_descriptor(key.dtype, planes.key.dtype);
         let args = kv::Args {
             key,
             value,
@@ -585,15 +589,7 @@ impl Attention {
         key: TensorView,
         value: TensorView,
     ) -> Result<()> {
-        let descriptor = kv::QuantizeDescriptor {
-            dtype: key.dtype,
-            scale: DType::F32,
-            page: self.page_size,
-            heads: self.kv_heads,
-            head_dim: self.head_dim,
-            block: kv_tile(self.head_dim),
-            pdl: PDL,
-        };
+        let descriptor = self.quantize_descriptor(key.dtype);
         let rows = u64::from(self.kv_heads) * u64::from(self.head_dim);
         for (name, cache, scale, initialized, source) in [
             (
@@ -636,6 +632,91 @@ impl Attention {
         Ok(())
     }
 
+    /// Check that the cache's page table is the batch's: one row per sequence, whole i32 pages.
+    ///
+    /// The operator sees only the table, so a table of another rank or another row count would read
+    /// another batch's pages there and the operator could not say so; the batch's arity is known
+    /// here, and the refusal names it. This is the check the first decode run needed and did not
+    /// have: a table built as a vector surfaced as `paged_attention: expected 2 axes, found 1`.
+    pub fn check_page_table(&self, table: TensorView, sequences: u64) -> Result<()> {
+        if table.shape.rank() != 2 || table.shape.dim(0) != sequences {
+            return Err(Error::shape(
+                "Attention::attend",
+                format!(
+                    "the page table is {:?}, [{sequences}, pages] expected: one row per sequence of \
+                     this batch",
+                    table.shape.dims()
+                ),
+            ));
+        }
+        if table.dtype != DType::I32 {
+            return Err(Error::shape(
+                "Attention::attend",
+                format!("the page table is {} pages, not i32", table.dtype),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The descriptor one paged attention launches with.
+    ///
+    /// `phase` is the batch's — a prefill reads a whole sequence and a decode one token — and the
+    /// three element types are the query's, the cache plane's and the output's, because the program
+    /// is compiled for the combination. The window and the deployment's bound are the layer's: a
+    /// windowed attention and a full one are different programs, and `max_kv_len` is the reduction
+    /// length the 7.3 tolerance is written against.
+    pub fn descriptor(
+        &self,
+        phase: Phase,
+        query: DType,
+        key_value: DType,
+        output: DType,
+    ) -> Descriptor {
+        Descriptor {
+            phase,
+            query,
+            key_value,
+            output,
+            head_dim: self.head_dim,
+            page_size: self.page_size,
+            q_heads: self.q_heads,
+            kv_heads: self.kv_heads,
+            mask: Mask::Causal,
+            windowed: self.window.is_some(),
+            max_kv_len: self.max_kv_len,
+        }
+    }
+
+    /// The descriptor the cache write launches with: the projection's type and the plane's.
+    ///
+    /// Both are key fields and they differ in an E4M3 deployment, which is why the projection's own
+    /// dtype cannot stand in for the cache's.
+    pub fn write_descriptor(&self, projection: DType, cache: DType) -> KvDescriptor {
+        KvDescriptor {
+            dtype: projection,
+            kv: cache,
+            page: self.page_size,
+            heads: self.kv_heads,
+            head_dim: self.head_dim,
+            tile: kv_tile(self.head_dim),
+            pdl: PDL,
+        }
+    }
+
+    /// The descriptor the quantizing cache write launches with: the projection's type, one plane's
+    /// page scales and the geometry both share.
+    pub fn quantize_descriptor(&self, projection: DType) -> kv::QuantizeDescriptor {
+        kv::QuantizeDescriptor {
+            dtype: projection,
+            scale: DType::F32,
+            page: self.page_size,
+            heads: self.kv_heads,
+            head_dim: self.head_dim,
+            block: kv_tile(self.head_dim),
+            pdl: PDL,
+        }
+    }
+
     /// Read the cache and write this batch's attended output.
     #[allow(
         clippy::too_many_arguments,
@@ -652,6 +733,9 @@ impl Attention {
         out: TensorView,
         workspace: TensorView,
     ) -> Result<()> {
+        // The batch's own parts are read by pointer arithmetic inside the programs, so they are
+        // checked against each other once here, before any of them is addressed.
+        batch.check()?;
         let planes = cache.planes(group, 0)?;
         let group_view = cache.group(group)?;
         if group_view.page_size != self.page_size || batch.page_size != self.page_size {
@@ -688,19 +772,12 @@ impl Attention {
                 ));
             }
         }
-        let descriptor = Descriptor {
-            phase,
-            query: query.dtype,
-            key_value: planes.key.dtype,
-            output: out.dtype,
-            head_dim: self.head_dim,
-            page_size: self.page_size,
-            q_heads: self.q_heads,
-            kv_heads: self.kv_heads,
-            mask: Mask::Causal,
-            windowed: self.window.is_some(),
-            max_kv_len: self.max_kv_len,
-        };
+        // The page table is the cache's and it carries one row per sequence of this batch.
+        self.check_page_table(
+            group_view.block_tables,
+            batch.query_offsets.numel().saturating_sub(1),
+        )?;
+        let descriptor = self.descriptor(phase, query.dtype, planes.key.dtype, out.dtype);
         // An FP8 plane stores each page divided by its own FP32 scale; the plane's element type
         // decides whether the call carries one, so a mismatch in either direction is an argument
         // error rather than a silently unscaled read. The scales are this layer's, so two layers of
@@ -774,13 +851,79 @@ mod tests {
     }
 
     #[test]
+    fn a_page_table_is_one_i32_row_per_sequence_of_its_batch() {
+        let attention = Attention::paged(128, 32, 4, 64, 40_960, None, 0.088).unwrap();
+        let table = |dtype: DType, shape: &[u64]| {
+            TensorView::new(DevicePtr::new(0x2_0000), dtype, Shape::new(shape))
+        };
+        assert!(
+            attention
+                .check_page_table(table(DType::I32, &[15, 4]), 15)
+                .is_ok()
+        );
+        // A table built as a vector: the shape a harness gets wrong, named with the batch's own
+        // sequence count rather than as the operator's axis count.
+        let error = attention
+            .check_page_table(table(DType::I32, &[60]), 15)
+            .expect_err("a page table of rank one");
+        assert!(
+            format!("{error}").contains("one row per sequence"),
+            "{error}"
+        );
+        // Another batch's table, and pages that are not whole i32 words.
+        assert!(
+            attention
+                .check_page_table(table(DType::I32, &[8, 4]), 15)
+                .is_err()
+        );
+        assert!(
+            attention
+                .check_page_table(table(DType::BF16, &[15, 4]), 15)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn the_cache_writes_key_the_plane_type_and_the_reads_key_the_phase() {
+        let attention = Attention::paged(128, 32, 4, 64, 40_960, None, 0.088).unwrap();
+        // A cache of the projection's own type and an E4M3 cache are two programs, because the
+        // quantizing write applies a page scale the scatter never sees.
+        assert_ne!(
+            attention
+                .write_descriptor(DType::BF16, DType::BF16)
+                .to_string(),
+            attention
+                .write_descriptor(DType::BF16, DType::F8E4M3)
+                .to_string()
+        );
+        // A prefill reads a whole sequence and a decode one token: one attention program each.
+        assert_ne!(
+            attention
+                .descriptor(Phase::Prefill, DType::BF16, DType::BF16, DType::BF16)
+                .to_string(),
+            attention
+                .descriptor(Phase::Decode, DType::BF16, DType::BF16, DType::BF16)
+                .to_string()
+        );
+    }
+
+    #[test]
     fn a_dense_layer_states_its_mask_and_its_bound() {
         let encoder = Attention::dense(128, 32, 4, 8_192, true, None, 0.088).unwrap();
         assert_eq!(encoder.backend(), AttentionBackend::Dense);
         assert_eq!(encoder.max_kv_len(), 8_192);
-        // The FP32 paths read a whole sequence at once: dense mask, no window.
-        let audio = Attention::fp32(64, 8, 8, 4_096, 0.125).unwrap();
+        assert!(encoder.causal());
+        // The FP32 paths read a whole sequence at once: dense mask, no window. The audio encoder's
+        // attention is causal and the sparse compression branch's is not, so the flag is the
+        // model's to state, and the two are different descriptors.
+        let audio = Attention::fp32(64, 8, 8, 4_096, true, 0.125).unwrap();
         assert_eq!(audio.backend(), AttentionBackend::Fp32);
+        assert!(audio.causal());
+        assert!(
+            !Attention::fp32(64, 8, 8, 4_096, false, 0.125)
+                .unwrap()
+                .causal()
+        );
         // A history window reads the causal mask only.
         assert!(Attention::dense(128, 32, 4, 8_192, false, Some(1_024), 0.088).is_err());
         assert!(Attention::dense(0, 32, 4, 8_192, true, None, 0.088).is_err());

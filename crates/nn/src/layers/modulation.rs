@@ -205,7 +205,10 @@ impl GatedResidual {
 
     /// Fold `update` into `hidden`, both `[rows, width]`; `hidden` is written in place.
     ///
-    /// `row_indices` is `[rows]` and selects the gate row each activation row multiplies by.
+    /// `row_indices` is `[rows]` and selects the gate row each activation row multiplies by. The row
+    /// count is the launch's, not the descriptor's: a clip's token count changes with every request,
+    /// so a descriptor carrying it would be a kernel per clip length (specs/worker.md 7.3's extent
+    /// rule), and the operator reads it from `hidden` and packs it as the launch's last scalar.
     pub fn forward(
         &self,
         f: &Forward,
@@ -241,7 +244,6 @@ impl GatedResidual {
                     "a row wider than a descriptor holds".to_owned(),
                 )
             })?,
-            elements: rows * width,
             gate_stride: self.gate.view().strides.get(0),
         };
         let args = modulation::GatedResidualArgs {
