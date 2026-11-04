@@ -1637,6 +1637,15 @@ impl MainProcess {
                 return self.revert(generation, failure);
             }
         }
+        // The record moves before the warmup: probation begins the moment every device serves the
+        // new generation, and the warmup is the last part of the cut-over rather than of the
+        // generation that served before it. So a warmup that fails is a revert of a generation that
+        // *served* - a reverse switchover on every device - and not a discard of one that never
+        // cut over, which is what the phase decides, and it cannot be asked before this line.
+        self.update.switchover(generation, Instant::now())?;
+        self.retired =
+            std::mem::replace(&mut self.generations, std::mem::take(&mut self.prepared));
+
         // §4.5: the first request served on a generation must not pay for a capture, so every
         // captured bucket of the generation that just took over runs once, here, between batches.
         // A switchover later in the epoch warms the buckets the new kernel programs changed; the
@@ -1658,11 +1667,6 @@ impl MainProcess {
             }
         }
 
-        // The state machine records the cut-over only when every device serves the new generation,
-        // and the process's record of what serves follows it.
-        self.update.switchover(generation, Instant::now())?;
-        self.retired =
-            std::mem::replace(&mut self.generations, std::mem::take(&mut self.prepared));
         Ok(ProgramStatus::Switched { generation })
     }
 
