@@ -1,25 +1,35 @@
 //! `uniserve`: the one executable of every UniServe process.
 //!
-//! `main` parses the command line and runs its command. `serve` installs
-//! tracing and builds the Tokio runtime; `async_main` hands the resolved
-//! configuration to `daemon::serve` together with a cancellation token that
-//! fires on Ctrl-C or SIGTERM. `engine` runs the engine process the leader
-//! daemon starts. `worker` and `storage` run before any thread exists: a worker loads the Python runtime on the main thread,
-//! and a Storage Server started with `--daemon` forks.
+//! `main` parses the command line and runs its command, one module each:
+//! `serve` (a node's daemon, and on the leader the application), `frontend`
+//! (the deployment's application process), `engine` (a node's main process
+//! for one epoch), `storage` (a host's Storage Server), `program-server` (a
+//! host's Program Server) and `worker` (one worker of the Python runtime the
+//! daemon still starts). `serve` installs tracing and builds the Tokio
+//! runtime; its module hands the resolved configuration to `daemon::serve`
+//! with a cancellation token that fires on Ctrl-C or SIGTERM. `worker` and
+//! `storage` run before any thread exists: a worker loads the Python runtime
+//! on the main thread, and a Storage Server started with `--daemon` forks.
+//!
+//! The runtime, the cancellation token and the supervision lifeline are the
+//! executable's own: every command that starts threads takes them from here.
 
 mod cli;
+mod engine;
+mod frontend;
 mod logging;
+mod program_server;
+mod serve;
 mod storage;
 mod worker;
 
 use std::env;
+use std::ffi::OsString;
 
 use anyhow::{Context, Result};
+use clap::Parser as _;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
-
-use clap::Parser as _;
-use daemon::options;
 
 use crate::cli::{Cli, Command};
 
@@ -65,7 +75,7 @@ fn tokio_worker_threads() -> Option<usize> {
 /// Must be called from within a Tokio runtime, since it spawns the listening
 /// task. A handler that fails to install is logged and never fires, leaving
 /// the other signal able to cancel the token.
-fn shutdown_signal() -> CancellationToken {
+pub(crate) fn shutdown_signal() -> CancellationToken {
     let token = CancellationToken::new();
     let shutdown = token.clone();
 
@@ -104,44 +114,38 @@ fn shutdown_signal() -> CancellationToken {
 fn main() -> Result<std::process::ExitCode> {
     let lifeline = take_lifeline();
     let cli = Cli::parse();
-    let args = match cli.command {
-        Command::Serve(args) => args,
-        Command::Engine(engine) => {
-            follow_lifeline(lifeline);
-            logging::init_tracing(
-                "Engine",
-                cli.log.log_level.as_deref(),
-                cli.log.log_level_http.as_deref(),
-            );
-            engine::run_engine(&engine.requests, &engine.processes, engine.engine)?;
-            return Ok(std::process::ExitCode::SUCCESS);
-        }
+    match cli.command {
+        Command::Serve(args) => serve::run(*args, &cli.log),
+        Command::Frontend(args) => frontend::run(*args, &cli.log),
+        Command::Engine(args) => engine::run(&args, lifeline, &cli.log),
         Command::Worker { arguments } => {
             follow_lifeline(lifeline);
             worker::run(arguments)
         }
-        Command::Storage(args) => return Ok(storage::run(*args)),
-    };
-    if let Some(descriptor) = args.predecessor {
-        logging::init_tracing(
-            "Daemon",
-            cli.log.log_level.as_deref(),
-            cli.log.log_level_http.as_deref(),
-        );
-        runtime()?.block_on(async move {
-            daemon::restart::take_over(descriptor, shutdown_signal()).await
-        })?;
-        return Ok(std::process::ExitCode::SUCCESS);
+        Command::Storage(args) => Ok(storage::run(*args)),
+        Command::External(arguments) => run_external(&arguments),
     }
+}
 
-    logging::init_tracing(
-        "Daemon",
-        cli.log.log_level.as_deref(),
-        cli.log.log_level_http.as_deref(),
-    );
-
-    runtime()?.block_on(async_main(*args))?;
-    Ok(std::process::ExitCode::SUCCESS)
+/// Runs a command whose parser another crate owns, with the arguments the
+/// top-level parser did not claim.
+///
+/// The Program Server's command line is the `program_server` crate's
+/// (`command`, `options`, `run`), so this executable mounts it rather than
+/// restating its surface. An unknown command is an error like any other.
+fn run_external(arguments: &[OsString]) -> Result<std::process::ExitCode> {
+    let Some(name) = arguments.first().and_then(|name| name.to_str()) else {
+        anyhow::bail!("missing command");
+    };
+    match name {
+        "program-server" => {
+            let matches = program_server::command().get_matches_from(arguments);
+            let options = program_server::options(&matches).map_err(anyhow::Error::new)?;
+            program_server::run(options).map_err(anyhow::Error::new)?;
+            Ok(std::process::ExitCode::SUCCESS)
+        }
+        other => anyhow::bail!("unknown command {other}"),
+    }
 }
 
 /// The lifeline this process inherited from the daemon that supervises it
@@ -164,7 +168,7 @@ fn take_lifeline() -> Option<i32> {
 /// Ends this process once its daemon is gone: the end of the lifeline's
 /// pipe arrives once the daemon, and every successor a hot restart handed
 /// its processes to, ended, however they ended.
-fn follow_lifeline(lifeline: Option<i32>) {
+pub(crate) fn follow_lifeline(lifeline: Option<i32>) {
     let Some(descriptor) = lifeline else {
         return;
     };
@@ -194,7 +198,7 @@ fn follow_lifeline(lifeline: Option<i32>) {
 }
 
 /// The daemon's Tokio runtime.
-fn runtime() -> Result<tokio::runtime::Runtime> {
+pub(crate) fn runtime() -> Result<tokio::runtime::Runtime> {
     let mut runtime = tokio::runtime::Builder::new_multi_thread();
     runtime.enable_all();
     // Chat-template rendering runs on Tokio's blocking pool. Complex model
@@ -204,25 +208,6 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
         runtime.worker_threads(worker_threads);
     }
     runtime.build().context("failed to build Tokio runtime")
-}
-
-/// Serves the configuration `args` resolve until Ctrl-C or SIGTERM.
-async fn async_main(args: options::ServeArgs) -> Result<()> {
-    let (config, stated) = args.resolve()?;
-    // A model-less leader serves its admin API until a deployment is
-    // configured. Followers join the leader without loading a model.
-    if config.leads() && config.model.is_none() {
-        info!(
-            host = %config.server_config.host,
-            port = config.server_config.port,
-            "serving no deployment until PUT /admin/config"
-        );
-        return daemon::node(config.server_config, shutdown_signal()).await;
-    }
-    info!(model = %config.model(),
-        resident_requests = config.max_running_requests,
-        worker_executable = %config.worker_config.executable.display(), "resolved serving options");
-    daemon::serve(config, stated, shutdown_signal()).await
 }
 
 #[cfg(all(test, target_os = "linux"))]

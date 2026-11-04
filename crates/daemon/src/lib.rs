@@ -28,14 +28,15 @@
 //!   daemon.
 
 pub mod engine;
+pub mod epoch;
 pub mod experts;
 pub mod http;
 pub mod input;
 mod interference;
 mod leader;
 pub mod metrics;
-pub mod migration;
 pub mod model;
+pub mod migration;
 pub mod openai;
 pub mod options;
 pub mod output;
@@ -44,8 +45,11 @@ pub mod restart;
 pub mod supervision;
 #[cfg(test)]
 pub(crate) mod test_support;
-pub mod tokenizer;
 pub mod worlds;
+
+// The application layer's lowest modules are `crates/frontend`'s while the
+// application still serves inside the daemon (delivery item 2, stage A).
+pub use frontend::tokenizer;
 
 pub use crate::http::{node, serve};
 pub use crate::leader::{Leader, Task};

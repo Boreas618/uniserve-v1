@@ -24,13 +24,15 @@ use models::diffusion_gemma::DiffusionGemmaProfile;
 use models::omni::bagel::BagelProfile;
 use models::omni::sensenova::SenseNovaProfile;
 
-use crate::model::assets::{
+use frontend::model::assets::{
     GenerationConfig, HfTokenizerConfig, ResolvedModelFiles, load_generation_config,
     load_model_config, load_tokenizer_config, read_json,
 };
-use crate::tokenizer::HuggingFaceTokenizer;
+use frontend::tokenizer::HuggingFaceTokenizer;
 
-pub mod assets;
+/// The checkpoint's files and their JSON metadata are the frontend's
+/// (`frontend::model::assets`): both processes read the same checkpoint.
+pub use frontend::model::assets;
 
 /// Model-provided sampling defaults. `None` remains distinct from an explicit zero.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -332,7 +334,7 @@ mod tests {
     use super::{BagelProfile, ModelConfig, ModelDescription, ModelParameters};
     use crate::model::assets::ResolvedModelFiles;
     use crate::model::assets::checkpoint::bf16_safetensors;
-    use crate::tokenizer::HuggingFaceTokenizer;
+    use frontend::tokenizer::HuggingFaceTokenizer;
     use models::omni::OmniProfile as _;
     use models::omni::sensenova::SenseNovaProfile;
 

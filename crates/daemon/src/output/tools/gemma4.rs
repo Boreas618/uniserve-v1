@@ -90,6 +90,66 @@ enum Mode {
 }
 
 impl Gemma4ToolParser {
+    /// The parser's state, as `Gemma4ToolCall`'s fields hold it.
+    fn state(&self) -> proto::handoff::Gemma4ToolCall {
+        let (phase, in_string, offset) = match &self.mode {
+            Mode::Text => (proto::handoff::gemma4_tool_call::Phase::Gemma4ToolPhaseText, false, 0),
+            Mode::Call(scan) => {
+                let (phase, in_string) = match scan.phase {
+                    CallPhase::Prefix => {
+                        (proto::handoff::gemma4_tool_call::Phase::Gemma4ToolPhasePrefix, false)
+                    }
+                    CallPhase::Name => {
+                        (proto::handoff::gemma4_tool_call::Phase::Gemma4ToolPhaseName, false)
+                    }
+                    CallPhase::Arguments { in_string } => (
+                        proto::handoff::gemma4_tool_call::Phase::Gemma4ToolPhaseArguments,
+                        in_string,
+                    ),
+                };
+                (phase, in_string, scan.offset)
+            }
+        };
+        proto::handoff::Gemma4ToolCall {
+            buffer: self.buffer.clone(),
+            published_calls: self.published_calls as u64,
+            phase: phase as i32,
+            in_string,
+            offset: offset as u64,
+        }
+    }
+
+    /// Takes over a state this parser produced (`Gemma4ToolParser::state`).
+    fn resume(&mut self, state: &proto::handoff::Gemma4ToolCall) {
+        self.buffer.clone_from(&state.buffer);
+        self.published_calls = state.published_calls as usize;
+        let phase = proto::handoff::gemma4_tool_call::Phase::try_from(state.phase)
+            .unwrap_or(proto::handoff::gemma4_tool_call::Phase::Gemma4ToolPhaseText);
+        self.mode = match phase {
+            proto::handoff::gemma4_tool_call::Phase::Gemma4ToolPhaseText => Mode::Text,
+            proto::handoff::gemma4_tool_call::Phase::Gemma4ToolPhasePrefix => {
+                Mode::Call(CallScan {
+                    phase: CallPhase::Prefix,
+                    offset: state.offset as usize,
+                })
+            }
+            proto::handoff::gemma4_tool_call::Phase::Gemma4ToolPhaseName => {
+                Mode::Call(CallScan {
+                    phase: CallPhase::Name,
+                    offset: state.offset as usize,
+                })
+            }
+            proto::handoff::gemma4_tool_call::Phase::Gemma4ToolPhaseArguments => {
+                Mode::Call(CallScan {
+                    phase: CallPhase::Arguments {
+                        in_string: state.in_string,
+                    },
+                    offset: state.offset as usize,
+                })
+            }
+        };
+    }
+
     /// Creates a parser in text mode with no published calls.
     pub fn new() -> Self {
         Self::default()
@@ -124,6 +184,16 @@ impl Gemma4ToolParser {
 }
 
 impl ToolParser for Gemma4ToolParser {
+    fn state(&self) -> Option<proto::handoff::tool_stage::Parser> {
+        Some(proto::handoff::tool_stage::Parser::Gemma4(self.state()))
+    }
+
+    fn resume(&mut self, state: &proto::handoff::tool_stage::Parser) {
+        if let proto::handoff::tool_stage::Parser::Gemma4(gemma4) = state {
+            self.resume(gemma4);
+        }
+    }
+
     /// Parses one text chunk into an existing output accumulator.
     ///
     /// Malformed calls become plain text instead of failing. Fails with
