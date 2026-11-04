@@ -30,7 +30,7 @@ use axum::http::header;
 use axum::response::sse::Event;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
-use axum::{Extension, Json, Router};
+use axum::{Extension, Router};
 use futures::{Stream, StreamExt as _, pin_mut};
 use itertools::Itertools as _;
 use proto::handoff;
@@ -133,6 +133,7 @@ async fn chat_completions(
         } = output;
         let request_id = response.request_id.clone();
         let parser = processor.parser().clone();
+        let sink = crate::openai::chat_completions::ChatStreamEmitter::new(&response, created);
         let inputs = crate::output::run::ChatOutputInputs {
             tokenizer,
             prompt_token_ids,
@@ -149,6 +150,7 @@ async fn chat_completions(
             inputs,
             events,
             outcome,
+            sink,
         ) {
             Ok(run) => run,
             Err(error) => {
@@ -181,21 +183,72 @@ async fn chat_completions(
         crate::http::stream::attach(&mut response, body);
         response
     } else {
-        let serve_stream = match engine
-            .generate(request)
+        let (events, output, compile_us, outcome) = match engine
+            .generate_handed(request)
             .instrument(request_span.clone())
             .await
         {
-            Ok(stream) => stream,
+            Ok(parts) => parts,
             Err(error) => return ApiError::from(error).into_response(),
         };
-        match collect_chat_completion(serve_stream, response, created)
-            .instrument(request_span)
-            .await
-        {
-            Ok(response) => Json(response).into_response(),
-            Err(error) => error.into_response(),
-        }
+        let crate::output::OutputParams {
+            tokenizer,
+            prompt_token_ids,
+            decode,
+            prompt_logprobs,
+            logprobs,
+            processor,
+        } = output;
+        let request_id = response.request_id.clone();
+        let parser = processor.parser().clone();
+        let sink = crate::output::run::ChatBodySink::new(&response, created);
+        let inputs = crate::output::run::ChatOutputInputs {
+            tokenizer,
+            prompt_token_ids,
+            decode,
+            prompt_logprobs,
+            logprobs,
+            processor,
+            parser,
+            context: response,
+        };
+        let run = match crate::output::run::GenerationRun::new(
+            request_id.clone(),
+            compile_us,
+            inputs,
+            events,
+            outcome,
+            sink,
+        ) {
+            Ok(run) => run,
+            Err(error) => {
+                return ApiError::from(crate::output::OutputError {
+                    request_id,
+                    source: error.into(),
+                })
+                .into_response();
+            }
+        };
+        // The response registers before its body computes, so a hot restart
+        // pauses it at its next engine event boundary and the successor
+        // collects the rest (design §7.5.1).
+        let registration = handoff.register();
+        let stream = crate::http::stream::ResponseStream::start(Box::new(run), false);
+        let Some(body) = crate::http::stream::HandedBody::new(
+            stream,
+            Some(registration),
+            request_id.clone(),
+        ) else {
+            return ApiError::server_error("the response cannot be handed over".to_string())
+                .into_response();
+        };
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::empty())
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        crate::http::stream::attach(&mut response, body);
+        response
     }
 }
 
@@ -310,17 +363,31 @@ pub async fn collect_chat_completion(
     created: u64,
 ) -> Result<ChatCompletionResponse, ApiError> {
     // Usage is part of every non-streaming response.
+    let collected = collect_chat_events(stream).await?;
+    chat_response(collected, &context, created)
+}
+
+/// The non-streaming response of one collected request.
+///
+/// # Errors
+///
+/// Fails when the request asked for logprobs generation did not return, or
+/// when a logprob cannot be converted.
+pub(crate) fn chat_response(
+    collected: CollectedChatOutput,
+    context: &ChatResponseContext,
+    created: u64,
+) -> Result<ChatCompletionResponse, ApiError> {
     let ChatResponseContext {
         request_id,
         response_model,
-        include_usage: _,
         requested_logprobs,
         include_prompt_logprobs,
         include_reasoning,
         return_token_ids,
         return_tokens_as_token_ids,
-    } = context;
-    let collected = collect_chat_events(stream).await?;
+        ..
+    } = context.clone();
     let CollectedChatOutput {
         message,
         prompt_token_ids,
@@ -409,7 +476,7 @@ pub async fn collect_chat_completion(
 
 /// Everything `collect_chat_events` accumulates from one request's stream.
 #[derive(Debug, Clone, PartialEq)]
-struct CollectedChatOutput {
+pub(crate) struct CollectedChatOutput {
     message: AssistantMessage,
     prompt_token_ids: Vec<u32>,
     prompt_logprobs: Option<crate::output::text::DecodedPromptLogprobs>,
@@ -425,6 +492,235 @@ struct CollectedChatOutput {
     usage: crate::output::RequestUsage,
 }
 
+/// One non-streaming chat response, collected from the request's outputs.
+///
+/// The closed content blocks and tool calls carry the complete message, so
+/// the deltas inside them are skipped. A hot restart hands this stage over
+/// too (`handoff.ChatCollection`, design §7.5.1 step 3): the successor goes on
+/// collecting from where the predecessor stopped and writes the one body the
+/// response has.
+#[derive(Default)]
+pub(crate) struct ChatCollector {
+    message: AssistantMessage,
+    prompt_token_ids: Vec<u32>,
+    prompt_logprobs: Option<crate::output::text::DecodedPromptLogprobs>,
+    /// Output logprobs concatenated across `TokenDelta` updates; `None` when
+    /// no update carried any.
+    logprobs: Option<DecodedLogprobs>,
+    token_ids: Vec<u32>,
+    images: Vec<crate::openai::protocol::ContentPart>,
+    /// `ImageStep` counts per completed image, in completion order. Images
+    /// that began but never completed are not listed.
+    image_step_counts: HashMap<u32, u32>,
+    completed_image_ids: Vec<u32>,
+    finished: Option<(FinishReason, crate::output::RequestUsage)>,
+}
+
+impl ChatCollector {
+    /// A collector before any output.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Folds one output into the collected response.
+    ///
+    /// # Errors
+    ///
+    /// Fails as the response does: a rejected or failed request.
+    pub(crate) fn push(&mut self, output: &RequestOutput) -> Result<(), ApiError> {
+        match output {
+            RequestOutput::Accepted(prompt) => {
+                self.prompt_token_ids = prompt.token_ids.to_vec();
+                self.prompt_logprobs = prompt.logprobs.clone();
+            }
+            RequestOutput::TokenDelta {
+                token_ids,
+                logprobs,
+            } => {
+                self.token_ids.extend(token_ids.iter().copied());
+                if let Some(delta_logprobs) = logprobs {
+                    self.logprobs
+                        .get_or_insert_with(|| DecodedLogprobs {
+                            positions: Vec::new(),
+                        })
+                        .positions
+                        .extend(delta_logprobs.positions.iter().cloned());
+                }
+            }
+            RequestOutput::OutputBlockEnd { block, .. } => self.message.push_block(block.clone()),
+            RequestOutput::ToolCallEnd { call, .. } => {
+                self.message
+                    .push_block(AssistantContentBlock::ToolCall(call.clone()));
+            }
+            RequestOutput::ImageStep { image_id } => {
+                *self.image_step_counts.entry(*image_id).or_default() += 1;
+            }
+            RequestOutput::ImageDone(image) => {
+                self.image_step_counts.entry(image.image_id).or_default();
+                self.completed_image_ids.push(image.image_id);
+                self.images.push(image_content_part(image.png_base64.clone()));
+            }
+            RequestOutput::Finished { reason, usage } => {
+                self.finished = Some((reason.clone(), usage.clone()));
+            }
+            RequestOutput::Rejected { kind, message } => {
+                return Err(ApiError::rejected(*kind, message.clone()));
+            }
+            RequestOutput::Failed { message } => {
+                // The failure detail is logged but not returned to the client.
+                error!(%message, "chat completion failed");
+                bail_server_error!("Internal server error");
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Whether the request's terminal output arrived.
+    pub(crate) fn done(&self) -> bool {
+        self.finished.is_some()
+    }
+
+    /// The collected response, once its terminal output arrived.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the stream ended before the terminal output.
+    pub(crate) fn collected(&self) -> Result<CollectedChatOutput, ApiError> {
+        let Some((reason, usage)) = self.finished.clone() else {
+            return Err(server_error!(
+                "chat completion stream closed before terminal finish event"
+            ));
+        };
+        Ok(CollectedChatOutput {
+            message: self.message.clone(),
+            prompt_token_ids: self.prompt_token_ids.clone(),
+            prompt_logprobs: self.prompt_logprobs.clone(),
+            logprobs: self.logprobs.clone(),
+            token_ids: self.token_ids.clone(),
+            images: self.images.clone(),
+            image_steps_per_image: self
+                .completed_image_ids
+                .iter()
+                .map(|image_id| {
+                    self.image_step_counts
+                        .get(image_id)
+                        .copied()
+                        .unwrap_or_default()
+                })
+                .collect(),
+            reason,
+            usage,
+        })
+    }
+
+    /// The collector's state, for the process that goes on collecting after a
+    /// hot restart (design §7.5.1 step 3).
+    pub(crate) fn state(&self) -> handoff::ChatCollection {
+        let finish_reason = self
+            .finished
+            .as_ref()
+            .map(|(reason, _)| reason.as_str().to_owned())
+            .unwrap_or_default();
+        handoff::ChatCollection {
+            blocks: self
+                .message
+                .content
+                .iter()
+                .map(|block| match block {
+                    AssistantContentBlock::Text { text } => handoff::AssistantBlock {
+                        block: Some(handoff::assistant_block::Block::Text(text.clone())),
+                    },
+                    AssistantContentBlock::Reasoning { text } => handoff::AssistantBlock {
+                        block: Some(handoff::assistant_block::Block::Reasoning(text.clone())),
+                    },
+                    AssistantContentBlock::ToolCall(call) => handoff::AssistantBlock {
+                        block: Some(handoff::assistant_block::Block::ToolCall(handoff::ToolCall {
+                            id: call.id.clone(),
+                            name: call.name.clone(),
+                            arguments: call.arguments.clone(),
+                        })),
+                    },
+                })
+                .collect(),
+            prompt_token_ids: self.prompt_token_ids.clone(),
+            prompt_logprobs: None,
+            logprobs: None,
+            token_ids: self.token_ids.clone(),
+            images: self
+                .images
+                .iter()
+                .map(|part| match part {
+                    crate::openai::protocol::ContentPart::ImageUrl { image_url, .. } => {
+                        image_url.url.clone()
+                    }
+                    other => format!("{other:?}"),
+                })
+                .collect(),
+            image_steps_per_image: self
+                .completed_image_ids
+                .iter()
+                .map(|image_id| {
+                    self.image_step_counts
+                        .get(image_id)
+                        .copied()
+                        .unwrap_or_default()
+                })
+                .collect(),
+            finish_reason,
+            usage: self.finished.as_ref().map(|(_, usage)| handoff::Usage {
+                prompt_tokens: usage.prompt_tokens,
+                output_tokens: usage.output_tokens,
+                image_count: usage.image_count,
+                image_steps: usage.image_steps,
+                image_steps_per_image: Vec::new(),
+            }),
+            stop_reason: None,
+        }
+    }
+
+    /// Takes over a state this collector produced.
+    pub(crate) fn resume(&mut self, state: &handoff::ChatCollection) {
+        let mut message = AssistantMessage::default();
+        for block in &state.blocks {
+            match block.block.as_ref() {
+                Some(handoff::assistant_block::Block::Text(text)) => {
+                    message.push_block(AssistantContentBlock::Text { text: text.clone() });
+                }
+                Some(handoff::assistant_block::Block::Reasoning(text)) => {
+                    message.push_block(AssistantContentBlock::Reasoning { text: text.clone() });
+                }
+                Some(handoff::assistant_block::Block::ToolCall(call)) => {
+                    message.push_block(AssistantContentBlock::ToolCall(
+                        crate::output::chat::AssistantToolCall {
+                            id: call.id.clone(),
+                            name: call.name.clone(),
+                            arguments: call.arguments.clone(),
+                        },
+                    ));
+                }
+                None => {}
+            }
+        }
+        self.message = message;
+        self.prompt_token_ids.clone_from(&state.prompt_token_ids);
+        self.token_ids.clone_from(&state.token_ids);
+        self.images = state
+            .images
+            .iter()
+            .map(|url| image_content_part(url.clone()))
+            .collect();
+        self.image_step_counts = state
+            .image_steps_per_image
+            .iter()
+            .enumerate()
+            .map(|(index, steps)| (index as u32, *steps))
+            .collect();
+        self.completed_image_ids = (0..state.images.len() as u32).collect();
+        self.finished = None;
+    }
+}
+
 /// Collects semantic serving events into one non-streaming chat response payload.
 ///
 /// The closed content blocks and tool calls carry the complete message, so
@@ -433,74 +729,10 @@ async fn collect_chat_events(
     stream: impl Stream<Item = Result<RequestOutput, crate::output::OutputError>> + Send,
 ) -> Result<CollectedChatOutput, ApiError> {
     pin_mut!(stream);
-    let mut message = AssistantMessage::default();
-    let mut prompt_token_ids = Vec::new();
-    let mut prompt_logprobs = None;
-    let mut logprobs: Option<DecodedLogprobs> = None;
-    let mut token_ids = Vec::new();
-    let mut images = Vec::new();
-    let mut image_step_counts = HashMap::<u32, u32>::new();
-    let mut completed_image_ids = Vec::<u32>::new();
-
+    let mut collector = ChatCollector::new();
     while let Some(next) = stream.next().await {
         match next {
-            Ok(RequestOutput::Accepted(prompt)) => {
-                prompt_token_ids = prompt.token_ids.to_vec();
-                prompt_logprobs = prompt.logprobs;
-            }
-            Ok(RequestOutput::TokenDelta {
-                token_ids: delta_token_ids,
-                logprobs: delta_logprobs,
-            }) => {
-                token_ids.extend(delta_token_ids);
-                if let Some(mut delta_logprobs) = delta_logprobs {
-                    logprobs
-                        .get_or_insert_with(|| DecodedLogprobs {
-                            positions: Vec::new(),
-                        })
-                        .positions
-                        .append(&mut delta_logprobs.positions);
-                }
-            }
-            Ok(RequestOutput::OutputBlockEnd { block, .. }) => message.push_block(block),
-            Ok(RequestOutput::ToolCallEnd { call, .. }) => {
-                message.push_block(AssistantContentBlock::ToolCall(call));
-            }
-            Ok(RequestOutput::ImageStep { image_id }) => {
-                *image_step_counts.entry(image_id).or_default() += 1;
-            }
-            Ok(RequestOutput::ImageDone(image)) => {
-                image_step_counts.entry(image.image_id).or_default();
-                completed_image_ids.push(image.image_id);
-                images.push(image_content_part(image.png_base64));
-            }
-            Ok(RequestOutput::Finished { reason, usage }) => {
-                return Ok(CollectedChatOutput {
-                    message,
-                    prompt_token_ids,
-                    prompt_logprobs,
-                    logprobs,
-                    token_ids,
-                    images,
-                    image_steps_per_image: completed_image_ids
-                        .iter()
-                        .map(|image_id| {
-                            image_step_counts.get(image_id).copied().unwrap_or_default()
-                        })
-                        .collect(),
-                    reason,
-                    usage,
-                });
-            }
-            Ok(RequestOutput::Rejected { kind, message }) => {
-                return Err(ApiError::rejected(kind, message));
-            }
-            Ok(RequestOutput::Failed { message }) => {
-                // The failure detail is logged but not returned to the client.
-                error!(%message, "chat completion failed");
-                bail_server_error!("Internal server error");
-            }
-            Ok(_) => {}
+            Ok(output) => collector.push(&output)?,
             Err(error) => {
                 return Err(server_error!(
                     "chat completion stream failed: {}",
@@ -509,10 +741,7 @@ async fn collect_chat_events(
             }
         }
     }
-
-    Err(server_error!(
-        "chat completion stream closed before terminal finish event"
-    ))
+    collector.collected()
 }
 
 /// The OpenAI chunks of one streamed chat completion: converts one serving
@@ -1666,7 +1895,11 @@ fn clamp_logprob(logprob: f32) -> f32 {
 mod tests {
     use futures::{StreamExt as _, stream};
 
+    use super::super::protocol::ChatCompletionStreamResponse;
+    use super::ChatCollector;
     use super::ChatResponseContext;
+    use super::ChatStreamEmitter;
+    use super::chat_response;
     use super::chat_completion_chunk_stream;
     use crate::output::chat::{AssistantBlockKind, AssistantContentBlock};
     use crate::output::text::{DecodedLogprobs, DecodedPositionLogprobs, DecodedTokenLogprob};
@@ -1775,5 +2008,156 @@ mod tests {
     #[tokio::test]
     async fn hidden_reasoning_streams_no_metadata_of_reasoning_updates() {
         assert_eq!(streamed_metadata(false).await, (Vec::new(), 0));
+    }
+
+    /// The chunk as the client receives it, for comparing two runs.
+    fn chunks_of(chunks: &[ChatCompletionStreamResponse]) -> Vec<serde_json::Value> {
+        chunks
+            .iter()
+            .map(|chunk| serde_json::to_value(chunk).expect("a chunk serializes"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_handed_over_chunk_stage_writes_the_same_chunks() {
+        let context = ChatResponseContext {
+            request_id: "r".to_string(),
+            response_model: "m".to_string(),
+            include_usage: true,
+            requested_logprobs: true,
+            include_prompt_logprobs: false,
+            include_reasoning: true,
+            return_token_ids: true,
+            return_tokens_as_token_ids: false,
+        };
+        let outputs: Vec<RequestOutput> = thinking_response()
+            .into_iter()
+            .map(|output| output.expect("a served event"))
+            .collect();
+
+        // The same response written in one process: the reference sequence.
+        let mut uninterrupted = ChatStreamEmitter::new(&context, 7);
+        let mut expected = Vec::new();
+        for output in &outputs {
+            expected.extend(uninterrupted.push(output).expect("a chunk"));
+        }
+        let expected = chunks_of(&expected);
+
+        // The same response handed over at every position: where the stage can
+        // state itself, the successor writes exactly the rest of the same
+        // chunks; where it cannot, it says so instead of losing one.
+        let mut handable = 0;
+        for split in 1..outputs.len() {
+            let mut first = ChatStreamEmitter::new(&context, 7);
+            let mut chunks = Vec::new();
+            for output in &outputs[..split] {
+                chunks.extend(first.push(output).expect("a chunk"));
+            }
+            let state = first.state();
+            let Some(state) = state else {
+                // Only a buffered update keeps the stage from being stated.
+                continue;
+            };
+            handable += 1;
+            let mut second = ChatStreamEmitter::new(&context, 7);
+            second.resume(&state);
+            for output in &outputs[split..] {
+                chunks.extend(second.push(output).expect("a chunk"));
+            }
+            assert_eq!(
+                chunks_of(&chunks),
+                expected,
+                "a handoff after {split} outputs writes different chunks"
+            );
+        }
+        assert!(handable > 0, "no position in the response can be handed over");
+    }
+
+    /// The collected one-body response continues where a handoff left it: a
+    /// collector handed over mid-response collects exactly the response the
+    /// uninterrupted one does.
+    #[tokio::test]
+    async fn a_handed_over_collector_writes_the_same_response() {
+        let context = ChatResponseContext {
+            request_id: "r".to_string(),
+            response_model: "m".to_string(),
+            include_usage: false,
+            requested_logprobs: true,
+            include_prompt_logprobs: false,
+            include_reasoning: true,
+            return_token_ids: true,
+            return_tokens_as_token_ids: false,
+        };
+        let outputs: Vec<RequestOutput> = thinking_response()
+            .into_iter()
+            .map(|output| output.expect("a served event"))
+            .collect();
+
+        let mut uninterrupted = ChatCollector::new();
+        for output in &outputs {
+            uninterrupted.push(output).expect("a collected output");
+        }
+        let expected = serde_json::to_value(
+            chat_response(uninterrupted.collected().expect("the response"), &context, 7)
+                .expect("a response"),
+        )
+        .expect("the response serializes");
+
+        for split in 1..outputs.len() {
+            let mut first = ChatCollector::new();
+            for output in &outputs[..split] {
+                first.push(output).expect("a collected output");
+            }
+            // The blocks, token ids and images travel; the request's terminal
+            // output arrives after the handoff.
+            let mut second = ChatCollector::new();
+            second.resume(&first.state());
+            for output in &outputs[split..] {
+                second.push(output).expect("a collected output");
+            }
+            let response = serde_json::to_value(
+                chat_response(second.collected().expect("the response"), &context, 7)
+                    .expect("a response"),
+            )
+            .expect("the response serializes");
+            assert_eq!(response, expected, "a handoff after {split} outputs differs");
+        }
+    }
+
+    /// A stage holding a buffered chunk reports that it cannot be handed over,
+    /// rather than handing over a state that would drop it.
+    #[tokio::test]
+    async fn a_buffered_chunk_cannot_be_handed_over() {
+        let context = ChatResponseContext {
+            request_id: "r".to_string(),
+            response_model: "m".to_string(),
+            include_usage: false,
+            requested_logprobs: true,
+            include_prompt_logprobs: false,
+            include_reasoning: true,
+            return_token_ids: true,
+            return_tokens_as_token_ids: false,
+        };
+        // The deltas of one update are buffered until its metadata arrives.
+        let mut emitter = ChatStreamEmitter::new(&context, 7);
+        emitter
+            .push(&RequestOutput::TextDelta {
+                text: "Hi".to_string(),
+            })
+            .expect("a buffered delta");
+        assert!(
+            emitter.state().is_none(),
+            "a buffered chunk is never stated as handed over"
+        );
+        emitter
+            .push(&RequestOutput::TokenDelta {
+                token_ids: vec![11],
+                logprobs: logprobs(11),
+            })
+            .expect("the update's metadata");
+        assert!(
+            emitter.state().is_some(),
+            "after the update's metadata the stage can be handed over again"
+        );
     }
 }
