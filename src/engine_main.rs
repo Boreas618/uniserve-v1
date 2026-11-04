@@ -702,7 +702,7 @@ impl MainProcess {
         // one `Arc` and not a second load. The load and the capacity plan are one call because the
         // order between them is the plan's: the weights are mapped first, so what the plan measures
         // is what is left of the device rather than what was there before the model.
-        let (model, mut memory, inventory) = plan
+        let (model, mut memory, inventory, graph) = plan
             .load_and_open(&mut weights, &mut &*client)
             .context("loading the epoch's model")?;
 
@@ -731,14 +731,15 @@ impl MainProcess {
         // memory and handed to the executor thread, so every owner and every runner books against
         // the same allowance.
         let pools = memory.pools();
-        let device = *plan
-            .devices()
-            .first()
-            .context("this rank serves no device")?;
-        // Only the scratch figure is read here: the device thread starts before any batch and the
-        // shadow region is the one pool it is sized with. The resident pool is the capacity plan's
-        // and `open_memory` opens it, so this call states none.
-        let scratch = plan.graph(device, 0)?.scratch;
+        // A rank with no device serves nothing, and saying it here names the deployment's fault
+        // rather than leaving the pool's figure to a plan that never sized one.
+        if plan.devices().is_empty() {
+            bail!("this rank serves no device");
+        }
+        // The scratch pool's figure comes from the one call that sized it, with the memory: the
+        // shadow region and the state group's snapshot are one reservation (4.5), and a second
+        // computation here could disagree with the pool the allocator reserved.
+        let scratch = graph.scratch;
         for device in plan.devices() {
             let generation = Arc::new(Generation::new(epoch.generation, std::iter::empty()));
             let runners = plan.runners(*device, Arc::clone(&model), &mut memory, &generation)?;
