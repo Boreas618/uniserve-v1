@@ -116,7 +116,12 @@ pub const TILE_ROWS: u32 = MMA_TILE.0;
 ///
 /// A whole number of sixteen-element scale blocks, as the layout requires, and small enough that a
 /// 2048-element row is walked in a handful of passes rather than materialized in one block.
-const ENCODE_CHUNK: u32 = 1024;
+/// Elements one activation-encoding program covers.
+///
+/// It is the encoder's block and therefore a key field of `nvfp4_quantize`, so a model that builds an
+/// [`crate::layers::Nvfp4Linear`] states it rather than choosing one: two deployments that disagreed
+/// would compile two programs for one launch site.
+pub const ENCODE_CHUNK: u32 = 1024;
 
 /// The encoder's chunk is a whole number of scale blocks; a chunk that were not would have a partial
 /// block with no scale to name it.

@@ -38,7 +38,7 @@
 
 use nn::capability::{CausalLm, KvView, TokenBatch};
 use nn::forward::ALIGNMENT;
-use nn::layers::{
+use nn::layers::{Nvfp4Linear,
     Attention, Embedding, Linear, Moe, ParallelLMHead, RmsNorm, Rotary, SwiGlu, TILE_ROWS,
     TRTLLM_WORKSPACE_BYTES,
 };
@@ -108,11 +108,58 @@ pub(crate) struct DecoderLayer {
 
 /// The attention sublayer: four projections, the fused Q/K normalization and rotation, and the
 /// paged attention layer.
+/// One linear projection, in whichever representation the checkpoint stores it.
+///
+/// The two are one type because a layer's code must not branch on the checkpoint's representation:
+/// the loader decides once, per projection, and every forward then calls the same method. A dense
+/// projection is the checkpoint's matrix; an encoded one is an activation encoder and a packed
+/// product in the deployment's scale layout, with the activation's tensor scale as an operand.
+pub(crate) enum Projection {
+    /// The checkpoint's own matrix, in the model's dtype.
+    Dense(Linear),
+    /// A calibrated NVFP4 matrix, with the product's `[1]` F32 alpha beside it.
+    Encoded {
+        /// The encoder and the packed product, which carry the checkpoint's scales. Boxed because it
+        /// is several times the dense layer's size and a layer holds seven projections.
+        linear: Box<Nvfp4Linear>,
+        /// The reciprocal of the weight's tensor scale, as the product takes it.
+        alpha: Weight,
+    },
+}
+
+impl Projection {
+    /// `out = projection(input)`.
+    fn forward(&self, f: &Forward, input: TensorView, out: TensorView) -> Result<()> {
+        match self {
+            Self::Dense(linear) => linear.forward(f, input, out).map_err(Error::from),
+            Self::Encoded { linear, alpha } => linear
+                .forward(f, input, alpha.view(), out)
+                .map_err(Error::from),
+        }
+    }
+
+    /// The arena one launch carves while it runs, for `rows` activation rows.
+    ///
+    /// Zero for a dense projection, which carves nothing: it reads the checkpoint's matrix and
+    /// writes only `out`.
+    fn scratch_bytes(&self, rows: u64) -> u64 {
+        match self {
+            Self::Dense(_) => 0,
+            Self::Encoded { linear, .. } => linear.scratch_bytes(rows),
+        }
+    }
+
+    /// Whether the checkpoint stored this projection packed.
+    fn is_encoded(&self) -> bool {
+        matches!(self, Self::Encoded { .. })
+    }
+}
+
 pub(crate) struct AttentionLayer {
-    pub(crate) q_proj: Linear,
-    pub(crate) k_proj: Linear,
-    pub(crate) v_proj: Linear,
-    pub(crate) o_proj: Linear,
+    pub(crate) q_proj: Projection,
+    pub(crate) k_proj: Projection,
+    pub(crate) v_proj: Projection,
+    pub(crate) o_proj: Projection,
     pub(crate) q_norm: Weight,
     pub(crate) k_norm: Weight,
     pub(crate) rotary: Rotary,
@@ -137,9 +184,9 @@ pub(crate) enum Mlp {
 
 /// A dense feed-forward block.
 pub(crate) struct DenseMlp {
-    pub(crate) gate_proj: Linear,
-    pub(crate) up_proj: Linear,
-    pub(crate) down_proj: Linear,
+    pub(crate) gate_proj: Projection,
+    pub(crate) up_proj: Projection,
+    pub(crate) down_proj: Projection,
     pub(crate) activation: SwiGlu,
 }
 
@@ -177,6 +224,14 @@ pub struct Plan {
     /// height permutes to ([`Self::exchange_rows`]), and one **combined** row per received token
     /// (`received · hidden · dtype`), which no single-rank path has.
     pub moe: u64,
+    /// Bytes one layer's **encoded projections** carve while they run; zero when the checkpoint
+    /// stores them dense.
+    ///
+    /// One reservation serves every layer, for the same reason the step's does: the layer loop
+    /// releases its scratch as it advances, so a plan is one layer deep. It is the *largest* layer's
+    /// sum, not the model's, because a routed layer has four encoded projections and a dense one
+    /// seven and only one of them runs at a time.
+    pub encoded: u64,
     /// The exchange this plan was sized for, when the model's experts are sharded.
     pub exchange: Option<nn::layers::Group>,
     /// The permuted rows an expert-parallel rank sorts over: zero on a single rank.
@@ -191,6 +246,7 @@ impl Plan {
         tokens: u64,
         options: &LoadOptions,
         dtype: DType,
+        encoded: u64,
     ) -> Result<Self> {
         // The exchange is a deployment, not a request: its rank count is the partition's and its
         // capacity is the load option's, so the plan can reserve the group's worst case before any
@@ -282,6 +338,7 @@ impl Plan {
                     nn::layers::exchanged_bytes(tokens, geometry, group, dtype)?
                 }
             },
+            encoded,
             exchange,
             exchange_rows: match exchange {
                 None => 0,
@@ -297,6 +354,7 @@ impl Plan {
             (self.tokens * self.factors, DType::F32), // cosine
             (self.tokens * self.factors, DType::F32), // sine
             (self.workspace, DType::U8),              // attention workspace
+            (self.encoded, DType::U8),                // the encoded projections' own scratch
             (self.tokens * self.hidden, dtype),       // normalized values
             (self.tokens * self.hidden, dtype),       // the layer's output
             (self.tokens * self.hidden, dtype),       // the residual stream
@@ -338,6 +396,11 @@ fn element(count: usize, what: &str) -> Result<u64> {
 /// One forward's activation views, reserved in the plan's order.
 struct Buffers {
     workspace: TensorView,
+    /// One layer's encoded projections' scratch, released as the layer ends. It is held only so the
+    /// plan's reservation covers the carves the projections make from the same arena, which is why
+    /// nothing reads it.
+    #[allow(dead_code, reason = "the reservation is the whole use")]
+    encoded: TensorView,
     normalized: TensorView,
     update: TensorView,
     residual: TensorView,
@@ -366,6 +429,9 @@ impl Buffers {
         Ok(Self {
             workspace: arena
                 .tensor(DType::U8, Shape::new(&[plan.workspace.max(1)]))
+                .map_err(Error::from)?,
+            encoded: arena
+                .tensor(DType::U8, Shape::new(&[plan.encoded.max(1)]))
                 .map_err(Error::from)?,
             normalized: arena
                 .tensor(dtype, rows(plan.hidden))
@@ -462,13 +528,47 @@ impl Qwen3Moe {
 
     /// The activation plan of a forward over `tokens` tokens.
     pub fn plan(&self, tokens: u64) -> Result<Plan> {
+        let encoded = self.encoded_scratch(tokens);
         Plan::new(
             &self.config,
             &self.partition,
             tokens,
             &self.options,
             self.dtype,
+            encoded,
         )
+    }
+
+    /// The arena one layer's encoded projections carve, taken over the layers: the largest layer's
+    /// sum, because the layer loop releases it as it advances.
+    fn encoded_scratch(&self, tokens: u64) -> u64 {
+        self.layers
+            .iter()
+            .map(|layer| {
+                let attention = layer.attention.q_proj.scratch_bytes(tokens)
+                    + layer.attention.k_proj.scratch_bytes(tokens)
+                    + layer.attention.v_proj.scratch_bytes(tokens)
+                    + layer.attention.o_proj.scratch_bytes(tokens);
+                let dense = match &layer.mlp {
+                    Mlp::Dense(mlp) => {
+                        mlp.gate_proj.scratch_bytes(tokens)
+                            + mlp.up_proj.scratch_bytes(tokens)
+                            + mlp.down_proj.scratch_bytes(tokens)
+                    }
+                    Mlp::Experts(_) => 0,
+                };
+                attention + dense
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Whether the checkpoint stored this model's projections packed, which is what decides whether
+    /// the walk names the per-bucket products.
+    pub(crate) fn projections_packed(&self) -> bool {
+        self.layers
+            .first()
+            .is_some_and(|layer| layer.attention.q_proj.is_encoded())
     }
 
     /// Run the decoder layers `0..=last` over `hidden`, and answer the layer's output rows.
@@ -916,8 +1016,7 @@ impl DecoderLayer {
         // run reads it, so no layer selects a table.
         if first {
             self.input_norm
-                .forward(f, hidden, normalized)
-                .map_err(Error::from)?;
+                .forward(f, hidden, normalized)?;
         } else {
             self.input_norm
                 .forward_with_residual(f, hidden, residual, residual, normalized)
@@ -967,15 +1066,11 @@ impl AttentionLayer {
         sine: TensorView,
         out: TensorView,
     ) -> Result<()> {
-        self.q_proj
-            .forward(f, normalized, buffers.query)
-            .map_err(Error::from)?;
+        self.q_proj.forward(f, normalized, buffers.query)?;
         self.k_proj
-            .forward(f, normalized, buffers.key)
-            .map_err(Error::from)?;
+            .forward(f, normalized, buffers.key)?;
         self.v_proj
-            .forward(f, normalized, buffers.value)
-            .map_err(Error::from)?;
+            .forward(f, normalized, buffers.value)?;
 
         let query = buffers.query.reshape(headed(buffers.query, &self.q_norm)?);
         let key = buffers.key.reshape(headed(buffers.key, &self.k_norm)?);
@@ -1014,8 +1109,7 @@ impl AttentionLayer {
             .map_err(Error::from)?;
 
         self.o_proj
-            .forward(f, attended.reshape(buffers.attended.shape), out)
-            .map_err(Error::from)?;
+            .forward(f, attended.reshape(buffers.attended.shape), out)?;
         // Row parallel: each rank's partial output is summed over the query-head split.
         if let Some(group) = f.group {
             group.all_reduce_sum(out, f.stream).map_err(Error::from)?;
@@ -1073,19 +1167,16 @@ impl DenseMlp {
             )
         })?;
         self.gate_proj
-            .forward(f, normalized, dense.gate)
-            .map_err(Error::from)?;
+            .forward(f, normalized, dense.gate)?;
         self.up_proj
-            .forward(f, normalized, dense.up)
-            .map_err(Error::from)?;
+            .forward(f, normalized, dense.up)?;
         // `silu(gate) · up`, written into the gate buffer: the activation applies to the branch
         // named `gate`, so the argument order is `(f, gate, value, out)` as in every gated layer.
         self.activation
-            .forward(f, dense.gate, dense.up, dense.gate)
-            .map_err(Error::from)?;
+            .forward(f, dense.gate, dense.up, dense.gate)?;
         self.down_proj
             .forward(f, dense.gate, out)
-            .map_err(Error::from)
+            
     }
 }
 
@@ -1369,6 +1460,7 @@ mod tests {
             4,
             &LoadOptions::default(),
             DType::BF16,
+            0,
         )
         .unwrap();
         assert_eq!(plan.hidden, 2048);
@@ -1393,6 +1485,7 @@ mod tests {
             2,
             &LoadOptions::default(),
             DType::BF16,
+            0,
         )
         .unwrap();
         assert_eq!(plan.feed_forward, 6144);
@@ -1402,7 +1495,7 @@ mod tests {
     fn tensor_parallel_heads_divide_the_projection() {
         let config = config();
         let partition = Partition::new(&config, 4, 1, 1, 0).unwrap();
-        let plan = Plan::new(&config, &partition, 3, &LoadOptions::default(), DType::BF16).unwrap();
+        let plan = Plan::new(&config, &partition, 3, &LoadOptions::default(), DType::BF16, 0).unwrap();
         assert_eq!(plan.query, 8 * 128);
         assert_eq!(plan.key_value, 128);
     }
@@ -1419,6 +1512,7 @@ mod tests {
             1,
             &LoadOptions::default(),
             DType::BF16,
+            0,
         )
         .unwrap();
         let sharded = Plan::new(
@@ -1427,6 +1521,7 @@ mod tests {
             1,
             &LoadOptions::default(),
             DType::BF16,
+            0,
         )
         .unwrap();
         assert_eq!(sharded.vocabulary, 75968);
@@ -1452,6 +1547,7 @@ mod tests {
             15,
             &LoadOptions::default(),
             DType::BF16,
+            0,
         )
         .unwrap();
         let encoded = Plan::new(
@@ -1463,6 +1559,7 @@ mod tests {
                 ..LoadOptions::default()
             },
             DType::BF16,
+            0,
         )
         .unwrap();
         // The permutation's worst case: 120 expanded routes over 128 experts at 128-row tiles is one
@@ -1499,6 +1596,7 @@ mod tests {
                 tokens,
                 &LoadOptions::default(),
                 DType::BF16,
+                0,
             )
             .unwrap()
         };

@@ -64,6 +64,7 @@ pub use head::{ParallelLMHead, gather_rows};
 pub use linear::{Linear, Nvfp4Linear};
 pub use modulation::{GatedResidual, ModulatedRmsNorm};
 pub use moe::{
+    ENCODE_CHUNK,
     Buffer, EncodedStep, Group, Launch, Moe, MoeGeometry, TILE_ROWS, dense_bytes, encoded_bytes,
     exchanged_bytes, exchanged_rows, router_bytes, routing_bytes, sort_bytes, step_bytes,
 };
