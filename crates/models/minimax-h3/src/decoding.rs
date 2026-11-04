@@ -164,29 +164,74 @@ pub fn video_arena(
 ) -> Result<Vec<Buffer>> {
     let tiles = crate::video_vae::Tiles::of(config, canvas)?;
     let grid = tiles.tiles(config, canvas);
-    let width = u64::from(config.decoder_num_attention_heads)
-        * u64::from(config.decoder_attention_head_dim);
-    let ffn = width * u64::from(config.decoder_ffn_mult);
+    let ffn = u64::from(config.decoder_ffn_mult);
     let (rotated, _) = crate::video_vae::rotary(config)?;
-    let rows_per_tile = u64::from(canvas.rows());
-    let rows = rows_per_tile * grid.len() as u64;
+    let rows = u64::from(canvas.rows()) * grid.len() as u64;
+    let columns = u64::from(config.decoder_num_attention_heads)
+        * u64::from(config.decoder_attention_head_dim);
     let (height, width_px) = canvas.pixels(config);
     let frames = canvas.frames_out(config);
+    let pixels = grid.len() as u64 * u64::from(frames) * u64::from(height) * u64::from(width_px);
     Ok(vec![
         Buffer {
-            name: "tokens",
+            name: "stream",
             element: "f16",
-            elements: rows * width,
+            elements: rows * columns,
+        },
+        Buffer {
+            name: "projected",
+            element: "f16",
+            elements: u64::from(canvas.voxels()) * grid.len() as u64 * columns,
         },
         Buffer {
             name: "normalized",
             element: "f16",
-            elements: rows * width,
+            elements: rows * columns,
         },
         Buffer {
-            name: "qkv",
+            name: "query",
             element: "f16",
-            elements: rows * 3 * width,
+            elements: rows * columns,
+        },
+        Buffer {
+            name: "key",
+            element: "f16",
+            elements: rows * columns,
+        },
+        Buffer {
+            name: "value",
+            element: "f16",
+            elements: rows * columns,
+        },
+        Buffer {
+            name: "rotated_query",
+            element: "f16",
+            elements: rows * columns,
+        },
+        Buffer {
+            name: "rotated_key",
+            element: "f16",
+            elements: rows * columns,
+        },
+        Buffer {
+            name: "attended",
+            element: "f16",
+            elements: rows * columns,
+        },
+        Buffer {
+            name: "update",
+            element: "f16",
+            elements: rows * columns,
+        },
+        Buffer {
+            name: "gate_up",
+            element: "f16",
+            elements: rows * 2 * columns * ffn,
+        },
+        Buffer {
+            name: "gated",
+            element: "f16",
+            elements: rows * columns * ffn,
         },
         Buffer {
             name: "rotary",
@@ -194,32 +239,14 @@ pub fn video_arena(
             elements: rows * u64::from(rotated),
         },
         Buffer {
-            name: "attended",
-            element: "f16",
-            elements: rows * width,
-        },
-        Buffer {
-            name: "gate_up",
-            element: "f16",
-            elements: rows * 2 * ffn,
-        },
-        Buffer {
             name: "pixels",
             element: "f16",
-            elements: grid.len() as u64
-                * u64::from(crate::output::Rgb::CHANNELS)
-                * u64::from(frames)
-                * u64::from(height)
-                * u64::from(width_px),
+            elements: pixels * u64::from(crate::output::Rgb::CHANNELS),
         },
         Buffer {
             name: "rgb",
             element: "u8",
-            elements: grid.len() as u64
-                * u64::from(crate::output::Rgb::CHANNELS)
-                * u64::from(frames)
-                * u64::from(height)
-                * u64::from(width_px),
+            elements: pixels * u64::from(crate::output::Rgb::CHANNELS),
         },
         Buffer {
             name: "overlap",
@@ -364,9 +391,8 @@ mod tests {
         assert_eq!(tiles, 28);
         let tokens = arena
             .iter()
-            .find(|buffer| buffer.name == "tokens")
+            .find(|buffer| buffer.name == "stream")
             .expect("the residual stream");
-        // 28 tiles of 1797 rows of 2048 channels.
         assert_eq!(tokens.elements, 28 * 1797 * 2048);
         assert_eq!(tokens.bytes(), tokens.elements * 2);
         // The rotary factors are the rotated width, not the head.

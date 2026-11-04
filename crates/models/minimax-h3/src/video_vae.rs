@@ -421,13 +421,13 @@ pub fn sources(config: &VideoVaeConfig) -> crate::Result<Vec<crate::audio_vae::S
 // ---------------------------------------------------------------------------------------------
 
 use nn::Forward;
+use nn::layers::Rotation;
 use nn::layers::{
     Attention, LayerNorm, Linear, PackedSwiGlu, RmsNorm, Rotary, Rows, ScaledResidual, Sections,
 };
 use nn::weights::{Weight, WeightLoader, WeightRequest};
+use nn::{DType, Shape, TensorView};
 use ops::gemm::WeightOrder;
-use ops::rope::Rotation;
-use ops::tensor::{DType, Shape, TensorView};
 
 /// One transformer layer of the decoder: the attention half and the gated feed-forward half, each
 /// with its own normalization and its own per-channel residual scale.
