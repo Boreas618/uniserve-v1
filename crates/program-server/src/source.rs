@@ -27,6 +27,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::manifest::{Manifest, ModuleForm, SourceKind, ToolchainKind};
+use crate::target::Target;
 use crate::toolchain::Toolchain;
 use crate::{Error, Result};
 
@@ -60,16 +61,19 @@ pub trait Source: Send + Sync {
     /// The toolchain this source compiles with.
     fn toolchain(&self) -> ToolchainKind;
 
-    /// Builds the module of one descriptor.
+    /// Builds the module of one descriptor for one target.
     ///
-    /// `op` and `key` are the operator name and the descriptor key of the
-    /// module's path (design section 5.3); `dir` is the workspace to write
+    /// `op`, `key` and `target` are three names of the module's path (design
+    /// section 5.3): the operator, the descriptor key and what the module is
+    /// compiled for — an architecture such as `sm_100a`, or a GPU model for a
+    /// package whose code reads the device. `dir` is the workspace to write
     /// into. The returned file names, and the module's form from the
     /// manifest, are what the store publishes.
     fn build(
         &self,
         op: &str,
         key: &str,
+        target: &Target,
         toolchain: &dyn Toolchain,
         dir: &Workspace,
     ) -> Result<Built>;
@@ -137,7 +141,12 @@ impl PackageSource {
     /// The environment the Program Server passes to a compile script: the
     /// package root, the descriptor key, the output directory and the
     /// toolchain's own variables.
-    pub fn environment(&self, key: &str, dir: &Workspace) -> Vec<(OsString, OsString)> {
+    pub fn environment(
+        &self,
+        key: &str,
+        target: &Target,
+        dir: &Workspace,
+    ) -> Vec<(OsString, OsString)> {
         vec![
             ("UNISERVE_OP".into(), self.manifest.op.clone().into()),
             (
@@ -145,6 +154,7 @@ impl PackageSource {
                 self.manifest.backend.clone().into(),
             ),
             ("UNISERVE_DESCRIPTOR".into(), key.into()),
+            ("UNISERVE_TARGET".into(), target.to_string().into()),
             (
                 "UNISERVE_PACKAGE".into(),
                 self.root.clone().into_os_string(),
@@ -177,6 +187,7 @@ impl Source for CudaSource {
         &self,
         _op: &str,
         _key: &str,
+        _target: &Target,
         _toolchain: &dyn Toolchain,
         _dir: &Workspace,
     ) -> Result<Built> {
@@ -207,6 +218,7 @@ impl Source for TritonSource {
         &self,
         _op: &str,
         _key: &str,
+        _target: &Target,
         _toolchain: &dyn Toolchain,
         _dir: &Workspace,
     ) -> Result<Built> {
@@ -238,6 +250,7 @@ impl Source for CuteDslSource {
         &self,
         _op: &str,
         _key: &str,
+        _target: &Target,
         _toolchain: &dyn Toolchain,
         _dir: &Workspace,
     ) -> Result<Built> {
@@ -268,6 +281,7 @@ impl Source for CubinSource {
         &self,
         _op: &str,
         _key: &str,
+        _target: &Target,
         _toolchain: &dyn Toolchain,
         _dir: &Workspace,
     ) -> Result<Built> {
@@ -299,6 +313,7 @@ impl Source for WasmSource {
         &self,
         _op: &str,
         _key: &str,
+        _target: &Target,
         _toolchain: &dyn Toolchain,
         _dir: &Workspace,
     ) -> Result<Built> {
@@ -329,6 +344,7 @@ impl Source for ExecutableSource {
         &self,
         _op: &str,
         _key: &str,
+        _target: &Target,
         _toolchain: &dyn Toolchain,
         _dir: &Workspace,
     ) -> Result<Built> {

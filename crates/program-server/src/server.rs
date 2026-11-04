@@ -109,6 +109,7 @@ pub struct ProgramServer {
     upstream: Option<PathBuf>,
     packages: RwLock<BTreeMap<(String, String, u32), Arc<Package>>>,
     store: Arc<Store>,
+    toolchains: Arc<Toolchains>,
     devices: Vec<Device>,
     queue: Arc<Queue>,
 }
@@ -128,9 +129,15 @@ impl ProgramServer {
             upstream: config.upstream.clone(),
             packages: RwLock::new(packages),
             store,
+            toolchains,
             devices: config.devices.clone(),
             queue,
         })
+    }
+
+    /// The host's toolchains (design section 6.2).
+    pub fn toolchains(&self) -> &Toolchains {
+        &self.toolchains
     }
 
     /// Serves until the process ends: binds the socket, answers every client
@@ -410,12 +417,18 @@ impl ProgramServer {
         let mut failures: Vec<Error> = Vec::new();
         for chosen in &chosen {
             let package = self.package(&chosen.slot.op, &chosen.program)?;
-            let keys = request
+            let mut keys = Vec::new();
+            for descriptors in request
                 .descriptors
                 .iter()
                 .filter(|descriptors| descriptors.op == chosen.slot.op)
-                .flat_map(|descriptors| descriptors.keys.iter().cloned())
-                .collect::<Vec<_>>();
+            {
+                for key in &descriptors.keys {
+                    if !keys.contains(key) {
+                        keys.push(key.clone());
+                    }
+                }
+            }
             for key in keys {
                 if !package.manifest.kernel.descriptors.covers(&key) {
                     return Err(Error::UnsupportedDescriptor {
@@ -446,9 +459,17 @@ impl ProgramServer {
                         // it and does not retry it, so a broken package cannot
                         // spin.
                         progress(Progress {
-                            path,
+                            path: path.clone(),
                             state: BuildState::Failed(detail.clone()),
-                            detail,
+                            detail: detail.clone(),
+                        });
+                        failures.push(Error::Build {
+                            op: path.op.clone(),
+                            backend: path.backend.clone(),
+                            revision: path.revision,
+                            target: path.target.clone(),
+                            descriptor: path.descriptor.clone(),
+                            message: detail,
                         });
                         continue;
                     }
