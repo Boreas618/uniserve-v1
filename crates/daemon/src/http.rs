@@ -10,6 +10,7 @@
 pub(crate) mod admin;
 pub(crate) mod handoff;
 pub(crate) mod listener;
+pub(crate) mod conn;
 pub(crate) mod stream;
 mod middleware;
 mod node;
@@ -316,8 +317,7 @@ async fn serve_on(
     );
     info!(%bind_address, model = engine.served_model_name(), "starting HTTP server");
 
-    let serving =
-        axum::serve(listener, app).with_graceful_shutdown(accepting.clone().cancelled_owned());
+    let serving = conn::serve(listener, app, accepting.clone());
     let drain = async {
         serving.await.context("HTTP server failed")?;
         jobs.wait().await;
