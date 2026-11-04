@@ -1311,68 +1311,7 @@ impl MainProcess {
     fn listed_programs(&self) -> std::result::Result<Programs, UpdateFailure> {
         let invalid = |reason: String| UpdateFailure::Precopy { reason };
         let listing = self.listing().map_err(invalid)?;
-        // The chosen (backend, revision) per operator, by the rule in the doc above.
-        let mut chosen: BTreeMap<String, (String, u32)> = BTreeMap::new();
-        let mut built = 0usize;
-        for package in &listing.packages {
-            // A package with no built module for any target cannot launch here: installing it would
-            // promise a kernel the store cannot resolve.
-            if package.modules.is_empty() {
-                continue;
-            }
-            // Only modules built for one of this launch's targets count: `prepare` would otherwise
-            // *build* the package for this host, and a resolution that turns a startup into a build
-            // of every operator in the store spends the precopy's twenty-minute clock on work the
-            // first token does not need. An operator whose module targets do not cover this host
-            // stays missing, and the walk names it - the honest answer for a host the store was not
-            // built for.
-            if !package
-                .modules
-                .iter()
-                .any(|module| self.targets.contains(&module.target))
-            {
-                tracing::debug!(
-                    op = %package.op,
-                    backend = %package.backend,
-                    "the store holds this operator for another target: not installed"
-                );
-                continue;
-            }
-            // The store may hold operators this binary does not implement - another model's, or one
-            // whose row an older build lacked. Installing one would refuse the whole precopy in
-            // `admit_installs`, which is the wrong answer for a program this process cannot launch
-            // anyway: it is left out, and named at debug level so a missing operator is traceable.
-            if ops::operator_name(&package.op).is_none() {
-                tracing::debug!(
-                    op = %package.op,
-                    backend = %package.backend,
-                    "the store holds an operator this build does not implement"
-                );
-                continue;
-            }
-            built += 1;
-            let candidate = (package.backend.clone(), package.revision);
-            match chosen.get(&package.op) {
-                Some((backend, revision))
-                    if *revision > candidate.1
-                        || (*revision == candidate.1
-                            && backend.as_str() <= candidate.0.as_str()) => {}
-                _ => {
-                    if let Some((backend, revision)) = chosen.get(&package.op) {
-                        tracing::info!(
-                            op = %package.op,
-                            taken = %candidate.0,
-                            revision = candidate.1,
-                            held = %backend,
-                            held_revision = revision,
-                            "an operator is built under two backends: the higher revision wins, \
-                             ties by backend name"
-                        );
-                    }
-                    chosen.insert(package.op.clone(), candidate);
-                }
-            }
-        }
+        let chosen = select_programs(&listing.packages, &self.targets);
         if chosen.is_empty() {
             return Err(invalid(format!(
                 "the precopy named no kernel program and this host has built none: the store's \
@@ -1382,7 +1321,7 @@ impl MainProcess {
             )));
         }
         tracing::info!(
-            packages = built,
+            packages = listing.packages.len(),
             operators = chosen.len(),
             "resolved this host's built programs for a precopy that named none"
         );
@@ -3172,6 +3111,78 @@ fn unfinished(submissions: &[Submission], what: &str) -> Option<StageFailure> {
 
 /// The descriptor keys `generation` holds for `operator`: what a precopy must
 /// cover, and exactly what it never adds to (§7.3 step 2, §5.3).
+/// The program each operator of `packages` is installed from, by identity: the highest installed
+/// revision, ties broken by the backend's name so the choice is the same on every run.
+///
+/// Two kinds of package are left out, and both would cost more than they buy:
+///
+/// - one with no module built for one of `targets`. Installing it asks `prepare` to *build* it for
+///   this host, so a store built for other targets would spend a startup's whole precopy clock
+///   compiling modules the first token does not need. The operator then stays missing, and the walk
+///   names it - the honest answer for a host the store was not built for.
+/// - one whose operator this binary does not implement: `admit_installs` refuses a precopy for such
+///   an operator, and a program this process could never launch is not worth failing a switchover
+///   over.
+fn select_programs(
+    packages: &[program_server::protocol::ListedPackage],
+    targets: &[Target],
+) -> BTreeMap<String, (String, u32)> {
+    let mut chosen: BTreeMap<String, (String, u32)> = BTreeMap::new();
+    for package in packages {
+        if package.modules.is_empty() {
+            tracing::debug!(
+                op = %package.op,
+                backend = %package.backend,
+                "a listed package has no built module"
+            );
+            continue;
+        }
+        if !package
+            .modules
+            .iter()
+            .any(|module| targets.contains(&module.target))
+        {
+            tracing::debug!(
+                op = %package.op,
+                backend = %package.backend,
+                "the store holds this operator for another target: not installed"
+            );
+            continue;
+        }
+        if ops::operator_name(&package.op).is_none() {
+            tracing::debug!(
+                op = %package.op,
+                backend = %package.backend,
+                "the store holds an operator this build does not implement"
+            );
+            continue;
+        }
+        let candidate = (package.backend.clone(), package.revision);
+        match chosen.get(&package.op) {
+            // The held program stays when it is the later revision, or the same revision under a
+            // backend that sorts first.
+            Some((backend, revision))
+                if *revision > candidate.1
+                    || (*revision == candidate.1 && backend.as_str() <= candidate.0.as_str()) => {}
+            _ => {
+                if let Some((backend, revision)) = chosen.get(&package.op) {
+                    tracing::info!(
+                        op = %package.op,
+                        taken = %candidate.0,
+                        revision = candidate.1,
+                        held = %backend,
+                        held_revision = revision,
+                        "an operator is built under two backends: the higher revision wins, ties by \
+                         backend name"
+                    );
+                }
+                chosen.insert(package.op.clone(), candidate);
+            }
+        }
+    }
+    chosen
+}
+
 /// The descriptor keys this host has already built for a named package, for this node's targets.
 ///
 /// The epoch's first generation has no serving generation to copy keys from, and without this the
@@ -3314,4 +3325,104 @@ fn handshake(control: &mut Control, launch: &Launch) -> Result<Epoch> {
         generation: 0,
         host: spec.host,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use program_server::protocol::{ListedModule, ListedPackage};
+    use program_server::ModuleForm;
+
+    /// A listed package with one built module for `target`.
+    fn package(op: &str, backend: &str, revision: u32, target: &str) -> ListedPackage {
+        ListedPackage {
+            op: op.to_owned(),
+            backend: backend.to_owned(),
+            revision,
+            modules: vec![ListedModule {
+                target: Target::new(target),
+                descriptor: "a-descriptor".to_owned(),
+                form: ModuleForm::Cubin,
+            }],
+        }
+    }
+
+    fn targets() -> Vec<Target> {
+        vec![Target::new("sm_90a")]
+    }
+
+    /// An operator name this build implements, taken from the build rather than written down, so a
+    /// renamed operator does not fail a test about selection.
+    fn implemented() -> &'static str {
+        ops::operators()
+            .first()
+            .copied()
+            .expect("the build implements operators")
+    }
+
+    /// The later installation of an operator is the one a startup installs, whatever order the
+    /// store lists them in.
+    #[test]
+    fn the_highest_revision_of_an_operator_is_chosen() {
+        let op = implemented();
+        for packages in [
+            vec![
+                package(op, "triton", 1, "sm_90a"),
+                package(op, "triton", 3, "sm_90a"),
+            ],
+            vec![
+                package(op, "triton", 3, "sm_90a"),
+                package(op, "triton", 1, "sm_90a"),
+            ],
+        ] {
+            let chosen = select_programs(&packages, &targets());
+            assert_eq!(
+                chosen.get(op),
+                Some(&("triton".to_owned(), 3)),
+                "the highest revision is the one installed"
+            );
+        }
+    }
+
+    /// One operator is one slot and takes one program; when two backends hold the same revision the
+    /// choice is the backend that sorts first, so it repeats on every run.
+    #[test]
+    fn a_tie_on_revision_is_broken_by_the_backend_name() {
+        let op = implemented();
+        for order in [["triton", "flashinfer"], ["flashinfer", "triton"]] {
+            let packages = order
+                .into_iter()
+                .map(|backend| package(op, backend, 2, "sm_90a"))
+                .collect::<Vec<_>>();
+            let chosen = select_programs(&packages, &targets());
+            assert_eq!(
+                chosen.get(op),
+                Some(&("flashinfer".to_owned(), 2)),
+                "the same backend wins whatever order the store lists them in"
+            );
+        }
+    }
+
+    /// Three packages that cannot launch here, for three different reasons, and one that can: only
+    /// the last is installed.
+    #[test]
+    fn only_packages_this_host_could_launch_are_installed() {
+        let op = implemented();
+        let mut unbuilt = package(op, "triton", 9, "sm_90a");
+        unbuilt.modules.clear();
+        let packages = vec![
+            unbuilt,
+            package(op, "triton", 8, "sm_70"),
+            package("an-operator-this-build-lacks", "triton", 7, "sm_90a"),
+            package(op, "triton", 1, "sm_90a"),
+        ];
+
+        let chosen = select_programs(&packages, &targets());
+        assert_eq!(chosen.len(), 1, "one operator can launch here: {chosen:?}");
+        assert_eq!(
+            chosen.get(op),
+            Some(&("triton".to_owned(), 1)),
+            "the package with a module for this target, whatever the others claim"
+        );
+    }
 }
