@@ -208,9 +208,13 @@ pub struct TopKDescriptor {
     /// (`do_not_specialize = ["rows", "vocabulary", "width"]`), so it does not enter the key - a
     /// key that named it would demand a module per vocabulary the deployment happens to serve.
     pub vocabulary: u32,
-    /// How many candidates a row keeps. **A compilation**: the emission's buffers are `width`
-    /// wide and the final sort runs over `width` lanes, so `WIDTH` is the program's constexpr and
-    /// one module serves one candidate count.
+    /// How many candidates a row keeps: the live count, a **launch** value.
+    ///
+    /// The buffers are this many lanes wide per row and every emitted lane past it is masked, so
+    /// the live count does not enter the key. What enters it is its **padded** width - the next
+    /// power of two - because the emission ends in a bitonic sort, and a sort needs a power-of-two
+    /// network. A deployment's candidate count is a vocabulary (151936, which is `2^6 · 2371`), so
+    /// the network is widened and the buffers are not.
     pub width: u32,
     /// Element type of the emitted vocabulary ids.
     pub ids: DType,
@@ -220,12 +224,12 @@ pub struct TopKDescriptor {
 
 impl fmt::Display for TopKDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // `vocabulary` is absent on purpose: the program takes it as a runtime scalar, so one module
-        // serves every vocabulary. `width` is present because it is the program's `WIDTH` - the
-        // emission's buffers and its final sort are that many lanes wide.
+        // `vocabulary` and the live `width` are absent on purpose: the program takes both as runtime
+        // scalars, so one module serves every vocabulary and every candidate count up to its
+        // network. What the key names is the network: the live count padded to a power of two.
         Key::new()
             .field("dtype", self.dtype)
-            .field("width", self.width)
+            .field("width", self.width.next_power_of_two())
             .field("ids", self.ids)
             .field("pdl", self.pdl)
             .finish(formatter)
