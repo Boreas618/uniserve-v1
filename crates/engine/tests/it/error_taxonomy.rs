@@ -93,12 +93,12 @@ impl Toy {
         };
         let dispatch = match self.dispatch {
             Dispatch::Plan => format!(
-                "(func (export \"{}\") (result i64) i64.const {})",
+                "(func (export \"{}\") (param i32 i32) (result i64) i64.const {})",
                 Call::Dispatch.export(),
                 packed(PLAN, plan.len())
             ),
             Dispatch::Burns => format!(
-                "(func (export \"{}\") (result i64) (loop (br 0)) i64.const 0)",
+                "(func (export \"{}\") (param i32 i32) (result i64) (loop (br 0)) i64.const 0)",
                 Call::Dispatch.export()
             ),
         };
@@ -114,7 +114,7 @@ impl Toy {
              (func (export \"sched_init\") (param i32 i32) (result i64) i64.const 0) \
              {observe} \
              {dispatch} \
-             (func (export \"{limits_call}\") (param i32 i32) (result i64) i64.const {limits_answer}) \
+             (func (export \"{limits_call}\") (result i64) i64.const {limits_answer}) \
              (func (export \"{reclaim_call}\") (param i32 i32) (result i64) i64.const {reclaim_answer}) \
              (func (export \"{warm_call}\") (param i32 i32) (result i64) i64.const {warm_answer}) \
              (func (export \"{experts_call}\") (param i32 i32) (result i64) i64.const {experts_answer}) \

@@ -46,9 +46,9 @@ pub(crate) use execution::generation_consuming_calls;
 use ipc::{ForwardMode, MediaCall, TransferMode};
 pub(crate) use policy::process_engine;
 pub use policy::{
-    Arrival, BatchCapacity, Candidate, PREFETCH_FLOOR_TOKENS, PolicyBytes, PolicyProgram,
-    PolicyReverted, PolicySlot, PolicySource, PolicyUsage, ProgramSource, Progress, RoutePolicy,
-    RouteTrial, Stage, TrialState, Validators, arrival_view, ceilings_of,
+    Arrival, BatchCapacity, Candidate, Limits, PREFETCH_FLOOR_TOKENS, Parameters, PolicyBytes,
+    PolicyProgram, PolicyReverted, PolicySlot, PolicySource, PolicyUsage, ProgramSource, Progress,
+    RoutePolicy, RouteTrial, Stage, TrialState, Validators, arrival_view, ceilings_of,
 };
 pub(crate) use run::{MAX_GUIDANCE_PREFIX_ROWS, guidance_prefix_rows};
 pub use stats::{
@@ -78,7 +78,20 @@ mod policy;
 mod preemption;
 mod run;
 mod speculation;
-mod submission;
+pub(crate) mod submission;
+
+/// The mechanism's door to the executor this process launched.
+pub(crate) fn submissions(executor: Box<dyn Executor>) -> submission::Submissions {
+    submission::Submissions::new(executor)
+}
+
+/// The mechanism's door to the executor crate's batch path, the in-process
+/// submission path of §2.4 and §7.3's splice.
+pub(crate) fn submissions_over(
+    batches: Arc<dyn executor::batch::Batches>,
+) -> anyhow::Result<submission::Submissions> {
+    submission::Submissions::over_batches(batches)
+}
 pub(crate) mod views;
 mod warming;
 mod world;
@@ -498,6 +511,10 @@ pub struct Scheduler {
     /// The candidate a precopy prepared at this boundary, until the switchover
     /// puts it in.
     policy_prepared: Option<policy::Candidate>,
+    /// The generation this scheduler's batches are stamped with (§7.3): the one
+    /// the epoch last switched to, written by the control thread's switchover
+    /// arm while it holds the generations' lock, read once per step.
+    generation: Arc<std::sync::atomic::AtomicU64>,
     /// Set once a policy instance actually serves this scheduler (§7.3).
     ///
     /// Before the epoch's first switchover the mechanism decides nothing — a

@@ -30,7 +30,7 @@ use std::sync::OnceLock;
 use scheduling::guest::decision::{Plan, Room, Shortage, Victim};
 use scheduling::guest::event::Event;
 use scheduling::guest::ids::PageId;
-use scheduling::guest::limits::{Limits, Parameters};
+pub use scheduling::guest::limits::{Limits, Parameters};
 use scheduling::guest::policy::Instantiation;
 use scheduling::guest::view::{
     CallView, ExpertLoad, ExpertOrder, RankView, ReplicaView, RequestState, RequestView, Snapshot,
@@ -145,10 +145,20 @@ impl PolicyProgram {
 
 /// One configured argument of a program, parsed as the type the policy
 /// parameter has.
+///
+/// The program states each argument as TOML text of the value itself — `2048`,
+/// `2.5` — so it is parsed as a TOML value and turned into the parameter's type,
+/// not read as a document.
 fn argument<T: serde::de::DeserializeOwned>(value: &str, name: &str) -> Result<T, PolicyError> {
-    toml::from_str(&format!("value = {value}")).map_err(|error| PolicyError::Load {
+    let failure = |error: String| PolicyError::Load {
         message: format!("the policy argument `{name} = {value}` does not parse: {error}"),
-    })
+    };
+    let parsed: toml::Value = value.trim().parse().map_err(|error: toml::de::Error| {
+        failure(error.to_string())
+    })?;
+    parsed
+        .try_into()
+        .map_err(|error: toml::de::Error| failure(error.to_string()))
 }
 
 /// The build config's hard bounds on what one step may be given to run (§4.4):
@@ -2065,7 +2075,7 @@ mod tests {
         // rest, so the source carries exactly what the daemon named.
         let arguments = std::collections::BTreeMap::from([
             ("max_batch".to_owned(), "16".to_owned()),
-            ("timeout".to_owned(), "\"5s\"".to_owned()),
+            ("timeout".to_owned(), "5000000000".to_owned()),
         ]);
         let built = PolicyProgram::from_arguments("fcfs", 7, &arguments)
             .expect("the arguments are the policy's");
@@ -2075,7 +2085,7 @@ mod tests {
         assert_eq!(server.backend, "fcfs");
         assert_eq!(server.revision, 7);
         assert_eq!(server.arguments["max_batch"].as_integer(), Some(16));
-        assert_eq!(server.arguments["timeout"].as_str(), Some("5s"));
+        assert_eq!(server.arguments["timeout"].as_integer(), Some(5_000_000_000));
         assert_eq!(server.arguments.len(), 2);
     }
 
