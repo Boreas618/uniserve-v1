@@ -36,6 +36,13 @@ import os
 import pathlib
 import sys
 
+# This is an interpreter check: the arithmetic is compared against a CPU reference, so the kernel runs
+# on Triton's interpreter even where a device exists. The flag is set before any kernel module is
+# imported, because Triton reads it when it launches.
+if os.environ.get("TRITON_INTERPRET") != "1":
+    os.environ["TRITON_INTERPRET"] = "1"
+    print("running on Triton's interpreter (no device needed)")
+
 import torch
 
 DTYPES = {"bf16": torch.bfloat16, "f16": torch.float16, "f32": torch.float32}

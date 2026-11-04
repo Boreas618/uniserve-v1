@@ -43,6 +43,13 @@ import os
 import pathlib
 import sys
 
+# This is an interpreter check: the arithmetic is compared against a CPU reference, so the kernel runs
+# on Triton's interpreter even where a device exists. The flag is set before any kernel module is
+# imported, because Triton reads it when it launches.
+if os.environ.get("TRITON_INTERPRET") != "1":
+    os.environ["TRITON_INTERPRET"] = "1"
+    print("running on Triton's interpreter (no device needed)")
+
 import torch
 
 DTYPES = {"bf16": torch.bfloat16, "f16": torch.float16, "f32": torch.float32}
@@ -135,8 +142,6 @@ def main():
         help="the package directory holding src/gelu.py",
     )
     options = parser.parse_args()
-    if os.environ.get("TRITON_INTERPRET") != "1":
-        raise SystemExit("run this with TRITON_INTERPRET=1: the kernel is checked on the CPU")
     module = load_kernel(options.package)
 
     # The exact form's first step is `libdevice.erf`, which the interpreter cannot evaluate: probe
@@ -168,10 +173,10 @@ def main():
                        values=None, columns=130, block=256)
         checked += run(module, approximate=approximate, dtype="f32",
                        values=None, columns=1024, block=512)
-    print(f"ok: {checked} activated values over {', '.join(FORMS)} at the manifest's dtypes and "
-          f"widths, within rounding(1)'s bound")
     if GAP:
         print(f"not checked here: {GAP}")
+    print(f"ok: {checked} activated values over {', '.join(FORMS)} at the manifest's dtypes and "
+          f"widths, within rounding(1)'s bound")
     return 0
 
 
