@@ -324,3 +324,74 @@ fn every_fixture_key_parses_to_the_fields_its_operator_s_packages_declare() {
     );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// Every package that ships declares the toolchain version it was built and
+/// validated against; only the fixtures under `crates/ops/program-fixtures` may
+/// leave it empty.
+///
+/// An empty version means "any version this host has" (design section 5.2), which
+/// is a real weakening of the rule that a toolchain change is a new revision: it
+/// is what a fixture whose build does not depend on a patch release declares, so
+/// that a delivery test does not fail for the wrong reason. A shipping package
+/// keeps the guard, and this test is what makes the waiver impossible to take by
+/// accident.
+#[test]
+fn every_shipping_package_declares_its_toolchain_version() {
+    let shipping = packages();
+    assert!(!shipping.is_empty(), "the tree ships the kernel packages");
+    let mut failures = Vec::new();
+    for package in &shipping {
+        let Ok(manifest) = Manifest::load(package) else {
+            continue; // The install gate reports a manifest that does not load.
+        };
+        // A package that compiles nothing has no compiler version to match.
+        if manifest.toolchain.kind == program_server::manifest::ToolchainKind::None {
+            continue;
+        }
+        if manifest.toolchain.version.is_empty() {
+            failures.push(format!(
+                "{}: {} {} declares no toolchain version",
+                package.display(),
+                manifest.op,
+                manifest.backend
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "a shipping package must declare its toolchain version; only a fixture \
+         may leave it empty:\n{}",
+        failures.join("\n")
+    );
+
+    // The other half of the rule: the fixtures are where an empty version is
+    // allowed, and one of them takes it.
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/ops/program-fixtures")
+        .canonicalize()
+        .expect("the fixtures' directory");
+    let mut empty = 0;
+    let mut seen = 0;
+    for entry in std::fs::read_dir(&fixtures).expect("the fixtures") {
+        let manifest = entry.expect("a fixture").path().join("package.toml");
+        if !manifest.is_file() {
+            continue;
+        }
+        seen += 1;
+        let text = std::fs::read_to_string(&manifest).expect("a fixture manifest");
+        let parsed = text.parse::<toml::Table>().expect("a fixture manifest");
+        let version = parsed
+            .get("toolchain")
+            .and_then(|toolchain| toolchain.get("version"))
+            .and_then(toml::Value::as_str)
+            .expect("a fixture's [toolchain] version");
+        if version.is_empty() {
+            empty += 1;
+        }
+    }
+    assert!(seen > 0, "the tree ships the fixture packages");
+    assert!(
+        empty > 0,
+        "no fixture takes the empty version the rule exists for"
+    );
+}
