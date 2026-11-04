@@ -462,6 +462,60 @@ fn inert_commit(rows: usize) -> Vec<i64> {
     table
 }
 
+/// The descriptor a plain decode step's commit uses, from the table's capacity and the geometry.
+///
+/// `ops::commit` checks the table's leading stride against `stride`, every operand's type against
+/// `index`, and the block against `count`; the arithmetic is here, once, so a host test can state it
+/// without a device and the runner cannot drift from it.
+fn commit_descriptor(
+    capacity: u64,
+    block: u32,
+    vocabulary: u32,
+) -> ops::commit::CommitDescriptor {
+    ops::commit::CommitDescriptor {
+        // The table and the sampled ids are i32 end to end: `nn::Sampler` emits i32 tokens, and the
+        // operator checks `tokens` against `index`.
+        index: DType::I32,
+        verified: DType::I32,
+        penalties: DType::I32,
+        // The table is `[COMMIT_FIELDS, capacity]` and a column is contiguous.
+        stride: capacity,
+        // One next-input token per slot, in a `[slots, 1]` matrix.
+        future_stride: 1,
+        vocab: vocabulary,
+        block,
+    }
+}
+
+/// The commit table the device reads, from the mechanism's `[COMMIT_FIELDS, rows]` i64 table.
+///
+/// The device table is `[COMMIT_FIELDS, capacity]` i32: the staged rows fill its first `rows`
+/// columns, and the rest keep whatever the previous batch left there behind `dim(1) >= count`.
+fn commit_table(commit: &[i64], rows: usize, capacity: usize) -> Result<Vec<i32>> {
+    let fields = ops::commit::COMMIT_FIELDS;
+    if commit.len() != fields * rows {
+        return Err(Error::Invariant(format!(
+            "the commit table holds {} values, {fields} fields of {rows} rows",
+            commit.len()
+        )));
+    }
+    let mut table = vec![0_i32; fields * capacity];
+    for field in 0..fields {
+        for row in 0..rows.min(capacity) {
+            let value = commit[field * rows + row];
+            table[field * capacity + row] = i32::try_from(value).map_err(|_| {
+                Error::Invalid(format!("a commit column value {value} does not fit i32"))
+            })?;
+        }
+    }
+    Ok(table)
+}
+
+/// The block a commit launch needs for `rows` rows: the smallest power of two that covers them.
+fn commit_block(rows: u32) -> u32 {
+    rows.max(1).next_power_of_two()
+}
+
 /// The rows the largest bucket of `buckets` holds, which sizes the columns bound once.
 fn largest_rows(buckets: &Buckets) -> Result<u32> {
     buckets
@@ -521,7 +575,7 @@ impl CommitColumns {
             verified: Column::new(device, DType::I32, u64::from(slots.max(1)))?,
             future: Column::new(device, DType::I32, u64::from(slots.max(1)))?,
             capacity,
-            block: rows.max(1).next_power_of_two(),
+            block: commit_block(rows),
         };
         // The roles a decode step leaves inert hold their starting values; only `table` is written
         // again per batch.
@@ -551,24 +605,7 @@ impl CommitColumns {
         if commit.is_empty() {
             return Ok(());
         }
-        let fields = ops::commit::COMMIT_FIELDS;
-        if commit.len() != fields * staged_rows {
-            return Err(Error::Invariant(format!(
-                "the commit table holds {} values, {fields} fields of {staged_rows} rows",
-                commit.len()
-            )));
-        }
-        // The table is `[fields][capacity]` on the device: the staged rows are its first `rows`
-        // columns and the rest keep the previous batch's values behind `dim(1) >= count`.
-        let mut table = vec![0_i32; fields * capacity];
-        for field in 0..fields {
-            for row in 0..staged_rows.min(capacity) {
-                let value = commit[field * staged_rows + row];
-                table[field * capacity + row] = i32::try_from(value).map_err(|_| {
-                    Error::Invalid(format!("a commit column value {value} does not fit i32"))
-                })?;
-            }
-        }
+        let table = commit_table(commit, staged_rows, capacity)?;
         let mut encoded = Vec::new();
         encode_i32(&mut encoded, &table);
         self.table.write(&encoded)?;
@@ -1812,16 +1849,11 @@ impl<M: CausalLm> CausalLmRunner<M> {
             return Ok(());
         }
         let rows = u64::from(bucket.rows);
-        let descriptor = ops::commit::CommitDescriptor {
-            index: DType::I32,
-            verified: DType::I32,
-            penalties: DType::I32,
-            // The table's leading stride, which `CommitColumns::table_view` states.
-            stride: self.commit.capacity,
-            future_stride: 1,
-            vocab: self.geometry.vocabulary,
-            block: self.commit.block,
-        };
+        let descriptor = commit_descriptor(
+            self.commit.capacity,
+            self.commit.block,
+            self.geometry.vocabulary,
+        );
         let slots = u64::from(self.geometry.slots.max(1));
         let args = ops::commit::CommitArgs {
             columns: self.commit.table_view(),
@@ -2103,6 +2135,50 @@ mod tests {
         )?;
         assert_eq!(staged.tokens, 64);
         assert_eq!(&staging.batch_rows().slot_mapping[3..], &[-1i32; 61]);
+        Ok(())
+    }
+
+    /// The commit launch is well formed for the rows a bucket holds, and its table is the
+    /// mechanism's in the layout the operator states: `[COMMIT_FIELDS, capacity]` i32,
+    /// column-major, the staged rows first.
+    ///
+    /// These are the operator's own conditions (`SlotCommit::launch` checks them and refuses with
+    /// `Error::argument`), stated here because a wrong block or stride is otherwise discovered as a
+    /// failed launch inside a captured bucket on a device.
+    #[test]
+    fn the_commit_launch_is_well_formed_for_a_bucket() -> Result<()> {
+        let rows = 3;
+        let capacity = 4;
+        let vocabulary = 1_024;
+        let descriptor = commit_descriptor(capacity as u64, commit_block(rows as u32), vocabulary);
+        assert_eq!(descriptor.index, DType::I32);
+        assert_eq!(descriptor.verified, DType::I32);
+        assert_eq!(descriptor.penalties, DType::I32);
+        // The table's leading stride is its capacity, the stride `table_view` states.
+        assert_eq!(descriptor.stride, capacity as u64);
+        // A single next-input token per slot is a `[slots, 1]` matrix whose rows are one apart.
+        assert_eq!(descriptor.future_stride, 1);
+        assert_eq!(descriptor.vocab, vocabulary);
+        // The block covers the step's rows and is a power of two.
+        assert!(descriptor.block.is_power_of_two());
+        assert!(u64::from(descriptor.block) >= rows as u64);
+        assert_eq!(commit_block(1), 1);
+        assert_eq!(commit_block(5), 8);
+
+        // The mechanism's `[fields, rows]` table, column-major, becomes `[fields, capacity]`.
+        let mut staged = vec![0_i64; ops::commit::COMMIT_FIELDS * rows];
+        for row in 0..rows {
+            staged[ops::commit::column::SLOT * rows + row] = row as i64 + 7;
+            staged[ops::commit::column::MODE * rows + row] = ops::commit::mode::DECODE;
+        }
+        let table = commit_table(&staged, rows, capacity)?;
+        assert_eq!(table.len(), ops::commit::COMMIT_FIELDS * capacity);
+        let slots = &table[ops::commit::column::SLOT * capacity..(ops::commit::column::SLOT + 1) * capacity];
+        assert_eq!(&slots[..rows], &[7, 8, 9]);
+        // The rows past the batch are not written from the staged table.
+        assert_eq!(slots[rows], 0);
+        // A table of the wrong length is refused rather than read past its end.
+        assert!(commit_table(&staged[..rows], rows, capacity).is_err());
         Ok(())
     }
 
