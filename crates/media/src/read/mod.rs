@@ -19,13 +19,14 @@
 //! from what the server probed fails the request instead of misaligning its
 //! rows.
 //!
-//! Images are decoded by the `image` crate. Its lossless decoders (PNG, BMP,
-//! GIF) reproduce Pillow's bytes exactly, which the tests assert; its lossy
-//! decoders (JPEG, WebP) round differently from libjpeg-turbo by a few units
-//! per channel, which the design's numerical tolerance allows and the §10
-//! visual check covers. Every decoder that exposes EXIF metadata (JPEG, PNG's
-//! `eXIf` chunk, WebP, TIFF) has its orientation applied, all eight EXIF cases
-//! included.
+//! Images are decoded by the `image` crate. Its lossless PNG decoder
+//! reproduces Pillow's bytes exactly, which the tests assert; JPEG rounds
+//! differently from libjpeg-turbo by a few units per channel, which the
+//! design's numerical tolerance allows and the §10 visual check covers. The
+//! crate's other formats (BMP, GIF, WebP) have no fixtures here, so no
+//! equality is claimed for them. Every decoder that exposes EXIF metadata
+//! (JPEG, PNG's `eXIf` chunk, WebP, TIFF) has its orientation applied, all
+//! eight EXIF cases included.
 
 use std::borrow::Cow;
 use std::io::{Seek as _, SeekFrom};
@@ -138,6 +139,29 @@ struct Rgb24 {
     pixels: Vec<u8>,
 }
 
+/// A clip's bytes per frame and in total, checked against the address space.
+///
+/// A plan comes from a peer, so an extent the host cannot address must fail the
+/// request rather than overflow the arithmetic that sizes its buffers.
+fn clip_bytes(clip: &VideoClip) -> Result<(usize, usize)> {
+    let frame = (clip.canvas.0 as usize)
+        .checked_mul(clip.canvas.1 as usize)
+        .and_then(|area| area.checked_mul(3))
+        .ok_or_else(|| {
+            Error::Plan(format!(
+                "a reference video's plan of {}x{} frames exceeds the host's address space",
+                clip.canvas.0, clip.canvas.1
+            ))
+        })?;
+    let planned = frame.checked_mul(clip.frames as usize).ok_or_else(|| {
+        Error::Plan(format!(
+            "a reference video's plan of {} frames of {}x{} exceeds the host's address space",
+            clip.frames, clip.canvas.0, clip.canvas.1
+        ))
+    })?;
+    Ok((frame, planned))
+}
+
 /// Decodes an image to RGB24 with its EXIF orientation applied, as Pillow's
 /// `ImageOps.exif_transpose` and `convert("RGB")` do.
 fn decode_rgb(encoded: &[u8]) -> Result<Rgb24> {
@@ -171,10 +195,26 @@ fn decode_rgb(encoded: &[u8]) -> Result<Rgb24> {
 ///
 /// # Errors
 ///
-/// [`crate::Error::Plan`] when the image decodes to another raster than
-/// planned or `out` has another length; [`crate::Error::Codec`] when decoding
-/// fails.
+/// [`crate::Error::Plan`] when the plan's extent cannot be addressed, the
+/// image decodes to another raster than planned, or `out` has another length;
+/// [`crate::Error::Codec`] when decoding fails.
 pub fn read_image(encoded: &[u8], plan: &ImagePlan, out: &mut [u8]) -> Result<()> {
+    let (left, top, width, height) = plan.window;
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| {
+            Error::Plan(format!(
+                "a condition image's plan of {}x{} exceeds the host's address space",
+                width, height
+            ))
+        })?;
+    if out.len() != expected {
+        return Err(Error::Plan(
+            "a condition image's rows disagree with its plan".to_owned(),
+        ));
+    }
+
     let decoded = decode_rgb(encoded)?;
     // Pillow's resize to the image's own size is a copy, so an image already
     // at its raster passes through unchanged.
@@ -195,7 +235,6 @@ pub fn read_image(encoded: &[u8], plan: &ImagePlan, out: &mut [u8]) -> Result<()
         }
     };
 
-    let (left, top, width, height) = plan.window;
     if (left, top, width, height) != (0, 0, image.width, image.height) {
         let right = left.checked_add(width);
         let bottom = top.checked_add(height);
@@ -208,12 +247,6 @@ pub fn read_image(encoded: &[u8], plan: &ImagePlan, out: &mut [u8]) -> Result<()
                 "a condition image's window exceeds its raster".to_owned(),
             ));
         }
-    }
-    let expected = width as usize * height as usize * 3;
-    if out.len() != expected {
-        return Err(Error::Plan(
-            "a condition image's rows disagree with its plan".to_owned(),
-        ));
     }
     if width == image.width && height == image.height && left == 0 && top == 0 {
         if out.len() != image.pixels.len() {
@@ -244,10 +277,28 @@ pub fn read_image(encoded: &[u8], plan: &ImagePlan, out: &mut [u8]) -> Result<()
 ///
 /// # Errors
 ///
-/// [`crate::Error::Plan`] when the track has no audio stream, another rate, too
-/// few samples, or resamples to another count; [`crate::Error::Codec`] when
-/// decoding fails.
+/// [`crate::Error::Plan`] when the plan's extent cannot be addressed, the track
+/// has no audio stream, another rate, too few samples, or resamples to another
+/// count; [`crate::Error::Codec`] when decoding fails.
 pub fn read_audio(source: &[u8], plan: &AudioPlan, out: &mut [f32]) -> Result<()> {
+    let out_samples = plan.samples.checked_mul(2).ok_or_else(|| {
+        Error::Plan(format!(
+            "a condition track's plan of {} samples exceeds the host's address space",
+            plan.samples
+        ))
+    })?;
+    if out.len() != out_samples {
+        return Err(Error::Plan(
+            "a condition track's rows disagree with its plan".to_owned(),
+        ));
+    }
+    let window_samples = plan.source_samples.checked_mul(2).ok_or_else(|| {
+        Error::Plan(format!(
+            "a condition track's plan of {} samples exceeds the host's address space",
+            plan.source_samples
+        ))
+    })?;
+
     let decoded = ffi::decode_audio(source)?;
     if decoded.rate != plan.native_rate {
         return Err(Error::Plan(format!(
@@ -264,7 +315,7 @@ pub fn read_audio(source: &[u8], plan: &AudioPlan, out: &mut [f32]) -> Result<()
 
     // Keep the planned native window per channel; a mono track feeds both
     // stereo channels.
-    let mut planar = vec![0.0f32; 2 * plan.source_samples];
+    let mut planar = vec![0.0f32; window_samples];
     for channel in 0..2 {
         let source_channel = if decoded.channels == 1 { 0 } else { channel };
         let from = source_channel * decoded.samples + plan.start;
@@ -284,17 +335,12 @@ pub fn read_audio(source: &[u8], plan: &AudioPlan, out: &mut [f32]) -> Result<()
     } else {
         planar
     };
-    if stereo.len() != 2 * plan.samples {
+    if stereo.len() != out_samples {
         return Err(Error::Plan(format!(
             "an audio track resampled to {} samples, {} were planned",
             stereo.len() / 2,
             plan.samples
         )));
-    }
-    if out.len() != 2 * plan.samples {
-        return Err(Error::Plan(
-            "a condition track's rows disagree with its plan".to_owned(),
-        ));
     }
     for sample in 0..plan.samples {
         out[sample * 2] = stereo[sample];
@@ -314,8 +360,9 @@ pub fn read_audio(source: &[u8], plan: &AudioPlan, out: &mut [f32]) -> Result<()
 /// # Errors
 ///
 /// [`crate::Error::ReferenceVideo`] when the process exits in failure;
-/// [`crate::Error::Plan`] when it decodes another frame count;
-/// [`crate::Error::Io`] when the process cannot be started.
+/// [`crate::Error::Plan`] when the clip's extent cannot be addressed or it
+/// decodes to another frame count; [`crate::Error::Io`] when the process
+/// cannot be started.
 pub fn read_video(
     ffmpeg: &Path,
     source: &std::fs::File,
@@ -323,6 +370,7 @@ pub fn read_video(
     out: &mut [u8],
 ) -> Result<()> {
     let (width, height) = clip.canvas;
+    let (frame_bytes, planned) = clip_bytes(clip)?;
     let filters = format!(
         "fps={},trim=start_frame={},scale={width}:{height}:flags=lanczos,setsar=1",
         clip.frame_rate, clip.start_frame
@@ -371,8 +419,6 @@ pub fn read_video(
             message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         });
     }
-    let frame_bytes = width as usize * height as usize * 3;
-    let planned = frame_bytes * clip.frames as usize;
     if output.stdout.len() != planned {
         return Err(Error::Plan(format!(
             "a reference video decoded to {} frames, {} were planned",
@@ -469,12 +515,14 @@ pub fn read_conditions(
     let mut declared_pixels = Vec::new();
     let mut declared_samples = Vec::new();
     for condition in conditions {
-        if let Some(clip) = condition.video
-            && clip.vae_frames > clip.frames
-        {
-            return Err(Error::Plan(
-                "a reference video's encoded frames exceed its decoded frames".to_owned(),
-            ));
+        if let Some(clip) = condition.video {
+            if clip.vae_frames > clip.frames {
+                return Err(Error::Plan(
+                    "a reference video's encoded frames exceed its decoded frames".to_owned(),
+                ));
+            }
+            // Reject an unaddressable clip before any buffer is sized from it.
+            clip_bytes(&clip)?;
         }
         let (wanted_pixels, wanted_samples) = extents(condition);
         if condition.pixels.len() != wanted_pixels {
@@ -487,8 +535,16 @@ pub fn read_conditions(
                 "a condition's sample rows disagree with its plan".to_owned(),
             ));
         }
-        pixel_rows += condition.pixels.len();
-        sample_rows += condition.samples.len();
+        pixel_rows = pixel_rows
+            .checked_add(condition.pixels.len())
+            .ok_or_else(|| {
+                Error::Plan("the request's conditions exceed their pixels".to_owned())
+            })?;
+        sample_rows = sample_rows
+            .checked_add(condition.samples.len())
+            .ok_or_else(|| {
+                Error::Plan("the request's conditions exceed their samples".to_owned())
+            })?;
         if !condition.pixels.is_empty() {
             declared_pixels.push(condition.pixels.clone());
         }
@@ -540,14 +596,9 @@ pub fn read_conditions(
                         "a reference video needs a seekable file".to_owned(),
                     ));
                 };
+                let planned = clip_bytes(&clip)?.1;
                 videos.push(Some(scope.spawn(move || {
-                    let mut frames = vec![
-                        0u8;
-                        clip.frames as usize
-                            * clip.canvas.0 as usize
-                            * clip.canvas.1 as usize
-                            * 3
-                    ];
+                    let mut frames = vec![0u8; planned];
                     read_video(ffmpeg, file, &clip, &mut frames)?;
                     Ok(frames)
                 })));

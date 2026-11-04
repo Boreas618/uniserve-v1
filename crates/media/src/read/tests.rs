@@ -508,6 +508,56 @@ fn conditions_read_a_reference_videos_soundtrack_from_its_file() {
 }
 
 #[test]
+fn readers_refuse_a_plan_the_host_cannot_address() {
+    // A plan comes from a peer: an extent whose byte count overflows must fail
+    // the request instead of panicking in the arithmetic that sizes buffers.
+    let image = &image_cases()[0];
+    let huge = ImagePlan {
+        resized: (u32::MAX, u32::MAX),
+        window: (0, 0, u32::MAX, u32::MAX),
+    };
+    let mut empty = Vec::new();
+    assert!(read_image(&image.media, &huge, &mut empty).is_err());
+
+    let audio = &audio_cases()[0];
+    let mut samples_plan = audio.plan;
+    samples_plan.samples = usize::MAX;
+    let mut no_samples = Vec::new();
+    assert!(read_audio(&audio.media, &samples_plan, &mut no_samples).is_err());
+
+    let video = &video_cases()[0];
+    let file = std::fs::File::open(&video.file).unwrap();
+    let mut clip = video.clip;
+    clip.canvas = (65_536, 65_536);
+    clip.frames = u32::MAX;
+    clip.vae_frames = 1;
+    let mut no_frames = Vec::new();
+    assert!(read_video(&ffmpeg(), &file, &clip, &mut no_frames).is_err());
+
+    // The same plan is refused before any buffer is sized for it, even when
+    // the request holds no products.
+    let rows = clip.vae_frames as usize;
+    assert!(
+        read_conditions(
+            &ffmpeg(),
+            &[ConditionRead {
+                source: ConditionSource::File(&file),
+                image: None,
+                video: Some(clip),
+                audio: None,
+                pixels: 0..rows,
+                samples: 0..0,
+            }],
+            &mut ConditionProducts {
+                pixels: None,
+                samples: None,
+            },
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn conditions_refuse_rows_that_do_not_fill_their_products() {
     let image = &image_cases()[0];
     let rows = image.plan.window.2 as usize * image.plan.window.3 as usize;
