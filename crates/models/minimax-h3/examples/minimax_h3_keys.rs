@@ -1077,6 +1077,109 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
         );
     }
 
+    // ---- The video VAE decoder's own stack, from `vae/config.json` and `video_vae.rs`'s composition.
+    //
+    // The decoder is 36 blocks of one width - `decoder_num_attention_heads 32 ·
+    // decoder_attention_head_dim 64 = 2048` - with a feed-forward four times as wide
+    // (`decoder_ffn_mult 4` -> 8192), and every shape below is one no other component of this model
+    // asks for. That is exactly why none of them was here: a row set written from the shapes that
+    // have run drifts from the shapes that have not, and stage 2 has never decoded.
+    //
+    // Each family is pushed once per element type the export may store the VAE in: F16 for a
+    // checkpoint that keeps it half (the default, `dtype = "auto"`, which converts nothing), F32 for
+    // one that keeps it whole.
+    for vae in VAES {
+        // `norm1`/`norm2` - `RmsNorm::new(weight, decoder_norm_eps)` over the width.
+        push(
+            "rms_norm",
+            ops::norm::RmsNormDescriptor {
+                dtype: vae,
+                columns: VAE_WIDTH,
+                tile: row_tile(VAE_WIDTH),
+                pdl: PDL,
+            }
+            .to_string(),
+        );
+        // `decoder.norm_out` - the one LayerNorm of the stack, and it has its bias.
+        push(
+            "layer_norm",
+            ops::norm::LayerNormDescriptor {
+                dtype: vae,
+                columns: VAE_WIDTH,
+                tile: row_tile(VAE_WIDTH),
+                bias: true,
+                pdl: PDL,
+            }
+            .to_string(),
+        );
+        // Both residual adds carry a projection's bias (`ScaledResidual::new(scale, Some(bias))`): the
+        // attention's `to_out` bias and the feed-forward's `ff.net.2` bias belong to the residuals, as
+        // the reference groups them, so `update_bias` is true - a different program from the DiT's.
+        push(
+            "scaled_residual",
+            ScaledResidualDescriptor {
+                dtype: vae,
+                columns: VAE_WIDTH,
+                block: ops::residual::RESIDUAL_BLOCK,
+                update_bias: true,
+            }
+            .to_string(),
+        );
+        // The packed gate projection's bias is the activation's (`PackedSwiGlu::new(Some(bias))`), and
+        // its two halves sit beside each other, so the row stride is twice the width. The DiT's row is
+        // `bias_false`; this one is not interchangeable with it.
+        push(
+            "value_first_swiglu",
+            ops::activation::ValueFirstSwigluDescriptor {
+                dtype: vae,
+                width: VAE_MLP,
+                block: ELEMENTWISE_BLOCK,
+                input_stride: 2 * u64::from(VAE_MLP),
+                bias: true,
+                absmax: false,
+            }
+            .to_string(),
+        );
+        // The attention: 32 heads of 64 with as many key/value heads, a dense mask, no window, and
+        // **no offsets** - `attend_dense(..., None, None, rows, ...)` attends one clip as one
+        // sequence, and the key names that form only by its `cu_seq_lens_false` suffix.
+        push(
+            "dense_attention",
+            ops::attention::DenseDescriptor {
+                query: vae,
+                key_value: vae,
+                output: vae,
+                head_dim: 64,
+                q_heads: 32,
+                kv_heads: 32,
+                mask: ops::attention::Mask::Dense,
+                windowed: false,
+                // A launch bound outside the key: one tile's rows are `voxels + registers + 1` for a
+                // 256 x 256 x 5 tile, and 2048 covers the largest tile the plan decodes.
+                max_kv_len: 2048,
+                cu_seq_lens: false,
+            }
+            .to_string(),
+        );
+        // Its projections, at the VAE's own type: the input projection, the three q/k/v projections
+        // and `proj_out` carry a bias, while `to_out` and `ff.net.2` fold theirs into the residuals.
+        for epilogue in [ops::gemm::Epilogue::None, ops::gemm::Epilogue::Bias] {
+            push(
+                "gemm",
+                ops::gemm::Descriptor {
+                    input: vae,
+                    weight: vae,
+                    accumulate: DType::F32,
+                    output: vae,
+                    order: ops::gemm::WeightOrder::NxK,
+                    epilogue,
+                    k: VAE_WIDTH,
+                }
+                .to_string(),
+            );
+        }
+    }
+
     // ---- The video VAE's encoder, `vae/config.json` and `encoding.rs`'s own construction.
     //
     // The encoder is FP32 and every convolution passes `tf32 = true` at `Conv3d::new`, so the flag is
