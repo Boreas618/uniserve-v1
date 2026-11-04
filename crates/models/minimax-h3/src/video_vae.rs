@@ -449,7 +449,7 @@ use nn::layers::{
     Attention, LayerNorm, Linear, PackedSwiGlu, RmsNorm, Rotary, Rows, ScaledResidual, Sections,
 };
 use nn::weights::{Weight, WeightLoader, WeightRequest};
-use nn::{DType, Shape, StateTable, TensorView};
+use nn::{DType, DecodedMedia, Decoder, Shape, StateTable, TensorView};
 use ops::gemm::WeightOrder;
 
 /// One transformer layer of the decoder: the attention half and the gated feed-forward half, each
@@ -479,6 +479,9 @@ struct Layer {
 /// which is what `Rotary::apply`'s absent gains express.
 pub struct VideoDecoder {
     canvas: Canvas,
+    /// The tile stitch: the unpatchify and one compiled blend per seam width, built at load so that no
+    /// layer is built on a request's path.
+    stitch: crate::decoding::ClipDecoder,
     width: u32,
     input: Linear,
     registers: Weight,
@@ -670,6 +673,7 @@ impl VideoDecoder {
         let heads = config.decoder_num_attention_heads;
         let ffn = width * config.decoder_ffn_mult;
         let (rotated, sections) = rotary(config)?;
+        let stitch = crate::decoding::ClipDecoder::new(config)?;
         let out_channels = config.out_channels
             * config.temporal_compression()
             * config.spatial_compression()
@@ -803,6 +807,7 @@ impl VideoDecoder {
         .sectioned(Sections::new(&sections)?)?;
         Ok(Self {
             canvas,
+            stitch,
             width,
             input,
             registers,
@@ -1070,6 +1075,82 @@ impl VideoDecoder {
 
         self.norm.forward(f, hidden, normalized)?;
         Ok(self.output.forward(f, normalized, out)?)
+    }
+}
+
+impl Decoder for VideoDecoder {
+    /// Decode one clip: every tile of its canvas, stitched into `out.video`.
+    ///
+    /// `latents` is the clip's `[voxels, latent_channels]` rows in tile order — the runner gathers them
+    /// with the layout's `video_clip_rows` — `state` holds this block's one table, `video_positions`
+    /// `[3, rows]` axis-major in radians, and `out.video` is the clip's raster. The raster is
+    /// `[channels, frames, rows, columns]` in the decoder's own element type: the layers on this path —
+    /// the unpatchify, the seam blends and the byte step — all read a planar channels-first raster, and
+    /// `frames` is the clip's **native** output, `temporal` frames per latent frame, so it still holds
+    /// the three padding frames the splice drops. `out.audio` must be absent.
+    ///
+    /// The grid is arithmetic on the raster's extent, so one block serves every canvas of this
+    /// checkpoint; the clips are the runner's loop, and so is the splice.
+    fn decode(
+        &self,
+        f: &Forward,
+        latents: TensorView,
+        state: &[TensorView],
+        out: DecodedMedia,
+    ) -> nn::Result<()> {
+        let refuse = |problem: String| nn::Error::Shape {
+            owner: "VideoDecoder",
+            problem,
+        };
+        let [positions] = state else {
+            return Err(refuse(format!(
+                "the video decoder reads one table, video_positions, and {} were given",
+                state.len()
+            )));
+        };
+        let video = out
+            .video
+            .ok_or_else(|| refuse("a video decode writes a raster".to_owned()))?;
+        if out.audio.is_some() {
+            return Err(refuse("the video decoder writes no audio".to_owned()));
+        }
+        let spatial = self.config.spatial_compression();
+        let temporal = self.config.temporal_compression();
+        let channels = u64::from(crate::output::Rgb::CHANNELS);
+        if video.shape.rank() != 4 || video.shape.dim(0) != channels {
+            return Err(refuse(format!(
+                "the clip's raster is [{channels}, frames, rows, columns], not {:?}",
+                video.shape.dims()
+            )));
+        }
+        let (frames, height, width) = (video.shape.dim(1), video.shape.dim(2), video.shape.dim(3));
+        if frames % u64::from(temporal) != 0
+            || height % u64::from(spatial) != 0
+            || width % u64::from(spatial) != 0
+        {
+            return Err(refuse(format!(
+                "a {frames}x{height}x{width} raster is not a whole number of {temporal}-frame, \
+                 {spatial}-pixel latent cells"
+            )));
+        }
+        let clip = Canvas::clip(
+            &self.config,
+            u32::try_from(height / u64::from(spatial)).unwrap_or(u32::MAX),
+            u32::try_from(width / u64::from(spatial)).unwrap_or(u32::MAX),
+        );
+        let latent_frames = u32::try_from(frames / u64::from(temporal)).unwrap_or(u32::MAX);
+        if latent_frames != clip.frames {
+            return Err(refuse(format!(
+                "a clip decodes {} latent frames to {frames} raster frames, and this one is {latent_frames}",
+                clip.frames
+            )));
+        }
+        let tiles = Tiles::of(&self.config, &clip)
+            .map_err(|error| refuse(format!("the clip's tile grid: {error}")))?
+            .tiles(&self.config, &clip);
+        self.stitch
+            .decode_clip(f, self, &tiles, latents, *positions, video)
+            .map_err(|error| refuse(format!("{error}")))
     }
 }
 
