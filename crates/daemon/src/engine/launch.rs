@@ -43,7 +43,8 @@ pub(crate) struct Launch {
     pub requests: String,
     /// The daemon's process interface, `unix:<path>` or `<host>:<port>`: the
     /// supervision frames this process claims its storage with and reports to,
-    /// and the one place a program-layer command can reach it.
+    /// and the one place a program-layer command can reach it. A different
+    /// vocabulary from `requests`, not a second address of the same one.
     pub processes: String,
     /// The identity the daemon started this process under: the engine number,
     /// or the launch generation in the epoch-switch path, where that is the
@@ -243,10 +244,6 @@ mod tests {
         .map(str::to_owned)
         .collect::<BTreeSet<_>>();
         assert_eq!(keys, expected);
-        assert_eq!(
-            value["processes"],
-            json!("unix:/run/uniserve/processes.sock")
-        );
         assert_eq!(value["engine"], json!(7));
         assert_eq!(value["world"], json!(12));
         assert_eq!(value["devices"], json!([0, 1]));

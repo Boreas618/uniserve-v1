@@ -1,7 +1,10 @@
-//! The leader's view of its engine processes: starting one (`control`), the
-//! client of the request interface it serves (`client`), and the hold every
-//! request passes, which waits while no engine is ready (`hold`).
+//! The leader's view of its processes: the application process that serves the
+//! API (`application`), starting a main process (`control`), the client of the
+//! request interface it serves (`client`), the launch file it reads (`launch`),
+//! and the hold every request passes, which waits while no engine is ready
+//! (`hold`).
 
+pub(crate) mod application;
 pub mod client;
 pub mod control;
 pub mod hold;

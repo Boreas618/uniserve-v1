@@ -117,6 +117,16 @@ impl Submissions {
             !info.workers.is_empty(),
             "the in-process executor states no pool to schedule against"
         );
+        // A batch carries the columns the kernels read, and every KV view is
+        // shaped to the longest sequence the deployment was built for: without
+        // that number no batch is servable, so it is a fact of the boot and not
+        // something to discover at the first step as "nothing was dispatched"
+        // (design §4.3's layout, §4.4's hard limits).
+        anyhow::ensure!(
+            info.max_model_len > 0,
+            "the in-process executor states no longest sequence; a policy cannot be shaped to a \
+             KV view without one"
+        );
         let (queue, pending) = crossbeam_channel::unbounded::<Pending>();
         let (reports, ready) = crossbeam_channel::unbounded();
         std::thread::Builder::new()

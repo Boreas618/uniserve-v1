@@ -1543,6 +1543,11 @@ pub(crate) const fn finished(request: ViewRequestId, end: End) -> Event {
     Event::Finished { request, end }
 }
 
+/// A request the mechanism ended, named by the mechanism's own id.
+pub(crate) const fn ended(request: ipc::RequestId, end: End) -> Event {
+    finished(ViewRequestId(request.0), end)
+}
+
 /// A scheduling step ended.
 pub(crate) fn stepped(step: u64, duration: std::time::Duration) -> Event {
     Event::Stepped {

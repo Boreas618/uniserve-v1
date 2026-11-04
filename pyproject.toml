@@ -120,7 +120,7 @@ debug = false
 # (one worker, in this environment) and `storage` (a host's Storage Server).
 [[tool.setuptools-rust.bins]]
 target = "uniserve"
-path = "crates/uniserve/Cargo.toml"
+path = "Cargo.toml"
 debug = false
 
 [tool.pytest.ini_options]

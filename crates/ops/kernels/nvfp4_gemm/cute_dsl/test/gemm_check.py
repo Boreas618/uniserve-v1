@@ -372,8 +372,8 @@ def run(module_dir, m, n, k, output, layout, seed, bias):
     declared = declared_bound(m, n, k, output)
     contraction = dot_bound(m, n, k, output)
     allowed = declared * magnitude
-    violations = int((error > allowed).sum())
-    worst = error.max().item()
+    violations = int((~(error <= allowed)).sum())
+    worst = torch.nan_to_num(error).max().item()
     worst_at = int(error.reshape(-1).argmax())
     cancellation = (a.abs() @ b.T.abs()).max().item() / max(magnitude.max().item(), 1e-30)
 
