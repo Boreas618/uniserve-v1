@@ -268,6 +268,21 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
                 .map(|buffer| buffer.elements * 4)
                 .sum::<u64>();
         }
+        if std::env::var("H3_PLAN_TILES").is_ok() && width == 1344 {
+            for tile in &plan.tiles {
+                println!(
+                    "    tile r{} c{}: latent {}x{} at ({},{}) overlaps {}/{}",
+                    tile.row,
+                    tile.column,
+                    tile.rows.1,
+                    tile.columns.1,
+                    tile.rows.0,
+                    tile.columns.0,
+                    tile.above,
+                    tile.left
+                );
+            }
+        }
         println!(
             "encoder grid {width}x{height}: {} tiles, {} distinct extents, largest tile {} MiB, loop-today {} MiB, hoisted {} MiB",
             plan.tiles.len(),
