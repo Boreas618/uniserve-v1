@@ -1123,11 +1123,18 @@ mod tests {
     fn vendor_package(directory: &Path, metadata: Option<&str>) {
         std::fs::create_dir_all(directory.join("cubin")).unwrap();
         std::fs::write(directory.join("cubin/dtype_bf16.cubin"), b"a cubin").unwrap();
-        std::fs::write(
-            directory.join("cubin/dtype_bf16.json"),
-            br#"{"name": "vendor"}"#,
-        )
-        .unwrap();
+        // A package without launch metadata carries no metadata JSON at all;
+        // one that names the metadata file carries a JSON per descriptor.
+        let files = if metadata.is_some() {
+            std::fs::write(
+                directory.join("cubin/dtype_bf16.json"),
+                br#"{"name": "vendor"}"#,
+            )
+            .unwrap();
+            r#"["cubin/{descriptor}.cubin", "cubin/{descriptor}.json"]"#
+        } else {
+            r#"["cubin/{descriptor}.cubin"]"#
+        };
         let metadata = metadata.map_or(String::new(), |name| format!("metadata = \"{name}\"\n"));
         std::fs::write(
             directory.join("package.toml"),
@@ -1145,7 +1152,7 @@ form = "cubin"
 {metadata}
 [source]
 kind = "cubin"
-files = ["cubin/{{descriptor}}.cubin", "cubin/{{descriptor}}.json"]
+files = {files}
 
 [kernel]
 architectures = ["sm_100a"]
@@ -1207,7 +1214,7 @@ keys = ["dtype_bf16"]
             )
             .unwrap_err();
         assert!(
-            error.to_string().contains("dtype_bf16.json"),
+            error.to_string().contains("metadata"),
             "the error names the missing metadata: {error}"
         );
     }

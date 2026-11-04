@@ -7,8 +7,9 @@
 //! region that is never read, because construction only inspects extents and strides.
 
 use nn::{
-    DType, DevicePtr, FrameNormPad, Linear, ModulatedRmsNorm, Rotary, Rotation, ScaledResidual,
-    ScaledResidualRmsNorm, Shape, SwiGlu, TensorView, VsaTiles, Weight, WeightedRmsNorm,
+    AdaptivePool, DType, DevicePtr, FrameNormPad, GatedResidual, KvGroup, KvPlanes, KvView, Linear,
+    ModulatedRmsNorm, Patch, PatchMode, Rotary, Rotate, Rotation, ScaledResidual,
+    ScaledResidualRmsNorm, Shape, Snake, SwiGlu, TensorView, VsaTiles, Weight, WeightedRmsNorm,
 };
 use ops::gemm::WeightOrder;
 
@@ -168,4 +169,96 @@ fn the_tile_selection_needs_a_whole_tile_and_a_pair_of_rotated_features() {
             .is_err(),
         "the rotation cannot be wider than the features"
     );
+}
+
+/// The page scales belong to the layer, not the group: two layers of one FP8 group keep their own
+/// encodings, and the cache view hands each layer's out with it.
+#[test]
+fn a_group_carries_each_layers_own_page_scales() {
+    let pages = Shape::new(&[16, 1, 1, 1]);
+    let planes_shape = Shape::new(&[16, 64, 8, 128]);
+    let fp8 = |address: u64| TensorView::new(DevicePtr::new(address), DType::F8E4M3, planes_shape);
+    let flags = |address: u64| TensorView::new(DevicePtr::new(address), DType::I32, pages);
+    let scale = |address: u64| TensorView::new(DevicePtr::new(address), DType::F32, pages);
+    let planes = |base: u64| KvPlanes {
+        key: fp8(base),
+        value: fp8(base + 0x100),
+        key_initialized: flags(base + 0x200),
+        value_initialized: flags(base + 0x300),
+        key_scale: Some(scale(base + 0x400)),
+        value_scale: Some(scale(base + 0x500)),
+    };
+    let layers = [planes(0x1_0000), planes(0x2_0000)];
+    let table = TensorView::new(DevicePtr::new(0x3_0000), DType::I32, Shape::new(&[4, 8]));
+    let groups = [KvGroup {
+        block_tables: table,
+        page_size: 64,
+        dtype: DType::F8E4M3,
+        layers: &layers,
+    }];
+    let view = KvView { groups: &groups };
+
+    let first = view.planes(0, 0).unwrap();
+    let second = view.planes(0, 1).unwrap();
+    assert_eq!(first.key_scale.unwrap().ptr, DevicePtr::new(0x1_0400));
+    assert_eq!(second.key_scale.unwrap().ptr, DevicePtr::new(0x2_0400));
+    assert_eq!(first.value_scale.unwrap().ptr, DevicePtr::new(0x1_0500));
+    assert_eq!(second.value_scale.unwrap().ptr, DevicePtr::new(0x2_0500));
+}
+
+/// The audio encoder's activation and head pool are built from the checkpoint's channel counts, so
+/// a mismatched checkpoint fails where it is loaded rather than at the first launch.
+#[test]
+fn the_audio_layers_hold_their_channels() {
+    assert!(Snake::new(0).is_err());
+    assert!(Snake::new(8).is_ok());
+
+    let pool = AdaptivePool::new(8, 256, 32).unwrap();
+    assert_eq!(pool.output(), 32);
+    // A pool of nothing, or into nothing, has no geometry to compile.
+    assert!(AdaptivePool::new(0, 256, 32).is_err());
+    assert!(AdaptivePool::new(8, 0, 32).is_err());
+    assert!(AdaptivePool::new(8, 256, 0).is_err());
+    // Wider than the descriptor's fields hold.
+    assert!(AdaptivePool::new(u64::from(u32::MAX) + 1, 256, 32).is_err());
+}
+
+/// The gate table of a diffusion block is one row per conditioning parameter, and a table of no
+/// rows or a vector is a loading error rather than a launch-time surprise.
+#[test]
+fn a_gated_residual_holds_the_gate_table_it_gates_with() {
+    assert!(GatedResidual::new(weight(&[4, 32])).is_ok());
+    let gate = GatedResidual::new(weight(&[4, 32])).unwrap();
+    assert_eq!(gate.width(), 32);
+    assert!(GatedResidual::new(weight(&[32])).is_err());
+    assert!(GatedResidual::new(weight(&[4, 0])).is_err());
+}
+
+/// The patch mapping is built from a layout's latent geometry: channels and the patch grid are
+/// fixed by the layout, frames are the call's launch value, and an odd extent has no whole patches.
+#[test]
+fn a_patch_mapping_holds_a_layouts_latent_geometry() {
+    let patch = Patch::new(24, 32, 32).unwrap();
+    assert_eq!(patch.channels(), 24);
+    assert_eq!(PatchMode::Patchify.to_string(), "patchify");
+    assert_eq!(PatchMode::Unpatchify.to_string(), "unpatchify");
+    assert!(Patch::new(0, 32, 32).is_err());
+    assert!(Patch::new(24, 0, 32).is_err());
+    assert!(
+        Patch::new(24, 33, 32).is_err(),
+        "an odd height has no whole patch"
+    );
+    assert!(Patch::new(24, 32, 31).is_err());
+    assert!(Patch::new(u64::from(u32::MAX) + 1, 32, 32).is_err());
+}
+
+/// The vision tower's rotation is built from its head geometry alone: the tables are the caller's
+/// and the whole head turns, so a narrower cut or an odd head has no program.
+#[test]
+fn a_vision_rotation_holds_a_head_and_its_heads() {
+    let rotate = Rotate::new(64, 12, Rotation::Half).unwrap();
+    assert_eq!((rotate.head_dim(), rotate.heads()), (64, 12));
+    assert!(Rotate::new(63, 12, Rotation::Half).is_err());
+    assert!(Rotate::new(0, 12, Rotation::Half).is_err());
+    assert!(Rotate::new(64, 0, Rotation::Half).is_err());
 }
