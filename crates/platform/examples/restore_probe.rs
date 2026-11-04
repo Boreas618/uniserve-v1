@@ -70,11 +70,11 @@ fn main() -> platform::Result<()> {
     let ledger = Ledger::new(64 << 20);
     let mut allocator = Allocator::new(&device, Arc::<Ledger>::clone(&ledger))?;
     for pool in [PoolKind::Graph, PoolKind::Scratch, PoolKind::Resident] {
-        allocator.reserve(pool, 4 << 20)?;
+        allocator.reserve(pool, 64 << 20)?;
     }
     let graph = allocator.allocate(PoolKind::Graph, 1 << 20)?;
     let scratch = allocator.allocate(PoolKind::Scratch, 1 << 20)?;
-    let resident = allocator.allocate(PoolKind::Resident, 1 << 20)?;
+    let resident = allocator.allocate(PoolKind::Resident, graph.len() * 2)?;
     println!(
         "blocks as the driver rounded them: graph {} bytes, scratch {} bytes, resident {} bytes, \
          together {} bytes",
@@ -94,9 +94,10 @@ fn main() -> platform::Result<()> {
     );
     ledger.print("suspended");
 
-    // The allowance the failing test shrinks to: below what the three blocks
-    // map, so at least one pool's restore must be refused.
-    let limit = (2u64 << 20) + (1 << 19);
+    // The allowance the test shrinks to: the graph and scratch pools' own
+    // totals, which is below the resident pool's, because a budget books one
+    // pool's total and not the sum over the three.
+    let limit = graph.len().max(scratch.len()) as u64;
     ledger.set_limit(limit);
     println!("allowance shrunk to {limit} bytes");
     match allocator.restore() {
