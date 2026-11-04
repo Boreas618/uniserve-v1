@@ -11,6 +11,7 @@ mod error_taxonomy;
 mod expert_rebalance;
 mod image_ipc;
 mod in_process;
+mod in_process_completion;
 mod media_occupancy;
 mod media_preemption;
 mod migration;
