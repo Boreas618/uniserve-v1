@@ -5,6 +5,7 @@
 
 mod boot;
 mod cache_storage;
+mod call_counts;
 mod canvas;
 mod control_plane;
 mod encoder_outputs;
