@@ -78,6 +78,7 @@ pub mod descriptor;
 pub mod embedding;
 pub mod error;
 pub mod exchange;
+pub mod frame;
 pub mod gemm;
 pub mod generation;
 pub mod kernel;
