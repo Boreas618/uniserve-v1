@@ -315,6 +315,10 @@ pub(crate) const fn device_page(unit: u32) -> PageId {
 }
 
 /// The page id of the host KV page with index `index`.
+///
+/// The mechanism reads host page ids from the pool's announcements; this is the
+/// inverse that states one, and the page-space tests are where it is needed.
+#[cfg(test)]
 pub(crate) const fn host_page(index: u64) -> PageId {
     PageId(HOST_PAGE | index)
 }
