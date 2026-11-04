@@ -229,14 +229,6 @@ pub fn video_arena(
     // because a tile at the canvas's edge can be narrower than the tile size.
     let rows: u64 = grid.iter().map(|tile| tile.canvas.rows()).sum();
     let voxels: u64 = grid.iter().map(|tile| tile.canvas.voxels()).sum();
-    // A tile's decoded block is its own latent extent in output pixels.
-    let patches: u64 = grid
-        .iter()
-        .map(|tile| {
-            let (tile_height, tile_width) = tile.canvas.pixels(config);
-            u64::from(frames) * u64::from(tile_height) * u64::from(tile_width)
-        })
-        .sum();
     // The clip's own raster, which the tiles are stitched into.
     let raster = u64::from(frames) * u64::from(height) * u64::from(width_px);
     let channels = u64::from(crate::output::Rgb::CHANNELS);
@@ -244,12 +236,11 @@ pub fn video_arena(
     // tile loop, and live across the whole clip; the per-tile ones are reserved inside it and reused by
     // every tile. `VideoDecoder::decode` reserves them in this list's order, and the executor sizes the
     // arena by the sum, because the clip-level buffers are live while the per-tile ones are in use.
+    let patch = u64::from(config.out_channels)
+        * u64::from(config.temporal_compression())
+        * u64::from(config.spatial_compression())
+        * u64::from(config.spatial_compression());
     Ok(vec![
-        Buffer {
-            name: "pixels",
-            element: "f16",
-            elements: patches * channels,
-        },
         Buffer {
             name: "decoded",
             element: "f16",
@@ -261,14 +252,9 @@ pub fn video_arena(
             elements: raster * channels,
         },
         Buffer {
-            name: "rgb",
-            element: "u8",
-            elements: raster * channels,
-        },
-        Buffer {
-            name: "overlap",
+            name: "tokens",
             element: "f16",
-            elements: crate::output::Rgb::of(frames, height, width_px).overlap_elements(),
+            elements: rows * patch,
         },
         Buffer {
             name: "stream",
@@ -365,30 +351,15 @@ pub struct ClipDecoder {
     blends: Vec<(u32, u32, CrossFade)>,
     /// Pixels per latent position, the ratio a tile's latent origin scales by.
     ratio: u32,
+    /// Elements of one token: `out_channels · temporal · spatial²`, the row width every tile's decode
+    /// writes and the unpatchify reads.
+    patch: u64,
     /// The raster's frames: a latent frame decodes to `temporal` of them, and every tile spans them
     /// all.
     frames: u32,
     /// The de-normalization into bytes: the ImageNet constants and the rounding, in the decoder's own
     /// element type so the fade's result is quantized without a conversion.
     rgb: RgbBytes,
-}
-
-/// The device views one clip's decode reads and writes, as the caller uploaded and reserved them.
-///
-/// One latent view and one position table per tile of the clip, one token buffer for the whole clip,
-/// and the two rasters the tiles are stitched into.
-#[derive(Clone, Copy, Debug)]
-pub struct Scene<'a> {
-    /// Tile `i`'s latent voxel rows, `[voxels, latent_channels]`, in tile order.
-    pub latents: &'a [TensorView],
-    /// Tile `i`'s rotary table, `[3, rows]` axis-major, in tile order.
-    pub positions: &'a [TensorView],
-    /// One buffer for the clip, `[tiles · rows, out_channels · temporal · spatial²]`.
-    pub tokens: TensorView,
-    /// The clip's raster as decoded: read as a neighbour, never written by a blend.
-    pub decoded: TensorView,
-    /// The clip's raster as stitched: the blends' destination.
-    pub blended: TensorView,
 }
 
 impl ClipDecoder {
@@ -407,6 +378,10 @@ impl ClipDecoder {
             config.temporal_compression(),
             spatial,
         )?;
+        let patch = u64::from(config.out_channels)
+            * u64::from(config.temporal_compression())
+            * u64::from(spatial)
+            * u64::from(spatial);
         // The grid spreads its slack over the seams, so the overlaps are not all equal; one compiled
         // blend serves every seam of the same width, and a decoder fades both ways needs both axes.
         let mut extents: Vec<u32> = tiles
@@ -428,6 +403,7 @@ impl ClipDecoder {
         let rgb = RgbBytes::new(DType::F16, crate::output::Rgb::CHANNELS, mean, std)?;
         Ok(Self {
             unpatchify,
+            patch,
             blends,
             ratio: spatial,
             frames: canvas.frames_out(config),
@@ -542,42 +518,83 @@ impl ClipDecoder {
         ))
     }
 
-    /// Decode one clip: every tile of its canvas, in [`Tile`] order, into the clip's two rasters.
+    /// Decode one clip: every tile of its canvas, in [`Tile`] order, into the clip's raster.
     ///
-    /// `latents[i]` is tile `i`'s latent voxel rows `[voxels, latent_channels]` and `positions[i]` its
-    /// `[3, rows]` rotary table, both as the caller uploaded them; `tokens` is one buffer for the whole
-    /// clip, `[tiles · rows, out_channels · temporal · spatial²]`, which each tile's decode writes into in
-    /// its own row range. `decoded` and `blended` are the clip's rasters: the first holds every tile as it
-    /// was decoded and is only ever read as a neighbour, the second carries the stitched result.
+    /// The runner hands this one latent block and one output and nothing else: `latents` is the clip's
+    /// `[voxels, latent_channels]` rows in tile order, `positions` the layout's `video_positions`
+    /// `[3, rows]` table, and `out` the clip's raster `[channels, frames, rows, columns]` in the
+    /// decoder's element type, which the tiles are stitched into. Every tile view is the model's own:
+    /// the rows are cumulative over the tiles' voxel counts, and the token buffer is reserved here, in
+    /// the arena, one tile at a time.
     ///
-    /// The tiles are the clip's own canvas — [`Tiles::tiles`] — and they are decoded one after another
-    /// because a seam blend reads what the tile above and the tile to the left have already written.
+    /// The tiles are decoded one after another because a seam blend reads what the tile above and the
+    /// tile to its left have already written.
     pub fn decode_clip(
         &self,
         f: &Forward,
         decoder: &crate::video_vae::VideoDecoder,
         tiles: &[Tile],
-        scene: Scene<'_>,
+        latents: TensorView,
+        positions: TensorView,
+        out: TensorView,
     ) -> Result<()> {
-        let Scene {
-            latents,
-            positions,
-            tokens,
-            decoded,
-            blended,
-        } = scene;
-        check_clip(tiles, latents.len(), positions.len(), tokens.shape)?;
+        let voxels: u64 = tiles.iter().map(|tile| tile.canvas.voxels()).sum();
+        let channels = u64::from(crate::output::Rgb::CHANNELS);
+        if latents.shape.rank() != 2 || latents.shape.dim(0) != voxels {
+            return Err(Error::config(format!(
+                "the clip's latent block is [{voxels}, latent_channels], not {:?}",
+                latents.shape.dims()
+            )));
+        }
+        // One table serves every tile only when the grid is uniform, which it is wherever the canvas
+        // is at least one tile wide: the coordinates are the tile's own extents, so a tile of another
+        // size would need a table of its own.
+        let table_rows = positions.shape.dim(1);
+        if positions.shape.rank() != 2 || positions.shape.dim(0) != 3 {
+            return Err(Error::config(format!(
+                "the position table is [3, rows], not {:?}",
+                positions.shape.dims()
+            )));
+        }
+        for tile in tiles {
+            if crate::video_vae::Canvas::rows(&tile.canvas) != table_rows {
+                return Err(Error::config(format!(
+                    "tile ({}, {}) needs {} position rows and the layout's table holds {table_rows}: \
+                     the table is the largest tile's, so a grid of two tile sizes has none",
+                    tile.row,
+                    tile.column,
+                    crate::video_vae::Canvas::rows(&tile.canvas)
+                )));
+            }
+        }
+        if out.shape.rank() != 4 || out.shape.dim(0) != channels {
+            return Err(Error::config(format!(
+                "the clip's raster is [{channels}, frames, rows, columns], not {:?}",
+                out.shape.dims()
+            )));
+        }
+        // The clip-level buffers, reserved once: the raster every tile is decoded into and then read
+        // from as a neighbour. `out` is the stitched result, so the two rasters the seam needs are
+        // these two and the plan's `decoded` is the only clip-level reservation this call makes.
+        let decoded = f.arena().tensor(out.dtype, out.shape)?;
+        let patch = self.patch;
         let mut start = 0_u64;
-        for (index, tile) in tiles.iter().enumerate() {
+        for tile in tiles {
             let tile_rows = crate::video_vae::Canvas::rows(&tile.canvas);
-            let view = TensorView::new(
-                tokens.offset_elements(start * tokens.shape.dim(1)),
-                tokens.dtype,
-                Shape::new(&[tile_rows, tokens.shape.dim(1)]),
+            let tile_voxels = tile.canvas.voxels();
+            let latent = TensorView::new(
+                latents.offset_elements(start * latents.shape.dim(1)),
+                latents.dtype,
+                Shape::new(&[tile_voxels, latents.shape.dim(1)]),
             );
-            decoder.decode(f, latents[index], positions[index], view)?;
-            self.write_tile(f, tile, view, decoded, blended)?;
-            start += tile_rows;
+            // One tile's token buffer: the plan's `tokens` is the whole clip's, and the reservations
+            // of the tiles sum to it because each is reused only by its own tile's decode.
+            let tokens = f
+                .arena()
+                .tensor(out.dtype, Shape::new(&[tile_rows, patch]))?;
+            decoder.decode(f, latent, positions, tokens)?;
+            self.write_tile(f, tile, tokens, decoded, out)?;
+            start += tile_voxels;
         }
         Ok(())
     }
@@ -608,32 +625,6 @@ impl ClipDecoder {
         self.rgb.forward(f, blended, out)?;
         Ok(())
     }
-}
-
-/// Check one clip's arguments before any launch, and answer the token rows it needs.
-///
-/// A clip decodes one tile per entry of its grid: one latent view and one position table each, and one
-/// token buffer whose rows are the tiles' rows in the same order.
-fn check_clip(tiles: &[Tile], latents: usize, positions: usize, tokens: Shape) -> Result<u64> {
-    if latents != tiles.len() || positions != tiles.len() {
-        return Err(Error::config(format!(
-            "{} tiles need {} latent views and {} position tables, found {latents} and {positions}",
-            tiles.len(),
-            tiles.len(),
-            tiles.len()
-        )));
-    }
-    let rows: u64 = tiles
-        .iter()
-        .map(|tile| crate::video_vae::Canvas::rows(&tile.canvas))
-        .sum();
-    if tokens.rank() != 2 || tokens.dim(0) != rows {
-        return Err(Error::config(format!(
-            "the clip's token buffer is {:?}, {rows} rows expected",
-            tokens.dims()
-        )));
-    }
-    Ok(rows)
 }
 
 #[cfg(test)]
@@ -950,11 +941,8 @@ mod tests {
         // The clip-level buffers come first and the per-tile ones after, which is the order the model
         // reserves them in: a plan that lists them the other way round is a plan the code does not
         // follow.
-        let clip_level: Vec<&str> = arena.iter().take(5).map(|buffer| buffer.name).collect();
-        assert_eq!(
-            clip_level,
-            ["pixels", "decoded", "blended", "rgb", "overlap"]
-        );
+        let clip_level: Vec<&str> = arena.iter().take(3).map(|buffer| buffer.name).collect();
+        assert_eq!(clip_level, ["decoded", "blended", "tokens"]);
         // Every buffer is named once and no buffer is empty.
         let mut names: Vec<&str> = arena.iter().map(|buffer| buffer.name).collect();
         let count = names.len();
