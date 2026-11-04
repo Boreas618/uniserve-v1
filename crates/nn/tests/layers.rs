@@ -7,8 +7,9 @@
 //! region that is never read, because construction only inspects extents and strides.
 
 use nn::{
-    DType, DevicePtr, FrameNormPad, Linear, ModulatedRmsNorm, Rotary, Rotation, ScaledResidual,
-    ScaledResidualRmsNorm, Shape, SwiGlu, TensorView, VsaTiles, Weight, WeightedRmsNorm,
+    DType, DevicePtr, FrameNormPad, KvGroup, KvPlanes, KvView, Linear, ModulatedRmsNorm, Rotary,
+    Rotation, ScaledResidual, ScaledResidualRmsNorm, Shape, SwiGlu, TensorView, VsaTiles, Weight,
+    WeightedRmsNorm,
 };
 use ops::gemm::WeightOrder;
 
@@ -168,4 +169,39 @@ fn the_tile_selection_needs_a_whole_tile_and_a_pair_of_rotated_features() {
             .is_err(),
         "the rotation cannot be wider than the features"
     );
+}
+
+/// The page scales belong to the layer, not the group: two layers of one FP8 group keep their own
+/// encodings, and the cache view hands each layer's out with it.
+#[test]
+fn a_group_carries_each_layers_own_page_scales() {
+    let pages = Shape::new(&[16, 1, 1, 1]);
+    let planes_shape = Shape::new(&[16, 64, 8, 128]);
+    let fp8 = |address: u64| TensorView::new(DevicePtr::new(address), DType::F8E4M3, planes_shape);
+    let flags = |address: u64| TensorView::new(DevicePtr::new(address), DType::I32, pages);
+    let scale = |address: u64| TensorView::new(DevicePtr::new(address), DType::F32, pages);
+    let planes = |base: u64| KvPlanes {
+        key: fp8(base),
+        value: fp8(base + 0x100),
+        key_initialized: flags(base + 0x200),
+        value_initialized: flags(base + 0x300),
+        key_scale: Some(scale(base + 0x400)),
+        value_scale: Some(scale(base + 0x500)),
+    };
+    let layers = [planes(0x1_0000), planes(0x2_0000)];
+    let table = TensorView::new(DevicePtr::new(0x3_0000), DType::I32, Shape::new(&[4, 8]));
+    let groups = [KvGroup {
+        block_tables: table,
+        page_size: 64,
+        dtype: DType::F8E4M3,
+        layers: &layers,
+    }];
+    let view = KvView { groups: &groups };
+
+    let first = view.planes(0, 0).unwrap();
+    let second = view.planes(0, 1).unwrap();
+    assert_eq!(first.key_scale.unwrap().ptr, DevicePtr::new(0x1_0400));
+    assert_eq!(second.key_scale.unwrap().ptr, DevicePtr::new(0x2_0400));
+    assert_eq!(first.value_scale.unwrap().ptr, DevicePtr::new(0x1_0500));
+    assert_eq!(second.value_scale.unwrap().ptr, DevicePtr::new(0x2_0500));
 }
