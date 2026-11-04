@@ -1,6 +1,6 @@
 # Qwen3-MoE GSM8K quality confirmation
 
-This page specifies how UniServe confirms Qwen3-MoE quality on GSM8K. Design section 10 confirms the model family by accuracy on a public benchmark: `uniserve-eval` runs the same checkpoint on the same sample set with the same sampling settings twice, once against the implementation in the checkout and once against a candidate build named with `--executable`, and accepts the candidate when the accuracy difference lies within the two-sided 95% confidence interval of the difference of two binomial proportions at that sample size. The confirmation covers three cells: the BF16 checkpoint, its ModelOpt NVFP4 export, and the BF16 checkpoint with FP8 KV pages.
+This page specifies how UniServe confirms Qwen3-MoE quality on GSM8K: `uniserve-eval` runs the same checkpoint on the same sample set with the same sampling settings twice, once against the current implementation and once against a candidate build named with `--executable`, and accepts the candidate when the accuracy difference lies within the two-sided 95% confidence interval of the difference of two binomial proportions at that sample size. The confirmation covers three cells: the BF16 checkpoint, its ModelOpt NVFP4 export, and the BF16 checkpoint with FP8 KV pages.
 
 The protocol lives in `uniserve_eval/qwen3_moe.toml` (suite `qwen3-moe-gsm8k`); the workload, sample set, request shape, extraction rule and comparison are fixed there and in the evaluator, not chosen per run. This page states those fixed choices and the commands that exercise them. The [results](#results) are pending.
 
@@ -42,7 +42,7 @@ An answer that does not parse is incorrect, not a request failure. A failed requ
 
 ## Acceptance
 
-Each cell is measured twice with the same profile: a baseline run on the implementation in the checkout, and a candidate run with `--executable <new server binary>`. Both runs must be completed, valid `gsm8k` runs over the same `selected_rows` identity whose count is 1319, with `load.num_prompts` equal to that count and the same `workload.sampling`, `workload.provenance`, `workload.model` and resolved daemon model argument. A pair that fails a premise is reported as not comparable instead of a verdict.
+Each cell is measured twice with the same profile: a baseline run on the current implementation, and a candidate run with `--executable <new server binary>`. Both runs must be completed, valid `gsm8k` runs over the same `selected_rows` identity whose count is 1319, with `load.num_prompts` equal to that count and the same `workload.sampling`, `workload.provenance`, `workload.model` and resolved daemon model argument. A pair that fails a premise is reported as not comparable instead of a verdict.
 
 For baseline accuracy `p1 = correct1 / n1` and candidate accuracy `p2 = correct2 / n2`, with `n1 = n2 = 1319`:
 
@@ -56,7 +56,7 @@ The factor is the two-sided 95% normal quantile the evaluator computes, `statist
 
 ## FP8 KV pages
 
-The FP8 KV cell is the BF16 checkpoint with `kv_cache_config.dtype = float8_e4m3fn`. It is the only cell that names an attention provider: `--set attention_backend=${UNISERVE_QWEN3_FP8_ATTENTION_BACKEND:-torch}`, because today only the torch provider reads per-block FP8 pages at head dimension 128 and the automatic selection raises for them. The baseline leaves the variable unset and so uses `torch`; the candidate sets it to `auto` or to its own provider, and changes nothing else. The BF16 and NVFP4 cells name no attention backend, so each implementation selects the provider it has.
+The FP8 KV cell is the BF16 checkpoint with `kv_cache_config.dtype = float8_e4m3fn`. It is the only cell that names an attention provider: `--set attention_backend=${UNISERVE_QWEN3_FP8_ATTENTION_BACKEND:-torch}`, because only the torch provider reads per-block FP8 pages at head dimension 128 and the automatic selection raises for them. The baseline leaves the variable unset and so uses `torch`; the candidate sets it to `auto` or to its own provider, and changes nothing else. The BF16 and NVFP4 cells name no attention backend, so each implementation selects the provider it has.
 
 ## Running the confirmation
 
