@@ -356,6 +356,9 @@ impl EngineControl {
             build: proto::BUILD.to_owned(),
             peer: Some(hello::Peer::Engine(process::Engine {
                 deployment: self.deployment.clone(),
+                // This connection commands the process socket; it is not a
+                // main process and states no engine number.
+                engine: 0,
             })),
         })?;
         let welcome: process::Welcome = control

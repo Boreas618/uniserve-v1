@@ -56,6 +56,12 @@ message Join {
 message Engine {
   // The deployment: the served model name.
   string deployment = 1;
+  // The engine number the launch named, for a main process: the number its
+  // daemon addresses it by, down with commands and up with reports. Zero for a
+  // peer that is not a main process - a worker's client of the process socket,
+  // or the daemon's own control connection - which is numbered by the order it
+  // arrived in and addressed by nothing.
+  uint64 engine = 2;
 }
 
 // The answer to a `Hello`.
