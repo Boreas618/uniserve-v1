@@ -338,7 +338,7 @@ fn stage_weights(args: &Args) -> Result<()> {
 
     let checkpoint = Checkpoint::open(&args.root)?;
     let source = checkpoint.component("text_encoder")?;
-    let stated = stated_dtype(&args)?;
+    let stated = stated_dtype(args)?;
     let dtype = compute_dtype(&checkpoint, TEXT_ENCODER, stated)?;
     let mut store = HostStore::new();
     let mut loader = WeightLoader::new(source, &mut store, stated, None);
@@ -785,7 +785,7 @@ fn stage_encode(args: &Args) -> Result<()> {
     })?;
     // The flag, the checkpoint and the element type are host checks: they run before a device is
     // opened, so a typo costs a second rather than a device.
-    let stated = stated_dtype(&args)?;
+    let stated = stated_dtype(args)?;
     let checkpoint = Checkpoint::open(&args.root)?;
     let source = checkpoint.component("text_encoder")?;
     let dtype = compute_dtype(&checkpoint, TEXT_ENCODER, stated)?;
