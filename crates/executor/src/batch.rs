@@ -189,6 +189,12 @@ pub struct Batch {
     /// and the graph then runs clean against the wrong memory. That failure looks like a model
     /// defect rather than a cache one, so it is refused at submit rather than left to the graph.
     pub block_tables: Vec<ipc::BlockTable>,
+    /// A media computation's columns, and `None` for every causal-LM batch.
+    ///
+    /// One batch is one computation (2.4): a media batch states its inputs here and carries no token
+    /// column a language model reads, and a token batch carries no media inputs. The runner that
+    /// receives one knows which class it serves, so the field is read by the media runners alone.
+    pub media: Option<MediaColumns>,
 }
 
 /// The commit table's own definition, so a producer outside this crate writes its rows against
@@ -239,6 +245,65 @@ pub struct BatchColumns {
     pub page_size: u32,
     /// The attention descriptor's static bound on a sequence's KV length.
     pub max_kv_len: u32,
+}
+
+/// One media computation's columns: the buffers the model prepared, per request (4.5).
+///
+/// A media computation is not staged from typed token columns. What a denoiser, an encoder or a
+/// decoder reads is what the model itself prepared for each request (`Denoiser::prepare_evaluation`
+/// and its siblings), so a media batch's columns are data: the executor copies them to device
+/// storage sized from the computation's extent and never interprets them, which is what keeps model
+/// mathematics out of the executor. The computation travels with them so the columns can state the
+/// rules of their own family without a shared struct growing a field only one family reads.
+#[derive(Clone, Debug)]
+pub struct MediaColumns {
+    /// The computation these columns are for, and the extent its kernels are captured for.
+    pub computation: crate::plan::Computation,
+    /// Per request, in batch order, the buffers the model prepared for it.
+    pub inputs: Vec<Vec<Vec<u8>>>,
+}
+
+impl MediaColumns {
+    /// Whether the columns state the computation they are for (4.5).
+    ///
+    /// The rules are the family's own: one set of inputs per request, no token column a language
+    /// model reads, and - except for an encode, which is sized by rows and tokens - an extent,
+    /// because a bucket captured for one canvas serves no other.
+    pub fn check(&self) -> Result<()> {
+        let computation = self.computation;
+        if !computation.stated() {
+            return Err(Error::Invalid(format!(
+                "a {:?} batch is a computation no variant states",
+                computation.call
+            )));
+        }
+        let rows = computation.rows as usize;
+        if self.inputs.len() != rows {
+            return Err(Error::Invalid(format!(
+                "a {:?} batch of {rows} rows carries {} request(s) of media inputs",
+                computation.call,
+                self.inputs.len()
+            )));
+        }
+        if computation.extent == crate::plan::Extent::None
+            && computation.variant() != Some(crate::plan::Variant::Encode)
+        {
+            return Err(Error::Invalid(format!(
+                "a {:?} batch states no extent: its kernels are captured for one canvas, and a                  batch cannot say which",
+                computation.call
+            )));
+        }
+        Ok(())
+    }
+
+    /// The bytes of every request's every buffer: what the staging path allocates for.
+    pub fn bytes(&self) -> usize {
+        self.inputs
+            .iter()
+            .flat_map(|request| request.iter())
+            .map(Vec::len)
+            .sum()
+    }
 }
 
 impl BatchColumns {
@@ -892,5 +957,101 @@ impl std::fmt::Debug for Submission {
 impl std::fmt::Debug for SubmissionState {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("SubmissionState")
+    }
+}
+
+#[cfg(test)]
+mod media_tests {
+    use super::*;
+    use crate::plan::{Computation, Extent, Variant};
+    use nn::capability::{LatentShape, Layout};
+
+    fn layout() -> Layout {
+        Layout {
+            video: LatentShape {
+                channels: 16,
+                frames: 13,
+                height: 60,
+                width: 34,
+            },
+            audio: None,
+            text_rows: 256,
+            condition_rows: 0,
+            condition_elements: 0,
+        }
+    }
+
+    /// A media batch's columns are the model's prepared buffers, one set per request, and the
+    /// family's rules are its own: a computation no variant states, a request count the batch does
+    /// not carry, and a denoising step without its canvas are each refused before a launch - while
+    /// an encode, which is sized by rows and tokens, states no extent and is accepted.
+    #[test]
+    fn a_media_batch_states_one_set_of_inputs_per_request_and_its_own_extent() {
+        let denoise = MediaColumns {
+            computation: Computation {
+                call: ipc::MediaCall::Denoising,
+                rows: 1,
+                tokens: 0,
+                extent: Extent::Latents(layout()),
+            },
+            inputs: vec![vec![vec![0u8; 64]]],
+        };
+        assert_eq!(denoise.bytes(), 64);
+        denoise.check().expect("one request, its canvas stated");
+
+        let unstated = MediaColumns {
+            computation: Computation {
+                call: ipc::MediaCall::Muxing,
+                rows: 1,
+                tokens: 0,
+                extent: Extent::None,
+            },
+            inputs: vec![Vec::new()],
+        };
+        assert!(
+            unstated.check().is_err(),
+            "a call no variant states is refused"
+        );
+
+        let wrong_rows = MediaColumns {
+            inputs: vec![Vec::new(), Vec::new()],
+            ..denoise.clone()
+        };
+        let refusal = wrong_rows
+            .check()
+            .expect_err("two request sets for a one-row batch");
+        assert!(
+            refusal.to_string().contains("2 request(s)"),
+            "the refusal names the count: {refusal}"
+        );
+
+        let no_canvas = MediaColumns {
+            computation: Computation {
+                call: ipc::MediaCall::Denoising,
+                rows: 1,
+                tokens: 0,
+                extent: Extent::None,
+            },
+            ..denoise.clone()
+        };
+        let refusal = no_canvas
+            .check()
+            .expect_err("a denoising step states its canvas");
+        assert!(
+            refusal.to_string().contains("states no extent"),
+            "the refusal names the missing extent: {refusal}"
+        );
+
+        let encode = MediaColumns {
+            computation: Computation {
+                call: ipc::MediaCall::TextEncoding,
+                rows: 1,
+                tokens: 300,
+                extent: Extent::None,
+            },
+            inputs: vec![vec![vec![1u8; 8]]],
+        };
+        assert_eq!(encode.computation.variant(), Some(Variant::Encode));
+        encode.check().expect("an encode is sized by rows and tokens");
     }
 }

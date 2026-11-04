@@ -93,8 +93,19 @@ pub struct OutputBuffer {
     devices: Vec<DeviceEvents>,
     sealed: bool,
     copies_finished: bool,
+    /// The batch's rows will never all be observed (a failed or cancelled
+    /// batch), so its lease may retire without them. Read by [`Self::retired`],
+    /// which decides when the pool recycles the storage.
+    ///
+    /// **The rule this marks:** a product that did not finish is not an answer,
+    /// and a reader that cannot tell it from a finished one will take the tail
+    /// of a cancelled generation as a result. So the path that ends a request
+    /// without success must mark its product abandoned, and whatever hands
+    /// products out must refuse an abandoned one by name. This slice has no
+    /// such path and no consumer of [`OutputPool`], so the field records a rule
+    /// the slice has yet to implement - [`Self::abandon`] is its only writer
+    /// and has no caller.
     abandoned: bool,
-    readers: usize,
     timing_events: bool,
     reserved: Instant,
     started: Option<Instant>,
@@ -128,7 +139,6 @@ impl OutputBuffer {
             sealed: false,
             copies_finished: false,
             abandoned: false,
-            readers: 0,
             timing_events: timing,
             reserved: Instant::now(),
             started: None,
@@ -535,22 +545,16 @@ impl OutputBuffer {
         self.abandoned = true;
     }
 
-    pub(crate) fn retain_reader(&mut self) -> Result<()> {
-        self.storage()?;
-        self.readers += 1;
-        Ok(())
-    }
-
-    pub(crate) fn release_reader(&mut self) -> Result<()> {
-        self.readers = self
-            .readers
-            .checked_sub(1)
-            .ok_or_else(|| Error::Invariant("output CPU reader count underflow".into()))?;
-        Ok(())
-    }
-
+    /// Whether the pool may recycle this lease's storage.
+    ///
+    /// Two facts hold it: every copy into the words has finished, and either
+    /// every row was observed or the batch was abandoned. A CPU reader does not
+    /// hold it and does not need to: [`Self::readback`] copies the words into
+    /// host storage before any reader sees them, and every borrow of this buffer
+    /// is taken behind its own mutex, so a reader cannot be reading the lease's
+    /// storage while the pool recycles it.
     fn retired(&self) -> bool {
-        self.copies_finished && (self.remaining == 0 || self.abandoned) && self.readers == 0
+        self.copies_finished && (self.remaining == 0 || self.abandoned)
     }
 
     fn require_open(&self) -> Result<()> {

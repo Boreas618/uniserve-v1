@@ -191,6 +191,37 @@ impl Executor {
             named.runner.attach_counters(Arc::clone(&counters));
             named.runner.attach_uncompared(Arc::clone(&uncompared));
         }
+        // What the next generation captures and what it is planned in, stated before the first
+        // capture rather than discovered by paying for it: the first generation of an epoch has no
+        // serving generation to compare against, so every bucket is captured and every operator of
+        // it is new.
+        //
+        // The two figures are not a sum. A stream's buckets are extents *inside* one buffer, and the
+        // first capture maps that buffer whole - the reservation - whether the plan holds sixteen
+        // buckets or nine thousand. `widest` is the largest extent a plan books inside it, and a
+        // bucket whose walk runs past the range is refused by name at that bucket, before anything
+        // writes past it (`nn::Error::Arena`). What a capture costs beyond that is a driver
+        // executable per graph, which no pool books: the count is what a run should read.
+        let captures: Vec<crate::plan::Bucket> = runners
+            .iter()
+            .flat_map(|named| named.runner.capture_plan())
+            .collect();
+        if !captures.is_empty() {
+            let reservation = pools
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .reserved();
+            let widest = captures.iter().max_by_key(|bucket| bucket.tokens);
+            tracing::info!(
+                device = device.0,
+                captures = captures.len(),
+                streams = 1,
+                graph_reservation = reservation,
+                widest = widest.map(|bucket| bucket.to_string()).unwrap_or_default(),
+                "the next generation captures one graph per bucket, largest first; their activations \
+                 are extents inside one range that the first capture maps whole"
+            );
+        }
         let queue = JobQueue::new(device, Arc::clone(&events));
         let state = Device {
             device,

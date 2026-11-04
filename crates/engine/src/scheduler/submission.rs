@@ -598,6 +598,9 @@ impl InProcess {
                 .iter()
                 .flat_map(|(_, placement)| placement.block_tables.iter().cloned())
                 .collect(),
+            // A token forward carries no media columns; the media path states its own here when it
+            // forms a media batch, which is the commit that first builds one.
+            media: None,
         };
         Ok((device, calls))
     }
