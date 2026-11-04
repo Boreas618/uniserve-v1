@@ -9,8 +9,17 @@
 //! --stage weights     no device: every parameter maps to a tensor of the config's shape and dtype
 //! --stage embedding   one operator on a GPU: the vocabulary table's rows, against the checkpoint
 //! --stage block       one decoder layer end to end (`--layer <n>`), against the same rows
+//!                     (`--substage <cut>` stops inside the layer at one operator)
 //! --stage decode      the whole model's decode step, against notes/reference/qwen3-reference.json
 //! ```
+//!
+//! `--reference <dir>` reads a reference stack's `hidden_NN.npy` files one stage at a time as the
+//! walk reaches them and prints each stage's `rms/scale` against the reference's own scale, the
+//! increment over the stage before it, and at the end the two readings that name a defect: the
+//! first stage past [`RELATIVE_BUDGET`] (where we stop agreeing) and the largest increment (where we
+//! start being wrong). They are not the same stage in general - smooth growth is bf16 accumulation
+//! and a jump is structure - so both are printed. A cut inside a layer prints the prefix's error
+//! beside it, because the cut inherits whatever the prefix already lost.
 //!
 //! All but `weights` need a program store: `--store <path>` or `UNISERVE_STORE`, holding the
 //! packages the fixture `notes/programs/qwen3-moe-keys.txt` names. Nothing here hard-codes a store
@@ -30,7 +39,7 @@ use nn::{
     Shape, TensorView, WeightKey, WeightLoader,
 };
 use ops::{Generation, KernelEntry};
-use qwen3_moe::{Config, LoadOptions, Partition};
+use qwen3_moe::{Config, LoadOptions, Partition, Substage};
 
 /// The checkpoint the reference was captured from, when `--checkpoint` does not name another.
 const DEFAULT_CHECKPOINT: &str = "/opt/uv/models/Qwen3-30B-A3B";
@@ -103,6 +112,9 @@ struct Args {
     /// A reference stack's `hidden_NN.npy` directory: its files are read one stage at a time as the
     /// decode stage walks the model, and the first stage past [`RELATIVE_BUDGET`] is named.
     reference: Option<PathBuf>,
+    /// A cut inside `--layer`, named by the reference tensor that answers it: `normalized`,
+    /// `attended` or `mlp_out`.
+    substage: Option<Substage>,
 }
 
 /// The four stages of the run.
@@ -125,6 +137,7 @@ impl Args {
         let mut resident = 0;
         let mut dump = None;
         let mut reference = None;
+        let mut substage = None;
         let mut words = std::env::args().skip(1);
         while let Some(word) = words.next() {
             let mut value = |name: &str| -> Result<String> {
@@ -164,6 +177,15 @@ impl Args {
                 "--tokens" => tokens = value("--tokens")?,
                 "--dump" => dump = Some(PathBuf::from(value("--dump")?)),
                 "--reference" => reference = Some(PathBuf::from(value("--reference")?)),
+                "--substage" => {
+                    let name = value("--substage")?;
+                    substage = Some(Substage::parse(&name).ok_or_else(|| {
+                        Failure::message(format!(
+                            "--substage {name:?} names no cut; the cuts are {}",
+                            Substage::NAMES.join(", ")
+                        ))
+                    })?);
+                }
                 "--resident" => {
                     let gib = value("--resident")?;
                     let size: u64 = gib.parse().map_err(|_| {
@@ -186,6 +208,11 @@ impl Args {
                 }
             }
         }
+        if substage.is_some() && stage != Stage::Block {
+            return Err(Failure::message(
+                "--substage cuts inside one layer, so it belongs to --stage block",
+            ));
+        }
         Ok(Self {
             stage,
             checkpoint,
@@ -196,6 +223,7 @@ impl Args {
             resident,
             dump,
             reference,
+            substage,
         })
     }
 }
@@ -667,22 +695,80 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
         }
         // One layer against the reference, without walking the stack: the same comparison the
         // decode stage makes, at a hundredth of the cost, for when a stage has already been named and
-        // the question is what one layer does.
-        if args.reference.is_some() || args.dump.is_some() {
-            let rows = model.forward_through(&forward, &batch, &cache, hidden, layer)?;
-            stream.synchronize()?;
+        // the question is what one layer does. `--substage` cuts inside the layer, and the cut is
+        // read against the prefix that produced it: a clean cut at layer 30 means the layer adds
+        // nothing to a prefix already off by that much, never that layers 0..29 are right.
+        if args.reference.is_some() || args.dump.is_some() || args.substage.is_some() {
+            let rows = tokens_usize(&batch);
             let width = usize::try_from(plan.hidden).unwrap_or(0);
-            let values = download_bf16(&stream, rows, tokens_usize(&batch), width)?;
-            let mut first_above = None;
-            let name = format!("hidden_{:02}.npy", layer + 1);
+            let mut table = Table::default();
+            if let Some(cut) = args.substage {
+                if layer == 0 {
+                    println!("prefix: layer 0 has none - it is handed the embedding itself");
+                } else {
+                    let prefix =
+                        model.forward_through(&forward, &batch, &cache, hidden, layer - 1)?;
+                    stream.synchronize()?;
+                    let values = download_bf16(&stream, prefix, rows, width)?;
+                    let file = format!("hidden_{layer:02}.npy");
+                    let stage = Walked {
+                        file: &file,
+                        label: &stage_name(layer),
+                        index: layer,
+                        rows,
+                        width,
+                    };
+                    let error = report_stage(args, stage, &values, &mut table)?;
+                    if let Some(error) = error {
+                        println!(
+                            "prefix: layers 0..{} are at rms/scale {error:.3e} - the cut below adds \
+                             to that error and cannot be read as better than it",
+                            layer - 1
+                        );
+                    }
+                }
+                let out = model.forward_substage(&forward, &batch, &cache, hidden, layer, cut)?;
+                stream.synchronize()?;
+                let values = download_bf16(&stream, out, rows, width)?;
+                let file = format!("hidden_{:02}_{}.npy", layer + 1, cut.name());
+                let label = format!("layer {layer}'s `{}` cut", cut.name());
+                let stage = Walked {
+                    file: &file,
+                    label: &label,
+                    index: layer + 1,
+                    rows,
+                    width,
+                };
+                dump_stage(args, stage, &values)?;
+                // The reference tensor that answers this cut exists only if the caller's hooks
+                // dumped it; without it the cut is our own number and says where in the layer a
+                // number changes, not that the reference agrees.
+                match args.reference.as_deref() {
+                    Some(dir) if dir.join(&file).exists() => {
+                        report_stage(args, stage, &values, &mut table)?;
+                    }
+                    _ => println!(
+                        "substage: {label}, rms {:.4e} - no `{file}` in the reference directory, \
+                         so it is not compared; the file comes from a post-hook on {}",
+                        rms(&values),
+                        cut_hook(cut)
+                    ),
+                }
+                return Ok(());
+            }
+            let out = model.forward_through(&forward, &batch, &cache, hidden, layer)?;
+            stream.synchronize()?;
+            let values = download_bf16(&stream, out, rows, width)?;
+            let file = format!("hidden_{:02}.npy", layer + 1);
             let stage = Walked {
-                file: &name,
+                file: &file,
                 label: &stage_name(layer + 1),
                 index: layer + 1,
-                rows: tokens_usize(&batch),
+                rows,
                 width,
             };
-            report_stage(args, stage, &values, &mut first_above)?;
+            report_stage(args, stage, &values, &mut table)?;
+            summarize(&table, config.num_hidden_layers);
         }
         return Ok(());
     }
@@ -692,13 +778,15 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     // layer's output is to stop there - `forward_through` runs layers `0..=layer` and releases each
     // layer's scratch as it ends, so the arena pays for one layer and not the stack.
     let width = usize::try_from(plan.hidden).unwrap_or(0);
+    // One table for the whole walk: an increment is measured against the stage before it, the last
+    // stage included, and that stage is the full run's output rather than a layer's.
+    let mut table = Table::default();
     if args.dump.is_some() || args.reference.is_some() {
         if let Some(dir) = args.dump.as_deref() {
             std::fs::create_dir_all(dir)
                 .map_err(|error| Failure::message(format!("--dump {}: {error}", dir.display())))?;
         }
         let rows = tokens_usize(&batch);
-        let mut first_above = None;
         let embedded = download_bf16(&stream, hidden, rows, width)?;
         let stage = Walked {
             file: "hidden_00.npy",
@@ -707,7 +795,7 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
             rows,
             width,
         };
-        report_stage(args, stage, &embedded, &mut first_above)?;
+        report_stage(args, stage, &embedded, &mut table)?;
         // Every call reserves a step's scratch, and nothing returns it: the arena is sized for one
         // forward and not for forty-eight, so each layer's rows are read back to the host and the
         // arena is then released to the mark taken before the first call. Without the release the
@@ -721,28 +809,16 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
             stream.synchronize()?;
             let values = download_bf16(&stream, out, rows, width)?;
             let index = layer + 1;
-            let name = format!("hidden_{index:02}.npy");
+            let file = format!("hidden_{index:02}.npy");
             let stage = Walked {
-                file: &name,
+                file: &file,
                 label: &stage_name(index),
                 index,
                 rows,
                 width,
             };
-            report_stage(args, stage, &values, &mut first_above)?;
+            report_stage(args, stage, &values, &mut table)?;
             arena.release(mark);
-        }
-        match first_above {
-            Some(index) => println!(
-                "reference: the first stage past {:.0}% is hidden_{index:02}, {}",
-                RELATIVE_BUDGET * 100.0,
-                stage_name(index)
-            ),
-            None => println!(
-                "reference: every stage is within {:.0}% of the reference, hidden_00 to hidden_{:02}",
-                RELATIVE_BUDGET * 100.0,
-                config.num_hidden_layers - 1
-            ),
         }
     }
 
@@ -755,24 +831,17 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
         let width = usize::try_from(plan.hidden).unwrap_or(0);
         let values = download_bf16(&stream, hidden, rows, width)?;
         let index = config.num_hidden_layers;
-        let name = format!("hidden_{index:02}.npy");
-        let mut first_above = None;
+        let file = format!("hidden_{index:02}.npy");
         let stage = Walked {
-            file: &name,
-            label: &final_stage_name(index),
+            file: &file,
+            label: &describe(index, config.num_hidden_layers),
             index,
             rows,
             width,
         };
-        report_stage(args, stage, &values, &mut first_above)?;
-        if let Some(index) = first_above {
-            println!(
-                "reference: the first stage past {:.0}% is hidden_{index:02}, {}",
-                RELATIVE_BUDGET * 100.0,
-                final_stage_name(index)
-            );
-        }
+        report_stage(args, stage, &values, &mut table)?;
     }
+    summarize(&table, config.num_hidden_layers);
     let logits = arena.tensor(
         DType::F32,
         Shape::new(&[1, u64::try_from(config.vocab_size).unwrap_or(0)]),
@@ -867,14 +936,53 @@ fn stage_name(index: usize) -> String {
     }
 }
 
-/// The last stage's name, which is the run's output after the final norm and not a layer's output.
-fn final_stage_name(index: usize) -> String {
-    format!("the output after the final norm (hidden_{index:02})")
+/// A stage's name for a summary line: the run's own output is not a layer's output.
+fn describe(index: usize, layers: usize) -> String {
+    if index == layers {
+        format!("the output after the final norm (hidden_{index:02})")
+    } else {
+        stage_name(index)
+    }
 }
 
 /// Write one stage's rows when `--dump` asked, and compare them against the reference when
 /// `--reference` did, recording the first stage that passes [`RELATIVE_BUDGET`].
+/// The reading of the walk as it accumulates: which stage first crossed the budget tripwire, the
+/// error the stage before printed (a stage's increment is measured against it), and the largest
+/// increment seen.
+///
+/// The increment is what names a defect: smooth growth is accumulation and a jump is structure, and
+/// the first crossing and the largest increment are not the same stage in general.
+#[derive(Default)]
+struct Table {
+    first_above: Option<usize>,
+    previous: Option<f64>,
+    largest: Option<(usize, f64)>,
+    /// How many stages were compared: one stage has no increment to print.
+    stages: usize,
+}
+
+impl Table {
+    /// Fold one stage's relative error in, answering the increment it makes over the stage before.
+    fn push(&mut self, index: usize, relative: f64) -> Option<f64> {
+        let increment = self.previous.map(|previous| relative - previous);
+        self.stages += 1;
+        if let Some(step) = increment {
+            let larger = self.largest.is_none_or(|(_, largest)| step > largest);
+            if larger {
+                self.largest = Some((index, step));
+            }
+        }
+        self.previous = Some(relative);
+        if relative > RELATIVE_BUDGET && self.first_above.is_none() {
+            self.first_above = Some(index);
+        }
+        increment
+    }
+}
+
 /// One stage of the walk: which file it is, what it follows, and the shape of its rows.
+#[derive(Clone, Copy)]
 struct Walked<'a> {
     file: &'a str,
     label: &'a str,
@@ -887,8 +995,8 @@ fn report_stage(
     args: &Args,
     stage: Walked<'_>,
     values: &[f32],
-    first_above: &mut Option<usize>,
-) -> Result<()> {
+    table: &mut Table,
+) -> Result<Option<f64>> {
     let Walked {
         file: name,
         label,
@@ -896,12 +1004,9 @@ fn report_stage(
         rows,
         width,
     } = stage;
-    if let Some(dir) = args.dump.as_deref() {
-        write_npy(&dir.join(name), values, rows, width)?;
-        println!("dump: {name} is {label}");
-    }
+    dump_stage(args, stage, values)?;
     let Some(dir) = args.reference.as_deref() else {
-        return Ok(());
+        return Ok(None);
     };
     let path = dir.join(name);
     let (theirs, their_rows, their_width) = read_npy(&path)?;
@@ -912,20 +1017,81 @@ fn report_stage(
         )));
     }
     let (relative, worst, scale, ours) = distance(values, &theirs);
+    let increment = table.push(index, relative);
     let marker = if relative > RELATIVE_BUDGET {
-        if first_above.is_none() {
-            *first_above = Some(index);
-        }
-        "  <-- past the budget"
+        "  <-- past the tripwire"
     } else {
         ""
     };
-    println!(
-        "reference: {name}, {}, rms {ours:.4e} against the reference's {scale:.4e} \
-         — rms/scale {relative:.3e}, max |diff| {worst:.3e}{marker}",
-        label
-    );
+    // The increment is printed beside the error: a stage whose error grew by much more than its
+    // predecessor's is the one to open, and one that crossed the tripwire by creeping up is not.
+    match increment {
+        Some(step) => println!(
+            "reference: {name}, {label}, rms {ours:.4e} against the reference's {scale:.4e} \
+             — rms/scale {relative:.3e} (step {step:+.2e}), max |diff| {worst:.3e}{marker}"
+        ),
+        None => println!(
+            "reference: {name}, {label}, rms {ours:.4e} against the reference's {scale:.4e} \
+             — rms/scale {relative:.3e} (the first stage), max |diff| {worst:.3e}{marker}"
+        ),
+    }
+    Ok(Some(relative))
+}
+
+/// Write one stage into the `--dump` directory, when one was asked for.
+fn dump_stage(args: &Args, stage: Walked<'_>, values: &[f32]) -> Result<()> {
+    let Some(dir) = args.dump.as_deref() else {
+        return Ok(());
+    };
+    write_npy(&dir.join(stage.file), values, stage.rows, stage.width)?;
+    println!("dump: {} is {}", stage.file, stage.label);
     Ok(())
+}
+
+/// A stage's root-mean-square, for a cut that has no reference file to be measured against.
+fn rms(values: &[f32]) -> f64 {
+    let count = values.len().max(1) as f64;
+    let squared: f64 = values.iter().map(|value| f64::from(*value).powi(2)).sum();
+    (squared / count).sqrt()
+}
+
+/// The reference module whose hook answer a cut, so a missing file says which hook to run.
+fn cut_hook(cut: Substage) -> &'static str {
+    match cut {
+        Substage::Normalized => "`input_layernorm`",
+        Substage::Attended => "`self_attn`",
+        Substage::MlpOut => "`mlp`",
+    }
+}
+
+/// The two readings the table gives, said as the decisions they are: where we stop agreeing and
+/// where we start being wrong.
+fn summarize(table: &Table, layers: usize) {
+    if table.previous.is_none() {
+        return;
+    }
+    match table.first_above {
+        Some(index) => println!(
+            "reference: the first stage past {:.0}% is hidden_{index:02}, {}",
+            RELATIVE_BUDGET * 100.0,
+            describe(index, layers)
+        ),
+        None => println!(
+            "reference: every stage is within {:.0}% of the reference, hidden_00 to hidden_{layers:02}",
+            RELATIVE_BUDGET * 100.0
+        ),
+    }
+    if table.stages < 2 {
+        return;
+    }
+    match table.largest {
+        // A step that is not above zero means no stage added anything: nothing here names a defect.
+        Some((index, step)) if step > 0.0 => println!(
+            "reference: the largest step is at hidden_{index:02} ({step:+.2e}), {} - the stage to open",
+            describe(index, layers)
+        ),
+        _ => println!("reference: no stage's error grew over the one before it"),
+    }
 }
 
 /// A stage's root-mean-square distance from the reference, relative to the reference's own scale,
