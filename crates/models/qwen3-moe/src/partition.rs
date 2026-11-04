@@ -152,12 +152,14 @@ mod tests {
         };
         // 151936 / 4 = 37984 exactly.
         assert_eq!(partition.vocabulary_shard(151936), (113952, 37984));
-        // An uneven vocabulary gives the last rank fewer rows.
+        // A shard is `ceil(vocabulary / degree)` rows: an uneven vocabulary rounds the width up,
+        // and the last rank keeps the remainder. (Such a checkpoint is refused at load, because
+        // the head's rows must be its padded width; the rule still has one meaning here.)
         let partition = Partition {
             tensor_rank: 3,
             ..partition
         };
-        assert_eq!(partition.vocabulary_shard(151937), (113952, 37985 - 4));
+        assert_eq!(partition.vocabulary_shard(151937), (113955, 37982));
     }
 
     #[test]

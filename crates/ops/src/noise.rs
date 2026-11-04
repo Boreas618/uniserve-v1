@@ -20,6 +20,12 @@
 //! never in batch order. The uniform is the exactly representable 24-bit value Philox's high word
 //! yields; the normal's arithmetic is single precision, and the result rounds once into the output's
 //! type.
+//!
+//! A request may also need a **uniform** draw instead of a normal one — the diffusion schedule's
+//! noise keeps the same stream so a redraw is reproducible — and that is the same addressing with
+//! one word: `out[i] = (words[0] >> 8) / 2^24` in `[0, 1)` for every element, one sample per element
+//! rather than one pair. The kind is part of the compilation, because the two draw different values
+//! from the same counter and their bounds differ (a normal has no absolute envelope).
 
 use std::fmt;
 
@@ -33,6 +39,24 @@ use crate::{Error, Op, Result, Twins};
 /// The elements one program draws.
 pub const NOISE_BLOCK: u32 = 1024;
 
+/// What a `philox_noise` draw yields.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum NoiseKind {
+    /// One standard normal sample per element, `r·cos` for an even and `r·sin` for an odd index.
+    Normal,
+    /// One sample per element in `[0, 1)`: the 24 bits Philox's first word yields.
+    Uniform,
+}
+
+impl fmt::Display for NoiseKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Normal => "normal",
+            Self::Uniform => "uniform",
+        })
+    }
+}
+
 /// One compilation of `philox_noise`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct NoiseDescriptor {
@@ -40,6 +64,8 @@ pub struct NoiseDescriptor {
     pub dtype: DType,
     /// The elements one program draws.
     pub block: u32,
+    /// Whether the draw is normal or uniform.
+    pub kind: NoiseKind,
 }
 
 impl fmt::Display for NoiseDescriptor {
@@ -47,6 +73,7 @@ impl fmt::Display for NoiseDescriptor {
         Key::new()
             .field("dtype", self.dtype)
             .field("block", self.block)
+            .field("kind", self.kind)
             .finish(formatter)
     }
 }
@@ -148,9 +175,13 @@ impl Op for PhiloxNoise {
     }
 
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
-        // Philox is integer arithmetic, so the uniforms agree bit for bit; the normal then costs the
-        // logarithm, the square root, the angle and its cosine or sine before the store rounds into
-        // the output type.
-        Tolerance::new(0.0, 4.0 * descriptor.dtype.unit_roundoff() as f32)
+        match descriptor.kind {
+            // Philox is integer arithmetic, so the uniforms agree bit for bit; the normal then costs
+            // the logarithm, the square root, the angle and its cosine or sine before the store
+            // rounds into the output type.
+            NoiseKind::Normal => Tolerance::new(0.0, 4.0 * descriptor.dtype.unit_roundoff() as f32),
+            // A 24-bit value scaled by 2^-24 is exact in FP32 and rounds once into a narrower output.
+            NoiseKind::Uniform => Tolerance::exact(),
+        }
     }
 }
