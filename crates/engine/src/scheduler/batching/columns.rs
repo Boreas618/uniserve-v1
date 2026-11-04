@@ -372,7 +372,7 @@ mod tests {
 
     /// A call of `kind` whose rows are `query_lens`, the first starting at
     /// `position`, with `write_cache` per row.
-    fn call(kind: CallKind, position: u32, query_lens: &[u32], write_cache: bool) -> Call {
+    fn call(kind: CallKind, position: u32, query_lens: &[u32]) -> Call {
         let mut call = Call::new(
             ipc::RequestKey::new(1, ipc::RequestId(1), 1),
             ipc::CallId::new(1, 0),
@@ -452,7 +452,7 @@ mod tests {
 
     #[test]
     fn a_decode_advances_its_own_slot_and_states_only_its_task() {
-        let mut decode_call = call(decode(), 12, &[1], true);
+        let mut decode_call = call(decode(), 12, &[1]);
         decode_call.coordinates.cache_visible_len = 12;
         let requests = vec![(decode_call, placement(3, &[1], &[true]))];
         let columns = columns(&requests, &[vec![42]], &[&sampling()], &[5], page(), 2048)
@@ -490,7 +490,7 @@ mod tests {
 
     #[test]
     fn a_prefill_that_samples_installs_its_token_at_the_host_coordinates() {
-        let mut prefill_call = call(prefill(), 8, &[4], true);
+        let mut prefill_call = call(prefill(), 8, &[4]);
         prefill_call.coordinates.cache_visible_len = 8;
         let requests = vec![(prefill_call, placement(1, &[4], &[true]))];
         let columns = columns(
@@ -529,7 +529,7 @@ mod tests {
 
     #[test]
     fn a_prefill_that_samples_nothing_still_states_its_cache_extent() {
-        let mut chunk = call(prefill(), 8, &[2], true);
+        let mut chunk = call(prefill(), 8, &[2]);
         chunk.token_output = None;
         chunk.coordinates.cache_visible_len = 8;
         let mut neutral = sampling();
@@ -566,7 +566,7 @@ mod tests {
 
     #[test]
     fn a_verification_states_the_base_its_accepted_span_advances_from() {
-        let mut verify_call = call(verify(), 9, &[1, 1, 1], true);
+        let mut verify_call = call(verify(), 9, &[1, 1, 1]);
         verify_call.coordinates.cache_visible_len = 9;
         let requests = vec![(verify_call, placement(1, &[1, 1, 1], &[true, true, true]))];
         let columns = columns(
@@ -610,12 +610,12 @@ mod tests {
     fn tasks_are_numbered_over_the_sampling_calls_only() {
         // A prompt chunk, then a decode, then a sampling prefill: the chunk
         // installs no token and so consumes no task.
-        let mut chunk = call(prefill(), 8, &[2], true);
+        let mut chunk = call(prefill(), 8, &[2]);
         chunk.token_output = None;
         chunk.coordinates.cache_visible_len = 8;
-        let mut decode_call = call(decode(), 10, &[1], true);
+        let mut decode_call = call(decode(), 10, &[1]);
         decode_call.coordinates.cache_visible_len = 10;
-        let mut prefill_call = call(prefill(), 11, &[2], true);
+        let mut prefill_call = call(prefill(), 11, &[2]);
         prefill_call.coordinates.cache_visible_len = 11;
         let requests = vec![
             (chunk, placement(1, &[2], &[true])),
@@ -650,7 +650,7 @@ mod tests {
     #[test]
     fn a_call_the_commit_cannot_state_is_no_batch_rather_than_a_guess() {
         // A decode always samples: one with no consumer has no task to name.
-        let mut unsampled_decode = call(decode(), 12, &[1], true);
+        let mut unsampled_decode = call(decode(), 12, &[1]);
         unsampled_decode.token_output = None;
         unsampled_decode.coordinates.cache_visible_len = 12;
         assert!(columns(
@@ -665,7 +665,7 @@ mod tests {
 
         // A prefill writing past the extent its block table covers is a
         // planning fault, not a clamped extent.
-        let mut overlong = call(prefill(), 18, &[4], true);
+        let mut overlong = call(prefill(), 18, &[4]);
         overlong.coordinates.cache_visible_len = 18;
         assert!(columns(
             &[(overlong, placement(1, &[4], &[true]))],
@@ -694,11 +694,11 @@ mod tests {
         // position 12 (page 3, unit 9).
         let requests = vec![
             (
-                call(prefill(), 8, &[4], true),
+                call(prefill(), 8, &[4]),
                 placement(1, &[4], &[true]),
             ),
             (
-                call(prefill(), 12, &[2], true),
+                call(prefill(), 12, &[2]),
                 placement(2, &[2], &[true]),
             ),
         ];
@@ -743,7 +743,7 @@ mod tests {
     #[test]
     fn a_filled_batch_states_one_sampler_row_per_row_and_passes_the_executors_check() {
         let requests = vec![(
-            call(prefill(), 8, &[4], true),
+            call(prefill(), 8, &[4]),
             placement(1, &[4], &[true]),
         )];
         let columns = columns(&requests, &[vec![1, 2, 3, 4]], &[&sampling()], &[0], page(), 2048)
@@ -767,7 +767,7 @@ mod tests {
     #[test]
     fn a_row_that_writes_nothing_states_minus_one_for_its_tokens() {
         let requests = vec![(
-            call(prefill(), 8, &[2], true),
+            call(prefill(), 8, &[2]),
             placement(1, &[2], &[false]),
         )];
         let columns = columns(&requests, &[vec![1, 2]], &[&sampling()], &[0], page(), 64).expect("a prefill batch");
@@ -778,7 +778,7 @@ mod tests {
     fn a_verify_batch_samples_every_candidate_row() {
         // Three candidate positions, one row each, all sampling.
         let requests = vec![(
-            call(verify(), 9, &[1, 1, 1], true),
+            call(verify(), 9, &[1, 1, 1]),
             placement(1, &[1, 1, 1], &[true, true, true]),
         )];
         let columns = columns(&requests, &[vec![7, 8, 9]], &[&sampling()], &[0], page(), 64).expect("a verify batch");
@@ -800,7 +800,7 @@ mod tests {
 
     #[test]
     fn a_media_call_is_not_a_token_batch() {
-        let media = call(ipc::CallKind::Media(ipc::MediaCall::Denoising), 0, &[1], true);
+        let media = call(ipc::CallKind::Media(ipc::MediaCall::Denoising), 0, &[1]);
         assert!(
             columns(&[(media, placement(1, &[1], &[true]))], &[vec![0]], &[&sampling()], &[0], page(), 64)
                 .is_none(),
@@ -812,7 +812,7 @@ mod tests {
     fn a_call_that_states_fewer_tokens_than_its_rows_embed_is_refused() {
         // The decode case: its rows evaluate one token each while the call
         // states no host token (`M708` question 1). The fill never invents one.
-        let decode = call(CallKind::Forward(ForwardMode::Decode), 12, &[1], true);
+        let decode = call(CallKind::Forward(ForwardMode::Decode), 12, &[1]);
         let mut decode = decode;
         decode.input_token_ids.clear();
         assert!(
@@ -825,7 +825,7 @@ mod tests {
     fn a_token_outside_its_table_is_a_fault_not_a_clamp() {
         // A call at position 20 lies past the table's last covered page.
         let requests = vec![(
-            call(prefill(), 20, &[1], true),
+            call(prefill(), 20, &[1]),
             placement(1, &[1], &[true]),
         )];
         assert!(columns(&requests, &[vec![1]], &[&sampling()], &[0], page(), 64).is_none());
@@ -835,14 +835,14 @@ mod tests {
     fn rows_of_two_requests_in_one_call_are_a_fault() {
         let mut placement = placement(1, &[2], &[true]);
         placement.forward.push(0, 2, 4, 1, true);
-        let requests = vec![(call(prefill(), 8, &[2], true), placement)];
+        let requests = vec![(call(prefill(), 8, &[2]), placement)];
         assert!(columns(&requests, &[vec![1, 2]], &[&sampling()], &[0], page(), 64).is_none());
     }
 
     #[test]
     fn the_inputs_must_name_one_token_per_token_the_rows_embed() {
         let requests = vec![(
-            call(prefill(), 8, &[2], true),
+            call(prefill(), 8, &[2]),
             placement(1, &[2], &[true]),
         )];
         assert!(columns(&requests, &[vec![1]], &[&sampling()], &[0], page(), 64).is_none());
