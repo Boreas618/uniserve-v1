@@ -722,13 +722,61 @@ const ACTIVATION_BLOCK: u32 = 256;
 /// The two channels the reference decodes and interleaves.
 const PCM_CHANNELS: u32 = 2;
 
+/// Every parameter name the audio decoder's load binds, in the order it binds them.
+///
+/// One source of truth for the load and its check: [`AudioDecoder::load`] binds exactly these names, and
+/// [`sources`] must name exactly the same set — a name in one and not the other is a load failure rather
+/// than a checkpoint field silently dropped or a tensor bound to the wrong layer.
+pub fn parameters(config: &AudioVaeConfig) -> Result<Vec<String>> {
+    let stages = stages(config)?;
+    let blocks = blocks(config)?;
+    let mut names = vec![
+        "input.weight".to_owned(),
+        "input.bias".to_owned(),
+        "pre.weight".to_owned(),
+        "pre.bias".to_owned(),
+    ];
+    let activation = |names: &mut Vec<String>, parameter: &str| {
+        for field in [
+            "act.alpha",
+            "act.beta",
+            "upsample.filter",
+            "downsample.lowpass.filter",
+        ] {
+            names.push(format!("{parameter}.{field}"));
+        }
+    };
+    for (index, _stage) in stages.iter().enumerate() {
+        names.push(format!("stages.{index}.upsample.weight"));
+        names.push(format!("stages.{index}.upsample.bias"));
+        for block in blocks.iter().filter(|block| block.stage == index) {
+            let at = |name: &str| format!("stages.{index}.blocks.{}.{name}", block.index);
+            for step in 0..block.steps.len() {
+                names.push(at(&format!("convs1.{step}.weight")));
+                names.push(at(&format!("convs1.{step}.bias")));
+                names.push(at(&format!("convs2.{step}.weight")));
+                names.push(at(&format!("convs2.{step}.bias")));
+                for half in 0..2 {
+                    activation(&mut names, &at(&format!("activations.{}", 2 * step + half)));
+                }
+            }
+        }
+    }
+    activation(&mut names, "post");
+    names.push("output.weight".to_owned());
+    Ok(names)
+}
+
 impl AudioDecoder {
     /// Bind every parameter the checkpoint's audio decoder has, through [`sources`].
     ///
     /// The table is consumed exactly: a tensor it names but the load never reads is an error, so a
     /// checkpoint field cannot be silently dropped, and a parameter read twice is an error too.
     pub fn load(config: &AudioVaeConfig, loader: &mut WeightLoader) -> Result<Self> {
-        let mut binder = Binder::new(loader, sources(config)?);
+        let table = sources(config)?;
+        let bound = parameters(config)?;
+        check_table(&table, &bound)?;
+        let mut binder = Binder::new(loader, table);
         let input = Conv1d::new(
             binder.normalized("input.weight")?,
             Some(binder.region("input.bias", &[u64::from(config.latent_dim)])?),
@@ -931,6 +979,26 @@ impl AudioDecoder {
     }
 }
 
+/// The table and the load's own list must name the same parameters.
+fn check_table(table: &[Source], bound: &[String]) -> Result<()> {
+    for name in bound {
+        if !table.iter().any(|source| source.parameter == *name) {
+            return Err(Error::checkpoint(format!(
+                "{name}: the audio decoder binds a parameter its table does not name"
+            )));
+        }
+    }
+    for source in table {
+        if !bound.contains(&source.parameter) {
+            return Err(Error::checkpoint(format!(
+                "{}: the table names a parameter the audio decoder does not bind",
+                source.parameter
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The 1-d convolution geometry: `kernel` taps, `stride`, `padding`, no dilation of its own, one group.
 fn geometry(kernel: u32, stride: u32, padding: u32) -> Result<ConvGeometry> {
     Ok(ConvGeometry::new(
@@ -1059,6 +1127,37 @@ impl<'a, 'b> Binder<'a, 'b> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+
+    #[test]
+    fn the_load_binds_every_parameter_the_table_names() {
+        let config = audio_config();
+        let table = sources(&config).expect("the table");
+        let bound = parameters(&config).expect("the load's list");
+        assert_eq!(bound.len(), table.len());
+        for name in &bound {
+            assert!(
+                table.iter().any(|source| source.parameter == *name),
+                "{name} is bound but not in the table"
+            );
+        }
+        // The block activations are per dilation and per half: six per block, twelve per stage.
+        assert_eq!(
+            bound
+                .iter()
+                .filter(|name| name.contains(".activations."))
+                .count(),
+            7 * BLOCKS_PER_STAGE * 6
+        );
+        // A configuration with one stage fewer keeps the two lists in step: the table and the load's
+        // list are checked against each other, not against a count written down here.
+        let mut fewer = config.clone();
+        fewer.decoder_rates.pop();
+        fewer.decoder_kernel_sizes.pop();
+        let table = sources(&fewer).expect("six stages' table");
+        let bound = parameters(&fewer).expect("six stages' list");
+        assert!(bound.len() < parameters(&config).expect("seven stages' list").len());
+        check_table(&table, &bound).expect("the two agree with six stages");
+    }
     use super::*;
 
     /// The checkpoint's audio VAE config (`audio_vae/config.json`).
