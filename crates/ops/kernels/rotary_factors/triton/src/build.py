@@ -15,7 +15,7 @@ import rotary_factors as kernels
 POSITIONS = {"i32": "i32", "i64": "i64"}
 
 #: Factor dtypes: FP32 keeps the FP32 phase, BF16 and FP16 halve the table.
-FACTORS = {"fp32": "fp32", "bf16": "bf16", "fp16": "fp16"}
+FACTORS = {"fp32": "fp32", "f32": "fp32", "bf16": "bf16", "fp16": "fp16"}
 
 
 def float_of(bits):

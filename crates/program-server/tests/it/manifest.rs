@@ -335,13 +335,17 @@ descriptors = { dimensions = { dtype = ["bf16"], head_dim = ["128"] } }
 
 #[test]
 fn a_scheduling_policy_is_a_wasm_package_without_metadata_or_entry() {
+    // The shape a policy package has: no kernel program, a build script that
+    // leaves the raw wasm, the precompiler's version, and the policy's own
+    // parameters (design sections 5.2 and 5.3).
     let text = r#"
 op = "scheduling"
 backend = "fcfs"
+tuning = ["tuning/weights.json"]
 
 [toolchain]
 kind = "wasm"
-version = "wasmtime-31"
+version = "50.0.1"
 
 [module]
 form = "wasm"
@@ -349,13 +353,52 @@ form = "wasm"
 [source]
 kind = "wasm"
 files = ["src/lib.rs"]
+script = "src/build.py"
+
+[parameters]
+bucket = 256
 "#;
-    let root = package(text, &["src/lib.rs"]);
+    let root = package(text, &["src/lib.rs", "tuning/weights.json"]);
     let manifest = Manifest::load(root.path()).unwrap();
     assert_eq!(manifest.module.form, ModuleForm::Wasm);
     assert!(manifest.module.metadata.is_none());
     assert!(manifest.module.entries.is_empty());
+    // One module fills the whole interface, for the one target wasm has.
     assert!(manifest.covers("default"));
+    assert!(manifest.builds_for("wasm32"));
+    assert!(!manifest.builds_for("sm_100a"));
+    assert_eq!(manifest.source.script.as_deref(), Some("src/build.py"));
+    assert_eq!(
+        manifest.parameters.get("bucket"),
+        Some(&toml::Value::Integer(256)),
+        "a policy's parameters are its own"
+    );
+    assert_eq!(manifest.tuning, ["tuning/weights.json"]);
+}
+
+#[test]
+fn a_wasm_package_that_names_a_kernel_program_is_refused() {
+    let text = r#"
+op = "scheduling"
+backend = "fcfs"
+
+[toolchain]
+kind = "wasm"
+version = "50.0.1"
+
+[module]
+form = "wasm"
+
+[source]
+kind = "wasm"
+files = ["src/lib.rs"]
+
+[kernel]
+architectures = ["wasm32"]
+descriptors = { keys = ["default"] }
+"#;
+    let root = package(text, &["src/lib.rs"]);
+    assert!(Manifest::load(root.path()).is_err());
 }
 
 #[test]
