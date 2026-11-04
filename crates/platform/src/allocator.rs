@@ -269,6 +269,46 @@ impl Allocator {
             .map_or(0, VirtualPool::mapped_bytes)
     }
 
+    /// Suspends every reserved pool for a parked standby (design 2.5): each
+    /// block's contents are copied to page-locked host storage, the physical
+    /// storage is released at unchanged addresses, and each pool's booked total
+    /// drops to what it maps, so the parked process does not hold the device's
+    /// budget for storage it no longer uses.
+    ///
+    /// Nothing may read or write a buffer between this call and
+    /// [`Self::restore`]. A buffer keeps its address and its contents across
+    /// the pair, but a descriptor exported before it is invalid afterwards,
+    /// since the block's physical storage was released.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a copy or an unmap fails; the blocks suspended before the
+    /// failure stay suspended and are restored by [`Self::restore`].
+    pub fn suspend(&mut self) -> Result<()> {
+        let mut outcome = Ok(());
+        for pool in self.pools.iter_mut().flatten() {
+            outcome = outcome.and(pool.suspend());
+        }
+        outcome
+    }
+
+    /// Maps new physical storage at every suspended block's address and copies
+    /// its saved contents back, booking each pool's new total before each
+    /// mapping. Restoring a pool that is not suspended does nothing.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the driver cannot create or map a block's storage, when a
+    /// pool's budget refuses the new total, or when a copy fails; the blocks
+    /// not yet restored stay suspended.
+    pub fn restore(&mut self) -> Result<()> {
+        let mut outcome = Ok(());
+        for pool in self.pools.iter_mut().flatten() {
+            outcome = outcome.and(pool.restore());
+        }
+        outcome
+    }
+
     fn pool(&mut self, pool: PoolKind) -> Result<&mut VirtualPool> {
         self.pools[pool.index()].as_mut().ok_or_else(|| {
             Error::invalid(format!(

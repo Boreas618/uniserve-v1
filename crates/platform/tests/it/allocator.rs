@@ -60,19 +60,25 @@ impl Budget for RecordingBudget {
     }
 }
 
+/// An allocator that books against `budget`, which stands for the executor's
+/// budget over its storage client.
+fn with_budget(device: &platform::Device, budget: &Arc<RecordingBudget>) -> Allocator {
+    let recording: Arc<RecordingBudget> = Arc::clone(budget);
+    let ledger: Arc<dyn Budget> = recording;
+    Allocator::new(device, ledger).unwrap()
+}
+
 #[test]
 #[ignore = "requires a CUDA device"]
 fn an_allocation_over_the_device_budget_fails_before_it_maps_anything() {
     let _driver = exclusive_driver();
     let device = platform::Device::new(DEVICE).unwrap();
     let budget = RecordingBudget::new(0);
-    let mut allocator = Allocator::new(&device, budget.clone()).unwrap();
+    let mut allocator = with_budget(&device, &budget);
     assert_eq!(allocator.device(), DEVICE);
     allocator.reserve(PoolKind::Scratch, 8 << 20).unwrap();
 
-    let refused = allocator
-        .allocate(PoolKind::Scratch, 1 << 20)
-        .unwrap_err();
+    let refused = allocator.allocate(PoolKind::Scratch, 1 << 20).unwrap_err();
     assert!(
         matches!(refused, Error::InvalidArgument(_)),
         "the budget's refusal reaches the caller unchanged, got {refused:?}"
@@ -97,7 +103,7 @@ fn a_freed_block_is_given_out_again_at_its_address_with_its_contents() {
     let _driver = exclusive_driver();
     let device = platform::Device::new(DEVICE).unwrap();
     let budget = RecordingBudget::new(16 << 20);
-    let mut allocator = Allocator::new(&device, budget).unwrap();
+    let mut allocator = with_budget(&device, &budget);
     allocator.reserve(PoolKind::Graph, 8 << 20).unwrap();
     let stream = device.stream().unwrap();
 
@@ -135,7 +141,7 @@ fn each_pool_has_its_own_range_and_a_block_exports_a_working_descriptor() {
     let _driver = exclusive_driver();
     let device = platform::Device::new(DEVICE).unwrap();
     let budget = RecordingBudget::new(64 << 20);
-    let mut allocator = Allocator::new(&device, budget).unwrap();
+    let mut allocator = with_budget(&device, &budget);
     for pool in [PoolKind::Graph, PoolKind::Scratch, PoolKind::Resident] {
         allocator.reserve(pool, 8 << 20).unwrap();
     }
@@ -172,4 +178,61 @@ fn each_pool_has_its_own_range_and_a_block_exports_a_working_descriptor() {
     unsafe { platform::memcpy_async(host.address(), imported.address(), 16, &stream) }.unwrap();
     stream.synchronize().unwrap();
     assert_eq!(read(&host), vec![0x3c; 16]);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn a_suspended_allocator_gives_its_budget_back_and_restores_its_blocks() {
+    let _driver = exclusive_driver();
+    let device = platform::Device::new(DEVICE).unwrap();
+    let budget = RecordingBudget::new(64 << 20);
+    let mut allocator = with_budget(&device, &budget);
+    for pool in [PoolKind::Graph, PoolKind::Scratch] {
+        allocator.reserve(pool, 8 << 20).unwrap();
+    }
+    let stream = device.stream().unwrap();
+
+    let first = allocator.allocate(PoolKind::Scratch, 4096).unwrap();
+    let second = allocator.allocate(PoolKind::Scratch, 4096).unwrap();
+    let graph = allocator.allocate(PoolKind::Graph, 4096).unwrap();
+    let (first_address, second_address, graph_address) =
+        (first.address(), second.address(), graph.address());
+    let scratch_bytes = first.len() + second.len();
+    // SAFETY: both blocks hold the bytes and outlive the fills, which the
+    // stream runs in order before the suspension.
+    unsafe {
+        platform::memset_d8(first_address, 0x11, 16, &stream).unwrap();
+        platform::memset_d8(second_address, 0x22, 16, &stream).unwrap();
+    }
+    stream.synchronize().unwrap();
+
+    // A parked standby gives the device's budget back: it counts what the
+    // process maps, and the process maps nothing while suspended.
+    allocator.suspend().unwrap();
+    assert_eq!(allocator.mapped_bytes(PoolKind::Scratch), 0);
+    assert_eq!(allocator.mapped_bytes(PoolKind::Graph), 0);
+    assert_eq!(budget.booked(PoolKind::Scratch), Some(0));
+    assert_eq!(budget.booked(PoolKind::Graph), Some(0));
+
+    // Restoring maps the storage again at the same addresses, books exactly
+    // what it maps, and brings every block's contents back.
+    allocator.restore().unwrap();
+    assert_eq!(first.address(), first_address, "addresses are restored");
+    assert_eq!(second.address(), second_address, "addresses are restored");
+    assert_eq!(graph.address(), graph_address, "addresses are restored");
+    assert_eq!(allocator.mapped_bytes(PoolKind::Scratch), scratch_bytes);
+    assert_eq!(allocator.mapped_bytes(PoolKind::Graph), graph.len());
+    assert_eq!(
+        budget.booked(PoolKind::Scratch),
+        Some(scratch_bytes as u64),
+        "the last total booked is exactly what the pool maps again"
+    );
+    assert_eq!(budget.booked(PoolKind::Graph), Some(graph.len() as u64));
+
+    let host = platform::PinnedBuffer::new(DEVICE, 16).unwrap();
+    // SAFETY: the block is mapped again and holds its saved contents; the host
+    // buffer is as long as the copy.
+    unsafe { platform::memcpy_async(host.address(), first_address, 16, &stream) }.unwrap();
+    stream.synchronize().unwrap();
+    assert_eq!(read(&host), vec![0x11; 16]);
 }
