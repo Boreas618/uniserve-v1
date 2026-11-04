@@ -41,6 +41,8 @@ mod dtype;
 mod error;
 mod event;
 mod graph;
+#[cfg(test)]
+mod header;
 mod launch;
 mod library;
 mod memory;
@@ -62,7 +64,7 @@ pub use copy::{
 };
 pub use cublas::{
     Algorithm, ComputeType, Epilogue, Matmul, MatmulArgs, MatmulBytes, MatmulDescriptor,
-    MatrixLayout,
+    MatrixLayout, Order,
 };
 pub use cudnn::{
     Convolution, ConvolutionArgs, ConvolutionBytes, ConvolutionKind, ConvolutionPlan, Cudnn,

@@ -91,6 +91,37 @@ const ACTIVATION_KERNEL: u32 = 12;
 /// The transformer's hidden width (`hidden_size`).
 const HIDDEN: u32 = 5376;
 
+/// The rotary geometry: 16 frequencies per position axis over three axes (time, height, width),
+/// so the leading 96 channels of each 128-channel head rotate and the trailing 32 do not.
+const ROPE_FREQ_DIM: u32 = 16;
+const ROPE_AXES: u32 = 3;
+const ROTATED: u32 = ROPE_FREQ_DIM * ROPE_AXES * 2;
+const ROPE_THETA: f32 = 10_000.0;
+
+/// Elements one `rotary_factors` program handles (`launch::ROTARY_BLOCK`).
+const ROTARY_BLOCK: u32 = 256;
+
+/// Tokens one `qk_norm_rope` program handles (`launch::QK_NORM_TOKENS`).
+const QK_NORM_TOKENS: u32 = 1;
+
+/// The attention projections' inner width, `num_attention_heads · attention_head_dim = 7168`: the
+/// contraction length of the output projection (`attention.py`'s `RowParallelLinear(inner, hidden)`).
+const HEADS_TIMES_HEAD_DIM: u32 = 7168;
+
+/// The attention geometry: 56 heads of 128 features (`num_attention_heads`, `attention_head_dim`).
+const HEADS: u32 = 56;
+const HEAD_DIM: u32 = 128;
+
+/// The transformer's feed-forward width (`ffn_dim`).
+const FFN: u32 = 14336;
+
+/// The audio encoder's attention: 8 heads over the 2048-wide latent, so 256 features per head.
+const AUDIO_ATTENTION_HEADS: u32 = 8;
+const AUDIO_LATENT_DIM: u32 = 2048;
+
+/// The audio VAE's latent channels (`latent_channels`): the encoder's narrow width.
+const AUDIO_LATENT_CHANNELS: u32 = 32;
+
 /// The transformer's normalizer epsilon (`norm_eps`, `qk_norm_eps`).
 const NORM_EPSILON: f32 = 1e-5;
 
@@ -194,6 +225,102 @@ fn main() {
         .to_string(),
     );
 
+    // ---- The DiT's projections: one key per distinct contraction length.
+    //
+    // The transformer stores its weights as Hugging Face checkpoints do (`[n, k]`, `nxk`), contracts
+    // in FP32 and adds no bias: `MergedColumnParallelLinear(..., bias=False)` for the fused q/k/v and
+    // `RowParallelLinear` for the output, `ffn_dim` for the feed-forward (`attention.py`,
+    // `transformer.py`). The three lengths are the attention projections' `hidden_size`,
+    // the output projection's `heads · head_dim = 7168`, and the feed-forward's `ffn_dim = 14336`.
+    for k in [HIDDEN, HEADS_TIMES_HEAD_DIM, FFN] {
+        push(
+            "gemm",
+            ops::gemm::Descriptor {
+                input: DType::BF16,
+                weight: DType::BF16,
+                accumulate: DType::F32,
+                output: DType::BF16,
+                order: ops::gemm::WeightOrder::NxK,
+                epilogue: ops::gemm::Epilogue::None,
+                k,
+            }
+            .to_string(),
+        );
+    }
+
+    // The audio encoder is FP32 throughout (`Model.forward` casts, and the whole autoencoder runs in
+    // FP32): its pre-block contracts at the latent width for the fused q/k/v and the shortcut, at
+    // the head width for the attended rows, and at the latent channels for the GeGLU's two halves
+    // and its output (`audio_vae.py:403-440`: `Linear(width, 3·width)`, `Linear(width, channels)`,
+    // `Linear(channels, channels)`, `GeGLU(channels, 2·channels)`).
+    for k in [
+        AUDIO_LATENT_DIM,
+        AUDIO_LATENT_DIM / AUDIO_ATTENTION_HEADS,
+        AUDIO_LATENT_CHANNELS,
+        2 * AUDIO_LATENT_CHANNELS,
+    ] {
+        push(
+            "gemm",
+            ops::gemm::Descriptor {
+                input: DType::F32,
+                weight: DType::F32,
+                accumulate: DType::F32,
+                output: DType::F32,
+                order: ops::gemm::WeightOrder::NxK,
+                epilogue: ops::gemm::Epilogue::None,
+                k,
+            }
+            .to_string(),
+        );
+    }
+
+    // ---- The DiT's rotation: three position axes of 16 frequencies each, cut into three sections
+    // of the head's rotated columns, and the per-head normalization fused with it.
+    //
+    // `attention.py` normalizes every query and key head with a *learned* RMSNorm (`affine`) and
+    // rotates the leading 96 channels with neox RoPE over (time, height, width).
+    push(
+        "rotary_factors",
+        ops::rope::FactorsDescriptor {
+            dtype: DType::F32,
+            positions: DType::I32,
+            columns: ROTATED / 2,
+            block: ROTARY_BLOCK,
+            scale: ops::Float::from(ROPE_THETA),
+            pdl: PDL,
+            axes: ROPE_AXES,
+            sections: {
+                let mut sections = [0; ops::rope::MAX_AXES];
+                sections[0] = ROPE_FREQ_DIM;
+                sections[1] = ROPE_FREQ_DIM;
+                sections[2] = ROPE_FREQ_DIM;
+                sections
+            },
+            // H3's text encoder is Qwen3-VL: its M-RoPE cycles the axes over the frequencies.
+            interleaved: true,
+        }
+        .to_string(),
+    );
+    push(
+        "qk_norm_rope",
+        ops::rope::QkNormRopeDescriptor {
+            dtype: DType::BF16,
+            output: DType::BF16,
+            head_dim: HEAD_DIM,
+            q_heads: HEADS,
+            k_heads: HEADS,
+            // "neox RoPE": adjacent pairs rotate together.
+            rotation: ops::rope::Rotation::Interleaved,
+            epsilon: ops::Float::from(NORM_EPSILON),
+            rotated: ROTATED,
+            rows: QK_NORM_TOKENS,
+            block: row_tile(HEAD_DIM).min(1024),
+            affine: true,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
+
     // ---- The transformer's per-row programs, at `hidden_size`.
     push(
         "modulated_rms_norm",
@@ -233,13 +360,129 @@ fn main() {
         }
         .to_string(),
     );
+    // The DiT's attention: one dense program over the packed sequence. `max_kv_len` is a declared
+    // bound outside the key (a padded-token bucket up to 174,598 for the widest layout), so the key
+    // names only the geometry. The batch path carries `[batch + 1]` offsets.
+    push(
+        "dense_attention",
+        ops::attention::dense::DenseDescriptor {
+            query: DType::BF16,
+            key_value: DType::BF16,
+            output: DType::BF16,
+            head_dim: HEAD_DIM,
+            q_heads: HEADS,
+            kv_heads: HEADS,
+            mask: ops::attention::Mask::Dense,
+            windowed: false,
+            max_kv_len: 174_598,
+            cu_seq_lens: true,
+        }
+        .to_string(),
+    );
+    // The VSA branch's own attention: one program per tile size, and the key extent (tiles per
+    // segment per layout) is a declared bound outside the key.
+    push(
+        "sparse_attention",
+        ops::attention::sparse::SparseDescriptor {
+            block: 64,
+            dtype: DType::BF16,
+            output: DType::BF16,
+            head_dim: HEAD_DIM,
+            lse: false,
+            keys: 65_536,
+        }
+        .to_string(),
+    );
+    // The DiT's row mapping, one key per latent raster the served canvases produce. The canvas is
+    // divided by the VAE's 16x spatial compression, and each side is even for every served canvas
+    // because the canvas's sides are multiples of the model's own step.
+    for (height, width) in [
+        (96, 42), // 1536x672
+        (84, 48), // 1344x768
+        (64, 48), // 1024x768
+        (48, 48), // 768x768
+        (48, 64), // 768x1024
+        (42, 48), // 672x768
+        // The 480p class: its caps give pixel sides like 992 and 832, but a canvas side is a
+        // multiple of 32, so every latent side stays even.
+        (62, 26), // 992x416
+        (52, 30), // 832x480
+        (40, 30), // 640x480
+        (30, 30), // 480x480
+        (30, 40), // 480x640
+        (30, 52), // 480x832
+    ] {
+        for mode in [ops::patch::Mode::Patchify, ops::patch::Mode::Unpatchify] {
+            push(
+                "patch",
+                ops::patch::Descriptor {
+                    dtype: DType::BF16,
+                    channels: 24,
+                    height,
+                    width,
+                    mode,
+                    block: ops::patch::BLOCK,
+                    pdl: PDL,
+                }
+                .to_string(),
+            );
+        }
+    }
+    // The audio decoder's fused BigVGAN block, at the decoder's own rate and taps.
+    push(
+        "audio_activation",
+        ops::audio_activation::Descriptor {
+            dtype: DType::F32,
+            channels: DECODER_DIM,
+            kernel: ACTIVATION_KERNEL,
+            ratio: ACTIVATION_RATIO,
+            block: 1024,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
+    // The timestep embedding's activation, over the transformer's hidden width.
+    push(
+        "silu",
+        ops::activation::SiluDescriptor {
+            dtype: DType::BF16,
+            columns: HIDDEN,
+            block: 1024,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
+    // The solver's Euler step: an FP32 source added into a BF16 running sample.
+    push(
+        "scaled_add",
+        ops::residual::ScaledAddDescriptor {
+            target: DType::BF16,
+            source: DType::F32,
+            columns: HIDDEN,
+            block: 1024,
+        }
+        .to_string(),
+    );
+    // The audio decoder's last step: two float channels to interleaved 16-bit PCM. The clip's length
+    // is a launch value, so the key holds only the element type and the block.
+    push(
+        "pcm_interleave",
+        ops::pcm::Descriptor {
+            dtype: DType::F32,
+            block: ops::pcm::BLOCK,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
     push(
         "philox_noise",
         NoiseDescriptor {
             dtype: DType::BF16,
             block: ops::noise::NOISE_BLOCK,
-            // The initial latent noise: one standard normal sample per element.
+            // The initial latent noise: one standard normal sample per element, its stream keyed by
+            // the request's seed as a launch scalar (the model has no key view to upload).
             kind: ops::noise::NoiseKind::Normal,
+            source: ops::noise::KeySource::Scalar,
         }
         .to_string(),
     );

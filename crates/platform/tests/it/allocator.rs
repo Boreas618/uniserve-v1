@@ -282,3 +282,65 @@ fn a_parked_block_changes_access_in_place_and_keeps_its_address() {
     stream.synchronize().unwrap();
     assert_eq!(read(&host), vec![0x77; 16]);
 }
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn a_restore_a_shrunk_budget_refuses_parks_every_pool_again() {
+    let _driver = exclusive_driver();
+    let device = platform::Device::new(DEVICE).unwrap();
+    let budget = RecordingBudget::new(64 << 20);
+    let mut allocator = with_budget(&device, &budget);
+    for pool in [PoolKind::Graph, PoolKind::Scratch, PoolKind::Resident] {
+        allocator.reserve(pool, 4 << 20).unwrap();
+    }
+    let stream = device.stream().unwrap();
+    let graph = allocator.allocate(PoolKind::Graph, 1 << 20).unwrap();
+    let scratch = allocator.allocate(PoolKind::Scratch, 1 << 20).unwrap();
+    let resident = allocator.allocate(PoolKind::Resident, 1 << 20).unwrap();
+    let addresses = (graph.address(), scratch.address(), resident.address());
+    // SAFETY: the block holds these bytes and outlives the fill, which the
+    // stream runs before the suspension.
+    unsafe { platform::memset_d8(graph.address(), 0x33, 16, &stream) }.unwrap();
+    stream.synchronize().unwrap();
+
+    allocator.suspend().unwrap();
+    assert_eq!(allocator.mapped_bytes(PoolKind::Resident), 0);
+
+    // The allowance shrinks below what the three pools mapped. Pools come back
+    // in the allocator's order, so graph (1 MiB) and scratch (2 MiB) map and
+    // the resident pool's 3 MiB is refused — and then nothing may stay
+    // promoted, which is the state a standby's accounting must never see.
+    budget.set_limit((2 << 20) + (1 << 19));
+    let refused = allocator.restore().unwrap_err();
+    let message = refused.to_string();
+    assert!(message.contains("resident"), "{message}");
+    // A refused restore names the cause too, not only the pool.
+    assert!(message.contains("budget"), "{message}");
+    for pool in [PoolKind::Graph, PoolKind::Scratch, PoolKind::Resident] {
+        assert_eq!(
+            allocator.mapped_bytes(pool),
+            0,
+            "{pool:?} stayed promoted after the failure"
+        );
+        assert_eq!(
+            budget.booked(pool),
+            Some(0),
+            "{pool:?} stayed booked after the failure"
+        );
+    }
+
+    // With the allowance back, the same restore brings every pool back at its
+    // address with its contents, so nothing was lost to the failure.
+    budget.set_limit(64 << 20);
+    allocator.restore().unwrap();
+    assert_eq!(
+        (graph.address(), scratch.address(), resident.address()),
+        addresses
+    );
+    let host = platform::PinnedBuffer::new(DEVICE, 16).unwrap();
+    // SAFETY: the block is mapped again with its contents and the host buffer
+    // is as long as the copy.
+    unsafe { platform::memcpy_async(host.address(), graph.address(), 16, &stream) }.unwrap();
+    stream.synchronize().unwrap();
+    assert_eq!(read(&host), vec![0x33; 16]);
+}
