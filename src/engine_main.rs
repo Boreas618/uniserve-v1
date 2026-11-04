@@ -90,7 +90,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use clap::Args;
 
 use crate::engine_plan::EpochPlan;
@@ -103,9 +103,9 @@ use executor::control::{Control, Endpoints, Ready};
 use executor::device::{Executor, Probe};
 use executor::host::{HostAction, HostTask, Lane};
 use executor::hot_update::{Action, HotUpdate};
+use executor::memory::Memory;
 use executor::memory::retained::Retained;
 use executor::memory::weights::WeightStore;
-use executor::memory::Memory;
 use executor::watchdog::{Running, Watchdog};
 use ipc::{ProgramCommand, ProgramStatus, UpdateFailure};
 use ops::{Generation, KernelEntry};
@@ -254,7 +254,7 @@ struct ProcessInterface {
 impl ProcessInterface {
     /// Connects to `address` and states this process's identity, which the daemon answers with the
     /// deployment's nodes or a refusal (§2.3).
-    fn connect(address: &str, deployment: &str) -> Result<Self> {
+    fn connect(address: &str, deployment: &str, engine: u64) -> Result<Self> {
         let mut connection = proto::Connection::connect(address).with_context(|| {
             format!("connecting to the daemon's process interface at {address}")
         })?;
@@ -265,6 +265,9 @@ impl ProcessInterface {
             peer: Some(proto::process::hello::Peer::Engine(
                 proto::process::Engine {
                     deployment: deployment.to_owned(),
+                    // The number the launch named: the daemon addresses this
+                    // connection, and no other of this process's, by it (§2.3).
+                    engine,
                 },
             )),
         })?;
@@ -681,7 +684,8 @@ impl MainProcess {
         // The daemon's two interfaces are two sockets: the epoch's requests and metrics travel on
         // the request connection above, and everything the daemon asks of this process - the claim,
         // the reports of §7.3, and every command of the program layer - travels on this one.
-        let mut process = ProcessInterface::connect(&launch.processes, &launch.deployment)?;
+        let mut process =
+            ProcessInterface::connect(&launch.processes, &launch.deployment, launch.engine)?;
 
         // §8: the rank's Storage Server and its claim are the node's, which the daemon answers for;
         // the retained weights outlive every world of the epoch, so the store is built once, before
@@ -1709,8 +1713,8 @@ impl MainProcess {
             right
                 .0
                 .cmp(&left.0)
-                .then_with(|| right.1 .1.cmp(&left.1 .1))
-                .then_with(|| left.1 .0.as_str().cmp(right.1 .0.as_str()))
+                .then_with(|| right.1.1.cmp(&left.1.1))
+                .then_with(|| left.1.0.as_str().cmp(right.1.0.as_str()))
         });
         let Some((covers, next)) = remaining.into_iter().next() else {
             // Every candidate is spent: the refusal names the operator, what it could not serve and
@@ -3442,14 +3446,12 @@ fn answer(
 
 /// What the engine answers a command of the worker era's surface: the operation named a worker
 /// world of its own, and this epoch executes batches itself (§2.4).
-const WORKER_ERA: &str =
-    "this epoch has no worker of that kind: the command names a worker-era engine, and the epoch's \
+const WORKER_ERA: &str = "this epoch has no worker of that kind: the command names a worker-era engine, and the epoch's \
      executors are the process's own";
 
 /// What the engine answers a command whose owner is the epoch layer: the same operation exists,
 /// and it is asked for through the process connection, where the driver applies it (§2.5, §7.4).
-const EPOCH_LIFECYCLE: &str =
-    "this command is the epoch layer's, applied through the process connection rather than the \
+const EPOCH_LIFECYCLE: &str = "this command is the epoch layer's, applied through the process connection rather than the \
      request connection";
 
 /// States a main process's state on the request interface (§7.3 step 1).
@@ -3474,8 +3476,7 @@ fn announce(
 
 /// What the engine answers a command over the deployment's storage ledgers or transfer budgets:
 /// each node's daemon reads them over the claim it holds, not through an epoch's main process (§8).
-const LEDGERS: &str =
-    "the storage ledgers and transfer budgets are read by each node's daemon over its claim, not \
+const LEDGERS: &str = "the storage ledgers and transfer budgets are read by each node's daemon over its claim, not \
      by an epoch's main process";
 
 /// The §7.3 stage a program-layer command belongs to, for the log line each one leaves.
@@ -4245,8 +4246,8 @@ fn handshake(control: &mut Control, launch: &Launch) -> Result<Epoch> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use program_server::protocol::{ListedModule, ListedPackage};
     use program_server::ModuleForm;
+    use program_server::protocol::{ListedModule, ListedPackage};
 
     /// A listed package with one built module for `target`.
     fn package(op: &str, backend: &str, revision: u32, target: &str) -> ListedPackage {

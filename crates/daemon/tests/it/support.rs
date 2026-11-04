@@ -68,6 +68,7 @@ impl Engine {
                 build: proto::BUILD.to_owned(),
                 peer: Some(hello::Peer::Engine(EnginePeer {
                     deployment: "deployment".into(),
+                    engine: 0,
                 })),
             })
             .unwrap();

@@ -209,6 +209,9 @@ impl ProcessClient {
             build: proto::BUILD.to_owned(),
             peer: Some(hello::Peer::Engine(proto::process::Engine {
                 deployment: deployment.to_owned(),
+                // Not a main process: the daemon numbers this connection by
+                // the order it arrived in and addresses no engine by it.
+                engine: 0,
             })),
         })?;
         let welcome: Welcome = connection

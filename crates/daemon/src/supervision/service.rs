@@ -545,6 +545,12 @@ pub(crate) fn run_leader(
             return Ok(None);
         }
         while let Some(connection) = listener.try_accept()? {
+            // The arrival numbering skips the numbers main processes state:
+            // an engine a launch named owns its number for the deployment's
+            // life, and a later arrival must not be given it.
+            while engines.contains_key(&next_engine) {
+                next_engine += 1;
+            }
             engines.insert(
                 next_engine,
                 EngineConnection {
@@ -609,6 +615,9 @@ pub(crate) fn run_leader(
             }
         }
 
+        // The main processes that stated an engine number this round, by the
+        // number their arrival gave them: applied once their hellos are read.
+        let mut renumbered: Vec<(u64, u64)> = Vec::new();
         // Engines: their hellos and requests; a closed engine takes its
         // processes on every node with it.
         for (&engine, peer) in &mut engines {
@@ -631,7 +640,25 @@ pub(crate) fn run_leader(
                                 break;
                             }
                             let frontend = matches!(hello.peer, Some(hello::Peer::Frontend(_)));
-                            tracing::info!(engine, build = %hello.build, frontend, "a process connected");
+                            // A main process states the engine number its
+                            // launch named, and is numbered by it from here
+                            // on: the epoch layer addresses a main process by
+                            // that number in both directions, and the order
+                            // its many connections arrived in says nothing
+                            // about which of them serves the epoch (§2.3).
+                            let stated = match &hello.peer {
+                                Some(hello::Peer::Engine(engine)) => {
+                                    Some(engine.engine).filter(|number| *number != 0)
+                                }
+                                _ => None,
+                            };
+                            tracing::info!(
+                                engine,
+                                stated = stated.unwrap_or(0),
+                                build = %hello.build,
+                                frontend,
+                                "a process connected"
+                            );
                             if frontend && let Some(frontend_greetings) = &frontend_greetings {
                                 let _ = frontend_greetings.send(engine);
                             }
@@ -639,12 +666,17 @@ pub(crate) fn run_leader(
                             // launch it started when the peer's first report
                             // names the launch generation (§2.5).
                             let _ = greetings.send((
-                                engine,
+                                stated.unwrap_or(engine),
                                 Greeting {
                                     build: hello.build.clone(),
                                     frontend,
                                 },
                             ));
+                            if let Some(number) = stated
+                                && number != engine
+                            {
+                                renumbered.push((engine, number));
+                            }
                             let _ = wake.send(());
                             peer.welcomed = true;
                             continue;
@@ -776,6 +808,34 @@ pub(crate) fn run_leader(
                     answer(key.0, stop.reply, &mut pending, &mut engines);
                 }
             }
+        }
+
+        // The numbers main processes stated take effect before this round's
+        // commands go down, so a command the epoch layer sends right after a
+        // process reported itself ready already reaches that process.
+        for (arrived, number) in renumbered.drain(..) {
+            let Some(connection) = engines.remove(&arrived) else {
+                continue;
+            };
+            if let Some(displaced) = engines.remove(&number) {
+                // Nothing addresses a peer that states no number: it is a
+                // worker's client or a client of this interface, and the
+                // number is the main process's.
+                let fresh = next_engine;
+                next_engine += 1;
+                engines.insert(fresh, displaced);
+                tracing::info!(
+                    engine = fresh,
+                    stated = number,
+                    "a peer was moved off the number a main process states"
+                );
+            }
+            engines.insert(number, connection);
+            tracing::info!(
+                engine = number,
+                arrived,
+                "a main process is numbered by the engine it states"
+            );
         }
 
         // This node's exits, to the engines that started the processes and
