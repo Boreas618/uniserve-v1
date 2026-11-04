@@ -647,7 +647,7 @@ impl ProgramServer {
         Ok(Module {
             form: package.manifest.module.form,
             files: module_files,
-            metadata: package.manifest.module.metadata.clone(),
+            metadata: package.manifest.module.metadata_name(&path.descriptor),
             entries,
         })
     }
