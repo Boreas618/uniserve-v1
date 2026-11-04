@@ -20,7 +20,6 @@
 //! failure discards a new generation, which one reverts the update, which one
 //! fails the epoch, and when a purge may run.
 
-use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use ipc::UpdateFailure;
@@ -94,12 +93,14 @@ pub struct HotUpdate {
     /// The generation kept for probation and revert: the one serving before the
     /// switchover, held until the purge after commit or revert.
     previous: Option<u64>,
-    /// The generation the daemon asked to purge, waiting for its last batch to
-    /// complete (§7.3 step 6).
+    /// The generation the daemon asked to purge (§7.3 step 6).
+    ///
+    /// The order that makes the release follow the generation's last batch is the device's,
+    /// not this state machine's: a purge is a command in the same FIFO as the batches, so the
+    /// device performs it behind every command it already holds, and after a switchover or a
+    /// revert nothing new of the replaced generation can be served. A batch that still names it
+    /// fails when it resolves its graph, saying which bucket and generation it wanted.
     purging: Option<u64>,
-    /// Batches submitted and not completed, by the generation their kernels
-    /// belong to: what the purge of a generation waits for.
-    in_flight: BTreeMap<u64, usize>,
     /// When probation began, for the rollback threshold of `update_config`
     /// (§7.3 step 4).
     probation_started: Option<Instant>,
@@ -119,7 +120,6 @@ impl HotUpdate {
             phase: Phase::Serving,
             previous: None,
             purging: None,
-            in_flight: BTreeMap::new(),
             probation_started: None,
             failure: None,
             failed_generation: None,
@@ -287,6 +287,9 @@ impl HotUpdate {
     /// §7.3 step 6: the daemon asks for `generation`'s purge. It runs once no
     /// batch that used its kernels is in flight.
     ///
+    /// The purge is a command in the device's FIFO, behind every batch the device already holds, so
+    /// the release follows the generation's last batch by the device's own order (§7.3 step 6).
+    ///
     /// Only the generation a switchover or a revert replaced is purged: any
     /// other number names a generation this process never held, and releasing
     /// it would report a purge of nothing. A second purge while one is pending
@@ -316,16 +319,11 @@ impl HotUpdate {
         Ok(())
     }
 
-    /// The generation whose purge may run now: the daemon asked for it and its
-    /// last batch completed. The caller then releases its graphs and kernels
-    /// and reports [`Self::purged`].
+    /// The generation whose purge runs now: the daemon asked for it, and the device performs the
+    /// release behind every batch its queue already holds (§7.3 step 6). The caller releases its
+    /// graphs and kernels and reports [`Self::purged`].
     pub fn purge_due(&self) -> Option<u64> {
-        let generation = self.purging?;
-        if self.in_flight.get(&generation).copied().unwrap_or(0) == 0 {
-            Some(generation)
-        } else {
-            None
-        }
+        self.purging
     }
 
     /// The purge of `generation` finished.
@@ -333,33 +331,11 @@ impl HotUpdate {
         if self.purging != Some(generation) {
             return Err(Error::State("no such purge is pending"));
         }
-        if self.purge_due() != Some(generation) {
-            return Err(Error::State(
-                "a batch of the purged generation is in flight",
-            ));
-        }
         self.purging = None;
         if self.previous == Some(generation) {
             self.previous = None;
         }
-        self.in_flight.remove(&generation);
         Ok(())
-    }
-
-    /// A batch of `generation`'s kernels was submitted.
-    pub fn batch_started(&mut self, generation: u64) {
-        *self.in_flight.entry(generation).or_default() += 1;
-    }
-
-    /// A batch of `generation`'s kernels completed.
-    pub fn batch_finished(&mut self, generation: u64) {
-        let Some(count) = self.in_flight.get_mut(&generation) else {
-            return;
-        };
-        *count = count.saturating_sub(1);
-        if *count == 0 {
-            self.in_flight.remove(&generation);
-        }
     }
 
     /// What `failure` means in the current phase (§7.3 steps 2 and 4, §2.5).
@@ -499,19 +475,19 @@ mod tests {
         assert!(update.commit(8).is_err());
     }
 
+    /// A purge the daemon asks for after a commit is due at once, and the release follows the
+    /// device's own order: the purge is a command behind every batch the device already holds, so
+    /// no count stands between the request and the release (§7.3 step 6).
     #[test]
-    fn a_purge_waits_for_the_last_batch_of_its_generation() {
+    fn a_purge_after_commit_is_due_and_releases_the_replaced_generation() {
         let mut update = update();
         update.begin_precopy(8).expect("a fresh update");
         update.precopied(8).expect("precopy finished");
         update.switchover(8, Instant::now()).expect("switchover");
         update.commit(8).expect("commit");
-        update.batch_started(7);
         update
             .request_purge(7)
             .expect("the daemon asks for the old purge");
-        assert_eq!(update.purge_due(), None);
-        update.batch_finished(7);
         assert_eq!(update.purge_due(), Some(7));
         update.purged(7).expect("purged");
         assert_eq!(update.phase(), Phase::Serving);
@@ -545,7 +521,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reverted_generation_is_purged_after_the_last_batch_of_its_kind() {
+    fn a_reverted_generation_is_purged() {
         let mut update = update();
         update.begin_precopy(8).expect("a fresh update");
         update.precopied(8).expect("precopy finished");
@@ -553,12 +529,9 @@ mod tests {
         update.revert(8, stall()).expect("revert");
         assert_eq!(update.current(), 7);
         assert_eq!(update.previous(), Some(8));
-        update.batch_started(8);
         update
             .request_purge(8)
             .expect("the reverted generation is purged");
-        assert_eq!(update.purge_due(), None);
-        update.batch_finished(8);
         assert_eq!(update.purge_due(), Some(8));
         update.purged(8).expect("purged");
         assert_eq!(update.previous(), None);
@@ -590,22 +563,21 @@ mod tests {
     }
 
     #[test]
-    fn a_purge_cannot_be_requested_twice_or_finished_early() {
+    fn a_purge_cannot_be_requested_twice_or_finished_out_of_turn() {
         let mut update = update();
         update.begin_precopy(8).expect("a fresh update");
         update.precopied(8).expect("precopy finished");
         update.switchover(8, Instant::now()).expect("switchover");
         update.commit(8).expect("commit");
-        update.batch_started(7);
         update
             .request_purge(7)
             .expect("the generation the switchover replaced");
         assert!(update.request_purge(7).is_err(), "its purge is pending");
-        assert!(update.purged(7).is_err(), "its last batch is in flight");
-        assert_eq!(update.purge_due(), None);
-        update.batch_finished(7);
+        // A release the state machine did not ask for names no purge of this update.
+        assert!(update.purged(6).is_err());
         assert_eq!(update.purge_due(), Some(7));
         update.purged(7).expect("purged");
+        assert_eq!(update.purge_due(), None);
     }
 
     #[test]

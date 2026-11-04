@@ -23,11 +23,11 @@ use platform::{CopyBatch, SourceOrder};
 
 use super::exports::{self, Exports, Location};
 use super::{Spans, Transports, copy_planner};
+use crate::memory::allocation::Backing;
+use crate::memory::allocation::ElementType;
 use crate::memory::allocation::{Storage, StorageView};
 use crate::memory::{CachePlanes, GroupTable, TransferBases, UnitAccesses};
 use crate::stream::Issue;
-use crate::memory::allocation::Backing;
-use crate::memory::allocation::ElementType;
 use crate::{Error, Result};
 
 /// The pages a token interval touches: `(absolute page, offset, length)`.

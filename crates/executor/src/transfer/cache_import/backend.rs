@@ -18,13 +18,13 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
 use super::{CacheImport, CacheImporter};
+use crate::memory::allocation::Backing;
+use crate::memory::allocation::ElementType;
 use crate::memory::allocation::StorageView;
 use crate::memory::prefix_cache::conversion::{
     ConversionRequest, ConversionScratch, PageConversion,
 };
 use crate::memory::{CachePlanes, GroupTable, UnitColumn};
-use crate::memory::allocation::Backing;
-use crate::memory::allocation::ElementType;
 use crate::transfer::fetch;
 use crate::transfer::read::{Read, ReadRef};
 use crate::transfer::{Notify, Retirement, Spans, Transports, notify};

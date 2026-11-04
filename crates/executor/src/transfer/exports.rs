@@ -7,8 +7,8 @@ use ipc::Locator;
 use super::transport::{Staged, Transport, TransportKind, Transports};
 use super::vmm::Exported;
 use super::{ByteReservation, Retirement, Spans};
-use crate::stream::Issue;
 use crate::memory::allocation::MemoryKind;
+use crate::stream::Issue;
 use crate::{Error, Result};
 
 /// One accepted export location and the transport that owns it.
@@ -235,10 +235,10 @@ mod tests {
     use ipc::{TransferTransport, WorkerEndpoint};
 
     use super::*;
+    use crate::memory::allocation::Backing;
+    use crate::memory::allocation::ElementType;
     use crate::memory::allocation::{Storage, StorageView};
     use crate::stream::EventPool;
-    use crate::memory::allocation::Backing;
-use crate::memory::allocation::ElementType;
     use crate::transfer::{TransferCapacity, TransportOptions};
 
     /// A rank whose only mechanism towards slot 1 is the rank channel.
