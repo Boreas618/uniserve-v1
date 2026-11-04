@@ -8,5 +8,6 @@ mod builder;
 mod manifest;
 mod program;
 mod protocol;
+mod serve;
 mod server;
 mod store;
