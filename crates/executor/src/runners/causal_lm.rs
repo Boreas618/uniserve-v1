@@ -136,7 +136,11 @@ impl Staging {
             )));
         }
         let tokens = columns.rows.tokens();
-        let rows = columns.rows.calls.len();
+        // A batch has two counts and each of its columns belongs to one of them: the sampler's
+        // `slots` and `parameters` are per **row** (a verify call carries several rows for one
+        // call), and the commit table states one row per **call**.
+        let rows = columns.rows.rows();
+        let calls = columns.rows.calls.len();
         if tokens > bucket.tokens as usize || rows > bucket.rows as usize {
             return Err(Error::Invalid(format!(
                 "the batch's {rows} rows and {tokens} tokens do not fit bucket {bucket}"
@@ -197,8 +201,6 @@ impl Staging {
         // Padding tokens belong to the last call's token range, and padding rows are appended
         // after it, each evaluating the padding token that follows.
         let mut cursor = tokens;
-        let calls = self.rows.calls.len();
-        let _ = calls;
         if let Some(last) = self.rows.calls.last_mut() {
             if tokens < bucket_tokens {
                 last.rows.end = bucket_tokens as u32;
@@ -238,23 +240,28 @@ impl Staging {
         self.commit.clear();
         if !columns.commit.is_empty() {
             let fields = ops::commit::COMMIT_FIELDS;
-            if columns.commit.len() != fields * rows {
+            if columns.commit.len() != fields * calls {
                 return Err(Error::Invariant(format!(
-                    "the commit table holds {} values, {fields} fields of {rows} rows",
+                    "the commit table holds {} values, {fields} fields of {calls} calls",
                     columns.commit.len()
                 )));
             }
             self.commit.extend_from_slice(&inert_commit(bucket_rows));
             for field in 0..fields {
-                self.commit[field * bucket_rows..field * bucket_rows + rows]
-                    .copy_from_slice(&columns.commit[field * rows..(field + 1) * rows]);
+                self.commit[field * bucket_rows..field * bucket_rows + calls]
+                    .copy_from_slice(&columns.commit[field * calls..(field + 1) * calls]);
             }
         }
         self.page_size = columns.page_size;
         self.max_kv_len = columns.max_kv_len;
         self.calls.clear();
         self.calls.extend_from_slice(call_ids);
-        self.calls.resize(bucket_rows, CallId(u64::MAX));
+        if self.calls.len() != calls {
+            return Err(Error::Invariant(format!(
+                "the batch states {} call ids for its {calls} calls",
+                self.calls.len()
+            )));
+        }
 
         self.staged = Some(bucket);
         Ok(bucket.shape())
@@ -1737,14 +1744,26 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 ),
             )
         };
+        // The completion names one row per call, and the state it reports is the call's own: the
+        // commit table is per call and the sampler's slot view is per row, so a multi-row call
+        // reads the slot its rows share through its first row.
         let row_slots = self.staging.slots(rows);
-        let mut states = Vec::with_capacity(rows);
-        for slot in row_slots {
-            // A padded row names no slot, so the commit table states nothing about it.
-            states.push(if *slot < 0 {
+        let calls = self.staging.calls();
+        let mut states = Vec::with_capacity(calls.len());
+        for index in 0..calls.len() {
+            let row = self
+                .staging
+                .batch_rows()
+                .calls
+                .get(index)
+                .map(|call| call.rows.start as usize)
+                .unwrap_or(0);
+            // A padded call names no slot, so the commit table states nothing about it.
+            let slot = row_slots.get(row).copied().unwrap_or(-1);
+            states.push(if slot < 0 {
                 RowState::default()
             } else {
-                let at = *slot as usize;
+                let at = slot as usize;
                 RowState {
                     // For text the slot's trajectory position is the number of tokens it has
                     // committed, which the table keeps in the sampling column; a latent
@@ -2124,10 +2143,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
             input_ids: vec![0; tokens],
             slots: vec![0; rows],
             parameters: vec![0.0; rows * ops::sampler::PARAMETER_COLUMNS as usize],
-            // An inert table, not an empty one: a row whose slot and task are `-1` commits
-            // nothing, and the launch is still recorded, so a serving replay of this bucket
-            // advances the slots it names.
-            commit: inert_commit(rows),
+            // An inert table, not an empty one, with one row per call: a row whose slot and task
+            // are `-1` commits nothing, and the launch is still recorded, so a serving replay of
+            // this bucket runs the operator over the bucket's rows and advances nothing.
+            commit: inert_commit(1),
             page_size: 1,
             max_kv_len: 1,
         };
@@ -2216,6 +2235,11 @@ fn length_at(column: &[i32], slot: usize) -> u32 {
 /// commit table left each call's slot at. A call with no sampling row still gets an entry - it
 /// advanced, it just ended no prompt - and a sampling row outside every call is an invariant
 /// violation, because the mechanism's columns and its calls would then disagree about the batch.
+/// The completion of one step: one [`CallOutput`] per call, in the batch's call order.
+///
+/// `calls` and `states` are per **call**, and `ids` and `sampling_rows` are per *row* (the bucket's
+/// rows, one sampled id and one `logits_rows` entry each). A sample belongs to the call that owns
+/// its batch row; a row whose logits entry is negative contributes nothing.
 pub fn calls_output(
     ids: &[i32],
     sampling_rows: &[i32],
@@ -2361,7 +2385,7 @@ mod tests {
         let bucket = Bucket::decode(4, Variant::DecodeGreedy);
         let staged = staging.stage(
             &decode_columns(),
-            &[CallId(5)],
+            &[CallId(4), CallId(5)],
             &Shape::decode(2, Variant::DecodeGreedy),
             bucket,
         )?;
