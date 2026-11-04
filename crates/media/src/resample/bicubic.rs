@@ -143,44 +143,39 @@ fn pass(
     let shift = axis.precision;
     if horizontal {
         let mut out = vec![0u8; output_width * input_height * channels];
-        for channel in 0..channels {
-            let plane =
-                &source[channel * input_width * input_height..][..input_width * input_height];
-            let out_plane =
-                &mut out[channel * output_width * input_height..][..output_width * input_height];
-            for row in 0..input_height {
-                let source_row = &plane[row * input_width..][..input_width];
-                let out_row = &mut out_plane[row * output_width..][..output_width];
-                for (column, cell) in out_row.iter_mut().enumerate() {
-                    let start = axis.starts[column];
-                    let weights = &axis.weights[column * axis.width..][..axis.counts[column]];
+        for row in 0..input_height {
+            let source_row = &source[row * input_width * channels..][..input_width * channels];
+            let out_row = &mut out[row * output_width * channels..][..output_width * channels];
+            for column in 0..output_width {
+                let start = axis.starts[column];
+                let weights = &axis.weights[column * axis.width..][..axis.counts[column]];
+                for channel in 0..channels {
                     let mut sum = bias;
                     for (index, weight) in weights.iter().enumerate() {
-                        sum += i32::from(source_row[start + index]) * i32::from(*weight);
+                        sum += i32::from(source_row[(start + index) * channels + channel])
+                            * i32::from(*weight);
                     }
-                    *cell = (sum >> shift).clamp(0, 255) as u8;
+                    out_row[column * channels + channel] = (sum >> shift).clamp(0, 255) as u8;
                 }
             }
         }
         out
     } else {
         let mut out = vec![0u8; output_height * output_width * channels];
-        for channel in 0..channels {
-            let plane =
-                &source[channel * input_width * input_height..][..input_width * input_height];
-            let out_plane =
-                &mut out[channel * output_width * output_height..][..output_width * output_height];
-            for row in 0..output_height {
-                let start = axis.starts[row];
-                let weights = &axis.weights[row * axis.width..][..axis.counts[row]];
-                let out_row = &mut out_plane[row * output_width..][..output_width];
-                for column in 0..output_width {
+        for row in 0..output_height {
+            let start = axis.starts[row];
+            let weights = &axis.weights[row * axis.width..][..axis.counts[row]];
+            let out_row = &mut out[row * output_width * channels..][..output_width * channels];
+            for column in 0..output_width {
+                for channel in 0..channels {
                     let mut sum = bias;
                     for (index, weight) in weights.iter().enumerate() {
-                        let sample = plane[(start + index) * input_width + column];
+                        let sample = source[(start + index) * input_width * channels
+                            + column * channels
+                            + channel];
                         sum += i32::from(sample) * i32::from(*weight);
                     }
-                    out_row[column] = (sum >> shift).clamp(0, 255) as u8;
+                    out_row[column * channels + channel] = (sum >> shift).clamp(0, 255) as u8;
                 }
             }
         }
@@ -352,43 +347,38 @@ fn pass32(
 ) -> Vec<f32> {
     if horizontal {
         let mut out = vec![0.0f32; output_width * input_height * channels];
-        for channel in 0..channels {
-            let plane =
-                &source[channel * input_width * input_height..][..input_width * input_height];
-            let out_plane =
-                &mut out[channel * output_width * input_height..][..output_width * input_height];
-            for row in 0..input_height {
-                let source_row = &plane[row * input_width..][..input_width];
-                let out_row = &mut out_plane[row * output_width..][..output_width];
-                for (column, cell) in out_row.iter_mut().enumerate() {
-                    let start = axis.starts[column];
-                    let weights = &axis.weights[column * axis.width..][..axis.counts[column]];
+        for row in 0..input_height {
+            let source_row = &source[row * input_width * channels..][..input_width * channels];
+            let out_row = &mut out[row * output_width * channels..][..output_width * channels];
+            for column in 0..output_width {
+                let start = axis.starts[column];
+                let weights = &axis.weights[column * axis.width..][..axis.counts[column]];
+                for channel in 0..channels {
                     let mut sum = 0.0f32;
                     for (index, weight) in weights.iter().enumerate() {
-                        sum += source_row[start + index] * weight;
+                        sum += source_row[(start + index) * channels + channel] * weight;
                     }
-                    *cell = sum;
+                    out_row[column * channels + channel] = sum;
                 }
             }
         }
         out
     } else {
         let mut out = vec![0.0f32; output_height * output_width * channels];
-        for channel in 0..channels {
-            let plane =
-                &source[channel * input_width * input_height..][..input_width * input_height];
-            let out_plane =
-                &mut out[channel * output_width * output_height..][..output_width * output_height];
-            for row in 0..output_height {
-                let start = axis.starts[row];
-                let weights = &axis.weights[row * axis.width..][..axis.counts[row]];
-                let out_row = &mut out_plane[row * output_width..][..output_width];
-                for column in 0..output_width {
+        for row in 0..output_height {
+            let start = axis.starts[row];
+            let weights = &axis.weights[row * axis.width..][..axis.counts[row]];
+            let out_row = &mut out[row * output_width * channels..][..output_width * channels];
+            for column in 0..output_width {
+                for channel in 0..channels {
                     let mut sum = 0.0f32;
                     for (index, weight) in weights.iter().enumerate() {
-                        sum += plane[(start + index) * input_width + column] * weight;
+                        let sample = source[(start + index) * input_width * channels
+                            + column * channels
+                            + channel];
+                        sum += sample * weight;
                     }
-                    out_row[column] = sum;
+                    out_row[column * channels + channel] = sum;
                 }
             }
         }
