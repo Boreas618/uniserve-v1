@@ -11,6 +11,8 @@
 
 pub mod causal_lm;
 pub(crate) mod columns;
+pub mod encoder;
+pub(crate) mod tables;
 pub mod lifecycle;
 
 pub use causal_lm::CausalLmRunner;
