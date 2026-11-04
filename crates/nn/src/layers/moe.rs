@@ -26,9 +26,8 @@ use ops::fp4::ScaleLayout;
 use ops::moe::combine::{self, MoeUnpermute, UnpermuteArgs};
 use ops::moe::exchange::{self, ExchangeArgs, ExpertExchange, Mode};
 use ops::moe::grouped::{
-    Activation, GatherGemm, GatherGemmArgs, GatherGemmDescriptor, GatherGemmNvfp4,
-    GatherGemmNvfp4Args, GatherGemmNvfp4Descriptor, RouteGemm, RouteGemmArgs, RouteGemmDescriptor,
-    RouteGemmNvfp4, RouteGemmNvfp4Args, RouteGemmNvfp4Descriptor,
+    Activation, GatherGemm, GatherGemmArgs, GatherGemmDescriptor, GatherGemmNvfp4Descriptor,
+    RouteGemm, RouteGemmArgs, RouteGemmDescriptor, RouteGemmNvfp4Descriptor,
 };
 use ops::moe::routing::{
     ExpertGather, GatherArgs, GatherDescriptor, TopkArgs, TopkDescriptor, TopkSoftmax,
@@ -772,89 +771,44 @@ impl Moe {
                 "Moe::forward_encoded: the block's experts are dense".to_owned(),
             ));
         };
-        let hidden_width = u64::from(self.hidden);
-        let intermediate = u64::from(self.intermediate);
-        let arena = f.arena();
+        let _ = (up_gate, down, out);
 
-        // 1-3. The same prefix the dense block runs.
+        // 1-3. The routing prefix is the dense block's, and it is what states the route count every
+        // later step of the block is sized from.
         let routes = self.route(f, hidden)?;
 
-        // The two encoded products take scratch the program uses for its own bookkeeping, sized from
-        // the plan's route count by the artifact's own arithmetic. Nothing grows it inside a step: a
-        // buffer that resized would be an allocation the captured graph does not own, so a plan whose
-        // arena cannot hold the scratch is refused here, naming the number of bytes it needs.
-        let bytes = self.workspace_bytes(routes.rows);
-        let available = arena.bytes().saturating_sub(arena.used());
-        let workspace = arena
-            .tensor(DType::U8, Shape::new(&[bytes]))
-            .map_err(|error| {
-                Error::shape(
-                    "Moe",
-                    format!(
-                        "the encoded products need {bytes} bytes of scratch for {} permuted rows, \
-                         and the arena has {available} left before it ends: {error}",
-                        routes.rows
-                    ),
-                )
-            })?;
-
-        // 4. FC1 over the packed up/gate stack: the gated product of each permuted row.
-        let gated = arena.tensor(hidden.dtype, Shape::new(&[routes.rows, intermediate]))?;
-        let first =
-            self.gather_nvfp4_descriptor(hidden.dtype, up_gate.scales.dtype(), up_gate.layout);
-        let args = GatherGemmNvfp4Args {
-            hidden,
-            weights: up_gate.values.view(),
-            scales: up_gate.scales.view(),
-            global_scale: up_gate.global_scale.view(),
-            ids: routes.local_ids,
-            tile_to_expert: routes.tile_to_expert,
-            tile_to_limit: routes.tile_to_limit,
-            permuted_to_expanded: routes.permuted_to_expanded,
-            num_non_exiting_tiles: routes.num_non_exiting_tiles,
-            out: gated,
-            workspace,
-        };
-
-        f.operate::<GatherGemmNvfp4>(&first, args)?;
-
-        // 5. FC2 over the packed down stack: one hidden row per route.
-        let products = arena.tensor(hidden.dtype, Shape::new(&[routes.rows, hidden_width]))?;
-        let second = self.route_nvfp4_descriptor(hidden.dtype, down.scales.dtype(), down.layout);
-        // The down stack has one projection, so its one packed row *is* the product's `[experts]`
-        // table; the row is contiguous, so the view is the same address with one axis.
-        let down_scales = down.global_scale.view();
-        let down_scales = TensorView::new(
-            down_scales.ptr,
-            DType::F32,
-            Shape::new(&[down_scales.shape.dim(1)]),
-        );
-        let args = RouteGemmNvfp4Args {
-            hidden: gated,
-            weights: down.values.view(),
-            scales: down.scales.view(),
-            global_scale: down_scales,
-            ids: routes.local_ids,
-            tile_to_expert: routes.tile_to_expert,
-            tile_to_limit: routes.tile_to_limit,
-            permuted_to_expanded: routes.permuted_to_expanded,
-            num_non_exiting_tiles: routes.num_non_exiting_tiles,
-            out: products,
-            workspace,
-        };
-
-        f.operate::<RouteGemmNvfp4>(&second, args)?;
-
-        // 6. Sum the routes back in FP32 and round once to the hidden dtype.
-        let combine = self.combine_descriptor(products.dtype, out.dtype);
-        let args = UnpermuteArgs {
-            routes: products,
-            expanded_to_permuted: routes.expanded_to_permuted,
-            scales: routes.weights,
-            out,
-        };
-
-        f.operate::<MoeUnpermute>(&combine, args)
+        // 4-6 are not the dense block's, and they are refused here rather than half-built. The
+        // encoded products read E2M1 activations with their own block scales, one FP8 scale per
+        // sixteen elements of the contraction, so each product's activation operand is produced by
+        // `nvfp4_quantize` rather than by the caller: `expert_gather` (`[tokens, hidden]` → the
+        // expanded route rows) → `nvfp4_quantize` → `gather_gemm_nvfp4`, then the gated epilogue →
+        // `nvfp4_quantize` → `route_gemm_nvfp4` → `moe_unpermute`. Two facts of that chain are not
+        // this layer's to settle:
+        //
+        // 1. **The row expansion has no operator.** `expert_gather` maps route ids through the
+        //    expert-parallel table; nothing in the store gathers `[tokens, width]` rows into the
+        //    expanded `[routes, width]` buffer the encoded products require. The dense pair gathers
+        //    its own A inside the product through `permuted_to_expanded`, which is why its operand
+        //    stays `[tokens, hidden]` and why it needs no such step.
+        // 2. **The encoder's one scalar** is the artifact's constant `1 / (448 · 6)`, folded into the
+        //    block scales rather than passed per request: it belongs in `nvfp4_quantize`'s
+        //    descriptor, and a layer that synthesised a device value for it would be inventing a
+        //    number the design puts elsewhere.
+        //
+        // The scratch the two products need is already stated by [`Self::workspace_bytes`] over the
+        // plan's route count, so nothing else in the step waits on this.
+        Err(Error::Unsupported(format!(
+            "Moe::forward_encoded: the encoded expert products read E2M1 activations, and this \
+             block does not encode them — the expanded-row gather the encoded operand needs has no \
+             operator in the store, and the encoder's global scale is the artifact's constant \
+             1/(448·6), which belongs in `nvfp4_quantize`'s descriptor rather than in a layer. The \
+             block's {} experts and {} hidden elements are built, its scratch is {} bytes for {} \
+             routes, and the dense path is unaffected",
+            self.experts,
+            self.hidden,
+            self.workspace_bytes(routes.rows),
+            routes.rows
+        )))
     }
 
     /// `out = Σ_routes weight · expert(hidden)` over an expert-parallel group.
