@@ -1385,32 +1385,24 @@ impl SchedulerHandle {
 
     /// §7.3 step 3: the prepared policy answers from this scheduler's next
     /// batch boundary.
-    pub fn switchover_policy(
-        &self,
-    ) -> crossbeam_channel::Receiver<Result<crate::handle::StageApplied, String>> {
+    pub fn switchover_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
         self.commands.switchover_policy()
     }
 
     /// §7.3 step 5: probation ended; the replaced policy stays until the next
-    /// precopy. The receiver gets the step the commit applied at.
-    pub fn commit_policy(
-        &self,
-    ) -> crossbeam_channel::Receiver<Result<crate::handle::StageApplied, String>> {
+    /// precopy.
+    pub fn commit_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
         self.commands.commit_policy()
     }
 
     /// §7.3 step 4: the previous policy answers again, on the state this
     /// scheduler holds when the stage applies.
-    pub fn revert_policy(
-        &self,
-    ) -> crossbeam_channel::Receiver<Result<crate::handle::StageApplied, String>> {
+    pub fn revert_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
         self.commands.revert_policy()
     }
 
     /// §7.3 step 6: the module a revert could return to is dropped.
-    pub fn purge_policy(
-        &self,
-    ) -> crossbeam_channel::Receiver<Result<crate::handle::StageApplied, String>> {
+    pub fn purge_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
         self.commands.purge_policy()
     }
 

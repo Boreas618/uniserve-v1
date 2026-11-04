@@ -499,7 +499,11 @@ pub struct Scheduler {
     /// The stage §7.3 asked for and the answer to give once it is applied: a
     /// stage changes the serving policy, so it waits for a boundary where no
     /// batch and no submission is in flight.
-    policy_stage: Option<(policy::Stage, Option<control::StageAnswer>, Option<u64>)>,
+    policy_stage: Option<(
+        policy::Stage,
+        Option<crate::handle::StageAnswer>,
+        Option<u64>,
+    )>,
     /// The events and transitions a policy is told about (§4.4).
     recorder: mechanism::Recorder,
     /// The device pages that exist, kept from the epoch's snapshot and from the

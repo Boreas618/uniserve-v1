@@ -549,6 +549,34 @@ pub struct Submission {
 }
 
 /// Command sent from a frontend handler to the scheduler thread.
+/// Who asked for a stage: a caller that reads the step it applied at, or an
+/// engine command that is answered with whether it applied.
+///
+/// One path applies every stage; the answer shape is the only difference, so a
+/// stage has exactly one place where it changes the slot.
+#[derive(Debug)]
+pub(crate) enum StageAnswer {
+    /// A handle's `stage`, answered with the step it applied at.
+    Step(crossbeam_channel::Sender<Result<StageApplied, String>>),
+    /// An engine or program-layer command, answered with whether it applied.
+    Applied(crossbeam_channel::Sender<Result<(), String>>),
+}
+
+impl StageAnswer {
+    /// Sends `result`, dropping either the step or the detail as the caller's
+    /// shape requires.
+    pub(crate) fn send(self, result: Result<StageApplied, String>) {
+        match self {
+            Self::Step(answer) => {
+                let _ = answer.send(result);
+            }
+            Self::Applied(answer) => {
+                let _ = answer.send(result.map(|_| ()));
+            }
+        }
+    }
+}
+
 /// The step a §7.3 stage was applied at: the boundary where nothing was in
 /// flight, so the policy it replaced had decided its last batch.
 ///
@@ -689,7 +717,7 @@ pub enum Command {
     /// is in flight; the answer names the step it was applied at.
     StagePolicy {
         stage: crate::scheduler::Stage,
-        answer: crossbeam_channel::Sender<Result<StageApplied, String>>,
+        answer: StageAnswer,
     },
     /// One command of the program-layer update (§2.3, §7.3), applied as far as
     /// one scheduler applies it: a stage, at the boundary its command names.
@@ -1138,32 +1166,49 @@ impl CommandSender {
         stage: crate::scheduler::Stage,
     ) -> crossbeam_channel::Receiver<Result<StageApplied, String>> {
         let (answer, done) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::StagePolicy { stage, answer });
+        let _ = self.send(Command::StagePolicy {
+            stage,
+            answer: StageAnswer::Step(answer),
+        });
+        done
+    }
+
+    /// A stage answered with whether it applied, for a caller that does not use
+    /// the step it applied at.
+    fn stage_applied(
+        &self,
+        stage: crate::scheduler::Stage,
+    ) -> crossbeam_channel::Receiver<Result<(), String>> {
+        let (answer, done) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::StagePolicy {
+            stage,
+            answer: StageAnswer::Applied(answer),
+        });
         done
     }
 
     /// Puts the prepared policy in from the scheduler's next boundary (§7.3
     /// step 3).
-    pub fn switchover_policy(&self) -> crossbeam_channel::Receiver<Result<StageApplied, String>> {
-        self.stage(crate::scheduler::Stage::Switchover)
+    pub fn switchover_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.stage_applied(crate::scheduler::Stage::Switchover)
     }
 
     /// Ends the probation: the replaced policy stays until the next precopy
     /// (§7.3 step 5).
-    pub fn commit_policy(&self) -> crossbeam_channel::Receiver<Result<StageApplied, String>> {
-        self.stage(crate::scheduler::Stage::Commit)
+    pub fn commit_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.stage_applied(crate::scheduler::Stage::Commit)
     }
 
     /// Serves the previous policy again, on the scheduler's current state
     /// (§7.3 step 4).
-    pub fn revert_policy(&self) -> crossbeam_channel::Receiver<Result<StageApplied, String>> {
-        self.stage(crate::scheduler::Stage::Revert)
+    pub fn revert_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.stage_applied(crate::scheduler::Stage::Revert)
     }
 
     /// Drops the module a revert could have returned to, once no batch uses it
     /// (§7.3 step 6).
-    pub fn purge_policy(&self) -> crossbeam_channel::Receiver<Result<StageApplied, String>> {
-        self.stage(crate::scheduler::Stage::Purge)
+    pub fn purge_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.stage_applied(crate::scheduler::Stage::Purge)
     }
 
     /// One command of the program-layer update, answered when this scheduler
