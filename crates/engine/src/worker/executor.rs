@@ -19,7 +19,7 @@
 //! without retaining it, and on a `WorkerFailure` computes the calls,
 //! requests, and buffers the failure invalidates.
 
-mod codecs;
+pub(crate) mod codecs;
 mod failure;
 mod results;
 
@@ -351,7 +351,13 @@ impl WorkerExecutor {
             .iter()
             .map(|(id, worker)| {
                 let (ranks, components) = worker.placement();
-                (id, ranks, components)
+                // The pairing is a host question: a media unit must be
+                // encoded where it was decoded.
+                (
+                    id.clone(),
+                    ranks.iter().map(|rank| rank.host.clone()).collect(),
+                    components.clone(),
+                )
             })
             .collect::<Vec<_>>();
         executor_info.video_codecs = video_unit_codecs(&media_routing, &placements)?;
