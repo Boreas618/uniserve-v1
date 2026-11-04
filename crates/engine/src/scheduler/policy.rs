@@ -156,7 +156,9 @@ fn argument<T: serde::de::DeserializeOwned>(value: &str, name: &str) -> Result<T
     let parsed: toml::Value = value.trim().parse().map_err(|error: toml::de::Error| {
         failure(error.to_string())
     })?;
-    parsed.try_into().map_err(failure)
+    parsed
+        .try_into()
+        .map_err(|error: toml::de::Error| failure(error.to_string()))
 }
 
 /// The build config's hard bounds on what one step may be given to run (§4.4):
