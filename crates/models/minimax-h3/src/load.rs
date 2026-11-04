@@ -89,14 +89,16 @@ impl Component {
         }
     }
 
-    /// The activation element type this block computes in when a deployment states none.
+    /// The element type this block is declared to compute in when a deployment states none.
     ///
-    /// The design's default `dtype = "auto"` converts nothing at load, so each block computes in
-    /// the checkpoint's own representation: BF16 for the text encoder and the DiT partitions,
-    /// FP16 for the video VAE decoder (`specs/worker.md` 1; the `quality` preset of
-    /// `uniserve/models/minimax_h3/precision.py`, which is that representation). The design names
-    /// no representation for the audio VAE or the condition encoders, so they take BF16 like the
-    /// blocks beside them rather than a conversion the design did not ask for.
+    /// The design's default `dtype = "auto"` converts nothing at load, so each block keeps the
+    /// checkpoint's own representation: BF16 for the text encoder and the DiT partitions, FP16 for
+    /// the video VAE decoder (`specs/worker.md` 1; the `quality` preset of
+    /// `uniserve/models/minimax_h3/precision.py`, which is that representation). This is the type a
+    /// block whose constructor takes one is *converted to*; a constructor that takes none keeps the
+    /// stored representation, so this value is informational for those blocks. The design names no
+    /// representation for the audio VAE or the condition encoders, so they are declared BF16 like
+    /// the blocks beside them and no conversion is made for them.
     pub const fn activation(self) -> DType {
         match self {
             Self::VideoDecoder => DType::F16,
