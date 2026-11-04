@@ -379,14 +379,24 @@ message Switchover {
 }
 
 message Commit {}
-message Revert {}
+
+// Return to the previous generation: the reverse of the switchover (§7.3
+// step 5). The reason is the main process's own account of why, such as the
+// first error of a probation; empty when the daemon states none.
+message Revert {
+  string reason = 1;
+}
 
 message Purge {
   uint64 generation = 1;
 }
 
 // What a daemon tells an engine, unasked: a report of one epoch's main
-// process (§7.3).
+// process (§7.3). The design names `Precopied`, `PolicyReverted` and the
+// switchover's, commit's, revert's and purge's answers; the acks and the
+// fault reports are what lets the daemon apply the probation's rules and
+// record the first error that marks an update unavailable (§7.3 step 4,
+// §7.2).
 message Report {
   oneof kind {
     // `Precopy` succeeded: generation `generation` is ready for the
@@ -396,6 +406,27 @@ message Report {
     // reinstantiated the previous policy on the current snapshot, and the
     // daemon's record takes it back.
     PolicyReverted policy_reverted = 2;
+    // `Switchover` took effect at the batch boundary: generation
+    // `generation` executes from now on (§7.3 step 3).
+    Switched switched = 3;
+    // `Commit` took effect: the previous generation is no longer kept
+    // (§7.3 step 5).
+    Committed committed = 4;
+    // `Revert` took effect: the previous generation executes again, and the
+    // reason is the main process's own account of why.
+    Reverted reverted = 5;
+    // `Purge` took effect: no batch or graph uses a generation older than
+    // `generation` (§7.3 step 6).
+    Purged purged = 6;
+    // A job ran past half the watchdog timeout in an executor (§2.4): step
+    // `step` of the main process, and what it was executing as the main
+    // process names it.
+    Stalled stalled = 7;
+    // A failure the main process itself observed: an error that makes an
+    // executor unusable, non-finite logits, or another fatal condition of
+    // §7.3 step 4. `kind` is a stable short name, `reason` the account for
+    // the daemon's record.
+    Fault fault = 8;
   }
 }
 
@@ -404,6 +435,30 @@ message Precopied {
 }
 
 message PolicyReverted {}
+
+message Switched {
+  uint64 generation = 1;
+}
+
+message Committed {}
+
+message Reverted {
+  string reason = 1;
+}
+
+message Purged {
+  uint64 generation = 1;
+}
+
+message Stalled {
+  uint64 step = 1;
+  string detail = 2;
+}
+
+message Fault {
+  string kind = 1;
+  string reason = 2;
+}
 
 // A supervised process exited.
 message Exit {
