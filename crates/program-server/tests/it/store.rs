@@ -216,3 +216,29 @@ fn a_store_with_two_writable_roots_is_refused() {
     ]);
     assert!(matches!(refused, Err(Error::Io(_))));
 }
+
+/// A descriptor key names a module's last path segment, so it must be one file name.
+///
+/// The design puts every module under `<operator>/<backend>/<revision>/<target>/<descriptor key>`,
+/// and a filesystem caps one file name at 255 bytes. A key longer than the store's own bound cannot
+/// name a directory at all — the write fails with `File name too long` — so the store refuses it
+/// when the path is made, with a message that says both numbers, rather than failing later in a
+/// build whose log cannot explain it.
+#[test]
+fn a_descriptor_key_too_long_to_name_a_directory_is_refused() {
+    let longest = program_server::store::DESCRIPTOR_NAME_LIMIT;
+    let at_limit = "d".repeat(longest);
+    assert!(
+        ModulePath::new("attention_gather_rows", "triton", 0, "sm_100a", at_limit.clone()).is_ok(),
+        "a key of exactly the limit names a directory"
+    );
+
+    let over = format!("{at_limit}d");
+    let error = ModulePath::new("attention_gather_rows", "triton", 0, "sm_100a", over.clone())
+        .expect_err("a key over the limit names no directory");
+    let message = error.to_string();
+    assert!(
+        message.contains(&format!("{} bytes", over.len())) && message.contains(&longest.to_string()),
+        "the refusal states the key's length and the limit: {message}"
+    );
+}

@@ -31,6 +31,17 @@ use crate::{Error, Result};
 /// The mark that makes a module directory a committed module.
 pub const COMMITTED: &str = ".committed";
 
+/// The longest a module path's last segment may be, in bytes.
+///
+/// A descriptor key is the last segment of a module's path (design section 5.3: every module sits
+/// under `<operator>/<backend>/<revision>/<target>/<descriptor key>`), so a key must be one file
+/// name. Filesystems cap one at 255 bytes and a staged directory's name adds a short prefix, so a
+/// key within this bound always fits. A descriptor whose key is longer cannot name a module: that
+/// operator needs fewer fields, or fields whose values are launch arguments rather than properties
+/// of the problem — a stride the kernel must know to vectorise stays in the key, a capacity the
+/// caller varies does not.
+pub const DESCRIPTOR_NAME_LIMIT: usize = 200;
+
 /// The path of one module in the store: pure names, no content.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ModulePath {
@@ -70,6 +81,17 @@ impl ModulePath {
                     format!("{name} {value:?} is not one path component"),
                 )));
             }
+        }
+        if path.descriptor.len() > DESCRIPTOR_NAME_LIMIT {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "the descriptor key is {} bytes and a module path segment holds at most \
+                     {DESCRIPTOR_NAME_LIMIT}: {}",
+                    path.descriptor.len(),
+                    path.descriptor
+                ),
+            )));
         }
         Ok(path)
     }
