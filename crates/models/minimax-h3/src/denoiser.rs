@@ -1089,30 +1089,26 @@ impl nn::capability::Denoiser for Denoiser {
     }
 
     fn prepare_evaluation(&self, index: u32, out: &mut [Vec<u8>]) -> nn::Result<()> {
-        // The one table a replay changes: the step the stack gathers its modulation at.
         if index >= self.evaluations {
             return Err(flattened(Error::config(format!(
                 "evaluation {index} is outside the {} this schedule has",
                 self.evaluations
             ))));
         }
-        let Some(buffer) = out.first_mut() else {
-            return Err(flattened(Error::config(
-                "no step buffer was offered".to_owned(),
-            )));
-        };
-        if buffer.len() != 4 {
+        // An evaluation has no host bytes of its own: every coefficient a step reads is a constant
+        // the loader wrote once (`constant_tables` is empty), and the step index is device data the
+        // executor writes before each replay. A buffer offered here means the caller and
+        // `constant_tables` disagree about what an evaluation owns.
+        if !out.is_empty() {
             return Err(flattened(Error::config(format!(
-                "the step table is {} bytes, not one i32",
-                buffer.len()
+                "{} coefficient buffers offered, and this deployment declares none",
+                out.len()
             ))));
         }
-        buffer.copy_from_slice(&(index as i32).to_le_bytes());
         Ok(())
     }
 }
 
-/// The state tables of a request, in the order [`Layouts::state_tables`] sorts them.
 /// The state tables of a dense layout, in `table_specs`' order (sorted by name).
 const DENSE_TABLES: [&str; 10] = [
     "audio_indices",
