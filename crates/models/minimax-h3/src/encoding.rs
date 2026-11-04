@@ -1928,14 +1928,21 @@ pub fn conditioning_arena(
             latent.frames
         )));
     }
-    let canvas = crate::video_vae::Canvas::clip(config, latent.height, latent.width);
-    let tiles = crate::video_vae::Tiles::of(config, &canvas)?;
-    let tile = tiles
-        .tiles(config, &canvas)
-        .iter()
-        .map(|tile| tile.canvas.pixels(config))
-        .max_by_key(|(height, width)| u64::from(*height) * u64::from(*width))
-        .ok_or_else(|| Error::config("a condition with no tile has no plan".to_owned()))?;
+    // The tile is the **encoder's** own grid, not the decoder's: this buffer is the encoder's input, so
+    // the plan reads the enumeration the encoder's driver reads. The two are one rule today - the
+    // checkpoint's 256-pixel tiles with a 64-pixel minimum overlap - and taking it from this side is
+    // what keeps the plan right if either ever moves.
+    let ratio = config.spatial_compression();
+    let grid = Grid::of(latent.height * ratio, latent.width * ratio)?;
+    let tile = (
+        grid.rows.lengths.iter().copied().max().unwrap_or(0),
+        grid.columns.lengths.iter().copied().max().unwrap_or(0),
+    );
+    if tile.0 == 0 || tile.1 == 0 {
+        return Err(Error::config(
+            "a condition with no tile has no plan".to_owned(),
+        ));
+    }
     if !latent.height.is_multiple_of(2) || !latent.width.is_multiple_of(2) {
         return Err(Error::config(format!(
             "a condition's rows are 2 x 2 latent patches, and {} x {} has an odd axis",
