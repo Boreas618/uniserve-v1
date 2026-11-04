@@ -205,6 +205,18 @@ pub(crate) struct Launch {
     /// Required, not defaulted: a world of one on a multi-node deployment sizes this rank's storage
     /// claim for one rank, and the second node's claim would collide with it.
     pub world_size: u32,
+    /// Whether this process was started as the standby of the epoch that serves: it maps its
+    /// scope's storage, loads the epoch's weights, opens its pools and captures its graphs, and
+    /// then parks - executing nothing and admitting nothing - and reports `Parked`. The daemon
+    /// promotes it in place (`Promote`, answered `Promoted`) and only then does the frontend
+    /// submit to it (§2.5, §7.4).
+    ///
+    /// Defaulted rather than required, so that a launch file written before this field existed
+    /// still reads: an initial process is not a standby, and `false` says exactly that. A standby
+    /// that claimed its storage writable would give its scope two writers, which is why the role
+    /// is the launcher's statement rather than the process's guess.
+    #[serde(default)]
+    pub standby: bool,
 }
 
 impl Launch {
@@ -498,6 +510,11 @@ pub(crate) struct MainProcess {
     programs: Arc<Mutex<Client>>,
     /// The precopy between serve passes, if one is in flight (§7.3 step 2).
     precopy: Option<Precopy>,
+    /// The warmups a switchover queued, one per device, with the generation each was queued for
+    /// (§4.5). They are read on later passes rather than waited for: a warmup is a device job of its
+    /// own, one bucket per queue turn behind serving, and a model with many buckets warms for longer
+    /// than the daemon waits for `Switched`.
+    warming: Vec<(u32, Submission, u64)>,
     /// The generations the last precopy built and the switchover has not taken:
     /// one per device, in `executors` order. A revert drops them, because the
     /// generation they hold never serves.
@@ -520,7 +537,9 @@ pub(crate) struct MainProcess {
     /// The admitted requests' event streams, by the daemon's request identity: the scheduler
     /// answers a submission with the stream of what the request produced, and this process is what
     /// carries those events back to the daemon (§2.3). A stream leaves when its request ends.
-    streams: Vec<(u64, engine::EventRx)>,
+    /// Each admitted request's scheduler rank beside its stream: a command for the request has to
+    /// reach the scheduler that serves it, and the command names the request, not the rank.
+    streams: Vec<(u64, usize, engine::EventRx)>,
     /// Whether this process admits and executes: a drain parks every scheduler, and only the
     /// `Serve` that names the epoch again resumes it in place (§2.3, §7.4 step 2).
     serving: bool,
@@ -531,6 +550,14 @@ pub(crate) struct MainProcess {
     /// The frontend's admission gate, the `/admin/pause_generation` of §2.3: submissions are
     /// refused while it is held, and no request in flight is ended by it.
     paused: bool,
+    /// The generations this process has released: a purge is a release of what it holds, so a
+    /// second request for one of them is answered rather than run again.
+    released: std::collections::BTreeSet<u64>,
+    /// The probation an update must survive before it is committed, when the launch file states
+    /// one (§7.3 step 4). The daemon decides the commit; this is the process's own guard against
+    /// an update that is left on probation with nobody watching: it reverts at the threshold
+    /// rather than serving a generation that was never accepted.
+    rollback: Option<Duration>,
 }
 
 impl MainProcess {
@@ -656,7 +683,7 @@ impl MainProcess {
         // and holds none would accept requests and dispatch nothing, which is refused by name.
         let schedulers = schedulers(&plan, launch, &memory, &model, &executors)?;
 
-        Ok(Self {
+        let mut process = Self {
             control,
             schedulers,
             executors,
@@ -667,6 +694,7 @@ impl MainProcess {
             watchdog,
             programs,
             precopy: None,
+            warming: Vec::new(),
             prepared: Vec::new(),
             retired: Vec::new(),
             generations,
@@ -675,13 +703,40 @@ impl MainProcess {
             process,
             stopping: false,
             streams: Vec::new(),
-            // The epoch serves from the end of `start` until the daemon drains it; a process the
-            // daemon spawned as a standby parks itself at the end of `start` instead, and the
-            // `Promote` that follows resumes it (2.5).
-            serving: true,
+            // The epoch serves from the end of `start` until the daemon drains it, unless the
+            // launcher started it as a standby: that one parks itself here, before it can admit
+            // anything, and the `Promote` that follows resumes it (2.5, 7.4).
+            serving: !launch.standby,
             parked: None,
             paused: false,
-        })
+            rollback: launch.rollback_s.map(Duration::from_secs),
+            released: std::collections::BTreeSet::new(),
+        };
+        if launch.standby {
+            process.park_standby()?;
+        }
+        Ok(process)
+    }
+
+    /// §2.5: a standby that has prepared announces itself and executes nothing until promoted.
+    ///
+    /// Its schedulers hold no request and have served no world, so parking them would ask for a
+    /// cache handover that belongs to a drained epoch; what makes this a park is that nothing is
+    /// admitted. `Promote` is the command that ends it.
+    ///
+    /// The report means exactly "prepared and admitted nothing", which is what the daemon gates
+    /// its promotion on: it is sent after `start` has mapped the weights, opened the memory and
+    /// started the runners, and *before* the epoch's first generation has been warmed - a warmup
+    /// belongs to the first switchover, and a standby's own generation reaches it when the daemon
+    /// sends the epoch's programs.
+    fn park_standby(&mut self) -> Result<()> {
+        self.serving = false;
+        self.send_report(proto::process::Report {
+            kind: Some(proto::process::report::Kind::Parked(proto::process::Parked {
+                generation: self.update.current(),
+            })),
+        });
+        Ok(())
     }
 
     /// Serves until the daemon closes the process or a failure ends it.
@@ -699,7 +754,20 @@ impl MainProcess {
                 self.send_metrics();
                 return Ok(None);
             }
-            let deadline = self.watchdog.deadline(oldest(&running));
+            // Two obligations the control thread has that no event announces: the counters' report,
+            // and a probation running out. An idle epoch has no events at all, so a deadline naming
+            // only the stall rule would leave both to whatever traffic arrived - the dashboard would
+            // see nothing of a server nobody is asking, and a generation nobody accepted would sit
+            // on probation past the window that reverts it (§7.3 step 4). Only a pending probation
+            // adds its poll, so an idle epoch without one keeps waking for its counters alone.
+            let stall = self.watchdog.deadline(oldest(&running));
+            let mut due = reported + METRICS_EVERY;
+            if self.rollback.is_some()
+                && matches!(self.update.phase(), executor::hot_update::Phase::Probation { .. })
+            {
+                due = due.min(Instant::now() + PROBATION_POLL);
+            }
+            let deadline = Some(stall.map_or(due, |stall| stall.min(due)));
             // One metrics report a second, and a final one on the way out
             // (§7.3: the daemon exports the engine's counters as metrics).
             if reported.elapsed() >= METRICS_EVERY {
@@ -740,9 +808,18 @@ impl MainProcess {
             // A precopy in flight advances one stage per pass, never waiting on
             // its builds or its devices (§7.3 step 2).
             self.advance_precopy()?;
+            if let Some(failure) = self.advance_warmup()? {
+                return Ok(Some(failure));
+            }
 
             running = self.read_executors();
             if let Some(failure) = self.watch(&running)? {
+                return Ok(Some(failure));
+            }
+            if let Some(failure) = self.watch_schedulers()? {
+                return Ok(Some(failure));
+            }
+            if let Some(failure) = self.watch_probation()? {
                 return Ok(Some(failure));
             }
         }
@@ -941,7 +1018,7 @@ impl MainProcess {
                     };
                     match scheduler.submit(request) {
                         Ok(stream) => {
-                            self.streams.push((id, stream));
+                            self.streams.push((id, rank, stream));
                             self.send_event(
                                 proto::request::wire::from_engine::Kind::Accepted(
                                     proto::request::wire::Accepted {
@@ -982,6 +1059,14 @@ impl MainProcess {
         command: proto::process::Command,
     ) -> Result<Option<UpdateFailure>> {
         let current = self.update.current();
+        // A revert carries the daemon's own account of why, which `ipc::ProgramCommand` does not
+        // keep: read it here so the report repeats the operator's reason rather than inventing one.
+        let reverted_by = match &command.kind {
+            Some(proto::process::command::Kind::Revert(revert)) => {
+                Some(revert.reason.clone()).filter(|reason| !reason.is_empty())
+            }
+            _ => None,
+        };
         let Some(program) = ProgramCommand::from_command(command.clone(), current)? else {
             // The rest are this process's own lifecycle, and no scheduler's: sched's handle
             // answers every one of them with exactly that (a park, promote, drain, serve or pause
@@ -1022,7 +1107,7 @@ impl MainProcess {
             }
             return Ok(None);
         };
-        match self.program(program, None)? {
+        match self.program_with(program, None, reverted_by)? {
             // A precopy answers when its installs finish, from `advance_precopy`.
             None => Ok(None),
             Some(status) => {
@@ -1060,6 +1145,20 @@ impl MainProcess {
         command: ProgramCommand,
         reply: Option<u32>,
     ) -> Result<Option<ProgramStatus>> {
+        self.program_with(command, reply, None)
+    }
+
+    /// §7.3: one program-layer command, with the daemon's own reason when it stated one.
+    ///
+    /// A revert's reason is the daemon's account of why an operator ended the probation; it is
+    /// carried into the epoch's record instead of a reason this process makes up. A peer's command
+    /// states none, and the epoch's own failures state their own.
+    fn program_with(
+        &mut self,
+        command: ProgramCommand,
+        reply: Option<u32>,
+        reverted_by: Option<String>,
+    ) -> Result<Option<ProgramStatus>> {
         let status = match command {
             ProgramCommand::Precopy {
                 generation,
@@ -1071,10 +1170,14 @@ impl MainProcess {
             }
             ProgramCommand::Switchover { generation, step } => self.switchover(generation, step)?,
             ProgramCommand::Commit { generation } => self.commit(generation)?,
+            // The operator's rollback is the daemon's decision, and its reason - when the
+            // daemon states one - is what the record keeps. It is not a policy failure: nothing
+            // about the scheduling policy failed, and saying it did would put a policy error in
+            // the epoch's record and in the daemon's account of why the update ended.
             ProgramCommand::Revert { generation } => self.revert(
                 generation,
-                UpdateFailure::Policy {
-                    error: "the daemon reverted the update".into(),
+                UpdateFailure::Threshold {
+                    reason: reverted_by.unwrap_or_else(|| "the daemon reverted the update".into()),
                 },
             )?,
             ProgramCommand::Purge { generation } => self.purge(generation)?,
@@ -1137,6 +1240,17 @@ impl MainProcess {
         });
         Ok(())
     }
+    /// The Program Server's store as it stands: every installed package, its revision and the
+    /// descriptors its modules cover for each target.
+    fn listing(&self) -> std::result::Result<program_server::Listing, String> {
+        let mut client = self
+            .programs
+            .lock()
+            .map_err(|_| "the Program Server client was poisoned".to_owned())?;
+        client
+            .list()
+            .map_err(|error| format!("reading the Program Server's store: {error}"))
+    }
 
     /// The module-load tasks one generation needs, one per device (§7.3 step 2).
     ///
@@ -1153,6 +1267,10 @@ impl MainProcess {
         learned: &BTreeMap<String, Vec<String>>,
     ) -> std::result::Result<Vec<Arc<HostTask<Install>>>, UpdateFailure> {
         let invalid = |reason: String| UpdateFailure::Precopy { reason };
+        // The Program Server's listing, read at most once and only when a program's keys cannot be
+        // taken from a generation that already launched it: the epoch's first generation has
+        // nothing to copy from, and the walk would otherwise discover one descriptor per capture.
+        let mut listing: Option<program_server::Listing> = None;
         let mut descriptors = Vec::with_capacity(programs.len());
         let mut requests = Vec::with_capacity(programs.len());
         for (slot, program) in programs {
@@ -1163,11 +1281,40 @@ impl MainProcess {
                 )));
             };
             let serving = descriptor_keys(&self.generations[0], operator);
-            let keys = if serving.is_empty() {
-                learned.get(operator).cloned().unwrap_or_default()
-            } else {
-                serving
-            };
+            // A generation that launched this operator states the keys it runs; a key the walk has
+            // taught since is added to them, never substituted for them. The first generation has
+            // nothing serving, so its keys come from the package - once, not one capture at a time -
+            // and a taught key joins them for the packages the store does not describe.
+            let mut keys = serving;
+            let mut known: Vec<String> = learned.get(operator).cloned().unwrap_or_default();
+            if keys.is_empty() {
+                if listing.is_none() {
+                    listing = Some(self.listing().map_err(invalid)?);
+                }
+                let declared = built_keys(
+                    listing.as_ref().expect("the listing was read above"),
+                    &slot.op,
+                    program,
+                    &self.targets,
+                );
+                if declared.is_empty() {
+                    // The listing names the modules this host has *built*, not what the package
+                    // declares, so an empty answer is a host that built none yet - not a program
+                    // that covers nothing. The walk is the authority on which descriptors the
+                    // model needs, and it teaches them one capture at a time; the listing only
+                    // makes the first capture enough when the store already holds them.
+                    tracing::debug!(
+                        op = %slot.op,
+                        backend = %program.backend,
+                        revision = program.revision,
+                        "no module of this package is built yet: the walk will name its descriptors"
+                    );
+                }
+                keys = declared;
+            }
+            keys.append(&mut known);
+            keys.sort_unstable();
+            keys.dedup();
             descriptors.push(Descriptors {
                 op: slot.op.clone(),
                 keys,
@@ -1208,6 +1355,45 @@ impl MainProcess {
         }
         Ok(tasks)
     }
+    /// Reads the warmups the switchovers queued (§4.5): a finished one leaves the list, and one
+    /// that failed reverts the generation it was warming.
+    ///
+    /// A warmup is the first run of every captured bucket of the generation that just took over, so
+    /// it is where a capture that cannot be made on this device surfaces - after the daemon was told
+    /// the cut-over happened, which is why the failure goes through the update's decision table
+    /// rather than through the switchover's answer.
+    fn advance_warmup(&mut self) -> Result<Option<UpdateFailure>> {
+        let mut pending = Vec::with_capacity(self.warming.len());
+        for (device, submission, generation) in std::mem::take(&mut self.warming) {
+            match submission.outcome() {
+                None => pending.push((device, submission, generation)),
+                Some(Outcome::Success(_)) => {
+                    tracing::debug!(device, generation, "a generation's warmup finished");
+                }
+                Some(outcome) => {
+                    self.warming = pending;
+                    let reason = match outcome {
+                        Outcome::Failed(error) => error.to_string(),
+                        _ => "the warmup was cancelled".to_owned(),
+                    };
+                    let failure = UpdateFailure::Device {
+                        device,
+                        error: format!(
+                            "warming generation {generation} on device {device}: {reason}"
+                        ),
+                        batch: None,
+                    };
+                    // The table decides, as it does for every other failure: on probation this
+                    // reverts the generation, and an update the daemon already committed leaves a
+                    // device that cannot run it, which ends the epoch rather than serving on.
+                    return self.failure(failure);
+                }
+            }
+        }
+        self.warming = pending;
+        Ok(None)
+    }
+
 
     /// §7.3 step 2, second half: advances the precopy at most one stage. It
     /// never waits on a job: a stage that has not finished leaves the precopy
@@ -1298,12 +1484,19 @@ impl MainProcess {
                                 // The walk named a key this generation already installed, so no
                                 // further attempt can succeed: the loop stops with both names
                                 // rather than retrying a key it holds.
+                                let cause = if precopy.programs.is_empty() {
+                                    " - and the daemon named no kernel program for this \
+                                     generation, so there is nothing to install it from (the \
+                                     startup switch states the scheduling policy alone)"
+                                } else {
+                                    ""
+                                };
                                 return self.abandon_precopy(
                                     generation,
                                     UpdateFailure::Precopy {
                                         reason: format!(
                                             "{operator} still has no kernel under {key} after it \
-                                             was installed: the walk and the install disagree"
+                                             was installed: the walk and the install disagree{cause}"
                                         ),
                                     },
                                     precopy.reply,
@@ -1439,9 +1632,10 @@ impl MainProcess {
     ) -> Result<()> {
         self.discard_policy();
         // The executors already rebound or recaptured this generation's graphs, and a generation
-        // that never serves must give its captures back (§7.3 step 2): `purge` releases what is
-        // older than the serving generation, which a discarded one is not, so the executor drops it
-        // by name. A device still busy with the capture is answered by the queue's own order.
+        // that never serves must give its captures back (§7.3 step 2). A purge names a generation a
+        // switchover or a revert released, and this one was never cut over, so it is discarded: the
+        // executor drops exactly this generation's graphs and kernels. A device still busy with the
+        // capture is answered by the queue's own order.
         for executor in &self.executors {
             match executor.discard(generation) {
                 Ok(submission) => {
@@ -1504,32 +1698,47 @@ impl MainProcess {
                 return self.revert(generation, failure);
             }
         }
+        // The record moves before the warmup: probation begins the moment every device serves the
+        // new generation, and the warmup is the last part of the cut-over rather than of the
+        // generation that served before it. So a warmup that fails is a revert of a generation that
+        // *served* - a reverse switchover on every device - and not a discard of one that never
+        // cut over, which is what the phase decides, and it cannot be asked before this line.
+        self.update.switchover(generation, Instant::now())?;
+        self.retired =
+            std::mem::replace(&mut self.generations, std::mem::take(&mut self.prepared));
+
         // §4.5: the first request served on a generation must not pay for a capture, so every
         // captured bucket of the generation that just took over runs once, here, between batches.
         // A switchover later in the epoch warms the buckets the new kernel programs changed; the
         // first one also warms the buckets no update touched, because until now nothing served
         // them.
+        // The warmups are queued, not waited for: each is a device job that runs one bucket per
+        // queue turn behind serving batches, so a model with many buckets warms for minutes while
+        // the daemon waits two minutes for `Switched` - and a control thread that waited here would
+        // answer no command, no request event and no metrics for the same minutes. `advance_warmup`
+        // reads them on the passes that follow, and a device that fails reverts the update.
         for executor in &self.executors {
             let device = executor.device();
-            let submission = executor
-                .warmup()
-                .with_context(|| format!("warming up device {}", device.0))?;
-            if let Err(error) = device_command(&self.watchdog, device, "warmup", submission) {
-                tracing::error!(%error, "warming the new generation failed; reverting the update");
-                let failure = UpdateFailure::Device {
-                    device: u32::try_from(device.0).unwrap_or_default(),
-                    error: error.to_string(),
-                    batch: None,
-                };
-                return self.revert(generation, failure);
+            let ordinal = u32::try_from(device.0).unwrap_or_default();
+            match executor.warmup() {
+                Ok(submission) => self.warming.push((ordinal, submission, generation)),
+                Err(error) => {
+                    let failure = UpdateFailure::Device {
+                        device: ordinal,
+                        error: format!("queueing the warmup of generation {generation}: {error}"),
+                        batch: None,
+                    };
+                    if let Some(ending) = self.failure(failure)? {
+                        return Ok(ProgramStatus::Failed {
+                            generation,
+                            failure: ending,
+                        });
+                    }
+                    return Ok(ProgramStatus::Switched { generation });
+                }
             }
         }
 
-        // The state machine records the cut-over only when every device serves the new generation,
-        // and the process's record of what serves follows it.
-        self.update.switchover(generation, Instant::now())?;
-        self.retired =
-            std::mem::replace(&mut self.generations, std::mem::take(&mut self.prepared));
         Ok(ProgramStatus::Switched { generation })
     }
 
@@ -1552,12 +1761,59 @@ impl MainProcess {
     /// again resumes it in place instead of reading its pages back. Weights and storage stay mapped
     /// and the threads stay up - a drain is not an exit, and the daemon's `Serve` is what ends it.
     fn drain(&mut self, epoch: u64) -> Result<()> {
+        // An update cannot cross the drain: its switchover takes effect at a batch boundary and a
+        // drained epoch reaches none, so what the precopy built is given back now rather than left
+        // prepared for a boundary that cannot come.
+        self.drop_prepared("the epoch drained before its switchover")?;
         self.park_schedulers("draining the epoch")?;
         self.send_report(proto::process::Report {
             kind: Some(proto::process::report::Kind::Drained(
                 proto::process::Drained { epoch },
             )),
         });
+        Ok(())
+    }
+
+    /// Gives back what an in-flight update prepared, by name.
+    ///
+    /// A precopy still running is abandoned through its own path, which discards the captures on
+    /// every device, reinstates the serving policy and answers the peer or the daemon that asked.
+    /// A generation already prepared is discarded the same way: the device queue orders the discard
+    /// after the walk that captured it, and the generation that serves keeps its plans.
+    fn drop_prepared(&mut self, reason: &str) -> Result<()> {
+        if let Some(precopy) = self.precopy.take() {
+            let generation = precopy.generation;
+            let reply = precopy.reply;
+            self.precopy = Some(precopy);
+            return self.abandon_precopy(
+                generation,
+                UpdateFailure::Precopy {
+                    reason: reason.to_owned(),
+                },
+                reply,
+            );
+        }
+        let Some(generation) = self.prepared.first().map(|built| built.number()) else {
+            return Ok(());
+        };
+        self.discard_policy();
+        for executor in &self.executors {
+            match executor.discard(generation) {
+                Ok(submission) => {
+                    if let Err(error) =
+                        device_command(&self.watchdog, executor.device(), "discard", submission)
+                    {
+                        // The generation never serves: a discard that did not finish holds storage
+                        // until the purge, and the epoch that drained is not made to fail for it.
+                        tracing::warn!(%error, generation, "discarding a prepared generation failed");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, generation, "queueing a prepared generation's discard failed");
+                }
+            }
+        }
+        self.prepared.clear();
         Ok(())
     }
 
@@ -1574,6 +1830,56 @@ impl MainProcess {
         }
         self.serving = true;
         Ok(())
+    }
+
+    /// §7.3 step 4: an update left on probation past the window the launch file states is
+    /// reverted, so a deployment never serves a generation nobody accepted.
+    ///
+    /// The daemon commits; this is the guard for when it does not - an operator who closed the
+    /// dashboard, a commit that never arrived. Without a stated window there is no guard, which is
+    /// the daemon's decision and not this process's.
+    fn watch_probation(&mut self) -> Result<Option<UpdateFailure>> {
+        let Some(window) = self.rollback else {
+            return Ok(None);
+        };
+        if !self.update.probation_expired(Instant::now(), window) {
+            return Ok(None);
+        }
+        let failure = UpdateFailure::Threshold {
+            reason: format!(
+                "the update was on probation for longer than the {} seconds the launch file allows",
+                window.as_secs()
+            ),
+        };
+        tracing::info!(seconds = window.as_secs(), "an update outlived its probation and is reverted");
+        // A device that cannot put the generation that served back is a device with no generation at
+        // all: the revert's refusal is the epoch's, and it ends by that name rather than continuing to
+        // serve a generation the process has just decided it cannot stand behind.
+        let generation = self.update.current();
+        self.revert(generation, failure)?;
+        Ok(None)
+    }
+
+    /// A scheduler thread that stopped ends the epoch's service, and the epoch says so.
+    ///
+    /// With no scheduler no batch is formed, so no job runs and no job can stall: the stall rule
+    /// reports nothing and every request waits for a batch that will never be planned. The reason
+    /// the thread stopped is its own - a policy that trapped or ran out of fuel is the usual one
+    /// (§4.4) - and the update's decision table decides whether that ends the epoch or reverts the
+    /// update on probation (§7.3 step 4).
+    fn watch_schedulers(&mut self) -> Result<Option<UpdateFailure>> {
+        for (rank, scheduler) in self.schedulers.iter().enumerate() {
+            if !scheduler.is_dead() {
+                continue;
+            }
+            let failure = UpdateFailure::Policy {
+                error: scheduler
+                    .failure()
+                    .unwrap_or_else(|| format!("the scheduler of rank {rank} stopped")),
+            };
+            return self.failure(failure);
+        }
+        Ok(None)
     }
 
     /// Parks every scheduler, keeping what each parks with for the resume.
@@ -1619,6 +1925,11 @@ impl MainProcess {
     /// generation and its nodes stayed through probation, so the revert is the
     /// reverse switchover and nothing has to be prepared again.
     fn revert(&mut self, generation: u64, failure: UpdateFailure) -> Result<ProgramStatus> {
+        // The phase before the call decides what a device does with the update's generation: a
+        // generation that was prepared but never cut over never served, so nothing goes back and it
+        // is discarded; a generation on probation served, and its reverse switchover runs. The
+        // machine answers `Serving` either way once the call returns, so the phase is read first.
+        let phase = self.update.phase();
         if let Err(error) = self.update.revert(generation, failure.clone()) {
             tracing::error!(%error, "reverting a program-layer update failed");
             return Ok(ProgramStatus::Failed {
@@ -1633,6 +1944,11 @@ impl MainProcess {
             self.generations = std::mem::take(&mut self.retired);
         }
         self.prepared.clear();
+        // The warmups still queued warm the generation this revert went back from: what runs when
+        // they reach the device is the generation that serves, so nothing hangs - the list is what
+        // stopped describing serving, and a failure read from a stale entry would revert an update
+        // that is over.
+        self.warming.clear();
         let current = self.update.current();
         for executor in &self.executors {
             let device = executor.device();
@@ -1644,10 +1960,36 @@ impl MainProcess {
             // generation at all: the update's kernels are the ones its graphs were rebound to, and a
             // revert that half happened leaves the epoch serving from neither. So a failed revert
             // ends the epoch by name instead of leaving it to fail on a batch that finds no graph.
-            let submission = executor.revert(current).with_context(|| {
+            let queued = match phase {
+                // §7.3 step 2's discard: the generation's graphs and kernels go, and the generation
+                // that serves is untouched. A reverse switchover here would be refused by name -
+                // nothing was switched over - and would end the epoch over an update that never cut.
+                executor::hot_update::Phase::Precopied { .. } => executor.discard(generation),
+                _ => executor.revert(current),
+            };
+            let submission = queued.with_context(|| {
                 format!("queueing device {}'s revert to generation {current}", device.0)
             })?;
             device_command(&self.watchdog, device, "revert", submission)?;
+        }
+        // No purge follows a revert: the daemon purges the generation a *commit* released, and its
+        // reverted path sends nothing (§7.3 step 5 and 6). The generation that served and went back
+        // would otherwise keep its graphs, its kernels and its arena until the process exits - a
+        // whole generation of device memory - so it is released here, now that every device has
+        // finished going back and no batch of it can be in flight.
+        if matches!(phase, executor::hot_update::Phase::Probation { .. }) {
+            match self.purge(generation) {
+                Ok(ProgramStatus::Purged { .. }) => {}
+                Ok(other) => tracing::warn!(
+                    ?other,
+                    "the generation the revert went back from was not released"
+                ),
+                Err(error) => {
+                    // The revert stands: serving is correct and what a failed release costs is the
+                    // reverted generation's storage, which the process keeps until it exits.
+                    tracing::error!(%error, "releasing the generation a revert went back from failed");
+                }
+            }
         }
         Ok(ProgramStatus::Reverted {
             generation,
@@ -1660,6 +2002,12 @@ impl MainProcess {
     /// it already holds, and `Captured` keeps each kernel alive until the graph
     /// that uses it is rebound or destroyed.
     fn purge(&mut self, generation: u64) -> Result<ProgramStatus> {
+        // A purge releases what this process holds of a generation, so a number it has already
+        // released is answered rather than refused: the revert below releases a reverted generation
+        // itself, and a daemon that later purges the same number asks for a release that happened.
+        if self.released.contains(&generation) {
+            return Ok(ProgramStatus::Purged { generation });
+        }
         if let Err(error) = self.update.request_purge(generation) {
             bail!("purging generation {generation}: {error}");
         }
@@ -1683,6 +2031,7 @@ impl MainProcess {
             }
         }
         self.update.purged(generation)?;
+        self.released.insert(generation);
         Ok(ProgramStatus::Purged { generation })
     }
 
@@ -1707,18 +2056,33 @@ impl MainProcess {
     /// daemon addresses commands to the main process, and the mechanism keeps
     /// the rank of every request it accepted.
     fn request_command(&mut self, command: proto::request::wire::Command) -> Result<()> {
-        match self.schedulers.as_slice() {
-            [scheduler] => answer(
-                scheduler.request_command(command),
-                self.watchdog.stall_bound(),
-                "a request command",
-            ),
-            [] => bail!("a request command arrived at a node that holds no scheduler"),
-            schedulers => bail!(
-                "a request command needs the rank the request was routed to, among {} schedulers",
-                schedulers.len()
-            ),
-        }
+        // A command names its request, not the scheduler serving it, so the rank is read from the
+        // stream the submission answered with. A request that is not in flight here has already
+        // ended: a cancel or a stop for it is a no-op, not a fault, and ending an epoch because a
+        // client disconnected a moment too late would be the daemon's most common message.
+        let Some((_, rank, _)) = self
+            .streams
+            .iter()
+            .find(|(id, _, _)| *id == command.request)
+        else {
+            tracing::debug!(
+                request = command.request,
+                "a request command names a request this epoch no longer serves"
+            );
+            return Ok(());
+        };
+        let Some(scheduler) = self.schedulers.get(*rank) else {
+            tracing::debug!(
+                request = command.request,
+                rank, "a request command names a rank this node does not hold"
+            );
+            return Ok(());
+        };
+        answer(
+            scheduler.request_command(command),
+            self.watchdog.stall_bound(),
+            "a request command",
+        )
     }
 
     /// A command to the whole main process: shutdown, drain, park or promote,
@@ -1727,14 +2091,141 @@ impl MainProcess {
         &mut self,
         command: proto::request::wire::EngineCommand,
     ) -> Result<Option<UpdateFailure>> {
-        // The request connection carries the epoch's own lifecycle commands. `Shutdown` ends the
-        // epoch: every request finishes as aborted, the workers close and the process exits, which
-        // is what `close` does in the order the owners need (§2.3). The rest are the routing's and
-        // the daemon's successor machinery's - they apply to connections this node does not hold -
-        // while the epoch layer's Park, Promote, Serve, Drain and Pause arrive on the process
-        // connection, where the schedulers take them.
-        if let Some(proto::request::wire::engine_command::Kind::Shutdown(_)) = command.kind {
-            self.stopping = true;
+        // §2.3: the epoch's lifecycle - Park, Promote, Serve, Drain, Pause, the program layer's
+        // stages - arrives on the process connection and is applied by the driver. On this
+        // connection the epoch owns exactly one command, `Shutdown`: every request finishes as
+        // aborted and the owners close in the order they need (`close`).
+        //
+        // The rest are the engine surface of the worker era, and the daemon's migration, expert
+        // and admin paths still send them here. Each is answered with what it needs instead of
+        // being dropped: a command a process does not serve is otherwise a caller waiting for a
+        // reply that never comes, which is a hang with no name in it.
+        let refused = match command.kind {
+            Some(proto::request::wire::engine_command::Kind::Shutdown(_)) => {
+                self.stopping = true;
+                return Ok(None);
+            }
+            Some(proto::request::wire::engine_command::Kind::Hook(hook)) => Some(
+                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
+                    id: hook.id,
+                    results: Vec::new(),
+                    error: WORKER_ERA.to_owned(),
+                }),
+            ),
+            Some(proto::request::wire::engine_command::Kind::ResizeCache(resize)) => {
+                Some(proto::request::wire::from_engine::Kind::Hooked(
+                    proto::request::wire::Hooked {
+                        id: resize.id,
+                        results: Vec::new(),
+                        error: WORKER_ERA.to_owned(),
+                    },
+                ))
+            }
+            Some(proto::request::wire::engine_command::Kind::UpdateWeights(update)) => Some(
+                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
+                    id: update.id,
+                    results: Vec::new(),
+                    error: WORKER_ERA.to_owned(),
+                }),
+            ),
+            Some(proto::request::wire::engine_command::Kind::CommitExperts(commit)) => Some(
+                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
+                    id: commit.id,
+                    results: Vec::new(),
+                    error: WORKER_ERA.to_owned(),
+                }),
+            ),
+            Some(proto::request::wire::engine_command::Kind::CacheWarm(warm)) => Some(
+                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
+                    id: warm.id,
+                    results: Vec::new(),
+                    error: WORKER_ERA.to_owned(),
+                }),
+            ),
+            // The worker era's park, resume and trial commit move a worker world between
+            // processes. The epoch parks, resumes and commits through the process connection, in
+            // front of the frontend rather than behind it (§2.5, §7.4).
+            Some(proto::request::wire::engine_command::Kind::Park(park)) => Some(
+                proto::request::wire::from_engine::Kind::Parked(proto::request::wire::Parked {
+                    id: park.id,
+                    error: EPOCH_LIFECYCLE.to_owned(),
+                    index: Vec::new(),
+                }),
+            ),
+            Some(proto::request::wire::engine_command::Kind::Resume(resume)) => Some(
+                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
+                    id: resume.id,
+                    results: Vec::new(),
+                    error: EPOCH_LIFECYCLE.to_owned(),
+                }),
+            ),
+            Some(proto::request::wire::engine_command::Kind::Commit(commit)) => Some(
+                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
+                    id: commit.id,
+                    results: Vec::new(),
+                    error: EPOCH_LIFECYCLE.to_owned(),
+                }),
+            ),
+            // The scheduling limits are the schedulers', applied at their next step through the
+            // policy slot the process connection names (§4.4).
+            Some(proto::request::wire::engine_command::Kind::Configure(configure)) => Some(
+                proto::request::wire::from_engine::Kind::Configured(
+                    proto::request::wire::Configured {
+                        id: configure.id,
+                        error: EPOCH_LIFECYCLE.to_owned(),
+                    },
+                ),
+            ),
+            // The storage ledgers and the transfer budgets are each node's daemon's, read over
+            // its claim (§8); an epoch's main process holds no claim of the deployment's.
+            Some(proto::request::wire::engine_command::Kind::DescribeStorage(describe)) => Some(
+                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
+                    id: describe.id,
+                    results: Vec::new(),
+                    error: LEDGERS.to_owned(),
+                }),
+            ),
+            Some(proto::request::wire::engine_command::Kind::ThrottleTransfers(throttle)) => Some(
+                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
+                    id: throttle.id,
+                    results: Vec::new(),
+                    error: LEDGERS.to_owned(),
+                }),
+            ),
+            // What the prefix cache holds is the schedulers' answer, and they are asked through
+            // the process connection.
+            Some(proto::request::wire::engine_command::Kind::DescribeCache(describe)) => Some(
+                proto::request::wire::from_engine::Kind::CacheDescribed(
+                    proto::request::wire::CacheDescribed {
+                        id: describe.id,
+                        error: EPOCH_LIFECYCLE.to_owned(),
+                        segments: Vec::new(),
+                    },
+                ),
+            ),
+            Some(proto::request::wire::engine_command::Kind::DescribeRequests(describe)) => Some(
+                proto::request::wire::from_engine::Kind::RequestsDescribed(
+                    proto::request::wire::RequestsDescribed {
+                        id: describe.id,
+                        error: EPOCH_LIFECYCLE.to_owned(),
+                        requests: Vec::new(),
+                    },
+                ),
+            ),
+            // Promote, FlushCache and Attach state no id and are answered with a state this
+            // process does not own: there is nothing to answer on, and a log line is what is
+            // left.
+            Some(other) => {
+                tracing::warn!(
+                    "the daemon sent an engine command this epoch does not serve: {}",
+                    engine_command_name(&other)
+                );
+                None
+            }
+            None => None,
+        };
+        if let Some(kind) = refused {
+            self.send_event(kind);
         }
         Ok(None)
     }
@@ -1867,7 +2358,7 @@ impl MainProcess {
         // small, and the survivors go back before the pass returns.
         let streams = std::mem::take(&mut self.streams);
         let mut running = Vec::with_capacity(streams.len());
-        for (id, mut stream) in streams {
+        for (id, rank, mut stream) in streams {
             loop {
                 match stream.try_recv() {
                     Ok(event) => {
@@ -1881,11 +2372,17 @@ impl MainProcess {
                         let (wire, media) = event.to_wire(proto::request::RequestId(id));
                         if media.is_some() {
                             // An artifact's bytes travel beside its event (`ArtifactPart`), and this
-                            // process does not carry them yet: the event alone would make a daemon
-                            // wait for bytes that never come, so the request is refused by name.
-                            tracing::warn!(
+                            // process does not carry them: a daemon that reads this event waits for
+                            // bytes that never come. It is reachable only if a media request was
+                            // admitted, and the guard against that is the scheduler's - a device
+                            // with no media runner refuses the phase at admission. So this is the
+                            // alarm, not the guard: it fires when the admission rule has been
+                            // bypassed, and the event goes on because the outcome it states is the
+                            // request's own.
+                            tracing::error!(
                                 request = id,
-                                "a request produced media artifacts, which this process does not carry"
+                                "a request produced media artifacts, which this process does not \
+                                 carry: the daemon will wait for bytes that never come"
                             );
                         }
                         self.send_event(proto::request::wire::from_engine::Kind::Event(wire));
@@ -1895,7 +2392,7 @@ impl MainProcess {
                     }
                     // A request that produced nothing yet keeps its stream.
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                        running.push((id, stream));
+                        running.push((id, rank, stream));
                         break;
                     }
                     // The scheduler that served the request is gone, which ends it.
@@ -1921,7 +2418,7 @@ impl MainProcess {
         // §2.3: a shutdown finishes every request in flight as aborted, and the daemon learns that
         // from the request's own event - a connection that closes under it says only that the
         // process ended, not which request was lost with it.
-        for (request, _) in std::mem::take(&mut self.streams) {
+        for (request, _, _) in std::mem::take(&mut self.streams) {
             let event = proto::request::wire::Event {
                 request,
                 kind: Some(proto::request::wire::event::Kind::Error(
@@ -1950,6 +2447,9 @@ impl MainProcess {
         for error in self.blocking.close() {
             tracing::warn!(%error, "closing a blocking lane failed");
         }
+        // The caches a park handed back name segments of the pools below: they go before the
+        // resident owners close, so nothing the memory releases is still described as parked.
+        self.parked = None;
         if let Some(memory) = self.memory.take() {
             if let Err(error) = memory.close() {
                 tracing::warn!(%error, "closing the resident owners failed");
@@ -2088,17 +2588,32 @@ fn report_of(status: &ProgramStatus) -> Option<proto::process::Report> {
 /// descriptor is what the model's forward computes for a bucket and nothing outside the forward can
 /// list them.
 fn missing_kernel(submissions: &[Submission]) -> Option<(String, String)> {
+    /// The kernel an error names as missing, whether it reached the executor as an operator's
+    /// error or wrapped in the model layer's: a capture reports it through
+    /// `nn::Forward::operate`, which resolves the kernel and converts the operator's error into the
+    /// layer's own. Matching only the operator's arm would leave every capture's miss unrecognised,
+    /// and the discovery loop would abandon a generation it could have completed.
+    fn named(error: &executor::Error) -> Option<(&'static str, &str)> {
+        let ops = match error {
+            executor::Error::Ops(ops) => ops,
+            executor::Error::Nn(nn::Error::Ops(ops)) => ops,
+            _ => return None,
+        };
+        match ops {
+            ops::Error::MissingKernel {
+                operator,
+                descriptor,
+                ..
+            } => Some((operator, descriptor.as_str())),
+            _ => None,
+        }
+    }
     for submission in submissions {
         let Some(Outcome::Failed(error)) = submission.outcome() else {
             continue;
         };
-        if let executor::Error::Ops(ops::Error::MissingKernel {
-            operator,
-            descriptor,
-            ..
-        }) = &*error
-        {
-            return Some(((*operator).to_owned(), descriptor.clone()));
+        if let Some((operator, descriptor)) = named(&error) {
+            return Some((operator.to_owned(), descriptor.to_owned()));
         }
     }
     None
@@ -2144,8 +2659,55 @@ fn answer(
     }
 }
 
+/// What the engine answers a command of the worker era's surface: the operation named a worker
+/// world of its own, and this epoch executes batches itself (§2.4).
+const WORKER_ERA: &str =
+    "this epoch has no worker of that kind: the command names a worker-era engine, and the epoch's \
+     executors are the process's own";
+
+/// What the engine answers a command whose owner is the epoch layer: the same operation exists,
+/// and it is asked for through the process connection, where the driver applies it (§2.5, §7.4).
+const EPOCH_LIFECYCLE: &str =
+    "this command is the epoch layer's, applied through the process connection rather than the \
+     request connection";
+
+/// What the engine answers a command over the deployment's storage ledgers or transfer budgets:
+/// each node's daemon reads them over the claim it holds, not through an epoch's main process (§8).
+const LEDGERS: &str =
+    "the storage ledgers and transfer budgets are read by each node's daemon over its claim, not \
+     by an epoch's main process";
+
+/// The name of an engine command, for a log line about one this epoch does not serve.
+fn engine_command_name(kind: &proto::request::wire::engine_command::Kind) -> &'static str {
+    use proto::request::wire::engine_command::Kind;
+    match kind {
+        Kind::Shutdown(_) => "shutdown",
+        Kind::Promote(_) => "promote",
+        Kind::FlushCache(_) => "flush_cache",
+        Kind::Hook(_) => "hook",
+        Kind::Configure(_) => "configure",
+        Kind::Attach(_) => "attach",
+        Kind::ResizeCache(_) => "resize_cache",
+        Kind::UpdateWeights(_) => "update_weights",
+        Kind::Park(_) => "park",
+        Kind::Resume(_) => "resume",
+        Kind::Commit(_) => "commit",
+        Kind::DescribeCache(_) => "describe_cache",
+        Kind::DescribeStorage(_) => "describe_storage",
+        Kind::ThrottleTransfers(_) => "throttle_transfers",
+        Kind::DescribeRequests(_) => "describe_requests",
+        Kind::CacheWarm(_) => "cache_warm",
+        Kind::CommitExperts(_) => "commit_experts",
+    }
+}
+
 /// How often the engine reports its counters.
 const METRICS_EVERY: Duration = Duration::from_secs(1);
+
+/// How closely an update's probation is watched while one is pending: the phase machine states an
+/// expiry, and the control thread asks it at least this often. A rollback window is stated in whole
+/// seconds, so the poll costs a wake per tenth of a second for the length of the window.
+const PROBATION_POLL: Duration = Duration::from_millis(100);
 
 /// How long a metrics pass waits on one scheduler's counters: the report is sent once a second and a
 /// pass that waited longer than this would be reporting what the next pass reports anyway.
@@ -2419,6 +2981,38 @@ fn unfinished(submissions: &[Submission], what: &str) -> Option<StageFailure> {
 
 /// The descriptor keys `generation` holds for `operator`: what a precopy must
 /// cover, and exactly what it never adds to (§7.3 step 2, §5.3).
+/// The descriptor keys this host has already built for a named package, for this node's targets.
+///
+/// The epoch's first generation has no serving generation to copy keys from, and without this the
+/// walk learns one descriptor per capture. What the Program Server lists is what it holds *built* -
+/// not what the package declares - so this accelerates a store that was built ahead of the epoch
+/// (every deployment whose programs were built offline) and answers nothing on a host that has built
+/// none yet, where the walk remains the source of truth. A module built for another target does not
+/// cover this node and is not claimed.
+fn built_keys(
+    listing: &program_server::Listing,
+    op: &str,
+    program: &Program,
+    targets: &[program_server::Target],
+) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    for package in &listing.packages {
+        if package.op != op
+            || package.backend != program.backend
+            || package.revision != program.revision
+        {
+            continue;
+        }
+        for module in &package.modules {
+            if !targets.contains(&module.target) || keys.contains(&module.descriptor) {
+                continue;
+            }
+            keys.push(module.descriptor.clone());
+        }
+    }
+    keys
+}
+
 fn descriptor_keys(generation: &Generation, operator: &'static str) -> Vec<String> {
     generation
         .iter()

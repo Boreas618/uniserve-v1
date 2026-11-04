@@ -189,7 +189,7 @@ impl Ledger {
         let books = self
             .streams
             .get_mut(&stream)
-            .ok_or_else(|| Error::State("the graph pool was not opened".into()))?;
+            .ok_or_else(|| Error::State("the graph pool was not opened"))?;
         books.extents.insert(bucket, bytes);
         let needed = books.extents.values().copied().max().unwrap_or(0);
         let map = needed.saturating_sub(books.mapped);
@@ -656,7 +656,7 @@ impl Pools {
         }
         self.pools
             .get_mut(&stream)
-            .ok_or_else(|| Error::State("the graph pool was not created".into()))
+            .ok_or_else(|| Error::State("the graph pool was not created"))
     }
 }
 

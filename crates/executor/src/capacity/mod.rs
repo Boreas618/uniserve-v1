@@ -405,9 +405,10 @@ mod tests {
     fn an_automatic_pool_takes_the_whole_units_its_grant_holds() -> Result<()> {
         let pages = [(64, 1), (64, 1)];
         let capacity = CacheCapacity::derive(&demand(&pages))?;
-        // 100 units of 1 KiB fit; one page of every group plus the sentinel
-        // stays free, so the pool is the rest.
-        assert_eq!(capacity.num_units, 100 - 2 - 1);
+        // 100 units of 1 KiB fit, and the pool takes all of them: the sentinel
+        // and one page of every group are units INSIDE it, and the minimum only
+        // refuses a grant too small to hold them - it takes nothing away.
+        assert_eq!(capacity.num_units, 100);
         Ok(())
     }
 
@@ -425,7 +426,9 @@ mod tests {
         let pages = [(64, 1), (64, 1)];
         let mut demand = demand(&pages);
         demand.token_units = Some(640);
-        // Ten pages of each group plus the sentinel.
+        // Ten pages of each group plus the sentinel: the grant must hold them,
+        // or the ask is refused rather than trimmed.
+        demand.available_bytes = Some(1024 * 1000);
         let capacity = CacheCapacity::derive(&demand)?;
         assert!(capacity.num_units >= 640);
         Ok(())
