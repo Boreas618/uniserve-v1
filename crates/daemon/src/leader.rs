@@ -1807,6 +1807,10 @@ pub(crate) struct Replica {
     /// live. Started by [`Replica::keep_standby`], taken by
     /// [`Replica::promote_standby`].
     pub(crate) standby: std::sync::Mutex<Option<Standby>>,
+    /// Serializes starting a standby: two callers that both saw none must not
+    /// both start a process, since a second engine of the same scope is a
+    /// whole copy of its device storage.
+    standby_starting: tokio::sync::Mutex<()>,
 }
 
 impl Replica {
@@ -1841,6 +1845,7 @@ impl Replica {
             profiles: crate::profiling::Profiles::default(),
             manifests: std::sync::Mutex::new(storage::manifest::Planner::default()),
             standby: std::sync::Mutex::new(None),
+            standby_starting: tokio::sync::Mutex::new(()),
         });
         hold.serve(client);
         replica
@@ -1944,6 +1949,7 @@ impl Replica {
         let Some(control) = self.control.get().cloned() else {
             return Ok(());
         };
+        let _starting = self.standby_starting.lock().await;
         let Some(serving) = self.hold.client() else {
             return Ok(());
         };
