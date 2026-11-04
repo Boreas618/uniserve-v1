@@ -1,0 +1,26 @@
+[package]
+name = "nn"
+description = "Tensor views, layers, capability traits, models and checkpoints"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The shared computation library: layers call `ops` operators and nothing below them. The stream,
+# the kernels and the communicator a forward borrows are `ops` names, so the dependency stays
+# `nn → ops → platform` (specs/worker.md 3).
+[dependencies]
+ops = { path = "../ops" }
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Checkpoints are safetensors: the Rust crate reads their headers and views their payloads.
+safetensors = "0.3"
+# A checkpoint shard is mapped, not loaded: the loader reads the bytes of one tensor at a time.
+memmap2 = "0.9"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

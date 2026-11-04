@@ -1,0 +1,17 @@
+[package]
+name = "ops"
+description = "Operator signatures, launch code, loaded kernels and their generations"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# `ops` depends only on the CUDA boundary: it loads and launches the modules it is handed and knows
+# no model, no layer and no runtime object (specs/worker.md 3, 4.2).
+[dependencies]
+platform = { path = "../platform" }
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
