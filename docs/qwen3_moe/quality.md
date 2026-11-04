@@ -77,15 +77,17 @@ The commands run from the checkout with the environment of the installation inst
 .venv/bin/python -c "from uniserve_eval.config import load_config; from uniserve_eval.datasets import load_examples; c = load_config('uniserve_eval/qwen3_moe.toml'); rows, _ = load_examples(c.selected_points('qwen3-moe-gsm8k-bf16')[0]); print(len(rows), rows[0].id, rows[-1].id)"
 .venv/bin/uniserve-eval --config uniserve_eval/qwen3_moe.toml plan qwen3-moe-gsm8k
 .venv/bin/uniserve-eval --config uniserve_eval/qwen3_moe.toml run qwen3-moe-gsm8k --output-root artifacts/qwen3_moe/gsm8k-baseline
-.venv/bin/uniserve-eval --config uniserve_eval/qwen3_moe.toml run qwen3-moe-gsm8k --output-root artifacts/qwen3_moe/gsm8k-candidate --executable <new server binary>
-for point in qwen3-moe-gsm8k-bf16 qwen3-moe-gsm8k-nvfp4 qwen3-moe-gsm8k-bf16-fp8-kv; do
-  .venv/bin/uniserve-eval compare \
-    artifacts/qwen3_moe/gsm8k-baseline/$point \
-    artifacts/qwen3_moe/gsm8k-candidate/$point
-done
+# Candidate: plan with the new binary, then the same profile's three cells by name.
+.venv/bin/uniserve-eval --config uniserve_eval/qwen3_moe.toml plan qwen3-moe-gsm8k --executable <new server binary>
+.venv/bin/uniserve-eval --config uniserve_eval/qwen3_moe.toml run qwen3-moe-gsm8k-bf16 --executable <new server binary> --output-root artifacts/qwen3_moe/gsm8k-candidate
+.venv/bin/uniserve-eval --config uniserve_eval/qwen3_moe.toml run qwen3-moe-gsm8k-nvfp4 --executable <new server binary> --output-root artifacts/qwen3_moe/gsm8k-candidate
+UNISERVE_QWEN3_FP8_ATTENTION_BACKEND=<provider> .venv/bin/uniserve-eval --config uniserve_eval/qwen3_moe.toml run qwen3-moe-gsm8k-bf16-fp8-kv --executable <new server binary> --output-root artifacts/qwen3_moe/gsm8k-candidate
+.venv/bin/uniserve-eval compare artifacts/qwen3_moe/gsm8k-baseline/qwen3-moe-gsm8k-bf16 artifacts/qwen3_moe/gsm8k-candidate/qwen3-moe-gsm8k-bf16
+.venv/bin/uniserve-eval compare artifacts/qwen3_moe/gsm8k-baseline/qwen3-moe-gsm8k-nvfp4 artifacts/qwen3_moe/gsm8k-candidate/qwen3-moe-gsm8k-nvfp4
+.venv/bin/uniserve-eval compare artifacts/qwen3_moe/gsm8k-baseline/qwen3-moe-gsm8k-bf16-fp8-kv artifacts/qwen3_moe/gsm8k-candidate/qwen3-moe-gsm8k-bf16-fp8-kv
 ```
 
-The pre-flight prints `1319 gsm8k-00000 gsm8k-01318`. The suite runs its three cells serially, one server at a time; `run` refuses a non-empty result directory, so each of the two runs needs its own root and a rerun needs a fresh one. The candidate run may differ from the baseline only in `--executable`, `--output-root` and, for the FP8 KV cell, `UNISERVE_QWEN3_FP8_ATTENTION_BACKEND`.
+The pre-flight prints `1319 gsm8k-00000 gsm8k-01318`. The baseline suite runs its three cells serially, one server at a time. The candidate runs the two non-FP8 cells by name and then the FP8 cell once with its own provider, also serially, each writing only its own `<point>` directory. `run` refuses a non-empty result directory, so the baseline and candidate roots are separate and a rerun needs a fresh one. The candidate run uses the same profile and may differ from the baseline only in `--executable`, `--output-root` and, for the FP8 KV cell, `UNISERVE_QWEN3_FP8_ATTENTION_BACKEND`.
 
 ## Results
 
