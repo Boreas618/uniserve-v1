@@ -29,7 +29,7 @@ architectures = ["sm_100a", "sm_90a"]
 
 # `dtype_bf16_ids_i64_hidden_2048_first_0_rows_151936_block_4_pdl_true`.
 [kernel.descriptors]
-dimensions = { dtype = ["bf16", "fp16", "f32"], ids = ["i64", "i32"], hidden = ["2048", "4096", "7168", "5120"], first = ["0", "151936", "75968"], rows = ["151936", "75968", "248320", "152064"], block = ["1", "2", "4", "8"], pdl = ["true", "false"] }
+dimensions = { dtype = ["bf16", "f16", "f32"], ids = ["i64", "i32"], hidden = ["2048", "4096", "7168", "5120"], first = ["0", "151936", "75968"], rows = ["151936", "75968", "248320", "152064"], block = ["1", "2", "4", "8"], pdl = ["true", "false"] }
 
 [parameters]
 # Columns one inner tile copies.

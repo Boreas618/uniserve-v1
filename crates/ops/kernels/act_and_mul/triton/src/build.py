@@ -16,7 +16,7 @@ import act_and_mul as kernels
 
 #: The floating dtypes the gates, the values and the output may have, as Triton spells them in an
 #: argument signature.
-DTYPES = {"bf16": "bf16", "fp16": "fp16", "fp32": "fp32", "f32": "fp32"}
+DTYPES = {"bf16": "bf16", "f16": "fp16", "f32": "fp32"}
 
 
 def spec(fields, parameters, target):
