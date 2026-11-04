@@ -868,6 +868,22 @@ fn encode(args: &Args) -> Result<(), String> {
     )?;
     std::fs::write(directory.join("readback.txt"), &readback)
         .map_err(|error| format!("readback.txt: {error}"))?;
+    // The anchoring draw, as the model received it: `source = t * clean + (1 - t) * draw`, so a
+    // reference that re-derives the draw would be comparing a *convention* - which stream, which
+    // counter, which index - and a seed mismatch reads as a defect in the encoder. One file removes
+    // the convention; the projection stays the reference's own code.
+    let draw = download(&stream, noise)?;
+    write_h3t(
+        &directory.join("condition_noise.h3t"),
+        H3T_F32,
+        &[
+            u64::from(dit.transformer.video_channels),
+            u64::from(latent.frames),
+            u64::from(latent.height),
+            u64::from(latent.width),
+        ],
+        &draw,
+    )?;
     // The pixels as the encoder received them. A reference probe reads this file instead of
     // rebuilding the pattern, so a comparison of the encoder's arithmetic starts from one input
     // rather than from two decodes and two orders of a channel axis.
@@ -891,7 +907,7 @@ fn encode(args: &Args) -> Result<(), String> {
          \"pixels_shape\": [{}, {}, {}, {}],\n  \
          \"pixels\": \"deterministic per-channel ramp, stated\",\n  \
          \"text\": \"deterministic pattern, stated (stage 4 owns the text encoder)\",\n  \
-         \"rows_file\": \"condition_rows.h3t\",\n  \
+         \"rows_file\": \"condition_rows.h3t\",\n  \"noise_file\": \"condition_noise.h3t\",\n  \
          \"rows_container\": \"f32\",\n  \
          \"posterior_fields\": \"not written: the trace that carries them is not on the served entry point\"\n}}\n",
         task_name(args.task),
