@@ -1338,6 +1338,20 @@ impl Leader {
         if crate::epoch::layer(&previous, &next) != crate::epoch::Layer::Epoch {
             return Ok(None);
         }
+        // One main process per node and one launch file per process: the file
+        // names its peers' request addresses, which this daemon does not know
+        // for a node it does not run on, so it can state a world of one only.
+        // A world of more is refused by name instead of silently writing
+        // `world_size = 1` for two processes (exec's rule: the world is its
+        // peers and itself).
+        if target.nnodes.get() != 1 {
+            return Err(UpdateError::Refused(format!(
+                "the target epoch runs {} nodes, and a launch file written here names no peer: a \
+                 multi-node epoch needs the launch contents carried in `process::Spawn` or a \
+                 world that states its peers' request addresses",
+                target.nnodes.get()
+            )));
+        }
         let epochs = self.updates.epochs();
         let (previous_epoch, serving) = epochs.serving().ok_or_else(|| {
             UpdateError::Refused("no epoch serves: there is nothing to switch from".to_owned())
