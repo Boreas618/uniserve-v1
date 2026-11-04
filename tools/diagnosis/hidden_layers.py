@@ -40,6 +40,10 @@ import sys
 
 import numpy as np
 
+#: The three cuts a layer is walked through, in the order the layer runs them. A reference that sets
+#: `hidden_NN_normalized.npy` and the two after it lets one layer be read operator by operator.
+CUTS = ["normalized", "attended", "mlp"]
+
 
 def load(path):
     if not path.exists():
@@ -66,10 +70,23 @@ def per_row(actual, expected):
 
 
 def names(reference):
-    """Every file the reference holds, in the order a run writes them: hidden, then logits."""
-    hidden = sorted(reference.glob("hidden_*.npy"))
-    logits = sorted(reference.glob("logits*.npy"))
-    return hidden + logits
+    """Every file the reference holds, in the order a run reaches them.
+
+    A stage's file is `hidden_NN.npy`, which is layer `NN - 1`'s output, and the embedding's is
+    `hidden_00.npy`. A layer cut open inside holds `hidden_NN_<cut>.npy` for the cuts this run
+    asked the model to stop at (`normalized`, `attended`, `mlp`, in that order), so the cut files of
+    layer `NN - 1` sort between `hidden_{NN-1}.npy` and `hidden_NN.npy` and the table reads as the
+    walk that produced it.
+    """
+    def order(path):
+        parts = path.stem.split("_")
+        index = int(parts[1])
+        cut = CUTS.index(parts[2]) if len(parts) > 2 else len(CUTS)
+        return (index, cut)
+
+    return sorted(reference.glob("hidden_*.npy"), key=order) + sorted(
+        reference.glob("logits*.npy")
+    )
 
 
 def main():
