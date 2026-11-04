@@ -309,10 +309,7 @@ impl VideoPostprocessor {
         let pixels = u64::from(raster.height) * u64::from(raster.width);
         for channel in 0..u64::from(Rgb::CHANNELS) {
             for frame in 0..count {
-                // The reference weights the *current* clip `i/5` over the five frames: `0, 0.2, ..., 0.8`,
-                // so the first blended frame is entirely the predecessor's and the last keeps a fifth of
-                // it. A ramp that started at `1/5` would drop the predecessor from the last frame.
-                let weight = frame as f32 / count as f32;
+                let weight = fade_weight(frame, count);
                 let target = TensorView::new(
                     blended.element(&[channel, u64::from(overlap.0 + frame), 0, 0]),
                     blended.dtype,
@@ -336,6 +333,16 @@ impl VideoPostprocessor {
         }
         Ok(())
     }
+}
+
+/// The weight the *current* clip carries on blend frame `frame` of `count`.
+///
+/// The reference's ramp is `arange(count) / count` - `0, 0.2, 0.4, 0.6, 0.8` over the five frames a
+/// clip overlaps - so the first blended frame is entirely the predecessor's and the last keeps a fifth
+/// of it. A ramp that started at `1 / count` would drop the predecessor from the last frame, and one
+/// that ended at `1` would have the timeline's first clip pick its own pixels back up.
+pub(crate) fn fade_weight(frame: u32, count: u32) -> f32 {
+    frame as f32 / count as f32
 }
 
 impl nn::capability::Decoder for VideoPostprocessor {
@@ -689,6 +696,27 @@ mod tests {
             }
         };
         assert!(RgbBytes::new(DType::F16, 2, two, constants(PIXEL_STD)).is_err());
+    }
+
+    #[test]
+    fn the_blend_is_the_references_ramp_and_neither_shifted() {
+        // The reference's `arange(5) / 5` over a clip's five overlap frames, written out because it is
+        // the contract and not an implementation detail: the first blended frame is entirely the
+        // predecessor's, the last is four fifths the clip's. The two neighbouring ramps are the ones
+        // this crate has already had once - starting at `1 / 5` drops the predecessor from the last
+        // frame, ending at `1` has a clip pick its own pixels back up.
+        let weights: Vec<f32> = (0..Rgb::OVERLAP_FRAMES)
+            .map(|frame| fade_weight(frame, Rgb::OVERLAP_FRAMES))
+            .collect();
+        assert_eq!(weights, vec![0.0, 0.2, 0.4, 0.6, 0.8]);
+        assert_eq!(
+            weights[0], 0.0,
+            "the predecessor keeps the first frame whole"
+        );
+        assert!(
+            weights[weights.len() - 1] < 1.0,
+            "the clip never takes the whole last frame, or the predecessor's tail would vanish"
+        );
     }
 
     #[test]

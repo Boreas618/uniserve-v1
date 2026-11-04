@@ -109,5 +109,113 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             component.activation()
         );
     }
+
+    // Which keys each block asks for, checked against the checkpoint's index without loading it.
+    //
+    // `load` publishes every tensor through `RetainedWeights`, which only the executor implements,
+    // so no test in this crate can execute a block's load path; the failure that hides there is the
+    // narrow one: a key the loader names that the checkpoint does not hold. The index states every
+    // tensor's name whether or not its shard is present, so that failure is a host fact and this
+    // walks it. Each prefix is one the loader builds - the loader is the authority and this table
+    // only quotes it, one line per group - and a group with no match is an error, not a count.
+    let prefixes: &[(&str, &str, &[&str])] = &[
+        (
+            "vae",
+            "video encoder",
+            &[
+                "encoder.conv_in.",
+                "encoder.norm_out.",
+                "encoder.conv_out.",
+                "encoder.down_blocks.",
+                "encoder.down_blocks.0.resnets.",
+                "quant_conv.",
+            ],
+        ),
+        (
+            "vae",
+            "video decoder",
+            &[
+                "decoder.proj_in.",
+                "decoder.register_tokens",
+                "decoder.transformer_blocks.",
+                "decoder.norm_out.",
+                "decoder.proj_out.",
+            ],
+        ),
+        (
+            "audio_vae",
+            "audio encoder",
+            &["encoder.block.", "encoder.conv_in.", "encoder.conv_out."],
+        ),
+        (
+            "audio_vae",
+            "audio decoder",
+            &[
+                "decoder.conv_pre",
+                "decoder.ups.",
+                "decoder.resblocks.",
+                "decoder.activation_post",
+                "decoder.conv_post",
+            ],
+        ),
+        (
+            "text_encoder",
+            "text encoder",
+            &[
+                "model.language_model.layers.",
+                "model.language_model.embed_tokens.",
+            ],
+        ),
+        (
+            "transformer",
+            "denoiser",
+            &["transformer_blocks.", "token_refiner."],
+        ),
+    ];
+    let mut names_by_directory = std::collections::BTreeMap::new();
+    for (directory, _, _) in prefixes {
+        if names_by_directory.contains_key(*directory) {
+            continue;
+        }
+        let mut names = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(root.join(directory)) {
+            for entry in entries.flatten() {
+                let file = entry.file_name().to_string_lossy().to_string();
+                if !file.ends_with(".index.json") {
+                    continue;
+                }
+                let index: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(entry.path())?)?;
+                if let Some(map) = index["weight_map"].as_object() {
+                    names.extend(map.keys().cloned());
+                }
+            }
+        }
+        names_by_directory.insert((*directory).to_owned(), names);
+    }
+    let mut missing = Vec::new();
+    for (directory, block, groups) in prefixes {
+        let names = &names_by_directory[*directory];
+        if names.is_empty() {
+            println!("keys {block}: {directory} states no index here, so its keys are unread");
+            continue;
+        }
+        for group in *groups {
+            let found = names.iter().filter(|name| name.starts_with(group)).count();
+            if found == 0 {
+                missing.push(format!(
+                    "{block} asks for {group}* and {directory} holds none"
+                ));
+            } else {
+                println!("keys {block}: {group}* {found} tensors");
+            }
+        }
+    }
+    if !missing.is_empty() {
+        for line in &missing {
+            eprintln!("missing key group: {line}");
+        }
+        return Err(format!("{} key groups the blocks ask for are absent", missing.len()).into());
+    }
     Ok(())
 }
