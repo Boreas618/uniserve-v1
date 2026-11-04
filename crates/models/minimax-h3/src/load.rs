@@ -127,15 +127,17 @@ impl Component {
 /// boundary because serving capacity is the caller's decision, not the architecture's
 /// (`AGENTS.md`, Model Library Boundary).
 ///
-/// `text_rows` and `condition_rows` are counted in the attention kind's capacity unit: 64 rows
-/// under dense attention, one VSA tile under sparse attention. The released checkpoint's
-/// deployment is text 2 units (128 rows) and conditions 3 units (192 rows): nine images, three
-/// videos and two keyframes at one unit each.
+/// `text_rows` and `condition_rows` are **rows**, and each is a whole number of the attention
+/// kind's capacity unit - 64 rows under dense attention, one VSA tile under sparse attention -
+/// which is also what `Denoiser::load`'s `Arrangement` takes. The released checkpoint's dense
+/// deployment is 128 text rows and 192 condition rows (two and three units: nine images, three
+/// videos and two keyframes at one unit each); under a 128-row tile the same deployment needs
+/// capacities in whole 128-row tiles instead.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Capacity {
-    /// Text rows every layout of this deployment holds, in capacity units.
+    /// Text rows every layout of this deployment holds, a whole number of capacity units.
     pub text_rows: u32,
-    /// Condition rows it holds, in capacity units.
+    /// Condition rows it holds, a whole number of capacity units.
     pub condition_rows: u32,
     /// The largest frame count it serves.
     ///
@@ -154,18 +156,8 @@ impl Capacity {
     /// capacity the checkpoint cannot reach is reported here rather than on the device.
     pub fn rows(&self, config: &crate::config::DenoiserConfig) -> Result<u32> {
         let unit = config.attention.capacity_rows();
-        let text = self.text_rows.checked_mul(unit).ok_or_else(|| {
-            Error::config(format!(
-                "a text capacity of {} units overflows at {unit} rows a unit",
-                self.text_rows
-            ))
-        })?;
-        let condition = self.condition_rows.checked_mul(unit).ok_or_else(|| {
-            Error::config(format!(
-                "a condition capacity of {} units overflows at {unit} rows a unit",
-                self.condition_rows
-            ))
-        })?;
+        let text = self.text_rows;
+        let condition = self.condition_rows;
         let frames = crate::packing::align_num_frames(self.frames);
         let mut largest = 0;
         for canvas in config.offered_canvases() {
@@ -427,20 +419,22 @@ mod tests {
     fn the_row_bound_is_the_largest_layout_the_deployments_capacity_reaches() {
         use crate::config::tests_support::released_config;
         let config = released_config();
-        let (_, denoiser) = config
-            .only_denoiser()
-            .expect("the released checkpoint's DiT");
+        // The released checkpoint holds both DiT partitions; the base one serves `t2va`/`fl2va`.
+        let denoiser = config
+            .denoisers
+            .get(&Dit::Base)
+            .expect("the released checkpoint's base DiT");
         let unit = denoiser.attention.capacity_rows();
         let capacity = Capacity {
-            text_rows: 2,
-            condition_rows: 3,
+            text_rows: 128,
+            condition_rows: 192,
             frames: 124,
         };
 
-        // The 5 s 16:9 layout of this capacity pads to 38080 rows in today's packing; the bound
-        // is the largest canvas's, so that or more, in whole units.
+        // The largest of the six 768p canvases pads to 38080 rows at this capacity in the
+        // released packing, and to 109440 at 15 s; both are whole attention units.
         let rows = capacity.rows(denoiser).expect("a row bound");
-        assert!(rows >= 38080, "{rows}");
+        assert_eq!(rows, 38080);
         assert_eq!(
             rows % unit,
             0,
@@ -454,19 +448,20 @@ mod tests {
         }
         .rows(denoiser)
         .expect("a row bound");
-        assert!(longer > rows, "{longer} is not larger than {rows}");
+        assert_eq!(longer, 109440);
     }
 
     #[test]
     fn a_sparse_admission_is_sized_by_the_larger_of_the_two_plans() {
         use crate::config::tests_support::released_config;
         let dense = released_config();
-        let (_, dense_dit) = dense
-            .only_denoiser()
-            .expect("the released checkpoint's DiT");
+        let dense_dit = dense
+            .denoisers
+            .get(&Dit::Base)
+            .expect("the released checkpoint's base DiT");
         let capacity = Capacity {
-            text_rows: 2,
-            condition_rows: 3,
+            text_rows: 128,
+            condition_rows: 192,
             frames: 124,
         };
         let dense_rows = capacity.rows(dense_dit).expect("a dense row bound");
@@ -506,8 +501,8 @@ mod tests {
         let options = LoadOptions::new(vec![Component::Transformer]);
         assert!(options.capacity.is_none());
         let sized = LoadOptions::new(vec![Component::Transformer]).with_capacity(Capacity {
-            text_rows: 2,
-            condition_rows: 3,
+            text_rows: 128,
+            condition_rows: 192,
             frames: 124,
         });
         assert!(sized.capacity.is_some());
