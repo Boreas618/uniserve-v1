@@ -45,8 +45,17 @@ pub struct MainProcess {
     /// The child's group and rank, which its standby child repeats.
     pub group: String,
     pub rank: u32,
-    /// The generation that serves, which a standby is started one after.
+    /// The generation that serves.
     pub generation: u64,
+    /// The generation the node's next child takes: the standby, or the
+    /// serving child a relaunch starts when no standby can be promoted. The
+    /// epoch layer takes it from the group and rank's **single generation
+    /// counter**, and it is above every live generation of that group and
+    /// rank when taken; these rules never mint a generation number. `0` means
+    /// none was taken: the rules then return [`Action::Allocate`] and change
+    /// nothing, and the caller takes a number, records it with
+    /// [`Roster::allocated`] and asks again.
+    pub standby_generation: u64,
     /// The cross-node world the node's process joins; `None` when the node
     /// is in no cross-node group and is therefore a failure domain alone.
     pub world: Option<u64>,
@@ -117,6 +126,14 @@ pub enum Action {
     },
     /// Terminate a standby child that can no longer be promoted.
     Terminate { host: String, generation: u64 },
+    /// The node needs a generation for its next child, and only the epoch
+    /// layer's counter can give one: take a number from the group and rank's
+    /// counter and record it with [`Roster::allocated`].
+    Allocate {
+        host: String,
+        group: String,
+        rank: u32,
+    },
     /// The node cannot run again after a device fault: its requests migrate
     /// to another node or replica.
     Migrate { host: String },
@@ -154,6 +171,10 @@ pub enum Phase {
     /// The domain's members are started again, `awaiting` of them not yet
     /// serving.
     Relaunching { awaiting: usize },
+    /// A replacement round waits for the epoch layer's generation numbers:
+    /// the caller takes one per node, records it with [`Roster::allocated`],
+    /// and the round's actions follow the last one.
+    Allocating,
 }
 
 /// A node's standby child.
@@ -183,6 +204,9 @@ pub struct Roster {
     /// The domain of each node, by node index.
     domain_of: Vec<usize>,
     phases: Vec<Phase>,
+    /// The host whose failure started a replacement round that waits for
+    /// generation numbers, per domain.
+    deferred: Vec<Option<String>>,
 }
 
 impl Roster {
@@ -209,6 +233,7 @@ impl Roster {
             domains[domain].push(index);
         }
         let phases = vec![Phase::Absent; domains.len()];
+        let deferred = vec![None; domains.len()];
         Self {
             nodes: processes
                 .into_iter()
@@ -222,6 +247,7 @@ impl Roster {
             domains,
             domain_of,
             phases,
+            deferred,
         }
     }
 
@@ -312,9 +338,16 @@ impl Roster {
                 // kept, and the domain relaunches when it fails.
                 continue;
             };
+            if live
+                .iter()
+                .any(|&node| self.nodes[node].process.standby_generation == 0)
+            {
+                actions.extend(self.allocate_actions(domain));
+                continue;
+            }
             for node in live {
-                let process = &self.nodes[node].process;
-                let generation = process.generation + 1;
+                let process = self.nodes[node].process.clone();
+                let generation = process.standby_generation;
                 actions.push(Action::Spawn {
                     host: process.host.clone(),
                     group: process.group.clone(),
@@ -326,6 +359,8 @@ impl Roster {
                     generation,
                     parked: false,
                 });
+                // The number is spent; the next child needs a new one.
+                self.nodes[node].process.standby_generation = 0;
             }
             self.phases[domain] = Phase::Starting;
         }
@@ -413,7 +448,7 @@ impl Roster {
         }
         if matches!(
             self.phases[domain],
-            Phase::Promoting { .. } | Phase::Relaunching { .. }
+            Phase::Promoting { .. } | Phase::Relaunching { .. } | Phase::Allocating
         ) {
             // The first failure of the round wins.
             return Vec::new();
@@ -442,19 +477,80 @@ impl Roster {
                 })
                 .collect();
         }
-        let mut actions = Vec::new();
         // A member has no parked standby: replace the domain by relaunching
         // every member; no promotion, not even of the members that have one.
-        self.relaunch_all(host, domain, &mut actions);
-        actions
+        match self.relaunch_all(host, domain) {
+            Some(actions) => actions,
+            None => {
+                // The round waits for the epoch layer's generation numbers.
+                self.phases[domain] = Phase::Allocating;
+                self.deferred[domain] = Some(host.to_owned());
+                self.allocate_actions(domain)
+            }
+        }
+    }
+
+    /// The `Allocate` action of every live node of `domain` without a number.
+    fn allocate_actions(&self, domain: usize) -> Vec<Action> {
+        self.live(domain)
+            .into_iter()
+            .filter(|&node| self.nodes[node].process.standby_generation == 0)
+            .map(|node| {
+                let process = &self.nodes[node].process;
+                Action::Allocate {
+                    host: process.host.clone(),
+                    group: process.group.clone(),
+                    rank: process.rank,
+                }
+            })
+            .collect()
+    }
+
+    /// Records the generation the epoch layer took for `host`'s next child,
+    /// from the group and rank's single counter. A replacement round that was
+    /// waiting for numbers starts with the last one.
+    pub fn allocated(&mut self, host: &str, generation: u64) -> Vec<Action> {
+        let Some(node) = self.nodes.iter().position(|node| node.process.host == host) else {
+            return Vec::new();
+        };
+        self.nodes[node].process.standby_generation = generation;
+        let Some(domain) = self.domain_of(host) else {
+            return Vec::new();
+        };
+        if self.phases[domain] != Phase::Allocating {
+            return Vec::new();
+        }
+        if self
+            .live(domain)
+            .iter()
+            .any(|&node| self.nodes[node].process.standby_generation == 0)
+        {
+            return Vec::new();
+        }
+        let failed = self.deferred[domain].take();
+        match failed {
+            Some(failed) => self.relaunch_all(&failed, domain).unwrap_or_default(),
+            None => Vec::new(),
+        }
     }
 
     /// Starts every live member of `domain` again and drops its standbys.
-    fn relaunch_all(&mut self, failed: &str, domain: usize, actions: &mut Vec<Action>) {
+    /// Returns `None` when any live member has no generation for its next
+    /// child: the caller then asks the epoch layer for the numbers
+    /// ([`Action::Allocate`]) and the round follows the last one.
+    fn relaunch_all(&mut self, failed: &str, domain: usize) -> Option<Vec<Action>> {
         let live = self.live(domain);
+        if live
+            .iter()
+            .any(|&node| self.nodes[node].process.standby_generation == 0)
+        {
+            return None;
+        }
+        let mut actions = Vec::new();
         for &node in &live {
             let process = self.nodes[node].process.clone();
             let generation = process.generation;
+            let next = process.standby_generation;
             if let Some(standby) = self.nodes[node].standby.take() {
                 actions.push(Action::Terminate {
                     host: process.host.clone(),
@@ -472,12 +568,15 @@ impl Roster {
                 host: process.host.clone(),
                 group: process.group.clone(),
                 rank: process.rank,
-                generation: generation + 1,
+                generation: next,
             });
+            // The number is spent; the next child needs a new one.
+            self.nodes[node].process.standby_generation = 0;
         }
         self.phases[domain] = Phase::Relaunching {
             awaiting: live.len(),
         };
+        Some(actions)
     }
 
     /// The promotion of the host's standby took effect:
@@ -516,6 +615,8 @@ impl Roster {
             });
             if let Some(standby) = self.nodes[node].standby.take() {
                 self.nodes[node].process.generation = standby.generation;
+                // The next child needs a number from the counter.
+                self.nodes[node].process.standby_generation = 0;
             }
         }
         self.phases[domain] = Phase::Absent;
@@ -530,9 +631,14 @@ impl Roster {
         if !matches!(self.phases[domain], Phase::Promoting { .. }) {
             return Vec::new();
         }
-        let mut actions = Vec::new();
-        self.relaunch_all(host, domain, &mut actions);
-        actions
+        match self.relaunch_all(host, domain) {
+            Some(actions) => actions,
+            None => {
+                self.phases[domain] = Phase::Allocating;
+                self.deferred[domain] = Some(host.to_owned());
+                self.allocate_actions(domain)
+            }
+        }
     }
 
     /// The serving child of `host` started again at `generation`.
@@ -545,6 +651,7 @@ impl Roster {
         };
         if let Some(node) = self.nodes.iter_mut().find(|node| node.process.host == host) {
             node.process.generation = generation;
+            node.process.standby_generation = 0;
         }
         self.phases[domain] = if awaiting <= 1 {
             Phase::Absent
@@ -591,29 +698,14 @@ impl Roster {
         // serving children are replaced, and the requests migrate off the
         // node that cannot run. The epoch's placement loses the node, which
         // the caller decides.
-        for &member in &live {
-            let process = self.nodes[member].process.clone();
-            if let Some(standby) = self.nodes[member].standby.take() {
-                actions.push(Action::Terminate {
-                    host: process.host.clone(),
-                    generation: standby.generation,
-                });
+        match self.relaunch_all(host, domain) {
+            Some(relaunched) => actions.extend(relaunched),
+            None => {
+                self.phases[domain] = Phase::Allocating;
+                self.deferred[domain] = Some(host.to_owned());
+                actions.extend(self.allocate_actions(domain));
             }
-            actions.push(Action::Stop {
-                host: process.host.clone(),
-                group: process.group.clone(),
-                generation: process.generation,
-            });
-            actions.push(Action::Relaunch {
-                host: process.host.clone(),
-                group: process.group.clone(),
-                rank: process.rank,
-                generation: process.generation + 1,
-            });
         }
-        self.phases[domain] = Phase::Relaunching {
-            awaiting: live.len(),
-        };
         actions.push(Action::Migrate {
             host: host.to_owned(),
         });
@@ -627,6 +719,10 @@ impl Roster {
     /// layer does not need to know its generation. A replacement round in
     /// flight owns the domain's children until it ends, so a retirement is
     /// refused then; the round's own actions stop them.
+    ///
+    /// A revert retires the target epoch's standbys this way, and the restored
+    /// epoch starts a new standby at a fresh number from the same counter: a
+    /// retired child's generation is never reused.
     pub fn retired(&mut self, host: &str) -> Vec<Action> {
         let Some(domain) = self.domain_of(host) else {
             return Vec::new();
@@ -678,6 +774,7 @@ impl Phase {
             Self::Parked => "parked",
             Self::Promoting { .. } => "promoting",
             Self::Relaunching { .. } => "relaunching",
+            Self::Allocating => "allocating",
         }
     }
 }
