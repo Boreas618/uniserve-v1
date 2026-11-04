@@ -28,13 +28,12 @@
 //!
 //! A row whose temperature is zero is **not** a draw: it is [`Self::argmax`]'s row. The shaper
 //! divides such a row by one rather than by zero (`ops::sampler`'s doc cites the rule), so the row's
-//! shaped logits keep the logits' order and its largest candidate is the temperature-zero token —
-//! which is exactly what a draw of `0` would select *because* the candidates are in descending order,
-//! not because the draw path knows about temperature. The temperature of each row is a request
-//! parameter, so the executor knows which rows are greedy and routes them: `argmax` over the row's
-//! candidates for those, this path's draw for the rest. Sending a greedy row down the draw path would
-//! be right only by that coincidence, and sending it down with a divided-by-zero temperature would be
-//! `nan`.
+//! shaped logits keep the logits' order and its largest candidate is the temperature-zero token. The
+//! temperature of each row is a request parameter, so the executor knows which rows are greedy and
+//! routes them: `argmax` over the row's logits for those, this path's draw for the rest. No draw can
+//! replace that step, because the draw path's candidates are sorted by token id before the CDF (the
+//! step the reference takes at `uniserve/sampling/top_k.py:307-314`), so a draw of zero selects the
+//! lowest token id rather than the largest logit.
 //!
 //! ## Rows that cannot be sampled
 //!
