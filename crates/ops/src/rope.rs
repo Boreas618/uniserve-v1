@@ -262,6 +262,13 @@ pub struct QkNormRopeDescriptor {
     pub rotation: Rotation,
     /// The RMS floor of the per-head normalization, in bit form so the key is canonical.
     pub epsilon: Float,
+    /// Channels of each head the rotation turns; `head_dim` for a full-width rotation.
+    ///
+    /// A multimodal transformer rotates the leading channels of a head and leaves the rest as they
+    /// are — H3 rotates 96 of 128 — so the tables carry `rotated / 2` pair columns rather than
+    /// `head_dim / 2`, and the program copies the trailing channels through. The key names this
+    /// only when it is narrower than the head, so every full-width key is unchanged.
+    pub rotated: u32,
     /// Tokens one program handles.
     pub rows: u32,
     /// The head tile one program loads at a time.
@@ -290,6 +297,12 @@ impl fmt::Display for QkNormRopeDescriptor {
             .field("rows", self.rows)
             .field("block", self.block)
             .field("pdl", self.pdl);
+        // A narrowed rotation is its own variant; a full-width one keeps the key it had.
+        let key = if self.rotated == self.head_dim {
+            key
+        } else {
+            key.field("rotated", self.rotated)
+        };
         // Named only for the unweighted form, so every key a trained transformer compiles stays
         // exactly the key it was: the video VAE's weightless per-head norm is a new variant, not a
         // renamed old one.
@@ -313,9 +326,9 @@ pub struct QkNormRopeArgs {
     pub q_weight: Option<TensorView>,
     /// `[head_dim]`, the key normalization's scale; `None` when the descriptor is unweighted.
     pub k_weight: Option<TensorView>,
-    /// `[tokens, head_dim/2]`, the cosine factors of each token's position.
+    /// `[tokens, rotated/2]`, the cosine factors of each token's position.
     pub cosine: TensorView,
-    /// `[tokens, head_dim/2]`, the sine factors of each token's position.
+    /// `[tokens, rotated/2]`, the sine factors of each token's position.
     pub sine: TensorView,
     /// `[tokens, q_heads, head_dim]` normalized, rotated queries.
     pub q_out: TensorView,
@@ -339,7 +352,19 @@ impl Op for QkNormRope {
         stream: &Stream,
     ) -> Result<()> {
         let head_dim = u64::from(descriptor.head_dim);
-        let pairs = head_dim / 2;
+        if descriptor.rotated == 0
+            || u64::from(descriptor.rotated) > head_dim
+            || descriptor.rotated % 2 != 0
+        {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "a rotation of {} channels does not fit a head of {head_dim} with whole pairs",
+                    descriptor.rotated
+                ),
+            ));
+        }
+        let pairs = u64::from(descriptor.rotated) / 2;
         let tokens = args.query.rows();
         if args.key.rows() != tokens {
             return Err(Error::argument(
@@ -429,6 +454,11 @@ impl Op for QkNormRope {
             .u64(tokens)
             .f32(f32::from_bits(descriptor.epsilon.0 as u32))
             .flag(descriptor.pdl);
+        // A full rotation's arguments end at `pdl`, so its existing packages stay valid; a partial
+        // one names how many channels rotate.
+        if descriptor.rotated != descriptor.head_dim {
+            arguments.u32(descriptor.rotated);
+        }
         kernel.launch(LaunchGrid::linear(programs)?, &mut arguments, stream)
     }
 
@@ -443,7 +473,7 @@ impl Op for QkNormRope {
 
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
         // The per-head RMS reduces over the head in FP32, then one rotation product and one
-        // rounding to the output dtype.
+        // rounding to the output dtype; the channels past `rotated` are copied and cost nothing.
         Tolerance::rounding(
             u64::from(descriptor.head_dim),
             DType::F32,
@@ -464,6 +494,7 @@ mod tests {
             q_heads: 32,
             k_heads: 4,
             rotation: Rotation::Half,
+            rotated: 128,
             epsilon: Float::from(1e-6_f32),
             rows: 1,
             block: 128,
@@ -480,6 +511,41 @@ mod tests {
             descriptor(true).to_string(),
             "dtype_bf16_output_bf16_head_dim_128_q_heads_32_k_heads_4_rotation_half_epsilon_0x358637bd_rows_1_block_128_pdl_false"
         );
+    }
+
+    #[test]
+    fn a_full_rotation_keeps_the_key_and_a_partial_one_names_its_width() {
+        assert_eq!(
+            descriptor(true).to_string(),
+            "dtype_bf16_output_bf16_head_dim_128_q_heads_32_k_heads_4_rotation_half_epsilon_0x358637bd_rows_1_block_128_pdl_false"
+        );
+        // H3's 96-of-128 rotary: the same descriptor with a narrower rotation is another module.
+        let partial = QkNormRopeDescriptor {
+            rotated: 96,
+            ..descriptor(true)
+        };
+        assert_eq!(
+            partial.to_string(),
+            "dtype_bf16_output_bf16_head_dim_128_q_heads_32_k_heads_4_rotation_half_epsilon_0x358637bd_rows_1_block_128_pdl_false_rotated_96"
+        );
+    }
+
+    #[test]
+    fn a_rotation_that_leaves_a_head_or_has_no_pair_is_refused() {
+        for rotated in [0, 127, 130] {
+            let descriptor = QkNormRopeDescriptor {
+                rotated,
+                ..descriptor(true)
+            };
+            // The check runs inside `launch`, which needs a kernel; the rule itself is pure, so it
+            // is asserted here on the values it must reject.
+            assert!(
+                descriptor.rotated == 0
+                    || descriptor.rotated > descriptor.head_dim
+                    || !descriptor.rotated.is_multiple_of(2),
+                "{rotated} must be rejected"
+            );
+        }
     }
 
     #[test]
