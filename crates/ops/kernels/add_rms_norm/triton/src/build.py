@@ -8,7 +8,7 @@ import _compile
 import add_rms_norm as kernels
 
 #: The floating dtypes an activation row, its residual and its outputs may have.
-DTYPES = {"bf16": "bf16", "fp16": "fp16", "fp32": "fp32"}
+DTYPES = {"bf16": "bf16", "fp16": "fp16", "fp32": "fp32", "f32": "fp32"}
 
 
 def warps_of(tile):

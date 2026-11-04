@@ -1,0 +1,36 @@
+# The antialiased_resize_uint8 operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
+# driver the Program Server runs for one descriptor and target).
+#
+# The interpolation is part of the compilation: the triangle and the cubic use
+# different supports and formulas, so they are separate programs. The frame is uint8
+# by construction, so no dtype dimension. The key is the one `Descriptor`'s `Display`
+# prints, e.g. `mode_bicubic_channels_3_block_1024_pdl_false`.
+
+op = "antialiased_resize_uint8"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/antialiased_resize_uint8.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+[kernel.descriptors]
+dimensions = { mode = ["bicubic", "bilinear"], channels = ["1", "2", "3", "4", "16", "32"], block = ["256", "512", "1024", "2048"], pdl = ["true", "false"] }
+
+[parameters]

@@ -1,9 +1,10 @@
 """The route_gemm package's compile script: one descriptor -> one module.
 
-FC2 of a mixture of experts: multiply each permuted row by its expert's down
-projection and store the unweighted result at the row's expanded index, so the
-output holds every token's uncombined routes. A descriptor is the MMA tile and
-cluster (the tactic), the problem's K and N and the expert count.
+FC2 of a mixture of experts over the MoE sort's tile metadata: multiply each
+permuted tile's rows by the expert's down projection and store each route's row
+of the model's hidden width. A descriptor is the problem's hidden and
+intermediate widths, its expert count, its top-k expansion, the element type,
+the MMA tile and the cluster, which is what the operator's key carries.
 """
 
 import cutlass
@@ -13,17 +14,17 @@ from cutlass.cute.runtime import make_ptr
 import _compile
 import route_gemm as kernels
 
-#: (MMA tile M, N) and cluster (M, N) of each tactic the operator offers; the
-#: MoE sort's routing tile equals the MMA tile's M.
-TACTICS = {
-    "m128n128": ((128, 128), (1, 1)),
-    "m128n256": ((128, 256), (1, 1)),
-    "m256n128": ((256, 128), (2, 1)),
-    "m256n256": ((256, 256), (2, 1)),
-}
+#: The element types the kernel serves, by the operator's name.
+DTYPES = {"bf16": cutlass.BFloat16}
 
-#: Elements of a BF16 row a pointer must be aligned to: 32 bytes.
+#: Elements of a row a pointer must be aligned to: 32 bytes.
 ALIGN = 16
+
+
+def shape_of(text):
+    """The (rows, columns) a `MxN` descriptor value names."""
+    rows, columns = text.split("x")
+    return (int(rows), int(columns))
 
 
 def pointer(dtype):
@@ -33,12 +34,16 @@ def pointer(dtype):
 
 def spec(fields, parameters, target):
     """The compilation of one route_gemm descriptor."""
-    tiler, cluster = TACTICS[fields["tactic"]]
-    k = int(fields["k"])
-    n = int(fields["n"])
+    tiler = shape_of(fields["tile"])
+    cluster = shape_of(fields["cluster"])
+    element = DTYPES[fields["dtype"]]
     experts = int(fields["experts"])
-    m = int(parameters["rows"])
-    routes = m
+    hidden = int(fields["hidden"])
+    intermediate = int(fields["intermediate"])
+    # The sort metadata and the row counts are runtime sizes; the compile
+    # describes one representative problem big enough for every bucket.
+    permuted_rows = int(parameters["permuted_rows"])
+    expanded_rows = int(parameters["expanded_rows"])
     kernel = kernels.RouteGroupedGemmKernel(
         mma_tiler_mn=tiler,
         cluster_shape_mn=cluster,
@@ -48,18 +53,18 @@ def spec(fields, parameters, target):
         "entry": "uniserve_route_gemm",
         "kernel": kernel.wrapper,
         "args": [
-            pointer(cutlass.BFloat16),
-            pointer(cutlass.BFloat16),
-            pointer(cutlass.BFloat16),
+            pointer(element),
+            pointer(element),
+            pointer(element),
             pointer(cutlass.Int32),
             pointer(cutlass.Int32),
             pointer(cutlass.Int32),
             pointer(cutlass.Int32),
-            m,
-            n,
-            k,
+            permuted_rows,
+            hidden,
+            intermediate,
             experts,
-            routes,
+            expanded_rows,
         ],
         "options": {
             "tile_size": tiler[0],

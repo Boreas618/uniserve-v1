@@ -791,6 +791,10 @@ fn a_created_segment_is_counted_as_created_until_it_is_released() {
     let granularity = HandleType::Descriptor.granularity(DEVICE).unwrap();
     let bytes = (1_usize << 30).div_ceil(granularity) * granularity;
     let mut segmented = SegmentedMapping::reserve(DEVICE, &[bytes], &[]).unwrap();
+    // Both NVML readings are taken with every queued release made, so what
+    // separates them is this test's own segment and not an earlier test's
+    // storage still waiting for the reclaimer.
+    reclaim::flush().unwrap();
     let before = match nvml.process_storage(DEVICE) {
         Ok(before) => before,
         // NVML lists host PIDs; a container without the host PID namespace
@@ -814,6 +818,9 @@ fn a_created_segment_is_counted_as_created_until_it_is_released() {
 
     segmented.release(0).unwrap();
     assert_eq!(platform::created_bytes(DEVICE), created_before);
+    // `release` unmaps the segment at once but hands the creating handle to
+    // the reclaimer, so the storage is freed when the queue has been made.
+    reclaim::flush().unwrap();
     let released = nvml.process_storage(DEVICE).unwrap();
     assert!(
         released < before + bytes as u64 / 2,
@@ -829,7 +836,7 @@ fn single_rank_communicators_run_collectives() {
     let data = DeviceAllocation::linear(DEVICE, 16).unwrap();
     let host = PinnedBuffer::new(DEVICE, 16).unwrap();
     let id = UniqueId::new().unwrap();
-    let mut communicator = Communicator::init(DEVICE, 1, 0, &id).unwrap();
+    let communicator = Communicator::init(DEVICE, 1, 0, &id).unwrap();
     assert_eq!((communicator.rank(), communicator.size()), (0, 1));
 
     // SAFETY: the buffers outlive the synchronization below.
@@ -1454,20 +1461,34 @@ fn a_matrix_product_runs_on_an_algorithm_the_heuristic_offers() {
     } else {
         DeviceAllocation::linear(DEVICE, 4).unwrap()
     };
+    let range = |allocation: &DeviceAllocation| {
+        DeviceRange::new(
+            DevicePtr::from_address(allocation.address()),
+            allocation.len(),
+        )
+    };
     let args = MatmulArgs {
-        a: a_device.address(),
-        b: b_device.address(),
-        c: c_device.address(),
-        d: d_device.address(),
+        a: range(&a_device),
+        b: range(&b_device),
+        c: range(&c_device),
+        d: range(&d_device),
         alpha: 1.0,
         beta: 0.0,
-        bias: 0,
-        workspace: workspace.address(),
-        workspace_bytes: workspace.len(),
+        // A multiplication without the bias epilogue names no bias vector.
+        bias: DeviceRange::new(DevicePtr::from_address(0), 0),
+        workspace: range(&workspace),
     };
-    // SAFETY: every operand is a device allocation of the descriptor's bytes and
-    // outlives the launch, and the workspace is the algorithm's own need.
-    unsafe { matmul.run(&descriptor, &algorithm, &args, &stream) }.unwrap();
+    matmul.run(&descriptor, &algorithm, &args, &stream).unwrap();
+    // A range too small for the descriptor's shape is refused by name, before
+    // any cuBLASLt call.
+    let short = MatmulArgs {
+        a: DeviceRange::new(DevicePtr::from_address(a_device.address()), 8),
+        ..args
+    };
+    let refused = matmul
+        .run(&descriptor, &algorithm, &short, &stream)
+        .unwrap_err();
+    assert!(matches!(refused, Error::InvalidArgument(_)), "{refused:?}");
     stream.synchronize().unwrap();
 
     let host = PinnedBuffer::new(DEVICE, expected.len() * 4).unwrap();
@@ -1518,10 +1539,12 @@ fn kernel_node_params_read_back_what_a_capture_recorded() {
     let mut parameters: [*mut c_void; 2] = [(&raw mut out).cast(), (&raw mut value).cast()];
 
     let mut capture = Capture::begin(&stream, CaptureMode::Relaxed).unwrap();
+    // The write kernel stores at `threadIdx.x`, so one block of eight threads
+    // fills the eight words of the allocation.
     write
         .launch_ex(
             &stream,
-            &LaunchConfig::new([2, 1, 1], [4, 1, 1]),
+            &LaunchConfig::new([1, 1, 1], [8, 1, 1]),
             &mut parameters,
         )
         .unwrap();
@@ -1531,8 +1554,8 @@ fn kernel_node_params_read_back_what_a_capture_recorded() {
 
     assert_eq!(node.kind().unwrap(), GraphNodeKind::Kernel);
     let read = graph.kernel_node_params(&node).unwrap();
-    assert_eq!(read.grid, [2, 1, 1], "the grid the launch carried");
-    assert_eq!(read.block, [4, 1, 1], "the block the launch carried");
+    assert_eq!(read.grid, [1, 1, 1], "the grid the launch carried");
+    assert_eq!(read.block, [8, 1, 1], "the block the launch carried");
     assert_eq!(read.shared_memory, 0);
     assert_eq!(read.parameters.len(), 2, "the kernel takes two parameters");
     assert_eq!(
@@ -1618,9 +1641,10 @@ fn recapture_builds_an_executable_of_the_new_capture() {
     );
 }
 
-/// A tensor map encodes the layout a TMA kernel moves: the driver accepts a
-/// rank-1 and a rank-2 description of device storage, and the description is
-/// checked against its rank before the driver sees it.
+/// A tensor map encodes the layout a TMA kernel moves: the driver encodes a
+/// two-dimensional description of device storage, a one-dimensional tensor
+/// reaches it as rank two with a trailing dimension of one, and a rank the
+/// driver refuses is named before the driver sees it.
 #[test]
 #[ignore = "requires a CUDA device"]
 fn tensor_maps_encode_tiled_descriptors() {
@@ -1629,19 +1653,21 @@ fn tensor_maps_encode_tiled_descriptors() {
     let device = Device::new(DEVICE).unwrap();
     let storage = DeviceAllocation::linear(DEVICE, 4096).unwrap();
 
-    let rank_one = TensorMapSpec {
+    // A one-dimensional tensor of 64 elements, as the rank the driver takes.
+    let one_dimensional_strides = [64 * 4];
+    let one_dimensional = TensorMapSpec {
         data_type: TensorDataType::Float32,
         global_address: storage.address(),
-        global_dim: &[64],
-        global_strides: &[],
-        box_dim: &[4],
-        element_strides: &[1],
+        global_dim: &[64, 1],
+        global_strides: &one_dimensional_strides,
+        box_dim: &[4, 1],
+        element_strides: &[1, 1],
         interleave: Interleave::None,
         swizzle: Swizzle::None,
         l2_promotion: L2Promotion::None,
         oob_fill: OobFill::None,
     };
-    let encoded = TensorMap::encode_tiled(&device, &rank_one).unwrap();
+    let encoded = TensorMap::encode_tiled(&device, &one_dimensional).unwrap();
     assert!(
         encoded.as_bytes().iter().any(|byte| *byte != 0),
         "the driver encoded the descriptor"
@@ -1672,21 +1698,34 @@ fn tensor_maps_encode_tiled_descriptors() {
     ));
     let rank_zero = TensorMapSpec {
         global_dim: &[],
-        ..rank_one
+        ..one_dimensional
     };
     assert!(matches!(
         TensorMap::encode_tiled(&device, &rank_zero),
         Err(Error::InvalidArgument(_))
     ));
+    // The driver on this platform encodes no rank-one map, so the API states
+    // the rank it takes instead of handing the description over.
+    let rank_one = TensorMapSpec {
+        global_dim: &[64],
+        global_strides: &[],
+        box_dim: &[4],
+        element_strides: &[1],
+        ..one_dimensional
+    };
+    assert!(matches!(
+        TensorMap::encode_tiled(&device, &rank_one),
+        Err(Error::InvalidArgument(_))
+    ));
 }
 
 #[test]
-#[ignore = "requires a CUDA device"]
+#[ignore = "requires a CUDA device and NCCL"]
 fn a_communicator_splits_into_a_subgroup_and_a_rank_left_out_gets_none() {
     let _driver = exclusive_driver();
     let id = UniqueId::new().unwrap();
     let world = Communicator::init(DEVICE, 1, 0, &id).unwrap();
-    let mut tp = world
+    let tp = world
         .split(&[0], 0)
         .unwrap()
         .expect("the only rank is in the subgroup");
@@ -1838,20 +1877,27 @@ fn convolve(
     let mut host_filter = PinnedBuffer::new(DEVICE, w.len() * 4).unwrap();
     let host_output = PinnedBuffer::new(DEVICE, y_len * 4).unwrap();
 
-    // SAFETY: each host slice is filled whole, and every copy below lies
-    // inside the buffers it names.
+    // SAFETY: each copy lies inside the buffers it names, and every one of
+    // them outlives the synchronization below.
     unsafe {
         host_input.as_mut_slice().copy_from_slice(float_bytes(x));
         host_filter.as_mut_slice().copy_from_slice(float_bytes(w));
         memcpy_async(input.address(), host_input.address(), x.len() * 4, stream).unwrap();
         memcpy_async(filter.address(), host_filter.address(), w.len() * 4, stream).unwrap();
-        let args = ConvolutionArgs {
-            x: input.address(),
-            w: filter.address(),
-            y: output.address(),
-            workspace: workspace.address(),
-        };
-        cudnn.run(&plan, args, stream).unwrap();
+    }
+    let args = ConvolutionArgs::new(
+        DeviceRange::new(DevicePtr::from_address(input.address()), x.len() * 4),
+        DeviceRange::new(DevicePtr::from_address(filter.address()), w.len() * 4),
+        DeviceRange::new(DevicePtr::from_address(output.address()), y_len * 4),
+        DeviceRange::new(
+            DevicePtr::from_address(workspace.address()),
+            workspace.len(),
+        ),
+    );
+    cudnn.run(&plan, args, stream).unwrap();
+    // SAFETY: the copy reads the output allocation into a pinned buffer of
+    // its size.
+    unsafe {
         memcpy_async(host_output.address(), output.address(), y_len * 4, stream).unwrap();
     }
     stream.synchronize().unwrap();
@@ -1897,6 +1943,8 @@ fn a_convolution_matches_the_definition_of_a_conv1d() {
         .collect();
     let expected = forward_reference(&x, x_dims, &w, w_dims, y_dims, stride, padding, dilation);
 
+    // The definition is an FP32 convolution, so the comparison asks for the
+    // engines that do not down-convert their inputs to TF32.
     let convolution = Convolution::new(
         Tensor::contiguous(vec![1, 2, 5], DataType::F32),
         Tensor::contiguous(vec![3, 2, 3], DataType::F32),
@@ -1904,10 +1952,39 @@ fn a_convolution_matches_the_definition_of_a_conv1d() {
         vec![padding],
         vec![stride],
         vec![dilation],
-    );
+    )
+    .with_tf32_allowed(false);
     let observed = convolve(&cudnn, &stream, &convolution, &x, &w, expected.len(), None);
 
     assert_close(&observed, &expected);
+
+    // With TF32 allowed an engine may round both inputs to ten mantissa bits,
+    // so each product carries up to 2 · 2⁻¹¹ of relative error and the sum is
+    // bounded by that times the products' magnitudes. That is the numerical
+    // contract a layer that leaves TF32 on accepts, and it is what the video
+    // VAE runs under.
+    let largest = |values: &[f32]| {
+        values
+            .iter()
+            .fold(0.0f32, |most, value| most.max(value.abs()))
+    };
+    let taps = (w_dims[1] * w_dims[2]) as f32;
+    let tf32_error = 2.0 * 2f32.powi(-11) * taps * largest(&x) * largest(&w);
+    let allowed = convolve(
+        &cudnn,
+        &stream,
+        &convolution.clone().with_tf32_allowed(true),
+        &x,
+        &w,
+        expected.len(),
+        None,
+    );
+    for (index, (observed, expected)) in allowed.iter().zip(&expected).enumerate() {
+        assert!(
+            (observed - expected).abs() <= tf32_error,
+            "element {index}: {observed} is outside TF32's error bound {tf32_error} around {expected}"
+        );
+    }
 
     // The plan's engine is the record a program carries: eight bytes that
     // round-trip, and a plan built from the recorded engine runs the same
@@ -1921,6 +1998,29 @@ fn a_convolution_matches_the_definition_of_a_conv1d() {
         plan.engine(),
         "the recorded engine is the one the heuristic proposes"
     );
+
+    // A range shorter than its tensor is named before the driver sees it.
+    let bytes = plan.bytes();
+    let input = DeviceAllocation::linear(DEVICE, bytes.x as usize).unwrap();
+    let filter = DeviceAllocation::linear(DEVICE, bytes.w as usize).unwrap();
+    let output = DeviceAllocation::linear(DEVICE, bytes.y as usize).unwrap();
+    let workspace = DeviceAllocation::linear(DEVICE, plan.workspace_bytes().max(4)).unwrap();
+    let short = ConvolutionArgs::new(
+        DeviceRange::new(DevicePtr::from_address(input.address()), bytes.x as usize),
+        DeviceRange::new(DevicePtr::from_address(filter.address()), bytes.w as usize),
+        DeviceRange::new(
+            DevicePtr::from_address(output.address()),
+            bytes.y as usize - 4,
+        ),
+        DeviceRange::new(
+            DevicePtr::from_address(workspace.address()),
+            workspace.len(),
+        ),
+    );
+    let error = cudnn
+        .run(&plan, short, &stream)
+        .expect_err("an output range one element short");
+    assert!(error.to_string().contains("its tensor needs"), "{error}");
 }
 
 /// cuDNN's backward data pass computes the definition of a `ConvTranspose1d`,
@@ -1961,8 +2061,313 @@ fn a_transposed_convolution_matches_the_definition_of_a_conv_transpose1d() {
         vec![stride],
         vec![dilation],
         vec![output_padding],
-    );
+    )
+    .with_tf32_allowed(false);
     let observed = convolve(&cudnn, &stream, &convolution, &x, &w, expected.len(), None);
 
     assert_close(&observed, &expected);
+}
+
+/// One logical 5-D tensor (batch, channels, depth, height, width) laid out the
+/// way `torch.channels_last_3d` lays it out: the channel of an element is
+/// adjacent to it and the batch strides over the rest.
+fn channels_last_3d(values: &[f32], dims: [usize; 5]) -> Vec<f32> {
+    let [batch, channels, depth, height, width] = dims;
+    let mut laid_out = vec![0.0f32; values.len()];
+    for n in 0..batch {
+        for c in 0..channels {
+            for d in 0..depth {
+                for h in 0..height {
+                    for w in 0..width {
+                        let logical =
+                            ((n * channels + c) * depth + d) * height * width + h * width + w;
+                        let offset =
+                            ((n * depth + d) * height * width + h * width + w) * channels + c;
+                        laid_out[offset] = values[logical];
+                    }
+                }
+            }
+        }
+    }
+    laid_out
+}
+
+/// The logical order of a tensor laid out the way `torch.channels_last_3d`
+/// lays it out, the inverse of [`channels_last_3d`].
+fn logical_3d(values: &[f32], dims: [usize; 5]) -> Vec<f32> {
+    let [batch, channels, depth, height, width] = dims;
+    let mut logical = vec![0.0f32; values.len()];
+    for n in 0..batch {
+        for c in 0..channels {
+            for d in 0..depth {
+                for h in 0..height {
+                    for w in 0..width {
+                        let offset =
+                            ((n * depth + d) * height * width + h * width + w) * channels + c;
+                        let logical_offset =
+                            ((n * channels + c) * depth + d) * height * width + h * width + w;
+                        logical[logical_offset] = values[offset];
+                    }
+                }
+            }
+        }
+    }
+    logical
+}
+
+/// The definition of a three-dimensional cross-correlation, computed on the
+/// host: `y[n][k][d][h][w] = sum over c, (j1, j2, j3) of
+/// x[n][c][d·s − p + j1·dil][h·s − p + j2·dil][w·s − p + j3·dil] · w[k][c][j]`,
+/// with a zero outside the input.
+#[allow(clippy::too_many_arguments)]
+fn forward_reference_3d(
+    x: &[f32],
+    x_dims: [usize; 5],
+    w: &[f32],
+    w_dims: [usize; 5],
+    y_dims: [usize; 5],
+    padding: usize,
+) -> Vec<f32> {
+    let [batch, channels, depth, height, width] = x_dims;
+    let [_, filters, kernel_d, kernel_h, kernel_w] = w_dims;
+    let [_, _, out_d, out_h, out_w] = y_dims;
+    let mut y = vec![0.0f32; batch * filters * out_d * out_h * out_w];
+    for n in 0..batch {
+        for k in 0..filters {
+            for od in 0..out_d {
+                for oh in 0..out_h {
+                    for ow in 0..out_w {
+                        let mut total = 0.0f64;
+                        for c in 0..channels {
+                            for jd in 0..kernel_d {
+                                let d = od as i64 + padding as i64 - jd as i64;
+                                if d < 0 || d >= depth as i64 {
+                                    continue;
+                                }
+                                for jh in 0..kernel_h {
+                                    let h = oh as i64 + padding as i64 - jh as i64;
+                                    if h < 0 || h >= height as i64 {
+                                        continue;
+                                    }
+                                    for jw in 0..kernel_w {
+                                        let w_index = ow as i64 + padding as i64 - jw as i64;
+                                        if w_index < 0 || w_index >= width as i64 {
+                                            continue;
+                                        }
+                                        let value = x[(((n * channels + c) * depth + d as usize)
+                                            * height
+                                            + h as usize)
+                                            * width
+                                            + w_index as usize];
+                                        let weight = w[(((k * channels + c) * kernel_d + jd)
+                                            * kernel_h
+                                            + jh)
+                                            * kernel_w
+                                            + jw];
+                                        total += f64::from(value) * f64::from(weight);
+                                    }
+                                }
+                            }
+                        }
+                        y[(((n * filters + k) * out_d + od) * out_h + oh) * out_w + ow] =
+                            total as f32;
+                    }
+                }
+            }
+        }
+    }
+    y
+}
+
+/// cuDNN runs the video VAE's layout: a `Conv3d` whose filter and tensors are
+/// laid out `channels_last_3d` — cuDNN's NHWC — computes the same definition
+/// as the contiguous case, so the description's explicit strides are what
+/// makes the VAE expressible.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn a_channels_last_convolution_matches_the_definition_of_a_conv3d() {
+    let _driver = exclusive_driver();
+    let device = Device::new(DEVICE).unwrap();
+    let cudnn = Cudnn::new(&device).unwrap();
+    let stream = Stream::new(DEVICE).unwrap();
+
+    let x_dims = [1usize, 2, 2, 3, 3];
+    let w_dims = [2usize, 2, 3, 3, 3];
+    let y_dims = [1usize, 2, 2, 3, 3];
+    let padding = 1usize;
+    let kernel = w_dims[2..].to_vec();
+
+    // Logical tensors, then the layout the model keeps them in.
+    let logical_x: Vec<f32> = (0..x_dims.iter().product())
+        .map(|i| (i % 7) as f32 * 0.25 - 0.75)
+        .collect();
+    let logical_w: Vec<f32> = (0..w_dims.iter().product())
+        .map(|i| ((i * 3) % 5) as f32 * 0.25 - 0.5)
+        .collect();
+    let expected = forward_reference_3d(&logical_x, x_dims, &logical_w, w_dims, y_dims, padding);
+    let x = channels_last_3d(&logical_x, x_dims);
+    let w = channels_last_3d(&logical_w, w_dims);
+
+    // Channels-last strides: the channel of an element is one step away, and
+    // the batch strides over the whole channel-last image.
+    let [batch, channels, depth, height, width] = x_dims;
+    let image = depth * height * width;
+    let x_strides = vec![
+        (image * channels) as i64,
+        1,
+        (height * width * channels) as i64,
+        (width * channels) as i64,
+        channels as i64,
+    ];
+    let [filters, _, kd, kh, kw] = w_dims;
+    let filter_strides = vec![
+        (kd * kh * kw * channels) as i64,
+        1,
+        (kh * kw * channels) as i64,
+        (kw * channels) as i64,
+        channels as i64,
+    ];
+    let y_strides = vec![
+        (y_dims[2] * y_dims[3] * y_dims[4] * y_dims[1]) as i64,
+        1,
+        (y_dims[3] * y_dims[4] * y_dims[1]) as i64,
+        (y_dims[4] * y_dims[1]) as i64,
+        y_dims[1] as i64,
+    ];
+    let tensor = |dims: [usize; 5], strides: Vec<i64>, dtype: DataType| Tensor {
+        dims: dims.iter().map(|&dim| dim as i64).collect(),
+        strides,
+        dtype,
+        byte_alignment: 16,
+    };
+    let convolution = Convolution::new(
+        tensor(x_dims, x_strides, DataType::F32),
+        tensor(w_dims, filter_strides, DataType::F32),
+        tensor(y_dims, y_strides, DataType::F32),
+        vec![padding as i64; 3],
+        vec![1; 3],
+        vec![1; 3],
+    )
+    .with_tf32_allowed(false);
+    assert_eq!(convolution.rank(), 3);
+    assert_eq!((batch, channels, filters, kernel), (1, 2, 2, vec![3, 3, 3]));
+
+    let observed = convolve(&cudnn, &stream, &convolution, &x, &w, expected.len(), None);
+    // The output comes back in the channels-last order its descriptor names;
+    // the comparison is made in the logical order the definition uses.
+    assert_close(&logical_3d(&observed, y_dims), &expected);
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn the_sticky_error_probe_answers_from_another_thread() {
+    let _driver = exclusive_driver();
+    let context = PrimaryContext::retain(DEVICE).unwrap();
+    // Warm the probe on this thread, where the context is current.
+    assert!(context.sticky_error().unwrap().is_none());
+    // The control thread probes a device whose context it has never entered.
+    let elsewhere = context.clone();
+    let poisoned =
+        std::thread::spawn(move || elsewhere.sticky_error().map(|error| error.is_some()))
+            .join()
+            .unwrap()
+            .unwrap();
+    assert!(
+        !poisoned,
+        "a healthy context must not read as sticky from a thread that has not entered it"
+    );
+}
+
+/// One rank of [`two_ranks_exchange_blocks_and_reduce_across_their_group`],
+/// run on its own thread as design 2.4 gives every device one.
+///
+/// Rank `r` sends block `j` of two `u32` elements as `[100·j + 10·r, + 1]`, so
+/// both the block's owner and the sender are visible in what each rank reads
+/// back after the exchange.
+fn two_rank_half(rank: i32, id: UniqueId) -> Result<(), String> {
+    let device = DeviceId(rank);
+    let world = Communicator::init(device, 2, rank, &id).map_err(|error| error.to_string())?;
+    let group = world
+        .split(&[0, 1], rank)
+        .map_err(|error| error.to_string())?
+        .ok_or("both ranks are in the group")?;
+    assert_eq!((group.rank(), group.size()), (rank, 2));
+
+    let stream = Stream::new(device).map_err(|error| error.to_string())?;
+    let send = DeviceAllocation::linear(device, 16).map_err(|error| error.to_string())?;
+    let recv = DeviceAllocation::linear(device, 16).map_err(|error| error.to_string())?;
+    let host = PinnedBuffer::new(device, 16).map_err(|error| error.to_string())?;
+
+    let mut pattern = [[0u8; 4]; 4];
+    for (element, chunk) in pattern.iter_mut().enumerate() {
+        let value = 100 * (element / 2) as u32 + 10 * rank as u32 + (element % 2) as u32;
+        *chunk = value.to_ne_bytes();
+    }
+    // SAFETY: the host array is live and the stream is synchronized below.
+    unsafe {
+        memcpy_async(send.address(), pattern.as_ptr() as u64, 16, &stream)
+            .map_err(|error| error.to_string())?;
+        memset_d32(recv.address(), 0, 4, &stream).map_err(|error| error.to_string())?;
+    }
+
+    // Design 4.3's shape: the group is reached through a shared reference.
+    let send_range = DeviceRange::new(DevicePtr::from_address(send.address()), 16);
+    let recv_range = DeviceRange::new(DevicePtr::from_address(recv.address()), 16);
+    group
+        .all_to_all(&stream, send_range, recv_range, 2, DataType::U32)
+        .map_err(|error| error.to_string())?;
+    // Sum the exchanged window across the group, in place.
+    group
+        .all_reduce(
+            &stream,
+            recv_range,
+            recv_range,
+            4,
+            DataType::U32,
+            ReduceOp::Sum,
+        )
+        .map_err(|error| error.to_string())?;
+    // SAFETY: the copy fills the pinned buffer and the stream is synchronized.
+    unsafe { memcpy_async(host.address(), recv.address(), 16, &stream) }
+        .map_err(|error| error.to_string())?;
+    stream.synchronize().map_err(|error| error.to_string())?;
+
+    // Rank r read `[100·r, 100·r + 1, 100·r + 10, 100·r + 11]`; summed over
+    // two ranks that is the same on both, and wrong block order, a wrong
+    // per-peer count or a single rank's data all give a different line.
+    let words: Vec<u32> = read(&host)
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| u32::from_ne_bytes(*word))
+        .collect();
+    assert_eq!(words, [100, 102, 120, 122], "rank {rank}");
+
+    group.destroy().map_err(|error| error.to_string())?;
+    world.destroy().map_err(|error| error.to_string())
+}
+
+/// Two ranks in one process, one thread per device (design 2.4): the shape the
+/// executor runs a world plan in, and the only test here that would catch a
+/// collective's per-peer count being confused with a buffer's element count.
+#[test]
+#[ignore = "requires two CUDA devices and NCCL"]
+fn two_ranks_exchange_blocks_and_reduce_across_their_group() {
+    let _driver = exclusive_driver();
+    let devices = Device::count().unwrap();
+    if devices < 2 {
+        eprintln!("two-rank test: {devices} device(s) here, and the exchange needs two");
+        return;
+    }
+    let id = UniqueId::new().unwrap();
+    let ranks: Vec<_> = (0..2)
+        .map(|rank| std::thread::spawn(move || two_rank_half(rank, id)))
+        .collect();
+    for (rank, handle) in ranks.into_iter().enumerate() {
+        match handle.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("rank {rank}: {error}"),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
 }
