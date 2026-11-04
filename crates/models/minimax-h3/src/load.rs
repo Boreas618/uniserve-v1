@@ -4,7 +4,8 @@
 //! `nn::Checkpoint` learns such a root: `checkpoint.component("transformer")` gives one
 //! component's shard set with each shard's own identity, and `WeightLoader::reborrow` gives one
 //! loader per component over the same store and precision policy (specs/worker.md 8). The blocks a
-//! rank holds are the [`Partition`]'s, so this module only names the components and builds them.
+//! rank holds are the [`Partition`]'s, so this module only builds them, and registers each under the
+//! name its runner addresses: the capability's name, not the checkpoint directory's.
 //!
 //! ## Testing
 //!
@@ -105,7 +106,9 @@ pub fn load(
                 )));
             }
         };
-        blocks.push((BlockName::new(component.name()), block));
+        // The runner addresses a block by the capability it serves, not by the checkpoint's
+        // directory: both DiT partitions are the `denoiser` block.
+        blocks.push((BlockName::new(component.block()), block));
     }
 
     Ok(nn::Model::new(blocks))
