@@ -503,13 +503,9 @@ fn stage_denoise(args: &Args) -> Result<()> {
     );
     // The stage's files are the prefix source and the trajectory, and it writes them in the
     // checkpoint's own element type: a conversion there would be a second representation of the same
-    // numbers on one side of the comparison only.
-    if dtype != DType::BF16 {
-        return Err(Failure::message(format!(
-            "this stage writes its synthetic prefix source in BF16 and the checkpoint's blocks \
-             compute in {dtype}; no conversion is declared, so the stage refuses"
-        )));
-    }
+    // numbers on one side of the comparison only. `dtype` is the block's, which is the deployment's -
+    // `dtype = "auto"` follows the checkpoint and the loader converts once - so the prefix source is
+    // written in the type the stack actually computes in and the case names it for the reference.
 
     // 4. The block's own view of the request, and the arena. The plan is the model's statement of one
     //    evaluation's temporaries; the harness adds what only it holds - the two kinds of table, the
@@ -599,8 +595,11 @@ fn stage_denoise(args: &Args) -> Result<()> {
     //    in every packed row that reads it. `text_features.h3t` holds the text segment alone,
     //    because the zero row is the runner's and the reference producer appends its own.
     let prefix_rows = text_rows + u64::from(shape.condition_rows) + 1;
-    let text_width = hidden * dtype.bytes().unwrap_or(2);
-    let mut source_bytes = pseudo_bytes(text_rows, hidden);
+    let text_width = hidden
+        * dtype
+            .bytes()
+            .ok_or_else(|| Failure::message(format!("{dtype} is not a whole number of bytes")))?;
+    let mut source_bytes = pseudo_bytes(dtype, text_rows, hidden)?;
     source_bytes.resize(usize::try_from(prefix_rows * text_width).unwrap_or(0), 0);
     let text = arena.tensor(dtype, Shape::new(&[prefix_rows, hidden]))?;
     upload_bytes(&stream, text, &source_bytes)?;
@@ -701,7 +700,7 @@ fn stage_denoise(args: &Args) -> Result<()> {
          \"text_rows\": {text_rows}, \"prefix_rows\": {prefix_rows}, \"condition_rows\": {}, \"layers\": {}, \"hidden\": {hidden}, \
          \"seed\": {}, \"evaluations\": {evaluations}, \"num_steps\": {num_steps}, \
          \"schedule\": {grid:?}, \
-         \"text_features\": \"synthetic-fixed\", \"sample_dtype\": \"f32\", \
+         \"text_features\": \"synthetic-fixed\", \"sample_dtype\": \"f32\", \"dtype\": \"{dtype}\", \
          \"video_shape\": {}}}\n",
         args.width,
         args.height,
@@ -717,7 +716,7 @@ fn stage_denoise(args: &Args) -> Result<()> {
     write_h3t(
         &directory.join("text_features.h3t"),
         &[text_rows, hidden],
-        4,
+        element_code(dtype)?,
         &source_bytes[..usize::try_from(text_rows * text_width).unwrap_or(0)],
     )?;
     let drew = write_sample(&stream, &directory, "e0", video_latents, audio_latents)?;
@@ -1017,6 +1016,11 @@ fn stage_block(args: &Args) -> Result<()> {
         (stack, projections, cache, memory)
     };
 
+    // The element type the stack computes in, which is the deployment's: `dtype = "auto"` follows the
+    // checkpoint and the loader converts once, so every buffer this harness hands the model - the
+    // input rows included - is written in it.
+    let dtype = stack.dtype();
+
     // 5. The arena: the stack's own temporaries are reserved inside the forward, so the region must
     //    cover the rows it holds twice, the attention's five buffers at the whole head count and the
     //    feed-forward's packed projection. `Denoiser::denoise_arena` is the authority on that sum and
@@ -1077,7 +1081,7 @@ fn stage_block(args: &Args) -> Result<()> {
         cu_seq_lens_k,
         key_rows: u32::try_from(tokens).unwrap_or(u32::MAX),
     };
-    let (input, input_bytes) = pseudo_rows(&stream, &arena, tokens, hidden)?;
+    let (input, input_bytes) = pseudo_rows(&stream, &arena, dtype, tokens, hidden)?;
 
     // 8. The forward. `--layers` layers, in place, at the schedule's first evaluation.
     println!("step    {evaluation} of the schedule");
@@ -1120,14 +1124,11 @@ fn stage_block(args: &Args) -> Result<()> {
     write_h3t(
         &directory.join("stack_in.h3t"),
         &[tokens, hidden],
-        4,
+        element_code(dtype)?,
         &input_bytes,
     )?;
-    let output_bytes = download_bf16(
-        &stream,
-        input,
-        usize::try_from(tokens * hidden).unwrap_or(0),
-    )?;
+    // The stack writes in place, so the output is read from the same buffer at the same width.
+    let output_bytes = download(&stream, input)?;
     if output_bytes == input_bytes {
         return Err(Failure::message(
             "the stack wrote nothing: `stack_out` is byte-identical to `stack_in`, so the forward \
@@ -1137,12 +1138,12 @@ fn stage_block(args: &Args) -> Result<()> {
     write_h3t(
         &directory.join("stack_out.h3t"),
         &[tokens, hidden],
-        4,
+        element_code(dtype)?,
         &output_bytes,
     )?;
     let case = format!(
         "{{\"task\": \"t2va\", \"width\": {}, \"height\": {}, \"frames\": {}, \"text_tokens\": {}, \
-         \"layers\": {}, \"padded_tokens\": {}, \"hidden\": {}, \"step\": {}}}\n",
+         \"layers\": {}, \"padded_tokens\": {}, \"hidden\": {}, \"step\": {}, \"dtype\": \"{dtype}\"}}\n",
         args.width,
         args.height,
         frames,
@@ -1299,15 +1300,21 @@ fn rotated_width() -> u64 {
     ROTATED_AXES.iter().map(|axis| u64::from(*axis)).sum()
 }
 
-/// A deterministic input: the same bytes on every host, so a reference can read them back.
+/// A deterministic input in the deployment's own element type: the same bytes on every host, so a
+/// reference can read them back.
+///
+/// The element type is the **deployment's**, not one this harness picks: `dtype = "auto"` converts
+/// nothing at load, so a buffer of another type would be a buffer the model has to convert - or, as
+/// the first device run showed, a launch whose descriptor no store holds.
 fn pseudo_rows(
     stream: &platform::Stream,
     arena: &Arena,
+    dtype: DType,
     rows: u64,
     columns: u64,
 ) -> Result<(TensorView, Vec<u8>)> {
-    let bytes = pseudo_bytes(rows, columns);
-    let tensor = arena.tensor(DType::BF16, Shape::new(&[rows, columns]))?;
+    let bytes = pseudo_bytes(dtype, rows, columns)?;
+    let tensor = arena.tensor(dtype, Shape::new(&[rows, columns]))?;
     upload_bytes(stream, tensor, &bytes)?;
     Ok((tensor, bytes))
 }
@@ -1315,23 +1322,47 @@ fn pseudo_rows(
 /// The same rows as host bytes, for a buffer that holds more than they do.
 ///
 /// A fixed function of nothing: no seed, no case, so two runs and both sides read the same bytes.
-fn pseudo_bytes(rows: u64, columns: u64) -> Vec<u8> {
+fn pseudo_bytes(dtype: DType, rows: u64, columns: u64) -> Result<Vec<u8>> {
+    let width = dtype
+        .bytes()
+        .ok_or_else(|| Failure::message(format!("{dtype} has no byte width")))?
+        as usize;
     let count = usize::try_from(rows * columns).unwrap_or(0);
-    let mut bytes = Vec::with_capacity(count * 2);
+    let mut bytes = Vec::with_capacity(count * width);
     let mut state = 0x2545_f491_4f6c_dd1d_u64;
     for _ in 0..count {
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
-        // A bf16 in `[-1, 1)`: twenty-five bits of the state scaled by 2^24 and shifted down, so the
+        // A value in `[-1, 1)`: twenty-five bits of the state scaled by 2^24 and shifted down, so the
         // draw is a ramp over a symmetric interval. Symmetry matters here rather than being tidy -
         // a one-sided draw would leave every sign-dependent path of the block (the gated
         // feed-forward's two halves, the norms' shifts) exercised on one side only, and both sides
         // of the comparison would agree on an untested range.
         let value = ((state >> 39) as f32) / ((1_u64 << 24) as f32) - 1.0;
-        bytes.extend_from_slice(&half_of(value).to_le_bytes());
+        match dtype {
+            DType::BF16 => bytes.extend_from_slice(&half_of(value).to_le_bytes()),
+            DType::F32 => bytes.extend_from_slice(&value.to_le_bytes()),
+            other => {
+                return Err(Failure::message(format!(
+                    "{other} has no pseudo rows: this harness writes the checkpoint's BF16 or F32"
+                )));
+            }
+        }
     }
-    bytes
+    Ok(bytes)
+}
+
+/// The `h3t` container's element code, which the comparator reads.
+fn element_code(dtype: DType) -> Result<u8> {
+    match dtype {
+        DType::F32 => Ok(1),
+        DType::BF16 => Ok(4),
+        DType::F16 => Ok(5),
+        other => Err(Failure::message(format!(
+            "{other} has no code in the `h3t` container this harness writes"
+        ))),
+    }
 }
 
 /// A BF16 holding the high half of `value`, rounded to nearest even.
@@ -1747,20 +1778,4 @@ fn upload_i32(
     }
     stream.synchronize()?;
     Ok(tensor)
-}
-
-/// Download `elements` BF16 values as their raw little-endian bytes.
-fn download_bf16(stream: &platform::Stream, view: TensorView, elements: usize) -> Result<Vec<u8>> {
-    let mut bytes = vec![0_u8; elements * 2];
-    // SAFETY: `bytes` is written by the copy, which completes before the wait below.
-    unsafe {
-        platform::memcpy_async(
-            bytes.as_mut_ptr() as u64,
-            view.ptr.address(),
-            bytes.len(),
-            stream,
-        )?;
-    }
-    stream.synchronize()?;
-    Ok(bytes)
 }
