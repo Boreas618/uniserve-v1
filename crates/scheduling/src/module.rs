@@ -11,13 +11,13 @@
 
 use std::sync::Arc;
 
-use scheduling_guest::limits::Limits;
-use scheduling_guest::policy::Init;
+use scheduling_guest::limits::{Limits, Parameters};
+use scheduling_guest::view::Snapshot;
 use wasmtime::{Module, Precompiled};
 
-use crate::Engine;
 use crate::error::PolicyError;
 use crate::instance::PolicyInstance;
+use crate::Engine;
 
 /// A loaded policy module: the compiled wasm32 module of one policy backend and
 /// revision (§5.1), ready to be instantiated.
@@ -95,9 +95,10 @@ impl PolicyModule {
     /// instance of the control thread.
     pub fn instantiate(
         &self,
-        init: &Init,
+        state: &Snapshot,
+        parameters: &Parameters,
         ceilings: &Limits,
     ) -> Result<PolicyInstance, PolicyError> {
-        PolicyInstance::new(&self.engine, &self.module, init, ceilings)
+        PolicyInstance::new(&self.engine, &self.module, state, parameters, ceilings)
     }
 }

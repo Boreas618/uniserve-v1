@@ -187,6 +187,8 @@ impl Op for ReplicatePad {
 
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
         let _ = descriptor;
+        // Every output element is a copy of one input element — the padding repeats the edge rather
+        // than inventing a value — so two implementations agree bit for bit.
         Tolerance::exact()
     }
 }

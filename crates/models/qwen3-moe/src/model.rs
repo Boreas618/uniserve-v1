@@ -516,8 +516,8 @@ impl DenseMlp {
         self.up_proj
             .forward(f, normalized, dense.up)
             .map_err(Error::from)?;
-        // `SwiGLU(x · W_up, x · W_gate) = silu(gate) · up`: the gate is the branch the activation
-        // applies to, and the result lands in the gate buffer.
+        // `silu(gate) · up`, written into the gate buffer: the activation applies to the branch
+        // named `gate`, so the argument order is `(f, gate, value, out)` as in every gated layer.
         self.activation
             .forward(f, dense.gate, dense.up, dense.gate)
             .map_err(Error::from)?;

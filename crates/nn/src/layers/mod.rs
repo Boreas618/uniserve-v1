@@ -22,6 +22,7 @@ mod activation;
 mod attention;
 mod bias;
 mod conv;
+mod cross_fade;
 mod embedding;
 mod exchange;
 mod frame;
@@ -41,11 +42,13 @@ mod rows;
 mod sampler;
 mod segment;
 mod segments;
+mod unpatchify;
 
 pub use activation::{GatedActivation, Gelu, PackedSwiGlu, Silu, Snake, SwiGlu};
 pub use attention::{Attention, AttentionBackend, TRTLLM_WORKSPACE_BYTES};
 pub use bias::BiasAdd;
 pub use conv::{Conv1d, Conv3d, ConvGeometry, ConvTranspose1d};
+pub use cross_fade::CrossFade;
 pub use embedding::Embedding;
 pub use exchange::UlyssesExchange;
 pub use frame::{FrameMoments, FrameNormPad, FramePad};
@@ -70,6 +73,7 @@ pub use rows::Rows;
 pub use sampler::{Candidates, Sampler, SamplerState, Samples};
 pub use segment::{SegmentAttention, SegmentTables};
 pub use segments::VsaTiles;
+pub use unpatchify::UnpatchifyVideo;
 
 /// The constants a layer's operator descriptor carries and the program package owns.
 ///

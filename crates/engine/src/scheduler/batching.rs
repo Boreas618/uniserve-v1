@@ -10,12 +10,15 @@
 //! calls still in flight (`scheduled_token_lengths`,
 //! `num_scheduled_denoise_steps`), so a successor can be planned before its
 //! predecessor resolves. Each planned call then reserves its storage, is
-//! registered as in flight, and joins the pass's batch for its `CallKind`:
-//! one batch per call kind, each a single numerical call on one component.
+//! registered as in flight, and joins the pass's batch for its phase and
+//! component: one batch per `(phase, component)`, each a single numerical call
+//! on one component, because a worker's batch carries one phase.
 //!
-//! The batch kind (`BatchKind`) only separates prefill from decode.
-//! `BatchKind::Media` calls are eligible in every pass, and a pass with no
-//! batch kind applies no filter.
+//! Token calls and media calls are planned in the same pass: a token call by
+//! the next-call planner, a media call of a video, image, or audio request by
+//! `plan_media_call`, which owns that flow's numerical extent, decoder ranges,
+//! and worker admission. The plan names both, so one policy decides the whole
+//! step.
 //!
 //! A pass's prefill calls, and likewise its decode calls, travel as one
 //! numerical call, bounded by the batch's call and token budgets and the
@@ -25,7 +28,9 @@
 //! within the rows a worker stages per call (`PassRows`).
 
 mod call;
+mod columns;
 mod plan;
+mod slots;
 
 use super::*;
 use crate::scheduler::views;
@@ -65,22 +70,51 @@ impl Scheduler {
         let mut work: Vec<(RequestId, PhaseId, Option<u32>)> = plan
             .work
             .iter()
-            .map(|work| {
-                (
-                    RequestId(work.request.0),
-                    work.phase,
-                    Some(work.tokens),
-                )
-            })
+            .map(|work| (RequestId(work.request.0), work.phase, Some(work.tokens)))
             .collect();
-        work.extend(plan.refill.iter().map(|request| {
-            (
-                RequestId(request.0),
-                refill,
-                None,
-            )
-        }));
+        work.extend(
+            plan.refill
+                .iter()
+                .map(|request| (RequestId(request.0), refill, None)),
+        );
         self.assemble_batch(&work)
+    }
+
+    /// The replica a planned call runs on: the mechanism's own residency when
+    /// the request already ran, the policy's answer when it has not (design
+    /// §4.4).
+    ///
+    /// The policy sees the candidates exactly as `views::replicas` shows them
+    /// and answers one of their indices; `views::replica_targets` names the same
+    /// workers in the same order, both built from one filter in `views.rs`, so
+    /// an index becomes a worker without two candidate lists that could
+    /// disagree. A policy that fails here fails as any decision does: the call
+    /// waits this step and the previous policy decides the next one.
+    fn place_call(&mut self, call: &Call) -> Option<placement::Choice> {
+        if self.placement.resident(call.request_key) {
+            return Some(placement::Choice::Existing);
+        }
+        let replicas = views::replicas(self, call.request_key, call.kind);
+        if replicas.is_empty() {
+            return Some(placement::Choice::Existing);
+        }
+        let targets = views::replica_targets(self, call.request_key, call.kind);
+        let view = views::call_view(call.request_key, call.kind);
+        let Some(mut policy) = self.policy.take() else {
+            return None;
+        };
+        let answer = policy
+            .place(&view, &replicas)
+            .and_then(|index| mechanism::validate_place(&view, &replicas, index).map(|()| index));
+        let target = match answer {
+            Ok(index) => targets.get(index).map(|(worker, _)| worker.clone()),
+            Err(error) => {
+                let _ = self.policy_failed(policy, error);
+                return None;
+            }
+        };
+        self.policy = Some(policy);
+        target.map(placement::Choice::Target)
     }
 
     /// Charges actual token work, including each CFG branch of a denoising step.
@@ -132,8 +166,13 @@ impl Scheduler {
             .running
             .get(&id)
             .map(|state| RequestKey::new(self.engine_id, id, state.request_epoch))?;
-        self.placement
-            .worker_target(self.executor.as_ref(), &self.info, request_key, call.kind)?;
+        self.placement.worker_target(
+            self.executor.as_ref(),
+            &self.info,
+            request_key,
+            call.kind,
+            &placement::Choice::Existing,
+        )?;
 
         let mut buffer_allocations = Vec::new();
         for bytes in call.buffer_outputs().map(TensorRef::max_bytes) {
@@ -210,13 +249,12 @@ impl Scheduler {
         &mut self,
         work: &[(RequestId, PhaseId, Option<u32>)],
     ) -> Vec<ExecutionBatch> {
-        // One batch per call kind: a batch is one numerical call on one
-        // component, so a rank receives it as a single homogeneous group. The
-        // component a call binds to follows from its kind, so the two
-        // together name one group. Kinds keep the order in which their
-        // first call was selected.
-        let mut kind_order: Vec<CallKind> = Vec::new();
-        let mut kind_batches: HashMap<CallKind, ExecutionBatch> = HashMap::new();
+        // One batch per (phase, component): a batch is one numerical call of one
+        // phase on one component, so a rank receives a homogeneous group and
+        // the executor's phase column names it exactly. The plan's order is the
+        // order the first call of each pair was selected in.
+        let mut kind_order: Vec<(PhaseId, String)> = Vec::new();
+        let mut kind_batches: HashMap<(PhaseId, String), ExecutionBatch> = HashMap::new();
         let submit_at = Instant::now();
         // The per-step token budget is the binding limit; individual prefill
         // chunks are clipped to its remaining capacity.
@@ -232,17 +270,18 @@ impl Scheduler {
             canvas: row_capacity,
             context: row_capacity.min(self.config.max_batch),
         };
-        // Host task occupancy, built when the pass meets its first encoder
-        // call carrying inline image bytes and charged with each one it
-        // selects.
-        let mut image_occupancy: Option<super::execution::Occupancy> = None;
+        // What the media calls in flight occupy — their component's media
+        // units and the host task pools preparing their units — built when the
+        // pass meets its first media call and charged with each one it selects.
+        let mut media_occupancy: Option<super::execution::Occupancy> = None;
+        // A media request's worker admission, queued by `plan_media_call`:
+        // it travels with the batch of the first call of that request in this
+        // pass.
+        let mut admissions: Vec<NewRequest> = Vec::new();
         let mut selected = 0usize;
         for (id, phase, wanted) in work.iter().copied() {
             let id = id;
             if selected >= self.config.max_batch {
-                break;
-            }
-            if budget == 0 {
                 break;
             }
             // The phase names the call kind this entry runs. A phase this epoch
@@ -250,6 +289,11 @@ impl Scheduler {
             let Some(kind) = views::phase_kind(phase).and_then(views::phase_call) else {
                 continue;
             };
+            // A spent token budget ends the pass's token work; a media call
+            // draws no tokens and still runs.
+            if budget == 0 && !matches!(kind, CallKind::Media(_)) {
+                break;
+            }
             let refill = views::phase_kind(phase) == Some(PhaseKind::Refill);
             if !self.can_schedule_next(id) {
                 continue;
@@ -270,6 +314,68 @@ impl Scheduler {
                 && (self.inflight.denoiser_held_by_other(id)
                     || !self.guidance_prefix_is_schedulable(id))
             {
+                continue;
+            }
+            // A media call is planned by the media flow, not by the token
+            // planner: the call's numerical extent, its decoder ranges, and its
+            // worker admission are that flow's. Its batch is made first, since
+            // the call's id names it, and the component is known before
+            // planning because a media call's kind fixes it.
+            if let CallKind::Media(media_call) = kind {
+                // The call waits for the media calls it reads and for the
+                // component and host task pools it occupies to find room.
+                let Some(state) = self.media_state(id) else {
+                    continue;
+                };
+                // A request offers nothing further while the call carrying its
+                // worker admission is in flight.
+                if state.admission_state == WorkerRegistration::InFlight
+                    || !self.ready_calls(state).contains(&media_call)
+                {
+                    continue;
+                }
+                let request_key = state.admission.request_key;
+                let units = self.call_units(state, media_call);
+                let demand = self.media_demand(request_key, media_call, units);
+                let occupancy = media_occupancy.get_or_insert_with(|| self.media_occupancy());
+                if !occupancy.admits(&demand, id, self)
+                    || !self.call_has_queue_capacity(request_key, media_call)
+                {
+                    self.record_domain_backpressure(kind);
+                    continue;
+                }
+                let Some(component) = self.info.media_components.get(&media_call).cloned() else {
+                    continue;
+                };
+                let key = (phase, component);
+                let batch = kind_batches.entry(key.clone()).or_insert_with(|| {
+                    kind_order.push(key);
+                    ExecutionBatch::new(
+                        self.inflight.next_batch_id(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                });
+                let Ok(request_index) = u32::try_from(batch.requests.len()) else {
+                    self.invariant_broken("a batch's request count fits the IPC index");
+                    return Vec::new();
+                };
+                let planned = self.plan_media_call(
+                    id,
+                    media_call,
+                    CallId::new(batch.id, request_index),
+                    &mut admissions,
+                );
+                match planned {
+                    Ok(planned) => batch.requests.push(planned),
+                    Err(invariant) => {
+                        self.invariant_broken(invariant);
+                        return Vec::new();
+                    }
+                }
+                occupancy.occupy(&demand, id);
+                selected += 1;
                 continue;
             }
             // Build one call when its exact resident resources fit. A prefill
@@ -312,36 +418,6 @@ impl Scheduler {
                     }
                     continue;
                 }
-                // An encoder call carrying inline image bytes holds a host
-                // task on each rank of its component while the worker
-                // prepares the image, so it waits here, as a media call
-                // does, until those host task pools have room.
-                let image_demand =
-                    match call.kind {
-                        CallKind::Media(media_call)
-                            if call.input_image.is_some() || call.carried_image.is_some() =>
-                        {
-                            let Some(request_key) = self.running.get(&id).map(|state| {
-                                RequestKey::new(self.engine_id, id, state.request_epoch)
-                            }) else {
-                                continue;
-                            };
-                            let demand = self.image_demand(request_key, media_call);
-                            let occupancy =
-                                image_occupancy.get_or_insert_with(|| self.media_occupancy());
-                            if !occupancy.admits(&demand, id, self) {
-                                self.record_domain_backpressure(call.kind);
-                                if let Some(state) = self.running.get_mut(&id) {
-                                    state.num_cache_units_sent = state
-                                        .num_cache_units_sent
-                                        .saturating_sub(u64::from(call.bounds.max_cache_units));
-                                }
-                                continue;
-                            }
-                            Some(demand)
-                        }
-                        _ => None,
-                    };
                 let planned_us = crate::clock::now_monotonic_us();
 
                 // Only a call that obtains its storage is charged to the
@@ -385,9 +461,9 @@ impl Scheduler {
 
                 // Identify the call by its batch and row, and stamp the
                 // coordinates projected through the request's in-flight calls.
-                let kind = call.kind;
-                let batch = kind_batches.entry(kind).or_insert_with(|| {
-                    kind_order.push(kind);
+                let key = (phase, call.component.clone());
+                let batch = kind_batches.entry(key.clone()).or_insert_with(|| {
+                    kind_order.push(key);
                     ExecutionBatch::new(
                         self.inflight.next_batch_id(),
                         Vec::new(),
@@ -477,10 +553,30 @@ impl Scheduler {
                     // Most preparation failures latch engine-fatal first.
                     return Vec::new();
                 }
-                if let (Some(demand), Some(occupancy)) = (&image_demand, image_occupancy.as_mut()) {
-                    occupancy.occupy(demand, id);
-                }
                 selected += 1;
+            }
+        }
+        // A media request's admission travels with the batch holding the first
+        // call of that request in this pass, so the request is registered on
+        // the worker that runs its first call.
+        for request in admissions {
+            let owner = kind_order
+                .iter()
+                .find(|key| {
+                    kind_batches[*key]
+                        .requests
+                        .iter()
+                        .any(|(call, _)| call.request_key == request.request_key)
+                })
+                .cloned();
+            let Some(owner) = owner else {
+                self.invariant_broken("an admitted media request has a selected call");
+                return Vec::new();
+            };
+            if let Some(batch) = kind_batches.get_mut(&owner) {
+                batch.commands.push(BatchCommand::Start {
+                    request: Box::new(request),
+                });
             }
         }
         kind_order.retain(|kind| {
@@ -488,7 +584,7 @@ impl Scheduler {
                 .get(kind)
                 .is_some_and(|batch| !batch.requests.is_empty())
         });
-        let Some(&last) = kind_order.last() else {
+        let Some(last) = kind_order.last().cloned() else {
             return Vec::new();
         };
 
@@ -500,9 +596,11 @@ impl Scheduler {
         // submissions, not round trips, so a command-only batch costs the
         // round a queue slot and halves how many rounds a depth-two rank can
         // hold in flight.
-        let prompt_only = kind_order
-            .iter()
-            .all(|kind| batch_kind(*kind) == BatchKind::Prefill);
+        let prompt_only = kind_order.iter().all(|(phase, _)| {
+            views::phase_kind(*phase)
+                .and_then(views::phase_call)
+                .is_some_and(|kind| batch_kind(kind) == BatchKind::Prefill)
+        });
         let commands = if prompt_only {
             let requests = kind_order
                 .iter()
@@ -519,7 +617,7 @@ impl Scheduler {
         let mut batches = Vec::with_capacity(kind_order.len());
         for kind in kind_order {
             let Some(mut batch) = kind_batches.remove(&kind) else {
-                self.invariant_broken("every selected call kind has its batch");
+                self.invariant_broken("every selected phase and component has its batch");
                 return Vec::new();
             };
             if kind == last {

@@ -2117,7 +2117,7 @@ pub(super) mod tests {
     /// The planning vectors, generated from the diffusers reference.
     pub(in crate::video) fn fixture() -> Value {
         serde_json::from_str(include_str!(
-            "../../../../tests/python/fixtures/minimax_h3_plan.json"
+            "../../../../../tests/python/fixtures/minimax_h3_plan.json"
         ))
         .unwrap()
     }
