@@ -34,7 +34,7 @@ architectures = ["sm_100a", "sm_90a"]
 
 # `input_bf16_weight_bf16_accumulate_f32_output_bf16_order_nxk_epilogue_none_k_2048`.
 [kernel.descriptors]
-dimensions = { input = ["bf16", "f16", "f32"], weight = ["bf16", "f16", "f32"], accumulate = ["f32", "bf16", "f16"], output = ["bf16", "f16", "f32"], order = ["kxn", "nxk"], epilogue = ["none", "bias"], k = ["768", "1536", "2048", "4096", "7168"] }
+dimensions = { input = ["bf16", "f16", "f32"], weight = ["bf16", "f16", "f32"], accumulate = ["f32", "bf16", "f16"], output = ["bf16", "f16", "f32"], order = ["kxn", "nxk"], epilogue = ["none", "bias"], k = ["32", "64", "256", "768", "1536", "2048", "4096", "5376", "7168", "14336"] }
 
 [parameters]
 # The language standard the host code is written in; the module has no device
