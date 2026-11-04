@@ -27,6 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use scheduling::PolicyError;
 
 use crate::scheduler::policy::{PolicyReverted, PolicySlot, TrialState, Validators};
+use crate::scheduler::views::{Recorded, RecordedTable};
 use scheduling::guest::decision::{Plan, Room, Shortage, Storage, Victim, Work};
 use scheduling::guest::event::Event;
 use scheduling::guest::wire::Call;
@@ -179,6 +180,7 @@ impl Validators for Checked<'_> {
     }
 }
 
+
 /// The mechanism's objects, as the validators read them.
 ///
 /// `scheduler/views.rs` builds this from the scheduler's own state each step
@@ -189,7 +191,10 @@ impl Validators for Checked<'_> {
 pub(crate) struct Live {
     /// Every request the main process holds, by id.
     pub requests: BTreeMap<RequestId, RequestView>,
-    /// The waiting queue, in the mechanism's admission order.
+    /// The requests waiting for admission, in the mechanism's own order.
+    ///
+    /// Only membership is read: the order a plan admits in is the policy's, and
+    /// the mechanism admits in the plan's order.
     pub queue: Vec<RequestId>,
     /// Every device and host page, by id.
     pub pages: BTreeMap<PageId, PageView>,
@@ -255,10 +260,14 @@ fn decodes(kind: PhaseKind) -> bool {
 /// Checks one step's plan against the live state and the room it was offered
 /// (design §4.4).
 ///
-/// A plan is valid when it names only live objects, in the order the mechanism
-/// can execute them, and fits what the mechanism offered: the step's token and
-/// call budgets, the prefill budget while an epoch warms, the graph tiers, and
-/// the phase each request can run next. A plan that fits is still executed
+/// A plan is valid when it names only live objects and fits what the mechanism
+/// offered: the step's token and call budgets, the prefill budget while an
+/// epoch warms, the graph tiers, and the phase each request can run next.
+///
+/// One request has at most one piece of work in a step: the mechanism plans one
+/// call per request per step, because a request's next call depends on the
+/// previous one's result. It is a mechanism limit, not a policy's choice, so a
+/// plan that names a request twice is rejected here. A plan that fits is still executed
 /// conservatively: work that does not fit the free storage after `reclaim`
 /// waits for the next step, which is the mechanism's hard limit and not a
 /// policy failure.
@@ -559,18 +568,16 @@ fn validate_release(plan: &Plan, live: &Live) -> Result<(), PolicyError> {
 /// A page may be freed only when it is live and no resident request continues
 /// from it (`evictable`); a request may be ended only when it is resident and
 /// migratable, because that is the only way the mechanism can end one without
-/// losing the tokens it generated (the frontend resubmits it).
+/// losing the tokens it generated (the frontend resubmits it). An empty answer
+/// is legal: a policy may leave the shortfall to natural completion.
 pub(crate) fn validate_victims(
     shortage: &Shortage,
     victims: &[Victim],
     live: &Live,
 ) -> Result<(), PolicyError> {
-    if victims.is_empty() {
-        return Err(invalid(
-            Call::Reclaim,
-            format!("nothing was freed for a {:?} shortage", shortage.kind),
-        ));
-    }
+    // Freeing nothing is a legal answer: the work that did not fit waits for
+    // the next step, and the watchdog bounds a resident request that then never
+    // advances (§4.4).
     let mut seen: Vec<Victim> = Vec::new();
     for victim in victims {
         if seen.contains(victim) {
@@ -805,6 +812,9 @@ pub(crate) struct Recorder {
     told: BTreeMap<RequestId, RequestView>,
     /// Requests whose view changed since the last `close`.
     touched: BTreeMap<RequestId, RequestView>,
+    /// The features no view of the request carries any more, kept for
+    /// `views.rs` between one step and the next.
+    recorded: RecordedTable,
 }
 
 impl Recorder {
@@ -817,10 +827,27 @@ impl Recorder {
             .iter()
             .map(|request| (request.id, request.clone()))
             .collect();
+        let recorded = snapshot
+            .requests
+            .iter()
+            .map(|request| {
+                (
+                    ipc::RequestId(request.id.0),
+                    Recorded {
+                        admitted_at: request.admitted_at,
+                        last_emitted_at: request.last_emitted_at,
+                        cached_prefix_tokens: request.cached_prefix_tokens,
+                        prefetch_tokens: request.prefetch_tokens,
+                        cache_rank: request.cache_rank,
+                    },
+                )
+            })
+            .collect();
         Self {
             pending: Vec::new(),
             told,
             touched: BTreeMap::new(),
+            recorded,
         }
     }
 
@@ -829,6 +856,16 @@ impl Recorder {
         match &event {
             Event::Arrived { request } => {
                 self.told.insert(request.id, request.clone());
+                self.recorded.insert(
+                    ipc::RequestId(request.id.0),
+                    Recorded {
+                        admitted_at: None,
+                        last_emitted_at: None,
+                        cached_prefix_tokens: request.cached_prefix_tokens,
+                        prefetch_tokens: request.prefetch_tokens,
+                        cache_rank: request.cache_rank,
+                    },
+                );
             }
             Event::Admitted { request } => {
                 if let Some(view) = self.told.get_mut(request) {
@@ -838,6 +875,13 @@ impl Recorder {
             Event::Finished { request, .. } => {
                 self.told.remove(request);
                 self.touched.remove(request);
+                self.recorded.remove(&ipc::RequestId(request.0));
+            }
+            Event::Emitted { request, at, .. } => {
+                self.recorded
+                    .entry(ipc::RequestId(request.0))
+                    .or_default()
+                    .last_emitted_at = Some(*at);
             }
             _ => {}
         }
@@ -859,6 +903,22 @@ impl Recorder {
                 self.pending.push(Event::Updated { request: view });
             }
         }
+    }
+
+    /// Notes an admission: the event, and the time the views report as
+    /// `admitted_at`.
+    pub(crate) fn admitted(&mut self, request: RequestId, at: Nanos) {
+        self.recorded
+            .entry(ipc::RequestId(request.0))
+            .or_default()
+            .admitted_at = Some(at);
+        self.record(Event::Admitted { request });
+    }
+
+    /// The features `views.rs` reads from the recorder rather than from the
+    /// scheduler's own state.
+    pub(crate) fn recorded(&self) -> &RecordedTable {
+        &self.recorded
     }
 
     /// Hands the events to the policy. The policy sees them once; the next step
