@@ -1,0 +1,17 @@
+[package]
+name = "scheduling-guest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Types, events and decisions of a scheduling policy: compiled into every policy and read by the mechanism."
+
+[dependencies]
+# The wire format between the mechanism and a policy module. JSON is
+# self-describing, so a policy skips event kinds and struct fields it does not
+# know; that is what makes the views and events append-only lists (design §4.4).
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
