@@ -477,6 +477,18 @@ impl Switch {
                 return;
             }
         }
+        // §7.4 step 1: the target's children mapped their world's storage as
+        // its standby and park at the end of their start; `Park` is what turns
+        // that into the `Parked` this phase waits for. Each child is commanded
+        // at the generation the node actually started it at, and one step per
+        // node, as the promotion is.
+        for (host, generation) in &self.spawned {
+            roster.command(
+                host,
+                *generation,
+                command(process::command::Kind::Park(process::Park {})),
+            );
+        }
     }
 
     /// Takes the roster's events and advances the switch as they and the
@@ -1262,6 +1274,22 @@ mod tests {
             epochs.get(12).map(|record| record.status),
             Some(Status::Precopy)
         );
+        // §7.4 step 1: each child is told to park on its read-only mapping as
+        // soon as it started and its world is claimed, at the generation the
+        // node gave it, and before anything is promoted.
+        assert_eq!(roster.commands.len(), 2, "one park per node");
+        for (index, (host, generation, kind)) in roster.commands.iter().enumerate() {
+            assert_eq!(host, &nodes()[index].host);
+            assert_eq!(*generation, 6);
+            assert!(matches!(kind, process::command::Kind::Park(_)));
+        }
+        assert!(
+            !roster
+                .commands
+                .iter()
+                .any(|(_, _, kind)| matches!(kind, process::command::Kind::Promote(_))),
+            "nothing is promoted before the targets parked"
+        );
 
         roster.scripted = vec![hello("n0", 6, "2.0.0+new"), hello("n1", 6, "2.0.0+new")];
         switch.advance(&mut roster);
@@ -1269,10 +1297,15 @@ mod tests {
         switch.parked(&mut roster, "n1", 6);
         assert_eq!(switch.phase(), Phase::Promoting);
         assert_eq!(switch.generation(), Some(6));
-        assert_eq!(roster.commands.len(), 2);
+        assert_eq!(roster.commands.len(), 4, "two parks, then two promotes");
         assert!(
-            roster
-                .commands
+            roster.commands[..2]
+                .iter()
+                .all(|(_, _, kind)| matches!(kind, process::command::Kind::Park(_))),
+            "the parks precede the promotion"
+        );
+        assert!(
+            roster.commands[2..]
                 .iter()
                 .all(|(_, generation, kind)| *generation == 6
                     && matches!(kind, process::command::Kind::Promote(_)))
@@ -1311,6 +1344,41 @@ mod tests {
             Some(Status::Probation)
         );
         assert!(switch.pause().is_some());
+    }
+
+    /// The target's children park on their read-only mapping, and the switch
+    /// waits for each of them: a readiness of another generation is not this
+    /// target's, and no promotion is sent until every node parked.
+    #[test]
+    fn a_target_is_promoted_only_after_every_node_parked() {
+        let (_epochs, mut switch) = setup();
+        let mut roster = Fake::default();
+        switch.start(&mut roster);
+        roster.scripted = vec![hello("n0", 6, "2.0.0+new"), hello("n1", 6, "2.0.0+new")];
+        switch.advance(&mut roster);
+
+        // `n0` reports the serving epoch's generation, not the target's.
+        switch.parked(&mut roster, "n0", 5);
+        switch.parked(&mut roster, "n1", 6);
+        assert_eq!(
+            switch.phase(),
+            Phase::Preparing,
+            "a foreign generation's readiness is not the target's"
+        );
+        assert!(
+            !roster
+                .commands
+                .iter()
+                .any(|(_, _, kind)| matches!(kind, process::command::Kind::Promote(_))),
+            "nothing is promoted while a node has not parked"
+        );
+
+        switch.parked(&mut roster, "n0", 6);
+        assert_eq!(switch.phase(), Phase::Promoting);
+        assert_eq!(
+            roster.commands_of(6, |kind| matches!(kind, process::command::Kind::Promote(_))),
+            2
+        );
     }
 
     /// A world an earlier switch dropped is retired by the next switch's
@@ -1381,7 +1449,15 @@ mod tests {
         assert_eq!(switch.phase(), Phase::Abandoned);
         assert_eq!(switch.update().state, UpdateState::Reverted);
         assert!(switch.update().unavailable().is_none());
-        assert!(roster.commands.is_empty(), "no promote, drain or commit");
+        assert!(
+            !roster.commands.iter().any(|(_, _, kind)| matches!(
+                kind,
+                process::command::Kind::Promote(_)
+                    | process::command::Kind::Drain(_)
+                    | process::command::Kind::Commit(_)
+            )),
+            "no promote, drain or commit"
+        );
         assert!(roster.serves.is_empty(), "the frontend never switched");
         assert_eq!(switch.discarded(), &[12]);
         assert_eq!(
@@ -1450,7 +1526,13 @@ mod tests {
                 .stops
                 .contains(&("n0".to_owned(), "engine:0".to_owned(), Some(6)))
         );
-        assert!(roster.commands.is_empty());
+        assert!(
+            !roster
+                .commands
+                .iter()
+                .any(|(_, _, kind)| matches!(kind, process::command::Kind::Promote(_))),
+            "the stopped target was never promoted"
+        );
     }
 
     /// Another executable's build is unknown until its first child connects:
@@ -1826,7 +1908,15 @@ mod tests {
         )];
         switch.advance(&mut roster);
         assert_eq!(switch.phase(), Phase::Reverting);
-        assert_eq!(roster.commands.len(), 2, "a revert per node");
+        assert_eq!(
+            roster
+                .commands
+                .iter()
+                .filter(|(_, _, kind)| matches!(kind, process::command::Kind::Revert(_)))
+                .count(),
+            2,
+            "a revert per node"
+        );
         assert!(roster.commands.iter().all(|(_, generation, kind)| {
             *generation == 6
                 && matches!(kind, process::command::Kind::Revert(revert)

@@ -1007,10 +1007,14 @@ impl MainProcess {
                 // after `Promoted`.
                 Some(proto::process::command::Kind::Park(_)) => {
                     self.park_schedulers("parking for a promotion")?;
+                    // The parked standby's readiness names the generation it was
+                    // spawned at (§2.5): the daemon's epoch layer promotes a child
+                    // by its launch generation, which is this process's own number
+                    // and not a program generation.
                     self.send_report(proto::process::Report {
                         kind: Some(proto::process::report::Kind::Parked(
                             proto::process::Parked {
-                                generation: current,
+                                generation: self.control.engine(),
                             },
                         )),
                     });
@@ -1021,7 +1025,7 @@ impl MainProcess {
                     self.send_report(proto::process::Report {
                         kind: Some(proto::process::report::Kind::Promoted(
                             proto::process::Promoted {
-                                generation: current,
+                                generation: self.control.engine(),
                             },
                         )),
                     });
