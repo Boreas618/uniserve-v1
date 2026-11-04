@@ -667,8 +667,9 @@ mod tests {
         let (frequencies, scale) = rotary_recipe(&config).unwrap();
         assert_eq!(frequencies.len(), 64);
         assert_eq!(frequencies[0], 1.0);
-        // 1 / theta^(2 / head_dim): the second pair of the head.
-        let second = 1.0 / 1_000_000_f32.powf(2.0 / 128.0);
+        // 1 / theta^(2 / head_dim): the second pair of the head, in the FP64 arithmetic the
+        // table is computed in before it is narrowed.
+        let second = (1.0 / 1_000_000_f64.powf(2.0 / 128.0)) as f32;
         assert!((frequencies[1] - second).abs() < 1e-9);
         assert_eq!(scale, 1.0);
         assert!(frequencies.windows(2).all(|pair| pair[0] > pair[1]));
