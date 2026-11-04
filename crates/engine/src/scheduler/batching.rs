@@ -849,6 +849,12 @@ impl Scheduler {
         Some(match st.phase {
             Phase::IngestState => CallKind::Forward(ForwardMode::Prefill),
             Phase::Prefill => CallKind::Forward(ForwardMode::Prefill),
+            // A speculating deployment's decode step verifies the drafts its
+            // last forward proposed: the call the mechanism builds from
+            // `DecodeUnd` is a verification, and the phase a policy reads must
+            // be the one that call runs in, or the batch is planned under one
+            // kind and built under another and is dropped unnamed.
+            Phase::DecodeUnd if self.speculates() => CallKind::Forward(ForwardMode::Verify),
             Phase::DecodeUnd => CallKind::Forward(ForwardMode::Decode),
             Phase::HandOff if st.handoff_export.is_some() => {
                 CallKind::Transfer(TransferMode::CacheInstall)
