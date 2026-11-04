@@ -83,22 +83,12 @@ pub(crate) fn scheduler_with(
 /// A deployed epoch takes its policy from the Program Server; a test world has
 /// none, and a scheduler with no policy decides nothing — no plan, no
 /// admission, no batch — so a world that submits a request must be given one.
-/// `SCHED_POLICY_WASM` names the module: the `fcfs` program this tree builds
-/// for `wasm32-unknown-unknown`, the one that reproduces the rules the tests
-/// were written against. Unset, every test fails here with what to build, rather
-/// than skipping or serving a policy nobody named.
+/// The module is the `fcfs` program this tree builds for
+/// `wasm32-unknown-unknown`, the one that reproduces the rules the tests were
+/// written against: `engine::packaged_module` builds it on first use, and a
+/// module named by `SCHED_POLICY_WASM` is read instead.
 pub(crate) fn policy_module() -> Vec<u8> {
-    let path = std::env::var("SCHED_POLICY_WASM").unwrap_or_else(|_| {
-        panic!(
-            "SCHED_POLICY_WASM names the scheduling policy module these worlds serve with, and it \
-             is unset. Build it with `cargo build -p scheduling-policy-fcfs --target \
-             wasm32-unknown-unknown --release` and set SCHED_POLICY_WASM to the file it wrote, \
-             e.g. target/wasm32-unknown-unknown/release/scheduling_policy_fcfs.wasm"
-        )
-    });
-    std::fs::read(&path).unwrap_or_else(|error| {
-        panic!("SCHED_POLICY_WASM names `{path}`, which cannot be read: {error}")
-    })
+    engine::packaged_module()
 }
 
 /// Installs the policy a test world serves with: the `fcfs` package, revision

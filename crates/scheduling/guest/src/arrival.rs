@@ -234,7 +234,7 @@ impl<K: Order> Arrival<K> {
         let share = shares.tokens().min(shares.prefill());
         let chunk = prefill_chunk(
             start,
-            view.prompt_tokens,
+            view.prefill_tokens.max(view.prompt_tokens),
             self.limits.chunked_prefill_size,
             share,
             room.page_tokens,

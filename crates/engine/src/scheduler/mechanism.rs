@@ -503,7 +503,8 @@ fn validate_work_entry(
         }
         PhaseKind::Prefill => {
             let remaining = request
-                .prompt_tokens
+                .prefill_tokens
+                .max(request.prompt_tokens)
                 .saturating_sub(request.prefilled_tokens);
             if work.tokens > remaining {
                 return Err(invalid(
@@ -1348,6 +1349,7 @@ mod tests {
             arrived_at: Nanos(0),
             admitted_at: None,
             prompt_tokens: 0,
+            prefill_tokens: 0,
             generated_tokens: 0,
             cached_prefix_tokens: 0,
             prefilled_tokens: 0,
@@ -1847,7 +1849,11 @@ mod tests {
         // the residency the live step will have made; without that, a mid-flight
         // install whose first plan admits and runs a request could never pass
         // probation.
-        let queued = request(1, RequestState::Queued);
+        let mut queued = request(1, RequestState::Queued);
+        // A queued request's prompt is known from its submission; the plan
+        // admits it and runs its first chunk from the prompt's start.
+        queued.prompt_tokens = 4;
+        queued.prefill_tokens = 4;
         let live = live(vec![queued], vec![RequestId(1)], &[(0, PhaseKind::Prefill)]);
         let work = Work {
             request: RequestId(1),
