@@ -1351,11 +1351,19 @@ mod tests {
         // start reads the ranks it places, and a spec with no scheduling or
         // cache tables is no deployment's.
         let mut spec = ServeConfig::default().engine_spec().unwrap();
+        // The leader completes the options' spec with what the loaded model
+        // determines, and a start reads it back (`crate::leader`), so a spec an
+        // epoch could start always states facts. This test starts a process,
+        // not a model, so it states the empty ones the crate's other specs do.
+        spec.model_facts = Some(Default::default());
         spec.deployment = "model".to_owned();
         spec.model = "/models/qwen3".to_owned();
         spec.host = "rank-0".to_owned();
         spec.world = 3;
-        let placement = spec.placement.as_mut().expect("the default spec places ranks");
+        let placement = spec
+            .placement
+            .as_mut()
+            .expect("the default spec places ranks");
         placement.devices = vec![0];
         placement.queue_depth = 4;
         spec.workers
@@ -1571,7 +1579,10 @@ fn local_devices(host: &str, spec: &wire::EngineSpec) -> anyhow::Result<Vec<u32>
                 })?
                 .parse::<u32>()
                 .with_context(|| {
-                    format!("the device ordinal of rank {:?} does not parse", rank.device)
+                    format!(
+                        "the device ordinal of rank {:?} does not parse",
+                        rank.device
+                    )
                 })?;
             if !devices.contains(&ordinal) {
                 devices.push(ordinal);
