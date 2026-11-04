@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use ipc::{BatchCommand, BatchOutput, CallId, CallKind, RequestKey, TensorExport, WorkerInfo};
 
 mod batch;
+pub(crate) mod inventory;
 
 pub use batch::{ExecutionBatch, PageOffloads, RankBuffer, RequestPlacement};
 
