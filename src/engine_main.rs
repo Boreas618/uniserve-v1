@@ -1399,6 +1399,20 @@ impl MainProcess {
     /// §7.3 step 3: cut over at the batch boundary whose step the scheduler put
     /// the command at; an expert group's ranks switch at the same step.
     fn switchover(&mut self, generation: u64, step: Option<u64>) -> Result<ProgramStatus> {
+        // A switchover to a generation this process never prepared cannot succeed, and cutting the
+        // devices over to try it costs a live graph rebuild to end where it started: it is refused
+        // before any device is touched, and the generation that serves keeps serving.
+        if self.prepared.is_empty() {
+            return Ok(ProgramStatus::PrecopyFailed {
+                generation,
+                failure: UpdateFailure::Precopy {
+                    reason: format!(
+                        "a switchover to generation {generation}, which this process prepared \
+                         nothing for: the precopy that builds it either failed or never arrived"
+                    ),
+                },
+            });
+        }
         self.switchover_policy(generation, step);
         for executor in &self.executors {
             let device = executor.device();
@@ -1440,11 +1454,8 @@ impl MainProcess {
         // The state machine records the cut-over only when every device serves the new generation,
         // and the process's record of what serves follows it.
         self.update.switchover(generation, Instant::now())?;
-        if self.prepared.is_empty() {
-            tracing::warn!(generation, "a switchover found no prepared generation");
-        } else {
-            self.retired = std::mem::replace(&mut self.generations, std::mem::take(&mut self.prepared));
-        }
+        self.retired =
+            std::mem::replace(&mut self.generations, std::mem::take(&mut self.prepared));
         Ok(ProgramStatus::Switched { generation })
     }
 
