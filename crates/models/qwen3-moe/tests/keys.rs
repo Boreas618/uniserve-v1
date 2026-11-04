@@ -6,7 +6,8 @@ use nn::layers::Attention;
 /// The slice's own attention geometry: 128 elements a head, 32 query heads over 4 key heads, 64-token
 /// pages, a 40 960-key bound and no window.
 fn attention() -> Attention {
-    Attention::paged(128, 32, 4, 64, 40_960, None, 1.0).expect("the slice's attention geometry")
+    Attention::paged(128, 32, 4, 64, 40_960, None, 1.0)
+        .unwrap_or_else(|error| panic!("the slice's attention geometry: {error}"))
 }
 
 #[test]
