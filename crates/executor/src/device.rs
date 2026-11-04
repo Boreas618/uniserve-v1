@@ -265,6 +265,17 @@ impl Executor {
         )
     }
 
+    /// The device's mapped bytes per pool kind, from the one allocator that books them (4.1).
+    ///
+    /// The figures are one booking's totals rather than a sum over owners, so item 5's
+    /// `graph + scratch + resident <= budget` is decided by one book.
+    pub fn memory(&self) -> crate::arena::DeviceMemory {
+        self.pools
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .memory()
+    }
+
     /// What the device has done since it started: kernel launches and device time (7.3).
     pub fn counters(&self) -> Counters {
         self.counters.read()
