@@ -556,7 +556,9 @@ impl Scheduler {
         self.pump_page_changes();
         self.recorder.close();
         let room = self.room();
-        let mut live = self.live();
+        // The starvation rule names only a request the watchdog tracks, so the
+        // step states those views and not a view of every resident.
+        let live = views::watching(self, self.recorder.recorded());
         // A resident request that has not advanced within the policy's timeout
         // is the policy's failure, not the request's (design §4.4).
         let now = scheduling::guest::Nanos(crate::clock::now_monotonic_us().saturating_mul(1_000));
@@ -599,11 +601,10 @@ impl Scheduler {
         // is what lets one plan both admit and run a request (§4.4).
         self.admit_plan(&plan);
         // Admission is the only thing between the policy's dispatch and the
-        // plan's check, and it moves just the names the plan decided: restating
-        // those in the live state keeps a step's cost the size of its decision
-        // rather than the size of the world it holds (design §4.4).
-        let recorded = self.recorder.recorded();
-        views::admit_live(self, recorded, &mut live, &plan);
+        // plan's check, so the state the plan is checked against is read once,
+        // here, after it: the pages are the scheduler's own table borrowed for
+        // the check (design §4.4).
+        let live = self.live();
         if let Err(error) = mechanism::validate_plan(&plan, &room, &live) {
             return self.policy_failed(policy, error);
         }
@@ -710,7 +711,7 @@ impl Scheduler {
         }
     }
 
-    fn live(&self) -> mechanism::Live {
+    fn live(&self) -> mechanism::Live<'_> {
         let mut live = mechanism::Live {
             queue: self
                 .waiting
@@ -722,13 +723,16 @@ impl Scheduler {
                         .map(|pending| scheduling::guest::RequestId(pending.request.request_id.0)),
                 )
                 .collect(),
+            // The page table is the scheduler's own, kept current by the page
+            // delta: a step borrows it rather than copying every page it holds.
+            pages: std::borrow::Cow::Borrowed(&self.pages),
             ..mechanism::Live::default()
         };
         for request in views::requests(self, self.recorder.recorded()) {
             live.requests.insert(request.id, request);
         }
         for page in &self.pages {
-            live.pages.insert(*page.0, page.1.clone());
+            live.pages.to_mut().insert(*page.0, page.1.clone());
         }
         for entry in views::encodings(self) {
             live.encodings.insert(entry.id, entry);

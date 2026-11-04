@@ -72,12 +72,12 @@ use scheduling::guest::{
 /// runs: a candidate that passes probation is judged by what will judge it once
 /// it serves.
 pub(crate) struct Checked<'a> {
-    live: &'a Live,
+    live: &'a Live<'a>,
     room: &'a Room,
 }
 
 impl<'a> Checked<'a> {
-    pub(crate) fn new(live: &'a Live, room: &'a Room) -> Self {
+    pub(crate) fn new(live: &'a Live<'a>, room: &'a Room) -> Self {
         Self { live, room }
     }
 }
@@ -124,8 +124,8 @@ impl Validators for Checked<'_> {
 /// (and the switch's trial evaluation at a batch boundary). The one thing no
 /// view carries is the waiting queue's order, which is the mechanism's own
 /// admission order, so it is here beside the requests.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct Live {
+#[derive(Clone, Debug)]
+pub(crate) struct Live<'a> {
     /// Every request the main process holds, by id.
     pub requests: BTreeMap<RequestId, RequestView>,
     /// The requests waiting for admission, in the mechanism's own order.
@@ -133,15 +133,29 @@ pub(crate) struct Live {
     /// Only membership is read: the order a plan admits in is the policy's, and
     /// the mechanism admits in the plan's order.
     pub queue: Vec<RequestId>,
-    /// Every device and host page, by id.
-    pub pages: BTreeMap<PageId, PageView>,
+    /// Every device and host page, by id: the scheduler's own table, which the
+    /// page delta maintains, borrowed for a step and owned when the state is
+    /// built from a snapshot at a batch boundary.
+    pub pages: std::borrow::Cow<'a, BTreeMap<PageId, PageView>>,
     /// Every encoder cache entry, by id.
     pub encodings: BTreeMap<EncodingId, EncodingView>,
     /// Every phase of this epoch, by id.
     pub phases: BTreeMap<PhaseId, PhaseView>,
 }
 
-impl Live {
+impl Default for Live<'_> {
+    fn default() -> Self {
+        Self {
+            requests: BTreeMap::new(),
+            queue: Vec::new(),
+            pages: std::borrow::Cow::Owned(BTreeMap::new()),
+            encodings: BTreeMap::new(),
+            phases: BTreeMap::new(),
+        }
+    }
+}
+
+impl Live<'static> {
     /// The state a policy is instantiated with, as the validators read it.
     pub(crate) fn of(snapshot: &Snapshot, queue: Vec<RequestId>) -> Self {
         let mut live = Live {
@@ -152,7 +166,7 @@ impl Live {
             live.requests.insert(request.id, request.clone());
         }
         for page in &snapshot.pages {
-            live.pages.insert(page.id, page.clone());
+            live.pages.to_mut().insert(page.id, page.clone());
         }
         for entry in &snapshot.encodings {
             live.encodings.insert(entry.id, entry.clone());
@@ -163,15 +177,20 @@ impl Live {
         live
     }
 
-    fn request(&self, id: RequestId) -> Result<&RequestView, PolicyError> {
+}
+
+impl Live<'_> {
+    fn request(&self, id: RequestId) -> Result<RequestView, PolicyError> {
         self.requests
             .get(&id)
+            .cloned()
             .ok_or_else(|| invalid(Call::Dispatch, format!("request {} does not exist", id.0)))
     }
 
-    fn page(&self, id: PageId) -> Result<&PageView, PolicyError> {
+    fn page(&self, id: PageId) -> Result<PageView, PolicyError> {
         self.pages
             .get(&id)
+            .cloned()
             .ok_or_else(|| invalid(Call::Dispatch, format!("page {} does not exist", id.0)))
     }
 
@@ -208,7 +227,7 @@ fn decodes(kind: PhaseKind) -> bool {
 /// conservatively: work that does not fit the free storage after `reclaim`
 /// waits for the next step, which is the mechanism's hard limit and not a
 /// policy failure.
-pub(crate) fn validate_plan(plan: &Plan, room: &Room, live: &Live) -> Result<(), PolicyError> {
+pub(crate) fn validate_plan(plan: &Plan, room: &Room, live: &Live<'_>) -> Result<(), PolicyError> {
     validate_admission(plan, live)?;
     validate_work(plan, room, live)?;
     validate_release(plan, live)?;
@@ -222,7 +241,7 @@ pub(crate) fn validate_plan(plan: &Plan, room: &Room, live: &Live) -> Result<(),
 /// stops at the first request its hard limits refuse, which is how `fcfs`
 /// reproduces first-come-first-served while a policy that reorders the queue
 /// gets its own order. Membership is all that is validated here.
-fn validate_admission(plan: &Plan, live: &Live) -> Result<(), PolicyError> {
+fn validate_admission(plan: &Plan, live: &Live<'_>) -> Result<(), PolicyError> {
     let mut admitted = BTreeSet::new();
     for id in &plan.admit {
         if !live.queued(*id) {
@@ -263,7 +282,7 @@ fn validate_admission(plan: &Plan, live: &Live) -> Result<(), PolicyError> {
     Ok(())
 }
 
-fn validate_work(plan: &Plan, room: &Room, live: &Live) -> Result<(), PolicyError> {
+fn validate_work(plan: &Plan, room: &Room, live: &Live<'_>) -> Result<(), PolicyError> {
     if plan.work.len() > room.call_budget {
         return Err(invalid(
             Call::Dispatch,
@@ -342,7 +361,7 @@ fn validate_work(plan: &Plan, room: &Room, live: &Live) -> Result<(), PolicyErro
     Ok(())
 }
 
-fn validate_work_entry(work: &Work, live: &Live) -> Result<(), PolicyError> {
+fn validate_work_entry(work: &Work, live: &Live<'_>) -> Result<(), PolicyError> {
     let request = live.request(work.request)?;
     if request.state != RequestState::Resident {
         return Err(invalid(
@@ -416,7 +435,7 @@ fn validate_work_entry(work: &Work, live: &Live) -> Result<(), PolicyError> {
     Ok(())
 }
 
-fn validate_release(plan: &Plan, live: &Live) -> Result<(), PolicyError> {
+fn validate_release(plan: &Plan, live: &Live<'_>) -> Result<(), PolicyError> {
     let mut pages = BTreeSet::new();
     for id in &plan.offload {
         let page = live.page(*id)?;
@@ -509,7 +528,7 @@ fn validate_release(plan: &Plan, live: &Live) -> Result<(), PolicyError> {
 pub(crate) fn validate_victims(
     shortage: &Shortage,
     victims: &[Victim],
-    live: &Live,
+    live: &Live<'_>,
 ) -> Result<(), PolicyError> {
     // Freeing nothing is a legal answer: the work that did not fit waits for
     // the next step, and the watchdog bounds a resident request that then never
@@ -985,7 +1004,14 @@ impl Watchdog {
     /// A request waiting for a transfer is not starved: the mechanism cannot
     /// progress it, so waiting is not the policy's doing. The first by id, so a
     /// report is deterministic.
-    pub(crate) fn starved(&self, live: &Live, now: Nanos, timeout: Nanos) -> Option<RequestId> {
+    /// The requests this watchdog tracks, with when each last advanced: the
+    /// only requests its starvation rule can name, so a step states the live
+    /// views of these and no others.
+    pub(crate) fn tracked(&self) -> impl Iterator<Item = &RequestId> {
+        self.advancing.keys()
+    }
+
+    pub(crate) fn starved(&self, live: &Live<'_>, now: Nanos, timeout: Nanos) -> Option<RequestId> {
         for (id, since) in &self.advancing {
             let Some(request) = live.requests.get(id) else {
                 continue;
@@ -1037,7 +1063,7 @@ mod tests {
         Live {
             requests: requests.into_iter().map(|r| (r.id, r)).collect(),
             queue,
-            pages: BTreeMap::new(),
+            pages: std::borrow::Cow::Owned(BTreeMap::new()),
             encodings: BTreeMap::new(),
             phases: kinds
                 .iter()
@@ -1356,7 +1382,7 @@ mod tests {
     #[test]
     fn only_pages_no_request_continues_from_are_offloaded() {
         let mut live = live(vec![], Vec::new(), &[]);
-        live.pages.insert(
+        live.pages.to_mut().insert(
             PageId(1),
             PageView {
                 id: PageId(1),
@@ -1366,7 +1392,7 @@ mod tests {
                 evictable: false,
             },
         );
-        live.pages.insert(
+        live.pages.to_mut().insert(
             PageId(2),
             PageView {
                 id: PageId(2),
@@ -1376,7 +1402,7 @@ mod tests {
                 evictable: true,
             },
         );
-        live.pages.insert(
+        live.pages.to_mut().insert(
             PageId(3),
             PageView {
                 id: PageId(3),
@@ -1422,7 +1448,7 @@ mod tests {
             Vec::new(),
             &[],
         );
-        live.pages.insert(
+        live.pages.to_mut().insert(
             PageId(1),
             PageView {
                 id: PageId(1),
@@ -1432,7 +1458,7 @@ mod tests {
                 evictable: true,
             },
         );
-        live.pages.insert(
+        live.pages.to_mut().insert(
             PageId(2),
             PageView {
                 id: PageId(2),
