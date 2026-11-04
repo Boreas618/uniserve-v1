@@ -2,17 +2,18 @@
 //!
 //! One call covers both halves because the batch's tokens are written exactly once and read in the
 //! same step: the scheduler's mechanism assigns each token a slot (`-1` for a token it does not
-//! persist), [`ops::kv::KvWrite`] scatters the projections into the pages, and
-//! [`ops::attention::PagedAttention`] reads the pages each row addresses (specs/worker.md 9, "KV
-//! 写入" and "注意力"). Both operators are compiled per geometry, so the descriptor pins the element
-//! types, the head and page geometry and the mask variant, while the batch, the lengths, the scale
-//! and the window travel in the call.
+//! persist), [`ops::kv::KvWrite`] scatters the projections into the pages — or, for an FP8 cache,
+//! [`ops::kv::KvQuantize`] divides by the page's own scale on the way in, the same tensor the read
+//! side multiplies back — and [`ops::attention::PagedAttention`] reads the pages each row addresses
+//! (specs/worker.md 9, "KV 写入" and "注意力"). Both operators are compiled per geometry, so the
+//! descriptor pins the element types, the head and page geometry and the mask variant, while the
+//! batch, the lengths, the scale and the window travel in the call.
 
 use ops::attention::dense::{DenseArgs, DenseAttention, DenseDescriptor};
 use ops::attention::sparse::{SparseArgs, SparseAttention, SparseDescriptor};
 use ops::attention::{Args, Descriptor, Mask, PagedAttention, Phase};
-use ops::kv::{self, Descriptor as KvDescriptor, KvWrite};
-use ops::{PhaseKind, TensorView};
+use ops::kv::{self, Descriptor as KvDescriptor, KvQuantize, KvWrite};
+use ops::{DType, PhaseKind, Shape, TensorView};
 
 use crate::capability::{KvView, TokenBatch};
 use crate::error::{Error, Result};
@@ -501,6 +502,30 @@ impl Attention {
                 ),
             ));
         }
+        // The cache's element type decides the program, and there are two: a cache of the
+        // projection's own type is a scatter of both planes in one launch, and an E4M3 cache is the
+        // quantizing write, one launch per plane, dividing each page by the scale its reader
+        // multiplies back. A cache of any other type, or one whose two planes are in different
+        // types, is refused here rather than launched into a reader that would misread it: the
+        // scatter writes two planes of one type and the quantizing write fills one plane at a time,
+        // so a mixed pair needs a per-plane scatter that no operator provides.
+        let quantized = matches!(planes.key.dtype, DType::F8E4M3);
+        if planes.key.dtype != key.dtype || planes.value.dtype != value.dtype {
+            if !quantized
+                || planes.value.dtype != planes.key.dtype
+                || planes.key.dtype != DType::F8E4M3
+            {
+                return Err(Error::shape(
+                    "Attention::write",
+                    format!(
+                        "the cache is {} keys and {} values over {} projections: a cache is the \
+                         projections' own type or E4M3 in both planes",
+                        planes.key.dtype, planes.value.dtype, key.dtype
+                    ),
+                ));
+            }
+            return self.write_quantized(f, batch, planes, key, value);
+        }
         let descriptor = KvDescriptor {
             dtype: key.dtype,
             kv: planes.key.dtype,
@@ -521,6 +546,71 @@ impl Attention {
         };
 
         f.operate::<KvWrite>(&descriptor, args)
+    }
+
+    /// The quantizing write into an E4M3 cache: two launches, one per plane, each with the page
+    /// scale its reader multiplies back.
+    ///
+    /// The operator takes one plane at a time — its scale is per plane and per page — so the keys
+    /// and the values are two calls. Both read the same slot mapping, which is the batch's: a slot
+    /// of `-1` writes nothing in either.
+    fn write_quantized(
+        &self,
+        f: &Forward,
+        batch: &TokenBatch,
+        planes: &crate::capability::KvPlanes,
+        key: TensorView,
+        value: TensorView,
+    ) -> Result<()> {
+        let descriptor = kv::QuantizeDescriptor {
+            dtype: key.dtype,
+            scale: DType::F32,
+            page: self.page_size,
+            heads: self.kv_heads,
+            head_dim: self.head_dim,
+            block: kv_tile(self.head_dim),
+            pdl: PDL,
+        };
+        let rows = u64::from(self.kv_heads) * u64::from(self.head_dim);
+        for (name, cache, scale, initialized, source) in [
+            (
+                "key",
+                planes.key,
+                planes.key_scale,
+                planes.key_initialized,
+                key,
+            ),
+            (
+                "value",
+                planes.value,
+                planes.value_scale,
+                planes.value_initialized,
+                value,
+            ),
+        ] {
+            // A reader of an E4M3 plane multiplies by a scale this launch must have applied, so a
+            // cache without one is a cache nobody can read: refused here, before the launch.
+            let scale = scale.ok_or_else(|| {
+                Error::shape(
+                    "Attention::write",
+                    format!(
+                        "the {name} cache is {} and carries no page scale",
+                        cache.dtype
+                    ),
+                )
+            })?;
+            f.operate::<KvQuantize>(
+                &descriptor,
+                kv::QuantizeArgs {
+                    source: source.reshape(Shape::new(&[source.rows(), rows])),
+                    slots: batch.slot_mapping,
+                    scales: scale,
+                    out: cache,
+                    initialized,
+                },
+            )?;
+        }
+        Ok(())
     }
 
     /// Read the cache and write this batch's attended output.
