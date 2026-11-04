@@ -28,6 +28,7 @@ mod handle;
 mod host_tier;
 mod kv_cache;
 pub mod launches;
+mod process_link;
 mod scheduler;
 mod service;
 #[cfg(feature = "testing")]
@@ -41,6 +42,7 @@ pub use crate::core::{
     EngineConfig, SchedulerHandle, WorkerGroupConfig, WorkerGroupRole, WorkerRank,
 };
 pub use crate::deployment::Deployment;
+pub use crate::process_link::ProcessLink;
 pub use crate::executor::{
     BatchResult, CallResult, CommandOutcome, ComponentConfig, ComponentDistribution,
     ExecutionBatch, Executor, ExecutorError, ExecutorInfo, ExecutorSubmitError, PageOffloads,
