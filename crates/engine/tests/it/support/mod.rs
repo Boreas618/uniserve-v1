@@ -17,7 +17,9 @@ pub(crate) fn image_digest(id: u64) -> [u8; 32] {
     digest
 }
 
-use engine::{Executor, Scheduler, SchedulerConfig, SimEngine, SpecialTokenIds};
+use engine::{
+    Executor, Parameters, PolicyProgram, Scheduler, SchedulerConfig, SimEngine, SpecialTokenIds,
+};
 use engine::{GenerationFeatures, GenerationLimits, ModelDtype};
 use ipc::{CallKind, ForwardMode, MediaCall};
 
@@ -65,13 +67,70 @@ pub(crate) fn scheduler_with(
             ..Default::default()
         }
     };
-    Scheduler::new(
-        executor,
+    let mut scheduler = Scheduler::new(
+        engine::Submissions::new(executor),
         special_tokens,
         config,
         ModelDtype::BFloat16,
         limits,
-    )
+    )?;
+    install_policy(&mut scheduler, engine::BatchCapacity::of(&info));
+    Ok(scheduler)
+}
+
+/// The policy module every integration test's world serves with.
+///
+/// A deployed epoch takes its policy from the Program Server; a test world has
+/// none, and a scheduler with no policy decides nothing — no plan, no
+/// admission, no batch — so a world that submits a request must be given one.
+/// `SCHED_POLICY_WASM` names the module: the `fcfs` program this tree builds
+/// for `wasm32-unknown-unknown`, the one that reproduces the rules the tests
+/// were written against. Unset, every test fails here with what to build, rather
+/// than skipping or serving a policy nobody named.
+pub(crate) fn policy_module() -> Vec<u8> {
+    let path = std::env::var("SCHED_POLICY_WASM").unwrap_or_else(|_| {
+        panic!(
+            "SCHED_POLICY_WASM names the scheduling policy module these worlds serve with, and it \
+             is unset. Build it with `cargo build -p scheduling-policy-fcfs --target \
+             wasm32-unknown-unknown --release` and set SCHED_POLICY_WASM to the file it wrote, \
+             e.g. target/wasm32-unknown-unknown/release/scheduling_policy_fcfs.wasm"
+        )
+    });
+    std::fs::read(&path).unwrap_or_else(|error| {
+        panic!("SCHED_POLICY_WASM names `{path}`, which cannot be read: {error}")
+    })
+}
+
+/// Installs the policy a test world serves with: the `fcfs` package, revision
+/// one, instantiated for the capacity this world's workers were built for.
+///
+/// A policy declares its own limits, and the mechanism refuses a declaration
+/// above the build config's ceilings - the calls and tokens the workers were
+/// started for (§4.4) - rather than clamping it. The declaration is the
+/// policy's argument, so a deployment states the capacity its policy serves:
+/// left at the package's defaults, `fcfs` declares the 128 calls a production
+/// deployment has, and every test world whose workers were built for fewer
+/// would have no policy at all.
+pub(crate) fn install_policy(scheduler: &mut Scheduler, capacity: engine::BatchCapacity) {
+    let ceilings = engine::ceilings_of(capacity);
+    let program = PolicyProgram {
+        backend: "fcfs".to_owned(),
+        revision: 1,
+        arguments: Parameters {
+            chunked_prefill_size: Some(ceilings.chunked_prefill_size),
+            max_queued_requests: ceilings.max_queued_requests,
+            max_batch: Some(ceilings.max_batch),
+            max_num_batched_tokens: Some(ceilings.max_num_batched_tokens),
+            prefetch_min_tokens: Some(ceilings.prefetch_min_tokens),
+            timeout: Some(ceilings.timeout),
+            ..Default::default()
+        },
+        stated: Default::default(),
+    };
+    let source = engine::PolicyBytes::new(policy_module());
+    scheduler
+        .install_policy(program, &source)
+        .unwrap_or_else(|error| panic!("the fcfs policy is installed: {error}"));
 }
 
 /// Builds a scheduler that batches at most `max_batch` calls per pass.
