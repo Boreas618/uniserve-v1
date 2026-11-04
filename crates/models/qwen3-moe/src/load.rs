@@ -476,6 +476,7 @@ fn expert_block(
                 &["up", "gate"],
                 vocabulary,
                 layout,
+            false,
             )
             .map_err(Error::from)?;
         let down: QuantizedStack = loader
@@ -485,6 +486,7 @@ fn expert_block(
                 &["down"],
                 vocabulary,
                 layout,
+            false,
             )
             .map_err(Error::from)?;
         let activation = activation(config.hidden_act)?;

@@ -316,9 +316,22 @@ pub struct QuantizedWeight {
     /// `ScaleLayout::shape(rows, columns)` U8: one E4M3 block scale per sixteen elements.
     pub scales: Weight,
     /// The reciprocal of the checkpoint's FP32 tensor scale.
+    ///
+    /// It enters a kernel as a launch scalar, which is why it is a plain value.
     pub global_scale: f32,
     /// The layout the block scales are stored in.
     pub layout: ScaleLayout,
+    /// The reciprocal of the checkpoint's activation tensor scale, `[1]` F32, when the caller asked
+    /// for it.
+    ///
+    /// A calibrated export states a static per-module `input_scale` for its activations, and an
+    /// encoder needs it as a **device operand**: the product that consumes the encoding reads it as
+    /// each thread block starts, so a host scalar would serialize the pair. It is calibration data
+    /// of one tensor, invariant across requests, so it lives with the weights rather than in a
+    /// descriptor or a request. `None` says the consumer is weight-only and asked for none, which is
+    /// a different fact from a calibrated checkpoint that omitted it — that one is refused by
+    /// tensor name.
+    pub input_scale: Option<Weight>,
 }
 
 /// A calibrated NVFP4 **stack of experts**, as `gather_gemm_nvfp4` and `route_gemm_nvfp4` read it.
@@ -348,6 +361,14 @@ pub struct QuantizedStack {
     pub global_scale: Weight,
     /// The layout the block scales are stored in.
     pub layout: ScaleLayout,
+    /// `[experts, projections]` f32, row-major, in the same order: the reciprocal of each expert's
+    /// **per-projection** activation tensor scale, when the caller asked for it.
+    ///
+    /// A ModelOpt MoE export calibrates each expert's projections separately, so one activation
+    /// scale per stack would encode every expert but one at the wrong magnitude. `None` says the
+    /// consumer is weight-only; a calibrated checkpoint asked for this and missing it is refused by
+    /// tensor name.
+    pub input_scale: Option<Weight>,
 }
 
 /// Whether `dtype` is one of the two element types a block-scale field may have.
@@ -673,6 +694,7 @@ impl<'a> WeightLoader<'a> {
         &mut self,
         values: &WeightRequest,
         scales: &WeightRequest,
+        input_scale: Option<&WeightRequest>,
         layout: ScaleLayout,
         global_scale: f32,
     ) -> Result<QuantizedWeight> {
@@ -718,12 +740,74 @@ impl<'a> WeightLoader<'a> {
         }
         let scales = self.load(&scales_request)?;
         block_scale_dtype(&scales_request.tensor, scales.dtype())?;
+        let input_scale = match input_scale {
+            None => None,
+            Some(request) => {
+                let reciprocal = self.activation_reciprocal(request)?;
+                let shape = Shape::new(&[1]);
+                let bytes = reciprocal.to_le_bytes();
+                let files = self.identities(&[
+                    request.tensor.clone(),
+                    format!("{}__nvfp4_input_scale", request.tensor),
+                ])?;
+                Some(
+                    self.publish_computed(
+                        WeightKey {
+                            files,
+                            dtype: DType::F32,
+                            layout: WeightLayout::ROW_MAJOR,
+                            region: WeightRegion {
+                                tensors: std::iter::once(format!(
+                                    "{}__nvfp4_input_scale",
+                                    request.tensor
+                                ))
+                                .collect(),
+                                start: 0,
+                                shape,
+                                stride: None,
+                            },
+                        },
+                        shape,
+                        &bytes,
+                    )?,
+                )
+            }
+        };
         Ok(QuantizedWeight {
             packed,
             scales,
             global_scale,
             layout,
+            input_scale,
         })
+    }
+
+    /// Read one tensor's single floating number and answer its reciprocal.
+    ///
+    /// Both tensor scales a calibrated NVFP4 export states — the weight's `weight_scale_2` and the
+    /// activation's `input_scale` — are one positive float each, and every kernel that consumes one
+    /// takes the reciprocal. A zero, a negative or a non-finite scale is refused here rather than
+    /// encoded at the wrong magnitude.
+    fn activation_reciprocal(&self, request: &WeightRequest) -> Result<f32> {
+        let tensor = self.checkpoint.read(&request.tensor)?;
+        if tensor.shape.numel() != 1 || !tensor.dtype.is_float() {
+            return Err(Error::weight(
+                &request.tensor,
+                format!(
+                    "a tensor scale is one floating number, not {} {:?}",
+                    tensor.dtype,
+                    tensor.shape.dims()
+                ),
+            ));
+        }
+        let scale = to_f32(tensor.dtype, &tensor.bytes, &request.tensor)?[0];
+        if !(scale.is_finite() && scale > 0.0) {
+            return Err(Error::weight(
+                &request.tensor,
+                format!("a tensor scale of {scale} is not a positive number"),
+            ));
+        }
+        Ok(1.0 / scale)
     }
 
     /// Load the encoded fields of a whole expert stack: `experts` experts, each contributing
@@ -751,6 +835,7 @@ impl<'a> WeightLoader<'a> {
         projections: &[&str],
         experts: u32,
         layout: ScaleLayout,
+        input_scale: bool,
     ) -> Result<QuantizedStack> {
         if experts == 0 || projections.is_empty() {
             return Err(Error::weight(
@@ -768,6 +853,7 @@ impl<'a> WeightLoader<'a> {
         let mut values_bytes = Vec::new();
         let mut scales_bytes = Vec::new();
         let mut reciprocals = Vec::with_capacity(experts as usize);
+        let mut activation_reciprocals = Vec::with_capacity(experts as usize * projections.len());
         let mut scale_shape = None;
         let mut scale_dtype = None;
         for expert in 0..count {
@@ -779,6 +865,10 @@ impl<'a> WeightLoader<'a> {
                 names.push(values_name.clone());
                 names.push(scales_name.clone());
                 names.push(tensor_name.clone());
+                let activation_name = format!("{stem}.input_scale");
+                if input_scale {
+                    names.push(activation_name.clone());
+                }
 
                 let values = self.checkpoint.read(&values_name)?;
                 if values.dtype != DType::U8 {
@@ -861,6 +951,10 @@ impl<'a> WeightLoader<'a> {
                     ));
                 }
                 reciprocals.push(1.0 / scale);
+                if input_scale {
+                    let request = WeightRequest::region(&activation_name, 0, Shape::new(&[1]));
+                    activation_reciprocals.push(self.activation_reciprocal(&request)?);
+                }
 
                 values_bytes.extend_from_slice(&values.bytes);
                 scales_bytes.extend_from_slice(&scales.bytes);
@@ -948,11 +1042,43 @@ impl<'a> WeightLoader<'a> {
             Shape::new(&[count, per]),
             &scale_bytes,
         )?;
+        let input_scale = if input_scale {
+            let bytes: Vec<u8> = activation_reciprocals
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect();
+            let shape = Shape::new(&[count, per]);
+            let files = self.identities(
+                &names
+                    .iter()
+                    .filter(|name| name.ends_with(".input_scale"))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )?;
+            Some(self.publish_computed(
+                WeightKey {
+                    files,
+                    dtype: DType::F32,
+                    layout: WeightLayout::ROW_MAJOR,
+                    region: WeightRegion {
+                        tensors: std::iter::once(format!("{name}__nvfp4_input_scales")).collect(),
+                        start: 0,
+                        shape,
+                        stride: None,
+                    },
+                },
+                shape,
+                &bytes,
+            )?)
+        } else {
+            None
+        };
         Ok(QuantizedStack {
             values,
             scales,
             global_scale,
             layout,
+            input_scale,
         })
     }
 

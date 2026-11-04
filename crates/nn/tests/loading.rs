@@ -452,6 +452,7 @@ fn a_calibrated_nvfp4_matrix_is_loaded_as_its_three_fields() {
         .nvfp4(
             &WeightRequest::region("w", 0, Shape::new(&[4, 32])),
             &WeightRequest::region("w_scale", 0, Shape::new(&[4, 4])),
+            None,
             ops::fp4::ScaleLayout::Linear,
             0.25,
         )
@@ -497,6 +498,7 @@ fn the_block_scales_must_have_the_layout_s_shape() {
         .nvfp4(
             &WeightRequest::region("w", 0, Shape::new(&[4, 32])),
             &WeightRequest::region("w_scale", 0, Shape::new(&[4, 4])),
+            None,
             ops::fp4::ScaleLayout::Swizzled128X4,
             0.25,
         )
@@ -557,6 +559,7 @@ fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection
                 &["up", "gate"],
                 2,
                 ops::fp4::ScaleLayout::Linear,
+                false,
             )
             .unwrap()
     };
@@ -598,6 +601,7 @@ fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection
                 &["up", "gate"],
                 2,
                 ops::fp4::ScaleLayout::Linear,
+                false,
             )
             .unwrap()
     };
@@ -658,6 +662,7 @@ fn a_stack_needs_every_expert_to_agree_on_its_geometry() {
             &["up"],
             2,
             ops::fp4::ScaleLayout::Linear,
+            false,
         )
         .expect_err("two experts of different shapes are not one stack");
     assert!(
@@ -1014,6 +1019,7 @@ fn a_stack_keeps_the_checkpoint_s_e4m3_block_scales() {
             &["up", "gate"],
             2,
             ops::fp4::ScaleLayout::Linear,
+            false,
         )
         .unwrap();
     assert_eq!(

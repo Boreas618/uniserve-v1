@@ -1119,6 +1119,7 @@ pub(super) mod tests {
             scales: weight(DType::U8, &[u64::from(experts), rows, columns / 16]),
             global_scale: weight(DType::F32, &[u64::from(experts), projections]),
             layout: ops::fp4::ScaleLayout::Linear,
+            input_scale: None,
         };
         Moe::quantized(
             router,
@@ -1163,6 +1164,7 @@ pub(super) mod tests {
             scales: weight(DType::U8, &[u64::from(experts), rows, columns / 16]),
             global_scale: weight(DType::F32, &[u64::from(experts), projections]),
             layout: ops::fp4::ScaleLayout::Linear,
+            input_scale: None,
         };
         // Down's contraction is the gated width, so 512 experts' contraction does not fit 768.
         assert!(
