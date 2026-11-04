@@ -643,6 +643,32 @@ impl Moe {
         self.experts
     }
 
+    /// Whether this block's experts are the checkpoint's encoded stacks.
+    ///
+    /// What the block launches depends on it: a dense block runs one grouped product per projection,
+    /// an encoded one encodes each operand first and multiplies packed codes. A caller that
+    /// enumerates programs — a key walk, a store's shopping list — asks this rather than the loading
+    /// options, so the two cannot disagree about what the block will launch.
+    pub const fn is_encoded(&self) -> bool {
+        matches!(self.stacks, ExpertStacks::Encoded { .. })
+    }
+
+    /// The element type of the encoded stacks' block scales, or `None` for a dense block.
+    pub fn scale_dtype(&self) -> Option<DType> {
+        match &self.stacks {
+            ExpertStacks::Dense { .. } => None,
+            ExpertStacks::Encoded { up_gate, .. } => Some(up_gate.scales.dtype()),
+        }
+    }
+
+    /// The layout the encoded stacks' block scales are stored in, or `None` for a dense block.
+    pub fn scale_layout(&self) -> Option<ScaleLayout> {
+        match &self.stacks {
+            ExpertStacks::Dense { .. } => None,
+            ExpertStacks::Encoded { up_gate, .. } => Some(up_gate.layout),
+        }
+    }
+
     /// The routing prefix: the router, its top-k, the expert map, and the sort that groups the
     /// routes into the tiles a grouped product reads.
     ///
