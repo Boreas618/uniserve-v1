@@ -35,6 +35,6 @@ architectures = ["sm_100a", "sm_90a"]
 dimensions = { dtype = ["f32"], positions = ["i32", "i64"], columns = ["64", "128", "32"], block = ["256", "512", "1024"], scale = ["0x49742400", "0x3f800000", "0x461c4000"], pdl = ["true", "false"] }
 
 [[kernel.descriptors]]
-dimensions = { dtype = ["f32"], positions = ["i32", "i64"], columns = ["48", "24", "96"], block = ["256"], scale = ["0x3f800000", "0x461c4000", "0x49742400"], pdl = ["false"], axes = ["3"], sections = ["16-16-16"], interleaved = ["true"] }
+dimensions = { dtype = ["f32"], positions = ["i32", "i64"], columns = ["48", "24", "96", "64"], block = ["256"], scale = ["0x3f800000", "0x461c4000", "0x49742400"], pdl = ["false"], axes = ["3"], sections = ["16-16-16", "48-40-40"], interleaved = ["true"] }
 
 [parameters]
