@@ -123,8 +123,14 @@ extern "C" int32_t uniserve_frame_moments(const uniserve_frame_moments_call* cal
       call->groups <= 0) {
     return refuse(call, "frame_moments needs positive pixels, channels per group and groups");
   }
-  if (call->values_frame < call->channels_per_group * call->pixels) {
-    return refuse(call, "frame_moments needs a frame's strided row to hold the group's values");
+  // A frame must span at least one channel's pixels of the group: the kernel walks a frame by
+  // `channels_per_group` steps of `stride_channel` and reads `pixels` of each, so a frame that is
+  // shorter than one row would read past the tensor. It must *not* be required to hold the whole
+  // group, which only a frame-major layout satisfies: H3's video tensors are [B, C, T, H, W], where
+  // `values_frame` is one frame of one channel (H·W) and `values_channel` is a whole frame of the
+  // sequence (T·H·W).
+  if (call->values_frame < call->pixels) {
+    return refuse(call, "frame_moments needs a frame to span at least one row of pixels");
   }
   const int64_t channels_per_group = call->channels_per_group;
   const int64_t pixels = call->pixels;

@@ -1,0 +1,42 @@
+# The transpose operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one architecture
+# of `[kernel.architectures]`, built by `src/build.py` (the compile driver the
+# Program Server runs for one descriptor and target).
+#
+# This is the audio encoder's frame/channel swap: it holds `[batch, channels,
+# frames]` and attends over frames, so frames move to the leading axis before the
+# qkv projection and back after it, and no view can stand in because the layers on
+# either side read contiguous rows. Both sides are contiguous, one program moves a
+# `block × block` tile through shared memory, and no arithmetic happens at all — so
+# the operator's tolerance is `exact()` and the checks compare bytes.
+#
+# The key holds the element type, the tile and the flag only: both extents are launch
+# values, because a clip's frame count varies per request while the arithmetic does
+# not, and a descriptor extent would recompile the encoder for every clip length.
+
+op = "transpose"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/transpose.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a", "sm_100f"]
+
+[kernel.descriptors]
+dimensions = { dtype = ["f32", "bf16", "f16"], block = ["32"], pdl = ["false", "true"] }
+
+[parameters]
