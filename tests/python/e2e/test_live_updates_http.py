@@ -357,6 +357,24 @@ def _stream_count(
 REPORT_SETTLE = 2.0
 
 
+def _admitted(base_url: str) -> float:
+    """The requests every scheduler admitted so far
+    (``uniserve:num_requests_admitted``), once the reports of what came
+    before arrived.
+
+    A request that a handoff keeps in its engine is admitted once: the count
+    is how the test tells a handoff that takes the engine request over from a
+    resubmission that computes the request again.
+    """  # noqa: D205
+    time.sleep(REPORT_SETTLE)
+    text = httpx.get(f"{base_url}/metrics", timeout=10).text
+    return sum(
+        float(line.rsplit(" ", 1)[1])
+        for line in text.splitlines()
+        if line.startswith("uniserve:num_requests_admitted")
+    )
+
+
 def _prefix_queries(base_url: str) -> float:
     """The prompt tokens every scheduler looked up in its prefix cache so
     far (``uniserve:prefix_cache_queries``), once the reports of what came
@@ -795,13 +813,17 @@ def _restart_while_streaming(
     Every in-flight stream moves to the successor at an event boundary: the
     client's bytes are one continuous response, the successor writes the
     events after the handoff, and the replaced daemon exits once every stream
-    is adopted, without waiting for any of them to end (design 7.5.1). Each
+    is adopted, without waiting for any of them to end (design 7.5.1). The
+    engine requests are not resubmitted — the successor takes each request's
+    event stream over from the position its response consumed — so each of
+    the three requests is admitted exactly once across the handoff. Each
     stream's pause is recorded under ``artifacts/handoff-streams``.
     """
     engines_before = _pids(log, "Engine")
     status = httpx.get(f"{base_url}/admin/status", timeout=10).json()
     assert status["deployment"]["engine"] == "ready", status
     (old_daemon,) = _pids(log, "Daemon")
+    admitted_before = _admitted(base_url)
 
     # Three streams in flight, each with the identity the handoff records
     # name it by.
@@ -857,6 +879,15 @@ def _restart_while_streaming(
         assert numbers[:200] == list(range(1, 201)), (
             f"{request_id}: " + "".join(reads[request_id])[:400]
         )
+
+    # No request was computed twice: three handed-over streams and the three
+    # requests made after the restart are four..six admissions, never nine.
+    admitted_after = _admitted(base_url)
+    admitted = admitted_after - admitted_before
+    assert admitted == 6, (
+        f"{admitted} admissions for 3 handed-over and 3 new requests:"
+        " a handoff resubmitted a request"
+    )
 
     # The handoff's own records: every in-flight stream was handed over and
     # adopted by the successor, and finished after the replaced daemon had
