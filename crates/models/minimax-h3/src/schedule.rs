@@ -102,8 +102,12 @@ impl Schedule {
     /// The sigma points of one modality: decreasing, starting from its noise level and ending at
     /// the clean endpoint `0`.
     ///
-    /// Consecutive equal FP32 values - which a strong shift can produce - collapse into one point,
-    /// as the released `unique_consecutive` does.
+    /// Consecutive equal FP32 values collapse into one point, as the released grid's
+    /// `unique_consecutive` does (`schedule.py:140-146`) - a uniform grid's strong shift can produce
+    /// them and its point count is a statement, not a count of evaluations. A **DMD ladder** is not
+    /// deduplicated by the reference (`schedule.py:154-174`): its rungs are one evaluation each and
+    /// its length must equal the fused per-step head tables' count, so collapsing two rungs would
+    /// silently misalign every step's heads.
     pub fn sigmas(&self, modality: Modality) -> Vec<f32> {
         let shift = f64::from(self.shift(modality));
         match &self.spec.grid {
@@ -289,7 +293,10 @@ fn ladder_sigmas(rungs: &[u32], num_train_timesteps: f64, shift: f64) -> Vec<f32
         .map(|rung| shifted(f64::from(*rung) / num_train_timesteps, shift) as f32)
         .collect();
     sigmas.push(0.0);
-    deduplicate(sigmas)
+    // Not deduplicated: the reference keeps one sigma per trained rung (`schedule.py:154-174`), and
+    // a collapsed rung would leave the schedule with fewer evaluations than the checkpoint has head
+    // tables. Only the uniform grid collapses equal points.
+    sigmas
 }
 
 /// A parallel-decoding student's node sigmas for one modality.
@@ -457,6 +464,20 @@ mod tests {
         assert_eq!(*video.last().expect("the clean endpoint"), 0.0);
         // A rung is unshifted on the training schedule and shifted once here.
         assert_eq!(video[0], shifted(999.0 / 1000.0, 10.0) as f32);
+    }
+
+    #[test]
+    fn a_dmd_ladder_keeps_one_evaluation_per_rung_though_two_round_together() {
+        // Two rungs a nanosecond apart under a strong shift collapse to one FP32 sigma. The reference
+        // keeps both (`schedule.py:154-174`): a ladder's length is its evaluations, and it must match
+        // the checkpoint's fused per-step head tables, so a collapse would misalign every step.
+        let spec = ScheduleSpec::dmd(vec![999_999_999, 1_000_000_000], 1_000_000_000.0, shifts())
+            .expect("a ladder of two rungs");
+        let schedule = Schedule::new(&spec).expect("a ladder of two rungs");
+        let video = schedule.sigmas(Modality::Video);
+        assert_eq!(video.len(), 3);
+        assert_eq!(video[0], video[1]);
+        assert_eq!(schedule.num_steps().expect("aligned modalities"), 2);
     }
 
     #[test]
