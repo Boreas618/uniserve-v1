@@ -32,7 +32,9 @@ const NVML_ERROR_INSUFFICIENT_SIZE: NvmlReturn = 7;
 /// this one starts with a parenthesis.
 const NVML_VALUE_NOT_AVAILABLE: u64 = u64::MAX;
 
-/// `nvmlProcessInfo_t` (v2), returned by the `_v3` process queries.
+/// `nvmlProcessInfo_t` (v2), returned by the `_v3` process queries; its layout
+/// is compared with `nvml.h` by
+/// [`tests::the_nvml_structures_are_sized_by_the_headers`].
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct ProcessInfo {
@@ -42,7 +44,8 @@ struct ProcessInfo {
     compute_instance_id: u32,
 }
 
-/// `nvmlMemory_v2_t`.
+/// `nvmlMemory_v2_t`, whose layout is compared with `nvml.h` by
+/// [`tests::the_nvml_structures_are_sized_by_the_headers`].
 #[repr(C)]
 #[derive(Default)]
 struct RawMemory {
@@ -297,6 +300,33 @@ impl Drop for Nvml {
 
 #[cfg(test)]
 mod tests {
+    /// The two structures this crate mirrors are laid out as `nvml.h` lays
+    /// them out: a field in the wrong place would return a plausible but wrong
+    /// byte count rather than an error, which no test reading a number can tell
+    /// from a real one.
+    #[test]
+    fn the_nvml_structures_are_sized_by_the_headers() {
+        use crate::header::struct_size;
+        for (name, size) in [
+            ("nvmlMemory_v2_t", std::mem::size_of::<super::RawMemory>()),
+            (
+                "nvmlProcessInfo_t",
+                std::mem::size_of::<super::ProcessInfo>(),
+            ),
+        ] {
+            match struct_size("nvml.h", name) {
+                Some(header) => assert_eq!(
+                    header, size,
+                    "{name}: nvml.h lays it out in {header} bytes, this crate in {size}"
+                ),
+                None => eprintln!(
+                    "skipped: nvml.h does not let {name} be laid out here, so the crate's {size} \
+                     bytes for it went uncompared"
+                ),
+            }
+        }
+    }
+
     #[test]
     fn the_nvml_constants_are_the_headers() {
         crate::header::assert_constants(
