@@ -120,7 +120,10 @@ def _top_k_kernel(
     # Emit: the keys above `prefix` fill the low slots, then the equal keys in
     # column order until the width is full.
     filled = 0
-    equal_count = 0
+    # The equal keys' slots need the count from the tiles before this one: a rank computed inside a
+    # tile alone restarts at `above` in every tile, so the second tile's equals overwrite the first
+    # tile's and the slots their ranks should have filled are left holding whatever the buffer had.
+    equal_before = 0
     for start in range(0, vocabulary, STEP):
         lanes = start + columns
         live = lanes < vocabulary
@@ -136,23 +139,23 @@ def _top_k_kernel(
         keep_gt = gt & (slot_gt < above)
         tl.store(values_ptr + row * stride + slot_gt, values, mask=keep_gt)
         tl.store(ids_ptr + row * stride + slot_gt, lanes.to(tl.int32), mask=keep_gt)
-        slot_eq = above + tl.cumsum(eq.to(tl.int32), axis=0) - 1
+        slot_eq = above + equal_before + tl.cumsum(eq.to(tl.int32), axis=0) - 1
         keep_eq = eq & (slot_eq < above + taken)
         tl.store(values_ptr + row * stride + slot_eq, values, mask=keep_eq)
         tl.store(ids_ptr + row * stride + slot_eq, lanes.to(tl.int32), mask=keep_eq)
         filled += tl.sum(gt.to(tl.int32), axis=0)
-        equal_count += tl.sum(eq.to(tl.int32), axis=0)
+        equal_before += tl.sum(eq.to(tl.int32), axis=0)
 
     # Slots the row did not fill keep a sentinel that sorts last: the lanes it did not fill inside
     # the live width, and - through the load's `other` below - the padding lanes of the network.
     #
     # The written slots are `[0, above)` and then the equal keys the quota still holds, so the count
-    # is `above + min(equal, taken - above)` - never `filled + equal_count`, which counts equal keys
-    # the quota refuses and so would leave slots below `taken` holding whatever the buffer had,
-    # and a stale positive key sorts above every real candidate.
+    # is `above + min(equal, taken)` - never `filled + equal_before`, which counts the equal keys the
+    # quota refuses too and so would leave slots below `taken` holding whatever the buffer had, and a
+    # stale positive key sorts above every real candidate.
     tl.debug_barrier()
     slots = tl.arange(0, WIDTH)
-    written = tl.minimum(above + equal_count, live_width)
+    written = tl.minimum(above + equal_before, live_width)
     empty = (slots >= written) & (slots < live_width)
     tl.store(values_ptr + row * stride + slots, -float("inf"), mask=empty)
     tl.store(ids_ptr + row * stride + slots, 0, mask=empty)
