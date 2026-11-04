@@ -137,7 +137,10 @@ impl Track {
 /// One scratch buffer of a decoder's forward, with the element type it holds.
 ///
 /// The executor sizes the arena from these; the model never allocates. Names are the ones the arena
-/// plan in `notes/h3/decoders-interface.md` uses, so a mismatch is visible in one place.
+/// plan in `notes/h3/decoders-interface.md` uses, so a mismatch is visible in one place - **and the order
+/// is the order the model reserves them in**, because the arena is one cursor: `VideoDecoder::decode`
+/// reserves the per-tile scratch of each tile as it goes, so a buffer listed before another is also
+/// reserved before it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Buffer {
     /// The buffer's name.
@@ -248,6 +251,16 @@ pub fn video_arena(
             elements: voxels * columns,
         },
         Buffer {
+            name: "cosine",
+            element: "f32",
+            elements: rows * u64::from(rotated / 2),
+        },
+        Buffer {
+            name: "sine",
+            element: "f32",
+            elements: rows * u64::from(rotated / 2),
+        },
+        Buffer {
             name: "normalized",
             element: "f16",
             elements: rows * columns,
@@ -296,11 +309,6 @@ pub fn video_arena(
             name: "gated",
             element: "f16",
             elements: rows * columns * ffn,
-        },
-        Buffer {
-            name: "rotary",
-            element: "f32",
-            elements: rows * u64::from(rotated),
         },
         Buffer {
             name: "pixels",
@@ -918,12 +926,22 @@ mod tests {
             .expect("the residual stream");
         assert_eq!(tokens.elements, 28 * 1797 * 2048);
         assert_eq!(tokens.bytes(), tokens.elements * 2);
-        // The rotary factors are the rotated width, not the head.
-        let rotary = arena
+        // The two rotary factor tables the code reserves, in the position it reserves them: half the
+        // rotated width each, so their sum is the rotated width - not the head.
+        let cosine = arena
             .iter()
-            .find(|buffer| buffer.name == "rotary")
-            .expect("the factors");
-        assert_eq!(rotary.elements, 28 * 1797 * 48);
+            .position(|buffer| buffer.name == "cosine")
+            .expect("the cosine factors");
+        let sine = arena
+            .iter()
+            .position(|buffer| buffer.name == "sine")
+            .expect("the sine factors");
+        assert_eq!(sine, cosine + 1);
+        assert_eq!(
+            arena[cosine].elements + arena[sine].elements,
+            28 * 1797 * u64::from(crate::video_vae::rotary(&config).expect("the rotary").0)
+        );
+        assert_eq!(arena[cosine].elements, arena[sine].elements);
         // Every buffer is named once and no buffer is empty.
         let mut names: Vec<&str> = arena.iter().map(|buffer| buffer.name).collect();
         let count = names.len();
