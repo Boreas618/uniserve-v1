@@ -2598,8 +2598,16 @@ impl EpochPolicy for Routing {
     }
 
     fn commit(&self) {
-        for slot in &self.slots {
-            slot.handle.commit_policy();
+        let answers: Vec<_> = self
+            .slots
+            .iter()
+            .map(|slot| slot.handle.commit_policy())
+            .collect();
+        for answer in answers {
+            // The scheduler applies the commit before the caller moves on; a
+            // scheduler that refuses it keeps serving the previous policy, which
+            // its next policy report names.
+            let _ = answer_stage(answer);
         }
     }
 
@@ -2926,11 +2934,10 @@ mod tests {
         proto::process::Command {
             kind: Some(proto::process::command::Kind::Precopy(
                 proto::process::Precopy {
-                    generation: 0,
                     kernels,
                     policy: Some(program()),
-                    // The engine numbers the generation (§7.3); a field the
-                    // message may still carry is not what decides it.
+                    // The engine numbers the generation (§7.3): the message
+                    // carries none.
                     ..Default::default()
                 },
             )),
@@ -3052,7 +3059,6 @@ mod tests {
         let other = proto::process::Command {
             kind: Some(proto::process::command::Kind::Precopy(
                 proto::process::Precopy {
-                    generation: 0,
                     kernels: Vec::new(),
                     policy: Some(proto::process::Program {
                         backend: "fcfs".to_owned(),

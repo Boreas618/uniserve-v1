@@ -5,6 +5,15 @@
 //! `ops::activation`): [`GatedActivation`] over two arbitrary views, and [`SwiGlu`] over one packed
 //! `[value, gate]` projection with its packed bias. The H3 block's MLP uses the packed form; the
 //! expert GEMMs use the separate forms.
+//!
+//! **Every gated activation in this module may write in place.** `out` may be the same view as one
+//! of its inputs — the reference's own `_swiglu` does exactly that, and a captured graph wants it,
+//! because the arena is fixed at capture and the input buffer is where the result belongs. It is
+//! safe because the activation is elementwise over unit-strided rows: each element is read before it
+//! is written. What is *not* safe is `out` as a shifted view of an input, where a row's write lands
+//! on a position a later read has not reached yet; the operators' shape and stride checks refuse
+//! mismatched extents but cannot see a shift inside one row, so the layer's documentation is the
+//! contract the caller holds.
 
 use ops::TensorView;
 use ops::activation::{self, Activation};
@@ -50,7 +59,8 @@ impl GatedActivation {
     /// `out = act(gate) · value`.
     ///
     /// `gate` and `value` have `out`'s extents; their rows may be strided (the halves of one packed
-    /// projection included), and `out` is contiguous.
+    /// projection included), and `out` is contiguous. `out` may be `gate` or `value`: each element is
+    /// read before it is written, but a *shifted* view of either is not allowed (module docs).
     pub fn forward(
         &self,
         f: &Forward,
@@ -156,6 +166,11 @@ impl SwiGlu {
     ///
     /// The gate comes first, as in [`GatedActivation`], so the two gated activations cannot be read
     /// one for the other: `gate` is the branch the activation is applied to.
+    ///
+    /// `out` may be the *same* view as `gate` — the dense MLP's only call site passes it so, writing
+    /// the result into the arena buffer the gate arrived in, and the reference's `_swiglu` is
+    /// in-place for the same reason. Each element is read before it is written; a shifted view of
+    /// `gate` (or of `value`) is not allowed (module docs).
     pub fn forward(
         &self,
         f: &Forward,
@@ -262,6 +277,9 @@ impl PackedSwiGlu {
     }
 
     /// The activation of a packed `[..., 2 · width]` projection into `[..., width]`.
+    ///
+    /// `out` may overlap the leading half of `projection` (the value half), element for element; it
+    /// must not be a shifted view of either half (module docs).
     pub fn forward(
         &self,
         f: &Forward,

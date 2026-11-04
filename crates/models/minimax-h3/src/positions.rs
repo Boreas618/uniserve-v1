@@ -518,7 +518,10 @@ fn grid_samples(extent: u32, size: u32) -> Result<Vec<(i32, i32, f32)>> {
         ));
     }
     // `torch.linspace(start, end, 1)` is `[start]`; otherwise the step is an FP32 division of the
-    // span, as `at::linspace` computes it.
+    // span, as `at::linspace` computes it, and the last point is `end` exactly rather than
+    // `start + (size - 1) * step`: the two differ by an ulp whenever the step is not
+    // representable, and `47 / 5` is not, so `48 x 6` would otherwise truncate its last column to
+    // 46 and sample the wrong two table rows.
     let step = if size == 1 {
         0.0
     } else {
@@ -527,7 +530,11 @@ fn grid_samples(extent: u32, size: u32) -> Result<Vec<(i32, i32, f32)>> {
     let last = extent as i32 - 1;
     Ok((0..size)
         .map(|index| {
-            let coordinate = index as f32 * step;
+            let coordinate = if index + 1 == size {
+                last as f32
+            } else {
+                index as f32 * step
+            };
             let lower = (coordinate as i32).min(last);
             let upper = (lower + 1).min(last);
             (lower, upper, coordinate - lower as f32)
@@ -655,18 +662,37 @@ mod tests {
     fn interleaved_sections_cycle_their_axes() {
         let sections = mrope();
         let axes = sections.frequency_axes();
+        let widths = sections.widths();
         assert_eq!(axes.len(), 64);
-        // Every frequency is below `24 * 3`, so the cycle decides all of them.
-        for (frequency, axis) in axes.iter().enumerate() {
-            assert_eq!(*axis as usize, frequency % 3);
+        // Each axis owns exactly its section's width of frequencies, counted from the whole
+        // spectrum: the reference's rule (`uniserve/nn/rope.py::_interleaved_axes`) gives every
+        // axis its stated count and no axis a contiguous block.
+        let mut owned = [0_usize; 3];
+        for axis in &axes {
+            owned[*axis as usize] += 1;
         }
-        // A narrower first section pushes the frequencies it cannot hold onto axis 0.
+        assert_eq!(
+            owned,
+            [widths[0] as usize, widths[1] as usize, widths[2] as usize]
+        );
+        // A frequency below its cycle axis's bound takes that axis; `[24, 20, 20]` has two
+        // frequencies (61 and 62) whose own axis is full, and they fall to axis 0.
+        for (frequency, axis) in axes.iter().enumerate() {
+            let cycle = frequency % 3;
+            if frequency < widths[cycle] as usize * 3 {
+                assert_eq!(*axis as usize, cycle, "frequency {frequency}");
+            } else {
+                assert_eq!(*axis, 0, "frequency {frequency} overflows its axis");
+            }
+        }
+        // A narrower first section pushes the frequencies it cannot hold onto axis 0: with
+        // `[16, 24, 24]` the bound of axis 0 is 48, so 48 itself falls back while 49 and 50 do not.
         let narrow = Mrope::new([16, 24, 24], HEAD_DIM).expect("sections");
         let axes = narrow.frequency_axes();
-        assert_eq!(axes[48], 1);
-        assert_eq!(axes[49], 2);
-        assert_eq!(axes[50], 0);
-        assert_eq!(axes[3 * 16], 0);
+        assert_eq!(axes[48], 0);
+        assert_eq!(axes[49], 1);
+        assert_eq!(axes[50], 2);
+        assert_eq!(axes[51], 0);
     }
 
     #[test]
@@ -703,31 +729,27 @@ mod tests {
         assert_eq!(positions.len(), 9);
         // The block starts where the text clock is (2) and is stored in merge-block order.
         assert_eq!(positions[2], [2, 2, 2]);
-        assert_eq!(positions[3], [2, 2, 4]);
-        assert_eq!(positions[4], [2, 4, 2]);
+        assert_eq!(positions[3], [2, 2, 3]);
+        assert_eq!(positions[4], [2, 2, 4]);
+        assert_eq!(positions[5], [2, 3, 2]);
         // The clock advances by `max(4, 6) / 2 = 3`.
         assert_eq!(positions[8], [5, 5, 5]);
     }
 
     #[test]
     fn a_video_grid_is_one_run_per_temporal_patch() {
+        // One video of two temporal patches, each a 2x4 patch grid merged 2x2: two runs of two
+        // placeholders, with a timestamp between them.
         let ids = [VIDEO_TOKEN, VIDEO_TOKEN, 7, VIDEO_TOKEN, VIDEO_TOKEN];
-        // A 2x2x4 grid (two temporal patches, 4 wide) and a 1x2x2 grid, merge 2.
-        let positions = rope_index(
-            &ids,
-            &[],
-            &[[2, 2, 4], [1, 2, 2]],
-            IMAGE_TOKEN,
-            VIDEO_TOKEN,
-            2,
-        )
-        .expect("positions");
-        // The first run is two temporal patches of a 1x2 patch row: 2 merged tokens each.
+        let positions =
+            rope_index(&ids, &[], &[[2, 2, 4]], IMAGE_TOKEN, VIDEO_TOKEN, 2).expect("positions");
+        assert_eq!(positions.len(), 5);
+        // Each run is one time step: its merged grid is 1 row by 2 columns, and the clock is the
+        // same one every axis reads.
         assert_eq!(positions[0], [0, 0, 0]);
         assert_eq!(positions[1], [0, 0, 1]);
-        // The text token continues the clock, which the first grid advanced by 4/2 = 2.
+        // The run advances the clock by `max(2, 4) / 2 = 2`, the timestamp takes 2 and leaves 3.
         assert_eq!(positions[2], [2, 2, 2]);
-        // The second video advances by 2/2 = 1 after its own merged token.
         assert_eq!(positions[3], [3, 3, 3]);
         assert_eq!(positions[4], [3, 3, 4]);
     }
@@ -738,8 +760,12 @@ mod tests {
         assert!(rope_index(&ids, &[], &[], IMAGE_TOKEN, VIDEO_TOKEN, 2).is_err());
         let ids = [3];
         assert!(rope_index(&ids, &[[1, 2, 2]], &[], IMAGE_TOKEN, VIDEO_TOKEN, 2).is_err());
+        // A grid whose merged rows the prompt does not have is refused: a 4x4 grid merges to
+        // four rows, and one placeholder cannot hold them.
         let ids = [IMAGE_TOKEN];
-        assert!(rope_index(&ids, &[[1, 2, 2]], &[], IMAGE_TOKEN, VIDEO_TOKEN, 2).is_err());
+        assert!(rope_index(&ids, &[[1, 4, 4]], &[], IMAGE_TOKEN, VIDEO_TOKEN, 2).is_err());
+        // A 2x2 grid does merge to one row, so the same prompt with it is well formed.
+        assert!(rope_index(&ids, &[[1, 2, 2]], &[], IMAGE_TOKEN, VIDEO_TOKEN, 2).is_ok());
     }
 
     #[test]
@@ -775,30 +801,65 @@ mod tests {
 
     #[test]
     fn merged_order_is_block_then_patch() {
+        // A 4x6 patch grid merges to six rows, and each merged row reads its own 2x2 patches:
+        // twenty-four patch coordinates, blocks in raster order and patches within a block in
+        // raster order. This is the order the reference's `merged_grid_coordinates` returns.
         let (rows, columns) = merged_coordinates(4, 6, 2).expect("coordinates");
-        assert_eq!(rows.len(), 6);
-        assert_eq!(columns, vec![0, 1, 4, 5, 0, 1, 4, 5, 0, 1, 4, 5]);
-        assert_eq!(rows, vec![0, 0, 0, 0, 2, 2, 2, 2, 1, 1, 1, 1]);
+        assert_eq!(rows.len(), 24);
+        assert_eq!(
+            rows,
+            vec![
+                0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 2, 2, 3, 3, 2, 2, 3, 3, 2, 2, 3, 3
+            ]
+        );
+        assert_eq!(
+            columns,
+            vec![
+                0, 1, 0, 1, 2, 3, 2, 3, 4, 5, 4, 5, 0, 1, 0, 1, 2, 3, 2, 3, 4, 5, 4, 5
+            ]
+        );
         assert!(merged_coordinates(3, 4, 2).is_err());
     }
 
     #[test]
     fn the_position_sample_blends_the_four_neighbours() {
+        // One sample per patch: a 4x6 grid has twenty-four, the table is 48x48, and patch
+        // `(i, j)` reads table point `(i * 47 / 3, j * 47 / 5)` with the corners aligned, as the
+        // reference's `PositionEmbedding.interpolate` does. Each tap list is the top-left,
+        // top-right, bottom-left and bottom-right neighbour of that point.
         let (indices, weights) = position_samples(48, 4, 6, 2).expect("samples");
-        // Six merged rows per grid; the first merged row is patch (0, 0), the table's corner.
-        assert_eq!(indices.len(), 6);
-        assert_eq!(indices[0], [0, 0, 48, 48]);
+        assert_eq!(indices.len(), 24);
+        assert_eq!(weights.len(), 24);
+        // The grid's first patch is the table's top-left corner: the top-left tap carries the
+        // whole blend and its three neighbours carry none of it.
+        assert_eq!(indices[0], [0, 1, 48, 49]);
         assert_eq!(weights[0], [1.0, 0.0, 0.0, 0.0]);
-        // The patch at column 2 samples table column `2 * 47 / 5 = 18.8`.
-        let (indices, weights) = position_samples(48, 4, 6, 2).expect("samples");
-        assert_eq!(indices[1][0], 18);
-        assert_eq!(indices[1][1], 19);
-        let fraction = 2.0f32 * (47.0 / 5.0) - 18.0;
-        assert!((weights[1][1] - fraction).abs() < 1e-6);
-        // A one-patch axis samples the table's first row.
-        let (indices, _) = position_samples(48, 1, 1, 2).unwrap();
-        assert_eq!(indices, vec![[0, 0, 48, 48]]);
-        assert!(position_samples(0, 2, 2, 1).is_err());
+        // Its right neighbour sits at column `47 / 5 = 9.4`: table columns 9 and 10 of the same
+        // row, split 0.6 / 0.4.
+        assert_eq!(indices[1], [9, 10, 57, 58]);
+        assert!((weights[1][0] - 0.6).abs() < 1e-6);
+        assert!((weights[1][1] - 0.4).abs() < 1e-6);
+        assert_eq!(weights[1][2], 0.0);
+        assert_eq!(weights[1][3], 0.0);
+        // Every blend partitions one over four taps inside the table, for every patch.
+        for (index, weight) in indices.iter().zip(&weights) {
+            for tap in index {
+                assert!((0..2304).contains(tap), "tap {tap} outside the table");
+            }
+            let total: f32 = weight.iter().sum();
+            assert!((total - 1.0).abs() < 1e-5, "{weight:?} does not sum to one");
+        }
+        // A one-block grid reaches the table's four corners through its four patches.
+        let (indices, _) = position_samples(48, 2, 2, 2).expect("samples");
+        assert_eq!(
+            indices,
+            vec![
+                [0, 1, 48, 49],
+                [47, 47, 95, 95],
+                [2256, 2257, 2256, 2257],
+                [2303, 2303, 2303, 2303],
+            ]
+        );
     }
 
     #[test]

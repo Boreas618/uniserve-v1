@@ -112,6 +112,17 @@ const HEADS_TIMES_HEAD_DIM: u32 = 7168;
 const HEADS: u32 = 56;
 const HEAD_DIM: u32 = 128;
 
+/// Rows of one VSA tile (`vsa_tile_size` in `fastvideo_inference.json`: 64 for the FastH3 students,
+/// 128 for OmniRef). `uniserve/models/minimax_h3/packing.py` binds a 64-row tile to a `4×4×4`
+/// spatiotemporal block and refuses any size it does not pack, so this is the checkpoint's number,
+/// not a scheduling choice. The `vsa_sparsity: 0.8` beside it gives the selection's keep count, which
+/// is a launch value: it follows the clip's tile count, so it is in no key.
+const VSA_TILE_ROWS: u32 = 64;
+
+/// Rows one VSA program handles (`_BLOCK_ROWS` in `uniserve_kernels/attention/vsa_segments.py`): the
+/// kernel's own tiling inside a tile, compiled in.
+const VSA_BLOCK_ROWS: u32 = 16;
+
 /// The transformer's feed-forward width (`ffn_dim`).
 const FFN: u32 = 14336;
 
@@ -412,21 +423,19 @@ fn main() {
         (30, 40), // 480x640
         (30, 52), // 480x832
     ] {
-        for mode in [ops::patch::Mode::Patchify, ops::patch::Mode::Unpatchify] {
-            push(
-                "patch",
-                ops::patch::Descriptor {
-                    dtype: DType::BF16,
-                    channels: 24,
-                    height,
-                    width,
-                    mode,
-                    block: ops::patch::BLOCK,
-                    pdl: PDL,
-                }
-                .to_string(),
-            );
-        }
+        // One key per raster: the inverse is `unpatchify_video` at 1×2×2, not a mode of this op.
+        push(
+            "patch",
+            ops::patch::Descriptor {
+                dtype: DType::BF16,
+                channels: 24,
+                height,
+                width,
+                block: ops::patch::BLOCK,
+                pdl: PDL,
+            }
+            .to_string(),
+        );
     }
     // The two `unpatchify_video` geometries the decoder needs: the latents and the decoder's own
     // output. The token grid is the request's -- its clip length and its canvas -- so it is a launch
@@ -530,6 +539,528 @@ fn main() {
         }
         .to_string(),
     );
+
+    // ---- The audio encoder's head pool, and the video path's last step.
+    //
+    // The pool is the projection's two fused reductions: `heads = num_attention_heads 8`, the head
+    // width `latent_dim / heads = 256`, pooled to `latent_channels = 32` (`audio_vae.py:431-440`,
+    // `audio_vae/config.json`).
+    push(
+        "adaptive_pool",
+        ops::adaptive_pool::Descriptor {
+            dtype: DType::F32,
+            heads: AUDIO_ATTENTION_HEADS,
+            width: AUDIO_LATENT_DIM / AUDIO_ATTENTION_HEADS,
+            output: AUDIO_LATENT_CHANNELS,
+            block: ELEMENTWISE_BLOCK,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
+    // The video path's last step: the VAE's raster is `float16`
+    // (`uniserve/models/minimax_h3/output.py`'s own state buffer), three channels, packed bytes.
+    push(
+        "rgb_bytes",
+        ops::rgb::Descriptor {
+            dtype: DType::F16,
+            channels: 3,
+            block: ops::rgb::BLOCK,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
+
+    // ---- The text encoder (Qwen3-VL, `text_encoder/config.json`): its norms and its two audited
+    // activations. `hidden_size 5120` for the language model, `intermediate_size` 25600 gated, and
+    // the vision tower's `gelu_pytorch_tanh` over its own `intermediate_size 4304`.
+    //
+    // `rms_norm`/`add_rms_norm` are compiled per column count and tile, the tile being the layer's
+    // `next_power_of_two(columns)`; the element type is the checkpoint's `bfloat16`.
+    let text_columns = 5120_u32;
+    push(
+        "rms_norm",
+        ops::norm::RmsNormDescriptor {
+            dtype: DType::BF16,
+            columns: text_columns,
+            tile: text_columns.next_power_of_two(),
+            pdl: PDL,
+        }
+        .to_string(),
+    );
+    push(
+        "add_rms_norm",
+        ops::norm::AddRmsNormDescriptor {
+            dtype: DType::BF16,
+            columns: text_columns,
+            tile: text_columns.next_power_of_two(),
+            pdl: PDL,
+        }
+        .to_string(),
+    );
+    // The audio encoder's GeGLU applies tanh-GELU over its hidden width, `2 · latent_channels`
+    // (`audio_vae.py:417`, `GeGLU(channels, 2 * channels)`), in FP32.
+    push(
+        "gelu",
+        ops::gelu::Descriptor {
+            dtype: DType::F32,
+            columns: AUDIO_LATENT_CHANNELS * 2,
+            block: ELEMENTWISE_BLOCK,
+            approximate: ops::gelu::Approximation::Tanh,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
+    // Its norms are `[patches, 1152]`, so the tile is the layer's `next_power_of_two`.
+    push(
+        "layer_norm",
+        ops::norm::LayerNormDescriptor {
+            dtype: DType::BF16,
+            columns: 1152,
+            tile: 1152_u32.next_power_of_two(),
+            bias: true,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
+    // Its 2-D rotary turns each head's leading half against the trailing half (`Rotation::Half`,
+    // `vision.rs`'s `Rotate::new(head_dim, heads, Rotation::Half)`), 8 rows and 128 lanes per program
+    // (`nn::layers::rotate`'s own constants); the whole 72-element head rotates, so no narrower
+    // `rotated` is appended.
+    push(
+        "rope_apply",
+        ops::rope::RopeApplyDescriptor {
+            dtype: DType::BF16,
+            output: DType::BF16,
+            head_dim: 72,
+            heads: 16,
+            rotation: ops::rope::Rotation::Half,
+            rows: 8,
+            block: 128,
+            pdl: PDL,
+            rotated: 72,
+        }
+        .to_string(),
+    );
+    // Its learned position table, bilinearly resampled from the 48 × 48 it was trained on to the
+    // patch grid a request's frame count produces. `channels` and `in_side` are compiled in; the
+    // output's grid is the args' extent.
+    push(
+        "position_interpolate",
+        ops::position::Descriptor {
+            dtype: DType::BF16,
+            channels: 1152,
+            in_side: 48,
+            block: 1024,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
+
+    // The vision tower is `Qwen3VLVisionModel` (`text_encoder/config.json`'s `vision_config`):
+    // `hidden_size 1152`, `num_heads 16` — so `head_dim 72` — 27 blocks, `num_position_embeddings
+    // 2304` (a 48 × 48 learned table), `patch_size 16`, `temporal_patch_size 2`, and both weight and
+    // bias on every LayerNorm (the checkpoint's `model.visual.*.norm{1,2}.bias` entries). Its MLP
+    // activation is `gelu_pytorch_tanh` over `intermediate_size 4304`.
+    push(
+        "gelu",
+        ops::gelu::Descriptor {
+            dtype: DType::BF16,
+            columns: 4304,
+            block: ELEMENTWISE_BLOCK,
+            approximate: ops::gelu::Approximation::Tanh,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
+
+    // ---- The vision tower's products, all BF16 against FP32 accumulation with no epilogue.
+    //
+    // The key names the contraction, not the output width, so four rows cover nine call sites: the
+    // patch projection reads the flat tubelet (`in_channels · temporal_patch_size · patch²` = 3 · 2 ·
+    // 16² = 1536, `vision.rs`'s `Geometry::tubelet`); the fused qkv branches and the attention
+    // projection contract over `hidden_size` 1152; the MLP's first matrix does too and its second
+    // contracts over `intermediate_size` 4304; and both merger matrices read the merged row
+    // (`hidden_size · spatial_merge_size²` = 4 · 1152 = 4608, `Geometry::merged_width`), the deepstack
+    // mergers included.
+    for k in [1536_u32, 1152, 4304, 4608] {
+        push(
+            "gemm",
+            ops::gemm::Descriptor {
+                input: DType::BF16,
+                weight: DType::BF16,
+                accumulate: DType::F32,
+                output: DType::BF16,
+                order: ops::gemm::WeightOrder::NxK,
+                epilogue: ops::gemm::Epilogue::None,
+                k,
+            }
+            .to_string(),
+        );
+    }
+
+    // Its attention and its residual add, at the tower's own geometry: 16 heads of 72, a dense mask
+    // with no window, and **one sequence per time step** — `vision.rs` calls `attend_dense` with the
+    // offsets the grid's time steps give it, so the key carries no `cu_seq_lens` suffix (that name is
+    // written only for the form without offsets).
+    push(
+        "dense_attention",
+        ops::attention::DenseDescriptor {
+            query: DType::BF16,
+            key_value: DType::BF16,
+            output: DType::BF16,
+            head_dim: 72,
+            q_heads: 16,
+            kv_heads: 16,
+            mask: ops::attention::Mask::Dense,
+            windowed: false,
+            // A declared bound outside the key, sized for the tower's longest sequence: its learned
+            // position table is `num_position_embeddings 2304`, and no attention sequence is longer
+            // than the patches that table covers.
+            max_kv_len: 2304,
+            cu_seq_lens: true,
+        }
+        .to_string(),
+    );
+    // The tower's residual stream is `[patches, 1152]` with a plain scale and no bias update.
+    push(
+        "scaled_residual",
+        ops::residual::ScaledResidualDescriptor {
+            dtype: DType::BF16,
+            columns: 1152,
+            block: ELEMENTWISE_BLOCK,
+            update_bias: false,
+        }
+        .to_string(),
+    );
+
+    // ---- The video VAE's encoder, `vae/config.json` and `encoding.rs`'s own construction.
+    //
+    // The encoder is FP32 and every convolution passes `tf32 = true` at `Conv3d::new`, so the flag is
+    // the model's declaration rather than a preset's inference. Its geometry is cubic with zero
+    // padding and unit dilation (`encoding.rs::geometry`), and the downsampler of a stage strides by
+    // that stage's factors: `spatial_downsample_factors [2,2,2,2,1,1]` against
+    // `temporal_downsample_factors [1,2,2,1,1,1]` gives three distinct pairs — `[1,2,2]`, `[2,2,2]`
+    // and the two stages whose product is 1, which carry no downsampler at all — so four rows cover
+    // every convolution of the encoder and the whole of `quant_conv`.
+    for (kernel, stride) in [
+        ([3_u32, 3, 3], [1_u32, 1, 1]),
+        ([3, 3, 3], [1, 2, 2]),
+        ([3, 3, 3], [2, 2, 2]),
+        ([1, 1, 1], [1, 1, 1]),
+    ] {
+        push(
+            "conv3d",
+            ops::conv::Descriptor {
+                input: DType::F32,
+                weight: DType::F32,
+                output: DType::F32,
+                geometry: ops::conv::Geometry {
+                    kernel,
+                    stride,
+                    padding: [0, 0, 0],
+                    dilation: [1, 1, 1],
+                    groups: 1,
+                },
+                bias: true,
+                tf32: true,
+                rank: 3,
+                transposed: false,
+            }
+            .to_string(),
+        );
+    }
+    // Its per-frame group statistics over `norm_num_groups 32` with `norm_eps 1e-6`.
+    push(
+        "frame_moments",
+        ops::frame::FrameMomentsDescriptor {
+            dtype: DType::F32,
+            epsilon: ops::descriptor::Float::from(1e-6_f32),
+        }
+        .to_string(),
+    );
+    // Its normalize-then-pad, with the affine parameters the checkpoint carries (`centered` is the
+    // form without them) and `spatial_padding_mode reflect`. `single_pixel` is the descriptor's form
+    // for a one-pixel raster, which needs no padding at all: both are listed because which one a
+    // request takes depends on the clip's latent grid, not on a compiled choice.
+    for single_pixel in [false, true] {
+        push(
+            "frame_norm_pad",
+            ops::frame::FrameNormPadDescriptor {
+                dtype: DType::F32,
+                channels_last: false,
+                centered: false,
+                single_pixel,
+            }
+            .to_string(),
+        );
+    }
+
+    // ---- The text encoder's MLP and its token embedding, and the two packed gated activations.
+    //
+    // The language layers' MLP is a `GatedActivation` over two *separate* contiguous projections —
+    // `text_encoder.rs` runs its own `gate` and `up` Linears into their own `[tokens, intermediate]`
+    // buffers before the activation — so both row strides are the intermediate width, 25600. The
+    // activation is `silu` (`hidden_act`), the layer's block is 1024, and `wide` is false because the
+    // output is in bytes far below the u32 element count.
+    push(
+        "act_and_mul",
+        ops::activation::ActAndMulDescriptor {
+            dtype: DType::BF16,
+            width: 25600,
+            block: 1024,
+            activation: ops::activation::Activation::Silu,
+            gate_stride: 25600,
+            value_stride: 25600,
+            wide: false,
+            pdl: PDL,
+            stepwise: false,
+        }
+        .to_string(),
+    );
+    // The two packed forms: the DiT's block MLP and the conditioning projection both contract to
+    // `ffn_dim 14336` in BF16 from a packed `[rows, 2 · width]` row, and the video VAE decoder's to
+    // its own `mlp` width 8192 in FP16 (`decoders.md`'s arena: `mlp [rows, 8192]`). The row stride is
+    // twice the width because the two halves are packed beside each other, and no call site passes a
+    // bias.
+    for (dtype, width) in [(DType::BF16, 14336_u32), (DType::F16, 8192)] {
+        push(
+            "value_first_swiglu",
+            ops::activation::ValueFirstSwigluDescriptor {
+                dtype,
+                width,
+                block: 1024,
+                input_stride: 2 * u64::from(width),
+                bias: false,
+                absmax: false,
+            }
+            .to_string(),
+        );
+    }
+    // The text encoder's token embedding, at the single-partition shape: the whole vocabulary
+    // (151936 rows of 5120) with i32 ids, eight tokens per program. A sharded deployment re-keys it,
+    // because `first` and `rows` are the rank's slice of the vocabulary.
+    push(
+        "embedding",
+        ops::embedding::Descriptor {
+            dtype: DType::BF16,
+            ids: DType::I32,
+            hidden: 5120,
+            first: 0,
+            rows: 151936,
+            block: 8,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
+
+    // The encoder's causal frame padding, in FP32 with reflect edges (`spatial_padding_mode`).
+    //
+    // **Its tile is a function of the raster's width**, not a constant: `FramePadDescriptor::tiles`
+    // takes `min(ROW_PIXELS 512, next_power_of_two(columns))` pixels per program and divides
+    // `ROW_ELEMENTS 2048` by it, so a raster at least 512 pixels wide gives the 512-pixel tile with
+    // four channels per program — every realistic clip width — and a narrower one re-keys to its own
+    // pixel block. This row is the wide case; a request whose width is under 512 compiles another.
+    push(
+        "frame_pad",
+        ops::frame::FramePadDescriptor {
+            dtype: DType::F32,
+            reflect: true,
+            block_pixels: 512,
+            block_channels: 4,
+        }
+        .to_string(),
+    );
+
+    // ---- The audio decoder's and encoder's convolutions, in FP32 with TF32 declared on.
+    //
+    // The decoder's seven upsamplers are `ConvTranspose1d` with `kernel = decoder_kernel_sizes`,
+    // `stride = decoder_rates`, `padding = (kernel - rate) / 2` — two distinct geometries for the
+    // seven stages (`autoencoder_kl_minimax_h3_audio.py:447-459`): `(9, 5, 2)` twice and `(4, 2, 1)`
+    // five times. The key names the geometry, not the channels, so two rows cover all seven.
+    // The key builder: the operator's name and the descriptor, pushed by the caller so that one
+    // closure does not hold `push` for the rest of the section.
+    let convolution = |kernel: [u32; 3],
+                       stride: [u32; 3],
+                       padding: [u32; 3],
+                       dilation: [u32; 3],
+                       transposed: bool|
+     -> (&'static str, String) {
+        (
+            if transposed {
+                "conv_transpose1d"
+            } else {
+                "conv1d"
+            },
+            ops::conv::Descriptor {
+                input: DType::F32,
+                weight: DType::F32,
+                output: DType::F32,
+                geometry: ops::conv::Geometry {
+                    kernel,
+                    stride,
+                    padding,
+                    dilation,
+                    groups: 1,
+                },
+                bias: true,
+                // The preset's declaration for a model convolution in FP32 (the video VAE keeps it
+                // on, and the audio VAEs are the same FP32 numerical path).
+                tf32: true,
+                rank: 1,
+                transposed,
+            }
+            .to_string(),
+        )
+    };
+    let (operator, key) = convolution([9, 1, 1], [5, 1, 1], [2, 1, 1], [1, 1, 1], true);
+    push(operator, key);
+    let (operator, key) = convolution([4, 1, 1], [2, 1, 1], [1, 1, 1], [1, 1, 1], true);
+    push(operator, key);
+    // The decoder's entry and exit convolutions, and the pointwise narrowing inside a residual unit.
+    let (operator, key) = convolution([7, 1, 1], [1, 1, 1], [3, 1, 1], [1, 1, 1], false);
+    push(operator, key);
+    let (operator, key) = convolution([1, 1, 1], [1, 1, 1], [0, 1, 1], [1, 1, 1], false);
+    push(operator, key);
+    // The decoder's residual units: the three resblock kernels, each at the three dilations
+    // (`resblock_kernel_sizes [3, 7, 11]`, `resblock_dilation_sizes [1, 3, 5]`).
+    for kernel in [3_u32, 7, 11] {
+        for dilation in [1_u32, 3, 5] {
+            push(
+                "conv1d",
+                ops::conv::Descriptor {
+                    input: DType::F32,
+                    weight: DType::F32,
+                    output: DType::F32,
+                    geometry: ops::conv::Geometry {
+                        kernel: [kernel, 1, 1],
+                        stride: [1, 1, 1],
+                        padding: [(dilation * (kernel - 1)) / 2, 1, 1],
+                        dilation: [dilation, 1, 1],
+                        groups: 1,
+                    },
+                    bias: true,
+                    tf32: true,
+                    rank: 1,
+                    transposed: false,
+                }
+                .to_string(),
+            );
+        }
+    }
+    // The encoder's residual units are a seven-tap convolution at dilations 1, 3 and 9
+    // (`audio_vae.py:352-354`, padding `3 · dilation`), and its exit convolution is three taps at
+    // padding 1. Two of these rows coincide with the decoder's seven-tap rows above.
+    for dilation in [1_u32, 3, 9] {
+        let (operator, key) = convolution(
+            [7, 1, 1],
+            [1, 1, 1],
+            [3 * dilation, 1, 1],
+            [dilation, 1, 1],
+            false,
+        );
+        push(operator, key);
+    }
+    let (operator, key) = convolution([3, 1, 1], [1, 1, 1], [1, 1, 1], [1, 1, 1], false);
+    push(operator, key);
+    // The encoder's strided convolutions: `kernel = 2 · stride`, `padding = ceil(stride / 2)`
+    // (`audio_vae.py:355-363`), for the three distinct rates of `encoder_rates [2, 4, 4, 5, 5]`.
+    for stride in [2_u32, 4, 5] {
+        let (operator, key) = convolution(
+            [2 * stride, 1, 1],
+            [stride, 1, 1],
+            [stride.div_ceil(2), 1, 1],
+            [1, 1, 1],
+            false,
+        );
+        push(operator, key);
+    }
+
+    // ---- The VSA selection's pooled-score product: the stage-1 video attention's per-head tile
+    // similarity, over the transformer's own head geometry (56 heads of 128). The operands are the
+    // pooled means in FP32 and so are the scores, so no element type is in the key; the lanes one
+    // program uses for the contraction are the head width, and the pooling itself (the tile
+    // reduction and its stride) is `vsa_prepare_tiles`' launch values.
+    push(
+        "vsa_scores",
+        ops::segments::ScoresDescriptor::new(HEADS, HEAD_DIM, HEAD_DIM.next_power_of_two(), PDL)
+            .to_string(),
+    );
+
+    // The pooling that feeds it, and the two tile passes around the attention, all at the tile the
+    // contract names. Q, K and V are contiguous `[rows, 56, 128]` views of one projected interval, so
+    // a row is 7168 elements and a head 128; stage-1 Q and K are normalized and rotated over the
+    // leading 96 of their 128 channels (`attention.py`'s `vsa.NormRope`), which is `ROTATED`.
+    push(
+        "vsa_prepare_tiles",
+        ops::segments::PrepareTilesDescriptor {
+            dtype: DType::BF16,
+            heads: HEADS,
+            width: HEAD_DIM,
+            rotated: ROTATED,
+            tile_rows: VSA_TILE_ROWS,
+            block_rows: VSA_BLOCK_ROWS,
+            epsilon: ops::descriptor::Float::from(NORM_EPSILON),
+            norm: true,
+            query_row_stride: u64::from(HEADS_TIMES_HEAD_DIM),
+            query_head_stride: u64::from(HEAD_DIM),
+            key_row_stride: u64::from(HEADS_TIMES_HEAD_DIM),
+            key_head_stride: u64::from(HEAD_DIM),
+            value_row_stride: u64::from(HEADS_TIMES_HEAD_DIM),
+            value_head_stride: u64::from(HEAD_DIM),
+            // A split-half factor table holds `rotated / 2` values a row.
+            factor_stride: u64::from(ROTATED / 2),
+        }
+        .to_string(),
+    );
+    // A tile's rows past its valid size hold zeros, on both sides of the attention.
+    push(
+        "vsa_zero_padding",
+        ops::segments::ZeroPaddingDescriptor {
+            dtype: DType::BF16,
+            heads: HEADS,
+            tile_rows: VSA_TILE_ROWS,
+            width: HEAD_DIM,
+            block_rows: VSA_BLOCK_ROWS,
+        }
+        .to_string(),
+    );
+    // The compressed gated tiles that give back the sparse rows.
+    push(
+        "vsa_add_gated_tiles",
+        ops::segments::AddGatedTilesDescriptor {
+            dtype: DType::BF16,
+            tile_rows: VSA_TILE_ROWS,
+            width: HEAD_DIM,
+            block_rows: VSA_BLOCK_ROWS,
+        }
+        .to_string(),
+    );
+
+    // ---- The audio encoder's frame/channel swap, in the audio VAEs' own FP32.
+    //
+    // `AudioVAEEncoder` holds `[batch, channels, frames]` and its attention attends over frames, so
+    // frames move to the leading axis before the qkv projection and back after it. Both extents are
+    // launch values, so one row covers every clip length.
+    push(
+        "transpose",
+        ops::transpose::Descriptor {
+            dtype: DType::F32,
+            block: ops::transpose::TILE,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
+
+    // Gaps this file does not fill, named rather than invented:
+    // - `bias_add`: the channel list per call site follows the stage widths above, but the call sites
+    //   are the decoder's and the video VAE's own composition, which is h3's to state.
+    // - `conv3d`: the video VAE's per-stage geometry (kernels 3, spatial strides from
+    //   `spatial_downsample_factors [2,2,2,2,1,1]`, temporal 1 or 2) is a construction inside
+    //   `diffusers`' `AutoencoderKLMiniMaxH3`, not a number in a config.
+    // - `embedding`, `act_and_mul`: the text encoder's shard rows and its gate/value strides are the
+    //   layer's layout choices, not the config's.
+    // - the five VSA operators, `gated_residual`, `frame_pad`/`frame_moments`/`frame_norm_pad`,
+    //   `position_interpolate`, `rope_apply`, `rows`, `paged_attention`: h3's packing and processor.
 
     // One key per line, the same key once: a variant two layers launch is packaged once.
     lines.sort();

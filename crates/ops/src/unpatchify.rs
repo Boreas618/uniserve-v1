@@ -30,7 +30,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Strides, TensorView};
+use crate::tensor::{DType, Shape, TensorView};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -195,18 +195,9 @@ impl Op for Unpatchify {
                 }
             }
         }
-        // The program indexes the raster as a flat row-major run of voxels, so a strided destination
-        // would have it write the wrong voxels rather than refuse.
-        if args.out.strides != Strides::row_major(args.out.shape) {
-            return Err(Error::argument(
-                Self::NAME,
-                format!(
-                    "the raster is written row-major; found strides {}",
-                    args.out.strides
-                ),
-            ));
-        }
-
+        // A tile lands inside a larger raster, so the destination is a strided block; the rule for
+        // what a row-at-a-time write needs of it is `tensor::row_writable`'s.
+        let out_strides = crate::tensor::row_writable(&args.out, Self::NAME)?;
         let mut arguments = Arguments::new();
         arguments.view(args.tokens);
         if let Some((scale, bias)) = affine {
@@ -221,6 +212,35 @@ impl Op for Unpatchify {
             .u32(descriptor.patch_frames)
             .u32(descriptor.patch_height)
             .u32(descriptor.patch_width)
+            // The destination's outer strides: the program writes one row contiguously and addresses
+            // its base with these, which is what lets a tile land inside a larger raster.
+            .u32(u32::try_from(out_strides[0]).map_err(|_| {
+                Error::argument(
+                    Self::NAME,
+                    format!(
+                        "the raster's channel stride {} does not fit a kernel parameter",
+                        out_strides[0]
+                    ),
+                )
+            })?)
+            .u32(u32::try_from(out_strides[1]).map_err(|_| {
+                Error::argument(
+                    Self::NAME,
+                    format!(
+                        "the raster's frame stride {} does not fit a kernel parameter",
+                        out_strides[1]
+                    ),
+                )
+            })?)
+            .u32(u32::try_from(out_strides[2]).map_err(|_| {
+                Error::argument(
+                    Self::NAME,
+                    format!(
+                        "the raster's row stride {} does not fit a kernel parameter",
+                        out_strides[2]
+                    ),
+                )
+            })?)
             .flag(descriptor.affine)
             .u32(descriptor.block)
             .flag(descriptor.pdl);

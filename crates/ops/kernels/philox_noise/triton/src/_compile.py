@@ -69,6 +69,29 @@ def parse_key(key, dimensions):
     return fields
 
 
+def descriptor_fields(key, descriptors):
+    """The fields of ``key`` under the descriptor shape that declares it.
+
+    A package may declare several shapes — ``[kernel.descriptors]`` with one
+    table of dimensions, or ``[[kernel.descriptors]]`` repeated — because an
+    operator prints different fields for different variants of the same
+    program. The shape whose declared dimensions parse the whole key is the one
+    the key belongs to; a key no shape declares is the caller's mistake and is
+    reported with every shape's dimensions.
+    """
+    shapes = descriptors if isinstance(descriptors, list) else [descriptors]
+    for shape in shapes:
+        dimensions = shape.get("dimensions", {})
+        try:
+            return parse_key(key, dimensions)
+        except SystemExit:
+            continue
+    declared = " | ".join(
+        ", ".join(sorted(shape.get("dimensions", {}))) for shape in shapes
+    )
+    raise SystemExit(f"{key}: no descriptor shape declares it; the shapes declare {declared}")
+
+
 def compile_one(package, target, key, out, spec):
     """Compile descriptor ``key`` of ``package`` for ``target`` into ``out``.
 
@@ -78,7 +101,7 @@ def compile_one(package, target, key, out, spec):
     compilation options.
     """
     manifest = tomllib.loads((package / "package.toml").read_text())
-    fields = parse_key(key, manifest["kernel"]["descriptors"]["dimensions"])
+    fields = descriptor_fields(key, manifest["kernel"]["descriptors"])
     described = spec(fields, manifest.get("parameters", {}), target)
     compiled = triton.compile(
         ASTSource(

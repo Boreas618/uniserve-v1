@@ -45,6 +45,9 @@ use crate::solver::Solver;
 use crate::transformer::Transformer;
 use crate::{Error, Result};
 
+/// The longest generated clip a deployment's bounds are taken over, in frames.
+const MAX_FRAMES: u32 = 1024;
+
 /// The modulation columns one AdaLN row holds: six affine vectors of three tags each.
 const ADALN_COLUMNS: u64 = 18;
 
@@ -111,25 +114,131 @@ impl Layouts {
     /// The elements the request's condition draws occupy, in request order.
     ///
     /// A condition's noise is drawn at latent resolution - patched afterwards, so its packed rows
-    /// overcount by four - and its audio rows are already channel-major elements.
-    pub fn condition_elements(&self, conditions: &[packing::Condition], canvas: &Canvas) -> u32 {
-        let Ok(segments) = packing::condition_segments(conditions, canvas) else {
-            return 0;
-        };
+    /// overcount by four - and its audio rows are already channel-major elements. The count is
+    /// computed from the conditions themselves, not from a packing, so it is total: every condition
+    /// whose raster and frame count are ones the packing would accept contributes exactly its
+    /// elements, and one it would refuse contributes none. A refused condition never reaches here -
+    /// the runner lays the request out, and that packing is the same function of the same values -
+    /// so a served request's offsets are exact.
+    pub fn condition_elements(&self, conditions: &[packing::Condition], _canvas: &Canvas) -> u32 {
         let channels = u64::from(self.config.transformer.video_channels);
-        let elements: u64 = segments
+        let elements: u64 = conditions
             .iter()
-            .map(|segment| {
-                let visual = segment.visual.map_or(0, |visual| {
-                    u64::from(visual.frames)
-                        * u64::from(visual.raster.height)
-                        * u64::from(visual.raster.width)
-                        * channels
+            .map(|condition| {
+                let visual = condition.frame.map_or(0, |frame| {
+                    let frames = if frame.num_frames <= 1 {
+                        1
+                    } else {
+                        packing::video_latent_frames(frame.num_frames).unwrap_or(0)
+                    };
+                    match packing::latent_raster(&frame.canvas) {
+                        Ok(raster) => {
+                            u64::from(frames)
+                                * u64::from(raster.height)
+                                * u64::from(raster.width)
+                                * channels
+                        }
+                        Err(_) => 0,
+                    }
                 });
-                visual + u64::from(segment.audio_rows())
+                let audio = u64::from(crate::config::AUDIO_CHANNELS)
+                    * u64::from(condition.audio_samples.div_ceil(crate::config::AUDIO_HOP));
+                visual + audio
             })
             .sum();
         elements as u32
+    }
+
+    /// The largest packed row count any layout of this deployment reaches.
+    ///
+    /// The attention allocates its scratch per packed row at load, so `rows` must bound every layout
+    /// the deployment can be asked for. Only the packing the checkpoint's attention kind reads is
+    /// such a bound: a dense deployment is sized by the dense packing, and taking the sparse one as
+    /// well would over-size its attention by a quarter for requests it cannot receive. The two
+    /// differ because the sparse packing pads to whole tiles (46848 against 38080 at the released
+    /// canvases).
+    pub fn rows_bound(&self) -> Result<u32> {
+        let mut bound = 0;
+        let sparse = matches!(
+            self.config.attention,
+            crate::config::AttentionKind::Sparse { .. }
+        );
+        for canvas in self.config.offered_canvases() {
+            let mut frames = crate::CLIP_FRAMES + crate::CLIP_LATENTS;
+            while frames <= MAX_FRAMES {
+                if sparse {
+                    let tile = self.config.attention.capacity_rows();
+                    if let Ok(segment) = packing::segment_packing(
+                        frames,
+                        canvas,
+                        self.arrangement.text_rows,
+                        self.arrangement.condition_rows,
+                        tile,
+                        tile,
+                    ) {
+                        bound = bound.max(segment.extent.padded_tokens);
+                    }
+                } else if let Ok(dense) = packing::dense_packing(
+                    frames,
+                    canvas,
+                    self.arrangement.text_rows,
+                    self.arrangement.condition_rows,
+                    self.arrangement.shard,
+                ) {
+                    bound = bound.max(dense.padded_tokens);
+                }
+                frames += crate::CLIP_FRAMES;
+            }
+        }
+        if bound == 0 {
+            return Err(Error::config(
+                "a deployment offers no canvas a layout can be built for".to_owned(),
+            ));
+        }
+        Ok(bound)
+    }
+
+    /// The segment packing of a sparse layout, rebuilt from the layout's own extents.
+    ///
+    /// The tile capacities a sparse layout holds are tile-rounded, so a rebuild from the layout's
+    /// numbers must return the same extent: a mismatch is a layout this deployment did not pack,
+    /// and the tables built from it would address rows that are not there.
+    pub fn segment_of(&self, layout: &Layout) -> Result<packing::SegmentPacking> {
+        let tile = match self.config.attention {
+            crate::config::AttentionKind::Sparse { tile, .. } => tile,
+            crate::config::AttentionKind::Dense => {
+                return Err(Error::config(
+                    "a dense deployment has no segment packing".to_owned(),
+                ));
+            }
+        };
+        let frames = frame_count(layout.video.frames)?;
+        let canvas = canvas_of_latents(layout)?;
+        let packed = packing::segment_packing(
+            frames,
+            &canvas,
+            layout.text_rows,
+            layout.condition_rows,
+            tile,
+            tile,
+        )?;
+        let extent = &packed.extent;
+        let raster = packing::latent_raster(&canvas)?;
+        let video_rows = extent.video_grid.0 * extent.video_grid.1 * extent.video_grid.2;
+        // The layout's capacities are rows of whole tokens; a segment packing rounds each prefix
+        // capacity up to its tile, and its audio and video rows are the layout's own.
+        let tiles = |rows: u32| rows.div_ceil(tile) * tile;
+        if u64::from(video_rows) != u64::from(layout.video.frames) * raster.patch_rows() as u64
+            || extent.audio_rows != packing::audio_rows(frames)
+            || extent.text_rows != tiles(layout.text_rows)
+            || extent.condition_rows != tiles(layout.condition_rows)
+        {
+            return Err(Error::config(format!(
+                "the layout's {:?} extents are not a segment packing this deployment builds",
+                layout.video
+            )));
+        }
+        Ok(packed)
     }
 
     /// The layout a request is laid out in, without packing it.
@@ -204,7 +313,9 @@ impl Layouts {
         condition_elements: u32,
     ) -> Result<Layout> {
         let raster = packing::latent_raster(canvas)?;
-        let frames = packing::video_latent_frames(packing.video_rows / raster.patch_rows())?;
+        // The packing's video rows are latent frames of raster patch rows, so the division recovers
+        // the latent frame count directly: it is not a generated count and must not be snapped.
+        let frames = packing.video_rows / raster.patch_rows();
         Ok(Layout {
             video: LatentShape {
                 channels: self.config.transformer.video_channels,
@@ -230,6 +341,14 @@ impl Layouts {
     /// [`packing::dense_packing`]'s for the frame count and canvas those extents imply, and the two
     /// must agree - a disagreement is a layout this model did not build.
     pub fn packing_of(&self, layout: &Layout) -> Result<DensePacking> {
+        if matches!(
+            self.config.attention,
+            crate::config::AttentionKind::Sparse { .. }
+        ) {
+            return Err(Error::config(
+                "a sparse deployment packs its layout in tiles, not densely".to_owned(),
+            ));
+        }
         let canvas = canvas_of_latents(layout)?;
         let frames = frame_count(layout.video.frames)?;
         let packing = packing::dense_packing(
@@ -261,6 +380,12 @@ impl Layouts {
     /// share one set. Every table is one the forward reads; none is a host value the executor would
     /// otherwise have to pass through a launch.
     pub fn table_specs(&self, layout: &Layout) -> Result<Vec<StateTable>> {
+        if matches!(
+            self.config.attention,
+            crate::config::AttentionKind::Sparse { .. }
+        ) {
+            return self.segment_table_specs(layout);
+        }
         let packing = self.packing_of(layout)?;
         let rows = u64::from(packing.padded_tokens);
         let video = u64::from(packing.video_rows);
@@ -279,16 +404,17 @@ impl Layouts {
                 shape: Shape::new(&[video]),
             },
             // One sequence over the whole shard: every query row sees the used key rows and no
-            // query sees a padding row. `cu_seq_lens_k` is the dense visibility, `_q` the rows.
+            // query sees a padding row. `cu_seq_lens_k` is the dense visibility, `_q` the rows, and
+            // a single run is named by its two ends - a start and a stop - not by every row.
             StateTable {
                 name: "cu_seq_lens_k",
                 dtype: DType::I32,
-                shape: Shape::new(&[rows + 1]),
+                shape: Shape::new(&[2]),
             },
             StateTable {
                 name: "cu_seq_lens_q",
                 dtype: DType::I32,
-                shape: Shape::new(&[rows + 1]),
+                shape: Shape::new(&[2]),
             },
             StateTable {
                 name: "groups",
@@ -329,6 +455,201 @@ impl Layouts {
         Ok(tables)
     }
 
+    /// The tables a sparse layout needs, in the order [`Layouts::write_state`] fills them.
+    ///
+    /// A sparse layout holds four tables a dense one does not - the tile sizes, each tile's video
+    /// segment, each segment's first tile, and the key tiles a query keeps - and neither of the dense
+    /// attention's two sequence-length tables: the sparse attention reads its tiles, not one run.
+    fn segment_table_specs(&self, layout: &Layout) -> Result<Vec<StateTable>> {
+        let packed = self.segment_of(layout)?;
+        let extent = &packed.extent;
+        let rows = u64::from(extent.padded_tokens);
+        let tiles = u64::from(extent.padded_tokens / extent.tile);
+        let video = u64::from(extent.video_grid.0 * extent.video_grid.1 * extent.video_grid.2);
+        let audio = u64::from(extent.audio_rows);
+        let mut tables = vec![
+            StateTable {
+                name: "audio_indices",
+                dtype: DType::I32,
+                shape: Shape::new(&[audio]),
+            },
+            StateTable {
+                name: "video_indices",
+                dtype: DType::I32,
+                shape: Shape::new(&[video]),
+            },
+            StateTable {
+                name: "groups",
+                dtype: DType::I32,
+                shape: Shape::new(&[rows]),
+            },
+            StateTable {
+                name: "modulation_indices",
+                dtype: DType::I32,
+                shape: Shape::new(&[rows]),
+            },
+            StateTable {
+                name: "position_ids",
+                dtype: DType::F32,
+                shape: Shape::new(&[3, rows]),
+            },
+            StateTable {
+                name: "prefix_index",
+                dtype: DType::I32,
+                shape: Shape::new(&[rows]),
+            },
+            StateTable {
+                // Over-allocated to the tile count and filled by segment index, exactly as the
+                // reference builds it (`packing.py:1228-1239`); `select` reads only its first
+                // `segments` entries, which is the prefix view the layer hands it.
+                name: "segment_keep",
+                dtype: DType::I32,
+                shape: Shape::new(&[tiles]),
+            },
+            StateTable {
+                name: "segment_starts",
+                dtype: DType::I32,
+                shape: Shape::new(&[tiles]),
+            },
+            StateTable {
+                name: "step",
+                dtype: DType::I32,
+                shape: Shape::new(&[1]),
+            },
+            StateTable {
+                name: "tile_segments",
+                dtype: DType::I32,
+                shape: Shape::new(&[tiles]),
+            },
+            StateTable {
+                name: "token_tags",
+                dtype: DType::I32,
+                shape: Shape::new(&[rows]),
+            },
+            StateTable {
+                name: "variable_block_sizes",
+                dtype: DType::I32,
+                shape: Shape::new(&[tiles]),
+            },
+        ];
+        tables.sort_by_key(|table| table.name);
+        Ok(tables)
+    }
+
+    /// Fill a sparse layout's tables: the tile packing's own indices and the segment tables.
+    fn write_segment_state(
+        &self,
+        request: &VideoRequest<'_>,
+        layout: &Layout,
+        out: &mut [Vec<u8>],
+    ) -> Result<()> {
+        let (sparsity, reference_keep) = match self.config.attention {
+            crate::config::AttentionKind::Sparse {
+                sparsity,
+                reference_keep,
+                ..
+            } => (sparsity, reference_keep),
+            crate::config::AttentionKind::Dense => {
+                return Err(Error::config(
+                    "a dense deployment holds no segment tables".to_owned(),
+                ));
+            }
+        };
+        let packing = self.segment_of(layout)?;
+        let frames = frame_count(layout.video.frames)?;
+        let canvas = canvas_of_latents(layout)?;
+        if request.text_tokens < 1 || request.text_tokens > packing.extent.text_rows {
+            return Err(Error::config(format!(
+                "a prompt of {} rows does not fit a text capacity of {}",
+                request.text_tokens, packing.extent.text_rows
+            )));
+        }
+        let conditions = conditions_of(request);
+        let segments = packing::condition_segments(&conditions, &canvas)?;
+        let tables = packing::segment_tables(
+            &packing,
+            frames,
+            &canvas,
+            request.text_tokens,
+            &segments,
+            // The prompt's vision rows arrive with `VideoRequest`'s condition shapes.
+            &[],
+            packing::Sparsity {
+                sparsity,
+                reference_keep,
+            },
+        )?;
+        let rows = tables.groups.len();
+        if rows != packing.extent.padded_tokens as usize {
+            return Err(Error::config(format!(
+                "{rows} table rows for {} packed rows",
+                packing.extent.padded_tokens
+            )));
+        }
+        let tiles = tables.variable_block_sizes.len();
+        let specs = self.segment_table_specs(layout)?;
+        let sizes: Vec<i32> = tables
+            .variable_block_sizes
+            .iter()
+            .map(|size| *size as i32)
+            .collect();
+        let audio: Vec<i32> = packing.audio_indices().map(|row| row as i32).collect();
+        let video: Vec<i32> = packing
+            .video_indices
+            .iter()
+            .map(|row| *row as i32)
+            .collect();
+        let filled: [(&str, Vec<u8>); 10] = [
+            ("audio_indices", integers(&audio)),
+            ("video_indices", integers(&video)),
+            ("groups", integers(&tables.groups)),
+            (
+                "modulation_indices",
+                modulation_indices(&tables.groups, &tables.token_tags),
+            ),
+            ("position_ids", coordinates(&tables.position_ids)),
+            ("prefix_index", integers(&tables.prefix_index)),
+            ("segment_keep", integers(&tables.segment_keep)),
+            ("segment_starts", integers(&tables.segment_starts)),
+            ("tile_segments", integers(&tables.tile_segments)),
+            ("token_tags", integers(&tables.token_tags)),
+        ];
+        for (name, bytes) in filled {
+            let position = specs
+                .iter()
+                .position(|table| table.name == name)
+                .ok_or_else(|| Error::config(format!("{name} is not a table of this layout")))?;
+            let buffer = out
+                .get_mut(position)
+                .ok_or_else(|| Error::config(format!("the executor holds no buffer for {name}")))?;
+            if buffer.len() != bytes.len() {
+                return Err(Error::config(format!(
+                    "{name} is {} bytes, its buffer {}",
+                    bytes.len(),
+                    buffer.len()
+                )));
+            }
+            buffer.copy_from_slice(&bytes);
+        }
+        let position = specs
+            .iter()
+            .position(|table| table.name == "variable_block_sizes")
+            .ok_or_else(|| Error::config("the block-size table is missing".to_owned()))?;
+        let buffer = out
+            .get_mut(position)
+            .ok_or_else(|| Error::config("the executor holds no block-size buffer".to_owned()))?;
+        let bytes = integers(&sizes);
+        if buffer.len() != bytes.len() || tiles != sizes.len() {
+            return Err(Error::config(format!(
+                "variable_block_sizes is {} bytes for {tiles} tiles, its buffer {}",
+                bytes.len(),
+                buffer.len()
+            )));
+        }
+        buffer.copy_from_slice(&bytes);
+        Ok(())
+    }
+
     /// Write one request's tables, in [`Layouts::state_tables`]' order.
     ///
     /// The bytes are host bytes in each table's own element type: the executor uploads them once
@@ -341,6 +662,12 @@ impl Layouts {
         layout: &Layout,
         out: &mut [Vec<u8>],
     ) -> Result<()> {
+        if matches!(
+            self.config.attention,
+            crate::config::AttentionKind::Sparse { .. }
+        ) {
+            return self.write_segment_state(request, layout, out);
+        }
         let packing = self.packing_of(layout)?;
         let text_tokens = request.text_tokens;
         if text_tokens > layout.text_rows {
@@ -672,6 +999,21 @@ impl nn::capability::Denoiser for Denoiser {
             + self
                 .first_row(audio_rows(layout).map_err(flattened)?)
                 .map_err(flattened)?;
+        // A layout with an audio stream and no audio latents would draw the video's noise and leave
+        // the audio's undrawn, which is a silent disagreement rather than an absent stream.
+        match (layout.audio, out.audio) {
+            (Some(_), None) => {
+                return Err(flattened(Error::config(
+                    "this layout draws audio noise and no audio latents were offered".to_owned(),
+                )));
+            }
+            (None, Some(_)) => {
+                return Err(flattened(Error::config(
+                    "audio latents were offered to a layout with no audio stream".to_owned(),
+                )));
+            }
+            _ => {}
+        }
         let noise = nn::Noise::new();
         noise.draw(
             f,
@@ -762,31 +1104,28 @@ impl nn::capability::Denoiser for Denoiser {
     }
 
     fn prepare_evaluation(&self, index: u32, out: &mut [Vec<u8>]) -> nn::Result<()> {
-        // The one table a replay changes: the step the stack gathers its modulation at.
         if index >= self.evaluations {
             return Err(flattened(Error::config(format!(
                 "evaluation {index} is outside the {} this schedule has",
                 self.evaluations
             ))));
         }
-        let Some(buffer) = out.first_mut() else {
-            return Err(flattened(Error::config(
-                "no step buffer was offered".to_owned(),
-            )));
-        };
-        if buffer.len() != 4 {
+        // An evaluation has no host bytes of its own: every coefficient a step reads is a constant
+        // the loader wrote once (`constant_tables` is empty), and the step index is device data the
+        // executor writes before each replay. A buffer offered here means the caller and
+        // `constant_tables` disagree about what an evaluation owns.
+        if !out.is_empty() {
             return Err(flattened(Error::config(format!(
-                "the step table is {} bytes, not one i32",
-                buffer.len()
+                "{} coefficient buffers offered, and this deployment declares none",
+                out.len()
             ))));
         }
-        buffer.copy_from_slice(&(index as i32).to_le_bytes());
         Ok(())
     }
 }
 
-/// The state tables of a request, in the order [`Layouts::state_tables`] sorts them.
-const STATE_TABLES: [&str; 10] = [
+/// The state tables of a dense layout, in `table_specs`' order (sorted by name).
+const DENSE_TABLES: [&str; 10] = [
     "audio_indices",
     "cu_seq_lens_k",
     "cu_seq_lens_q",
@@ -799,16 +1138,52 @@ const STATE_TABLES: [&str; 10] = [
     "video_indices",
 ];
 
-/// One state view of a request, by name.
-fn state(state: &[TensorView], name: &str) -> Result<TensorView> {
-    let position = STATE_TABLES
-        .iter()
-        .position(|table| *table == name)
-        .ok_or_else(|| Error::config(format!("{name} is not a state table")))?;
-    state
-        .get(position)
-        .copied()
-        .ok_or_else(|| Error::config(format!("the executor passed no {name} table")))
+/// The state tables of a segment layout, in `segment_table_specs`' order (sorted by name).
+///
+/// A segment layout has no `cu_seq_lens` pair and carries four tables a dense one does not, so the
+/// two sets do not share positions: a name resolved against the wrong set silently reads another
+/// tensor. [`Tables`] picks the set from the deployment's attention kind for exactly that reason.
+const SEGMENT_TABLES: [&str; 12] = [
+    "audio_indices",
+    "groups",
+    "modulation_indices",
+    "position_ids",
+    "prefix_index",
+    "segment_keep",
+    "segment_starts",
+    "step",
+    "tile_segments",
+    "token_tags",
+    "variable_block_sizes",
+    "video_indices",
+];
+
+/// One request's state views, resolved by name against its kind's table set.
+struct Tables<'a> {
+    names: &'static [&'static str],
+    views: &'a [TensorView],
+}
+
+impl<'a> Tables<'a> {
+    fn new(kind: crate::config::AttentionKind, views: &'a [TensorView]) -> Self {
+        let names: &'static [&'static str] = match kind {
+            crate::config::AttentionKind::Dense => &DENSE_TABLES,
+            crate::config::AttentionKind::Sparse { .. } => &SEGMENT_TABLES,
+        };
+        Self { names, views }
+    }
+
+    fn get(&self, name: &str) -> Result<TensorView> {
+        let position = self
+            .names
+            .iter()
+            .position(|table| *table == name)
+            .ok_or_else(|| Error::config(format!("{name} is not a state table of this kind")))?;
+        self.views
+            .get(position)
+            .copied()
+            .ok_or_else(|| Error::config(format!("the executor passed no {name} table")))
+    }
 }
 
 impl Denoiser {
@@ -826,13 +1201,13 @@ impl Denoiser {
         latents: nn::Latents,
         cond: nn::Conditioning<'_>,
     ) -> Result<()> {
-        let tables = cond.state;
+        let tables = Tables::new(self.config.attention, cond.state);
         let video = latents.video;
         let channels = video.shape.dim(0);
         let frames = video.shape.dim(1);
         let height = video.shape.dim(2);
         let width = video.shape.dim(3);
-        let tokens = u64::from(state(tables, "groups")?.shape.dim(0) as u32);
+        let tokens = u64::from(tables.get("groups")?.shape.dim(0) as u32);
         let hidden_size = u64::from(self.config.transformer.hidden_size);
         let dtype = cond.text.dtype;
         let arena = f.arena();
@@ -840,26 +1215,45 @@ impl Denoiser {
         // The packed rows: every row gathers its prefix source, so a generated row reads the zero
         // row and a text row reads itself.
         let hidden = arena.tensor(dtype, Shape::new(&[tokens, hidden_size]))?;
-        nn::layers::gather_rows(f, cond.text, state(tables, "prefix_index")?, hidden)?;
+        nn::layers::gather_rows(f, cond.text, tables.get("prefix_index")?, hidden)?;
 
         // The video rows: patchify, project, scatter.
-        let video_indices = state(tables, "video_indices")?;
+        let video_indices = tables.get("video_indices")?;
         let video_rows = u64::from(video_indices.shape.dim(0) as u32);
         let patch = nn::layers::Patch::new(channels, height, width)?;
+        // The one inverse of the pack above: the DiT's `1x2x2` tiles back into the latent raster.
+        // It reads the token grid from `out`, so a clip of another length replays the same launch.
+        let unpatch = nn::layers::UnpatchifyVideo::new(dtype, channels, 1, 2)?;
         let patched = arena.tensor(dtype, Shape::new(&[video_rows, channels * 4]))?;
-        patch.forward(f, video, patched, frames, nn::layers::PatchMode::Patchify)?;
+        patch.forward(f, video, patched, frames)?;
         let projected = arena.tensor(dtype, Shape::new(&[video_rows, hidden_size]))?;
         self.transformer.project(f, patched, projected)?;
         nn::layers::Rows::new(dtype, hidden_size)?.replace(f, hidden, projected, video_indices)?;
 
+        // One audio stream or none. A layout with audio rows and no audio latents would otherwise
+        // denoise the video and return it without sound, and a missing table where the layout has
+        // one is a disagreement about the layout rather than an absent stream.
+        let audio = match (latents.audio, tables.get("audio_indices")) {
+            (Some(audio), Ok(indices)) => Some((audio, indices)),
+            (None, Ok(indices)) if indices.shape.dim(0) > 0 => {
+                return Err(Error::config(format!(
+                    "this layout has {} audio rows and no audio latents",
+                    indices.shape.dim(0)
+                )));
+            }
+            (Some(_), Err(error)) => return Err(error),
+            _ => None,
+        };
+
         // The audio rows: one element per channel-step pair, projected like any other row.
-        if let (Some(audio), Ok(audio_indices)) = (latents.audio, state(tables, "audio_indices")) {
+        if let Some((audio, audio_indices)) = audio {
             let audio_rows = u64::from(audio_indices.shape.dim(0) as u32);
+            let features = u64::from(self.config.transformer.audio_channels);
             let flat = TensorView::with_strides(
                 audio.ptr,
                 audio.dtype,
-                Shape::new(&[audio_rows, 1]),
-                nn::Strides::new(&[1, 1]),
+                Shape::new(&[audio_rows, features]),
+                nn::Strides::new(&[features, 1]),
             );
             let projected = arena.tensor(dtype, Shape::new(&[audio_rows, hidden_size]))?;
             self.transformer.project_audio(f, flat, projected)?;
@@ -871,28 +1265,52 @@ impl Denoiser {
             )?;
         }
 
-        // The rotary tables and the visibility of the one packed sequence.
-        let rotated = 48_u64;
+        // The rotary tables and the visibility of the one packed sequence. Each of the three axes
+        // rotates `rope_frequency_dim` channel pairs, and a factor table holds one column per pair.
+        let rotated = u64::from(self.config.transformer.rope_frequency_dim) * 3;
         let cosine = arena.tensor(DType::F32, Shape::new(&[tokens, rotated]))?;
         let sine = arena.tensor(DType::F32, Shape::new(&[tokens, rotated]))?;
         self.transformer
-            .factors(f, state(tables, "position_ids")?, cosine, sine)?;
-        let visible = Visible {
-            cu_seq_lens_q: state(tables, "cu_seq_lens_q")?,
-            cu_seq_lens_k: state(tables, "cu_seq_lens_k")?,
-            key_rows: tokens as u32,
+            .factors(f, tables.get("position_ids")?, cosine, sine)?;
+        // The dense kind reads the whole packed sequence in one go; the sparse kind reads the
+        // segment tables instead and has no visibility pair at all.
+        let visible = self.config.attention.is_dense().then(|| {
+            Ok::<_, Error>(Visible {
+                cu_seq_lens_q: tables.get("cu_seq_lens_q")?,
+                cu_seq_lens_k: tables.get("cu_seq_lens_k")?,
+                key_rows: tokens as u32,
+            })
+        });
+        let visible = match visible {
+            None => None,
+            Some(visible) => Some(visible?),
         };
+        // A sparse deployment's layers read the valid rows of each tile, the segment of each tile,
+        // and the keep table.
+        let segments = self
+            .config
+            .attention
+            .is_dense()
+            .then_some(())
+            .map_or(Ok(None), |()| {
+                Ok::<_, Error>(Some(crate::attention_sparse::Segments {
+                    sizes: tables.get("variable_block_sizes")?,
+                    segments: tables.get("tile_segments")?,
+                    keep: tables.get("segment_keep")?,
+                }))
+            })?;
 
         // The stack, conditioned by the step's gathered modulation.
-        let step_index = state(tables, "step")?;
+        let step_index = tables.get("step")?;
         self.transformer.forward(
             f,
             &self.cache,
             step_index,
             hidden,
-            state(tables, "modulation_indices")?,
+            tables.get("modulation_indices")?,
             Factors { cosine, sine },
-            &visible,
+            visible.as_ref(),
+            segments.as_ref(),
             tokens as u32,
         )?;
 
@@ -906,7 +1324,7 @@ impl Denoiser {
         let video_hidden = arena.tensor(dtype, Shape::new(&[video_rows, hidden_size]))?;
         nn::layers::gather_rows(f, hidden, video_indices, video_hidden)?;
         let video_groups = arena.tensor(DType::I32, Shape::new(&[video_rows]))?;
-        nn::layers::gather_rows(f, state(tables, "groups")?, video_indices, video_groups)?;
+        nn::layers::gather_rows(f, tables.get("groups")?, video_indices, video_groups)?;
         let velocity_rows = arena.tensor(dtype, Shape::new(&[video_rows, channels * 4]))?;
         self.transformer.velocity(
             f,
@@ -917,23 +1335,18 @@ impl Denoiser {
             velocity_rows,
         )?;
         let velocity = arena.tensor(dtype, video.shape)?;
-        patch.forward(
-            f,
-            velocity,
-            velocity_rows,
-            frames,
-            nn::layers::PatchMode::Unpatchify,
-        )?;
+        unpatch.forward(f, velocity_rows, velocity)?;
         self.solver
             .step(f, Modality::Video, video, velocity, step.index)?;
 
-        if let (Some(audio), Ok(audio_indices)) = (latents.audio, state(tables, "audio_indices")) {
+        if let Some((audio, audio_indices)) = audio {
             let audio_rows = u64::from(audio_indices.shape.dim(0) as u32);
             let audio_hidden = arena.tensor(dtype, Shape::new(&[audio_rows, hidden_size]))?;
             nn::layers::gather_rows(f, hidden, audio_indices, audio_hidden)?;
             let audio_groups = arena.tensor(DType::I32, Shape::new(&[audio_rows]))?;
-            nn::layers::gather_rows(f, state(tables, "groups")?, audio_indices, audio_groups)?;
-            let velocity = arena.tensor(dtype, Shape::new(&[audio_rows, 1]))?;
+            nn::layers::gather_rows(f, tables.get("groups")?, audio_indices, audio_groups)?;
+            let features = u64::from(self.config.transformer.audio_channels);
+            let velocity = arena.tensor(dtype, Shape::new(&[audio_rows, features]))?;
             self.transformer.velocity(
                 f,
                 audio_hidden,
@@ -945,8 +1358,8 @@ impl Denoiser {
             let flat = TensorView::with_strides(
                 audio.ptr,
                 audio.dtype,
-                Shape::new(&[audio_rows, 1]),
-                nn::Strides::new(&[1, 1]),
+                Shape::new(&[audio_rows, features]),
+                nn::Strides::new(&[features, 1]),
             );
             self.solver
                 .step(f, Modality::Audio, flat, velocity, step.index)?;
@@ -1179,6 +1592,138 @@ mod tests {
         }
     }
 
+    const TILE: u32 = 64;
+
+    fn sparse_layouts() -> Layouts {
+        let mut config = layouts().config;
+        config.attention = AttentionKind::sparse(TILE, 0.8, None).unwrap();
+        Layouts::new(config, layouts().arrangement).unwrap()
+    }
+
+    #[test]
+    fn a_sparse_layout_declares_its_tile_tables_and_fills_them() {
+        let rule = sparse_layouts();
+        let mut request = request(121, 1344, 768);
+        request.text_tokens = 12;
+        let (layout, _) = rule.layout(&request).unwrap();
+        let specs = rule.table_specs(&layout).unwrap();
+        let names: Vec<&str> = specs.iter().map(|table| table.name).collect();
+        // The four tile tables, and neither of the dense attention's sequence-length tables.
+        for name in [
+            "variable_block_sizes",
+            "tile_segments",
+            "segment_starts",
+            "segment_keep",
+        ] {
+            assert!(names.contains(&name), "{name}");
+        }
+        assert!(!names.contains(&"cu_seq_lens_k"));
+        assert!(!names.contains(&"cu_seq_lens_q"));
+        let tile = u64::from(TILE);
+        let rows = specs
+            .iter()
+            .find(|table| table.name == "groups")
+            .map(|table| table.shape.dim(0))
+            .expect("the group table");
+        assert_eq!(rows % tile, 0);
+        for name in ["variable_block_sizes", "segment_keep", "tile_segments"] {
+            let table = specs.iter().find(|table| table.name == name).unwrap();
+            assert_eq!(table.shape.dim(0), rows / tile, "{name}");
+        }
+        // The tables fill, and every block size is at most one tile's rows.
+        let mut out: Vec<Vec<u8>> = specs
+            .iter()
+            .map(|table| {
+                vec![0_u8; (table.shape.numel() as usize) * table.dtype.bytes().unwrap() as usize]
+            })
+            .collect();
+        rule.write_state(&request, &layout, &mut out).unwrap();
+        let sizes = specs
+            .iter()
+            .position(|table| table.name == "variable_block_sizes")
+            .unwrap();
+        let block_sizes = decode_i32(&out[sizes]);
+        assert_eq!(block_sizes.len() as u64, rows / tile);
+        assert!(
+            block_sizes
+                .iter()
+                .all(|size| 0 <= *size && *size as u64 <= tile)
+        );
+        assert!(block_sizes.iter().any(|size| *size > 0));
+    }
+
+    #[test]
+    fn a_sparse_layout_rebuilds_its_segment_packing() {
+        let rule = sparse_layouts();
+        // The dense layout carries the capacities a request names; the segment packing rounds each
+        // prefix capacity up to its tile and pads the rows to whole tiles.
+        let (layout, _) = rule.layout(&request(121, 1344, 768)).unwrap();
+        let packed = rule.segment_of(&layout).unwrap();
+        assert_eq!(packed.extent.tile, 64);
+        assert_eq!(packed.extent.text_rows, 128);
+        assert_eq!(packed.extent.condition_rows, 64);
+        assert_eq!(packed.extent.padded_tokens % 64, 0);
+        assert_eq!(
+            packed.video_variable_block_sizes.len() as u32,
+            packed.extent.video_tiles
+        );
+        // A dense deployment has no segment packing to give, and says so rather than guessing.
+        assert!(layouts().segment_of(&layout).is_err());
+    }
+
+    #[test]
+    fn a_layout_built_densely_is_not_a_segment_packing_a_sparse_deployment_builds() {
+        // The same request read by the two deployments: only the sparse one pads to whole tiles, and
+        // a layout whose raster does not match its frame count is refused by both.
+        let (layout, dense) = layouts().layout(&request(121, 1344, 768)).unwrap();
+        let packed = sparse_layouts().segment_of(&layout).unwrap();
+        assert!(packed.extent.padded_tokens > dense.padded_tokens);
+        let mut broken = layout;
+        broken.video.frames = 24;
+        assert!(sparse_layouts().segment_of(&broken).is_err());
+    }
+
+    #[test]
+    fn a_dense_deployment_bounds_its_rows_by_its_own_packing() {
+        let dense = layouts().rows_bound().unwrap();
+        // The same deployment read as sparse pads every layout to whole tiles, which is larger for
+        // every canvas; a dense checkpoint never captures one of those, so its bound must be below.
+        let mut sparse = layouts();
+        sparse.config.attention = AttentionKind::sparse(64, 0.8, None).unwrap();
+        assert!(dense < sparse.rows_bound().unwrap(), "{dense}");
+        // And it still bounds the largest dense layout the deployment offers.
+        let (_, packing) = layouts().layout(&request(107, 1344, 768)).unwrap();
+        assert!(dense >= packing.padded_tokens);
+    }
+
+    #[test]
+    fn a_still_condition_draws_its_latent_elements_and_nothing_more() {
+        let conditions = [packing::Condition {
+            role: packing::Role::FirstFrame,
+            frame: Some(packing::Frame {
+                canvas: crate::config::Canvas {
+                    short_edge: 768,
+                    aspect: (16, 9),
+                    width: 1344,
+                    height: 768,
+                },
+                num_frames: 1,
+            }),
+            audio_samples: 0,
+        }];
+        let canvas = crate::config::Canvas {
+            short_edge: 768,
+            aspect: (16, 9),
+            width: 1344,
+            height: 768,
+        };
+        // One latent frame of the canvas' raster, 24 channels wide: the video's stream starts here.
+        assert_eq!(
+            layouts().condition_elements(&conditions, &canvas),
+            48 * 84 * 24
+        );
+    }
+
     #[test]
     fn a_request_snaps_to_a_legal_frame_count_and_raster() {
         let rule = layouts();
@@ -1188,9 +1733,9 @@ mod tests {
         assert_eq!(packing.video_rows, 32 * 42 * 24);
         assert_eq!(layout.video.frames, 32);
         assert_eq!((layout.video.height, layout.video.width), (48, 84));
-        // Four stereo rows per audio latent step.
-        assert_eq!(packing.audio_rows, 4 * 179);
-        assert_eq!(layout.audio.unwrap().frames, 179);
+        // Two rows of 32 channels per audio latent step, and 107 frames at 24 fps are 178 steps.
+        assert_eq!(packing.audio_rows, 2 * 178);
+        assert_eq!(layout.audio.unwrap().frames, 178);
         assert_eq!(layout.text_rows, 128);
         assert_eq!(layout.condition_rows, 64);
     }
@@ -1219,11 +1764,25 @@ mod tests {
         // Every table but the step covers one row per packed row.
         let rows = u64::from(packing.padded_tokens);
         for table in &tables {
-            if table.name == "step" {
-                assert_eq!(table.shape.dims(), &[1]);
-                continue;
+            match table.name {
+                "step" => {
+                    assert_eq!(table.shape.dims(), &[1]);
+                }
+                // The audio table is addressed by audio row and names the packed row it occupies,
+                // so its length is the audio rows rather than every packed row.
+                "audio_indices" => assert_eq!(table.shape.dim(0), u64::from(packing.audio_rows)),
+                // The dense visibility table names both ends of the used row run, so it carries one
+                // more entry than there are packed rows.
+                "cu_seq_lens_k" | "cu_seq_lens_q" => assert_eq!(table.shape.dims(), &[2]),
+                // The rotation reads the coordinates axis-major, so the axes lead.
+                "position_ids" => assert_eq!(table.shape.dims(), &[3, rows]),
+                // The video indices name the packed row of every video row, and video rows are
+                // patched: four voxels to a row.
+                "video_indices" => {
+                    assert_eq!(table.shape.dim(0), u64::from(packing.video_rows));
+                }
+                _ => assert_eq!(table.shape.dim(0), rows, "{}", table.name),
             }
-            assert_eq!(table.shape.dim(0), rows, "{}", table.name);
         }
         // Axis-major: the rotation reads `[axis, token]`, so the axes are the leading extent.
         assert_eq!(tables[5].shape.dims(), &[3, rows]);
@@ -1232,7 +1791,8 @@ mod tests {
     #[test]
     fn the_state_bytes_fill_the_tables_the_layout_names() {
         let rule = layouts();
-        let request = request(121, 1344, 768);
+        let mut request = request(121, 1344, 768);
+        request.text_tokens = 12;
         let (layout, _) = rule.layout(&request).unwrap();
         let tables = rule.table_specs(&layout).unwrap();
         let mut out: Vec<Vec<u8>> = tables
@@ -1244,27 +1804,36 @@ mod tests {
         rule.write_state(&request, &layout, &mut out).unwrap();
         // A prompt of 12 rows is text, so every write index points into the text rows and every
         // generated row takes the prefix's zero row.
-        let prefix: Vec<i32> = decode_i32(&out[6]);
+        let at = |name: &str| {
+            tables
+                .iter()
+                .position(|table| table.name == name)
+                .expect("the layout names the table")
+        };
+        let prefix: Vec<i32> = decode_i32(&out[at("prefix_index")]);
         assert_eq!(prefix.len(), tables[3].shape.dim(0) as usize);
+        // The prefix segment is packed after the generated rows, so the prompt's twelve rows sit at
+        // `prefix_start()` and each points at its own source row.
+        let first = rule.packing_of(&layout).unwrap().prefix_start() as usize;
         assert!(
-            prefix[..12]
+            prefix[first..first + 12]
                 .iter()
                 .enumerate()
                 .all(|(row, column)| *column == row as i32)
         );
-        // The modulation index of the first text row is `3 * video_group + text`.
-        let indices = decode_i32(&out[4]);
-        assert_eq!(indices[0], 1);
+        // The first packed row is a generated video row, so it takes the video timestep.
+        let indices = decode_i32(&out[at("modulation_indices")]);
+        assert_eq!(indices[0], packing::Group::Video as i32);
     }
 
     #[test]
     fn a_raster_off_the_grid_snaps_up_to_it() {
         let rule = layouts();
-        // 1340x770 is not a multiple of 32: the request renders the next legal raster, so two
+        // 1340x770 is not a multiple of 32: the request renders the next legal raster up, so two
         // requests either side of a multiple share one layout rather than each carrying its own.
         let (layout, _) = rule.layout(&request(121, 1340, 770)).unwrap();
-        assert_eq!((layout.video.height, layout.video.width), (48, 84));
-        assert_eq!(layout.video.height * 16, 768);
+        assert_eq!((layout.video.height, layout.video.width), (50, 84));
+        assert_eq!(layout.video.height * 16, 800);
         assert_eq!(layout.video.width * 16, 1344);
     }
 
@@ -1275,10 +1844,36 @@ mod tests {
         // 24 latent frames is not a frame count a request snaps to: no rounding produces 5n + 2 = 24.
         layout.video.frames = 24;
         assert!(rule.packing_of(&layout).is_err());
-        // A prefix capacity that is not a whole attention unit is not this deployment's either.
+        // A prefix that holds no text row is not a layout this deployment packs either.
         let (mut layout, _) = rule.layout(&request(121, 1344, 768)).unwrap();
-        layout.text_rows = 100;
+        layout.text_rows = 0;
         assert!(rule.packing_of(&layout).is_err());
+    }
+
+    #[test]
+    fn the_row_bound_covers_both_packings() {
+        let rule = layouts();
+        let bound = rule.rows_bound().unwrap();
+        // The bound is at least any layout the deployment can be asked for, and the sparse packing's
+        // whole-tile padding makes it strictly larger than the dense one at the same request.
+        let (dense, _) = rule.layout(&request(121, 1344, 768)).unwrap();
+        let dense_packing = rule.packing_of(&dense).unwrap();
+        assert!(bound >= dense_packing.padded_tokens);
+        let segment = packing::segment_packing(
+            124,
+            &Canvas {
+                short_edge: 768,
+                aspect: (7, 4),
+                width: 1344,
+                height: 768,
+            },
+            rule.arrangement().text_rows,
+            rule.arrangement().condition_rows,
+            64,
+            64,
+        )
+        .unwrap();
+        assert!(segment.extent.padded_tokens > dense_packing.padded_tokens);
     }
 
     #[test]
@@ -1312,8 +1907,8 @@ mod tests {
         // 121 frames snap to 124, which is 37 latent frames of 48x84 at 24 channels.
         assert_eq!(layout.video.frames, 37);
         assert_eq!(bare.audio, 37 * 48 * 84 * 24);
-        // One condition of two latent frames at a 48x84 raster carries two stereo channels per
-        // latent step: its rows are patched, and its element count weights each modality by its own
+        // A 22-frame reference is one clip, which the VAE encodes to seven latent frames of the
+        // 48x84 raster; its rows are patched, and its element count weights each modality by its own
         // channel count.
         let conditions = [packing::Condition {
             role: packing::Role::Reference,
@@ -1324,14 +1919,14 @@ mod tests {
                     width: 1344,
                     height: 768,
                 },
-                num_frames: 2,
+                num_frames: 22,
             }),
             audio_samples: 0,
         }];
         let one = rule.noise_offsets(&layout, &conditions).unwrap();
-        // A condition's noise is its latent volume times the channels, not its packed rows: two
+        // A condition's noise is its latent volume times the channels, not its packed rows: seven
         // latent frames of 48x84 at 24 channels, and no audio.
-        let expected = 2 * 48 * 84 * 24;
+        let expected = 7 * 48 * 84 * 24;
         assert_eq!(one.condition, expected);
         assert_eq!(one.video, one.condition);
         assert_eq!(one.audio, one.video + bare.audio);
@@ -1359,5 +1954,29 @@ mod tests {
             .iter()
             .map(|chunk| i32::from_le_bytes(*chunk))
             .collect()
+    }
+    #[test]
+    fn each_kind_resolves_its_state_tables_by_its_own_names() {
+        // The names are positional: the executor passes its views in `table_specs`' order, so a set
+        // that is not exactly that order reads another tensor without any shape complaining.
+        let dense = layouts();
+        let layout = dense.cover(&request(22, 1344, 768));
+        let names: Vec<&str> = dense
+            .table_specs(&layout)
+            .unwrap()
+            .iter()
+            .map(|table| table.name)
+            .collect();
+        assert_eq!(names, DENSE_TABLES);
+
+        let sparse = sparse_layouts();
+        let layout = sparse.cover(&request(22, 1344, 768));
+        let names: Vec<&str> = sparse
+            .table_specs(&layout)
+            .unwrap()
+            .iter()
+            .map(|table| table.name)
+            .collect();
+        assert_eq!(names, SEGMENT_TABLES);
     }
 }

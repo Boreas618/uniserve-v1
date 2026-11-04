@@ -34,6 +34,7 @@
 //! the capability it implements.
 
 pub mod attention;
+pub mod attention_sparse;
 pub mod audio_vae;
 pub mod checkpoint;
 pub mod conditioning;
@@ -50,6 +51,7 @@ pub mod positions;
 pub mod schedule;
 pub mod solver;
 pub mod text_encoder;
+pub mod tiled_encode;
 pub mod transformer;
 pub mod video_vae;
 pub mod vision;
@@ -63,8 +65,8 @@ pub use config::{
     ScheduleSpec, Shifts, SpatialPadding, TextEncoderConfig, TransformerConfig,
     UNIFORM_GRID_POINTS, VideoVaeConfig, VisionConfig,
 };
-pub use load::{Capacity, Component, LoadOptions, load};
-pub use partition::Partition;
+pub use load::load;
+pub use partition::{Component, Partition};
 
 /// What this crate can fail with.
 #[derive(Debug, thiserror::Error)]
