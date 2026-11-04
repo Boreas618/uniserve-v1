@@ -349,7 +349,7 @@ pub fn sources(config: &VideoVaeConfig) -> crate::Result<Vec<crate::audio_vae::S
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn seams(starts: &[u32], overlaps: &[u32], length: u32) -> Seams {
