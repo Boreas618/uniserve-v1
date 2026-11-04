@@ -16,10 +16,15 @@
 # `padding_1x1x1_dilation_1x1x1_groups_1_bias_true_tf32_false_rank_1_`
 # `transposed_false`.
 #
-# `tf32` describes FP32 inputs only: cuDNN 9's backend API chooses the engine's
-# arithmetic and exposes no math-type knob, so an FP32 convolution runs the engine
-# cuDNN proposes and a half-precision one has no such choice. A descriptor whose
-# `tf32` disagrees with its input type is refused at launch rather than run.
+# `tf32` is a permission, not a setting: it says whether the engine *may* use TF32
+# tensor cores for an FP32 convolution, which is what design 9 asks the video VAE
+# to keep. cuDNN 9's backend API chooses the engine's arithmetic itself and exposes
+# no math-type knob (`cudnnSetConvolutionMathType` is the legacy path, and the
+# heuristic's numerical notes no longer carry a TF32 note), so this module cannot
+# turn TF32 on inside an engine that would not use it and cannot turn it off. It
+# does the part that matters: `tf32` is validated against the input type — true for
+# FP32, false otherwise — and a descriptor that disagrees is refused at launch
+# instead of run. Do not go looking for a setting in this package; there is none.
 
 op = "conv1d"
 backend = "cudnn"
