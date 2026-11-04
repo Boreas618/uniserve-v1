@@ -23,6 +23,7 @@
 //! descriptor key is passed through untouched: the package's compile script
 //! reads the parameter values out of it and picks the kernel.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -187,6 +188,71 @@ impl PackageSource {
             .unwrap_or_else(|| "metadata.json".to_owned())
     }
 
+    /// Checks that a build wrote the module its manifest's form requires: a
+    /// cubin with metadata naming the kernel to launch, or a native library.
+    pub fn check_module(
+        &self,
+        key: &str,
+        target: &Target,
+        dir: &Workspace,
+        log: &Path,
+    ) -> Result<()> {
+        match self.manifest.module.form {
+            ModuleForm::Cubin => {
+                if !dir.path().join(MODULE_CUBIN).is_file() {
+                    return Err(self.failure(
+                        key,
+                        target,
+                        format!(
+                            "the build wrote no {MODULE_CUBIN}; its log was:\n{}",
+                            read_log(log)
+                        ),
+                    ));
+                }
+                let metadata = self.metadata_name();
+                let path = dir.path().join(&metadata);
+                if !path.is_file() {
+                    return Err(self.failure(
+                        key,
+                        target,
+                        format!(
+                            "the build wrote no {metadata}, the launch metadata a cubin module \
+                             needs"
+                        ),
+                    ));
+                }
+                check_metadata_symbol(&self.manifest.op, &path).map_err(|message| {
+                    self.failure(
+                        key,
+                        target,
+                        format!("{metadata} names no kernel to launch: {message}"),
+                    )
+                })
+            }
+            ModuleForm::Native => {
+                if !dir.path().join(MODULE_SO).is_file() {
+                    return Err(self.failure(
+                        key,
+                        target,
+                        format!(
+                            "the build wrote no {MODULE_SO}; its log was:\n{}",
+                            read_log(log)
+                        ),
+                    ));
+                }
+                Ok(())
+            }
+            other => Err(self.failure(
+                key,
+                target,
+                format!(
+                    "a {:?} source writes a cubin or a native module, not {other:?}",
+                    self.manifest.source.kind
+                ),
+            )),
+        }
+    }
+
     /// A failed build of this package, with the package's identity in the
     /// error so a log line names what was being built.
     pub fn failure(&self, key: &str, target: &Target, message: impl Into<String>) -> Error {
@@ -202,13 +268,7 @@ impl PackageSource {
 
     /// A failed compiler process, with the package's identity and the
     /// compiler's log.
-    pub fn failure_with_log(
-        &self,
-        key: &str,
-        target: &Target,
-        error: Error,
-        log: &Path,
-    ) -> Error {
+    pub fn failure_with_log(&self, key: &str, target: &Target, error: Error, log: &Path) -> Error {
         let cause = match error {
             Error::Build { message, .. } => message,
             other => other.to_string(),
@@ -216,7 +276,11 @@ impl PackageSource {
         self.failure(
             key,
             target,
-            format!("{cause}\nthe build log {}:\n{}", log.display(), read_log(log)),
+            format!(
+                "{cause}\nthe build log {}:\n{}",
+                log.display(),
+                read_log(log)
+            ),
         )
     }
 }
@@ -260,6 +324,30 @@ fn collect(directory: &Path) -> Result<Vec<String>> {
     Ok(files)
 }
 
+/// A string parameter of a package, or a value the manifest states some other
+/// way (a number, a boolean).
+fn parameter(parameters: &BTreeMap<String, toml::Value>, name: &str) -> Option<String> {
+    parameters.get(name).map(|value| match value {
+        toml::Value::String(text) => text.clone(),
+        other => other.to_string(),
+    })
+}
+
+/// A list parameter of a package, each item as a string.
+fn list(parameters: &BTreeMap<String, toml::Value>, name: &str) -> Option<Vec<String>> {
+    parameters.get(name).and_then(|value| {
+        value.as_array().map(|items| {
+            items
+                .iter()
+                .map(|item| match item {
+                    toml::Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                })
+                .collect()
+        })
+    })
+}
+
 /// Copies one file of a package into the build's workspace, creating the
 /// directories its relative path names.
 fn copy_file(source: &Path, destination: &Path) -> Result<()> {
@@ -273,12 +361,7 @@ fn copy_file(source: &Path, destination: &Path) -> Result<()> {
 /// Copies the package's tuning data into the build's workspace (design section
 /// 5.4): tuning data is part of the revision and travels with the module it
 /// was measured for, so the main process gets it from the same `resolve`.
-fn copy_tuning(
-    package: &PackageSource,
-    key: &str,
-    target: &Target,
-    dir: &Workspace,
-) -> Result<()> {
+fn copy_tuning(package: &PackageSource, key: &str, target: &Target, dir: &Workspace) -> Result<()> {
     for declared in &package.manifest.tuning {
         let relative = declared.replace(crate::manifest::DESCRIPTOR_PLACEHOLDER, key);
         let source = package.file(&relative);
@@ -331,13 +414,216 @@ impl Source for CudaSource {
     fn build(
         &self,
         _op: &str,
-        _key: &str,
-        _target: &Target,
-        _toolchain: &dyn Toolchain,
-        _dir: &Workspace,
+        key: &str,
+        target: &Target,
+        toolchain: &dyn Toolchain,
+        dir: &Workspace,
     ) -> Result<Built> {
-        todo!("the nvcc source: compile the package's CUDA C++ into a cubin or a native library")
+        let package = &self.package;
+        let log = build_log(dir);
+        // A package may state its command line in its own compile script, for
+        // flags the manifest's parameters do not express; otherwise the
+        // Program Server runs nvcc itself (design section 6.2).
+        match package.manifest.source.script.as_deref() {
+            Some(script) => {
+                let script = package.file(script);
+                if !script.is_file() {
+                    return Err(package.failure(
+                        key,
+                        target,
+                        format!("the compile script {} does not exist", script.display()),
+                    ));
+                }
+                let interpreter =
+                    toolchain
+                        .script_interpreter()
+                        .ok_or_else(|| Error::Toolchain {
+                            kind: ToolchainKind::Nvcc,
+                            message: format!(
+                                "no Python environment to run {}: create \
+                                 crates/program-server/python with `uv sync`",
+                                script.display()
+                            ),
+                        })?;
+                let job = ToolJob::new(interpreter, &package.root, &log)
+                    .argument(&script)
+                    .environment(package.environment(key, target, dir));
+                toolchain
+                    .run(job)
+                    .map_err(|error| package.failure_with_log(key, target, error, &log))?;
+            }
+            None => run_nvcc(package, key, target, toolchain, dir, &log)?,
+        }
+        package.check_module(key, target, dir, &log)?;
+        copy_tuning(package, key, target, dir)?;
+        Ok(Built {
+            files: collect(dir.path())?,
+        })
     }
+}
+
+/// Runs nvcc over the package's CUDA C++ for one descriptor, writing the
+/// module its form names.
+///
+/// The parameters are the ones a CUDA package states for its translation
+/// unit: `standard` (`-std=c++20`), `optimization` (passed through, such as
+/// `-O3`), `defines` (`NAME=VALUE`), `include` (directories under the package
+/// root) and `libraries` (link options). A cubin module also states its launch
+/// metadata in `[kernel.selection]`: `name`, `num_warps`, and optionally
+/// `shared`, `num_ctas`, `launch_pdl`, `launch_cooperative_grid`,
+/// `global_scratch_size` and `global_scratch_align`, in Triton's field names
+/// (design section 5.3).
+fn run_nvcc(
+    package: &PackageSource,
+    key: &str,
+    target: &Target,
+    toolchain: &dyn Toolchain,
+    dir: &Workspace,
+    log: &Path,
+) -> Result<()> {
+    let nvcc = toolchain.executable().ok_or_else(|| Error::Toolchain {
+        kind: ToolchainKind::Nvcc,
+        message: "no nvcc on this host: install the CUDA toolkit".into(),
+    })?;
+    let parameters = &package.manifest.parameters;
+    let mut job = ToolJob::new(nvcc, &package.root, log).argument(format!("-arch={target}"));
+    if let Some(standard) = parameter(parameters, "standard") {
+        job = job.argument(format!("-std={standard}"));
+    }
+    if let Some(optimization) = parameter(parameters, "optimization") {
+        for flag in optimization.split_whitespace() {
+            job = job.argument(flag);
+        }
+    }
+    if let Some(defines) = list(parameters, "defines") {
+        for define in defines {
+            job = job.argument(format!("-D{define}"));
+        }
+    }
+    job = job.argument("-I").argument(package.root.join("src"));
+    if let Some(includes) = list(parameters, "include") {
+        for include in includes {
+            job = job.argument("-I").argument(package.root.join(include));
+        }
+    }
+    let output = match package.manifest.module.form {
+        ModuleForm::Native => {
+            job = job
+                .argument("--shared")
+                .argument("-Xcompiler")
+                .argument("-fPIC");
+            if let Some(libraries) = list(parameters, "libraries") {
+                for library in libraries {
+                    job = job.argument(library);
+                }
+            }
+            dir.path().join(MODULE_SO)
+        }
+        ModuleForm::Cubin => {
+            job = job.argument("--cubin");
+            dir.path().join(MODULE_CUBIN)
+        }
+        other => {
+            return Err(package.failure(
+                key,
+                target,
+                format!("a cuda package compiles a cubin or a native module, not {other:?}"),
+            ));
+        }
+    };
+    let mut sources = 0;
+    for relative in package.manifest.source.files_for(key) {
+        if !relative.ends_with(".cu") {
+            continue;
+        }
+        let source = package.file(&relative);
+        if !source.is_file() {
+            return Err(package.failure(
+                key,
+                target,
+                format!("the package carries no {relative} for this descriptor"),
+            ));
+        }
+        job = job.argument(source);
+        sources += 1;
+    }
+    if sources == 0 {
+        return Err(package.failure(key, target, "the package names no .cu file to compile"));
+    }
+    job = job.argument("-o").argument(&output);
+    toolchain
+        .run(job)
+        .map_err(|error| package.failure_with_log(key, target, error, log))?;
+    if package.manifest.module.form == ModuleForm::Cubin {
+        write_cuda_metadata(package, key, target, dir)?;
+    }
+    Ok(())
+}
+
+/// Writes the launch metadata of an nvcc-built cubin in Triton's field names
+/// (design section 5.3), from the package's `[kernel.selection]`.
+fn write_cuda_metadata(
+    package: &PackageSource,
+    key: &str,
+    target: &Target,
+    dir: &Workspace,
+) -> Result<()> {
+    let kernel = package.manifest.kernel.as_ref().ok_or_else(|| {
+        package.failure(
+            key,
+            target,
+            "a cubin module needs a [kernel] section with its launch metadata",
+        )
+    })?;
+    let selection = &kernel.selection;
+    let name = selection
+        .get("name")
+        .and_then(toml::Value::as_str)
+        .or(package.manifest.source.kernel.as_deref())
+        .ok_or_else(|| {
+            package.failure(
+                key,
+                target,
+                "a cubin module needs the kernel's name in [kernel.selection] name",
+            )
+        })?;
+    let num_warps = selection
+        .get("num_warps")
+        .and_then(toml::Value::as_integer)
+        .ok_or_else(|| {
+            package.failure(
+                key,
+                target,
+                "a cubin module needs its threads per block in [kernel.selection] num_warps",
+            )
+        })?;
+    let integer = |field: &str, fallback: i64| {
+        selection
+            .get(field)
+            .and_then(toml::Value::as_integer)
+            .unwrap_or(fallback)
+    };
+    let flag = |field: &str| {
+        selection
+            .get(field)
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false)
+    };
+    let metadata = serde_json::json!({
+        "name": name,
+        "num_warps": num_warps,
+        "num_ctas": integer("num_ctas", 1),
+        "shared": integer("shared", 0),
+        "launch_pdl": flag("launch_pdl"),
+        "launch_cooperative_grid": flag("launch_cooperative_grid"),
+        "global_scratch_size": integer("global_scratch_size", 0),
+        "global_scratch_align": integer("global_scratch_align", 1),
+    });
+    let path = dir.path().join(package.metadata_name());
+    let text = serde_json::to_vec_pretty(&metadata)
+        .map_err(|error| package.failure(key, target, format!("writing metadata: {error}")))?;
+    std::fs::write(path, text)?;
+    Ok(())
 }
 
 /// Triton through `triton.compile` (design section 5.3).
@@ -356,7 +642,7 @@ impl TritonSource {
 
 impl Source for TritonSource {
     fn toolchain(&self) -> ToolchainKind {
-        ToolchainKind::Python
+        ToolchainKind::Triton
     }
 
     fn build(
@@ -393,7 +679,7 @@ impl Source for TritonSource {
             ));
         }
         let interpreter = toolchain.script_interpreter().ok_or_else(|| Error::Toolchain {
-            kind: ToolchainKind::Python,
+            kind: ToolchainKind::Triton,
             message: format!(
                 "no Python environment to run {}: create crates/program-server/python with `uv sync`",
                 script.display()
@@ -408,35 +694,7 @@ impl Source for TritonSource {
 
         // A cubin module is the cubin and the metadata JSON that says how to
         // launch it; a package that wrote neither did not build a module.
-        let cubin = dir.path().join(MODULE_CUBIN);
-        if !cubin.is_file() {
-            return Err(package.failure(
-                key,
-                target,
-                format!(
-                    "the compile script wrote no {MODULE_CUBIN}; its output was:\n{}",
-                    read_log(&log)
-                ),
-            ));
-        }
-        let metadata = package.metadata_name();
-        let metadata_path = dir.path().join(&metadata);
-        if !metadata_path.is_file() {
-            return Err(package.failure(
-                key,
-                target,
-                format!(
-                    "the compile script wrote no {metadata}, the launch metadata the module needs"
-                ),
-            ));
-        }
-        check_metadata_symbol(&package.manifest.op, &metadata_path).map_err(|message| {
-            package.failure(
-                key,
-                target,
-                format!("{metadata} names no kernel to launch: {message}"),
-            )
-        })?;
+        package.check_module(key, target, dir, &log)?;
         copy_tuning(package, key, target, dir)?;
         let files = collect(dir.path())?;
         Ok(Built { files })
@@ -460,18 +718,60 @@ impl CuteDslSource {
 
 impl Source for CuteDslSource {
     fn toolchain(&self) -> ToolchainKind {
-        ToolchainKind::Python
+        ToolchainKind::CuteDsl
     }
 
     fn build(
         &self,
         _op: &str,
-        _key: &str,
-        _target: &Target,
-        _toolchain: &dyn Toolchain,
-        _dir: &Workspace,
+        key: &str,
+        target: &Target,
+        toolchain: &dyn Toolchain,
+        dir: &Workspace,
     ) -> Result<Built> {
-        todo!("the CuTe DSL source: export_to_c, then link libcuda_dialect_runtime_static.a")
+        let package = &self.package;
+        let log = build_log(dir);
+        // A CuTe DSL kernel is a Python kernel: it is traced, exported to a
+        // host launcher and linked with the runtime archive into a native
+        // library by the package's own script, because the kernel's argument
+        // types are the package's knowledge (design sections 5.2 and 5.3).
+        let script = package.script().map_err(|_| {
+            package.failure(
+                key,
+                target,
+                "a CuTe DSL package must name the compile script that builds it in [source] \
+                 script",
+            )
+        })?;
+        if !script.is_file() {
+            return Err(package.failure(
+                key,
+                target,
+                format!(
+                    "the compile script {} does not exist in the package",
+                    script.display()
+                ),
+            ));
+        }
+        let interpreter = toolchain.script_interpreter().ok_or_else(|| Error::Toolchain {
+            kind: ToolchainKind::CuteDsl,
+            message: format!(
+                "no Python environment to run {}: create crates/program-server/python with \
+                 `uv sync`",
+                script.display()
+            ),
+        })?;
+        let job = ToolJob::new(interpreter, &package.root, &log)
+            .argument(&script)
+            .environment(package.environment(key, target, dir));
+        toolchain
+            .run(job)
+            .map_err(|error| package.failure_with_log(key, target, error, &log))?;
+        package.check_module(key, target, dir, &log)?;
+        copy_tuning(package, key, target, dir)?;
+        Ok(Built {
+            files: collect(dir.path())?,
+        })
     }
 }
 
@@ -491,7 +791,8 @@ impl CubinSource {
 
 impl Source for CubinSource {
     fn toolchain(&self) -> ToolchainKind {
-        ToolchainKind::Nvcc
+        // A vendor cubin is stored as it is: nothing compiles it.
+        ToolchainKind::None
     }
 
     fn build(
@@ -578,12 +879,149 @@ impl Source for WasmSource {
     fn build(
         &self,
         _op: &str,
-        _key: &str,
-        _target: &Target,
-        _toolchain: &dyn Toolchain,
-        _dir: &Workspace,
+        key: &str,
+        target: &Target,
+        toolchain: &dyn Toolchain,
+        dir: &Workspace,
     ) -> Result<Built> {
-        todo!("the wasm source: build wasm32, then precompile it with wasmtime")
+        let package = &self.package;
+        let log = build_log(dir);
+        // The raw module: either the package's own build writes it (it knows
+        // how its guest crate is assembled), or the package is a crate that
+        // `cargo build` compiles for wasm32 as it stands.
+        let raw = match package.manifest.source.script.as_deref() {
+            Some(script) => {
+                let script = package.file(script);
+                if !script.is_file() {
+                    return Err(package.failure(
+                        key,
+                        target,
+                        format!("the compile script {} does not exist", script.display()),
+                    ));
+                }
+                let interpreter =
+                    toolchain
+                        .script_interpreter()
+                        .ok_or_else(|| Error::Toolchain {
+                            kind: ToolchainKind::Wasm,
+                            message: format!(
+                                "no Python environment to run {}: create \
+                                 crates/program-server/python with `uv sync`",
+                                script.display()
+                            ),
+                        })?;
+                let job = ToolJob::new(interpreter, &package.root, &log)
+                    .argument(&script)
+                    .environment(package.environment(key, target, dir));
+                toolchain
+                    .run(job)
+                    .map_err(|error| package.failure_with_log(key, target, error, &log))?;
+                find_wasm(dir.path())?
+            }
+            None => build_wasm_crate(package, key, target, dir, &log)?,
+        };
+
+        // Precompile it for this host's CPU: a policy is loaded into the
+        // scheduler's wasmtime as a serialized module (design section 5.3).
+        let precompiler = toolchain.executable().ok_or_else(|| Error::Toolchain {
+            kind: ToolchainKind::Wasm,
+            message: "no wasm precompiler on this host: crates/scheduling's \
+                      scheduling-precompile builds it"
+                .into(),
+        })?;
+        let output = dir.path().join(MODULE_WASM);
+        let job = ToolJob::new(precompiler, &package.root, &log)
+            .argument("--wasm")
+            .argument(&raw)
+            .argument("--out")
+            .argument(&output);
+        toolchain
+            .run(job)
+            .map_err(|error| package.failure_with_log(key, target, error, &log))?;
+        if !output.is_file() {
+            return Err(package.failure(
+                key,
+                target,
+                format!(
+                    "the precompiler wrote no {MODULE_WASM}; its log was:\n{}",
+                    read_log(&log)
+                ),
+            ));
+        }
+        copy_tuning(package, key, target, dir)?;
+        Ok(Built {
+            files: vec![MODULE_WASM.to_owned()],
+        })
+    }
+}
+
+/// Compiles a policy package that is a crate by itself: `cargo build
+/// --release` for wasm32, in the package root, with its own target directory
+/// in the build's workspace.
+fn build_wasm_crate(
+    package: &PackageSource,
+    key: &str,
+    target: &Target,
+    dir: &Workspace,
+    log: &Path,
+) -> Result<PathBuf> {
+    let cargo = crate::toolchain::find_program("cargo").ok_or_else(|| Error::Toolchain {
+        kind: ToolchainKind::Wasm,
+        message: "no cargo on this host: the wasm32 build of a policy needs the Rust toolchain"
+            .into(),
+    })?;
+    let target_directory = dir.path().join("cargo");
+    let job = ToolJob::new(&cargo, &package.root, log)
+        .argument("build")
+        .argument("--release")
+        .argument("--target")
+        .argument("wasm32-unknown-unknown")
+        .argument("--target-dir")
+        .argument(&target_directory)
+        .environment(package.environment(key, target, dir));
+    crate::toolchain::execute(&job, 1)
+        .map_err(|error| package.failure_with_log(key, target, error, log))?;
+    find_wasm(&target_directory.join("wasm32-unknown-unknown").join("release"))
+}
+
+/// The one `.wasm` file a wasm32 build wrote in `directory`.
+fn find_wasm(directory: &Path) -> Result<PathBuf> {
+    let mut candidates = std::fs::read_dir(directory)
+        .map_err(Error::Io)?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "wasm"))
+        .collect::<Vec<_>>();
+    // A Cdylib names its output after the crate; a package that writes the
+    // raw module under its own name states which one it is.
+    candidates.sort();
+    match candidates.len() {
+        0 => Err(Error::Build {
+            op: String::new(),
+            backend: String::new(),
+            revision: 0,
+            target: String::new(),
+            descriptor: String::new(),
+            message: format!("no .wasm module in {}", directory.display()),
+        }),
+        1 => Ok(candidates.remove(0)),
+        _ => {
+            let chosen = candidates
+                .iter()
+                .find(|path| path.file_name().is_some_and(|name| name == "policy.wasm"));
+            chosen.cloned().ok_or_else(|| Error::Build {
+                op: String::new(),
+                backend: String::new(),
+                revision: 0,
+                target: String::new(),
+                descriptor: String::new(),
+                message: format!(
+                    "more than one .wasm module in {}: {candidates:?}",
+                    directory.display()
+                ),
+            })
+        }
     }
 }
 
@@ -603,17 +1041,36 @@ impl ExecutableSource {
 
 impl Source for ExecutableSource {
     fn toolchain(&self) -> ToolchainKind {
-        ToolchainKind::Nvcc
+        ToolchainKind::None
     }
 
     fn build(
         &self,
         _op: &str,
-        _key: &str,
-        _target: &Target,
+        key: &str,
+        target: &Target,
         _toolchain: &dyn Toolchain,
-        _dir: &Workspace,
+        dir: &Workspace,
     ) -> Result<Built> {
-        todo!("the executable source: store the package's binary as it is")
+        let package = &self.package;
+        // An executable program is stored as it is (design section 5.1): the
+        // program was built with its own toolchain, outside the Program
+        // Server, and this source only publishes the bytes under the
+        // revision's path.
+        for relative in package.manifest.source.files_for(key) {
+            let source = package.file(&relative);
+            if !source.is_file() {
+                return Err(package.failure(
+                    key,
+                    target,
+                    format!("the package carries no {relative}"),
+                ));
+            }
+            copy_file(&source, &dir.path().join(&relative))?;
+        }
+        copy_tuning(package, key, target, dir)?;
+        Ok(Built {
+            files: collect(dir.path())?,
+        })
     }
 }

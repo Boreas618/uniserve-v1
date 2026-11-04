@@ -5,12 +5,21 @@
 //! compile queue reserves before it starts the build; and how to run a
 //! compiler process, which every toolchain process caps with `MAX_JOBS`.
 //!
-//! The three toolchains are nvcc (the CUDA toolkit), the Program Server's own
-//! Python environment under `python/` (Triton and CuTe DSL), and the
-//! WebAssembly toolchain (a wasm32 build, then `wasmtime`'s precompilation for
-//! this host's CPU).
+//! Design section 5.2 names four compilers, and each is one toolchain:
 //!
-//! A toolchain the host does not have is not an error of the server: it is
+//! - nvcc, the CUDA toolkit's compiler, for CUDA C++ ([`ToolchainKind::Nvcc`]).
+//! - Triton, from the Program Server's own Python environment under `python/`
+//!   ([`ToolchainKind::Triton`]).
+//! - CuTe DSL, from the same Python environment
+//!   ([`ToolchainKind::CuteDsl`]).
+//! - wasmtime, which precompiles a scheduling policy for this host's CPU
+//!   ([`ToolchainKind::Wasm`]).
+//!
+//! A source that compiles nothing — a vendor cubin, an executable — needs no
+//! toolchain and asks for [`ToolchainKind::None`], which always reports the
+//! version the package declares.
+//!
+//! A compiler the host does not have is not an error of the server: it is
 //! discovered as missing, and only a build that needs it fails. That keeps a
 //! host without a CUDA toolkit able to serve the packages it already has.
 
@@ -21,14 +30,19 @@ use std::process::Command;
 use crate::manifest::ToolchainKind;
 use crate::{Error, Result};
 
-/// The peak host memory of one Python compile, in bytes.
+/// The peak host memory of one Triton compile, in bytes.
 ///
 /// Triton's compiler holds the kernel's IR, its LLVM module and the ptxas
-/// process at once; measured Triton builds of the attention kernels sit below
-/// four gigabytes, and eight leaves room for the compiler's own parallelism
-/// (`MAX_JOBS` caps the jobs, each of which may start a worker). The number is
-/// the reservation the queue makes, not a measurement of one build.
-const PYTHON_PEAK_HOST_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// process at once; measured Triton builds of these kernels sit below four
+/// gigabytes, and eight leaves room for the compiler's own parallelism
+/// (`MAX_JOBS` caps the jobs, each of which may start a worker). It is the
+/// reservation the queue makes, not a measurement of one build.
+const TRITON_PEAK_HOST_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// The peak host memory of one CuTe DSL compile, in bytes: the DSL's Python
+/// interpreter, the traced module, `ptxas` and the link of the host launcher.
+/// Ten gigabytes leaves room above the largest attention kernel's trace.
+const CUTE_DSL_PEAK_HOST_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 /// The peak host memory of one nvcc compile, in bytes: nvcc, cicc and ptxas
 /// over one translation unit. Four gigabytes covers the attention and MoE
@@ -36,14 +50,14 @@ const PYTHON_PEAK_HOST_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const NVCC_PEAK_HOST_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// The peak host memory of one wasm32 build and precompilation, in bytes:
-/// `cargo build` of one policy crate plus `wasmtime compile`. Two gigabytes
+/// `cargo build` of one policy crate plus its precompilation. Two gigabytes
 /// covers both.
 const WASM_PEAK_HOST_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// One compiler process a source runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolJob {
-    /// The program to run: the interpreter, nvcc or cargo.
+    /// The program to run: the interpreter, nvcc or the wasm precompiler.
     pub program: PathBuf,
     pub arguments: Vec<OsString>,
     /// The directory the program runs in.
@@ -56,8 +70,7 @@ pub struct ToolJob {
 }
 
 impl ToolJob {
-    /// A job of a toolchain's own program in `directory`, with its output
-    /// going to `log`.
+    /// A job of a program in `directory`, with its output going to `log`.
     pub fn new(program: &Path, directory: &Path, log: &Path) -> Self {
         Self {
             program: program.to_path_buf(),
@@ -87,9 +100,11 @@ impl ToolJob {
 
 /// What compiles a package.
 pub trait Toolchain: Send + Sync {
-    /// The compiler's version, such as nvcc's `13.0.48` or Triton's `3.7.1`.
-    /// A package declares the version it is written for; a mismatch refuses
-    /// the build (design section 6.2).
+    /// The compiler's version, such as nvcc's `13.0.48`, Triton's `3.7.1` or
+    /// CuTe DSL's `4.6.2`. A package declares the version it is written for;
+    /// a mismatch refuses the build (design section 6.2). A toolchain that
+    /// compiles nothing answers the empty string, which such a package
+    /// declares.
     fn version(&self) -> &str;
 
     /// The peak host memory a build of this descriptor would use, in bytes.
@@ -105,19 +120,20 @@ pub trait Toolchain: Send + Sync {
     /// queue's `limits.max_jobs`.
     fn max_jobs(&self) -> usize;
 
-    /// The toolchain's principal program: the interpreter of the Python
-    /// environment, nvcc, or the precompiler of a wasm module. A source runs
-    /// it as its [`ToolJob`]'s program.
-    fn executable(&self) -> &Path;
+    /// The toolchain's principal program: nvcc, or the wasm precompiler.
+    /// `None` for a toolchain that compiles nothing.
+    fn executable(&self) -> Option<&Path> {
+        None
+    }
 
     /// The interpreter that runs a package's Python compile script, when this
     /// toolchain has one.
     ///
-    /// The Python toolchain is that interpreter. nvcc and the wasm toolchain
-    /// also run a package's compile script, because a CUDA C++ or wasm32
-    /// package states its command line in a Python driver (design section
-    /// 6.2: a source drives the package's compile script), so they carry the
-    /// Python environment's interpreter when the host has it.
+    /// The Python toolchains are that interpreter. nvcc and the wasm
+    /// toolchain also run a package's compile script, because a CUDA C++ or
+    /// wasm32 package states its command line in a Python driver (design
+    /// section 6.2: a source drives the package's compile script), so they
+    /// carry the Python environment's interpreter when the host has it.
     fn script_interpreter(&self) -> Option<&Path> {
         None
     }
@@ -131,11 +147,13 @@ pub struct ToolchainConfig {
     pub nvcc: Option<PathBuf>,
     /// The Program Server's Python environment: the interpreter under
     /// `python/.venv`, created from `python/pyproject.toml` and
-    /// `python/uv.lock`.
+    /// `python/uv.lock`. Triton and CuTe DSL are the environment's two
+    /// toolchains.
     pub python: PathBuf,
-    /// wasmtime, when the host can precompile wasm modules. `None` looks for
-    /// `wasmtime` on `PATH`.
-    pub wasmtime: Option<PathBuf>,
+    /// The wasm precompiler, when the host can precompile wasm modules:
+    /// `scheduling-precompile`, which builds the policy module with the
+    /// schedule crate's own engine. `None` looks for it on `PATH`.
+    pub wasm: Option<PathBuf>,
     /// The number of compilers that may run at once (`limits.max_jobs`).
     pub max_jobs: usize,
 }
@@ -146,7 +164,8 @@ pub struct ToolchainConfig {
 pub struct Toolchains {
     config: ToolchainConfig,
     nvcc: Discovered<Nvcc>,
-    python: Discovered<Python>,
+    triton: Discovered<Triton>,
+    cute_dsl: Discovered<CuteDsl>,
     wasm: Discovered<Wasm>,
 }
 
@@ -159,11 +178,13 @@ impl Toolchains {
     /// A missing toolchain is recorded with its reason; it does not fail the
     /// server, because only a build that needs it does.
     pub fn discover(config: &ToolchainConfig) -> Result<Toolchains> {
+        let interpreter = resolve(&config.python);
         Ok(Toolchains {
             config: config.clone(),
             nvcc: Nvcc::discover(config),
-            python: Python::discover(config),
-            wasm: Wasm::discover(config),
+            triton: Triton::discover(config, &interpreter),
+            cute_dsl: CuteDsl::discover(config, &interpreter),
+            wasm: Wasm::discover(config, &interpreter),
         })
     }
 
@@ -175,12 +196,23 @@ impl Toolchains {
     /// kind, or it cannot report its version.
     pub fn get(&self, kind: ToolchainKind) -> Result<&dyn Toolchain> {
         match kind {
-            ToolchainKind::Nvcc => self.nvcc.as_ref().map(|toolchain| toolchain as &dyn Toolchain),
-            ToolchainKind::Python => self
-                .python
+            ToolchainKind::Nvcc => self
+                .nvcc
                 .as_ref()
                 .map(|toolchain| toolchain as &dyn Toolchain),
-            ToolchainKind::Wasm => self.wasm.as_ref().map(|toolchain| toolchain as &dyn Toolchain),
+            ToolchainKind::Triton => self
+                .triton
+                .as_ref()
+                .map(|toolchain| toolchain as &dyn Toolchain),
+            ToolchainKind::CuteDsl => self
+                .cute_dsl
+                .as_ref()
+                .map(|toolchain| toolchain as &dyn Toolchain),
+            ToolchainKind::Wasm => self
+                .wasm
+                .as_ref()
+                .map(|toolchain| toolchain as &dyn Toolchain),
+            ToolchainKind::None => Ok(&NOTHING as &dyn Toolchain),
         }
         .map_err(|reason| Error::Toolchain {
             kind,
@@ -197,8 +229,13 @@ impl Toolchains {
                 .as_ref()
                 .map(|toolchain| toolchain.version())
                 .map_err(String::as_str),
-            ToolchainKind::Python => self
-                .python
+            ToolchainKind::Triton => self
+                .triton
+                .as_ref()
+                .map(|toolchain| toolchain.version())
+                .map_err(String::as_str),
+            ToolchainKind::CuteDsl => self
+                .cute_dsl
                 .as_ref()
                 .map(|toolchain| toolchain.version())
                 .map_err(String::as_str),
@@ -207,6 +244,7 @@ impl Toolchains {
                 .as_ref()
                 .map(|toolchain| toolchain.version())
                 .map_err(String::as_str),
+            ToolchainKind::None => Ok(""),
         }
     }
 
@@ -276,8 +314,8 @@ impl Toolchain for Nvcc {
         self.max_jobs
     }
 
-    fn executable(&self) -> &Path {
-        &self.path
+    fn executable(&self) -> Option<&Path> {
+        Some(&self.path)
     }
 
     fn script_interpreter(&self) -> Option<&Path> {
@@ -285,61 +323,32 @@ impl Toolchain for Nvcc {
     }
 }
 
-/// The Program Server's Python environment: Triton, CuTe DSL, and the
-/// precompiled wasmtime the scheduling policies are stored for.
-///
-/// Its version is Triton's, the environment's principal compiler: a package
-/// declares that version in `[toolchain] version`, and the versions of the
-/// other distributions it imports in `[toolchain] packages`.
+/// Triton, from the Program Server's Python environment.
 #[derive(Debug)]
-struct Python {
+struct Triton {
     interpreter: PathBuf,
     version: String,
     max_jobs: usize,
 }
 
-impl Python {
-    fn discover(config: &ToolchainConfig) -> Discovered<Python> {
-        let interpreter = resolve(&config.python);
-        if !interpreter.is_file() {
-            return Err(format!(
-                "no Python environment at {}: create it from crates/program-server/python/pyproject.toml",
-                interpreter.display()
-            ));
-        }
-        let reported = Command::new(&interpreter)
-            .args(["-c", "import triton; print(triton.__version__)"])
-            .output()
-            .map_err(|error| format!("running {}: {error}", interpreter.display()))?;
-        let text = String::from_utf8_lossy(&reported.stdout).trim().to_owned();
-        let error = String::from_utf8_lossy(&reported.stderr).trim().to_owned();
-        if !reported.status.success() {
-            return Err(format!(
-                "{} cannot import Triton: {error}",
-                interpreter.display()
-            ));
-        }
-        if text.is_empty() {
-            return Err(format!(
-                "{} reported no Triton version",
-                interpreter.display()
-            ));
-        }
-        Ok(Python {
-            interpreter,
-            version: text,
+impl Triton {
+    fn discover(config: &ToolchainConfig, interpreter: &Path) -> Discovered<Triton> {
+        let version = python_version(interpreter, "triton")?;
+        Ok(Triton {
+            interpreter: interpreter.to_path_buf(),
+            version,
             max_jobs: config.max_jobs,
         })
     }
 }
 
-impl Toolchain for Python {
+impl Toolchain for Triton {
     fn version(&self) -> &str {
         &self.version
     }
 
     fn peak_host_bytes(&self, _op: &str, _key: &str) -> u64 {
-        PYTHON_PEAK_HOST_BYTES
+        TRITON_PEAK_HOST_BYTES
     }
 
     fn run(&self, job: ToolJob) -> Result<()> {
@@ -350,51 +359,81 @@ impl Toolchain for Python {
         self.max_jobs
     }
 
-    fn executable(&self) -> &Path {
-        &self.interpreter
+    fn script_interpreter(&self) -> Option<&Path> {
+        Some(&self.interpreter)
     }
 }
 
-/// The WebAssembly toolchain: cargo builds a policy for wasm32, and wasmtime
-/// precompiles it for this host's CPU (design section 5.3).
+/// CuTe DSL, from the Program Server's Python environment.
 #[derive(Debug)]
-struct Wasm {
-    wasmtime: PathBuf,
+struct CuteDsl {
+    interpreter: PathBuf,
     version: String,
     max_jobs: usize,
 }
 
-impl Wasm {
-    fn discover(config: &ToolchainConfig) -> Discovered<Wasm> {
-        let wasmtime = config
-            .wasmtime
-            .clone()
-            .or_else(|| find("wasmtime"))
-            .ok_or_else(|| {
-                "no wasmtime on this host: install it to precompile scheduling policies".to_owned()
-            })?;
-        let reported = Command::new(&wasmtime)
-            .arg("--version")
-            .output()
-            .map_err(|error| format!("running {}: {error}", wasmtime.display()))?;
-        let text = String::from_utf8_lossy(&reported.stdout);
-        if !reported.status.success() {
-            return Err(format!(
-                "{} --version failed: {}",
-                wasmtime.display(),
-                text.trim()
-            ));
-        }
-        let version = text
-            .split_whitespace()
-            .last()
-            .filter(|version| !version.is_empty())
-            .ok_or_else(|| format!("{} --version names no version", wasmtime.display()))?
-            .to_owned();
-        Ok(Wasm {
-            wasmtime,
+impl CuteDsl {
+    fn discover(config: &ToolchainConfig, interpreter: &Path) -> Discovered<CuteDsl> {
+        let version = python_version(interpreter, "cutlass")?;
+        Ok(CuteDsl {
+            interpreter: interpreter.to_path_buf(),
             version,
             max_jobs: config.max_jobs,
+        })
+    }
+}
+
+impl Toolchain for CuteDsl {
+    fn version(&self) -> &str {
+        &self.version
+    }
+
+    fn peak_host_bytes(&self, _op: &str, _key: &str) -> u64 {
+        CUTE_DSL_PEAK_HOST_BYTES
+    }
+
+    fn run(&self, job: ToolJob) -> Result<()> {
+        execute(&job, self.max_jobs)
+    }
+
+    fn max_jobs(&self) -> usize {
+        self.max_jobs
+    }
+
+    fn script_interpreter(&self) -> Option<&Path> {
+        Some(&self.interpreter)
+    }
+}
+
+/// The wasm precompiler: the scheduling crate's program that precompiles a
+/// wasm32 policy for this host's CPU (design section 5.3).
+#[derive(Debug)]
+struct Wasm {
+    precompiler: PathBuf,
+    version: String,
+    max_jobs: usize,
+    /// The interpreter of the Program Server's Python environment, which runs
+    /// a policy package's compile script when the package names one.
+    interpreter: Option<PathBuf>,
+}
+
+impl Wasm {
+    fn discover(config: &ToolchainConfig, interpreter: &Path) -> Discovered<Wasm> {
+        let precompiler = config
+            .wasm
+            .clone()
+            .or_else(|| find("scheduling-precompile"))
+            .ok_or_else(|| {
+                "no wasm precompiler on this host: crates/scheduling's scheduling-precompile \
+                 builds it"
+                    .to_owned()
+            })?;
+        let version = wasmtime_version(&precompiler)?;
+        Ok(Wasm {
+            precompiler,
+            version,
+            max_jobs: config.max_jobs,
+            interpreter: interpreter.is_file().then(|| interpreter.to_path_buf()),
         })
     }
 }
@@ -416,9 +455,108 @@ impl Toolchain for Wasm {
         self.max_jobs
     }
 
-    fn executable(&self) -> &Path {
-        &self.wasmtime
+    fn executable(&self) -> Option<&Path> {
+        Some(&self.precompiler)
     }
+
+    fn script_interpreter(&self) -> Option<&Path> {
+        self.interpreter.as_deref()
+    }
+}
+
+/// A toolchain for a source that compiles nothing: a vendor cubin, or an
+/// executable stored as it is. It reports the empty version, which such a
+/// package declares, and runs nothing.
+#[derive(Debug)]
+struct Nothing;
+
+static NOTHING: Nothing = Nothing;
+
+impl Toolchain for Nothing {
+    fn version(&self) -> &str {
+        ""
+    }
+
+    fn peak_host_bytes(&self, _op: &str, _key: &str) -> u64 {
+        0
+    }
+
+    fn run(&self, job: ToolJob) -> Result<()> {
+        Err(Error::Build {
+            op: String::new(),
+            backend: String::new(),
+            revision: 0,
+            target: String::new(),
+            descriptor: String::new(),
+            message: format!(
+                "nothing to run: this source compiles no program ({} was asked)",
+                job.program.display()
+            ),
+        })
+    }
+
+    fn max_jobs(&self) -> usize {
+        1
+    }
+}
+
+/// Asks the Python environment for the version of one of its distributions.
+fn python_version(interpreter: &Path, module: &str) -> Discovered<String> {
+    if !interpreter.is_file() {
+        return Err(format!(
+            "no Python environment at {}: create it from crates/program-server/python/pyproject.toml",
+            interpreter.display()
+        ));
+    }
+    let reported = Command::new(interpreter)
+        .args([
+            "-c",
+            &format!("import {module}; print({module}.__version__)"),
+        ])
+        .output()
+        .map_err(|error| format!("running {}: {error}", interpreter.display()))?;
+    let text = String::from_utf8_lossy(&reported.stdout).trim().to_owned();
+    let error = String::from_utf8_lossy(&reported.stderr).trim().to_owned();
+    if !reported.status.success() {
+        return Err(format!(
+            "{} cannot import {module}: {error}",
+            interpreter.display()
+        ));
+    }
+    if text.is_empty() {
+        return Err(format!(
+            "{} reported no {module} version",
+            interpreter.display()
+        ));
+    }
+    Ok(text)
+}
+
+/// The wasmtime version a precompiler reports, either itself or through the
+/// `wasmtime` program beside it. A precompiled module is only loadable by the
+/// wasmtime that wrote it, so this string is what a policy package declares.
+fn wasmtime_version(precompiler: &Path) -> Discovered<String> {
+    if let Ok(reported) = Command::new(precompiler).arg("--version").output()
+        && reported.status.success()
+    {
+        let text = String::from_utf8_lossy(&reported.stdout);
+        if let Some(version) = text.split_whitespace().last() {
+            return Ok(version.to_owned());
+        }
+    }
+    if let Some(wasmtime) = find("wasmtime")
+        && let Ok(reported) = Command::new(wasmtime).arg("--version").output()
+        && reported.status.success()
+    {
+        let text = String::from_utf8_lossy(&reported.stdout);
+        if let Some(version) = text.split_whitespace().last() {
+            return Ok(version.to_owned());
+        }
+    }
+    Err(format!(
+        "{} does not report a wasmtime version; it must print one for `--version`",
+        precompiler.display()
+    ))
 }
 
 /// The version nvcc reports, such as `13.0.48` from
@@ -440,6 +578,11 @@ fn find(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&path)
         .map(|directory| directory.join(name))
         .find(|candidate| candidate.is_file())
+}
+
+/// A program this host has on `PATH`, such as `cargo` for a wasm32 build.
+pub fn find_program(name: &str) -> Option<PathBuf> {
+    find(name)
 }
 
 /// A path that exists, if the file is there.
@@ -501,12 +644,6 @@ pub fn execute(job: &ToolJob, max_jobs: usize) -> Result<()> {
             message: format!("{} failed: {status}: {text}", job.program.display()),
         })
     }
-}
-
-/// The program a toolchain runs for a script: the Python interpreter of the
-/// Program Server's environment.
-pub fn interpreter(config: &ToolchainConfig) -> &Path {
-    &config.python
 }
 
 #[cfg(test)]
