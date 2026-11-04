@@ -703,13 +703,32 @@ fn encode(args: &Args) -> Result<(), String> {
     )?;
     std::fs::write(directory.join("readback.txt"), &readback)
         .map_err(|error| format!("readback.txt: {error}"))?;
+    // The pixels as the encoder received them. A reference probe reads this file instead of
+    // rebuilding the pattern, so a comparison of the encoder's arithmetic starts from one input
+    // rather than from two decodes and two orders of a channel axis.
+    write_h3t(
+        &directory.join("pixels.h3t"),
+        H3T_F32,
+        &[
+            channels,
+            u64::from(pixels.frames),
+            u64::from(pixels.height),
+            u64::from(pixels.width),
+        ],
+        &pixels_host,
+    )?;
     let case = format!(
         "{{\n  \"stage\": \"encode\",\n  \"task\": \"{}\",\n  \"canvas\": [{}, {}],\n  \
          \"frames\": {},\n  \"image\": {},\n  \"prompt_tokens\": {},\n  \"seed\": {},\n  \
          \"dtype\": \"{}\",\n  \"text_rows\": {},\n  \"condition_rows\": {},\n  \
          \"prefix_rows\": {},\n  \"hidden\": {},\n  \"pieces\": {},\n  \
-         \"piece_rows\": [{}, {}],\n  \"pixels\": \"deterministic ramp, stated\",\n  \
-         \"text\": \"deterministic pattern, stated (stage 4 owns the text encoder)\"\n}}\n",
+         \"piece_rows\": [{}, {}],\n  \"pixels_file\": \"pixels.h3t\",\n  \
+         \"pixels_shape\": [{}, {}, {}, {}],\n  \
+         \"pixels\": \"deterministic per-channel ramp, stated\",\n  \
+         \"text\": \"deterministic pattern, stated (stage 4 owns the text encoder)\",\n  \
+         \"rows_file\": \"condition_rows.h3t\",\n  \
+         \"rows_container\": \"f32\",\n  \
+         \"posterior_fields\": \"not written: the trace that carries them is not on the served entry point\"\n}}\n",
         task_name(args.task),
         args.width,
         args.height,
@@ -724,7 +743,11 @@ fn encode(args: &Args) -> Result<(), String> {
         hidden,
         segments.len(),
         pieces[0].0,
-        pieces[0].1
+        pieces[0].1,
+        channels,
+        u64::from(pixels.frames),
+        u64::from(pixels.height),
+        u64::from(pixels.width)
     );
     std::fs::write(directory.join("case.json"), case)
         .map_err(|error| format!("case.json: {error}"))?;
