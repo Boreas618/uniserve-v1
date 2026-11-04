@@ -1,0 +1,35 @@
+# The top_k operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py`.
+#
+# One program per row selects the row's `width` largest logits by four radix
+# passes and one emission pass, then sorts them; the vocabulary and the row count
+# are launch values.
+
+op = "top_k"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/top_k.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+# `dtype_f32_vocabulary_151936_width_2048_ids_i32_pdl_false`.
+[kernel.descriptors]
+dimensions = { dtype = ["f32", "bf16", "fp16"], vocabulary = ["151936", "152064", "248320", "2048"], width = ["2048", "4096", "1024", "128"], ids = ["i32", "i64"], pdl = ["true", "false"] }
+
+[parameters]
