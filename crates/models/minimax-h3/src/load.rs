@@ -23,6 +23,7 @@
 //! (specs/worker.md 1, 9).
 
 use nn::{Block, BlockName};
+use std::sync::Arc;
 
 use crate::audio_vae::AudioDecoder;
 use crate::checkpoint::{Dit, Layout, Sidecars};
@@ -79,7 +80,7 @@ pub fn load(
                 let mut shards = loader.reborrow(source)?;
                 let encoder =
                     TextEncoder::load(&mut shards, &config.text_encoder, &partition, dtype)?;
-                Block::Encoder(Box::new(encoder))
+                Block::Encoder(Arc::new(encoder))
             }
             Component::Transformer | Component::TransformerRef => {
                 let dit = match component {
@@ -134,7 +135,7 @@ pub fn load(
                 if let Some(encoders) = encoders.take() {
                     denoiser.attach_encoders(encoders)?;
                 }
-                Block::Denoiser(Box::new(denoiser))
+                Block::Denoiser(Arc::new(denoiser))
             }
             Component::VideoPostprocessor => {
                 // Weightless: the splice's only constants are the reference's ImageNet means and standard
@@ -160,7 +161,7 @@ pub fn load(
                     &bytes(crate::output::PIXEL_STD),
                 )?;
                 let postprocessor = crate::output::VideoPostprocessor::new(dtype, mean, std)?;
-                nn::Block::Decoder(Box::new(postprocessor))
+                nn::Block::Decoder(Arc::new(postprocessor))
             }
             Component::AudioDecoder => {
                 // The audio decoder has no layout tables - every table it reads is a weight bound
@@ -168,7 +169,7 @@ pub fn load(
                 let source = checkpoint.component("audio_vae")?;
                 let mut shards = loader.reborrow(source)?;
                 let decoder = AudioDecoder::load(&config.audio_vae, &mut shards)?;
-                Block::Decoder(Box::new(decoder))
+                Block::Decoder(Arc::new(decoder))
             }
             Component::VideoDecoder => {
                 // One block serves every canvas: the tile grid is arithmetic on a request's raster,
@@ -232,7 +233,7 @@ pub fn load(
                     input,
                     &mut shards,
                 )?;
-                Block::Decoder(Box::new(decoder))
+                Block::Decoder(Arc::new(decoder))
             }
             Component::LatentEncoder => {
                 // No block of its own: the two condition encoders are the `denoiser` block's

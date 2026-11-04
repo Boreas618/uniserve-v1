@@ -45,24 +45,35 @@ pub struct Arena {
 }
 
 impl Arena {
-    /// The arena of `bytes` bytes starting at `base`.
+    /// The arena of `bytes` bytes starting at `base`, aligned up to [`ALIGNMENT`].
     ///
     /// `base` is a region the executor reserved in the graph pool for this captured bucket; the
     /// executor keeps it alive for as long as any graph that addresses it may replay.
-    pub const fn new(base: DevicePtr, bytes: u64) -> Self {
+    ///
+    /// The base is aligned **up** to [`ALIGNMENT`] and the same number of bytes is taken off the
+    /// region's size, so that every reservation is 256-byte aligned whatever the allocator answered.
+    /// An arena hands its reservations out at that granularity, so a base carrying the pool's own
+    /// skew would put every buffer of a forward at the same skew — and the tensor-core programs these
+    /// buffers feed are compiled for sixteen-byte tensor pointers, which turns that skew into a warp
+    /// misaligned address inside a kernel that names no operand. An eight-byte-skewed region costs
+    /// at most 255 bytes here and nothing anywhere else.
+    pub fn new(base: DevicePtr, bytes: u64) -> Self {
+        let address = base.address();
+        let aligned = address.next_multiple_of(ALIGNMENT);
+        let skew = aligned - address;
         Self {
-            base,
-            bytes,
+            base: DevicePtr::new(aligned),
+            bytes: bytes.saturating_sub(skew),
             cursor: Cell::new(0),
         }
     }
 
-    /// The region's first address.
+    /// The region's first address, aligned to [`ALIGNMENT`].
     pub const fn base(&self) -> DevicePtr {
         self.base
     }
 
-    /// The region's size in bytes.
+    /// The region's usable size in bytes, after the base was aligned.
     pub const fn bytes(&self) -> u64 {
         self.bytes
     }
@@ -266,6 +277,23 @@ mod tests {
         assert_eq!(first.ptr.address(), 0x1_0000);
         assert_eq!(second.ptr.address(), 0x1_0000 + ALIGNMENT);
         assert_eq!(arena.used(), ALIGNMENT + 8);
+    }
+
+    /// A pool may answer a region at eight-byte granularity, and the programs these buffers feed are
+    /// compiled for sixteen-byte tensor pointers: the arena's own base is where that has to be
+    /// fixed, because a reservation cannot correct a skew it inherits.
+    #[test]
+    fn a_skewed_region_is_aligned_up_before_anything_is_reserved() {
+        let arena = Arena::new(DevicePtr::new(0x1_0008), 4096);
+        assert_eq!(arena.base().address(), 0x1_0100);
+        assert_eq!(arena.bytes(), 4096 - 0xF8);
+        let tensor = arena.tensor(DType::BF16, Shape::new(&[8])).unwrap();
+        assert_eq!(tensor.ptr.address() % ALIGNMENT, 0);
+        assert_eq!(tensor.ptr.address(), 0x1_0100);
+        // An already-aligned region keeps its address and its whole size.
+        let held = Arena::new(DevicePtr::new(0x1_0000), 4096);
+        assert_eq!(held.base().address(), 0x1_0000);
+        assert_eq!(held.bytes(), 4096);
     }
 
     #[test]

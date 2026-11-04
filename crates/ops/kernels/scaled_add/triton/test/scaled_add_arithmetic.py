@@ -47,6 +47,24 @@ def run(rows, columns, block, alpha, beta, exact):
     return ok
 
 
+def run_poisoned(rows, columns, block, alpha):
+    """A `β = 0` step over a target holding a NaN: the source must arrive unread of the target.
+
+    `0 · NaN` is a NaN, so a kernel that loads the target before multiplying it writes the poisoning
+    through - the failure a random target cannot show, because `0 · x` is `0` for every finite `x`.
+    A `β = 0` step is a *replacement*, and the reference's FP32 copies are exactly this: a source
+    widening into a target nothing has written yet.
+    """
+    target = torch.full((rows, columns), float("nan"), dtype=torch.float32)
+    source = torch.rand(rows, columns, dtype=torch.float32)
+    grid = ((target.numel() + block - 1) // block, 1, 1)
+    kernels._scaled_add_kernel[grid](target, source, alpha, 0.0, target.numel(), BLOCK=block)
+    ok = torch.equal(target, source * alpha)
+    detail = "bit-exact" if ok else f"{int(torch.isnan(target).sum())} NaN(s) survived"
+    print(f"rows={rows} columns={columns} block={block} α={alpha} β=0 over a NaN target: {detail}")
+    return ok
+
+
 def main() -> int:
     cases = [
         # β = 0, α = 1 is a copy; β = 1, α = 0 is the identity: both exact in FP32.
@@ -55,7 +73,8 @@ def main() -> int:
         (3, 100, 128, 0.25, 0.75, False),
         (4, 5376, 1024, 0.5, 1.0, False),
     ]
-    return 0 if all(run(*case) for case in cases) else 1
+    poisoned = [run_poisoned(2, 64, 64, 1.0), run_poisoned(3, 100, 128, 0.5)]
+    return 0 if all(run(*case) for case in cases) and all(poisoned) else 1
 
 
 if __name__ == "__main__":
