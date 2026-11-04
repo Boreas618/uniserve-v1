@@ -65,13 +65,38 @@ impl CrossFade {
     /// Blend `previous` and `current` into `out`, all `[channels, frames, rows, columns]`.
     ///
     /// The leading `extent` positions of `axis` blend; every later position is `current`'s, copied.
+    ///
+    /// `previous` is `None` for a clip's first tile, which has nothing to fade against: the tile is
+    /// already where it belongs, so the blend is the identity and nothing is launched. The two views
+    /// must then be the same buffer — same address, extents, strides and type — because the operator
+    /// has no copy form: passing `None` with a different `out` is refused rather than silently
+    /// leaving the tile unwritten, and a caller that needs that copy makes it with the operator that
+    /// produces the raster. Never synthesise a zero tile to satisfy the signature: it costs a copy
+    /// per clip and it makes the seam arithmetic wrong at the edge, which is why the parameter is
+    /// optional.
     pub fn forward(
         &self,
         f: &Forward,
-        previous: TensorView,
+        previous: Option<TensorView>,
         current: TensorView,
         out: TensorView,
     ) -> Result<()> {
+        let Some(previous) = previous else {
+            let same = out.ptr == current.ptr
+                && out.dtype == current.dtype
+                && out.shape.dims() == current.shape.dims()
+                && out.strides == current.strides;
+            if !same {
+                return Err(Error::shape(
+                    "CrossFade",
+                    "a first tile has nothing to fade against and the layer launches no copy: \
+                     pass the tile you decoded as both `current` and `out`, or make the copy with \
+                     the operator that produces the raster"
+                        .to_owned(),
+                ));
+            }
+            return Ok(());
+        };
         let descriptor = cross_fade::Descriptor {
             dtype: self.dtype,
             extent: self.extent,

@@ -29,9 +29,10 @@
 //! the tokens a verification carrying drafts commits, the worker's time of
 //! a decoding step with and without drafts, and its time per prompt token.
 
+use crate::scheduler::completion::CallCompletion;
 use super::*;
 use crate::kv_cache::Checkpoint;
-use ipc::{CallOutput, ForwardMode};
+use ipc::ForwardMode;
 
 /// The weight of each new observation in the meter's averages: an average
 /// of about the last sixteen.
@@ -280,7 +281,7 @@ impl Scheduler {
         &mut self,
         id: RequestId,
         call: &Call,
-        record: &CallOutput,
+        record: &CallCompletion,
     ) {
         if !self.speculates() || record.status != CallStatus::Ok {
             return;
@@ -319,7 +320,7 @@ impl Scheduler {
     /// Counts an accepted verification's drafts: those it accepted, the
     /// accepted prefix of its committed tokens (all of them when a finish
     /// token among the drafts ended the commit), and those it rejected.
-    fn count_verification(&self, id: RequestId, call: &Call, record: &CallOutput) {
+    fn count_verification(&self, id: RequestId, call: &Call, record: &CallCompletion) {
         let drafts = generation::verify_drafts(call);
         let committed = &record.committed_tokens;
         let matching = committed
@@ -456,7 +457,7 @@ impl Scheduler {
         &mut self,
         id: RequestId,
         call: &Call,
-        record: &CallOutput,
+        record: &CallCompletion,
     ) {
         if record.status != CallStatus::Ok {
             return;

@@ -26,14 +26,6 @@ pub enum Error {
         source: std::io::Error,
     },
 
-    /// A safetensors shard could not be read.
-    #[error("safetensors: {path}: {source}")]
-    Safetensors {
-        path: PathBuf,
-        #[source]
-        source: safetensors::SafeTensorError,
-    },
-
     /// A checkpoint's index or configuration is not well formed.
     #[error("checkpoint {path}: {problem}")]
     Checkpoint { path: PathBuf, problem: String },

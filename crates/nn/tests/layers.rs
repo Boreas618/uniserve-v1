@@ -8,8 +8,8 @@
 
 use nn::{
     AdaptivePool, DType, DevicePtr, FrameNormPad, GatedResidual, KvGroup, KvPlanes, KvView, Linear,
-    ModulatedRmsNorm, Patch, PatchMode, Rotary, Rotate, Rotation, ScaledResidual,
-    ScaledResidualRmsNorm, Shape, Snake, SwiGlu, TensorView, VsaTiles, Weight, WeightedRmsNorm,
+    ModulatedRmsNorm, Patch, Rotary, Rotate, Rotation, ScaledResidual, ScaledResidualRmsNorm,
+    Shape, Snake, SwiGlu, TensorView, VsaTiles, Weight, WeightedRmsNorm,
 };
 use ops::gemm::WeightOrder;
 
@@ -240,8 +240,6 @@ fn a_gated_residual_holds_the_gate_table_it_gates_with() {
 fn a_patch_mapping_holds_a_layouts_latent_geometry() {
     let patch = Patch::new(24, 32, 32).unwrap();
     assert_eq!(patch.channels(), 24);
-    assert_eq!(PatchMode::Patchify.to_string(), "patchify");
-    assert_eq!(PatchMode::Unpatchify.to_string(), "unpatchify");
     assert!(Patch::new(0, 32, 32).is_err());
     assert!(Patch::new(24, 0, 32).is_err());
     assert!(

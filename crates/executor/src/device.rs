@@ -29,6 +29,9 @@ use crate::{Error, Result};
 /// A device executor's handle.
 pub struct Executor {
     device: DeviceId,
+    /// The phases this device's runners serve, recorded here because the runners themselves live
+    /// on the device thread and a router above the executors has to choose one without asking it.
+    phases: Vec<ipc::PhaseId>,
     queue: Arc<JobQueue>,
     thread: Option<JoinHandle<()>>,
     /// The device's graph pools, shared by every runner that issues here (4.1).
@@ -105,29 +108,48 @@ pub struct GraphStorage {
 impl Executor {
     /// Starts the device thread, which owns the runners and the arena their graphs use.
     ///
-    /// The graph storage arrives as [`GraphStorage`]: the engine sizes it, the executor reserves it
-    /// on the device's thread and hands the one `Pools` set to every runner that issues here.
+    /// The pool set arrives from [`Executor::open`], which the engine calls while it opens the
+    /// resident owners: it is the one allocator of the device, so every owner and every runner that
+    /// issues here books against the same allowance (4.1). `scratch` is the shadow pair's region,
+    /// which the engine sized beside the graph pool.
     ///
     /// From this call on the calling thread issues no device work for this device: everything
     /// reaches the device through [`Executor::submit`], the program-layer calls, and the storage
     /// owners' recorded jobs.
+    /// Opens the device's one pool set, before anything that allocates on the device exists.
+    ///
+    /// The resident owners (4.1) carve their storage from this allocator, and they are opened
+    /// before the executor thread - the runner that serves batches is built from them - so the pool
+    /// set is built here and handed to [`Executor::spawn`] rather than built inside it.
+    pub fn open(device: DeviceId, graph: &GraphStorage) -> Result<Arc<std::sync::Mutex<Pools>>> {
+        let handle = platform::Device::new(device)?;
+        // One book per device (4.1): the allocator books every pool kind against the same
+        // allowance, so the three kinds cannot sum past it.
+        let totals = Arc::new(Pools::totals_of(graph.budget));
+        let allocator =
+            platform::Allocator::new(&handle, Arc::clone(&totals) as Arc<dyn platform::Budget>)?;
+        Ok(Arc::new(std::sync::Mutex::new(Pools::new(
+            allocator,
+            totals,
+            graph.bytes,
+            graph.scratch,
+            graph.resident,
+            graph.streams,
+        )?)))
+    }
+
     pub fn spawn(
         device: DeviceId,
         mut runners: Vec<NamedRunner>,
         events: Arc<EventPool>,
-        graph: GraphStorage,
+        pools: Arc<std::sync::Mutex<Pools>>,
+        scratch: u64,
     ) -> Result<Self> {
-        let handle = platform::Device::new(device)?;
-        let allocator = platform::Allocator::new(&handle, Arc::new(GraphBudget { bytes: graph.budget }))?;
-        let pools = Arc::new(std::sync::Mutex::new(Pools::with_pools(
-            allocator,
-            graph.bytes,
-            graph.scratch,
-            graph.resident,
-            graph.budget,
-            graph.streams,
-        )?));
         let counters = Arc::new(SharedCounters::default());
+        let phases: Vec<ipc::PhaseId> = runners
+            .iter()
+            .flat_map(|named| named.phases.iter().copied())
+            .collect();
         for named in &mut runners {
             named.runner.attach_pools(Arc::clone(&pools));
             named.runner.attach_counters(Arc::clone(&counters));
@@ -137,7 +159,7 @@ impl Executor {
             device,
             runners,
             queue: Arc::clone(&queue),
-            scratch: graph.scratch,
+            scratch,
             pools: Arc::clone(&pools),
             counters: Arc::clone(&counters),
             sticky: None,
@@ -153,6 +175,7 @@ impl Executor {
             })?;
         Ok(Self {
             device,
+            phases,
             queue,
             thread: Some(thread),
             pools,
@@ -252,6 +275,36 @@ impl Executor {
             None,
         )?;
         Ok(submission)
+    }
+
+    /// Releases everything that references `generation`, which was prepared and never served (7.3
+    /// step 2).
+    ///
+    /// A failed precopy abandons the generation it prepared: its kernels unload with it, and the
+    /// graphs and arena regions the runner rebound or recaptured for it are released here. `purge`
+    /// cannot do this, because purge drops what is *older* than the serving generation and an
+    /// abandoned generation is newer than it.
+    pub fn discard(&self, generation: u64) -> Result<Submission> {
+        let id = SubmissionId(self.queue.next_submission());
+        let (submission, _) = Submission::pending(id);
+        self.queue.submit(
+            Command::Discard(generation),
+            &submission,
+            JobKind::Discard,
+            None,
+        )?;
+        Ok(submission)
+    }
+
+    /// Whether one of this device's runners serves `phase` (4.4): what a router above the executors
+    /// asks before it hands a batch over.
+    pub fn serves(&self, phase: ipc::PhaseId) -> bool {
+        self.phases.contains(&phase)
+    }
+
+    /// The phases this device's runners serve, in the order they were spawned.
+    pub fn phases(&self) -> &[ipc::PhaseId] {
+        &self.phases
     }
 
     /// The device's one pool set, for an owner that carves its own storage from the same allocator
@@ -376,24 +429,6 @@ enum Step {
     Done(BatchOutput),
     /// The command put its remainder at the tail; its submission completes on that step.
     Requeued,
-}
-
-/// The device's graph-storage budget, as the allocator books against it (4.1).
-struct GraphBudget {
-    /// Bytes the device may map for captured graphs.
-    bytes: u64,
-}
-
-impl platform::Budget for GraphBudget {
-    fn book(&self, _device: DeviceId, _pool: platform::PoolKind, bytes: u64) -> platform::Result<()> {
-        if bytes > self.bytes {
-            return Err(platform::Error::InvalidArgument(format!(
-                "a graph pool of {bytes} bytes exceeds the device's {} bytes",
-                self.bytes
-            )));
-        }
-        Ok(())
-    }
 }
 
 /// What a sticky-error probe found (2.4).
@@ -552,6 +587,13 @@ impl Device {
             Command::Purge(generation) => {
                 for named in &mut self.runners {
                     named.runner.purge(*generation);
+                }
+                self.synchronize()?;
+                Ok(Step::Done(BatchOutput::default()))
+            }
+            Command::Discard(generation) => {
+                for named in &mut self.runners {
+                    named.runner.discard(*generation);
                 }
                 self.synchronize()?;
                 Ok(Step::Done(BatchOutput::default()))

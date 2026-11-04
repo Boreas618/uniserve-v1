@@ -162,6 +162,13 @@ fn element_type_names() -> Vec<String> {
 
 /// The descriptor fields whose values are element types (`ops`' `DType`
 /// `Display`), across the operators of design section 9.
+///
+/// A name here does not settle what a package's field means: `output` is a
+/// convolution's output element type and also `adaptive_pool`'s pooled width, and
+/// `input` is a `gemm`'s activations' type and would be a count anywhere else. So a
+/// value in one of these fields is examined only when it is not a bare integer —
+/// which is what tells an element type (`bf16`, and a package's mistake `float16`)
+/// from a width or an extent (`32`).
 const ELEMENT_TYPE_FIELDS: [&str; 7] =
     ["dtype", "input", "weight", "output", "accumulate", "scores", "scales"];
 
@@ -174,16 +181,22 @@ fn every_element_type_a_descriptor_can_carry_is_one_ops_prints() {
         let Some(kernel) = &manifest.kernel else {
             continue;
         };
-        for (field, values) in &kernel.descriptors.dimensions {
-            if !ELEMENT_TYPE_FIELDS.contains(&field.as_str()) {
-                continue;
-            }
-            for value in values {
-                if !names.contains(value) {
-                    failures.push(format!(
-                        "{} {}: {field} = {value:?} is not one of {names:?}",
-                        manifest.op, manifest.backend
-                    ));
+        for shape in kernel.descriptors.shapes() {
+            for (field, values) in &shape.dimensions {
+                if !ELEMENT_TYPE_FIELDS.contains(&field.as_str()) {
+                    continue;
+                }
+                for value in values {
+                    if value.parse::<u64>().is_ok() {
+                        // A width or an extent, not an element type.
+                        continue;
+                    }
+                    if !names.contains(value) {
+                        failures.push(format!(
+                            "{} {}: {field} = {value:?} is not one of {names:?}",
+                            manifest.op, manifest.backend
+                        ));
+                    }
                 }
             }
         }
@@ -283,10 +296,18 @@ fn every_fixture_key_parses_to_the_fields_its_operator_s_packages_declare() {
                 })
                 .filter_map(|package| {
                     let manifest = Manifest::load(&package).ok()?;
-                    let descriptors = manifest.kernel?.descriptors;
-                    Some((package.display().to_string(), descriptors.dimensions))
+                    // One entry per shape the package declares: a key has to
+                    // parse against *one* of an operator's shapes, not against a
+                    // merged table.
+                    let shapes = manifest.kernel?.descriptors.shapes().to_vec();
+                    Some(
+                        shapes
+                            .into_iter()
+                            .filter(|shape| !shape.dimensions.is_empty())
+                            .map(move |shape| (package.display().to_string(), shape.dimensions)),
+                    )
                 })
-                .filter(|(_, dimensions)| !dimensions.is_empty())
+                .flatten()
                 .collect();
             // An operator with no package at all is the coverage gate's business.
             if declared.is_empty() {
@@ -393,5 +414,66 @@ fn every_shipping_package_declares_its_toolchain_version() {
     assert!(
         empty > 0,
         "no fixture takes the empty version the rule exists for"
+    );
+}
+
+/// The expert exchange's topology is a descriptor dimension, so the store keeps the
+/// group sizes apart — and the package covers exactly the one a host can serve today.
+///
+/// `ranks` being in the module key is what stops a module built for one group from
+/// being resolved for another. The larger groups have no module on purpose: the
+/// executor's `group` interface, over which a package would exchange peer handles,
+/// is not named yet, and `create` refuses those groups by name rather than falling
+/// back to one rank (`test/create_check.py` in the package checks that refusal).
+#[test]
+fn the_exchange_covers_one_group_size_and_no_other() {
+    let package = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/ops/kernels/expert_exchange/alltoall");
+    let manifest = Manifest::load(&package).expect("the exchange's package parses");
+    let key = |ranks: u32| {
+        format!(
+            "mode_dispatch_hidden_2048_top_8_experts_128_max_tokens_8192_ranks_{ranks}_dtype_bf16"
+        )
+    };
+    assert!(
+        manifest.covers(&key(1)),
+        "the package must build the module of the one rank it serves"
+    );
+    for ranks in [2, 4, 8] {
+        assert!(
+            !manifest.covers(&key(ranks)),
+            "the package declares a module for a group of {ranks} ranks, which no host \
+             can serve: the transport for a group is not named yet"
+        );
+    }
+}
+
+/// Every package names an operator the `ops` crate declares.
+///
+/// A package is requested by its operator's name — `install` and `prepare` take an operator name,
+/// and a program slot is built from one — so a package published under a name no operator carries
+/// is a program nothing can ever request. The names move: an operator renamed in `crates/ops`
+/// leaves its package behind, and nothing else in the tree would notice, because the store builds
+/// a package by its manifest and never asks whether an operator exists.
+#[test]
+fn every_package_names_an_operator_the_ops_crate_declares() {
+    let operators = ops::operators();
+    let mut failures = Vec::new();
+    for package in packages() {
+        let Ok(manifest) = Manifest::load(&package) else {
+            continue;
+        };
+        if !operators.contains(&manifest.op.as_str()) {
+            failures.push(format!(
+                "{}: op `{}` is no operator of `crates/ops`",
+                package.display(),
+                manifest.op
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "a package under a name no operator carries is a program nothing can request:\n{}",
+        failures.join("\n")
     );
 }

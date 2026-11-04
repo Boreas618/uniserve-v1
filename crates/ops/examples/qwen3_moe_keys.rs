@@ -314,6 +314,17 @@ fn main() {
             pdl: PDL,
         }),
     ));
+    // The permutation between the filtering and the draw: it takes the candidate pair and writes it
+    // in token order, so the draw does not depend on the order the top-k program produced. Its
+    // candidate count is a launch value, so the key names only the two element types.
+    lines.push((
+        "candidate_order".to_owned(),
+        key(&ops::sampler::OrderDescriptor {
+            values: DType::F32,
+            ids: DType::I32,
+            pdl: PDL,
+        }),
+    ));
     lines.push((
         "inverse_cdf".to_owned(),
         key(&ops::sampler::InverseCdfDescriptor {

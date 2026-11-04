@@ -488,6 +488,17 @@ impl Op for DenseAttention {
         }
     }
 
+    /// The standard bound of 7.3 for a softmax-weighted sum of `max_kv_len` products.
+    ///
+    /// Each output element is `Σ_j w_j · v_j` over the visible keys: `max_kv_len` products of the
+    /// query/key dot (itself a reduction of `head_dim` terms) against the value, accumulated in FP32,
+    /// so `γₙ` is the reduction's own factor and `rtol = γₙ + u` covers it. The extra `atol` is the
+    /// **value term** the reduction length does not cover: the weights are normalized, so the sum is
+    /// bounded by `max|v|`, and forming it costs `2γₙ + u` relative to that bound.
+    ///
+    /// `max_kv_len` is a declared bound that is deliberately **not** in the key (a layout's padded
+    /// token bucket), so the bound is written for the widest bucket the module serves: it is never
+    /// tighter than the true reduction, which is the accepted deviation for a variable extent.
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
         let reduction = u64::from(descriptor.max_kv_len);
         let accumulate = DType::F32;
