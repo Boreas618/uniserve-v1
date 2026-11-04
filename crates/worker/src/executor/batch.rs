@@ -46,7 +46,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use cuda::{CopyBatch, DeviceId, SourceOrder, Stream};
+use platform::{CopyBatch, DeviceId, SourceOrder, Stream};
 use ipc::CallId;
 use ipc::{
     Batch as BatchPlan, BatchOutput, Call, CallKind, CallStatus, DType, ErrorCode, ForwardStats,
@@ -750,7 +750,7 @@ fn abandon_launched(requests: &mut RequestPool, mut launched: Launched) -> Resul
 /// ledger): each batch waits for the previous batch recorded on another stream.
 #[derive(Default)]
 pub(crate) struct StreamOrder {
-    last: Option<(usize, Arc<cuda::Event>)>,
+    last: Option<(usize, Arc<platform::Event>)>,
 }
 
 impl StreamOrder {
@@ -774,7 +774,7 @@ impl StreamOrder {
         };
         let event = match self.last.take() {
             Some((_, event)) => event,
-            None => Arc::new(cuda::Event::new(cuda::EventFlags::default())),
+            None => Arc::new(platform::Event::new(platform::EventFlags::default())),
         };
         stream.record(&event)?;
         self.last = Some((raw, event));
@@ -880,7 +880,7 @@ mod tests {
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
 
-    use cuda::{DeviceId, Event, EventFlags, Stream};
+    use platform::{DeviceId, Event, EventFlags, Stream};
     use ipc::{
         BufferAllocation, ForwardMode, GenerationParams, NewRequest, RequestKey, ShapeBound,
     };

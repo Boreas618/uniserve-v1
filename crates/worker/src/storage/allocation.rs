@@ -7,7 +7,7 @@
 //! torch tensor views a torch storage. Python receives a view as one torch tensor, made once from
 //! the view's DLPack export and passed by every call that takes the view
 //! ([`StorageView::handle`]). Dropping the last Rust and Python reference
-//! releases the storage through `cuda`'s reclaimer, which never
+//! releases the storage through `platform`'s reclaimer, which never
 //! waits for device work: owners must retire all device accesses to an
 //! allocation before dropping it.
 //!
@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use std::os::fd::OwnedFd;
 
-use cuda::{
+use platform::{
     DeviceAllocation, DeviceId, HostRegistration, PeerMapping, PinnedBuffer, Protection,
     SegmentedMapping, ShareableHandle, Strided,
 };
@@ -371,7 +371,7 @@ impl Storage {
     pub(crate) fn physical_allocation(
         &self,
         index: usize,
-    ) -> Result<Option<Arc<cuda::PhysicalAllocation>>> {
+    ) -> Result<Option<Arc<platform::PhysicalAllocation>>> {
         Ok(lock(&self.segments()?.mapping).allocation(index))
     }
 
@@ -670,7 +670,7 @@ pub struct StorageView {
 }
 
 /// An owned copy operand: a view's address, element width, shape and
-/// element strides in the form [`cuda::StridedCopy`] plans.
+/// element strides in the form [`platform::StridedCopy`] plans.
 pub(crate) struct CopyOperand {
     address: u64,
     element_bytes: usize,

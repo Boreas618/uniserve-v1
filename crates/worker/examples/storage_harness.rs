@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use config::Config;
-use cuda::{DeviceId, Stream};
+use platform::{DeviceId, Stream};
 use ipc::{BlockTable, BufferId, RequestKey, WorkerEndpoint};
 use ipc::{CallId, RequestId, UnitId};
 use tvm_ffi::{Any, AnyView, Array, Map, String as FfiString};

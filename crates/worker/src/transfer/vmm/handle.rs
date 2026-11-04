@@ -9,7 +9,7 @@
 
 use std::os::fd::AsRawFd;
 
-use cuda::ShareableHandle;
+use platform::ShareableHandle;
 
 use super::grants::fetch_descriptor;
 use crate::{Error, Result};

@@ -24,7 +24,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use cuda::Stream;
+use platform::Stream;
 
 use crate::config::{Device, WorkerLaunch};
 use crate::executor::python::PythonExecutor;

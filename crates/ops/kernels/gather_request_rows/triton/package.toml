@@ -1,0 +1,33 @@
+# The gather_request_rows operator's triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the
+# compile driver the Program Server runs for one descriptor and target).
+
+op = "gather_request_rows"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/gather_request_rows.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+[kernel.descriptors]
+dimensions = { tables = ["1"], request_width = ["640"], slots = ["256"], rows = ["127", "255", "511", "1023", "2047", "4095"] }
+
+[parameters]
+block = 256
+tokens = 8192

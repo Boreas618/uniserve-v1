@@ -5,7 +5,7 @@ use crate::ffi::MemoryKind;
 use crate::storage::allocation::StorageView;
 use crate::stream::Issue;
 use crate::{Error, Result};
-use cuda::{DeviceId, Event, Stream};
+use platform::{DeviceId, Event, Stream};
 use ipc::CallId;
 use ipc::TensorRef;
 use std::collections::{HashMap, HashSet};
