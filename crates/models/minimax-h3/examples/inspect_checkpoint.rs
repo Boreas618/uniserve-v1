@@ -164,7 +164,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &[
                 "model.language_model.layers.",
                 "model.language_model.embed_tokens.",
+                // The tower's groups, from `vision.rs`'s own prefix. Its final norm is removed, so
+                // a table naming `model.visual.norm` would ask for a tensor nothing reads.
+                "model.visual.patch_embed.",
+                "model.visual.pos_embed.",
                 "model.visual.blocks.",
+                "model.visual.merger.",
+                "model.visual.deepstack_merger_list.",
             ],
         ),
         (
