@@ -295,7 +295,7 @@ impl Op for GatherGemm {
                     format!("expected i32 sort metadata, found {}", view.dtype),
                 ));
             }
-            view.require_row(Self::NAME, DType::I32, 1)?;
+            super::require_i32_vector(Self::NAME, view)?;
         }
         // The sort pads its permuted rows up to whole tiles, so the map holds at least one row per
         // route and exactly the rows the product writes.
@@ -425,7 +425,7 @@ impl Op for RouteGemm {
                     format!("expected i32 sort metadata, found {}", view.dtype),
                 ));
             }
-            view.require_row(Self::NAME, DType::I32, 1)?;
+            super::require_i32_vector(Self::NAME, view)?;
         }
         if rows != args.permuted_to_expanded.numel() {
             return Err(Error::argument(
