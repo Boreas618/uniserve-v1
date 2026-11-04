@@ -510,6 +510,11 @@ pub(crate) struct MainProcess {
     programs: Arc<Mutex<Client>>,
     /// The precopy between serve passes, if one is in flight (§7.3 step 2).
     precopy: Option<Precopy>,
+    /// The warmups a switchover queued, one per device, with the generation each was queued for
+    /// (§4.5). They are read on later passes rather than waited for: a warmup is a device job of its
+    /// own, one bucket per queue turn behind serving, and a model with many buckets warms for longer
+    /// than the daemon waits for `Switched`.
+    warming: Vec<(u32, Submission, u64)>,
     /// The generations the last precopy built and the switchover has not taken:
     /// one per device, in `executors` order. A revert drops them, because the
     /// generation they hold never serves.
@@ -689,6 +694,7 @@ impl MainProcess {
             watchdog,
             programs,
             precopy: None,
+            warming: Vec::new(),
             prepared: Vec::new(),
             retired: Vec::new(),
             generations,
@@ -802,6 +808,7 @@ impl MainProcess {
             // A precopy in flight advances one stage per pass, never waiting on
             // its builds or its devices (§7.3 step 2).
             self.advance_precopy()?;
+            self.advance_warmup()?;
 
             running = self.read_executors();
             if let Some(failure) = self.watch(&running)? {
@@ -1346,6 +1353,43 @@ impl MainProcess {
         }
         Ok(tasks)
     }
+    /// Reads the warmups the switchovers queued (§4.5): a finished one leaves the list, and one
+    /// that failed reverts the generation it was warming.
+    ///
+    /// A warmup is the first run of every captured bucket of the generation that just took over, so
+    /// it is where a capture that cannot be made on this device surfaces - after the daemon was told
+    /// the cut-over happened, which is why the failure goes through the update's decision table
+    /// rather than through the switchover's answer.
+    fn advance_warmup(&mut self) -> Result<()> {
+        let mut pending = Vec::with_capacity(self.warming.len());
+        for (device, submission, generation) in std::mem::take(&mut self.warming) {
+            match submission.outcome() {
+                None => pending.push((device, submission, generation)),
+                Some(Outcome::Success(_)) => {
+                    tracing::debug!(device, generation, "a generation's warmup finished");
+                }
+                Some(outcome) => {
+                    self.warming = pending;
+                    let reason = match outcome {
+                        Outcome::Failed(error) => error.to_string(),
+                        _ => "the warmup was cancelled".to_owned(),
+                    };
+                    let failure = UpdateFailure::Device {
+                        device,
+                        error: format!(
+                            "warming generation {generation} on device {device}: {reason}"
+                        ),
+                        batch: None,
+                    };
+                    self.failure(failure)?;
+                    return Ok(());
+                }
+            }
+        }
+        self.warming = pending;
+        Ok(())
+    }
+
 
     /// §7.3 step 2, second half: advances the precopy at most one stage. It
     /// never waits on a job: a stage that has not finished leaves the precopy
@@ -1664,19 +1708,30 @@ impl MainProcess {
         // A switchover later in the epoch warms the buckets the new kernel programs changed; the
         // first one also warms the buckets no update touched, because until now nothing served
         // them.
+        // The warmups are queued, not waited for: each is a device job that runs one bucket per
+        // queue turn behind serving batches, so a model with many buckets warms for minutes while
+        // the daemon waits two minutes for `Switched` - and a control thread that waited here would
+        // answer no command, no request event and no metrics for the same minutes. `advance_warmup`
+        // reads them on the passes that follow, and a device that fails reverts the update.
         for executor in &self.executors {
             let device = executor.device();
-            let submission = executor
-                .warmup()
-                .with_context(|| format!("warming up device {}", device.0))?;
-            if let Err(error) = device_command(&self.watchdog, device, "warmup", submission) {
-                tracing::error!(%error, "warming the new generation failed; reverting the update");
-                let failure = UpdateFailure::Device {
-                    device: u32::try_from(device.0).unwrap_or_default(),
-                    error: error.to_string(),
-                    batch: None,
-                };
-                return self.revert(generation, failure);
+            let ordinal = u32::try_from(device.0).unwrap_or_default();
+            match executor.warmup() {
+                Ok(submission) => self.warming.push((ordinal, submission, generation)),
+                Err(error) => {
+                    let failure = UpdateFailure::Device {
+                        device: ordinal,
+                        error: format!("queueing the warmup of generation {generation}: {error}"),
+                        batch: None,
+                    };
+                    if let Some(ending) = self.failure(failure)? {
+                        return Ok(ProgramStatus::Failed {
+                            generation,
+                            failure: ending,
+                        });
+                    }
+                    return Ok(ProgramStatus::Switched { generation });
+                }
             }
         }
 
@@ -1885,6 +1940,11 @@ impl MainProcess {
             self.generations = std::mem::take(&mut self.retired);
         }
         self.prepared.clear();
+        // The warmups still queued warm the generation this revert went back from: what runs when
+        // they reach the device is the generation that serves, so nothing hangs - the list is what
+        // stopped describing serving, and a failure read from a stale entry would revert an update
+        // that is over.
+        self.warming.clear();
         let current = self.update.current();
         for executor in &self.executors {
             let device = executor.device();
