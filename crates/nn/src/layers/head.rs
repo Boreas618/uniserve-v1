@@ -236,6 +236,19 @@ pub fn gather_rows(
 ) -> Result<()> {
     let columns = hidden.last();
     let count = rows.numel();
+    // The operator's indices are one axis and its output two, because it derives the row count from
+    // `out`. A caller holding `[1, count]` - the shape an output of one row needs - must flatten it
+    // itself: the same bytes as a two-axis view reach the kernel as two axes and are refused there
+    // (`expected 1 axes, found 2`), which names neither the caller nor the fix.
+    if rows.shape.rank() != 1 {
+        return Err(Error::shape(
+            "gather_rows",
+            format!(
+                "rows is {:?}, and the operator takes a flat [count] index view",
+                rows.shape.dims()
+            ),
+        ));
+    }
     if out.shape.rank() != 2 || out.shape.dim(0) != count || out.shape.dim(1) != columns {
         return Err(Error::shape(
             "gather_rows",

@@ -1716,7 +1716,16 @@ impl<'a> Tables<'a> {
             .names
             .iter()
             .position(|table| *table == name)
-            .ok_or_else(|| Error::config(format!("{name} is not a state table of this kind")))?;
+            .ok_or_else(|| {
+                Error::config(format!(
+                    "{name} is not a state table of this layout, which declares {}",
+                    if self.names.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        self.names.join(", ")
+                    }
+                ))
+            })?;
         self.views
             .get(position)
             .copied()
@@ -2795,19 +2804,20 @@ impl Denoiser {
             Some(visible) => Some(visible?),
         };
         // A sparse deployment's layers read the valid rows of each tile, the segment of each tile,
-        // and the keep table.
-        let segments = self
-            .config
-            .attention
-            .is_dense()
-            .then_some(())
-            .map_or(Ok(None), |()| {
-                Ok::<_, Error>(Some(crate::attention_sparse::Segments {
-                    sizes: tables.get("variable_block_sizes")?,
-                    segments: tables.get("tile_segments")?,
-                    keep: tables.get("segment_keep")?,
-                }))
-            })?;
+        // and the keep table; a dense one reads the whole packed sequence through `cu_seq_lens`
+        // and declares none of them. The two are exclusive, and the condition here was the wrong
+        // way round: a dense deployment asked its layout for `variable_block_sizes` - a table that
+        // layout never declares - and the refusal named the table rather than the inversion
+        // (`configuration: variable_block_sizes is not a state table of this kind`, launch 18).
+        let segments = if self.config.attention.is_dense() {
+            None
+        } else {
+            Some(crate::attention_sparse::Segments {
+                sizes: tables.get("variable_block_sizes")?,
+                segments: tables.get("tile_segments")?,
+                keep: tables.get("segment_keep")?,
+            })
+        };
 
         // The stack, conditioned by the step's gathered modulation.
         let step_index = tables.get("step")?;
