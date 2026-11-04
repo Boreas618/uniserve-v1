@@ -632,6 +632,27 @@ pub trait Denoiser {
     fn prepare_evaluation(&self, index: u32, out: &mut [Vec<u8>]) -> Result<()>;
 }
 
+/// One clip's place on a timeline, as the runner states it.
+///
+/// A decoder decodes one clip and stops; the clip's frames become the request's video only once they are
+/// placed, faded where they overlap the clip before them. These three numbers are what the runner knows
+/// and the model does not: how many of the clip's frames the timeline keeps, how many of those fade against
+/// the predecessor, and where the first kept frame goes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Splice {
+    /// The frames of the clip's own decode the timeline keeps, counted from the clip's first frame.
+    ///
+    /// A clip a successor follows keeps the frames before its tail; the clip that ends the timeline keeps
+    /// its tail too, so this is the larger number for the last clip.
+    pub keep: u32,
+    /// How many of the kept frames fade against the predecessor, counted at the end of `keep`.
+    ///
+    /// Zero for the timeline's first clip, which has nothing to fade against.
+    pub overlap: u32,
+    /// The destination frame index of the clip's first kept frame.
+    pub first: u32,
+}
+
 /// A decoder that turns latents back into media.
 pub trait Decoder {
     /// Decode `latents` into `out`, reading the layout's tables in order.
@@ -642,6 +663,28 @@ pub trait Decoder {
         state: &[TensorView],
         out: DecodedMedia,
     ) -> Result<()>;
+
+    /// Place one decoded clip on the timeline, fading it against its predecessor.
+    ///
+    /// `clip` is the clip's decoded raster; `previous` is the predecessor's own decode of the frames the
+    /// two share, absent for the timeline's first clip; `out.video` is the whole timeline's raster, which
+    /// the splice writes at `splice.first`. A decoder that decodes one clip and knows nothing of timelines
+    /// leaves this default, which refuses by the block kind's name so a runner that splices with the wrong
+    /// block hears which kind it called.
+    fn splice(
+        &self,
+        f: &Forward,
+        previous: Option<TensorView>,
+        clip: TensorView,
+        splice: Splice,
+        out: DecodedMedia,
+    ) -> Result<()> {
+        let _ = (f, previous, clip, splice, out);
+        Err(Error::shape(
+            "Decoder",
+            "this decoder splices no clips".to_owned(),
+        ))
+    }
 }
 
 /// An autoregressive token model.

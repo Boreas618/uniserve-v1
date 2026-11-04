@@ -119,6 +119,32 @@ pub fn load(
                 )?;
                 Block::Denoiser(Box::new(denoiser))
             }
+            Component::VideoPostprocessor => {
+                // Weightless: the splice's only constants are the reference's ImageNet means and standard
+                // deviations, uploaded once as the two `[3]` weights the byte step reads.
+                let dtype = Component::VideoDecoder.activation();
+                let bytes = |values: [f32; 3]| -> Vec<u8> {
+                    values
+                        .iter()
+                        .flat_map(|value| value.to_ne_bytes())
+                        .collect()
+                };
+                let shape = nn::Shape::new(&[3]);
+                let mean = loader.constant(
+                    "video_postprocessor.pixel_mean",
+                    nn::DType::F32,
+                    shape,
+                    &bytes(crate::output::PIXEL_MEAN),
+                )?;
+                let std = loader.constant(
+                    "video_postprocessor.pixel_std",
+                    nn::DType::F32,
+                    shape,
+                    &bytes(crate::output::PIXEL_STD),
+                )?;
+                let postprocessor = crate::output::VideoPostprocessor::new(dtype, mean, std)?;
+                nn::Block::Decoder(Box::new(postprocessor))
+            }
             Component::AudioDecoder => {
                 // The audio decoder has no layout tables - every table it reads is a weight bound
                 // at load - so it constructs from its own component and its sidecar alone.
