@@ -588,7 +588,7 @@ impl Device {
             }
             Command::Discard(generation) => {
                 for named in &mut self.runners {
-                    named.runner.discard(*generation);
+                    named.runner.discard(*generation)?;
                 }
                 self.synchronize()?;
                 Ok(Step::Done(BatchOutput::default()))
