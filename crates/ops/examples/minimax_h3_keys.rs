@@ -360,6 +360,33 @@ fn main() {
         }
         .to_string(),
     );
+    // The DiT's row mapping, one key per latent raster the served canvases produce. The canvas is
+    // divided by the VAE's 16x spatial compression, and each side is even for every served canvas
+    // because the canvas's sides are multiples of the model's own step.
+    for (height, width) in [
+        (96, 42), // 1536x672
+        (84, 48), // 1344x768
+        (64, 48), // 1024x768
+        (48, 48), // 768x768
+        (48, 64), // 768x1024
+        (42, 48), // 672x768
+    ] {
+        for mode in [ops::patch::Mode::Patchify, ops::patch::Mode::Unpatchify] {
+            push(
+                "patch",
+                ops::patch::Descriptor {
+                    dtype: DType::BF16,
+                    channels: 24,
+                    height,
+                    width,
+                    mode,
+                    block: ops::patch::BLOCK,
+                    pdl: PDL,
+                }
+                .to_string(),
+            );
+        }
+    }
     // The audio decoder's last step: two float channels to interleaved 16-bit PCM. The clip's length
     // is a launch value, so the key holds only the element type and the block.
     push(
