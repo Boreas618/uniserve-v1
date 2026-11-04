@@ -109,6 +109,8 @@ def program_server(tmp_path_factory: pytest.TempPathFactory):
     socket = work / "program-server.sock"
     packages = work / "packages"
     packages.mkdir()
+    store = work / "store"
+    store.mkdir()
     log = work / "program-server.log"
     process = start_server(
         [
@@ -119,6 +121,8 @@ def program_server(tmp_path_factory: pytest.TempPathFactory):
             str(socket),
             "--package-root",
             str(packages),
+            "--store-root",
+            str(store),
             "--target",
             os.environ.get("UNISERVE_PROGRAM_TARGET", "sm_100a"),
         ],
