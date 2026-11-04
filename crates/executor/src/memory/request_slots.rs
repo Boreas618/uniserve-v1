@@ -11,7 +11,7 @@ use crate::{Error, Result};
 /// One field of per-slot state a model declares: `shape` is one slot's
 /// extent; host fields live in page-locked host storage.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SlotField {
+pub struct SlotField {
     pub name: String,
     pub dtype: ElementType,
     pub shape: Vec<i64>,
