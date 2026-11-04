@@ -949,12 +949,6 @@ def main() -> int:
             file=sys.stderr,
         )
         return 0
-    if arguments.interpreter and arguments.op == "top_k":
-        print(
-            "skipped: needs a device — its kernel complements a uint32 with `~`, which the interpreter turns into the Python integer -1 and refuses",
-            file=sys.stderr,
-        )
-        return 0
     if arguments.interpreter and arguments.op == "filter_candidates":
         print(
             "skipped: needs a device — its kernel combines a scalar comparison with an array comparison using `|`, which the interpreter hands to a bitwise ufunc as `numpy.bool_ | ndarray` and which then refuses",
