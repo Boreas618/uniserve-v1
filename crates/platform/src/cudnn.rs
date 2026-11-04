@@ -1222,6 +1222,8 @@ struct Configs {
     returned: usize,
     /// How many of them were read back.
     inspected: usize,
+    /// Whether the query dropped the engines that down-convert their inputs.
+    exact: bool,
     /// The ones this request may use, best first.
     kept: Vec<Descriptor>,
     /// The numerical notes of the ones the exactness filter refused.
@@ -1235,6 +1237,13 @@ impl Configs {
             return Error::invalid(format!(
                 "cuDNN's heuristic (mode {}) returned no engine configuration for {shape}",
                 mode_name(self.mode)
+            ));
+        }
+        if !self.exact {
+            return Error::invalid(format!(
+                "cuDNN's heuristic (mode {}) listed {} engine configuration(s) for {shape} and                  filled none of them",
+                mode_name(self.mode),
+                self.returned
             ));
         }
         Error::invalid(format!(
@@ -1774,8 +1783,9 @@ impl Cudnn {
         let mut proposal = Configs {
             mode,
             returned,
-            kept: Vec::new(),
             inspected: 0,
+            exact,
+            kept: Vec::new(),
             dropped: Vec::new(),
         };
         let wanted = returned.min(limit.clamp(1, MAX_ENGINE_CONFIGS));
