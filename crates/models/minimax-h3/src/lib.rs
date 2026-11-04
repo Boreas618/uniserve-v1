@@ -63,7 +63,7 @@ pub use config::{
     ScheduleSpec, Shifts, SpatialPadding, TextEncoderConfig, TransformerConfig,
     UNIFORM_GRID_POINTS, VideoVaeConfig, VisionConfig,
 };
-pub use load::{Component, LoadOptions};
+pub use load::{Capacity, Component, LoadOptions, load};
 pub use partition::Partition;
 
 /// What this crate can fail with.
