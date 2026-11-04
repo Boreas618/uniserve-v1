@@ -33,7 +33,7 @@ mod module;
 
 pub use engine::Engine;
 pub use error::PolicyError;
-pub use instance::{PolicyInstance, DEFAULT_CALL_FUEL};
+pub use instance::{DEFAULT_CALL_FUEL, PolicyCost, PolicyInstance};
 pub use limits::MAX_STARVATION_TIMEOUT;
 pub use module::PolicyModule;
 
@@ -43,10 +43,10 @@ pub use module::PolicyModule;
 /// The mechanism and the policy modules are compiled from this one crate, so
 /// there is no second set of types to keep in step.
 pub use scheduling_guest as guest;
-/// The calls of the interface, as the mechanism names them in a failure.
-pub use scheduling_guest::wire::Call;
 /// The `Policy` trait, which a policy implements inside its module.
 pub use scheduling_guest::Policy;
+/// The calls of the interface, as the mechanism names them in a failure.
+pub use scheduling_guest::wire::Call;
 
 /// The wasmtime version this crate is built against, which a policy package
 /// declares in its `[toolchain]` and which the Program Server's
