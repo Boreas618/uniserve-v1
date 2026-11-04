@@ -1,0 +1,286 @@
+# MiniMax-H3 check set: the fixed requests that confirm every combination
+# the service offers by watching and listening to the generated MP4s.
+#
+# One point per cell: FastH3 DMD (FastVideo/FastVideo-FastH3-8-Step-V2)
+# serves t2va and fl2va, FastH3 OmniRef
+# (FastVideo/FastVideo-FastH3-Omni-8-Step-V1) serves ref2va, and base
+# MiniMax-H3 (MiniMaxAI/MiniMax-H3) serves t2va and fl2va through its
+# transformer partition and ref2va through its transformer_ref partition.
+# Each point first sends one unmeasured warmup at seed 42 and then measures
+# one request at seed 0. The rows are frozen in
+# uniserve_eval/workloads/minimax_h3/check-*.jsonl as exact copies of the
+# seed-0 rows of W1 (t2va, official prompt, 16:9, 5 s), W3 (fl2va, official
+# first keyframe, auto canvas, 8 s) and W4 (ref2va, reference image and
+# voice, auto canvas, 5 s) and of their seed-42 warmup rows, so the check set
+# does not depend on the order or content of the performance manifests.
+#
+# Every point writes its MP4 to a fixed per-cell directory,
+# artifacts/minimax_h3/check/<checkpoint>-<task>/<request id>.mp4, so a
+# confirmed cell keeps the same path for people to watch; the result bundles
+# go to artifact_root. The automatic checks are exactly the ones the video
+# task already makes (MP4 validity: canvas, frame count, frame rate, stereo
+# soundtrack) and the protected performance metrics; nothing else is added.
+#
+# No server states dtype or quantization: the checkpoint's own numerical
+# representation is the serving default (dtype auto, no quantization), which
+# for MiniMax-H3 is the quality preset (DiT and text encoder BF16, video VAE
+# decoder FP16). Naming bfloat16 explicitly would force the VAE decoder to
+# BF16 and change the generated output, and quantization_config and its
+# precision presets retire in favour of the checkpoint representation and
+# SGLang's quantization field.
+#
+# Environment:
+# - UNISERVE_FAST_H3_MODEL names a local copy of
+#   FastVideo/FastVideo-FastH3-8-Step-V2.
+# - UNISERVE_MINIMAX_H3_OMNIREF names FastVideo/FastVideo-FastH3-Omni-8-Step-V1;
+#   the Hugging Face cache holds the MiniMax-H3 revision it pins.
+# - UNISERVE_MINIMAX_H3_MODEL names a local copy of MiniMaxAI/MiniMax-H3 at
+#   revision 42ed227ee7df40d41602854ae760620d6eb651fe.
+# - UNISERVE_MINIMAX_H3_INPUTS names the protocol inputs directory, whose
+#   media/ holds the keyframe, reference image and reference voice the check
+#   rows name.
+# - UNISERVE_MINIMAX_H3_FFMPEG names the bin directory of the FFmpeg 8.1.2
+#   build whose ffprobe probes condition media and whose ffmpeg decodes them.
+#
+# Run the points serially, one server at a time; --reuse-deployment keeps
+# one server up for the consecutive points that name it, so each checkpoint
+# loads once:
+#
+#   .venv/bin/uniserve-eval --config uniserve_eval/check_h3.toml plan check-h3
+#   .venv/bin/uniserve-eval --config uniserve_eval/check_h3.toml run check-h3 \
+#     --reuse-deployment
+root = ".."
+artifact_root = "artifacts/minimax_h3/check/results"
+
+# ------------------------------------------------------------------ FastH3 DMD
+# The 8-step student's transformer partition on four GB200 GPUs, sized for
+# the two cells it serves: W1's 1024-token text capacity and W3's 2048-token
+# capacity with the keyframe media its conditions name.
+[servers.fasth3-dmd]
+host = "127.0.0.1"
+port = 18083
+ready_path = "/health"
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-executable", ".venv/bin/uniserve", "--worker-groups", "configs/minimax_h3/ulysses4.toml", "--max-running-requests", "2", "--max-model-len", "2048", "--set", "video_config.text_capacities=1024,2048", "--set", "video_config.max_seconds=8", "--set", "media_config.directory=${UNISERVE_MINIMAX_H3_INPUTS}", "--set", "media_config.ffprobe=${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--set", "media_config.ffmpeg=${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.70"]
+
+# ----------------------------------------------------------------- FastH3 OmniRef
+# The OmniRef student's transformer_ref partition on four GB200 GPUs, sized
+# for W4: an 8192-token text capacity (the subject image's vision tokens are
+# prompt tokens), 49,152 condition rows and the released pipeline's
+# reference sizing.
+[servers.fasth3-omniref]
+host = "127.0.0.1"
+port = 18083
+ready_path = "/health"
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_OMNIREF}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-executable", ".venv/bin/uniserve", "--worker-groups", "configs/minimax_h3/ulysses4-reference.toml", "--max-running-requests", "2", "--max-model-len", "8192", "--set", "video_config.text_capacities=8192", "--set", "video_config.max_seconds=5", "--set", "video_config.max_condition_rows=49152", "--set", "media_config.directory=${UNISERVE_MINIMAX_H3_INPUTS}", "--set", "media_config.ffprobe=${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--set", "media_config.ffmpeg=${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.70", "--set", "mm_processor_kwargs.enlarge_references=true"]
+
+# ------------------------------------------------------------ base transformer
+# The base release's transformer partition on four GB200 GPUs, sized for the
+# two cells it serves: W1's 1024-token text capacity and W3's 2048-token
+# capacity with the keyframe media its conditions name.
+[servers.base-transformer]
+host = "127.0.0.1"
+port = 18083
+ready_path = "/health"
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-executable", ".venv/bin/uniserve", "--worker-groups", "configs/minimax_h3/ulysses4.toml", "--max-running-requests", "2", "--max-model-len", "2048", "--set", "video_config.text_capacities=1024,2048", "--set", "video_config.max_seconds=8", "--set", "media_config.directory=${UNISERVE_MINIMAX_H3_INPUTS}", "--set", "media_config.ffprobe=${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--set", "media_config.ffmpeg=${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.70"]
+
+# -------------------------------------------------------- base transformer_ref
+# The base release's transformer_ref partition on four GB200 GPUs, sized for
+# W4: an 8192-token text capacity, 40,960 condition rows and the released
+# pipeline's reference sizing.
+[servers.base-reference]
+host = "127.0.0.1"
+port = 18083
+ready_path = "/health"
+command = [".venv/bin/uniserve", "serve", "${UNISERVE_MINIMAX_H3_MODEL}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-executable", ".venv/bin/uniserve", "--worker-groups", "configs/minimax_h3/ulysses4-reference.toml", "--max-running-requests", "2", "--max-model-len", "8192", "--set", "video_config.text_capacities=8192", "--set", "video_config.max_seconds=5", "--set", "video_config.max_condition_rows=40960", "--set", "media_config.directory=${UNISERVE_MINIMAX_H3_INPUTS}", "--set", "media_config.ffprobe=${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--set", "media_config.ffmpeg=${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.70", "--set", "mm_processor_kwargs.enlarge_references=true"]
+
+# -------------------------------------------------------------------- t2va cells
+# W1's seed-0 row: the official t2va prompt at 16:9, 5 seconds.
+
+[benchmarks.check-fasth3-dmd-t2va]
+server = "fasth3-dmd"
+task = "video"
+model = "FastH3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/check-t2va.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.check-fasth3-dmd-t2va.video]
+task = "t2va"
+aspect_ratio = "16:9"
+media_dir = "artifacts/minimax_h3/check/fasth3-dmd-t2va"
+
+[benchmarks.check-fasth3-dmd-t2va.load]
+num_prompts = 1
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/check-t2va-warmup.jsonl"
+
+[benchmarks.check-fasth3-dmd-t2va.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.check-fasth3-dmd-t2va.provenance]
+checkpoint = "FastVideo/FastVideo-FastH3-8-Step-V2"
+task = "t2va"
+
+[benchmarks.check-base-t2va]
+server = "base-transformer"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/check-t2va.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.check-base-t2va.video]
+task = "t2va"
+aspect_ratio = "16:9"
+media_dir = "artifacts/minimax_h3/check/base-t2va"
+
+[benchmarks.check-base-t2va.load]
+num_prompts = 1
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/check-t2va-warmup.jsonl"
+
+[benchmarks.check-base-t2va.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.check-base-t2va.provenance]
+checkpoint = "MiniMaxAI/MiniMax-H3"
+task = "t2va"
+
+# ------------------------------------------------------------------- fl2va cells
+# W3's seed-0 row: the official first keyframe and prompt on an automatic
+# canvas, 8 seconds.
+
+[benchmarks.check-fasth3-dmd-fl2va]
+server = "fasth3-dmd"
+task = "video"
+model = "FastH3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/check-fl2va.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.check-fasth3-dmd-fl2va.video]
+task = "fl2va"
+aspect_ratio = "auto"
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+media_dir = "artifacts/minimax_h3/check/fasth3-dmd-fl2va"
+
+[benchmarks.check-fasth3-dmd-fl2va.load]
+num_prompts = 1
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/check-fl2va-warmup.jsonl"
+
+[benchmarks.check-fasth3-dmd-fl2va.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.check-fasth3-dmd-fl2va.provenance]
+checkpoint = "FastVideo/FastVideo-FastH3-8-Step-V2"
+task = "fl2va"
+
+[benchmarks.check-base-fl2va]
+server = "base-transformer"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/check-fl2va.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.check-base-fl2va.video]
+task = "fl2va"
+aspect_ratio = "auto"
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+media_dir = "artifacts/minimax_h3/check/base-fl2va"
+
+[benchmarks.check-base-fl2va.load]
+num_prompts = 1
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/check-fl2va-warmup.jsonl"
+
+[benchmarks.check-base-fl2va.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.check-base-fl2va.provenance]
+checkpoint = "MiniMaxAI/MiniMax-H3"
+task = "fl2va"
+
+# ------------------------------------------------------------------- ref2va cells
+# W4's seed-0 row: a reference image and the official reference voice on an
+# automatic canvas, 5 seconds.
+
+[benchmarks.check-fasth3-omniref-ref2va]
+server = "fasth3-omniref"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/check-ref2va.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.check-fasth3-omniref-ref2va.video]
+task = "ref2va"
+aspect_ratio = "auto"
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+media_dir = "artifacts/minimax_h3/check/fasth3-omniref-ref2va"
+
+[benchmarks.check-fasth3-omniref-ref2va.load]
+num_prompts = 1
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/check-ref2va-warmup.jsonl"
+
+[benchmarks.check-fasth3-omniref-ref2va.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.check-fasth3-omniref-ref2va.provenance]
+checkpoint = "FastVideo/FastVideo-FastH3-Omni-8-Step-V1"
+task = "ref2va"
+
+[benchmarks.check-base-ref2va]
+server = "base-reference"
+task = "video"
+model = "MiniMax-H3"
+dataset = "jsonl"
+dataset_path = "uniserve_eval/workloads/minimax_h3/check-ref2va.jsonl"
+endpoint = "/v1/videos/sync"
+
+[benchmarks.check-base-ref2va.video]
+task = "ref2va"
+aspect_ratio = "auto"
+condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+media_dir = "artifacts/minimax_h3/check/base-ref2va"
+
+[benchmarks.check-base-ref2va.load]
+num_prompts = 1
+request_rate = inf
+max_concurrency = 1
+request_timeout_s = 3600
+warmup_manifest = "uniserve_eval/workloads/minimax_h3/check-ref2va-warmup.jsonl"
+
+[benchmarks.check-base-ref2va.metrics]
+videos_per_second = "higher"
+"video_latency_ms.p50" = "lower"
+"video_latency_ms.p95" = "lower"
+
+[benchmarks.check-base-ref2va.provenance]
+checkpoint = "MiniMaxAI/MiniMax-H3"
+task = "ref2va"
+
+[suites.check-h3]
+points = ["check-fasth3-dmd-t2va", "check-fasth3-dmd-fl2va", "check-fasth3-omniref-ref2va", "check-base-t2va", "check-base-fl2va", "check-base-ref2va"]
