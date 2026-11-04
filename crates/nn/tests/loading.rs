@@ -1,8 +1,8 @@
 //! The loading boundary's behaviour: a checkpoint read through its index, its file identities, and
 //! the loader's conversion, fusion and key reuse.
 //!
-//! These tests build their own shards with the safetensors crate, so they need no checkpoint and no
-//! device: a weight is published to a stub store that records what it was given.
+//! These tests write their own shards — the header and the payload, by hand — so they need no
+//! checkpoint and no device: a weight is published to a stub store that records what it was given.
 
 // The helpers below unwrap; clippy's test detection needs the crate to say it is a test crate.
 #![cfg(test)]
@@ -10,7 +10,6 @@ use std::path::Path;
 
 use nn::weights::{RetainedWeights, WeightRequest};
 use nn::{Checkpoint, DType, DevicePtr, Shape, WeightKey, WeightLayout, WeightLoader};
-use safetensors::tensor::{Dtype, TensorView};
 
 /// The bytes of `values` as BF16.
 fn bf16(values: &[f32]) -> Vec<u8> {
@@ -20,47 +19,67 @@ fn bf16(values: &[f32]) -> Vec<u8> {
         .collect()
 }
 
-/// Write one shard holding `tensors` and answer the path.
-fn shard(dir: &Path, name: &str, tensors: &[(&str, Vec<u64>, Vec<u8>)]) -> std::path::PathBuf {
-    let path = dir.join(name);
-    let views: Vec<(String, TensorView<'_>)> = tensors
-        .iter()
-        .map(|(tensor, shape, bytes)| {
-            let shape: Vec<usize> = shape.iter().map(|&extent| extent as usize).collect();
-            (
-                (*tensor).to_owned(),
-                TensorView::new(Dtype::BF16, shape, bytes).unwrap(),
-            )
-        })
-        .collect();
-    safetensors::serialize_to_file(views, &None, &path).unwrap();
-    path
+/// The format's name for an element type: the header states the name, not a number.
+fn dtype_name(dtype: DType) -> &'static str {
+    match dtype {
+        DType::U8 => "U8",
+        DType::I16 => "I16",
+        DType::I32 => "I32",
+        DType::I64 => "I64",
+        DType::F16 => "F16",
+        DType::BF16 => "BF16",
+        DType::F32 => "F32",
+        DType::F8E4M3 => "F8_E4M3",
+        DType::F4E2M1 => "F4_E2M1",
+    }
 }
 
-/// Write one shard whose tensors are byte buffers of a stated type, and answer the path.
+/// Write one shard holding `tensors` — name, element type, extents, bytes — and answer the path.
 ///
-/// The dtype is stated per tensor because an encoded expert's fields are not all bytes: its packed
-/// FP4 values and its swizzled scales are `U8`, and its per-expert global scale is an FP32 scalar
-/// stored as four bytes. A shape and a byte count that disagree are a bug in the test's fixture, so
-/// the view refuses them here rather than in the loader.
+/// The header is written here rather than by a crate: an encoded expert's fields are not all bytes
+/// (its packed FP4 values and block scales are one byte each, its tensor scale an FP32 scalar), and
+/// a calibrated export's block scales are `F8_E4M3`, which the safetensors crate's own `DType`
+/// cannot express — the same gap the library's reader exists to close. A shape and a byte count that
+/// disagree are a bug in the fixture, so they are refused here rather than in the loader.
 fn shard_typed(
     dir: &Path,
     name: &str,
-    tensors: &[(&str, Dtype, Vec<u64>, Vec<u8>)],
+    tensors: &[(&str, DType, Vec<u64>, Vec<u8>)],
 ) -> std::path::PathBuf {
     let path = dir.join(name);
-    let views: Vec<(String, TensorView<'_>)> = tensors
-        .iter()
-        .map(|(tensor, dtype, shape, bytes)| {
-            let shape: Vec<usize> = shape.iter().map(|&extent| extent as usize).collect();
-            (
-                (*tensor).to_owned(),
-                TensorView::new(*dtype, shape, bytes).unwrap(),
-            )
-        })
-        .collect();
-    safetensors::serialize_to_file(views, &None, &path).unwrap();
+    let mut header = String::from("{");
+    let mut payload: Vec<u8> = Vec::new();
+    for (tensor, dtype, shape, bytes) in tensors {
+        let expected: u64 = shape.iter().product::<u64>() * dtype.bytes().unwrap();
+        assert_eq!(
+            expected,
+            bytes.len() as u64,
+            "the fixture's `{tensor}` says {shape:?} of {dtype}, which is {expected} bytes, not {}",
+            bytes.len()
+        );
+        let start = payload.len() as u64;
+        payload.extend_from_slice(bytes);
+        let extents: Vec<String> = shape.iter().map(u64::to_string).collect();
+        header.push_str(&format!(
+            r#""{tensor}":{{"dtype":"{}","shape":[{}],"data_offsets":[{start},{}]}},"#,
+            dtype_name(*dtype),
+            extents.join(","),
+            payload.len()
+        ));
+    }
+    header.pop();
+    header.push('}');
+    shard_with_header(dir, name, &header, &payload);
     path
+}
+
+/// Write one shard holding BF16 tensors and answer the path.
+fn shard(dir: &Path, name: &str, tensors: &[(&str, Vec<u64>, Vec<u8>)]) -> std::path::PathBuf {
+    let typed: Vec<(&str, DType, Vec<u64>, Vec<u8>)> = tensors
+        .iter()
+        .map(|(tensor, shape, bytes)| (*tensor, DType::BF16, shape.clone(), bytes.clone()))
+        .collect();
+    shard_typed(dir, name, &typed)
 }
 
 /// A store that keeps what it was given, in host memory.
@@ -421,8 +440,8 @@ fn a_calibrated_nvfp4_matrix_is_loaded_as_its_three_fields() {
         directory,
         "model.safetensors",
         &[
-            ("w", Dtype::U8, vec![4, 32], values.clone()),
-            ("w_scale", Dtype::U8, vec![4, 4], scales.clone()),
+            ("w", DType::U8, vec![4, 32], values.clone()),
+            ("w_scale", DType::U8, vec![4, 4], scales.clone()),
         ],
     );
 
@@ -466,8 +485,8 @@ fn the_block_scales_must_have_the_layout_s_shape() {
         directory,
         "model.safetensors",
         &[
-            ("w", Dtype::U8, vec![4, 32], values),
-            ("w_scale", Dtype::U8, vec![4, 4], scales),
+            ("w", DType::U8, vec![4, 32], values),
+            ("w_scale", DType::U8, vec![4, 4], scales),
         ],
     );
 
@@ -494,7 +513,7 @@ fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection
     let directory = tempfile::tempdir().unwrap();
     let directory = directory.path();
     // Two experts, `[2, 64]` packed (32 bytes a row), two projections each, four block scales a row.
-    let mut tensors: Vec<(String, Dtype, Vec<u64>, Vec<u8>)> = Vec::new();
+    let mut tensors: Vec<(String, DType, Vec<u64>, Vec<u8>)> = Vec::new();
     let mut expected = Vec::new();
     for expert in 0..2u8 {
         for (index, projection) in ["up", "gate"].iter().enumerate() {
@@ -506,22 +525,22 @@ fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection
                 .map(|byte| 0x20 + byte as u8 + expert * 8 + index as u8)
                 .collect();
             expected.extend_from_slice(&values);
-            tensors.push((format!("{stem}.weight"), Dtype::U8, vec![2, 32], values));
+            tensors.push((format!("{stem}.weight"), DType::U8, vec![2, 32], values));
             tensors.push((
                 format!("{stem}.weight_scale"),
-                Dtype::U8,
+                DType::U8,
                 vec![2, 4],
                 scales.clone(),
             ));
             tensors.push((
                 format!("{stem}.weight_scale_2"),
-                Dtype::F32,
+                DType::F32,
                 vec![1],
                 (0.5f32 * (expert + 1) as f32).to_le_bytes().to_vec(),
             ));
         }
     }
-    let views: Vec<(&str, Dtype, Vec<u64>, Vec<u8>)> = tensors
+    let views: Vec<(&str, DType, Vec<u64>, Vec<u8>)> = tensors
         .iter()
         .map(|(name, dtype, shape, bytes)| (name.as_str(), *dtype, shape.clone(), bytes.clone()))
         .collect();
@@ -596,34 +615,34 @@ fn a_stack_needs_every_expert_to_agree_on_its_geometry() {
         directory,
         "model.safetensors",
         &[
-            ("experts.0.up_proj.weight", Dtype::U8, vec![2, 32], byte(64)),
+            ("experts.0.up_proj.weight", DType::U8, vec![2, 32], byte(64)),
             (
                 "experts.0.up_proj.weight_scale",
-                Dtype::U8,
+                DType::U8,
                 vec![2, 4],
                 byte(8),
             ),
             (
                 "experts.0.up_proj.weight_scale_2",
-                Dtype::F32,
+                DType::F32,
                 vec![1],
                 1.0f32.to_le_bytes().to_vec(),
             ),
             (
                 "experts.1.up_proj.weight",
-                Dtype::U8,
+                DType::U8,
                 vec![4, 32],
                 byte(128),
             ),
             (
                 "experts.1.up_proj.weight_scale",
-                Dtype::U8,
+                DType::U8,
                 vec![4, 4],
                 byte(16),
             ),
             (
                 "experts.1.up_proj.weight_scale_2",
-                Dtype::F32,
+                DType::F32,
                 vec![1],
                 1.0f32.to_le_bytes().to_vec(),
             ),
@@ -867,7 +886,7 @@ fn a_missing_tensor_in_a_union_names_the_roots_it_searched() {
 }
 
 /// Write a shard whose header is written by hand, so the test can name a dtype the safetensors
-/// crate's own `Dtype` cannot express — which is the whole reason the library reads headers itself.
+/// crate's own `DType` cannot express — which is the whole reason the library reads headers itself.
 fn shard_with_header(dir: &Path, name: &str, header: &str, payload: &[u8]) -> std::path::PathBuf {
     let path = dir.join(name);
     let mut bytes = Vec::new();
@@ -878,7 +897,7 @@ fn shard_with_header(dir: &Path, name: &str, header: &str, payload: &[u8]) -> st
     path
 }
 
-/// A calibrated checkpoint's header names FP8 and FP4 dtypes, which `safetensors` 0.3.3's `Dtype`
+/// A calibrated checkpoint's header names FP8 and FP4 dtypes, which `safetensors` 0.3.3's `DType`
 /// has no variants for: the library reads the header itself and maps the format's names onto the
 /// types our operators speak, with the offsets the payload actually has.
 #[test]

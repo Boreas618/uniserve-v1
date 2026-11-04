@@ -5,14 +5,30 @@
 //! own during a program-layer update; the `Sampler` layer calls them in this order (specs/worker.md
 //! 9, "采样"):
 //!
-//! 1. `logits_shape` applies the request's penalties and divides by its temperature.
+//! 1. `logits_shape` applies the request's penalties and divides by its temperature. **A row whose
+//!    temperature is zero divides by one**, not by zero: `uniserve/sampling/select.py:443` states
+//!    the rule ("a zero temperature divides by one; callers select those rows by argmax"), and without
+//!    it every greedy request would be shaped into `inf` and `nan` logits. The shaped row is then the
+//!    penalized logits themselves, so the row's largest candidate is its greedy token.
 //! 2. `top_k` keeps the `width` largest logits of each row, sorted, with the vocabulary id of each.
 //! 3. `filter_candidates` applies the row's top-k width, its nucleus threshold and its min-p
 //!    threshold, and reports whether the row's candidates form a usable distribution.
 //! 4. `softmax` over the candidates (the shared operator in [`crate::norm`]).
-//! 5. `inverse_cdf` draws one token per row from one uniform draw, ordering the candidates by
-//!    vocabulary id so a draw is deterministic for a fixed random value.
-//! 6. `argmax` picks the largest candidate for a row without a positive temperature.
+//! 5. `inverse_cdf` draws one token per row from one uniform draw, inverting the row's cumulative
+//!    distribution in the candidate order the layer supplies; the operator has no order of its own
+//!    (`uniserve/sampling/categorical.py` inverts in the order it receives). **That order is the
+//!    candidates sorted by token id**, not the descending logit order `top_k` leaves behind: the
+//!    reference reorders by token id before the draw "so inverse-CDF draws are deterministic for a
+//!    fixed random value independent of top-k kernel ordering, and matches the general path, which
+//!    selects in vocabulary order" (`uniserve/sampling/top_k.py:307-314`). The sort is a step of its
+//!    own between the filtering and the draw, because the operator that filters does not reorder
+//!    rows. A consequence worth stating: a draw of zero selects the *lowest token id* of each row's
+//!    candidates, not its largest logit — no draw path produces a greedy token.
+//! 6. `argmax` picks the largest candidate, which is a row's greedy token: with the divide-by-one
+//!    rule the shaped row keeps the logits' order, so its largest candidate is the temperature-zero
+//!    token. The reference computes it separately — `torch.max`, with an `all_gather` across the
+//!    tensor-parallel ranks (`uniserve/sampling/greedy.py`) — because no draw can produce it once the
+//!    candidates are in token order.
 //! 7. `log_softmax` and `logprob_gather` report the log-probability of the tokens the caller asks
 //!    for.
 //!
@@ -407,7 +423,9 @@ impl fmt::Display for InverseCdfDescriptor {
 /// The arguments of `inverse_cdf`.
 #[derive(Clone, Copy)]
 pub struct InverseCdfArgs {
-    /// `[rows, width]` FP32 candidate probabilities, in descending logit order.
+    /// `[rows, width]` FP32 candidate probabilities, in the order the caller supplies them; the layer
+    /// sorts by token id first (`uniserve/sampling/top_k.py:307-314`), so the draw does not depend on
+    /// the order the top-k kernel happened to produce.
     pub probabilities: TensorView,
     /// `[rows, width]` the vocabulary ids of the candidates.
     pub ids: TensorView,
@@ -749,5 +767,163 @@ impl Op for LogprobGather {
     // `log_softmax`, and this moves its result.
     fn tolerance(_descriptor: &Self::Descriptor) -> Tolerance {
         Tolerance::exact()
+    }
+}
+
+/// One compilation of `candidate_order`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct OrderDescriptor {
+    /// Element type of the candidate values, which the permutation does not change.
+    pub values: DType,
+    /// Element type of the candidate ids.
+    pub ids: DType,
+    /// Launch with programmatic dependent launch.
+    pub pdl: bool,
+}
+
+impl fmt::Display for OrderDescriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The candidate count is a launch value: the reference's width follows the request's top-k,
+        // so an extent here would recompile the sampler per request.
+        Key::new()
+            .field("values", self.values)
+            .field("ids", self.ids)
+            .field("pdl", self.pdl)
+            .finish(formatter)
+    }
+}
+
+/// The arguments of `candidate_order`.
+#[derive(Clone, Copy)]
+pub struct OrderArgs {
+    /// `[rows, width]` the candidate values (probabilities or shaped logits — the permutation is the
+    /// same for either).
+    pub values: TensorView,
+    /// `[rows, width]` the candidate token ids.
+    pub ids: TensorView,
+    /// `[rows, width]` the values in ascending token order.
+    pub ordered_values: TensorView,
+    /// `[rows, width]` the ids in ascending token order.
+    pub ordered_ids: TensorView,
+}
+
+/// Put each row's candidates in ascending token order.
+///
+/// This is the step between filtering and drawing. [`InverseCdf`] inverts a cumulative distribution
+/// in the order it is given and sorts nothing, while the reference reorders the candidates **by token
+/// id** before the draw "so inverse-CDF draws are deterministic for a fixed random value independent
+/// of top-k kernel ordering, and matches the general path, which selects in vocabulary order"
+/// (`uniserve/sampling/top_k.py:307-314`). Without this step a draw would depend on the order the
+/// top-k program happened to produce, which is exactly what the reference refuses to depend on.
+///
+/// It permutes and nothing else: the row's greedy token is not read here. `Sampler::greedy` takes it
+/// from `argmax` over the shaped **full-vocabulary** row, where a column is a token id, so the index
+/// is the token and "lowest index among ties" is `torch.max`'s rule (`uniserve/sampling/greedy.py`);
+/// reading a second greedy token from the candidate set here would be a second answer to the same
+/// question, and the two would eventually disagree about a tie.
+pub struct CandidateOrder;
+
+impl Op for CandidateOrder {
+    const NAME: &'static str = "candidate_order";
+
+    type Descriptor = OrderDescriptor;
+    type Args<'a> = OrderArgs;
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let rows = args.values.rows();
+        let width = args.values.last();
+        if width == 0 {
+            return Err(Error::argument(
+                Self::NAME,
+                "a row without candidates has no order".to_owned(),
+            ));
+        }
+        for (name, view, dtype) in [
+            ("values", args.values, descriptor.values),
+            ("ids", args.ids, descriptor.ids),
+            ("ordered_values", args.ordered_values, descriptor.values),
+            ("ordered_ids", args.ordered_ids, descriptor.ids),
+        ] {
+            view.require_shape(Self::NAME, Shape::new(&[rows, width]))?;
+            if view.dtype != dtype {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!(
+                        "the {name} are {dtype} over [{rows}, {width}], the view says {}",
+                        view.dtype
+                    ),
+                ));
+            }
+            // A permutation written through rows that interleave would move each other's elements:
+            // the program writes one row contiguously, so every view must be packed.
+            if view.strides != crate::tensor::Strides::row_major(view.shape) {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!("the {name} are written row-major; found {}", view.strides),
+                ));
+            }
+        }
+
+        let mut arguments = Arguments::new();
+        arguments
+            .view(args.values)
+            .view(args.ids)
+            .view(args.ordered_values)
+            .view(args.ordered_ids)
+            .u64(rows)
+            .u32(u32::try_from(width).map_err(|_| {
+                Error::argument(
+                    Self::NAME,
+                    format!("{width} candidates do not fit a kernel parameter"),
+                )
+            })?);
+        kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
+    }
+
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
+        let _ = stream;
+        OrderArgs {
+            ordered_values: twins.shadow_of(args.ordered_values),
+            ordered_ids: twins.shadow_of(args.ordered_ids),
+            ..args
+        }
+    }
+
+    fn tolerance(_descriptor: &Self::Descriptor) -> Tolerance {
+        // A permutation: an implementation that differs has ordered a different candidate set, and
+        // the token it selects from a draw is then a different token, which no rounding bound covers.
+        Tolerance::exact()
+    }
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+
+    #[test]
+    fn the_key_names_the_types_and_not_the_candidate_count() {
+        let descriptor = OrderDescriptor {
+            values: DType::F32,
+            ids: DType::I32,
+            pdl: false,
+        };
+        assert_eq!(descriptor.to_string(), "values_f32_ids_i32_pdl_false");
+    }
+
+    #[test]
+    fn the_bound_is_exact_because_a_permutation_has_no_rounding() {
+        let descriptor = OrderDescriptor {
+            values: DType::F32,
+            ids: DType::I32,
+            pdl: false,
+        };
+        let bound = CandidateOrder::tolerance(&descriptor);
+        assert_eq!(bound.atol, 0.0);
+        assert_eq!(bound.rtol, 0.0);
     }
 }

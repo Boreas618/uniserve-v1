@@ -277,6 +277,22 @@ impl Moe {
                         ),
                     ));
                 }
+                // The block scales are the checkpoint's own one-byte type, which the product's
+                // descriptor states: `F8_E4M3` for a calibrated export, `U8` where an export labels
+                // the same bytes as raw. Nothing converts them here, so a stack that is neither is
+                // refused where the descriptor would be composed, with both dtypes named.
+                for (name, stack) in [("up/gate", &up_gate.scales), ("down", &down.scales)] {
+                    let scales = stack.dtype();
+                    if !matches!(scales, DType::U8 | DType::F8E4M3) {
+                        return Err(Error::shape(
+                            "Moe",
+                            format!(
+                                "the {name} block scales are {scales}, and a product's kernel \
+                                 reads one-byte scales: F8_E4M3 or U8"
+                            ),
+                        ));
+                    }
+                }
                 // The tensor scales are the checkpoint's per expert and per projection: the fused
                 // up/gate stack carries two scalars per expert and the down stack one. A table of
                 // another shape would dequantize one projection with another's scale, which is a
