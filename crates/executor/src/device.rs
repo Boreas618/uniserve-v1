@@ -254,6 +254,25 @@ impl Executor {
         Ok(submission)
     }
 
+    /// Releases everything that references `generation`, which was prepared and never served (7.3
+    /// step 2).
+    ///
+    /// A failed precopy abandons the generation it prepared: its kernels unload with it, and the
+    /// graphs and arena regions the runner rebound or recaptured for it are released here. `purge`
+    /// cannot do this, because purge drops what is *older* than the serving generation and an
+    /// abandoned generation is newer than it.
+    pub fn discard(&self, generation: u64) -> Result<Submission> {
+        let id = SubmissionId(self.queue.next_submission());
+        let (submission, _) = Submission::pending(id);
+        self.queue.submit(
+            Command::Discard(generation),
+            &submission,
+            JobKind::Discard,
+            None,
+        )?;
+        Ok(submission)
+    }
+
     /// The device's one pool set, for an owner that carves its own storage from the same allocator
     /// (the storage owners' resident planes, the paired forward's scratch pages).
     ///
@@ -552,6 +571,13 @@ impl Device {
             Command::Purge(generation) => {
                 for named in &mut self.runners {
                     named.runner.purge(*generation);
+                }
+                self.synchronize()?;
+                Ok(Step::Done(BatchOutput::default()))
+            }
+            Command::Discard(generation) => {
+                for named in &mut self.runners {
+                    named.runner.discard(*generation);
                 }
                 self.synchronize()?;
                 Ok(Step::Done(BatchOutput::default()))
