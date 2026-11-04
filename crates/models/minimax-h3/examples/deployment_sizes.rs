@@ -34,13 +34,13 @@ const STAGES: &[Stage] = &[
     Stage { deployment: "fl2va dense", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
     Stage { deployment: "fl2va dense", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "fl2va dense", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
-    Stage { deployment: "fl2va dense", stage: "latent_encoder", weights: 512, constants: 0, arena: 216958, tables: 0 },
+    Stage { deployment: "fl2va dense", stage: "latent_encoder", weights: 512, constants: 0, arena: 189582, tables: 0 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "denoiser (OmniRef DiT + refiner)", weights: 41953, constants: 1946, arena: 1550, tables: 14 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
-    Stage { deployment: "ref2va dense (tile 128)", stage: "latent_encoder", weights: 512, constants: 0, arena: 216958, tables: 0 },
+    Stage { deployment: "ref2va dense (tile 128)", stage: "latent_encoder", weights: 512, constants: 0, arena: 189582, tables: 0 },
     Stage { deployment: "t2va + DMD student", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
     Stage { deployment: "t2va + DMD student", stage: "denoiser (student + refiner)", weights: 41953, constants: 343, arena: 1470, tables: 12 },
     Stage { deployment: "t2va + DMD student", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
@@ -112,7 +112,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             mib(weights),
             mib(constants)
         );
-        println!("largest stage: {} of weights + constants", mib(largest));
+        // The note's "largest stage" is weights + constants + arena; this line says which of the three
+        // it is summing so the two cannot drift apart quietly.
+        println!(
+            "largest stage by weights + constants: {} (the note's largest stage counts the arena too, and the \
+             table above carries it)",
+            mib(largest)
+        );
     }
 
     if let Some(root) = root {
@@ -241,16 +247,39 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
+        // After the hoist the run reserves one set per *distinct* tile extent, which is what
+        // `VideoEncoder::reserve` keeps; the extents are the plan's, so the sum is the rank's cost.
+        let mut distinct: Vec<(u32, u32)> = Vec::new();
+        for tile in &plan.tiles {
+            let extent = (tile.rows.1 * ratio, tile.columns.1 * ratio);
+            if !distinct.contains(&extent) {
+                distinct.push(extent);
+            }
+        }
+        let mut hoisted = 0_u64;
+        for (height, width) in &distinct {
+            let extent = minimax_h3::encoding::Extent {
+                frames: minimax_h3::decoding::CLIP_OUTPUT_FRAMES,
+                height: *height,
+                width: *width,
+            };
+            hoisted += minimax_h3::encoding::video_encoder_tile_arena(&config.video_vae, extent)?
+                .iter()
+                .map(|buffer| buffer.elements * 4)
+                .sum::<u64>();
+        }
         println!(
-            "encoder grid {width}x{height}: {} tiles, largest tile {} MiB, whole loop {} MiB",
+            "encoder grid {width}x{height}: {} tiles, {} distinct extents, largest tile {} MiB, loop-today {} MiB, hoisted {} MiB",
             plan.tiles.len(),
+            distinct.len(),
             largest / (1 << 20),
-            total / (1 << 20)
+            total / (1 << 20),
+            hoisted / (1 << 20)
         );
     }
     // The video encoder reads one tile per call, so its plan is stated per tile; the driver's loop
     // must hoist it or the arena is reserved once per tile.
-    for (width, height) in [(256_u32, 64_u32), (512, 128)] {
+    for (width, height) in [(256_u32, 256_u32), (512, 128)] {
         let raster = minimax_h3::encoding::Extent {
             frames: 25,
             height,
