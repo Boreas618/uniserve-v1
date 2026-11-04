@@ -72,13 +72,21 @@ pub(crate) trait PageConversion: Send + Sync {
     fn convert(&self, stream: Option<&Stream>, request: &ConversionRequest<'_>) -> Result<()>;
 }
 
-/// The serving generation the import path resolves its kernels on.
+/// The generation the import path resolves its kernels on.
 ///
 /// The program-layer hot update swaps the generation under the executor, so the
 /// import path asks for the one serving now rather than holding a kernel: a
 /// conversion launched after a switchover runs the new program.
+///
+/// The contract is "serving until compared", not "newest": a generation answers
+/// only once its paired comparison has passed - the shadow's agreement on the
+/// last operator, the import conversion programs included - and until then this
+/// answers the generation that already served. Without that ordering the first
+/// thing a wrong conversion corrupts is the data no request checks: the pages
+/// it imports.
 pub(crate) trait GenerationSource: Send + Sync {
-    /// The generation that currently serves.
+    /// The generation that may serve: the latest one whose paired comparison
+    /// has passed, and before any has, the one already serving.
     fn current(&self) -> Arc<ops::Generation>;
 }
 
