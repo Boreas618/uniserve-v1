@@ -276,10 +276,16 @@ impl VideoPostprocessor {
             }
             None => clip,
         };
-        self.bytes.forward(f, raster.body(source, splice)?, out)?;
-        if splice.last {
+        // The byte step writes as many frames as it reads, so each range goes to its own slice of `out`:
+        // the body to the clip's kept frames, and the last clip's tail after them. Handing `out` whole to
+        // either write would be refused by the layer's own shape check, and the tail written at the front
+        // of a wider output would overwrite the body's first frames.
+        let (body_out, tail_out) = raster.destinations(out, splice)?;
+        self.bytes
+            .forward(f, raster.body(source, splice)?, body_out)?;
+        if let Some(tail_out) = tail_out {
             self.bytes
-                .forward(f, raster.written(source, splice.overlap)?, out)?;
+                .forward(f, raster.written(source, splice.overlap)?, tail_out)?;
         }
         Ok(())
     }
@@ -353,6 +359,29 @@ impl Raster {
     /// The body view of one clip: what the timeline keeps before the tail.
     fn body(&self, raster: TensorView, splice: &Splice) -> Result<TensorView> {
         self.written(raster, splice.body)
+    }
+
+    /// The frames of `out` each write goes to: the body's, and the last clip's tail after them.
+    ///
+    /// `out` is `[frames, rows, columns, channels]` bytes for the whole clip, and a write covers exactly
+    /// the frames its source reads, so a clip that keeps its own tail needs two destination views.
+    fn destinations(
+        &self,
+        out: TensorView,
+        splice: &Splice,
+    ) -> Result<(TensorView, Option<TensorView>)> {
+        let keep = splice.body.1 - splice.body.0;
+        let body = frames_of(out, 0, keep)?;
+        let tail = if splice.last {
+            Some(frames_of(
+                out,
+                keep,
+                keep + (splice.overlap.1 - splice.overlap.0),
+            )?)
+        } else {
+            None
+        };
+        Ok((body, tail))
     }
 
     /// The output view of one clip: `[frames, rows, columns, channels]` bytes.
@@ -430,6 +459,33 @@ pub fn splice_arena(
     }])
 }
 
+/// The frames `start..stop` of an output raster: `[frames, rows, columns, channels]` bytes.
+///
+/// The last axis is dense, so a frame slice is that frame's own element address and a narrowed first
+/// extent; the strides are the raster's own, which keeps the view right for a raster that is itself a
+/// slice of a larger buffer.
+fn frames_of(out: TensorView, start: u32, stop: u32) -> Result<TensorView> {
+    let shape = out.shape;
+    if shape.rank() != 4 || start >= stop || shape.dim(0) < u64::from(stop) {
+        return Err(Error::config(format!(
+            "frames {start}..{stop} of a {}-frame output raster do not exist",
+            shape.dim(0)
+        )));
+    }
+    let element = out.element(&[u64::from(start), 0, 0, 0]);
+    Ok(TensorView::with_strides(
+        element,
+        out.dtype,
+        Shape::new(&[
+            u64::from(stop - start),
+            shape.dim(1),
+            shape.dim(2),
+            shape.dim(3),
+        ]),
+        nn::Strides::new(out.strides.as_slice()),
+    ))
+}
+
 /// The whole timeline of `clips` clips: how many frames it writes.
 pub fn timeline_frames(clips: &[Splice]) -> Result<u32> {
     if clips.is_empty() {
@@ -479,6 +535,69 @@ mod tests {
             }
         };
         assert!(RgbBytes::new(DType::F16, 2, two, constants(PIXEL_STD)).is_err());
+    }
+
+    #[test]
+    fn the_last_clips_tail_is_written_after_its_body() {
+        // A `[frames, rows, columns, channels]` output raster of 22 frames, the last clip's own count:
+        // its body goes to the first 17 and its tail to the 5 after them. Handing the whole raster to
+        // either write is what the byte layer refuses, and writing the tail at the front would overwrite
+        // the body - so the destination views are the contract this test pins.
+        let (height, width) = (4u32, 6u32);
+        let channels = Rgb::CHANNELS;
+        let out = TensorView::with_strides(
+            nn::DevicePtr::new(0),
+            DType::U8,
+            Shape::new(&[22, u64::from(height), u64::from(width), u64::from(channels)]),
+            nn::Strides::new(&[
+                u64::from(height) * u64::from(width) * u64::from(channels),
+                u64::from(width) * u64::from(channels),
+                u64::from(channels),
+                1,
+            ]),
+        );
+        let raster = Raster {
+            frames: 25,
+            height,
+            width,
+        };
+        let (body, tail) = raster
+            .destinations(out, &Splice::LAST)
+            .expect("the last clip's two destinations");
+        assert_eq!(
+            body.shape.dims()[0],
+            u64::from(Splice::LAST.body.1 - Splice::LAST.body.0)
+        );
+        assert_eq!(body.element(&[0, 0, 0, 0]).address(), 0);
+        let tail = tail.expect("the last clip keeps its tail");
+        assert_eq!(
+            tail.shape.dims()[0],
+            u64::from(Splice::LAST.overlap.1 - Splice::LAST.overlap.0)
+        );
+        // The tail starts at the body's end, which is the 17th frame's own address.
+        assert_eq!(
+            tail.element(&[0, 0, 0, 0]).address(),
+            out.element(&[17, 0, 0, 0]).address()
+        );
+        // A clip that is not last writes one destination, and it is the body.
+        let (body, tail) = raster
+            .destinations(
+                TensorView::with_strides(
+                    nn::DevicePtr::new(0),
+                    DType::U8,
+                    Shape::new(&[17, u64::from(height), u64::from(width), u64::from(channels)]),
+                    nn::Strides::new(&[
+                        u64::from(height) * u64::from(width) * u64::from(channels),
+                        u64::from(width) * u64::from(channels),
+                        u64::from(channels),
+                        1,
+                    ]),
+                ),
+                &Splice::CLIP,
+            )
+            .expect("the interior clip's destination");
+        assert_eq!(body.shape.dims()[0], 17);
+        assert!(tail.is_none());
     }
 
     #[test]
