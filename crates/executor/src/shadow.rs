@@ -356,6 +356,84 @@ pub fn scratch_slots(
     Ok(slots)
 }
 
+/// The cache slots a paired forward writes: the same tokens as the served batch, in the scratch
+/// set's own numbering.
+///
+/// A slot is flat over one plane's pages (`ops::kv`'s `Args::slots`: `page · page_size + offset`),
+/// and the scratch set gives row `r` the pages `r · pages .. (r + 1) · pages` - the ids its block
+/// table states (`ScratchCache`). So token `t` of row `r` at position `p` writes
+/// `(r · pages + p / page_size) · page_size + p % page_size`, which is inside the row's own pages
+/// and never a resident slot. A token the served batch does not write (`slots[t] < 0`, a padded
+/// row) writes nothing here either.
+///
+/// `positions` is `[tokens]`, `query_offsets` is `[rows + 1]` packed, and `slots` is the served
+/// batch's `[tokens]` slot column. The result is `[tokens]`, the column the paired forward stages
+/// in place of the served batch's.
+pub fn scratch_slot_mapping(
+    positions: &[i32],
+    query_offsets: &[i32],
+    slots: &[i32],
+    pages: u32,
+    page_size: u32,
+) -> Result<Vec<i32>> {
+    if page_size == 0 || pages == 0 {
+        return Err(Error::Invariant(
+            "a scratch page set needs a non-zero page and page size".into(),
+        ));
+    }
+    if query_offsets.len() < 2 {
+        return Err(Error::Invariant(
+            "a batch's packed query offsets name no row".into(),
+        ));
+    }
+    match query_offsets.last().copied() {
+        Some(tokens) if tokens as usize == positions.len() && positions.len() == slots.len() => {}
+        _ => {
+            return Err(Error::Invariant(
+                "the batch's offsets, positions and slots describe different token counts".into(),
+            ))
+        }
+    }
+    let rows = query_offsets.len() - 1;
+    let mut mapping = vec![-1_i32; positions.len()];
+    for row in 0..rows {
+        let (start, end) = (query_offsets[row], query_offsets[row + 1]);
+        if start < 0 || end < start {
+            return Err(Error::Invariant(format!(
+                "row {row}'s packed query offsets are {start}..{end}"
+            )));
+        }
+        for token in start as usize..end as usize {
+            if slots[token] < 0 {
+                continue;
+            }
+            let position = positions[token];
+            if position < 0 {
+                return Err(Error::Invariant(format!(
+                    "token {token} writes cache page {position} of the batch, which is no position"
+                )));
+            }
+            let (page, offset) = (
+                position as u32 / page_size,
+                position as u32 % page_size,
+            );
+            if page >= pages {
+                return Err(Error::Invalid(format!(
+                    "row {row} writes position {position}, which needs page {page} of a scratch \
+                     set of {pages} pages; the paired forward's page set is too small"
+                )));
+            }
+            let flat = (row as u32 * pages + page) * page_size + offset;
+            mapping[token] = i32::try_from(flat).map_err(|_| {
+                Error::Invalid(format!(
+                    "a scratch slot of {flat} is outside the slot range a cache address holds"
+                ))
+            })?;
+        }
+    }
+    Ok(mapping)
+}
+
 fn ceildiv(value: u64, divisor: u64) -> u64 {
     value.div_ceil(divisor)
 }
@@ -395,6 +473,36 @@ mod tests {
             .expect_err("a difference beyond tolerance fails");
         let message = error.to_string();
         assert!(message.contains("element 0"), "{message}");
+    }
+
+    /// Each row of a paired forward writes its own scratch pages: row 0's three tokens and row
+    /// 1's two are addressed as `(row * pages + page) * page_size + offset`, so no two rows share
+    /// a page and none of them names a resident slot.
+    #[test]
+    fn a_paired_forward_writes_its_own_scratch_pages() {
+        let mapping = scratch_slot_mapping(
+            &[5, 6, 7, 0, 1],
+            &[0, 3, 5],
+            &[10, 11, 12, 20, 21],
+            2,
+            4,
+        )
+        .expect("every token fits the set");
+        // Row 0: positions 5..8 are page 1, offsets 1..3. Row 1: positions 0..2, page 0.
+        assert_eq!(mapping, vec![5, 6, 7, 8, 9]);
+    }
+
+    /// A token the served batch does not write (a padded row, `slot < 0`) writes no scratch page
+    /// either, and a position past the set's pages is refused by name rather than wrapped.
+    #[test]
+    fn a_padded_token_writes_nothing_and_a_full_set_is_refused() {
+        let mapping = scratch_slot_mapping(&[0, 0], &[0, 2], &[-1, 3], 1, 4)
+            .expect("the padded token and the written one are both in range");
+        assert_eq!(mapping, vec![-1, 0]);
+
+        let error = scratch_slot_mapping(&[9], &[0, 1], &[7], 1, 4)
+            .expect_err("position 9 needs page 2 of a one-page set");
+        assert!(error.to_string().contains("page 2"), "{error}");
     }
 
     /// A NaN has no distance to anything, so the comparison treats two NaNs as agreeing and a NaN

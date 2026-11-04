@@ -63,6 +63,31 @@ struct Table {
 }
 
 impl Table {
+    /// Writes `indices` (row-major, `rows * width` values) into the table once, from the host.
+    ///
+    /// A block table states fixed page ids for the runner's lifetime, so this runs once per table
+    /// and never on a step: a paired forward reads the ids, it does not build them.
+    fn fill(&self, indices: &[i32], stream: &Stream) -> Result<()> {
+        let bytes = std::mem::size_of_val(indices);
+        if bytes != self.buffer.len() {
+            return Err(Error::Invariant(format!(
+                "a block table of {} bytes cannot hold {bytes} of indices",
+                self.buffer.len()
+            )));
+        }
+        let mut host = platform::PinnedBuffer::new(self.buffer.device(), bytes)?;
+        // SAFETY: the source is `indices`, `bytes` long, and the destination is this table's own
+        // host buffer, allocated for exactly that length and not read concurrently.
+        unsafe {
+            host.as_mut_slice()[..bytes]
+                .copy_from_slice(std::slice::from_raw_parts(indices.as_ptr().cast::<u8>(), bytes));
+            // SAFETY: both addresses are this table's device buffer and that host buffer, of the
+            // same length; the copy is stream-ordered before the walk that reads the table.
+            platform::memcpy_async(self.buffer.address(), host.address(), bytes, stream)?;
+        }
+        Ok(())
+    }
+
     /// Allocates `rows x width` i32 for one group from the device's pools.
     fn new(pools: &mut Pools, rows: u32, width: u32) -> Result<Self> {
         if rows == 0 || width == 0 {
@@ -402,20 +427,71 @@ impl KvProvider for ResidentCache {
     fn scratch(
         &self,
         group: usize,
-        _slots: &[i32],
-        _pages: u32,
-        _stream: &Stream,
+        slots: &[i32],
+        pages: u32,
+        stream: &Stream,
     ) -> Result<(TensorView, Vec<KvPlanes>)> {
-        // The scratch page set is the storage owners' region (`PrefixCache::scratch`, agreed in
-        // M619/M682 and not published yet), so a paired forward has nowhere it may write without
-        // touching a page a request reads. Failing here says which piece is missing instead of
-        // writing resident pages: 7.3's rule is that a paired forward never does.
-        let _ = group;
-        Err(Error::State(
-            "the pool's scratch region (PrefixCache::scratch) is not published, so a paired \
-             forward has no page set it may write"
-                .into(),
-        ))
+        let rows = slots.len().max(1) as u32;
+        let mut guard = self
+            .scratch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.is_none() {
+            // One set serves every paired forward of this runner: its rows are the largest
+            // bucket's and its pages are the walk's, so no shadow step of a later bucket allocates.
+            let rows = self.rows.max(rows);
+            let pools = self
+                .pools
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+                .ok_or_else(|| {
+                    Error::State(
+                        "the cache provider has no pools: the executor attaches them before the \
+                         first capture"
+                            .into(),
+                    )
+                })?;
+            let cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut pools = pools
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // `ScratchCache` states the set's total page count: every row owns `pages` of them,
+            // so the set is `rows * pages` pages wide and page `k` of row `r` is `r * pages + k`.
+            let total = rows
+                .checked_mul(pages)
+                .ok_or_else(|| Error::Invalid("a scratch page set overflows pages".into()))?;
+            let set = cache.scratch(rows, total, self.device, &mut pools)?;
+            // One `[rows, pages]` block table per group, stating the set's own page ids, so two
+            // rows of one walk never share a page.
+            let mut tables = Vec::with_capacity(self.groups);
+            let indices: Vec<i32> = (0..total).map(|page| page as i32).collect();
+            for _ in 0..self.groups {
+                let table = Table::new(&mut pools, rows, pages)?;
+                table.fill(&indices, stream)?;
+                tables.push(table);
+            }
+            *guard = Some(Scratch {
+                cache: set,
+                tables,
+            });
+        }
+        let scratch = guard.as_ref().ok_or_else(|| {
+            Error::Invariant("the scratch page set was allocated and is not held".into())
+        })?;
+        let asked = rows.saturating_mul(pages);
+        if rows > self.rows || asked > scratch.cache.pages() {
+            return Err(Error::Invalid(format!(
+                "a paired forward asks for {rows} rows of {pages} pages; the scratch set holds {} \
+                 rows of {} pages, so the walk would write outside its own pages",
+                self.rows,
+                scratch.cache.pages() / pages.max(1)
+            )));
+        }
+        Ok(self.scratch_view(group, slots, scratch))
     }
 }
 
