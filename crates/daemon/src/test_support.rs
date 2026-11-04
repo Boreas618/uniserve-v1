@@ -20,8 +20,6 @@ use axum::http::{HeaderMap, StatusCode};
 use engine::{EngineConfig, SchedulerHandle, SimEngine, SimExecutor};
 use models::video::plan::{MAX_VIDEO_SECONDS, ProcessorConfig, canvas};
 use proto::request::ModelDtype;
-use tokenizers::models::bpe::{BPE, Vocab};
-use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt as _;
 
@@ -37,66 +35,14 @@ use crate::options::ChatTemplateContentFormatOption;
 use crate::options::{
     ImageFetchOptions, LoggingOptions, ServeConfig, ServerOptions, VideoJobOptions,
 };
-use crate::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
+use crate::tokenizer::DynTokenizer;
 
 /// Served model name the simulated engines answer to.
 pub(crate) const SERVED_MODEL: &str = "sim-model";
 
-/// Loads a `tokenizers` definition in storage, as the server loads a
-/// checkpoint's `tokenizer.json`.
-pub(crate) fn load_tokenizer(definition: &TokenizerBuilder) -> HuggingFaceTokenizer {
-    let json = definition.to_string(false).expect("serialize tokenizer");
-    HuggingFaceTokenizer::from_json(serde_json::from_str(&json).expect("parse tokenizer"))
-        .expect("load tokenizer")
-}
-
-/// Builds a deterministic byte-oriented tokenizer for serving tests.
-///
-/// Every printable ASCII character encodes to the token whose ID equals its
-/// code point, so tests write IDs as `b'a' as u32`. ID 0 is the `<unk>`
-/// token, and IDs 1 through 6 (control characters) are replaced by the chat,
-/// vision, and thinking special tokens, which encode atomically. The BPE model
-/// has no merges, so encoding is one token per character.
-pub(crate) fn configured_tokenizer() -> DynTokenizer {
-    let mut vocab = (0_u32..=127)
-        .map(|id| {
-            let token = if id == 0 {
-                "<unk>".to_string()
-            } else {
-                char::from_u32(id).expect("ASCII code point").to_string()
-            };
-            (token, id)
-        })
-        .collect::<Vocab>();
-    for (id, token) in [
-        (1, "<|im_start|>"),
-        (2, "<|im_end|>"),
-        (3, "<|vision_start|>"),
-        (4, "<|vision_end|>"),
-        (5, "<think>"),
-        (6, "</think>"),
-        (97, "a"),
-        (98, "b"),
-    ] {
-        vocab.retain(|_, existing_id| *existing_id != id);
-        vocab.insert(token.to_string(), id);
-    }
-    let model = BPE::builder()
-        .vocab_and_merges(vocab, Vec::new())
-        .unk_token("<unk>".to_string())
-        .build()
-        .expect("build configured tokenizer model");
-    let mut tokenizer = TokenizerBuilder::new(model);
-    tokenizer.add_special_tokens(&[
-        AddedToken::from("<|im_start|>", true),
-        AddedToken::from("<|im_end|>", true),
-        AddedToken::from("<|vision_start|>", true),
-        AddedToken::from("<|vision_end|>", true),
-        AddedToken::from("<think>", true),
-        AddedToken::from("</think>", true),
-    ]);
-    Arc::new(load_tokenizer(&tokenizer))
-}
+/// The application crate's byte tokenizer, which the serving tests decode
+/// with (see `frontend::test_support::configured_tokenizer`).
+pub(crate) use frontend::test_support::{configured_tokenizer, load_tokenizer};
 
 /// The server's router over `engine` under the default server options.
 pub(crate) fn router(engine: Leader) -> Router {
