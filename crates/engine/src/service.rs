@@ -24,7 +24,7 @@
 //! for writing before its events can be, so the daemon always reads it
 //! first.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -47,7 +47,10 @@ const STATS_INTERVAL: Duration = Duration::from_secs(1);
 const READ_INTERVAL: Duration = Duration::from_millis(200);
 
 /// One frame for the daemon, with the media whose descriptor travels beside
-/// it.
+/// it. Cloned when a successor takes over a request and the frames the
+/// response has not taken are sent to it again (`specs/worker.md` §7.5.1
+/// step 4).
+#[derive(Clone)]
 struct Frame {
     message: wire::FromEngine,
     media: Option<Arc<dyn ArtifactMedia>>,
@@ -75,6 +78,19 @@ struct InFlight {
     slot: usize,
     front: usize,
     consumed: tokio::sync::watch::Sender<u64>,
+    /// The connection a successor asked to take this request's event stream
+    /// over from a position, which the forwarding task acts on
+    /// (`specs/worker.md` §7.5.1 step 4).
+    takeover: tokio::sync::watch::Sender<Option<Takeover>>,
+}
+
+/// A connection taking over one request's event stream from a position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Takeover {
+    /// The connection's index among the engine's fronts.
+    front: usize,
+    /// How many of the request's events its response consumed.
+    consumed: u64,
 }
 
 /// Shared between the readers and the event tasks: the schedulers, which
@@ -124,6 +140,17 @@ impl Routing {
                 *consumed = (*consumed).max(events);
                 advanced
             });
+        }
+    }
+
+    /// Moves `request`'s event stream to the connection at `front`, which
+    /// takes it over from the position `consumed`: from now on this request
+    /// belongs to that connection, so closing another one does not abandon
+    /// it (`specs/worker.md` §7.5.1 step 4).
+    fn take_over(&self, request: RequestId, front: usize, consumed: u64) {
+        if let Some(in_flight) = crate::lock(&self.requests).get_mut(&request) {
+            in_flight.front = front;
+            let _ = in_flight.takeover.send(Some(Takeover { front, consumed }));
         }
     }
 
@@ -513,7 +540,7 @@ fn read_requests(
                 refuse_unready(submit, front, routing);
             }
             Some(to_engine::Kind::Submit(submit)) => submit_all(submit, front, routing, streams),
-            Some(to_engine::Kind::Command(command)) => apply(command, routing),
+            Some(to_engine::Kind::Command(command)) => apply(command, front, routing),
             Some(to_engine::Kind::Engine(command)) => match command.kind {
                 Some(wire::engine_command::Kind::Shutdown(_)) => {
                     let _ = control.send(Control::Shutdown);
@@ -645,7 +672,13 @@ fn submit_all(
     routing: &Routing,
     streams: &tokio::sync::mpsc::UnboundedSender<Stream>,
 ) {
-    let mut batches: HashMap<usize, Vec<(RequestId, Request, Credit)>> = HashMap::new();
+    type Submitted = (
+        RequestId,
+        Request,
+        Credit,
+        tokio::sync::watch::Receiver<Option<Takeover>>,
+    );
+    let mut batches: HashMap<usize, Vec<Submitted>> = HashMap::new();
     for message in submit.requests {
         let id = RequestId(message.id);
         let request = match Request::from_wire(message) {
@@ -676,32 +709,41 @@ fn submit_all(
             .in_flight
             .fetch_add(1, Ordering::Relaxed);
         let (consumed, credit) = tokio::sync::watch::channel(0);
+        let (takeover, taken_over) = tokio::sync::watch::channel(None);
         crate::lock(&routing.requests).insert(
             id,
             InFlight {
                 slot: index,
                 front,
                 consumed,
+                takeover,
             },
         );
         batches
             .entry(index)
             .or_default()
-            .push((id, request, credit));
+            .push((id, request, credit, taken_over));
     }
     for (index, batch) in batches {
         let mut ids = Vec::with_capacity(batch.len());
         let mut requests = Vec::with_capacity(batch.len());
         let mut credits = Vec::with_capacity(batch.len());
-        for (id, request, credit) in batch {
+        let mut takeovers = Vec::with_capacity(batch.len());
+        for (id, request, credit, takeover) in batch {
             ids.push(id);
             requests.push(request);
             credits.push(credit);
+            takeovers.push(takeover);
         }
         let handle = &routing.slots[index].handle;
         match handle.submit_all(requests) {
             Ok(events) => {
-                for ((id, events), credit) in ids.into_iter().zip(events).zip(credits) {
+                for (((id, events), credit), takeover) in ids
+                    .into_iter()
+                    .zip(events)
+                    .zip(credits)
+                    .zip(takeovers)
+                {
                     routing.send(
                         front,
                         Frame::plain(from_engine::Kind::Accepted(wire::Accepted {
@@ -714,6 +756,7 @@ fn submit_all(
                         front,
                         events,
                         credit,
+                        takeover,
                     });
                 }
             }
@@ -1543,7 +1586,7 @@ fn refuse(front: usize, routing: &Routing, id: RequestId, message: String) {
 
 /// Applies a command to the request it names, on the scheduler serving it;
 /// a request that already ended needs none.
-fn apply(command: wire::Command, routing: &Routing) {
+fn apply(command: wire::Command, front: usize, routing: &Routing) {
     let id = RequestId(command.request);
     let Some(handle) = routing.of(id) else {
         return;
@@ -1556,6 +1599,9 @@ fn apply(command: wire::Command, routing: &Routing) {
         }
         Some(wire::command::Kind::Abort(_)) => handle.abort(id),
         Some(wire::command::Kind::Consumed(consumed)) => routing.consumed(id, consumed.events),
+        Some(wire::command::Kind::Takeover(take_over)) => {
+            routing.take_over(id, front, take_over.events);
+        }
         None => {}
     }
 }
@@ -1626,28 +1672,90 @@ struct Stream {
     front: usize,
     events: EventRx,
     credit: Credit,
+    /// The connection a successor takes this request's events over from.
+    takeover: tokio::sync::watch::Receiver<Option<Takeover>>,
 }
 
 /// Forwards one request's events until its terminal one, never more than
-/// [`EVENT_WINDOW`] beyond those its consumer took.
+/// [`EVENT_WINDOW`] beyond those its consumer took, and keeps the events the
+/// consumer has not taken so that a connection taking the request over from a
+/// position receives them again without the request repeating its work
+/// (`specs/worker.md` §7.5.1 step 4).
 async fn forward(stream: Stream, routing: &Routing) {
     let Stream {
         id,
-        front,
+        mut front,
         mut events,
         mut credit,
+        mut takeover,
     } = stream;
     let mut sent = 0_u64;
+    // The events already sent and not taken yet, by their 1-based position in
+    // the request's stream: a successor takes over from the position its
+    // response consumed and receives those after it.
+    let mut replay: VecDeque<(u64, Frame)> = VecDeque::new();
+    let mut ended = false;
     loop {
-        // A closed credit channel means the request ended in the reader's
-        // view; its remaining events still go out.
-        while sent >= *credit.borrow() + EVENT_WINDOW {
-            if credit.changed().await.is_err() {
-                break;
+        // A takeover moves the request to the connection that asked for it
+        // before another event goes out, so the successor sees one ordered
+        // stream from the position it named.
+        if let Some(taken) = *takeover.borrow_and_update() {
+            front = taken.front;
+            replay.retain(|(position, _)| *position > taken.consumed);
+            for (_, frame) in &replay {
+                routing.send(front, frame.clone());
             }
         }
-        let Some(event) = events.recv().await else {
-            break;
+        let consumed = *credit.borrow();
+        replay.retain(|(position, _)| *position > consumed);
+        if ended {
+            // The request ended, but events before its terminal one may still
+            // be on their way to a consumer that stopped at a boundary: keep
+            // them until they are taken, then forget the request.
+            if consumed >= sent {
+                break;
+            }
+            tokio::select! {
+                changed = credit.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+                changed = takeover.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        // A closed credit channel means the request ended in the reader's
+        // view; its remaining events still go out.
+        'window: while sent >= *credit.borrow() + EVENT_WINDOW {
+            tokio::select! {
+                changed = credit.changed() => {
+                    if changed.is_err() {
+                        break 'window;
+                    }
+                }
+                changed = takeover.changed() => {
+                    if changed.is_err() {
+                        break 'window;
+                    }
+                }
+            }
+        }
+        let event = tokio::select! {
+            event = events.recv() => match event {
+                Some(event) => event,
+                None => break,
+            },
+            changed = takeover.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                continue;
+            }
         };
         sent += 1;
         let terminal = event.is_terminal();
@@ -1658,17 +1766,16 @@ async fn forward(stream: Stream, routing: &Routing) {
             routing.report_failure();
         }
         let (message, media) = event.to_wire(id);
-        routing.send(
-            front,
-            Frame {
-                message: wire::FromEngine {
-                    kind: Some(from_engine::Kind::Event(message)),
-                },
-                media,
+        let frame = Frame {
+            message: wire::FromEngine {
+                kind: Some(from_engine::Kind::Event(message)),
             },
-        );
+            media,
+        };
+        replay.push_back((sent, frame.clone()));
+        routing.send(front, frame);
         if terminal {
-            break;
+            ended = true;
         }
     }
     routing.finish(id);

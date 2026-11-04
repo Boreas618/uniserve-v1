@@ -17,7 +17,6 @@ use clap::{Args, Parser, Subcommand};
 use daemon::options::ServeArgs;
 
 use crate::engine::EngineArgs;
-use crate::program_server::ProgramServerArgs;
 use crate::storage::StorageArgs;
 
 /// Top-level parser for the `uniserve` binary.
@@ -84,10 +83,11 @@ pub(crate) enum Command {
     /// The Storage Server of this host and the operator's commands against
     /// it.
     Storage(Box<StorageArgs>),
-    /// The Program Server of this host and the operator's commands against
-    /// it.
-    #[command(hide = true)]
-    ProgramServer(Box<ProgramServerArgs>),
+    /// A command whose parser belongs to another crate, such as the Program
+    /// Server's: the executable hands the arguments to that parser instead of
+    /// restating its surface here.
+    #[command(hide = true, external_subcommand)]
+    External(Vec<OsString>),
 }
 
 #[cfg(test)]
@@ -127,7 +127,10 @@ mod tests {
                 Command::Serve(_) => "serve",
                 Command::Frontend(_) => "frontend",
                 Command::Storage(_) => "storage",
-                Command::ProgramServer(_) => "program-server",
+                Command::External(arguments) => match arguments.first().and_then(|name| name.to_str()) {
+                    Some("program-server") => "program-server",
+                    _ => "other",
+                },
                 Command::Engine(_) | Command::Worker { .. } => "other",
             };
             assert_eq!(name, expected);

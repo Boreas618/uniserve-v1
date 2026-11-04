@@ -24,6 +24,7 @@ mod storage;
 mod worker;
 
 use std::env;
+use std::ffi::OsString;
 
 use anyhow::{Context, Result};
 use clap::Parser as _;
@@ -122,7 +123,28 @@ fn main() -> Result<std::process::ExitCode> {
             worker::run(arguments)
         }
         Command::Storage(args) => Ok(storage::run(*args)),
-        Command::ProgramServer(args) => program_server::run(*args, &cli.log),
+        Command::External(arguments) => run_external(&arguments),
+    }
+}
+
+/// Runs a command whose parser another crate owns, with the arguments the
+/// top-level parser did not claim.
+///
+/// The Program Server's command line is the `program_server` crate's
+/// (`command`, `options`, `run`), so this executable mounts it rather than
+/// restating its surface. An unknown command is an error like any other.
+fn run_external(arguments: &[OsString]) -> Result<std::process::ExitCode> {
+    let Some(name) = arguments.first().and_then(|name| name.to_str()) else {
+        anyhow::bail!("missing command");
+    };
+    match name {
+        "program-server" => {
+            let matches = program_server::command().get_matches_from(arguments);
+            let options = program_server::options(&matches).map_err(anyhow::Error::new)?;
+            program_server::run(options).map_err(anyhow::Error::new)?;
+            Ok(std::process::ExitCode::SUCCESS)
+        }
+        other => anyhow::bail!("unknown command {other}"),
     }
 }
 
