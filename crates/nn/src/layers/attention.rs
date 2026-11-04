@@ -271,8 +271,14 @@ impl Attention {
     }
 
     /// Dense attention from packed queries to packed keys: `query [q_tokens, q_heads, head_dim]`,
-    /// `key`/`value [kv_tokens, kv_heads, head_dim]`, `cu_seq_lens_q`/`cu_seq_lens_k [rows + 1] i32`
-    /// (both written by the executor's scheduler), `out [q_tokens, q_heads, head_dim]`.
+    /// `key`/`value [kv_tokens, kv_heads, head_dim]`, `out [q_tokens, q_heads, head_dim]`.
+    ///
+    /// `cu_seq_lens_q`/`cu_seq_lens_k` are the `[sequences + 1]` i32 row offsets the scheduler
+    /// writes, given together or both absent. Absent means **one sequence**, `[0, q_tokens]` and
+    /// `[0, kv_tokens]`: a decoder that runs one sequence per tile owns no table, and the
+    /// descriptor carries that fact, so the call launches the single-sequence program rather than
+    /// reading a table at a null address. A batch that packs several sequences always passes both,
+    /// and one table without the other is refused by the operator.
     ///
     /// Serves both the `Dense` and the `Fp32` backend; the element types the views carry decide the
     /// descriptor, and the package behind it decides the tile and split heuristics.
@@ -286,8 +292,8 @@ impl Attention {
         query: TensorView,
         key: TensorView,
         value: TensorView,
-        cu_seq_lens_q: TensorView,
-        cu_seq_lens_k: TensorView,
+        cu_seq_lens_q: Option<TensorView>,
+        cu_seq_lens_k: Option<TensorView>,
         out: TensorView,
     ) -> Result<()> {
         if !matches!(
@@ -313,6 +319,8 @@ impl Attention {
             },
             windowed: self.window.is_some(),
             max_kv_len: self.max_kv_len,
+            // Which of the two programs this call launches, not what this launch reads.
+            cu_seq_lens: cu_seq_lens_q.is_some(),
         };
         let args = DenseArgs {
             query,
@@ -557,26 +565,12 @@ impl Attention {
             windowed: self.window.is_some(),
             max_kv_len: self.max_kv_len,
         };
-        // An FP8 cache stores each page divided by its own FP32 scale, one for keys and one for
-        // values; the descriptor's `kv` dtype decides whether the call carries them, so a mismatch
-        // in either direction is an argument error rather than a silently unscaled read.
-        let (key_scale, value_scale) = if planes.key.dtype == ops::DType::F8E4M3 {
-            let key = group_view.key_scales.ok_or_else(|| {
-                Error::shape(
-                    "Attention::attend",
-                    "an FP8 key cache needs its per-page scales".to_owned(),
-                )
-            })?;
-            let value = group_view.value_scales.ok_or_else(|| {
-                Error::shape(
-                    "Attention::attend",
-                    "an FP8 value cache needs its per-page scales".to_owned(),
-                )
-            })?;
-            (Some(key), Some(value))
-        } else {
-            (None, None)
-        };
+        // An FP8 plane stores each page divided by its own FP32 scale; the plane's element type
+        // decides whether the call carries one, so a mismatch in either direction is an argument
+        // error rather than a silently unscaled read. The scales are this layer's, so two layers of
+        // one group reach the launch with their own.
+        let key_scale = page_scale(planes.key, planes.key_scale)?;
+        let value_scale = page_scale(planes.value, planes.value_scale)?;
         let args = Args {
             query,
             key: planes.key,
@@ -597,6 +591,29 @@ impl Attention {
     }
 }
 
+/// The per-page scale a plane's call carries: exactly one when the plane is FP8.
+///
+/// An FP8 plane without its scale would be read unnormalized and a scaled plane of another type
+/// would multiply a scale the cache never divided by, so both mismatches are refused here rather
+/// than at the launch.
+fn page_scale(plane: TensorView, scale: Option<TensorView>) -> Result<Option<TensorView>> {
+    match (plane.dtype == ops::DType::F8E4M3, scale) {
+        (true, Some(scale)) => Ok(Some(scale)),
+        (true, None) => Err(Error::shape(
+            "Attention::attend",
+            "an FP8 cache plane needs its per-page scale".to_owned(),
+        )),
+        (false, Some(_)) => Err(Error::shape(
+            "Attention::attend",
+            format!(
+                "a {} cache plane carries no scale; the scale belongs to the page's encoding",
+                plane.dtype
+            ),
+        )),
+        (false, None) => Ok(None),
+    }
+}
+
 /// The bytes the trtllm-gen attention program needs as its workspace.
 ///
 /// The program's `workspace_size` argument (specs/worker.md 9); the executor carves it from its
@@ -605,6 +622,8 @@ pub const TRTLLM_WORKSPACE_BYTES: u64 = 512 << 20;
 
 #[cfg(test)]
 mod tests {
+    use ops::{DType, DevicePtr, Shape};
+
     use super::*;
 
     #[test]
@@ -642,5 +661,42 @@ mod tests {
         assert!(Attention::sparse(64, 128, 12, 1_000, false, 0.088).is_err());
         assert!(Attention::sparse(0, 128, 12, 1_024, false, 0.088).is_err());
         assert!(Attention::sparse(128, 128, 12, 1_024, false, 0.088).is_ok());
+    }
+
+    /// A page's scale is its own layer's, so two layers of one group carry different ones and the
+    /// call refuses a plane whose type and scale disagree in either direction.
+    #[test]
+    fn a_planes_per_page_scale_follows_the_planes_element_type() {
+        let pages = Shape::new(&[16, 1, 1, 1]);
+        let fp8 = TensorView::new(
+            DevicePtr::new(0x1000),
+            DType::F8E4M3,
+            Shape::new(&[16, 64, 8, 128]),
+        );
+        let bf16 = TensorView::new(
+            DevicePtr::new(0x2000),
+            DType::BF16,
+            Shape::new(&[16, 64, 8, 128]),
+        );
+        let first = TensorView::new(DevicePtr::new(0x3000), DType::F32, pages);
+        let second = TensorView::new(DevicePtr::new(0x4000), DType::F32, pages);
+
+        assert_eq!(
+            page_scale(fp8, Some(first)).unwrap().unwrap().ptr,
+            first.ptr
+        );
+        assert_eq!(
+            page_scale(fp8, Some(second)).unwrap().unwrap().ptr,
+            second.ptr
+        );
+        assert!(
+            page_scale(fp8, None).is_err(),
+            "an FP8 plane without its scale"
+        );
+        assert!(
+            page_scale(bf16, Some(first)).is_err(),
+            "a scale on a plane that has none"
+        );
+        assert!(page_scale(bf16, None).unwrap().is_none());
     }
 }
