@@ -72,6 +72,24 @@ pub(crate) trait PageConversion: Send + Sync {
     fn convert(&self, stream: Option<&Stream>, request: &ConversionRequest<'_>) -> Result<()>;
 }
 
+/// The program of a rank that imports no cache: every conversion is refused
+/// by name rather than performed.
+///
+/// A rank whose deployment never takes another rank's export still builds its
+/// memory the same way, so it needs a program; this one states that the path is
+/// unreachable, and a request that does reach it says why instead of silently
+/// writing nothing.
+pub(crate) struct Unimported;
+
+impl PageConversion for Unimported {
+    fn convert(&self, _stream: Option<&Stream>, request: &ConversionRequest<'_>) -> Result<()> {
+        Err(crate::Error::Unsupported(format!(
+            "this rank imports no cache, so group {} has nothing to convert",
+            request.group
+        )))
+    }
+}
+
 /// The generation the import path resolves its kernels on.
 ///
 /// The program-layer hot update swaps the generation under the executor, so the
