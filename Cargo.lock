@@ -3020,6 +3020,7 @@ version = "2.0.0"
 dependencies = [
  "clap",
  "libc",
+ "ops",
  "prost",
  "prost-build",
  "protox",
