@@ -165,10 +165,13 @@ impl Toy {
 /// decision from the one the case is about.
 fn unknown_phase() -> Plan {
     Plan {
-        // The request is queued when the trial judges the plan: admitting it is
-        // what makes the work legal for the same plan (§4.4), so the refusal
-        // that follows is the phase's and not the request's.
-        admit: vec![scheduling::guest::RequestId(1)],
+        // The request is the scheduler's resident when the trial judges the
+        // plan, so no admission is stated and the work is judged against the
+        // resident view: the refusal that follows is the phase's and not the
+        // request's. A plan that admitted it instead would have its work
+        // judged on the admission this plan makes (§4.4), which exempts the
+        // work from every check this case exists to state.
+        admit: Vec::new(),
         work: vec![Work {
             request: scheduling::guest::RequestId(1),
             phase: PhaseId(999),
@@ -432,10 +435,17 @@ fn limits_over_the_build_ceiling_fail_the_policy() {
 
 #[test]
 fn an_invalid_decision_fails_the_policy_and_applies_nothing() {
-    let world = World::serving(Toy::idle());
-    // The state the trial judges must hold the request the plan names: a plan
-    // naming a request that never arrived is refused for that, which is a
-    // different decision from the one this case states.
+    // The serving program admits the request and gives it no work, so the
+    // state the trial judges holds it as a resident: a plan naming a request
+    // that never arrived is refused for that, which is a different decision
+    // from the one this case states, and a plan naming a queued one would be
+    // exempt (§4.4) because its own admission would make the work legal.
+    let mut admitting = Toy::idle();
+    admitting.plan = Plan {
+        admit: vec![scheduling::guest::RequestId(1)],
+        ..Plan::default()
+    };
+    let world = World::serving(admitting);
     world
         .handle
         .submit(text_request(1, 8, 4))
