@@ -541,32 +541,48 @@ fn the_convolutions_are_one_source_in_three_packages() {
 }
 
 /// Operators that are one computation with one difference share one check script, and each
-/// pair's packages must carry the same bytes of it: whoever edits the reference, the
-/// interpreter's truncation or a case edits both, or the copies diverge and one operator's
-/// evidence quietly stops being the other's.
+/// set of packages must carry the same bytes of it: whoever edits the reference, the
+/// interpreter's truncation or a case edits every copy, or they diverge and one operator's
+/// evidence quietly stops being the others'.
 #[test]
-fn an_operator_pair_shares_one_check() {
-    const PAIRS: [(&str, &str, &str); 2] = [
-        ("rms_norm", "add_rms_norm", "triton/test/row_norm_check.py"),
-        ("softmax", "log_softmax", "triton/test/softmax_check.py"),
+fn a_family_of_operators_shares_one_check() {
+    const FAMILIES: [(&str, &[&str]); 3] = [
+        (
+            "triton/test/row_norm_check.py",
+            &["rms_norm", "add_rms_norm"],
+        ),
+        ("triton/test/softmax_check.py", &["softmax", "log_softmax"]),
+        (
+            "triton/test/sampling_check.py",
+            &["logits_gather", "vocab_unpad", "logits_shape"],
+        ),
     ];
-    for (first, second, shared) in PAIRS {
-        let scripts = [first, second].map(|op| {
-            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../ops/kernels")
-                .join(op)
-                .join(shared);
-            std::fs::read_to_string(&path).unwrap_or_else(|error| {
-                panic!("{op}'s check is not readable at {}: {error}", path.display())
+    for (shared, operators) in FAMILIES {
+        let scripts: Vec<String> = operators
+            .iter()
+            .map(|op| {
+                let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../ops/kernels")
+                    .join(op)
+                    .join(shared);
+                std::fs::read_to_string(&path).unwrap_or_else(|error| {
+                    panic!("{op}'s check is not readable at {}: {error}", path.display())
+                })
             })
-        });
-        assert!(
-            scripts[0] == scripts[1],
-            "{shared} differs between {first} and {second}"
-        );
-        assert!(
-            scripts[0].contains("--op") && scripts[0].contains(second),
-            "{shared} names both {first} and {second} on its command line"
-        );
+            .collect();
+        for (index, script) in scripts.iter().enumerate().skip(1) {
+            assert!(
+                script == &scripts[0],
+                "{shared} differs between {} and {}",
+                operators[0],
+                operators[index]
+            );
+        }
+        for op in operators {
+            assert!(
+                scripts[0].contains("--op") && scripts[0].contains(op),
+                "{shared} does not name {op} on its command line"
+            );
+        }
     }
 }
