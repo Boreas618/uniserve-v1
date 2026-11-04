@@ -1,0 +1,40 @@
+# The act_and_mul_fp8 operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
+# driver the Program Server runs for one descriptor and target).
+#
+# The descriptor is the row-scaled gating's own: the element type of the halves
+# (the output is always E4M3), the output row width, the lane block that covers a
+# row, the activation, the two input row strides and the stepwise flag. The key
+# is the one `ActAndMulE4M3Descriptor`'s `Display` prints, e.g.
+# `dtype_bf16_output_f8e4m3_width_3072_block_4096_activation_silu_gate_stride_3072_value_stride_3072_stepwise_false`.
+#
+# The row strides are whole multiples of the row width. The values narrow to the
+# keys `model` publishes for H3's FP8 MLP.
+
+op = "act_and_mul_fp8"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/act_and_mul_fp8.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+[kernel.descriptors]
+dimensions = { dtype = ["bf16", "fp16", "f32"], width = ["1024", "1536", "2048", "3072", "4096", "6144", "7168", "8192", "12288", "16384", "32768"], block = ["1024", "1536", "2048", "3072", "4096", "6144", "8192", "16384", "32768"], activation = ["silu", "gelu", "gelu_tanh"], gate_stride = ["1024", "1536", "2048", "3072", "4096", "4608", "6144", "7168", "8192", "9216", "12288", "14336", "16384", "18432", "21504", "24576", "28672", "32768", "36864", "43008", "49152", "65536", "73728", "98304", "131072", "196608"], value_stride = ["1024", "1536", "2048", "3072", "4096", "4608", "6144", "7168", "8192", "9216", "12288", "14336", "16384", "18432", "21504", "24576", "28672", "32768", "36864", "43008", "49152", "65536", "73728", "98304", "131072", "196608"], stepwise = ["true", "false"] }
+
+[parameters]

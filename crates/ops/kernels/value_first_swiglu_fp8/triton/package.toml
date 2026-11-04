@@ -1,0 +1,40 @@
+# The value_first_swiglu_fp8 operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
+# driver the Program Server runs for one descriptor and target).
+#
+# The descriptor is the row-scaled SwiGLU's own: the element type of the packed
+# input (the output is always E4M3), the output row width, the lane block that
+# covers a row, and the packed row stride. The key is the one
+# `ValueFirstSwigluE4M3Descriptor`'s `Display` prints, e.g.
+# `dtype_bf16_output_f8e4m3_width_3072_block_4096_input_stride_6144`.
+#
+# The packed row stride is the row width times a whole number. The values narrow
+# to the keys `model` publishes for H3's FP8 MLP.
+
+op = "value_first_swiglu_fp8"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/value_first_swiglu_fp8.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+[kernel.descriptors]
+dimensions = { dtype = ["bf16", "fp16", "f32"], width = ["1024", "1536", "2048", "3072", "4096", "6144", "7168", "8192", "12288", "16384", "32768"], block = ["1024", "1536", "2048", "3072", "4096", "6144", "8192", "16384", "32768"], input_stride = ["2048", "3072", "4096", "4608", "6144", "8192", "9216", "12288", "14336", "16384", "18432", "21504", "24576", "28672", "32768", "36864", "43008", "49152", "57344", "65536", "73728", "98304", "131072", "196608", "262144"] }
+
+[parameters]
