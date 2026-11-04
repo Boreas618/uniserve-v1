@@ -483,6 +483,12 @@ impl Op for PagedAttention {
             }
         }
 
+        for (name, view) in [("query", args.query), ("out", args.out)] {
+            check_vector_alignment(Self::NAME, name, &view)?;
+        }
+        check_vector_alignment(Self::NAME, "key", &args.key)?;
+        check_vector_alignment(Self::NAME, "value", &args.value)?;
+
         args.page_table.require_rank(Self::NAME, 2)?;
         if args.page_table.dtype != DType::I32 {
             return Err(Error::argument(
@@ -773,22 +779,85 @@ fn quantized(dtype: DType) -> bool {
     matches!(dtype, DType::F8E4M3 | DType::F4E2M1)
 }
 
-/// The elements between consecutive rows of a view.
+/// The elements between consecutive rows of a `[rows, heads, dim]` view.
+///
+/// Every attention program takes a row's stride and a head's stride as separate launch values, so an
+/// axis is named here by its distance from the last one — element last, head second to last, row
+/// third to last — and never by its index in a rank-2 view. The distinction is not cosmetic: reading
+/// the head axis as the row axis states `head_dim` where the program expects `heads * head_dim`, and
+/// one element where it expects `head_dim`, which walks every head of a row two bytes into the row
+/// and breaks the sixteen-byte vector loads the sm100 programs are compiled for.
 pub(super) fn row_stride(view: &TensorView) -> u64 {
-    if view.strides.rank() >= 2 {
-        view.strides.get(view.strides.rank() - 2)
-    } else {
-        0
-    }
+    axis_stride(view, 2)
 }
 
 /// The elements between consecutive heads of a `[rows, heads, dim]` view.
 pub(super) fn head_stride(view: &TensorView) -> u64 {
-    if view.strides.rank() >= 2 {
-        view.strides.get(view.strides.rank() - 2 + 1)
-    } else {
-        0
+    axis_stride(view, 1)
+}
+
+/// The stride of the axis `from_last` positions from the last, or `0` when the view has no such axis.
+fn axis_stride(view: &TensorView, from_last: usize) -> u64 {
+    let rank = view.strides.rank();
+    match rank.checked_sub(from_last + 1) {
+        Some(axis) => view.strides.get(axis),
+        None => 0,
     }
+}
+
+/// The alignment every attention program's descriptor states for its tensor pointers.
+///
+/// The sm100 programs are compiled with `gmemalign16` and take `i64` strides, so an operand's base and
+/// every axis they walk must fall on a whole sixteen-byte unit.
+pub(super) const ATTENTION_ALIGNMENT: u64 = 16;
+
+/// Refuse an operand the tensor-core programs cannot address.
+///
+/// Their descriptors state a sixteen-byte-aligned tensor pointer (`gmemalign16`) and take the strides
+/// of the axes they walk, so every address they form must be a whole number of sixteen-byte units:
+/// the base, and each stride of an axis that is not the vectorized last one. A view carved at an odd
+/// element offset, or with a stride that is not a whole unit, faults inside the kernel with no word
+/// about which operand — a warp misaligned address and a program counter — so it is refused here
+/// instead, by name.
+pub(super) fn check_vector_alignment(
+    operator: &'static str,
+    name: &str,
+    view: &TensorView,
+) -> Result<()> {
+    // A four-bit element type packs two elements a byte, so "sixteen bytes" is not a whole number of
+    // its elements and the packages that read one state their own alignment.
+    let Some(bytes) = view.dtype.bytes().filter(|bytes| *bytes > 0) else {
+        return Ok(());
+    };
+    if !ATTENTION_ALIGNMENT.is_multiple_of(bytes) {
+        return Ok(());
+    }
+    let unit = ATTENTION_ALIGNMENT / bytes;
+    let address = platform::address(view.ptr);
+    if !address.is_multiple_of(ATTENTION_ALIGNMENT) {
+        return Err(Error::argument(
+            operator,
+            format!(
+                "the {name} starts at {address:#x}, which is not {} bytes aligned",
+                ATTENTION_ALIGNMENT
+            ),
+        ));
+    }
+    let rank = view.strides.rank();
+    for axis in 0..rank.saturating_sub(1) {
+        let stride = view.strides.get(axis);
+        if !stride.is_multiple_of(unit) {
+            return Err(Error::argument(
+                operator,
+                format!(
+                    "the {name} has a stride of {stride} elements on axis {axis}, which is not a \
+                     whole number of {unit}-element ({}-byte) units",
+                    ATTENTION_ALIGNMENT
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn address(pointer: DevicePtr) -> u64 {
@@ -951,5 +1020,48 @@ mod tests {
         assert!(long.allows(1.0, 1.0));
         // A dropped history window changes the output by far more than the bound.
         assert!(!long.allows(0.0, 1.0));
+    }
+
+    /// A `[tokens, heads, dim]` view states its row stride and its head stride, not the two strides
+    /// nearest the last axis: 32 heads of 128 elements put the next token 4096 elements on, and the
+    /// next head 128. Reading the head axis as the row axis is what the launch cannot recover from,
+    /// because the program then walks heads two bytes apart and its vector loads fault.
+    #[test]
+    fn a_rows_strides_are_the_rows_and_not_the_head() {
+        let view = TensorView::new(
+            DevicePtr::new(0x1_0000),
+            DType::BF16,
+            Shape::new(&[15, 32, 128]),
+        );
+        assert_eq!(row_stride(&view), 4096);
+        assert_eq!(head_stride(&view), 128);
+    }
+
+    /// The eighteen-byte and four-byte cases: a view whose base or whose walked stride is not a whole
+    /// sixteen-byte unit is refused before the launch, naming the operand.
+    #[test]
+    fn a_misaligned_operand_is_refused_by_name() {
+        let ok = TensorView::new(
+            DevicePtr::new(0x1_0000),
+            DType::BF16,
+            Shape::new(&[15, 32, 128]),
+        );
+        check_vector_alignment("test", "query", &ok).unwrap();
+
+        let odd_base = TensorView::new(
+            DevicePtr::new(0x1_0002),
+            DType::BF16,
+            Shape::new(&[15, 32, 128]),
+        );
+        let refusal = check_vector_alignment("test", "query", &odd_base).unwrap_err();
+        assert!(
+            format!("{refusal}").contains("16 bytes aligned"),
+            "{refusal}"
+        );
+
+        // A row of 100 elements of bf16 is 200 bytes: every second row starts four bytes off.
+        let narrow = TensorView::new(DevicePtr::new(0x1_0000), DType::BF16, Shape::new(&[4, 100]));
+        let refusal = check_vector_alignment("test", "key", &narrow).unwrap_err();
+        assert!(format!("{refusal}").contains("stride of 100"), "{refusal}");
     }
 }
