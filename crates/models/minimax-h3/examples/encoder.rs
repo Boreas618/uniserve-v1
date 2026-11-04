@@ -790,6 +790,33 @@ fn stage_encode(args: &Args) -> Result<()> {
     let source = checkpoint.component("text_encoder")?;
     let dtype = compute_dtype(&checkpoint, TEXT_ENCODER, stated)?;
 
+    // 0. The page's directory, emptied first. A stage that stops before its forward - in the loader,
+    //    in the pool, in a launch - leaves no page rather than the previous run's: an old
+    //    `prompt_hidden.h3t` beside a new `case.json` compares as a residual nobody can attribute,
+    //    and the reference probe would read the old one happily.
+    let directory = args.out.join("text_encoder");
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
+    let mut cleared = 0;
+    for name in ["prompt_hidden.h3t", "case.json", "walk.txt"] {
+        match std::fs::remove_file(directory.join(name)) {
+            Ok(()) => cleared += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(Failure::message(format!(
+                    "{}: {error}",
+                    directory.join(name).display()
+                )));
+            }
+        }
+    }
+    if cleared > 0 {
+        println!(
+            "cleared {cleared} file(s) of a previous run from {}",
+            directory.display()
+        );
+    }
+
     // 1. The device and the generation the compiled programs were loaded for.
     let device = platform::Device::new(DeviceId(args.device))?;
     let _guard = device.enter()?;
@@ -923,45 +950,48 @@ fn stage_encode(args: &Args) -> Result<()> {
     // 7. The encode, with the executor's own recorder installed for its duration: the walk is what
     //    proves every program the forward binds is in the store's list.
     let mut walk = Walk(Vec::new());
-    ops::capture::set_sink(Some(&mut walk));
-    let sink = SinkGuard;
-    encoder.encode(
-        &forward,
-        EncoderInputs {
-            ids: ids_view,
-            batch,
-            images: &[],
-            layout: &layout,
-            state: &state,
-            diagnostics: &[],
-        },
-        EncoderOutputs { hidden: output },
-    )?;
-    drop(sink);
+    let outcome = {
+        ops::capture::set_sink(Some(&mut walk));
+        let sink = SinkGuard;
+        let outcome = encoder.encode(
+            &forward,
+            EncoderInputs {
+                ids: ids_view,
+                batch,
+                images: &[],
+                layout: &layout,
+                state: &state,
+                diagnostics: &[],
+            },
+            EncoderOutputs { hidden: output },
+        );
+        drop(sink);
+        outcome
+    };
+    // The walk is written before the outcome is read, because a stop has no other record: which
+    // launch stopped is the launch after the last one listed here.
+    let walked = walk.text();
+    std::fs::write(directory.join("walk.txt"), &walked)
+        .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
+    outcome?;
 
-    // 8. The page: the rows, the case that says what they are, and the walk.
+    // 8. The page: the rows and the case that says what they are. The walk is already on disk.
     let rows = u64::from(layout.rows);
     let elements = usize::try_from(rows * hidden)
         .map_err(|_| Failure::message("the output is larger than this host addresses"))?;
     let payload = download(&stream, output, elements)?;
-    let walked = walk.text();
     println!(
         "walk: {} launches, {} distinct programs",
         walk.0.len(),
         walk.distinct()
     );
 
-    let directory = args.out.join("text_encoder");
-    std::fs::create_dir_all(&directory)
-        .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
     write_h3t(
         &directory.join("prompt_hidden.h3t"),
         &[rows, hidden],
         code_of(dtype),
         &payload,
     )?;
-    std::fs::write(directory.join("walk.txt"), walked)
-        .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
     let ids_json = ids
         .iter()
         .map(u32::to_string)
