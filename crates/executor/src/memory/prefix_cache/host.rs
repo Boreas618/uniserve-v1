@@ -36,10 +36,10 @@ use sha2::{Digest, Sha256};
 
 use super::plan::{CacheGroupPlan, CachePlan};
 use super::planes::{CachePlanes, UnitColumn};
+use crate::memory::allocation::Backing;
 use crate::memory::allocation::Storage;
 use crate::memory::retained::Retained;
 use crate::stream::Issue;
-use crate::memory::allocation::Backing;
 use crate::{Error, Result};
 
 /// The version of the page encoding above: pages of another version are

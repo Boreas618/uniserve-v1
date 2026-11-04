@@ -1,10 +1,10 @@
 //! Scalar products and their writes.
 
 use super::*;
+use crate::memory::allocation::ElementType;
+use crate::memory::allocation::MemoryKind;
 use crate::memory::allocation::StorageView;
 use crate::stream::{Fill, Issue};
-use crate::memory::allocation::ElementType;
-use crate::memory::allocation::{MemoryKind};
 use crate::{Error, Result};
 use platform::{CopyBatch, SourceOrder};
 use std::collections::HashSet;

@@ -14,9 +14,9 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use crate::Result;
 use crate::lock;
-use crate::memory::allocation::Storage;
 use crate::memory::allocation::Backing;
-use crate::memory::allocation::{MemoryKind};
+use crate::memory::allocation::MemoryKind;
+use crate::memory::allocation::Storage;
 
 /// The smallest block, so that small inputs share block sizes.
 const MIN_BLOCK: usize = 1 << 16;
