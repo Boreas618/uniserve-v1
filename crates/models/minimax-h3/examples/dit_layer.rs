@@ -529,10 +529,16 @@ fn stage_block(args: &Args) -> Result<()> {
     let sine = arena.tensor(DType::F32, Shape::new(&[tokens, rotated_width()]))?;
     stack.factors(&forward, positions, cosine, sine)?;
     let rows = upload_i32(&stream, &arena, Shape::new(&[tokens]), &tables.groups)?;
-    let step = upload_i32(&stream, &arena, Shape::new(&[1]), &[0])?;
+    // The evaluation the stack runs: the schedule's first, which is also the row the modulation
+    // cache's entry table is indexed at. It is printed and written into `case.json`, because the
+    // reference producer runs its own stack at one step and two sides at different steps differ by
+    // exactly the modulation, which reads like an arithmetic difference.
+    let evaluation: i32 = 0;
+    let step = upload_i32(&stream, &arena, Shape::new(&[1]), &[evaluation])?;
     let (input, input_bytes) = pseudo_rows(&stream, &arena, tokens, hidden)?;
 
-    // 8. The forward. `--layers` layers, in place, at step 0 of the schedule.
+    // 8. The forward. `--layers` layers, in place, at the schedule's first evaluation.
+    println!("step    {evaluation} of the schedule");
     let total = u32::try_from(tokens).unwrap_or(u32::MAX);
     stack.forward(
         &forward,
@@ -583,8 +589,15 @@ fn stage_block(args: &Args) -> Result<()> {
     )?;
     let case = format!(
         "{{\"task\": \"t2va\", \"width\": {}, \"height\": {}, \"frames\": {}, \"text_tokens\": {}, \
-         \"layers\": {}, \"padded_tokens\": {}, \"hidden\": {}}}\n",
-        args.width, args.height, frames, request.text_tokens, args.layers, tokens, hidden
+         \"layers\": {}, \"padded_tokens\": {}, \"hidden\": {}, \"step\": {}}}\n",
+        args.width,
+        args.height,
+        frames,
+        request.text_tokens,
+        args.layers,
+        tokens,
+        hidden,
+        evaluation
     );
     std::fs::write(directory.join("case.json"), case)
         .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
