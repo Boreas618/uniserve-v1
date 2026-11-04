@@ -78,7 +78,7 @@ impl Partition {
         }
         for (dit, denoiser) in &config.denoisers {
             let heads = denoiser.transformer.num_attention_heads as usize;
-            if heads % self.ulysses_degree != 0 {
+            if !heads.is_multiple_of(self.ulysses_degree) {
                 return Err(Error::config(format!(
                     "the Ulysses degree {} does not divide the {} attention heads of {}",
                     self.ulysses_degree,
@@ -88,13 +88,13 @@ impl Partition {
             }
         }
         let text = &config.text_encoder;
-        if text.num_attention_heads as usize % self.tensor_parallel != 0 {
+        if !(text.num_attention_heads as usize).is_multiple_of(self.tensor_parallel) {
             return Err(Error::config(format!(
                 "the tensor-parallel degree {} does not divide the text encoder's {} query heads",
                 self.tensor_parallel, text.num_attention_heads
             )));
         }
-        if text.num_key_value_heads as usize % self.tensor_parallel != 0 {
+        if !(text.num_key_value_heads as usize).is_multiple_of(self.tensor_parallel) {
             return Err(Error::config(format!(
                 "the tensor-parallel degree {} does not divide the text encoder's {} key/value \
                  heads",

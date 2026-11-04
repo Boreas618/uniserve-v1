@@ -138,7 +138,7 @@ impl VisionConfig {
             num_position_embeddings: field::count(values, "num_position_embeddings", owner)?,
             deepstack_visual_indexes,
         };
-        if config.hidden_size % config.num_heads != 0 {
+        if !config.hidden_size.is_multiple_of(config.num_heads) {
             return Err(Error::config(format!(
                 "Qwen3-VL vision heads {} do not divide the hidden size {}",
                 config.num_heads, config.hidden_size
@@ -146,7 +146,7 @@ impl VisionConfig {
         }
         // The 2D rotary embedding rotates half of each head by the patch row and half by its
         // column, each as split-half pairs.
-        if (config.hidden_size / config.num_heads) % 4 != 0 {
+        if !(config.hidden_size / config.num_heads).is_multiple_of(4) {
             return Err(Error::config(format!(
                 "Qwen3-VL vision head width {} must split into two even rotary halves",
                 config.hidden_size / config.num_heads
@@ -302,7 +302,11 @@ impl TextEncoderConfig {
                 self.num_retained_layers, self.num_checkpoint_layers
             )));
         }
-        if self.num_attention_heads % self.num_key_value_heads != 0 || self.head_dim % 2 != 0 {
+        if !self
+            .num_attention_heads
+            .is_multiple_of(self.num_key_value_heads)
+            || !self.head_dim.is_multiple_of(2)
+        {
             return Err(Error::config(format!(
                 "H3 text encoder needs divisible group-query attention and even rotary \
                  dimensions: {} heads, {} key/value heads, head width {}",

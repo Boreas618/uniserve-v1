@@ -128,14 +128,14 @@ impl Config {
         };
         // A student's contract states the same two shifts next to its scheduler sidecars; a
         // checkpoint whose two statements disagree is refused rather than resolved silently.
-        if let Some(contract) = &layout.contract {
-            if contract.video_shift != shifts.video || contract.audio_shift != shifts.audio {
-                return Err(Error::config(format!(
-                    "fastvideo_inference.json shifts ({}, {}) disagree with the scheduler \
+        if let Some(contract) = &layout.contract
+            && (contract.video_shift != shifts.video || contract.audio_shift != shifts.audio)
+        {
+            return Err(Error::config(format!(
+                "fastvideo_inference.json shifts ({}, {}) disagree with the scheduler \
                      sidecars ({}, {})",
-                    contract.video_shift, contract.audio_shift, shifts.video, shifts.audio
-                )));
-            }
+                contract.video_shift, contract.audio_shift, shifts.video, shifts.audio
+            )));
         }
 
         let mut denoisers = BTreeMap::new();

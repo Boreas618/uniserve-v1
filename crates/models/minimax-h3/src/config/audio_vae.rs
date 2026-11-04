@@ -87,7 +87,7 @@ impl AudioVaeConfig {
                 self.resblock_dilation_sizes.len()
             )));
         }
-        if self.latent_dim % self.num_attention_heads != 0 {
+        if !self.latent_dim.is_multiple_of(self.num_attention_heads) {
             return Err(Error::config(format!(
                 "{owner}: latent width {} is not divisible by {} attention heads",
                 self.latent_dim, self.num_attention_heads
