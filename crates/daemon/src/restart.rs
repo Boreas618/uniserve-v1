@@ -743,6 +743,7 @@ async fn prepared_successor(
     let mut adopted = adopted.into_iter();
     let (handed, options, served, observer, client) =
         adopted.next().context("the takeover names no replicas")?;
+    let adopted_world = served.world;
     let leader = Arc::new(Leader::finish(
         &config,
         prepared,
@@ -752,6 +753,41 @@ async fn prepared_successor(
         observer,
         updates,
     )?);
+    // The successor adopts the epoch that serves: without its record the
+    // epoch layer would say no epoch serves and refuse the next switch
+    // ("nothing to switch from"), and without the process row it would
+    // number a new child at 1 again, under a live process's generation
+    // (§2.5, §7.4, §7.5). The record's build config and programs are the
+    // ones the adopted configuration fills; its generation is the launch
+    // generation the child reported, which is the identity it runs under.
+    {
+        let deployment = crate::epoch::Deployment::of(options.clone());
+        epoch_records.record(
+            adopted_world,
+            crate::epoch::EpochRecord {
+                build_config: deployment.build_config.clone(),
+                kernels: deployment.programs.kernels.clone(),
+                policy: deployment.programs.policy.clone(),
+                previous_kernels: std::collections::BTreeMap::new(),
+                previous_policy: None,
+                status: crate::epoch::Status::Serving,
+                generation: Some(handed.engine),
+                world: adopted_world,
+            },
+        );
+        let mut processes = epoch_records.processes();
+        processes.push(crate::epoch::ManagedProcess {
+            role: crate::epoch::Role::MainProcess,
+            group: crate::engine::control::ENGINE_GROUP.to_owned(),
+            rank: 0,
+            pid: None,
+            epoch: Some(adopted_world),
+            build: deployment.build_config.executable.clone(),
+            generation: handed.engine,
+            state: crate::epoch::ProcessState::Serving,
+        });
+        epoch_records.set_processes(processes);
+    }
     let first = Arc::clone(&leader.replicas()[0]);
     *crate::leader::locked(&first.config) = options;
     first.adopt_pause(handed.paused, handed.asleep, handed.sleep_paused);
