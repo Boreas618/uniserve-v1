@@ -345,6 +345,24 @@ impl Scheduler {
         let Some(mut state) = self.take_media_state(id) else {
             return;
         };
+        // The policy sees the request end, with how it ended, exactly as a token
+        // request's end is stated (`retire_token_request`): a media request the
+        // policy still holds resident is one it plans work for, and the
+        // mechanism refuses that work as naming a request it no longer holds.
+        let end = match &event {
+            DiffusionTerminal::Migrated(..) => scheduling::guest::End::Migratable,
+            DiffusionTerminal::Rejected(_) => scheduling::guest::End::Rejected,
+            DiffusionTerminal::Failed(_) => scheduling::guest::End::Failed,
+            DiffusionTerminal::Completed(_) => scheduling::guest::End::Completed,
+            DiffusionTerminal::Finished(reason) => match reason {
+                FinishReason::Cancelled => scheduling::guest::End::Cancelled,
+                FinishReason::Error => scheduling::guest::End::Failed,
+                _ => scheduling::guest::End::Completed,
+            },
+        };
+        let request = scheduling::guest::RequestId(id.0);
+        self.recorder.record(views::finished(request, end));
+        self.watchdog.finished(request);
         self.running_order.retain(|candidate| *candidate != id);
         // The pins of its stored trajectory end, and a store not yet carried
         // to its workers is aborted; so do its encoder outputs' pins and

@@ -881,3 +881,86 @@ impl<M: AsRef<[u8]> + Send + Sync + 'static> Session for VideoContentRun<M> {
     /// A successor owns the body from `offset` on.
     fn detach(&mut self) {}
 }
+
+#[cfg(test)]
+mod tests {
+    use std::task::Context;
+
+    use super::*;
+
+    /// Polls a body to its end and answers the bytes it wrote.
+    fn written(run: &mut impl Session) -> Vec<u8> {
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut bytes = Vec::new();
+        loop {
+            match run.poll_step(&mut cx) {
+                Poll::Ready(Step::Frames(frames)) => {
+                    for frame in frames {
+                        bytes.extend_from_slice(&frame);
+                    }
+                }
+                Poll::Ready(Step::Ended) => return bytes,
+                Poll::Ready(Step::Migrate) => panic!("a video body performs no migration"),
+                Poll::Pending => panic!("a video body never waits on anything"),
+            }
+        }
+    }
+
+    /// An artifact of three and a half chunks, so the last frame is short.
+    fn artifact() -> Arc<Vec<u8>> {
+        let len = VideoContentRun::<Vec<u8>>::CHUNK * 3 + VideoContentRun::<Vec<u8>>::CHUNK / 2;
+        Arc::new((0..len).map(|byte| (byte % 251) as u8).collect())
+    }
+
+    fn body(media: &Arc<Vec<u8>>) -> VideoContentRun<Vec<u8>> {
+        VideoContentRun::new(
+            "job-1".to_owned(),
+            "video/mp4".to_owned(),
+            Arc::clone(media),
+        )
+    }
+
+    #[test]
+    fn a_video_body_writes_the_artifact_once() {
+        let media = artifact();
+        assert_eq!(written(&mut body(&media)), media.as_slice());
+    }
+
+    /// The state a handoff carries is the byte the predecessor reached, and a
+    /// successor that resumes from it writes exactly the rest: no byte twice,
+    /// none missing.
+    #[test]
+    fn a_handed_over_video_body_writes_only_the_bytes_after_the_offset() {
+        let media = artifact();
+        let mut first = body(&media);
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let Poll::Ready(Step::Frames(frames)) = first.poll_step(&mut cx) else {
+            panic!("the first step writes a frame");
+        };
+        let first_frame = frames.iter().map(Bytes::len).sum::<usize>();
+        assert_eq!(first_frame, VideoContentRun::<Vec<u8>>::CHUNK);
+
+        let Some(Application::VideoContent(state)) = first.freeze() else {
+            panic!("a video body states itself");
+        };
+        assert_eq!(state.offset, first_frame as u64);
+        assert_eq!(state.job_id, "job-1");
+        assert_eq!(state.content_type, "video/mp4");
+
+        let mut successor = body(&media).from_offset(state.offset as usize);
+        assert_eq!(written(&mut successor), &media.as_slice()[first_frame..]);
+    }
+
+    /// A body frozen at its last byte, and one handed over beyond it, write
+    /// nothing and end: the successor of a finished download does not repeat
+    /// it.
+    #[test]
+    fn a_video_body_at_or_past_its_end_writes_nothing() {
+        let media = artifact();
+        let len = media.len();
+        assert!(written(&mut body(&media).from_offset(len)).is_empty());
+        assert!(written(&mut body(&media).from_offset(len + 1024)).is_empty());
+    }
+}

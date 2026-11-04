@@ -1323,6 +1323,22 @@ impl SchedulerHandle {
         }
     }
 
+    /// The handle a main process that holds its own devices serves from: the
+    /// configuration its launch file's facts state, over the executor's own
+    /// batch path (§2.4, §7.3).
+    ///
+    /// The three steps are the boot's whole shape and are stated here once so
+    /// that a call site cannot take two of them and forget the third:
+    /// [`EngineConfig::of`] derives the configuration from the facts — refusing
+    /// by name and source any fact it needs and the launch file does not state —
+    /// and [`Self::over_batches`] builds the scheduler over `batches`, whose
+    /// inventory is where the executor states the pools it serves. No worker
+    /// group is launched: the ranks are `batches`' own.
+    pub fn boot(facts: &RankFacts, batches: Arc<dyn Batches>) -> anyhow::Result<Self> {
+        let config = EngineConfig::of(facts)?;
+        Self::over_batches(config, batches)
+    }
+
     /// Builds the scheduler `config` states over `executor` and runs it.
     fn assemble(
         config: EngineConfig,

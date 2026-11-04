@@ -50,7 +50,11 @@ def _inverse_cdf_kernel(
     # never drawn.
     total = tl.sum(ordered_probabilities, axis=0)
     cumulative = tl.cumsum(ordered_probabilities, axis=0)
-    crossed = cumulative >= draw * total
+    # Strict: a candidate with zero mass leaves the cumulative where the previous one put
+    # it, so `>` never selects it, and a draw of zero lands on the first candidate that has
+    # mass rather than on the lowest id. The last candidate stays reachable because its
+    # cumulative is the total and every draw is below one.
+    crossed = cumulative > draw * total
     # The candidates are in ascending id order, so the first crossing holds the
     # lowest of the ids whose mass the draw reaches.
     token = tl.min(tl.where(crossed, ordered_ids, MAX_ID), axis=0)

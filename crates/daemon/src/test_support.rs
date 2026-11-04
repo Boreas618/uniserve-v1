@@ -94,10 +94,42 @@ pub(crate) fn sim_readout_engine(
     engine_over(model, configured_tokenizer(), vec![core], readout)
 }
 
-/// Starts a scheduler under `config` that drives `worker` in process.
+/// Starts a scheduler under `config` that drives `worker` in process, with the
+/// epoch's policy installed ([`policy_on`]): a scheduler with no policy decides
+/// nothing, and a fixture's engine has no Program Server to give it one.
 pub(crate) fn sim_core(config: EngineConfig, worker: SimEngine) -> SchedulerHandle {
-    SchedulerHandle::with_executor(config, Box::new(SimExecutor::new(worker)))
-        .expect("start a sim scheduler")
+    let core = SchedulerHandle::with_executor(config, Box::new(SimExecutor::new(worker)))
+        .expect("start a sim scheduler");
+    policy_on(&core);
+    core
+}
+
+/// Installs the tree's `fcfs` policy on `core` through the mechanism's own
+/// steps (§7.3 steps 2 and 3): `Precopy`, then the switchover at a batch
+/// boundary.
+///
+/// A deployed scheduler takes its policy from the Program Server while its
+/// epoch starts; a simulated one has none, so every fixture that submits a
+/// request needs this. The program is the real module this tree builds, with
+/// the arguments of `core`'s own batch capacity — the limits it declares fit
+/// the ceilings the mechanism checks them against, so the precopy is answered
+/// with success rather than a refusal that would hide behind a fixture.
+///
+/// Requires `SCHED_POLICY_WASM`; see [`engine::packaged_policy`], whose panic
+/// states the command that builds the module.
+pub(crate) fn policy_on(core: &SchedulerHandle) {
+    let capacity = engine::BatchCapacity::of(core.info());
+    let (program, module) = engine::packaged_policy(capacity);
+    let source: std::sync::Arc<dyn engine::PolicySource + Send + Sync> =
+        std::sync::Arc::new(engine::PolicyBytes::new(module));
+    core.precopy_policy(program, source)
+        .recv()
+        .expect("the policy precopy is answered")
+        .expect("the packaged policy's limits fit the scheduler's capacity");
+    core.switchover_policy()
+        .recv()
+        .expect("the switchover is answered")
+        .expect("the switchover applies at the next batch boundary");
 }
 
 /// Builds an engine for a model with `parameters` over started schedulers,

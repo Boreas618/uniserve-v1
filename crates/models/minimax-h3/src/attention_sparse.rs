@@ -225,9 +225,10 @@ impl Sparse {
             scratch.pooled_key,
             scratch.pooled_value,
         )?;
-        for padded in [query, key, value] {
-            self.tiles.zero_padding(f, padded, sizes)?;
-        }
+        // `prepare` already stored zeros past each tile's valid size, for all three of Q, K and V,
+        // before it pooled them (`vsa_prepare_tiles.py:812-831`), so the fine attention reads the
+        // same zeroed rows without a second pass: a `zero_padding` per tensor here would repeat
+        // three launches of every layer of every evaluation to write what is already written.
         self.tiles
             .scores(f, scratch.pooled_query, scratch.pooled_key, scratch.scores)?;
         // `segment_keep` is over-allocated to the tile count and filled by segment index, as the
