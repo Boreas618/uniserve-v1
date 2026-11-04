@@ -346,12 +346,6 @@ pub(crate) fn encoding_id(key: &[u8; 32]) -> EncodingId {
     EncodingId(u64::from_be_bytes(head))
 }
 
-/// The page a request holds its cached prefix in, per cache group: the pages
-/// whose hashes the request reused or published.
-fn prefix_pages(state: &RequestState) -> usize {
-    state.prefix_published.iter().copied().min().unwrap_or(0)
-}
-
 // ---------------------------------------------------------------------------
 // Views from facts
 // ---------------------------------------------------------------------------
@@ -506,33 +500,6 @@ pub(crate) fn call_view(request: RequestKey, kind: CallKind) -> CallView {
         request: ViewRequestId(request.request_id.0),
         phase: phase_id(phase),
         kind: phase,
-    }
-}
-
-/// The view of one DP rank, for `route`.
-pub(crate) fn rank_view(index: usize, in_flight: u32, alive: bool) -> RankView {
-    RankView {
-        index,
-        in_flight,
-        alive,
-    }
-}
-
-/// The views of the ranks, in scheduler-index order.
-pub(crate) fn ranks(loads: impl IntoIterator<Item = (u32, bool)>) -> Vec<RankView> {
-    loads
-        .into_iter()
-        .enumerate()
-        .map(|(index, (in_flight, alive))| rank_view(index, in_flight, alive))
-        .collect()
-}
-
-/// The load an `experts` decision balances.
-pub(crate) fn expert_load(ranks: usize, experts: usize, tokens: Vec<u64>) -> ExpertLoad {
-    ExpertLoad {
-        ranks,
-        experts,
-        tokens,
     }
 }
 
