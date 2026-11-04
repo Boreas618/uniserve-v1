@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""Run `page_conversion`'s kernel on Triton's interpreter and check what it decodes.
+"""Check `page_conversion`'s kernel: its scale rows on Triton's interpreter, its decode on a device.
 
-    crates/program-server/python/.venv/bin/python page_conversion_check.py
+    crates/program-server/python/.venv/bin/python page_conversion_check.py            # interpreter
+    crates/program-server/python/.venv/bin/python page_conversion_check.py --device   # a device
+
+The script has two halves because the two things it checks lie in different places.
 
 An imported rank's cache arrives as raw keys and values in the source's own element type, with one
 FP32 scale per source page and head group when the source stores FP8. This program decodes one field
@@ -23,6 +26,13 @@ be wrong without any build noticing:
 
 The scratch is `20·E + 8·S` bytes, and this check asserts every byte it does not name is untouched:
 the FP32 block past the span, the raw areas, and the scale rows.
+
+**The halves.** The scale-row arithmetic is integer and exact in FP32, so the interpreter runs it and
+the answer is a statement about the kernel. The decode is not: Triton's interpreter garbles an E4M3
+store (measured: `-126.4941` reads back `-64`, where the format says `-128`), so a green on an FP8
+source would be a statement about the tool, and the cases that decode E4M3 or round to a narrow
+logical type run only under `--device`. Without a device the script runs its half and says in one
+sentence which cases it left, and why.
 """
 
 import argparse
@@ -33,13 +43,15 @@ import pathlib
 import struct
 import sys
 
-os.environ.setdefault("TRITON_INTERPRET", "1")
+#: Triton reads `TRITON_INTERPRET` when it is imported, so the mode is chosen from the command line
+#: before the import below: `--device` compiles for the device, anything else interprets.
+DEVICE = "--device" in sys.argv
+if not DEVICE:
+    os.environ["TRITON_INTERPRET"] = "1"
 
 import torch  # noqa: E402  (after TRITON_INTERPRET, which Triton reads at import)
 import triton  # noqa: E402
 import triton.language as tl  # noqa: E402
-
-print("page_conversion_check runs Triton's interpreter (TRITON_INTERPRET=1)")
 
 FIELD_KEYS = 0
 FIELD_VALUES = 1
@@ -143,8 +155,13 @@ def truncation_model(values, compute):
     return (narrow & ~0x1FFF).view(torch.float16).to(torch.float32)
 
 
-def run(module, case):
-    """One launch, and what the kernel wrote against the reference."""
+def run(module, case, models=("nearest", "truncated")):
+    """One launch, and what the kernel wrote against the reference.
+
+    `models` is the roundings the run may show: the operator's rule is round-to-nearest through the
+    logical type, and only the interpreter is allowed the truncating model as well, because a narrow
+    store through it truncates.
+    """
     scratch, keys, values, scales, elements, scale_entries = case_scratch(case)
     original = scratch.clone()
     source, source_bytes, _ = SOURCES[case["source"]]
@@ -201,6 +218,8 @@ def run(module, case):
     truncated = truncation_model(exact, case["compute"])
     named = None
     for name, candidate in (("nearest", nearest), ("truncated", truncated)):
+        if name not in models:
+            continue
         if torch.equal(got, candidate):
             named = name
             break
@@ -212,7 +231,7 @@ def run(module, case):
             f"first at {position}: {float(got.reshape(-1)[position])!r} vs "
             f"{float(nearest.reshape(-1)[position])!r} (nearest) or "
             f"{float(truncated.reshape(-1)[position])!r} (truncated)")
-    if torch.equal(nearest, truncated):
+    if len(models) > 1 and torch.equal(nearest, truncated):
         raise SystemExit(
             f"{where}: the nearest and truncating models come out identical, so this case cannot "
             f"tell which rounding the kernel takes and must be rebuilt with a value that sits "
@@ -261,6 +280,19 @@ CASES = [
     dict(what="dense bf16 keys to f32", field=FIELD_KEYS, source="bf16", compute="f32",
          scaled=False, head_dim=64, heads=4, layers=32, count=2, source_block_size=16,
          source_offset=0, scale_heads=0, pages=1, seed=16),
+    # The scale-row rule in exact arithmetic: a bf16 source multiplied by an FP32 factor is an FP32
+    # product with no rounding to argue about, so the interpreter's answer is the kernel's.
+    dict(what="bf16 keys to f32 from inside a later page", field=FIELD_KEYS, source="bf16",
+         compute="f32", scaled=True, head_dim=64, heads=4, layers=32, count=3,
+         source_block_size=16, source_offset=36, scale_heads=4, pages=1, seed=17),
+    dict(what="bf16 values to f32 across two page rows", field=FIELD_VALUES, source="bf16",
+         compute="f32", scaled=True, head_dim=64, heads=4, layers=32, count=2,
+         source_block_size=1, source_offset=5, scale_heads=2, pages=2, seed=18),
+]
+
+#: The cases the interpreter can answer: no E4M3 store, and no rounding into a narrow type.
+INTERPRETER_CASES = [
+    case for case in CASES if case["source"] == "bf16" and case["compute"] == "f32"
 ]
 
 
@@ -272,17 +304,38 @@ def main():
         default=pathlib.Path(__file__).resolve().parents[1],
         help="the package directory holding src/page_conversion.py",
     )
+    parser.add_argument(
+        "--device",
+        action="store_true",
+        help="compile for the device and run every case, including the ones that decode E4M3 or "
+        "round into a narrow logical type",
+    )
     options = parser.parse_args()
+    if options.device and not torch.cuda.is_available():
+        raise SystemExit(
+            "the device half decodes E4M3 and rounds into a narrow type, which needs the device the "
+            "module was built for; run this without --device for the scale-row half"
+        )
     module = load_kernel(options.package)
+    cases = CASES if options.device else INTERPRETER_CASES
+    models = ("nearest",) if options.device else ("nearest", "truncated")
     checked = 0
-    models = {}
-    for case in CASES:
-        count, model = run(module, case)
+    seen = {}
+    for case in cases:
+        count, model = run(module, case, models)
         checked += count
-        models[model] = models.get(model, 0) + 1
-    named = ", ".join(f"{model}: {count}" for model, count in sorted(models.items()))
-    print(f"ok: {checked} decoded values over {len(CASES)} cases, every one exactly the reference "
-          f"and every byte outside the FP32 block untouched — {named}")
+        seen[model] = seen.get(model, 0) + 1
+    named = ", ".join(f"{model}: {count}" for model, count in sorted(seen.items()))
+    where = "the device" if options.device else "Triton's interpreter"
+    print(f"ok on {where}: {checked} decoded values over {len(cases)} cases, every one the "
+          f"reference and every byte outside the FP32 block untouched — {named}")
+    if not options.device:
+        left = len(CASES) - len(cases)
+        print(
+            f"{left} cases are left for --device: they decode E4M3 or round into a narrow logical "
+            f"type, and Triton's interpreter garbles an E4M3 store, so a green from it would be a "
+            f"statement about the tool and not about the kernel"
+        )
     return 0
 
 
