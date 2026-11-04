@@ -773,6 +773,19 @@ def cases(operator, flags):
                 "seed": 2,
             },
             {
+                # The same row at the deployment's default bound: the quota the equal keys hold is
+                # far smaller than the row, which is the case a rank computed per tile corrupts from
+                # the low slots up, and the case one module has to serve once the key names no width.
+                "label": "the deployment's default bound out of the same vocabulary",
+                "dtype": flags.dtype,
+                "rows": flags.rows,
+                "vocabulary": flags.vocabulary,
+                "width": 128,
+                "ties": False,
+                "masked_tail": False,
+                "seed": 4,
+            },
+            {
                 "label": "a masked -inf tail, which is never kept over a real candidate",
                 "dtype": flags.dtype,
                 "rows": 2,
