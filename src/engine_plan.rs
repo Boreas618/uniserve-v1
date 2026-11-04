@@ -37,7 +37,7 @@ use ipc::PhaseId;
 use ops::DType;
 use ops::Generation;
 use platform::DeviceId;
-use proto::request::GraphPolicy;
+use proto::request::{GenerationFeatures, GenerationLimits, GraphPolicy};
 use program_server::Target;
 
 use crate::engine_main::Launch;
@@ -297,6 +297,7 @@ impl EpochPlan {
         model: &qwen3_moe::Qwen3Moe,
     ) -> Result<engine::RankFacts> {
         let (rows, tokens) = self.buckets.bounds();
+        let control = checkpoint_tokens(&self.checkpoint)?;
         // The graph sizes this rank captures, which is the tier a plan's batch must fit (§4.5).
         let graph_tiers = self
             .buckets
@@ -347,10 +348,18 @@ impl EpochPlan {
                 )?),
             },
             graph_tiers: Some(graph_tiers),
-            bos: None,
-            eos: None,
-            end_of_image: None,
-            generation_limits: None,
+            // The tokenizer facts are the checkpoint's (`checkpoint_tokens`): a launch file states
+            // where the checkpoint is, not what its vocabulary means, and the engine schedules
+            // against the ids themselves.
+            bos: Some(control.bos),
+            eos: Some(control.eos),
+            // A causal LM encodes no image, so no token closes encoded image content. `0` is the
+            // daemon's own value for a profile that states no generation controls:
+            // `crates/daemon/src/leader.rs:2400`, `let end_of_image = controls.map_or(0, |value|
+            // value.end_of_image);`. It is the absence of a token, not an invented one.
+            end_of_image: Some(0),
+            // What one request may be given to generate on this model; see `understanding_limits`.
+            generation_limits: Some(understanding_limits()),
             max_model_len: self.build.max_model_len.map(|length| length.get()),
             watchdog_timeout: Some(self.watchdog_timeout()),
         })
@@ -642,6 +651,166 @@ pub(crate) fn rank_report(
     })
 }
 
+/// The control tokens a checkpoint states of itself: what begins its sequences and what ends them.
+#[derive(Debug)]
+struct ControlTokens {
+    /// The token that begins a sequence.
+    bos: u32,
+    /// The tokens that terminate generation, the primary one first.
+    eos: Vec<u32>,
+}
+
+/// Reads the control tokens from the checkpoint the launch file names.
+///
+/// A launch file states where the checkpoint is, not what its vocabulary means, so the ids come
+/// from the checkpoint's own files, in the order the engine reads them:
+///
+/// - `generation_config.json` states the generation defaults, and its `eos_token_id` is the primary
+///   end of generation;
+/// - `config.json` states the architecture's `bos_token_id` and `eos_token_id`, which may be one id
+///   or a list;
+/// - `tokenizer_config.json` names its special tokens and maps each to an id in
+///   `added_tokens_decoder`.
+///
+/// Qwen3 states no beginning-of-sequence token (`"bos_token_id": null`), so the beginning a text
+/// model has is the tokenizer's own end of text, `<|endoftext|>`, read from the file that names it
+/// rather than written here as a constant - and it joins the eos list for the same reason: a
+/// completion that emits the vocabulary's end of text must stop, and the engine acts only on the
+/// ids it is given.
+///
+/// The primary end of generation is `eos[0]`, because that is the token the engine gives a
+/// completion that commits none (`crates/daemon/src/leader.rs::special_token_ids`, whose rule this
+/// follows); the rest follow ascending.
+fn checkpoint_tokens(dir: &Path) -> Result<ControlTokens> {
+    let config = read_json(&dir.join("config.json"))?;
+    // Both files are optional: a checkpoint may state its generation defaults in the architecture's
+    // configuration alone, and an architecture that states a beginning states it there.
+    let generation = read_json(&dir.join("generation_config.json")).ok();
+    let tokenizer = read_json(&dir.join("tokenizer_config.json")).ok();
+    let end_of_text = tokenizer.as_ref().and_then(|value| added_token(value, "<|endoftext|>"));
+
+    let bos = token_id(config.get("bos_token_id"))
+        .or_else(|| generation.as_ref().and_then(|value| token_id(value.get("bos_token_id"))))
+        .or(end_of_text)
+        .with_context(|| {
+            format!(
+                "{} states no beginning-of-sequence token: `config.json` and \
+                 `generation_config.json` state no `bos_token_id`, and `tokenizer_config.json` \
+                 names no `<|endoftext|>`",
+                dir.display()
+            )
+        })?;
+
+    let mut eos = Vec::new();
+    for value in [
+        generation.as_ref().and_then(|value| value.get("eos_token_id")),
+        config.get("eos_token_id"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for id in token_ids(value) {
+            if !eos.contains(&id) {
+                eos.push(id);
+            }
+        }
+    }
+    if let Some(end_of_text) = end_of_text {
+        if !eos.contains(&end_of_text) {
+            eos.push(end_of_text);
+        }
+    }
+    anyhow::ensure!(
+        !eos.is_empty(),
+        "{} states no end-of-generation token: neither `config.json` nor \
+         `generation_config.json` states `eos_token_id`, and `tokenizer_config.json` names no \
+         `<|endoftext|>`",
+        dir.display()
+    );
+    Ok(ControlTokens { bos, eos })
+}
+
+/// Reads one JSON file of a checkpoint.
+fn read_json(path: &Path) -> Result<serde_json::Value> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+}
+
+/// One token id, whether the file writes it as a number or as a list of numbers.
+fn token_id(value: Option<&serde_json::Value>) -> Option<u32> {
+    let value = value?;
+    match value {
+        serde_json::Value::Number(number) => number.as_u64().and_then(|id| u32::try_from(id).ok()),
+        serde_json::Value::Array(ids) => ids
+            .first()
+            .and_then(|id| id.as_u64())
+            .and_then(|id| u32::try_from(id).ok()),
+        _ => None,
+    }
+}
+
+/// Every token id a field states, in the order it writes them; a single number is a list of one.
+fn token_ids(value: &serde_json::Value) -> Vec<u32> {
+    match value {
+        serde_json::Value::Number(number) => number
+            .as_u64()
+            .and_then(|id| u32::try_from(id).ok())
+            .into_iter()
+            .collect(),
+        serde_json::Value::Array(ids) => ids
+            .iter()
+            .filter_map(|id| id.as_u64())
+            .filter_map(|id| u32::try_from(id).ok())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The id a tokenizer gives the special token whose text is `content`.
+///
+/// The tokenizer states its added tokens as a map from id to token in `added_tokens_decoder`, and
+/// older checkpoints state them as a list of `{id, content}` in `added_tokens`; both are read, so a
+/// checkpoint of either shape resolves the same token.
+fn added_token(tokenizer: &serde_json::Value, content: &str) -> Option<u32> {
+    if let Some(decoder) = tokenizer
+        .get("added_tokens_decoder")
+        .and_then(serde_json::Value::as_object)
+    {
+        for (id, token) in decoder {
+            if token.get("content").and_then(serde_json::Value::as_str) == Some(content) {
+                return id.parse::<u32>().ok();
+            }
+        }
+    }
+    tokenizer
+        .get("added_tokens")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .find(|token| token.get("content").and_then(serde_json::Value::as_str) == Some(content))
+        .and_then(|token| token.get("id"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|id| u32::try_from(id).ok())
+}
+
+/// What one request may be given to generate on a text model.
+///
+/// This model understands a prompt and generates tokens, and it encodes no vision features and
+/// denoises no latents, so the served feature is `GenerationFeatures::UNDERSTANDING` and every
+/// capacity is zero. The two nonzero figures are the Qwen3 profile's own
+/// (`crates/frontend/src/model/generation.rs`, its `ModelParameters::Qwen3` arm:
+/// `GenerationLimits { latent_downsample: 1, max_cfg_branches: 1, ..Default::default() }`):
+/// a zero downsample is a divisor and a zero branch count admits no request at all, so the model
+/// that has no media still states both as one.
+fn understanding_limits() -> GenerationLimits {
+    GenerationLimits {
+        features: GenerationFeatures::UNDERSTANDING,
+        latent_downsample: 1,
+        max_cfg_branches: 1,
+        ..GenerationLimits::default()
+    }
+}
+
 /// The element type the cache pool stores, from the deployment when it states one.
 ///
 /// An unstated cache dtype is the model's own activation dtype, which is what its layers compute
@@ -790,3 +959,85 @@ impl Placement {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A checkpoint directory holding the files a test states.
+    fn checkpoint(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let directory = tempfile::tempdir().expect("a temporary checkpoint directory");
+        for (name, body) in files {
+            std::fs::write(directory.path().join(name), body).expect("writing a checkpoint file");
+        }
+        directory
+    }
+
+    #[test]
+    fn a_qwen3_checkpoint_states_its_ends_and_its_tokenizer_names_the_beginning() {
+        let directory = checkpoint(&[
+            ("config.json", r#"{"bos_token_id": null, "eos_token_id": 151645}"#),
+            (
+                "tokenizer_config.json",
+                r#"{"added_tokens_decoder": {
+                    "151643": {"content": "<|endoftext|>"},
+                    "151645": {"content": "<|im_end|>"}
+                }}"#,
+            ),
+        ]);
+
+        let control = checkpoint_tokens(directory.path()).expect("the checkpoint's control tokens");
+
+        // The architecture states no beginning, so the tokenizer's own end of text is the
+        // beginning a text model has; the stated end of generation comes first and the vocabulary's
+        // end of text follows it, because a completion that emits it must stop.
+        assert_eq!(control.bos, 151643);
+        assert_eq!(control.eos, vec![151645, 151643]);
+    }
+
+    #[test]
+    fn the_stated_beginning_wins_and_the_generation_default_orders_the_ends() {
+        let directory = checkpoint(&[
+            ("config.json", r#"{"bos_token_id": 5, "eos_token_id": [3, 2]}"#),
+            ("generation_config.json", r#"{"eos_token_id": 2}"#),
+        ]);
+
+        let control = checkpoint_tokens(directory.path()).expect("the checkpoint's control tokens");
+
+        assert_eq!(control.bos, 5, "the architecture's own beginning is the one it means");
+        // `eos[0]` is what the engine gives a completion that commits none, so the generation
+        // default leads and the architecture's remaining ids follow, each stated once.
+        assert_eq!(control.eos, vec![2, 3]);
+    }
+
+    #[test]
+    fn a_checkpoint_that_states_no_end_of_generation_is_refused_by_name() {
+        let directory = checkpoint(&[("config.json", r#"{"bos_token_id": 5}"#)]);
+
+        let error = checkpoint_tokens(directory.path()).expect_err("an unstated eos token");
+        let message = format!("{error:#}");
+
+        assert!(
+            message.contains("states no end-of-generation token"),
+            "the refusal names what is missing: {message}"
+        );
+        assert!(
+            message.contains("config.json"),
+            "the refusal names the file that was read: {message}"
+        );
+    }
+
+    #[test]
+    fn a_text_model_states_understanding_and_no_media_capacity() {
+        let limits = understanding_limits();
+
+        assert!(limits.features.contains(GenerationFeatures::UNDERSTANDING));
+        assert!(!limits.features.contains(GenerationFeatures::IMAGE_GENERATION));
+        assert!(!limits.features.contains(GenerationFeatures::VISION_ENCODE));
+        // The two figures the Qwen3 profile states as one, because zero divides and admits nothing.
+        assert_eq!(limits.latent_downsample, 1);
+        assert_eq!(limits.max_cfg_branches, 1);
+        assert_eq!(limits.max_latent_units, 0);
+        assert_eq!(limits.max_vit_grid_tokens, 0);
+    }
+}
