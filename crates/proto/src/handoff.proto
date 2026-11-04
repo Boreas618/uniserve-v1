@@ -1,0 +1,480 @@
+// The handoff interface: what a daemon hands the process that succeeds it so
+// that the responses it was writing go on without a break (specs/worker.md
+// §7.5.1).
+//
+// A successor daemon of the same or another build takes the deployment's
+// listening socket, the connections of the responses in flight and the state
+// of those responses from the process it replaces. Each response stops at an
+// event boundary: the predecessor produced every body frame of the events it
+// consumed, and what it did not write to the socket travels here as bytes.
+// The successor writes those bytes, submits the request's continuation to the
+// engine that serves next and produces the frames of the events after it, so
+// the client reads one continuous response.
+//
+// Like `request.proto` and `process.proto`, this schema changes only by
+// additions: a field is never renumbered or removed. A successor of a later
+// build reads the state of an earlier one with the defaults of what it lacked;
+// a predecessor whose successor cannot read a state keeps that response and
+// serves it to its end.
+
+syntax = "proto3";
+
+package uniserve.handoff;
+
+// One response in flight, stopped at an event boundary.
+message Stream {
+  // The connection it is written on.
+  Http http = 1;
+  // The request's identity, as the deployment named it.
+  string request_id = 2;
+  // What the response is made of, as the route that began it.
+  oneof application {
+    // A chat completion streamed as server-sent events (`stream: true`).
+    ChatStream chat_stream = 3;
+    // One chat completion answered as a single JSON body (`stream: false`).
+    ChatResponse chat_response = 4;
+    // A video job's artifact, streamed from the job's retained media.
+    VideoContent video_content = 5;
+  }
+}
+
+// The HTTP/1.1 exchange of the response. The socket itself travels beside the
+// state: the successor holds the same socket object, with the bytes the kernel
+// buffered and its sequence numbers, so only the bytes still in this process
+// travel here.
+message Http {
+  // Whether the connection takes another request after this response.
+  bool keep_alive = 1;
+  // Response bytes this process produced and has not written to the socket:
+  // the head when it is not written yet, whole body frames, or the beginning
+  // of one. They continue the byte stream exactly where the socket leaves off,
+  // so the successor writes them before any frame of its own.
+  bytes unwritten = 2;
+  // Request bytes this process read from the socket and did not process, such
+  // as a pipelined request after this response. The successor reads them as
+  // its own, before the bytes the kernel still holds.
+  bytes read_ahead = 3;
+  // Response bytes this process wrote to the socket, and body frames it
+  // produced, for the record of the pause.
+  uint64 written = 4;
+  uint64 frames = 5;
+  // Whether the response body is framed in chunks. Every frame is buffered
+  // whole, so the successor goes on writing frames where this process stopped
+  // between two of them.
+  bool chunked = 6;
+  // The response body's length, for a body the head declares one for.
+  optional uint64 content_length = 7;
+}
+
+// A chat completion streamed as server-sent events, stopped at an event
+// boundary.
+message ChatStream {
+  // The request as this process submitted it last, with the tokens it
+  // generated (`uniserve.request.GenerationRequest`): the successor submits it
+  // again to the engine that serves next.
+  bytes request = 1;
+  // How input processing lowered the request into the response, which the
+  // successor reconstructs instead of lowering the request again: a later
+  // build lowers it differently.
+  Lowering lowering = 2;
+  // The incremental detokenizer and the stop-string decisions it made.
+  Decode decode = 3;
+  // The reasoning and tool-call parsers' state.
+  Processor processor = 4;
+  // The assistant blocks the response assembled so far.
+  Assembly assembly = 5;
+  // The OpenAI chunks and server-sent events the response produced.
+  ChatChunks chunks = 6;
+  // Engine events this process consumed, and the token count they carried:
+  // the position on the request interface this state continues from.
+  uint64 consumed_events = 7;
+  uint64 consumed_tokens = 8;
+  // Whether the terminal usage chunk (stream_options.include_usage) is still
+  // owed to the client.
+  bool usage_owed = 9;
+}
+
+// One chat completion answered as a single JSON body.
+message ChatResponse {
+  // The request as submitted, as `ChatStream.request`.
+  bytes request = 1;
+  // How input processing lowered the request, as `ChatStream.lowering`.
+  Lowering lowering = 2;
+  // The incremental detokenizer and the stop-string decisions.
+  Decode decode = 3;
+  // The parsers' state.
+  Processor processor = 4;
+  // The assistant blocks assembled so far.
+  Assembly assembly = 5;
+  // What the non-streaming response collected: the message, token ids,
+  // logprobs, images and usage.
+  ChatCollection collection = 6;
+  uint64 consumed_events = 7;
+  uint64 consumed_tokens = 8;
+}
+
+// A video job's artifact streamed as the response body.
+message VideoContent {
+  // The job whose retained media the body streams.
+  string job_id = 1;
+  // The body's content type, as the artifact states it.
+  string content_type = 2;
+  // Bytes of the body this process wrote; the successor writes from here on.
+  uint64 offset = 3;
+}
+
+// What input processing decided for a response: the values a successor needs
+// to finish it without lowering the request again.
+message Lowering {
+  // The prompt's token identifiers, which seed incremental decoding.
+  repeated uint32 prompt_token_ids = 1;
+  // Incremental detokenization and stop strings, the stop strings still to
+  // match.
+  TextDecode decode_options = 2;
+  // Whether prompt log-probabilities were requested.
+  bool prompt_logprobs = 3;
+  // Whether generated-token log-probabilities were requested.
+  bool logprobs = 4;
+  // The output parsers the request's model family chose.
+  Parser parser = 5;
+  // The response's OpenAI fields.
+  ChatResponseOptions response = 6;
+  // How long the request took to reach the engine, in microseconds.
+  uint64 compile_us = 7;
+  // When the request entered the server, as microseconds since the UNIX
+  // epoch: the origin of every timing the response reports.
+  uint64 started_unix_us = 8;
+}
+
+// Incremental detokenization and stop strings of one generation.
+message TextDecode {
+  // Whether tokenizer special tokens are omitted from the text.
+  bool skip_special_tokens = 1;
+  // Whether a matched stop string stays in the emitted text.
+  bool include_stop_str_in_output = 2;
+  // The stop strings not matched yet.
+  repeated string stop_strings = 3;
+  // Generated tokens before stop strings can end the request.
+  uint32 min_tokens = 4;
+}
+
+// The output parsers of a request, as its model family chose them.
+message Parser {
+  // Which parser set the request uses.
+  enum Kind {
+    // Neither reasoning nor tool calls are parsed.
+    PARSER_KIND_NONE = 0;
+    // Qwen3's `<think>` reasoning and Qwen2.5's JSON tool calls.
+    PARSER_KIND_QWEN3 = 1;
+    // Gemma-4's thought channels and native tool calls.
+    PARSER_KIND_GEMMA4 = 2;
+    // SenseNova's delimited reasoning and its profile's output filter.
+    PARSER_KIND_SENSE_NOVA = 3;
+  }
+
+  Kind kind = 1;
+  // Whether reasoning is parsed.
+  bool parse_reasoning = 2;
+  // Whether tool calls are parsed.
+  bool parse_tools = 3;
+}
+
+// The OpenAI fields every chunk and the final body of a chat response carry.
+message ChatResponseOptions {
+  // The response identifier.
+  string request_id = 1;
+  // The model name the response reports.
+  string response_model = 2;
+  // Whether streamed responses carry a terminal usage chunk.
+  bool include_usage = 3;
+  // Whether generated-token logprobs were requested.
+  bool requested_logprobs = 4;
+  // Whether prompt-token logprobs were requested.
+  bool include_prompt_logprobs = 5;
+  // Whether parsed reasoning is exposed.
+  bool include_reasoning = 6;
+  // Whether token identifiers are exposed.
+  bool return_token_ids = 7;
+  // Whether textual tokens are token-identifier placeholders.
+  bool return_tokens_as_token_ids = 8;
+  // The response timestamp, in seconds since the UNIX epoch, shared by every
+  // chunk.
+  uint64 created = 9;
+}
+
+// The incremental detokenizer and the stop-string decisions of the events
+// consumed so far.
+message Decode {
+  IncrementalDecode decoder = 1;
+  // The stop strings still to match: this process removed the ones it matched,
+  // which held back the text after them.
+  repeated string stop_strings = 2;
+  // Prompt logprob positions received so far.
+  repeated PositionLogprobs prompt_positions = 3;
+  // The engine's scheduling event, in UNIX seconds.
+  optional double queued_at = 4;
+  optional double scheduled_at = 5;
+  // Whether the request's start was emitted, once scheduling and the prompt
+  // metadata allowed it.
+  bool started = 6;
+  // A generated token awaiting its logprobs event.
+  optional uint32 pending_token = 7;
+  // Generated text tokens the decoder consumed.
+  uint64 output_tokens = 8;
+}
+
+// The incremental detokenizer's window and the text it published but no
+// caller read yet.
+message IncrementalDecode {
+  // The token window the decoder decodes on every push.
+  repeated uint32 ids = 1;
+  // The window's decode at the last emit or seed.
+  string prefix = 2;
+  // Leading window tokens the next emit drops.
+  uint64 prefix_index = 3;
+  // All text the decoder emitted, which stop strings are matched in.
+  string cumulative_output = 4;
+  // The offset in `cumulative_output` up to which callers read text.
+  uint64 output_index = 5;
+  // Whether the prompt seeded the window.
+  bool prompt_seeded = 6;
+  // Consecutive pushes that emitted nothing, bounded by the decoder.
+  uint64 pending_since_emit = 7;
+  // The decoder's construction: whether special tokens are skipped, and how
+  // many trailing bytes it withholds for stop-string matching.
+  bool skip_special_tokens = 8;
+  uint64 min_bytes_to_buffer = 9;
+}
+
+// The reasoning and tool-call parsers of a request.
+message Processor {
+  // The reasoning parser, absent when the request parses no reasoning.
+  optional Reasoning reasoning = 1;
+  // The tool-call stage, absent when the request parses no tool calls.
+  optional ToolStage tools = 2;
+}
+
+// The delimited reasoning state machine's state. Its delimiters, labels and
+// region default are configuration: the request's model family restates them
+// when the successor rebuilds the parser.
+message Reasoning {
+  // Whether the text parsed so far is inside a reasoning section.
+  bool in_reasoning = 1;
+  // Whether a start delimiter was parsed and its section label may follow.
+  bool label_pending = 2;
+  // Text a later delta may still complete into a delimiter or label.
+  string buffer = 3;
+}
+
+// The tool-call stage of the output processor.
+message ToolStage {
+  // Whether parsing failed and later text bypasses the parser.
+  bool parser_failed = 1;
+  // The parser-local index of the tool call later arguments extend.
+  optional uint64 open_call_index = 2;
+  // The parser behind the stage, with its state.
+  oneof parser {
+    JsonToolCall json = 3;
+    Gemma4ToolCall gemma4 = 4;
+  }
+}
+
+// The marker-wrapped JSON tool-call parser's state.
+message JsonToolCall {
+  // Input no complete event consumed.
+  string buffer = 1;
+  // Which part of the grammar the parser is in.
+  JsonToolMode mode = 2;
+  // The tool call later arguments extend.
+  optional uint64 active_tool_index = 3;
+  // Tool calls published since the last reset; the next call's index.
+  uint64 emitted_tool_count = 4;
+}
+
+// A point of the JSON tool-call grammar.
+enum JsonToolModeKind {
+  JSON_TOOL_MODE_TEXT = 0;
+  JSON_TOOL_MODE_HEADER = 1;
+  JSON_TOOL_MODE_ARGUMENTS = 2;
+}
+
+message JsonToolMode {
+  JsonToolModeKind kind = 1;
+  // The arguments object's lexical scan, inside JSON_TOOL_MODE_ARGUMENTS.
+  optional JsonObjectScan scan = 2;
+}
+
+// The lexical scan of one raw JSON arguments object.
+message JsonObjectScan {
+  uint64 object_depth = 1;
+  uint64 array_depth = 2;
+  // Whether the scan is inside a string literal.
+  bool in_string = 3;
+  // Whether the previous string byte was an unescaped backslash.
+  bool escape = 4;
+  enum Phase {
+    JSON_OBJECT_PHASE_INITIAL = 0;
+    JSON_OBJECT_PHASE_SCANNING = 1;
+    JSON_OBJECT_PHASE_COMPLETE = 2;
+  }
+  Phase phase = 5;
+}
+
+// The Gemma-4 native tool-call parser's state.
+message Gemma4ToolCall {
+  // Input no complete event consumed.
+  string buffer = 1;
+  // Calls published since the last reset; the next call's index.
+  uint64 published_calls = 2;
+  enum Phase {
+    GEMMA4_TOOL_PHASE_TEXT = 0;
+    GEMMA4_TOOL_PHASE_PREFIX = 1;
+    GEMMA4_TOOL_PHASE_NAME = 2;
+    GEMMA4_TOOL_PHASE_ARGUMENTS = 3;
+  }
+  Phase phase = 3;
+  // Inside GEMMA4_TOOL_PHASE_ARGUMENTS: whether the scan is between string
+  // delimiters, where markers are string text.
+  bool in_string = 4;
+  // Inside a call: the byte offset in the call text the scan reached.
+  uint64 offset = 5;
+}
+
+// The assistant blocks a chat response assembled.
+message Assembly {
+  // Number of closed blocks, text-like and tool calls alike.
+  uint64 completed_blocks = 1;
+  // The open text-like block.
+  optional OpenTextBlock text_block = 2;
+  // The open tool call.
+  optional OpenToolCall tool_call = 3;
+  // The next tool call's ordinal among tool calls.
+  uint64 next_tool_call_index = 4;
+  // Images that began and completed, and denoising steps seen.
+  uint32 images = 5;
+  uint32 image_steps = 6;
+  // Timing of the request's first visible output, in microseconds since
+  // `Lowering.started_unix_us`.
+  optional uint64 first_visible_output_us = 7;
+  // The engine's queue wait, in microseconds.
+  optional uint64 queue_us = 8;
+}
+
+// A text-like block being assembled.
+message OpenTextBlock {
+  uint64 index = 1;
+  // Whether the block is visible text or reasoning.
+  bool reasoning = 2;
+  string text = 3;
+}
+
+// A tool call being assembled.
+message OpenToolCall {
+  uint64 index = 1;
+  string id = 2;
+  string name = 3;
+  string arguments = 4;
+}
+
+// The chat-completion chunks and server-sent events of a streamed response.
+message ChatChunks {
+  // Whether a tool call was published, which the finish reason follows.
+  bool saw_tool_calls = 1;
+  // Denoising steps per image, by image identity.
+  map<uint32, uint32> image_steps = 2;
+  // Completed images, in completion order.
+  repeated uint32 completed_images = 3;
+  // Whether a reasoning block is open that the client does not see.
+  bool inside_hidden_reasoning = 4;
+  // Whether the current update's metadata belongs to hidden reasoning.
+  bool suppress_current_update_metadata = 5;
+  // Body frames produced, and whether the terminal `[DONE]` event is written.
+  uint64 frames = 6;
+  bool done = 7;
+}
+
+// What a non-streaming chat completion collected from the request's events.
+message ChatCollection {
+  // The assistant message's closed blocks.
+  repeated AssistantBlock blocks = 1;
+  // The prompt's token identifiers.
+  repeated uint32 prompt_token_ids = 2;
+  // Prompt logprobs, when collected.
+  optional DecodedPromptLogprobs prompt_logprobs = 3;
+  // Generated-token logprobs concatenated across updates.
+  optional DecodedLogprobs logprobs = 4;
+  // Generated token identifiers.
+  repeated uint32 token_ids = 5;
+  // Generated images as data URLs, in completion order.
+  repeated string images = 6;
+  // Denoising steps per completed image, in completion order.
+  repeated uint32 image_steps_per_image = 7;
+  // The finish reason, as the response lists it.
+  string finish_reason = 8;
+  // The usage the terminal event reported.
+  Usage usage = 9;
+  // The stop reason the terminal event reported, when it reported one.
+  optional string stop_reason = 10;
+}
+
+// One closed assistant content block.
+message AssistantBlock {
+  oneof block {
+    string text = 1;
+    string reasoning = 2;
+    ToolCall tool_call = 3;
+  }
+}
+
+// One finalized assistant tool call.
+message ToolCall {
+  string id = 1;
+  string name = 2;
+  string arguments = 3;
+}
+
+// A request's token counts, as a response reports them.
+message Usage {
+  uint32 prompt_tokens = 1;
+  uint32 output_tokens = 2;
+  uint32 image_count = 3;
+  uint32 image_steps = 4;
+  repeated uint32 image_steps_per_image = 5;
+}
+
+// Candidate tokens of one scored position, as the engine reported them.
+message PositionLogprobs {
+  repeated TokenLogprob entries = 1;
+}
+
+// One candidate token and its log probability.
+message TokenLogprob {
+  uint32 token_id = 1;
+  float logprob = 2;
+  uint32 rank = 3;
+}
+
+// One decoded token candidate and its logprob metadata.
+message DecodedTokenLogprob {
+  uint32 token_id = 1;
+  string token = 2;
+  float logprob = 3;
+  uint32 rank = 4;
+}
+
+// One position's decoded token candidates.
+message DecodedPositionLogprobs {
+  repeated DecodedTokenLogprob entries = 1;
+}
+
+// Per-position generated-token logprobs.
+message DecodedLogprobs {
+  repeated DecodedPositionLogprobs positions = 1;
+}
+
+// Per-position prompt logprobs.
+message DecodedPromptLogprobs {
+  uint32 first_token_id = 1;
+  string first_token = 2;
+  repeated DecodedPositionLogprobs scored_positions = 3;
+}
