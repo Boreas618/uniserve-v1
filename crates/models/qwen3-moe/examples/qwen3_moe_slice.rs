@@ -804,9 +804,22 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     // the representation is not the same as measuring it: the counts below come from the checkpoint's
     // own index, where a packed projection appears as a `weight_scale_2` and a kept one does not.
     let (packed, kept) = representation_counts(&args.checkpoint);
+    // The declaration of a calibrated export excludes forty-eight modules by name, and a first line
+    // that lists them is a first line nobody reads: the count is the fact, the list is in the file.
+    let named = match &declared {
+        Representation::Dense => "dense (nothing quantized)".to_owned(),
+        Representation::Nvfp4 {
+            excluded,
+            also_excluded,
+        } => format!(
+            "nvfp4, {} + {} module(s) kept in their own dtype",
+            excluded.len(),
+            also_excluded.len()
+        ),
+    };
     println!(
-        "combination: checkpoint {} declares {declared:?}; tensors packed {packed}, in their own \
-         dtype {kept}; kv pages {}",
+        "combination: checkpoint {} declares {named}; tensors packed {packed}, in their own dtype \
+         {kept}; kv pages {}",
         args.checkpoint.display(),
         args.kv_pages,
     );
