@@ -433,13 +433,21 @@ fn validate_work_entry(
     admitted: &BTreeSet<RequestId>,
 ) -> Result<(), PolicyError> {
     let request = live.request(work.request)?;
-    if request.state != RequestState::Resident && !admitted.contains(&work.request) {
+    let by_this_plan = request.state != RequestState::Resident && admitted.contains(&work.request);
+    if request.state != RequestState::Resident && !by_this_plan {
         return Err(invalid(
             Call::Dispatch,
             format!("{} is not resident", work.request.0),
         ));
     }
-    if request.phase != Some(work.phase) {
+    // A request the plan itself admits has no phase in this state: the phase it
+    // serves next is the mechanism's to compute once the request is resident,
+    // and a step applies admission before it checks the work. So the phase is
+    // compared where the mechanism's own answer exists — against the state
+    // admission left (`validate_after_admission` on the live step) — and not
+    // here, where a queued view's `None` would refuse every plan that admits
+    // and runs a request in one step.
+    if !by_this_plan && request.phase != Some(work.phase) {
         return Err(invalid(
             Call::Dispatch,
             format!(
