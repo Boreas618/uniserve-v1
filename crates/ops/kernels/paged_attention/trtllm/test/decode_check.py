@@ -123,7 +123,23 @@ def main() -> int:
     parser.add_argument("--workspace-mib", type=int, default=512)
     arguments = parser.parse_args()
 
-    module_path = arguments.module / "module.so"
+    # The module directory is where the build wrote it: a relative path is
+    # taken from the current directory first and from this package's own
+    # directory second, so the check runs from the repository root or from
+    # the package either way.
+    module = arguments.module
+    if not (module / "module.so").is_file():
+        beside = pathlib.Path(__file__).resolve().parent.parent / module
+        if (beside / "module.so").is_file():
+            module = beside
+    module_path = (module / "module.so").resolve()
+    if not module_path.is_file():
+        print(
+            f"no module at {module_path}: build it first (see the TEST REQUEST) "
+            f"or pass the directory the build wrote",
+            file=sys.stderr,
+        )
+        return 1
     library = ctypes.CDLL(str(module_path))
     entry = library.uniserve_paged_attention
     entry.argtypes = [ctypes.POINTER(Call), ctypes.c_void_p]
