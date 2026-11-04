@@ -722,9 +722,9 @@ mod tests {
                 .bytes(DType::BF16)
                 .unwrap()
         };
-        // Per token: two F32 factor columns, three hidden buffers, four query-width buffers and
-        // three key/value-width buffers.
-        let per_token = 2 * 64 * 4 + 3 * 2048 * 2 + 4 * 4096 * 2 + 3 * 512 * 2;
+        // Per token: two F32 factor columns, three hidden buffers, three query-width buffers
+        // (query, rotated query, attended output) and three key/value-width buffers.
+        let per_token = 2 * 64 * 4 + 3 * 2048 * 2 + 3 * 4096 * 2 + 3 * 512 * 2;
         assert_eq!(bytes(2) - bytes(1), per_token);
     }
 }
