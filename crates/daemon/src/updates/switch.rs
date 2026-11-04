@@ -988,6 +988,13 @@ impl Switch {
                 self.epochs.record(self.target, self.record.clone());
                 roster.serve(self.target, &self.requests);
                 for node in &self.nodes {
+                    // One number addresses the previous epoch on every node,
+                    // which is right while the epoch arm runs one node and one
+                    // main process (`apply_epoch` refuses more): the switch
+                    // never launched the previous epoch, so it holds no
+                    // per-node number for it. Lifting that refusal means the
+                    // previous epoch's generations must come from the process
+                    // table the same way the target's come from `spawned`.
                     roster.command(
                         &node.host,
                         self.previous_generation,
