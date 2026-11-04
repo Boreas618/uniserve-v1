@@ -364,6 +364,17 @@ fn main() {
         }),
     ));
     lines.push((
+        // The candidates' probabilities: the general selection's step between the top-k program and
+        // the filters, over the candidate width rather than the vocabulary.
+        "softmax".to_owned(),
+        key(&ops::norm::SoftmaxDescriptor {
+            dtype: DType::F32,
+            columns: CANDIDATE_WIDTH,
+            tile: row_tile(CANDIDATE_WIDTH),
+            pdl: PDL,
+        }),
+    ));
+    lines.push((
         "log_softmax".to_owned(),
         key(&ops::sampler::LogSoftmaxDescriptor {
             dtype: DType::F32,
