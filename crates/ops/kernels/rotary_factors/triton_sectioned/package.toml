@@ -1,0 +1,38 @@
+# The rotary_factors operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py`.
+#
+# One program stores a block of scaled cosine and sine factors; the token count
+# is a launch value, so one module serves every sequence length.
+
+op = "rotary_factors"
+backend = "triton_sectioned"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/rotary_factors.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+# `dtype_fp32_positions_i64_columns_64_block_256_scale_0x3f800000_pdl_true`.
+[kernel.descriptors]
+# A sectioned rotation's keys: a key names `axes`, `sections` and — for the
+# interleaved form — `interleaved`, and such a key is this package's, not the
+# one-dimensional package's beside it. The two forms are two programs over one
+# source, because a Triton program's parameters are its call's words in order.
+dimensions = { dtype = ["f32"], positions = ["i32", "i64"], columns = ["48", "24", "96"], block = ["256"], scale = ["0x3f800000", "0x461c4000", "0x49742400"], pdl = ["false"], axes = ["3"], sections = ["16-16-16"], interleaved = ["true"] }
+
+[parameters]
