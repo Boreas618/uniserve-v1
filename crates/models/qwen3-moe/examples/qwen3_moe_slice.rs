@@ -874,7 +874,7 @@ fn report_stage(
             path.display()
         )));
     }
-    let (relative, worst, scale) = distance(values, &theirs);
+    let (relative, worst, scale, ours) = distance(values, &theirs);
     let marker = if relative > RELATIVE_BUDGET {
         if first_above.is_none() {
             *first_above = Some(index);
@@ -884,8 +884,8 @@ fn report_stage(
         ""
     };
     println!(
-        "reference: {name}, {}, rms/scale {relative:.3e} of the reference's rms {scale:.3e} \
-         (max |diff| {worst:.3e}){marker}",
+        "reference: {name}, {}, rms {ours:.4e} against the reference's {scale:.4e} \
+         — rms/scale {relative:.3e}, max |diff| {worst:.3e}{marker}",
         stage_name(index)
     );
     Ok(())
@@ -897,14 +897,16 @@ fn report_stage(
 /// The root-mean-square is the measure, not the largest element: a bf16 reference differs from a
 /// bf16 computation by about `2**-8` per element and the maximum of a row says more about one
 /// rounding than about the two rows' agreement.
-fn distance(values: &[f32], reference: &[f32]) -> (f64, f64, f64) {
+fn distance(values: &[f32], reference: &[f32]) -> (f64, f64, f64, f64) {
     let count = values.len().min(reference.len()).max(1) as f64;
     let mut squared = 0.0_f64;
+    let mut ours = 0.0_f64;
     let mut theirs = 0.0_f64;
     let mut worst = 0.0_f64;
     for (mine, other) in values.iter().zip(reference.iter()) {
         let difference = f64::from(*mine) - f64::from(*other);
         squared += difference * difference;
+        ours += f64::from(*mine) * f64::from(*mine);
         theirs += f64::from(*other) * f64::from(*other);
         worst = worst.max(difference.abs());
     }
@@ -914,7 +916,9 @@ fn distance(values: &[f32], reference: &[f32]) -> (f64, f64, f64) {
     } else {
         f64::INFINITY
     };
-    (relative, worst, scale)
+    // Our own rms goes beside the reference's: a stage whose scale has collapsed disagrees in a way
+    // the ratio alone hides, and the reference's growth is the shape the stack has to reproduce.
+    (relative, worst, scale, (ours / count).sqrt())
 }
 
 /// Read a C-ordered `f32` `.npy` file: the magic, one version, a header dict this reads for the
