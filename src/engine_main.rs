@@ -247,6 +247,8 @@ struct ProcessInterface {
     /// `Precopy` while a claim is outstanding, and dropping it would lose the epoch's first
     /// generation.
     pending: std::collections::VecDeque<proto::process::Command>,
+    /// The daemon closed the interface: the epoch is over, and the process says so and goes.
+    closed: bool,
 }
 
 impl ProcessInterface {
@@ -295,6 +297,7 @@ impl ProcessInterface {
         Ok(Self {
             connection,
             pending: std::collections::VecDeque::new(),
+            closed: false,
         })
     }
 
@@ -357,7 +360,21 @@ impl ProcessInterface {
     ///
     /// Nothing waits here: a command that has not arrived is one the next serve pass looks for.
     fn take_command(&mut self) -> Result<Option<proto::process::Command>> {
-        while let Some(message) = self.connection.try_recv::<proto::process::Downstream>()? {
+        // The daemon owns this process's life: the interface closing is the end of the epoch and not
+        // an error, so it stops the loop by name instead of surfacing as a failure the daemon never
+        // sees. A process that ends silently on a closed interface is how a run reads as a lost
+        // engine with no side of its own in the log.
+        loop {
+            let message = match self.connection.try_recv::<proto::process::Downstream>() {
+                Ok(Some(message)) => message,
+                Ok(None) => break,
+                Err(proto::Error::Closed) => {
+                    tracing::info!("the daemon closed the process interface, so this process ends");
+                    self.closed = true;
+                    return Ok(None);
+                }
+                Err(error) => return Err(error.into()),
+            };
             match message.kind {
                 Some(proto::process::downstream::Kind::Event(event)) => self.file(event),
                 Some(proto::process::downstream::Kind::Reply(reply)) => {
@@ -370,6 +387,11 @@ impl ProcessInterface {
             }
         }
         Ok(self.pending.pop_front())
+    }
+
+    /// Whether the daemon closed the interface, which ends this process.
+    const fn closed(&self) -> bool {
+        self.closed
     }
 
     /// Files what the daemon sent unasked.
@@ -880,6 +902,11 @@ impl MainProcess {
                 if let Some(failure) = self.process_command(command)? {
                     return Ok(Some(failure));
                 }
+            }
+            // The daemon owns this process's life: an interface it closed is the end of the epoch,
+            // not a failure to report to it, so the pass stops by name and the process exits cleanly.
+            if self.process.closed() {
+                self.stopping = true;
             }
 
             // A precopy in flight advances one stage per pass, never waiting on
