@@ -25,7 +25,7 @@ use std::os::fd::OwnedFd;
 
 use crate::tensor::{Backing, DType, MemoryKind, contiguous_strides};
 use crate::{Error, Result, lock};
-use cuda::{
+use platform::{
     DeviceAllocation, DeviceId, HostRegistration, PeerMapping, PinnedBuffer, Protection,
     SegmentedMapping, ShareableHandle, Strided,
 };
@@ -367,7 +367,7 @@ impl Storage {
     pub(crate) fn physical_allocation(
         &self,
         index: usize,
-    ) -> Result<Option<Arc<cuda::PhysicalAllocation>>> {
+    ) -> Result<Option<Arc<platform::PhysicalAllocation>>> {
         Ok(lock(&self.segments()?.mapping).allocation(index))
     }
 
@@ -663,7 +663,7 @@ pub struct StorageView {
 }
 
 /// An owned copy operand: a view's address, element width, shape and
-/// element strides in the form [`cuda::StridedCopy`] plans.
+/// element strides in the form [`platform::StridedCopy`] plans.
 pub(crate) struct CopyOperand {
     address: u64,
     element_bytes: usize,

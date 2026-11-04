@@ -1,6 +1,6 @@
 //! Per-request-slot state banks.
 
-use cuda::DeviceId;
+use platform::DeviceId;
 use std::sync::Arc;
 
 use crate::memory::allocation::{Storage, StorageView};

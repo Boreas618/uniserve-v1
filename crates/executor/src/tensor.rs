@@ -11,7 +11,7 @@
 //! that boundary so that resident storage and transfers compile without the
 //! model crates.
 
-use cuda::DeviceId;
+use platform::DeviceId;
 
 use crate::Result;
 

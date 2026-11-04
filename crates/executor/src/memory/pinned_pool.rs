@@ -9,7 +9,7 @@
 //! A block is reused as soon as its last reference drops: a user whose
 //! device work reads a block retains a reference until that work completed.
 
-use cuda::DeviceId;
+use platform::DeviceId;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use crate::Result;
