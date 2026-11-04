@@ -56,6 +56,7 @@ impl fmt::Display for Descriptor {
 }
 
 /// The arguments of one sort.
+#[derive(Clone, Copy)]
 pub struct SortArgs {
     /// `[tokens, top]` i32 route ids.
     pub ids: TensorView,

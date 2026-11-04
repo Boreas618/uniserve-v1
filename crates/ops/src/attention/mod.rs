@@ -179,6 +179,7 @@ impl fmt::Display for Descriptor {
 }
 
 /// The arguments of one attention call.
+#[derive(Clone, Copy)]
 pub struct Args {
     /// `[tokens, q_heads, head_dim]` queries, row-major on the last axis.
     pub query: TensorView,

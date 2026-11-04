@@ -84,6 +84,7 @@ impl fmt::Display for TopkDescriptor {
 }
 
 /// The arguments of one routing call.
+#[derive(Clone, Copy)]
 pub struct TopkArgs {
     /// `[tokens, experts]` router scores, unit stride on the expert axis.
     pub scores: TensorView,
@@ -241,6 +242,7 @@ impl Op for TopkSoftmax {
 }
 
 /// The arguments of one expert-map call.
+#[derive(Clone, Copy)]
 pub struct GatherArgs {
     /// `[tokens, top]` i32 logical expert ids.
     pub ids: TensorView,

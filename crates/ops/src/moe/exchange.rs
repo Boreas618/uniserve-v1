@@ -130,6 +130,8 @@ impl fmt::Display for Descriptor {
 /// package fills the peer slots and their counts. At [`Mode::Combine`] it passes the partials it
 /// received in `state` and the counts of them in `counts`, and the package writes its own rows into
 /// `out`. Views a mode does not read are empty (`[0]`-element) views.
+
+#[derive(Clone, Copy)]
 pub struct ExchangeArgs {
     /// The group's transport, created and owned by the executor through the package.
     pub transport: ExchangeTransport,

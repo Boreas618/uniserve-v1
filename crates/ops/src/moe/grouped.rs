@@ -145,6 +145,7 @@ impl fmt::Display for RouteGemmDescriptor {
 }
 
 /// The arguments of one FC1 launch.
+#[derive(Clone, Copy)]
 pub struct GatherGemmArgs {
     /// `[tokens, hidden]` hidden states, row-major.
     pub hidden: TensorView,
@@ -468,6 +469,7 @@ impl Op for RouteGemm {
 }
 
 /// The arguments of one FC2 launch.
+#[derive(Clone, Copy)]
 pub struct RouteGemmArgs {
     /// `[max_permuted_rows, intermediate]` FC1's gated products.
     pub rows: TensorView,
