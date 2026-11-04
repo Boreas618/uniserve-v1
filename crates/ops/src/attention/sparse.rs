@@ -517,6 +517,17 @@ impl Op for SparseAttention {
         }
     }
 
+    /// The standard bound written against the **declared key bound**, which is conservative.
+    ///
+    /// A row sums `Σ_j w_j · v_j` over the rows of the tiles its selection keeps, plus the dense
+    /// prefix tiles: at most `keys` products, each an FP32 dot of `head_dim` against a value, so
+    /// `γₙ` with `n = keys` is the reduction's factor. The true reduction is smaller — `Σ over
+    /// selected tiles of their valid rows` — and the excess is bounded by the ratio `keys / Σ rows`,
+    /// which the descriptor cannot know because the selection is the layout's. Conservatism is the
+    /// right side to err on: a bound tighter than the arithmetic would fail a correct kernel.
+    ///
+    /// `keys` is a declared bound outside the key (the VSA's per-layout tile counts), so one program
+    /// serves every segment that fits it and the bound is written for the largest.
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
         let reduction = u64::from(descriptor.keys);
         let accumulate = DType::F32;
