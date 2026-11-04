@@ -1794,13 +1794,14 @@ impl Cudnn {
             ),
         ];
         for (name, requested, created, initial) in variants {
-            match self.fill_once(heuristic, requested, created, initial) {
-                Ok(line) => steps.push((format!("engine heuristic fill {name}: {line}"), None)),
-                Err(error) => steps.push((
-                    format!("engine heuristic fill {name}"),
-                    Some(error.to_string()),
-                )),
-            }
+            // A variant the library refuses is one reading of the contract that
+            // does not hold, which is exactly what the probe asks about: it is
+            // reported in its line, not counted as a refusal of the probe.
+            let line = match self.fill_once(heuristic, requested, created, initial) {
+                Ok(line) => line,
+                Err(error) => format!("refused: {error}"),
+            };
+            steps.push((format!("engine heuristic fill {name}: {line}"), None));
         }
         steps
     }
