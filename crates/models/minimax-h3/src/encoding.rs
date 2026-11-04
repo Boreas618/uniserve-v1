@@ -1892,6 +1892,70 @@ impl AudioEncoder {
 /// per tile multiplies this whole list by the tile count. The level-0 buffers are the pixels at the
 /// encoder's first width, so at a 256-by-64-pixel tile they are ~143 MB each: four of them is most of a
 /// gigabyte for one tile, and a tiled reference clip is tens of tiles. This function states one tile so
+/// The conditioning pass's own reservations for one visual condition.
+///
+/// A condition's sizes are the **condition's**, not a request's: the pass runs once per condition and
+/// the encoder's own set is reserved beside it, so nothing here multiplies by a request's clip or frame
+/// count. Three conditions in one request are three sequential uses of one plan, not three plans.
+///
+/// `latent` is the condition's **latent** extent - the encoder's own rule decided the frame count
+/// (`VideoEncoder::latent_frames`), so a still is one frame. The six buffers, in the order the pass
+/// reserves them:
+///
+/// | name | extent | why |
+/// | --- | --- | --- |
+/// | `tile` | `in_channels · frames · tile_height · tile_width` | **one** buffer, refilled per tile: the tiles are uniform, so a per-tile buffer would grow with the grid and buy nothing. The extents are the plan's largest tile, taken from the same `Tiles` the decoder's grid uses |
+/// | `stitch` | `2 · latent_channels · frames · rows · columns` | the moments' two halves, stitched over the grid |
+/// | `moments` | the same | the projection the posterior reads |
+/// | `sample` | `latent_channels · frames · rows · columns` | the posterior's draw |
+/// | `clean` | `patch_rows · latent_channels · 4` | the condition's latent patchified into rows |
+/// | `anchored` | the same | those rows at the condition's timestep |
+///
+/// `patch_rows` is the latent's voxels divided by four: the condition's rows are `2 x 2` latent
+/// patches, so `latent_channels · 4` columns, and a 84 x 48 latent gives 42 x 24 of them a frame.
+pub fn conditioning_arena(
+    config: &crate::VideoVaeConfig,
+    latent: Extent,
+) -> Result<Vec<crate::decoding::Buffer>> {
+    let stack = Stack::of(config)?;
+    let canvas = crate::video_vae::Canvas::clip(config, latent.height, latent.width);
+    let tiles = crate::video_vae::Tiles::of(config, &canvas)?;
+    let tile = tiles
+        .tiles(config, &canvas)
+        .iter()
+        .map(|tile| tile.canvas.pixels(config))
+        .max_by_key(|(height, width)| u64::from(*height) * u64::from(*width))
+        .ok_or_else(|| Error::config("a condition with no tile has no plan".to_owned()))?;
+    if !latent.height.is_multiple_of(2) || !latent.width.is_multiple_of(2) {
+        return Err(Error::config(format!(
+            "a condition's rows are 2 x 2 latent patches, and {} x {} has an odd axis",
+            latent.height, latent.width
+        )));
+    }
+    let frames = u64::from(latent.frames);
+    let rows = u64::from(latent.height);
+    let columns = u64::from(latent.width);
+    let voxels = frames * rows * columns;
+    let channels = u64::from(config.latent_channels);
+    let patch_rows = voxels / 4;
+    let buffer = |name: &str, elements: u64| crate::decoding::Buffer {
+        name: name.to_owned(),
+        element: "f32",
+        elements,
+    };
+    Ok(vec![
+        buffer(
+            "tile",
+            u64::from(stack.input_channels) * frames * u64::from(tile.0) * u64::from(tile.1),
+        ),
+        buffer("stitch", 2 * channels * voxels),
+        buffer("moments", 2 * channels * voxels),
+        buffer("sample", channels * voxels),
+        buffer("clean", patch_rows * channels * 4),
+        buffer("anchored", patch_rows * channels * 4),
+    ])
+}
+
 /// the multiplication is visible rather than hidden inside a driver.
 pub fn video_encoder_tile_arena(
     config: &VideoVaeConfig,
@@ -2251,6 +2315,78 @@ mod tests {
     /// weights are loaded.
     fn encoder_stack() -> Stack {
         Stack::of(&video_config()).expect("the fixture's stack")
+    }
+
+    #[test]
+    fn the_conditioning_plan_is_one_tile_per_run_not_one_per_tile() {
+        // A condition's plan is the pass's, so nothing in it scales with the tile grid: the two
+        // canvases here are the served ones and their grids differ in tile count, while the plan's
+        // six buffers are the same six of the same size. A per-tile buffer would fail this on the
+        // larger canvas and nowhere else.
+        let config = video_config();
+        let vertical = Extent {
+            frames: 5,
+            height: 84,
+            width: 48,
+        };
+        let wide = Extent {
+            frames: 5,
+            height: 48,
+            width: 84,
+        };
+        let first = conditioning_arena(&config, vertical).expect("the vertical condition");
+        let second = conditioning_arena(&config, wide).expect("the wide condition");
+        let names: Vec<&str> = first.iter().map(|buffer| buffer.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["tile", "stitch", "moments", "sample", "clean", "anchored"]
+        );
+        assert_eq!(
+            second
+                .iter()
+                .map(|buffer| buffer.name.as_str())
+                .collect::<Vec<_>>(),
+            names,
+            "the same six buffers, whatever the canvas"
+        );
+        // The tile buffer is **one** tile's pixels, not the grid's: its extent is the largest tile of
+        // the decoder's own grid, which is the same `Tiles` the decode reads, and the grid's count
+        // never enters it.
+        let tile = first
+            .iter()
+            .find(|buffer| buffer.name == "tile")
+            .expect("a tile buffer");
+        let canvas = crate::video_vae::Canvas::clip(&config, vertical.height, vertical.width);
+        let tiles = crate::video_vae::Tiles::of(&config, &canvas).expect("the grid");
+        let grid = tiles.tiles(&config, &canvas);
+        assert!(grid.len() > 1, "the fixture's canvas is more than one tile");
+        let (tile_height, tile_width) = grid
+            .iter()
+            .map(|tile| tile.canvas.pixels(&config))
+            .max_by_key(|(height, width)| u64::from(*height) * u64::from(*width))
+            .expect("a largest tile");
+        let stack = Stack::of(&config).expect("the stack");
+        assert_eq!(
+            tile.elements,
+            u64::from(stack.input_channels)
+                * u64::from(vertical.frames)
+                * u64::from(tile_height)
+                * u64::from(tile_width),
+            "the tile buffer is one tile's pixels, refilled per tile"
+        );
+    }
+
+    #[test]
+    fn a_condition_that_is_not_whole_patches_is_refused() {
+        // The condition's rows are `2 x 2` latent patches, so an odd axis has no row count at all and
+        // must be refused here rather than sized by a division that rounds.
+        let config = video_config();
+        let odd = Extent {
+            frames: 1,
+            height: 83,
+            width: 48,
+        };
+        assert!(conditioning_arena(&config, odd).is_err());
     }
 
     #[test]
