@@ -19,24 +19,36 @@
 //! Both live here so the crate states the call protocol in one place, and both
 //! are compiled only under the `testing` feature.
 
+#[cfg(test)]
 use scheduling::guest::decision::{Plan, Victim};
+#[cfg(test)]
 use scheduling::guest::ids::PageId;
 use scheduling::guest::limits::{Limits, Parameters};
+#[cfg(test)]
 use scheduling::guest::view::ExpertOrder;
+#[cfg(test)]
 use scheduling::guest::wire::Call;
+#[cfg(test)]
 use serde::Serialize;
 
 use super::policy::{BatchCapacity, PolicyProgram, ceilings_of};
 
 /// Where a module keeps its message buffer and its replies.
+#[cfg(test)]
 const MESSAGE: u32 = 4096;
+#[cfg(test)]
 const PLAN: u32 = 8192;
+#[cfg(test)]
 const LIMITS: u32 = 12288;
+#[cfg(test)]
 const VICTIMS: u32 = 16384;
+#[cfg(test)]
 const PAGES: u32 = 20480;
+#[cfg(test)]
 const EXPERTS: u32 = 24576;
 
 /// The answer a toy policy module gives, and the calls it fails in.
+#[cfg(test)]
 pub(crate) struct Toy {
     pub(crate) plan: Plan,
     pub(crate) limits: Limits,
@@ -49,6 +61,7 @@ pub(crate) struct Toy {
     pub(crate) spin: Option<Call>,
 }
 
+#[cfg(test)]
 impl Default for Toy {
     fn default() -> Self {
         Self {
@@ -64,6 +77,7 @@ impl Default for Toy {
 }
 
 /// The module bytes of `toy`.
+#[cfg(test)]
 pub(crate) fn toy_module(toy: &Toy) -> Vec<u8> {
     let bodies = [
         (Call::Dispatch, PLAN, json(&toy.plan)),
@@ -105,6 +119,7 @@ pub(crate) fn toy_module(toy: &Toy) -> Vec<u8> {
 }
 
 /// The export of a call that answers with a reply buffer.
+#[cfg(test)]
 fn buffered(call: Call, offset: u32, len: usize, toy: &Toy) -> String {
     let params = if call == Call::Limits {
         String::new()
@@ -131,6 +146,7 @@ fn buffered(call: Call, offset: u32, len: usize, toy: &Toy) -> String {
 }
 
 /// The export of a call that answers with the chosen index.
+#[cfg(test)]
 fn indexed(call: Call, index: u32, toy: &Toy) -> String {
     if toy.trap == Some(call) {
         format!(
@@ -146,17 +162,20 @@ fn indexed(call: Call, index: u32, toy: &Toy) -> String {
 }
 
 /// `value` as the protocol's JSON.
+#[cfg(test)]
 fn json<T: Serialize>(value: &T) -> String {
     serde_json::to_string(value).expect("an interface value is JSON")
 }
 
 /// `text` escaped for a WebAssembly text data segment.
+#[cfg(test)]
 fn escape(text: &str) -> String {
     text.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Limits a test's build config allows: below every ceiling the mechanism
 /// states for a pool the tests build.
+#[cfg(test)]
 pub(crate) fn fitting_limits() -> Limits {
     Limits {
         chunked_prefill_size: 256,
