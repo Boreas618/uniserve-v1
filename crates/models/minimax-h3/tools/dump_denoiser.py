@@ -98,7 +98,11 @@ TRAJECTORY = "trajectory"
 # The schedule kinds a checkpoint can ship, in the reference's class names and the case's words. A
 # kind outside this table is refused rather than compared loosely: a FastH3 contract read as the base
 # grid is the one mistake a trajectory page cannot show.
-SCHEDULE_KINDS = {"UniformGrid": "base", "BlockGrid": "dmd", "PddGrid": "pdd"}
+# The reference's class names against the model's own three words (`ScheduleGrid::kind` in
+# `config/denoiser.rs`): `uniform`, `dmd`, `blocks`. The mapping is many-to-one because both
+# block-derived grids are `blocks` - they differ in how the nodes are derived, not in the grid the
+# case names, and the case carries the model's word rather than a second vocabulary of its own.
+SCHEDULE_KINDS = {"UniformGrid": "uniform", "BlockGrid": "blocks", "PddGrid": "blocks"}
 
 # The probes this script can produce without the reference's runner, a device or weights.
 HOST_PROBES = frozenset({"noise", "rows"})
