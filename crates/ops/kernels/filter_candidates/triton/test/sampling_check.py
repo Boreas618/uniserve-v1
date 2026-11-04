@@ -361,8 +361,9 @@ def run_inverse_cdf(case):
         rows, width, generator=generator, dtype=torch.float32
     )
     if case["zero_mass"]:
-        # The lowest token id holds no mass: a draw of zero must not select it, because a
-        # dropped candidate is never drawn.
+        # The *lowest* token id of every row holds no mass — id 0 on column 0 — so a draw of
+        # zero has to skip it. This is the case the boundary is about: with an inclusive
+        # comparison the draw lands on the filtered-out candidate.
         probabilities[:, 0] = 0.0
     if case["one_survivor"]:
         probabilities[:, 1:] = 0.0
@@ -371,9 +372,16 @@ def run_inverse_cdf(case):
     vocabulary = max(4 * width, 1024)
     ids = torch.zeros(rows, width, dtype=torch.int32)
     for row in range(rows):
-        ids[row] = torch.randperm(vocabulary, generator=generator)[:width].to(
-            torch.int32
-        )
+        if case["zero_mass"]:
+            # Ids above zero everywhere but column 0, which holds the lowest id and no mass.
+            ids[row] = (
+                torch.randperm(vocabulary - 1, generator=generator)[:width] + 1
+            ).to(torch.int32)
+            ids[row, 0] = 0
+        else:
+            ids[row] = torch.randperm(vocabulary, generator=generator)[
+                :width
+            ].to(torch.int32)
     if case["last_holds_mass"]:
         # 90 % of the mass on the candidate with the highest token id, the rest spread thin:
         # a draw near the top of the unit interval lands only on it, so a cumulative sum the
@@ -400,7 +408,9 @@ def run_inverse_cdf(case):
         ordered = row_probabilities[order]
         total = ordered.sum()
         cumulative = torch.cumsum(ordered, dim=0)
-        crossed = cumulative >= draws[row].double() * total
+        # Strict, as the operator's rule reads: a zero-mass candidate is never drawn, and
+        # a draw of zero lands on the first candidate that has mass.
+        crossed = cumulative > draws[row].double() * total
         token = ordered_ids[crossed].min().item() if crossed.any() else None
         if token is None:
             positive = ordered[ordered > 0.0]
@@ -564,7 +574,7 @@ def cases(operator, flags):
                 "seed": 1,
             },
             {
-                "label": "a zero-mass candidate at the lowest id, drawn at zero",
+                "label": "a zero-mass candidate at the lowest id: a draw of zero must skip it",
                 "rows": 2,
                 "width": flags.width,
                 "draws": (0.0, 0.5),
