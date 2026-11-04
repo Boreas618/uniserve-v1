@@ -485,6 +485,21 @@ def test_only_the_checkpoint_and_kv_cache_dtype_differ_between_cells() -> None:
         )
 
 
+def test_a_host_may_point_the_cells_at_a_local_split(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unset path downloads; a set one names the same split locally."""
+    for name in CELLS:
+        assert _configured_cell(name)[0].dataset_path == ""
+
+    monkeypatch.setenv("UNISERVE_GSM8K_DATASET", "/data/gsm8k/test.parquet")
+
+    for name in CELLS:
+        assert (
+            _configured_cell(name)[0].dataset_path == "/data/gsm8k/test.parquet"
+        )
+
+
 def test_the_profile_renders_every_point(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

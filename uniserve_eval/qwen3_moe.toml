@@ -20,6 +20,10 @@
 #   per-block FP8 prefix caches at head dimension 128; a candidate
 #   implementation sets it to its own provider (or `auto`) and changes
 #   nothing else.
+# - UNISERVE_GSM8K_DATASET optionally names a local copy of the test split (a
+#   Parquet or JSON Lines file, or a directory holding it); unset, the adapter
+#   downloads the pinned revision from the Hub. Every cell reads the same
+#   source, and the selected_rows identity is what proves the runs comparable.
 # - UNISERVE_QWEN3_MOE_CUDA_VISIBLE_DEVICES selects each server's GPUs.
 # - UNISERVE_QWEN3_MOE_TENSOR_PARALLEL_SIZE sets the tensor-parallel degree.
 # - UNISERVE_QWEN3_MOE_MEM_FRACTION sets each server's share of device
@@ -72,6 +76,7 @@ task = "gsm8k"
 model = "Qwen3-30B-A3B"
 dataset = "gsm8k"
 dataset_revision = "740312add88f781978c0658806c59bc2815b9866"
+dataset_path = "${UNISERVE_GSM8K_DATASET:-}"
 
 [benchmarks.qwen3-moe-gsm8k-bf16.load]
 num_prompts = 1319
@@ -105,6 +110,7 @@ task = "gsm8k"
 model = "Qwen3-30B-A3B"
 dataset = "gsm8k"
 dataset_revision = "740312add88f781978c0658806c59bc2815b9866"
+dataset_path = "${UNISERVE_GSM8K_DATASET:-}"
 
 [benchmarks.qwen3-moe-gsm8k-nvfp4.load]
 num_prompts = 1319
@@ -138,6 +144,7 @@ task = "gsm8k"
 model = "Qwen3-30B-A3B"
 dataset = "gsm8k"
 dataset_revision = "740312add88f781978c0658806c59bc2815b9866"
+dataset_path = "${UNISERVE_GSM8K_DATASET:-}"
 
 [benchmarks.qwen3-moe-gsm8k-bf16-fp8-kv.load]
 num_prompts = 1319
