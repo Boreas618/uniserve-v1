@@ -266,13 +266,20 @@ pub struct QkNormRopeDescriptor {
     pub rows: u32,
     /// The head tile one program loads at a time.
     pub block: u32,
+    /// Whether the per-head normalization has a learned scale.
+    ///
+    /// `true` is the trained transformer's form: each head's RMS is scaled by a `[head_dim]` weight
+    /// per query and key head, which the program reads. `false` is a per-head normalization with no
+    /// learned weight — the video VAE's decoder normalizes this way — so the program has no weight
+    /// ports at all and the arguments carry none.
+    pub affine: bool,
     /// Launch with programmatic dependent launch.
     pub pdl: bool,
 }
 
 impl fmt::Display for QkNormRopeDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        Key::new()
+        let key = Key::new()
             .field("dtype", self.dtype)
             .field("output", self.output)
             .field("head_dim", self.head_dim)
@@ -282,8 +289,16 @@ impl fmt::Display for QkNormRopeDescriptor {
             .field("epsilon", self.epsilon)
             .field("rows", self.rows)
             .field("block", self.block)
-            .field("pdl", self.pdl)
-            .finish(formatter)
+            .field("pdl", self.pdl);
+        // Named only for the unweighted form, so every key a trained transformer compiles stays
+        // exactly the key it was: the video VAE's weightless per-head norm is a new variant, not a
+        // renamed old one.
+        let key = if self.affine {
+            key
+        } else {
+            key.field("affine", false)
+        };
+        key.finish(formatter)
     }
 }
 
@@ -294,10 +309,10 @@ pub struct QkNormRopeArgs {
     pub query: TensorView,
     /// `[tokens, k_heads, head_dim]` keys, before normalization.
     pub key: TensorView,
-    /// `[head_dim]`, the query normalization's scale.
-    pub q_weight: TensorView,
-    /// `[head_dim]`, the key normalization's scale.
-    pub k_weight: TensorView,
+    /// `[head_dim]`, the query normalization's scale; `None` when the descriptor is unweighted.
+    pub q_weight: Option<TensorView>,
+    /// `[head_dim]`, the key normalization's scale; `None` when the descriptor is unweighted.
+    pub k_weight: Option<TensorView>,
     /// `[tokens, head_dim/2]`, the cosine factors of each token's position.
     pub cosine: TensorView,
     /// `[tokens, head_dim/2]`, the sine factors of each token's position.
@@ -357,10 +372,36 @@ impl Op for QkNormRope {
                 ),
             ));
         }
-        args.q_weight
-            .require_shape(Self::NAME, Shape::new(&[head_dim]))?;
-        args.k_weight
-            .require_shape(Self::NAME, Shape::new(&[head_dim]))?;
+        // The weights exist exactly when the descriptor says the normalization has them: a program
+        // compiled unweighted has no weight ports, and one compiled weighted cannot normalize
+        // without them.
+        let weights = if descriptor.affine {
+            let q_weight = args.q_weight.ok_or_else(|| {
+                Error::argument(
+                    Self::NAME,
+                    "a weighted normalization was launched without its query weight".to_owned(),
+                )
+            })?;
+            let k_weight = args.k_weight.ok_or_else(|| {
+                Error::argument(
+                    Self::NAME,
+                    "a weighted normalization was launched without its key weight".to_owned(),
+                )
+            })?;
+            q_weight.require_shape(Self::NAME, Shape::new(&[head_dim]))?;
+            k_weight.require_shape(Self::NAME, Shape::new(&[head_dim]))?;
+            Some((q_weight, k_weight))
+        } else {
+            if args.q_weight.is_some() || args.k_weight.is_some() {
+                return Err(Error::argument(
+                    Self::NAME,
+                    "an unweighted normalization was launched with a weight; the descriptor and \
+                     the arguments disagree"
+                        .to_owned(),
+                ));
+            }
+            None
+        };
         args.cosine.require_row(Self::NAME, DType::F32, pairs)?;
         args.sine.require_row(Self::NAME, DType::F32, pairs)?;
         if args.cosine.rows() != tokens || args.sine.rows() != tokens {
@@ -376,11 +417,11 @@ impl Op for QkNormRope {
 
         let programs = tokens.div_ceil(u64::from(descriptor.rows));
         let mut arguments = Arguments::new();
+        arguments.view(args.query).view(args.key);
+        if let Some((q_weight, k_weight)) = weights {
+            arguments.view(q_weight).view(k_weight);
+        }
         arguments
-            .view(args.query)
-            .view(args.key)
-            .view(args.q_weight)
-            .view(args.k_weight)
             .view(args.cosine)
             .view(args.sine)
             .view(args.q_out)
@@ -408,5 +449,43 @@ impl Op for QkNormRope {
             DType::F32,
             descriptor.output,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn descriptor(affine: bool) -> QkNormRopeDescriptor {
+        QkNormRopeDescriptor {
+            dtype: DType::BF16,
+            output: DType::BF16,
+            head_dim: 128,
+            q_heads: 32,
+            k_heads: 4,
+            rotation: Rotation::Half,
+            epsilon: Float::from(1e-6_f32),
+            rows: 1,
+            block: 128,
+            affine,
+            pdl: false,
+        }
+    }
+
+    #[test]
+    fn a_weighted_normalization_keeps_the_key_it_already_had() {
+        // The Qwen3 slice's key, exactly: the learned-scale variant does not name the flag, so no
+        // package has to repackage the transformer for the video VAE's weightless norm.
+        assert_eq!(
+            descriptor(true).to_string(),
+            "dtype_bf16_output_bf16_head_dim_128_q_heads_32_k_heads_4_rotation_half_epsilon_0x358637bd_rows_1_block_128_pdl_false"
+        );
+    }
+
+    #[test]
+    fn an_unweighted_normalization_is_its_own_variant() {
+        let unweighted = descriptor(false).to_string();
+        assert_eq!(unweighted, format!("{}_affine_false", descriptor(true)));
+        assert_ne!(unweighted, descriptor(true).to_string());
     }
 }
