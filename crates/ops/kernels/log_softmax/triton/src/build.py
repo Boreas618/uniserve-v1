@@ -12,7 +12,7 @@ import log_softmax as kernels
 LANES = 4096
 
 #: The input logits' dtype.
-DTYPES = {"bf16": "bf16", "fp16": "fp16", "fp32": "fp32"}
+DTYPES = {"bf16": "bf16", "fp16": "fp16", "fp32": "fp32", "f32": "fp32"}
 
 
 def spec(fields, parameters, target):

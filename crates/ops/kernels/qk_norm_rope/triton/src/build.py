@@ -12,7 +12,7 @@ import _compile
 import qk_norm_rope as kernels
 
 #: Element types of the queries, keys and their normalized outputs.
-DTYPES = {"bf16": "bf16", "fp16": "fp16", "fp32": "fp32"}
+DTYPES = {"bf16": "bf16", "fp16": "fp16", "fp32": "fp32", "f32": "fp32"}
 
 #: The two rotations a single rotary axis takes.
 ROTATIONS = {"half": False, "interleaved": True}
