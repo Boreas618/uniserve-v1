@@ -52,6 +52,15 @@ TORCH_TYPES = {
 ROUNDINGS = 3.0
 
 
+def truncate(values):
+    """The reference as Triton's interpreter stores it: one ulp low, not rounded.
+
+    The `bf16` significand is eight bits, so the value is truncated on its own mantissa.
+    """
+    bits = values.view(torch.int64)
+    return (bits & ~((1 << 45) - 1)).view(torch.float64)
+
+
 def check(case, device):
     """Add one scaled update into a residual in place and compare every element."""
     import scaled_residual as kernels
@@ -89,9 +98,10 @@ def check(case, device):
     expected = before.cpu().double() + exact_update * scale.cpu().double()
     if case["truncate"]:
         # Triton's interpreter truncates a narrow store instead of rounding to nearest
-        # even; the reference takes the same cast so the run compares arithmetic.
-        bits = expected.float().view(torch.int32)
-        expected = (bits & ~0xFFFF).view(torch.float32).to(dtype).double()
+        # even; the reference takes the same cast so the run compares arithmetic. The
+        # truncation is of the value's own mantissa: rounding to `f32` first would step
+        # values across a boundary the kernel's arithmetic stays below.
+        expected = truncate(expected)
     rounding = ROUNDINGS * UNIT_ROUNDOFF[case["dtype"]]
     # The three roundings are of the terms, whose magnitudes the sum can cancel away.
     terms = (

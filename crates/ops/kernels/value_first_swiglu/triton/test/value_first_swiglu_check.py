@@ -63,6 +63,15 @@ def silu(gate):
     return gate * torch.sigmoid(gate)
 
 
+def truncate(values):
+    """The reference as Triton's interpreter stores it: one ulp low, not rounded.
+
+    The `bf16` significand is eight bits, so the value is truncated on its own mantissa.
+    """
+    bits = values.view(torch.int64)
+    return (bits & ~((1 << 45) - 1)).view(torch.float64)
+
+
 def check(scenario, case, device):
     """Evaluate one packed projection and compare the output and the magnitudes."""
     import value_first_swiglu as kernels
@@ -132,9 +141,10 @@ def check(scenario, case, device):
     expected = exact_value * silu(exact_gate)
     if case["truncate"]:
         # Triton's interpreter truncates a narrow store; the reference takes the same cast
-        # so that what is compared is the arithmetic and not the interpreter's store.
-        bits = expected.float().view(torch.int32)
-        expected = (bits & ~0xFFFF).view(torch.float32).to(dtype).double()
+        # so that what is compared is the arithmetic and not the interpreter's store. The
+        # truncation is of the value's own mantissa: rounding to `f32` first would step
+        # values across a boundary the kernel's arithmetic stays below.
+        expected = truncate(expected)
 
     got = out.cpu().double()
     if scenario == "beyond fp32's exp":

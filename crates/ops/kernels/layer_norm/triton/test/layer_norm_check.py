@@ -74,6 +74,15 @@ def absolute_floor(weight, bias, dtype):
     return UNIT_ROUNDOFF[dtype] * scale.max().item()
 
 
+def truncate(values):
+    """The reference as Triton's interpreter stores it: one ulp low, not rounded.
+
+    The `bf16` significand is eight bits, so the value is truncated on its own mantissa.
+    """
+    bits = values.view(torch.int64)
+    return (bits & ~((1 << 45) - 1)).view(torch.float64)
+
+
 def check(case, device):
     """Normalize one matrix and compare every element against the exact rows."""
     import layer_norm as kernels
@@ -125,9 +134,10 @@ def check(case, device):
     if case["truncate"]:
         # Triton's interpreter truncates a narrow store instead of rounding to nearest
         # even, one ulp low; the reference is truncated the same way so that what the run
-        # compares is the arithmetic and not the interpreter's cast.
-        bits = expected.float().view(torch.int32)
-        expected = (bits & ~0xFFFF).view(torch.float32).to(dtype).double()
+        # compares is the arithmetic and not the interpreter's cast. The truncation is of
+        # the value's own mantissa: rounding it to `f32` first would step values across a
+        # boundary the kernel's arithmetic stays below.
+        expected = truncate(expected)
     got = out.cpu().double()
     difference = (got - expected).abs()
     relative = bound(columns, case["dtype"]) * expected.abs()
