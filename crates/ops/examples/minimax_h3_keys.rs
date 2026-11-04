@@ -360,6 +360,39 @@ fn main() {
         }
         .to_string(),
     );
+    // The DiT's attention: one dense program over the packed sequence. `max_kv_len` is a declared
+    // bound outside the key (a padded-token bucket up to 174,598 for the widest layout), so the key
+    // names only the geometry. The batch path carries `[batch + 1]` offsets.
+    push(
+        "dense_attention",
+        ops::attention::dense::DenseDescriptor {
+            query: DType::BF16,
+            key_value: DType::BF16,
+            output: DType::BF16,
+            head_dim: HEAD_DIM,
+            q_heads: HEADS,
+            kv_heads: HEADS,
+            mask: ops::attention::Mask::Dense,
+            windowed: false,
+            max_kv_len: 174_598,
+            cu_seq_lens: true,
+        }
+        .to_string(),
+    );
+    // The VSA branch's own attention: one program per tile size, and the key extent (tiles per
+    // segment per layout) is a declared bound outside the key.
+    push(
+        "sparse_attention",
+        ops::attention::sparse::SparseDescriptor {
+            block: 64,
+            dtype: DType::BF16,
+            output: DType::BF16,
+            head_dim: HEAD_DIM,
+            lse: false,
+            keys: 65_536,
+        }
+        .to_string(),
+    );
     // The DiT's row mapping, one key per latent raster the served canvases produce. The canvas is
     // divided by the VAE's 16x spatial compression, and each side is even for every served canvas
     // because the canvas's sides are multiples of the model's own step.
@@ -387,6 +420,41 @@ fn main() {
             );
         }
     }
+    // The audio decoder's fused BigVGAN block, at the decoder's own rate and taps.
+    push(
+        "audio_activation",
+        ops::audio_activation::Descriptor {
+            dtype: DType::F32,
+            channels: DECODER_DIM,
+            kernel: ACTIVATION_KERNEL,
+            ratio: ACTIVATION_RATIO,
+            block: 1024,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
+    // The timestep embedding's activation, over the transformer's hidden width.
+    push(
+        "silu",
+        ops::activation::SiluDescriptor {
+            dtype: DType::BF16,
+            columns: HIDDEN,
+            block: 1024,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
+    // The solver's Euler step: an FP32 source added into a BF16 running sample.
+    push(
+        "scaled_add",
+        ops::residual::ScaledAddDescriptor {
+            target: DType::BF16,
+            source: DType::F32,
+            columns: HIDDEN,
+            block: 1024,
+        }
+        .to_string(),
+    );
     // The audio decoder's last step: two float channels to interleaved 16-bit PCM. The clip's length
     // is a launch value, so the key holds only the element type and the block.
     push(
