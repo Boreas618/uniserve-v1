@@ -12,3 +12,4 @@
 pub mod causal_lm;
 
 pub use causal_lm::CausalLmRunner;
+pub mod resident;

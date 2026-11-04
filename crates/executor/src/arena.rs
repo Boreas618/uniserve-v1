@@ -25,6 +25,9 @@ use platform::{Allocator, Buffer, DeviceId, DevicePtr, PoolKind};
 use crate::plan::Bucket;
 use crate::{Error, Result};
 
+/// What the pool arithmetic answers when a reservation does not fit in `usize`.
+const POOL_TOO_LARGE: &str = "a device pool is larger than memory";
+
 /// The executor's name for one of a runner's streams.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct StreamId(pub usize);
@@ -254,6 +257,49 @@ impl Pools {
             streams,
             scratch_reserved: false,
         })
+    }
+
+    /// The same, reserving every pool the device maps in one place (4.1): the graph range the
+    /// captured graphs address, the scratch the shadow pair's region and the paired forward's
+    /// pages come from, and the resident range the storage owners carve.
+    ///
+    /// One `Pools` per device is the only allocator on it, so the three pool kinds are one booking
+    /// and item 5's `graph + scratch + resident <= budget` is decided by one book.
+    pub fn with_pools(allocator: Allocator, graph: u64, scratch: u64, resident: u64, budget: u64, streams: usize) -> Result<Self> {
+        let mut pools = Self::new(allocator, graph, budget, streams)?;
+        for (pool, bytes) in [(PoolKind::Scratch, scratch), (PoolKind::Resident, resident)] {
+            if bytes == 0 {
+                continue;
+            }
+            let size = usize::try_from(bytes)
+                .map_err(|_| Error::Resource(POOL_TOO_LARGE))?;
+            pools.allocator.reserve(pool, size)?;
+        }
+        pools.scratch_reserved = scratch != 0;
+        Ok(pools)
+    }
+
+    /// Maps `bytes` of `pool` through the device's one allocator, for an owner that carves its own
+    /// storage (the resident planes, a scratch page set).
+    pub fn allocate(&mut self, pool: PoolKind, bytes: u64) -> Result<Buffer> {
+        let size = usize::try_from(bytes)
+            .map_err(|_| Error::Resource("an allocation is larger than memory".into()))?;
+        Ok(self.allocator.allocate(pool, size)?)
+    }
+
+    /// Gives a `pool` block back to the device's allocator; the block stays mapped, as 4.1 has it.
+    pub fn free(&mut self, buffer: Buffer) {
+        self.allocator.free(buffer);
+    }
+
+    /// The bytes `pool` has mapped, as the device's one allocator books them (4.1).
+    pub fn mapped_bytes(&self, pool: PoolKind) -> u64 {
+        self.allocator.mapped_bytes(pool) as u64
+    }
+
+    /// The device's allowance.
+    pub fn budget(&self) -> u64 {
+        self.ledger.budget
     }
 
     /// The bytes each stream's range reserves.

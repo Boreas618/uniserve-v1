@@ -90,13 +90,16 @@ impl SharedCounters {
 pub struct GraphStorage {
     /// Bytes the device may map for captured graphs (4.1's budget).
     pub bytes: u64,
-    /// The device budget those mappings are booked against.
+    /// The device budget every mapping on the device is booked against.
     pub budget: u64,
-    /// How many streams the executor issues on; the range is divided among them.
+    /// How many streams the executor issues on; the graph range is divided among them.
     pub streams: usize,
-    /// Bytes for the shadow pair's region (`ops::Twins`), carved from the device's allocator's
-    /// scratch pool on the first shadow batch (7.3). Zero when the rank never shadows.
+    /// Bytes of the device's scratch pool: the shadow pair's region and the paired forward's
+    /// pages (7.3). Zero when the rank never shadows.
     pub scratch: u64,
+    /// Bytes of the device's resident pool, which the storage owners carve through the same
+    /// allocator (4.1). Zero when the rank keeps nothing resident in this process.
+    pub resident: u64,
 }
 
 impl Executor {
@@ -116,9 +119,11 @@ impl Executor {
     ) -> Result<Self> {
         let handle = platform::Device::new(device)?;
         let allocator = platform::Allocator::new(&handle, Arc::new(GraphBudget { bytes: graph.budget }))?;
-        let pools = Arc::new(std::sync::Mutex::new(Pools::new(
+        let pools = Arc::new(std::sync::Mutex::new(Pools::with_pools(
             allocator,
             graph.bytes,
+            graph.scratch,
+            graph.resident,
             graph.budget,
             graph.streams,
         )?));
@@ -247,6 +252,15 @@ impl Executor {
             None,
         )?;
         Ok(submission)
+    }
+
+    /// The device's one pool set, for an owner that carves its own storage from the same allocator
+    /// (the storage owners' resident planes, the paired forward's scratch pages).
+    ///
+    /// Nothing else on the device constructs a `Pools` (4.1): a second allocator would book the
+    /// same device allowance twice.
+    pub fn pools(&self) -> Arc<std::sync::Mutex<Pools>> {
+        Arc::clone(&self.pools)
     }
 
     /// The device's graph pools as their ledger books them: the reserved range, the bytes mapped
