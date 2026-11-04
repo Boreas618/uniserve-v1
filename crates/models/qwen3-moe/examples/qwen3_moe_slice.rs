@@ -1720,7 +1720,42 @@ fn check_continuation(
 
 #[cfg(test)]
 mod tests {
-    use super::{argmax_over, check_continuation, slot_for};
+    use std::path::Path;
+
+    use super::{argmax_over, check_continuation, needed_keys, slot_for, KvPages, Stage};
+
+    /// The store rows a run requires follow the deployment's page type: an fp8 cache asks for the
+    /// scale-deriving write and the fp8 reads, and a bf16 cache asks for neither, so neither
+    /// deployment is held up by the other one's program.
+    #[test]
+    fn the_required_rows_follow_the_page_type() {
+        let root = Path::new(".");
+        let bf16 = needed_keys(root, Stage::Decode, false, KvPages::Bf16).expect("the fixture");
+        let fp8 = needed_keys(root, Stage::Decode, false, KvPages::Fp8).expect("the fixture");
+        let names = |keys: &[(String, String)]| -> Vec<String> {
+            keys.iter().map(|(operator, _)| operator.clone()).collect()
+        };
+        let (bf16, fp8) = (names(&bf16), names(&fp8));
+        assert!(bf16.iter().any(|name| name == "kv_write"), "{bf16:?}");
+        assert!(
+            !bf16.iter().any(|name| name == "kv_write_scaled"),
+            "{bf16:?}"
+        );
+        assert!(fp8.iter().any(|name| name == "kv_write_scaled"), "{fp8:?}");
+        // The same operator twice: the fp8 deployment reads its own key/value type.
+        assert_eq!(
+            fp8.iter().filter(|name| *name == "paged_attention").count(),
+            2,
+            "{fp8:?}"
+        );
+        assert_eq!(
+            bf16.iter()
+                .filter(|name| *name == "paged_attention")
+                .count(),
+            2,
+            "{bf16:?}"
+        );
+    }
 
     /// The line a continuation's batch must satisfy, on the numbers a prompt of fifteen tokens
     /// produces: the first generated token is the one at position 15, its sequence length is 16, and
