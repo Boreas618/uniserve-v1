@@ -33,6 +33,7 @@ pub mod runners;
 pub mod shadow;
 
 pub mod blocking;
+pub mod capacity;
 pub mod completion;
 pub mod config;
 pub mod error;
