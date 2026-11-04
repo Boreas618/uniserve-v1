@@ -30,13 +30,14 @@ use std::time::Duration;
 
 use prost::Message as _;
 use proto::process::{
-    self, Answered, Downstream, Event, Exited, Forwarded, FromMember, Hello, LedgerReport, Node,
-    NodesKnown, Reply, Request, Spawned, Stopped, ToMember, TransfersThrottled, Upstream, Welcome,
-    downstream, event, from_member, hello, reply, request, to_member, upstream,
+    self, Answered, Downstream, Event, Exit, Exited, Forwarded, FromMember, Hello, LedgerReport,
+    Node, NodesKnown, Reply, Request, Spawned, Stopped, ToMember, TransfersThrottled, Upstream,
+    Welcome, downstream, event, from_member, hello, reply, request, to_member, upstream,
 };
 use proto::{Connection, Handed, Listener};
 
 use crate::supervision::claims::{ClaimHolder, HandedClaims};
+use crate::supervision::roster::Greeting;
 use crate::supervision::supervisor::{HandedProcesses, Supervisor};
 
 /// How often children are polled for exits while nothing else happens.
@@ -324,6 +325,11 @@ struct EngineConnection {
     welcomed: bool,
 }
 
+/// The owner id of the main processes the epoch layer starts: it is no
+/// connection, so no disconnect ever releases them, and the service keeps
+/// them for the daemon's life (§2.5, §7.4).
+pub(crate) const EPOCH_ENGINE: u64 = 0;
+
 /// Runs the leader's service until `stop`: engines connect on `listener`,
 /// `members` joined before, and other nodes may join at `joins`. Returns
 /// what it served when `stop` asks for a hot restart's handoff, and `None`
@@ -336,6 +342,10 @@ pub(crate) fn serve_leader(
     members: Vec<Membership>,
     commands: Receiver<(u64, process::Command)>,
     reports: Sender<(u64, process::Report)>,
+    requests: Receiver<(Request, Sender<Reply>)>,
+    greetings: Sender<(u64, Greeting)>,
+    exits: Sender<Exit>,
+    wake: Sender<()>,
     stop: &Stop,
 ) -> anyhow::Result<Option<(HandedService, Vec<OwnedFd>)>> {
     let mut nodes = vec![Node {
@@ -361,6 +371,11 @@ pub(crate) fn serve_leader(
             stops: HashMap::new(),
             commands,
             reports,
+            requests,
+            greetings,
+            exits,
+            pending: HashMap::new(),
+            wake,
         },
         stop,
     )
@@ -388,6 +403,21 @@ pub(crate) struct LeaderService {
     /// Where each `Upstream::Report` an engine's main process sends goes,
     /// with the engine that sent it.
     reports: Sender<(u64, process::Report)>,
+    /// The epoch layer's requests, each with the answer it waits for: a
+    /// request for this node is answered at once, one for a node is answered
+    /// when its daemon's reply arrives.
+    requests: Receiver<(Request, Sender<Reply>)>,
+    /// Every peer that greeted the leader, with its build and its kind: the
+    /// epoch layer binds a peer to the launch it started once the peer's
+    /// report names it.
+    greetings: Sender<(u64, Greeting)>,
+    /// Every supervised process that exited, for the epoch layer's switch.
+    exits: Sender<Exit>,
+    /// The epoch layer's requests a node has not answered yet, by request id.
+    pending: HashMap<u64, Sender<Reply>>,
+    /// A token per thing the epoch layer has to read: a greeting, a report or
+    /// an exit wakes the thread that advances the switch.
+    wake: Sender<()>,
 }
 
 /// Runs the leader's service from `service` until `stop`.
@@ -405,8 +435,13 @@ pub(crate) fn run_leader(
         mut engines,
         mut next_engine,
         mut stops,
-        mut commands,
+        commands,
         reports,
+        requests,
+        greetings,
+        exits,
+        mut pending,
+        wake,
     } = service;
     let host = host.as_str();
     loop {
@@ -423,6 +458,11 @@ pub(crate) fn run_leader(
                 stops,
                 commands,
                 reports,
+                requests,
+                greetings,
+                exits,
+                pending,
+                wake,
             };
             return service.hand_over().map(Some);
         }
@@ -473,6 +513,28 @@ pub(crate) fn run_leader(
             }
         }
 
+        // The epoch layer's requests (§7.4): a spawn, stop or claim it asks
+        // for is executed here, by this node's supervisor and claims or by a
+        // member's daemon, and the answer goes back the way it came.
+        while let Ok((request, answer)) = requests.try_recv() {
+            match route(
+                EPOCH_ENGINE,
+                &request,
+                host,
+                &mut local,
+                &mut members,
+                &nodes,
+                &mut stops,
+            ) {
+                Some(reply) => {
+                    let _ = answer.send(reply);
+                }
+                None => {
+                    pending.insert(request.id, answer);
+                }
+            }
+        }
+
         // Engines: their hellos and requests; a closed engine takes its
         // processes on every node with it.
         for (&engine, peer) in &mut engines {
@@ -480,8 +542,9 @@ pub(crate) fn run_leader(
                 if !peer.welcomed {
                     match peer.connection.try_recv::<Hello>() {
                         Ok(Some(hello)) => {
-                            let refusal =
-                                refusal(&hello, |peer| matches!(peer, hello::Peer::Engine(_)));
+                            let refusal = refusal(&hello, |peer| {
+                                matches!(peer, hello::Peer::Engine(_) | hello::Peer::Frontend(_))
+                            });
                             let welcome = Welcome {
                                 major: proto::PROTOCOL_MAJOR,
                                 minor: proto::PROTOCOL_MINOR,
@@ -493,7 +556,19 @@ pub(crate) fn run_leader(
                                 closed.push(engine);
                                 break;
                             }
-                            tracing::info!(engine, build = %hello.build, "an engine connected");
+                            let frontend = matches!(hello.peer, Some(hello::Peer::Frontend(_)));
+                            tracing::info!(engine, build = %hello.build, frontend, "a process connected");
+                            // The epoch layer binds this connection to the
+                            // launch it started when the peer's first report
+                            // names the launch generation (§2.5).
+                            let _ = greetings.send((
+                                engine,
+                                Greeting {
+                                    build: hello.build.clone(),
+                                    frontend,
+                                },
+                            ));
+                            let _ = wake.send(());
                             peer.welcomed = true;
                             continue;
                         }
@@ -528,6 +603,7 @@ pub(crate) fn run_leader(
                         // Reports go to the daemon's switch (§7.3); a
                         // daemon that stopped reading them drops them.
                         let _ = reports.send((engine, report));
+                        let _ = wake.send(());
                     }
                     Ok(Some(_)) => {}
                     Ok(None) => break,
@@ -556,36 +632,42 @@ pub(crate) fn run_leader(
             loop {
                 match member.connection.try_recv::<FromMember>() {
                     Ok(Some(message)) => {
-                        let (engine, downstream) = match message.kind {
+                        match message.kind {
                             Some(from_member::Kind::Answered(Answered {
                                 engine,
                                 reply: Some(reply),
                             })) => match stops.get_mut(&(engine, reply.id)) {
                                 // A stop is answered once every node stopped
                                 // the group.
-                                Some(pending) => {
+                                Some(stop) => {
                                     if !reply.error.is_empty() {
-                                        pending.reply.error = reply.error;
+                                        stop.reply.error = reply.error;
                                     }
-                                    pending.awaiting.retain(|&rank| rank != member.node_rank);
-                                    if !pending.awaiting.is_empty() {
+                                    stop.awaiting.retain(|&rank| rank != member.node_rank);
+                                    if !stop.awaiting.is_empty() {
                                         continue;
                                     }
-                                    let Some(pending) = stops.remove(&(engine, reply.id)) else {
+                                    let Some(stop) = stops.remove(&(engine, reply.id)) else {
                                         continue;
                                     };
-                                    (engine, downstream_reply(pending.reply))
+                                    answer(engine, stop.reply, &mut pending, &mut engines);
+                                    continue;
                                 }
-                                None => (engine, downstream_reply(reply)),
+                                None => {
+                                    answer(engine, reply, &mut pending, &mut engines);
+                                    continue;
+                                }
                             },
                             Some(from_member::Kind::Exited(Exited {
                                 engine,
                                 exit: Some(exit),
-                            })) => (engine, downstream_exit(exit)),
+                            })) => {
+                                if let Some(peer) = engines.get_mut(&engine) {
+                                    let _ = peer.connection.send(&downstream_exit(exit));
+                                }
+                                continue;
+                            }
                             _ => continue,
-                        };
-                        if let Some(peer) = engines.get_mut(&engine) {
-                            let _ = peer.connection.send(&downstream);
                         }
                     }
                     Ok(None) => break,
@@ -606,23 +688,24 @@ pub(crate) fn run_leader(
             members.retain(|member| !lost.contains(&member.node_rank));
             nodes.retain(|node| !lost.contains(&node.node_rank));
             let mut settled = Vec::new();
-            for (&key, pending) in &mut stops {
-                pending.awaiting.retain(|rank| !lost.contains(rank));
-                if pending.awaiting.is_empty() {
+            for (&key, stop) in &mut stops {
+                stop.awaiting.retain(|rank| !lost.contains(rank));
+                if stop.awaiting.is_empty() {
                     settled.push(key);
                 }
             }
             for key in settled {
-                if let Some(pending) = stops.remove(&key)
-                    && let Some(peer) = engines.get_mut(&key.0)
-                {
-                    let _ = peer.connection.send(&downstream_reply(pending.reply));
+                if let Some(stop) = stops.remove(&key) {
+                    answer(key.0, stop.reply, &mut pending, &mut engines);
                 }
             }
         }
 
-        // This node's exits, to the engines that started the processes.
+        // This node's exits, to the engines that started the processes and
+        // to the epoch layer, whose switch reads them (§7.3, §7.4).
         for (engine, exit) in local.supervisor.exits() {
+            let _ = exits.send(exit.clone());
+            let _ = wake.send(());
             if let Some(peer) = engines.get_mut(&engine) {
                 let _ = peer.connection.send(&downstream_exit(exit));
             }
@@ -643,6 +726,23 @@ struct PendingStop {
     reply: Reply,
     /// The node ranks of the members that have not answered yet.
     awaiting: Vec<u32>,
+}
+
+/// Delivers one reply: to the epoch layer when the main processes' owner
+/// asked, otherwise down the engine's own connection.
+fn answer(
+    engine: u64,
+    reply: Reply,
+    pending: &mut HashMap<u64, Sender<Reply>>,
+    engines: &mut HashMap<u64, EngineConnection>,
+) {
+    if engine == EPOCH_ENGINE {
+        if let Some(waiter) = pending.remove(&reply.id) {
+            let _ = waiter.send(reply);
+        }
+    } else if let Some(peer) = engines.get_mut(&engine) {
+        let _ = peer.connection.send(&downstream_reply(reply));
+    }
 }
 
 /// Routes one engine request: answered here for this node, forwarded to the
@@ -881,6 +981,11 @@ impl LeaderService {
             // successor makes its own ends when it resumes (`ProcessCommands`).
             commands: _,
             reports: _,
+            requests: _,
+            greetings: _,
+            exits: _,
+            pending: _,
+            wake: _,
         } = self;
         let (listener_descriptor, unix, address) = listener.hand_over();
         let mut descriptors = vec![listener_descriptor];
@@ -937,6 +1042,10 @@ pub(crate) fn resume(
     descriptors: Vec<OwnedFd>,
     commands: Receiver<(u64, process::Command)>,
     reports: Sender<(u64, process::Report)>,
+    requests: Receiver<(Request, Sender<Reply>)>,
+    greetings: Sender<(u64, Greeting)>,
+    exits: Sender<Exit>,
+    wake: Sender<()>,
     stop: &Stop,
 ) -> anyhow::Result<Option<(HandedService, Vec<OwnedFd>)>> {
     let mut descriptors = descriptors.into_iter();
@@ -1017,6 +1126,11 @@ pub(crate) fn resume(
                     stops,
                     commands,
                     reports,
+                    requests,
+                    greetings,
+                    exits,
+                    pending: HashMap::new(),
+                    wake,
                 },
                 stop,
             )
