@@ -115,6 +115,147 @@ PLUGIN_ENTRY_POINTS = (
 )
 
 
+# The package this file installs: the scheduling policy the deployments serve.
+# Every deployment needs a policy, a policy's module comes only from this
+# host's Program Server, and the leader resolves it before the main processes
+# serve (design 5.1, 6.1).
+POLICY_PACKAGE = "crates/ops/program-fixtures/policy"
+
+#: The socket of the module's Program Server, which every deployment of this
+#: file reaches through ``--program-server``. Set by :func:`program_server`.
+PROGRAM_SERVER: Path | None = None
+
+
+def _repository() -> Path:
+    """The repository root: the workspace the policy package is built in."""
+    return Path(__file__).resolve().parents[3]
+
+
+def _precompiler() -> Path:
+    """The wasm precompiler the Program Server turns a policy module into.
+
+    A policy is built for wasm32 and precompiled for this host's CPU, so the
+    server needs the precompiler before it can install a policy (design 5.3).
+    It is named by the environment, found on the path, shipped beside the
+    ``uniserve`` binary, or built from this tree, in that order.
+    """
+    named = os.environ.get("UNISERVE_SCHEDULING_PRECOMPILE")
+    if named:
+        return Path(named)
+    found = shutil.which("scheduling-precompile")
+    if found:
+        return Path(found)
+    beside = Path(require_uniserve_binary()).with_name("scheduling-precompile")
+    if beside.exists():
+        return beside
+    root = _repository()
+    done = subprocess.run(
+        [
+            "cargo",
+            "build",
+            "--package",
+            "scheduling",
+            "--bin",
+            "scheduling-precompile",
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=3600,
+    )
+    if done.returncode != 0:
+        pytest.fail(
+            f"scheduling-precompile did not build: {done.stderr[-2000:]}"
+        )
+    return root / "target" / "debug" / "scheduling-precompile"
+
+
+@pytest.fixture(scope="module", autouse=True)
+def program_server(tmp_path_factory: pytest.TempPathFactory):
+    """The host's Program Server, with the deployment's policy installed.
+
+    Autouse and module-scoped because every deployment of this file needs it:
+    the daemon's leader resolves each epoch's programs at this server, and a
+    policy's module exists nowhere else. The policy is installed once, built
+    for wasm32 by the package's own script while the tree it came from exists
+    (design 6.2); a deployment that never reaches the server never serves.
+    """
+    global PROGRAM_SERVER
+    binary = require_uniserve_binary()
+    work = tmp_path_factory.mktemp("program-server")
+    socket = work / "program-server.sock"
+    packages = work / "packages"
+    packages.mkdir()
+    store = work / "store"
+    store.mkdir()
+    log = work / "program-server.log"
+    command = [
+        str(binary),
+        "program-server",
+        "serve",
+        "--socket",
+        str(socket),
+        "--package-root",
+        str(packages),
+        "--store-root",
+        str(store),
+        "--target",
+        os.environ.get("UNISERVE_PROGRAM_TARGET", "sm_100a"),
+        "--wasm",
+        str(_precompiler()),
+    ]
+    interpreter = _repository() / ".venv" / "bin" / "python"
+    if interpreter.exists():
+        command += ["--python", str(interpreter)]
+    process = start_server(command, log)
+    deadline = time.monotonic() + 120.0
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(f"the Program Server exited: {log.read_text()}")
+        if socket.exists():
+            break
+        time.sleep(0.2)
+    else:
+        raise TimeoutError(f"the Program Server left no socket at {socket}")
+
+    installed = subprocess.run(
+        [
+            str(binary),
+            "program-server",
+            "install",
+            "--socket",
+            str(socket),
+            str(_repository() / POLICY_PACKAGE),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=3600,
+    )
+    if installed.returncode != 0:
+        raise AssertionError(
+            "installing the scheduling policy failed: "
+            f"{installed.stdout}\n{installed.stderr}"
+        )
+    PROGRAM_SERVER = socket
+    try:
+        yield socket
+    finally:
+        PROGRAM_SERVER = None
+        stop_server(process)
+
+
+def program_server_option() -> list[str]:
+    """The command-line option that gives a deployment its programs' server.
+
+    Every deployment serves a scheduling policy, and a policy's module comes
+    from this host's Program Server (design 6.1); without the option the leader
+    resolves the epoch's programs nowhere and the deployment never serves.
+    """
+    if PROGRAM_SERVER is None:
+        pytest.fail("the module's Program Server is not running")
+    return ["--program-server", str(PROGRAM_SERVER)]
+
+
 def _checkpoint() -> str:
     checkpoint = os.environ.get("UNISERVE_QWEN3_MODEL", "")
     if not checkpoint or not Path(checkpoint).is_dir():
@@ -315,6 +456,7 @@ def _node(runtime: Path, device: str, log: Path) -> Iterator[tuple[str, int]]:
             "127.0.0.1",
             "--port",
             str(port),
+            *program_server_option(),
         ],
         log,
         env={"CUDA_VISIBLE_DEVICES": device, "XDG_RUNTIME_DIR": str(runtime)},
@@ -461,6 +603,7 @@ def _serve(
         str(worker_executable()),
         "--set",
         f"kv_cache_config.host_gib={HOST_GIB}",
+        *program_server_option(),
     ]
     for option in options:
         command += ["--set", option]
