@@ -602,8 +602,8 @@ pub struct GatherGemmNvfp4Descriptor {
     pub top: u32,
     /// The gated activation.
     pub activation: Activation,
-    /// Element type of the activations and of the output. The weights are packed, so this is the
-    /// unpacked element type rather than the stored one.
+    /// Element type of the output — the type the accumulator rounds to. The weights *and* the
+    /// activations are packed E2M1, so neither is this type; it is the epilogue's.
     pub dtype: DType,
     /// Element type of the block scales, as the checkpoint stores them: `F8_E4M3` for a ModelOpt
     /// export, `U8` for a shard that already holds the codes. One byte either way, and never
@@ -640,8 +640,15 @@ impl fmt::Display for GatherGemmNvfp4Descriptor {
 /// The arguments of one encoded FC1 launch.
 #[derive(Clone, Copy)]
 pub struct GatherGemmNvfp4Args {
-    /// `[routes, hidden]` the gathered activations.
+    /// `[routes, hidden/2]` U8: the gathered activations, encoded — two E2M1 codes a byte along the
+    /// contraction, exactly what `nvfp4_quantize` produces. The design's NVFP4 expert product reads
+    /// encoded activations (specs/worker.md's NVFP4 row: the FP4 GEMM, the *activation encoding* and
+    /// the FP4 expert GEMM are three kernel programs), and every kernel in the artifact that takes an
+    /// E2M1 weight takes an E2M1 activation as well.
     pub hidden: TensorView,
+    /// The activations' block scales, one per sixteen elements of the contraction, of the
+    /// descriptor's `scale` type in its `layout`.
+    pub hidden_scale: TensorView,
     /// `[experts, 2·intermediate, hidden/2]` U8: two E2M1 codes a byte along the contraction.
     pub weights: TensorView,
     /// `[experts, ...]` the block scales in the descriptor's layout, one per sixteen elements.
@@ -705,8 +712,10 @@ fn check_workspace(operator: &'static str, workspace: TensorView) -> Result<()> 
 /// scale layout — travel as well, since the entry checks the call against the module it was built as
 /// and refuses a mismatch by name rather than launching a kernel with another tactic's assumptions.
 pub struct GatherNvfp4Call {
-    /// `[routes, hidden]`: the gathered activations.
+    /// `[routes, hidden/2]` U8: the gathered activations, two E2M1 codes a byte.
     pub hidden: *const c_void,
+    /// The activations' block scales.
+    pub hidden_scale: *const c_void,
     /// `[experts, 2·intermediate, hidden/2]` U8: two E2M1 codes a byte.
     pub weights: *const c_void,
     /// The block scales, one per sixteen elements of the contraction.
@@ -758,6 +767,7 @@ pub struct GatherNvfp4Call {
 /// The offsets of [`GatherNvfp4Call`] its header mirrors, stated once for the test below.
 pub struct GatherNvfp4CallLayout {
     pub size: usize,
+    pub hidden_scale: usize,
     pub global_scale: usize,
     pub global_scale_gate: usize,
     pub workspace: usize,
@@ -769,13 +779,14 @@ pub struct GatherNvfp4CallLayout {
 impl GatherNvfp4Call {
     /// The offsets the C header must agree with.
     pub const LAYOUT: GatherNvfp4CallLayout = GatherNvfp4CallLayout {
-        size: 704,
-        global_scale: 24,
-        global_scale_gate: 32,
-        workspace: 88,
-        workspace_bytes: 96,
-        dtype: 184,
-        error: 192,
+        size: 712,
+        hidden_scale: 8,
+        global_scale: 32,
+        global_scale_gate: 40,
+        workspace: 96,
+        workspace_bytes: 104,
+        dtype: 192,
+        error: 200,
     };
 }
 
@@ -788,8 +799,10 @@ impl NativeCall for GatherNvfp4Call {
 
 /// One encoded FC2 launch, as the trtllm-gen batched-GEMM entry reads it.
 pub struct RouteNvfp4Call {
-    /// `[routes, intermediate]`: the gated product FC1 produced.
+    /// `[routes, intermediate/2]` U8: the gated rows FC1 produced, encoded.
     pub hidden: *const c_void,
+    /// The rows' block scales.
+    pub hidden_scale: *const c_void,
     /// `[experts, hidden, intermediate/2]` U8: two E2M1 codes a byte.
     pub weights: *const c_void,
     /// The block scales, one per sixteen elements of the contraction.
@@ -835,8 +848,9 @@ pub struct RouteNvfp4Call {
 impl RouteNvfp4Call {
     /// The offsets the C header must agree with.
     pub const LAYOUT: RouteNvfp4CallLayout = RouteNvfp4CallLayout {
-        size: 680,
-        global_scale: 24,
+        size: 688,
+        hidden_scale: 8,
+        global_scale: 32,
         workspace: 88,
         workspace_bytes: 96,
         dtype: 168,
@@ -847,6 +861,7 @@ impl RouteNvfp4Call {
 /// The offsets of [`RouteNvfp4Call`] its header mirrors.
 pub struct RouteNvfp4CallLayout {
     pub size: usize,
+    pub hidden_scale: usize,
     pub global_scale: usize,
     pub workspace: usize,
     pub workspace_bytes: usize,
@@ -890,6 +905,43 @@ impl GatherGemmNvfp4 {
         }
         args.out
             .require_row(Self::NAME, descriptor.dtype, intermediate)?;
+        // The activations are encoded the same way the weights are: two codes a byte along the
+        // contraction. A BF16 row here would be read as packed codes and produce a product of half
+        // the contraction, so the operand's width is the encoding's and is refused when it is not.
+        args.hidden
+            .require_shape(Self::NAME, Shape::new(&[routes, hidden / 2]))?;
+        if args.hidden.dtype != DType::U8 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "expected the gathered activations as packed u8, found {}: the product's kernels \
+                     take an E2M1 activation, and `nvfp4_quantize` is the program that encodes one",
+                    args.hidden.dtype
+                ),
+            ));
+        }
+        if args.hidden_scale.dtype != descriptor.scale {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "expected {} activation block scales, found {}",
+                    descriptor.scale, args.hidden_scale.dtype
+                ),
+            ));
+        }
+        // The scales cover the contraction in blocks of sixteen, one per gathered row. A table that
+        // covers fewer rows than the product reads would scale another row's block.
+        let activation_blocks = hidden.div_ceil(u64::from(crate::fp4::BLOCK_ELEMENTS));
+        let covered: u64 = args.hidden_scale.shape.dims().iter().product();
+        if covered < routes * activation_blocks {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "{covered} activation block scales cover fewer than {routes} rows of \
+                     {activation_blocks} blocks"
+                ),
+            ));
+        }
         // The packed field holds two codes a byte along the contraction, so its width is half the
         // contraction and no more: a wider one would read past the expert's weights.
         args.weights.require_shape(
@@ -1022,6 +1074,7 @@ impl Op for GatherGemmNvfp4 {
         let tokens = args.hidden.rows();
         let mut call = GatherNvfp4Call {
             hidden: address(args.hidden.ptr) as usize as *const c_void,
+            hidden_scale: address(args.hidden_scale.ptr) as usize as *const c_void,
             weights: address(args.weights.ptr) as usize as *const c_void,
             scales: address(args.scales.ptr) as usize as *const c_void,
             global_scale: address(args.global_scale.ptr) as usize as *const c_void,
@@ -1218,7 +1271,7 @@ pub struct RouteGemmNvfp4Descriptor {
     pub experts: u32,
     /// Routes per token.
     pub top: u32,
-    /// Element type of the rows and of the output; the weights are packed.
+    /// Element type of the output; the weights and the rows are both packed E2M1.
     pub dtype: DType,
     /// Element type of the block scales.
     pub scale: DType,
@@ -1252,8 +1305,13 @@ impl fmt::Display for RouteGemmNvfp4Descriptor {
 /// The arguments of one encoded FC2 launch.
 #[derive(Clone, Copy)]
 pub struct RouteGemmNvfp4Args {
-    /// `[routes, intermediate]` the gated product.
+    /// `[routes, intermediate/2]` U8: the gated rows, encoded as `nvfp4_quantize` produces them —
+    /// two E2M1 codes a byte along the contraction. FC1's epilogue is a BF16 row, so the encoding
+    /// between the two products is a program of its own, not a wider operand of this one.
     pub hidden: TensorView,
+    /// The rows' block scales, one per sixteen elements of the contraction, of the descriptor's
+    /// `scale` type in its `layout`.
+    pub hidden_scale: TensorView,
     /// `[experts, hidden, intermediate/2]` U8: two E2M1 codes a byte along the contraction.
     pub weights: TensorView,
     /// The block scales, one per sixteen elements of the contraction and one row per output row.
@@ -1325,6 +1383,38 @@ impl Op for RouteGemmNvfp4 {
                 ),
             ));
         }
+        args.hidden
+            .require_shape(Self::NAME, Shape::new(&[routes, intermediate / 2]))?;
+        if args.hidden.dtype != DType::U8 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "expected the gated rows as packed u8, found {}: FC1's epilogue emits \
+                     {:?}, and `nvfp4_quantize` is the program that encodes it",
+                    args.hidden.dtype, descriptor.dtype
+                ),
+            ));
+        }
+        if args.hidden_scale.dtype != descriptor.scale {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "expected {} activation block scales, found {}",
+                    descriptor.scale, args.hidden_scale.dtype
+                ),
+            ));
+        }
+        let row_blocks = intermediate.div_ceil(u64::from(crate::fp4::BLOCK_ELEMENTS));
+        let covered: u64 = args.hidden_scale.shape.dims().iter().product();
+        if covered < routes * row_blocks {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "{covered} activation block scales cover fewer than {routes} rows of \
+                     {row_blocks} blocks"
+                ),
+            ));
+        }
         args.weights
             .require_shape(Self::NAME, Shape::new(&[experts, hidden, intermediate / 2]))?;
         if args.weights.dtype != DType::U8 {
@@ -1389,6 +1479,7 @@ impl Op for RouteGemmNvfp4 {
         check_workspace(Self::NAME, args.workspace)?;
         let mut call = RouteNvfp4Call {
             hidden: address(args.hidden.ptr) as usize as *const c_void,
+            hidden_scale: address(args.hidden_scale.ptr) as usize as *const c_void,
             weights: address(args.weights.ptr) as usize as *const c_void,
             scales: address(args.scales.ptr) as usize as *const c_void,
             global_scale: address(args.global_scale.ptr) as usize as *const c_void,
@@ -1465,7 +1556,8 @@ mod nvfp4_launch_tests {
     /// the permuted rows past `tokens · top`.
     fn fc1_args() -> GatherGemmNvfp4Args {
         GatherGemmNvfp4Args {
-            hidden: table(DType::BF16, &[3, 2048]),
+            hidden: table(DType::U8, &[3, 1024]),
+            hidden_scale: table(DType::F8E4M3, &[3, 128]),
             weights: table(DType::U8, &[128, 1536, 1024]),
             scales: table(DType::F8E4M3, &[128, 1536, 128]),
             global_scale: table(DType::F32, &[2, 128]),
@@ -1552,9 +1644,10 @@ mod nvfp4_call_layout_tests {
         assert_eq!(std::mem::offset_of!(GatherNvfp4Call, dtype), 184);
         assert_eq!(std::mem::offset_of!(GatherNvfp4Call, error), 192);
 
-        assert_eq!(std::mem::size_of::<RouteNvfp4Call>(), 680);
+        assert_eq!(std::mem::size_of::<RouteNvfp4Call>(), 688);
         assert_eq!(std::mem::offset_of!(RouteNvfp4Call, hidden), 0);
-        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, global_scale), 24);
+        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, hidden_scale), 8);
+        assert_eq!(std::mem::offset_of!(RouteNvfp4Call, global_scale), 32);
         assert_eq!(std::mem::offset_of!(RouteNvfp4Call, workspace), 88);
         assert_eq!(std::mem::offset_of!(RouteNvfp4Call, workspace_bytes), 96);
         assert_eq!(std::mem::offset_of!(RouteNvfp4Call, dtype), 168);
