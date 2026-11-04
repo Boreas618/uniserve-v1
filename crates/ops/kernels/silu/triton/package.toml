@@ -1,0 +1,30 @@
+# The silu operator's Triton backend: design 5.2's program package.
+#
+# One cubin per descriptor: the plain sigmoid linear unit, `out = x / (1 + exp(−x))` over a
+# contiguous `[rows, columns]` buffer. One formula, so one program — the element type and the
+# block width are the compilation, the element count and the row width are launch words.
+
+op = "silu"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+
+[source]
+kind = "triton"
+files = ["src/silu.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+[kernel.descriptors]
+dimensions = { dtype = ["bf16", "f16", "f32"], columns = ["5376"], block = ["1024"], pdl = ["false", "true"] }
+
+[parameters]
