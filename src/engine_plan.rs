@@ -282,7 +282,12 @@ impl EpochPlan {
                     // A request may ask for any top-k it likes, so the candidate width is the
                     // vocabulary: a narrower buffer would silently sample a different set.
                     width: narrow(model.config().vocab_size, "vocab_size")?,
-                    page_size: model.page_tokens(),
+                    // The page size the resident cache was planned with, not the one the model
+                    // asked for: the capacity plan may have had to take a smaller page, and a
+                    // runner that read a different one would address another request's pages.
+                    // A plan that disagrees with the model's stated page size is refused here,
+                    // naming both figures, rather than served.
+                    page_size: cache_page_size(memory, &model)?,
                     max_kv_len: self.max_kv_len(&model)?,
                 };
                 let stream = platform::Stream::new(device)
@@ -325,6 +330,31 @@ impl EpochPlan {
                 .context("the checkpoint's context length is wider than the protocol's"),
         }
     }
+}
+
+/// The page size the resident cache was planned with, checked against the model's (§4.5, §8).
+///
+/// The model states the page it reads; the capacity plan states the page it could afford, and the
+/// two must be the same page. A runner that served the model's figure while the pool held another
+/// would read another request's tokens out of the cache - wrong tokens with no error - so this is a
+/// refusal at spawn, naming both figures, and the block table and the sampler read the same one.
+fn cache_page_size(memory: &Memory, model: &qwen3_moe::Qwen3Moe) -> Result<u32> {
+    let cache = memory.shared_cache();
+    let cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let planned = cache
+        .layer_planes(0, 0)
+        .context("reading the resident cache's planned page size")?
+        .block_size;
+    let stated = model.page_tokens();
+    if planned != stated {
+        bail!(
+            "the model reads {stated} tokens per cache page and the resident cache was planned \
+             with {planned}; the pool would hold pages the runner does not address"
+        );
+    }
+    Ok(planned)
 }
 
 /// The targets this rank resolves a module for: the architecture-specific instruction set of every
