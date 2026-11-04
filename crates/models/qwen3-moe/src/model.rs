@@ -561,6 +561,13 @@ impl Qwen3Moe {
     /// reference's `layer.mlp.gate` needs this call or none.
     ///
     /// A layer whose MLP is dense has no router, and is refused by name.
+    ///
+    /// **`hidden` is a state, not a block's update.** The residual stream below the layer and the
+    /// update a layer's block produces have the same shape, so handing this method an update answers
+    /// a well-formed question about the wrong tensor: nothing here can refuse it, and the difference
+    /// shows only when the ids are compared. Above layer 0 the state exists only after the prefix,
+    /// which is why a caller holding the reference's files passes `hidden_{layer}` and a caller
+    /// without them has nothing correct to pass.
     pub fn route(
         &self,
         f: &Forward,
