@@ -276,19 +276,21 @@ def main() -> int:
     absolute, relative = tolerance(int(lengths.max()))
     difference = (out.double() - expected).abs()
     allowed = absolute + relative * expected.abs()
-    exceeded = int((difference > allowed).sum().item())
+    # `~(error <= bound)` rather than `error > bound`: a NaN difference — an unwritten row, or
+    # `-inf - -inf` — is neither, and the plain comparison would count it as inside the bound.
+    exceeded = int((~(difference <= allowed)).sum().item())
     print(
         f"mask {arguments.mask}, {arguments.sequences} sequence form, "
         f"window {arguments.window}: {batch} sequence(s), "
         f"{q_tokens} query rows over {kv_tokens} keys"
     )
     print(
-        f"max |out - exact| = {difference.max().item():.6g}, "
+        f"max |out - exact| = {difference.nan_to_num().max().item():.6g}, "
         f"tolerance = {absolute:.6g} + {relative:.3g}·|out|, "
         f"largest value {expected.abs().max().item():.6g}"
     )
     if exceeded:
-        crossing = (difference > allowed).nonzero()
+        crossing = (~(difference <= allowed)).nonzero()
         print(
             f"the FP32 pass exceeds the operator's tolerance at "
             f"{exceeded} element(s), "

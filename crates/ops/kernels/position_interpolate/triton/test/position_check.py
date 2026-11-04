@@ -124,12 +124,14 @@ def run(module, *, dtype, channels, in_side, block, indices, weights, seed=31):
     # operator.
     allowed = (bound + UNIT_ROUNDOFF_OF[dtype]) * expected.abs() + cast_noise + 1e-30
     unset = int(torch.isnan(out).sum())
-    violations = int((error > allowed).sum()) + unset
+    # `~(error <= allowed)` counts a NaN difference as outside, which also covers the rows the
+    # kernel never wrote — so `unset` is reported but not added.
+    violations = int((~(error <= allowed)).sum())
     if violations:
-        position = int(((error > allowed) | torch.isnan(out)).reshape(-1).nonzero()[0])
+        position = int((~(error <= allowed)).reshape(-1).nonzero()[0])
         raise SystemExit(
             f"{dtype} channels {channels} in_side {in_side} block {block}, {points} points: "
-            f"{violations} of {out.numel()} elements outside the bound ({unset} never written); "
+            f"{violations} of {out.numel()} elements outside the bound ({unset} not finite); "
             f"first at {position}: {float(out.reshape(-1)[position])} vs "
             f"{float(expected.reshape(-1)[position])}, rtol {bound:.3e}, "
             f"worst Σ|ab|/|out| {cancellation:.1f}"
