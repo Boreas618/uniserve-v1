@@ -218,6 +218,14 @@ impl Watchdog {
     }
 }
 
+/// What one turn of the device thread finished (4.5's interleaving).
+enum Step {
+    /// The command finished; its submission completes with this output.
+    Done(BatchOutput),
+    /// The command put its remainder at the tail; its submission completes on that step.
+    Requeued,
+}
+
 /// What a sticky-error probe found (2.4).
 #[derive(Debug)]
 pub enum Probe {
@@ -258,10 +266,20 @@ impl Device {
                 queue.complete(entry, Err(Error::Cuda(sticky.clone())));
                 continue;
             }
-            let result = self.serve(entry.command);
+            let result = self.serve(&entry);
             if let Err(error) = &result {
                 tracing::warn!(%error, device = self.device.0, "a device command failed");
             }
+            if matches!(result, Ok(Step::Requeued)) {
+                // The entry put the rest of its command at the tail; its submission waits for the
+                // last step, so nothing completes here.
+                continue;
+            }
+            let result = match result {
+                Ok(Step::Done(output)) => Ok(output),
+                Ok(Step::Requeued) => unreachable!("handled above"),
+                Err(error) => Err(error),
+            };
             if result.is_err() {
                 // A failure may be the sticky error's first symptom; probe before the next command
                 // so the executor stops issuing to a broken context (2.4).
@@ -289,64 +307,91 @@ impl Device {
     /// blocks only on the current command's device work).
     ///
     /// A command that serves a batch answers with that step's output; every other command answers
-    /// with an empty one.
-    fn serve(&mut self, command: Command) -> Result<BatchOutput> {
-        match command {
+    /// with an empty one. A multi-job command ([`Command::Steps`]) performs one job and puts the
+    /// rest back at the tail of the queue, so a serving batch the scheduler submitted meanwhile is
+    /// served between two of its jobs (4.5's interleaving).
+    fn serve(&mut self, entry: &crate::job::Entry) -> Result<Step> {
+        match &entry.command {
             Command::Batch(batch) => {
-                let runner = self.runner_of(phase_of(&batch))?;
-                let jobs = self.runner_mut(runner)?.submit(batch)?;
-                self.perform(jobs_of(runner, jobs))
+                let runner = self.runner_of(phase_of(batch))?;
+                let jobs = self.runner_mut(runner)?.submit(batch.clone())?;
+                // A batch's jobs are its replay and nothing else: serving it is one turn, because
+                // the mechanism waits on this submission to build the next step.
+                self.perform(jobs_of(runner, jobs)).map(Step::Done)
             }
             Command::Warmup => {
                 let mut jobs = Vec::new();
                 for named in &mut self.runners {
                     jobs.extend(jobs_of(named.id, named.runner.warmup()?));
                 }
-                self.perform(jobs)
+                self.steps(entry, None, jobs)
             }
             Command::Precopy(next) => {
                 let mut jobs = Vec::new();
                 for named in &mut self.runners {
-                    jobs.extend(jobs_of(named.id, named.runner.precopy(&next)?));
+                    jobs.extend(jobs_of(named.id, named.runner.precopy(next)?));
                 }
-                self.perform(jobs)
+                self.steps(entry, Some(next.number()), jobs)
+            }
+            Command::Steps { generation, jobs } => {
+                self.steps(entry, *generation, jobs.clone())
             }
             Command::Switchover(generation) => {
                 for named in &mut self.runners {
-                    named.runner.switchover(generation);
+                    named.runner.switchover(*generation);
                 }
                 self.streams.synchronize()?;
-                Ok(BatchOutput::default())
+                Ok(Step::Done(BatchOutput::default()))
             }
             Command::Revert(generation) => {
                 for named in &mut self.runners {
-                    named.runner.revert(generation);
+                    named.runner.revert(*generation);
                 }
                 self.streams.synchronize()?;
-                Ok(BatchOutput::default())
+                Ok(Step::Done(BatchOutput::default()))
             }
             Command::Purge(generation) => {
                 for named in &mut self.runners {
-                    named.runner.purge(generation);
+                    named.runner.purge(*generation);
                 }
                 self.streams.synchronize()?;
-                Ok(BatchOutput::default())
+                Ok(Step::Done(BatchOutput::default()))
             }
             Command::Issue(work) => {
                 work.perform()?;
                 self.streams.synchronize()?;
-                Ok(BatchOutput::default())
+                Ok(Step::Done(BatchOutput::default()))
             }
             Command::After(events) => {
                 // The command establishes that the work deferred on these events may run: wait
                 // for them on the host, bounded like every host wait for device work.
                 let deadline = std::time::Instant::now() + DRAIN_LIMIT;
-                for event in &events {
+                for event in events {
                     drain_event(event, deadline)?;
                 }
-                Ok(BatchOutput::default())
+                Ok(Step::Done(BatchOutput::default()))
             }
         }
+    }
+
+    /// Performs one job of a multi-job command and puts the rest at the tail (4.5).
+    ///
+    /// A capture pass and a precopy are sets of independent per-bucket jobs; performing them in
+    /// one turn would stop serving for the whole set, which is the long pause the design forbids.
+    /// One job per turn lets whatever the scheduler submitted in between be served first, and a
+    /// quiet queue still runs the steps back to back.
+    fn steps(&mut self, entry: &crate::job::Entry, generation: Option<u64>, jobs: Vec<Job>) -> Result<Step> {
+        let mut jobs = jobs;
+        if jobs.is_empty() {
+            return Ok(Step::Done(BatchOutput::default()));
+        }
+        let first = jobs.remove(0);
+        let output = self.perform(vec![first])?;
+        if jobs.is_empty() {
+            return Ok(Step::Done(output));
+        }
+        self.queue.requeue(entry, Command::Steps { generation, jobs })?;
+        Ok(Step::Requeued)
     }
 
     /// Performs a runner's jobs in order, each on the runner that returned it.

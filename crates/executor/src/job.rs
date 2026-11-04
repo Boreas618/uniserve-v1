@@ -46,6 +46,9 @@ pub(crate) struct Entry {
     pub(crate) kind: JobKind,
     /// The batch the command serves, when it serves one.
     pub(crate) batch: Option<crate::batch::BatchId>,
+    /// Whether this entry is the last step of its submission (4.5: a precopy or a capture pass is
+    /// performed one job per queue step, so serving batches interleave with it).
+    pub(crate) final_step: bool,
 }
 
 /// One command the device executor performs.
@@ -54,6 +57,9 @@ pub(crate) enum Command {
     Batch(Batch),
     /// Capture every bucket of the serving generation (warmup).
     Warmup,
+    /// One queued step of a multi-job command: the jobs not yet performed (4.5's capture pass and
+    /// precopy run one job per queue turn, so serving batches interleave with them).
+    Steps { generation: Option<u64>, jobs: Vec<Job> },
     /// Prepare the next generation (7.3 step 2).
     Precopy(Arc<Generation>),
     /// Switch the serving generation at a batch boundary (7.3 step 3).
@@ -146,6 +152,33 @@ impl JobQueue {
             submission_id,
             kind,
             batch,
+            final_step: true,
+        });
+        drop(state);
+        self.ready.notify_one();
+        Ok(id)
+    }
+
+    /// Puts `command` at the tail as the next step of `entry`'s submission (4.5's interleaving).
+    ///
+    /// The submission is the same one, so it completes only when the last step does; a serving
+    /// batch submitted while the previous step ran is queued ahead of this one and is served
+    /// between the two.
+    pub(crate) fn requeue(&self, entry: &Entry, command: Command) -> Result<JobId> {
+        let mut state = lock(&self.state);
+        if state.closed {
+            return Err(Error::State("the job queue is closed".into()));
+        }
+        let id = JobId(state.next);
+        state.next += 1;
+        state.pending.push_back(Entry {
+            id,
+            command,
+            submission: entry.submission.clone(),
+            submission_id: entry.submission_id,
+            kind: entry.kind,
+            batch: entry.batch,
+            final_step: false,
         });
         drop(state);
         self.ready.notify_one();
@@ -179,6 +212,7 @@ impl JobQueue {
             submission_id: None,
             kind: JobKind::After,
             batch: None,
+            final_step: true,
         });
         drop(state);
         self.ready.notify_one();
@@ -236,6 +270,10 @@ impl JobQueue {
             }
         }
         if let Some(submission) = entry.submission {
+            if !entry.final_step {
+                // A middle step of a multi-job command: the submission waits for the last one.
+                return;
+            }
             let outcome = match result {
                 Ok(output) => Outcome::Success(output),
                 Err(error) => Outcome::Failed(Arc::new(error)),
@@ -423,6 +461,112 @@ mod tests {
 
         assert!(matches!(first.outcome(), Some(Outcome::Success(()))));
         assert!(matches!(second.outcome(), Some(Outcome::Failed(_))));
+    }
+
+    /// A capture pass or a precopy performs one job per queue turn and puts the rest at the tail,
+    /// so a serving batch the scheduler submitted meanwhile is served between two of its jobs
+    /// (4.5's interleaving, not one long pause).
+    #[test]
+    fn a_capture_pass_interleaves_with_a_serving_batch() {
+        let (queue, _events) = queue();
+        let bucket = crate::plan::Bucket::decode(2, crate::plan::Variant::DecodeGreedy);
+        let jobs: Vec<Job> = (0..3)
+            .map(|_| Job::Capture {
+                runner: crate::runner::RunnerId(0),
+                bucket,
+                generation: 2,
+            })
+            .collect();
+        let (precopy, _) = Submission::pending(crate::batch::SubmissionId(0));
+        queue
+            .submit(
+                Command::Steps {
+                    generation: Some(2),
+                    jobs,
+                },
+                &precopy,
+                JobKind::Precopy,
+                None,
+            )
+            .expect("the precopy is queued");
+        let (served, _) = Submission::pending(crate::batch::SubmissionId(1));
+        queue
+            .submit(Command::Batch(batch()), &served, JobKind::Batch, None)
+            .expect("the batch is queued");
+
+        // The device loop, as the executor performs it: one job of a multi-job command per turn.
+        let mut order = Vec::new();
+        while let Some(entry) = queue.next(Some(Duration::from_millis(5))) {
+            match entry.command {
+                Command::Steps { generation, mut jobs } => {
+                    order.push("capture");
+                    jobs.remove(0);
+                    if jobs.is_empty() {
+                        queue.complete(entry, Ok(BatchOutput::default()));
+                    } else {
+                        queue
+                            .requeue(&entry, Command::Steps { generation, jobs })
+                            .expect("the remainder is queued");
+                        assert!(
+                            precopy.outcome().is_none(),
+                            "the submission waits for the last step"
+                        );
+                    }
+                }
+                Command::Batch(_) => {
+                    order.push("batch");
+                    queue.complete(entry, Ok(BatchOutput::default()));
+                    assert!(
+                        precopy.outcome().is_none(),
+                        "a served batch does not complete the precopy"
+                    );
+                }
+                _ => queue.complete(entry, Ok(BatchOutput::default())),
+            }
+        }
+
+        // The batch runs between the first and the last capture, not after the whole pass.
+        assert_eq!(order, vec!["capture", "batch", "capture", "capture"]);
+        assert!(matches!(precopy.outcome(), Some(Outcome::Success(_))));
+        assert!(matches!(served.outcome(), Some(Outcome::Success(_))));
+    }
+
+    /// A step that fails fails its submission and drops the rest of its command: a precopy whose
+    /// shadow comparison failed must not go on capturing.
+    #[test]
+    fn a_failed_step_fails_its_submission_and_drops_the_rest() {
+        let (queue, _events) = queue();
+        let bucket = crate::plan::Bucket::decode(2, crate::plan::Variant::DecodeGreedy);
+        let jobs: Vec<Job> = (0..3)
+            .map(|_| Job::Capture {
+                runner: crate::runner::RunnerId(0),
+                bucket,
+                generation: 2,
+            })
+            .collect();
+        let (precopy, _) = Submission::pending(crate::batch::SubmissionId(0));
+        queue
+            .submit(
+                Command::Steps {
+                    generation: Some(2),
+                    jobs,
+                },
+                &precopy,
+                JobKind::Precopy,
+                None,
+            )
+            .expect("queued");
+
+        let mut turns = 0;
+        while let Some(entry) = queue.next(Some(Duration::from_millis(5))) {
+            turns += 1;
+            if turns == 1 {
+                queue.complete(entry, Err(Error::State("the shadow comparison failed".into())));
+            } else {
+                panic!("the rest of the command was performed after a failure");
+            }
+        }
+        assert!(matches!(precopy.outcome(), Some(Outcome::Failed(_))));
     }
 
     /// A deferred-release wait is a command of its own, after everything submitted before it.
