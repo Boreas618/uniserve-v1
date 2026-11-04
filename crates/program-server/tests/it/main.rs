@@ -6,6 +6,7 @@
 
 mod build;
 mod builder;
+mod command;
 mod manifest;
 mod packages;
 mod program;

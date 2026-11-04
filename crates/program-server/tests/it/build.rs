@@ -52,22 +52,79 @@ struct TreePackage {
     descriptor: String,
 }
 
-/// Finds the first package of `crates/ops/kernels` whose source is of `kind`,
-/// in the order the tree names its operators.
+/// The operators the Qwen3-MoE slice names, in the order its fixture lists
+/// them; empty when the generated fixture is absent.
+fn slice_operators() -> Vec<String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.local/qwen3-moe-keys.txt");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut operators = Vec::new();
+    for line in text.lines() {
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        if let Some((operator, _)) = line.split_once('\t')
+            && !operators
+                .iter()
+                .any(|known: &String| known == operator.trim())
+        {
+            operators.push(operator.trim().to_owned());
+        }
+    }
+    operators
+}
+
+/// The package of `crates/ops/kernels` whose source is of `kind` and whose
+/// operator the slice names first, so a witness builds the kernel a deployment
+/// needs rather than whichever backend the tree lists first; when the slice's
+/// fixture is absent, the first package of that kind.
 fn tree_package(kind: &str) -> Option<TreePackage> {
+    let slice = slice_operators();
+    let packages = tree_packages(kind);
+    for operator in &slice {
+        if let Some(package) = packages
+            .iter()
+            .find(|package| &package.op == operator)
+            .map(repackage)
+        {
+            return Some(package);
+        }
+    }
+    packages.into_iter().next()
+}
+
+/// A package of `tree_packages`, by value, so the caller can own it.
+fn repackage(package: &TreePackage) -> TreePackage {
+    TreePackage {
+        directory: package.directory.clone(),
+        op: package.op.clone(),
+        backend: package.backend.clone(),
+        descriptor: package.descriptor.clone(),
+    }
+}
+
+/// Every package of `crates/ops/kernels` whose source is of `kind`, in the
+/// order the tree names its operators.
+fn tree_packages(kind: &str) -> Vec<TreePackage> {
+    let mut found = Vec::new();
     let root = repository().join("crates/ops/kernels");
-    let mut operators = std::fs::read_dir(&root)
-        .ok()?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.is_dir())
-        .collect::<Vec<_>>();
-    operators.sort();
-    for operator in operators {
-        let mut backends = std::fs::read_dir(&operator)
-            .ok()?
+    let mut operators = match std::fs::read_dir(&root) {
+        Ok(entries) => entries
             .filter_map(|entry| entry.ok().map(|entry| entry.path()))
             .filter(|path| path.is_dir())
-            .collect::<Vec<_>>();
+            .collect::<Vec<_>>(),
+        Err(_) => return found,
+    };
+    operators.sort();
+    for operator in operators {
+        let mut backends = match std::fs::read_dir(&operator) {
+            Ok(entries) => entries
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .filter(|path| path.is_dir())
+                .collect::<Vec<_>>(),
+            Err(_) => continue,
+        };
         backends.sort();
         for backend in backends {
             let manifest = backend.join("package.toml");
@@ -93,7 +150,7 @@ fn tree_package(kind: &str) -> Option<TreePackage> {
             let Some(descriptor) = descriptor_key(&text) else {
                 continue;
             };
-            return Some(TreePackage {
+            found.push(TreePackage {
                 directory: backend,
                 op: op.to_owned(),
                 backend: backend_name.to_owned(),
@@ -101,7 +158,7 @@ fn tree_package(kind: &str) -> Option<TreePackage> {
             });
         }
     }
-    None
+    found
 }
 
 /// One descriptor a package covers, as the packages declare them: a list of
@@ -135,6 +192,74 @@ fn descriptor_key(text: &str) -> Option<String> {
         rest = &after[after.find(']')? + 1..];
     }
     (!name.is_empty()).then(|| name.join("_"))
+}
+
+/// A copy of a tree package in `temporary` that declares this host's version of
+/// the toolchain, or `None` when the host has no such toolchain.
+///
+/// A checked-in package is written for one toolkit version, and a version
+/// change is a new revision (design sections 5.1 and 5.2), so a package of the
+/// tree can only build on a host whose compiler is that exact version. A
+/// witness must not fail because a host's compiler patch differs: it copies the
+/// package and declares the version the host's toolchain reports, which leaves
+/// the form, the entries and the sources under test untouched.
+fn at_host_version(
+    source: &Path,
+    temporary: &Path,
+    toolchains: &ToolchainConfig,
+) -> Option<PathBuf> {
+    let manifest = program_server::manifest::Manifest::load(source).ok()?;
+    let kind = manifest.toolchain.kind;
+    let version = program_server::toolchain::Toolchains::discover(toolchains)
+        .ok()?
+        .version(kind)
+        .ok()?
+        .to_owned();
+    let name = source
+        .file_name()
+        .map(|name| name.to_owned())
+        .unwrap_or_else(|| "package".into());
+    let destination = temporary.join(name);
+    copy_tree(source, &destination);
+    let text = std::fs::read_to_string(destination.join("package.toml")).ok()?;
+    std::fs::write(
+        destination.join("package.toml"),
+        declare_toolchain_version(&text, &version),
+    )
+    .ok()?;
+    Some(destination)
+}
+
+/// Every file and directory of `source`, under `destination`.
+fn copy_tree(source: &Path, destination: &Path) {
+    std::fs::create_dir_all(destination).expect("the copied package's directory");
+    for entry in std::fs::read_dir(source).expect("the package's files") {
+        let entry = entry.expect("a package file");
+        let target = destination.join(entry.file_name());
+        if entry.file_type().expect("a file type").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("a copied package file");
+        }
+    }
+}
+
+/// `manifest` with the `[toolchain]` section's `version` set to `version`.
+fn declare_toolchain_version(manifest: &str, version: &str) -> String {
+    let mut lines = Vec::new();
+    let mut in_toolchain = false;
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_toolchain = trimmed == "[toolchain]";
+        }
+        if in_toolchain && trimmed.starts_with("version") && trimmed.contains('=') {
+            lines.push(format!("version = \"{version}\""));
+        } else {
+            lines.push(line.to_owned());
+        }
+    }
+    lines.join("\n") + "\n"
 }
 
 /// Whether the host has a program, which a witness needs before it runs.
@@ -302,22 +427,34 @@ fn a_triton_package_builds_a_cubin_module_and_resolves_it() {
         );
         return;
     }
-    let package = tree_package("triton").expect("the tree has a Triton package");
+    let Some(package) = tree_package("triton") else {
+        eprintln!("SKIPPED: the tree holds no Triton package");
+        return;
+    };
+    let toolchains = ToolchainConfig {
+        nvcc: None,
+        python: interpreter(),
+        wasm: None,
+        max_jobs: 2,
+    };
+    // The tree's package is written for one Triton version; this host's may be
+    // another patch, which is a new revision and not a defect of the witness.
+    let temporary = tempfile::tempdir().unwrap();
+    let Some(directory) = at_host_version(&package.directory, temporary.path(), &toolchains)
+    else {
+        eprintln!("SKIPPED (provisioning): this host reports no Triton version to build with");
+        return;
+    };
     let witness = witness(
-        &package.directory,
+        &directory,
         &package.op,
         &package.backend,
         &package.descriptor,
-        ToolchainConfig {
-            nvcc: None,
-            python: interpreter(),
-            wasm: None,
-            max_jobs: 2,
-        },
+        toolchains,
     );
 
     // The package's `[parameters]` fill the selected program's arguments.
-    let manifest = std::fs::read_to_string(package.directory.join("package.toml")).unwrap();
+    let manifest = std::fs::read_to_string(directory.join("package.toml")).unwrap();
     let parameters = manifest
         .split("[parameters]")
         .nth(1)
@@ -387,7 +524,7 @@ fn a_triton_package_builds_a_cubin_module_and_resolves_it() {
 }
 
 #[test]
-fn a_cuda_package_builds_a_native_module_with_its_entries() {
+fn a_cuda_package_builds_the_module_its_manifest_declares() {
     if !have("nvcc", &["--version"]) {
         eprintln!("SKIPPED (provisioning): no nvcc on this host");
         return;
@@ -396,47 +533,80 @@ fn a_cuda_package_builds_a_native_module_with_its_entries() {
         eprintln!("SKIPPED: the tree holds no CUDA package");
         return;
     };
+    let toolchains = ToolchainConfig {
+        nvcc: None,
+        python: interpreter(),
+        wasm: None,
+        max_jobs: 2,
+    };
+    // A package of the tree declares one toolkit version, and a version change
+    // is a new revision; the witness builds this host's toolkit instead.
+    let temporary = tempfile::tempdir().unwrap();
+    let Some(directory) = at_host_version(&package.directory, temporary.path(), &toolchains)
+    else {
+        eprintln!("SKIPPED (provisioning): this host reports no nvcc version to build with");
+        return;
+    };
+    // What the package declares is what the module must be: nvcc writes a
+    // cubin and its launch metadata, or a native library with the entries the
+    // package names (design section 5.3).
+    let manifest = program_server::manifest::Manifest::load(&directory).expect("the package loads");
     let witness = witness(
-        &package.directory,
+        &directory,
         &package.op,
         &package.backend,
         &package.descriptor,
-        ToolchainConfig {
-            nvcc: None,
-            python: interpreter(),
-            wasm: None,
-            max_jobs: 2,
-        },
+        toolchains,
     );
 
     assert_eq!(witness.progress[0].state, BuildState::Committed);
-    assert_eq!(witness.resolved.form, ModuleForm::Native);
-    assert!(
-        witness.resolved.metadata.is_none(),
-        "a native module has no launch metadata"
-    );
-    let package_manifest = std::fs::read_to_string(package.directory.join("package.toml")).unwrap();
-    let launch = package_manifest
-        .split("[module.entries]")
-        .nth(1)
-        .and_then(|entries| entries.split("launch = \"").nth(1))
-        .and_then(|rest| rest.split('"').next())
-        .expect("a native package names its launch entry");
-    assert_eq!(
-        witness.resolved.entries.get("launch").map(String::as_str),
-        Some(launch),
-        "the module's launch symbol is the package's"
-    );
-    let library = file_of(&witness.resolved, "module.so");
-    assert_eq!(
-        &library[..4],
-        b"\x7fELF",
-        "a native module is a shared object"
-    );
-    assert!(
-        String::from_utf8_lossy(&library).contains(launch),
-        "the module exports the entry its package names"
-    );
+    assert_eq!(witness.resolved.form, manifest.module.form);
+    match manifest.module.form {
+        ModuleForm::Cubin => {
+            let metadata = witness
+                .resolved
+                .metadata
+                .clone()
+                .expect("a cubin module names its launch metadata");
+            assert!(
+                witness.resolved.entries.is_empty(),
+                "a cubin has no C entry"
+            );
+            let cubin = file_of(&witness.resolved, "module.cubin");
+            assert_eq!(&cubin[..4], b"\x7fELF");
+            let text = String::from_utf8(file_of(&witness.resolved, &metadata)).unwrap();
+            let parsed: serde_json::Value =
+                serde_json::from_str(&text).expect("the metadata is JSON");
+            assert!(
+                !parsed
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .is_empty(),
+                "the metadata names the kernel it launches"
+            );
+        }
+        ModuleForm::Native => {
+            assert!(witness.resolved.metadata.is_none());
+            assert_eq!(
+                witness.resolved.entries.get("launch"),
+                manifest.module.entries.get("launch"),
+                "the module's launch symbol is the package's"
+            );
+            let library = file_of(&witness.resolved, "module.so");
+            assert_eq!(&library[..4], b"\x7fELF");
+            let launch = manifest
+                .module
+                .entries
+                .get("launch")
+                .expect("a native package names its launch entry");
+            assert!(
+                String::from_utf8_lossy(&library).contains(launch),
+                "the module exports the entry its package names"
+            );
+        }
+        other => panic!("a CUDA package builds a cubin or a native module, not {other:?}"),
+    }
 
     witness.stop.store(true, Ordering::SeqCst);
     witness.thread.join().unwrap();
@@ -455,17 +625,24 @@ fn a_cute_dsl_package_builds_a_native_module_with_its_entries() {
         eprintln!("SKIPPED: the tree holds no CuTe DSL package");
         return;
     };
+    let toolchains = ToolchainConfig {
+        nvcc: None,
+        python: interpreter(),
+        wasm: None,
+        max_jobs: 2,
+    };
+    let temporary = tempfile::tempdir().unwrap();
+    let Some(directory) = at_host_version(&package.directory, temporary.path(), &toolchains)
+    else {
+        eprintln!("SKIPPED (provisioning): this host reports no CuTe DSL version to build with");
+        return;
+    };
     let witness = witness(
-        &package.directory,
+        &directory,
         &package.op,
         &package.backend,
         &package.descriptor,
-        ToolchainConfig {
-            nvcc: None,
-            python: interpreter(),
-            wasm: None,
-            max_jobs: 2,
-        },
+        toolchains,
     );
 
     assert_eq!(witness.progress[0].state, BuildState::Committed);
@@ -598,4 +775,63 @@ fn a_vendor_cubin_is_installed_stored_and_resolved_as_it_is() {
 
     stop.store(true, Ordering::SeqCst);
     thread.join().unwrap();
+}
+
+/// An executable program package: a program the main process runs as its own
+/// process, stored as it is (design section 5.1).
+const EXECUTABLE_MANIFEST: &str = r#"
+op = "sampler"
+backend = "process"
+
+[toolchain]
+kind = "none"
+version = ""
+
+[module]
+form = "executable"
+
+[source]
+kind = "executable"
+files = ["bin/sampler"]
+
+[kernel]
+architectures = ["sm_100a"]
+descriptors = { dimensions = { dtype = ["bf16"] } }
+"#;
+
+#[test]
+fn an_executable_program_is_installed_stored_and_resolved_as_it_is() {
+    let temporary = tempfile::tempdir().unwrap();
+    let package = temporary.path().join("sampler-process");
+    std::fs::create_dir_all(package.join("bin")).unwrap();
+    std::fs::write(package.join("package.toml"), EXECUTABLE_MANIFEST).unwrap();
+    // A program is what its bytes say it is; this one only has to survive the
+    // round trip, so the test does not run it.
+    let program = b"#!/bin/sh\nexit 0\n".to_vec();
+    std::fs::write(package.join("bin/sampler"), &program).unwrap();
+
+    let witness = witness(
+        &package,
+        "sampler",
+        "process",
+        "dtype_bf16",
+        ToolchainConfig {
+            nvcc: None,
+            python: temporary.path().join("no-python"),
+            wasm: None,
+            max_jobs: 1,
+        },
+    );
+    assert_eq!(witness.progress[0].state, BuildState::Committed);
+    assert_eq!(witness.resolved.form, ModuleForm::Executable);
+    assert!(witness.resolved.metadata.is_none());
+    assert!(witness.resolved.entries.is_empty());
+    assert_eq!(
+        file_of(&witness.resolved, "bin/sampler"),
+        program,
+        "the module is the package's program, byte for byte"
+    );
+
+    witness.stop.store(true, Ordering::SeqCst);
+    witness.thread.join().unwrap();
 }
