@@ -10,6 +10,7 @@ ignored = ["serde_bytes"]
 
 [dependencies]
 libc.workspace = true
+program-server.workspace = true
 proto.workspace = true
 rmp-serde.workspace = true
 serde = { workspace = true, features = ["rc"] }
