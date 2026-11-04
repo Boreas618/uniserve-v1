@@ -369,12 +369,94 @@ impl Scheduler {
         let Some(plan) = self.policy_step() else {
             return Vec::new();
         };
-        // The page decisions run first: a prefetch's pins are in flight by the
-        // time this step's calls are built.
+        // What the policy gives up comes first: the plan was decided on the
+        // state it saw, and freeing a victim makes room for the step's calls.
+        // The plan's own page decisions then run, so a prefetch's pins are in
+        // flight by the time the calls are built.
+        self.reclaim_shortage();
         self.execute_plan_pages(&plan);
         let batches = self.assemble_plan(&plan);
         self.end_step(started.elapsed());
         batches
+    }
+
+    /// Asks the policy for the victims of the shortage the mechanism reports,
+    /// validates them, and frees exactly those (design §4.4).
+    ///
+    /// The mechanism decides that there is a shortage and owns every cache; the
+    /// policy decides what to give up. A victim list that does not validate is
+    /// a policy failure, like any other invalid decision.
+    fn reclaim_shortage(&mut self) {
+        let Some(shortage) = views::shortage_now(self) else {
+            return;
+        };
+        let Some(mut policy) = self.policy.take() else {
+            return;
+        };
+        let victims = match policy.reclaim(&shortage) {
+            Ok(victims) => victims,
+            Err(error) => {
+                let _ = self.policy_failed(policy, error);
+                return;
+            }
+        };
+        let live = self.live();
+        if let Err(error) = mechanism::validate_victims(&shortage, &victims, &live) {
+            let _ = self.policy_failed(policy, error);
+            return;
+        }
+        self.policy = Some(policy);
+        for victim in &victims {
+            self.free_victim(victim);
+        }
+        if !victims.is_empty() {
+            tracing::debug!(
+                kind = ?shortage.kind,
+                need = shortage.need,
+                victims = victims.len(),
+                "the policy freed what it named"
+            );
+        }
+    }
+
+    /// Frees the one thing a victim names.
+    ///
+    /// An encoder entry leaves the encoder cache and its worker buffer goes with
+    /// it; a device page goes to the host KV cache, exactly as a withdrawal's
+    /// pages do, and the units it held return when the copy completes (or at
+    /// once when the host cache has nowhere to put it).
+    fn free_victim(&mut self, victim: &scheduling::guest::Victim) {
+        match victim {
+            scheduling::guest::Victim::Encoding(id) => {
+                let key = self
+                    .storage
+                    .encoder_cache
+                    .entries()
+                    .map(|(key, _)| key)
+                    .find(|key| views::encoding_id(key) == *id);
+                let freed = key.and_then(|key| self.storage.encoder_cache.evict(&key));
+                if let Some(product) = freed {
+                    self.free_buffers([product.buffer_id()]);
+                }
+            }
+            scheduling::guest::Victim::Page(page) => {
+                if let Some(unit) = views::unit_of(*page) {
+                    self.offload_units(&[unit]);
+                }
+            }
+            // Preempting a request for want of capacity needs a cause the
+            // protocol does not name yet: `MigrationCause` has `Drain` and
+            // `Loss`, and a request ended for either reason is not the same
+            // thing as one the mechanism preempted to give its units away.
+            // Until a cause exists, the list is executed as far as it goes and
+            // the starvation stands: the watchdog bounds it (§4.4).
+            scheduling::guest::Victim::Request(request) => {
+                tracing::warn!(
+                    request = request.0,
+                    "a request victim cannot be preempted for want of capacity yet"
+                );
+            }
+        }
     }
 
     /// Executes the page half of a validated plan (§4.4).
