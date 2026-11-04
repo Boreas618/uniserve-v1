@@ -1,0 +1,63 @@
+{
+  "note": "eight bf16 tokens of 128 experts; grid 2 blocks of 4 warps; scores.bin holds 8x128 bf16 in native order and ids.bin/weights.bin are what the kernel writes",
+  "module": "modules/topk_softmax/nvcc/1/sm_100a/scores_bf16_experts_128_top_8_renormalize_true_scale_none",
+  "entry": "uniserve_topk_softmax",
+  "grid": [
+    2,
+    1,
+    1
+  ],
+  "buffers": {
+    "scores": {
+      "bytes": 2048,
+      "fill": "scores.bin",
+      "dump": "scores.bin"
+    },
+    "scratch": {
+      "bytes": 64
+    },
+    "ids": {
+      "bytes": 256,
+      "dump": "ids.bin"
+    },
+    "weights": {
+      "bytes": 256,
+      "dump": "weights.bin"
+    }
+  },
+  "parameters": [
+    {
+      "pointer": "scores"
+    },
+    {
+      "i32": 1
+    },
+    {
+      "i64": 128
+    },
+    {
+      "i32": 8
+    },
+    {
+      "baked": "experts"
+    },
+    {
+      "baked": "top"
+    },
+    {
+      "i32": 1
+    },
+    {
+      "pointer": "scratch"
+    },
+    {
+      "i32": -1
+    },
+    {
+      "pointer": "ids"
+    },
+    {
+      "pointer": "weights"
+    }
+  ]
+}

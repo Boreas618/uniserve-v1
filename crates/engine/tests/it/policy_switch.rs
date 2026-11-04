@@ -319,7 +319,13 @@ fn the_program_layers_commands_reach_one_scheduler_and_name_what_they_need() {
     );
 
     // A step the scheduler has passed is not a boundary any more: it is refused
-    // with the step, rather than applied at one the epoch is past.
+    // with the step, rather than applied at one the epoch is past. A candidate is
+    // prepared first, because the switchover above used the one it applied: with
+    // nothing prepared the answer would be that, and the boundary's own refusal
+    // would never be reached.
+    world
+        .precopy("fcfs", 3, toy())
+        .expect("a candidate the boundary check can leave prepared");
     let refused_step = answer(world.handle.program_command(ipc::ProgramCommand::Switchover {
         generation: 1,
         step: Some(ahead - 1),
@@ -331,7 +337,7 @@ fn the_program_layers_commands_reach_one_scheduler_and_name_what_they_need() {
     );
 
     // One that names a step far ahead waits for it instead of applying early.
-    world.precopy("priority", 3, toy()).expect("the second precopy");
+    world.precopy("priority", 4, toy()).expect("the second precopy");
     let waiting = world.handle.program_command(ipc::ProgramCommand::Switchover {
         generation: 2,
         step: Some(world.step() + 1000),

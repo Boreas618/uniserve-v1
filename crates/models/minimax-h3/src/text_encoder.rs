@@ -2039,12 +2039,23 @@ mod tests {
             &[[1, 24, 24], [4, 16, 16]],
         )
         .expect("a prompt with two images");
+        let merge = config.vision.spatial_merge_size;
+        // The prompt's rows are the capacity the caller asked for; each image's patch rows are its
+        // grid's patches, and its merged rows are the 2 by 2 blocks of each time step.
         assert_eq!(plan.rows, 4096);
-        assert_eq!(plan.images, [576, 1024]);
-        assert_eq!(plan.merged, 144 + 256);
-        assert_eq!(plan.deepstack, 3);
-        assert_eq!(plan.hidden, 5120);
-        assert_eq!(plan.head_dim, 128);
+        assert_eq!(plan.images, [24 * 24, 4 * 16 * 16]);
+        assert_eq!(
+            plan.merged,
+            (24 / merge) * (24 / merge) + 4 * (16 / merge) * (16 / merge)
+        );
+        // One DeepStack tap per checkpoint layer the tower taps, and the width and head width the text
+        // config states rather than a number this file owns.
+        assert_eq!(
+            plan.deepstack,
+            config.vision.deepstack_visual_indexes.len() as u32
+        );
+        assert_eq!(plan.hidden, config.hidden_size);
+        assert_eq!(plan.head_dim, config.head_dim);
     }
 
     #[test]

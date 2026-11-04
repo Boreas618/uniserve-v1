@@ -302,6 +302,12 @@ pub(crate) fn validate_after_admission(
 /// one check that must run before it: a plan read against the state after its
 /// own admission would name requests the mechanism no longer queues.
 pub(crate) fn validate_admission(plan: &Plan, live: &Live<'_>) -> Result<(), PolicyError> {
+    // §4.4 puts the slot limit in the mechanism's *stop*, not in a refusal:
+    // `admit_tokens`/`admit_media` admit in the plan's order until the first
+    // request that cannot be placed, and it and those after it stay queued. A
+    // plan that names more requests than there are slots free is exactly what
+    // `fcfs` states - it names every queued request - so refusing it here would
+    // stop every loaded world.
     let mut admitted = BTreeSet::new();
     for id in &plan.admit {
         if !live.queued(*id) {
@@ -361,8 +367,14 @@ fn validate_work(plan: &Plan, room: &Room, live: &Live<'_>) -> Result<(), Policy
     // on one component, so the graph tier bounds the group, not the step.
     let mut groups: Vec<((u32, PhaseKind), u64)> = Vec::new();
 
+    // A request the plan admits is resident for the work the same plan gives
+    // it: the step applies admission before the work, which is what lets one
+    // plan both admit and run a request (§4.4). The trial runs the same check
+    // on one state and never applies anything, so it reads the plan's own
+    // admission as the residency the live step will have made.
+    let admitted: BTreeSet<RequestId> = plan.admit.iter().copied().collect();
     for work in &plan.work {
-        validate_work_entry(work, live)?;
+        validate_work_entry(work, live, &admitted)?;
         if !seen.insert(work.request) {
             return Err(invalid(
                 Call::Dispatch,
@@ -421,15 +433,27 @@ fn validate_work(plan: &Plan, room: &Room, live: &Live<'_>) -> Result<(), Policy
     Ok(())
 }
 
-fn validate_work_entry(work: &Work, live: &Live<'_>) -> Result<(), PolicyError> {
+fn validate_work_entry(
+    work: &Work,
+    live: &Live<'_>,
+    admitted: &BTreeSet<RequestId>,
+) -> Result<(), PolicyError> {
     let request = live.request(work.request)?;
-    if request.state != RequestState::Resident {
+    let by_this_plan = request.state != RequestState::Resident && admitted.contains(&work.request);
+    if request.state != RequestState::Resident && !by_this_plan {
         return Err(invalid(
             Call::Dispatch,
             format!("{} is not resident", work.request.0),
         ));
     }
-    if request.phase != Some(work.phase) {
+    // A request the plan itself admits has no phase in this state: the phase it
+    // serves next is the mechanism's to compute once the request is resident,
+    // and a step applies admission before it checks the work. So the phase is
+    // compared where the mechanism's own answer exists — against the state
+    // admission left (`validate_after_admission` on the live step) — and not
+    // here, where a queued view's `None` would refuse every plan that admits
+    // and runs a request in one step.
+    if !by_this_plan && request.phase != Some(work.phase) {
         return Err(invalid(
             Call::Dispatch,
             format!(
@@ -1051,6 +1075,15 @@ impl Recorder {
     }
 
     /// The requests the policy has been told about.
+    /// The requests the policy currently knows, as the mechanism's own account
+    /// of what it last told: a request leaves here when its end is announced,
+    /// which is what makes this the set to compare against the mechanism's
+    /// queues. (The `announced_*` sets below are cumulative: they answer "was
+    /// this ever shown", which is the victim rules' question, not this one.)
+    pub(crate) fn known(&self) -> impl Iterator<Item = RequestId> + '_ {
+        self.told.keys().copied()
+    }
+
     pub(crate) fn announced_requests(&self) -> &BTreeSet<RequestId> {
         &self.announced_requests
     }
@@ -1343,10 +1376,20 @@ mod tests {
         };
         // The validators judge a victim against what the policy was told, so a
         // fixture's live state is also what it was told: every identity in it.
+        tell_everything(&mut live);
+        live
+    }
+
+    /// States that the policy was told about every identity the fixture holds.
+    ///
+    /// A case that adds a page or a request to the live state after building it
+    /// calls this once more: an identity the fixture holds and the policy was
+    /// never told of is exactly what the reclaim refuses, which is not what
+    /// such a case is about.
+    fn tell_everything(live: &mut Live<'_>) {
         live.told_pages = std::borrow::Cow::Owned(live.pages.keys().copied().collect());
         live.told_encodings = std::borrow::Cow::Owned(live.encodings.keys().copied().collect());
         live.told_requests = std::borrow::Cow::Owned(live.requests.keys().copied().collect());
-        live
     }
 
     fn room() -> Room {
@@ -1743,6 +1786,7 @@ mod tests {
                 last_used: Nanos(1),
             },
         );
+        tell_everything(&mut live);
 
         let units = Shortage {
             kind: Storage::KvUnits,
@@ -1781,6 +1825,33 @@ mod tests {
             need: 1,
         };
         validate_victims(&entries, &[Victim::Encoding(EncodingId(7))], &live).expect("an entry");
+    }
+
+    #[test]
+    fn a_plan_may_run_what_it_admits() {
+        // §4.4: the step applies admission before the work, so one plan may both
+        // admit a request and give it work. The trial checks the same rule on
+        // one state and applies nothing, so it reads the plan's own admission as
+        // the residency the live step will have made; without that, a mid-flight
+        // install whose first plan admits and runs a request could never pass
+        // probation.
+        let queued = request(1, RequestState::Queued);
+        let live = live(vec![queued], vec![RequestId(1)], &[(0, PhaseKind::Prefill)]);
+        let work = Work {
+            request: RequestId(1),
+            phase: PhaseId(0),
+            tokens: 4,
+        };
+        let admitting = Plan {
+            admit: vec![RequestId(1)],
+            ..plan(vec![work.clone()])
+        };
+        validate_plan(&admitting, &room(), &live).expect("a plan may run what it admits");
+        // The same work without the admission names a request that is not
+        // running, which stays a refused decision.
+        let refused = plan(vec![work]);
+        let error = validate_plan(&refused, &room(), &live).expect_err("not resident");
+        assert!(format!("{error}").contains("not resident"));
     }
 
     #[test]
