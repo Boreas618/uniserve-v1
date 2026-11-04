@@ -1036,6 +1036,7 @@ fn stage_block(args: &Args) -> Result<()> {
             memory.entries,
             memory.groups,
             config.hidden_size,
+            config.time_dim,
         )?;
         (stack, projections, cache, memory)
     };
@@ -1082,8 +1083,10 @@ fn stage_block(args: &Args) -> Result<()> {
 
     // 7. The inputs: the packed rows' rotary, the row table, the step, and the tokens themselves.
     let positions = transpose_positions(&stream, &arena, &tables.position_ids, tokens)?;
-    let cosine = arena.tensor(DType::F32, Shape::new(&[tokens, rotated_width()]))?;
-    let sine = arena.tensor(DType::F32, Shape::new(&[tokens, rotated_width()]))?;
+    // A factor table holds one column per rotated pair, not per rotated channel: `rotated_width()`
+    // counts channels (three axes of 32) and `Rotary::factors` reads `rotated / 2`.
+    let cosine = arena.tensor(DType::F32, Shape::new(&[tokens, rotated_width() / 2]))?;
+    let sine = arena.tensor(DType::F32, Shape::new(&[tokens, rotated_width() / 2]))?;
     stack.factors(&forward, positions, cosine, sine)?;
     let rows = upload_i32(&stream, &arena, Shape::new(&[tokens]), &tables.groups)?;
     // The evaluation the stack runs: the schedule's first, which is also the row the modulation
@@ -1267,21 +1270,25 @@ fn adaln_memory(
         Shape::new(&[rows, u64::from(groups.count())]),
         &entry_bytes,
     )?;
-    let zeros = vec![0_u8; usize::try_from(entries * columns * 4).unwrap_or(0)];
+    // The tables are the modulation projections' own type - the reference allocates them from the
+    // product - so the harness follows the loaded weights rather than naming a type of its own.
+    let table_type = projections.dtype();
+    let unit = table_type.bytes().unwrap_or(4);
+    let zeros = vec![0_u8; usize::try_from(entries * columns * unit).unwrap_or(0)];
     let mut layers = Vec::with_capacity(denoiser.transformer.num_hidden_layers as usize);
     for index in 0..denoiser.transformer.num_hidden_layers {
         layers.push(loader.constant(
             &format!("minimax_h3.adaln.layers.{index}"),
-            DType::F32,
+            table_type,
             Shape::new(&[entries, columns]),
             &zeros,
         )?);
     }
     let output = loader.constant(
         "minimax_h3.adaln.output",
-        DType::F32,
+        table_type,
         Shape::new(&[entries, 2 * hidden]),
-        &vec![0_u8; usize::try_from(entries * 2 * hidden * 4).unwrap_or(0)],
+        &vec![0_u8; usize::try_from(entries * 2 * hidden * unit).unwrap_or(0)],
     )?;
     Ok(AdaLnMemory {
         groups,
