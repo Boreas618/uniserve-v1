@@ -71,7 +71,7 @@ impl ServeOptions {
             .store_roots
             .iter()
             .map(|path| Root {
-                path: path.clone(),
+                path: absolute(path.clone()),
                 writable: false,
             })
             .collect::<Vec<_>>();
@@ -80,9 +80,9 @@ impl ServeOptions {
         }
         ServerConfig {
             socket,
-            package_root: self.package_root.clone(),
+            package_root: absolute(self.package_root.clone()),
             store_roots,
-            upstream: self.upstream.clone(),
+            upstream: self.upstream.clone().map(absolute),
             limits: self.limits,
             toolchains: self.toolchains.clone(),
             devices: self.devices.clone(),
@@ -195,6 +195,7 @@ pub fn options(matches: &ArgMatches) -> Result<Options> {
     let socket = matches
         .get_one::<String>("socket")
         .map(PathBuf::from)
+        .map(absolute)
         .unwrap_or_else(default_socket);
     let action = match name {
         "serve" => {
@@ -226,12 +227,20 @@ pub fn options(matches: &ArgMatches) -> Result<Options> {
                 upstream: matches.get_one::<String>("upstream").map(PathBuf::from),
                 limits,
                 toolchains: ToolchainConfig {
-                    nvcc: matches.get_one::<String>("nvcc").map(PathBuf::from),
-                    python: matches
-                        .get_one::<String>("python")
+                    nvcc: matches
+                        .get_one::<String>("nvcc")
                         .map(PathBuf::from)
-                        .unwrap_or_else(|| PathBuf::from("python/.venv/bin/python")),
-                    wasm: matches.get_one::<String>("wasm").map(PathBuf::from),
+                        .map(absolute),
+                    python: absolute(
+                        matches
+                            .get_one::<String>("python")
+                            .map(PathBuf::from)
+                            .unwrap_or_else(|| PathBuf::from("python/.venv/bin/python")),
+                    ),
+                    wasm: matches
+                        .get_one::<String>("wasm")
+                        .map(PathBuf::from)
+                        .map(absolute),
                     max_jobs: limits.max_jobs,
                 },
                 devices,
@@ -291,17 +300,35 @@ pub fn run(options: Options) -> Result<()> {
     }
 }
 
+/// A path made absolute against the directory the command was started in.
+///
+/// Every path the command takes is absolute before it reaches the server, because a
+/// build runs with its working directory set to the store's copy of a package: a
+/// relative toolchain path would name that copy instead of this host's compiler, and
+/// the failure is an errno from a directory the caller never named.
+///
+/// `std::path::absolute` rather than `canonicalize`, which follows symlinks: the
+/// environment's `python` is a symlink, and canonicalizing it makes toolchain
+/// discovery read the host interpreter instead of the pinned one.
+fn absolute(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        return path;
+    }
+    std::path::absolute(&path).unwrap_or(path)
+}
+
 fn required_path(matches: &ArgMatches, name: &str) -> Result<PathBuf> {
     matches
         .get_one::<String>(name)
         .map(PathBuf::from)
+        .map(absolute)
         .ok_or_else(|| Error::Protocol(format!("program-server needs --{name}")))
 }
 
 fn values(matches: &ArgMatches, name: &str) -> Vec<PathBuf> {
     matches
         .get_many::<String>(name)
-        .map(|values| values.map(PathBuf::from).collect())
+        .map(|values| values.map(|value| absolute(PathBuf::from(value))).collect())
         .unwrap_or_default()
 }
 
