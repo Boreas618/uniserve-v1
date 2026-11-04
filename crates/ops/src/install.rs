@@ -104,6 +104,10 @@ const OPERATORS: &[&str] = &[
     <crate::moe::sort::MoeSort as Op>::NAME,
     <crate::fp4::Nvfp4Quantize as Op>::NAME,
     <crate::fp4::Nvfp4Gemm as Op>::NAME,
+    <crate::snake_beta::SnakeBeta as Op>::NAME,
+    <crate::replicate_pad::ReplicatePad as Op>::NAME,
+    <crate::audio_resample::AudioResample as Op>::NAME,
+    <crate::resize::AntialiasedResizeUint8 as Op>::NAME,
 ];
 
 /// `name`, interned, when this build has an operator by that name.
