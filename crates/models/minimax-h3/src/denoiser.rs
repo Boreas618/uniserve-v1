@@ -999,6 +999,21 @@ impl nn::capability::Denoiser for Denoiser {
             + self
                 .first_row(audio_rows(layout).map_err(flattened)?)
                 .map_err(flattened)?;
+        // A layout with an audio stream and no audio latents would draw the video's noise and leave
+        // the audio's undrawn, which is a silent disagreement rather than an absent stream.
+        match (layout.audio, out.audio) {
+            (Some(_), None) => {
+                return Err(flattened(Error::config(
+                    "this layout draws audio noise and no audio latents were offered".to_owned(),
+                )));
+            }
+            (None, Some(_)) => {
+                return Err(flattened(Error::config(
+                    "audio latents were offered to a layout with no audio stream".to_owned(),
+                )));
+            }
+            _ => {}
+        }
         let noise = nn::Noise::new();
         noise.draw(
             f,
