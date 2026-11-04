@@ -211,6 +211,16 @@ impl Submissions {
 
     /// Runs `batch`'s paired forwards without serving them (7.3 step 2).
     ///
+    /// Whether a shadow batch can be submitted through this door.
+    ///
+    /// The in-process arm shadows its own devices; the worker processes shadow
+    /// on their workers, not through the mechanism's submit point, so a
+    /// worker-world epoch refuses the update's ask at command time rather than
+    /// accepting one nothing will run (7.3 step 2).
+    pub(super) fn serves_in_process(&self) -> bool {
+        matches!(self.path, Path::InProcess(_))
+    }
+
     /// Runs `batch`'s paired forwards for `generation` too, without serving
     /// them (7.3 step 2).
     ///
