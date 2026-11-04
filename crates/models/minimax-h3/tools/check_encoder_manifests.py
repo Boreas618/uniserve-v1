@@ -233,6 +233,21 @@ def text_calls(text: dict, dtype: str) -> list[Call]:
             "text_encoder.rs: the gated MLP's activation",
         )
     )
+    # The language stack's residual stream: each retained layer's down projection folded into
+    # `[tokens, hidden]` before the next layer's norm. It is the *text* width, and the tower's own
+    # residual (below) is 1152 - two rows, neither covering the other.
+    calls.append(
+        (
+            "scaled_residual/triton",
+            {
+                "dtype": dtype,
+                "columns": str(hidden),
+                "block": "1024",
+                "update_bias": "false",
+            },
+            "text_encoder.rs: the residual stream the layers write into",
+        )
+    )
     return calls
 
 
@@ -298,6 +313,16 @@ def tower_calls(vision: dict, dtype: str) -> list[Call]:
                 "approximate": "exact",
             },
             "vision.rs: the patch merger's activation",
+        ),
+        (
+            "scaled_residual/triton",
+            {
+                "dtype": dtype,
+                "columns": str(hidden),
+                "block": "1024",
+                "update_bias": "false",
+            },
+            "vision.rs: the tower's residual stream at its own 1152",
         ),
     ]
     return calls

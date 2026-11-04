@@ -1020,17 +1020,24 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
         }
         .to_string(),
     );
-    // The tower's residual stream is `[patches, 1152]` with a plain scale and no bias update.
-    push(
-        "scaled_residual",
-        ops::residual::ScaledResidualDescriptor {
-            dtype: deployment,
-            columns: 1152,
-            block: ELEMENTWISE_BLOCK,
-            update_bias: false,
-        }
-        .to_string(),
-    );
+    // Two residual streams, two widths, and neither covers the other: the tower's is
+    // `[patches, 1152]` and the text encoder's is `[tokens, 5120]` - the language stack's hidden,
+    // which `text_encoder.rs:1140` writes each retained layer's down projection into before the next
+    // layer's norm. Both are a plain scale with no bias update, and the block is the residual
+    // operator's own (`RESIDUAL_BLOCK`, 1024) rather than the elementwise one that happens to equal
+    // it.
+    for columns in [1152_u32, 5120] {
+        push(
+            "scaled_residual",
+            ops::residual::ScaledResidualDescriptor {
+                dtype: deployment,
+                columns,
+                block: ops::residual::RESIDUAL_BLOCK,
+                update_bias: false,
+            }
+            .to_string(),
+        );
+    }
 
     // ---- The video VAE's encoder, `vae/config.json` and `encoding.rs`'s own construction.
     //
