@@ -104,6 +104,20 @@ class BenchmarkTask:
         """
         return ValidationResult(checks={"observable_output": bool(records)})
 
+    def summary_metrics(
+        self, records: Sequence[RequestRecord]
+    ) -> dict[str, float | int]:
+        """Return task-specific metric values for the run summary.
+
+        `pipeline.report.build_summary` starts the summary's `metrics`
+        mapping from the generic throughput and latency metrics of
+        `uniserve_eval.metrics.summarize` and then adds these values, so a
+        key here replaces a generic metric of the same name. A task that
+        scores its outputs, such as GSM8K's extracted-answer accuracy,
+        supplies its metrics here. The default adds none.
+        """
+        return {}
+
     @classmethod
     def check_endpoint(cls, endpoint: str | None, context: str) -> str:
         """Resolve and validate an endpoint supported by the task."""
