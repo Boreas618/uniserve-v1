@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 use crate::epoch::Phase;
 use crate::leader::{Leader, LeaderStatus, UpdateError};
 use crate::openai::ApiError;
-use crate::worlds::{Applied, ApplyRequest, InFlight};
+use crate::updates::change::{Applied, ApplyRequest, InFlight};
 
 /// Events the log keeps; older ones leave it.
 const EVENT_CAPACITY: usize = 1024;
@@ -715,7 +715,7 @@ async fn program_update(
         // No replica serves: the world path answers that account itself.
         return Ok(None);
     };
-    let Ok((target, _, _)) = crate::worlds::resolve(&current, request) else {
+    let Ok((target, _, _)) = crate::updates::change::resolve(&current, request) else {
         // The change itself is refused; the world path answers it the same way.
         return Ok(None);
     };

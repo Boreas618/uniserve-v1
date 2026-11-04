@@ -88,7 +88,7 @@ pub(crate) struct Replicas {
     pub(crate) serving: watch::Sender<Vec<Arc<Replica>>>,
     pub(crate) replacing: tokio::sync::Mutex<()>,
     pub(crate) pending:
-        std::sync::Mutex<std::collections::VecDeque<(usize, crate::worlds::ApplyRequest)>>,
+        std::sync::Mutex<std::collections::VecDeque<(usize, crate::updates::change::ApplyRequest)>>,
     pub(crate) adapters: Arc<std::sync::Mutex<BTreeMap<String, Adapter>>>,
     pub(crate) schedulers: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -118,7 +118,7 @@ pub enum Task {
 /// `observer`, which reads each world's rates.
 pub(crate) fn stats_sink(
     model_name: String,
-    observer: Arc<crate::worlds::Observer>,
+    observer: Arc<crate::observe::Observer>,
     replica: usize,
 ) -> StatsSink {
     Box::new(move |world, scheduler, snapshot| {
@@ -486,7 +486,7 @@ impl Leader {
                 let starting = Arc::clone(&control);
                 let build = build.clone();
                 tokio::task::spawn_blocking(move || {
-                    let observer = Arc::new(crate::worlds::Observer::default());
+                    let observer = Arc::new(crate::observe::Observer::default());
                     let sink = stats_sink(model, Arc::clone(&observer), index);
                     let client = starting.start(spec.clone(), &build, sink)?;
                     spec.world = client.world();
@@ -759,7 +759,7 @@ impl Leader {
         control: Arc<EngineControl>,
         client: EngineClient,
         served: wire::EngineSpec,
-        observer: Arc<crate::worlds::Observer>,
+        observer: Arc<crate::observe::Observer>,
         updates: Arc<crate::updates::driver::Driver>,
     ) -> anyhow::Result<Self> {
         let Prepared {
@@ -917,7 +917,7 @@ impl Leader {
         images: MediaConnector,
         readout: Option<ReadoutEncoder>,
         options: &ServeConfig,
-        observer: Arc<crate::worlds::Observer>,
+        observer: Arc<crate::observe::Observer>,
         updates: Arc<crate::updates::driver::Driver>,
     ) -> Self {
         let logging = &options.logging_config;
@@ -1569,7 +1569,7 @@ pub(crate) struct EngineHandoff {
     pub(crate) asleep: bool,
     pub(crate) sleep_paused: bool,
     /// The configurations a rollback marked unavailable.
-    pub(crate) unavailable: Vec<crate::worlds::Unavailable>,
+    pub(crate) unavailable: Vec<crate::updates::epoch::Unavailable>,
 }
 
 /// What the leader serves, for `GET /admin/status`.
@@ -1757,9 +1757,9 @@ pub(crate) struct Replica {
     pub(crate) adapters: Arc<std::sync::Mutex<BTreeMap<String, Adapter>>>,
     /// The deployment's worlds: the executing one, a trial, a change in
     /// progress and the configurations a rollback marked unavailable.
-    pub(crate) worlds: std::sync::Mutex<crate::worlds::WorldState>,
+    pub(crate) worlds: std::sync::Mutex<crate::updates::entry::WorldState>,
     /// Every world's scheduler statistics, which a trial reads.
-    pub(crate) observer: Arc<crate::worlds::Observer>,
+    pub(crate) observer: Arc<crate::observe::Observer>,
     /// The profiling session that runs, or the last that ended
     /// (`crate::profiling`).
     pub(crate) profiles: crate::profiling::Profiles,
@@ -1771,7 +1771,7 @@ impl Replica {
     pub(crate) fn new(
         options: &ServeConfig,
         client: Arc<EngineClient>,
-        observer: Arc<crate::worlds::Observer>,
+        observer: Arc<crate::observe::Observer>,
         ordinal: usize,
         registry: std::sync::Weak<Replicas>,
         adapters: Arc<std::sync::Mutex<BTreeMap<String, Adapter>>>,
@@ -1791,7 +1791,7 @@ impl Replica {
             asleep: AtomicBool::new(false),
             sleep_paused: AtomicBool::new(false),
             adapters,
-            worlds: std::sync::Mutex::new(crate::worlds::WorldState {
+            worlds: std::sync::Mutex::new(crate::updates::entry::WorldState {
                 executing: client.world(),
                 ..Default::default()
             }),
@@ -1926,7 +1926,7 @@ impl Replica {
 
     /// Takes over the configurations a rollback marked unavailable on the
     /// leader a hot restart replaced.
-    pub(crate) fn adopt_unavailable(&self, unavailable: Vec<crate::worlds::Unavailable>) {
+    pub(crate) fn adopt_unavailable(&self, unavailable: Vec<crate::updates::epoch::Unavailable>) {
         let mut worlds = locked(&self.worlds);
         for mark in unavailable {
             worlds.unavailable.insert(mark.digest.clone(), mark);

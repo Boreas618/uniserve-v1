@@ -1,72 +1,36 @@
-//! The deployment's worlds and how it moves between them
-//! (`PUT /admin/config`, `specs/online-operations.md`).
+//! The update entry: one change of the deployment's configuration, decided
+//! by the layer that owns it (`PUT /admin/config`, `specs/worker.md` §7).
 //!
-//! A world is the processes that execute one configuration of the
-//! deployment: an engine and its workers, their communicators, graphs and
-//! the storage they created. A deployment has two slots for worlds, and at
-//! most one world executes. An update to a configuration that changes what
-//! a world executes takes four steps:
+//! A change is one of three kinds. What the main processes are built from —
+//! their executable, the parallel ranks, the deployment file, the model's
+//! files, the placement, the KV cache's options — is `BuildConfig`'s, and
+//! the epoch layer switches to a new epoch (§7.4, [`crate::updates::switch`]).
+//! What they execute — the programs — is the program layer's, prepared
+//! against every host's Program Server before the processes switch to them
+//! (§7.2). Everything else is this daemon's own: its options change in a hot
+//! restart (§7.5), and the scheduling limits change in place at the engine's
+//! next step boundary, within the batch its workers were started for.
 //!
-//! 1. **Preparation.** The serving world gives back the tail of its KV
-//!    cache the successor needs (its requests run on; its capacity drops),
-//!    and the successor starts in the other slot: its workers map what they
-//!    share with the serving world read-only (the weights of the same keys,
-//!    and the KV cache segments of the serving world's workers of the same
-//!    scope), create the rest of their own, warm up and capture their graphs.
-//!    The serving world executes throughout. A successor of another
-//!    parallel configuration holds other regions of the logical tensors on
-//!    each GPU: before anything starts the daemon plans its ranks' weights,
-//!    their GPUs and the copy manifests that bring them over
-//!    ([`redistribution`]), and the successor maps the weight chunks whose
-//!    keys (the regions they hold) lie on its GPUs, receives the rest from
-//!    the serving world, and maps none of its KV cache, which it lays out
-//!    for its own heads.
-//! 2. **Promotion.** At a step boundary new requests wait, the serving world
-//!    parks (it ends every token request that resumes from its generated
-//!    tokens as migratable and executes nothing more, keeping its storage and
-//!    its prefix cache index), and the successor imports that index into
-//!    the units it maps and serves: every migrated request is submitted
-//!    again with the tokens it generated and reuses the pages of every
-//!    complete page of them, computing at most its last page. On a
-//!    successor of another parallel configuration each computes its tokens
-//!    again.
-//! 3. **Trial.** The successor executes; the previous world is kept as
-//!    `update_config.previous_world` states: parked, its weights alone, or
-//!    its weights in host storage. The trial ends only with the operator's
-//!    commit, and rolls back by itself on a fault of the successor (a fatal
-//!    worker error, its engine process's exit, a stalled job, non-finite
-//!    logits) or past a threshold of `update_config.rollback`.
-//! 4. **Commit** or **rollback.** A commit releases the previous world: its
-//!    processes exit, the successor takes the segments it mapped read-only
-//!    and retires the previous world's storage, and grows its cache into the
-//!    storage freed. A rollback parks and closes the successor, resumes the
-//!    previous world (or starts it again on its kept weights), retires the
-//!    successor's storage, and marks the configuration unavailable: applying
-//!    it again needs `force`.
+//! `Leader::apply` decides in that order and answers what it applied;
+//! `Leader::commit` and `Leader::rollback` are the switch's. A change that
+//! fits no layer is refused by name: the mechanism that moved a deployment
+//! to a successor world, with its trial and its rollback, is gone, and
+//! nothing here starts a second engine beside the one that serves.
 
 use std::collections::BTreeMap;
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::Context as _;
-use proto::report::SchedulerStats;
 use proto::request::wire;
-use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::info;
 
-use crate::engine::client::{EngineClient, EngineState, Successor};
-use crate::engine::hold::Kept;
-use crate::leader::{Leader, Replica, UpdateError, locked, stats_sink};
-use crate::options::{PreviousWorld, RollbackOptions, ServeConfig};
-
-// The epoch layer owns these three definitions; the API and the leader still
-// name them as `crate::worlds::{…}` until their `use` lines move to
-// `crate::updates` in builder02's routing commit.
-pub(crate) use crate::observe::{Observer, Rates, Sample};
-pub(crate) use crate::updates::change::{Applied, ApplyRequest, InFlight, resolve};
-pub(crate) use crate::updates::epoch::Unavailable;
+use crate::engine::client::EngineState;
+use crate::leader::{Leader, Replica, UpdateError, locked};
+use crate::options::ServeConfig;
+use crate::updates::change::{Applied, ApplyRequest, resolve};
+use crate::updates::epoch::Unavailable;
 
 /// The deployment's worlds as the leader tracks them.
 #[derive(Default)]
@@ -867,38 +831,6 @@ impl Replica {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn stats(batch_us: u64, batches: u64, tokens: u64, faults: u64) -> SchedulerStats {
-        SchedulerStats {
-            batch_roundtrip_us: batch_us,
-            batch_count: batches,
-            numerical_faults: faults,
-            worker_forward_stats: Some(proto::report::ForwardStats {
-                mode_tokens: BTreeMap::from([("decode".to_owned(), tokens)]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-    }
-
-    /// A world's rates average its own batches over the window, apart from
-    /// another world's.
-    #[test]
-    fn rates_average_one_worlds_batches() {
-        let observer = Observer::default();
-        let since = Instant::now();
-        observer.record(1, 0, &stats(1_000, 10, 500, 0));
-        observer.record(1, 0, &stats(3_000, 10, 500, 0));
-        observer.record(2, 0, &stats(90_000, 1, 1, 2));
-        let rates = observer
-            .rates(1, since, Duration::from_secs(60))
-            .expect("world 1 ran batches");
-        assert!((rates.step_us - 200.0).abs() < 1e-9, "{rates:?}");
-        assert!(rates.tokens_per_second > 0.0);
-        assert_eq!(observer.numerical_faults(1, since), 0);
-        assert_eq!(observer.numerical_faults(2, since), 2);
-        assert!(observer.rates(3, since, Duration::from_secs(60)).is_none());
-    }
 
     /// A change of the scheduling alone, within the batch the workers were
     /// started for, is in place for a world that a change started, whose

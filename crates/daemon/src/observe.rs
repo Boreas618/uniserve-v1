@@ -147,3 +147,43 @@ impl Observer {
             .sum()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proto::report::SchedulerStats;
+    use std::collections::BTreeMap;
+
+    fn stats(batch_us: u64, batches: u64, tokens: u64, faults: u64) -> SchedulerStats {
+        SchedulerStats {
+            batch_roundtrip_us: batch_us,
+            batch_count: batches,
+            numerical_faults: faults,
+            worker_forward_stats: Some(proto::report::ForwardStats {
+                mode_tokens: BTreeMap::from([("decode".to_owned(), tokens)]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// A world's rates average its own batches over the window, apart from
+    /// another world's.
+    #[test]
+    fn rates_average_one_worlds_batches() {
+        let observer = Observer::default();
+        let since = Instant::now();
+        observer.record(1, 0, &stats(1_000, 10, 500, 0));
+        observer.record(1, 0, &stats(3_000, 10, 500, 0));
+        observer.record(2, 0, &stats(90_000, 1, 1, 2));
+        let rates = observer
+            .rates(1, since, Duration::from_secs(60))
+            .expect("world 1 ran batches");
+        assert!((rates.step_us - 200.0).abs() < 1e-9, "{rates:?}");
+        assert!(rates.tokens_per_second > 0.0);
+        assert_eq!(observer.numerical_faults(1, since), 0);
+        assert_eq!(observer.numerical_faults(2, since), 2);
+        assert!(observer.rates(3, since, Duration::from_secs(60)).is_none());
+    }
+
+}
