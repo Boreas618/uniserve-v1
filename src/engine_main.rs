@@ -2070,6 +2070,27 @@ impl MainProcess {
                 self.after_modules(precopy, loaded)
             }
             PrecopyStage::Executors(submissions) => {
+                // A device that never answers is a process that serves nothing until the epoch
+                // ends: the stage is polled, so without this bound the only line it prints is the
+                // stall warning, and the run waits out the daemon's whole prepare bound to learn
+                // what the log already showed. Preparing an installed generation is a rebind or a
+                // recapture - seconds of capture and a pinned upload, never a compile - so a stage
+                // that has stood past twice the watchdog's stall bound is failed here by name,
+                // saying what never answered. Serving keeps what it had; the update does not.
+                if precopy.since.elapsed() > self.watchdog.stall_bound() * 2 {
+                    let pending = pending_work(&precopy.stage);
+                    return self.abandon_precopy(
+                        generation,
+                        UpdateFailure::Precopy {
+                            reason: format!(
+                                "this node's device never answered its preparation after {}s \
+                                 ({pending}): the device thread is the one to look at",
+                                precopy.since.elapsed().as_secs()
+                            ),
+                        },
+                        precopy.reply,
+                    );
+                }
                 // The policy's module is built on each scheduler's blocking thread, so its answer
                 // arrives here as well: a policy that did not prepare fails the update before any
                 // device cuts over, which is what §4.4's dry run is for.
