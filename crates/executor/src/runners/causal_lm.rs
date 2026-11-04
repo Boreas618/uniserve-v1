@@ -30,22 +30,6 @@ use crate::batch::{Batch, BatchColumns, BatchOutput, CallId, CallOutput, Job, Jo
 use crate::captured::Captured;
 use crate::graph::Graphs;
 use crate::plan::{Bucket, Buckets, Shape};
-/// Writes `values` into `buffer` as the kernel ABI expects them, reusing its capacity.
-fn encode_i32(buffer: &mut Vec<u8>, values: &[i32]) {
-    buffer.clear();
-    for value in values {
-        buffer.extend_from_slice(&value.to_ne_bytes());
-    }
-}
-
-/// The same for f32 columns.
-fn encode_f32(buffer: &mut Vec<u8>, values: &[f32]) {
-    buffer.clear();
-    for value in values {
-        buffer.extend_from_slice(&value.to_ne_bytes());
-    }
-}
-
 /// `rows` uniform draws in `[0, 1)`, from the runner's generator into its own buffer.
 ///
 /// The generator is the runner's (sampling state is the executor's, 4.5) and a seeded one is what
@@ -67,6 +51,7 @@ fn draw_uniforms(seed: &std::cell::Cell<u64>, draws: &mut Vec<f32>, rows: usize)
 #[cfg(test)]
 use crate::plan::Variant;
 use crate::runner::{Binding, Runner, RunnerId};
+use crate::runners::columns::{encode_f32, encode_i32, Column};
 use crate::runners::lifecycle::{walk_capture, Lifecycle, Walked};
 
 /// The capture sink, at the path the device tests of the rebind mechanism import it from.
@@ -354,75 +339,6 @@ pub struct Geometry {
     pub page_size: u32,
     /// The bound on the keys a row reads: the attention descriptor's reduction length.
     pub max_kv_len: u32,
-}
-
-/// One host column of a batch, uploaded into a device buffer whose address never moves.
-///
-/// A captured graph addresses these buffers directly, so they are allocated once when the runner
-/// binds, sized for the largest bucket, and every step rewrites their contents instead of
-/// allocating: what 4.5 forbids is an allocation inside a step, not a copy into a fixed buffer.
-struct Column {
-    device: TensorView,
-    host: platform::PinnedBuffer,
-}
-
-impl Column {
-    /// A column of `numel` elements of `dtype` on `device`.
-    fn new(device: DeviceId, dtype: DType, numel: u64) -> Result<Self> {
-        let bytes = dtype
-            .bytes()
-            .ok_or_else(|| Error::Invalid(format!("{dtype} has no whole-byte size")))?
-            .checked_mul(numel)
-            .ok_or_else(|| Error::Invalid("a batch column's extent overflows".into()))?;
-        let host = platform::PinnedBuffer::new(device, bytes as usize)?;
-        let device = TensorView::new(
-            ops::DevicePtr::new(host.address()),
-            dtype,
-            ops::Shape::new(&[numel]),
-        );
-        Ok(Self { device, host })
-    }
-
-    /// Writes `bytes` into the host side; the device copy follows in [`Column::upload`].
-    fn write(&mut self, bytes: &[u8]) -> Result<()> {
-        if bytes.len() > self.host.len() {
-            return Err(Error::Invariant(format!(
-                "a column of {} bytes cannot hold {}",
-                self.host.len(),
-                bytes.len()
-            )));
-        }
-        // SAFETY: the caller wrote `bytes.len()` bytes of one element type into a host buffer of at
-        // least that size, allocated for exactly this purpose; the buffer is not read concurrently.
-        unsafe {
-            self.host.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
-        }
-        Ok(())
-    }
-
-    /// Copies the host side into the device column; the caller's graph reads it afterwards.
-    fn upload(&self, stream: &platform::Stream) -> Result<()> {
-        // SAFETY: source and destination are this column's own host and device buffers, of the
-        // same length, and the copy is stream-ordered before the graph that reads the device one.
-        unsafe {
-            platform::memcpy_async(
-                self.device.ptr.address(),
-                self.host.address(),
-                self.host.len(),
-                stream,
-            )?;
-        }
-        Ok(())
-    }
-
-    /// The first `elements` of the column, as a view the batch reads.
-    fn extent(&self, elements: std::ops::Range<u64>) -> TensorView {
-        TensorView::new(
-            self.device.ptr,
-            self.device.dtype,
-            ops::Shape::new(&[elements.end - elements.start]),
-        )
-    }
 }
 
 /// The batch columns of every bucket of one runner, sized for the largest bucket it serves.
