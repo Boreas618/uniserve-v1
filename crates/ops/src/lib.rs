@@ -86,6 +86,7 @@ pub mod generation;
 pub mod kernel;
 pub mod kv;
 pub mod logits;
+pub mod metadata;
 pub mod modulation;
 pub mod moe;
 pub mod noise;
