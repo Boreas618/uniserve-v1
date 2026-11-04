@@ -465,9 +465,38 @@ impl TensorView {
         Self { ptr, ..*self }
     }
 
-    /// The same view of other extents, with the same element type and strides.
+    /// The same elements under other extents, with the same element type and address.
+    ///
+    /// A view whose axes are row-major packed reshapes into the row-major packed view of the new
+    /// shape, so its strides are the new shape's own: `[tokens, heads * head_dim]` refined to
+    /// `[tokens, heads, head_dim]` strides `(heads * head_dim, head_dim, 1)`. A view that is not
+    /// row-major cannot be reshaped without moving bytes, so its strides are kept and only the
+    /// shape changes - correct when the new extents refine or merge the last axis, which is the
+    /// only reshape a strided view can express.
     pub fn reshape(&self, shape: Shape) -> Self {
-        Self { shape, ..*self }
+        let strides = if self.is_row_major() {
+            Strides::row_major(shape)
+        } else {
+            self.strides
+        };
+        Self {
+            shape,
+            strides,
+            ..*self
+        }
+    }
+
+    /// Whether the axes are packed row-major: the last axis's stride is one and every axis's
+    /// stride is the extent of the axis after it times that axis's stride.
+    pub fn is_row_major(&self) -> bool {
+        let mut expected = 1_u64;
+        for axis in (0..self.strides.rank()).rev() {
+            if self.strides.get(axis) != expected {
+                return false;
+            }
+            expected *= self.shape.dim(axis);
+        }
+        true
     }
 
     /// The number of elements the view names.
@@ -594,6 +623,28 @@ mod tests {
             shape: Shape::new(shape),
             strides: Strides::new(strides),
         }
+    }
+
+    #[test]
+    fn a_reshape_of_a_packed_view_is_packed_at_its_new_extents() {
+        // `[tokens, heads * head_dim]` refined to `[tokens, heads, head_dim]`: the elements do not
+        // move, so the refined axes are row-major at the new extents. Carrying the packed pair over
+        // left the head axis at stride one, which read a token's four heads as one element.
+        let packed = view(&[15, 512], &[512, 1]);
+        let refined = packed.reshape(Shape::new(&[15, 4, 128]));
+        assert_eq!(refined.strides.get(0), 512);
+        assert_eq!(refined.strides.get(1), 128);
+        assert_eq!(refined.strides.last(), 1);
+    }
+
+    #[test]
+    fn a_reshape_of_a_strided_view_keeps_the_layout_it_cannot_move() {
+        // A last axis that is not unit-strided cannot be repacked without a copy, so the strides are
+        // the caller's and only the extents change.
+        let strided = view(&[8, 16], &[512, 8]);
+        let reshaped = strided.reshape(Shape::new(&[8, 2, 8]));
+        assert_eq!(reshaped.strides.get(0), 512);
+        assert_eq!(reshaped.strides.get(1), 8);
     }
 
     #[test]

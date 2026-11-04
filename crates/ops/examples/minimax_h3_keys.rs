@@ -128,6 +128,9 @@ const VSA_TILE_ROWS: u32 = 64;
 /// kernel's own tiling inside a tile, compiled in.
 const VSA_BLOCK_ROWS: u32 = 16;
 
+/// The key tiles of the deployment's longest sparse reduction: 40960 keys at `VSA_TILE_ROWS`.
+const VSA_MAX_TILES: u32 = 640;
+
 /// The transformer's feed-forward width (`ffn_dim`).
 const FFN: u32 = 14336;
 
@@ -371,6 +374,18 @@ fn main() {
         }
         .to_string(),
     );
+    // The solver's step flattens the latent to `[elements, 1]` and steps it by one scalar, so the
+    // residual's width there is one column and the kernel's `WIDTH` is one.
+    push(
+        "scaled_residual",
+        ScaledResidualDescriptor {
+            dtype: DType::BF16,
+            columns: 1,
+            block: ops::residual::RESIDUAL_BLOCK,
+            update_bias: false,
+        }
+        .to_string(),
+    );
     push(
         "scaled_residual",
         ScaledResidualDescriptor {
@@ -424,51 +439,26 @@ fn main() {
         }
         .to_string(),
     );
-    // The DiT's row mapping, one key per latent raster the served canvases produce. The canvas is
-    // divided by the VAE's 16x spatial compression, and each side is even for every served canvas
-    // because the canvas's sides are multiples of the model's own step.
-    for (height, width) in [
-        (96, 42), // 1536x672
-        (84, 48), // 1344x768
-        (64, 48), // 1024x768
-        (48, 48), // 768x768
-        (48, 64), // 768x1024
-        (42, 48), // 672x768
-        // The 480p class: its caps give pixel sides like 992 and 832, but a canvas side is a
-        // multiple of 32, so every latent side stays even.
-        (62, 26), // 992x416
-        (52, 30), // 832x480
-        (40, 30), // 640x480
-        (30, 30), // 480x480
-        (30, 40), // 480x640
-        (30, 52), // 480x832
-    ] {
-        // One key per raster: the inverse is `unpatchify_video` at 1×2×2, not a mode of this op.
-        push(
-            "patch",
-            ops::patch::Descriptor {
-                dtype: DType::BF16,
-                channels: 24,
-                height,
-                width,
-                block: ops::patch::BLOCK,
-                pdl: PDL,
-            }
-            .to_string(),
-        );
-    }
-    // The two `unpatchify_video` geometries the decoder needs: the latents and the decoder's own
-    // output. The token grid is the request's -- its clip length and its canvas -- so it is a launch
-    // value, and the keys name only the channels, the patch and the affine form.
-    for (channels, patch, affine) in [(24u32, (1u32, 2u32, 2u32), true), (3, (4, 16, 16), false)] {
+    // The DiT's row mapping: one key for every raster, because the program reads the canvas as a
+    // launch word. A canvas is a multiple of the model's own step and the VAE compresses it 16x, so
+    // every latent side a served canvas produces is even — that check is the operator's, at launch.
+    push(
+        "patch",
+        ops::patch::Descriptor {
+            dtype: DType::BF16,
+            block: ops::patch::BLOCK,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
+    // The two `unpatchify_video` forms the decoder needs: the latents, whose per-channel scale and
+    // bias denormalize, and the decoder's own output, which does not. The token grid, the channels
+    // and the patch are the request's and travel at launch, so the two forms are the whole set.
+    for affine in [true, false] {
         push(
             "unpatchify_video",
             ops::unpatchify::Descriptor {
                 dtype: DType::F16,
-                channels,
-                patch_frames: patch.0,
-                patch_height: patch.1,
-                patch_width: patch.2,
                 affine,
                 block: 1024,
                 pdl: PDL,
@@ -516,6 +506,18 @@ fn main() {
             .to_string(),
         );
     }
+    // The condition encoder's last numerical step: the VAE encoder's moments to the sample a
+    // conditioner reads, through its FP16 round trip. One row: the chain is fixed and in f32 by the
+    // reference, so the only thing the key can name is the operator's own tiling -- and the two
+    // launches the conditioned path makes (it does not use programmatic dependent launch) share it.
+    push(
+        "posterior",
+        ops::posterior::Descriptor {
+            block: ops::posterior::BLOCK,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
     // The audio decoder's fused BigVGAN block, at the decoder's own rate and taps.
     push(
         "audio_activation",
@@ -551,6 +553,20 @@ fn main() {
         }
         .to_string(),
     );
+    // The conditioner's anchoring mix runs over `[condition rows, video_channels * 4]`, which is
+    // narrower than any hidden width, in the conditioner's own dtype and in the trace path's.
+    for (target, source) in [(DType::F32, DType::F32), (DType::BF16, DType::BF16)] {
+        push(
+            "scaled_add",
+            ops::residual::ScaledAddDescriptor {
+                target,
+                source,
+                columns: 96,
+                block: 1024,
+            }
+            .to_string(),
+        );
+    }
     // The audio decoder's last step: two float channels to interleaved 16-bit PCM. The clip's length
     // is a launch value, so the key holds only the element type and the block.
     push(
@@ -1019,6 +1035,23 @@ fn main() {
         "vsa_scores",
         ops::segments::ScoresDescriptor::new(HEADS, HEAD_DIM, HEAD_DIM.next_power_of_two(), PDL)
             .to_string(),
+    );
+
+    // The compression the gate adds to every query row: one softmax over the key tiles. `max_tiles`
+    // is the deployment's longest sparse reduction — 40960 keys at the 64-key tile — because it is
+    // the block the softmax reduces in, and so the reduction length the tolerance is written
+    // against. The pooled scores and values are FP32, so the result's type is the whole of `dtype`.
+    push(
+        "vsa_compress_pooled",
+        ops::segments::CompressPooledDescriptor::new(
+            DType::BF16,
+            HEADS,
+            HEAD_DIM,
+            VSA_MAX_TILES,
+            HEAD_DIM.next_power_of_two(),
+            PDL,
+        )
+        .to_string(),
     );
 
     // The pooling that feeds it, and the two tile passes around the attention, all at the tile the

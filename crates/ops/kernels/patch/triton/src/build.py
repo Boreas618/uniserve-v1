@@ -5,10 +5,10 @@ argument signature in the order the operator launches them, the compile-time val
 dimensions give, and the compilation options. The Program Server's Triton source drives
 ``_compile`` with it.
 
-The direction is baked in as a constexpr: the two read and write the two views the other way
-round, and the launch's grid names the packed rows either way, so the modes are two programs.
-Programmatic dependent launch is a compilation option of the module, so a descriptor that asks
-for it compiles one that declares it in its metadata.
+Nothing of a raster's geometry is baked in: the channels, the frames, the canvas and the block all
+travel as the words ``spec`` lists after the two views, so one module serves every request. What is
+compiled is the element type — it is the pointer type — and programmatic dependent launch, which is
+a module option, so a descriptor that asks for it compiles one that declares it in its metadata.
 """
 
 import _compile
