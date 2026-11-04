@@ -342,6 +342,19 @@ pub struct Connection {
     descriptors: Vec<OwnedFd>,
 }
 
+/// How the client waits through a restart: this many attempts, this far apart
+/// (design section 7.5 bounds the wait, and the total is the product).
+const WAIT_ATTEMPTS: usize = 300;
+const WAIT_BETWEEN: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Reads one answer frame on `connection`.
+fn answer_on(connection: &mut Connection) -> Result<wire::server_message::Message> {
+    let (message, descriptors) = connection.receive::<wire::ServerMessage>()?;
+    let answer = message.message.ok_or_else(|| unexpected(None))?;
+    connection.hold(descriptors);
+    Ok(answer)
+}
+
 impl Connection {
     /// Opens a blocking connection to a Program Server's socket.
     pub fn connect(socket: &Path) -> Result<Connection> {
@@ -493,6 +506,10 @@ impl Connection {
 #[derive(Debug)]
 pub struct Client {
     connection: Connection,
+    /// The socket this client was opened on, when it was opened by its path.
+    /// A client that wraps an existing connection has no path and does not
+    /// wait through a restart.
+    socket: Option<std::path::PathBuf>,
 }
 
 impl Client {
@@ -500,12 +517,16 @@ impl Client {
     pub fn connect(socket: &Path) -> Result<Client> {
         Ok(Client {
             connection: Connection::connect(socket)?,
+            socket: Some(socket.to_path_buf()),
         })
     }
 
     /// Wraps an open connection.
     pub fn new(connection: Connection) -> Client {
-        Client { connection }
+        Client {
+            connection,
+            socket: None,
+        }
     }
 
     /// Installs a program package and answers its revision.
@@ -554,14 +575,23 @@ impl Client {
         request: &PrepareRequest,
         progress: &mut dyn FnMut(Progress),
     ) -> Result<Prepared> {
-        self.connection.send(
+        self.call(|connection| Self::prepare_on(connection, request, &mut *progress))
+    }
+
+    /// One attempt at a `prepare`: the whole exchange on one connection.
+    fn prepare_on(
+        connection: &mut Connection,
+        request: &PrepareRequest,
+        progress: &mut dyn FnMut(Progress),
+    ) -> Result<Prepared> {
+        connection.send(
             &wire::Request {
                 request: Some(wire::request::Request::Prepare(prepare_message(request)?)),
             },
             &[],
         )?;
         loop {
-            match self.answer()? {
+            match answer_on(connection)? {
                 wire::server_message::Message::Progress(step) => progress(step.into()),
                 wire::server_message::Message::Prepared(prepared) => {
                     let mut chosen = Vec::with_capacity(prepared.programs.len());
@@ -600,7 +630,21 @@ impl Client {
         descriptor: &str,
         progress: &mut dyn FnMut(Progress),
     ) -> Result<Module> {
-        self.connection.send(
+        self.call(|connection| {
+            Self::resolve_on(connection, op, program, target, descriptor, &mut *progress)
+        })
+    }
+
+    /// One attempt at a `resolve`: the whole exchange on one connection.
+    fn resolve_on(
+        connection: &mut Connection,
+        op: &str,
+        program: &Program,
+        target: &Target,
+        descriptor: &str,
+        progress: &mut dyn FnMut(Progress),
+    ) -> Result<Module> {
+        connection.send(
             &wire::Request {
                 request: Some(wire::request::Request::Resolve(wire::Resolve {
                     op: op.to_owned(),
@@ -612,13 +656,13 @@ impl Client {
             &[],
         )?;
         loop {
-            match self.answer()? {
+            match answer_on(connection)? {
                 wire::server_message::Message::Progress(step) => progress(step.into()),
                 wire::server_message::Message::Resolved(resolved) => {
                     let form = wire::ModuleForm::try_from(resolved.form)
                         .map_err(|_| Error::Protocol("unknown module form".into()))?
                         .try_into()?;
-                    let descriptors = self.connection.take_descriptors();
+                    let descriptors = connection.take_descriptors();
                     if descriptors.len() != resolved.files.len() {
                         return Err(Error::Protocol(format!(
                             "a module names {} files and came with {}",
@@ -701,11 +745,70 @@ impl Client {
     /// Progress reports are frames like any other: the requests that report
     /// builds read them in their own loop, so dropping them here would lose
     /// every report a caller asked for.
+    /// Runs one call, waiting through a Program Server restart (design section
+    /// 7.5).
+    ///
+    /// The calls that wait are `prepare` and `resolve`: the Program Server is
+    /// not on the serving path, so a restart may only make an epoch's
+    /// preparation wait. An attempt that ends because the server was away is
+    /// retried on a fresh connection, because a restart ends the old one;
+    /// anything the server itself decided — a refusal, a build failure, an
+    /// unknown revision, an unsupported descriptor — is returned at once,
+    /// since retrying would repeat the decision. A call that timed out or read
+    /// something out of protocol is not a restart either: the server was there.
+    ///
+    /// A retry re-asks for the same content: program revisions name their
+    /// content and are never overwritten, so a second attempt selects the same
+    /// programs and finds the modules an abandoned attempt committed. Steps
+    /// may therefore be reported twice.
+    fn call<T>(
+        &mut self,
+        mut attempt: impl FnMut(&mut Connection) -> Result<T>,
+    ) -> Result<T> {
+        let Some(socket) = self.socket.clone() else {
+            return attempt(&mut self.connection);
+        };
+        let restarted = || Error::Restarted {
+            socket: socket.display().to_string(),
+            attempts: WAIT_ATTEMPTS,
+        };
+        let mut attempts = 0_usize;
+        let mut reconnect = false;
+        loop {
+            if reconnect {
+                match Connection::connect(&socket) {
+                    Ok(connection) => {
+                        self.connection = connection;
+                        reconnect = false;
+                    }
+                    Err(error) if error.away() => {
+                        attempts += 1;
+                        if attempts >= WAIT_ATTEMPTS {
+                            return Err(restarted());
+                        }
+                        std::thread::sleep(WAIT_BETWEEN);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            attempts += 1;
+            match attempt(&mut self.connection) {
+                Ok(answer) => return Ok(answer),
+                Err(error) if error.away() => {
+                    if attempts >= WAIT_ATTEMPTS {
+                        return Err(restarted());
+                    }
+                    std::thread::sleep(WAIT_BETWEEN);
+                    reconnect = true;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     fn answer(&mut self) -> Result<wire::server_message::Message> {
-        let (message, descriptors) = self.connection.receive::<wire::ServerMessage>()?;
-        let answer = message.message.ok_or_else(|| unexpected(None))?;
-        self.connection.hold(descriptors);
-        Ok(answer)
+        answer_on(&mut self.connection)
     }
 }
 
