@@ -26,6 +26,7 @@ mod imports;
 mod manifest;
 pub(super) mod plan;
 pub(crate) mod planes;
+pub mod scratch;
 mod transfers;
 
 pub(crate) use access::UnitAccesses;
