@@ -22,6 +22,16 @@
 //! point expression. `round_half_to_even` is the reference's: ties go to the even neighbour, which is
 //! what `numpy.rint` and Rust's `f32::round_ties_even` do.
 //!
+//! **`out` may be a sub-region of a larger raster, and so may `input`**: the write goes through
+//! `out`'s own strides, so a channel tile placed inside a canvas is one launch rather than a pass and
+//! a copy — which is what the decoder needs, since each decoded tile lands in a sub-region of one
+//! clip raster. The rule is the crate's: the **innermost** axis is unit-strided (the channels of
+//! `[frames, rows, columns, 3]`, the columns of the read side), **rows must not overlap** (each
+//! outer stride is at least the next axis's extent times its stride), and every outer stride is
+//! otherwise arbitrary. A transposed view is refused, because it would put a gather in the inner
+//! loop for a layout nobody needs; where the strides are row-major the same loop vectorizes, so the
+//! general form costs nothing in the common case.
+//!
 //! `mean` and `std` are **views, not host scalars**: they are the checkpoint's ImageNet constants,
 //! published once as device weights and held by the layer, so no call re-uploads three floats and a
 //! captured forward sees them as the memory it already has.
@@ -70,6 +80,47 @@ pub fn quantize_scaled(scaled: f32) -> u8 {
         return 0;
     }
     scaled.clamp(0.0, BYTE_SCALE).round_ties_even() as u8
+}
+
+/// The outer strides of a raster view, refusing a broadcast or an overlapping one.
+///
+/// A rank-4 raster's axes are `[channels, frames, rows, columns]` on the read side and
+/// `[frames, rows, columns, channels]` on the write side; the innermost is unit-strided by the
+/// crate's row rule (`require_row`), so what the program needs is the three that carry it between
+/// planes, rows and columns. Two views are refused here: one with a **zero** stride on an axis (every
+/// element of that axis would be the same byte — a broadcast, not a raster), and one whose axes
+/// **overlap** (`stride[i]` below `extent[i+1] · stride[i+1]`, so two elements would share a byte).
+///
+/// A sub-region of a larger raster passes unchanged: it is only a bigger outer stride, which is what
+/// the decoder's tile-in-a-canvas write needs.
+fn strides_of(operator: &'static str, name: &str, view: &TensorView) -> Result<[u64; 3]> {
+    let rank = view.shape.rank();
+    let strides = view.strides.as_slice();
+    let mut outer = [0_u64; 3];
+    for axis in 0..rank {
+        if strides[axis] == 0 {
+            return Err(Error::argument(
+                operator,
+                format!("the {name} raster has a zero stride on axis {axis}"),
+            ));
+        }
+        if axis + 1 < rank {
+            let needed = view.shape.dim(axis + 1) * strides[axis + 1];
+            if strides[axis] < needed {
+                return Err(Error::argument(
+                    operator,
+                    format!(
+                        "the {name} raster overlaps on axis {axis}: stride {} is below {needed}",
+                        strides[axis]
+                    ),
+                ));
+            }
+        }
+        if axis < 3 {
+            outer[axis] = strides[axis];
+        }
+    }
+    Ok(outer)
 }
 
 /// One compilation of `rgb_bytes`.
@@ -193,6 +244,12 @@ impl Op for RgbBytes {
         // The packed image is contiguous, and the program writes it as a flat run of pixels.
         args.out.require_row(Self::NAME, DType::U8, channels)?;
 
+        // A view carries its base address into the launch, not its strides, so a strided operand has
+        // to hand them over: the program walks `out` as a block of a larger raster and `input` as a
+        // slice of the latent, and both are only correct if it is told how far apart the axes are.
+        let input = strides_of(Self::NAME, "input", &args.input)?;
+        let out = strides_of(Self::NAME, "out", &args.out)?;
+
         let mut arguments = Arguments::new();
         arguments
             .view(args.input)
@@ -203,6 +260,12 @@ impl Op for RgbBytes {
             .u64(rows)
             .u64(columns)
             .u32(descriptor.channels)
+            .u64(input[0])
+            .u64(input[1])
+            .u64(input[2])
+            .u64(out[0])
+            .u64(out[1])
+            .u64(out[2])
             .flag(descriptor.pdl);
         kernel.launch(
             LaunchGrid::linear(args.out.numel().div_ceil(u64::from(descriptor.block)))?,
@@ -313,6 +376,37 @@ mod tests {
                 assert_eq!(back, 255, "the high end clamps");
             }
         }
+    }
+
+    #[test]
+    fn a_tile_inside_a_canvas_is_accepted_and_a_broadcast_or_an_overlap_is_not() {
+        use crate::DevicePtr;
+        use crate::tensor::{Shape, Strides};
+
+        // One tile of a larger packed raster: 2 frames of rows × columns pixels of 3 bytes, placed
+        // every 1000 bytes along the canvas's rows (a row is 96 bytes) and every 2000 rows in frames.
+        let tile = TensorView {
+            ptr: DevicePtr::new(0),
+            dtype: DType::U8,
+            shape: Shape::new(&[2, 4, 32, 3]),
+            strides: Strides::new(&[4 * 1000, 1000, 3, 1]),
+        };
+        let outer = strides_of("test", "out", &tile).expect("a sub-region is a valid raster");
+        assert_eq!(outer, [4000, 1000, 3]);
+
+        // The same view squeezed against its neighbour: the rows would share bytes.
+        let overlapping = TensorView {
+            strides: Strides::new(&[4 * 90, 90, 3, 1]),
+            ..tile
+        };
+        assert!(strides_of("test", "out", &overlapping).is_err());
+
+        // A broadcast axis is not a raster.
+        let broadcast = TensorView {
+            strides: Strides::new(&[0, 1000, 3, 1]),
+            ..tile
+        };
+        assert!(strides_of("test", "out", &broadcast).is_err());
     }
 
     #[test]
