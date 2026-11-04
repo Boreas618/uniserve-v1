@@ -313,6 +313,12 @@ def test_the_marker_and_value_rule_decides_parsing(
 
 def test_the_request_is_one_system_and_one_user_message() -> None:
     """Every measured request carries the fixed prompt and sampling fields."""
+    # The protocol's prompt literal, not just the module constant, is fixed:
+    # a rewritten prompt would score different work.
+    assert SYSTEM_PROMPT == (
+        "Solve the problem step by step. End your answer with the final answer "
+        "on its own line in the form `#### <number>`."
+    )
     task = GSM8KTask(_point(None, num_prompts=1))
 
     request = task.build_request(
@@ -444,12 +450,17 @@ def test_only_the_checkpoint_and_kv_cache_dtype_differ_between_cells() -> None:
     """One change separates the cells, so a comparison isolates it."""
 
     def normalized(command: list[str]) -> list[str]:
-        values = [
-            value
-            for value in command
-            if not value.startswith("attention_backend=")
-        ]
+        # Drop the FP8 cell's `--set attention_backend=...` pair: the
+        # provider is not part of the cell's identity. Each cell also
+        # listens on its own port, which cannot change the scored text.
+        values: list[str] = []
+        for value in command:
+            if value.startswith("attention_backend="):
+                assert values.pop() == "--set"
+                continue
+            values.append(value)
         values[values.index("serve") + 1] = "<checkpoint>"
+        values[values.index("--port") + 1] = "<port>"
         return [
             "kv_cache_config.dtype=<dtype>"
             if value.startswith("kv_cache_config.dtype=")
