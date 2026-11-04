@@ -8,6 +8,7 @@
 //! while a published call is open; that call keeps the arguments already
 //! streamed.
 
+use proto::handoff;
 use thiserror_ext::AsReport as _;
 use tracing::warn;
 
@@ -34,6 +35,25 @@ impl ToolStage {
             parser,
             parser_failed: false,
             open_call_index: None,
+        }
+    }
+
+    /// The stage's state, for the process that goes on parsing where this one
+    /// stopped (design §7.5.1 step 3); `None` when the parser has no state.
+    pub(super) fn state(&self) -> Option<handoff::ToolStage> {
+        Some(handoff::ToolStage {
+            parser_failed: self.parser_failed,
+            open_call_index: self.open_call_index.map(|index| index as u64),
+            parser: Some(self.parser.state()?),
+        })
+    }
+
+    /// Takes over `state`, which this stage's parser produced.
+    pub(super) fn resume(&mut self, state: &handoff::ToolStage) {
+        self.parser_failed = state.parser_failed;
+        self.open_call_index = state.open_call_index.map(|index| index as usize);
+        if let Some(parser) = state.parser.as_ref() {
+            self.parser.resume(parser);
         }
     }
 

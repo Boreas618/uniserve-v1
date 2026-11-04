@@ -36,6 +36,17 @@ pub trait ReasoningParser: Send {
 
     /// Flushes buffered text at end of stream as text of the current region.
     fn finish(&mut self) -> ReasoningDelta;
+
+    /// The parser's state, for a response that moves to another process
+    /// (design §7.5.1).
+    ///
+    /// `None` when the parser's state is not one delimited state machine's:
+    /// a model family the design retires keeps such a parser, and a stream
+    /// with one is served where it began.
+    fn state(&self) -> Option<proto::handoff::Reasoning>;
+
+    /// Restores the state [`Self::state`] reported.
+    fn resume(&mut self, state: &proto::handoff::Reasoning);
 }
 
 /// Result alias for reasoning parser calls.

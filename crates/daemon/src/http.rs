@@ -8,7 +8,9 @@
 //! `middleware`.
 
 pub(crate) mod admin;
+pub(crate) mod handoff;
 pub(crate) mod listener;
+pub(crate) mod stream;
 mod middleware;
 mod node;
 
