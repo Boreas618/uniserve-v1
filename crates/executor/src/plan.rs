@@ -19,6 +19,8 @@
 //! vector and [`Bucket::holds`] compares three pairs of integers.
 
 use std::collections::BTreeSet;
+
+use crate::error::{Error, Result};
 use std::fmt;
 
 /// The kind of forward a captured graph serves.
@@ -176,6 +178,27 @@ impl fmt::Display for Bucket {
     }
 }
 
+/// The decode row counts captured when the build config names none: dense small batches kept exact,
+/// then strides of eight, because a bucket is captured for every size in the list.
+pub fn decode_catalog() -> Vec<u32> {
+    (1..=32).chain((40..=128).step_by(8)).collect()
+}
+
+/// The prefill token counts captured when the build config names none: fine near one prompt's first
+/// chunk, coarser as chunks grow, which is where a bucket's cost is amortised.
+pub fn prefill_catalog() -> Vec<u32> {
+    (4..=32)
+        .step_by(4)
+        .chain((48..=256).step_by(16))
+        .chain((288..=512).step_by(32))
+        .chain((576..=4096).step_by(64))
+        .chain((4608..=16384).step_by(512))
+        .collect()
+}
+
+/// The media flow shapes `(height, width)` captured when the build config names none.
+pub const FLOW_CATALOG: [(u32, u32); 2] = [(1152, 2048), (2048, 1152)];
+
 /// The buckets one runner captures, in the order it captures them.
 ///
 /// The set is fixed when the executor is bound, from the build config's graph sizes
@@ -217,6 +240,70 @@ impl Buckets {
             }
         }
         Self::new(buckets)
+    }
+
+    /// The bucket set of a batch plan that admits `rows` rows and `tokens` tokens, from the sizes
+    /// the deployment configured and the catalog where it configured none (4.5).
+    ///
+    /// A bucket is captured for each size and never for a size the batch plan cannot admit, so a
+    /// configured size above the bound is dropped rather than captured and never used. `sampled`
+    /// also captures the sampling variants, which a deployment that samples needs and one that
+    /// serves logits only does not pay for. A plan whose sizes all exceed the bound is refused here,
+    /// at startup, rather than at the first batch of an unusual shape.
+    pub fn for_batch(
+        decode: Option<&[u32]>,
+        prefill: Option<&[u32]>,
+        rows: u32,
+        tokens: u32,
+        sampled: bool,
+    ) -> Result<Self> {
+        let mut decode: Vec<u32> = match decode {
+            Some(sizes) => sizes.to_vec(),
+            None => decode_catalog(),
+        };
+        let mut prefill: Vec<u32> = match prefill {
+            Some(sizes) => sizes.to_vec(),
+            None => prefill_catalog(),
+        };
+        decode.retain(|size| *size != 0 && *size <= rows);
+        prefill.retain(|size| *size != 0 && *size <= tokens);
+        if decode.is_empty() && prefill.is_empty() {
+            return Err(Error::Invalid(format!(
+                "no captured bucket fits a batch of {rows} rows and {tokens} tokens"
+            )));
+        }
+        Ok(Self::causal_lm(&decode, &prefill, sampled))
+    }
+
+    /// The default catalog of a causal-language rank: the deployment's graph options, or the
+    /// rank's own sizes where an option leaves them unset.
+    ///
+    /// The sizes are the ones the reference deployment captures: every decode batch size from one
+    /// row to 32 and then in eights to 128, and prefill chunks of 4 tokens up to 32, 16 up to 256,
+    /// 32 up to 512, 64 up to 4096 and 512 up to 16384. They are captured every warmup, so a
+    /// deployment that serves shorter prompts states its own and captures less.
+    ///
+    /// `sampled` captures a sampled decode bucket beside every greedy one: a request that samples
+    /// needs one, and the mechanism cannot serve it from a greedy graph.
+    pub fn default_causal_lm(rows: Option<&[u32]>, tokens: Option<&[u32]>, sampled: bool) -> Self {
+        const DECODE: [u32; 32] = [
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+            24, 25, 26, 27, 28, 29, 30, 31, 32,
+        ];
+        const DECODE_STEP: [u32; 12] = [40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128];
+        let default_rows: Vec<u32> = DECODE.into_iter().chain(DECODE_STEP).collect();
+        let default_tokens: Vec<u32> = (4..=32)
+            .step_by(4)
+            .chain((48..=256).step_by(16))
+            .chain((288..=512).step_by(32))
+            .chain((576..=4096).step_by(64))
+            .chain((4608..=16384).step_by(512))
+            .collect();
+        Self::causal_lm(
+            rows.unwrap_or(&default_rows),
+            tokens.unwrap_or(&default_tokens),
+            sampled,
+        )
     }
 
     /// Every bucket, ascending by size.
@@ -340,5 +427,80 @@ mod tests {
                 variant: bucket.variant
             }));
         }
+    }
+
+    /// The catalog is clamped to what the batch plan admits, so nothing is captured that no batch
+    /// can fill, and a batch of the bound's own shape is still served.
+    #[test]
+    fn the_catalog_is_clamped_to_the_batch_bound() {
+        let buckets = Buckets::for_batch(None, None, 8, 64, false).expect("a plan within the catalog");
+        for bucket in buckets.iter() {
+            assert!(bucket.rows <= 8, "{bucket} is wider than the batch bound");
+            assert!(bucket.tokens <= 64, "{bucket} is longer than the batch bound");
+        }
+        let full = Shape {
+            rows: 8,
+            tokens: 64,
+            variant: Variant::PrefillWrite,
+        };
+        assert!(buckets.select(&full).is_some(), "the bound's own shape is served");
+        // Every decode row up to the bound is served by its own bucket.
+        for rows in 1..=8 {
+            let shape = Shape {
+                rows,
+                tokens: rows,
+                variant: Variant::DecodeGreedy,
+            };
+            assert_eq!(
+                buckets.select(&shape).map(|bucket| bucket.rows),
+                Some(rows),
+                "a decode of {rows} rows is padded into a larger bucket"
+            );
+        }
+    }
+
+    /// A size the deployment configured is used as it stands, and one above the bound is not
+    /// captured: capturing it would reserve a graph no batch can fill.
+    #[test]
+    fn a_configured_size_above_the_bound_is_not_captured() {
+        let buckets = Buckets::for_batch(Some(&[4, 1024]), Some(&[512]), 8, 64, false)
+            .expect("the sizes below the bound fit");
+        assert!(buckets.contains(&Bucket::decode(4, Variant::DecodeGreedy)));
+        assert!(!buckets.contains(&Bucket::decode(1024, Variant::DecodeGreedy)));
+        assert!(
+            buckets
+                .iter()
+                .all(|bucket| bucket.variant.is_decode() || bucket.tokens <= 4),
+            "a prefill size above the token bound was captured"
+        );
+    }
+
+    /// Sizes that all exceed the bound are refused at startup rather than failed in service.
+    #[test]
+    fn a_plan_no_size_fits_is_refused() {
+        assert!(Buckets::for_batch(Some(&[256]), Some(&[4096]), 8, 64, false).is_err());
+        // One size within the bound is enough for the plan to be usable.
+        assert!(Buckets::for_batch(Some(&[8, 256]), Some(&[4096]), 8, 64, false).is_ok());
+    }
+
+    /// The sampling variants are captured only for a deployment that samples.
+    #[test]
+    fn sampling_variants_follow_the_deployment() {
+        let rows = [4_u32];
+        let greedy = Buckets::for_batch(Some(&rows), None, 8, 64, false).expect("a plan");
+        let sampled = Buckets::for_batch(Some(&rows), None, 8, 64, true).expect("a plan");
+        assert!(!greedy
+            .iter()
+            .any(|bucket| bucket.variant == Variant::DecodeSampled));
+        assert!(sampled
+            .iter()
+            .any(|bucket| bucket.variant == Variant::DecodeSampled));
+        // Both sets serve the same decode shape, greedily.
+        let shape = Shape {
+            rows: 4,
+            tokens: 4,
+            variant: Variant::DecodeGreedy,
+        };
+        assert_eq!(greedy.select(&shape), sampled.select(&shape));
     }
 }
