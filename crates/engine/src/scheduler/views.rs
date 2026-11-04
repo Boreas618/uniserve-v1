@@ -698,7 +698,18 @@ fn next_phase(scheduler: &Scheduler, state: &RequestState, id: RequestId) -> Opt
         // phase it needs next, and its draft gap appears in `refill_tokens`.
         // `PhaseKind::Refill` stays in the phase table as the kind of the call
         // the mechanism builds, not as a phase a request sits in.
-        CallKind::Forward(ForwardMode::Prefill) if refill_gap(scheduler, state).is_some() => {
+        // Only a request whose context is fully ingested can be refilled:
+        // before that, a prefill call is the chunk that writes the rest of
+        // the prompt, and naming it a decode hides that chunk from the
+        // policy (the built call then differs from the plan and is dropped).
+        CallKind::Forward(ForwardMode::Prefill)
+            if refill_gap(scheduler, state).is_some()
+                && scheduler
+                    .num_scheduled_prompt_tokens(id)
+                    .is_some_and(|scheduled| {
+                        scheduled >= state.req.prompt_token_ids.len() as u32
+                    }) =>
+        {
             PhaseKind::Decode
         }
         other => call_phase(other),
