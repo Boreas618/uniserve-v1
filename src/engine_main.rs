@@ -656,7 +656,10 @@ impl MainProcess {
             .devices()
             .first()
             .context("this rank serves no device")?;
-        let scratch = plan.graph(device)?.scratch;
+        // Only the scratch figure is read here: the device thread starts before any batch and the
+        // shadow region is the one pool it is sized with. The resident pool is the capacity plan's
+        // and `open_memory` opens it, so this call states none.
+        let scratch = plan.graph(device, 0)?.scratch;
         for device in plan.devices() {
             let generation = Arc::new(Generation::new(epoch.generation, std::iter::empty()));
             let runners = plan.runners(*device, Arc::clone(&model), &mut memory, &generation)?;
