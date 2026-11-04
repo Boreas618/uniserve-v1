@@ -1,0 +1,372 @@
+use nn::layers::{Linear, Rotary, Rotation, Sections, SegmentAttention, SegmentTables, VsaTiles};
+use nn::weights::{Weight, WeightLoader, WeightRequest};
+use nn::{Forward, Shape, TensorView};
+use ops::gemm::WeightOrder;
+
+use crate::attention::Factors;
+use crate::config::TransformerConfig;
+use crate::partition::Partition;
+use crate::{Error, Result};
+
+/// One layer's sparse attention: four projections, the tile preparation, and both attentions.
+pub struct Sparse {
+    /// The query, key and value projections, `[inner, hidden]` each.
+    pub query: Linear,
+    pub key: Linear,
+    pub value: Linear,
+    /// The gate the compression is weighted by, `[inner, hidden]`: a fourth projection of the same
+    /// fused matrix as the three above (`attention.py:139`).
+    pub gate: Linear,
+    /// The output projection back to the residual's width, `[hidden, inner]`.
+    pub output: Linear,
+    /// Per-head normalization gains of the query and the key.
+    pub query_gain: Weight,
+    pub key_gain: Weight,
+    /// The partial rotation of the head.
+    pub rotary: Rotary,
+    /// The tile preparation: normalization, rotation, padding and pooling.
+    pub tiles: VsaTiles,
+    /// The fine attention over the selected tiles of the rows, in the checkpoint's dtype.
+    pub fine: SegmentAttention,
+    /// The compression over the pooled tiles, written in the rows' dtype from FP32 arithmetic.
+    pub compressed: SegmentAttention,
+    /// Heads of the whole model, and the heads this rank holds.
+    pub heads: u32,
+    pub local_heads: u32,
+    /// Elements of one head.
+    pub head_dim: u32,
+    /// Rows of one tile.
+    pub tile_rows: u32,
+    /// `[tiles]` int32, all one: every pooled tile is a single valid row for the compression.
+    pub ones: Weight,
+}
+
+impl Sparse {
+    /// Read layer `index`'s sparse attention of a DiT partition.
+    pub fn load(
+        index: u32,
+        config: &TransformerConfig,
+        rows: u32,
+        rotated_axes: &[u32],
+        tile_rows: u32,
+        partition: &Partition,
+        loader: &mut WeightLoader<'_>,
+    ) -> Result<Self> {
+        let prefix = format!("transformer_blocks.{index}.attn");
+        let hidden = u64::from(config.hidden_size);
+        let head = u64::from(config.head_dim);
+        let inner = u64::from(config.num_attention_heads) * head;
+        let rotated: u32 = rotated_axes.iter().sum();
+        if rotated == 0 || rotated > config.head_dim || !rotated.is_multiple_of(2) {
+            return Err(Error::config(format!(
+                "{rotated} rotated channels of a {} element head",
+                config.head_dim
+            )));
+        }
+        let query_gain = gain(loader, &format!("{prefix}.norm_q.weight"), head)?;
+        let key_gain = gain(loader, &format!("{prefix}.norm_k.weight"), head)?;
+        let frequencies = frequencies(loader, config, rotated)?;
+        let rotary = Rotary::new(
+            frequencies,
+            config.head_dim,
+            config.num_attention_heads,
+            config.num_attention_heads,
+            config.qk_norm_eps,
+            Rotation::Half,
+            1.0,
+        )?
+        .partial(rotated)?
+        .sectioned(Sections::new(rotated_axes)?.interleaved())?;
+        // The reference composes a layer's compression across the exchange's members (`compose`,
+        // `slots`); until that is written, a sharded sparse deployment would attend its own rows
+        // alone and silently produce a different model.
+        if partition.ulysses_degree > 1 {
+            return Err(Error::config(format!(
+                "the sparse attention composes its compression across {} ulysses ranks, whose \
+                 exchange is not written",
+                partition.ulysses_degree
+            )));
+        }
+        let local_heads = partition.denoiser_heads(config.num_attention_heads);
+        let tiles = VsaTiles::new(tile_rows, local_heads, config.head_dim, config.qk_norm_eps)?
+            .with_norm()
+            .with_rotation(rotated)?;
+        let fine = SegmentAttention::new(
+            u64::from(tile_rows),
+            u64::from(local_heads),
+            head,
+            u64::from(rows),
+            nn::DType::BF16,
+        )?;
+        // One pooled row per tile, so the compression's block is one; its arithmetic is FP32 and
+        // its result is written in the rows' dtype, which is what the gate reads.
+        let compressed = SegmentAttention::new(
+            1,
+            u64::from(local_heads),
+            head,
+            u64::from(rows / tile_rows),
+            nn::DType::BF16,
+        )?;
+        let tile_count = rows / tile_rows;
+        let ones = loader.constant(
+            &format!("transformer.vsa.ones.{tile_count}"),
+            nn::DType::I32,
+            Shape::new(&[u64::from(tile_count)]),
+            &vec![1u8; tile_count as usize * 4],
+        )?;
+        Ok(Self {
+            query: projection(loader, &format!("{prefix}.to_q.weight"), inner, hidden)?,
+            key: projection(loader, &format!("{prefix}.to_k.weight"), inner, hidden)?,
+            value: projection(loader, &format!("{prefix}.to_v.weight"), inner, hidden)?,
+            gate: projection(
+                loader,
+                &format!("{prefix}.to_gate_compress.weight"),
+                inner,
+                hidden,
+            )?,
+            output: projection(loader, &format!("{prefix}.to_out.0.weight"), hidden, inner)?,
+            query_gain,
+            key_gain,
+            rotary,
+            tiles,
+            fine,
+            compressed,
+            heads: config.num_attention_heads,
+            local_heads,
+            head_dim: config.head_dim,
+            tile_rows,
+            ones,
+        })
+    }
+
+    /// The rotary factor tables of `positions` `[3, rows]`, written into the two views.
+    pub fn factors(
+        &self,
+        f: &Forward,
+        positions: TensorView,
+        cosine: TensorView,
+        sine: TensorView,
+    ) -> Result<()> {
+        self.rotary
+            .factors(f, positions, cosine, sine)
+            .map_err(Error::from)
+    }
+
+    /// Attend `normalized` `[rows, hidden]` and write `[rows, hidden]`.
+    ///
+    /// `sizes` is `[tiles]` int32, the valid rows of each tile; `segments` is `[tiles]` int32, the
+    /// segment each tile belongs to, and `keep` is the tile-count-long table of each segment's kept
+    /// key tiles, as the reference builds it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward(
+        &self,
+        f: &Forward,
+        normalized: TensorView,
+        factors: Factors,
+        sizes: TensorView,
+        segments: TensorView,
+        keep: TensorView,
+        scratch: &Scratch,
+        out: TensorView,
+    ) -> Result<()> {
+        let rows = normalized.shape.dim(0);
+        if !rows.is_multiple_of(u64::from(self.tile_rows)) {
+            return Err(Error::config(format!(
+                "{rows} rows do not fill {} tiles",
+                self.tile_rows
+            )));
+        }
+        self.query.forward(f, normalized, scratch.query)?;
+        self.key.forward(f, normalized, scratch.key)?;
+        self.value.forward(f, normalized, scratch.value)?;
+        self.gate.forward(f, normalized, scratch.gate)?;
+
+        // The rows are `[tiles * tile_rows, heads, width]` for the preparation; the pooled views are
+        // `[tiles, heads, width]` FP32 and stay tile-major, which is the order the reference's
+        // permutation reads them in.
+        let shape = Shape::new(&[rows, u64::from(self.local_heads), u64::from(self.head_dim)]);
+        let (query, key, value, gate) = (
+            scratch.query.reshape(shape),
+            scratch.key.reshape(shape),
+            scratch.value.reshape(shape),
+            scratch.gate.reshape(shape),
+        );
+        self.tiles.prepare(
+            f,
+            query,
+            key,
+            value,
+            Some(&self.query_gain),
+            Some(&self.key_gain),
+            Some(factors.cosine),
+            Some(factors.sine),
+            sizes,
+            scratch.pooled_query,
+            scratch.pooled_key,
+            scratch.pooled_value,
+        )?;
+        for padded in [query, key, value] {
+            self.tiles.zero_padding(f, padded, sizes)?;
+        }
+        self.tiles
+            .scores(f, scratch.pooled_query, scratch.pooled_key, scratch.scores)?;
+        // `segment_keep` is over-allocated to the tile count and filled by segment index, as the
+        // reference builds it; `select` reads its entries by segment and ignores the rest.
+        self.tiles.select(
+            f,
+            scratch.scores,
+            segments,
+            sizes,
+            keep,
+            scratch.indices,
+            scratch.counts,
+            0,
+        )?;
+
+        // The fine branch reads the selected tiles of the rows in the checkpoint's dtype.
+        let tables = SegmentTables {
+            indices: scratch.indices,
+            counts: scratch.counts,
+            sizes,
+        };
+        self.fine
+            .forward(f, query, key, value, &tables, scratch.fine)?;
+
+        // The compression reads one pooled row per tile with the same selection, in FP32, and
+        // writes the rows' dtype; the gate then weights it into the fine rows.
+        let pooled_tables = SegmentTables {
+            indices: scratch.indices,
+            counts: scratch.counts,
+            // Every pooled tile is one valid row, so the valid sizes are all one.
+            sizes: self.ones.view(),
+        };
+        self.compressed.forward(
+            f,
+            scratch.pooled_query,
+            scratch.pooled_key,
+            scratch.pooled_value,
+            &pooled_tables,
+            scratch.compressed,
+        )?;
+        // The compression is folded into the fine rows, in place, and one binding names both the
+        // buffer the fold writes and the buffer the projection reads: `add_gated` modifies its first
+        // argument only, so folding into any other buffer would drop this branch without a shape
+        // ever saying so (`vsa/segments.py:461-478`).
+        let composed = scratch.fine;
+        self.tiles
+            .add_gated(f, composed, scratch.compressed, gate)?;
+        Ok(self.output.forward(f, composed, out)?)
+    }
+}
+
+/// The per-request device views a sparse stack's layers read.
+///
+/// `sizes` is `[tiles]` int32, the valid rows of each tile; `segments` is `[tiles]` int32, the video
+/// segment of each tile; `keep` is the `segment_keep` table, over-allocated to the tile count as the
+/// reference builds it.
+#[derive(Clone, Copy)]
+pub struct Segments {
+    pub sizes: TensorView,
+    pub segments: TensorView,
+    pub keep: TensorView,
+}
+
+/// Every temporary view the sparse branch reads, reserved once for the whole stack.
+///
+/// The shapes do not depend on the layer, and the executor's arena is a bump allocator reset once
+/// per forward, so a per-layer reservation would multiply the arena by the layer count - two
+/// `tiles * tiles * heads` matrices per layer is gigabytes at a served canvas.
+pub struct Scratch {
+    pub query: TensorView,
+    pub key: TensorView,
+    pub value: TensorView,
+    pub gate: TensorView,
+    pub pooled_query: TensorView,
+    pub pooled_key: TensorView,
+    pub pooled_value: TensorView,
+    pub scores: TensorView,
+    pub indices: TensorView,
+    pub counts: TensorView,
+    pub fine: TensorView,
+    pub compressed: TensorView,
+}
+
+impl Scratch {
+    /// Reserve the stack's sparse scratch for `rows` rows of `tiles` tiles.
+    pub fn reserve(
+        layer: &Sparse,
+        f: &Forward,
+        normalized: TensorView,
+        tiles: u32,
+    ) -> Result<Self> {
+        let dtype = normalized.dtype;
+        let rows = normalized.shape.dim(0);
+        let inner = u64::from(layer.local_heads) * u64::from(layer.head_dim);
+        let heads = u64::from(layer.local_heads);
+        let tiles64 = u64::from(tiles);
+        let arena = f.arena();
+        Ok(Self {
+            query: arena.tensor(dtype, Shape::new(&[rows, inner]))?,
+            key: arena.tensor(dtype, Shape::new(&[rows, inner]))?,
+            value: arena.tensor(dtype, Shape::new(&[rows, inner]))?,
+            gate: arena.tensor(dtype, Shape::new(&[rows, inner]))?,
+            pooled_query: arena.tensor(
+                nn::DType::F32,
+                Shape::new(&[tiles64, heads, u64::from(layer.head_dim)]),
+            )?,
+            pooled_key: arena.tensor(
+                nn::DType::F32,
+                Shape::new(&[tiles64, heads, u64::from(layer.head_dim)]),
+            )?,
+            pooled_value: arena.tensor(
+                nn::DType::F32,
+                Shape::new(&[tiles64, heads, u64::from(layer.head_dim)]),
+            )?,
+            scores: arena.tensor(nn::DType::F32, Shape::new(&[heads, tiles64, tiles64]))?,
+            // The selection is as wide as the scores it comes from: `select` requires the index
+            // matrix to have the scores' shape, and the reference returns one entry per key tile
+            // with the kept ones first (`vsa/segments.py:205-208`).
+            indices: arena.tensor(nn::DType::I32, Shape::new(&[heads, tiles64, tiles64]))?,
+            counts: arena.tensor(nn::DType::I32, Shape::new(&[heads, tiles64]))?,
+            fine: arena.tensor(dtype, Shape::new(&[rows, inner]))?,
+            compressed: arena.tensor(
+                dtype,
+                Shape::new(&[tiles64, heads, u64::from(layer.head_dim)]),
+            )?,
+        })
+    }
+}
+
+fn frequencies(
+    loader: &mut WeightLoader<'_>,
+    config: &TransformerConfig,
+    rotated: u32,
+) -> Result<Weight> {
+    let half = (rotated / 2) as usize;
+    let mut bytes = Vec::with_capacity(half * 4);
+    for index in 0..half {
+        let exponent = 2.0 * index as f64 / f64::from(rotated);
+        let value = (config.rope_theta as f64).powf(-exponent) as f32;
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    let name = format!("transformer.rotary.{rotated}.{}", config.rope_theta);
+    Ok(loader.constant(&name, nn::DType::F32, Shape::new(&[half as u64]), &bytes)?)
+}
+
+fn projection(
+    loader: &mut WeightLoader<'_>,
+    name: &str,
+    out_features: u64,
+    in_features: u64,
+) -> Result<Linear> {
+    let weight = loader.load(&WeightRequest::region(
+        name,
+        0,
+        Shape::new(&[out_features, in_features]),
+    ))?;
+    Ok(Linear::new(weight, None, WeightOrder::NxK)?)
+}
+
+fn gain(loader: &mut WeightLoader<'_>, name: &str, width: u64) -> Result<Weight> {
+    Ok(loader.load(&WeightRequest::region(name, 0, Shape::new(&[width])))?)
+}
