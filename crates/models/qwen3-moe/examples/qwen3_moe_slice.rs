@@ -792,6 +792,9 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     // One table for the whole walk: an increment is measured against the stage before it, the last
     // stage included, and that stage is the full run's output rather than a layer's.
     let mut table = Table::default();
+    // Set by `hidden_00` below: a table lookup that disagrees means the two stacks are not the same
+    // tensor, and the rows that follow would read as defects in layers that are not being measured.
+    let mut misaligned = false;
     if args.dump.is_some() || args.reference.is_some() {
         if let Some(dir) = args.dump.as_deref() {
             std::fs::create_dir_all(dir)
@@ -806,7 +809,19 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
             rows,
             width,
         };
-        report_stage(args, stage, &embedded, &mut table)?;
+        let embedded_error = report_stage(args, stage, &embedded, &mut table)?;
+        // The tripwire that caught the last misalignment: a table lookup agrees or the two files
+        // are not the same tensor, and a stack compared across that gap reads as a defect at every
+        // layer while measuring nothing. The rows are still dumped - the file is useful - and are
+        // not compared.
+        misaligned = embedded_error.is_some_and(|error| error > EMBEDDING_BUDGET);
+        if misaligned {
+            println!(
+                "reference: hidden_00 is a table lookup and is {:.3e} from the reference's - the \
+                 comparison is misaligned, so the rows below are dumped and not compared",
+                embedded_error.unwrap_or_default()
+            );
+        }
         // Every call reserves a step's scratch, and nothing returns it: the arena is sized for one
         // forward and not for forty-eight, so each layer's rows are read back to the host and the
         // arena is then released to the mark taken before the first call. Without the release the
@@ -828,7 +843,11 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
                 rows,
                 width,
             };
-            report_stage(args, stage, &values, &mut table)?;
+            if misaligned {
+                dump_stage(args, stage, &values)?;
+            } else {
+                report_stage(args, stage, &values, &mut table)?;
+            }
             arena.release(mark);
         }
     }
@@ -850,9 +869,15 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
             rows,
             width,
         };
-        report_stage(args, stage, &values, &mut table)?;
+        if misaligned {
+            dump_stage(args, stage, &values)?;
+        } else {
+            report_stage(args, stage, &values, &mut table)?;
+        }
     }
-    summarize(&table, config.num_hidden_layers);
+    if !misaligned {
+        summarize(&table, config.num_hidden_layers);
+    }
     let logits = arena.tensor(
         DType::F32,
         Shape::new(&[1, u64::try_from(config.vocab_size).unwrap_or(0)]),
@@ -938,6 +963,15 @@ fn check_reference_prompt(dir: &std::path::Path, tokens: &[i32]) -> Result<()> {
 /// `hidden` values averages it down; five percent is two orders above that floor and still far below
 /// what a wrong computation produces, which is what makes it a line worth printing.
 const RELATIVE_BUDGET: f64 = 0.05;
+
+/// How far `hidden_00` may sit from the reference's before the comparison is called misaligned.
+///
+/// `hidden_00` is a table lookup: both sides read the same bf16 embedding rows, so the widened f32
+/// values are equal and the distance is exactly zero. A nonzero row therefore does not mean the
+/// embedding operator is off — it means the reference's file is not the tensor this slice compares
+/// against (a different prompt, a hook placed somewhere else, a stack captured at another width),
+/// and every row below it would be read as a defect in a layer that is not being measured.
+const EMBEDDING_BUDGET: f64 = 1e-3;
 
 /// `hidden_NN`'s stage: the embedding's output at zero, then one layer per file.
 fn stage_name(index: usize) -> String {
