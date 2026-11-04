@@ -23,8 +23,8 @@
 
 use std::path::PathBuf;
 
-use nn::VideoTask;
 use nn::weights::{HostStore, WeightLoader};
+use nn::{DType, VideoTask};
 
 use minimax_h3::checkpoint::{Layout, Sidecars};
 use minimax_h3::config::Config;
@@ -60,9 +60,22 @@ fn directory_bytes(
     Ok(bytes)
 }
 
+fn parse_dtype(text: &str) -> Result<Option<DType>, String> {
+    match text {
+        "auto" => Ok(None),
+        "bf16" => Ok(Some(DType::BF16)),
+        "f16" => Ok(Some(DType::F16)),
+        "f32" => Ok(Some(DType::F32)),
+        other => Err(format!(
+            "`{other}` is not an element type; write auto, bf16, f16 or f32"
+        )),
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut roots: Vec<PathBuf> = Vec::new();
     let mut requested: Vec<String> = Vec::new();
+    let mut stated: Option<DType> = None;
     let mut task_name = "t2va".to_owned();
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
@@ -71,6 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 roots.push(arguments.next().ok_or("--root needs a path")?.into());
             }
             "--component" => requested.push(arguments.next().ok_or("--component needs a name")?),
+            "--dtype" => stated = parse_dtype(&arguments.next().ok_or("--dtype needs a type")?)?,
             "--task" => {
                 task_name = arguments.next().ok_or("--task needs a name")?;
             }
@@ -80,7 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if roots.is_empty() {
         return Err(
             "usage: check_load --root <export> [--root <reference export>] \
-             [--task t2va|fl2va|ref2va] [--component <name> ...]"
+             [--task t2va|fl2va|ref2va] [--dtype auto|bf16|f16|f32] [--component <name> ...]"
                 .into(),
         );
     }
@@ -189,11 +203,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let partition = serving.placing(Components::of([component]));
         let mut store = HostStore::new();
         let outcome = {
-            let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+            // `--dtype` is the deployment's statement, and it reaches both the loader (one
+            // conversion per weight, named in the retained key) and the boundary (`auto` refuses a
+            // component of two floating-point types rather than mixing them in a forward).
+            let mut loader = WeightLoader::new(&checkpoint, &mut store, stated, None);
             if matches!(component, Component::LatentEncoder) {
                 ConditionEncoders::load(&config, &checkpoint, &mut loader).map(|_| ())
             } else {
-                load(&checkpoint, partition, &mut loader).map(|_| ())
+                load(&checkpoint, partition, stated, &mut loader).map(|_| ())
             }
         };
         if let Err(error) = outcome {

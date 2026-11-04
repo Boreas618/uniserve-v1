@@ -41,6 +41,7 @@ use minimax_h3::checkpoint::Dit;
 use minimax_h3::config::Config;
 use minimax_h3::denoiser::{Denoiser, Layouts};
 use minimax_h3::encoding::Extent;
+use minimax_h3::load::stored_dtype;
 use minimax_h3::partition::{Component, Partition};
 use nn::capability::{Conditioning, Denoiser as _, MediaInput, MediaRole};
 use nn::{
@@ -526,6 +527,7 @@ fn encode(args: &Args) -> Result<(), String> {
     // for the blocks it places - not by a default: a pool that cannot give out one more buffer is a
     // stop the caller reads as a defect in the model (`platform: the pool's reservation cannot give
     // out ... more`), and it is the harness's number that was wrong.
+    let dtype = stored_dtype(&checkpoint, Component::Transformer.directories()[0]).map_err(show)?;
     let mut published = 0_u64;
     for component in partition.blocks.iter() {
         for directory in component.directories() {
@@ -543,15 +545,23 @@ fn encode(args: &Args) -> Result<(), String> {
     );
     let mut weights = DeviceWeights::new(&device, resident)?;
     let model = {
-        let mut loader = WeightLoader::new(&checkpoint, &mut weights, None, None);
-        minimax_h3::load(&checkpoint, partition, &mut loader).map_err(show)?
+        // The deployment's type reaches the loader and the boundary together: the loader converts
+        // each weight once, and the boundary refuses a mixed component only when nothing converts.
+        let mut loader = WeightLoader::new(&checkpoint, &mut weights, Some(dtype), None);
+        minimax_h3::load(&checkpoint, partition, Some(dtype), &mut loader).map_err(show)?
     };
     let denoiser = std::sync::Arc::clone(
         model
             .transformer()
             .ok_or_else(|| "the deployment placed no denoiser block".to_owned())?,
     );
-    let dtype = denoiser_dtype(&denoiser);
+    if denoiser_dtype(&denoiser) != dtype {
+        return Err(format!(
+            "the deployment loads at {dtype} and the block reports {}: the loader and the boundary \
+             disagreed",
+            denoiser_dtype(&denoiser)
+        ));
+    }
     let hidden = u64::from(dit.transformer.hidden_size);
     let source_width = u64::from(config.text_encoder.hidden_size);
     // The prefix source's three regions, from the packing's own indices: the text capacity, then the
