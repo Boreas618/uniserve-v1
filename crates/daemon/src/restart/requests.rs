@@ -1,8 +1,20 @@
 //! Continuation admission through the daemon that owns the deployment.
 //!
-//! Existing HTTP streams stay in their original daemon. Only their next
-//! engine connection is obtained over the handoff channel; tokens and media
-//! continue over the ordinary engine request protocol.
+//! Responses in flight do not travel this way: at the handoff they are frozen
+//! at an event boundary and adopted by the successor, with their connections
+//! and their state (§7.5.1, `restart/streams.rs`). What this module carries is
+//! the request the predecessor had already accepted but not yet submitted when
+//! the deployment was handed over: it asks the successor which engine serves
+//! the request now, and submits there, instead of failing a request the old
+//! process admitted.
+//!
+//! The window is wider than the handover itself. The listener stops accepting
+//! between requests, so a connection that had already begun sending a body
+//! keeps reading it — a slow upload may take seconds — and only then submits.
+//! Such a request has no stream to hand over, because nothing of it has run
+//! yet; forwarding it is what keeps an admitted request from becoming a
+//! client-visible failure. The old process forwards it and does not wait for
+//! it: what item 1 requires is that no *stream* keeps it alive (§7.5.1).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
