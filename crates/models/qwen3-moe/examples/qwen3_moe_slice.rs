@@ -600,6 +600,11 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     let pages_per_row = i32::try_from(pages).unwrap_or(1);
     let block_table: Vec<i32> = (0..pages_per_row).collect();
 
+    // The prompt's ids and its positions are two different buffers with the same length: the
+    // embedding reads the ids, and every later launch reads the positions. Handing the positions to
+    // the embedding is silent - it produces rows 0..n of the table, a perfectly plausible stack -
+    // and every layer after it is then computing on the wrong prompt.
+    let ids = upload_i32(&stream, &arena, &tokens)?;
     let positions = upload_i32(&stream, &arena, &positions)?;
     let slot_mapping = upload_i32(&stream, &arena, &slots)?;
     let seq_lens = upload_i32(&stream, &arena, &seq_lens)?;
@@ -654,7 +659,14 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
 
     // The forward: embed, then either stop at one layer or walk the stack and project the last row.
     let hidden = arena.tensor(DType::BF16, Shape::new(&[count, plan.hidden]))?;
-    model.embed_input_ids(&forward, positions, hidden)?;
+    model.embed_input_ids(&forward, ids, hidden)?;
+    // The embedding is the one operator in the pass a run can check against the checkpoint alone,
+    // and a stack computed on the wrong prompt is indistinguishable from a model with a defect in
+    // every layer. So it is checked before the first layer launches, and the run stops here rather
+    // than producing a table of thirty numbers that measure the wrong prompt.
+    if args.reference.is_some() || args.dump.is_some() {
+        check_embedded_rows(&stream, &checkpoint, &tokens, hidden, &plan)?;
+    }
     if let Some(layer) = last {
         // The layer's rows, twice: a block has no reference capture, so what it can prove is that
         // every key it composes resolves and that two identical runs agree. A digest that moves
@@ -1837,4 +1849,71 @@ mod tests {
         assert_eq!(cut_file(Substage::Normalized), "normalized");
         assert_eq!(cut_file(Substage::Attended), "attended");
     }
+}
+
+/// Check that the embedding read the prompt's ids: every row of `hidden` is the table's row for
+/// that token, which the checkpoint itself can vouch for without a reference capture.
+///
+/// Both sides are the checkpoint's own BF16 rows widened to `f32`, so the rows are equal exactly.
+/// A row that is not equal names the first token whose row differs and the positions row it *does*
+/// match, because the failure this exists for is ids and positions being two buffers that were
+/// handed over the wrong way round, and that is what the message has to say rather than "the
+/// embedding is wrong".
+fn check_embedded_rows(
+    stream: &platform::Stream,
+    checkpoint: &Checkpoint,
+    tokens: &[i32],
+    hidden: TensorView,
+    plan: &qwen3_moe::Plan,
+) -> Result<()> {
+    let width = usize::try_from(plan.hidden).unwrap_or(0);
+    let rows = download_bf16(stream, hidden, tokens.len(), width)?;
+    let table = checkpoint.read("model.embed_tokens.weight")?;
+    let table_rows = usize::try_from(table.shape.dim(0)).unwrap_or(0);
+    let row_of = |index: usize| -> Option<&[u8]> {
+        let at = index.checked_mul(width)?.checked_mul(2)?;
+        table.bytes.get(at..at + width * 2)
+    };
+    for (row, token) in tokens.iter().enumerate() {
+        let token = usize::try_from(*token).unwrap_or(usize::MAX);
+        let Some(theirs) = row_of(token).filter(|_| token < table_rows) else {
+            return Err(Failure::message(format!(
+                "token {token} is past the table's {table_rows} rows"
+            )));
+        };
+        let ours = &rows[row * width..(row + 1) * width];
+        let agrees = theirs
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(ours)
+            .all(|(pair, value)| half_to_f32(u16::from_le_bytes(*pair)) == *value);
+        if !agrees {
+            // The row the embedding actually wrote, for the message: if it is the table's row at
+            // this token's *position*, the two buffers were swapped, which is the whole point.
+            let wrote = (0..table_rows)
+                .find(|index| {
+                    row_of(*index).is_some_and(|theirs| {
+                        theirs
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .zip(ours)
+                            .all(|(pair, value)| half_to_f32(u16::from_le_bytes(*pair)) == *value)
+                    })
+                })
+                .map(|index| index.to_string())
+                .unwrap_or_else(|| "no table row".to_owned());
+            return Err(Failure::message(format!(
+                "row {row} of the embedding is the table's row {wrote}, and the prompt's token there \
+                 is {token}: the embedding read something other than the prompt's ids (positions \
+                 instead of ids, or an ids buffer nothing filled)"
+            )));
+        }
+    }
+    println!(
+        "embedding: {} rows are the checkpoint's rows for the prompt's ids, exactly",
+        tokens.len()
+    );
+    Ok(())
 }
