@@ -176,6 +176,15 @@ pub(crate) trait ResponseSink: Send + 'static {
 
     /// The sink's own state, as the response's application states it.
     fn body_state(&self) -> Option<BodyState>;
+
+    /// The frames this response writes when it fails, in the sink's own shape:
+    /// server-sent events for a streamed response, the one document a
+    /// one-body response answers with.
+    fn failed(&mut self, error: &ApiError) -> Vec<Bytes>;
+
+    /// Whether the response's head waits for the body's first output, because
+    /// the body is one document whose status is its outcome.
+    fn holds_head(&self) -> bool;
 }
 
 /// The body's own state, which one response's application carries.
@@ -202,6 +211,16 @@ impl ResponseSink for ChatStreamEmitter {
 
     fn body_state(&self) -> Option<BodyState> {
         ChatStreamEmitter::state(self).map(BodyState::Stream)
+    }
+
+    fn failed(&mut self, error: &ApiError) -> Vec<Bytes> {
+        vec![error_frame(error), done_frame()]
+    }
+
+    fn holds_head(&self) -> bool {
+        // Server-sent events start at once: the stream's own error event is
+        // what a failure looks like inside a response already begun.
+        false
     }
 }
 
@@ -257,6 +276,25 @@ impl ResponseSink for ChatBodySink {
 
     fn body_state(&self) -> Option<BodyState> {
         Some(BodyState::Collection(self.collector.state()))
+    }
+
+    fn failed(&mut self, error: &ApiError) -> Vec<Bytes> {
+        // The document `ApiError`'s own response writes, so a failed
+        // generation answers what the route answered before this response
+        // became a body of the handoff path.
+        let body = serde_json::to_vec(&error.to_error_response()).unwrap_or_else(|_| {
+            br#"{"error":{"message":"failed to serialize error response","type":"server_error"}}"#
+                .to_vec()
+        });
+        vec![Bytes::from(body)]
+    }
+
+    fn holds_head(&self) -> bool {
+        // One document, whose status is the outcome: nothing is gained by
+        // sending its head before the document exists, and a head that went
+        // out cannot state a failure (§7.5.1 step 4 hands such a response over
+        // before it has started writing).
+        true
     }
 }
 
@@ -635,6 +673,22 @@ impl<S: ResponseSink> GenerationRun<S> {
             }
         })
     }
+
+    /// The step a failed response ends with.
+    ///
+    /// A response whose head is still held states the failure there, in the
+    /// status it answers with; a response already writing reports it inside
+    /// the stream, in its sink's own shape. Either way the sink renders it:
+    /// server-sent events inside a stream, one error document for the body
+    /// that has none yet.
+    fn failed(&mut self, error: ApiError) -> Step {
+        let frames = self.sink.failed(&error);
+        if self.sink.holds_head() {
+            Step::Failed { error, frames }
+        } else {
+            Step::Frames(frames)
+        }
+    }
 }
 
 impl<S: ResponseSink> Session for GenerationRun<S> {
@@ -648,19 +702,25 @@ impl<S: ResponseSink> Session for GenerationRun<S> {
                 Poll::Ready(EventStep::Migrate) => return Poll::Ready(Step::Migrate),
                 Poll::Ready(EventStep::Ended) => {
                     // The engine stream ends only after the terminal event,
-                    // which the decoder checks.
+                    // which the decoder checks. An engine stream that ends
+                    // before it is a failed response, and it is answered as
+                    // one rather than left as a body that stops mid-document.
                     self.ended = true;
-                    return Poll::Ready(Step::Ended);
+                    if self.sink.done() {
+                        return Poll::Ready(Step::Ended);
+                    }
+                    return Poll::Ready(self.failed(ApiError::server_error(
+                        "the response ended before its terminal output",
+                    )));
                 }
                 Poll::Ready(EventStep::Event(event)) => match self.push(event) {
                     Ok(frames) if frames.is_empty() => continue,
                     Ok(frames) => return Poll::Ready(Step::Frames(frames)),
                     Err(error) => {
                         error!(error = %error.as_report(), "a handed-over response failed");
-                        return Poll::Ready(Step::Frames(vec![
-                            error_frame(&ApiError::server_error("Internal server error")),
-                            done_frame(),
-                        ]));
+                        return Poll::Ready(
+                            self.failed(ApiError::server_error("Internal server error")),
+                        );
                     }
                 },
             }
@@ -904,6 +964,7 @@ mod tests {
                     }
                 }
                 Poll::Ready(Step::Ended) => return bytes,
+                Poll::Ready(Step::Failed { .. }) => panic!("a video body states no failure"),
                 Poll::Ready(Step::Migrate) => panic!("a video body performs no migration"),
                 Poll::Pending => panic!("a video body never waits on anything"),
             }

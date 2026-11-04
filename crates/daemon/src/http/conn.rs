@@ -49,7 +49,7 @@ use tracing::{debug, trace, warn};
 
 use crate::http::handoff::{self, Admissions, Decision, FrozenStream};
 use crate::http::listener::Listener;
-use crate::http::stream::{Handed, HandedBody, Pause};
+use crate::http::stream::{Handed, HandedBody, Opened, Pause};
 
 /// The accepted connection: a TCP stream on a serving address, a Unix stream
 /// on a socket address.
@@ -445,7 +445,7 @@ impl Connection {
         body: &mut RequestBody,
     ) -> anyhow::Result<Outcome> {
         let head_only = body.head_request;
-        let handed = response
+        let mut handed = response
             .extensions()
             .get::<HandedBody>()
             .and_then(HandedBody::take);
@@ -472,12 +472,55 @@ impl Connection {
         };
         let framed = chunked || content_length.is_some();
         let closing = !keep_alive || !body.complete() || !framed;
-        self.write_head(&parts, chunked, content_length, closing)
-            .await?;
+        // A response answered as one document holds its head until the body's
+        // first output: the status is the outcome, so a head sent before the
+        // outcome could not state a failure (§7.5.1 step 4 — such a response
+        // has not started writing when a handoff pauses it, and the head bytes
+        // travel in `http.unwritten` if it does). The head is queued rather
+        // than written for the same reason: a pause in this window must be
+        // able to freeze it.
+        let holds = !head_only && !status_without_body(parts.status) && framed;
+        let mut opening = None;
+        if holds
+            && handed
+                .as_ref()
+                .is_some_and(|handed| handed.stream.head_held())
+        {
+            self.pending
+                .extend_from_slice(&head_bytes(&parts, chunked, content_length, closing));
+            match handed
+                .as_mut()
+                .expect("a held head has a body")
+                .stream
+                .opened()
+                .await
+            {
+                Opened::Frame(frame) => opening = Some(frame),
+                Opened::Failed(error, frames) => {
+                    return self.write_failure(error, frames, closing).await;
+                }
+                // One document, so a body that ends before producing one is a
+                // failure rather than an empty response.
+                Opened::Ended => {
+                    return self
+                        .write_failure(
+                            crate::openai::error::ApiError::server_error(
+                                "the response ended before it wrote its document".to_owned(),
+                            ),
+                            Vec::new(),
+                            closing,
+                        )
+                        .await;
+                }
+            }
+        } else {
+            self.write_head(&parts, chunked, content_length, closing)
+                .await?;
+        }
         if !head_only && !status_without_body(parts.status) {
             let complete = match handed {
                 Some(handed) => match self
-                    .write_handed(handed, keep_alive, body, chunked, content_length)
+                    .write_handed(handed, keep_alive, body, chunked, content_length, opening)
                     .await?
                 {
                     HandedOutcome::Complete => true,
@@ -509,37 +552,35 @@ impl Connection {
         content_length: Option<u64>,
         closing: bool,
     ) -> anyhow::Result<()> {
-        let reason = parts.status.canonical_reason().unwrap_or("");
-        let mut head = BytesMut::with_capacity(256);
-        head.extend_from_slice(
-            format!("HTTP/1.1 {} {}\r\n", parts.status.as_u16(), reason).as_bytes(),
-        );
-        for (name, value) in &parts.headers {
-            let name = name.as_str();
-            // The connection decides the body's framing and the connection's
-            // fate, not the handler.
-            if name.eq_ignore_ascii_case("connection")
-                || name.eq_ignore_ascii_case("transfer-encoding")
-                || name.eq_ignore_ascii_case("content-length")
-            {
-                continue;
-            }
-            head.extend_from_slice(name.as_bytes());
-            head.extend_from_slice(b": ");
-            head.extend_from_slice(value.as_bytes());
-            head.extend_from_slice(b"\r\n");
-        }
-        if let Some(length) = content_length {
-            head.extend_from_slice(format!("Content-Length: {length}\r\n").as_bytes());
-        } else if chunked {
-            head.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
-        }
-        head.extend_from_slice(if closing {
-            b"Connection: close\r\n\r\n" as &[u8]
-        } else {
-            b"Connection: keep-alive\r\n\r\n" as &[u8]
-        });
+        let head = head_bytes(parts, chunked, content_length, closing);
         self.write(&head, None).await.map(|_| ())
+    }
+
+    /// Answers a response that failed before its head was written: the status
+    /// is the failure's, and the body is the sink's document for it.
+    async fn write_failure(
+        &mut self,
+        error: crate::openai::error::ApiError,
+        frames: Vec<Bytes>,
+        closing: bool,
+    ) -> anyhow::Result<Outcome> {
+        // Nothing of the response is written yet: whatever was queued as its
+        // head is replaced by the one the failure states.
+        self.pending.clear();
+        let response = axum::response::IntoResponse::into_response(error);
+        let parts = response.into_parts().0;
+        let length: u64 = frames.iter().map(|frame| frame.len() as u64).sum();
+        let head = head_bytes(&parts, false, Some(length), closing);
+        self.pending.extend_from_slice(&head);
+        for frame in &frames {
+            self.pending.extend_from_slice(frame);
+        }
+        self.drain(None).await?;
+        Ok(if closing {
+            Outcome::Close
+        } else {
+            Outcome::KeepAlive
+        })
     }
 
     /// Writes the frames of a body the handler produced; `false` when the body
@@ -573,6 +614,7 @@ impl Connection {
         body: &RequestBody,
         chunked: bool,
         content_length: Option<u64>,
+        opening: Option<Bytes>,
     ) -> anyhow::Result<HandedOutcome> {
         let Handed {
             mut stream,
@@ -583,7 +625,16 @@ impl Connection {
         // After the first pause the restart owns the decision: the report is
         // spent, and the response goes on here whatever later requests say.
         let mut paused = false;
+        // The first frame a held-head body produced before its head was
+        // written; it goes out after the queued head, and the pause keeps
+        // stopping the response before it.
+        let mut opening = opening;
         loop {
+            if let Some(frame) = opening.take() {
+                self.write_frame(&frame, chunked, (!paused).then_some(&pause_requested))
+                    .await?;
+                continue;
+            }
             if paused {
                 // Everything is written here now; a stale request no longer
                 // stops the response.
@@ -812,6 +863,46 @@ impl Connection {
         }
         Ok(drain)
     }
+}
+
+/// The head bytes of one response, as this connection writes them: the status
+/// from the response, every header the connection does not own, and the framing
+/// and connection headers it does.
+fn head_bytes(
+    parts: &axum::http::response::Parts,
+    chunked: bool,
+    content_length: Option<u64>,
+    closing: bool,
+) -> BytesMut {
+    let reason = parts.status.canonical_reason().unwrap_or("");
+    let mut head = BytesMut::with_capacity(256);
+    head.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", parts.status.as_u16(), reason).as_bytes());
+    for (name, value) in &parts.headers {
+        let name = name.as_str();
+        // The connection decides the body's framing and the connection's
+        // fate, not the handler.
+        if name.eq_ignore_ascii_case("connection")
+            || name.eq_ignore_ascii_case("transfer-encoding")
+            || name.eq_ignore_ascii_case("content-length")
+        {
+            continue;
+        }
+        head.extend_from_slice(name.as_bytes());
+        head.extend_from_slice(b": ");
+        head.extend_from_slice(value.as_bytes());
+        head.extend_from_slice(b"\r\n");
+    }
+    if let Some(length) = content_length {
+        head.extend_from_slice(format!("Content-Length: {length}\r\n").as_bytes());
+    } else if chunked {
+        head.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+    }
+    head.extend_from_slice(if closing {
+        b"Connection: close\r\n\r\n" as &[u8]
+    } else {
+        b"Connection: keep-alive\r\n\r\n" as &[u8]
+    });
+    head
 }
 
 /// What a drain found.
@@ -1738,6 +1829,76 @@ mod tests {
         response
     }
 
+    /// A session of a response answered as one document: the one step it takes,
+    /// or a body that is over at once.
+    struct DocumentSession {
+        step: Option<Step>,
+    }
+
+    impl Session for DocumentSession {
+        fn poll_step(&mut self, _cx: &mut Context<'_>) -> Poll<Step> {
+            match self.step.take() {
+                Some(step) => Poll::Ready(step),
+                None => Poll::Ready(Step::Ended),
+            }
+        }
+
+        fn migrate(&mut self) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            Box::pin(std::future::ready(()))
+        }
+
+        fn freeze(&mut self) -> Option<stream::Application> {
+            Some(stream::Application::ChatResponse(Default::default()))
+        }
+
+        fn abort(&mut self) {}
+
+        fn detach(&mut self) {}
+    }
+
+    /// The response of a handoffable body that holds its head: one document,
+    /// whose status is its outcome.
+    fn held_response(
+        session: Box<dyn Session>,
+        registration: Arc<Registration>,
+        request_id: &str,
+    ) -> Response<Body> {
+        let stream = ResponseStream::start_held(session, false);
+        let body = HandedBody::new(stream, Some(registration), request_id.to_owned())
+            .expect("a registration makes a body handoffable");
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::empty())
+            .expect("a response");
+        stream::attach(&mut response, body);
+        response
+    }
+
+    /// Serves one held-head response on a socket pair and answers the client
+    /// side of it.
+    fn serve_document(step: Option<Step>) -> TestClient {
+        let step = Arc::new(std::sync::Mutex::new(step));
+        let registry = Handoff::new();
+        let registration = registry.register();
+        let app = Router::new().route(
+            "/document",
+            get(move || {
+                let step = step.lock().expect("the session's step").take();
+                let registration = Arc::clone(&registration);
+                async move { held_response(Box::new(DocumentSession { step }), registration, "r") }
+            }),
+        );
+        let (io, client) = pair();
+        tokio::spawn(serve_connection(
+            io,
+            app,
+            CancellationToken::new(),
+            Admissions::default(),
+        ));
+        TestClient::new(client)
+    }
+
     /// Serves one handoffable response on a socket pair, and hands the test the
     /// client side, the frames' producer and the registry the response
     /// registers in.
@@ -2229,5 +2390,79 @@ mod tests {
         let raw = client.read_to_end().await;
         assert!(raw.len() < big.len(), "the rest went to the successor");
         drop(frames);
+    }
+
+    /// A one-document response whose generation fails before it writes anything
+    /// answers the failure's own status and document: the head was held for
+    /// exactly this (§7.5.1 step 4).
+    #[tokio::test]
+    async fn a_one_body_response_states_its_failure_in_the_head_it_held() {
+        let document = Bytes::from_static(
+            br#"{"error":{"message":"the engine failed","type":"server_error"}}"#,
+        );
+        let mut client = serve_document(Some(Step::Failed {
+            error: crate::openai::error::ApiError::server_error("the engine failed".to_owned()),
+            frames: vec![Bytes::clone(&document)],
+        }));
+        client
+            .send(conn_head("GET /document HTTP/1.1").as_bytes())
+            .await;
+
+        let response = client.read_response().await;
+        assert_eq!(response.status, 500, "{}", response.headers);
+        assert!(
+            response.headers.contains("content-type: application/json"),
+            "{}",
+            response.headers
+        );
+        assert_eq!(
+            response
+                .headers
+                .contains(&format!("content-length: {}", document.len())),
+            true,
+            "{}",
+            response.headers
+        );
+        assert_eq!(response.body, String::from_utf8_lossy(&document));
+    }
+
+    /// The document a one-document response produces goes out under the head
+    /// the connection held for it.
+    #[tokio::test]
+    async fn a_one_body_response_writes_its_document_under_the_head_it_held() {
+        let document = Bytes::from_static(br#"{"id":"r","object":"chat.completion"}"#);
+        let mut client = serve_document(Some(Step::Frames(vec![Bytes::clone(&document)])));
+        client
+            .send(conn_head("GET /document HTTP/1.1").as_bytes())
+            .await;
+
+        let response = client.read_response().await;
+        assert_eq!(response.status, 200, "{}", response.headers);
+        assert!(
+            response.headers.contains("content-type: application/json"),
+            "{}",
+            response.headers
+        );
+        assert_eq!(response.body, String::from_utf8_lossy(&document));
+    }
+
+    /// A one-document response whose body ends before producing its document is
+    /// a failure, not an empty success.
+    #[tokio::test]
+    async fn a_one_body_response_that_ends_early_states_a_server_error() {
+        let mut client = serve_document(None);
+        client
+            .send(conn_head("GET /document HTTP/1.1").as_bytes())
+            .await;
+
+        let response = client.read_response().await;
+        assert_eq!(response.status, 500, "{}", response.headers);
+        assert!(
+            response
+                .body
+                .contains("the response ended before it wrote its document"),
+            "{}",
+            response.body
+        );
     }
 }
