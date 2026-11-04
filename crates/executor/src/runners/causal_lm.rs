@@ -1145,6 +1145,20 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
     }
 
     fn precopy(&mut self, next: &Arc<Generation>) -> Result<Jobs> {
+        // One update at a time: a second generation prepared while the first is still waiting for
+        // its switchover would leave the first one's graphs unreachable and unaccounted for. The
+        // daemon discards an update before starting the next, so this is a disagreement, not a
+        // sequence to support.
+        if let Some(prepared) = &self.next {
+            if prepared.number() != next.number() {
+                return Err(Error::Invariant(format!(
+                    "precopy of generation {} while generation {} is prepared and has not been \
+                     switched over or discarded",
+                    next.number(),
+                    prepared.number()
+                )));
+            }
+        }
         // Which (operator, key) pairs changed between the serving generation and `next` (7.3
         // step 1). A kernel is unchanged when it is the same `Arc`, so an untouched program keeps
         // its bucket as it is.
