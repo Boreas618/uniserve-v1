@@ -429,3 +429,107 @@ pub(crate) fn finished(request_id: &str) {
         })
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use engine::{EngineConfig, SimEngine};
+    use proto::handoff::stream::Application;
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::model::ModelParameters;
+    use crate::options::VideoJobOptions;
+    use crate::test_support::{configured_tokenizer, leader_over, sim_client, sim_core, sim_model};
+
+    /// A response the successor cannot read is not taken over: it stays the
+    /// predecessor's, it is reported as taken over by nobody, and the
+    /// successor does not take its socket out of the handover — it does not
+    /// own the connection, so nothing about it moves.
+    #[tokio::test]
+    async fn a_response_that_cannot_be_read_stays_with_the_predecessor() {
+        // The queue of taken-over responses is this process's, so the test
+        // starts from what earlier tests left there.
+        let _ = take_adopted();
+        let core = sim_core(EngineConfig::sim("refused-handoff"), SimEngine::new());
+        let client = std::sync::Arc::new(sim_client(vec![core]));
+        let leader = std::sync::Arc::new(leader_over(
+            sim_model(ModelParameters::Qwen3),
+            configured_tokenizer(),
+            "refused-handoff".into(),
+            vec![client],
+            None,
+        ));
+        let jobs = std::sync::Arc::new(VideoJobs::new(
+            VideoJobOptions::default(),
+            CancellationToken::new(),
+        ));
+
+        // Bytes that are not a `uniserve.handoff.Stream`.
+        let record = StreamHandoff {
+            request_id: "refused-handoff-request".to_owned(),
+            frozen_at_ns: 1,
+            state: b"not a handed-over stream".to_vec(),
+        };
+        let mut socket_taken = false;
+        let adoption = adopt(&leader, vec![record], &jobs, &mut || {
+            socket_taken = true;
+            anyhow::bail!("a refused response must not take a descriptor")
+        });
+
+        assert!(
+            adoption.streams.is_empty(),
+            "a response that cannot be read is taken over by nobody"
+        );
+        assert!(
+            take_adopted().is_empty(),
+            "nothing is reported as adopted"
+        );
+        assert!(
+            !socket_taken,
+            "the successor takes no socket of a response it did not take over"
+        );
+    }
+
+    /// The same refusal when the state is readable but names no application:
+    /// the record is complete enough to decode and still cannot be resumed.
+    #[tokio::test]
+    async fn a_response_that_names_no_application_stays_with_the_predecessor() {
+        let _ = take_adopted();
+        let core = sim_core(EngineConfig::sim("refused-handoff-2"), SimEngine::new());
+        let client = std::sync::Arc::new(sim_client(vec![core]));
+        let leader = std::sync::Arc::new(leader_over(
+            sim_model(ModelParameters::Qwen3),
+            configured_tokenizer(),
+            "refused-handoff-2".into(),
+            vec![client],
+            None,
+        ));
+        let jobs = std::sync::Arc::new(VideoJobs::new(
+            VideoJobOptions::default(),
+            CancellationToken::new(),
+        ));
+        let state = StreamHandoff {
+            request_id: "nameless-application".to_owned(),
+            frozen_at_ns: 1,
+            state: Vec::new(),
+        };
+        // A decoded stream with no application and no framing.
+        let mut record = state;
+        record.state = handoff::Stream {
+            request_id: "nameless-application".to_owned(),
+            http: None,
+            application: None::<Application>,
+        }
+        .encode_to_vec();
+
+        let mut socket_taken = false;
+        let adoption = adopt(&leader, vec![record], &jobs, &mut || {
+            socket_taken = true;
+            anyhow::bail!("a refused response must not take a descriptor")
+        });
+
+        assert!(adoption.streams.is_empty());
+        assert!(take_adopted().is_empty());
+        assert!(!socket_taken, "a response without framing does not move");
+    }
+}
