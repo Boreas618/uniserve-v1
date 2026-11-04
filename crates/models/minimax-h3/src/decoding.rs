@@ -251,6 +251,11 @@ pub fn video_arena(
             elements: pixels * u64::from(crate::output::Rgb::CHANNELS),
         },
         Buffer {
+            name: "decoded",
+            element: "f16",
+            elements: pixels * u64::from(crate::output::Rgb::CHANNELS),
+        },
+        Buffer {
             name: "rgb",
             element: "u8",
             elements: pixels * u64::from(crate::output::Rgb::CHANNELS),
@@ -271,9 +276,14 @@ pub fn video_arena(
 /// its left over the columns they share. The first tile row and column have no predecessor, so they
 /// are written and nothing is blended.
 ///
-/// The raster is `[channels, frames, rows, columns]` in the decoder's element type, one clip's
-/// decoded frames; the caller sizes it and hands the same buffer to every tile. A tile's placement is
-/// a view into it, so no copy and no separate placement operator is needed.
+/// Two rasters of `[channels, frames, rows, columns]` in the decoder's element type carry one clip
+/// while it is stitched. `plain` holds every tile as it was decoded and is never blended into;
+/// `blended` holds the result. The reference keeps its neighbours unmodified for a reason
+/// (`uniserve/nn/vae/tiled.py:51-56`): a tile's row blend reads the tile above, and that neighbour
+/// must be its *decoded* block rather than one already faded into its own predecessor, or the
+/// overlap where two seams cross is computed in a different order from the seams themselves. Writing
+/// each tile into both rasters costs one extra unpatchify launch per tile and no copy operator: every
+/// placement is a strided view of a raster, which the operators now write through.
 pub struct ClipDecoder {
     unpatchify: UnpatchifyVideo,
     /// One blend layer for each overlap the tile grid has, by extent and axis.
