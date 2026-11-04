@@ -60,7 +60,9 @@ def evaluations(root: pathlib.Path) -> dict[tuple[str, int], pathlib.Path]:
     the last step, and a tree that renumbered them would pair two different schedules.
     """
     if not root.is_dir():
-        raise SystemExit(f"{root} is not a directory; --ref and --got name a case's `denoiser` directory")
+        raise SystemExit(
+            f"{root} is not a directory; --ref and --got name a case's `denoiser` directory"
+        )
     found: dict[tuple[str, int], pathlib.Path] = {}
     for path in sorted(root.iterdir()):
         match = EVALUATION.match(path.name)
@@ -68,7 +70,9 @@ def evaluations(root: pathlib.Path) -> dict[tuple[str, int], pathlib.Path]:
             continue
         key = (match.group("modality"), int(match.group("index")))
         if key in found:
-            raise SystemExit(f"{root} holds two files for {key[0]} evaluation {key[1]}")
+            raise SystemExit(
+                f"{root} holds two files for {key[0]} evaluation {key[1]}"
+            )
         found[key] = path
     if not found:
         raise SystemExit(
@@ -90,10 +94,16 @@ def metrics(got: np.ndarray, ref: np.ndarray) -> dict[str, object]:
     difference = a - b
     scale = float(np.linalg.norm(b))
     norm = float(np.linalg.norm(difference))
-    cosine = float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b))) if np.linalg.norm(a) and np.linalg.norm(b) else 0.0
+    cosine = (
+        float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
+        if np.linalg.norm(a) and np.linalg.norm(b)
+        else 0.0
+    )
     return {
         "rel_l2": norm / scale if scale else norm,
-        "max_abs": float(np.max(np.abs(difference))) if difference.size else 0.0,
+        "max_abs": float(np.max(np.abs(difference)))
+        if difference.size
+        else 0.0,
         "cosine": cosine,
         "exact": bool(np.array_equal(np.asarray(got), np.asarray(ref))),
         "elements": int(b.size),
@@ -105,7 +115,11 @@ def movement(previous: np.ndarray, current: np.ndarray) -> float:
     a = np.asarray(previous, dtype=np.float64).reshape(-1)
     b = np.asarray(current, dtype=np.float64).reshape(-1)
     scale = float(np.linalg.norm(a))
-    return float(np.linalg.norm(b - a)) / scale if scale else float(np.linalg.norm(b - a))
+    return (
+        float(np.linalg.norm(b - a)) / scale
+        if scale
+        else float(np.linalg.norm(b - a))
+    )
 
 
 def compare(ref: pathlib.Path, got: pathlib.Path) -> dict[str, object]:
@@ -114,6 +128,7 @@ def compare(ref: pathlib.Path, got: pathlib.Path) -> dict[str, object]:
     missing_ours = sorted(set(theirs) - set(ours))
     missing_theirs = sorted(set(ours) - set(theirs))
     if missing_ours or missing_theirs:
+
         def names(keys):
             return ", ".join(f"{modality} e{index}" for modality, index in keys)
 
@@ -122,7 +137,11 @@ def compare(ref: pathlib.Path, got: pathlib.Path) -> dict[str, object]:
             f" only the reference has {names(missing_ours) or 'nothing'};"
             f" only this side has {names(missing_theirs) or 'nothing'}"
         )
-    report: dict[str, object] = {"ref": str(ref), "got": str(got), "modalities": {}}
+    report: dict[str, object] = {
+        "ref": str(ref),
+        "got": str(got),
+        "modalities": {},
+    }
     for modality in MODALITIES:
         keys = sorted(index for name, index in theirs if name == modality)
         if not keys:
@@ -143,6 +162,21 @@ def compare(ref: pathlib.Path, got: pathlib.Path) -> dict[str, object]:
                     f" {candidate.dtype}; a pair of two element types measures the conversion"
                     " and not the arithmetic"
                 )
+            # A non-finite element is not a comparison: `rel_l2` of a pair holding `nan` is `nan`,
+            # and the page would show a number-shaped hole where a broken launch should be named.
+            # A magnitude is the wrong signal here - a large finite error and a `nan` mean
+            # different things - so the elements are counted and the side is named.
+            for side, tensor in (
+                ("reference", reference),
+                ("this side", candidate),
+            ):
+                finite = np.isfinite(tensor)
+                if not bool(finite.all()):
+                    raise SystemExit(
+                        f"{modality} e{index}: the {side} holds"
+                        f" {int((~finite).sum())} of {finite.size} non-finite elements;"
+                        " that is a broken launch rather than a number to compare"
+                    )
             row = {"evaluation": index, **metrics(candidate, reference)}
             if index > keys[0]:
                 row["ref_moved"] = movement(previous["ref"], reference)
@@ -162,7 +196,9 @@ def compare(ref: pathlib.Path, got: pathlib.Path) -> dict[str, object]:
 
 def table(report: dict[str, object]) -> str:
     """The report as the table a caller reads."""
-    lines = ["modality  evaluation  rel_l2       max_abs      cosine   exact  elements"]
+    lines = [
+        "modality  evaluation  rel_l2       max_abs      cosine   exact  elements"
+    ]
     for modality, rows in report["modalities"].items():
         for row in rows:
             lines.append(
@@ -173,17 +209,26 @@ def table(report: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
-def _write(path: pathlib.Path, shape: tuple[int, ...], dtype: np.dtype, values: np.ndarray) -> None:
+def _write(
+    path: pathlib.Path,
+    shape: tuple[int, ...],
+    dtype: np.dtype,
+    values: np.ndarray,
+) -> None:
     """Write one H3D1 container: magic, element code, rank, extents, then the payload."""
     # `dump_tables.CODES`: 0 f64, 1 f32, 2 i64, 3 i32, 4 bf16, 5 f16. The self-test's tensors are
     # FP32 and integer, and a wrong code here is what a first self-test run catches: it labels an
     # FP32 payload `i32` and the reader answers integers with the right magnitude.
     codes = {"<f8": 0, "<f4": 1, "<i8": 2, "<i4": 3, "<f2": 5}
     code = codes[dtype.str]
-    header = b"H3D1" + bytes([code, len(shape)]) + b"".join(
-        int(extent).to_bytes(8, "little") for extent in shape
+    header = (
+        b"H3D1"
+        + bytes([code, len(shape)])
+        + b"".join(int(extent).to_bytes(8, "little") for extent in shape)
     )
-    path.write_bytes(header + np.ascontiguousarray(values).astype(dtype).tobytes())
+    path.write_bytes(
+        header + np.ascontiguousarray(values).astype(dtype).tobytes()
+    )
 
 
 def self_test() -> int:
@@ -197,18 +242,57 @@ def self_test() -> int:
         sample = rng.standard_normal((4, 8)).astype(np.float32)
         for index in range(3):
             moved = (sample * (1.0 - 0.1 * index)).astype(np.float32)
-            _write(ref / f"latents_video_e{index}.h3t", moved.shape, moved.dtype, moved)
-            same = moved if index == 0 else (moved * (1.0 + 1e-3)).astype(np.float32)
-            _write(got / f"latents_video_e{index}.h3t", same.shape, same.dtype, same)
+            _write(
+                ref / f"latents_video_e{index}.h3t",
+                moved.shape,
+                moved.dtype,
+                moved,
+            )
+            same = (
+                moved
+                if index == 0
+                else (moved * (1.0 + 1e-3)).astype(np.float32)
+            )
+            _write(
+                got / f"latents_video_e{index}.h3t",
+                same.shape,
+                same.dtype,
+                same,
+            )
         report = compare(ref, got)
         rows = report["modalities"]["video"]
         checks = [
             ("evaluation 0 is bit-identical", rows[0]["exact"] is True),
             ("evaluation 1 differs", rows[1]["exact"] is False),
-            ("its relative error is the scale's", abs(rows[1]["rel_l2"] - 1e-3) < 1e-4),
+            (
+                "its relative error is the scale's",
+                abs(rows[1]["rel_l2"] - 1e-3) < 1e-4,
+            ),
             ("three evaluations paired", len(rows) == 3),
             ("movement is reported, not zero", rows[1]["ref_moved"] > 0.0),
         ]
+        # A non-finite element is refused by name rather than reported as a number.
+        broken = sample.copy()
+        broken[3] = np.nan
+        _write(got / "latents_video_e2.h3t", broken.shape, broken.dtype, broken)
+        try:
+            compare(ref, got)
+            checks.append(("a non-finite element is refused", False))
+        except SystemExit as error:
+            checks.append(
+                (
+                    "a non-finite element is refused",
+                    "non-finite elements" in str(error),
+                )
+            )
+        restored = (sample * 0.8).astype(np.float32)
+        _write(
+            got / "latents_video_e2.h3t",
+            restored.shape,
+            restored.dtype,
+            restored,
+        )
+
         # A missing file on one side is refused by name.
         (got / "latents_video_e2.h3t").unlink()
         try:
@@ -216,19 +300,40 @@ def self_test() -> int:
             checks.append(("a missing evaluation is refused", False))
         except SystemExit as error:
             checks.append(
-                ("a missing evaluation is refused", "only the reference has video e2" in str(error))
+                (
+                    "a missing evaluation is refused",
+                    "only the reference has video e2" in str(error),
+                )
             )
         # A trajectory that did not move is refused even though every tensor is valid.
-        _write(got / "latents_video_e2.h3t", sample.shape, sample.dtype, (sample * 0.8).astype(np.float32))
+        _write(
+            got / "latents_video_e2.h3t",
+            sample.shape,
+            sample.dtype,
+            (sample * 0.8).astype(np.float32),
+        )
         for index in range(3):
-            _write(got / f"latents_video_e{index}.h3t", sample.shape, sample.dtype, sample)
-            _write(ref / f"latents_video_e{index}.h3t", sample.shape, sample.dtype, sample)
+            _write(
+                got / f"latents_video_e{index}.h3t",
+                sample.shape,
+                sample.dtype,
+                sample,
+            )
+            _write(
+                ref / f"latents_video_e{index}.h3t",
+                sample.shape,
+                sample.dtype,
+                sample,
+            )
         try:
             compare(ref, got)
             checks.append(("a trajectory that did not move is refused", False))
         except SystemExit as error:
             checks.append(
-                ("a trajectory that did not move is refused", "neither side moved" in str(error))
+                (
+                    "a trajectory that did not move is refused",
+                    "neither side moved" in str(error),
+                )
             )
     for name, passed in checks:
         print(f"{'ok  ' if passed else 'FAIL'} {name}")
@@ -237,8 +342,12 @@ def self_test() -> int:
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--ref", type=pathlib.Path, help="the reference's `denoiser` directory")
-    parser.add_argument("--got", type=pathlib.Path, help="this model's `denoiser` directory")
+    parser.add_argument(
+        "--ref", type=pathlib.Path, help="the reference's `denoiser` directory"
+    )
+    parser.add_argument(
+        "--got", type=pathlib.Path, help="this model's `denoiser` directory"
+    )
     parser.add_argument("--out", type=pathlib.Path, help="report.json to write")
     parser.add_argument(
         "--self-test",
@@ -249,7 +358,9 @@ def main(argv: list[str]) -> int:
     if args.self_test:
         return self_test()
     if args.ref is None or args.got is None:
-        parser.error("--ref and --got name the two trees, or --self-test proves the harness")
+        parser.error(
+            "--ref and --got name the two trees, or --self-test proves the harness"
+        )
     report = compare(args.ref, args.got)
     print(table(report))
     if args.out is not None:
