@@ -383,9 +383,12 @@ fn a_replacement_waits_for_the_epoch_layers_generation_numbers() {
     assert_eq!(roster.state()[1].phase.as_str(), "allocating");
     // The first number is not enough; the round starts with the last one.
     assert!(roster.allocated("b", 41).is_empty());
+    // The failed node's child is gone, so it is not stopped; its sibling
+    // still serves at the old generation and is stopped before its
+    // replacement starts.
     assert_eq!(
         roster.allocated("c", 42),
-        vec![relaunch("b", 41), relaunch("c", 42)]
+        vec![relaunch("b", 41), stop("c", SERVING), relaunch("c", 42)]
     );
     assert_eq!(roster.state()[1].phase.as_str(), "relaunching");
 }
