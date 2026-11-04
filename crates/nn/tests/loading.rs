@@ -755,3 +755,79 @@ fn a_pipeline_root_holds_its_components() {
     };
     assert!(format!("{error}").contains("fp8"), "{error}");
 }
+
+/// An export over a base is one checkpoint whose file set spans both: the union is per tensor, the
+/// export's own tensors shadow the base's, a component only the base carries still answers, and a
+/// tensor only the base carries inside a unioned component comes from the base.
+#[test]
+fn an_export_over_a_base_shadows_per_tensor_across_roots() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let base = root.join("base");
+    let export = root.join("export");
+    for (dir, files) in [
+        (&base, vec!["transformer", "text_encoder"]),
+        (&export, vec!["transformer"]),
+    ] {
+        for component in files {
+            std::fs::create_dir_all(dir.join(component)).unwrap();
+        }
+    }
+    // The base: `transformer` with two tensors, and a `text_encoder` the export does not carry.
+    shard(
+        &base.join("transformer"),
+        "model.safetensors",
+        &[
+            ("shared", vec![2], bf16(&[1.0, 2.0])),
+            ("base_only", vec![1], bf16(&[3.0])),
+        ],
+    );
+    shard(
+        &base.join("text_encoder"),
+        "model.safetensors",
+        &[("weight", vec![1], bf16(&[4.0]))],
+    );
+    // The export overrides `shared` and says nothing about the other two.
+    shard(
+        &export.join("transformer"),
+        "model.safetensors",
+        &[("shared", vec![2], bf16(&[9.0, 9.0]))],
+    );
+
+    let unioned = Checkpoint::open_roots(&[&export, &base]).unwrap();
+
+    // The export's root is the one a log names.
+    assert_eq!(unioned.root(), export.as_path());
+    // The override wins, and it is the export's *bytes*, not a duplicate-key refusal.
+    let transformer = unioned.component("transformer").unwrap();
+    assert_eq!(
+        transformer.read("shared").unwrap().bytes,
+        bf16(&[9.0, 9.0]),
+        "the export shadows the base's tensor of the same name"
+    );
+    // The tensor only the base carries inside the unioned component comes from the base.
+    assert_eq!(
+        transformer.read("base_only").unwrap().bytes,
+        bf16(&[3.0]),
+        "a unioned component is not all-or-nothing"
+    );
+    // A component the export does not carry is the base's.
+    assert_eq!(
+        unioned
+            .component("text_encoder")
+            .unwrap()
+            .read("weight")
+            .unwrap()
+            .bytes,
+        bf16(&[4.0]),
+        "a component only the base carries still answers"
+    );
+    assert_eq!(
+        unioned.components().collect::<Vec<_>>(),
+        ["text_encoder", "transformer"]
+    );
+    // One root is what `open` already means.
+    let single = Checkpoint::open_roots(&[&export]).unwrap();
+    assert_eq!(single.root(), export.as_path());
+    assert!(single.component("text_encoder").is_err());
+}

@@ -269,6 +269,58 @@ impl Checkpoint {
         })
     }
 
+    /// Open `roots` as **one** checkpoint: the first root's tensors shadow the later ones'.
+    ///
+    /// A deployment that ships a delta export over a base is one checkpoint whose file set spans
+    /// both, so the union is per tensor and not per component: components are enumerated in each
+    /// root as [`Checkpoint::open`] already does; a component present in several roots is one
+    /// unioned component whose tensors come from the earliest root that holds each name; a
+    /// component that only a later root holds is that root's; and the same shadowing applies at the
+    /// top level, where an export's tensor replaces the base's.
+    ///
+    /// A shadowed tensor is expected and is **not** a byte comparison: a delta export legitimately
+    /// differs from the base it was trained from, and refusing the difference would refuse the
+    /// deployment. Two roots of *one* root's shard set disagreeing is still an error, because that
+    /// is a malformed checkpoint and no precedence can say which is meant.
+    ///
+    /// [`Checkpoint::root`] answers the first root: the export's, which is the one a log names.
+    pub fn open_roots(roots: &[&Path]) -> Result<Self> {
+        let mut roots = roots.iter();
+        let first = roots.next().ok_or_else(|| Error::Checkpoint {
+            path: PathBuf::new(),
+            problem: "a checkpoint needs at least one root".to_owned(),
+        })?;
+        let mut held = Self::open(first)?;
+        for root in roots {
+            held = held.merge(Self::open(root)?);
+        }
+        Ok(held)
+    }
+
+    /// The union of `self` (earlier, shadowing) and `later`, as [`Checkpoint::open_roots`] defines
+    /// it. File indices of the later root are rebased onto the union's file list, so a tensor
+    /// location keeps naming the shard it was read from.
+    fn merge(mut self, later: Self) -> Self {
+        let base = self.files.len();
+        for (name, mut location) in later.tensors {
+            // The earlier root wins: a name the union already holds keeps its own bytes.
+            if self.tensors.contains_key(&name) {
+                continue;
+            }
+            location.file += base;
+            self.tensors.insert(name, location);
+        }
+        self.files.extend(later.files);
+        for (name, component) in later.components {
+            let union = match self.components.remove(&name) {
+                Some(held) => held.merge(component),
+                None => component,
+            };
+            self.components.insert(name, union);
+        }
+        self
+    }
+
     /// Open a pipeline root: one component per subdirectory that holds a shard set.
     fn pipeline(root: &Path) -> Result<Self> {
         let entries = std::fs::read_dir(root).map_err(|source| Error::Io {
@@ -308,7 +360,8 @@ impl Checkpoint {
         })
     }
 
-    /// The directory this checkpoint was opened with.
+    /// The directory this checkpoint was opened with — and, for a union of roots, the **first** of
+    /// them: the export's, which is the one a log names.
     ///
     /// A pipeline's components are opened under it, so a model's `load()` can reach each component
     /// without a second copy of the path being threaded through the engine.
