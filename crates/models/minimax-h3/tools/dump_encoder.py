@@ -202,7 +202,46 @@ def encoder_sidecars(checkpoint: Path):
         raise SystemExit(1) from error
 
 
-def load_encoder(case: dict, checkpoint: Path, device: str):
+# The safetensors element type names, as its headers spell them, and the torch types they mean.
+ELEMENTS = {"F64": "float64", "F32": "float32", "F16": "float16", "BF16": "bfloat16"}
+
+
+def checkpoint_dtype(checkpoint: Path):
+    """The one element type the export's text encoder shards hold.
+
+    Read from the shards' own headers rather than assumed: the precision rule keeps the checkpoint's
+    own representation and converts nothing, so a reference loaded at a harness's constant would be
+    a page for a model nobody serves - and the two sides would agree with each other while both
+    disagreed with the export. Two types in one component is refused, naming both.
+    """
+    torch = reference("torch")
+    safetensors = reference("safetensors")
+    directory = checkpoint / "text_encoder"
+    found = {}
+    for path in sorted(directory.glob("*.safetensors")):
+        with safetensors.safe_open(str(path), framework="pt") as handle:
+            for name in handle.keys():
+                spelling = handle.get_slice(name).get_dtype()
+                found.setdefault(spelling, name)
+    if not found:
+        raise SystemExit(
+            f"no *.safetensors under {directory}: the export's text encoder is not here"
+        )
+    if len(found) > 1:
+        raise SystemExit(
+            "the export's text encoder holds "
+            + ", ".join(f"{name} (first {where})" for name, where in found.items())
+            + "; the precision rule keeps one representation, so this probe refuses rather than"
+            " choose"
+        )
+    spelling = next(iter(found))
+    name = ELEMENTS.get(spelling)
+    if name is None:
+        raise SystemExit(f"an element type this probe does not know: {spelling}")
+    return getattr(torch, name)
+
+
+def load_encoder(case: dict, checkpoint: Path, device: str, dtype):
     """The reference's text encoder loaded through its own loader, at the checkpoint's dtype."""
     torch = reference("torch")
     encoder_module = reference("uniserve.models.minimax_h3.encoder")
@@ -220,7 +259,7 @@ def load_encoder(case: dict, checkpoint: Path, device: str):
         (source,),
         mapping=lambda _root: (mapping,),
         device=device,
-        weights=weight_options.Config(dtype=torch.bfloat16),
+        weights=weight_options.Config(dtype=dtype),
     )
     for report in reports:
         print(
@@ -256,7 +295,16 @@ def run_prompt_hidden(
         )
 
     torch = reference("torch")
-    model = load_encoder(case, checkpoint, device)
+    dtype = checkpoint_dtype(checkpoint)
+    stated = case.get("dtype")
+    if stated is not None and stated != str(dtype).removeprefix("torch."):
+        raise SystemExit(
+            f"the case says the encoder runs at {stated} and the export's shards hold"
+            f" {str(dtype).removeprefix('torch.')}: the candidate and the reference would be two"
+            f" models, so the pair is refused before either is loaded"
+        )
+    print(f"dtype   {str(dtype).removeprefix('torch.')}, the checkpoint's own (case: {stated})")
+    model = load_encoder(case, checkpoint, device, dtype)
     width = int(model.network.hidden_size)
     if int(case["hidden"]) != width:
         raise SystemExit(

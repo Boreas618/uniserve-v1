@@ -113,7 +113,7 @@ def descriptor_blocks(path: pathlib.Path) -> list[dict[str, set[str]]]:
     return blocks
 
 
-def text_calls(text: dict) -> list[Call]:
+def text_calls(text: dict, dtype: str) -> list[Call]:
     """Every descriptor call the text encoder's load and forward make."""
     hidden = text["hidden_size"]
     heads = text["num_attention_heads"]
@@ -135,9 +135,9 @@ def text_calls(text: dict) -> list[Call]:
             (
                 "dense_attention/fa4",
                 {
-                    "dtype": "bf16",
-                    "kv": "bf16",
-                    "out": "bf16",
+                    "dtype": dtype,
+                    "kv": dtype,
+                    "out": dtype,
                     "head_dim": str(head_dim),
                     "q_heads": str(heads // degree),
                     "kv_heads": str(kv_heads // degree),
@@ -151,8 +151,8 @@ def text_calls(text: dict) -> list[Call]:
             (
                 "qk_norm_rope/triton",
                 {
-                    "dtype": "bf16",
-                    "output": "bf16",
+                    "dtype": dtype,
+                    "output": dtype,
                     "head_dim": str(head_dim),
                     "q_heads": str(heads // degree),
                     "k_heads": str(kv_heads // degree),
@@ -186,7 +186,7 @@ def text_calls(text: dict) -> list[Call]:
     calls.append(
         (
             "rms_norm/triton",
-            {"dtype": "bf16", "columns": str(hidden)},
+            {"dtype": dtype, "columns": str(hidden)},
             "text_encoder.rs: a layer's norms",
         )
     )
@@ -194,7 +194,7 @@ def text_calls(text: dict) -> list[Call]:
         (
             "act_and_mul/triton",
             {
-                "dtype": "bf16",
+                "dtype": dtype,
                 "width": str(ffn),
                 "block": "1024",
                 # The gate and the up projection are two separate `[tokens, intermediate]`
@@ -214,7 +214,7 @@ def text_calls(text: dict) -> list[Call]:
     return calls
 
 
-def tower_calls(vision: dict) -> list[Call]:
+def tower_calls(vision: dict, dtype: str) -> list[Call]:
     """Every descriptor call the vision tower's load and forward make."""
     hidden = vision["hidden_size"]
     heads = vision["num_heads"]
@@ -224,7 +224,7 @@ def tower_calls(vision: dict) -> list[Call]:
         (
             "layer_norm/triton",
             {
-                "dtype": "bf16",
+                "dtype": dtype,
                 "columns": str(hidden),
                 "tile": _row_tile(hidden),
                 "bias": "true",
@@ -235,9 +235,9 @@ def tower_calls(vision: dict) -> list[Call]:
         (
             "dense_attention/fa4",
             {
-                "dtype": "bf16",
-                "kv": "bf16",
-                "out": "bf16",
+                "dtype": dtype,
+                "kv": dtype,
+                "out": dtype,
                 "head_dim": str(head_dim),
                 "q_heads": str(heads),
                 "kv_heads": str(heads),
@@ -249,8 +249,8 @@ def tower_calls(vision: dict) -> list[Call]:
         (
             "rope_apply/triton",
             {
-                "dtype": "bf16",
-                "output": "bf16",
+                "dtype": dtype,
+                "output": dtype,
                 "head_dim": str(head_dim),
                 "heads": str(heads),
                 "rotation": "half",
@@ -260,7 +260,7 @@ def tower_calls(vision: dict) -> list[Call]:
         ),
         (
             "gelu/triton",
-            {"dtype": "bf16", "columns": str(ffn), "approximate": "tanh"},
+            {"dtype": dtype, "columns": str(ffn), "approximate": "tanh"},
             "vision.rs: the MLP's activation",
         ),
     ]
@@ -332,6 +332,60 @@ def _head_block(head_dim: int) -> str:
 def _row_tile(columns: int) -> str:
     """The lane tile a row of `columns` takes: its own power of two (`nn::layers::row_tile`)."""
     return str(1 << (columns - 1).bit_length())
+
+
+# The safetensors element-type spellings, and the words the descriptors use for them.
+ELEMENTS = {"F32": "f32", "F16": "f16", "BF16": "bf16", "F64": "f64"}
+
+
+def element_type(asked: str, directory: pathlib.Path) -> str:
+    """The element type the text stack computes in.
+
+    A descriptor key names it (`dtype_bf16_columns_5120`), and a build compiles one set: a list
+    built at the wrong width checks rows the run never binds and misses the ones it does. The
+    export's own answer is in its shards' headers; a host holding metadata only cannot read them, so
+    `bf16` stands in and the assumption is printed rather than hidden.
+    """
+    if asked != "auto":
+        return asked
+    found = {}
+    for path in sorted(directory.glob("*.safetensors")):
+        try:
+            import json
+            import struct
+
+            with path.open("rb") as handle:
+                length = struct.unpack("<Q", handle.read(8))[0]
+                header = json.loads(handle.read(length))
+        except OSError:
+            continue
+        for name, entry in header.items():
+            if name == "__metadata__":
+                continue
+            spelling = entry.get("dtype")
+            if spelling is not None:
+                found.setdefault(spelling, name)
+    if not found:
+        print(
+            "dtype: the export's shards are absent here, so `bf16` is assumed; pass --dtype to"
+            " check the set a build actually compiles",
+            file=sys.stderr,
+        )
+        return "bf16"
+    if len(found) > 1:
+        print(
+            "dtype: the export holds "
+            + ", ".join(f"{spelling} (first {name})" for spelling, name in found.items())
+            + "; pass --dtype to name the one this build compiles",
+            file=sys.stderr,
+        )
+        return "bf16"
+    spelling = next(iter(found))
+    name = ELEMENTS.get(spelling)
+    if name is None:
+        print(f"dtype: an element type this tool does not know: {spelling}", file=sys.stderr)
+        return "bf16"
+    return name
 
 
 def called_keys(calls: list[Call]) -> tuple[list[tuple[str, str]], list[str]]:
@@ -457,6 +511,15 @@ def report(name: str, calls: list[Call], kernels: pathlib.Path) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default="/opt/uv/models/MiniMax-H3")
+    parser.add_argument(
+        "--dtype",
+        default="auto",
+        help=(
+            "the element type the text stack computes in: `auto` reads the export's "
+            "`text_encoder` shard headers, and a host holding metadata only falls back to `bf16` "
+            "with the assumption printed"
+        ),
+    )
     parser.add_argument("--kernels", default="crates/ops/kernels")
     parser.add_argument(
         "--against",
@@ -486,10 +549,11 @@ def main() -> int:
             print(f"no {path}", file=sys.stderr)
             return 2
 
+    dtype = element_type(arguments.dtype, root / "text_encoder")
     text_config = json.loads(text_path.read_text())
     sections = [
-        ("text encoder", text_calls(text_config["text_config"])),
-        ("vision tower", tower_calls(text_config["vision_config"])),
+        ("text encoder", text_calls(text_config["text_config"], dtype)),
+        ("vision tower", tower_calls(text_config["vision_config"], dtype)),
         ("video VAE encoder", vae_calls(json.loads(vae_path.read_text()))),
     ]
 
