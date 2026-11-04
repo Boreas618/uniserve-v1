@@ -1,0 +1,50 @@
+# The Program Server's own Python environment (design section 6.2).
+#
+# Python appears in the system in one place: here, as the compiler of Triton
+# and CuTe DSL kernel programs. The Program Server runs every package's compile
+# script with this environment's interpreter, and the environment locks the
+# compiler distributions and the external packages the kernel programs import
+# (design section 5.2: a package names the packages it needs, and this lock
+# fixes their versions).
+#
+# It is not the repository's `.venv`: the serving environment holds the full
+# runtime for the models under Python, while this one holds only what compiles
+# a kernel, so a package's compile script cannot depend on the runtime's
+# packages by accident.
+#
+#   uv sync --project crates/program-server/python --python /usr/bin/python3.12
+#
+# creates `python/.venv` from this file and `python/uv.lock`; the Program
+# Server's `--python` option names its interpreter, which defaults to
+# `python/.venv/bin/python` under the repository root.
+[project]
+name = "uniserve-program-server"
+version = "2.0.0"
+description = "The compilers of UniServe's kernel and scheduling programs"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # Triton compiles a kernel program to a cubin and its metadata JSON
+    # (design section 5.3).
+    "triton==3.7.1",
+    # CuTe DSL compiles a kernel program to a host launcher object, which the
+    # package links with the dialect runtime into a native module (design
+    # section 5.3).
+    "nvidia-cutlass-dsl[cu13]==4.6.2",
+    # The CuTe DSL kernels of FlashInfer 0.6.18 (MoE sort and unpermute) and
+    # FlashAttention-4 4.0.0b30 are the sources of the packages that import
+    # them; they are pinned here, not in the serving environment.
+    "flashinfer-python==0.6.18",
+    "flash-attn-4[cu13]==4.0.0b30",
+]
+
+[build-system]
+requires = ["uv_build>=0.12,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "uniserve_program_server"
+module-root = "src"
+
+[tool.uv]
+# The compile drivers are the package's only use; nothing here runs a server.
+package = true
