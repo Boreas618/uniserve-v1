@@ -357,7 +357,13 @@ impl MainProcess {
         let storage = claim(&mut control, launch, &epoch.host)?;
         let client = Retained::connect(&storage, &launch.group, launch.rank, epoch.generation)
             .context("connecting to the Storage Server")?;
-        let mut weights = WeightStore::new(Arc::clone(&client));
+        // A weight's region is one device's address, so the store maps on the device this rank's
+        // model is loaded for; the client is shared, the mapping is not.
+        let weight_device = *plan
+            .devices()
+            .first()
+            .context("this rank serves no device to map its weights on")?;
+        let mut weights = WeightStore::new(Arc::clone(&client), weight_device);
         let placement = Placement::of(launch, build)?;
         // One model per rank: every device's runner reads the same weights, so a second device costs
         // one `Arc` and not a second load.
