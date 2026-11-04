@@ -1,7 +1,7 @@
 //! Run a deployment's load path on the host and report what each component's load read.
 //!
 //!     cargo run -p minimax-h3 --example check_load -- --root <export> [--root <ref export>] \
-//!         [--task t2va|fl2va|ref2va] [--component <name> ...]
+//!         [--task t2va|fl2va|ref2va] [--dtype auto|bf16|f16|f32] [--component <name> ...]
 //!
 //! This is the loading boundary's own check, and it needs no device: `nn::HostStore` keeps the
 //! weights in host memory, so `load` runs its real path - sidecars, the fold, the encoders'
@@ -11,6 +11,9 @@
 //!
 //! - The verdict is the number of weight regions the store published. A component that publishes
 //!   none asked the checkpoint for nothing, whatever its key list says.
+//! - The published types are listed per component. The key of a retained region carries the type it
+//!   was retained at, so a per-tensor pin shows here as the type the model asked for rather than the
+//!   one the file holds, and a stated deployment converting its weights shows as one type only.
 //! - The per-name `read`/`unread` columns come from `Checkpoint::reading`, which records a claim the
 //!   loader takes per name; this loader reads bytes without claiming, so the columns are printed as
 //!   information and are not a verdict. When the claims land, the unread column becomes the second
@@ -219,6 +222,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         println!("  {} weight regions published", store.len());
+        // The types the load actually published, which is the statement a per-tensor pin makes: the
+        // key of a retained region carries the type it was retained at, so a pin shows up here as a
+        // type the component does not store (a conversion) or as two types side by side where the
+        // reference pins two families differently. A deployment that stated one type should show one
+        // and nothing else.
+        let mut types: Vec<(DType, usize)> = Vec::new();
+        for key in store.keys() {
+            match types.iter_mut().find(|(dtype, _)| *dtype == key.dtype) {
+                Some((_, count)) => *count += 1,
+                None => types.push((key.dtype, 1)),
+            }
+        }
+        let published: Vec<String> = types
+            .iter()
+            .map(|(dtype, count)| format!("{count} at {dtype}"))
+            .collect();
+        println!("  published: {}", published.join(", "));
+        if let Some(stated) = stated
+            && types.iter().any(|(dtype, _)| *dtype != stated)
+        {
+            let other: Vec<String> = types
+                .iter()
+                .filter(|(dtype, _)| *dtype != stated)
+                .map(|(dtype, count)| format!("{count} at {dtype}"))
+                .collect();
+            println!(
+                "  note: the deployment states {stated} and the load published {} - a pinned tensor \
+                 keeps its pin, and a component that is not pinned must not",
+                other.join(", ")
+            );
+        }
         // What the load published is the load's own statement of what it asked for. A component
         // that publishes nothing read nothing, whatever its keys say, and that is a finding.
         if store.is_empty() {
