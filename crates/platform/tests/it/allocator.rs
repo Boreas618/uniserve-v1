@@ -6,6 +6,7 @@
 //! These tests need a CUDA device; they take the driver lock of `gpu.rs`, so
 //! they neither block nor are blocked by the tests there.
 
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -563,4 +564,37 @@ fn several_allocators_of_one_pool_book_one_ledger_through_an_adapter() {
     assert_eq!(ledger.total(), two.len() as u64);
     first.restore().unwrap();
     assert_eq!(ledger.total(), one.len() as u64 + two.len() as u64);
+}
+
+/// A buffer handed out before a suspension still names its block afterwards: the
+/// pool released the block's storage, so exporting it is refused rather than
+/// naming a handle the driver has taken back, and once the restore has mapped
+/// new storage the same buffer exports that storage.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn an_exported_block_follows_the_storage_a_restore_maps() {
+    let _driver = exclusive_driver();
+    let device = platform::Device::new(DEVICE).unwrap();
+    let budget = RecordingBudget::new(8 << 20);
+    let mut allocator = with_budget(&device, &budget);
+    allocator.reserve(PoolKind::Graph, 8 << 20).unwrap();
+    let block = allocator.allocate(PoolKind::Graph, 4096).unwrap();
+    assert!(
+        block.export().unwrap().as_raw_fd() >= 0,
+        "a mapped block exports a descriptor"
+    );
+
+    allocator.suspend().unwrap();
+    let refused = block.export().unwrap_err();
+    assert!(
+        refused.to_string().contains("suspended"),
+        "an exported answer names the suspension, not a driver error: {refused}"
+    );
+
+    // The restore maps new storage; the block the buffer holds must name it.
+    allocator.restore().unwrap();
+    assert!(
+        block.export().unwrap().as_raw_fd() >= 0,
+        "after the restore the block exports the storage the restore mapped"
+    );
 }
