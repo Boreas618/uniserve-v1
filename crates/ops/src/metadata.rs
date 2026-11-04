@@ -49,8 +49,11 @@ pub fn row_columns_size(max_rows: u64, tables: u64, max_tokens: u64) -> u64 {
 /// One compilation of `attention_gather_rows`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct GatherRowsDescriptor {
-    /// Element type of the host column array.
-    pub columns: DType,
+    /// Element type of the host column array the caller fills: `i32` today.
+    ///
+    /// A type, not a count — the columns' *count* is `ROW_SECTIONS` and their extent is a launch
+    /// value, so the name says which of the two a reader has.
+    pub column_dtype: DType,
     /// Element type of the request and output tables.
     pub index: DType,
     /// The numerical tables of the call.
@@ -84,7 +87,7 @@ pub struct GatherRowsDescriptor {
 impl fmt::Display for GatherRowsDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
-            .field("columns", self.columns)
+            .field("column_dtype", self.column_dtype)
             .field("index", self.index)
             .field("tables", self.tables)
             .field("row_stride", self.row_stride)
@@ -185,7 +188,7 @@ impl Op for AttentionGatherRows {
             Self::NAME,
             "the host columns",
             &args.columns,
-            descriptor.columns,
+            descriptor.column_dtype,
         )?;
         args.columns.require_rank(Self::NAME, 1)?;
         if args.columns.shape.dim(0)

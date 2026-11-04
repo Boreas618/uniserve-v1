@@ -212,6 +212,7 @@ fn main() {
             // One-dimensional positions: Qwen3 is text only, so no section is cut.
             axes: 1,
             sections: [0; MAX_AXES],
+            interleaved: false,
         }),
     ));
     lines.push((
@@ -226,8 +227,10 @@ fn main() {
             rotation: Rotation::Half,
             // The checkpoint's rms_norm_eps, by bit pattern.
             epsilon: Float::from(1e-6_f32),
+            rotated: HEAD_DIM,
             rows: QK_NORM_TOKENS,
             block: row_tile(HEAD_DIM).min(1024),
+            affine: true,
             pdl: PDL,
         }),
     ));
