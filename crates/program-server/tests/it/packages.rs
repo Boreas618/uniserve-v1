@@ -325,17 +325,36 @@ fn every_fixture_key_parses_to_the_fields_its_operator_s_packages_declare() {
                 })
             });
             if !covering {
-                let fields: Vec<String> = declared
+                // Name what is wrong rather than that something is: a key whose
+                // values a package does not declare and a key whose field names
+                // are different are both "not covered", and the fix for each is
+                // different work by a different actor.
+                let why: Vec<String> = declared
                     .iter()
-                    .map(|(package, dimensions)| {
-                        let names: Vec<&str> = dimensions.keys().map(String::as_str).collect();
-                        format!("{package} declares [{}]", names.join(", "))
+                    .map(|(package, dimensions)| match parse_key(dimensions, key.as_str()) {
+                        None => {
+                            let names: Vec<&str> = dimensions.keys().map(String::as_str).collect();
+                            format!("{package} names the fields [{}]", names.join(", "))
+                        }
+                        Some(fields) => {
+                            let missing: Vec<String> = fields
+                                .iter()
+                                .filter(|(name, value)| {
+                                    !dimensions
+                                        .get(name)
+                                        .is_some_and(|allowed| allowed.iter().any(|one| one == value))
+                                })
+                                .map(|(name, value)| format!("{name}_{value}"))
+                                .collect();
+                            if missing.is_empty() {
+                                format!("{package} declares every value")
+                            } else {
+                                format!("{package} does not declare {}", missing.join(", "))
+                            }
+                        }
                     })
                     .collect();
-                failures.push(format!(
-                    "{operator}\t{key}: no package declares this key's fields exactly; {}",
-                    fields.join("; ")
-                ));
+                failures.push(format!("{operator}\t{key}: no package covers it; {}", why.join("; ")));
             }
         }
     }
