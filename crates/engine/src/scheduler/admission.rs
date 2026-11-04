@@ -367,6 +367,8 @@ impl Scheduler {
             logical_position: 0,
             cache_visible_len: 0,
             cache_computed_len: 0,
+            // A request draws its first token at position zero of its stream.
+            sampling_position: 0,
             next_token: next_token.0,
             num_generated_tokens: generated,
             image_id: u32::try_from(images).unwrap_or(u32::MAX),
