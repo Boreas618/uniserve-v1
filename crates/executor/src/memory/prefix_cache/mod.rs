@@ -764,13 +764,7 @@ impl PrefixCache {
         let plan = self.plan();
         let group = &plan.groups[group_index];
         let columns = plan.columns;
-        let width = plan.plane_bytes;
         let units_held = self.planes.units();
-        if self.planes.device_of().is_none() {
-            return Err(Error::Invalid(
-                "a state page's block copy runs on a device pool".to_owned(),
-            ));
-        }
         // Every layer's planes in order, one run per field: the whole index vector is written
         // once, so each launch only names its own rows of it.
         let mut runs: Vec<(usize, Vec<i64>)> = Vec::new();
@@ -778,6 +772,65 @@ impl PrefixCache {
             runs.extend(state::page_cells(
                 group, columns, units_held, checkpoint, units,
             )?);
+        }
+        tracing::debug!(page, "copying a state page's checkpoints");
+        self.copy_runs(generation, &runs, snapshot, stream, snapshot_direction)
+    }
+
+    /// Writes a checked state page into this rank's own units: the last step of an import, once
+    /// the page's rows are in `snapshot`.
+    ///
+    /// `page` comes from [`Self::state_page`], which refused a key or a shape this rank does not
+    /// hold, so what is left is the copy itself: the same runs the export gathered, written into
+    /// the destination's cells by the scatter program. A snapshot whose rows or width disagree
+    /// with the page is refused before the launch, so a page is written whole or not at all.
+    pub fn scatter_state_page(
+        &self,
+        page: &StatePage,
+        snapshot: &mut Snapshot,
+        generation: &ops::Generation,
+        stream: &Stream,
+    ) -> Result<()> {
+        if page.rows > snapshot.rows() {
+            return Err(Error::Invalid(format!(
+                "a state page of {} rows does not fit the snapshot's {} rows",
+                page.rows,
+                snapshot.rows()
+            )));
+        }
+        if page.width != snapshot.width() {
+            return Err(Error::Invalid(format!(
+                "a state page of {}-byte blocks does not fit a snapshot of {}-byte rows",
+                page.width,
+                snapshot.width()
+            )));
+        }
+        self.copy_runs(generation, &page.runs, snapshot, stream, false)
+    }
+
+    /// Runs the block copy of one page's `runs` between the checkpoints and `snapshot`: the
+    /// snapshot program fills the snapshot's rows from the fields, the scatter program writes them
+    /// into the fields.
+    ///
+    /// This is the copy both directions of a page end in - a batch copying a request's state, and
+    /// an import scattering the rows a snapshot carried - so the order of the runs, and the index
+    /// vector they are selected by, are stated once.
+    pub fn copy_runs(
+        &self,
+        generation: &ops::Generation,
+        runs: &[(usize, Vec<i64>)],
+        snapshot: &mut Snapshot,
+        stream: &Stream,
+        snapshot_direction: bool,
+    ) -> Result<()> {
+        let plan = self.plan();
+        let columns = plan.columns;
+        let width = plan.plane_bytes;
+        let units_held = self.planes.units();
+        if self.planes.device_of().is_none() {
+            return Err(Error::Invalid(
+                "a state page's block copy runs on a device pool".to_owned(),
+            ));
         }
         let total: u32 = runs.iter().map(|(_, cells)| cells.len() as u32).sum();
         if total == 0 {
@@ -787,6 +840,12 @@ impl PrefixCache {
             return Err(Error::Invalid(format!(
                 "a state page of {total} blocks does not fit the snapshot's {} rows",
                 snapshot.rows()
+            )));
+        }
+        if snapshot.width() != width {
+            return Err(Error::Invalid(format!(
+                "a state page of {width}-byte blocks does not fit a snapshot of {}-byte rows",
+                snapshot.width()
             )));
         }
         let cells: Vec<i64> = runs
@@ -804,7 +863,7 @@ impl PrefixCache {
             width,
         );
         let mut row = 0u32;
-        for (field, blocks) in &runs {
+        for (field, blocks) in runs {
             let count = blocks.len() as u32;
             let storage = self.planes.state_storage(*field)?;
             let field_view = ops::TensorView::new(
@@ -835,7 +894,7 @@ impl PrefixCache {
             }
             row += count;
         }
-        tracing::debug!(page, blocks = total, "copied a state page's checkpoints");
+        tracing::debug!(blocks = total, "copied a state page's checkpoints");
         Ok(())
     }
 
