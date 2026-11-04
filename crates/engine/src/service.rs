@@ -2534,18 +2534,22 @@ impl EpochPolicy for Routing {
         policies: &Arc<dyn PolicySource + Send + Sync>,
         program: &PolicyProgram,
     ) -> Result<(), String> {
-        for slot in &self.slots {
-            match slot
-                .handle
-                .precopy_policy(program.clone(), Arc::clone(policies))
-                .recv_timeout(POLICY_STAGE_TIMEOUT)
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(reason)) => return Err(reason),
-                Err(error) => return Err(format!("a scheduler did not answer: {error}")),
-            }
+        // Every scheduler prepares on a thread of its own, so all ranks
+        // prepare at once and the epoch waits for the slowest, not for their
+        // sum (§7.3 step 2).
+        let answers: Vec<_> = self
+            .slots
+            .iter()
+            .map(|slot| {
+                slot.handle
+                    .precopy_policy(program.clone(), Arc::clone(policies))
+            })
+            .collect();
+        let route = self.precopy_route(policies.as_ref(), program.clone());
+        for answer in answers {
+            answer_stage(answer)?;
         }
-        self.precopy_route(policies.as_ref(), program.clone())
+        route
     }
 
     fn discard(&self) {
@@ -2556,18 +2560,16 @@ impl EpochPolicy for Routing {
     }
 
     fn switchover(&self) -> Result<(), String> {
-        for slot in &self.slots {
-            match slot
-                .handle
-                .switchover_policy()
-                .recv_timeout(POLICY_STAGE_TIMEOUT)
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(reason)) => return Err(reason),
-                Err(error) => return Err(format!("a scheduler did not answer: {error}")),
-            }
+        let answers: Vec<_> = self
+            .slots
+            .iter()
+            .map(|slot| slot.handle.switchover_policy())
+            .collect();
+        let route = self.switchover_route();
+        for answer in answers {
+            answer_stage(answer)?;
         }
-        self.switchover_route()
+        route
     }
 
     fn commit(&self) {
@@ -2577,37 +2579,28 @@ impl EpochPolicy for Routing {
     }
 
     fn revert(&self) -> Result<(), String> {
-        for slot in &self.slots {
-            match slot
-                .handle
-                .revert_policy()
-                .recv_timeout(POLICY_STAGE_TIMEOUT)
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(reason)) => return Err(reason),
-                Err(error) => return Err(format!("a scheduler did not answer: {error}")),
-            }
+        let answers: Vec<_> = self
+            .slots
+            .iter()
+            .map(|slot| slot.handle.revert_policy())
+            .collect();
+        let route = self.revert_route();
+        for answer in answers {
+            answer_stage(answer)?;
         }
-        self.revert_route()
+        route
     }
 
     fn purge(&self) -> Result<(), String> {
+        let answers: Vec<_> = self
+            .slots
+            .iter()
+            .map(|slot| slot.handle.purge_policy())
+            .collect();
         let mut failure = None;
-        for slot in &self.slots {
-            match slot
-                .handle
-                .purge_policy()
-                .recv_timeout(POLICY_STAGE_TIMEOUT)
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(reason)) => {
-                    failure = Some(reason);
-                    break;
-                }
-                Err(error) => {
-                    failure = Some(format!("a scheduler did not answer: {error}"));
-                    break;
-                }
+        for answer in answers {
+            if let Err(reason) = answer_stage(answer) {
+                failure = Some(reason);
             }
         }
         // The control thread's instance drops its previous program whether or
@@ -2618,6 +2611,16 @@ impl EpochPolicy for Routing {
             Some(reason) => Err(reason),
             None => Ok(()),
         }
+    }
+}
+
+/// One scheduler's answer to a stage, as the command thread reads it: an
+/// applied stage, the scheduler's reason, or no answer at all.
+fn answer_stage(answer: crossbeam_channel::Receiver<Result<(), String>>) -> Result<(), String> {
+    match answer.recv_timeout(POLICY_STAGE_TIMEOUT) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(reason)) => Err(reason),
+        Err(error) => Err(format!("a scheduler did not answer: {error}")),
     }
 }
 
