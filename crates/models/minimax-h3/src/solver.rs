@@ -297,12 +297,13 @@ mod tests {
 
     #[test]
     fn the_released_clean_sample_form_closes_to_the_same_step() {
-        // The released solver reaches `x + v Δsigma` through the clean estimate:
-        //   x0 = x + v sigma;  x' = x r + x0 (1 - r),  r = sigma_next / sigma.
+        // The velocity points from the clean sample towards the noise, `v = (x - x0) / sigma`, so the
+        // release reaches `x + v Δsigma` through the clean estimate it recovers:
+        //   x0 = x - v sigma;  x' = x r + x0 (1 - r),  r = sigma_next / sigma.
         let (sigma, sigma_next) = (0.75f32, 0.25f32);
         let ratio = sigma_next / sigma;
         for (x, v) in [(0.5f32, 1.25f32), (-2.0, 0.125), (0.0, -3.0)] {
-            let clean = x + v * sigma;
+            let clean = x - v * sigma;
             let released = x * ratio + clean * (1.0 - ratio);
             let euler = x + v * (sigma_next - sigma);
             assert!(
