@@ -29,17 +29,6 @@ pub enum CaptureStatus {
     Invalidated,
 }
 
-/// What a stream's write of a 32-bit flag orders (`CUstreamWriteValue_flags`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WriteValue {
-    /// The write is an ordering point: a stream waiting on the flag observes
-    /// every write the writing stream issued before it.
-    Ordered,
-    /// The write may be reordered among the stream's own writes
-    /// (`CU_STREAM_WRITE_VALUE_NO_MEMORY_BARRIER`).
-    Reordered,
-}
-
 /// The condition that releases a stream's wait on a 32-bit flag
 /// (`CUstreamWaitValue_flags`).
 ///
@@ -50,8 +39,10 @@ pub enum WriteValue {
 /// crate does not carry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WaitValue {
-    /// Releases when the flag is at least `value`, compared signed
-    /// (`CU_STREAM_WAIT_VALUE_GEQ`).
+    /// Releases when `(int32_t)(flag - value) >= 0`
+    /// (`CU_STREAM_WAIT_VALUE_GEQ`): a cyclic comparison that ignores
+    /// wraparound, so a flag that passes the value and wraps still releases the
+    /// wait rather than blocking it forever.
     AtLeast,
     /// Releases when the flag equals `value` (`CU_STREAM_WAIT_VALUE_EQ`).
     Equal,
@@ -60,8 +51,6 @@ pub enum WaitValue {
     AnyBitSet,
 }
 
-/// `CU_STREAM_WRITE_VALUE_NO_MEMORY_BARRIER`.
-pub(crate) const CU_STREAM_WRITE_VALUE_NO_MEMORY_BARRIER: u32 = 0x1;
 /// `CU_STREAM_WAIT_VALUE_GEQ`.
 pub(crate) const CU_STREAM_WAIT_VALUE_GEQ: u32 = 0x0;
 /// `CU_STREAM_WAIT_VALUE_EQ`.
@@ -324,26 +313,22 @@ impl Stream {
     /// (`cuStreamWriteValue32`).
     ///
     /// This is how one stream tells another that the work before this point is
-    /// done, without a host round trip. `Ordered` makes the write an ordering
-    /// point: a stream that waits on the flag sees every write this stream
-    /// issued before it. `Reordered` permits the write to move among this
-    /// stream's writes and is only correct when nothing but the flag itself
-    /// depends on the ordering.
+    /// done, without a host round trip. The write fences before it — the
+    /// driver's `__threadfence_system` equivalent, scoped to the stream — so a
+    /// stream that waits on the flag observes every write this stream issued
+    /// before it. There is no weaker mode to ask for: the driver's
+    /// `CU_STREAM_WRITE_VALUE_NO_MEMORY_BARRIER` is not supported by the
+    /// entry point this crate resolves (`cuda.h`, `CUstreamWriteValue_flags`).
     ///
     /// `address` is device memory of this stream's device or host memory mapped
     /// into it, and it must hold a 32-bit aligned value that stays valid until
     /// the write runs — for a captured graph, until every replay does.
-    pub fn write_value32(&self, address: DevicePtr, value: u32, kind: WriteValue) -> Result<()> {
-        let flags = match kind {
-            WriteValue::Ordered => 0,
-            WriteValue::Reordered => CU_STREAM_WRITE_VALUE_NO_MEMORY_BARRIER,
-        };
-
+    pub fn write_value32(&self, address: DevicePtr, value: u32) -> Result<()> {
         let driver = driver()?;
         // SAFETY: the caller keeps the flag valid until the write runs, and the
         // stream owns the ordering of its own work.
         driver.check(
-            unsafe { (driver.stream_write_value32)(self.raw, address.address(), value, flags) },
+            unsafe { (driver.stream_write_value32)(self.raw, address.address(), value, 0) },
             "cuStreamWriteValue32",
         )
     }
@@ -359,6 +344,10 @@ impl Stream {
     /// `address` must hold a 32-bit aligned value that stays valid until the
     /// wait is satisfied; a wait whose flag is never written blocks the stream
     /// for as long as the stream lives.
+    ///
+    /// A wait captured into a graph must have its flag written by something
+    /// outside that graph's own replay: a graph whose only writer is a node of
+    /// the same graph blocks on its first replay, and every replay after it.
     pub fn wait_value32(&self, address: DevicePtr, value: u32, kind: WaitValue) -> Result<()> {
         let flags = match kind {
             WaitValue::AtLeast => CU_STREAM_WAIT_VALUE_GEQ,

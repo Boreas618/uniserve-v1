@@ -87,7 +87,7 @@ pub use native::NativeLibrary;
 pub use nccl::{Communicator, UniqueId};
 pub use nvml::{Nvml, NvmlMemory};
 pub use pool::VirtualPool;
-pub use stream::{CaptureStatus, Stream, WaitValue, WriteValue};
+pub use stream::{CaptureStatus, Stream, WaitValue};
 pub use tensormap::{
     Interleave, L2Promotion, OobFill, Swizzle, TensorDataType, TensorMap, TensorMapSpec,
 };
