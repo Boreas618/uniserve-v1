@@ -206,6 +206,31 @@ def order_of(path):
     return (index, CUTS.index(cut) if cut in CUTS else len(CUTS))
 
 
+def renormalization_note(actual, expected):
+    """The per-row sum of a router's weights, which is what says whether they were renormalized.
+
+    Renormalized weights divide by the top-k's own sum, so every row of them sums to 1. Raw softmax
+    probabilities sum to the row's share in its top few instead, and that share is a *different*
+    number for each row -- so a disabled renormalization multiplies a whole row's weights by one
+    factor and keeps the update's direction, which is exactly what a short block update with a
+    preserved direction looks like.
+    """
+    ours = np.asarray(actual, dtype=np.float64).sum(axis=1)
+    reference = np.asarray(expected, dtype=np.float64).sum(axis=1)
+    ratio = ours / np.where(reference == 0.0, np.nan, reference)
+    spread = float(np.nanmax(ratio) - np.nanmin(ratio))
+    note = (
+        f"  weights sum to {ours[0]:.6f} ours against {reference[0]:.6f} the reference's at row 0;"
+        f" every row's ratio {np.nanmin(ratio):.4f} to {np.nanmax(ratio):.4f}"
+    )
+    if spread < 0.02 and abs(float(np.nanmean(ratio)) - 1.0) > 0.02:
+        note += (
+            " - one factor on every row, the shape a weight vector has when it was not normalized"
+            " over the top k"
+        )
+    return note
+
+
 def compare_ids(actual, expected, scores):
     """How two expert selections differ, in the classes that decide what a difference means.
 
@@ -410,9 +435,12 @@ def main():
         # The absolute peak is the number a small operand needs: the router's weights sit near 1/8,
         # so a relative figure says nothing about whether a difference is a rounding or a defect.
         absolute = float(np.max(np.abs(actual.astype(np.float64) - expected.astype(np.float64))))
+        sums = ""
+        if path.stem.endswith("_router_weights") and expected.ndim == 2:
+            sums = renormalization_note(actual, expected)
         lines.append(
             f"{path.name:<16} {str(expected.shape):<12} {rel:10.3e} {rms:10.3e} {absolute:10.3e}"
-            f" {increment:10.3e}  {worst} ({rows[worst]:.3e}){flag}{prefix_text}"
+            f" {increment:10.3e}  {worst} ({rows[worst]:.3e}){flag}{prefix_text}{sums}"
         )
 
     # The marker goes on the one row whose increment is the largest: every later row of a persistent
