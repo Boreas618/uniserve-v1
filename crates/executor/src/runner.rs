@@ -159,6 +159,23 @@ pub trait Runner: Send {
 
 /// One runner the device executor owns: its name, the phases it serves, and the runner itself.
 ///
+/// What binds a runner to the executor: its name, the phases it serves, and the device it issues
+/// on.
+///
+/// The four travel together - a runner is named once, serves a fixed set of phases, and issues
+/// every job on one device's one stream - so a constructor that took them apart could be called
+/// with answers that belong to different runners.
+pub struct Binding {
+    /// The executor's name for this runner.
+    pub id: RunnerId,
+    /// The phases it serves, in scheduler order.
+    pub phases: Vec<PhaseId>,
+    /// The device it computes on.
+    pub device: platform::DeviceId,
+    /// The stream every job it issues runs on.
+    pub stream: platform::Stream,
+}
+
 /// The device executor keeps these in [`RunnerId`] order and serves a batch through the runner
 /// whose phase it names.
 pub struct NamedRunner {

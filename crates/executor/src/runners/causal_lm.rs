@@ -66,7 +66,7 @@ fn draw_uniforms(seed: &std::cell::Cell<u64>, draws: &mut Vec<f32>, rows: usize)
 
 #[cfg(test)]
 use crate::plan::Variant;
-use crate::runner::{Runner, RunnerId};
+use crate::runner::{Binding, Runner, RunnerId};
 use crate::{Error, Result};
 
 /// The host columns of one batch, padded to a bucket and held for the upload.
@@ -214,10 +214,10 @@ impl Staging {
                 "the batch states no query offsets for its {rows} rows"
             )));
         }
-        if tokens < bucket_tokens {
-            if let Some(last) = self.rows.query_offsets.last_mut() {
-                *last = bucket_tokens as i32;
-            }
+        if tokens < bucket_tokens
+            && let Some(last) = self.rows.query_offsets.last_mut()
+        {
+            *last = bucket_tokens as i32;
         }
         while self.rows.query_offsets.len() <= bucket_rows {
             let end = self
@@ -1110,17 +1110,20 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// It captures nothing here: the device executor's warmup captures every bucket after the
     /// runner is bound, largest first, so the pools' plans exist before serving starts.
     pub fn new(
-        id: RunnerId,
-        phases: Vec<PhaseId>,
+        binding: Binding,
         model: M,
         generation: Arc<Generation>,
         buckets: Buckets,
-        device: DeviceId,
-        stream: platform::Stream,
         geometry: Geometry,
         kv: Box<dyn KvProvider>,
         seed: u64,
     ) -> Result<Self> {
+        let Binding {
+            id,
+            phases,
+            device,
+            stream,
+        } = binding;
         let mut staging = Staging::new();
         staging.reserve(&buckets)?;
         let commit_rows = largest_rows(&buckets)?;
@@ -1354,15 +1357,15 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         // its switchover would leave the first one's graphs unreachable and unaccounted for. The
         // daemon discards an update before starting the next, so this is a disagreement, not a
         // sequence to support.
-        if let Some(prepared) = &self.next {
-            if prepared.number() != next.number() {
-                return Err(Error::Invariant(format!(
-                    "precopy of generation {} while generation {} is prepared and has not been \
-                     switched over or discarded",
-                    next.number(),
-                    prepared.number()
-                )));
-            }
+        if let Some(prepared) = &self.next
+            && prepared.number() != next.number()
+        {
+            return Err(Error::Invariant(format!(
+                "precopy of generation {} while generation {} is prepared and has not been \
+                 switched over or discarded",
+                next.number(),
+                prepared.number()
+            )));
         }
         // Which (operator, key) pairs changed between the serving generation and `next` (7.3
         // step 1). A kernel is unchanged when it is the same `Arc`, so an untouched program keeps
@@ -1689,7 +1692,7 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 generation,
                 ..
             } => self
-                .shadow(*operator, key, *bucket, *generation)
+                .shadow(operator, key, *bucket, *generation)
                 .map(|()| BatchOutput::default()),
             Job::Rebind {
                 bucket, generation, ..
@@ -1736,11 +1739,14 @@ impl<M: CausalLm> CausalLmRunner<M> {
         kernels: &Arc<ops::Generation>,
     ) -> Result<Walked> {
         let stream = self.stream.clone();
-        let capture = Arc::new(std::sync::Mutex::new(platform::Capture::begin(
+        // One thread records and takes the capture back: an `Arc`/`Mutex` here would say the
+        // handle is shared across threads, which it is not, and the allocator is right to warn
+        // about a non-`Send` handle in an `Arc`.
+        let capture = std::rc::Rc::new(std::cell::RefCell::new(platform::Capture::begin(
             &stream,
             platform::CaptureMode::Relaxed,
         )?));
-        let mut recording = Recording::new(Arc::clone(&capture));
+        let mut recording = Recording::new(std::rc::Rc::clone(&capture));
         // The forward runs with the generation being walked and the bucket's arena, so every
         // operator launch becomes a node of the template and is reported to `recording`.
         ops::capture::set_sink(Some(&mut recording));
@@ -1751,10 +1757,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
             return Err(failure.into());
         }
         walked?;
-        let capture = Arc::try_unwrap(capture)
-            .map_err(|_| Error::Invariant("the capture is still shared by its recorder".into()))?
-            .into_inner()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let capture = std::rc::Rc::try_unwrap(capture).map_err(|_| {
+            Error::Invariant("the capture is still shared by its recorder".into())
+        })?;
+        let capture = capture.into_inner();
         let template = capture.end()?;
         // The node table comes from the capture sink, and the template is the record of what was
         // actually launched: the two can only be compared here. A graph that launched kernels and
@@ -2613,14 +2619,14 @@ fn hold_kernels(
 /// Public because a device test of the rebind mechanism must record with the sink the runner
 /// captures with: a copy of it in a test would measure the copy.
 pub struct Recording {
-    capture: Arc<std::sync::Mutex<platform::Capture>>,
+    capture: std::rc::Rc<std::cell::RefCell<platform::Capture>>,
     nodes: crate::captured::Nodes,
     failure: Option<platform::Error>,
 }
 
 impl Recording {
     /// Records into `capture`, which the caller installs as the sink and takes back afterwards.
-    pub fn new(capture: Arc<std::sync::Mutex<platform::Capture>>) -> Self {
+    pub fn new(capture: std::rc::Rc<std::cell::RefCell<platform::Capture>>) -> Self {
         Self {
             capture,
             nodes: Vec::new(),
@@ -2646,13 +2652,7 @@ impl Recording {
 
 impl ops::capture::Sink for Recording {
     fn launched(&mut self, operator: &'static str, key: &str) {
-        let recorded = {
-            let mut capture = self
-                .capture
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            capture.record()
-        };
+        let recorded = self.capture.borrow_mut().record();
         match recorded {
             Ok(nodes) => self.nodes.push((operator, key.to_owned(), nodes)),
             Err(error) => {

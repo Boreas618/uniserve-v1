@@ -29,7 +29,7 @@ use executor::capacity::{graph_storage_budget_bytes, graph_storage_bytes, quota}
 use executor::device::GraphStorage;
 use executor::memory::Memory;
 use executor::plan::{Buckets, Variant};
-use executor::runner::{NamedRunner, RunnerId};
+use executor::runner::{Binding, NamedRunner, RunnerId};
 use executor::runners::causal_lm::{CausalLmRunner, Geometry, KvProvider, Shared};
 use executor::runners::resident::ResidentCache;
 use executor::stream::EventPool;
@@ -452,13 +452,15 @@ impl EpochPlan {
                 let provider: Box<dyn KvProvider> =
                     Box::new(ResidentCache::new(memory.shared_cache(), device, rows)?);
                 let runner = CausalLmRunner::new(
-                    RunnerId(0),
-                    vec![PhaseId(0)],
+                    Binding {
+                        id: RunnerId(0),
+                        phases: vec![PhaseId(0)],
+                        device,
+                        stream,
+                    },
                     Shared::new(model),
                     Arc::clone(generation),
                     self.buckets.clone(),
-                    device,
-                    stream,
                     geometry,
                     provider,
                     // A seed that changes with the process, so two runs of one deployment are not
