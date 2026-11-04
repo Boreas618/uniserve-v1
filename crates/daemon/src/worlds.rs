@@ -1109,6 +1109,24 @@ impl Leader {
         if let Some(applied) = self.apply_epoch(&current, &target, request.dry_run)? {
             return Ok(applied);
         }
+        // The program layer (§7.2): only what the serving epoch's processes
+        // execute differs, and the programs are prepared against every host's
+        // Program Server before the processes switch to them. A program-layer
+        // update is named by the epoch it executes in; `route` answers `None`
+        // when the programs a configuration selects do not differ, and the
+        // world path below decides the rest.
+        let epoch = self
+            .updates
+            .epochs()
+            .serving()
+            .map_or(0, |(epoch, _)| epoch);
+        if let Some(update) = self.apply_programs(epoch, &target, request.dry_run).await? {
+            return Ok(Applied::Program(serde_json::json!({
+                "change": "program",
+                "epoch": epoch,
+                "update": update.number,
+            })));
+        }
         let count = if target.moe_config.expert_parallel {
             1
         } else {
@@ -1151,7 +1169,7 @@ impl Leader {
                     return Ok(applied);
                 }
                 Applied::Planned(report) | Applied::InPlace(report) => reports.push(report),
-                applied @ Applied::Epoch(_) => return Ok(applied),
+                applied @ (Applied::Epoch(_) | Applied::Program(_)) => return Ok(applied),
                 Applied::Unchanged => {}
             }
         }
@@ -1489,9 +1507,9 @@ pub(crate) async fn complete_commit(
                 break;
             }
             Ok(Applied::InPlace(_) | Applied::Unchanged) => {}
-            // The epoch layer answers the deployment's changes itself, before
-            // a replica is asked; a replica cannot start an epoch.
-            Ok(Applied::Epoch(_)) => break,
+            // The epoch and program layers answer the deployment's changes
+            // themselves, before a replica is asked; a replica starts neither.
+            Ok(Applied::Epoch(_) | Applied::Program(_)) => break,
             Ok(Applied::Daemon { .. } | Applied::Planned(_)) => {
                 locked(&registry.pending).clear();
                 committed["rollout_error"] = "the next replica requires a deployment update".into();
