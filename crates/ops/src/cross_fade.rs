@@ -159,6 +159,21 @@ impl Op for CrossFade {
                     format!("{} frames do not fit a kernel parameter", dims[1]),
                 )
             })?)
+            // The two frame-grid extents the blend walks: the C ABI hands a program raw slots, so
+            // the rows and columns the kernel loops over travel as scalars rather than as extents a
+            // view carries. They are the axis the overlap does not run along, one per position.
+            .u32(u32::try_from(dims[2]).map_err(|_| {
+                Error::argument(
+                    Self::NAME,
+                    format!("{} rows do not fit a kernel parameter", dims[2]),
+                )
+            })?)
+            .u32(u32::try_from(dims[3]).map_err(|_| {
+                Error::argument(
+                    Self::NAME,
+                    format!("{} columns do not fit a kernel parameter", dims[3]),
+                )
+            })?)
             .u32(descriptor.block)
             .flag(descriptor.pdl);
         // One thread per output voxel: the leading band blends and everything after it copies, and
