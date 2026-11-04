@@ -23,8 +23,9 @@
 //! GIF) reproduce Pillow's bytes exactly, which the tests assert; its lossy
 //! decoders (JPEG, WebP) round differently from libjpeg-turbo by a few units
 //! per channel, which the design's numerical tolerance allows and the §10
-//! visual check covers. PNG `eXIf` chunks are not read; JPEG, WebP and TIFF
-//! carry their orientation and all eight EXIF cases are applied.
+//! visual check covers. Every decoder that exposes EXIF metadata (JPEG, PNG's
+//! `eXIf` chunk, WebP, TIFF) has its orientation applied, all eight EXIF cases
+//! included.
 
 use std::borrow::Cow;
 use std::io::{Seek as _, SeekFrom};
