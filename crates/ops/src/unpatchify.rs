@@ -30,7 +30,7 @@ use std::fmt;
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, TensorView};
+use crate::tensor::{DType, Shape, Strides, TensorView};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -195,14 +195,27 @@ impl Op for Unpatchify {
                 }
             }
         }
-        // A tile lands inside a larger raster, so the destination is a strided block; the rule for
-        // what a row-at-a-time write needs of it is `tensor::row_writable`'s.
-        let out_strides = crate::tensor::row_writable(&args.out, Self::NAME)?;
+        // The raster is written contiguously: the program addresses the destination as a flat
+        // element range, so a destination whose rows interleave would be written to the wrong voxels.
+        // A tile inside a larger raster needs the three outer strides as launch words, which the
+        // program does not take yet; refusing here is what keeps that from being a silent wrong answer.
+        if args.out.strides != Strides::row_major(out_shape) {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the raster is written contiguously; found strides {} for {out_shape}",
+                    args.out.strides
+                ),
+            ));
+        }
         let mut arguments = Arguments::new();
         arguments.view(args.tokens);
         if let Some((scale, bias)) = affine {
             arguments.view(scale).view(bias);
         }
+        // The affine operand pair and the raster's form are the compilation's, not the launch's: the
+        // descriptor says which program this is, so naming it here would only shift the two scratch
+        // addresses the compiler's launcher appends after these parameters.
         arguments
             .view(args.out)
             .u32(descriptor.channels)
@@ -212,36 +225,6 @@ impl Op for Unpatchify {
             .u32(descriptor.patch_frames)
             .u32(descriptor.patch_height)
             .u32(descriptor.patch_width)
-            // The destination's outer strides: the program writes one row contiguously and addresses
-            // its base with these, which is what lets a tile land inside a larger raster.
-            .u32(u32::try_from(out_strides[0]).map_err(|_| {
-                Error::argument(
-                    Self::NAME,
-                    format!(
-                        "the raster's channel stride {} does not fit a kernel parameter",
-                        out_strides[0]
-                    ),
-                )
-            })?)
-            .u32(u32::try_from(out_strides[1]).map_err(|_| {
-                Error::argument(
-                    Self::NAME,
-                    format!(
-                        "the raster's frame stride {} does not fit a kernel parameter",
-                        out_strides[1]
-                    ),
-                )
-            })?)
-            .u32(u32::try_from(out_strides[2]).map_err(|_| {
-                Error::argument(
-                    Self::NAME,
-                    format!(
-                        "the raster's row stride {} does not fit a kernel parameter",
-                        out_strides[2]
-                    ),
-                )
-            })?)
-            .flag(descriptor.affine)
             .u32(descriptor.block)
             .flag(descriptor.pdl);
         // The grid walks the output's elements: one thread writes one voxel, so a token's voxels are
