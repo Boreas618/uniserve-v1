@@ -306,7 +306,9 @@ impl WorkerGroup {
         let first = arguments
             .first()
             .context("a launch places a worker group")?;
-        let processes = ProcessClient::connect(&first.daemon, &first.deployment)?;
+        // A spawner is not a main process: it states no engine number, and no program-layer command
+        // is ever addressed to this connection.
+        let processes = ProcessClient::connect(&first.daemon, &first.deployment, 0)?;
         // One listener serves every group of the deployment. Its TCP port is
         // routable only when some rank runs on another node.
         let remote = arguments

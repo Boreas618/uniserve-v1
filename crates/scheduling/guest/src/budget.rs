@@ -116,9 +116,11 @@ impl Shares {
 /// reuse whole pages. A chunk that reaches the prompt end may end there, and a
 /// chunk is never shorter than one token.
 ///
-/// The start is `cached_prefix_tokens + prefilled_tokens`
-/// ([`crate::RequestView`]); `page_tokens` is the KV page size
-/// ([`crate::Room::page_tokens`]). A zero here means the prompt is done.
+/// The start is the view's `prefilled_tokens`, which already states the further
+/// of the two cursors — the prompt tokens the runtime computed and the prefix
+/// the cache held at admission ([`crate::RequestView`]); `page_tokens` is the KV
+/// page size ([`crate::Room::page_tokens`]). A zero here means the prompt is
+/// done.
 pub fn prefill_chunk(
     start: u32,
     prompt_tokens: u32,

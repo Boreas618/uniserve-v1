@@ -200,6 +200,60 @@ impl Scheduler {
     /// flushes output journals, resolves at most one ready result, reaps
     /// cancellations, and fills available executor slots, but leaves any
     /// blocking result wait to `run`.
+    /// Strips a retiring request's queued calls, and the admissions among its
+    /// commands, from the batches the executor has not accepted yet.
+    ///
+    /// A batch is planned from the state of the step that named it, and a
+    /// worker queue deeper than one batch keeps it queued while later steps
+    /// run. A request that ends in that window leaves calls behind that no
+    /// result will resolve, and a batch that still carries one can no longer
+    /// state the layout its kernels read: the request's allocation is gone, so
+    /// its columns would name no cache table at all. The batches keep their
+    /// other work, and one left with nothing is forgotten - the pending
+    /// identity goes with it, so no step waits for a result it will never see.
+    /// Its `Finish` and `Free` commands stay: they are what settles the
+    /// worker's state for the request.
+    pub(super) fn retire_queued_calls(&mut self, id: RequestId) {
+        let requests: HashSet<RequestKey> = self
+            .inflight
+            .pending_submissions
+            .iter()
+            .flat_map(|batch| batch.requests.iter())
+            .filter(|(call, _)| call.request_key.request_id == id)
+            .map(|(call, _)| call.request_key)
+            .collect();
+        if requests.is_empty() {
+            return;
+        }
+        let mut queued = VecDeque::new();
+        for mut batch in std::mem::take(&mut self.inflight.pending_submissions) {
+            for (call, _) in batch.retire_requests(&requests) {
+                if let Some(pending) =
+                    self.inflight
+                        .retire_call(batch.id, call.request_key, call.call_id)
+                {
+                    self.reclaim_domain_credit(pending.call.kind, true);
+                }
+            }
+            if let Some(pending) = self.inflight.pending_batches.get_mut(&batch.id) {
+                pending.commands = batch
+                    .commands
+                    .iter()
+                    .filter(|command| !matches!(command, BatchCommand::Start { .. }))
+                    .cloned()
+                    .collect();
+            }
+            queued.push_back(batch);
+        }
+        for batch in queued {
+            if batch.requests.is_empty() && batch.commands.is_empty() {
+                self.inflight.pending_batches.remove(&batch.id);
+            } else {
+                self.inflight.pending_submissions.push_back(batch);
+            }
+        }
+    }
+
     pub(super) fn step_nonblocking(&mut self) -> bool {
         let _span = tracing::trace_span!("scheduler.step").entered();
         let mut progressed = self.flush_output_journals();

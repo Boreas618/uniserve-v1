@@ -143,6 +143,18 @@ impl Generation {
         Generation { number, kernels }
     }
 
+    /// The descriptor keys the generation holds for `operator`, in no particular order.
+    ///
+    /// An update replaces an operator's whole set of descriptors, so this is what tells a paired
+    /// forward whether the program it compares against is the same compilation (the key it served
+    /// with) or another one, compiled for a descriptor the serving generation never had.
+    pub fn keys(&self, operator: &'static str) -> impl Iterator<Item = &str> {
+        self.kernels
+            .keys()
+            .filter(move |(name, _)| *name == operator)
+            .map(|(_, descriptor)| descriptor.as_str())
+    }
+
     /// Every kernel of the generation, as (operator, descriptor key, kernel).
     pub fn iter(&self) -> impl Iterator<Item = (&'static str, &str, &Arc<Kernel>)> {
         self.kernels

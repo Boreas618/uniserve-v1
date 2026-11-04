@@ -29,7 +29,13 @@ use ipc::{
 };
 
 /// How long a command answer may take.
-const ANSWER: Duration = Duration::from_secs(10);
+///
+/// Generous because the first one is the whole installation of a policy: the
+/// tree's `fcfs` module is built for `wasm32-unknown-unknown` on first use and
+/// then loaded and instantiated, on a machine that runs this suite's tests in
+/// parallel. The bound is the harness's, not the mechanism's; a mechanism that
+/// stopped answering would still fail here, only later.
+const ANSWER: Duration = Duration::from_secs(60);
 
 /// How long a request may take to emit its first token.
 const FIRST_TOKEN: Duration = Duration::from_secs(20);
@@ -61,7 +67,10 @@ fn rank(host: &str) -> WorkerInfo {
         request_slots: 8,
         max_batch_calls: 16,
         max_batch_tokens: 512,
-        prefix_cache: None,
+        // A text pool serves token generation, so it advertises the paged KV
+        // pool every such worker has (`WorkerInfo::default`): a worker with no
+        // prefix cache is refused a token request at submission, which is the
+        // rule for a media-only rank and not for this one.
         buffer_pool_bytes: 1 << 20,
         ..WorkerInfo::default()
     }

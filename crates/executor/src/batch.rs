@@ -532,6 +532,22 @@ pub trait Batches: Send + Sync {
     /// update's, which the main process reports as `PrecopyFailed`.
     fn shadow(&self, batch: Batch) -> Result<Submission>;
 
+    /// The bucket this executor would serve `computation` in, or `None` when it serves no such
+    /// computation (2.4's stated capability).
+    ///
+    /// The mechanism asks before it forms a media batch: a media call is served only where a
+    /// runner's plan states the computation, and the answer is the bucket that plan planned it
+    /// into, so the refusal the mechanism makes names a capability the executor does not state
+    /// rather than a check that was deleted. A missing phase is its own refusal: a batch cannot be
+    /// sent to a device that does not exist.
+    fn media(
+        &self,
+        _phase: ipc::PhaseId,
+        _computation: &crate::plan::Computation,
+    ) -> Result<Option<crate::plan::Bucket>> {
+        Ok(None)
+    }
+
     /// The pools this executor serves (4.2, 7.3): what the mechanism schedules against.
     ///
     /// The mechanism builds its `ExecutorInfo` from this and nothing else, so a pool whose ranks,
@@ -663,6 +679,14 @@ impl Batches for Executors {
         &self.inventory
     }
 
+    fn media(
+        &self,
+        phase: ipc::PhaseId,
+        computation: &crate::plan::Computation,
+    ) -> Result<Option<crate::plan::Bucket>> {
+        Ok(self.route(phase)?.media(computation))
+    }
+
     fn submit(&self, batch: Batch) -> Result<Submission> {
         self.route(batch.phase)?.submit(batch)
     }
@@ -701,6 +725,10 @@ pub enum JobKind {
     Purge,
     /// Releasing a prepared generation that never served (an abandoned precopy, 7.3 step 2).
     Discard,
+    /// Giving the resident cache segments back, for a standby's park (2.5).
+    Sleep,
+    /// Mapping the released cache segments again, with the unit resets that follow (2.5).
+    Wake,
     /// A job that only waits for the events it was given.
     After,
 }
@@ -720,6 +748,8 @@ impl JobKind {
             Self::Revert => "revert",
             Self::Purge => "purge",
             Self::Discard => "discard",
+            Self::Sleep => "sleep",
+            Self::Wake => "wake",
             Self::After => "after",
         }
     }

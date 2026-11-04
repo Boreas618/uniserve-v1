@@ -155,8 +155,15 @@ impl Arena {
 pub struct Shadow<'a> {
     /// The operator whose programs are being compared, by `Op::NAME`.
     pub operator: &'static str,
-    /// The descriptor key of the one call being compared.
-    pub descriptor_key: String,
+    /// The descriptor key of the program the previous generation served this operator with.
+    ///
+    /// The comparison pairs by operator, not by descriptor: an update may replace an operator by
+    /// another compilation of the same mathematics, whose descriptor text differs (7.3 step 2).
+    /// The old program is resolved by this key, because that is the one it was stored under; a
+    /// launch whose own key the previous generation still holds is paired with that one instead,
+    /// so an operator that appears under several descriptors is never compared against a program
+    /// compiled for another.
+    pub previous_key: String,
     /// The generation the previous program is resolved from.
     pub previous: &'a Generation,
     /// The twin buffers the new program writes into.
@@ -164,16 +171,17 @@ pub struct Shadow<'a> {
 }
 
 impl<'a> Shadow<'a> {
-    /// The comparison of `operator`'s call whose descriptor key is `descriptor_key`.
+    /// The comparison of `operator`'s calls, against the program the previous generation served it
+    /// with under `previous_key`.
     pub fn new(
         operator: &'static str,
-        descriptor_key: impl Into<String>,
+        previous_key: impl Into<String>,
         previous: &'a Generation,
         twins: &'a mut Twins,
     ) -> Self {
         Self {
             operator,
-            descriptor_key: descriptor_key.into(),
+            previous_key: previous_key.into(),
             previous,
             twins: RefCell::new(twins),
         }
@@ -237,9 +245,12 @@ impl<'a> Forward<'a> {
     where
         O::Args<'t>: Copy,
     {
-        let shadow = self.shadow.as_ref().filter(|shadow| {
-            shadow.operator == O::NAME && shadow.descriptor_key == ops::descriptor::key(descriptor)
-        });
+        // Paired by operator: a program replaced by another compilation of the same mathematics
+        // may carry a different descriptor text, and that is the update 7.3 step 2 exists for.
+        let shadow = self
+            .shadow
+            .as_ref()
+            .filter(|shadow| shadow.operator == O::NAME);
         let Some(shadow) = shadow else {
             let kernel = self.kernels.op::<O>(descriptor)?;
             O::launch(kernel, descriptor, args, self.stream).map_err(Error::from)?;
@@ -251,7 +262,15 @@ impl<'a> Forward<'a> {
         let mut twins = shadow.twins.borrow_mut();
         twins.set_tolerance(O::tolerance(descriptor));
         let current = self.kernels.op::<O>(descriptor)?;
-        let previous = shadow.previous.op::<O>(descriptor)?;
+        // The previous program is resolved by the key its generation stored it under, and by the
+        // launch's own key when that generation still has one: an operator served under several
+        // descriptors is compared program for program, never against a neighbour's compilation.
+        let key = ops::descriptor::key(descriptor);
+        let previous = if shadow.previous.contains(O::NAME, &key) {
+            shadow.previous.kernel(O::NAME, &key)?
+        } else {
+            shadow.previous.kernel(O::NAME, &shadow.previous_key)?
+        };
         // Redirect the call's outputs into the twins and let the new program write them; the
         // previous program then writes the real outputs, which the forward continues on.
         let redirected = O::shadow(args, &mut twins, self.stream);
