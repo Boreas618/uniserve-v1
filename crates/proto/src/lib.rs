@@ -43,8 +43,12 @@ pub const PROTOCOL_MAJOR: u32 = 1;
 /// The interfaces' minor version: the additions this build knows. Minor 1
 /// adds the leader's answer of the nodes it knows now (`NodesQuery`). Minor 2
 /// adds explicit publication of committed worlds' immutable pages. Minor 3
-/// carries generated artifacts over TCP in bounded parts.
-pub const PROTOCOL_MINOR: u32 = 3;
+/// carries generated artifacts over TCP in bounded parts. Minor 4 adds the
+/// management of a main process's epoch: the commands parking, promotion and
+/// program switch (`Park`, `Promote`, `Precopy`, `Switchover`, `Commit`,
+/// `Revert`, `Purge`), the programs those commands carry, and the main
+/// process's reports (`Precopied`, `PolicyReverted`).
+pub const PROTOCOL_MINOR: u32 = 4;
 
 /// The build this crate is compiled in: the package version, then `+` and a
 /// digest of the workspace sources every artifact of the build is compiled

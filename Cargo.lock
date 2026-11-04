@@ -718,6 +718,7 @@ dependencies = [
  "expect-test",
  "fastokens",
  "fnv",
+ "frontend",
  "futures",
  "hf-hub 0.5.0",
  "http-body",
@@ -1160,6 +1161,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "frontend"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "fastokens",
+ "frontend",
+ "hf-hub 0.5.0",
+ "models",
+ "proto",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "tempfile",
+ "thiserror",
+ "thiserror-ext",
+ "tokenizers",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

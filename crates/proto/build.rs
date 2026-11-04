@@ -15,7 +15,9 @@
 //! The digest covers what Cargo compiles those artifacts from: the
 //! workspace's manifest, lockfile, toolchain file and Cargo configuration,
 //! and of each member crate under `crates/` its manifest, its build script
-//! and every file under its `src/`. A member's tests, benches and examples
+//! and every file under its `src/`; the workspace's root package is the
+//! `uniserve` executable, whose manifest is the workspace manifest and whose
+//! sources are the root `src/`. A member's tests, benches and examples
 //! are part of no artifact and are left out. Each file enters with its path
 //! relative to the workspace root and its length, so the digest depends on
 //! neither where the tree is checked out nor how files split their bytes.
@@ -61,6 +63,12 @@ fn emit_source_digest() -> io::Result<()> {
         watched.push(sources.clone());
         list_files(&root, &sources, &mut inputs)?;
     }
+    // The workspace's root package is the `uniserve` executable: its manifest
+    // is the workspace manifest (`ROOT_FILES`) and its sources are the root
+    // `src/`.
+    let root_sources = PathBuf::from("src");
+    watched.push(root_sources.clone());
+    list_files(&root, &root_sources, &mut inputs)?;
     inputs.sort();
     inputs.dedup();
 
