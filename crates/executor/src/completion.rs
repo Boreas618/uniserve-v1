@@ -1,6 +1,7 @@
 //! Shared operation results, waits, and completion observers.
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use crate::{Error, Result, lock};
 
@@ -37,6 +38,8 @@ struct State<C, T> {
 /// releasing its lock. `T` is the operation's value.
 pub struct Completion<C, T = ()> {
     state: Mutex<State<C, T>>,
+    /// Signalled when the outcome lands, so a waiter sleeps instead of polling.
+    ready: Condvar,
 }
 
 impl<C, T> Default for Completion<C, T> {
@@ -46,6 +49,7 @@ impl<C, T> Default for Completion<C, T> {
                 outcome: None,
                 callbacks: Vec::new(),
             }),
+            ready: Condvar::new(),
         }
     }
 }
@@ -65,8 +69,43 @@ impl<C, T: Clone> Completion<C, T> {
         matches!(self.state().outcome, Some(Outcome::Success(_)))
     }
 
-    pub(crate) fn outcome(&self) -> Option<Outcome<T>> {
+    /// The outcome, once the operation ended.
+    pub fn outcome(&self) -> Option<Outcome<T>> {
         self.state().outcome.clone()
+    }
+
+    /// Waits for the operation's outcome.
+    pub fn wait(&self) -> Outcome<T> {
+        let mut state = self.state();
+        while state.outcome.is_none() {
+            state = self
+                .ready
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        state
+            .outcome
+            .clone()
+            .unwrap_or_else(|| Outcome::Failed(Arc::new(Error::State("completion has no outcome"))))
+    }
+
+    /// Waits at most `timeout` for the outcome: what a serve loop does between
+    /// batches, where `Duration::ZERO` is a poll.
+    pub fn wait_timeout(&self, timeout: Duration) -> Option<Outcome<T>> {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state();
+        while state.outcome.is_none() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            state = self
+                .ready
+                .wait_timeout(state, left)
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
+        }
+        state.outcome.clone()
     }
 
     /// Register a callback, or return it for immediate dispatch if already done.
@@ -90,7 +129,10 @@ impl<C, T: Clone> Completion<C, T> {
             Ok(value) => Outcome::Success(value),
             Err(error) => Outcome::Failed(Arc::new(error)),
         });
-        Ok(std::mem::take(&mut state.callbacks))
+        let callbacks = std::mem::take(&mut state.callbacks);
+        drop(state);
+        self.ready.notify_all();
+        Ok(callbacks)
     }
 
     /// Cancel an unresolved completion. This does not stop its producer.
@@ -103,7 +145,10 @@ impl<C, T: Clone> Completion<C, T> {
         }
 
         state.outcome = Some(Outcome::Cancelled);
-        (true, std::mem::take(&mut state.callbacks))
+        let callbacks = std::mem::take(&mut state.callbacks);
+        drop(state);
+        self.ready.notify_all();
+        (true, callbacks)
     }
 }
 
