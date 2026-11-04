@@ -1414,6 +1414,7 @@ fn rebinding_changes_a_kernel_node_function_and_arguments() {
 /// A row-major matrix product runs on an algorithm cuBLASLt's heuristic
 /// offers, and its result is the arithmetic the descriptor names.
 #[test]
+#[ignore = "requires a CUDA device"]
 fn a_matrix_product_runs_on_an_algorithm_the_heuristic_offers() {
     let _driver = exclusive_driver();
     let device = Device::new(DEVICE).unwrap();
@@ -1526,6 +1527,7 @@ fn a_matrix_product_runs_on_an_algorithm_the_heuristic_offers() {
 /// captured, its grid, block and the values of its arguments, and setting those
 /// on another executable's node runs the same work.
 #[test]
+#[ignore = "requires a CUDA device"]
 fn kernel_node_params_read_back_what_a_capture_recorded() {
     let _driver = exclusive_driver();
     let device = Device::new(DEVICE).unwrap();
@@ -1861,8 +1863,14 @@ fn the_three_dimensional_and_transposed_references_are_the_definitions() {
     // and the padding: 2·1 + 3·10 = 32. The reversed tap (`o + padding − j`)
     // would answer 12, 123 and 230 instead.
     let x = [1.0f32, 2.0, 3.0];
-    let w = [1.0f32, 10.0, 100.0];
-    let y = forward_reference_3d(&x, [1, 1, 1, 1, 3], &w, [1, 1, 1, 1, 3], [1, 1, 1, 1, 3], 1);
+    // A 3×3×3 filter whose only non-zero plane is the centre one, so the
+    // hand values below are the width taps alone: a filter that is one deep
+    // has no centre plane to reach through the padding.
+    let mut w = [0.0f32; 27];
+    w[12] = 1.0;
+    w[13] = 10.0;
+    w[14] = 100.0;
+    let y = forward_reference_3d(&x, [1, 1, 1, 1, 3], &w, [1, 1, 3, 3, 3], [1, 1, 1, 1, 3], 1);
     assert_eq!(y, vec![210.0, 321.0, 32.0]);
 
     // The transposed reference on the transposed test's own inputs, generated
