@@ -1487,6 +1487,12 @@ impl Scheduler {
                     u32::try_from(cached_tokens).unwrap_or(u32::MAX),
                     u32::try_from(host_tokens).unwrap_or(u32::MAX),
                 );
+                // One `Hit` per page the mechanism re-uses: a policy's LRU
+                // orders evictions by these, so a page that was hit must move.
+                for head_unit in &prefix_hit.matched_pages {
+                    self.recorder
+                        .hit(scheduling::guest::PageId(u64::from(*head_unit)));
+                }
                 let prefix_tokens = cached_tokens + host_tokens;
                 let first_chunk = n.saturating_sub(prefix_tokens).min(chunk_limit).max(1);
                 let first_chunk_units = cache

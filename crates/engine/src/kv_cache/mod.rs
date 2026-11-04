@@ -1755,6 +1755,10 @@ pub(crate) struct PrefixLookup {
     /// Leading prompt tokens acquired from the prefix cache. A final
     /// partial page is copied before the resumed computation appends to it.
     pub(crate) cached_tokens: usize,
+    /// The first unit of every page the hit acquired, in logical order and
+    /// group by group: the pages a policy is told were hit, so its LRU places
+    /// them where the mechanism used them.
+    pub(crate) matched_pages: Vec<u32>,
     /// Leading prompt tokens whose draft cache was acquired from the prefix
     /// cache with them; at most `cached_tokens`, zero without a draft
     /// cache.
@@ -1764,6 +1768,9 @@ pub(crate) struct PrefixLookup {
 /// Read-only prefix-cache probe result across every cache group.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct PrefixHit {
+    /// The first unit of every page the hit covers, group by group, in logical
+    /// order: the pages the mechanism re-uses, which a policy's LRU orders by.
+    pub(crate) matched_pages: Vec<u32>,
     /// Leading prompt tokens every required group can reuse, including a
     /// stored partial tail when the group's computation permits it.
     pub(crate) cached_tokens: usize,
@@ -2567,9 +2574,17 @@ impl PrefixCacheCoordinator {
                 .filter(|(tail, _)| tail.is_some_and(|tail| tail.cached))
                 .map(|(_, shape)| shape.units_per_page)
                 .sum::<usize>();
+        // The pages the hit covers, group by group: admission names them to the
+        // policy, whose LRU places them where the mechanism used them.
+        let matched_pages = selection
+            .pages
+            .iter()
+            .flat_map(|(_, pages)| pages.iter().map(|(head, _)| head.0))
+            .collect();
         PrefixHit {
             cached_tokens: selection.tokens,
             cached_free_units,
+            matched_pages,
         }
     }
 
@@ -2615,6 +2630,7 @@ impl PrefixCacheCoordinator {
         let mut result = PrefixLookup {
             page_hashes: hashes,
             cached_tokens: 0,
+            matched_pages: Vec::new(),
             draft_tokens: 0,
         };
         if !cache_read && scope.resume.is_none() {
@@ -2722,6 +2738,11 @@ impl PrefixCacheCoordinator {
                 result.draft_tokens = references.len() * table.shape.block_size;
             }
             table.start_page = start;
+            for reference in &references {
+                if let Some(head) = reference.units().first() {
+                    result.matched_pages.push(head.0);
+                }
+            }
             table
                 .pages
                 .extend(references.into_iter().map(|page| TablePage {

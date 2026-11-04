@@ -750,6 +750,22 @@ impl Scheduler {
         self.policy = Some(policy);
     }
 
+    /// Tells the policy that the encoder entry `key` is live, with the last use
+    /// the cache now records for it (§4.4's `Encoded`).
+    ///
+    /// Called where the cache creates, re-activates, or re-uses an entry: a
+    /// re-use raises its last use, which is the order a policy's LRU reads.
+    pub(super) fn record_encoded(&mut self, key: [u8; 32]) {
+        let Some(last_used) = self.storage.encoder_cache.last_used(&key) else {
+            return;
+        };
+        let entry = views::encoding_view(
+            views::encoding_id(&key),
+            scheduling::guest::Nanos(last_used),
+        );
+        self.recorder.encoded(entry);
+    }
+
     /// The executor's routed-token counts per expert, which the mechanism asks
     /// about on its own interval. The executor's edge publishes them; `None`
     /// withdraws them.
