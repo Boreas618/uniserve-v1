@@ -56,6 +56,12 @@ message Join {
 message Engine {
   // The deployment: the served model name.
   string deployment = 1;
+  // The engine number the daemon started this process under, which the launch
+  // file states as `engine` and the epoch layer addresses commands by. The
+  // daemon keys this connection by it, so a command reaches the process it
+  // names rather than the one that happened to connect in that order; zero
+  // states no number, and a daemon refuses it rather than guessing.
+  uint64 engine = 2;
 }
 
 // The answer to a `Hello`.

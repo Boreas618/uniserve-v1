@@ -254,7 +254,7 @@ struct ProcessInterface {
 impl ProcessInterface {
     /// Connects to `address` and states this process's identity, which the daemon answers with the
     /// deployment's nodes or a refusal (§2.3).
-    fn connect(address: &str, deployment: &str) -> Result<Self> {
+    fn connect(address: &str, deployment: &str, engine: u64) -> Result<Self> {
         let mut connection = proto::Connection::connect(address).with_context(|| {
             format!("connecting to the daemon's process interface at {address}")
         })?;
@@ -265,6 +265,10 @@ impl ProcessInterface {
             peer: Some(proto::process::hello::Peer::Engine(
                 proto::process::Engine {
                     deployment: deployment.to_owned(),
+                    // The daemon keys this connection by the number the epoch layer started this
+                    // process under, so a command it sends for engine N reaches this process and
+                    // not whichever connection the daemon happened to accept Nth.
+                    engine,
                 },
             )),
         })?;
@@ -681,7 +685,11 @@ impl MainProcess {
         // The daemon's two interfaces are two sockets: the epoch's requests and metrics travel on
         // the request connection above, and everything the daemon asks of this process - the claim,
         // the reports of §7.3, and every command of the program layer - travels on this one.
-        let mut process = ProcessInterface::connect(&launch.processes, &launch.deployment)?;
+        let mut process = ProcessInterface::connect(
+            &launch.processes,
+            &launch.deployment,
+            launch.engine,
+        )?;
 
         // §8: the rank's Storage Server and its claim are the node's, which the daemon answers for;
         // the retained weights outlive every world of the epoch, so the store is built once, before
