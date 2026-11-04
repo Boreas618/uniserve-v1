@@ -295,15 +295,32 @@ def run_prompt_hidden(
         )
 
     torch = reference("torch")
-    dtype = checkpoint_dtype(checkpoint)
+    # The case states the element type the deployment computes in; the export's shards state the one
+    # it is stored in. The case wins, because the pair compares two implementations of one deployment
+    # - and when the two disagree it is one conversion at load, which the page names rather than
+    # hides: the alternative is a page that compares two precisions and reads as arithmetic.
+    own = checkpoint_dtype(checkpoint)
     stated = case.get("dtype")
-    if stated is not None and stated != str(dtype).removeprefix("torch."):
-        raise SystemExit(
-            f"the case says the encoder runs at {stated} and the export's shards hold"
-            f" {str(dtype).removeprefix('torch.')}: the candidate and the reference would be two"
-            f" models, so the pair is refused before either is loaded"
+    if stated is None:
+        dtype = own
+        print(
+            f"dtype   {str(dtype).removeprefix('torch.')}, the checkpoint's own (the case states"
+            f" none)"
         )
-    print(f"dtype   {str(dtype).removeprefix('torch.')}, the checkpoint's own (case: {stated})")
+    else:
+        name = str(own).removeprefix("torch.")
+        if stated not in (name, "f32", "f16", "bf16"):
+            raise SystemExit(
+                f"the case states the element type {stated!r}; this probe knows f32, f16 and bf16"
+            )
+        dtype = getattr(torch, {"f32": "float32", "f16": "float16", "bf16": "bfloat16"}[stated])
+        if stated == name:
+            print(f"dtype   {stated}, the checkpoint's own and the case's")
+        else:
+            print(
+                f"dtype   {stated}, the case's; the export's shards hold {name}, so both sides"
+                f" load at {stated} and the page compares one precision"
+            )
     model = load_encoder(case, checkpoint, device, dtype)
     width = int(model.network.hidden_size)
     if int(case["hidden"]) != width:
