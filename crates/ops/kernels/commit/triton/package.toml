@@ -1,0 +1,37 @@
+# The commit operator's Triton backend.
+#
+# One program applies a batch's commit rows to per-slot continuation state: the
+# next input token, the continuation flag, the logical and sampling positions,
+# the verified cache length and the penalty counts. The vocabulary and the
+# captured batch bucket are compile-time values, so a module covers one bucket
+# of one epoch's slot layout.
+op = "commit"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "triton"
+
+[source]
+kind = "triton"
+files = ["src/commit.py", "src/build.py", "src/_compile.py"]
+
+architectures = ["sm_100a", "sm_90a"]
+target = "arch"
+
+# `vocab_151936_future_1_batch_64`.
+[descriptors]
+vocab = ["151936"]
+# The width of the slot's future-token row; column 0 is the next input token.
+future = ["1"]
+# The captured batch buckets the commit runs in.
+batch = ["1", "2", "4", "8", "16", "32", "64", "128", "256"]
+
+[parameters]
+# Rows of the int64 commit column table.
+columns = 8

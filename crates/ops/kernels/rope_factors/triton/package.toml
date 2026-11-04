@@ -1,0 +1,37 @@
+# The rope_factors operator's Triton backend.
+#
+# One program stores a block of compact cosine and sine factors for strided
+# positions, with full-range FP32 trigonometry. A module covers one (positions
+# dtype, factor dtype, half head width, layout, target).
+op = "rope_factors"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "triton"
+
+[source]
+kind = "triton"
+files = ["src/rope_factors.py", "src/build.py", "src/_compile.py"]
+
+architectures = ["sm_100a", "sm_90a"]
+target = "arch"
+
+# `positions_i64_factors_fp32_half_dim_64_layout_sequence`.
+[descriptors]
+positions = ["i32", "i64"]
+factors = ["fp32", "bf16"]
+half_dim = ["64", "128"]
+layout = ["sequence"]
+
+[parameters]
+# The factor scale `RotaryEmbedding` bakes into its tables; 1.0 for YaRN with
+# no attention scaling.
+scale = 1.0
+# Elements one program covers.
+block = 256

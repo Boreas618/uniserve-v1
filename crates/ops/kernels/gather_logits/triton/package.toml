@@ -1,0 +1,33 @@
+# The gather_logits operator's Triton backend.
+#
+# One program copies one block of one selected row of the hidden state into a
+# dense matrix, so the vocabulary head's GEMM reads only the requests' last
+# positions.
+op = "gather_logits"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "triton"
+
+[source]
+kind = "triton"
+files = ["src/gather_logits.py", "src/build.py", "src/_compile.py"]
+
+architectures = ["sm_100a", "sm_90a"]
+target = "arch"
+
+# `dtype_bf16_width_2048_rows_i32`.
+[descriptors]
+dtype = ["bf16", "fp16", "fp32"]
+width = ["2048"]
+rows = ["i32", "i64"]
+
+[parameters]
+block = 1024
+warps = 4

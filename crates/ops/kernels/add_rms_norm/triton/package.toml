@@ -1,0 +1,32 @@
+# The add_rms_norm operator's Triton backend.
+#
+# One program adds a residual row and normalizes the FP32 sum, writing both the
+# residual stream and its normalized projection. A module covers one (dtype,
+# width, target): the row width and the epsilon are compile-time values of the
+# kernel, and programmatic dependent launch follows the target's capability.
+op = "add_rms_norm"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "triton"
+
+[source]
+kind = "triton"
+files = ["src/add_rms_norm.py", "src/build.py", "src/_compile.py"]
+
+architectures = ["sm_100a", "sm_90a"]
+target = "arch"
+
+# `dtype_bf16_width_2048`.
+[descriptors]
+dtype = ["bf16", "fp16", "fp32"]
+width = ["768", "2048", "4096", "6144"]
+
+[parameters]
+eps = 1e-06

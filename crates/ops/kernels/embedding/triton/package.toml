@@ -1,0 +1,34 @@
+# The embedding operator's Triton backend.
+#
+# One program gathers one block of one token's row from this rank's vocabulary
+# shard and zeroes tokens outside it, so the tensor-parallel all-reduce that
+# follows produces the full row.
+op = "embedding"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "triton"
+
+[source]
+kind = "triton"
+files = ["src/embedding.py", "src/build.py", "src/_compile.py"]
+
+architectures = ["sm_100a", "sm_90a"]
+target = "arch"
+
+# `ids_i64_dtype_bf16_width_2048`.
+[descriptors]
+ids = ["i64", "i32"]
+dtype = ["bf16", "fp16", "fp32"]
+width = ["2048"]
+
+[parameters]
+# Elements one program loads of a row.
+block = 1024
+warps = 4
