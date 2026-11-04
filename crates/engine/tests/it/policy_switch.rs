@@ -15,7 +15,9 @@ use std::thread;
 use std::time::Duration;
 
 use crossbeam_channel::Receiver;
-use engine::{CommandSender, PolicyBytes, PolicyProgram, PolicySource, SimEngine, SimExecutor};
+use engine::{
+    CommandSender, PolicyBytes, PolicyProgram, PolicySource, SimEngine, SimExecutor, StageApplied,
+};
 use scheduling::guest::decision::Plan;
 use scheduling::guest::limits::Limits;
 use scheduling::guest::view::ExpertOrder;
@@ -169,19 +171,28 @@ impl World {
         answer(self.handle.precopy_policy(program, source))
     }
 
-    /// The switchover's answer.
-    fn switch_over(&self) -> Result<(), String> {
+    /// The switchover's answer: the step it applied at.
+    fn switch_over(&self) -> Result<StageApplied, String> {
         answer(self.handle.switchover_policy())
     }
 
-    /// The revert's answer.
-    fn revert(&self) -> Result<(), String> {
+    /// The revert's answer: the step it applied at.
+    fn revert(&self) -> Result<StageApplied, String> {
         answer(self.handle.revert_policy())
+    }
+
+    /// The step the scheduler reached, as it reports it.
+    fn step(&self) -> u64 {
+        self.handle
+            .progress()
+            .recv_timeout(ANSWER)
+            .expect("the scheduler reports its step")
+            .step
     }
 }
 
 /// Blocks until a command answers, and answers its result.
-fn answer(receiver: Receiver<Result<(), String>>) -> Result<(), String> {
+fn answer<T>(receiver: Receiver<Result<T, String>>) -> Result<T, String> {
     match receiver.recv_timeout(ANSWER) {
         Ok(result) => result,
         Err(error) => Err(format!("the scheduler did not answer: {error}")),
@@ -197,18 +208,30 @@ fn the_switch_passes_through_its_stages_and_a_revert_brings_the_previous_policy_
     world
         .precopy("fcfs", 1, toy())
         .expect("the first program's precopy");
-    world.switch_over().expect("the first switchover");
+    let first = world.switch_over().expect("the first switchover");
+    // A stage names the boundary it applied at: the step the scheduler had
+    // reached, which is zero before any policy step ran.
+    assert_eq!(
+        first.step,
+        world.step(),
+        "a switchover answers the step it applied at"
+    );
 
     // The next program is precopied while the first serves, then switched in;
     // the first is kept for a revert.
     world
         .precopy("priority", 2, toy())
         .expect("the second program's precopy");
-    world.switch_over().expect("the second switchover");
+    let second = world.switch_over().expect("the second switchover");
+    assert_eq!(
+        second.step,
+        world.step(),
+        "a later switchover names the boundary it applied at as well"
+    );
 
     // A commit keeps the replaced policy until the next precopy (§7.3 step 5),
     // so a revert still finds it and brings it back.
-    world.handle.commit_policy();
+    answer(world.handle.commit_policy()).expect("the commit applies at a boundary");
     world.revert().expect("the commit kept the previous policy");
 
     // The revert consumed it: there is nothing older to revert to.
