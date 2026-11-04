@@ -1497,14 +1497,15 @@ impl nn::capability::Denoiser for Denoiser {
                 out.video.shape.dims()
             ))));
         }
-        noise.draw(
-            f,
-            out.video,
-            nn::NoiseKey::Scalar(seed.0),
-            0,
-            0,
-            video_offset,
-        )?;
+        // The draw is a flat stream - `(seed, element)` - so the operator reads a two-axis view and
+        // the raster keeps its own shape: merging the last two axes is one reinterpretation of the
+        // same bytes, and the element order is the raster's flat order either way. Handing the
+        // four-axis view over is what the operator refused (`expected 2 axes, found 4`), and it
+        // refused it after the load, one launch after the first stage's.
+        let flat = out
+            .video
+            .reshape(Shape::new(&[native[0] * native[1] * native[2], native[3]]));
+        noise.draw(f, flat, nn::NoiseKey::Scalar(seed.0), 0, 0, video_offset)?;
         if let Some(audio) = out.audio {
             noise.draw(f, audio, nn::NoiseKey::Scalar(seed.0), 0, 1, audio_offset)?;
         }
@@ -2754,9 +2755,13 @@ impl Denoiser {
 
         // The rotary tables and the visibility of the one packed sequence. Each of the three axes
         // rotates `rope_frequency_dim` channel pairs, and a factor table holds one column per pair.
-        let rotated = u64::from(self.config.transformer.rope_frequency_dim) * 3;
-        let cosine = arena.tensor(DType::F32, Shape::new(&[tokens, rotated]))?;
-        let sine = arena.tensor(DType::F32, Shape::new(&[tokens, rotated]))?;
+        // One column per rotated **pair**, and `rope_freq_dim` is already the pairs of one axis:
+        // the operator's `rotated` counts channels (three axes of `2 * rope_freq_dim` = 96) and a
+        // factor table is half that (48), so this product is the table's width and not the
+        // operator's field. The two numbers differ by two and are named alike.
+        let pairs = u64::from(self.config.transformer.rope_frequency_dim) * 3;
+        let cosine = arena.tensor(DType::F32, Shape::new(&[tokens, pairs]))?;
+        let sine = arena.tensor(DType::F32, Shape::new(&[tokens, pairs]))?;
         self.transformer
             .factors(f, tables.get("position_ids")?, cosine, sine)?;
         // The dense kind reads the whole packed sequence in one go; the sparse kind reads the
@@ -2952,21 +2957,27 @@ impl Denoiser {
             &entry_bytes,
         )?;
 
+        // The tables are the modulation projections' own type, because the reference allocates them
+        // from the product (`adaln_cache.py:141-145`) - so at a BF16 stack they are BF16 and at an
+        // FP32 deployment FP32. The timestep pair in front of them stays FP32, and the one narrowing
+        // between the two halves lives in `Projections::compute`.
+        let table_type = projections.dtype();
+        let unit = table_type.bytes().unwrap_or(4);
         let mut adaln_layers = Vec::with_capacity(config.transformer.num_hidden_layers as usize);
-        let zeros = vec![0_u8; (entries * columns * 4) as usize];
+        let zeros = vec![0_u8; (entries * columns * unit) as usize];
         for index in 0..config.transformer.num_hidden_layers {
             adaln_layers.push(loader.constant(
                 &format!("minimax_h3.adaln.layers.{index}"),
-                DType::F32,
+                table_type,
                 Shape::new(&[entries, columns]),
                 &zeros,
             )?);
         }
         let adaln_output = loader.constant(
             "minimax_h3.adaln.output",
-            DType::F32,
+            table_type,
             Shape::new(&[entries, 2 * hidden]),
-            &vec![0_u8; (entries * 2 * hidden * 4) as usize],
+            &vec![0_u8; (entries * 2 * hidden * unit) as usize],
         )?;
         let cache = AdaLnCache::new(
             adaln_layers.clone(),
@@ -2974,6 +2985,7 @@ impl Denoiser {
             entry_table,
             groups,
             config.transformer.hidden_size,
+            config.transformer.time_dim,
         )?;
         // A sparse deployment states the compression's tile bound once, from its own layouts: the
         // score matrix is `[heads, query tiles, tiles]` and must cover every video tile any layout

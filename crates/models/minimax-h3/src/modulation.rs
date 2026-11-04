@@ -91,6 +91,8 @@ pub struct AdaLnCache {
     entries: Weight,
     groups: Groups,
     hidden_size: u32,
+    /// The timestep activation's width, which is the one narrowing the cache's two halves meet at.
+    time_dim: u32,
 }
 
 impl AdaLnCache {
@@ -129,6 +131,7 @@ impl AdaLnCache {
         entries: Weight,
         groups: Groups,
         hidden_size: u32,
+        time_dim: u32,
     ) -> Result<Self> {
         if layers.is_empty() {
             return Err(Error::checkpoint(
@@ -164,6 +167,7 @@ impl AdaLnCache {
             entries,
             groups,
             hidden_size,
+            time_dim,
         })
     }
 
@@ -233,11 +237,13 @@ impl AdaLnCache {
         u64::from(self.groups.count()) * 2 * u64::from(self.hidden_size)
     }
 
-    /// Bytes the per-forward scratch needs: the entry ids and the largest gathered table.
+    /// Bytes the per-forward scratch needs: the entry ids, the largest gathered table, and the one
+    /// narrowing the cache's two halves meet at (an FP32 timestep activation of `time_dim`).
     pub fn scratch_bytes(&self) -> u64 {
         let elements = self.layer_elements().max(self.output_elements());
         let width = elements * self.dtype().bytes().unwrap_or(2);
-        width + u64::from(self.groups.count()) * 4
+        let narrow = u64::from(self.groups.count()) * u64::from(self.time_dim) * 4;
+        width + narrow + u64::from(self.groups.count()) * 4
     }
 }
 
@@ -343,13 +349,13 @@ impl Projections {
                         &format!("{prefix}.weight"),
                         VECTORS as u64 * hidden * u64::from(TAGS),
                         time_dim,
-                        DType::F32,
+                        None,
                     )?,
                     vector(
                         loader,
                         &format!("{prefix}.bias"),
                         VECTORS as u64 * hidden * u64::from(TAGS),
-                        DType::F32,
+                        None,
                     )?,
                 ))
             })
@@ -361,13 +367,13 @@ impl Projections {
                     "time_embedder.linear_1.weight",
                     time_hidden,
                     frequency,
-                    DType::F32,
+                    Some(DType::F32),
                 )?,
                 vector(
                     loader,
                     "time_embedder.linear_1.bias",
                     time_hidden,
-                    DType::F32,
+                    Some(DType::F32),
                 )?,
             ),
             second: (
@@ -376,20 +382,19 @@ impl Projections {
                     "time_embedder.linear_2.weight",
                     time_dim,
                     time_hidden,
-                    DType::F32,
+                    Some(DType::F32),
                 )?,
-                vector(loader, "time_embedder.linear_2.bias", time_dim, DType::F32)?,
+                vector(
+                    loader,
+                    "time_embedder.linear_2.bias",
+                    time_dim,
+                    Some(DType::F32),
+                )?,
             ),
             layers,
             output: (
-                matrix(
-                    loader,
-                    "norm_out.linear.weight",
-                    2 * hidden,
-                    time_dim,
-                    DType::F32,
-                )?,
-                vector(loader, "norm_out.linear.bias", 2 * hidden, DType::F32)?,
+                matrix(loader, "norm_out.linear.weight", 2 * hidden, time_dim, None)?,
+                vector(loader, "norm_out.linear.bias", 2 * hidden, None)?,
             ),
             frequency_dim: config.frequency_dim,
             time_hidden_dim: config.time_hidden_dim,
@@ -438,9 +443,20 @@ impl Projections {
         // first projection of the forward asked cuBLASLt for an FP32 activation against a BF16
         // weight, a pair no algorithm exists for (`input_f32_weight_bf16_...` refused at its plan).
         //
-        // The embedding stays FP32: it is the one input the model computes rather than reads, and the
-        // reference leaves it so until the first projection reads it.
-        let dtype = self.first.0.dtype();
+        // The two halves of the family have different types, and the reference says so: the timestep
+        // pair is FP32 at every preset (`weights.py:186-192`), the modulation projections take the
+        // deployment's. So the activation the second pair leaves is FP32 and the modulation
+        // projections read the deployment's type - **one narrowing between them**, which is the
+        // reference's `.to(weight.dtype)` and the only crossing in this cache. At an FP32
+        // deployment the two types coincide and the narrowing is skipped.
+        let time_type = self.first.0.dtype();
+        let dtype = self.layers[0].0.dtype();
+        if time_type != DType::F32 {
+            return Err(Error::config(format!(
+                "the AdaLN timestep pair is {time_type} and the reference pins it to FP32 at every \
+                 preset"
+            )));
+        }
         if output_out.dtype != dtype {
             return Err(Error::config(format!(
                 "the AdaLN tables are {} and the projections' weights are {dtype}: the reference \
@@ -449,31 +465,49 @@ impl Projections {
                 output_out.dtype
             )));
         }
-        if embedding.dtype != DType::F32 {
+        for table in layers_out {
+            if table.dtype != dtype {
+                return Err(Error::config(format!(
+                    "an AdaLN layer table is {} and the projections' weights are {dtype}",
+                    table.dtype
+                )));
+            }
+        }
+        if embedding.dtype != time_type {
             return Err(Error::config(format!(
-                "the AdaLN embedding is {} and the reference computes it in FP32",
+                "the AdaLN embedding is {} and the timestep pair computes in {time_type}",
                 embedding.dtype
             )));
         }
         let hidden = arena.tensor(
-            dtype,
+            time_type,
             Shape::new(&[groups, u64::from(self.time_hidden_dim)]),
         )?;
         let activated = arena.tensor(
-            dtype,
+            time_type,
             Shape::new(&[groups, u64::from(self.time_hidden_dim)]),
         )?;
-        let time = arena.tensor(dtype, Shape::new(&[groups, u64::from(self.time_dim)]))?;
+        let time = arena.tensor(time_type, Shape::new(&[groups, u64::from(self.time_dim)]))?;
         let linear = |weights: &(Weight, Weight)| {
             nn::layers::Linear::new(weights.0, Some(weights.1), nn::layers::WeightOrder::NxK)
         };
         linear(&self.first)?.forward(f, embedding, hidden)?;
         nn::layers::Silu.forward(f, hidden, activated)?;
         linear(&self.second)?.forward(f, activated, time)?;
+        // The one crossing: the activation the timestep pair built, rounded into the type the
+        // modulation projections read. `target <- 1 * source + 0 * target` is the reference's
+        // `.to(weight.dtype)`, and the zero beta means the target is never read.
+        let narrow = if dtype == time_type {
+            time
+        } else {
+            let out = arena.tensor(dtype, time.shape)?;
+            nn::layers::ScaledAdd.forward(f, out, time, 1.0, 0.0)?;
+            out
+        };
         for (weights, out) in self.layers.iter().zip(layers_out) {
-            linear(weights)?.forward(f, time, *out)?;
+            linear(weights)?.forward(f, narrow, *out)?;
         }
-        Ok(linear(&self.output)?.forward(f, time, output_out)?)
+        Ok(linear(&self.output)?.forward(f, narrow, output_out)?)
     }
 
     /// The sinusoidal embedding a step's network times need: `[groups, frequency_dim]` FP32.
@@ -483,6 +517,11 @@ impl Projections {
     /// here because it is the only part of the cache that is arithmetic on a host value.
     pub fn frequencies(&self, times: &[f32]) -> Result<Vec<u8>> {
         embedding(times, self.frequency_dim)
+    }
+
+    /// The element type the modulation projections read: the tables' type, and the cache's.
+    pub fn dtype(&self) -> DType {
+        self.layers[0].0.dtype()
     }
 
     /// How many layers the projections cover.
@@ -548,14 +587,26 @@ fn matrix(
     name: &str,
     rows: u64,
     columns: u64,
-    dtype: DType,
+    dtype: Option<DType>,
 ) -> Result<Weight> {
-    Ok(loader.load(&WeightRequest::region(name, 0, Shape::new(&[rows, columns])).pinned(dtype))?)
+    let mut request = WeightRequest::region(name, 0, Shape::new(&[rows, columns]));
+    if let Some(dtype) = dtype {
+        request = request.pinned(dtype);
+    }
+    Ok(loader.load(&request)?)
 }
 
-/// A `[rows]` checkpoint weight.
-fn vector(loader: &mut WeightLoader<'_>, name: &str, rows: u64, dtype: DType) -> Result<Weight> {
-    Ok(loader.load(&WeightRequest::region(name, 0, Shape::new(&[rows])).pinned(dtype))?)
+fn vector(
+    loader: &mut WeightLoader<'_>,
+    name: &str,
+    rows: u64,
+    dtype: Option<DType>,
+) -> Result<Weight> {
+    let mut request = WeightRequest::region(name, 0, Shape::new(&[rows]));
+    if let Some(dtype) = dtype {
+        request = request.pinned(dtype);
+    }
+    Ok(loader.load(&request)?)
 }
 
 #[cfg(test)]
