@@ -47,7 +47,7 @@ pub(crate) use policy::process_engine;
 pub use policy::{
     Arrival, BatchCapacity, Candidate, PREFETCH_FLOOR_TOKENS, PolicyBytes, PolicyProgram,
     PolicyReverted, PolicySlot, PolicySource, PolicyStore, RoutePolicy, RouteTrial, Stage,
-    TrialState, Validators, arrival_view, backend_name, ceilings_of, parameters_of, program_of,
+    TrialState, Validators, arrival_view, ceilings_of,
 };
 pub(crate) use run::{MAX_GUIDANCE_PREFIX_ROWS, guidance_prefix_rows};
 pub use stats::{
@@ -116,7 +116,7 @@ use ipc::{
     ShapeBound, TensorRef, TimingCounters, WorkerInfo,
 };
 use ipc::{SharedMedia, TokenLogprob};
-use proto::request::{MigrationCause, SchedulingPolicy};
+use proto::request::MigrationCause;
 
 use crate::executor::{RankBuffer, WorkerFailure};
 use crate::scheduler::image_artifact::png_artifact_info;
