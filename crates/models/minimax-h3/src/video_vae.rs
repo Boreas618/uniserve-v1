@@ -750,13 +750,22 @@ impl VideoDecoder {
             * config.spatial_compression()
             * config.spatial_compression();
         let epsilon = config.decoder_norm_eps;
+        // The constants this canvas publishes, declared once: a caller that reserves device storage
+        // before loading sizes its pool by this list, and every publish below is checked against it.
+        let declared_sizes = constants(config, canvas, u64::from(width), dtype)?;
 
         let registers = read(
             loader,
             "decoder.register_tokens",
             &[u64::from(canvas.registers), u64::from(width)],
         )?;
-        let zero_row = zeroes(loader, "video_vae.zero_row", dtype, u64::from(width))?;
+        let zero_row = zeroes(
+            loader,
+            &declared_sizes,
+            "video_vae.zero_row",
+            dtype,
+            u64::from(width),
+        )?;
         if canvas.tail == 0 {
             return Err(Error::config(
                 "the decoder canvas has the trailing zero row".to_owned(),
@@ -764,12 +773,14 @@ impl VideoDecoder {
         }
         let register_rows = indices(
             loader,
+            &declared_sizes,
             "video_vae.register_rows",
             canvas.voxels() as u32,
             canvas.registers,
         )?;
         let zero_rows = indices(
             loader,
+            &declared_sizes,
             "video_vae.zero_rows",
             (canvas.voxels() + u64::from(canvas.registers)) as u32,
             canvas.tail,
@@ -865,7 +876,7 @@ impl VideoDecoder {
             u64::from(out_channels),
             true,
         )?;
-        let frequencies = frequencies(loader, config)?;
+        let frequencies = frequencies(loader, &declared_sizes, config)?;
         let rotary = Rotary::new(
             frequencies,
             head,
@@ -892,7 +903,13 @@ impl VideoDecoder {
             output,
             rotary,
             place: Rows::new(dtype, u64::from(width))?,
-            voxel_rows: indices(loader, "video_vae.voxel_rows", 0, canvas.voxels() as u32)?,
+            voxel_rows: indices(
+                loader,
+                &declared_sizes,
+                "video_vae.voxel_rows",
+                0,
+                canvas.voxels() as u32,
+            )?,
             attention: Attention::dense(
                 head,
                 heads,
@@ -922,6 +939,37 @@ fn linear(loader: &mut WeightLoader, name: &str, from: u64, to: u64, bias: bool)
     Ok(Linear::new(weight, bias, WeightOrder::NxK)?)
 }
 
+/// The constants a decoder of this canvas publishes, as `(name, bytes)`.
+///
+/// `load` builds five tensors the export does not hold - the zero row the token layout appends, the
+/// two index tables that address them, the rotary frequencies and the voxel rows - and a caller that
+/// reserves device storage before loading has to know what they cost: the pool charges a block per
+/// publish, so a reservation computed from the checkpoint's names alone is short by every one of
+/// these. The list is one statement of them, and `load` checks what it publishes against it, so the
+/// two cannot drift.
+pub fn constants(
+    config: &VideoVaeConfig,
+    canvas: Canvas,
+    width: u64,
+    dtype: DType,
+) -> Result<Vec<(String, u64)>> {
+    let (rotated, _) = rotary(config)?;
+    let element = dtype.bytes().unwrap_or(4);
+    Ok(vec![
+        ("video_vae.zero_row".to_owned(), width * element),
+        (
+            "video_vae.register_rows".to_owned(),
+            u64::from(canvas.registers) * 4,
+        ),
+        ("video_vae.zero_rows".to_owned(), u64::from(canvas.tail) * 4),
+        (
+            format!("video_vae.rotary.{rotated}.{}", config.decoder_rope_theta),
+            u64::from(rotated / 2) * 4,
+        ),
+        ("video_vae.voxel_rows".to_owned(), canvas.voxels() * 4),
+    ])
+}
+
 /// Read one weight.
 fn read(loader: &mut WeightLoader, name: &str, shape: &[u64]) -> Result<Weight> {
     Ok(loader.load(&WeightRequest::region(
@@ -931,14 +979,42 @@ fn read(loader: &mut WeightLoader, name: &str, shape: &[u64]) -> Result<Weight> 
     ))?)
 }
 
+/// Check one published constant against [`constants`]' list, so the declaration a caller reserves by
+/// and the tensors the loader publishes are one statement rather than two that can drift.
+fn declared(declared: &[(String, u64)], name: &str, bytes: usize) -> Result<()> {
+    match declared.iter().find(|(entry, _)| entry == name) {
+        Some((_, expected)) if *expected == bytes as u64 => Ok(()),
+        Some((_, expected)) => Err(Error::config(format!(
+            "the constant `{name}` publishes {bytes} bytes where its declared size is {expected}"
+        ))),
+        None => Err(Error::config(format!(
+            "the constant `{name}` is published but not declared"
+        ))),
+    }
+}
+
 /// A constant row of `width` zeros, which the checkpoint's token layout appends.
-fn zeroes(loader: &mut WeightLoader, name: &str, dtype: DType, width: u64) -> Result<Weight> {
+fn zeroes(
+    loader: &mut WeightLoader,
+    declared_sizes: &[(String, u64)],
+    name: &str,
+    dtype: DType,
+    width: u64,
+) -> Result<Weight> {
     let bytes = vec![0u8; (width as usize) * dtype.bytes().unwrap_or(4) as usize];
+    declared(declared_sizes, name, bytes.len())?;
     Ok(loader.constant(name, dtype, Shape::new(&[1, width]), &bytes)?)
 }
 
 /// A constant index table: `count` rows starting at `start`.
-fn indices(loader: &mut WeightLoader, name: &str, start: u32, count: u32) -> Result<Weight> {
+fn indices(
+    loader: &mut WeightLoader,
+    declared_sizes: &[(String, u64)],
+    name: &str,
+    start: u32,
+    count: u32,
+) -> Result<Weight> {
+    declared(declared_sizes, name, count as usize * 4)?;
     let mut bytes = Vec::with_capacity(count as usize * 4);
     for index in 0..count {
         bytes.extend_from_slice(&(start + index).to_le_bytes());
@@ -947,7 +1023,11 @@ fn indices(loader: &mut WeightLoader, name: &str, start: u32, count: u32) -> Res
 }
 
 /// The rotary frequency table of the decoder: `theta^(-2i/rotated)` over the rotated width.
-fn frequencies(loader: &mut WeightLoader, config: &VideoVaeConfig) -> Result<Weight> {
+fn frequencies(
+    loader: &mut WeightLoader,
+    declared_sizes: &[(String, u64)],
+    config: &VideoVaeConfig,
+) -> Result<Weight> {
     let (rotated, sections) = rotary(config)?;
     // One block per axis, each over that axis's own width: the reference builds its embedding with
     // `head_dim · ratio / 3` and reuses those frequencies on all three axes, so axis `a` takes
@@ -971,6 +1051,7 @@ fn frequencies(loader: &mut WeightLoader, config: &VideoVaeConfig) -> Result<Wei
         bytes.extend_from_slice(&value.to_le_bytes());
     }
     let name = format!("video_vae.rotary.{rotated}.{}", config.decoder_rope_theta);
+    declared(declared_sizes, &name, bytes.len())?;
     Ok(loader.constant(&name, DType::F32, Shape::new(&[table.len() as u64]), &bytes)?)
 }
 
