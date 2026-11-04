@@ -653,7 +653,13 @@ fn stage_embedding(args: &Args) -> Result<()> {
     //    missing package is reported as coverage rather than as the first operator to launch.
     // Only the operator this stage launches is required: a key the stage never calls must be
     // reported, not fatal, or a missing sampler program would read as a broken embedding.
-    let needed = needed_keys(&store_root, Stage::Embedding, false, args.kv_pages)?;
+    let needed = needed_keys(
+        &store_root,
+        Stage::Embedding,
+        false,
+        args.kv_pages,
+        Encoded::default(),
+    )?;
     let generation = load_generation(&device, &store_root, &needed)?;
 
     // 3. Weights on the device, through the loader's own boundary, as the checkpoint declares
@@ -886,6 +892,11 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
         Stage::Decode,
         args.generate.is_some(),
         args.kv_pages,
+        Encoded {
+            declared: declared.is_encoded(),
+            tokens: Some(count),
+            generated: args.generate.map(|_| 1),
+        },
     )?;
     let generation = load_generation(&device, &store_root, &needed)?;
 
@@ -1983,6 +1994,56 @@ mod tests {
         assert!(super::reference_margins(&ids_only).is_empty());
     }
 
+    /// An encoded deployment asks the store for its own products, per row count; a dense one asks
+    /// for none of them, so neither representation's gap can block the other's run.
+    #[test]
+    fn an_encoded_deployment_requires_its_own_rows() {
+        let root = Path::new(".");
+        let dense = super::needed_keys(
+            root,
+            Stage::Decode,
+            false,
+            KvPages::Bf16,
+            super::Encoded::default(),
+        )
+        .expect("the fixture");
+        assert!(
+            !dense.iter().any(|(operator, _)| operator.contains("nvfp4")),
+            "{dense:?}"
+        );
+        let encoded = super::needed_keys(
+            root,
+            Stage::Decode,
+            false,
+            KvPages::Bf16,
+            super::Encoded {
+                declared: true,
+                tokens: Some(15),
+                generated: Some(1),
+            },
+        )
+        .expect("the fixture");
+        let packed = encoded
+            .iter()
+            .filter(|(operator, _)| operator == "nvfp4_gemm")
+            .count();
+        // The product is compiled per row count: every `m_15` and `m_1` row the fixture names, and
+        // no row for a count this run will not launch.
+        assert_eq!(packed, 6, "{encoded:?}");
+        for operator in ["nvfp4_quantize", "gather_gemm_nvfp4", "route_gemm_nvfp4"] {
+            assert!(
+                encoded.iter().any(|(name, _)| name == operator),
+                "{operator} missing"
+            );
+        }
+        assert!(
+            !encoded
+                .iter()
+                .any(|(_, descriptor)| descriptor.contains("_m_7_")),
+            "a row count this run will not launch"
+        );
+    }
+
     /// The host tie rule: the first largest wins, which is the one the sampler's argmax takes.
     #[test]
     fn the_argmax_takes_the_first_largest() {
@@ -2611,6 +2672,7 @@ fn needed_keys(
     stage: Stage,
     sampling: bool,
     kv_pages: KvPages,
+    encoded: Encoded,
 ) -> Result<Vec<(String, String)>> {
     let fixture =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../notes/programs/qwen3-moe-keys.txt");
@@ -2640,6 +2702,18 @@ fn needed_keys(
         if scaled != (kv_pages == KvPages::Fp8) {
             continue;
         }
+        // An encoded checkpoint's programs are its own: a dense deployment must not be held up by
+        // them, and an NVFP4 one must not be able to load and then fail at its first product. The
+        // packed product is compiled per row count, so only the counts this run will launch are
+        // required - the prompt's, and one row when a continuation will follow it.
+        let packed_row = operator == "nvfp4_gemm"
+            && [encoded.tokens, encoded.generated]
+                .into_iter()
+                .flatten()
+                .any(|rows| descriptor.contains(&format!("_m_{rows}_")));
+        if encoded.declared != (packed_row || ENCODED_OPERATORS.contains(&operator)) {
+            continue;
+        }
         if !required(stage, operator, sampling) {
             continue;
         }
@@ -2662,9 +2736,11 @@ fn required(stage: Stage, operator: &str, sampling: bool) -> bool {
         Stage::Block | Stage::Decode => {
             MODEL_OPERATORS.contains(&operator)
                 || (sampling && SAMPLER_OPERATORS.contains(&operator))
-                // The scale-deriving write is an fp8 deployment's, and the filter above has already
-                // kept only the rows that deployment selects.
+                // The scale-deriving write is an fp8 deployment's, and the encoded products are an
+                // NVFP4 checkpoint's; the filter above has already kept only the rows that
+                // deployment selects.
                 || operator == "kv_write_scaled"
+                || ENCODED_OPERATORS.contains(&operator)
         }
     }
 }
@@ -2676,6 +2752,21 @@ fn required(stage: Stage, operator: &str, sampling: bool) -> bool {
 /// log-probability of the chosen token is computed on the host from the same row, which keeps this
 /// list at two and keeps a missing `log_softmax` program out of the way of a token's id.
 const SAMPLER_OPERATORS: &[&str] = &["logits_shape", "argmax"];
+
+/// The operators an encoded checkpoint's step launches: the activation encoder, the packed product,
+/// and the two routed products whose grid is the sorted rows.
+const ENCODED_OPERATORS: &[&str] = &["nvfp4_quantize", "gather_gemm_nvfp4", "route_gemm_nvfp4"];
+
+/// What an encoded deployment asks the store for, and which row counts.
+#[derive(Clone, Copy, Default)]
+struct Encoded {
+    /// Whether the checkpoint declares an encoded representation.
+    declared: bool,
+    /// The prompt's row count, which the prefill's packed product is compiled for.
+    tokens: Option<u64>,
+    /// One row, which a continuation's step is compiled for, when one will run.
+    generated: Option<u64>,
+}
 
 /// The operators `Qwen3Moe`'s own forward launches, in the order a layer composes them.
 ///
