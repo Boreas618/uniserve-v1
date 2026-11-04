@@ -412,21 +412,19 @@ fn main() {
         (30, 40), // 480x640
         (30, 52), // 480x832
     ] {
-        for mode in [ops::patch::Mode::Patchify, ops::patch::Mode::Unpatchify] {
-            push(
-                "patch",
-                ops::patch::Descriptor {
-                    dtype: DType::BF16,
-                    channels: 24,
-                    height,
-                    width,
-                    mode,
-                    block: ops::patch::BLOCK,
-                    pdl: PDL,
-                }
-                .to_string(),
-            );
-        }
+        // One key per raster: the inverse is `unpatchify_video` at 1×2×2, not a mode of this op.
+        push(
+            "patch",
+            ops::patch::Descriptor {
+                dtype: DType::BF16,
+                channels: 24,
+                height,
+                width,
+                block: ops::patch::BLOCK,
+                pdl: PDL,
+            }
+            .to_string(),
+        );
     }
     // The two `unpatchify_video` geometries the decoder needs: the latents and the decoder's own
     // output. The token grid is the request's -- its clip length and its canvas -- so it is a launch
