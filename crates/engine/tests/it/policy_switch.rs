@@ -415,7 +415,6 @@ fn the_engines_commands_reach_a_scheduler_and_name_what_is_not_its_own() {
             proto::process::Precopy {
                 kernels: Vec::new(),
                 policy: None,
-                generation: 2,
             },
         )),
     };

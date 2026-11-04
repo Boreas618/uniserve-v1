@@ -30,7 +30,7 @@ use std::sync::OnceLock;
 use scheduling::guest::decision::{Plan, Room, Shortage, Victim};
 use scheduling::guest::event::Event;
 use scheduling::guest::ids::PageId;
-use scheduling::guest::limits::{Limits, Parameters};
+pub use scheduling::guest::limits::{Limits, Parameters};
 use scheduling::guest::policy::Instantiation;
 use scheduling::guest::view::{
     CallView, ExpertLoad, ExpertOrder, RankView, ReplicaView, RequestState, RequestView, Snapshot,
