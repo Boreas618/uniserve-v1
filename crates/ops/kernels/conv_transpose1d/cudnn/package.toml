@@ -1,0 +1,57 @@
+# The conv_transpose1d operator's cudnn backend: design 5.2's program package.
+#
+# One native module per descriptor. The module is the convolution itself, through
+# cuDNN 9's backend API: an engine per shape, chosen once (`tuning/engines.json`
+# when a tuning pass has run, cuDNN's first proposal until then) and executed on
+# the caller's stream, workspace from the stream's pool so a captured graph
+# records it.
+#
+# The audio decoder's upsampling layers are transposed convolutions, which cuDNN
+# runs as the backward-data pass of the convolution each layer transposes: the
+# layer's weight is `[c, k/groups, t]` in memory and is read by the pass as
+# `[k, c, t]` through the filter descriptor's strides, without copying it. The
+# layer's output padding is zero in `ops`, so both paddings are the layer's own.
+# A grouped transposed convolution is not described by that pass in this layout
+# and the module refuses it.
+#
+# The key is the operator crate's, all three axes printed as the geometry carries
+# them: `input_bf16_weight_bf16_output_bf16_geometry_kernel_4x1x1_stride_2x1x1_`
+# `padding_1x1x1_dilation_1x1x1_groups_1_bias_false_tf32_false_rank_1_`
+# `transposed_true`.
+#
+# `tf32` describes FP32 inputs only: cuDNN 9's backend API chooses the engine's
+# arithmetic and exposes no math-type knob, so an FP32 convolution runs the engine
+# cuDNN proposes and a half-precision one has no such choice. A descriptor whose
+# `tf32` disagrees with its input type is refused at launch rather than run.
+
+op = "conv_transpose1d"
+backend = "cudnn"
+
+[toolchain]
+kind = "nvcc"
+version = "13.0.48"
+packages = []
+
+[module]
+form = "native"
+
+[module.entries]
+launch = "uniserve_conv_transpose1d"
+
+[source]
+kind = "cuda"
+files = [
+    "include/uniserve_conv.h",
+    "src/conv.cu",
+    "src/build.py",
+]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_100f"]
+
+[kernel.descriptors]
+dimensions = { input = ["bf16", "f32"], weight = ["bf16", "f32"], output = ["bf16", "f32"], geometry_kernel = ["4x1x1", "2x1x1", "8x1x1"], stride = ["2x1x1", "1x1x1"], padding = ["1x1x1", "0x0x0"], dilation = ["1x1x1"], groups = ["1"], bias = ["false"], tf32 = ["true", "false"], rank = ["1"], transposed = ["true"] }
+
+[parameters]
