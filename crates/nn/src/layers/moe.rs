@@ -48,6 +48,30 @@ const MMA_TILE: (u32, u32) = (128, 128);
 /// The cluster shape the grouped products' packages are compiled for.
 const MMA_CLUSTER: (u32, u32) = (1, 1);
 
+/// What a block's routing prefix produced: the views every expert product and the combine read.
+///
+/// All of them are the forward's arena, sized from the routing geometry, so a captured graph
+/// replays over the same addresses however the router routes a later batch.
+#[derive(Clone, Copy)]
+struct Routes {
+    /// `[tokens, top]` i32: the weight row of each route.
+    local_ids: TensorView,
+    /// `[tokens, top]` f32: the route's normalized weight.
+    weights: TensorView,
+    /// The permuted rows the products write, padding included.
+    rows: u64,
+    /// `[max_tiles]` i32: the expert of each tile.
+    tile_to_expert: TensorView,
+    /// `[max_tiles]` i32: the live rows of each tile.
+    tile_to_limit: TensorView,
+    /// `[tokens, top]` i32: the permuted row of each expanded route.
+    expanded_to_permuted: TensorView,
+    /// `[max_permuted_rows]` i32: the expanded route of each permuted row.
+    permuted_to_expanded: TensorView,
+    /// `[1]` i32: the live tiles.
+    num_non_exiting_tiles: TensorView,
+}
+
 /// A mixture-of-experts block over a colocated expert group.
 pub struct Moe {
     router: Linear,
@@ -285,40 +309,18 @@ impl Moe {
         self.experts
     }
 
-    /// `out = Σ_routes weight · expert(hidden)`.
+    /// The routing prefix: the router, its top-k, the expert map, and the sort that groups the
+    /// routes into the tiles a grouped product reads.
     ///
-    /// `hidden` and `out` are `[tokens, hidden]`.
-    pub fn forward(&self, f: &Forward, hidden: TensorView, out: TensorView) -> Result<()> {
-        if self.local != self.experts || f.exchange.is_some() {
-            return Err(Error::Unsupported(
-                "Moe: this block's experts are split across ranks; call \
-                 forward_expert_parallel so the routes travel over the exchange"
-                    .to_owned(),
-            ));
-        }
-        let hidden_width = u64::from(self.hidden);
-        hidden
-            .require_row("Moe", hidden.dtype, hidden_width)
-            .map_err(Error::from)?;
-        out.require_row("Moe", out.dtype, hidden_width)
-            .map_err(Error::from)?;
-        if hidden.rows() != out.rows() {
-            return Err(Error::shape(
-                "Moe",
-                format!(
-                    "{} input rows against {} output rows",
-                    hidden.rows(),
-                    out.rows()
-                ),
-            ));
-        }
+    /// Every expert product a block can run starts here and differs only in the two multiplies, so
+    /// the prefix is one path: a variant that multiplies something else still routes, sorts and
+    /// combines identically, and a heavy quantized product cannot drift from the dense one.
+    fn route(&self, f: &Forward, hidden: TensorView) -> Result<Routes> {
         let tokens = hidden.rows();
         let top = u64::from(self.top);
         let experts = u64::from(self.experts);
-        let intermediate = u64::from(self.intermediate);
         let arena = f.arena();
 
-        // 1. The replicated router, then its top-k.
         let scores = arena.tensor(hidden.dtype, Shape::new(&[tokens, experts]))?;
         let ids = arena.tensor(DType::I32, Shape::new(&[tokens, top]))?;
         let weights = arena.tensor(DType::F32, Shape::new(&[tokens, top]))?;
@@ -339,7 +341,7 @@ impl Moe {
 
         f.operate::<TopkSoftmax>(&routing, args)?;
 
-        // 2. Logical ids become weight rows.
+        // Logical ids become weight rows.
         let local_ids = match &self.map {
             Some(map) => {
                 let mapped = arena.tensor(DType::I32, Shape::new(&[tokens, top]))?;
@@ -359,7 +361,7 @@ impl Moe {
             None => ids,
         };
 
-        // 3. Group the routes by expert into the tiles the products read.
+        // Group the routes by expert into the tiles the products read.
         let tiles = ops::moe::max_tiles(tokens, top, experts, u64::from(self.tile));
         let rows = ops::moe::max_permuted_rows(tokens, top, experts, u64::from(self.tile));
         let tile_to_expert = arena.tensor(DType::I32, Shape::new(&[tiles]))?;
@@ -389,8 +391,55 @@ impl Moe {
 
         f.operate::<MoeSort>(&sort, args)?;
 
+        Ok(Routes {
+            local_ids,
+            weights,
+            rows,
+            tile_to_expert,
+            tile_to_limit,
+            expanded_to_permuted,
+            permuted_to_expanded,
+            num_non_exiting_tiles,
+        })
+    }
+
+    /// `out = Σ_routes weight · expert(hidden)`.
+    ///
+    /// `hidden` and `out` are `[tokens, hidden]`.
+    pub fn forward(&self, f: &Forward, hidden: TensorView, out: TensorView) -> Result<()> {
+        if self.local != self.experts || f.exchange.is_some() {
+            return Err(Error::Unsupported(
+                "Moe: this block's experts are split across ranks; call \
+                 forward_expert_parallel so the routes travel over the exchange"
+                    .to_owned(),
+            ));
+        }
+        let hidden_width = u64::from(self.hidden);
+        hidden
+            .require_row("Moe", hidden.dtype, hidden_width)
+            .map_err(Error::from)?;
+        out.require_row("Moe", out.dtype, hidden_width)
+            .map_err(Error::from)?;
+        if hidden.rows() != out.rows() {
+            return Err(Error::shape(
+                "Moe",
+                format!(
+                    "{} input rows against {} output rows",
+                    hidden.rows(),
+                    out.rows()
+                ),
+            ));
+        }
+        let tokens = hidden.rows();
+        let top = u64::from(self.top);
+        let intermediate = u64::from(self.intermediate);
+        let arena = f.arena();
+
+        // 1-3. The router, its top-k, the map and the sort: the prefix every expert product shares.
+        let routes = self.route(f, hidden)?;
+
         // 4. FC1: the gated product of each permuted row, then FC2.
-        let gated = arena.tensor(hidden.dtype, Shape::new(&[rows, intermediate]))?;
+        let gated = arena.tensor(hidden.dtype, Shape::new(&[routes.rows, intermediate]))?;
         let first = GatherGemmDescriptor {
             hidden: self.hidden,
             intermediate: self.intermediate,
@@ -404,11 +453,11 @@ impl Moe {
         let args = GatherGemmArgs {
             hidden,
             weights: self.up_gate.view(),
-            ids: local_ids,
-            tile_to_expert,
-            tile_to_limit,
-            permuted_to_expanded,
-            num_non_exiting_tiles,
+            ids: routes.local_ids,
+            tile_to_expert: routes.tile_to_expert,
+            tile_to_limit: routes.tile_to_limit,
+            permuted_to_expanded: routes.permuted_to_expanded,
+            num_non_exiting_tiles: routes.num_non_exiting_tiles,
             out: gated,
         };
 
@@ -427,11 +476,11 @@ impl Moe {
         let args = RouteGemmArgs {
             rows: gated,
             weights: self.down.view(),
-            ids: local_ids,
-            tile_to_expert,
-            tile_to_limit,
-            permuted_to_expanded,
-            num_non_exiting_tiles,
+            ids: routes.local_ids,
+            tile_to_expert: routes.tile_to_expert,
+            tile_to_limit: routes.tile_to_limit,
+            permuted_to_expanded: routes.permuted_to_expanded,
+            num_non_exiting_tiles: routes.num_non_exiting_tiles,
             out: products,
         };
 
@@ -448,8 +497,8 @@ impl Moe {
         };
         let args = UnpermuteArgs {
             routes: products,
-            expanded_to_permuted,
-            scales: weights,
+            expanded_to_permuted: routes.expanded_to_permuted,
+            scales: routes.weights,
             out,
         };
 
@@ -652,11 +701,16 @@ impl Moe {
         f.operate::<MoeSort>(&sort, args)?;
 
         // 5. FC1 and FC2 over the received rows, with this rank's experts.
+        //
+        // The products name the resident stack's expert count, not the vocabulary's: `up_gate` and
+        // `down` hold `local` experts, and the sort rebased every received route into that window
+        // with `local_offset`, so the vocabulary count would name a stack this rank does not hold
+        // (and the operator's shape check would refuse the launch).
         let gated = arena.tensor(hidden.dtype, Shape::new(&[rows, intermediate]))?;
         let first = GatherGemmDescriptor {
             hidden: self.hidden,
             intermediate: self.intermediate,
-            experts: self.experts,
+            experts: self.local,
             top: self.top,
             activation: self.activation,
             dtype: hidden.dtype,
@@ -680,7 +734,7 @@ impl Moe {
         let second = RouteGemmDescriptor {
             hidden: self.hidden,
             intermediate: self.intermediate,
-            experts: self.experts,
+            experts: self.local,
             top: self.top,
             dtype: hidden.dtype,
             tile: MMA_TILE,

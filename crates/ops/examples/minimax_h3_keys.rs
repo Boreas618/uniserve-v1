@@ -360,6 +360,120 @@ fn main() {
         }
         .to_string(),
     );
+    // The DiT's attention: one dense program over the packed sequence. `max_kv_len` is a declared
+    // bound outside the key (a padded-token bucket up to 174,598 for the widest layout), so the key
+    // names only the geometry. The batch path carries `[batch + 1]` offsets.
+    push(
+        "dense_attention",
+        ops::attention::dense::DenseDescriptor {
+            query: DType::BF16,
+            key_value: DType::BF16,
+            output: DType::BF16,
+            head_dim: HEAD_DIM,
+            q_heads: HEADS,
+            kv_heads: HEADS,
+            mask: ops::attention::Mask::Dense,
+            windowed: false,
+            max_kv_len: 174_598,
+            cu_seq_lens: true,
+        }
+        .to_string(),
+    );
+    // The VSA branch's own attention: one program per tile size, and the key extent (tiles per
+    // segment per layout) is a declared bound outside the key.
+    push(
+        "sparse_attention",
+        ops::attention::sparse::SparseDescriptor {
+            block: 64,
+            dtype: DType::BF16,
+            output: DType::BF16,
+            head_dim: HEAD_DIM,
+            lse: false,
+            keys: 65_536,
+        }
+        .to_string(),
+    );
+    // The DiT's row mapping, one key per latent raster the served canvases produce. The canvas is
+    // divided by the VAE's 16x spatial compression, and each side is even for every served canvas
+    // because the canvas's sides are multiples of the model's own step.
+    for (height, width) in [
+        (96, 42), // 1536x672
+        (84, 48), // 1344x768
+        (64, 48), // 1024x768
+        (48, 48), // 768x768
+        (48, 64), // 768x1024
+        (42, 48), // 672x768
+        // The 480p class: its caps give pixel sides like 992 and 832, but a canvas side is a
+        // multiple of 32, so every latent side stays even.
+        (62, 26), // 992x416
+        (52, 30), // 832x480
+        (40, 30), // 640x480
+        (30, 30), // 480x480
+        (30, 40), // 480x640
+        (30, 52), // 480x832
+    ] {
+        for mode in [ops::patch::Mode::Patchify, ops::patch::Mode::Unpatchify] {
+            push(
+                "patch",
+                ops::patch::Descriptor {
+                    dtype: DType::BF16,
+                    channels: 24,
+                    height,
+                    width,
+                    mode,
+                    block: ops::patch::BLOCK,
+                    pdl: PDL,
+                }
+                .to_string(),
+            );
+        }
+    }
+    // The audio decoder's fused BigVGAN block, at the decoder's own rate and taps.
+    push(
+        "audio_activation",
+        ops::audio_activation::Descriptor {
+            dtype: DType::F32,
+            channels: DECODER_DIM,
+            kernel: ACTIVATION_KERNEL,
+            ratio: ACTIVATION_RATIO,
+            block: 1024,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
+    // The timestep embedding's activation, over the transformer's hidden width.
+    push(
+        "silu",
+        ops::activation::SiluDescriptor {
+            dtype: DType::BF16,
+            columns: HIDDEN,
+            block: 1024,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
+    // The solver's Euler step: an FP32 source added into a BF16 running sample.
+    push(
+        "scaled_add",
+        ops::residual::ScaledAddDescriptor {
+            target: DType::BF16,
+            source: DType::F32,
+            columns: HIDDEN,
+            block: 1024,
+        }
+        .to_string(),
+    );
+    // The audio decoder's last step: two float channels to interleaved 16-bit PCM. The clip's length
+    // is a launch value, so the key holds only the element type and the block.
+    push(
+        "pcm_interleave",
+        ops::pcm::Descriptor {
+            dtype: DType::F32,
+            block: ops::pcm::BLOCK,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
     push(
         "philox_noise",
         NoiseDescriptor {
