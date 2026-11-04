@@ -667,12 +667,10 @@ pub(crate) fn validate_place(
             ),
         ));
     };
-    if !replica.kinds.contains(&call.kind) {
-        return Err(invalid(
-            Call::Place,
-            format!("replica {chosen} does not run {:?} calls", call.kind),
-        ));
-    }
+    // A prefill-only replica is refused with its own reason before the
+    // generic one: it is the case a policy meets most often, and "runs prefill
+    // only" says what to do about it, where "does not run Decode calls" does
+    // not.
     if replica.prefills_only && decodes(call.kind) {
         return Err(invalid(
             Call::Place,
@@ -680,6 +678,12 @@ pub(crate) fn validate_place(
                 "replica {chosen} runs prefill only, a {:?} call cannot land on it",
                 call.kind
             ),
+        ));
+    }
+    if !replica.kinds.contains(&call.kind) {
+        return Err(invalid(
+            Call::Place,
+            format!("replica {chosen} does not run {:?} calls", call.kind),
         ));
     }
     Ok(())
@@ -797,6 +801,8 @@ pub(crate) struct Recorder {
     /// The features no view of the request carries any more, kept for
     /// `views.rs` between one step and the next.
     recorded: RecordedTable,
+    /// Requests the policy was told had ended and has not been told of since.
+    finished: BTreeSet<RequestId>,
 }
 
 impl Recorder {
@@ -830,6 +836,7 @@ impl Recorder {
             told,
             touched: BTreeMap::new(),
             recorded,
+            finished: BTreeSet::new(),
         }
     }
 
@@ -849,6 +856,7 @@ impl Recorder {
     pub(crate) fn record(&mut self, event: Event) {
         match &event {
             Event::Arrived { request } => {
+                self.finished.remove(&request.id);
                 self.told.insert(request.id, request.clone());
                 self.recorded.insert(
                     ipc::RequestId(request.id.0),
@@ -867,6 +875,7 @@ impl Recorder {
                 }
             }
             Event::Finished { request, .. } => {
+                self.finished.insert(*request);
                 self.told.remove(request);
                 self.touched.remove(request);
                 self.recorded.remove(&ipc::RequestId(request.0));
@@ -889,8 +898,17 @@ impl Recorder {
     }
 
     /// Closes the step: one `Updated` per request whose view moved.
+    ///
+    /// A request the policy was told had ended is skipped even when a view of it
+    /// is touched afterwards: its end is the last thing the policy acts on, and
+    /// an update after it would be about a request it has already retired. The
+    /// id is forgotten as soon as that touch is skipped, so the set holds only
+    /// the requests that ended in this step.
     pub(crate) fn close(&mut self) {
         for (id, view) in std::mem::take(&mut self.touched) {
+            if self.finished.remove(&id) {
+                continue;
+            }
             let changed = self.told.get(&id).is_none_or(|told| moved(told, &view));
             if changed {
                 self.told.insert(id, view.clone());
@@ -1492,8 +1510,11 @@ mod tests {
         validate_victims(&units, &[Victim::Request(RequestId(2))], &live)
             .expect("a migratable request");
 
-        let error = validate_victims(&units, &[], &live).expect_err("nothing freed");
-        assert!(format!("{error}").contains("nothing was freed"));
+        // Freeing nothing is a legal answer: work that did not fit waits for
+        // the next step, and §4.4's watchdog is what fails a policy that then
+        // never advances a resident request. The shortage itself is not a
+        // failure, because a policy may have nothing it may free.
+        validate_victims(&units, &[], &live).expect("freeing nothing is legal");
         let error = validate_victims(&units, &[Victim::Request(RequestId(1))], &live)
             .expect_err("not migratable");
         assert!(format!("{error}").contains("not migratable"));

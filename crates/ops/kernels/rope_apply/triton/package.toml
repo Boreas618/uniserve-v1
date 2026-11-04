@@ -1,0 +1,48 @@
+# The rope_apply operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py`.
+#
+# One program rotates `rows` tokens' heads: a head's leading `rotated` channels
+# turn by the token's own cosine and sine factors in the descriptor's pairing,
+# and the channels past the rotation are copied. The tables arrive already
+# evaluated, so nothing here reads a position or a frequency.
+
+op = "rope_apply"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/rope_apply.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+# `dtype_bf16_output_bf16_head_dim_72_heads_16_rotation_half_rows_8_block_128_pdl_false`.
+#
+# `rotation` is the pairing rule and not a separate convention: `half` pairs
+# channel `j` with `j + rotated/2`, `interleaved` pairs `2j` with `2j + 1`, and
+# the operator's own documentation states both. H3's audio path rotates all 72
+# channels of its 16 heads with the split-half pairing, which is the key above.
+#
+# The second shape is a rotation narrower than the head — a multimodal
+# transformer turns part of a head — which is the same program with the tail
+# copied through; the operator prints `rotated` only for that form.
+[[kernel.descriptors]]
+dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = ["72", "128", "64"], heads = ["16", "8", "32"], rotation = ["half", "interleaved"], rows = ["8", "1", "4"], block = ["128", "64"], pdl = ["true", "false"] }
+
+[[kernel.descriptors]]
+dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = ["128", "96", "64"], heads = ["16", "8", "32"], rotation = ["half", "interleaved"], rows = ["8", "1"], block = ["128", "64"], pdl = ["true", "false"], rotated = ["96", "64", "32"] }
+
+[parameters]
