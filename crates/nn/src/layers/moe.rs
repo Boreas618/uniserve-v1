@@ -23,6 +23,7 @@
 //! expert refuses the forward rather than computing a routing the weights do not have.
 
 use ops::moe::combine::{self, MoeUnpermute, UnpermuteArgs};
+use ops::moe::exchange::{self, ExchangeArgs, ExpertExchange, Mode};
 use ops::moe::grouped::{
     Activation, GatherGemm, GatherGemmArgs, GatherGemmDescriptor, RouteGemm, RouteGemmArgs,
     RouteGemmDescriptor,
@@ -31,7 +32,7 @@ use ops::moe::routing::{
     ExpertGather, GatherArgs, GatherDescriptor, TopkArgs, TopkDescriptor, TopkSoftmax,
 };
 use ops::moe::sort::{self, MoeSort, SortArgs};
-use ops::{DType, Op, Shape, TensorView};
+use ops::{DType, DevicePtr, Op, Shape, TensorView};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -61,6 +62,10 @@ pub struct Moe {
     renormalize: bool,
     scale: Option<Weight>,
     tile: u32,
+    /// Experts of the vocabulary this rank holds; every expert in the colocated case.
+    local: u32,
+    /// The first expert of this rank's window.
+    local_offset: u32,
 }
 
 impl Moe {
@@ -81,6 +86,41 @@ impl Moe {
         down: Weight,
         map: Option<Weight>,
         experts: u32,
+        top: u32,
+        activation: Activation,
+        renormalize: bool,
+        scale: Option<Weight>,
+    ) -> Result<Self> {
+        // The colocated case: every expert of the vocabulary is resident here.
+        Self::build(
+            router,
+            up_gate,
+            down,
+            map,
+            experts,
+            experts,
+            0,
+            top,
+            activation,
+            renormalize,
+            scale,
+        )
+    }
+
+    /// The block over `local` experts of the vocabulary starting at `local_offset`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the block is named by its parts: the router, the two expert stacks, the map, \
+                  the vocabulary, the resident window and the routing"
+    )]
+    fn build(
+        router: Linear,
+        up_gate: Weight,
+        down: Weight,
+        map: Option<Weight>,
+        experts: u32,
+        local: u32,
+        local_offset: u32,
         top: u32,
         activation: Activation,
         renormalize: bool,
@@ -113,25 +153,35 @@ impl Moe {
                 ),
             ));
         }
-        if up_gate.shape().rank() != 3 || up_gate.shape().dim(0) != u64::from(experts) {
+        if local == 0
+            || local_offset
+                .checked_add(local)
+                .is_none_or(|end| end > experts)
+        {
+            return Err(Error::shape(
+                "Moe",
+                format!("a window of {local} experts at {local_offset} does not lie in {experts}"),
+            ));
+        }
+        if up_gate.shape().rank() != 3 || up_gate.shape().dim(0) != u64::from(local) {
             return Err(Error::shape(
                 "Moe",
                 format!(
-                    "the up/gate weight is {:?}, [{experts}, 2·intermediate, hidden] expected",
+                    "the up/gate weight is {:?}, [{local}, 2·intermediate, hidden] expected",
                     up_gate.shape().dims()
                 ),
             ));
         }
         let intermediate = up_gate.shape().dim(1) / 2;
         if down.shape().rank() != 3
-            || down.shape().dim(0) != u64::from(experts)
+            || down.shape().dim(0) != u64::from(local)
             || down.shape().dim(1) != up_gate.shape().dim(2)
             || down.shape().dim(2) != intermediate
         {
             return Err(Error::shape(
                 "Moe",
                 format!(
-                    "the down weight is {:?}, [{experts}, {}, {intermediate}] expected",
+                    "the down weight is {:?}, [{local}, {}, {intermediate}] expected",
                     down.shape().dims(),
                     up_gate.shape().dim(2)
                 ),
@@ -176,7 +226,53 @@ impl Moe {
             renormalize,
             scale,
             tile: 128,
+            local,
+            local_offset,
         })
+    }
+
+    /// The same block placed on one rank of an expert-parallel group.
+    ///
+    /// `up_gate` and `down` hold this rank's `[local, ...]` experts only and `experts` is the
+    /// router's whole vocabulary (the router is replicated, as the model's routing is). `local` is
+    /// the number of experts the rank holds and `local_offset` the first of them in the router's
+    /// order; the pair must tile the vocabulary across the group.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the block is named by its parts: the router, the two expert stacks, the map, \
+                  the vocabulary, the resident window and the routing"
+    )]
+    pub fn expert_parallel(
+        router: Linear,
+        up_gate: Weight,
+        down: Weight,
+        map: Option<Weight>,
+        experts: u32,
+        local: u32,
+        local_offset: u32,
+        top: u32,
+        activation: Activation,
+        renormalize: bool,
+        scale: Option<Weight>,
+    ) -> Result<Self> {
+        Self::build(
+            router,
+            up_gate,
+            down,
+            map,
+            experts,
+            local,
+            local_offset,
+            top,
+            activation,
+            renormalize,
+            scale,
+        )
+    }
+
+    /// The experts this rank holds.
+    pub const fn local_experts(&self) -> u32 {
+        self.local
     }
 
     /// The experts each token routes to.
@@ -193,6 +289,13 @@ impl Moe {
     ///
     /// `hidden` and `out` are `[tokens, hidden]`.
     pub fn forward(&self, f: &Forward, hidden: TensorView, out: TensorView) -> Result<()> {
+        if self.local != self.experts || f.exchange.is_some() {
+            return Err(Error::Unsupported(
+                "Moe: this block's experts are split across ranks; call \
+                 forward_expert_parallel so the routes travel over the exchange"
+                    .to_owned(),
+            ));
+        }
         let hidden_width = u64::from(self.hidden);
         hidden
             .require_row("Moe", hidden.dtype, hidden_width)
@@ -351,6 +454,285 @@ impl Moe {
         };
         let kernel = f.kernels().op::<MoeUnpermute>(&combine)?;
         MoeUnpermute::launch(kernel, &combine, args, f.stream).map_err(Error::from)
+    }
+
+    /// `out = Σ_routes weight · expert(hidden)` over an expert-parallel group.
+    ///
+    /// The rank routes every token over the whole vocabulary, sends each token's payload to the
+    /// ranks that hold its experts (`dispatch`), multiplies the routes it was sent with its own
+    /// experts, and sums the ranks' partial results back into its own rows (`combine`,
+    /// specs/worker.md 9's expert rows, `uniserve/backends/experts/alltoall.py` today).
+    ///
+    /// `exchange` is the executor's bundle for this group: the package's transport and the views of
+    /// its workspace — the rows this rank received at dispatch, with their ids and weights, in the
+    /// package's capacity-sized layout. The layer never allocates or owns any of it.
+    ///
+    /// Every buffer is the worst case for the group's capacity, so a captured graph replays over
+    /// the same addresses however the router routes a later batch.
+    pub fn forward_expert_parallel(
+        &self,
+        f: &Forward,
+        hidden: TensorView,
+        out: TensorView,
+    ) -> Result<()> {
+        let exchange = f.exchange.ok_or_else(|| {
+            Error::shape(
+                "Moe",
+                "an expert-parallel block reads the group's exchange views, and the forward \
+                 borrows none"
+                    .to_owned(),
+            )
+        })?;
+        exchange.require_extents("Moe")?;
+        let hidden_width = u64::from(self.hidden);
+        let top = u64::from(self.top);
+        let ranks = u64::from(exchange.ranks);
+        let capacity = u64::from(exchange.capacity);
+        let received = u64::from(exchange.ranks) * capacity;
+        let tokens = hidden.rows();
+
+        hidden
+            .require_row("Moe", hidden.dtype, hidden_width)
+            .map_err(Error::from)?;
+        out.require_row("Moe", out.dtype, hidden_width)
+            .map_err(Error::from)?;
+        if out.rows() != tokens {
+            return Err(Error::shape(
+                "Moe",
+                format!("{tokens} input rows against {} output rows", out.rows()),
+            ));
+        }
+        // The group's geometry has to agree with the placement the block was built for.
+        let expected_ranks = u64::from(self.experts / self.local.max(1));
+        if ranks != expected_ranks {
+            return Err(Error::shape(
+                "Moe",
+                format!(
+                    "the exchange has {ranks} ranks, {} experts over this rank's {} tile into \
+                     {expected_ranks}",
+                    self.experts, self.local
+                ),
+            ));
+        }
+        if capacity == 0 || received == 0 {
+            return Err(Error::shape(
+                "Moe",
+                "the exchange's capacity is empty: a rank sends at least one row".to_owned(),
+            ));
+        }
+        if tokens > capacity {
+            return Err(Error::shape(
+                "Moe",
+                format!("the batch has {tokens} tokens, the exchange carries {capacity} per rank"),
+            ));
+        }
+        for (name, view, dtype) in [
+            ("ids", exchange.ids, DType::I32),
+            ("weights", exchange.weights, DType::F32),
+            ("counts", exchange.counts, DType::I32),
+        ] {
+            if view.dtype != dtype {
+                return Err(Error::shape(
+                    "Moe",
+                    format!("the exchange's {name} are {}, not {dtype}", view.dtype),
+                ));
+            }
+        }
+        if exchange.states.dtype != hidden.dtype {
+            return Err(Error::shape(
+                "Moe",
+                format!(
+                    "the exchange carries {} rows, the batch is {}",
+                    exchange.states.dtype, hidden.dtype
+                ),
+            ));
+        }
+
+        let experts = u64::from(self.experts);
+        let local = u64::from(self.local);
+        let intermediate = u64::from(self.intermediate);
+        let arena = f.arena();
+        let empty = TensorView::new(DevicePtr::new(0), DType::U8, Shape::new(&[0]));
+
+        // 1. The replicated router and its top-k: every rank routes whole tokens the same way.
+        let scores = arena.tensor(hidden.dtype, Shape::new(&[tokens, experts]))?;
+        let ids = arena.tensor(DType::I32, Shape::new(&[tokens, top]))?;
+        let weights = arena.tensor(DType::F32, Shape::new(&[tokens, top]))?;
+        self.router.forward(f, hidden, scores)?;
+        let routing = TopkDescriptor {
+            scores: scores.dtype,
+            experts: self.experts,
+            top: self.top,
+            renormalize: self.renormalize,
+            scale: self.scale.as_ref().map(Weight::dtype),
+        };
+        let args = TopkArgs {
+            scores,
+            scale: self.scale.as_ref().map(Weight::view),
+            ids,
+            weights,
+        };
+        let kernel = f.kernels().op::<TopkSoftmax>(&routing)?;
+        TopkSoftmax::launch(kernel, &routing, args, f.stream)?;
+
+        // 2. Logical ids become weight rows before anything leaves the rank, so a peer sorts by the
+        //    same physical order the weights are stacked in.
+        let sent = match &self.map {
+            Some(map) => {
+                let mapped = arena.tensor(DType::I32, Shape::new(&[tokens, top]))?;
+                let descriptor = GatherDescriptor {
+                    experts: self.experts,
+                    top: self.top,
+                };
+                let args = GatherArgs {
+                    ids,
+                    map: map.view(),
+                    out: mapped,
+                };
+                let kernel = f.kernels().op::<ExpertGather>(&descriptor)?;
+                ExpertGather::launch(kernel, &descriptor, args, f.stream)?;
+                mapped
+            }
+            None => ids,
+        };
+
+        // 3. Dispatch: each token's payload goes to the ranks that hold its experts.
+        let exchange_descriptor = |mode: Mode| exchange::Descriptor {
+            mode,
+            hidden: self.hidden,
+            top: self.top,
+            experts: self.experts,
+            max_tokens: exchange.capacity,
+            ranks: exchange.ranks,
+            dtype: hidden.dtype,
+        };
+        let dispatch = exchange_descriptor(Mode::Dispatch);
+        let args = ExchangeArgs {
+            transport: exchange.transport,
+            tokens: u32::try_from(tokens)
+                .map_err(|_| Error::shape("Moe", format!("{tokens} tokens exceed u32")))?,
+            state: hidden,
+            ids: sent,
+            weights,
+            out: empty,
+            counts: exchange.counts,
+            ranks: exchange.ranks,
+        };
+        let kernel = f.kernels().op::<ExpertExchange>(&dispatch)?;
+        ExpertExchange::launch(kernel, &dispatch, args, f.stream)?;
+
+        // 4. The rows this rank was sent, grouped by its own experts.
+        let tiles = ops::moe::max_tiles(received, top, local, u64::from(self.tile));
+        let rows = ops::moe::max_permuted_rows(received, top, local, u64::from(self.tile));
+        let tile_to_expert = arena.tensor(DType::I32, Shape::new(&[tiles]))?;
+        let tile_to_limit = arena.tensor(DType::I32, Shape::new(&[tiles]))?;
+        let expanded_to_permuted = arena.tensor(DType::I32, Shape::new(&[received, top]))?;
+        let permuted_to_expanded = arena.tensor(DType::I32, Shape::new(&[rows]))?;
+        let total_padded_tokens = arena.tensor(DType::I32, Shape::new(&[1]))?;
+        let num_non_exiting_tiles = arena.tensor(DType::I32, Shape::new(&[1]))?;
+        let sort = sort::Descriptor {
+            experts: self.experts,
+            top: self.top,
+            local_experts: self.local,
+            tile_tokens: self.tile,
+            scales: DType::F32,
+        };
+        let args = SortArgs {
+            ids: exchange.ids,
+            scales: exchange.weights,
+            tile_to_expert,
+            tile_to_limit,
+            expanded_to_permuted,
+            permuted_to_expanded,
+            total_padded_tokens,
+            num_non_exiting_tiles,
+            local_offset: self.local_offset,
+        };
+        let kernel = f.kernels().op::<MoeSort>(&sort)?;
+        MoeSort::launch(kernel, &sort, args, f.stream)?;
+
+        // 5. FC1 and FC2 over the received rows, with this rank's experts.
+        let gated = arena.tensor(hidden.dtype, Shape::new(&[rows, intermediate]))?;
+        let first = GatherGemmDescriptor {
+            hidden: self.hidden,
+            intermediate: self.intermediate,
+            experts: self.experts,
+            top: self.top,
+            activation: self.activation,
+            dtype: hidden.dtype,
+            tile: MMA_TILE,
+            cluster: MMA_CLUSTER,
+        };
+        let args = GatherGemmArgs {
+            hidden: exchange.states,
+            weights: self.up_gate.view(),
+            ids: exchange.ids,
+            tile_to_expert,
+            tile_to_limit,
+            permuted_to_expanded,
+            num_non_exiting_tiles,
+            out: gated,
+        };
+        let kernel = f.kernels().op::<GatherGemm>(&first)?;
+        GatherGemm::launch(kernel, &first, args, f.stream)?;
+
+        let products = arena.tensor(hidden.dtype, Shape::new(&[received * top, hidden_width]))?;
+        let second = RouteGemmDescriptor {
+            hidden: self.hidden,
+            intermediate: self.intermediate,
+            experts: self.experts,
+            top: self.top,
+            dtype: hidden.dtype,
+            tile: MMA_TILE,
+            cluster: MMA_CLUSTER,
+        };
+        let args = RouteGemmArgs {
+            rows: gated,
+            weights: self.down.view(),
+            ids: exchange.ids,
+            tile_to_expert,
+            tile_to_limit,
+            permuted_to_expanded,
+            num_non_exiting_tiles,
+            out: products,
+        };
+        let kernel = f.kernels().op::<RouteGemm>(&second)?;
+        RouteGemm::launch(kernel, &second, args, f.stream)?;
+
+        // 6. Each received row's routes summed with their FP32 weights, in receive order.
+        let combined = arena.tensor(hidden.dtype, Shape::new(&[received, hidden_width]))?;
+        let combine_descriptor = combine::Descriptor {
+            hidden: self.hidden,
+            top: self.top,
+            experts: self.experts,
+            input: products.dtype,
+            scales: DType::F32,
+            output: hidden.dtype,
+        };
+        let args = UnpermuteArgs {
+            routes: products,
+            expanded_to_permuted,
+            scales: exchange.weights,
+            out: combined,
+        };
+        let kernel = f.kernels().op::<MoeUnpermute>(&combine_descriptor)?;
+        MoeUnpermute::launch(kernel, &combine_descriptor, args, f.stream)?;
+
+        // 7. Combine: the ranks' partial sums for this rank's tokens, rounded once to `out`.
+        let combine_exchange = exchange_descriptor(Mode::Combine);
+        let args = ExchangeArgs {
+            transport: exchange.transport,
+            tokens: u32::try_from(tokens)
+                .map_err(|_| Error::shape("Moe", format!("{tokens} tokens exceed u32")))?,
+            state: combined,
+            ids: empty,
+            weights: empty,
+            out,
+            counts: exchange.counts,
+            ranks: exchange.ranks,
+        };
+        let kernel = f.kernels().op::<ExpertExchange>(&combine_exchange)?;
+        ExpertExchange::launch(kernel, &combine_exchange, args, f.stream).map_err(Error::from)
     }
 
     /// The bound the combined rows' implementations may differ by.
