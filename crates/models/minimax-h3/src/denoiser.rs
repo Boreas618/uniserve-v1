@@ -1841,9 +1841,9 @@ pub fn denoise_arena(
     push(&mut plan, "packed", element, tokens * hidden);
     // The sample's own type is FP32 - the draw writes it, the solver updates it, and the reference
     // refuses anything else - so the patch's input and output are FP32 and so is nothing else here
-    // that the stack reads. The input projections keep the checkpoint's weight and take an FP32
-    // activation and an FP32 output (`transformer.py:366-372`), and the one rounding into the packed
-    // rows is the narrowing that follows them.
+    // that the stack reads. The input projections are FP32 parameters at every preset
+    // (`precision.py:106-117`, pinned at load) and read the widened FP32 rows, and the one rounding
+    // into the packed rows is the narrowing that follows them.
     push(&mut plan, "patched", "f32", video_rows * patches);
     push(&mut plan, "video.projected", "f32", video_rows * hidden);
     push(
