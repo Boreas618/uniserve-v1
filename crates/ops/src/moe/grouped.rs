@@ -280,6 +280,22 @@ impl Op for GatherGemm {
             .require_shape(Self::NAME, Shape::new(&[experts, 2 * intermediate, hidden]))?;
         args.weights
             .require_row(Self::NAME, descriptor.dtype, hidden)?;
+        // `ids` states the expanded route count and `expanded_to_permuted` is that same
+        // `(token, route)` space as the consumer sees it: the sort writes both, and a map of another
+        // shape is one a layer looks routes up in past its end. The hidden states name `tokens`, so
+        // all three agree on the route count or the launch refuses.
+        for (what, view) in [
+            ("route ids", &args.ids),
+            ("the route map", &args.expanded_to_permuted),
+        ] {
+            view.require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
+            if view.dtype != DType::I32 {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!("expected i32 {what}, found {}", view.dtype),
+                ));
+            }
+        }
         for view in [
             &args.tile_to_expert,
             &args.tile_to_limit,
@@ -510,7 +526,9 @@ pub struct RouteGemmArgs {
     pub permuted_to_expanded: TensorView,
     /// `[1]` i32 live tiles.
     pub num_non_exiting_tiles: TensorView,
-    /// `[tokens · top, hidden]` every route's expert product, written unweighted.
+    /// `[max_permuted_rows, hidden]` every permuted row's expert product, written unweighted: row
+    /// `p` of `out` is the product of the sort's permuted row `p`, which is also `out`'s row count
+    /// here and the height the launch checks.
     pub out: TensorView,
 }
 
