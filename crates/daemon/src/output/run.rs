@@ -30,6 +30,7 @@ use thiserror_ext::AsReport as _;
 use tracing::{Level, error, trace};
 
 use crate::http::stream::{Application, Session, Step};
+use crate::metrics::stats::RequestOutcome;
 use crate::migration::{RequestEvents, Step as EventStep};
 use crate::openai::chat_completions::ChatStreamEmitter;
 use crate::openai::error::ApiError;
@@ -82,6 +83,8 @@ pub(crate) struct GenerationRun {
     /// The response's OpenAI fields, which a successor rebuilds the emitter
     /// and the chunks from.
     context: ChatResponseContext,
+    /// The request's statistics, recorded at its terminal output.
+    outcome: RequestOutcome,
     /// Whether the decoder's terminal event was consumed.
     ended: bool,
 }
@@ -95,10 +98,10 @@ impl GenerationRun {
     /// Fails as [`DecodeStream::new`] does.
     pub(crate) fn new(
         request_id: String,
-        started: Instant,
         compile_us: u64,
         inputs: ChatOutputInputs,
         events: RequestEvents,
+        outcome: RequestOutcome,
     ) -> Result<Self, crate::output::text::Error> {
         let ChatOutputInputs {
             tokenizer,
@@ -118,6 +121,7 @@ impl GenerationRun {
             decode,
         )?;
         let created = (unix_us() / 1_000_000) as u64;
+        let started = outcome.started();
         Ok(Self {
             request_id,
             created,
@@ -132,6 +136,7 @@ impl GenerationRun {
             emitter: ChatStreamEmitter::new(&context, created),
             context,
             events,
+            outcome,
             image_count: 0,
             image_steps: 0,
             ended: false,
@@ -253,6 +258,7 @@ impl GenerationRun {
     /// The frames one public output produces: its chunk's server-sent event,
     /// and, at the end of the response, the terminal `[DONE]` event.
     fn frames(&mut self, output: RequestOutput) -> Result<Vec<Bytes>, ApiError> {
+        self.outcome.observe(&output);
         let visible = is_visible(&output);
         let chunks = self.emitter.push(&output)?;
         if visible {
@@ -350,10 +356,12 @@ impl Session for GenerationRun {
     }
 
     fn abort(&mut self) {
+        self.outcome.abandoned();
         self.events.cancel();
     }
 
     fn detach(&mut self) {
+        self.outcome.abandoned();
         self.events.hand_over();
     }
 }

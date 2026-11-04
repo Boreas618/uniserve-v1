@@ -366,6 +366,10 @@ pub(crate) fn router(
     admin: Arc<admin::Admin>,
     restarter: Option<Arc<crate::restart::Restarter>>,
 ) -> Router {
+    let handoff = Arc::new(handoff::Handoff::new());
+    if let Some(restarter) = restarter.as_ref() {
+        restarter.attach_handoff(Arc::clone(&handoff));
+    }
     let timeout = |router: Router| match server.request_timeout {
         Some(timeout) => router.layer(from_fn(move |request: Request, next: Next| {
             middleware::enforce_timeout(timeout, request, next)
@@ -389,7 +393,10 @@ pub(crate) fn router(
     for task in engine.supported_tasks() {
         match task {
             Task::Generate => {
-                generation = generation.merge(chat_completions::router(Arc::clone(&engine)));
+                generation = generation.merge(chat_completions::router(
+                    Arc::clone(&engine),
+                    Arc::clone(&handoff),
+                ));
             }
             Task::ImageGeneration => {
                 generation = generation.merge(images::router(Arc::clone(&engine)));
