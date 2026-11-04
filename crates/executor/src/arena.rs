@@ -81,6 +81,19 @@ pub struct Pools {
     streams: usize,
     /// Whether the scratch pool the shadow pair's region comes from is reserved.
     scratch_reserved: bool,
+    /// The addresses the pools held when they were suspended: a restore must map storage at
+    /// exactly these, because the graphs captured over them address them by number.
+    suspended_at: Option<Vec<RangeLayout>>,
+}
+
+/// One stream's range as a captured graph addresses it: the range's base and length, and each
+/// bucket's extent inside it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RangeLayout {
+    pub stream: StreamId,
+    pub base: u64,
+    pub len: u64,
+    pub buckets: Vec<(Bucket, u64)>,
 }
 
 /// What a runner's graph pools hold, for the metrics report and item 5's invariant.
@@ -305,6 +318,50 @@ impl platform::Budget for PoolTotals {
     }
 }
 
+/// The first stream whose range or bucket extents differ between two layouts, as a refusal that
+/// names it.
+fn first_difference(before: &[RangeLayout], after: &[RangeLayout]) -> Option<String> {
+    let mut was = before.iter();
+    let mut is = after.iter();
+    loop {
+        match (was.next(), is.next()) {
+            (None, None) => return None,
+            (Some(was), Some(is)) if was == is => continue,
+            (Some(was), Some(is)) => {
+                let moved = if was.base != is.base || was.len != is.len {
+                    format!(
+                        "its range moved from {:#x}+{} to {:#x}+{}",
+                        was.base, was.len, is.base, is.len
+                    )
+                } else {
+                    format!(
+                        "its buckets went from {:?} to {:?}",
+                        was.buckets, is.buckets
+                    )
+                };
+                return Some(format!(
+                    "the restored pools do not hold the layout the captured graphs address: \
+                     stream {:?} {moved}",
+                    was.stream
+                ));
+            }
+            (Some(was), None) => {
+                return Some(format!(
+                    "the restored pools lost stream {:?}'s range, which a captured graph addresses",
+                    was.stream
+                ));
+            }
+            (None, Some(is)) => {
+                return Some(format!(
+                    "the restored pools hold stream {:?}'s range, which no captured graph \
+                     addresses",
+                    is.stream
+                ));
+            }
+        }
+    }
+}
+
 impl Pools {
     /// Reserves the device's graph pool and divides it among `streams` ranges.
     ///
@@ -342,6 +399,7 @@ impl Pools {
             pools: HashMap::new(),
             streams,
             scratch_reserved: scratch != 0,
+            suspended_at: None,
         })
     }
 
@@ -484,6 +542,85 @@ impl Pools {
         Ok(bytes)
     }
 
+    /// The addresses the pools hold now, one entry per stream range, in stream order.
+    ///
+    /// This is the layout a captured graph addresses: a graph holds pointer values, so anything
+    /// that unmaps and remaps the pools must bring these numbers back unchanged.
+    pub fn layout(&self) -> Vec<RangeLayout> {
+        let mut streams: Vec<StreamId> = self.pools.keys().copied().collect();
+        streams.sort_unstable();
+        streams
+            .into_iter()
+            .filter_map(|stream| {
+                let pool = self.pools.get(&stream)?;
+                let mut buckets: Vec<(Bucket, u64)> = pool
+                    .plans
+                    .iter()
+                    .map(|(bucket, plan)| (*bucket, plan.bytes))
+                    .collect();
+                buckets.sort_unstable();
+                Some(RangeLayout {
+                    stream,
+                    base: pool.buffer.address(),
+                    len: pool.buffer.len() as u64,
+                    buckets,
+                })
+            })
+            .collect()
+    }
+
+    /// Unmaps every pool's storage while keeping its reservation, so the device's memory can
+    /// serve another generation or another owner (design 8's exchange transport, and a world
+    /// switch that must take a generation's storage away while its graphs stay).
+    ///
+    /// The virtual ranges stay reserved, so every address a captured graph holds stays valid;
+    /// [`Self::restore`] maps storage at exactly those addresses again. Suspending a pool that is
+    /// already suspended is an error: the layout recorded here is the one a restore must honour,
+    /// and a second suspend would overwrite it.
+    ///
+    /// # Errors
+    ///
+    /// The driver's error when a block cannot be unmapped, and [`Error::Invalid`] when the pools
+    /// were already suspended.
+    pub fn suspend(&mut self) -> Result<()> {
+        if self.suspended_at.is_some() {
+            return Err(Error::Invalid(
+                "the device's pools are already suspended".to_owned(),
+            ));
+        }
+        let layout = self.layout();
+        self.allocator.suspend()?;
+        self.suspended_at = Some(layout);
+        Ok(())
+    }
+
+    /// Maps storage at the addresses the pools held when they were suspended, with their saved
+    /// contents, and refuses a layout the captured graphs do not address.
+    ///
+    /// The refusal is the point: the platform restores every block at its own address, but a
+    /// caller that gave a range back and reallocated it between the two calls would otherwise get
+    /// a pool that maps fine and a graph that writes over another owner's storage. The check names
+    /// the first stream whose base, length or bucket extents moved.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] naming the first difference when the layout moved, the platform's error
+    /// when a block cannot be mapped (nothing is left suspended), and [`Error::Invalid`] when the
+    /// pools were not suspended.
+    pub fn restore(&mut self) -> Result<()> {
+        let Some(before) = self.suspended_at.take() else {
+            return Err(Error::Invalid(
+                "the device's pools are not suspended, so there is nothing to restore".to_owned(),
+            ));
+        };
+        self.allocator.restore()?;
+        let after = self.layout();
+        if let Some(difference) = first_difference(&before, &after) {
+            return Err(Error::Invalid(difference));
+        }
+        Ok(())
+    }
+
     /// Gives `stream`'s range back: its plans go and the pool takes the buffer's block back.
     pub fn release(&mut self, stream: StreamId) -> Result<()> {
         self.ledger.close(stream);
@@ -554,8 +691,12 @@ mod tests {
         let totals = PoolTotals::new(12 << 30);
         assert_eq!(totals.allowance(), 12 << 30);
         // Two kinds, each well under the allowance, together holding most of it.
-        totals.book(device, PoolKind::Graph, 8 << 30).expect("8 GiB of 12");
-        totals.book(device, PoolKind::Scratch, 3 << 30).expect("11 GiB of 12");
+        totals
+            .book(device, PoolKind::Graph, 8 << 30)
+            .expect("8 GiB of 12");
+        totals
+            .book(device, PoolKind::Scratch, 3 << 30)
+            .expect("11 GiB of 12");
         // The third would take the sum past the allowance: refused, and nothing is recorded.
         let error = totals
             .book(device, PoolKind::Resident, 2 << 30)
@@ -564,11 +705,17 @@ mod tests {
         assert_eq!(totals.total(PoolKind::Resident), 0);
         // The first two books did not move, and a smaller third size fits.
         assert_eq!(totals.totals(), (8 << 30, 3 << 30, 0));
-        totals.book(device, PoolKind::Resident, 1 << 30).expect("12 GiB of 12");
+        totals
+            .book(device, PoolKind::Resident, 1 << 30)
+            .expect("12 GiB of 12");
         assert_eq!(totals.totals(), (8 << 30, 3 << 30, 1 << 30));
         // A total replaces the kind's own, so shrinking one makes room for another.
-        totals.book(device, PoolKind::Scratch, 0).expect("the total is what is booked");
-        totals.book(device, PoolKind::Resident, 4 << 30).expect("8 + 4 of 12");
+        totals
+            .book(device, PoolKind::Scratch, 0)
+            .expect("the total is what is booked");
+        totals
+            .book(device, PoolKind::Resident, 4 << 30)
+            .expect("8 + 4 of 12");
         assert_eq!(totals.totals(), (8 << 30, 0, 4 << 30));
     }
 
