@@ -667,6 +667,7 @@ impl Scheduler {
         }
         let mut inputs = Vec::with_capacity(batch.requests.len());
         let mut sampling = Vec::with_capacity(batch.requests.len());
+        let mut draws = Vec::with_capacity(batch.requests.len());
         for (call, placed) in &batch.requests {
             let Some(state) = self.running.get(&call.request_key.request_id) else {
                 return;
@@ -685,8 +686,10 @@ impl Scheduler {
             };
             inputs.push(tokens);
             sampling.push(&state.req.sampling);
+            draws.push(state.sampling_position);
         }
-        batch.columns = columns::columns(&batch.requests, &inputs, &sampling, page, max_kv_len);
+        batch.columns =
+            columns::columns(&batch.requests, &inputs, &sampling, &draws, page, max_kv_len);
     }
 
     /// Determines the next call kind without mutating request or resource state.

@@ -1802,11 +1802,13 @@ fn forward_reference(
                 let mut total = 0.0f64;
                 for c in 0..channels {
                     for j in 0..kernel {
-                        let i = (o as i64 + padding - j as i64 * dilation) / stride;
-                        let aligned = i >= 0
-                            && (i < length as i64)
-                            && o as i64 == i * stride - padding + j as i64 * dilation;
-                        if aligned {
+                        // The definition of a cross-correlation: output `o`
+                        // reads the input at `o·stride − padding +
+                        // j·dilation`, the whole tap position and nothing
+                        // divided into it. A position outside the input is the
+                        // padding and contributes nothing.
+                        let i = o as i64 * stride - padding + j as i64 * dilation;
+                        if i >= 0 && i < length as i64 {
                             let value = x[(n * channels + c) * length + i as usize];
                             let weight = w[(k * channels + c) * kernel + j];
                             total += f64::from(value) * f64::from(weight);
@@ -1818,6 +1820,33 @@ fn forward_reference(
         }
     }
     y
+}
+
+/// The host reference is the definition the device is compared against, so it
+/// is checked against values computed by hand: a reference that is wrong in
+/// the same way for every input would let a wrong device result pass, and one
+/// that is merely wrong turns a correct device result into a failure (which is
+/// how the tap position, divided by the stride, was found).
+#[test]
+fn the_one_dimensional_reference_is_the_definition() {
+    // x[1, 2, 5] as two channels of five, w[3, 2, 3] as KCRS, stride 2,
+    // padding 1, dilation 1: the taps of output 0 sit at input -1 (the
+    // padding), 0 and 1.
+    let x = [-1.0f32, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5];
+    let w = [
+        -0.5f32, 0.25, -0.25, 0.5, 0.0, -0.5, // filter 0
+        0.25, -0.25, 0.5, 0.0, -0.5, 0.25, // filter 1
+        -0.25, 0.5, 0.0, -0.5, 0.25, -0.25, // filter 2
+    ];
+    let y = forward_reference(&x, [1, 2, 5], &w, [3, 2, 3], [1, 3, 3], 2, 1, 1);
+    // Output 0 of filter 0: x[0][0]·w[0][0][1] + x[0][1]·w[0][0][2] +
+    // x[1][0]·w[0][1][1] + x[1][1]·w[0][1][2]
+    // = -1·0.25 + -0.5·-0.25 + 1.5·0.0 + 2.0·-0.5 = -0.25 + 0.125 - 1.0.
+    assert_eq!(y[0], -1.125);
+    // Output 1 reads inputs 1, 2 and 3: channel 0 gives
+    // -0.5·-0.5 + 0·0.25 + 0.5·-0.25 = 0.125, channel 1 gives
+    // 2·0.5 + 2.5·0.0 + 3·-0.5 = -0.5, and the sum is -0.375.
+    assert_eq!(y[1], -0.375);
 }
 
 /// The definition of a one-dimensional transposed convolution, computed on
@@ -2134,23 +2163,25 @@ fn forward_reference_3d(
     let mut y = vec![0.0f32; batch * filters * out_d * out_h * out_w];
     for n in 0..batch {
         for k in 0..filters {
+            // The same definition as the one-dimensional reference: in each
+            // axis, output `o` reads the input at `o + j − padding`.
             for od in 0..out_d {
                 for oh in 0..out_h {
                     for ow in 0..out_w {
                         let mut total = 0.0f64;
                         for c in 0..channels {
                             for jd in 0..kernel_d {
-                                let d = od as i64 + padding as i64 - jd as i64;
+                                let d = od as i64 - padding as i64 + jd as i64;
                                 if d < 0 || d >= depth as i64 {
                                     continue;
                                 }
                                 for jh in 0..kernel_h {
-                                    let h = oh as i64 + padding as i64 - jh as i64;
+                                    let h = oh as i64 - padding as i64 + jh as i64;
                                     if h < 0 || h >= height as i64 {
                                         continue;
                                     }
                                     for jw in 0..kernel_w {
-                                        let w_index = ow as i64 + padding as i64 - jw as i64;
+                                        let w_index = ow as i64 - padding as i64 + jw as i64;
                                         if w_index < 0 || w_index >= width as i64 {
                                             continue;
                                         }

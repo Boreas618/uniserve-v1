@@ -43,7 +43,7 @@ use program_server::Target;
 use crate::engine_main::Launch;
 
 /// One epoch's build config, resolved against the node the main process runs on.
-pub struct EpochPlan {
+pub(crate) struct EpochPlan {
     /// The epoch's build config, which the daemon wrote (§7.2).
     build: daemon::epoch::BuildConfig,
     /// The checkpoint this rank serves.
@@ -56,6 +56,16 @@ pub struct EpochPlan {
     targets: Vec<Target>,
     /// The bucket catalog every device of this rank captures.
     buckets: Buckets,
+    /// This rank's ordinal inside its group, which the storage claims and the cache plan's
+    /// agreement with its group are keyed by.
+    rank: u32,
+    /// The world the epoch executes, which keys the storage it creates.
+    world: u64,
+    /// Ranks in the deployment, whose minimum the cache plan's block size and slot count are
+    /// agreed by (§4.1).
+    world_size: usize,
+    /// Batches the rank's schedulers keep in flight, which the capacity plan relays through.
+    queue_depth: usize,
 }
 
 impl EpochPlan {
@@ -65,7 +75,7 @@ impl EpochPlan {
     /// starts every rank of a node with the ordinals that rank serves, and a main process that
     /// guessed its devices from the epoch's parallelism would capture graphs on another rank's
     /// device.
-    pub fn of(launch: &Launch, build: &daemon::epoch::BuildConfig) -> Result<Self> {
+    pub(crate) fn of(launch: &Launch, build: &daemon::epoch::BuildConfig) -> Result<Self> {
         if launch.devices.is_empty() {
             bail!(
                 "rank {} of group {} was started with no device to serve",
@@ -124,16 +134,20 @@ impl EpochPlan {
             program_server: PathBuf::from(&launch.program_server),
             targets,
             buckets,
+            rank: launch.rank,
+            world: launch.world,
+            world_size: launch.world_size as usize,
+            queue_depth: launch.queue_depth as usize,
         })
     }
 
     /// The epoch's build config, for an accessor that needs another of its fields.
-    pub fn build(&self) -> &daemon::epoch::BuildConfig {
+    pub(crate) fn build(&self) -> &daemon::epoch::BuildConfig {
         &self.build
     }
 
     /// The checkpoint this rank serves.
-    pub fn checkpoint(&self) -> &Path {
+    pub(crate) fn checkpoint(&self) -> &Path {
         &self.checkpoint
     }
 
@@ -142,7 +156,7 @@ impl EpochPlan {
     /// A catalog is a property of the epoch, not of a device, so `graph` and `runners` share it
     /// rather than each building one: two catalogs of one epoch would be two answers to what a
     /// batch may be, and a batch that fits one but not the other would have no graph to replay.
-    pub fn buckets(&self) -> &Buckets {
+    pub(crate) fn buckets(&self) -> &Buckets {
         &self.buckets
     }
 
@@ -153,7 +167,7 @@ impl EpochPlan {
     /// count for the lane that maps weights and installs programs, and the host's parallelism for
     /// the lanes that read transfers, reclaim storage and handle media. A lane whose bound is
     /// narrower than the work in flight queues it; it never drops it.
-    pub fn blocking_limits(&self) -> Limits {
+    pub(crate) fn blocking_limits(&self) -> Limits {
         let available = std::thread::available_parallelism()
             .map(|count| count.get())
             .unwrap_or(4);
@@ -179,17 +193,17 @@ impl EpochPlan {
     }
 
     /// The Program Server's socket, which the rank's program client connects to.
-    pub fn program_server(&self) -> &Path {
+    pub(crate) fn program_server(&self) -> &Path {
         &self.program_server
     }
 
     /// This rank's devices, in the order the daemon named them.
-    pub fn devices(&self) -> &[DeviceId] {
+    pub(crate) fn devices(&self) -> &[DeviceId] {
         &self.devices
     }
 
     /// The device's completion events: one pool per rank, shared by its executors (§2.4).
-    pub fn events(&self) -> Arc<EventPool> {
+    pub(crate) fn events(&self) -> Arc<EventPool> {
         EventPool::new()
     }
 
@@ -202,7 +216,7 @@ impl EpochPlan {
     /// the shadow pair's region are carved from (7.3). The resident pool is reserved by whoever
     /// carves it - `Memory`, through `Executor::pools()` - so the graph storage asks for none: a
     /// second figure here would be a second claim on the same bytes.
-    pub fn graph(&self, device: DeviceId) -> Result<GraphStorage> {
+    pub(crate) fn graph(&self, device: DeviceId) -> Result<GraphStorage> {
         let handle = platform::Device::new(device)
             .with_context(|| format!("opening device {}", device.0))?;
         let total = handle.total_memory();
@@ -233,12 +247,12 @@ impl EpochPlan {
     }
 
     /// How long a job may run without rank progress before it is reported `Stalled` (§2.4).
-    pub fn watchdog_timeout(&self) -> Duration {
+    pub(crate) fn watchdog_timeout(&self) -> Duration {
         self.build.worker.watchdog_timeout
     }
 
     /// The Program Server's targets this rank resolves a module for (§5.3).
-    pub fn targets(&self) -> &[Target] {
+    pub(crate) fn targets(&self) -> &[Target] {
         &self.targets
     }
 
@@ -247,7 +261,7 @@ impl EpochPlan {
     /// This is the single match on model class in the tree. Everything downstream of it - the
     /// buckets, the arena, the sampler, the graphs - is written against `nn`'s capability traits,
     /// so a second causal-language class joins as a variant here and changes nothing else.
-    pub fn runners(
+    pub(crate) fn runners(
         &self,
         device: DeviceId,
         model: Arc<qwen3_moe::Qwen3Moe>,
@@ -282,7 +296,12 @@ impl EpochPlan {
                     // A request may ask for any top-k it likes, so the candidate width is the
                     // vocabulary: a narrower buffer would silently sample a different set.
                     width: narrow(model.config().vocab_size, "vocab_size")?,
-                    page_size: model.page_tokens(),
+                    // The page size the resident cache was planned with, not the one the model
+                    // asked for: the capacity plan may have had to take a smaller page, and a
+                    // runner that read a different one would address another request's pages.
+                    // A plan that disagrees with the model's stated page size is refused here,
+                    // naming both figures, rather than served.
+                    page_size: cache_page_size(memory, &model)?,
                     max_kv_len: self.max_kv_len(&model)?,
                 };
                 let stream = platform::Stream::new(device)
@@ -317,6 +336,101 @@ impl EpochPlan {
         Ok(runners)
     }
 
+    /// Opens the rank's resident owners from the capacity plan (4.1, 8).
+    ///
+    /// Called after the epoch's model is loaded and before any thread that borrows the owners: the
+    /// plan measures a device the weights are already mapped on, so what it computes is what is
+    /// left, not what was there before the load. Every owner is booked against the device's one
+    /// allowance as it maps, which is what makes the first `mapped <= budget` reading after warmup
+    /// count every byte the plan charged. The device's pool set is opened here, first, because the
+    /// owners carve their storage from it and the runner is built from them.
+    pub(crate) fn open_memory(
+        &self,
+        model: &qwen3_moe::Qwen3Moe,
+        storage: &mut dyn executor::memory::retained::ExclusiveStorage,
+    ) -> Result<Memory> {
+        let device = *self
+            .devices
+            .first()
+            .context("this rank serves no device to open its resident memory on")?;
+        let class = architectural_class(&self.checkpoint)?;
+        if class != "Qwen3MoeForCausalLM" {
+            bail!(
+                "{} declares model class {class}, which states no cache geometry this build can \
+                 plan",
+                self.checkpoint.display()
+            );
+        }
+        // The KV geometry is the model's own: its layer count, the heads each layer stores and the
+        // width of a head. Every figure comes from `config()`, so a checkpoint whose shape this
+        // build cannot state is refused by name below rather than planned with a literal.
+        let config = model.config();
+        let cache = executor::capacity::CacheGeometry {
+            layers: narrow(config.num_hidden_layers, "num_hidden_layers")?,
+            kv_heads: narrow(config.num_key_value_heads, "num_key_value_heads")?,
+            head_dim: narrow(config.head_dim, "head_dim")?,
+        };
+        // What a batch may be, from the epoch's own graph plan: a rank that serves captured graphs
+        // only is never handed a batch larger than its largest bucket - `Graphs` refuses it before
+        // a kernel runs - so the catalog is the rank's admission bound and not an estimate.
+        let (rows, tokens) = self.buckets.bounds();
+        let host = host_name()?;
+        let facts = executor::capacity::RankFacts {
+            device: executor::config::Device::Cuda(device),
+            host: &host,
+            world: self.world,
+            world_size: self.world_size,
+            queue_depth: self.queue_depth,
+            // The model's page is the preset: the plan returns it or fails, and a plan that lowered
+            // it would leave every runner addressing pages the pool does not hold.
+            block_size: Some(model.page_tokens()),
+            max_batch_calls: rows as usize,
+            max_batch_tokens: tokens as usize,
+            max_request_pool_size: self.build.max_running_requests.get(),
+            max_model_len: self.max_kv_len(model)? as usize,
+            mem_fraction_static: self.build.mem_fraction_static,
+            cache,
+            kv_dtype: cache_dtype(model, self.build.kv_cache.dtype)?,
+        };
+        // One rank's host group: this rank alone, which is what a world of one rank is. A
+        // deployment of several ranks forms its group over the peers' rendezvous at start, and
+        // until that exists a plan that agreed a block size over one member would be a plan this
+        // rank cannot honour - so it is refused rather than served.
+        if self.world_size != 1 {
+            bail!(
+                "this rank is one of {} ranks and the host group they agree capacity over is not \
+                 formed yet; capacity is planned for a world of one rank",
+                self.world_size
+            );
+        }
+        let group = executor::parallel::host::HostGroup::single(self.rank as usize);
+        let report = rank_report(device, &host)?;
+        let planned = executor::capacity::plan_rank(&facts, report, &group)?;
+        let graph = self.graph(device)?;
+        let pools = executor::device::Executor::open(device, &graph)?;
+        let stream = platform::Stream::new(device)
+            .with_context(|| format!("creating device {}'s stream", device.0))?;
+        executor::memory::open_memory(
+            executor::memory::OpenMemory {
+                plan: &planned.plan,
+                // A causal-language rank keeps no per-slot bank: its per-request state is the KV
+                // pages in the cache, and the sampler's parameters travel in the batch's columns.
+                slots: &[],
+                device: Some(device),
+                stream: Some(&stream),
+                width: planned.width,
+                devices: vec![executor::memory::allocation::MemoryKind::Cuda(device)],
+                // A rank that takes no other rank's export states that as the absence of a
+                // program: a conversion that reaches it is a mistake, and it says so by name.
+                conversion: Arc::new(executor::memory::prefix_cache::conversion::Unimported),
+                events: self.events(),
+                pools,
+            },
+            storage,
+        )
+        .map_err(|error| error).context("opening the rank's resident memory")
+    }
+
     /// The keys a row reads at most: the cache's bound, from the epoch's context length.
     fn max_kv_len(&self, model: &qwen3_moe::Qwen3Moe) -> Result<u32> {
         match self.build.max_model_len {
@@ -325,6 +439,102 @@ impl EpochPlan {
                 .context("the checkpoint's context length is wider than the protocol's"),
         }
     }
+}
+
+/// What this rank advertises of itself: the report the capacity plan is made against (§2.3, §4).
+///
+/// A causal-language rank states one component - the model's single block - the two forward calls
+/// it serves, and the three identities that name this process. It publishes no products (`logits`
+/// returns through the batch, not as an exported tensor), so no device product is exported and no
+/// media component is routed: the deployment is one class of computation, and saying otherwise
+/// would make the engine reserve storage for exports that never happen.
+pub(crate) fn rank_report(
+    device: DeviceId,
+    host: &str,
+) -> Result<executor::capacity::Report> {
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos() as u64);
+    Ok(executor::capacity::Report {
+        endpoint: ipc::WorkerEndpoint {
+            host: host.to_owned(),
+            // The address space this rank's tensors live in: one main process, one pid.
+            address_space: std::process::id().to_string(),
+            // This process's start, which the engine compares to notice a relaunched rank.
+            incarnation: format!("{at}"),
+        },
+        device_exports: false,
+        fabric_handles: platform::HandleType::probe(device)? == platform::HandleType::Fabric,
+        supported_calls: vec![
+            ipc::CallKind::Forward(ipc::ForwardMode::Prefill),
+            ipc::CallKind::Forward(ipc::ForwardMode::Decode),
+        ],
+        media_components: std::collections::BTreeMap::new(),
+        components: vec![ipc::ComponentInfo {
+            name: "backbone".to_owned(),
+            outputs: Vec::new(),
+        }],
+    })
+}
+
+/// The element type the cache pool stores, from the deployment when it states one.
+///
+/// An unstated cache dtype is the model's own activation dtype, which is what its layers compute
+/// in until the deployment asks for a narrower cache. A model whose activations have no cache
+/// element type cannot have its pool planned, and says so rather than taking the nearest.
+fn cache_dtype(
+    model: &qwen3_moe::Qwen3Moe,
+    stated: Option<proto::request::PrefixCacheDtype>,
+) -> Result<proto::request::PrefixCacheDtype> {
+    if let Some(dtype) = stated {
+        return Ok(dtype);
+    }
+    match model.dtype() {
+        DType::BF16 => Ok(proto::request::PrefixCacheDtype::BFloat16),
+        DType::F16 => Ok(proto::request::PrefixCacheDtype::Float16),
+        DType::F32 => Ok(proto::request::PrefixCacheDtype::Float32),
+        DType::F8E4M3 => Ok(proto::request::PrefixCacheDtype::Float8E4m3Fn),
+        other => bail!("this build plans no KV cache in a model whose activations are {other:?}"),
+    }
+}
+
+/// This host's name, as `gethostname(2)` gives it: the report's host identity (§2.3).
+fn host_name() -> Result<String> {
+    let mut name = [0_u8; 256];
+    // SAFETY: gethostname writes at most `name.len()` bytes into `name`.
+    if unsafe { libc::gethostname(name.as_mut_ptr().cast(), name.len()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("reading the host name");
+    }
+    let length = name
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(name.len());
+    String::from_utf8(name[..length].to_vec()).context("the host name is not UTF-8")
+}
+
+/// The page size the resident cache was planned with, checked against the model's (§4.5, §8).
+///
+/// The model states the page it reads; the capacity plan states the page it could afford, and the
+/// two must be the same page. A runner that served the model's figure while the pool held another
+/// would read another request's tokens out of the cache - wrong tokens with no error - so this is a
+/// refusal at spawn, naming both figures, and the block table and the sampler read the same one.
+fn cache_page_size(memory: &Memory, model: &qwen3_moe::Qwen3Moe) -> Result<u32> {
+    let cache = memory.shared_cache();
+    let cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let planned = cache
+        .layer_planes(0, 0)
+        .context("reading the resident cache's planned page size")?
+        .block_size;
+    let stated = model.page_tokens();
+    if planned != stated {
+        bail!(
+            "the model reads {stated} tokens per cache page and the resident cache was planned \
+             with {planned}; the pool would hold pages the runner does not address"
+        );
+    }
+    Ok(planned)
 }
 
 /// The targets this rank resolves a module for: the architecture-specific instruction set of every

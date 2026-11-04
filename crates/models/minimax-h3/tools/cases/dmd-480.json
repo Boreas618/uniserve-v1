@@ -1,0 +1,18 @@
+{
+  "canvas": {
+    "width": 992,
+    "height": 416
+  },
+  "num_frames": 124,
+  "num_text_tokens": 96,
+  "text_capacity": 128,
+  "condition_capacity": 128,
+  "token_multiple": 64,
+  "attention": {
+    "kind": "sparse",
+    "tile": 64,
+    "sparsity": 0.8
+  },
+  "conditions": [],
+  "vision_spans": []
+}

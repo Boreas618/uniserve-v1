@@ -1,0 +1,33 @@
+{
+  "canvas": {
+    "width": 1344,
+    "height": 768
+  },
+  "num_frames": 124,
+  "num_text_tokens": 128,
+  "text_capacity": 128,
+  "condition_capacity": 32768,
+  "token_multiple": 128,
+  "attention": {
+    "kind": "sparse",
+    "tile": 128,
+    "sparsity": 0.9,
+    "reference_keep": 0.1
+  },
+  "conditions": [
+    {
+      "role": "reference",
+      "canvas": {
+        "width": 1344,
+        "height": 768
+      },
+      "frames": 39,
+      "audio_samples": 52000
+    },
+    {
+      "role": "reference",
+      "audio_samples": 64000
+    }
+  ],
+  "vision_spans": []
+}

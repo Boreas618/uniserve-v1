@@ -1704,14 +1704,12 @@ impl Cudnn {
                 .count(&mode_b, ATTR_ENGINEHEUR_RESULTS, TYPE_BACKEND_DESCRIPTOR)
         );
         // The graph's own count of the engines it has at all. Read beside the
-        // heuristic's counts because the two modes answered the same number on
-        // both shapes tried, which a mode-specific search should not do: a
-        // number that matches this one in every mode would say the two
-        // readings are not coming from different places.
-        for (label, descriptor) in [("the graph", &graph)] {
+        // heuristic's counts because a search's count is a list that still has
+        // to be materialised, and the graph's is every engine it holds.
+        {
             let mut global = 0i64;
             let line = match self.api.get(
-                descriptor,
+                &graph,
                 ATTR_OPERATIONGRAPH_ENGINE_GLOBAL_COUNT,
                 TYPE_INT64,
                 std::slice::from_mut(&mut global),
@@ -1721,7 +1719,7 @@ impl Cudnn {
                 Err(error) => format!("refused: {error}"),
             };
             steps.push((
-                format!("operation graph: {label}, engine global count: {line}"),
+                format!("operation graph: every engine it holds, engine global count: {line}"),
                 None,
             ));
         }

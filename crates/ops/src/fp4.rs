@@ -220,7 +220,11 @@ pub use crate::gemm::Epilogue;
 pub struct GemmDescriptor {
     /// Element type of the packed activations and weights: `U8`, two E2M1 values per byte.
     pub packed: DType,
-    /// Element type of the block scales: `U8`, one E4M3 byte per block.
+    /// Element type of the block scales, as the checkpoint declares them: a real ModelOpt export
+    /// stores them `F8_E4M3` (one per sixteen elements), and a stack's dtype is the checkpoint's,
+    /// agreed across experts. Eight bits per block either way — the two names differ in what the
+    /// byte *means*, not in how a program reads it, which is why one byte of it is decoded as an
+    /// E4M3 scale whichever name the shard uses.
     pub scale: DType,
     /// Element type of the product before the epilogue.
     pub accumulate: DType,
