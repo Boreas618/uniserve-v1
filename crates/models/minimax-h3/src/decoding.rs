@@ -173,12 +173,24 @@ pub fn video_arena(
     let grid = tiles.tiles(config, canvas);
     let ffn = u64::from(config.decoder_ffn_mult);
     let (rotated, _) = crate::video_vae::rotary(config)?;
-    let rows = canvas.rows() * grid.len() as u64;
     let columns = u64::from(config.decoder_num_attention_heads)
         * u64::from(config.decoder_attention_head_dim);
     let (height, width_px) = canvas.pixels(config);
     let frames = canvas.frames_out(config);
-    let pixels = grid.len() as u64 * u64::from(frames) * u64::from(height) * u64::from(width_px);
+    // One token buffer holds every tile, so its rows are the tiles' rows in grid order — summed,
+    // because a tile at the canvas's edge can be narrower than the tile size.
+    let rows: u64 = grid.iter().map(|tile| tile.canvas.rows()).sum();
+    let voxels: u64 = grid.iter().map(|tile| tile.canvas.voxels()).sum();
+    // A tile's decoded block is its own latent extent in output pixels.
+    let patches: u64 = grid
+        .iter()
+        .map(|tile| {
+            let (tile_height, tile_width) = tile.canvas.pixels(config);
+            u64::from(frames) * u64::from(tile_height) * u64::from(tile_width)
+        })
+        .sum();
+    // The clip's own raster, which the tiles are stitched into.
+    let raster = u64::from(frames) * u64::from(height) * u64::from(width_px);
     Ok(vec![
         Buffer {
             name: "stream",
@@ -188,7 +200,7 @@ pub fn video_arena(
         Buffer {
             name: "projected",
             element: "f16",
-            elements: canvas.voxels() * grid.len() as u64 * columns,
+            elements: voxels * columns,
         },
         Buffer {
             name: "normalized",
@@ -248,22 +260,22 @@ pub fn video_arena(
         Buffer {
             name: "pixels",
             element: "f16",
-            elements: pixels * u64::from(crate::output::Rgb::CHANNELS),
+            elements: patches * u64::from(crate::output::Rgb::CHANNELS),
         },
         Buffer {
             name: "decoded",
             element: "f16",
-            elements: pixels * u64::from(crate::output::Rgb::CHANNELS),
+            elements: raster * u64::from(crate::output::Rgb::CHANNELS),
         },
         Buffer {
             name: "blended",
             element: "f16",
-            elements: pixels * u64::from(crate::output::Rgb::CHANNELS),
+            elements: raster * u64::from(crate::output::Rgb::CHANNELS),
         },
         Buffer {
             name: "rgb",
             element: "u8",
-            elements: pixels * u64::from(crate::output::Rgb::CHANNELS),
+            elements: raster * u64::from(crate::output::Rgb::CHANNELS),
         },
         Buffer {
             name: "overlap",
@@ -612,8 +624,8 @@ mod tests {
     fn the_clip_rows_invert_the_packing_over_each_clips_seven_frames() {
         let canvas = crate::config::Canvas {
             short_edge: 768,
-            aspect: (5, 3),
-            width: 1280,
+            aspect: (7, 4),
+            width: 1344,
             height: 768,
         };
         let patch_rows = u64::from(
@@ -625,11 +637,17 @@ mod tests {
         let rows = crate::packing::clip_rows(crate::config::AttentionKind::Dense, 107, &canvas)
             .expect("rows");
         assert_eq!(rows.len() as u64, 6 * 7 * patch_rows);
+        // Clips start five latent frames after the previous one and read seven, so clip `k`'s rows are
+        // the raster's rows from frame `5k` — not from `7k`, which is what a clip without overlap
+        // would give.
         for (index, row) in rows.iter().enumerate() {
-            assert_eq!(u64::from(*row), index as u64);
+            let clip = index as u64 / (7 * patch_rows);
+            let within = index as u64 % (7 * patch_rows);
+            assert_eq!(u64::from(*row), clip * 5 * patch_rows + within);
         }
-        // A sparse packing permutes them: every clip still reads seven consecutive latent frames,
-        // which covers the whole generated video exactly once across the clips.
+        // A sparse packing permutes them within the generated video. Consecutive clips share their
+        // last two latent frames, so a row is named once per clip that reads it — the union covers the
+        // generated rows, and no row is named twice inside one clip.
         let sparse = crate::config::AttentionKind::Sparse {
             tile: 128,
             sparsity: 0.8,
@@ -637,26 +655,39 @@ mod tests {
         };
         let rows = crate::packing::clip_rows(sparse, 107, &canvas).expect("rows");
         assert_eq!(rows.len() as u64, 6 * 7 * patch_rows);
-        let mut seen = vec![false; (5 * 6 + 2) as usize * patch_rows as usize];
-        for row in &rows {
-            let index = *row as usize;
-            assert!(!seen[index], "row {index} is named twice");
-            seen[index] = true;
-        }
-        assert!(seen.iter().all(|row| *row), "a generated row is missing");
-        // Clips overlap by two latent frames: the second clip starts five frames after the first.
         let per_frame = patch_rows as usize;
+        let clip_rows = 7 * per_frame;
+        let mut generated = vec![false; (5 * 6 + 2) as usize * per_frame];
+        for (clip, block) in rows.chunks(clip_rows).enumerate() {
+            let mut in_clip = vec![false; generated.len()];
+            for row in block {
+                let index = *row as usize;
+                assert!(
+                    index < generated.len(),
+                    "clip {clip} reads row {index} outside the video"
+                );
+                assert!(!in_clip[index], "clip {clip} names row {index} twice");
+                in_clip[index] = true;
+                generated[index] = true;
+            }
+        }
+        assert!(
+            generated.iter().all(|row| *row),
+            "a generated row is read by no clip"
+        );
+        // Clips overlap by two latent frames: the second clip starts five frames after the first.
         assert_eq!(rows[7 * per_frame], rows[5 * per_frame]);
     }
     #[test]
     fn the_video_arena_holds_all_tiles_of_one_clip() {
         let config = crate::video_vae::tests::video_config();
-        let canvas = crate::video_vae::Canvas::clip(&config, 48, 80);
+        let canvas = crate::video_vae::Canvas::clip(&config, 48, 84);
         let arena = video_arena(&config, &canvas).expect("the arena");
-        // 768x1280 at 256/64 is 4 x 7 tiles, each 16x16 latent voxels of 7 frames.
+        // The served 768x1344 canvas at 256/64 is 4 rows of 7 tiles, each 16x16 latent voxels of
+        // 7 frames.
         assert_eq!(canvas.frames, 7);
         assert_eq!(canvas.height, 48);
-        assert_eq!(canvas.width, 80);
+        assert_eq!(canvas.width, 84);
         let tiles = crate::video_vae::Tiles::of(&config, &canvas)
             .expect("the grid")
             .tiles(&config, &canvas)
@@ -685,10 +716,10 @@ mod tests {
 
     #[test]
     fn a_tiles_placement_is_a_view_of_the_raster_and_its_blends_read_the_neighbour() {
-        // 768x1280 pixels: 48x80 latent positions, so the checkpoint's 256-pixel tiles and 64-pixel
+        // 768x1344 pixels: 48x84 latent positions, so the checkpoint's 256-pixel tiles and 64-pixel
         // minimum overlap give a grid of four columns and seven rows, each tile 16x16 latent.
         let config = crate::video_vae::tests::video_config();
-        let canvas = Canvas::clip(&config, 48, 80);
+        let canvas = Canvas::clip(&config, 48, 84);
         let clip = ClipDecoder::new(&config, &canvas).expect("the output path");
         let tiles = Tiles::of(&config, &canvas)
             .expect("the grid")
@@ -736,15 +767,16 @@ mod tests {
                 left_seams += 1;
             }
         }
-        // Every tile but the first row blends upwards, every tile but the first column blends left.
-        assert_eq!(above_seams, 28 - 4);
-        assert_eq!(left_seams, 28 - 7);
+        // The canvas is 48 x 80 latent cells, so its grid is 4 rows of 7: every tile but the first row
+        // blends upwards (3 x 7), and every tile but the first column blends left (4 x 6).
+        assert_eq!(above_seams, 21);
+        assert_eq!(left_seams, 24);
     }
 
     #[test]
     fn a_clip_needs_one_latent_view_and_one_position_table_per_tile() {
         let config = crate::video_vae::tests::video_config();
-        let canvas = Canvas::clip(&config, 48, 80);
+        let canvas = Canvas::clip(&config, 48, 84);
         let tiles = Tiles::of(&config, &canvas)
             .expect("the grid")
             .tiles(&config, &canvas);

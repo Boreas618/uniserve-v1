@@ -185,8 +185,8 @@ impl Seams {
         self.starts.is_empty()
     }
 
-    /// The latent span of tile `index`: `(start, length)` in latent columns, and the tile's extent
-    /// clipped to the raster.
+    /// The latent span of tile `index`: `(first, end)` in latent cells, end exclusive, over a raster
+    /// whose extent is `raster` **output pixels** (the same unit `split` was given).
     pub fn latent(&self, index: usize, raster: u32, ratio: u32) -> (u32, u32) {
         let start = self.starts[index];
         let end = (start + self.lengths[index]).min(raster);
@@ -250,11 +250,15 @@ impl Tiles {
     /// will, and a tile trims its trailing rows and columns exactly when those are nonzero.
     pub fn tiles(&self, config: &VideoVaeConfig, canvas: &Canvas) -> Vec<Tile> {
         let ratio = config.spatial_compression();
+        // The seams are split on the canvas's output pixels, so the tile's span is clipped there and
+        // then divided into latent cells; using the latent extent here would clip pixel coordinates
+        // to a latent count and give a tile that ends before it starts.
+        let (height, width) = canvas.pixels(config);
         let mut tiles = Vec::with_capacity(self.rows.len() * self.columns.len());
         for row in 0..self.rows.len() {
             for column in 0..self.columns.len() {
-                let (row_start, row_end) = self.rows.latent(row, canvas.height, ratio);
-                let (column_start, column_end) = self.columns.latent(column, canvas.width, ratio);
+                let (row_start, row_end) = self.rows.latent(row, height, ratio);
+                let (column_start, column_end) = self.columns.latent(column, width, ratio);
                 let above = row
                     .checked_sub(1)
                     .map_or(0, |previous| self.rows.overlap(previous).unwrap_or(0));
@@ -985,9 +989,12 @@ pub(crate) mod tests {
         assert_eq!(first.latent_columns, (0, 16));
         assert_eq!((first.above, first.left), (0, 0));
         assert_eq!((first.below, first.right), (96, 80));
-        // The second column of the first row cross-fades 80 pixels of its predecessor.
+        // The second column of the first row cross-fades 80 pixels of its predecessor: the width's
+        // slack of 64 pixels is four alignment steps over six seams, so the first four seams carry
+        // 80 pixels and the last two the minimum 64, and the second tile starts 176 pixels in.
         assert_eq!(planned[1].left, 80);
-        assert_eq!(planned[1].latent_columns, (192 / 16, (192 + 256) / 16));
+        assert_eq!(planned[1].latent_columns, (176 / 16, (176 + 256) / 16));
+        assert_eq!(planned[5].left, 64);
         // A tile that has a successor below trims its trailing rows; the last row does not.
         let below = planned[7];
         assert_eq!(below.row, 1);

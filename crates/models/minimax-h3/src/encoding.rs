@@ -1178,9 +1178,10 @@ mod tests {
         let table = audio_sources(&crate::audio_vae::tests::audio_config())
             .expect("the encoder's parameters");
         // The input pair, five stages of twenty-one — eighteen for the three residual units, two for
-        // the widening convolution and one for the stage's Snake — the output Snake and its pair, the
-        // projection's twenty-two and the mean convolution's pair.
-        assert_eq!(table.len(), 2 + 5 * 21 + 3 + 22 + 2);
+        // the widening convolution and one for the stage's Snake — the output Snake and its pair, and
+        // the projection block with the mean convolution: twenty-one tensors and the fused
+        // query-key-value bias.
+        assert_eq!(table.len(), 2 + 5 * 21 + 3 + 22);
         let names: Vec<&str> = table
             .iter()
             .map(|source| source.parameter.as_str())
@@ -1205,13 +1206,14 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), names.len());
-        // Every convolution is weight-normalized: four per stage plus the input, the output and the
-        // mean convolution.
+        // Seven weight-normalized convolutions per stage — six in the three residual units and the
+        // widening one — plus the input and the output convolution. The projection block's weights and
+        // the mean convolution are plain, as the checkpoint stores them.
         let normalized = table
             .iter()
             .filter(|source| matches!(source.tensor, crate::audio_vae::Tensor::Normalized { .. }))
             .count();
-        assert_eq!(normalized, 3 + 5 * 7 + 3);
+        assert_eq!(normalized, 1 + 5 * 7 + 1);
         // The fused query-key-value bias names its three checkpoint vectors in order.
         let bias = table
             .iter()
