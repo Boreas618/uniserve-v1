@@ -260,6 +260,40 @@ fn collect(directory: &Path) -> Result<Vec<String>> {
     Ok(files)
 }
 
+/// Copies one file of a package into the build's workspace, creating the
+/// directories its relative path names.
+fn copy_file(source: &Path, destination: &Path) -> Result<()> {
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(source, destination)?;
+    Ok(())
+}
+
+/// Copies the package's tuning data into the build's workspace (design section
+/// 5.4): tuning data is part of the revision and travels with the module it
+/// was measured for, so the main process gets it from the same `resolve`.
+fn copy_tuning(
+    package: &PackageSource,
+    key: &str,
+    target: &Target,
+    dir: &Workspace,
+) -> Result<()> {
+    for declared in &package.manifest.tuning {
+        let relative = declared.replace(crate::manifest::DESCRIPTOR_PLACEHOLDER, key);
+        let source = package.file(&relative);
+        if !source.is_file() {
+            return Err(package.failure(
+                key,
+                target,
+                format!("the package names tuning data it does not have: {relative}"),
+            ));
+        }
+        copy_file(&source, &dir.path().join(&relative))?;
+    }
+    Ok(())
+}
+
 /// Checks that a cubin module's metadata JSON names the kernel to launch.
 ///
 /// `ops` loads the module with `cuLibraryLoadData` and launches the symbol the
@@ -403,6 +437,7 @@ impl Source for TritonSource {
                 format!("{metadata} names no kernel to launch: {message}"),
             )
         })?;
+        copy_tuning(package, key, target, dir)?;
         let files = collect(dir.path())?;
         Ok(Built { files })
     }
@@ -462,12 +497,61 @@ impl Source for CubinSource {
     fn build(
         &self,
         _op: &str,
-        _key: &str,
-        _target: &Target,
+        key: &str,
+        target: &Target,
         _toolchain: &dyn Toolchain,
-        _dir: &Workspace,
+        dir: &Workspace,
     ) -> Result<Built> {
-        todo!("the cubin source: copy the package's cubin and metadata into the workspace")
+        let package = &self.package;
+        // A vendor package carries one cubin and one metadata JSON per
+        // descriptor (their names hold `{descriptor}`); copying them is the
+        // whole build, and it needs no toolchain at all.
+        let mut copied_cubin = false;
+        let mut copied_metadata = false;
+        let metadata = package.metadata_name();
+        for relative in package.manifest.source.files_for(key) {
+            let source = package.file(&relative);
+            if !source.is_file() {
+                return Err(package.failure(
+                    key,
+                    target,
+                    format!("the package carries no {relative} for this descriptor"),
+                ));
+            }
+            // The module's own files have the names `ops` loads them by: the
+            // cubin is `module.cubin` and the metadata JSON is the name the
+            // manifest states. Other files keep their place.
+            let name = if relative.ends_with(".cubin") {
+                copied_cubin = true;
+                MODULE_CUBIN.to_owned()
+            } else if relative.ends_with(".json") {
+                copied_metadata = true;
+                metadata.clone()
+            } else {
+                relative.clone()
+            };
+            copy_file(&source, &dir.path().join(&name))?;
+        }
+        if !copied_cubin {
+            return Err(package.failure(
+                key,
+                target,
+                "the package names no .cubin file for this descriptor",
+            ));
+        }
+        if !copied_metadata {
+            return Err(package.failure(
+                key,
+                target,
+                "the package names no metadata JSON for this descriptor",
+            ));
+        }
+        check_metadata_symbol(&package.manifest.op, &dir.path().join(&metadata))
+            .map_err(|message| package.failure(key, target, message))?;
+        copy_tuning(package, key, target, dir)?;
+        Ok(Built {
+            files: collect(dir.path())?,
+        })
     }
 }
 
