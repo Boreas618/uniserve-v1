@@ -478,14 +478,17 @@ pub trait KvProvider: Send + Sync {
     /// Element type of the KV planes.
     fn dtype(&self) -> DType;
 
-    /// The block table of `group` for the batch rows whose slots are `slots`, `[rows, max_pages]`.
+    /// The block table of `group` for the batch's rows, `[rows, max_pages]` i32.
     ///
-    /// The batch's rows are the calls' request slots, so this gathers one table row per batch row
-    /// on `stream` and returns a view the captured graph addresses.
+    /// `slots[r]` is row `r`'s request slot, in the batch's row order and exactly as many entries as
+    /// the bucket has rows (padding included); a row whose slot is negative has no table and its
+    /// row of the view is filled with `-1`, not an error. `max_pages` is the attention
+    /// descriptor's bound (`max_kv_len / page_size`), so the view has a fixed shape the captured
+    /// graph can address, and it is assembled on `stream` before the replay reads it.
     fn block_table(
         &self,
         group: usize,
-        slots: &[u32],
+        slots: &[i32],
         stream: &platform::Stream,
     ) -> Result<TensorView>;
 
@@ -495,11 +498,12 @@ pub trait KvProvider: Send + Sync {
     /// The per-page scales of `group`'s planes, for a quantized cache.
     fn scales(&self, group: usize) -> Option<(TensorView, TensorView)>;
 
-    /// A scratch page set of `pages` pages for `group`, its table over `slots`, and its planes.
+    /// A scratch page set of `pages` pages for `group`, its table over `slots` (`block_table`'s
+    /// order and `-1` rule), and its planes.
     fn scratch(
         &self,
         group: usize,
-        slots: &[u32],
+        slots: &[i32],
         pages: u32,
         stream: &platform::Stream,
     ) -> Result<(TensorView, Vec<nn::KvPlanes>, Option<(TensorView, TensorView)>)>;
@@ -1155,13 +1159,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             .tokens
             .div_ceil(self.geometry.page_size.max(1))
             .max(1);
-        let slots: Vec<u32> = self
-            .staging
-            .batch_rows()
-            .calls
-            .iter()
-            .map(|call| call.request)
-            .collect();
+        let slots: Vec<i32> = self.staging.slots(bucket.rows as usize).to_vec();
         self.with_kv(&slots, Some(pages), |cache| {
             self.model
                 .forward(&forward, &batch, cache, hidden)
@@ -1332,7 +1330,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// tables and groups are locals of one scope and the model reads them borrowed.
     fn with_kv<R>(
         &self,
-        slots: &[u32],
+        slots: &[i32],
         scratch_pages: Option<u32>,
         operation: impl FnOnce(&KvView<'_>) -> Result<R>,
     ) -> Result<R> {
@@ -1394,13 +1392,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             self.geometry.hidden_dtype,
             ops::Shape::new(&[u64::from(bucket.tokens), u64::from(self.geometry.hidden)]),
         )?;
-        let slots: Vec<u32> = self
-            .staging
-            .batch_rows()
-            .calls
-            .iter()
-            .map(|call| call.request)
-            .collect();
+        let slots: Vec<i32> = self.staging.slots(bucket.rows as usize).to_vec();
         self.with_kv(&slots, None, |cache| {
             self.model
                 .forward(&forward, &batch, cache, hidden)
