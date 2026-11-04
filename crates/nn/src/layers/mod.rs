@@ -30,10 +30,12 @@ mod modulation;
 mod moe;
 mod noise;
 mod norm;
+mod patch;
 mod pool;
 mod position;
 mod residual;
 mod rope;
+mod rotate;
 mod rows;
 mod sampler;
 mod segments;
@@ -51,12 +53,14 @@ pub use moe::Moe;
 pub use noise::{Key as NoiseKey, Noise};
 pub use norm::{LayerNorm, RmsNorm};
 pub use ops::rope::Rotation;
+pub use patch::{Patch, PatchMode};
 pub use pool::AdaptivePool;
 pub use position::PositionInterpolate;
 pub use residual::{
     ScaledAdd, ScaledResidual, ScaledResidualLayerNorm, ScaledResidualRmsNorm, WeightedRmsNorm,
 };
-pub use rope::Rotary;
+pub use rope::{Rotary, Sections};
+pub use rotate::Rotate;
 pub use rows::Rows;
 pub use sampler::{Candidates, Sampler, SamplerState, Samples};
 pub use segments::VsaTiles;

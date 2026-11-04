@@ -8,8 +8,8 @@
 
 use nn::{
     AdaptivePool, DType, DevicePtr, FrameNormPad, GatedResidual, KvGroup, KvPlanes, KvView, Linear,
-    ModulatedRmsNorm, Rotary, Rotation, ScaledResidual, ScaledResidualRmsNorm, Shape, Snake,
-    SwiGlu, TensorView, VsaTiles, Weight, WeightedRmsNorm,
+    ModulatedRmsNorm, Patch, PatchMode, Rotary, Rotate, Rotation, ScaledResidual,
+    ScaledResidualRmsNorm, Shape, Snake, SwiGlu, TensorView, VsaTiles, Weight, WeightedRmsNorm,
 };
 use ops::gemm::WeightOrder;
 
@@ -232,4 +232,33 @@ fn a_gated_residual_holds_the_gate_table_it_gates_with() {
     assert_eq!(gate.width(), 32);
     assert!(GatedResidual::new(weight(&[32])).is_err());
     assert!(GatedResidual::new(weight(&[4, 0])).is_err());
+}
+
+/// The patch mapping is built from a layout's latent geometry: channels and the patch grid are
+/// fixed by the layout, frames are the call's launch value, and an odd extent has no whole patches.
+#[test]
+fn a_patch_mapping_holds_a_layouts_latent_geometry() {
+    let patch = Patch::new(24, 32, 32).unwrap();
+    assert_eq!(patch.channels(), 24);
+    assert_eq!(PatchMode::Patchify.to_string(), "patchify");
+    assert_eq!(PatchMode::Unpatchify.to_string(), "unpatchify");
+    assert!(Patch::new(0, 32, 32).is_err());
+    assert!(Patch::new(24, 0, 32).is_err());
+    assert!(
+        Patch::new(24, 33, 32).is_err(),
+        "an odd height has no whole patch"
+    );
+    assert!(Patch::new(24, 32, 31).is_err());
+    assert!(Patch::new(u64::from(u32::MAX) + 1, 32, 32).is_err());
+}
+
+/// The vision tower's rotation is built from its head geometry alone: the tables are the caller's
+/// and the whole head turns, so a narrower cut or an odd head has no program.
+#[test]
+fn a_vision_rotation_holds_a_head_and_its_heads() {
+    let rotate = Rotate::new(64, 12, Rotation::Half).unwrap();
+    assert_eq!((rotate.head_dim(), rotate.heads()), (64, 12));
+    assert!(Rotate::new(63, 12, Rotation::Half).is_err());
+    assert!(Rotate::new(0, 12, Rotation::Half).is_err());
+    assert!(Rotate::new(64, 0, Rotation::Half).is_err());
 }
