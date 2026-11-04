@@ -1200,6 +1200,10 @@ impl VideoEncoder {
             }
             None => values,
         };
+        // The reference groups the sum as `residual + (values + bias)` and adds the convolution's
+        // bias in a pass of its own; cuDNN adds that bias in a pass of its own too, and IEEE addition
+        // commutes, so `(values + bias) + residual` here is the same rounded value
+        // (`video_vae.py:852-859`, `:1009-1020`).
         Ok(ScaledAdd.forward(f, rows(out)?, rows(residual)?, 1.0, 1.0)?)
     }
 }
