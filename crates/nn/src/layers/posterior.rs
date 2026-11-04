@@ -42,6 +42,14 @@ impl Posterior {
     /// `mean` and `log_variance` may be the two halves of one moments buffer cut by an offset -- in
     /// either physical layout, channels-last `(row = channels, channel = 1)` or channel-major
     /// `(row = 1, channel = positions)`. `out` may not alias any of them.
+    /// The descriptor this layer's launch takes, for a walk without a device.
+    pub fn descriptor(&self) -> posterior::Descriptor {
+        posterior::Descriptor {
+            block: posterior::BLOCK,
+            pdl: self.pdl,
+        }
+    }
+
     pub fn forward(
         &self,
         f: &Forward,
@@ -61,10 +69,7 @@ impl Posterior {
             ));
         }
         f.operate::<PosteriorOp>(
-            &posterior::Descriptor {
-                block: posterior::BLOCK,
-                pdl: self.pdl,
-            },
+            &self.descriptor(),
             posterior::Args {
                 mean,
                 log_variance,

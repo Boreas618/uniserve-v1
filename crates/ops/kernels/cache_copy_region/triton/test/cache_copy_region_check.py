@@ -23,6 +23,7 @@ expression, in that order.
 
 import argparse
 import importlib.util
+import pathlib
 
 import torch
 
@@ -42,7 +43,8 @@ SCALE_FLOOR = 1e-12
 
 def load_kernel(package):
     """The package's kernel, imported from its source directory."""
-    path = f"{package}/src/cache_copy_region.py"
+    del package  # the check's own location is the package's, wherever it is run from
+    path = pathlib.Path(__file__).resolve().parents[1] / "src" / "cache_copy_region.py"
     spec = importlib.util.spec_from_file_location("copy_region_kernel", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
