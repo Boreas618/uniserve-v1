@@ -296,6 +296,8 @@ fn main() {
                 sections[2] = ROPE_FREQ_DIM;
                 sections
             },
+            // H3's text encoder is Qwen3-VL: its M-RoPE cycles the axes over the frequencies.
+            interleaved: true,
         }
         .to_string(),
     );
