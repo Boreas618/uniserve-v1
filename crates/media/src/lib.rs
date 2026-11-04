@@ -48,7 +48,6 @@
 
 // The published interface and the FFmpeg shim's declarations are filled in
 // body by body; unused until their callers land.
-#![allow(dead_code, unused_variables)]
 
 pub mod codec;
 pub mod config;

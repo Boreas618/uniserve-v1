@@ -1,6 +1,6 @@
 //! Where the external media executables of one deployment live.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The media configuration of a main process.
 ///
@@ -17,14 +17,33 @@ pub struct MediaConfig {
 }
 
 impl MediaConfig {
-    /// The configuration named by `UNISERVE_FFMPEG`, or `ffmpeg` from the
-    /// loader's search path.
+    /// The configuration named by `UNISERVE_FFMPEG`, else the `ffmpeg` of the
+    /// runtime the crate links (the installation's `bin/ffmpeg`), else
+    /// `ffmpeg` from the loader's search path.
     pub fn from_env() -> Self {
         Self {
-            ffmpeg: std::env::var_os("UNISERVE_FFMPEG")
-                .map_or_else(|| PathBuf::from("ffmpeg"), PathBuf::from),
+            ffmpeg: ffmpeg_executable(),
         }
     }
+}
+
+/// The reference-video decoder of this deployment.
+///
+/// The linked runtime usually ships its own `ffmpeg`, and it is the natural
+/// decoder because it is the build whose codecs the crate was compiled
+/// against; a deployment that provisions its decoder elsewhere names it with
+/// `UNISERVE_FFMPEG`.
+fn ffmpeg_executable() -> PathBuf {
+    if let Some(path) = std::env::var_os("UNISERVE_FFMPEG") {
+        return PathBuf::from(path);
+    }
+    let runtime = Path::new(env!("UNISERVE_MEDIA_RUNTIME"))
+        .join("bin")
+        .join("ffmpeg");
+    if runtime.is_file() {
+        return runtime;
+    }
+    PathBuf::from("ffmpeg")
 }
 
 impl Default for MediaConfig {

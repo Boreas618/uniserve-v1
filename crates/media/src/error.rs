@@ -46,11 +46,6 @@ impl Error {
         Self::Plan(reason.into())
     }
 
-    /// A codec failure reported by the FFmpeg shim.
-    pub(crate) fn codec(reason: impl Into<String>) -> Self {
-        Self::Codec(reason.into())
-    }
-
     /// An operating-system failure with its context.
     pub(crate) fn io(context: impl Into<String>, source: std::io::Error) -> Self {
         Self::Io {
