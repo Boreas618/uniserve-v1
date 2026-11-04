@@ -19,13 +19,16 @@
 pub mod completion;
 pub mod config;
 pub mod error;
+pub mod host;
 pub mod keys;
 pub mod memory;
 pub mod stream;
 pub mod tensor;
 pub mod transfer;
 
+pub use completion::Outcome;
 pub use error::{Error, Failure, Result};
+pub use host::{HostPool, HostTask};
 
 /// Lock `mutex`, keeping the state a panicking holder left.
 ///
