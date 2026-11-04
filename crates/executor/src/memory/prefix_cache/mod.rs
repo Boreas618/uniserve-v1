@@ -154,9 +154,14 @@ impl PrefixCache {
         capacity.clamp(1, IMPORT_WORKERS)
     }
 
-    /// Fixed device bytes besides the pool itself: block tables, import
-    /// scratch, per-stream unit columns (`unit_columns` streams besides the
-    /// import workers') and the banks of the layers kept per request slot.
+    /// Fixed device bytes besides the pool itself: the block tables, the import
+    /// scratch, the per-stream unit columns and the banks of the layers kept
+    /// per request slot.
+    ///
+    /// The unit columns are the cache's index, one per stream that writes a
+    /// unit, and each holds one `i64` per unit; the block tables are the batch
+    /// plan's, one row per request slot at the widest table. Both are charged
+    /// here so a pool's fit is not optimistic by their bytes per unit.
     pub(crate) fn fixed_bytes(
         plan: &CachePlan,
         num_units: u32,
@@ -169,10 +174,17 @@ impl PrefixCache {
         let (elements, scales) = plan.page_extents();
         let states: Vec<_> = plan.states.iter().map(|field| field.slot()).collect();
         let (states, _) = RequestSlots::bytes(&states, request_pool_size)?;
+        // Every unit column holds one index per unit, charged with each unit:
+        // the import workers', the primary stream's and the copy stream's of a
+        // rank that copies pages through the host KV cache.
+        let columns = u64::try_from(unit_columns).map_err(|_| {
+            crate::Error::Invariant("a rank holds more stream columns than fit".into())
+        })? * UnitColumn::bytes(num_units);
         Ok(
             BlockTableStorage::bytes(&plan.group_shapes()?, request_pool_size, width)
                 + workers * ImportWorkspace::scratch_bytes(elements, scales)
-                + states,
+                + states
+                + columns,
         )
     }
 
@@ -987,5 +999,43 @@ impl ScratchUnits {
         Issue::synchronize(&stream)?;
         cache.planes.zero_leading(self.count, stream)?;
         Issue::synchronize(&stream)
+    }
+}
+
+#[cfg(test)]
+mod fixed_bytes_tests {
+    use super::*;
+
+    fn plan() -> CachePlan {
+        CachePlan {
+            columns: 1,
+            plane_bytes: 16,
+            quantized: false,
+            unit_bytes: 16,
+            dtype: ipc::PrefixCacheDtype::BFloat16,
+            groups: Vec::new(),
+            states: Vec::new(),
+            checkpoints: Vec::new(),
+        }
+    }
+
+    /// The two fixed figures are charged separately: one column's bytes per
+    /// unit for the index, and nothing at all when no stream writes one.
+    #[test]
+    fn unit_columns_are_charged_per_unit_and_per_stream() -> Result<()> {
+        let plan = plan();
+        let at = |units: u32, columns: usize| {
+            PrefixCache::fixed_bytes(&plan, units, 4, 8, 0, columns).expect("fixed bytes")
+        };
+        let one_column = at(100, 1);
+        let no_column = at(100, 0);
+
+        // One column adds exactly one column's bytes per unit.
+        assert_eq!(one_column - no_column, 100 * 8);
+        // Doubling the units adds that same figure again, so the term is per unit.
+        assert_eq!(at(200, 1) - one_column, 100 * 8);
+        // A second stream adds one more column, not a re-count of the first.
+        assert_eq!(at(100, 2) - one_column, 100 * 8);
+        Ok(())
     }
 }
