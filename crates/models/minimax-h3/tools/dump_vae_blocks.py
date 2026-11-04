@@ -295,8 +295,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     value = captured[path]
     print(f"got     {tuple(value.shape)} {value.dtype} on the component's own path")
-    options.out.mkdir(parents=True, exist_ok=True)
-    name = f"vae.{component}.{path}"
+    # The tree's convention is the Rust side's: one file per probe at `<block>/<name>.npy`, which is what
+    # `compare.py` matches on (`$UNISERVE_DIAG_DIR/<block>/<name>.npy`, notes/h3/diagnosis.md 3).
+    name = f"{component}/{path}"
+    (options.out / component).mkdir(parents=True, exist_ok=True)
     dump(options.out, name, value)
     print(f"wrote   {options.out / (name + '.h3t')}")
     return 0
