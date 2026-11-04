@@ -23,6 +23,16 @@
 # path's arithmetic is one FP32 product accumulated in FP32, the exponentials and
 # their sum in FP32, and the output's own single rounding — the accumulation
 # `dense_attention`'s tolerance is derived from for the FP32 dtype.
+#
+# The weights are normalized *before* the second product (`p_j = exp(s_j − max) /
+# Σ exp`), not after it, and that stays inside the operator's tolerance rather than
+# needing a wider one: a normalized weight carries one rounding of its own, and the
+# error that introduces is bounded by `u · Σ|p_j| · V ≤ u·V` because the weights of
+# a row are non-negative and sum to one — which is the `u·V` absolute term
+# `dense_attention`'s tolerance already carries (`dense.rs::tolerance`, Higham's
+# convex-combination bound over the descriptor's cap and the value envelope). Do not
+# "fix" this into an unnormalized pass: the product would then have to divide every
+# output element afterwards, which rounds once more per element and buys nothing.
 
 op = "dense_attention"
 backend = "f32"

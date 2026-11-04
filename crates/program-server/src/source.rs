@@ -880,6 +880,14 @@ impl Source for CubinSource {
 
 /// A scheduling policy: wasm32, then precompiled for this host's CPU
 /// (design section 5.3).
+///
+/// A policy is the one package built when it is *installed* (design section
+/// 6.2): its build is the publisher's crate inside the publisher's workspace, so
+/// it can only run while the directory the install named still exists. The
+/// server keeps the precompiled module in the revision directory beside the
+/// manifest, and [`Source::stored`] publishes it — so a host with no wasm
+/// precompiler, or one whose `cargo` cannot build the crate, still serves a
+/// policy the upstream server built.
 #[derive(Clone, Debug)]
 pub struct WasmSource {
     package: PackageSource,

@@ -1148,3 +1148,71 @@ script = "src/build.py"
     stop.store(true, Ordering::SeqCst);
     thread.join().unwrap();
 }
+
+/// A package compiles from the copy its install kept, not from the tree it was
+/// installed from: the publisher's directory is deleted before the build, and the
+/// module still commits.
+///
+/// This is the property a deployment depends on. The upstream Program Server
+/// installs a package from a checkout it may later lose, and a downstream server's
+/// package root is a read-only mount of the upstream's; neither has the tree, so
+/// what compiles must be what was installed.
+#[test]
+fn a_package_compiles_from_the_copy_its_install_kept() {
+    let Some(toolchains) = cuda_toolchains() else {
+        eprintln!("SKIPPED (provisioning): this host has no nvcc to build with");
+        return;
+    };
+    let source = repository().join("crates/ops/kernels/moe_sort/trtllm");
+    let Ok(manifest) = std::fs::read_to_string(source.join("package.toml")) else {
+        eprintln!("SKIPPED: the tree holds no moe_sort package");
+        return;
+    };
+    let Some(key) = descriptor_key(&manifest) else {
+        panic!("the moe_sort package declares no descriptor");
+    };
+
+    let temporary = tempfile::tempdir().unwrap();
+    // The publisher's directory: a copy of the tree package, declaring this
+    // host's toolkit so the witness is not about the version.
+    let publisher = temporary.path().join("publisher");
+    std::fs::create_dir_all(&publisher).unwrap();
+    let Some(to_build_from) = at_host_version(&source, &publisher, &toolchains) else {
+        eprintln!("SKIPPED (provisioning): this host reports no nvcc version to build with");
+        return;
+    };
+
+    let configuration = configuration(temporary.path(), toolchains);
+    let (_server, stop, thread) = start(&configuration);
+    let mut client = Client::connect(&configuration.socket).unwrap();
+    client.install(&to_build_from).unwrap();
+
+    // The tree the install named is gone; the installed copy is all there is.
+    std::fs::remove_dir_all(&to_build_from).unwrap();
+    assert!(!to_build_from.exists());
+
+    let request = PrepareRequest {
+        targets: vec![Target::new("sm_100a")],
+        programs: vec![ProgramRequest {
+            slot: ProgramSlot::all("moe_sort"),
+            selector: Selector::Latest {
+                backend: "trtllm".to_owned(),
+                arguments: toml::Table::new(),
+            },
+        }],
+        descriptors: vec![Descriptors {
+            op: "moe_sort".to_owned(),
+            keys: vec![key],
+        }],
+    };
+    let mut states = Vec::new();
+    client
+        .prepare(&request, &mut |progress| states.push(progress.state))
+        .expect("the package compiles from the installed copy");
+    assert!(
+        states.iter().any(|state| *state == BuildState::Committed),
+        "the build of the installed copy committed nothing: {states:?}"
+    );
+    stop.store(true, Ordering::SeqCst);
+    thread.join().unwrap();
+}
