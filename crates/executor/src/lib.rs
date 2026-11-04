@@ -26,6 +26,8 @@ pub mod parallel;
 pub mod stream;
 pub mod tensor;
 pub mod transfer;
+pub mod blocking;
+pub mod watchdog;
 
 pub use completion::Outcome;
 pub use error::{Error, Failure, Result};
