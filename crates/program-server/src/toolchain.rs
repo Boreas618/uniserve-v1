@@ -564,7 +564,15 @@ fn wasmtime_version(precompiler: &Path) -> Discovered<String> {
 fn parse_nvcc_version(text: &str) -> Option<String> {
     let release = text.split("release ").nth(1)?;
     let after = release.split(',').nth(1)?.trim();
-    let version = after.strip_prefix('V').unwrap_or(after).trim();
+    // `nvcc --version` follows the release with a second line ("Build
+    // cuda_13.0.r13.0/compiler.…"), so the version is the first word after
+    // the `V`, not everything to the end of the output.
+    let version = after
+        .strip_prefix('V')
+        .unwrap_or(after)
+        .split_whitespace()
+        .next()
+        .unwrap_or_default();
     if version.is_empty() {
         None
     } else {

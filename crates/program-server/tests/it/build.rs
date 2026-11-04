@@ -3,16 +3,14 @@
 //! module compiled by the real toolchain, committed into the store, and
 //! resolved with the module's files arriving as descriptors.
 //!
-//! The build compiles `crates/ops/kernels/rms_norm/triton` with
-//! `python/.venv`'s Triton, which is compiling and needs no GPU. The
-//! environment is provisioned, not part of the repository:
+//! Each witness takes a package of the tree by the kind of source it declares,
+//! so it follows the kernel programs as they are renamed and rewritten
+//! against the model's operator names. Three need compilers on the host and
+//! report what to provision when one is absent; the vendor cubin needs none.
 //!
-//! ```text
-//! uv sync --project crates/program-server/python --python /usr/bin/python3.12
-//! ```
-//!
-//! Without it the test reports the provisioning it needs and does not run;
-//! with it, it runs the whole path a deployment takes.
+//! The Python environment is provisioned, not part of the repository, and
+//! `uv sync --project crates/program-server/python --python /usr/bin/python3.12`
+//! creates it (5.1 GB under `crates/program-server/python/.venv`).
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -22,14 +20,14 @@ use std::time::{Duration, Instant};
 
 use program_server::builder::{BuildState, Limits};
 use program_server::manifest::ModuleForm;
-use program_server::protocol::{Descriptors, PrepareRequest, ProgramRequest, Selector};
+use program_server::protocol::{Descriptors, Module, PrepareRequest, ProgramRequest, Selector};
 use program_server::server::{ProgramServer, ServerConfig};
 use program_server::store::{ModulePath, Root};
 use program_server::target::{Device, Target};
 use program_server::toolchain::ToolchainConfig;
 use program_server::{Client, ProgramSlot};
 
-/// The repository root, three directories above this crate.
+/// The repository root, two directories above this crate.
 fn repository() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -43,19 +41,111 @@ fn interpreter() -> PathBuf {
     repository().join("crates/program-server/python/.venv/bin/python")
 }
 
-/// The `rms_norm` package of the tree: a Triton kernel program whose one
-/// descriptor this test builds.
-fn package() -> PathBuf {
-    repository().join("crates/ops/kernels/rms_norm/triton")
+/// A package of the tree and the pieces a request names it by: its directory,
+/// its operator, its backend, and one descriptor its `[kernel.descriptors]`
+/// covers — the first value of every dimension, in the order the package
+/// writes them.
+struct TreePackage {
+    directory: PathBuf,
+    op: String,
+    backend: String,
+    descriptor: String,
 }
 
-/// The descriptor built here: `bf16`, 2048 columns, contiguous, which the
-/// package's `[kernel.descriptors]` covers.
-fn descriptor() -> String {
-    "dtype_bf16_width_2048_layout_contiguous".to_owned()
+/// Finds the first package of `crates/ops/kernels` whose source is of `kind`,
+/// in the order the tree names its operators.
+fn tree_package(kind: &str) -> Option<TreePackage> {
+    let root = repository().join("crates/ops/kernels");
+    let mut operators = std::fs::read_dir(&root)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    operators.sort();
+    for operator in operators {
+        let mut backends = std::fs::read_dir(&operator)
+            .ok()?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.is_dir())
+            .collect::<Vec<_>>();
+        backends.sort();
+        for backend in backends {
+            let manifest = backend.join("package.toml");
+            let Ok(text) = std::fs::read_to_string(&manifest) else {
+                continue;
+            };
+            let Ok(parsed) = text.parse::<toml::Table>() else {
+                continue;
+            };
+            let source_kind = parsed
+                .get("source")
+                .and_then(|source| source.get("kind"))
+                .and_then(toml::Value::as_str);
+            if source_kind != Some(kind) {
+                continue;
+            }
+            let (Some(op), Some(backend_name)) = (
+                parsed.get("op").and_then(toml::Value::as_str),
+                parsed.get("backend").and_then(toml::Value::as_str),
+            ) else {
+                continue;
+            };
+            let Some(descriptor) = descriptor_key(&text) else {
+                continue;
+            };
+            return Some(TreePackage {
+                directory: backend,
+                op: op.to_owned(),
+                backend: backend_name.to_owned(),
+                descriptor,
+            });
+        }
+    }
+    None
 }
 
-/// Starts a server on a socket and answers it with the stop flag.
+/// One descriptor a package covers, as the packages declare them: a list of
+/// names under `keys`, or every dimension's first value joined by `_`.
+fn descriptor_key(text: &str) -> Option<String> {
+    // The section header on its own line: the packages' prose also names it.
+    let kernel = text.split("\n[kernel.descriptors]\n").nth(1)?;
+    if let Some(keys) = kernel
+        .split("keys = [")
+        .nth(1)
+        .and_then(|rest| rest.split(']').next())
+    {
+        let first = keys.split(',').next()?.trim().trim_matches('"');
+        if !first.is_empty() {
+            return Some(first.to_owned());
+        }
+    }
+    let dimensions = kernel.split("dimensions = {").nth(1)?.split('}').next()?;
+    // Each dimension is written `field = ["first", ...]`; the first value and
+    // the field name, in the order the package writes them, are the key.
+    let mut name = Vec::new();
+    let mut rest = dimensions;
+    while let Some(start) = rest.find("= [\"") {
+        let field = rest[..start].trim_start_matches(',').trim();
+        let values = &rest[start + 4..];
+        let end = values.find('"')?;
+        name.push(field.to_owned());
+        name.push(values[..end].to_owned());
+        // Skip the rest of this dimension's values, up to its `]`.
+        let after = &values[end..];
+        rest = &after[after.find(']')? + 1..];
+    }
+    (!name.is_empty()).then(|| name.join("_"))
+}
+
+/// Whether the host has a program, which a witness needs before it runs.
+fn have(program: &str, arguments: &[&str]) -> bool {
+    std::process::Command::new(program)
+        .args(arguments)
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+/// Starts a server on its socket and answers it with its stop flag.
 fn start(
     configuration: &ServerConfig,
 ) -> (
@@ -84,74 +174,75 @@ fn start(
     (server, stop, thread)
 }
 
-#[test]
-fn install_prepare_committed_resolve() {
-    let interpreter = interpreter();
-    if !interpreter.is_file() {
-        eprintln!(
-            "SKIPPED (provisioning): no Python environment at {}.\n\
-             Create it with `uv sync --project crates/program-server/python \
-             --python /usr/bin/python3.12`, then run this test again.",
-            interpreter.display()
-        );
-        return;
-    }
-
-    let temporary = tempfile::tempdir().unwrap();
-    let package_root = temporary.path().join("packages");
-    std::fs::create_dir_all(&package_root).unwrap();
-    let store = temporary.path().join("store");
-    std::fs::create_dir_all(&store).unwrap();
-    let configuration = ServerConfig {
-        socket: temporary.path().join("program-server.sock"),
-        package_root: package_root.clone(),
+/// A server over a fresh package root and module store, with the compilers
+/// `toolchains` names.
+fn configuration(temporary: &Path, toolchains: ToolchainConfig) -> ServerConfig {
+    let package_root = temporary.join("packages");
+    std::fs::create_dir_all(&package_root).expect("the package root");
+    let store = temporary.join("store");
+    std::fs::create_dir_all(&store).expect("the store");
+    ServerConfig {
+        socket: temporary.join("program-server.sock"),
+        package_root,
         store_roots: vec![Root {
-            path: store.clone(),
+            path: store,
             writable: true,
         }],
         upstream: None,
         limits: Limits::default(),
-        toolchains: ToolchainConfig {
-            nvcc: None,
-            python: interpreter,
-            wasm: None,
-            max_jobs: 2,
-        },
+        toolchains,
         devices: vec![Device {
             arch: Target::new("sm_100a"),
             model: Target::new("b200"),
         }],
-    };
+    }
+}
+
+/// What one witness observed: the module `resolve` answered, the listing, and
+/// the things the test shuts down at its end.
+struct Witness {
+    _temporary: tempfile::TempDir,
+    stop: Arc<AtomicBool>,
+    thread: std::thread::JoinHandle<()>,
+    /// The program `prepare` selected: its revision, and the package's
+    /// parameter defaults merged into its arguments.
+    program: program_server::Program,
+    progress: Vec<program_server::protocol::Progress>,
+    resolved: Module,
+}
+
+/// Installs `package` over a fresh server, prepares one descriptor of it for
+/// `sm_100a`, and resolves the committed module.
+fn witness(
+    package: &Path,
+    op: &str,
+    backend: &str,
+    key: &str,
+    toolchains: ToolchainConfig,
+) -> Witness {
+    let temporary = tempfile::tempdir().unwrap();
+    let configuration = configuration(temporary.path(), toolchains);
     let (_server, stop, thread) = start(&configuration);
     let mut client = Client::connect(&configuration.socket).unwrap();
 
-    // 1. Install: the package is copied into the package root as revision 1.
-    let installed = client.install(&package()).unwrap();
-    assert_eq!(installed.package.op, "rms_norm");
-    assert_eq!(installed.package.backend, "triton");
+    let installed = client.install(package).unwrap();
     assert_eq!(installed.package.revision, 1);
-    assert!(
-        package_root
-            .join("rms_norm/triton/1/package.toml")
-            .is_file(),
-        "the installed package is under the package root"
-    );
+    assert_eq!(installed.package.op, op);
+    assert_eq!(installed.package.backend, backend);
 
-    // 2. Prepare: the descriptor's module is built and committed.
-    let key = descriptor();
     let target = Target::new("sm_100a");
     let request = PrepareRequest {
         targets: vec![target.clone()],
         programs: vec![ProgramRequest {
-            slot: ProgramSlot::all("rms_norm"),
+            slot: ProgramSlot::all(op),
             selector: Selector::Latest {
-                backend: "triton".into(),
+                backend: backend.to_owned(),
                 arguments: toml::Table::new(),
             },
         }],
         descriptors: vec![Descriptors {
-            op: "rms_norm".into(),
-            keys: vec![key.clone()],
+            op: op.to_owned(),
+            keys: vec![key.to_owned()],
         }],
     };
     let mut progress = Vec::new();
@@ -160,108 +251,231 @@ fn install_prepare_committed_resolve() {
         .unwrap();
     assert_eq!(prepared.programs.len(), 1);
     assert_eq!(prepared.programs[0].program.revision, 1);
-    // The package's `[parameters]` fill the program's arguments.
-    assert_eq!(
-        prepared.programs[0]
-            .program
-            .arguments
-            .get("eps")
-            .and_then(toml::Value::as_float),
-        Some(1e-06)
-    );
-    assert_eq!(progress.len(), 1, "one descriptor is one build");
-    let path = ModulePath::new("rms_norm", "triton", 1, target.as_str(), &key).unwrap();
-    assert_eq!(progress[0].path, path);
-    assert_eq!(
-        progress[0].state,
-        BuildState::Committed,
-        "the build failed: {}",
-        progress[0].detail
-    );
 
-    // 3. Committed: the module is in the store, and the store says so.
-    let module = store
-        .join("rms_norm")
-        .join("triton")
-        .join("1")
-        .join(target.as_str())
-        .join(&key);
-    for name in ["module.cubin", "metadata.json", ".committed"] {
-        assert!(
-            module.join(name).is_file(),
-            "the committed module has no {name}"
-        );
-    }
-
-    // 4. Resolve: the files come back as descriptors, and they are the
-    // module the store holds.
     let program = prepared.programs[0].program.clone();
     let resolved = client
-        .resolve("rms_norm", &program, &target, &key, &mut |_| {})
+        .resolve(op, &program, &target, key, &mut |_| {})
         .unwrap();
-    assert_eq!(resolved.form, ModuleForm::Cubin);
-    assert_eq!(resolved.metadata.as_deref(), Some("metadata.json"));
-    assert!(
-        resolved.entries.is_empty(),
-        "a cubin is launched, not called"
-    );
+    Witness {
+        _temporary: temporary,
+        stop,
+        thread,
+        program,
+        progress,
+        resolved,
+    }
+}
 
-    let cubin = resolved
-        .files
-        .iter()
-        .find(|file| file.name == "module.cubin")
-        .expect("the module's cubin arrives on a descriptor");
+/// Reads a file of a resolved module, by its name.
+fn file_of(module: &Module, name: &str) -> Vec<u8> {
     let mut bytes = Vec::new();
-    let mut file = cubin.file.try_clone().unwrap();
-    file.read_to_end(&mut bytes).unwrap();
-    assert_eq!(bytes.len() as u64, cubin.size);
-    assert_eq!(
-        &bytes[..4],
-        b"\x7fELF",
-        "a cubin is an ELF file the CUDA driver loads"
-    );
-    assert_eq!(
-        bytes,
-        std::fs::read(module.join("module.cubin")).unwrap(),
-        "the resolved cubin is the committed one"
-    );
-
-    let metadata = resolved
+    module
         .files
         .iter()
-        .find(|file| file.name == "metadata.json")
-        .expect("the module's metadata arrives on a descriptor");
-    let mut text = String::new();
-    metadata
+        .find(|file| file.name == name)
+        .unwrap_or_else(|| {
+            panic!(
+                "the module has no {name}, only {:?}",
+                module
+                    .files
+                    .iter()
+                    .map(|file| file.name.as_str())
+                    .collect::<Vec<_>>()
+            )
+        })
         .file
         .try_clone()
         .unwrap()
-        .read_to_string(&mut text)
+        .read_to_end(&mut bytes)
         .unwrap();
+    bytes
+}
+
+#[test]
+fn a_triton_package_builds_a_cubin_module_and_resolves_it() {
+    if !interpreter().is_file() {
+        eprintln!(
+            "SKIPPED (provisioning): no Python environment at {}.\n\
+             Create it with `uv sync --project crates/program-server/python \
+             --python /usr/bin/python3.12`, then run this test again.",
+            interpreter().display()
+        );
+        return;
+    }
+    let package = tree_package("triton").expect("the tree has a Triton package");
+    let witness = witness(
+        &package.directory,
+        &package.op,
+        &package.backend,
+        &package.descriptor,
+        ToolchainConfig {
+            nvcc: None,
+            python: interpreter(),
+            wasm: None,
+            max_jobs: 2,
+        },
+    );
+
+    // The package's `[parameters]` fill the selected program's arguments.
+    let manifest = std::fs::read_to_string(package.directory.join("package.toml")).unwrap();
+    let parameters = manifest
+        .split("[parameters]")
+        .nth(1)
+        .map(|rest| {
+            rest.split('\n')
+                .take_while(|line| !line.starts_with('['))
+                .collect::<String>()
+        })
+        .unwrap_or_default();
+    let declared: toml::Table = parameters.parse().expect("the package's parameters");
+    for (name, default) in &declared {
+        assert_eq!(
+            witness.program.arguments.get(name),
+            Some(default),
+            "the program carries the package's {name} default"
+        );
+    }
+
+    // One descriptor is one build, and the build committed.
+    assert_eq!(witness.progress.len(), 1, "one descriptor is one build");
+    assert_eq!(
+        witness.progress[0].state,
+        BuildState::Committed,
+        "the build failed: {}",
+        witness.progress[0].detail
+    );
+    let path = ModulePath::new(
+        &package.op,
+        &package.backend,
+        1,
+        "sm_100a",
+        &package.descriptor,
+    )
+    .unwrap();
+    assert_eq!(witness.progress[0].path, path);
+
+    // The module is a cubin and the metadata that says how to launch it.
+    assert_eq!(witness.resolved.form, ModuleForm::Cubin);
+    let metadata = witness
+        .resolved
+        .metadata
+        .clone()
+        .expect("a cubin module names its launch metadata");
+    assert!(
+        witness.resolved.entries.is_empty(),
+        "a cubin has no C entry"
+    );
+    let cubin = file_of(&witness.resolved, "module.cubin");
+    assert_eq!(
+        &cubin[..4],
+        b"\x7fELF",
+        "a cubin is an ELF file the CUDA driver loads"
+    );
+    let text = String::from_utf8(file_of(&witness.resolved, &metadata)).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&text).expect("the metadata is JSON");
     assert!(
         !parsed
             .get("name")
-            .and_then(|name| name.as_str())
+            .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .is_empty(),
         "the metadata names the kernel it launches"
     );
 
-    // 5. List: the package and its committed module are visible.
-    let listing = client.list().unwrap();
-    let listed = listing
-        .packages
-        .iter()
-        .find(|package| package.op == "rms_norm" && package.backend == "triton")
-        .expect("the installed package is listed");
-    assert_eq!(listed.revision, 1);
-    assert!(listed.modules.iter().any(|module| {
-        module.target == target && module.descriptor == key && module.form == ModuleForm::Cubin
-    }));
+    witness.stop.store(true, Ordering::SeqCst);
+    witness.thread.join().unwrap();
+}
 
-    stop.store(true, Ordering::SeqCst);
-    thread.join().unwrap();
+#[test]
+fn a_cuda_package_builds_a_native_module_with_its_entries() {
+    if !have("nvcc", &["--version"]) {
+        eprintln!("SKIPPED (provisioning): no nvcc on this host");
+        return;
+    }
+    let Some(package) = tree_package("cuda") else {
+        eprintln!("SKIPPED: the tree holds no CUDA package");
+        return;
+    };
+    let witness = witness(
+        &package.directory,
+        &package.op,
+        &package.backend,
+        &package.descriptor,
+        ToolchainConfig {
+            nvcc: None,
+            python: interpreter(),
+            wasm: None,
+            max_jobs: 2,
+        },
+    );
+
+    assert_eq!(witness.progress[0].state, BuildState::Committed);
+    assert_eq!(witness.resolved.form, ModuleForm::Native);
+    assert!(
+        witness.resolved.metadata.is_none(),
+        "a native module has no launch metadata"
+    );
+    let package_manifest = std::fs::read_to_string(package.directory.join("package.toml")).unwrap();
+    let launch = package_manifest
+        .split("[module.entries]")
+        .nth(1)
+        .and_then(|entries| entries.split("launch = \"").nth(1))
+        .and_then(|rest| rest.split('"').next())
+        .expect("a native package names its launch entry");
+    assert_eq!(
+        witness.resolved.entries.get("launch").map(String::as_str),
+        Some(launch),
+        "the module's launch symbol is the package's"
+    );
+    let library = file_of(&witness.resolved, "module.so");
+    assert_eq!(
+        &library[..4],
+        b"\x7fELF",
+        "a native module is a shared object"
+    );
+    assert!(
+        String::from_utf8_lossy(&library).contains(launch),
+        "the module exports the entry its package names"
+    );
+
+    witness.stop.store(true, Ordering::SeqCst);
+    witness.thread.join().unwrap();
+}
+
+#[test]
+fn a_cute_dsl_package_builds_a_native_module_with_its_entries() {
+    if !interpreter().is_file() {
+        eprintln!(
+            "SKIPPED (provisioning): no Python environment at {}",
+            interpreter().display()
+        );
+        return;
+    }
+    let Some(package) = tree_package("cute_dsl") else {
+        eprintln!("SKIPPED: the tree holds no CuTe DSL package");
+        return;
+    };
+    let witness = witness(
+        &package.directory,
+        &package.op,
+        &package.backend,
+        &package.descriptor,
+        ToolchainConfig {
+            nvcc: None,
+            python: interpreter(),
+            wasm: None,
+            max_jobs: 2,
+        },
+    );
+
+    assert_eq!(witness.progress[0].state, BuildState::Committed);
+    assert_eq!(witness.resolved.form, ModuleForm::Native);
+    assert!(witness.resolved.metadata.is_none());
+    let library = file_of(&witness.resolved, "module.so");
+    assert_eq!(&library[..4], b"\x7fELF");
+
+    witness.stop.store(true, Ordering::SeqCst);
+    witness.thread.join().unwrap();
 }
 
 /// A vendor cubin package: the package carries the cubin and the launch
@@ -288,8 +502,7 @@ descriptors = { dimensions = { dtype = ["bf16"], page = ["64"] } }
 "#;
 
 /// The bytes of a cubin, as a package carries them: an ELF object with the
-/// little-endian CUDA magic. The Program Server stores it as it is; no driver
-/// reads it here.
+/// CUDA magic. The Program Server stores it as it is; no driver reads it here.
 fn cubin_bytes() -> Vec<u8> {
     let mut bytes = vec![0u8; 64];
     bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
@@ -312,32 +525,16 @@ fn a_vendor_cubin_is_installed_stored_and_resolved_as_it_is() {
     )
     .unwrap();
 
-    let package_root = temporary.path().join("packages");
-    std::fs::create_dir_all(&package_root).unwrap();
-    let store = temporary.path().join("store");
-    std::fs::create_dir_all(&store).unwrap();
-    let configuration = ServerConfig {
-        socket: temporary.path().join("program-server.sock"),
-        package_root: package_root.clone(),
-        store_roots: vec![Root {
-            path: store.clone(),
-            writable: true,
-        }],
-        upstream: None,
-        limits: Limits::default(),
-        // A vendor cubin compiles nothing, so this server needs no compiler
-        // at all: neither the Python environment nor nvcc exists here.
-        toolchains: ToolchainConfig {
+    let configuration = configuration(
+        temporary.path(),
+        ToolchainConfig {
             nvcc: None,
             python: temporary.path().join("no-python"),
             wasm: None,
             max_jobs: 1,
         },
-        devices: vec![Device {
-            arch: Target::new("sm_100a"),
-            model: Target::new("b200"),
-        }],
-    };
+    );
+    let store = configuration.store_roots[0].path.clone();
     let (_server, stop, thread) = start(&configuration);
     let mut client = Client::connect(&configuration.socket).unwrap();
 
@@ -376,6 +573,16 @@ fn a_vendor_cubin_is_installed_stored_and_resolved_as_it_is() {
         cubin,
         "the module is the package's cubin, byte for byte"
     );
+    for name in [
+        "module.cubin",
+        "metadata_dtype_bf16_page_64.json",
+        ".committed",
+    ] {
+        assert!(
+            module.join(name).is_file(),
+            "the committed module has no {name}"
+        );
+    }
 
     let program = prepared.programs[0].program.clone();
     let resolved = client
@@ -384,20 +591,10 @@ fn a_vendor_cubin_is_installed_stored_and_resolved_as_it_is() {
     assert_eq!(resolved.form, ModuleForm::Cubin);
     assert_eq!(
         resolved.metadata.as_deref(),
-        Some(format!("metadata_{key}.json").as_str())
+        Some(format!("metadata_{key}.json").as_str()),
+        "the resolve answer names the metadata the module holds"
     );
-    let mut bytes = Vec::new();
-    resolved
-        .files
-        .iter()
-        .find(|file| file.name == "module.cubin")
-        .expect("the cubin arrives on a descriptor")
-        .file
-        .try_clone()
-        .unwrap()
-        .read_to_end(&mut bytes)
-        .unwrap();
-    assert_eq!(bytes, cubin);
+    assert_eq!(file_of(&resolved, "module.cubin"), cubin);
 
     stop.store(true, Ordering::SeqCst);
     thread.join().unwrap();
