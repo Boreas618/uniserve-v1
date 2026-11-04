@@ -1512,9 +1512,19 @@ impl nn::capability::Denoiser for Denoiser {
         let flat = out
             .video
             .reshape(Shape::new(&[native[0] * native[1] * native[2], native[3]]));
+        // Both draws carry the **same** `stage` and `draw`, and only the offset differs: the
+        // operator's address is `counter = [pair_low, pair_high, stage, draw]`, so either of those
+        // words selects a different stream rather than a later position in this one. The reference
+        // draws a request's conditions, its video latent and its audio latent through one Philox
+        // stream, each buffer consuming the elements the one before it ended at
+        // (`runner/denoiser.py:fill_noise`, "the seed's stream draws each condition's noise, then
+        // each modality's"), so the audio's noise is that stream continued - not an independent
+        // stream drawn under the same seed. A `draw` of one per modality would give every audio
+        // latent noise the reference never produces, which a comparison of `video` would pass and
+        // which no shape or type refuses.
         noise.draw(f, flat, nn::NoiseKey::Scalar(seed.0), 0, 0, video_offset)?;
         if let Some(audio) = out.audio {
-            noise.draw(f, audio, nn::NoiseKey::Scalar(seed.0), 0, 1, audio_offset)?;
+            noise.draw(f, audio, nn::NoiseKey::Scalar(seed.0), 0, 0, audio_offset)?;
         }
         Ok(())
     }
