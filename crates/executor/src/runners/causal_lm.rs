@@ -990,6 +990,39 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         self.counters = Some(counters);
     }
 
+    fn discard(&mut self, generation: u64) {
+        // A prepared generation that never served: its graphs go, then their arena regions where
+        // no other generation holds the bucket, in `Captured`'s order. The serving generation and
+        // probation's old one are keyed separately and are not touched.
+        let dropped = self.graphs.discard(generation);
+        let dropped_count = dropped.len();
+        for bucket in dropped
+            .iter()
+            .filter(|bucket| !self.graphs.holds(**bucket))
+        {
+            if let Err(error) = self
+                .pool()
+                .and_then(|mut pools| pools.release_bucket(self.stream_id(), *bucket))
+            {
+                tracing::warn!(%error, %bucket, "releasing a discarded bucket's arena region");
+            }
+        }
+        // The generation object itself: a prepared one is held as `next` until switchover takes
+        // it, so an abandoned precopy drops the last reference that keeps its kernels loaded.
+        if self
+            .next
+            .as_ref()
+            .is_some_and(|next| next.number() == generation)
+        {
+            self.next = None;
+        }
+        tracing::debug!(
+            dropped = dropped_count,
+            generation,
+            "discarded a prepared generation that never served"
+        );
+    }
+
     fn pool_metrics(&self) -> PoolMetrics {
         self.pool().map(|pools| pools.metrics()).unwrap_or_default()
     }

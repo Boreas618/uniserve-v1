@@ -95,6 +95,14 @@ pub trait Runner: Send {
     /// and the kernels they held. It runs after the last batch of the old generation completed.
     fn purge(&mut self, generation: u64);
 
+    /// Releases everything that references `generation`, which was prepared and never served
+    /// (7.3 step 2): its graphs, the kernels they held, and its arena regions where nothing else
+    /// addresses them.
+    ///
+    /// This is not `purge`, which drops what is *older* than the serving generation: a precopy that
+    /// was abandoned leaves a generation *newer* than it, and only this call reaches that.
+    fn discard(&mut self, generation: u64);
+
     /// What this runner's graph pools hold and what they may hold (4.1, item 5's invariant).
     ///
     /// A runner without graph pools answers zeroes. The figures feed
