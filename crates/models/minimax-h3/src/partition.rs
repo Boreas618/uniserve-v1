@@ -38,6 +38,9 @@ pub enum Component {
     AudioDecoder,
     /// Both condition encoders, which `ref2va` uses.
     LatentEncoder,
+    /// The video postprocessor: the clip splice. Holds no weights, so it names no checkpoint directory and
+    /// its block is a [`nn::Block::Decoder`] whose operation is the splice rather than a decode.
+    VideoPostprocessor,
 }
 
 impl Component {
@@ -50,17 +53,19 @@ impl Component {
             Self::VideoDecoder => 3,
             Self::AudioDecoder => 4,
             Self::LatentEncoder => 5,
+            Self::VideoPostprocessor => 6,
         }
     }
 
     /// Every component a deployment may place.
-    pub const ALL: [Component; 6] = [
+    pub const ALL: [Component; 7] = [
         Component::TextEncoder,
         Component::Transformer,
         Component::TransformerRef,
         Component::VideoDecoder,
         Component::AudioDecoder,
         Component::LatentEncoder,
+        Component::VideoPostprocessor,
     ];
 
     /// The component's name in the checkpoint and in a deployment file.
@@ -75,6 +80,7 @@ impl Component {
             Self::VideoDecoder => "video_decoder",
             Self::AudioDecoder => "audio_decoder",
             Self::LatentEncoder => "latent_encoder",
+            Self::VideoPostprocessor => "video_postprocessor",
         }
     }
 
@@ -90,6 +96,9 @@ impl Component {
             Self::VideoDecoder => &["vae"],
             Self::AudioDecoder => &["audio_vae"],
             Self::LatentEncoder => &["vae", "audio_vae"],
+            // The postprocessor holds no weights: its arithmetic is the splice, and the constants it reads
+            // are the ImageNet means and standard deviations the reference hard-codes.
+            Self::VideoPostprocessor => &[],
         }
     }
 
@@ -105,7 +114,8 @@ impl Component {
     /// the blocks beside them and no conversion is made for them.
     pub const fn activation(self) -> DType {
         match self {
-            Self::VideoDecoder => DType::F16,
+            // The postprocessor reads and writes the video decoder's rasters, so it holds their element type.
+            Self::VideoDecoder | Self::VideoPostprocessor => DType::F16,
             Self::TextEncoder
             | Self::Transformer
             | Self::TransformerRef
@@ -127,6 +137,7 @@ impl Component {
             Self::VideoDecoder => "video_decoder",
             Self::AudioDecoder => "audio_decoder",
             Self::LatentEncoder => "latent_encoder",
+            Self::VideoPostprocessor => "video_postprocessor",
         }
     }
 

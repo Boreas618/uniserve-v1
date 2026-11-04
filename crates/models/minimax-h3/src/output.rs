@@ -291,6 +291,84 @@ impl VideoPostprocessor {
     }
 }
 
+impl nn::capability::Decoder for VideoPostprocessor {
+    /// Refuse: the postprocessor has no latents to decode.
+    ///
+    /// It is a named block of the decoder kind because the splice is a decode of the *timeline*, not of one
+    /// clip, and placing it under its own name is what lets a deployment serve without it. A runner that
+    /// asks it to decode a clip hears which operation it should have called.
+    fn decode(
+        &self,
+        f: &Forward,
+        latents: TensorView,
+        state: &[TensorView],
+        out: nn::capability::DecodedMedia,
+    ) -> nn::Result<()> {
+        let _ = (f, latents, state, out);
+        Err(nn::Error::Shape {
+            owner: "VideoPostprocessor",
+            problem: "a postprocessor splices; it decodes nothing".to_owned(),
+        })
+    }
+
+    /// Write one clip's kept frames into the timeline, fading it against its predecessor.
+    ///
+    /// `previous` is the predecessor's own decode of the frames the two share,
+    /// `[channels, splice.overlap, rows, columns]`, and is absent for the timeline's first clip;
+    /// `out.video` is the whole timeline's byte raster `[frames, rows, columns, channels]`, whose frames at
+    /// `splice.first` this writes. The clip keeps `splice.keep` frames from its first, so the clip that ends
+    /// the timeline - the one that keeps its tail as well - states a larger `keep`, which is this block's
+    /// own `last`.
+    fn splice(
+        &self,
+        f: &Forward,
+        previous: Option<TensorView>,
+        clip: TensorView,
+        splice: nn::capability::Splice,
+        out: nn::capability::DecodedMedia,
+    ) -> nn::Result<()> {
+        let refuse = |problem: String| nn::Error::Shape {
+            owner: "VideoPostprocessor",
+            problem,
+        };
+        let video = out
+            .video
+            .ok_or_else(|| refuse("a splice writes a timeline's raster".to_owned()))?;
+        if out.audio.is_some() {
+            return Err(refuse("a splice writes no audio".to_owned()));
+        }
+        if splice.overlap > OVERLAP_FRAMES {
+            return Err(refuse(format!(
+                "{} frames of overlap, and the checkpoint fades {OVERLAP_FRAMES}",
+                splice.overlap
+            )));
+        }
+        let raster = Raster::of(clip).map_err(|error| refuse(format!("{error}")))?;
+        // The checkpoint's clip is 25 decoded frames: 17 the timeline keeps and, after three padding
+        // frames, a five-frame tail. A clip a successor follows hands that tail on; the clip that ends the
+        // timeline keeps it, which the runner states by keeping frames beyond the body.
+        let internal = Splice {
+            body: (0, CLIP_FRAMES),
+            overlap: (CLIP_OUTPUT_FRAMES - splice.overlap, CLIP_OUTPUT_FRAMES),
+            last: splice.keep > CLIP_FRAMES,
+        };
+        // The clip's frames go where the runner says they do, so the view handed to the write starts at
+        // `first`: the raster is `[frames, rows, columns, channels]` and a frame is one contiguous block.
+        let view = TensorView::new(
+            video.element(&[u64::from(splice.first), 0, 0, 0]),
+            DType::U8,
+            Shape::new(&[
+                u64::from(Self::frames(&internal)),
+                u64::from(raster.height),
+                u64::from(raster.width),
+                u64::from(Rgb::CHANNELS),
+            ]),
+        );
+        self.forward(f, previous, clip, &internal, view)
+            .map_err(|error| refuse(format!("{error}")))
+    }
+}
+
 /// The extents of one clip's decoded raster, read off the view.
 #[derive(Clone, Copy)]
 struct Raster {
