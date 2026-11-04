@@ -894,6 +894,12 @@ mod tests {
         let ratio = 16;
         let mut above_seams = 0;
         let mut left_seams = 0;
+        // A seam's width is the **raster's** unit - output pixels - so every width the grid asks the
+        // blend table for must be at least the minimum overlap and a whole alignment step, and the
+        // widths along one axis must sum to what the grid's tiles overhang that axis by. A table keyed
+        // in latent cells answers a 4 for a seam that is 64 pixels wide and is refused; a table keyed
+        // in pixels answers every width this grid can produce.
+        let (mut above_widths, mut left_widths) = (Vec::new(), Vec::new());
         for tile in &tiles {
             let first_row = u64::from(tile.latent_rows.0) * ratio;
             let first_column = u64::from(tile.latent_columns.0) * ratio;
@@ -913,6 +919,7 @@ mod tests {
                     0x1000 + origin - u64::from(tile.above) * u64::from(WIDTH) * 2
                 );
                 assert!(clip.blend(tile.above, 2).is_ok());
+                above_widths.push(tile.above);
                 above_seams += 1;
             }
             if tile.left != 0 {
@@ -924,6 +931,7 @@ mod tests {
                     0x1000 + origin - u64::from(tile.left) * 2
                 );
                 assert!(clip.blend(tile.left, 3).is_ok());
+                left_widths.push(tile.left);
                 left_seams += 1;
             }
         }
@@ -931,5 +939,25 @@ mod tests {
         // blends upwards (3 x 7), and every tile but the first column blends left (4 x 6).
         assert_eq!(above_seams, 21);
         assert_eq!(left_seams, 24);
+        // Four tiles of 256 pixels cover 768: the row seams carry the overhang, and the same for the
+        // seven columns over 1344. The width of each is derived here from the grid, never from the
+        // blend table - which is the point of asserting it.
+        let alignment = u64::from(config.spatial_compression());
+        let minimum = u64::from(crate::video_vae::MINIMUM_OVERLAP);
+        for (widths, tiles, pixels) in [
+            (&above_widths, 4_u64, 768_u64),
+            (&left_widths, 7, u64::from(WIDTH)),
+        ] {
+            let total: u64 = widths.iter().map(|width| u64::from(*width)).sum();
+            assert_eq!(
+                total,
+                tiles * u64::from(crate::video_vae::TILE_PIXELS) - pixels
+            );
+            assert!(
+                widths
+                    .iter()
+                    .all(|width| *width % alignment as u32 == 0 && u64::from(*width) >= minimum)
+            );
+        }
     }
 }
