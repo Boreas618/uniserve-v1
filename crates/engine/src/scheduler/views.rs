@@ -57,7 +57,6 @@
 //!   fetch tags, so it lists none; no `PageId` is a live host page and a
 //!   `HostPages` shortage has no page victim until the storage side reports its
 //!   pages (an open item with `front`).
-//! - a media request's phase: `VideoGraph` keeps its own cursor.
 //! - `ExpertLoad`: no routed-token counters reach the scheduler, so `experts`
 //!   is skipped rather than asked about a load nobody measured.
 
@@ -861,20 +860,30 @@ pub(crate) fn request(
     })
 }
 
+/// The phase of a resident media request's next ready call, when its graph has
+/// one ready.
+fn media_phase(scheduler: &Scheduler, id: RequestId) -> Option<PhaseId> {
+    scheduler
+        .media_ready_calls(id)
+        .first()
+        .map(|kind| call_phase_id(*kind))
+}
+
 /// The view of a media (diffusion) request the scheduler holds.
 ///
-/// A media request's progress is its call graph's, which keeps its own cursor:
-/// an epoch's views carry no phase for it yet.
+/// A media request's progress is its call graph's: `phase` is the phase of the
+/// graph's first ready call, which is what the mechanism would run next.
 pub(crate) fn diffusion_request(
     request: &DiffusionRequest,
     standing: Standing,
     queued_at: f64,
+    phase: Option<PhaseId>,
     recorded: &Recorded,
 ) -> RequestView {
     request_view(RequestFacts {
         id: ViewRequestId(request.request_id.0),
         standing,
-        phase: None,
+        phase,
         priority: request.priority,
         arrived_at: nanos_at(queued_at),
         admitted_at: recorded.admitted_at,
@@ -919,6 +928,7 @@ pub(crate) fn requests(scheduler: &Scheduler, recorded: &RecordedTable) -> Vec<R
             &pending.request,
             Standing::Queued,
             pending.queued_at,
+            None,
             &facts,
         ));
     }
@@ -936,6 +946,7 @@ pub(crate) fn requests(scheduler: &Scheduler, recorded: &RecordedTable) -> Vec<R
                 &flow.request,
                 Standing::Resident,
                 0.0,
+                media_phase(scheduler, *id),
                 &facts,
             ));
         }
@@ -953,6 +964,7 @@ pub(crate) fn requests(scheduler: &Scheduler, recorded: &RecordedTable) -> Vec<R
             &flow.request,
             Standing::Resident,
             0.0,
+            media_phase(scheduler, *id),
             &facts,
         ));
     }
@@ -1257,6 +1269,7 @@ fn request_of(scheduler: &Scheduler, id: RequestId, standing: Standing) -> Optio
                 &pending.request,
                 standing,
                 pending.queued_at,
+                None,
                 &Recorded::default(),
             )
         })
