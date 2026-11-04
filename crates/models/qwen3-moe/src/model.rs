@@ -63,6 +63,14 @@ pub struct LoadOptions {
     /// has to know it: the encoded step's buffers are the plan's to reserve, and a plan built for
     /// dense experts would size an arena the encoded step writes past.
     pub experts_encoded: bool,
+    /// Tokens one rank's expert exchange carries, on a deployment whose experts are sharded.
+    ///
+    /// Zero on a single rank, which has no exchange. On a group it is the **load-time** bound the
+    /// plan is built with: a rank sorts `ranks · capacity` received rows over the experts it holds,
+    /// so the step's buffers are shaped by this number and not by the batch's token count. A request
+    /// is admitted within it; a batch larger than it is a deployment error rather than a buffer that
+    /// grows.
+    pub exchange_capacity: u64,
 }
 
 impl Default for LoadOptions {
@@ -73,6 +81,7 @@ impl Default for LoadOptions {
             attention_workspace_bytes: TRTLLM_WORKSPACE_BYTES,
             page_tokens: 64,
             experts_encoded: false,
+            exchange_capacity: 0,
         }
     }
 }
@@ -160,7 +169,18 @@ pub struct Plan {
     ///
     /// One reservation serves every routed layer, as the rest of the plan does: the step's buffers
     /// are released as the layer loop advances, so a plan is one layer deep.
+    ///
+    /// What it covers depends on the deployment, and the difference is not a constant. A single rank
+    /// reserves the router, the sort's metadata at the batch's height, and the permuted pair. An
+    /// expert-parallel rank reserves the router at the batch's height, the sort's metadata at the
+    /// **received** height (`ranks · capacity`) over the experts it holds, the pair at the rows that
+    /// height permutes to ([`Self::exchange_rows`]), and one **combined** row per received token
+    /// (`received · hidden · dtype`), which no single-rank path has.
     pub moe: u64,
+    /// The exchange this plan was sized for, when the model's experts are sharded.
+    pub exchange: Option<nn::layers::Group>,
+    /// The permuted rows an expert-parallel rank sorts over: zero on a single rank.
+    pub exchange_rows: u64,
 }
 
 impl Plan {
@@ -172,6 +192,36 @@ impl Plan {
         options: &LoadOptions,
         dtype: DType,
     ) -> Result<Self> {
+        // The exchange is a deployment, not a request: its rank count is the partition's and its
+        // capacity is the load option's, so the plan can reserve the group's worst case before any
+        // request exists. A sharded deployment that states no capacity has nothing to size with, and
+        // guessing one is how a buffer ends up smaller than the rows that reach it.
+        let exchange = match partition.expert_parallel {
+            1 => None,
+            ranks => {
+                if options.exchange_capacity == 0 {
+                    return Err(Error::Config(format!(
+                        "an expert-parallel deployment of {ranks} ranks states no exchange \
+                         capacity: the plan is sized from the deployment's bound, not from a request"
+                    )));
+                }
+                Some(nn::layers::Group {
+                    ranks: u64::try_from(ranks).map_err(|_| {
+                        Error::Config(format!("{ranks} ranks exceed a plan's row counts"))
+                    })?,
+                    capacity: options.exchange_capacity,
+                })
+            }
+        };
+        // The block's own geometry, which both the single-rank and the exchanged step are stated
+        // over: the vocabulary's expert count, and the tile the permutation packs in.
+        let geometry = nn::layers::MoeGeometry {
+            hidden: element(config.hidden_size, "hidden_size")?,
+            intermediate: element(config.moe_intermediate_size, "moe_intermediate_size")?,
+            top: element(config.num_experts_per_tok, "num_experts_per_tok")?,
+            experts: element(config.num_experts, "num_experts")?,
+            tile: u64::from(TILE_ROWS),
+        };
         Ok(Self {
             tokens,
             hidden: element(config.hidden_size, "hidden_size")?,
@@ -203,29 +253,39 @@ impl Plan {
                 0
             },
             workspace: options.attention_workspace_bytes,
-            moe: if config.num_experts > 0 {
-                // One routed layer's whole step: the routing prefix, the permuted pair, and the
-                // encoded planes when the checkpoint stores them encoded. Sized from the same
-                // `max_permuted_rows` the runtime reserves, so plan and step cannot disagree. The
-                // activation encoding's block scales are the CUTLASS product's plain layout.
-                nn::layers::step_bytes(
-                    tokens,
-                    nn::layers::MoeGeometry {
-                        hidden: element(config.hidden_size, "hidden_size")?,
-                        intermediate: element(
-                            config.moe_intermediate_size,
-                            "moe_intermediate_size",
-                        )?,
-                        top: element(config.num_experts_per_tok, "num_experts_per_tok")?,
-                        experts: element(config.num_experts, "num_experts")?,
-                        tile: u64::from(TILE_ROWS),
-                    },
-                    ops::fp4::ScaleLayout::Linear,
-                    dtype,
-                    options.experts_encoded,
-                )?
-            } else {
-                0
+            moe: match exchange {
+                None => {
+                    // One routed layer's whole step: the routing prefix, the permuted pair, and the
+                    // encoded planes when the checkpoint stores them encoded. Sized from the same
+                    // `max_permuted_rows` the runtime reserves, so plan and step cannot disagree. The
+                    // activation encoding's block scales are the CUTLASS product's plain layout.
+                    if config.num_experts > 0 {
+                        nn::layers::step_bytes(
+                            tokens,
+                            geometry,
+                            ops::fp4::ScaleLayout::Linear,
+                            dtype,
+                            options.experts_encoded,
+                        )?
+                    } else {
+                        0
+                    }
+                }
+                Some(group) => {
+                    // The exchanged step: the received rows over this rank's experts, and one
+                    // combined row per received token — the shape the single-rank step cannot state.
+                    if config.num_experts == 0 {
+                        return Err(Error::Config(
+                            "an expert-parallel deployment of a model with no experts".to_owned(),
+                        ));
+                    }
+                    nn::layers::exchanged_bytes(tokens, geometry, group, dtype)?
+                }
+            },
+            exchange,
+            exchange_rows: match exchange {
+                None => 0,
+                Some(group) => nn::layers::exchanged_rows(tokens, geometry, group)?,
             },
         })
     }
