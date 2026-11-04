@@ -42,6 +42,8 @@ pub(crate) struct PageGeometry {
 /// `unit_ids` cover, so the unit is `unit_ids[page - start_page]` and the slot
 /// is that unit's first token slot plus the position's offset in its page.
 ///
+/// A token whose KV is not written states `-1` (see [`slot_mapping_where`]).
+///
 /// `None` when:
 /// - a position lies before `start_page` or past the table's last page, which is
 ///   a planning fault rather than something to clamp: a batch must not write a
@@ -55,6 +57,23 @@ pub(crate) fn slot_mapping(
     table: &ipc::BlockTable,
     page: PageGeometry,
     positions: Range<u32>,
+) -> Option<Vec<i32>> {
+    slot_mapping_where(table, page, positions, |_| true)
+}
+
+/// The slot each position of `positions` writes through `table`, with `-1` for a
+/// position the mechanism decides writes nothing.
+///
+/// The write decision is the mechanism's, per token: a token's KV is written
+/// unless its row's write flag says otherwise, so a caller expands its rows'
+/// flags to tokens and `writes` answers for each position. `-1` writes nothing
+/// and initializes nothing, which is what the kernels do with it; a position
+/// outside the table is still a fault rather than a `-1`.
+pub(crate) fn slot_mapping_where(
+    table: &ipc::BlockTable,
+    page: PageGeometry,
+    positions: Range<u32>,
+    writes: impl Fn(u32) -> bool,
 ) -> Option<Vec<i32>> {
     if page.block_size == 0 || page.units_per_page != 1 {
         return None;
@@ -73,6 +92,10 @@ pub(crate) fn slot_mapping(
         }
         let index = usize::try_from(page_index - start_page).ok()?;
         let unit = u64::from(table.unit_ids.get(index)?.0);
+        if !writes(u32::try_from(position).ok()?) {
+            slots.push(-1);
+            continue;
+        }
         let slot = unit
             .checked_mul(block_size)?
             .checked_add(position % block_size)?;
@@ -126,7 +149,9 @@ pub(crate) fn positions(call: &ipc::Call) -> Option<Vec<i32>> {
 ///   mapping is the identity;
 /// - a **verify** carries one row per candidate position of its request, in
 ///   candidate order, so its rows are the positions that sample and the mapping
-///   is the identity there too;
+///   is the identity there too. That rests on model's confirmation that every
+///   row of a verify call is a candidate position; a call that also carries a
+///   row producing no logits would need that row marked -1 instead;
 /// - every other kind produces latents rather than logits, and a call with no
 ///   consumer slots is sampled by nobody: both leave -1 on every row.
 ///
@@ -316,5 +341,23 @@ mod tests {
         assert_eq!(positions(&token_call(&[], 12)), Some(Vec::new()));
         // A position past the column's range.
         assert_eq!(positions(&token_call(&[0; 2], u32::MAX)), None);
+    }
+
+    #[test]
+    fn a_token_the_mechanism_does_not_write_states_minus_one() {
+        // Page 2's four tokens (8..12, unit 7), writing only the even positions.
+        let slots =
+            slot_mapping_where(&table(), page(), 8..12, |position| position % 2 == 0).unwrap();
+        assert_eq!(slots, vec![7 * 4, -1, 7 * 4 + 2, -1]);
+        // Writing nothing is still a slot decision, not a fault.
+        assert_eq!(
+            slot_mapping_where(&table(), page(), 8..10, |_| false).unwrap(),
+            vec![-1, -1]
+        );
+        // A position outside the table stays a fault whatever the write flag.
+        assert_eq!(
+            slot_mapping_where(&table(), page(), 19..21, |_| false),
+            None
+        );
     }
 }
