@@ -62,7 +62,10 @@ impl Component {
         Component::LatentEncoder,
     ];
 
-    /// The component's name in a deployment file and in the executor's block addressing.
+    /// The component's name in the checkpoint and in a deployment file.
+    ///
+    /// This is the checkpoint's own naming - a directory under the pipeline root - not the name the
+    /// runner addresses the built block by; that is [`Component::block`].
     pub const fn name(self) -> &'static str {
         match self {
             Self::TextEncoder => "text_encoder",
@@ -107,6 +110,22 @@ impl Component {
             | Self::TransformerRef
             | Self::AudioDecoder
             | Self::LatentEncoder => DType::BF16,
+        }
+    }
+
+    /// The name the runner addresses this block by.
+    ///
+    /// Blocks are addressed by the capability their runner serves, not by the checkpoint's
+    /// directories: both DiT partitions are the `Denoiser` block, so a rank that places either
+    /// serves the same media call. The engine's media calls name `denoiser`, `text_encoder`,
+    /// `video_decoder`, `audio_decoder` and `latent_encoder`, which is this list.
+    pub const fn block(self) -> &'static str {
+        match self {
+            Self::TextEncoder => "text_encoder",
+            Self::Transformer | Self::TransformerRef => "denoiser",
+            Self::VideoDecoder => "video_decoder",
+            Self::AudioDecoder => "audio_decoder",
+            Self::LatentEncoder => "latent_encoder",
         }
     }
 
