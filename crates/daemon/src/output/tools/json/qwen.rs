@@ -47,6 +47,16 @@ impl Qwen25ToolParser {
 }
 
 impl ToolParser for Qwen25ToolParser {
+    fn state(&self) -> Option<proto::handoff::tool_stage::Parser> {
+        Some(proto::handoff::tool_stage::Parser::Json(self.inner.state()))
+    }
+
+    fn resume(&mut self, state: &proto::handoff::tool_stage::Parser) {
+        if let proto::handoff::tool_stage::Parser::Json(json) = state {
+            self.inner.resume(json);
+        }
+    }
+
     /// Parses one text chunk into an existing output accumulator.
     ///
     /// Fails with `ToolParserError::ParsingFailed` on input outside the
