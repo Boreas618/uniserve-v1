@@ -105,7 +105,7 @@ use executor::memory::Memory;
 use executor::watchdog::{Running, Watchdog};
 use crate::engine_plan::EpochPlan;
 use daemon::epoch::BuildConfig;
-use engine::{PolicyProgram, PolicySource, ProgramSource, SchedulerHandle};
+use engine::{PolicyProgram, PolicySource, ProgramSource};
 use ipc::{ProgramCommand, ProgramStatus, UpdateFailure};
 use ops::{Generation, KernelEntry};
 use program_server::program::Programs;
