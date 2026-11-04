@@ -985,16 +985,58 @@ impl Moe {
     /// Every expert product a block can run starts here and differs only in the two multiplies, so
     /// the prefix is one path: a variant that multiplies something else still routes, sorts and
     /// combines identically, and a heavy quantized product cannot drift from the dense one.
-    fn route(&self, f: &Forward, hidden: TensorView) -> Result<Routes> {
+    /// The router's choice for `hidden`, and nothing else: the top-k expert ids and their
+    /// weights, `[tokens, top]` i32 and F32, written into the caller's own buffers.
+    ///
+    /// The ids are the checkpoint's expert indices, *before* the expert map, so they are exactly
+    /// what a reference's router names and a comparison of routing is an integer comparison. That
+    /// keeps three findings apart that a whole MoE's output would confound: a wrong id (routing),
+    /// a right id with a wrong product (the experts), and a right id with a wrong weight (the
+    /// top-k's renormalization).
+    ///
+    /// No expert runs, so this costs one router row per token and the scores it needs, which are
+    /// scratch inside `f`'s arena: nothing outlives the call but the two buffers written here. A
+    /// caller that wants ids on the host passes views of its own memory; one that wants them in a
+    /// capture's graph passes arena tensors, as the prefix does.
+    pub fn route(
+        &self,
+        f: &Forward,
+        hidden: TensorView,
+        ids: TensorView,
+        weights: TensorView,
+    ) -> Result<()> {
+        hidden
+            .require_row("Moe::route", hidden.dtype, u64::from(self.hidden))
+            .map_err(Error::from)?;
+
         let tokens = hidden.rows();
         let top = u64::from(self.top);
-        let experts = u64::from(self.experts);
-        let arena = f.arena();
+        let expected = Shape::new(&[tokens, top]);
+        for (name, tensor, dtype) in [("ids", ids, DType::I32), ("weights", weights, DType::F32)] {
+            if tensor.dtype != dtype {
+                return Err(Error::shape(
+                    "Moe::route",
+                    format!("the {name} are {dtype}, not {}", tensor.dtype),
+                ));
+            }
+            if tensor.shape != expected {
+                return Err(Error::shape(
+                    "Moe::route",
+                    format!(
+                        "the {name} are {expected:?} for {tokens} rows of top {top}, not {:?}",
+                        tensor.shape
+                    ),
+                ));
+            }
+        }
 
-        let scores = arena.tensor(hidden.dtype, Shape::new(&[tokens, experts]))?;
-        let ids = arena.tensor(DType::I32, Shape::new(&[tokens, top]))?;
-        let weights = arena.tensor(DType::F32, Shape::new(&[tokens, top]))?;
+        let experts = u64::from(self.experts);
+        let scores = f
+            .arena()
+            .tensor(hidden.dtype, Shape::new(&[tokens, experts]))?;
+
         self.router.forward(f, hidden, scores)?;
+
         let routing = self.topk_descriptor(scores.dtype);
         let args = TopkArgs {
             scores,
@@ -1004,6 +1046,19 @@ impl Moe {
         };
 
         f.operate::<TopkSoftmax>(&routing, args)?;
+
+        Ok(())
+    }
+
+    fn routed(&self, f: &Forward, hidden: TensorView) -> Result<Routes> {
+        let tokens = hidden.rows();
+        let top = u64::from(self.top);
+        let experts = u64::from(self.experts);
+        let arena = f.arena();
+
+        let ids = arena.tensor(DType::I32, Shape::new(&[tokens, top]))?;
+        let weights = arena.tensor(DType::F32, Shape::new(&[tokens, top]))?;
+        self.route(f, hidden, ids, weights)?;
 
         // Logical ids become weight rows.
         let local_ids = match &self.map {
@@ -1093,7 +1148,7 @@ impl Moe {
         let arena = f.arena();
 
         // 1-3. The router, its top-k, the map and the sort: the prefix every expert product shares.
-        let routes = self.route(f, hidden)?;
+        let routes = self.routed(f, hidden)?;
 
         // 4. FC1: the gated product of each permuted row, then FC2.
         let gated = arena.tensor(hidden.dtype, Shape::new(&[routes.rows, intermediate]))?;
@@ -1382,7 +1437,7 @@ impl Moe {
         }
 
         // 1-3. The router, its top-k, the map and the sort: the prefix every expert product shares.
-        let routes = self.route(f, hidden)?;
+        let routes = self.routed(f, hidden)?;
         let arena = f.arena();
 
         // 4. The activation's encoding: the same pass computes the block scales and the row factor
