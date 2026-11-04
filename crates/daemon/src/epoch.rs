@@ -246,6 +246,15 @@ pub struct EpochRecord {
     pub previous_policy: Option<Program>,
     /// Where the epoch is in its life.
     pub status: Status,
+    /// The MODEL generation: the number the epoch's own main processes gave
+    /// the programs they execute, read from their `Parked`, `Promoted` or
+    /// launch report and never invented here (§2.5, §7.4). It is not a
+    /// process's identity: that is [`ManagedProcess::generation`], the
+    /// launch generation, allocated by [`Epochs::next_generation`].
+    pub generation: Option<u64>,
+    /// The deployment's world allocation this epoch executes (§7.4), which
+    /// the epoch's launch file and its Storage Server claim carry.
+    pub world: u64,
 }
 
 /// The role of a process a node's daemon manages (§2.1).
@@ -278,12 +287,23 @@ pub enum ProcessState {
 pub struct ManagedProcess {
     /// What it is.
     pub role: Role,
+    /// The worker group it runs in (`engine`, `worker`, ...): the group a
+    /// launch generation is allocated for (§2.5).
+    pub group: String,
+    /// Its rank inside that group.
+    pub rank: u64,
     /// Its process id on its node, once started.
     pub pid: Option<u32>,
     /// The epoch a main process belongs to; `None` for the frontend.
     pub epoch: Option<u64>,
     /// The build identity it was started from.
     pub build: String,
+    /// The LAUNCH generation: the identity of this launch of the process,
+    /// which the daemon allocates ([`Epochs::next_generation`]) and the
+    /// process names in its launch file and its reports. It is not the
+    /// model generation ([`EpochRecord::generation`]), which the main
+    /// process numbers for the programs it executes; 0 until launched.
+    pub generation: u64,
     /// Where it is.
     pub state: ProcessState,
 }
@@ -497,6 +517,9 @@ impl Phase {
 pub struct Epochs {
     records: Mutex<BTreeMap<u64, EpochRecord>>,
     processes: Mutex<Vec<ManagedProcess>>,
+    update: Mutex<Option<Update>>,
+    /// The last launch generation allocated per worker group and rank.
+    generations: Mutex<BTreeMap<(String, u64), u64>>,
 }
 
 impl Epochs {
@@ -509,6 +532,90 @@ impl Epochs {
     /// that epoch before.
     pub fn record(&self, epoch: u64, record: EpochRecord) {
         locked(&self.records).insert(epoch, record);
+    }
+
+    /// The launch generation to start `group`'s rank `rank` in (§2.5,
+    /// §7.4): one more than the highest launch generation this daemon knows
+    /// for it, which is the one it allocated last or the one the process
+    /// table records for that group and rank, so a standby of a serving
+    /// process is `serving + 1`.
+    ///
+    /// This is the one place a generation is allocated: a caller that
+    /// computed one itself would launch two processes under one number.
+    pub fn next_generation(&self, group: &str, rank: u64) -> u64 {
+        let runnning = self
+            .processes()
+            .iter()
+            .filter(|process| process.group == group && process.rank == rank)
+            .map(|process| process.generation)
+            .max()
+            .unwrap_or(0);
+        let mut allocated = locked(&self.generations);
+        let key = (group.to_owned(), rank);
+        let last = allocated.get(&key).copied().unwrap_or(0).max(runnning);
+        let next = last + 1;
+        allocated.insert(key, next);
+        next
+    }
+
+    /// Records `update` as the deployment's update: the one in flight, or
+    /// the last one that ended.
+    pub fn set_update(&self, update: Update) {
+        *locked(&self.update) = Some(update);
+    }
+
+    /// The deployment's update: the one in flight, or the last one that
+    /// ended.
+    pub fn update(&self) -> Option<Update> {
+        locked(&self.update).clone()
+    }
+
+    /// Why `target` may not be applied without `force` (§7.2, §7.3 step 4):
+    /// the last update reverted from the same programs after a failure.
+    ///
+    /// The comparison is the programs', revisions included, because those
+    /// are what a reverted program-layer update was: applying the same
+    /// configuration again selects the same revisions, so the refusal is
+    /// about the change and not about how it was asked for.
+    pub fn unavailable(&self, target: &Deployment) -> Option<Failure> {
+        let update = locked(&self.update);
+        let update = update.as_ref()?;
+        let failure = update.unavailable()?;
+        (update.target.programs == target.programs).then(|| failure.clone())
+    }
+
+    /// Records that epoch `epoch` now executes `programs`, keeping what it
+    /// executed before as the probation's previous generation (§7.3 steps
+    /// 2-4). The record's status stays what it was: the programs are in the
+    /// main process, the probation is the update's.
+    pub fn precopied(&self, epoch: u64, programs: FilledPrograms) {
+        let mut records = locked(&self.records);
+        let Some(record) = records.get_mut(&epoch) else {
+            return;
+        };
+        record.previous_kernels = std::mem::replace(&mut record.kernels, programs.kernels);
+        record.previous_policy = Some(std::mem::replace(&mut record.policy, programs.policy));
+    }
+
+    /// Records that epoch `epoch`'s new programs are what serves and the
+    /// previous generation is no longer kept (§7.3 step 5).
+    pub fn committed(&self, epoch: u64) {
+        let mut records = locked(&self.records);
+        let Some(record) = records.get_mut(&epoch) else {
+            return;
+        };
+        record.previous_kernels.clear();
+        record.previous_policy = None;
+        record.status = Status::Serving;
+    }
+
+    /// Records that everything older than the generation epoch `epoch`
+    /// executes is gone (§7.3 step 6).
+    pub fn purged(&self, epoch: u64) {
+        let mut records = locked(&self.records);
+        if let Some(record) = records.get_mut(&epoch) {
+            record.status = Status::Purged;
+        }
     }
 
     /// Epoch `epoch`'s record, if the daemon keeps one.
@@ -591,6 +698,8 @@ fn record_report(epoch: u64, record: &EpochRecord) -> Value {
         "policy": program_report(&record.policy),
         "previous_kernels": previous,
         "previous_policy": record.previous_policy.as_ref().map(program_report),
+        "generation": record.generation,
+        "world": record.world,
         "status": match record.status {
             Status::Precopy => "precopy",
             Status::Serving => "serving",
@@ -618,7 +727,10 @@ fn process_report(process: &ManagedProcess) -> Value {
         },
         "pid": process.pid,
         "epoch": process.epoch,
+        "group": process.group,
+        "rank": process.rank,
         "build": process.build,
+        "generation": process.generation,
         "state": match &process.state {
             ProcessState::Starting => "starting".to_owned(),
             ProcessState::Serving => "serving".to_owned(),
@@ -902,6 +1014,8 @@ mod tests {
             previous_kernels: BTreeMap::new(),
             previous_policy: None,
             status: Status::Serving,
+            generation: None,
+            world: 3,
         }
     }
 
@@ -1323,6 +1437,49 @@ mod tests {
         );
     }
 
+    /// A launch generation is allocated in one place: one more than the
+    /// highest generation the daemon knows for that group and rank, which is
+    /// the serving epoch's (§2.5, §7.4), so a standby of a serving epoch is
+    /// `serving + 1`, and two callers never get one number.
+    #[test]
+    fn a_launch_generation_is_one_more_than_the_serving_epochs() {
+        let epochs = Epochs::new();
+        assert_eq!(epochs.next_generation("engine", 0), 1, "the first launch");
+
+        // A serving process's launch generation is the base: its standby is
+        // one more, and so is the next allocation after that.
+        epochs.set_processes(vec![ManagedProcess {
+            role: Role::MainProcess,
+            group: "engine".to_owned(),
+            rank: 0,
+            pid: Some(42),
+            epoch: Some(1),
+            build: "2.0.0+0123456789abcdef".to_owned(),
+            generation: 6,
+            state: ProcessState::Serving,
+        }]);
+        assert_eq!(
+            epochs.next_generation("engine", 0),
+            7,
+            "the standby of a serving process is serving + 1"
+        );
+        assert_eq!(
+            epochs.next_generation("engine", 0),
+            8,
+            "an allocation is one more than the last one"
+        );
+        assert_eq!(
+            epochs.next_generation("engine", 1),
+            7,
+            "a rank allocates for itself"
+        );
+        assert_eq!(
+            epochs.next_generation("worker", 0),
+            7,
+            "a group allocates for itself"
+        );
+    }
+
     /// The process table names each process's role, epoch and state.
     #[test]
     fn the_process_table_reports_what_the_daemon_manages() {
@@ -1330,16 +1487,22 @@ mod tests {
         epochs.set_processes(vec![
             ManagedProcess {
                 role: Role::Frontend,
+                group: "frontend".to_owned(),
+                rank: 0,
                 pid: Some(41),
                 epoch: None,
                 build: "2.0.0+0123456789abcdef".to_owned(),
+                generation: 0,
                 state: ProcessState::Serving,
             },
             ManagedProcess {
                 role: Role::MainProcess,
+                group: "engine".to_owned(),
+                rank: 0,
                 pid: Some(42),
                 epoch: Some(7),
                 build: "2.0.0+0123456789abcdef".to_owned(),
+                generation: 4,
                 state: ProcessState::Parked,
             },
         ]);
