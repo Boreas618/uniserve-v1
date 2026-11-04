@@ -1209,6 +1209,25 @@ impl SchedulerHandle {
         self.commands.describe_requests()
     }
 
+    /// The state the epoch's policy is instantiated with, as this scheduler
+    /// holds it and with `ranks` as the control thread knows them (§7.3);
+    /// `None` while the epoch waits for its first switchover or the scheduler
+    /// does not answer in time.
+    ///
+    /// The control thread instantiates its route instance on it and reverts
+    /// there after a `route` failure, so a failure costs one boundary, not the
+    /// epoch.
+    pub fn policy_state(
+        &self,
+        ranks: Vec<scheduling::guest::view::RankView>,
+    ) -> Option<crate::scheduler::TrialState> {
+        self.commands
+            .policy_state(ranks)
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .ok()
+            .flatten()
+    }
+
     /// Publishes the committed world's immutable pages on every claimed node.
     pub fn publish_world(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
         self.commands.publish_world()

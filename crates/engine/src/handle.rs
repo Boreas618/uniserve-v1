@@ -642,6 +642,12 @@ pub enum Command {
     DescribeCache(crossbeam_channel::Sender<Result<Vec<crate::scheduler::GroupCache>, String>>),
     /// Accepted prefixes of running requests that can move to another world.
     DescribeRequests(crossbeam_channel::Sender<Vec<proto::request::wire::RequestPrefix>>),
+    /// Reports the state a policy is instantiated with, as seen from this
+    /// scheduler with every rank's load the control thread named (§7.3).
+    DescribePolicyState {
+        ranks: Vec<scheduling::guest::view::RankView>,
+        answer: crossbeam_channel::Sender<Option<crate::scheduler::TrialState>>,
+    },
     CacheWarm {
         operation: storage::manifest::cache::Operation,
         together: Arc<HookBarrier>,
@@ -1005,6 +1011,21 @@ impl CommandSender {
         let (answer, described) = crossbeam_channel::bounded(1);
         let _ = self.send(Command::DescribeCache(answer));
         described
+    }
+
+    /// Reports the state a policy is instantiated with at the scheduler's next
+    /// boundary, with `ranks` as the control thread knows them; `None` while
+    /// the epoch has no policy yet, which is until its first switchover.
+    ///
+    /// The control thread's route instance is instantiated and, after a
+    /// `route` failure, reverted on this state (§7.3).
+    pub fn policy_state(
+        &self,
+        ranks: Vec<scheduling::guest::view::RankView>,
+    ) -> crossbeam_channel::Receiver<Option<crate::scheduler::TrialState>> {
+        let (answer, state) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::DescribePolicyState { ranks, answer });
+        state
     }
 
     /// Read accepted cache lengths of requests that can move to a successor.

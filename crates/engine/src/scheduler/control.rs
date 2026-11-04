@@ -165,6 +165,14 @@ impl Scheduler {
             Command::DescribeRequests(answer) => {
                 let _ = answer.send(self.migrating_cache().1);
             }
+            Command::DescribePolicyState { ranks, answer } => {
+                // No policy, no state a policy is instantiated with: the epoch
+                // waits for its first switchover (lead's ruling).
+                let state = self.policy.as_ref().map(|_| {
+                    views::trial_state_with_ranks(self, self.step, self.recorder.recorded(), ranks)
+                });
+                let _ = answer.send(state);
+            }
             Command::CacheWarm {
                 operation,
                 together,
