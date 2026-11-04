@@ -324,17 +324,15 @@ pub(crate) async fn send(
     router: &Router,
     request: Request<Body>,
 ) -> (StatusCode, HeaderMap, serde_json::Value) {
+    let waited = format!("{} {}", request.method(), request.uri());
     let response = match tokio::time::timeout(STALL, router.clone().oneshot(request)).await {
         Ok(response) => response.unwrap(),
-        Err(_) => panic!("the handler answered nothing within {} s", STALL.as_secs()),
+        Err(_) => panic!("{waited} answered nothing within {} s", STALL.as_secs()),
     };
     let (parts, body) = response.into_parts();
     let bytes = match tokio::time::timeout(STALL, axum::body::to_bytes(body, usize::MAX)).await {
         Ok(bytes) => bytes.unwrap(),
-        Err(_) => panic!(
-            "the response's body did not end within {} s",
-            STALL.as_secs()
-        ),
+        Err(_) => panic!("{waited}'s body did not end within {} s", STALL.as_secs()),
     };
     let json = if bytes.is_empty() {
         serde_json::Value::Null
