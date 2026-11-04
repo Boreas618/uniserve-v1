@@ -322,6 +322,65 @@ fn a_request_is_served_through_the_executors_own_batch_path() {
     handle.shutdown();
 }
 
+/// A request too big for the pool ends there, and the epoch goes on.
+///
+/// Admission refuses a queued request whose prompt alone cannot fit the device
+/// cache — the mechanism ends it, and the policy never named it. A policy's
+/// state is append-only, so unless the mechanism says the request ended the
+/// policy keeps it in its own queue and offers it in the next `admit`, where the
+/// mechanism refuses it as "not queued": a policy failure, and the whole world
+/// stops. This case states the behaviour a caller sees: the oversized request
+/// ends with a rejection, and the request behind it is still served.
+#[test]
+fn a_request_too_big_for_the_pool_does_not_stop_the_epoch() {
+    let serving = Arc::new(Serving::new(vec![pool()]));
+    let batches: Arc<dyn Batches> = serving.clone();
+    let handle = SchedulerHandle::over_batches(config(), batches).expect("the pool serves");
+    install(&handle, &serving);
+
+    // The pool is 4095 units of 64 tokens: this prompt cannot fit it however
+    // the mechanism chunks it.
+    let mut oversized = handle
+        .submit(text_request(1, 300_000, 4))
+        .expect("the request is submitted");
+    let deadline = Instant::now() + FIRST_TOKEN;
+    let mut rejected = false;
+    while !rejected && Instant::now() < deadline {
+        match oversized.try_recv() {
+            Ok(Event::Rejected { .. }) => rejected = true,
+            Ok(_) => {}
+            Err(_) => std::thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    assert!(
+        rejected,
+        "the oversized request is refused, not left queued"
+    );
+
+    // The epoch is serving: the request behind it emits a token.
+    let mut events = handle
+        .submit(text_request(2, 8, 4))
+        .expect("the second request is submitted");
+    let mut served = None;
+    let deadline = Instant::now() + FIRST_TOKEN;
+    while served.is_none() && Instant::now() < deadline {
+        match events.try_recv() {
+            Ok(Event::TextToken { id, .. }) => served = Some(id),
+            Ok(Event::TextTokens { ids }) => served = ids.first().copied(),
+            Ok(Event::Rejected { .. }) | Ok(Event::Error { .. }) => {
+                panic!("the request behind the refused one was refused too")
+            }
+            Ok(_) => {}
+            Err(_) => std::thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    assert!(
+        served.is_some(),
+        "the epoch kept serving after the mechanism ended a request"
+    );
+    handle.shutdown();
+}
+
 /// An admitted request is worked on, in the phase the mechanism tells the
 /// policy it serves next.
 ///

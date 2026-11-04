@@ -1352,6 +1352,11 @@ impl Scheduler {
 
     /// Refuses one queued request the plan rejected, whether it waits as a
     /// token request or as a media one.
+    ///
+    /// The policy named it, and the mechanism still tells it the request ended:
+    /// the queue it keeps is the policy's own, and an end it is not told of
+    /// leaves a name behind that a later view change makes admissible again —
+    /// which the mechanism would then refuse as "not queued".
     fn reject_queued(&mut self, id: ipc::RequestId) {
         if let Some(position) = self
             .waiting
@@ -1359,6 +1364,7 @@ impl Scheduler {
             .position(|state| state.req.request_id == id)
             && let Some(state) = self.waiting.remove(position)
         {
+            self.announce_end(id, scheduling::guest::event::End::Rejected);
             let _ = state.output.events.event_tx.send(Event::Rejected {
                 kind: RejectionKind::Overloaded,
                 message: "the scheduling policy rejected the request as over capacity".into(),
@@ -1370,6 +1376,7 @@ impl Scheduler {
             .position(|pending| pending.request.request_id == id)
             && let Some(pending) = self.waiting_media.remove(position)
         {
+            self.announce_end(id, scheduling::guest::event::End::Rejected);
             let _ = pending.event_tx.send(Event::Rejected {
                 kind: RejectionKind::Overloaded,
                 message: "the scheduling policy rejected the request as over capacity".into(),
@@ -1423,6 +1430,11 @@ impl Scheduler {
                     let Some(st) = self.waiting.pop_front() else {
                         break;
                     };
+                    // The mechanism ends a request the policy still queues, so
+                    // it says so: a policy learns a request from `Arrived` and
+                    // an end from this, and a name it is not told has gone is
+                    // one it offers in `admit` again (§4.4).
+                    self.announce_end(st.req.request_id, scheduling::guest::event::End::Rejected);
                     let _ = st.output.events.event_tx.send(Event::Rejected {
                         kind: RejectionKind::Invalid,
                         message: "request exceeds total KV capacity".into(),
@@ -1509,6 +1521,7 @@ impl Scheduler {
                     let Some(st) = self.waiting.pop_front() else {
                         break;
                     };
+                    self.announce_end(st.req.request_id, scheduling::guest::event::End::Rejected);
                     let _ = st.output.events.event_tx.send(Event::Rejected {
                         kind: RejectionKind::Invalid,
                         message: "request exceeds total KV capacity".into(),
