@@ -197,7 +197,7 @@ impl LatentPlan {
 }
 
 /// Model-independent values of the report.
-pub(crate) struct Report {
+pub struct Report {
     pub endpoint: WorkerEndpoint,
     /// The rank publishes device products over CUDA VMM, which keeps an
     /// export pool on its primary device.
@@ -210,7 +210,7 @@ pub(crate) struct Report {
 
 /// Media-timeline facts of a video model.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct MediaFacts {
+pub struct MediaFacts {
     pub video_denoiser: Option<VideoDenoiserInfo>,
     /// Device bytes of one request's state buffers.
     pub state_bytes: u64,
@@ -235,7 +235,7 @@ impl MediaFacts {
 }
 
 /// Inputs of the token layout taken from the loaded model.
-pub(crate) struct TokenFacts {
+pub struct TokenFacts {
     /// The model has an image processor (it encodes request images).
     pub image_processor: bool,
     /// Bytes of one encoded image's vision features.
@@ -246,12 +246,16 @@ pub(crate) struct TokenFacts {
     pub latent: Option<LatentPlan>,
 }
 
-/// The resolved capacity of a rank.
-pub(crate) struct Plan {
+/// The resolved capacity of a rank: what the main process builds its resident
+/// memory from.
+pub struct Plan {
+    /// The capacity the rank reports to the engine.
     pub info: WorkerInfo,
+    /// The host and device arenas of its calls.
     pub arena: ArenaCapacity,
     /// Fixed bytes by device, beside the cache pool.
     pub fixed_device_bytes: BTreeMap<Device, u64>,
+    /// The latent pool of a rank that stores one.
     pub latent: Option<LatentPlan>,
     /// The cache layout, with the agreed unit count in `info.prefix_cache`.
     pub cache: Option<Arc<CachePlan>>,
