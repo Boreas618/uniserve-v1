@@ -20,7 +20,7 @@
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use ipc::{CallStatus, ErrorCode, PhaseId, TimingCounters};
+use ipc::{CallStatus, ComponentConfig, ErrorCode, PhaseId, TimingCounters, WorkerInfo};
 
 use crate::completion::Outcome;
 use crate::plan::{Bucket, Shape};
@@ -518,6 +518,42 @@ pub trait Batches: Send + Sync {
     /// A shadow batch never writes resident memory and never serves a request; its failure is the
     /// update's, which the main process reports as `PrecopyFailed`.
     fn shadow(&self, batch: Batch) -> Result<Submission>;
+
+    /// The pools this executor serves (4.2, 7.3): what the mechanism schedules against.
+    ///
+    /// The mechanism builds its `ExecutorInfo` from this and nothing else, so a pool whose ranks,
+    /// cache geometry or model length is absent here is a pool it refuses to serve rather than one
+    /// it assumes: a scheduler that guesses a rank's cache makes the host KV path disappear at
+    /// runtime. An executor that states none cannot be served in process, and the mechanism says so
+    /// when it builds its info.
+    fn inventory(&self) -> &[Inventory] {
+        &[]
+    }
+}
+
+/// One pool of the deployment an executor serves (4.2, 7.3).
+#[derive(Clone, Debug, Default)]
+pub struct Inventory {
+    /// The deployment's name for the pool, the identity the mechanism's `WorkerGroupId` carries.
+    pub group: String,
+    /// The pool's ranks in launch order, each with what it reported at handshake.
+    pub ranks: Vec<WorkerInfo>,
+    /// What the deployment launched the pool with; the ranks' reports do not carry it back.
+    pub placement: Placement,
+    /// The longest sequence the pool's model was built for: the attention descriptor's static bound
+    /// on the keys one row reads.
+    pub max_model_len: u32,
+}
+
+/// What a deployment launched one pool with (4.2).
+#[derive(Clone, Debug, Default)]
+pub struct Placement {
+    /// Unresolved physical batches the pool admits at once, counted as at least one.
+    pub queue_depth: usize,
+    /// Ranks the pool was launched with, counted as at least one.
+    pub ranks: usize,
+    /// The pool's components by name, each with its member ranks, parallel degrees and distribution.
+    pub components: std::collections::BTreeMap<String, ComponentConfig>,
 }
 
 /// The mechanism's `Batches` over a rank's devices (2.4, 4.4): a batch goes to the device whose

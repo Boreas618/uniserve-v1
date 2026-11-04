@@ -2609,8 +2609,8 @@ trait EpochPolicy {
     fn switchover(&self, generation: u64) -> Result<(), String>;
 
     /// Records `generation` as the one the epoch serves without staging a
-    /// switch: a number that is another name for the content already serving
-    /// (§7.3's alias), so the executor's batches name it from now on.
+    /// switch: the switchover of a number this engine already serves changes
+    /// nothing but the number its batches carry from now on.
     fn record_generation(&self, generation: u64);
 
     /// §7.3 step 5: probation ends; the replaced policy stays.
@@ -2836,8 +2836,9 @@ fn apply_process_command(
                     generations.candidate.clone(),
                 )
             };
-            // The same content under the number already serving is an alias of
-            // it: the epoch calls that policy by this number from now on.
+            // The number already serving, or one naming the content it serves:
+            // the policy stays and the epoch calls it by this number from now
+            // on, so a repeated switchover changes nothing but the number.
             let already = serves == Some(generation)
                 || crate::lock(generations)
                     .serving
@@ -3087,9 +3088,6 @@ mod tests {
         }
     }
 
-    /// The number a test's first precopy names, as the daemon would.
-    const DEFAULT_GENERATION: u64 = 1;
-
     /// A program as the epoch names it on the wire.
     fn program() -> proto::process::Program {
         proto::process::Program {
@@ -3264,9 +3262,13 @@ mod tests {
         let generations = Mutex::new(Generations::default());
         let store = store();
         let mut run = |command| apply_process_command(&policy, &generations, Some(&store), command);
-        assert!(matches!(answered(run(precopy(Vec::new()))), Kind::Precopied(_)));
-        assert!(matches!(answered(run(switchover(3))), Kind::Switched(_)));
-        match answered(run(purge(3))) {
+        // The main process numbers the generation, and the first one is 1.
+        let prepared = match answered(run(precopy(Vec::new()))) {
+            Kind::Precopied(precopied) => precopied.generation,
+            other => panic!("a precopy is answered by Precopied, not {other:?}"),
+        };
+        assert!(matches!(answered(run(switchover(prepared))), Kind::Switched(_)));
+        match answered(run(purge(prepared))) {
             Kind::Fault(fault) => {
                 assert_eq!(fault.kind, "policy_purge");
                 assert!(fault.reason.contains("serves"), "{}", fault.reason);
@@ -3274,35 +3276,73 @@ mod tests {
             other => panic!("a serving generation is answered by Fault, not {other:?}"),
         }
         assert_eq!(
-            crate::lock(&generations).serving.as_ref().map(|(number, _)| *number),
-            Some(3),
+            crate::lock(&generations)
+                .serving
+                .as_ref()
+                .map(|(number, _)| *number),
+            Some(prepared),
             "the purge changed nothing"
         );
     }
 
     #[test]
-    fn a_purge_keeps_a_programs_module_while_another_number_names_it() {
+    fn a_purged_generations_number_is_never_handed_out_again() {
         use proto::process::report::Kind;
 
         let policy = Recording::default();
         let generations = Mutex::new(Generations::default());
         let store = store();
         let mut run = |command| apply_process_command(&policy, &generations, Some(&store), command);
-        // The same content under two numbers: an alias.
-        assert!(matches!(answered(run(precopy(Vec::new()))), Kind::Precopied(_)));
-        assert!(matches!(answered(run(precopy(Vec::new()))), Kind::Precopied(_)));
+
+        let first = match answered(run(precopy(Vec::new()))) {
+            Kind::Precopied(precopied) => precopied.generation,
+            other => panic!("a precopy is answered by Precopied, not {other:?}"),
+        };
+        assert!(matches!(answered(run(switchover(first))), Kind::Switched(_)));
+        // The next program is a generation of its own.
+        let next = proto::process::Command {
+            kind: Some(proto::process::command::Kind::Precopy(
+                proto::process::Precopy {
+                    kernels: Vec::new(),
+                    policy: Some(proto::process::Program {
+                        backend: "fcfs".to_owned(),
+                        revision: 4,
+                        arguments: Default::default(),
+                    }),
+                    ..Default::default()
+                },
+            )),
+        };
+        let second = match answered(run(next)) {
+            Kind::Precopied(precopied) => precopied.generation,
+            other => panic!("a new program is answered by Precopied, not {other:?}"),
+        };
+        assert_ne!(second, first, "another program is another generation");
+        assert!(matches!(answered(run(switchover(second))), Kind::Switched(_)));
+
+        // Purging the generation before the serving one drops its module, and
+        // its number is never handed out again: an old switchover cannot
+        // install a program this engine no longer holds.
         let calls = policy.calls().len();
-        // Purging one number leaves the other naming the module: nothing drops.
-        assert!(matches!(answered(run(purge(2))), Kind::Purged(_)));
-        assert_eq!(policy.calls().len(), calls, "the module is still named");
-        // The last number to name it is the serving one, which a purge refuses;
-        // a purge of a forgotten number drops nothing either.
-        assert!(matches!(answered(run(purge(2))), Kind::Purged(_)));
-        assert_eq!(policy.calls().len(), calls);
+        assert!(matches!(answered(run(purge(first))), Kind::Purged(_)));
+        assert_eq!(policy.calls().len(), calls + 1, "the module was dropped");
+        match answered(run(switchover(first))) {
+            Kind::Fault(fault) => assert!(fault.reason.contains("not prepared"), "{}", fault.reason),
+            other => panic!("a forgotten generation is answered by Fault, not {other:?}"),
+        }
+        // Preparing that program again takes a fresh number, never the old one.
+        let again = match answered(run(precopy(Vec::new()))) {
+            Kind::Precopied(precopied) => precopied.generation,
+            other => panic!("a precopy is answered by Precopied, not {other:?}"),
+        };
+        assert!(
+            again > second,
+            "a forgotten number is not reused: {again} after {second}"
+        );
     }
 
     #[test]
-    fn a_precopy_under_a_number_the_engine_holds_is_answered_without_preparing() {
+    fn a_repeated_precopy_of_the_same_program_prepares_nothing() {
         let policy = Recording::default();
         let generations = Mutex::new(Generations::default());
         let store = store();
