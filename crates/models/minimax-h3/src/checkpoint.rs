@@ -62,6 +62,13 @@ pub const MANIFEST_ROOTS: [(&str, Dit); 2] = [
     ("reference_denoiser", Dit::Reference),
 ];
 
+/// The pipeline class a load of this crate takes (`model_index.json`'s `_class_name`).
+///
+/// A task export such as `MiniMax-H3/FL2VA` states `MiniMaxH3Pipeline` and names a `video_vae`
+/// directory; it is not a pipeline root, and the engine's dispatch on the checkpoint's class name
+/// does not reach this crate with one.
+pub const PIPELINE_CLASS: &str = "MiniMaxH3ModularPipeline";
+
 /// The tasks `dit` serves, in canonical order.
 pub fn tasks_of(dit: Dit) -> Vec<VideoTask> {
     TASK_DITS
@@ -164,6 +171,15 @@ impl Layout {
                 root.display()
             ))
         })?;
+        if let Some(class) = index.get("_class_name").and_then(Value::as_str) {
+            if class != PIPELINE_CLASS {
+                return Err(Error::checkpoint(format!(
+                    "{} is a {class} checkpoint, not a {PIPELINE_CLASS} pipeline root; the task \
+                     exports under FL2VA/ are not pipeline roots",
+                    root.display()
+                )));
+            }
+        }
         let mut dits = Vec::new();
         for dit in Dit::ALL {
             if index.contains_key(dit.directory())
@@ -483,6 +499,39 @@ mod tests {
             .collect::<Vec<_>>()
             .join(", ");
         format!("{{{entries}}}")
+    }
+
+    #[test]
+    fn a_task_export_is_not_a_pipeline_root() {
+        let root = tempfile::tempdir().expect("tempdir");
+        // `MiniMax-H3/FL2VA/model_index.json`: the pipeline class a task export states, with its
+        // `video_vae` directory rather than the modular pipeline's `vae`.
+        write(
+            &root.path(),
+            "model_index.json",
+            r#"{"_class_name": "MiniMaxH3Pipeline", "transformer": ["diffusers", "Model"]}"#,
+        );
+        write(&root.path(), "transformer/config.json", "{}");
+        write(&root.path(), "video_vae/config.json", "{}");
+        let error = Layout::detect(root.path())
+            .err()
+            .expect("a task export is refused");
+        assert!(
+            matches!(error, Error::Checkpoint(ref problem)
+                if problem.contains("MiniMaxH3Pipeline") && problem.contains("pipeline root")),
+            "{error}"
+        );
+
+        // The modular pipeline's own class name is taken, and an index that states none is not
+        // refused for it: a hand-built export need not name one.
+        write(
+            &root.path(),
+            "model_index.json",
+            &format!(
+                r#"{{"_class_name": "{PIPELINE_CLASS}", "transformer": ["diffusers", "Model"]}}"#
+            ),
+        );
+        assert!(Layout::detect(root.path()).is_ok());
     }
 
     #[test]
