@@ -77,6 +77,12 @@ impl Snapshot {
         self.width
     }
 
+    /// Address of the snapshot's first block: the caller that fills it before a scatter, or reads
+    /// it after a snapshot, copies through this.
+    pub fn address(&self) -> u64 {
+        self.data.address()
+    }
+
     /// Bytes the snapshot's data occupies, which is what a cache export of a state page states.
     pub fn bytes(&self) -> u64 {
         u64::from(self.rows) * self.width

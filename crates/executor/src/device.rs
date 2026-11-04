@@ -317,26 +317,11 @@ impl Executor {
         Arc::clone(&self.pools)
     }
 
-    /// The device's graph pools as their ledger books them: the reserved range, the bytes mapped
-    /// and the budget they are booked against (4.1, item 5's invariant).
-    ///
-    /// This is the device's figure and not a sum over its runners: one `Pools` is shared by every
-    /// runner on the device, so summing runners would count the same mapping twice. The pools are
-    /// created when the executor starts, so this is `Some` from then on; the answer stays an
-    /// `Option` for a caller that reads a device it has not yet started serving.
-    pub fn pool_metrics(&self) -> Option<crate::arena::PoolMetrics> {
-        Some(
-            self.pools
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .metrics(),
-        )
-    }
-
     /// The device's mapped bytes per pool kind, from the one allocator that books them (4.1).
     ///
-    /// The figures are one booking's totals rather than a sum over owners, so item 5's
-    /// `graph + scratch + resident <= budget` is decided by one book.
+    /// The figures are one booking's totals rather than a sum over owners - one `Pools` is shared
+    /// by every runner on the device, so a sum over runners would count the same mapping twice -
+    /// and item 5's `graph + scratch + resident <= budget` is therefore decided by one book.
     pub fn memory(&self) -> crate::arena::DeviceMemory {
         self.pools
             .lock()
@@ -565,7 +550,7 @@ impl Device {
             }
             Command::Switchover(generation) => {
                 for named in &mut self.runners {
-                    named.runner.switchover(*generation);
+                    named.runner.switchover(*generation)?;
                 }
                 self.synchronize()?;
                 Ok(Step::Done(BatchOutput::default()))
@@ -605,13 +590,6 @@ impl Device {
                 for named in &mut self.runners {
                     named.runner.discard(*generation);
                 }
-                self.synchronize()?;
-                Ok(Step::Done(BatchOutput::default()))
-            }
-            Command::Issue(work) => {
-                work.lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .perform()?;
                 self.synchronize()?;
                 Ok(Step::Done(BatchOutput::default()))
             }
