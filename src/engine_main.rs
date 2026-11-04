@@ -1005,6 +1005,13 @@ impl MainProcess {
                 // resume the schedulers, and each has an answer the daemon's epoch layer waits
                 // for: it promotes a child only after `Parked`, and switches the frontend only
                 // after `Promoted`.
+                //
+                // Two generations travel in the reports of this process and they are not
+                // comparable. `Precopy`/`Precoded` name the MODEL generation this process
+                // numbers for the programs it executes (`HotUpdate::current`), which the epoch
+                // record keeps. `Parked`/`Promoted` name the LAUNCH generation, the identity
+                // this process was started under and is commanded by (`control.engine`), which
+                // the daemon allocates and compares against the number it spawned the child at.
                 Some(proto::process::command::Kind::Park(_)) => {
                     self.park_schedulers("parking for a promotion")?;
                     // The parked standby's readiness names the generation it was

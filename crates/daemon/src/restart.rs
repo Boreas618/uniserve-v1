@@ -930,7 +930,10 @@ async fn prepared_successor(
 /// The epoch record and the process row of an epoch a restarting daemon
 /// adopts: the build config and the programs the adopted configuration
 /// fills, serving, at the launch generation the child reported (which is the
-/// identity it runs under, §7.4).
+/// identity it runs under, §7.4). The record's own generation stays `None`:
+/// that field is the MODEL generation the adopted child numbers for its
+/// programs, and a daemon that adopted it never saw that number — the launch
+/// generation belongs to the process row alone.
 ///
 /// Without the record the epoch layer says no epoch serves and refuses the
 /// next switch; without the row the next launch would be numbered 1 again,
@@ -948,7 +951,7 @@ fn adopted_epoch(
         previous_kernels: std::collections::BTreeMap::new(),
         previous_policy: None,
         status: crate::epoch::Status::Serving,
-        generation: Some(engine),
+        generation: None,
         world,
     };
     let process = crate::epoch::ManagedProcess {
@@ -968,16 +971,21 @@ fn adopted_epoch(
 mod tests {
     use super::*;
 
-    /// The adopted epoch states the configuration it serves, at the launch
-    /// generation its child reported, so a later switch compares against it
-    /// and numbers its children above it.
+    /// The adopted epoch states the configuration it serves, and its process
+    /// row the launch generation its child reported, so a later switch
+    /// compares against it and numbers its children above it. The record's
+    /// generation is the model generation, which the adopting daemon did not
+    /// see and does not invent.
     #[test]
     fn an_adopted_epoch_records_the_build_it_serves_and_the_generation_it_runs_at() {
         let options = crate::options::ServeConfig::default();
         let (record, process) = adopted_epoch(7, 12, &options);
         assert_eq!(record.status, crate::epoch::Status::Serving);
         assert_eq!(record.world, 7);
-        assert_eq!(record.generation, Some(12));
+        assert_eq!(
+            record.generation, None,
+            "the model generation is not the launch generation the child reported"
+        );
         assert_eq!(record.build_config, crate::epoch::BuildConfig::of(&options));
         assert_eq!(process.generation, 12);
         assert_eq!(process.epoch, Some(7));
