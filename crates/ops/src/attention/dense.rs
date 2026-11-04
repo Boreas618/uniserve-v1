@@ -11,6 +11,14 @@
 //! value       [kv_tokens, kv_heads, head_dim]
 //! out         [q_tokens, q_heads, head_dim]
 //! cu_seq_lens_q [batch + 1] i32        row offsets of the queries of each sequence
+//!
+//! ## One sequence without offsets
+//!
+//! `DenseDescriptor::cu_seq_lens` says whether a launch carries offsets, and the arguments carry
+//! `Some`/`None` accordingly; a launch that disagrees with its descriptor is refused in both
+//! directions. Without offsets the call is one sequence: `batch` is one, and the program attends
+//! `[0, q_tokens)` against `[0, kv_tokens)` without reading a table. It is a separate compilation,
+//! so a program never branches on a missing port, and no launch is ever handed a null view.
 //! cu_seq_lens_k [batch + 1] i32        row offsets of the keys of each sequence
 //! ```
 //!
@@ -84,11 +92,18 @@ pub struct DenseDescriptor {
     pub windowed: bool,
     /// The longest sequence (keys) the module serves.
     pub max_kv_len: u32,
+    /// Whether a launch carries `[batch + 1]` sequence offsets.
+    ///
+    /// `true` is the scheduled batch path, and the key every existing package has. `false` is one
+    /// sequence with no offsets at all: the program attends `[0, q_tokens)` against
+    /// `[0, kv_tokens)` and never reads a table. The two are separate compilations, so no program
+    /// branches on a missing pointer.
+    pub cu_seq_lens: bool,
 }
 
 impl fmt::Display for DenseDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        Key::new()
+        let key = Key::new()
             .field("dtype", self.query)
             .field("kv", self.key_value)
             .field("out", self.output)
@@ -97,8 +112,15 @@ impl fmt::Display for DenseDescriptor {
             .field("kv_heads", self.kv_heads)
             .field("mask", self.mask)
             .field("window", self.windowed)
-            .field("len", self.max_kv_len)
-            .finish(formatter)
+            .field("len", self.max_kv_len);
+        // Named only for the form without offsets, so every key the scheduled batch path compiles
+        // stays byte-identical: one sequence is a new variant, not a renamed old one.
+        let key = if self.cu_seq_lens {
+            key
+        } else {
+            key.field("cu_seq_lens", false)
+        };
+        key.finish(formatter)
     }
 }
 
@@ -112,9 +134,12 @@ pub struct DenseArgs {
     /// `[kv_tokens, kv_heads, head_dim]` values.
     pub value: TensorView,
     /// `[batch + 1]` i32: the first query row of each sequence, then `q_tokens`.
-    pub cu_seq_lens_q: TensorView,
+    ///
+    /// Both offsets are `None` exactly when the descriptor says the launch has none. One absent and
+    /// one given is refused: they describe one sequence layout together.
+    pub cu_seq_lens_q: Option<TensorView>,
     /// `[batch + 1]` i32: the first key row of each sequence, then `kv_tokens`.
-    pub cu_seq_lens_k: TensorView,
+    pub cu_seq_lens_k: Option<TensorView>,
     /// `[q_tokens, q_heads, head_dim]` output.
     pub out: TensorView,
     /// Softmax scale applied to `q · k` before the exponential.
@@ -368,36 +393,9 @@ impl Op for DenseAttention {
             ));
         }
         // The scheduler writes the offsets; the module pads its schedule to the longest row, which
-        // the descriptor bounds.
-        let batch = args
-            .cu_seq_lens_q
-            .shape
-            .dims()
-            .first()
-            .copied()
-            .unwrap_or(0)
-            .saturating_sub(1);
-        args.cu_seq_lens_q
-            .require_shape(operator, Shape::new(&[batch + 1]))?;
-        args.cu_seq_lens_k
-            .require_shape(operator, Shape::new(&[batch + 1]))?;
-        for (name, view) in [
-            ("cu_seq_lens_q", &args.cu_seq_lens_q),
-            ("cu_seq_lens_k", &args.cu_seq_lens_k),
-        ] {
-            if view.dtype != DType::I32 {
-                return Err(Error::argument(
-                    operator,
-                    format!("expected i32 {name}, found {}", view.dtype),
-                ));
-            }
-        }
-        if batch == 0 {
-            return Err(Error::argument(
-                operator,
-                "expected at least one sequence: cu_seq_lens_q holds batch + 1 offsets",
-            ));
-        }
+        // the descriptor bounds. Two absent tables are the one-sequence form: every query row
+        // attends the whole key range, which is exactly `[0, q_tokens)` and `[0, kv_tokens)`.
+        let batch = sequence_layout(operator, descriptor, args.cu_seq_lens_q, args.cu_seq_lens_k)?;
         if kv_tokens > u64::from(descriptor.max_kv_len) {
             return Err(Error::argument(
                 operator,
@@ -437,8 +435,14 @@ impl Op for DenseAttention {
             query: address(args.query.ptr) as usize as *const c_void,
             key: address(args.key.ptr) as usize as *const c_void,
             value: address(args.value.ptr) as usize as *const c_void,
-            cu_seq_lens_q: address(args.cu_seq_lens_q.ptr) as usize as *const i32,
-            cu_seq_lens_k: address(args.cu_seq_lens_k.ptr) as usize as *const i32,
+            // Absent offsets are null because the no-offsets form's program has no ports for them;
+            // its entry reads `batch == 1` as `[0, q_tokens)` against `[0, kv_tokens)`.
+            cu_seq_lens_q: args
+                .cu_seq_lens_q
+                .map_or(std::ptr::null(), |q| address(q.ptr) as usize as *const i32),
+            cu_seq_lens_k: args
+                .cu_seq_lens_k
+                .map_or(std::ptr::null(), |k| address(k.ptr) as usize as *const i32),
             batch: to_i64(operator, batch)?,
             q_tokens: to_i64(operator, q_tokens)?,
             kv_tokens: to_i64(operator, kv_tokens)?,
@@ -486,6 +490,73 @@ impl Op for DenseAttention {
     }
 }
 
+/// The batch a launch attends, from its offsets and its descriptor's declared form.
+///
+/// Two given offsets must be `[batch + 1]` i32 tables of the same length — the *values* are the
+/// scheduler's, and the two tables need not end at the same row: a cross-attention has
+/// `q_tokens > kv_tokens` with no offsets and one padded sequence on each side. Both absent is one
+/// sequence. A launch that disagrees with the descriptor, or gives one table and not the other, is
+/// refused by name.
+fn sequence_layout(
+    operator: &'static str,
+    descriptor: &DenseDescriptor,
+    queries: Option<TensorView>,
+    keys: Option<TensorView>,
+) -> Result<u64> {
+    let offsets = match (queries, keys) {
+        (Some(q), Some(k)) => Some((q, k)),
+        (None, None) => None,
+        _ => {
+            return Err(Error::argument(
+                operator,
+                "the two sequence offsets are given together or both absent; one alone defines no \
+                 sequence layout"
+                    .to_owned(),
+            ));
+        }
+    };
+    if offsets.is_some() != descriptor.cu_seq_lens {
+        return Err(Error::argument(
+            operator,
+            if descriptor.cu_seq_lens {
+                "the module was compiled with sequence offsets and the launch has none"
+            } else {
+                "the module was compiled without sequence offsets and the launch has them"
+            }
+            .to_owned(),
+        ));
+    }
+    let Some((q, k)) = offsets else {
+        // One sequence: the whole packing, which for a cross-attention is a query range wider than
+        // the key range.
+        return Ok(1);
+    };
+    let batch = q
+        .shape
+        .dims()
+        .first()
+        .copied()
+        .unwrap_or(0)
+        .saturating_sub(1);
+    q.require_shape(operator, Shape::new(&[batch + 1]))?;
+    k.require_shape(operator, Shape::new(&[batch + 1]))?;
+    for (name, view) in [("cu_seq_lens_q", q), ("cu_seq_lens_k", k)] {
+        if view.dtype != DType::I32 {
+            return Err(Error::argument(
+                operator,
+                format!("expected i32 {name}, found {}", view.dtype),
+            ));
+        }
+    }
+    if batch == 0 {
+        return Err(Error::argument(
+            operator,
+            "expected at least one sequence: cu_seq_lens_q holds batch + 1 offsets",
+        ));
+    }
+    Ok(batch)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -502,6 +573,7 @@ mod tests {
             mask: Mask::Dense,
             windowed: false,
             max_kv_len: 4096,
+            cu_seq_lens: true,
         }
     }
 
@@ -517,7 +589,49 @@ mod tests {
             mask: Mask::Dense,
             windowed: false,
             max_kv_len: 8192,
+            cu_seq_lens: true,
         }
+    }
+
+    /// A view the validation reads without touching: an address of zero is never dereferenced here.
+    fn table(extent: u64) -> TensorView {
+        TensorView::new(
+            crate::tensor::DevicePtr::new(0),
+            DType::I32,
+            Shape::new(&[extent]),
+        )
+    }
+
+    #[test]
+    fn a_cross_attention_with_no_offsets_accepts_more_queries_than_keys() {
+        // H3's whole visibility rule: every query sees keys `[0, used)`. Eight queries against five
+        // keys, one sequence each, no offsets — the descriptor does not change and no mask is added.
+        let unweighted = DenseDescriptor {
+            cu_seq_lens: false,
+            ..cross()
+        };
+        assert_eq!(
+            sequence_layout("dense_attention", &unweighted, None, None).unwrap(),
+            1
+        );
+        // The batch path is unchanged: two tables of `batch + 1` offsets.
+        assert_eq!(
+            sequence_layout("dense_attention", &cross(), Some(table(3)), Some(table(3))).unwrap(),
+            2
+        );
+        // A launch that disagrees with its descriptor is refused in both directions, and one table
+        // without the other defines no layout.
+        assert!(sequence_layout("dense_attention", &cross(), None, None).is_err());
+        assert!(
+            sequence_layout(
+                "dense_attention",
+                &unweighted,
+                Some(table(3)),
+                Some(table(3))
+            )
+            .is_err()
+        );
+        assert!(sequence_layout("dense_attention", &cross(), Some(table(3)), None).is_err());
     }
 
     #[test]
