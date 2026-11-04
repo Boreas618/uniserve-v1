@@ -191,6 +191,10 @@ mod tests {
         type Output = ();
 
         fn run(&self) -> Result<()> {
+            // The fact this probe exists for is that the lane holds its task's input for the whole
+            // run, not only until it is admitted: reaching through the Arc is what shows the input
+            // is alive while the run happens.
+            assert!(Arc::strong_count(&self.input) >= 1);
             self.runs.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }

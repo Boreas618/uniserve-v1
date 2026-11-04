@@ -162,6 +162,7 @@ impl Executor {
             scratch,
             pools: Arc::clone(&pools),
             counters: Arc::clone(&counters),
+            current: None,
             sticky: None,
         };
         let thread_queue = Arc::clone(&queue);
@@ -452,6 +453,9 @@ struct Device {
     pools: Arc<std::sync::Mutex<Pools>>,
     /// What the device thread has done, shared with the handle the control thread reads.
     counters: Arc<SharedCounters>,
+    /// What the job in hand is doing, for the report of a failed submission. The device thread is
+    /// the only place that knows it, and a failure crosses the thread boundary as a bare error.
+    current: Option<String>,
     /// The context's first sticky error, once one has been seen (2.4).
     ///
     /// A sticky error is not recoverable: every launch after it fails, so the executor issues
@@ -473,7 +477,11 @@ impl Device {
             if let Some(sticky) = &self.sticky {
                 // The context is unusable: the command is not issued, and its submission fails
                 // with the sticky error rather than with a launch error that would hide it.
-                queue.complete(entry, Err(Error::Cuda(sticky.clone())));
+                queue.complete(
+                    entry,
+                    Err(Error::Cuda(sticky.clone())),
+                    Some("the device's context already had a sticky error".to_owned()),
+                );
                 continue;
             }
             let result = self.serve(&entry);
@@ -502,7 +510,8 @@ impl Device {
                     self.sticky = Some(sticky);
                 }
             }
-            queue.complete(entry, result);
+            let detail = self.current.take();
+            queue.complete(entry, result, detail);
         }
         events.set_submitter(None);
     }
@@ -521,37 +530,38 @@ impl Device {
     /// rest back at the tail of the queue, so a serving batch the scheduler submitted meanwhile is
     /// served between two of its jobs (4.5's interleaving).
     fn serve(&mut self, entry: &crate::job::Entry) -> Result<Step> {
+        let label = entry.label.clone();
         match &entry.command {
             Command::Batch(batch) => {
                 let runner = self.runner_of(phase_of(batch))?;
                 let jobs = self.runner_mut(runner)?.runner.submit(batch.clone())?;
                 // A batch's jobs are its replay and nothing else: serving it is one turn, because
                 // the mechanism waits on this submission to build the next step.
-                self.perform(jobs_of(runner, jobs)).map(Step::Done)
+                self.perform(&label, jobs_of(runner, jobs)).map(Step::Done)
             }
             Command::Warmup => {
                 let mut jobs = Vec::new();
                 for named in &mut self.runners {
                     jobs.extend(jobs_of(named.id, named.runner.warmup()?));
                 }
-                self.steps(entry, None, jobs)
+                self.steps(entry, &label, None, jobs)
             }
             Command::Shadow(batch) => {
                 let runner = self.runner_of(phase_of(batch))?;
                 let jobs = self.runner_mut(runner)?.runner.shadow(batch.clone())?;
                 // A shadow batch is a set of independent paired forwards, one per changed operator:
                 // they interleave with serving batches like a precopy's steps (7.3 step 2).
-                self.steps(entry, Some(batch.generation), jobs_of(runner, jobs))
+                self.steps(entry, &label, Some(batch.generation), jobs_of(runner, jobs))
             }
             Command::Precopy(next) => {
                 let mut jobs = Vec::new();
                 for named in &mut self.runners {
                     jobs.extend(jobs_of(named.id, named.runner.precopy(next)?));
                 }
-                self.steps(entry, Some(next.number()), jobs)
+                self.steps(entry, &label, Some(next.number()), jobs)
             }
             Command::Steps { generation, jobs } => {
-                self.steps(entry, *generation, jobs.clone())
+                self.steps(entry, &label, *generation, jobs.clone())
             }
             Command::Switchover(generation) => {
                 for named in &mut self.runners {
@@ -623,13 +633,19 @@ impl Device {
     /// one turn would stop serving for the whole set, which is the long pause the design forbids.
     /// One job per turn lets whatever the scheduler submitted in between be served first, and a
     /// quiet queue still runs the steps back to back.
-    fn steps(&mut self, entry: &crate::job::Entry, generation: Option<u64>, jobs: Vec<Job>) -> Result<Step> {
+    fn steps(
+        &mut self,
+        entry: &crate::job::Entry,
+        label: &str,
+        generation: Option<u64>,
+        jobs: Vec<Job>,
+    ) -> Result<Step> {
         let mut jobs = jobs;
         if jobs.is_empty() {
             return Ok(Step::Done(BatchOutput::default()));
         }
         let first = jobs.remove(0);
-        let output = self.perform(vec![first])?;
+        let output = self.perform(label, vec![first])?;
         if jobs.is_empty() {
             return Ok(Step::Done(output));
         }
@@ -641,18 +657,21 @@ impl Device {
     ///
     /// The answer is the output of the jobs that produced one; a job list with no output (every
     /// program-layer command) answers empty.
-    fn perform(&mut self, jobs: Vec<Job>) -> Result<BatchOutput> {
+    fn perform(&mut self, label: &str, jobs: Vec<Job>) -> Result<BatchOutput> {
         let mut output = BatchOutput::default();
         for job in jobs {
             let runner = job
                 .runner()
                 .ok_or_else(|| Error::Invariant("a serving job names no runner".into()))?;
+            // The job in hand names the bucket, generation and operator a failure is about; the
+            // command's label says which submission was running it.
+            self.current = Some(format!("{label}, {}", job.describe()));
             let started = Instant::now();
             let produced = self.runner_mut(runner)?.runner.serve(&job)?;
             self.synchronize()?;
             self.counters.time(started.elapsed());
-            if !produced.tokens.is_empty() {
-                if !output.tokens.is_empty() {
+            if !produced.calls.is_empty() {
+                if !output.calls.is_empty() {
                     return Err(Error::Invariant(
                         "two jobs of one command produced tokens".into(),
                     ));
