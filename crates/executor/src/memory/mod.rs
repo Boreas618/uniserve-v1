@@ -17,6 +17,7 @@ pub mod pinned_pool;
 pub mod prefix_cache;
 pub mod products;
 pub mod request_slots;
+pub mod weights;
 pub mod retained;
 
 pub use latent::LatentPlan;
