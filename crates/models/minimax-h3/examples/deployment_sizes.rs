@@ -6,6 +6,13 @@
 //!
 //! Runs host-only: no checkpoint, no GPU, no reference Python. `--root <checkpoint>` additionally
 //! recomputes the derived quantities from that checkpoint's sidecars.
+//!
+//! **What each figure is a number of:** the design's cost for the row's deployment shape, from the
+//! index's bytes, the block's once-at-load constants and the plan function of the row's request. It is
+//! not a run's reservation. A run sizes a stage by its own partition (no tensor or Ulysses flag means
+//! 1 and 1), so a line this program prints in a log is the note's row and must not be read as the
+//! partition the run stated; the measurement to check a row against is a harness's own reservation
+//! line (`conditioned --stage encode` prints one before it loads).
 
 use std::path::PathBuf;
 
