@@ -197,6 +197,18 @@ fn task_name(task: VideoTask) -> &'static str {
     }
 }
 
+/// The blocks this stage's process places: the deployment's own, **without the text encoder**.
+///
+/// The text encoder is the pipeline stage before this one - its weights are 47.97 GiB beside this
+/// stage's 41.46 - and a process that placed both would need 89 GiB, past an 80 GB device and past
+/// what a stage is for. Its output is the runner's prefix buffer, which is what a deployment passes
+/// between the two stages and what this harness states as a synthetic pattern (stage 4 owns the text
+/// encoder). Placing it here would reserve it and read nothing.
+fn stage_partition(config: &Config, task: VideoTask) -> Result<Partition, String> {
+    let serving = Partition::serving(config, task, 1, 1, 0, 0).map_err(show)?;
+    Ok(serving.placing(serving.blocks.without(Component::TextEncoder)))
+}
+
 /// Every tensor name the checkpoint's index lists for one component directory.
 fn index_names(directory: &Path) -> Result<std::collections::BTreeSet<String>, String> {
     let mut names = std::collections::BTreeSet::new();
@@ -249,9 +261,9 @@ fn weights(args: &Args) -> Result<(), String> {
         minimax_h3::checkpoint::Sidecars::read(&args.root, None, &layout).map_err(show)?;
     let config = Config::normalize(&layout, &sidecars).map_err(show)?;
 
-    let partition = Partition::serving(&config, args.task, 1, 1, 0, 0).map_err(show)?;
+    let partition = stage_partition(&config, args.task)?;
     println!(
-        "{} places {} blocks: {}",
+        "{} places {} blocks (the text encoder is the stage before this one): {}",
         task_name(args.task),
         partition.blocks.iter().count(),
         partition
@@ -333,7 +345,7 @@ fn plan(args: &Args) -> Result<(), String> {
     let sidecars =
         minimax_h3::checkpoint::Sidecars::read(&args.root, None, &layout).map_err(show)?;
     let config = Config::normalize(&layout, &sidecars).map_err(show)?;
-    let partition = Partition::serving(&config, args.task, 1, 1, 0, 0).map_err(show)?;
+    let partition = stage_partition(&config, args.task)?;
     let dit = config
         .denoisers
         .get(&Dit::Base)
@@ -489,7 +501,7 @@ fn encode(args: &Args) -> Result<(), String> {
     //    build, attaches the condition encoders to the denoiser block, and converts nothing.
     let checkpoint = Checkpoint::open(&args.root).map_err(show)?;
     let config = Config::read(&args.root, None).map_err(show)?;
-    let partition = Partition::serving(&config, args.task, 1, 1, 0, 0).map_err(show)?;
+    let partition = stage_partition(&config, args.task)?;
     let dit = config
         .denoisers
         .get(&Dit::Base)
