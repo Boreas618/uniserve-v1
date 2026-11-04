@@ -40,7 +40,7 @@ use platform::DeviceId;
 use proto::request::GraphPolicy;
 use program_server::Target;
 
-use crate::engine_main::EngineArgs;
+use crate::engine_main::Launch;
 
 /// One epoch's build config, resolved against the node the main process runs on.
 pub struct EpochPlan {
@@ -65,16 +65,16 @@ impl EpochPlan {
     /// starts every rank of a node with the ordinals that rank serves, and a main process that
     /// guessed its devices from the epoch's parallelism would capture graphs on another rank's
     /// device.
-    pub fn of(args: &EngineArgs, build: &daemon::epoch::BuildConfig) -> Result<Self> {
-        if args.devices.is_empty() {
+    pub fn of(launch: &Launch, build: &daemon::epoch::BuildConfig) -> Result<Self> {
+        if launch.devices.is_empty() {
             bail!(
                 "rank {} of group {} was started with no device to serve",
-                args.rank,
-                args.group
+                launch.rank,
+                launch.group
             );
         }
-        let mut devices = Vec::with_capacity(args.devices.len());
-        for ordinal in &args.devices {
+        let mut devices = Vec::with_capacity(launch.devices.len());
+        for ordinal in &launch.devices {
             let ordinal = i32::try_from(*ordinal).with_context(|| {
                 format!("device ordinal {ordinal} is outside the driver's range")
             })?;
@@ -119,9 +119,9 @@ impl EpochPlan {
         let targets = targets(&devices)?;
         Ok(Self {
             build: build.clone(),
-            checkpoint: args.model.clone(),
+            checkpoint: launch.model.clone(),
             devices,
-            program_server: args.program_server.clone(),
+            program_server: PathBuf::from(&launch.program_server),
             targets,
             buckets,
         })
@@ -256,6 +256,18 @@ impl EpochPlan {
     ) -> Result<Vec<NamedRunner>> {
         let class = architectural_class(&self.checkpoint)?;
         let mut runners: Vec<NamedRunner> = Vec::new();
+        // One model per rank is loaded and mapped on the rank's first device, and a kernel on a
+        // second device would read the first device's addresses: a node whose rank serves two
+        // devices needs the model loaded per device. Refusing says so; serving would emit wrong
+        // tokens and look like a kernel defect.
+        if Some(&device) != self.devices.first() {
+            bail!(
+                "this build maps one model per rank, on device {}; a runner on device {} would \
+                 forward from another device's addresses",
+                self.devices.first().map_or(-1, |first| first.0),
+                device.0
+            );
+        }
         match class.as_str() {
             "Qwen3MoeForCausalLM" => {
                 let geometry = Geometry {
