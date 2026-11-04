@@ -51,7 +51,7 @@ CUTS = ["normalized", "attended", "mlp_out"]
 CUT_SITES = [
     ("normalized", "input_layernorm's output (its residual add is already in it)"),
     ("attended", "self_attn's output, element [0], before the residual add"),
-    ("mlp_out", "the layer's state after the block's residual add, which the next boundary holds"),
+    ("mlp_out", "mlp's output, before the residual add"),
 ]
 
 
