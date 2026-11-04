@@ -520,10 +520,6 @@ mod tests {
             };
             assert_eq!(request.image.steps, IMAGE_STEPS, "every denoising step");
             assert_eq!(request.max_images, 1, "and one decoded image");
-            assert_eq!(
-                (request.image.height, request.image.width),
-                (request.image.height, request.image.width),
-            );
         }
         let shapes: Vec<(u32, u32)> = images
             .iter()
