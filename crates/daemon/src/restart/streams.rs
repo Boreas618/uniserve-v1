@@ -362,11 +362,11 @@ pub(crate) fn adopted(adopted: &[Adopted]) {
 ///
 /// The record is one log line whose message is `handoff finished ` and one
 /// JSON object, which the deployment's restart test parses.
-pub(crate) fn finished(response: &Adopted) {
+pub(crate) fn finished(request_id: &str) {
     info!(
         "handoff finished {}",
         serde_json::json!({
-            "request_id": response.request_id,
+            "request_id": request_id,
             "pid": std::process::id(),
             "at_ns": crate::http::handoff::now_ns(),
         })
