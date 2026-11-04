@@ -450,7 +450,7 @@ impl InProcess {
         }
         let phase =
             kind.ok_or_else(|| anyhow::anyhow!("batch {} carries no call to serve", batch.id))?;
-        let shape = shape_of(&batch.requests, &columns);
+        let shape = crate::scheduler::batching::columns::batch_shape(&columns);
         columns
             .check(&shape)
             .map_err(|error| anyhow::anyhow!("batch {}: {error}", batch.id))?;
@@ -474,42 +474,4 @@ impl InProcess {
 fn wire_phase(kind: ipc::CallKind) -> Option<ipc::PhaseId> {
     let id = crate::scheduler::views::phase_id(crate::scheduler::views::call_phase(kind));
     u16::try_from(id.0).ok().map(ipc::PhaseId)
-}
-
-/// The shape a batch computes (4.4, 4.5): the rows and tokens its columns
-/// hold, and what the runner does with them.
-///
-/// A batch whose calls prefill is a prefill of `rows` rows holding `tokens`
-/// tokens; the phase fixes which. It projects each row's last hidden state
-/// exactly when a row's logits are wanted — a prefill that samples or scores
-/// from its last row states that in `logits_rows` — and only writes the cache
-/// otherwise. A decode row runs the sampler graph, which is what turns a row's
-/// parameters into a token; a greedy request's parameters are the sampler's, so
-/// the graph is the same one (4.6, `ops::sampler`).
-///
-/// This rule lives at the mechanism's batch assembly, where the sampling rows
-/// are decided; it is stated here until the assembly states the shape itself.
-fn shape_of(
-    requests: &[(ipc::Call, crate::executor::RequestPlacement)],
-    columns: &executor::batch::BatchColumns,
-) -> executor::plan::Shape {
-    let rows = columns.rows.rows() as u32;
-    let tokens = columns.rows.tokens() as u32;
-    let prefill = requests
-        .iter()
-        .any(|(call, _)| matches!(call.kind, ipc::CallKind::Forward(ipc::ForwardMode::Prefill)));
-    let variant = if prefill {
-        if columns.rows.logits_rows.is_empty() {
-            executor::plan::Variant::PrefillWrite
-        } else {
-            executor::plan::Variant::PrefillOutput
-        }
-    } else {
-        executor::plan::Variant::DecodeSampled
-    };
-    executor::plan::Shape {
-        rows,
-        tokens,
-        variant,
-    }
 }
