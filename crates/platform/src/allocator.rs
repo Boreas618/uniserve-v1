@@ -86,6 +86,14 @@ pub trait Budget: Send + Sync {
     /// a device-wide or deployment-wide limit adds the kinds up itself. A
     /// refused booking must leave the allocator nothing to undo — the booking
     /// comes before the storage is created, and a refusal maps nothing.
+    ///
+    /// One budget instance serves one allocator. A device that holds several
+    /// allocators of the same pool — a rank's graph pools are several — cannot
+    /// hand them all the same instance and record `bytes` as that pool's
+    /// total: the second allocator's call would replace the first's total and
+    /// the ledger would count less than the device holds. Give each allocator
+    /// an adapter that keeps that allocator's last total and passes the
+    /// difference on, so the ledger behind all of them sums them.
     fn book(&self, device: DeviceId, pool: PoolKind, bytes: u64) -> Result<()>;
 }
 
