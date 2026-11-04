@@ -650,6 +650,13 @@ pub enum Command {
     RevertPolicy {
         answer: crossbeam_channel::Sender<Result<(), String>>,
     },
+    /// §7.3 step 6: drop the module a revert could have returned to.
+    PurgePolicy {
+        answer: crossbeam_channel::Sender<Result<(), String>>,
+    },
+    /// §7.3 step 2's failure: the precopied generation is dropped and the
+    /// serving policy kept.
+    DiscardPolicy,
     /// Hands the control thread a policy failure this scheduler recorded: it
     /// reverted to the previous policy and serves on (§7.3).
     TakePolicyReport(crossbeam_channel::Sender<Option<crate::scheduler::PolicyReverted>>),
@@ -1059,6 +1066,19 @@ impl CommandSender {
         let (answer, done) = crossbeam_channel::bounded(1);
         let _ = self.send(Command::RevertPolicy { answer });
         done
+    }
+
+    /// Drops the module a revert could have returned to, once no batch uses it
+    /// (§7.3 step 6).
+    pub fn purge_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
+        let (answer, done) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::PurgePolicy { answer });
+        done
+    }
+
+    /// Drops a precopied generation that failed or was abandoned (§7.3 step 2).
+    pub fn discard_policy(&self) {
+        let _ = self.send(Command::DiscardPolicy);
     }
 
     /// Takes the policy failure this scheduler recorded since the last call,

@@ -988,6 +988,28 @@ pub(crate) fn pages(scheduler: &Scheduler) -> Vec<PageView> {
     views
 }
 
+/// The view of one pool page, from the mechanism's own record of it.
+///
+/// `units` are all the page's units and `tokens` the tokens it holds: what a
+/// cached page carries, and what a change log keeps of a page it freed. The
+/// evictability rule is [`pages`]'s — no resident request continues from any of
+/// the page's units — so a policy is never told a page is evictable that the
+/// mechanism would refuse to evict, and this reads one page rather than the
+/// cache.
+pub(crate) fn page_of(scheduler: &Scheduler, units: &[u32], tokens: u32) -> Option<PageView> {
+    let first = *units.first()?;
+    let held = held_units(scheduler);
+    Some(page_view(PageFacts {
+        id: device_page(first),
+        tokens,
+        last_used: Nanos(0),
+        on_host: false,
+        // A page is evictable once no resident request continues from any of
+        // its units, not just from the one its id names.
+        evictable: !units.iter().any(|unit| held.contains(unit)),
+    }))
+}
+
 /// Every page of the device KV cache, keyed by id: the table `Live` checks a
 /// named page against.
 ///

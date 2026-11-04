@@ -39,15 +39,15 @@ pub(crate) mod stats_report;
 
 pub use config::{
     DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
-    DEFAULT_MAX_RUNNING_REQUESTS, RefillPolicy, SchedulerConfig,
+    DEFAULT_MAX_RUNNING_REQUESTS, SchedulerConfig,
 };
 pub(crate) use execution::generation_consuming_calls;
 use ipc::{ForwardMode, MediaCall, TransferMode};
 pub(crate) use policy::process_engine;
 pub use policy::{
-    Arrival, BatchCapacity, Candidate, PREFETCH_FLOOR_TOKENS, PolicyBytes, PolicyProgram,
-    PolicyReverted, PolicySlot, PolicySource, PolicyStore, RoutePolicy, RouteTrial, Stage,
-    TrialState, Validators, arrival_view, ceilings_of,
+    Arrival, BatchCapacity, CONTROL_THREAD, Candidate, PREFETCH_FLOOR_TOKENS, PolicyBytes,
+    PolicyProgram, PolicyReverted, PolicySlot, PolicySource, PolicyStore, RoutePolicy, RouteTrial,
+    Stage, TrialState, Validators, arrival_view, ceilings_of,
 };
 pub(crate) use run::{MAX_GUIDANCE_PREFIX_ROWS, guidance_prefix_rows};
 pub use stats::{
@@ -486,8 +486,10 @@ pub struct Scheduler {
     /// The stage §7.3 asked for and the answer to give once it is applied: a
     /// stage changes the serving policy, so it waits for a boundary where no
     /// batch and no submission is in flight.
-    policy_stage:
-        Option<(policy::Stage, Option<crossbeam_channel::Sender<Result<(), String>>>)>,
+    policy_stage: Option<(
+        policy::Stage,
+        Option<crossbeam_channel::Sender<Result<(), String>>>,
+    )>,
     /// The events and transitions a policy is told about (§4.4).
     recorder: mechanism::Recorder,
     /// The starvation watchdog: a resident request that does not advance
