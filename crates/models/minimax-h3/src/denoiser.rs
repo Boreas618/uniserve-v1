@@ -202,51 +202,6 @@ impl Layouts {
         Ok(bound)
     }
 
-    /// This layout's packed row count, as the forward's own packing computes it.
-    ///
-    /// A dense deployment's rows are the packing's padded token count and a sparse deployment's are
-    /// the segment packing's, which rounds to whole tiles. Both come from the same functions the
-    /// loader and the layout build from, so the plan and the forward cannot disagree about a row.
-    fn packed_rows(&self, layout: &Layout) -> Result<u32> {
-        match self.config.attention {
-            crate::config::AttentionKind::Sparse { .. } => {
-                Ok(self.segment_of(layout)?.extent.padded_tokens)
-            }
-            crate::config::AttentionKind::Dense => {
-                let frames = frame_count(layout.video.frames)?;
-                let canvas = canvas_of_latents(layout)?;
-                Ok(packing::dense_packing(
-                    frames,
-                    &canvas,
-                    self.arrangement.text_rows,
-                    self.arrangement.condition_rows,
-                    self.arrangement.shard,
-                )?
-                .padded_tokens)
-            }
-        }
-    }
-
-    /// Every buffer one evaluation reserves at `layout`, in the order the forward reserves them.
-    ///
-    /// The executor sizes the denoiser's arena by the sum of this plan and keys its storage by the
-    /// names, as it does for the decoder's two plans and the splice's. The list is the forward's own
-    /// reservation order - [`Self::denoise_traced`], then
-    /// [`crate::transformer::Transformer::forward`], then each modality's head in the order the
-    /// forward reaches them - because the arena is one cursor: a buffer listed before another is
-    /// reserved before it.
-    ///
-    /// Nothing here is multiplied by the layer count. The stack reserves its scratch once
-    /// ([`crate::transformer::Scratch`]) and its attention's once, which is what makes a 52-layer
-    /// stack affordable; a per-layer reservation would multiply every entry below by 52.
-    ///
-    /// The rows are this layout's own packed count, so a plan is exact for a canvas rather than a
-    /// bound, and the executor takes the largest layout it will serve.
-    /// The segment packing of a sparse layout, rebuilt from the layout's own extents.
-    ///
-    /// The tile capacities a sparse layout holds are tile-rounded, so a rebuild from the layout's
-    /// numbers must return the same extent: a mismatch is a layout this deployment did not pack,
-    /// and the tables built from it would address rows that are not there.
     pub fn segment_of(&self, layout: &Layout) -> Result<packing::SegmentPacking> {
         let tile = match self.config.attention {
             crate::config::AttentionKind::Sparse { tile, .. } => tile,
@@ -1525,217 +1480,290 @@ impl<'a> Tables<'a> {
     }
 }
 
-impl Denoiser {
-    pub fn denoise_arena(&self, layout: &Layout) -> Result<Vec<crate::decoding::Buffer>> {
-        let dtype = self.transformer.dtype();
-        let element = match dtype {
-            DType::BF16 => "bf16",
-            DType::F16 => "f16",
-            DType::F32 => "f32",
-            other => {
-                return Err(Error::config(format!(
-                    "the denoiser's activations are {other}, which has no arena element"
-                )));
-            }
-        };
-        let transformer = &self.config.transformer;
-        let hidden = u64::from(transformer.hidden_size);
-        let ffn = u64::from(transformer.intermediate_size);
-        let heads = u64::from(transformer.num_attention_heads);
-        let head_dim = u64::from(transformer.head_dim);
-        // One rank's share of the heads; the exchange's buffers are per rank, as the layers are.
-        let local_heads = heads / u64::from(self.shard);
-        let groups = u64::from(self.cache.groups().count());
-        let tokens = u64::from(self.rules.packed_rows(layout)?);
-        let channels = u64::from(layout.video.channels);
-        let frames = u64::from(layout.video.frames);
-        let height = u64::from(layout.video.height);
-        let columns = u64::from(layout.video.width);
-        // The `1x2x2` patch: one row per latent frame and each pair of rows and columns.
-        let video_rows = frames * (height / 2) * (columns / 2);
-        let patches = channels * 4;
-        let rotated = u64::from(transformer.rope_frequency_dim) * 3;
-        let audio = layout.audio.map(|audio| {
-            let rows = u64::from(crate::config::AUDIO_CHANNELS) * u64::from(audio.frames);
-            (rows, u64::from(transformer.audio_channels))
-        });
+/// This layout's packed row count, as the forward's own packing computes it.
+///
+/// A dense deployment's rows are the packing's padded token count and a sparse deployment's are the
+/// segment packing's, which rounds to whole tiles. Both come from the same functions the loader builds
+/// layouts from, so a plan and a forward cannot disagree about a row.
+pub fn packed_rows(
+    config: &DenoiserConfig,
+    arrangement: &Arrangement,
+    layout: &Layout,
+) -> Result<u32> {
+    let frames = frame_count(layout.video.frames)?;
+    let canvas = canvas_of_latents(layout)?;
+    match config.attention {
+        crate::config::AttentionKind::Sparse { tile, .. } => Ok(packing::segment_packing(
+            frames,
+            &canvas,
+            arrangement.text_rows,
+            arrangement.condition_rows,
+            tile,
+            tile,
+        )?
+        .extent
+        .padded_tokens),
+        crate::config::AttentionKind::Dense => Ok(packing::dense_packing(
+            frames,
+            &canvas,
+            arrangement.text_rows,
+            arrangement.condition_rows,
+            arrangement.shard,
+        )?
+        .padded_tokens),
+    }
+}
 
-        /// One line of the plan.
-        fn push(
-            plan: &mut Vec<crate::decoding::Buffer>,
-            name: &str,
-            element: &'static str,
-            elements: u64,
-        ) {
-            plan.push(crate::decoding::Buffer {
-                name: name.to_owned(),
-                element,
-                elements,
-            });
+/// Every buffer one evaluation reserves at `layout`, in the order the forward reserves them.
+///
+/// The executor sizes the denoiser's arena by the sum of this plan and keys its storage by the names,
+/// as it does for the decoder's two plans and the splice's. The list is the forward's own reservation
+/// order - `Denoiser::denoise_traced`, then the transformer's forward, then each modality's head in
+/// the order the forward reaches them - because the arena is one cursor: a buffer listed before
+/// another is reserved before it.
+///
+/// Nothing here is multiplied by the layer count. The stack reserves its scratch once and its
+/// attention's once, which is what makes a 52-layer stack affordable; a per-layer reservation would
+/// multiply every entry below by the number of layers. A parallel-decoding student's fused head is
+/// the one repeated entry, gathered once per modality.
+///
+/// The rows are this layout's own packed count, so a plan is exact for a canvas rather than a bound,
+/// and the executor takes the largest layout it will serve.
+///
+/// This is the plan itself, with every value the deployment supplies passed in, so a host tool that
+/// has a configuration and no checkpoint can size a stage from it.
+pub fn denoise_arena(
+    config: &DenoiserConfig,
+    arrangement: &Arrangement,
+    groups: u32,
+    dtype: DType,
+    layout: &Layout,
+) -> Result<Vec<crate::decoding::Buffer>> {
+    let element = match dtype {
+        DType::BF16 => "bf16",
+        DType::F16 => "f16",
+        DType::F32 => "f32",
+        other => {
+            return Err(Error::config(format!(
+                "the denoiser's activations are {other}, which has no arena element"
+            )));
         }
+    };
+    let transformer = &config.transformer;
+    let hidden = u64::from(transformer.hidden_size);
+    let ffn = u64::from(transformer.intermediate_size);
+    let heads = u64::from(transformer.num_attention_heads);
+    let head_dim = u64::from(transformer.head_dim);
+    // One rank's share of the heads; the exchange's buffers are per rank, as the layers are.
+    let local_heads = heads / u64::from(arrangement.shard);
+    let groups = u64::from(groups);
+    let tokens = u64::from(packed_rows(config, arrangement, layout)?);
+    let channels = u64::from(layout.video.channels);
+    let frames = u64::from(layout.video.frames);
+    let height = u64::from(layout.video.height);
+    let columns = u64::from(layout.video.width);
+    // The `1x2x2` patch: one row per latent frame and each pair of rows and columns.
+    let video_rows = frames * (height / 2) * (columns / 2);
+    let patches = channels * 4;
+    let rotated = u64::from(transformer.rope_frequency_dim) * 3;
+    let audio = layout.audio.map(|audio| {
+        let rows = u64::from(crate::config::AUDIO_CHANNELS) * u64::from(audio.frames);
+        (rows, u64::from(transformer.audio_channels))
+    });
 
-        // One modality's head: the norm every deployment runs, then the weight and bias a student
-        // gathers out of its fused tables.
-        fn head(
-            plan: &mut Vec<crate::decoding::Buffer>,
-            element: &'static str,
-            hidden: u64,
-            student: bool,
-            name: &str,
-            rows: u64,
-            out: u64,
-        ) {
-            push(plan, &format!("{name}.normed"), element, rows * hidden);
-            if student {
-                push(plan, &format!("{name}.head"), element, out * hidden);
-                push(plan, &format!("{name}.head_bias"), element, out);
-            }
-        }
-
-        let mut plan = Vec::new();
-
-        // The packed rows, the two projections that fill them, and the rotary tables of the one
-        // sequence.
-        push(&mut plan, "packed", element, tokens * hidden);
-        push(&mut plan, "patched", element, video_rows * patches);
-        push(&mut plan, "video.projected", element, video_rows * hidden);
-        if let Some((audio_rows, _)) = audio {
-            push(&mut plan, "audio.projected", element, audio_rows * hidden);
-        }
-        push(&mut plan, "cosine", "f32", tokens * rotated);
-        push(&mut plan, "sine", "f32", tokens * rotated);
-
-        // The stack: the step's gathered modulation, one alternate residual buffer, and the scratch
-        // every layer shares.
-        push(&mut plan, "step.entries", "i32", groups);
-        push(
-            &mut plan,
-            "step.modulation",
+    /// One line of the plan.
+    fn push(
+        plan: &mut Vec<crate::decoding::Buffer>,
+        name: &str,
+        element: &'static str,
+        elements: u64,
+    ) {
+        plan.push(crate::decoding::Buffer {
+            name: name.to_owned(),
             element,
-            groups * 3 * 6 * hidden,
-        );
-        push(&mut plan, "alternate", element, tokens * hidden);
-        push(&mut plan, "normalized", element, tokens * hidden);
-        push(&mut plan, "update", element, tokens * hidden);
-        push(&mut plan, "mlp.packed", element, tokens * 2 * ffn);
-        push(&mut plan, "mlp", element, tokens * ffn);
-        match self.config.attention {
-            crate::config::AttentionKind::Dense => {
-                let inner = heads * head_dim;
-                let local = local_heads * head_dim;
-                for name in ["query", "key", "value", "rotated_query", "rotated_key"] {
-                    push(
-                        &mut plan,
-                        &format!("attention.{name}"),
-                        element,
-                        tokens * inner,
-                    );
-                }
-                for name in [
-                    "exchanged_query",
-                    "exchanged_key",
-                    "exchanged_value",
-                    "attended",
-                ] {
-                    push(
-                        &mut plan,
-                        &format!("attention.{name}"),
-                        element,
-                        tokens * local,
-                    );
-                }
-                push(&mut plan, "attention.gathered", element, tokens * inner);
-            }
-            crate::config::AttentionKind::Sparse { .. } => {
-                let inner = local_heads * head_dim;
-                // The segment packing rounds the rows to whole tiles, so this divides exactly.
-                let tiles = tokens / u64::from(self.config.attention.capacity_rows());
-                for name in ["query", "key", "value", "gate", "fine"] {
-                    push(
-                        &mut plan,
-                        &format!("attention.{name}"),
-                        element,
-                        tokens * inner,
-                    );
-                }
-                for name in ["pooled_query", "pooled_key", "pooled_value"] {
-                    push(
-                        &mut plan,
-                        &format!("attention.{name}"),
-                        "f32",
-                        tiles * local_heads * head_dim,
-                    );
-                }
+            elements,
+        });
+    }
+
+    // One modality's head: the norm every deployment runs, then the weight and bias a student
+    // gathers out of its fused tables.
+    fn head(
+        plan: &mut Vec<crate::decoding::Buffer>,
+        element: &'static str,
+        hidden: u64,
+        student: bool,
+        name: &str,
+        rows: u64,
+        out: u64,
+    ) {
+        push(plan, &format!("{name}.normed"), element, rows * hidden);
+        if student {
+            push(plan, &format!("{name}.head"), element, out * hidden);
+            push(plan, &format!("{name}.head_bias"), element, out);
+        }
+    }
+
+    let mut plan = Vec::new();
+
+    // The packed rows, the two projections that fill them, and the rotary tables of the one
+    // sequence.
+    push(&mut plan, "packed", element, tokens * hidden);
+    push(&mut plan, "patched", element, video_rows * patches);
+    push(&mut plan, "video.projected", element, video_rows * hidden);
+    if let Some((audio_rows, _)) = audio {
+        push(&mut plan, "audio.projected", element, audio_rows * hidden);
+    }
+    push(&mut plan, "cosine", "f32", tokens * rotated);
+    push(&mut plan, "sine", "f32", tokens * rotated);
+
+    // The stack: the step's gathered modulation, one alternate residual buffer, and the scratch
+    // every layer shares.
+    push(&mut plan, "step.entries", "i32", groups);
+    push(
+        &mut plan,
+        "step.modulation",
+        element,
+        groups * 3 * 6 * hidden,
+    );
+    push(&mut plan, "alternate", element, tokens * hidden);
+    push(&mut plan, "normalized", element, tokens * hidden);
+    push(&mut plan, "update", element, tokens * hidden);
+    push(&mut plan, "mlp.packed", element, tokens * 2 * ffn);
+    push(&mut plan, "mlp", element, tokens * ffn);
+    match config.attention {
+        crate::config::AttentionKind::Dense => {
+            let inner = heads * head_dim;
+            let local = local_heads * head_dim;
+            for name in ["query", "key", "value", "rotated_query", "rotated_key"] {
                 push(
                     &mut plan,
-                    "attention.scores",
-                    "f32",
-                    local_heads * tiles * tiles,
-                );
-                push(
-                    &mut plan,
-                    "attention.indices",
-                    "i32",
-                    local_heads * tiles * tiles,
-                );
-                push(&mut plan, "attention.counts", "i32", local_heads * tiles);
-                push(
-                    &mut plan,
-                    "attention.compressed",
+                    &format!("attention.{name}"),
                     element,
+                    tokens * inner,
+                );
+            }
+            for name in [
+                "exchanged_query",
+                "exchanged_key",
+                "exchanged_value",
+                "attended",
+            ] {
+                push(
+                    &mut plan,
+                    &format!("attention.{name}"),
+                    element,
+                    tokens * local,
+                );
+            }
+            push(&mut plan, "attention.gathered", element, tokens * inner);
+        }
+        crate::config::AttentionKind::Sparse { .. } => {
+            let inner = local_heads * head_dim;
+            // The segment packing rounds the rows to whole tiles, so this divides exactly.
+            let tiles = tokens / u64::from(config.attention.capacity_rows());
+            for name in ["query", "key", "value", "gate", "fine"] {
+                push(
+                    &mut plan,
+                    &format!("attention.{name}"),
+                    element,
+                    tokens * inner,
+                );
+            }
+            for name in ["pooled_query", "pooled_key", "pooled_value"] {
+                push(
+                    &mut plan,
+                    &format!("attention.{name}"),
+                    "f32",
                     tiles * local_heads * head_dim,
                 );
             }
-        }
-
-        // Each modality's head, in the order the forward reaches them: the norm, then a student's
-        // gathered weight and bias.
-        let student = u64::from(transformer.output_heads) > 1;
-        head(
-            &mut plan, element, hidden, student, "video", video_rows, patches,
-        );
-
-        // The output's modulation and the solver's one staging word.
-        push(&mut plan, "output.entries", "i32", groups);
-        push(&mut plan, "output.modulation", "f32", groups * 2 * hidden);
-        push(&mut plan, "coefficient", "f32", 1);
-
-        // The video step: the rows gathered out of the packed sequence, their groups, the velocity
-        // at the patch width, and the velocity the solver writes into the latents from.
-        push(&mut plan, "video.hidden", element, video_rows * hidden);
-        push(&mut plan, "video.groups", "i32", video_rows);
-        push(
-            &mut plan,
-            "video.velocity_rows",
-            element,
-            video_rows * patches,
-        );
-        push(
-            &mut plan,
-            "video.velocity",
-            element,
-            channels * frames * height * columns,
-        );
-        if let Some((audio_rows, audio_features)) = audio {
-            head(
-                &mut plan,
-                element,
-                hidden,
-                student,
-                "audio",
-                audio_rows,
-                audio_features,
-            );
-            push(&mut plan, "audio.hidden", element, audio_rows * hidden);
-            push(&mut plan, "audio.groups", "i32", audio_rows);
             push(
                 &mut plan,
-                "audio.velocity",
+                "attention.scores",
+                "f32",
+                local_heads * tiles * tiles,
+            );
+            push(
+                &mut plan,
+                "attention.indices",
+                "i32",
+                local_heads * tiles * tiles,
+            );
+            push(&mut plan, "attention.counts", "i32", local_heads * tiles);
+            push(
+                &mut plan,
+                "attention.compressed",
                 element,
-                audio_rows * audio_features,
+                tiles * local_heads * head_dim,
             );
         }
-        Ok(plan)
+    }
+
+    // Each modality's head, in the order the forward reaches them: the norm, then a student's
+    // gathered weight and bias.
+    let student = u64::from(transformer.output_heads) > 1;
+    head(
+        &mut plan, element, hidden, student, "video", video_rows, patches,
+    );
+
+    // The output's modulation and the solver's one staging word.
+    push(&mut plan, "output.entries", "i32", groups);
+    push(&mut plan, "output.modulation", "f32", groups * 2 * hidden);
+    push(&mut plan, "coefficient", "f32", 1);
+
+    // The video step: the rows gathered out of the packed sequence, their groups, the velocity
+    // at the patch width, and the velocity the solver writes into the latents from.
+    push(&mut plan, "video.hidden", element, video_rows * hidden);
+    push(&mut plan, "video.groups", "i32", video_rows);
+    push(
+        &mut plan,
+        "video.velocity_rows",
+        element,
+        video_rows * patches,
+    );
+    push(
+        &mut plan,
+        "video.velocity",
+        element,
+        channels * frames * height * columns,
+    );
+    if let Some((audio_rows, audio_features)) = audio {
+        head(
+            &mut plan,
+            element,
+            hidden,
+            student,
+            "audio",
+            audio_rows,
+            audio_features,
+        );
+        push(&mut plan, "audio.hidden", element, audio_rows * hidden);
+        push(&mut plan, "audio.groups", "i32", audio_rows);
+        push(
+            &mut plan,
+            "audio.velocity",
+            element,
+            audio_rows * audio_features,
+        );
+    }
+    Ok(plan)
+}
+
+impl Denoiser {
+    /// Every buffer one evaluation at `layout` reserves, in the forward's own reservation order.
+    ///
+    /// The executor sizes the denoiser's arena by the sum of this plan and keys its storage by the
+    /// names, as it does for the decoder's two plans and the splice's. It is [`denoise_arena`] with
+    /// this deployment's own numbers - the checkpoint's element type and the schedule's group count -
+    /// so the plan and the forward read one configuration.
+    pub fn denoise_arena(&self, layout: &Layout) -> Result<Vec<crate::decoding::Buffer>> {
+        denoise_arena(
+            &self.config,
+            &self.rules.arrangement,
+            self.cache.groups().count(),
+            self.transformer.dtype(),
+            layout,
+        )
     }
 
     /// Refine one request's conditioning: the text encoder's features into the DiT's width.
