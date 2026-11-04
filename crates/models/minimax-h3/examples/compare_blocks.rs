@@ -248,6 +248,7 @@ fn run() -> Result<String, String> {
         tensors: Vec::new(),
         missing: Vec::new(),
         extra: Vec::new(),
+        split_roots: false,
         nothing_dumped: false,
     };
     let mut seen = Vec::new();
@@ -666,6 +667,13 @@ struct Report {
     tensors: Vec<Comparison>,
     missing: Vec<String>,
     extra: Vec<String>,
+    /// Whether the two trees share no tensor name at all.
+    ///
+    /// Each name is a path relative to the root the comparator was given, so two trees whose roots
+    /// sit at different depths - one at a run directory, the other at its `denoiser/` - pair
+    /// nothing while both hold the same tensors. Without this the report is a page of
+    /// `missing_in_candidate` and `candidate_only` rows that reads as a total mismatch.
+    split_roots: bool,
     /// Whether the reference side held no tensor at all.
     ///
     /// An empty reference directory and a fully matching one both leave `tensors` and `missing` empty,
@@ -685,6 +693,15 @@ impl Report {
              tables and bitwise for the coordinates; `largest` and `largest_relative` are the\n\
              worst absolute and relative differences of the coordinates.\n\n",
         );
+        if self.split_roots {
+            text.push_str(
+                "**The two trees share no tensor name, so nothing was paired.** Each name is a path\n\
+                 relative to the root this comparator was given: roots at different depths - one at a\n\
+                 run directory and the other at its `denoiser/` - hold the same tensors under names\n\
+                 that cannot meet. Pass two directories at the same depth, the outer run directories\n\
+                 keeping every name's block prefix, and run this again.\n\n",
+            );
+        }
         if self.nothing_dumped {
             text.push_str(
                 "**Nothing was dumped on the reference side.** There is no tensor to compare, so this\n\
@@ -759,6 +776,7 @@ impl Report {
                 "missing": &self.missing,
                 "extra": &self.extra,
                 "nothing_dumped": self.nothing_dumped,
+                "split_roots": self.split_roots,
             }))
             .unwrap_or_default()
         ));
@@ -791,6 +809,7 @@ fn compare_tensor_dumps(
         tensors: Vec::new(),
         missing: Vec::new(),
         extra: Vec::new(),
+        split_roots: false,
         nothing_dumped: theirs.is_empty(),
     };
     for name in &theirs {
@@ -813,6 +832,13 @@ fn compare_tensor_dumps(
             report.extra.push(name.clone());
         }
     }
+
+    // Same tensors under roots of different depths: every name missing on one side and extra on the
+    // other, which is a pair of arguments to fix rather than a comparison to read.
+    report.split_roots = !theirs.is_empty()
+        && !ours.is_empty()
+        && report.missing.len() == theirs.len()
+        && report.extra.len() == ours.len();
 
     let text = report.render();
     if let Some(out) = out {
