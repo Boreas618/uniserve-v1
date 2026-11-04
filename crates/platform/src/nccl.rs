@@ -162,6 +162,11 @@ impl Communicator {
         let needed = elements_bytes(count, dtype)?;
         require_room(send.bytes(), needed, "send")?;
         require_room(recv.bytes(), needed, "recv")?;
+        // NCCL launches on `stream`, which the driver accepts only with the
+        // stream's context current on the calling thread; entering it here is
+        // what lets any thread issue a collective.
+        let _guard = self.context.enter()?;
+
         let api = api()?;
         // SAFETY: the caller's ranges hold `count` elements of `dtype` and stay
         // valid until the stream completes, which the checks above establish.
@@ -196,6 +201,11 @@ impl Communicator {
         self.ready(stream, "ncclReduceScatter")?;
         require_room(send.bytes(), ranks_bytes(count, dtype, self.size)?, "send")?;
         require_room(recv.bytes(), elements_bytes(count, dtype)?, "recv")?;
+        // NCCL launches on `stream`, which the driver accepts only with the
+        // stream's context current on the calling thread; entering it here is
+        // what lets any thread issue a collective.
+        let _guard = self.context.enter()?;
+
         let api = api()?;
         // SAFETY: as in `all_reduce`, with `size * count` elements in `send`.
         let status = unsafe {
@@ -227,6 +237,11 @@ impl Communicator {
         self.ready(stream, "ncclAllGather")?;
         require_room(send.bytes(), ranks_bytes(count, dtype, self.size)?, "send")?;
         require_room(recv.bytes(), ranks_bytes(count, dtype, self.size)?, "recv")?;
+        // NCCL launches on `stream`, which the driver accepts only with the
+        // stream's context current on the calling thread; entering it here is
+        // what lets any thread issue a collective.
+        let _guard = self.context.enter()?;
+
         let api = api()?;
         // SAFETY: as in `all_reduce`, with `size * count` elements in `recv`.
         let status = unsafe {
@@ -259,6 +274,11 @@ impl Communicator {
         let needed = ranks_bytes(count, dtype, self.size)?;
         require_room(send.bytes(), needed, "send")?;
         require_room(recv.bytes(), needed, "recv")?;
+        // NCCL launches on `stream`, which the driver accepts only with the
+        // stream's context current on the calling thread; entering it here is
+        // what lets any thread issue a collective.
+        let _guard = self.context.enter()?;
+
         let api = api()?;
         let all_to_all = api.all_to_all.clone()?;
         // SAFETY: as in `all_reduce`, with `size * count` elements in both.
@@ -294,6 +314,11 @@ impl Communicator {
         let needed = elements_bytes(count, dtype)?;
         require_room(send.bytes(), needed, "send")?;
         require_room(recv.bytes(), needed, "recv")?;
+        // NCCL launches on `stream`, which the driver accepts only with the
+        // stream's context current on the calling thread; entering it here is
+        // what lets any thread issue a collective.
+        let _guard = self.context.enter()?;
+
         let api = api()?;
         // SAFETY: as in `all_reduce`, with `count` elements in both ranges.
         let status = unsafe {
@@ -326,6 +351,11 @@ impl Communicator {
         self.ready(stream, "ncclSend")?;
         self.require_rank(peer, "peer")?;
         require_room(data.bytes(), elements_bytes(count, dtype)?, "data")?;
+        // NCCL launches on `stream`, which the driver accepts only with the
+        // stream's context current on the calling thread; entering it here is
+        // what lets any thread issue a collective.
+        let _guard = self.context.enter()?;
+
         let api = api()?;
         // SAFETY: as in `all_reduce`, with `count` elements in `data`.
         let status = unsafe {
@@ -356,6 +386,11 @@ impl Communicator {
         self.ready(stream, "ncclRecv")?;
         self.require_rank(peer, "peer")?;
         require_room(data.bytes(), elements_bytes(count, dtype)?, "data")?;
+        // NCCL launches on `stream`, which the driver accepts only with the
+        // stream's context current on the calling thread; entering it here is
+        // what lets any thread issue a collective.
+        let _guard = self.context.enter()?;
+
         let api = api()?;
         // SAFETY: as in `all_reduce`, with `count` elements in `data`.
         let status = unsafe {
