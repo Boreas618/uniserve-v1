@@ -1595,14 +1595,28 @@ impl MainProcess {
                 Err(failure) if programs.is_empty() => {
                     return self.abandon_precopy(generation, failure, reply);
                 }
+                // A first generation that could not take the store's set holds only what the
+                // deployment named - one operator pinned while the model's buckets launch every
+                // other one. Nothing can bind that generation, so it is refused here, where the
+                // figures are, rather than submitted to the devices: a device stage handed such a
+                // generation recaptures the catalogue bucket by bucket and answers nothing for
+                // minutes, which is a hang to every reader of the log.
                 Err(failure) => {
-                    tracing::warn!(
-                        ?failure,
-                        named = programs.len(),
-                        "this host's store describes no program to overlay: installing what the \
-                         deployment named"
+                    return self.abandon_precopy(
+                        generation,
+                        UpdateFailure::Precopy {
+                            reason: format!(
+                                "the epoch's first generation would hold {} of the operators its \
+                                 buckets launch: {}",
+                                programs.len(),
+                                match failure {
+                                    UpdateFailure::Precopy { reason } => reason,
+                                    other => format!("{other:?}"),
+                                }
+                            ),
+                        },
+                        reply,
                     );
-                    programs
                 }
             }
         } else {
@@ -4427,9 +4441,18 @@ fn select_programs(
             .iter()
             .any(|module| targets.contains(&module.target))
         {
-            tracing::debug!(
+            // A store built for another device is the one store-side defect a run cannot name from
+            // the outside: the package is there, the operator exists, and nothing installs. Both
+            // sets are printed, because the difference between them is the fix.
+            tracing::info!(
                 op = %package.op,
                 backend = %package.backend,
+                held = ?package
+                    .modules
+                    .iter()
+                    .map(|module| module.target.to_string())
+                    .collect::<Vec<_>>(),
+                wanted = ?targets.iter().map(ToString::to_string).collect::<Vec<_>>(),
                 "the store holds this operator for another target: not installed"
             );
             continue;
