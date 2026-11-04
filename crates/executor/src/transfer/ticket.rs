@@ -266,9 +266,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::memory::allocation::{Storage, StorageView};
     use crate::memory::allocation::Backing;
-use crate::memory::allocation::ElementType;
+    use crate::memory::allocation::ElementType;
+    use crate::memory::allocation::{Storage, StorageView};
     use crate::transfer::{TransferCapacity, notify};
 
     /// A host value of `elements` bytes.
