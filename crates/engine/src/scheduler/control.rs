@@ -230,17 +230,16 @@ impl Scheduler {
                 answer,
             } => self.precopy_policy(program, source, answer),
             Command::SwitchoverPolicy { answer } => {
-                let _ = answer.send(self.switchover_policy());
+                self.request_stage(Stage::Switchover, Some(answer));
             }
-            Command::CommitPolicy => self.commit_policy(),
-            Command::RevertPolicy { answer } => {
-                let _ = answer.send(self.revert_policy());
-            }
+            Command::CommitPolicy => self.request_stage(Stage::Commit, None),
+            Command::RevertPolicy { answer } => self.request_stage(Stage::Revert, Some(answer)),
             Command::Shutdown => return true,
         }
-        // A precopy that finished on its blocking thread is taken here, before
-        // the next command or step reads it.
+        // A precopy that finished on its blocking thread is taken here, and a
+        // stage that waited for a boundary is applied when there is one.
         self.take_prepared_policy();
+        self.apply_policy_stage();
         false
     }
 
@@ -312,75 +311,96 @@ impl Scheduler {
         }
     }
 
-    /// §7.3 step 3: the prepared policy answers from this boundary.
-    fn switchover_policy(&mut self) -> Result<(), String> {
-        self.take_prepared_policy();
-        let Some(candidate) = self.policy_prepared.take() else {
-            return Err("a switchover arrived without a prepared policy".to_owned());
-        };
-        self.apply_stage(Stage::Switchover, Some(candidate))?;
-        Ok(())
+    /// Asks for a stage of §7.3, answered when it is applied.
+    ///
+    /// A stage changes the serving policy, so it is applied where no batch and
+    /// no submission is in flight — never in the middle of one (§7.3: "在一个
+    /// 批次边界（更新点）上"). A switchover with nothing prepared is refused at
+    /// once: the daemon's precopy failed and the update is discarded.
+    fn request_stage(
+        &mut self,
+        stage: Stage,
+        answer: Option<crossbeam_channel::Sender<Result<(), String>>>,
+    ) {
+        if stage == Stage::Switchover {
+            self.take_prepared_policy();
+            if self.policy_prepared.is_none() {
+                if let Some(answer) = answer {
+                    let _ = answer.send(Err(
+                        "a switchover arrived without a policy prepared by a precopy".to_owned(),
+                    ));
+                }
+                return;
+            }
+        }
+        self.policy_stage = Some((stage, answer));
+        self.apply_policy_stage();
     }
 
-    /// §7.3 step 6: the policy a revert could return to is forgotten at the
-    /// next boundary, after the last batch that could be reverted.
-    fn commit_policy(&mut self) {
+    /// Applies the stage asked for, when the scheduler is at a boundary: no
+    /// batch and no submission is in flight, so the policy that decided them is
+    /// no longer needed by anything (§7.3 steps 3 to 6).
+    pub(super) fn apply_policy_stage(&mut self) {
+        let ready = self.inflight.pending_batches.is_empty()
+            && self.inflight.pending_submissions.is_empty();
+        if !ready {
+            return;
+        }
+        let Some((stage, answer)) = self.policy_stage.take() else {
+            return;
+        };
         let state = views::trial_state(self, self.step, self.recorder.recorded());
-        if let Some(policy) = self.policy.as_mut() {
-            policy.request(Stage::Commit);
-            if let Err(error) = policy.boundary(&state) {
-                tracing::warn!(%error, "a policy commit could not be applied");
+        let applied = match self.stage_policy(stage, &state) {
+            Ok(report) => {
+                if let Some(report) = report {
+                    self.policy_report = Some(report);
+                }
+                Ok(())
             }
+            Err(reason) => {
+                let program = self.policy.as_ref().map(|policy| policy.program().clone());
+                if let Some(program) = program {
+                    self.policy_report = Some(policy::PolicyReverted {
+                        scheduler: None,
+                        program,
+                        reason: reason.clone(),
+                        fatal: true,
+                    });
+                }
+                Err(reason)
+            }
+        };
+        if let Some(answer) = answer {
+            let _ = answer.send(applied);
         }
     }
 
-    /// §7.3 step 4: the previous policy answers again, instantiated on the
-    /// state this scheduler holds now.
-    fn revert_policy(&mut self) -> Result<(), String> {
-        self.apply_stage(Stage::Revert, None)
-    }
-
-    /// Asks the serving slot for `stage` and applies it here, which is a batch
-    /// boundary: commands are drained between steps, with no batch in flight.
-    ///
-    /// A stage that cannot be applied leaves no policy to serve under, so the
-    /// epoch ends; the report names the policy that failed and why.
-    fn apply_stage(&mut self, stage: Stage, candidate: Option<Candidate>) -> Result<(), String> {
-        let state = views::trial_state(self, self.step, self.recorder.recorded());
+    /// Applies `stage` to the serving slot, installing an epoch's first policy
+    /// from the candidate its precopy prepared.
+    fn stage_policy(
+        &mut self,
+        stage: Stage,
+        state: &TrialState,
+    ) -> Result<Option<policy::PolicyReverted>, String> {
         let Some(policy) = self.policy.as_mut() else {
             // An epoch's first switchover: no policy served before, so the
             // candidate's precopy prepared the only instance this policy has.
-            let Some(candidate) = candidate else {
-                return Ok(());
+            let Some(candidate) = self.policy_prepared.take() else {
+                return Ok(None);
             };
             let engine = policy::process_engine().map_err(|error| error.to_string())?;
             let ceilings = ceilings_of(BatchCapacity::of(&self.info));
             self.adopt(PolicySlot::from_candidate(engine, ceilings, candidate));
-            return Ok(());
+            return Ok(None);
         };
-        if let Some(candidate) = candidate {
+        if stage == Stage::Switchover {
+            let Some(candidate) = self.policy_prepared.take() else {
+                return Err("a switchover arrived without a prepared policy".to_owned());
+            };
             policy.adopt(candidate);
         }
         policy.request(stage);
-        let outcome = policy.boundary(&state);
-        let program = policy.program().clone();
-        let report = match outcome {
-            Ok(report) => report,
-            Err(error) => {
-                let reason = error.to_string();
-                self.policy_report = Some(policy::PolicyReverted {
-                    scheduler: None,
-                    program,
-                    reason: reason.clone(),
-                    fatal: true,
-                });
-                return Err(reason);
-            }
-        };
-        if let Some(report) = report {
-            self.policy_report = Some(report);
-        }
-        Ok(())
+        policy.boundary(state).map_err(|error| error.to_string())
     }
 
     /// Selects commands with available destinations without bypassing an older
