@@ -138,6 +138,12 @@ Each cell sends one unmeasured warmup at seed 42 and one measured request at see
 
 Every measured video is written to a fixed path under `artifacts/`, `artifacts/minimax_h3/check/<checkpoint>-<task>/<request id>.mp4`, so a confirmed cell keeps the path a person watches and no cell writes into another's directory: `<checkpoint>` is `fasth3-dmd`, `fasth3-omniref` or `base`, `<task>` is `t2va`, `fl2va` or `ref2va`, and `<request id>` is the row's ID, such as `w1-measured-seed0`. Each point's bundle, with its requests, media index and summary, is under `artifacts/minimax_h3/check/results/<point>`.
 
+No server states a precision selector except `base-reference`, which states `dtype=bfloat16` and
+`quantization_config.mode=quality`: the launch defaults already are those values, but on that server
+omitting them produced a constant frame and silence in the `ref2va` cell while stating them passes
+(1 of 1 requests, a real MP4). The set therefore states them where they were measured to matter and
+nowhere else, and a check cell states only what its own path needs.
+
 The automatic checks are the two this document defines for every video point and nothing more: MP4 validity (canvas, frame count, frame rate and stereo 32-kHz soundtrack, which the `video` task validates) and the performance metrics the profile marks as protected, each checked to be finite and positive. The set adds no gate, tolerance or metric; the confirmation is the person's judgement of the six videos.
 
 The four servers place four GPUs each, with `configs/minimax_h3/ulysses4.toml` for the two transformer partitions and `configs/minimax_h3/ulysses4-reference.toml` for the two reference partitions, and use port 18083 one server at a time. `--reuse-deployment` keeps a checkpoint loaded across its consecutive points, so the four checkpoints load once each. The profile reads `UNISERVE_FAST_H3_MODEL` from the [FastH3 post](#fasth3-post) and `UNISERVE_MINIMAX_H3_MODEL`, `UNISERVE_MINIMAX_H3_OMNIREF`, `UNISERVE_MINIMAX_H3_INPUTS` and `UNISERVE_MINIMAX_H3_FFMPEG` from [MiniMax-H3 workloads](#minimax-h3-workloads):
