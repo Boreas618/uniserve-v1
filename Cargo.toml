@@ -9,7 +9,10 @@ members = [
     "crates/manager",
     "crates/media",
     "crates/models",
+    "crates/models/qwen3-moe",
     "crates/nixl",
+    "crates/nn",
+    "crates/ops",
     "crates/program-server",
     "crates/proto",
     "crates/scheduling",
@@ -37,6 +40,9 @@ executor = { path = "crates/executor" }
 ipc = { path = "crates/ipc" }
 media = { path = "crates/media" }
 models = { path = "crates/models" }
+nn = { path = "crates/nn" }
+ops = { path = "crates/ops" }
+qwen3-moe = { path = "crates/models/qwen3-moe" }
 nixl = { path = "crates/nixl" }
 program-server = { path = "crates/program-server" }
 proto = { path = "crates/proto" }
