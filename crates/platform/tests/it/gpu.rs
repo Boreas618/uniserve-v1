@@ -14,9 +14,9 @@ use platform::nccl::{Communicator, ReduceOp, UniqueId};
 use platform::{
     Algorithm, Capture, CaptureMode, CaptureStatus, Cluster, ComputeType, Convolution,
     ConvolutionArgs, CopyBatch, Cudnn, DataType, Device, DeviceAllocation, DeviceAttribute,
-    DeviceId, DevicePtr, Engine, Error, Event, EventFlags, FunctionAttribute, GraphNodeKind,
-    HandleType, Interleave, KernelNodeParams, L2Promotion, LaunchConfig, Library, Matmul,
-    MatmulArgs, MatmulDescriptor, Nvml, OobFill, PeerMapping, PinnedBuffer, PrimaryContext,
+    DeviceId, DevicePtr, DeviceRange, Engine, Error, Event, EventFlags, FunctionAttribute,
+    GraphNodeKind, HandleType, Interleave, KernelNodeParams, L2Promotion, LaunchConfig, Library,
+    Matmul, MatmulArgs, MatmulDescriptor, Nvml, OobFill, PeerMapping, PinnedBuffer, PrimaryContext,
     Protection, SegmentedMapping, ShareableHandle, SourceOrder, Stream, Strided, StridedCopy,
     Swizzle, Tensor, TensorDataType, TensorMap, TensorMapSpec, VirtualPool, memcpy_async,
     memset_2d_d8, memset_d8, memset_d32, reclaim,
@@ -834,38 +834,23 @@ fn single_rank_communicators_run_collectives() {
 
     // SAFETY: the buffers outlive the synchronization below.
     unsafe { memset_d32(data.address(), 41, 4, &stream).unwrap() };
-    let words = DevicePtr::from_address(data.address());
-    let all = data.len();
+    let words = DeviceRange::new(DevicePtr::from_address(data.address()), data.len());
     communicator
-        .all_reduce(
-            &stream,
-            words,
-            all,
-            words,
-            all,
-            4,
-            DataType::I32,
-            ReduceOp::Min,
-        )
+        .all_reduce(&stream, words, words, 4, DataType::I32, ReduceOp::Min)
         .unwrap();
     communicator
-        .broadcast(&stream, words, all, words, all, 4, DataType::I32, 0)
+        .broadcast(&stream, words, words, 4, DataType::I32, 0)
         .unwrap();
     // A collective whose stated ranges cannot hold the elements it asks for
     // fails before any NCCL call is made.
-    let short = communicator
-        .all_reduce(
-            &stream,
-            words,
-            8,
-            words,
-            all,
-            4,
-            DataType::I32,
-            ReduceOp::Min,
-        )
+    let short = DeviceRange::new(DevicePtr::from_address(data.address()), 8);
+    let refused = communicator
+        .all_reduce(&stream, short, words, 4, DataType::I32, ReduceOp::Min)
         .unwrap_err();
-    assert!(matches!(short, Error::InvalidArgument { .. }), "{short:?}");
+    assert!(
+        matches!(refused, Error::InvalidArgument { .. }),
+        "{refused:?}"
+    );
     // SAFETY: the buffer outlives the synchronization below.
     unsafe { memcpy_async(host.address(), data.address(), 16, &stream).unwrap() };
     stream.synchronize().unwrap();
@@ -1478,7 +1463,7 @@ fn a_matrix_product_runs_on_an_algorithm_the_heuristic_offers() {
         beta: 0.0,
         bias: 0,
         workspace: workspace.address(),
-        workspace_bytes: workspace.len() as usize,
+        workspace_bytes: workspace.len(),
     };
     // SAFETY: every operand is a device allocation of the descriptor's bytes and
     // outlives the launch, and the workspace is the algorithm's own need.
@@ -1794,19 +1779,9 @@ fn a_communicator_splits_into_a_subgroup_and_a_rank_left_out_gets_none() {
     let host = PinnedBuffer::new(DEVICE, 16).unwrap();
     // SAFETY: the buffers outlive the synchronization below.
     unsafe { memset_d32(data.address(), 41, 4, &stream).unwrap() };
-    let words = DevicePtr::from_address(data.address());
-    let all = data.len();
-    tp.all_reduce(
-        &stream,
-        words,
-        all,
-        words,
-        all,
-        4,
-        DataType::I32,
-        ReduceOp::Min,
-    )
-    .unwrap();
+    let words = DeviceRange::new(DevicePtr::from_address(data.address()), data.len());
+    tp.all_reduce(&stream, words, words, 4, DataType::I32, ReduceOp::Min)
+        .unwrap();
     // SAFETY: the buffer outlives the synchronization below.
     unsafe { memcpy_async(host.address(), data.address(), 16, &stream).unwrap() };
     stream.synchronize().unwrap();
@@ -1849,6 +1824,7 @@ fn floats(bytes: Vec<u8>) -> Vec<f32> {
 ///
 /// This is the reference the convolution's own numbers are compared with; it
 /// is written from the definition, not from the device's result.
+#[allow(clippy::too_many_arguments)]
 fn forward_reference(
     x: &[f32],
     x_dims: [usize; 3],
@@ -1890,6 +1866,7 @@ fn forward_reference(
 /// The definition of a one-dimensional transposed convolution, computed on
 /// the host: every input element is scattered through the filter,
 /// `y[n][k][i · stride - padding + j · dilation] += x[n][c][i] · w[c][k][j]`.
+#[allow(clippy::too_many_arguments)]
 fn transposed_reference(
     x: &[f32],
     x_dims: [usize; 3],

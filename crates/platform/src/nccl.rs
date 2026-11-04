@@ -6,11 +6,14 @@ use std::ffi::c_void;
 
 use ffi::{Handle, RawUniqueId, api};
 
-use crate::{DataType, DeviceId, Error, PrimaryContext, Result, Stream};
+use crate::{DataType, DeviceId, DevicePtr, DeviceRange, Error, PrimaryContext, Result, Stream};
 
 /// `ncclCommSuspend`'s flag that releases the communicator's dynamic device
 /// storage.
 const NCCL_SUSPEND_MEM: i32 = 0x01;
+
+/// `NCCL_SPLIT_NOCOLOR`: the colour a rank that does not join a split passes.
+const NCCL_SPLIT_NOCOLOR: i32 = -1;
 
 /// The 128-byte rendezvous token every rank of a communicator initializes
 /// with. Rank 0 creates it and the caller hands it to the other ranks.
@@ -138,27 +141,34 @@ impl Communicator {
         self.size
     }
 
-    /// Reduces `count` elements from every rank into every rank's `recv`
-    /// (in place when `send == recv`).
+    /// Reduces `count` elements from every rank into every rank's `recv` (in
+    /// place when both ranges start at the same address).
     ///
-    /// # Safety
-    /// Both buffers hold `count` elements of `dtype` on the communicator's
-    /// device and stay valid until the stream (or graph replay) completes.
-    pub unsafe fn all_reduce(
+    /// Each range states how many bytes are valid from its address. The call
+    /// checks, before any NCCL call, that `stream` belongs to this
+    /// communicator's device and that `count` elements of `dtype` fit both
+    /// ranges; the caller keeps the storage alive until the stream (or graph
+    /// replay) completes.
+    pub fn all_reduce(
         &mut self,
-        send: u64,
-        recv: u64,
+        stream: &Stream,
+        send: DeviceRange,
+        recv: DeviceRange,
         count: usize,
         dtype: DataType,
         op: ReduceOp,
-        stream: &Stream,
     ) -> Result<()> {
+        self.ready(stream, "ncclAllReduce")?;
+        let needed = elements_bytes(count, dtype)?;
+        require_room(send.bytes(), needed, "send")?;
+        require_room(recv.bytes(), needed, "recv")?;
         let api = api()?;
-        // SAFETY: forwarded from the caller.
+        // SAFETY: the caller's ranges hold `count` elements of `dtype` and stay
+        // valid until the stream completes, which the checks above establish.
         let status = unsafe {
             (api.all_reduce)(
-                pointer(send),
-                pointer(recv),
+                pointer(send.ptr()),
+                pointer(recv.ptr()),
                 count,
                 dtype.nccl(),
                 op as i32,
@@ -169,27 +179,29 @@ impl Communicator {
         api.check(status, "ncclAllReduce")
     }
 
-    /// Reduces `size * count` input elements and leaves block `rank` (`count`
+    /// Reduces `size * count` elements and leaves block `rank` (`count`
     /// elements) in `recv`.
     ///
-    /// # Safety
-    /// `send` holds `size * count` and `recv` holds `count` elements; both
-    /// stay valid until the stream (or graph replay) completes.
-    pub unsafe fn reduce_scatter(
+    /// The checks are [`Self::all_reduce`]'s, with `size * count` elements
+    /// required in `send` and `count` in `recv`.
+    pub fn reduce_scatter(
         &mut self,
-        send: u64,
-        recv: u64,
+        stream: &Stream,
+        send: DeviceRange,
+        recv: DeviceRange,
         count: usize,
         dtype: DataType,
         op: ReduceOp,
-        stream: &Stream,
     ) -> Result<()> {
+        self.ready(stream, "ncclReduceScatter")?;
+        require_room(send.bytes(), ranks_bytes(count, dtype, self.size)?, "send")?;
+        require_room(recv.bytes(), elements_bytes(count, dtype)?, "recv")?;
         let api = api()?;
-        // SAFETY: forwarded from the caller.
+        // SAFETY: as in `all_reduce`, with `size * count` elements in `send`.
         let status = unsafe {
             (api.reduce_scatter)(
-                pointer(send),
-                pointer(recv),
+                pointer(send.ptr()),
+                pointer(recv.ptr()),
                 count,
                 dtype.nccl(),
                 op as i32,
@@ -202,23 +214,25 @@ impl Communicator {
 
     /// Gathers `count` elements from every rank into `recv`, rank-major.
     ///
-    /// # Safety
-    /// `send` holds `count` and `recv` holds `size * count` elements; both
-    /// stay valid until the stream (or graph replay) completes.
-    pub unsafe fn all_gather(
+    /// The checks are [`Self::all_reduce`]'s, with `count` elements required in
+    /// `send` and `size * count` in `recv`.
+    pub fn all_gather(
         &mut self,
-        send: u64,
-        recv: u64,
+        stream: &Stream,
+        send: DeviceRange,
+        recv: DeviceRange,
         count: usize,
         dtype: DataType,
-        stream: &Stream,
     ) -> Result<()> {
+        self.ready(stream, "ncclAllGather")?;
+        require_room(send.bytes(), ranks_bytes(count, dtype, self.size)?, "send")?;
+        require_room(recv.bytes(), ranks_bytes(count, dtype, self.size)?, "recv")?;
         let api = api()?;
-        // SAFETY: forwarded from the caller.
+        // SAFETY: as in `all_reduce`, with `size * count` elements in `recv`.
         let status = unsafe {
             (api.all_gather)(
-                pointer(send),
-                pointer(recv),
+                pointer(send.ptr()),
+                pointer(recv.ptr()),
                 count,
                 dtype.nccl(),
                 self.raw,
@@ -231,24 +245,27 @@ impl Communicator {
     /// Sends block `j` (`count` elements) of `send` to rank `j` and receives
     /// rank `j`'s block into block `j` of `recv`.
     ///
-    /// # Safety
-    /// Both buffers hold `size * count` elements and stay valid until the
-    /// stream (or graph replay) completes.
-    pub unsafe fn all_to_all(
+    /// The checks are [`Self::all_reduce`]'s, with `size * count` elements
+    /// required in both ranges.
+    pub fn all_to_all(
         &mut self,
-        send: u64,
-        recv: u64,
+        stream: &Stream,
+        send: DeviceRange,
+        recv: DeviceRange,
         count: usize,
         dtype: DataType,
-        stream: &Stream,
     ) -> Result<()> {
+        self.ready(stream, "ncclAlltoAll")?;
+        let needed = ranks_bytes(count, dtype, self.size)?;
+        require_room(send.bytes(), needed, "send")?;
+        require_room(recv.bytes(), needed, "recv")?;
         let api = api()?;
         let all_to_all = api.all_to_all.clone()?;
-        // SAFETY: forwarded from the caller.
+        // SAFETY: as in `all_reduce`, with `size * count` elements in both.
         let status = unsafe {
             all_to_all(
-                pointer(send),
-                pointer(recv),
+                pointer(send.ptr()),
+                pointer(recv.ptr()),
                 count,
                 dtype.nccl(),
                 self.raw,
@@ -260,24 +277,29 @@ impl Communicator {
 
     /// Copies `count` elements of `root`'s `send` into every rank's `recv`.
     ///
-    /// # Safety
-    /// Both buffers hold `count` elements (`send` is read on `root` only) and
-    /// stay valid until the stream (or graph replay) completes.
-    pub unsafe fn broadcast(
+    /// The checks are [`Self::all_reduce`]'s, and `root` must be one of this
+    /// communicator's ranks; `send` is read on `root` only but must hold
+    /// `count` elements on every rank since the same call is posted there.
+    pub fn broadcast(
         &mut self,
-        send: u64,
-        recv: u64,
+        stream: &Stream,
+        send: DeviceRange,
+        recv: DeviceRange,
         count: usize,
         dtype: DataType,
         root: i32,
-        stream: &Stream,
     ) -> Result<()> {
+        self.ready(stream, "ncclBroadcast")?;
+        self.require_rank(root, "root")?;
+        let needed = elements_bytes(count, dtype)?;
+        require_room(send.bytes(), needed, "send")?;
+        require_room(recv.bytes(), needed, "recv")?;
         let api = api()?;
-        // SAFETY: forwarded from the caller.
+        // SAFETY: as in `all_reduce`, with `count` elements in both ranges.
         let status = unsafe {
             (api.broadcast)(
-                pointer(send),
-                pointer(recv),
+                pointer(send.ptr()),
+                pointer(recv.ptr()),
                 count,
                 dtype.nccl(),
                 root,
@@ -288,23 +310,27 @@ impl Communicator {
         api.check(status, "ncclBroadcast")
     }
 
-    /// Sends `count` elements to `peer`, which posts a matching [`Self::recv`].
+    /// Sends `count` elements to `peer`, which posts a matching
+    /// [`Self::recv`].
     ///
-    /// # Safety
-    /// The buffer stays valid until the stream (or graph replay) completes.
-    pub unsafe fn send(
+    /// The checks are [`Self::all_reduce`]'s, and `peer` must be one of this
+    /// communicator's ranks.
+    pub fn send(
         &mut self,
-        data: u64,
+        stream: &Stream,
+        data: DeviceRange,
         count: usize,
         dtype: DataType,
         peer: i32,
-        stream: &Stream,
     ) -> Result<()> {
+        self.ready(stream, "ncclSend")?;
+        self.require_rank(peer, "peer")?;
+        require_room(data.bytes(), elements_bytes(count, dtype)?, "data")?;
         let api = api()?;
-        // SAFETY: forwarded from the caller.
+        // SAFETY: as in `all_reduce`, with `count` elements in `data`.
         let status = unsafe {
             (api.send)(
-                pointer(data),
+                pointer(data.ptr()),
                 count,
                 dtype.nccl(),
                 peer,
@@ -317,21 +343,24 @@ impl Communicator {
 
     /// Receives `count` elements from `peer`.
     ///
-    /// # Safety
-    /// The buffer stays valid until the stream (or graph replay) completes.
-    pub unsafe fn recv(
+    /// The checks are [`Self::all_reduce`]'s, and `peer` must be one of this
+    /// communicator's ranks.
+    pub fn recv(
         &mut self,
-        data: u64,
+        stream: &Stream,
+        data: DeviceRange,
         count: usize,
         dtype: DataType,
         peer: i32,
-        stream: &Stream,
     ) -> Result<()> {
+        self.ready(stream, "ncclRecv")?;
+        self.require_rank(peer, "peer")?;
+        require_room(data.bytes(), elements_bytes(count, dtype)?, "data")?;
         let api = api()?;
-        // SAFETY: forwarded from the caller.
+        // SAFETY: as in `all_reduce`, with `count` elements in `data`.
         let status = unsafe {
             (api.recv)(
-                pointer(data),
+                pointer(data.ptr()),
                 count,
                 dtype.nccl(),
                 peer,
@@ -340,6 +369,79 @@ impl Communicator {
             )
         };
         api.check(status, "ncclRecv")
+    }
+
+    /// Fails unless `stream` belongs to this communicator's device.
+    fn ready(&self, stream: &Stream, call: &'static str) -> Result<()> {
+        if stream.device() != self.device() {
+            return Err(Error::invalid(format!(
+                "{call} on the communicator of {} takes a stream of that device, not of {}",
+                self.device(),
+                stream.device()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Fails unless `rank` is one of this communicator's ranks.
+    fn require_rank(&self, rank: i32, what: &'static str) -> Result<()> {
+        if !(0..self.size).contains(&rank) {
+            return Err(Error::invalid(format!(
+                "{what} {rank} is outside a communicator of {} ranks",
+                self.size
+            )));
+        }
+        Ok(())
+    }
+
+    /// Splits a subgroup out of this communicator (`ncclCommSplit`), which is
+    /// how a world plan becomes the TP, DP and expert groups the design's
+    /// blocks run on.
+    ///
+    /// `ranks` are the parent ranks of the subgroup this rank belongs to, in
+    /// the order their new ranks take; `rank` is this communicator's rank in
+    /// the parent. The colour is derived from the subgroup itself — its
+    /// smallest parent rank — so one call serves a whole world plan: every
+    /// member passes the same list, and disjoint subgroups get distinct
+    /// colours. A rank that is not in `ranks` still calls this, because the
+    /// split is collective over the parent; it passes `NCCL_SPLIT_NOCOLOR` and
+    /// answers `None`, since NCCL hands it no communicator.
+    ///
+    /// The child is destroyed before its parent: a parent cannot retire while
+    /// a child still communicates. `ranks` must be non-empty and must contain
+    /// no duplicate.
+    pub fn split(&self, ranks: &[i32], rank: i32) -> Result<Option<Self>> {
+        let position = ranks.iter().position(|parent| *parent == rank);
+        let (color, key) = match position {
+            Some(position) => {
+                let smallest = ranks
+                    .iter()
+                    .copied()
+                    .min()
+                    .ok_or_else(|| Error::invalid("a split needs the ranks of its subgroup"))?;
+                (smallest, position as i32)
+            }
+            None => (NCCL_SPLIT_NOCOLOR, 0),
+        };
+        let api = api()?;
+        let split = api.comm_split.clone()?;
+        let _guard = self.context.enter()?;
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: the parent is live; NCCL writes the child handle (NULL when
+        // this rank does not join) and reads no config because none is given.
+        let status = unsafe { split(self.raw, color, key, &mut raw, std::ptr::null_mut()) };
+        api.check(status, "ncclCommSplit")?;
+        if raw.is_null() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            raw,
+            context: self.context.clone(),
+            rank: position.ok_or_else(|| {
+                Error::invalid("NCCL returned a communicator to a rank that did not join")
+            })? as i32,
+            size: ranks.len() as i32,
+        }))
     }
 
     /// Destroys the communicator. Collective:
@@ -392,8 +494,38 @@ impl Communicator {
     }
 }
 
-fn pointer(address: u64) -> Handle {
-    address as usize as *mut c_void
+/// The bytes `count` elements of `dtype` occupy, without overflowing.
+fn elements_bytes(count: usize, dtype: DataType) -> Result<usize> {
+    count.checked_mul(dtype.bytes()).ok_or_else(|| {
+        Error::invalid(format!(
+            "{count} elements of {dtype:?} overflow the byte count"
+        ))
+    })
+}
+
+/// The bytes `size * count` elements of `dtype` occupy, without overflowing.
+fn ranks_bytes(count: usize, dtype: DataType, size: i32) -> Result<usize> {
+    elements_bytes(count, dtype)?
+        .checked_mul(size as usize)
+        .ok_or_else(|| {
+            Error::invalid(format!(
+                "{count} elements of {dtype:?} on {size} ranks overflow the byte count"
+            ))
+        })
+}
+
+/// Fails unless `bytes` states at least `needed` bytes from `what`'s pointer.
+fn require_room(bytes: usize, needed: usize, what: &'static str) -> Result<()> {
+    if bytes < needed {
+        return Err(Error::invalid(format!(
+            "the {what} range states {bytes} bytes, but the collective needs {needed}"
+        )));
+    }
+    Ok(())
+}
+
+fn pointer(address: DevicePtr) -> Handle {
+    address.address() as usize as *mut c_void
 }
 
 /// Runs `submit` inside `ncclGroupStart` / `ncclGroupEnd`, so that its

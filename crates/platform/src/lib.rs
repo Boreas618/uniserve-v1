@@ -54,7 +54,7 @@ mod stream;
 mod tensormap;
 mod vmm;
 
-pub use allocator::{Allocator, Budget, Buffer, PoolKind};
+pub use allocator::{Allocator, Budget, Buffer, DevicePtr, DeviceRange, PoolKind};
 pub use context::{DeviceGuard, PrimaryContext};
 pub use copy::{
     CopyBatch, Pitched, PitchedBatch, SourceOrder, Strided, StridedCopy, memcpy_async,
