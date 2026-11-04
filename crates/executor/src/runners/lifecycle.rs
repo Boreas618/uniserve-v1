@@ -18,8 +18,6 @@ use crate::graph::Graphs;
 use crate::plan::Bucket;
 use crate::runner::RunnerId;
 
-use ops::Generation;
-
 /// The generations one runner holds: the one that serves, the one being prepared, and the one kept
 /// for a revert (7.3).
 ///
@@ -301,7 +299,7 @@ impl Lifecycle {
             // The launch structure changed: the bucket is recaptured from the walk's template,
             // which already carries the new kernels and their arguments. The generation being
             // replaced keeps its own graph and executable, which a revert serves from.
-            let held = hold_kernels(&kernels, &walked.nodes)?;
+            let held = hold_kernels(kernels, &walked.nodes)?;
             let recaptured = Captured::new(walked.template, walked.nodes, held)?;
             self.graphs.insert(bucket, generation, recaptured);
             if unannotated {
@@ -343,7 +341,7 @@ impl Lifecycle {
             launches.push((*operator, *ordinal, params));
             *ordinal += 1;
         }
-        let held = hold_kernels(&kernels, &walked.nodes)?;
+        let held = hold_kernels(kernels, &walked.nodes)?;
         let prepared = Captured::from_template(template, walked.nodes, held)?;
         let mut applied = 0usize;
         for (operator, ordinal, params) in launches {
@@ -473,7 +471,7 @@ pub(crate) fn walk_capture(
         // handle is shared across threads, which it is not, and the allocator is right to warn
         // about a non-`Send` handle in an `Arc`.
         let capture = std::rc::Rc::new(std::cell::RefCell::new(platform::Capture::begin(
-            &stream,
+            stream,
             platform::CaptureMode::Relaxed,
         )?));
         let mut recording = Recording::new(std::rc::Rc::clone(&capture));

@@ -31,6 +31,8 @@ struct Held {
     /// allocation while a captured graph still addresses the address.
     _buffer: platform::Buffer,
     view: TensorView,
+    /// The table's size: exactly the bytes this table books to the resident pool, so what a
+    /// generation holds can be compared with what the plan reserved for it.
     bytes: u64,
 }
 
@@ -71,6 +73,17 @@ impl Tables {
             .sum()
     }
 
+    /// The bytes `generation`'s tables of `layout` hold, which is what the resident pool books for
+    /// them. `fill` compares it with the plan's own figure, so a deployment whose tables grew past
+    /// its reservation is refused at load rather than after a request.
+    pub(crate) fn held_bytes(&self, generation: u64, layout: &str) -> u64 {
+        self.entries
+            .iter()
+            .filter(|((held, at, _), _)| *held == generation && at == layout)
+            .map(|(_, table)| table.bytes)
+            .sum()
+    }
+
     /// Release every table `generation` holds: the rule that a generation's tables retire with it.
     pub(crate) fn release(&mut self, generation: u64) {
         self.entries.retain(|(held, _, _), _| *held != generation);
@@ -107,10 +120,8 @@ impl Tables {
             .as_ref()
             .ok_or(Error::State(
                 "the runner has no pools to allocate its model's tables from",
-            ))?
-            .clone();
-        let held = Self::plan_bytes(&missing.iter().map(|table| (*table).clone()).collect::<Vec<_>>())?;
-        let _ = held;
+            ))?;
+        let allocator = Arc::clone(allocator);
         let mut host: Vec<Vec<u8>> = Vec::with_capacity(missing.len());
         for table in &missing {
             let bytes = Self::plan_bytes(std::slice::from_ref(*table))?;
@@ -132,7 +143,7 @@ impl Tables {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .allocator()
                 .allocate(TABLE_POOL, bytes.len())?;
-            allocated.push(((*table).clone(), buffer));
+            allocated.push((*table, buffer));
         }
         for ((table, buffer), host) in allocated.into_iter().zip(host) {
             // SAFETY: the source is this table's host bytes, of exactly the length uploaded, and the
@@ -147,12 +158,20 @@ impl Tables {
                     view: TensorView::new(
                         ops::DevicePtr::new(buffer.address()),
                         table.dtype,
-                        table.shape.clone(),
+                        table.shape,
                     ),
                     _buffer: buffer,
                     bytes: host.len() as u64,
                 },
             );
+        }
+        let planned = Self::plan_bytes(tables)?;
+        let held = self.held_bytes(generation, layout);
+        if held != planned {
+            return Err(Error::Resource(
+                "the tables this runner loaded for one layout are not the bytes the plan reserved \
+                 for them: the deployment was admitted on the plan's figure",
+            ));
         }
         let _ = device;
         Ok(())
@@ -181,10 +200,6 @@ impl Tables {
             .collect()
     }
 
-    /// The bytes every layout's tables hold: what the resident pool books for the model's state.
-    pub(crate) fn bytes(&self) -> u64 {
-        self.entries.values().map(|held| held.bytes).sum()
-    }
 }
 
 #[cfg(test)]

@@ -27,8 +27,6 @@ use platform::DeviceId;
 
 use crate::arena::{Pools, StreamId};
 use crate::batch::{Batch, BatchColumns, BatchOutput, CallId, CallOutput, Job, Jobs, RowState};
-use crate::captured::Captured;
-use crate::graph::Graphs;
 use crate::plan::{Bucket, Buckets, Shape};
 /// `rows` uniform draws in `[0, 1)`, from the runner's generator into its own buffer.
 ///
@@ -52,7 +50,8 @@ fn draw_uniforms(seed: &std::cell::Cell<u64>, draws: &mut Vec<f32>, rows: usize)
 use crate::plan::Variant;
 use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::{encode_f32, encode_i32, Column};
-use crate::runners::lifecycle::{walk_capture, Lifecycle, Walked};
+use crate::graph::Graphs;
+use crate::runners::lifecycle::{walk_capture, Lifecycle};
 
 /// The capture sink, at the path the device tests of the rebind mechanism import it from.
 pub use crate::runners::lifecycle::Recording;
