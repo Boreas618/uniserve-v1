@@ -165,6 +165,11 @@ impl Buffer {
     /// Exports one reference to the block's physical storage as a POSIX file
     /// descriptor (`cuMemExportToShareableHandle`). Closing the descriptor does
     /// not affect the mapping.
+    ///
+    /// This is the first half of design 8's NVML rule: the owner imports the
+    /// descriptor and maps it, then drops the handle that created the storage,
+    /// so NVML attributes the storage to the importer and not to the process
+    /// that created it. The Storage Server takes resident storage that way.
     pub fn export(&self) -> Result<OwnedFd> {
         self.block.export()
     }
