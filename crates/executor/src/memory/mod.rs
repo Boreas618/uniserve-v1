@@ -13,5 +13,15 @@ pub mod buffer;
 pub mod encoders;
 pub mod output;
 pub mod pinned_pool;
+pub mod prefix_cache;
 pub mod request_slots;
 pub mod retained;
+
+pub(crate) use prefix_cache::block_tables::AttentionRow;
+pub use prefix_cache::block_tables::{
+    BlockTableStorage, BlockTableUpdate, BlockTables, GroupShape, GroupTable,
+};
+pub use prefix_cache::plan::{CacheDescription, CacheGroupPlan, CachePlan, GroupAxis, StateField};
+pub use prefix_cache::planes::{CachePlanes, LaidSegment, PlaneLayout, UnitColumn};
+pub use prefix_cache::{PendingImport, PrefixCache};
+pub(crate) use prefix_cache::{TransferBases, UnitAccesses};
