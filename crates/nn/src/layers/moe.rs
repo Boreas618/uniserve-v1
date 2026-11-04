@@ -140,6 +140,167 @@ pub struct MoeGeometry {
     pub tile: u64,
 }
 
+/// The encoded step's launches, in the order it runs them. A buffer names the one that writes it.
+///
+/// The two encodings are launches of their own rather than wider operands of the products: the router's
+/// input rows and FC1's gated rows are different widths, so one program cannot serve both.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Launch {
+    /// `nvfp4_quantize` over the router's input rows.
+    Encode,
+    /// `gather_gemm_nvfp4`: the fused up/gate product, one gated row per permuted route.
+    FirstProduct,
+    /// `nvfp4_quantize` over FC1's gated rows.
+    SecondEncode,
+    /// `route_gemm_nvfp4`: the down product, one permuted row of hidden width per route.
+    SecondProduct,
+}
+
+impl Launch {
+    /// The operator this launch is, as its key names it.
+    pub fn operator(self) -> &'static str {
+        match self {
+            Self::Encode | Self::SecondEncode => "nvfp4_quantize",
+            Self::FirstProduct => "gather_gemm_nvfp4",
+            Self::SecondProduct => "route_gemm_nvfp4",
+        }
+    }
+}
+
+/// One buffer of the encoded step: its extent, its element type, and the launch that writes it.
+///
+/// The element type is the buffer's own and not a default: packed codes and block scales are one byte
+/// each for two different reasons, and the per-row factors are FP32 because the products read them as
+/// one scalar per row.
+#[derive(Clone, Copy, Debug)]
+pub struct Buffer {
+    pub shape: Shape,
+    pub dtype: DType,
+    /// The step's launch that fills this buffer; the combine reads some of them and writes none.
+    pub written_by: Launch,
+}
+
+impl Buffer {
+    /// The bytes this buffer's extent occupies, unaligned.
+    pub fn bytes(&self) -> Result<u64> {
+        let element = self
+            .dtype
+            .bytes()
+            .ok_or_else(|| Error::shape("Moe", format!("{} has no byte size", self.dtype)))?;
+        Ok(self.shape.numel().saturating_mul(element))
+    }
+}
+
+/// The buffers one encoded expert step allocates, for `tokens` rows and a block's geometry.
+///
+/// One table answers both questions the step has about its working set — how much the plan must
+/// reserve, and what the launches write — so a buffer cannot be reserved without being written and
+/// cannot be written without being reserved. That equality is what the plan and the step kept losing:
+/// a term missing from the sum is a write past the arena, and a buffer the plan never heard of is space
+/// nobody can attribute.
+///
+/// Every row count is the permutation's worst case (see [`encoded_bytes`]), and the activation planes'
+/// layout is the encoder's plain one — the products' *weight* planes are their own descriptor field and
+/// are not part of this table.
+#[derive(Clone, Copy, Debug)]
+pub struct EncodedStep {
+    pub values: Buffer,
+    pub scales: Buffer,
+    pub token_scale: Buffer,
+    pub gated: Buffer,
+    /// Both products' shared scratch. The first product's entry writes its preamble and planes; the
+    /// second reuses the same region after the first launch, which is why one buffer serves both.
+    pub scratch: Buffer,
+    pub gated_values: Buffer,
+    pub gated_scales: Buffer,
+    pub gated_token_scale: Buffer,
+    pub products: Buffer,
+}
+
+impl EncodedStep {
+    /// The step's buffers for `tokens` rows, at the permutation's worst-case height.
+    pub fn new(
+        tokens: u64,
+        geometry: MoeGeometry,
+        layout: ScaleLayout,
+        dtype: DType,
+    ) -> Result<Self> {
+        let MoeGeometry {
+            hidden,
+            intermediate,
+            top,
+            experts,
+            tile,
+        } = geometry;
+        if dtype.bytes().is_none() {
+            return Err(Error::shape("Moe", format!("{dtype} has no byte size")));
+        }
+        let routes = ops::moe::max_permuted_rows(tokens, top, experts, tile);
+        let buffer = |shape: Shape, dtype: DType, written_by: Launch| Buffer {
+            shape,
+            dtype,
+            written_by,
+        };
+        Ok(Self {
+            // The activation's packed codes, a byte per two codes, and one block scale each.
+            values: buffer(Shape::new(&[tokens, hidden / 2]), DType::U8, Launch::Encode),
+            scales: buffer(layout.shape(tokens, hidden), DType::U8, Launch::Encode),
+            token_scale: buffer(Shape::new(&[tokens]), DType::F32, Launch::Encode),
+            gated: buffer(
+                Shape::new(&[routes, intermediate]),
+                dtype,
+                Launch::FirstProduct,
+            ),
+            gated_values: buffer(
+                Shape::new(&[routes, intermediate / 2]),
+                DType::U8,
+                Launch::SecondEncode,
+            ),
+            gated_scales: buffer(
+                layout.shape(routes, intermediate),
+                DType::U8,
+                Launch::SecondEncode,
+            ),
+            gated_token_scale: buffer(Shape::new(&[routes]), DType::F32, Launch::SecondEncode),
+            products: buffer(Shape::new(&[routes, hidden]), dtype, Launch::SecondProduct),
+            // The products' shared scratch, the entries' preamble included: sized from the route count
+            // the plan states, so a replay reserves the same addresses.
+            scratch: buffer(
+                Shape::new(&[encoded_scratch_bytes(routes, hidden, intermediate).max(1)]),
+                DType::U8,
+                Launch::FirstProduct,
+            ),
+        })
+    }
+
+    /// The buffers with their names, in the order the launches write them.
+    ///
+    /// The names are the table's own, so a report of what the step holds and a test of what it reserves
+    /// read the same words.
+    pub fn iter(&self) -> [(&'static str, &Buffer); 9] {
+        [
+            ("values", &self.values),
+            ("scales", &self.scales),
+            ("token_scale", &self.token_scale),
+            ("gated", &self.gated),
+            ("scratch", &self.scratch),
+            ("gated_values", &self.gated_values),
+            ("gated_scales", &self.gated_scales),
+            ("gated_token_scale", &self.gated_token_scale),
+            ("products", &self.products),
+        ]
+    }
+
+    /// The bytes these buffers reserve from the arena, each aligned as the arena hands it out.
+    pub fn bytes(&self) -> Result<u64> {
+        let mut total: u64 = 0;
+        for (_, buffer) in self.iter() {
+            total = total.saturating_add(buffer.bytes()?.next_multiple_of(ALIGNMENT));
+        }
+        Ok(total)
+    }
+}
+
 /// The bytes one forward's encoded step reserves from the arena, for `tokens` rows.
 ///
 /// The step's buffers are the same for every layer and for every replay of a plan, so they are
@@ -164,37 +325,7 @@ pub fn encoded_bytes(
     layout: ScaleLayout,
     dtype: DType,
 ) -> Result<u64> {
-    let width_bytes = dtype
-        .bytes()
-        .ok_or_else(|| Error::shape("Moe", format!("{dtype} has no byte size")))?;
-    let MoeGeometry {
-        hidden,
-        intermediate,
-        top,
-        experts,
-        tile,
-    } = geometry;
-    let routes = ops::moe::max_permuted_rows(tokens, top, experts, tile);
-    // One byte per block scale in either element type the field may have.
-    let scales = |rows: u64, columns: u64| layout.shape(rows, columns).numel();
-    let scratch = encoded_scratch_bytes(routes, hidden, intermediate);
-    let mut total: u64 = 0;
-    for bytes in [
-        tokens * (hidden / 2),  // the activation's packed codes, a byte per two codes
-        scales(tokens, hidden), // its block scales
-        tokens * 4,             // its per-token factor, F32
-        routes * intermediate * width_bytes, // FC1's gated rows, the hidden type
-        routes * (intermediate / 2), // their packed codes
-        scales(routes, intermediate), // their block scales
-        routes * 4,             // their per-token factor, F32
-        routes * hidden * width_bytes, // FC2's rows, one per route
-        scratch,                // the products' scratch
-    ] {
-        // Each buffer starts on the arena's alignment, so the plan is the sum of the aligned
-        // extents: the order the step reserves them in does not change the total.
-        total = total.saturating_add(bytes.next_multiple_of(ALIGNMENT));
-    }
-    Ok(total)
+    EncodedStep::new(tokens, geometry, layout, dtype)?.bytes()
 }
 
 /// The bytes the routing prefix reserves for `tokens` rows: the scores, the kept ids and weights,
@@ -946,6 +1077,28 @@ impl Moe {
         encoded_scratch_bytes(routes, u64::from(self.hidden), u64::from(self.intermediate))
     }
 
+    /// The buffers this block's encoded step allocates for `tokens` rows — the same table the plan
+    /// sizes the arena from, so what the step reserves and what it launches cannot drift.
+    pub fn encoded_step(
+        &self,
+        tokens: u64,
+        layout: ScaleLayout,
+        dtype: DType,
+    ) -> Result<EncodedStep> {
+        EncodedStep::new(
+            tokens,
+            MoeGeometry {
+                hidden: u64::from(self.hidden),
+                intermediate: u64::from(self.intermediate),
+                top: u64::from(self.top),
+                experts: u64::from(self.experts),
+                tile: u64::from(self.tile),
+            },
+            layout,
+            dtype,
+        )
+    }
+
     /// The bytes one routed layer's whole expert step reserves from the arena, for `tokens` rows —
     /// the routing prefix included.
     ///
@@ -1087,7 +1240,6 @@ impl Moe {
 
         // 1-3. The router, its top-k, the map and the sort: the prefix every expert product shares.
         let routes = self.route(f, hidden)?;
-        let rows = routes.rows;
         let arena = f.arena();
 
         // 4. The activation's encoding: the same pass computes the block scales and the row factor
@@ -1099,9 +1251,12 @@ impl Moe {
         // are different fields of different descriptors and must not be swapped: a product told the
         // activation's layout would dequantize the checkpoint's swizzled table as if it were linear.
         let activation_layout = ScaleLayout::Linear;
-        let values = arena.tensor(DType::U8, Shape::new(&[tokens, hidden_width / 2]))?;
-        let scales = arena.tensor(DType::U8, activation_layout.shape(tokens, hidden_width))?;
-        let token_scale = arena.tensor(DType::F32, Shape::new(&[tokens]))?;
+        // The step's whole working set from one table: the plan sums the same extents to size the
+        // arena, so every buffer a launch writes is a buffer the plan reserved.
+        let step = self.encoded_step(tokens, activation_layout, hidden.dtype)?;
+        let values = arena.tensor(step.values.dtype, step.values.shape)?;
+        let scales = arena.tensor(step.scales.dtype, step.scales.shape)?;
+        let token_scale = arena.tensor(step.token_scale.dtype, step.token_scale.shape)?;
         let first = self.quantize_descriptor(
             hidden.dtype,
             u32::try_from(hidden_width)
@@ -1118,9 +1273,8 @@ impl Moe {
         f.operate::<Nvfp4Quantize>(&first, args)?;
 
         // 5. FC1: the token-major gather product, one gated row per permuted route.
-        let gated = arena.tensor(hidden.dtype, Shape::new(&[rows, intermediate]))?;
-        let workspace =
-            arena.tensor(DType::U8, Shape::new(&[self.workspace_bytes(rows).max(1)]))?;
+        let gated = arena.tensor(step.gated.dtype, step.gated.shape)?;
+        let workspace = arena.tensor(step.scratch.dtype, step.scratch.shape)?;
         // The scale's element type and the plane layout are the **checkpoint's**, read off the stack
         // they belong to; the loader published them from the shard's own tensors.
         let descriptor =
@@ -1143,9 +1297,10 @@ impl Moe {
 
         // 6. The gated rows' own encoding: FC1's epilogue is a BF16 row, so this is a program of its
         //    own rather than a wider operand of the second product.
-        let gated_values = arena.tensor(DType::U8, Shape::new(&[rows, intermediate / 2]))?;
-        let gated_scales = arena.tensor(DType::U8, activation_layout.shape(rows, intermediate))?;
-        let gated_token_scale = arena.tensor(DType::F32, Shape::new(&[rows]))?;
+        let gated_values = arena.tensor(step.gated_values.dtype, step.gated_values.shape)?;
+        let gated_scales = arena.tensor(step.gated_scales.dtype, step.gated_scales.shape)?;
+        let gated_token_scale =
+            arena.tensor(step.gated_token_scale.dtype, step.gated_token_scale.shape)?;
         let second = self.quantize_descriptor(
             hidden.dtype,
             u32::try_from(intermediate).map_err(|_| {
@@ -1163,7 +1318,7 @@ impl Moe {
         f.operate::<Nvfp4Quantize>(&second, args)?;
 
         // 7. FC2: one row per permuted route, the `top` repeats still separate.
-        let products = arena.tensor(hidden.dtype, Shape::new(&[rows, hidden_width]))?;
+        let products = arena.tensor(step.products.dtype, step.products.shape)?;
         let descriptor =
             self.route_nvfp4_descriptor(hidden.dtype, down.scales.dtype(), down.layout);
         let args = RouteGemmNvfp4Args {
@@ -1602,6 +1757,156 @@ pub(super) mod tests {
         // A bucket small enough that the artifact's planes are a single tile still carries both
         // preambles: the bias columns do not shrink with the row count.
         assert_eq!(quantized.workspace_bytes(8), 17_428);
+    }
+
+    /// The encoded step states one buffer per launch and the plan states the same extents: the two
+    /// readers of the table cannot disagree, which is the defect class the step has had twice (a term
+    /// missing from the sum, and a buffer reserved at another height than the one it is written at).
+    #[test]
+    fn the_encoded_step_states_a_buffer_for_every_launch_and_the_plan_sizes_them() {
+        let moe = quantized_block(2048, 768).expect("the encoded block");
+        let tokens = 15;
+        let step = moe
+            .encoded_step(tokens, ScaleLayout::Linear, DType::BF16)
+            .expect("the step's buffers");
+        // The permutation's worst case: 120 expanded routes over 128 experts at 128-row tiles is one
+        // tile per route, so the step's rows are 15 360 and not 120.
+        let routes = 15_360;
+        assert_eq!(
+            step.values.shape.dims(),
+            [tokens, 1024],
+            "the activation's codes"
+        );
+        assert_eq!(step.scales.shape.dims(), [tokens, 128], "its block scales");
+        assert_eq!(step.token_scale.shape.dims(), [tokens], "its row factor");
+        assert_eq!(step.gated.shape.dims(), [routes, 768], "FC1's gated rows");
+        assert_eq!(step.gated_values.shape.dims(), [routes, 384], "their codes");
+        assert_eq!(
+            step.gated_scales.shape.dims(),
+            [routes, 48],
+            "their block scales"
+        );
+        assert_eq!(
+            step.gated_token_scale.shape.dims(),
+            [routes],
+            "their row factor"
+        );
+        assert_eq!(step.products.shape.dims(), [routes, 2048], "FC2's rows");
+        assert_eq!(
+            step.scratch.shape.dims(),
+            [995_348],
+            "both products' scratch, each entry's preamble included"
+        );
+        // Every buffer names a launch, and the table is in the order those launches run: a buffer
+        // attributed to a launch that runs before its writer would be read uninitialized.
+        let writers: Vec<Launch> = step
+            .iter()
+            .into_iter()
+            .map(|(_, buffer)| buffer.written_by)
+            .collect();
+        assert!(
+            writers.windows(2).all(|pair| pair[0] <= pair[1]),
+            "{writers:?} is not the step's launch order"
+        );
+        // Packed codes are E2M1 (two per byte), the block scales one byte each, the factors one FP32
+        // per row, and the rows that are activations carry the model's own type.
+        for (name, buffer) in step.iter() {
+            let expected = match name {
+                "values" | "gated_values" | "scales" | "gated_scales" | "scratch" => DType::U8,
+                "token_scale" | "gated_token_scale" => DType::F32,
+                _ => DType::BF16,
+            };
+            assert_eq!(buffer.dtype, expected, "{name}");
+        }
+        // The plan is the routing prefix plus exactly this table, and nothing else.
+        let geometry = MoeGeometry {
+            hidden: 2048,
+            intermediate: 768,
+            top: 8,
+            experts: 128,
+            tile: 128,
+        };
+        let planned = encoded_bytes(tokens, geometry, ScaleLayout::Linear, DType::BF16)
+            .expect("the encoded term");
+        assert_eq!(planned, step.bytes().expect("the step's bytes"));
+        assert_eq!(
+            moe.step_bytes(tokens, ScaleLayout::Linear, DType::BF16)
+                .expect("the step"),
+            routing_bytes(tokens, geometry, DType::BF16).expect("the prefix") + planned
+        );
+    }
+
+    /// The two products are named by the checkpoint's scale plane and layout, and the encoders' plane
+    /// is the plain one: the four keys a store has to contain, as the store's own directory names them.
+    ///
+    /// The plane fields sat three lines apart in the same two calls and were read from the activation
+    /// instead of from the stack; a key that drifts from what a layer launches is the failure a build
+    /// reports as `MissingKernel` after any amount of GPU time, and it is caught here on the host.
+    #[test]
+    fn the_encoded_products_name_the_checkpoint_s_scale_plane_and_the_encoders_are_plain() {
+        let moe = quantized_block(2048, 768).expect("the encoded block");
+        let gather =
+            moe.gather_nvfp4_descriptor(DType::BF16, DType::F8E4M3, ScaleLayout::Swizzled128X4);
+        assert_eq!(gather.scale, DType::F8E4M3);
+        assert_eq!(gather.layout, ScaleLayout::Swizzled128X4);
+        // A descriptor prints the store's leaf; the operator's name is the directory above it.
+        assert_eq!(
+            ops::descriptor::key(&gather),
+            "hidden_2048_intermediate_768_experts_128_top_8_activation_silu_dtype_bf16_scale_f8e4m3_layout_swizzled_128x4_tile_128x128_cluster_1x1"
+        );
+        let route =
+            moe.route_nvfp4_descriptor(DType::BF16, DType::F8E4M3, ScaleLayout::Swizzled128X4);
+        assert_eq!(
+            ops::descriptor::key(&route),
+            "hidden_2048_intermediate_768_experts_128_top_8_dtype_bf16_scale_f8e4m3_layout_swizzled_128x4_tile_128x128_cluster_1x1"
+        );
+        // The encoder writes plain scales, one per sixteen codes, over the row it encodes.
+        let hidden = moe.quantize_descriptor(DType::BF16, 2048, ScaleLayout::Linear);
+        assert_eq!(hidden.layout, ScaleLayout::Linear);
+        assert_eq!(hidden.columns, 2048);
+        let gated = moe.quantize_descriptor(DType::BF16, 768, ScaleLayout::Linear);
+        assert_eq!(gated.layout, ScaleLayout::Linear);
+        assert_eq!(gated.columns, 768);
+    }
+
+    /// The numbers a plan reserves at the slice's own geometry, stated so a change to any extent or to
+    /// the arena's alignment shows up as a number here rather than as a write past the region on a
+    /// device. 15 tokens over 128 experts at 128-row tiles is the 15 360-row permutation worst case.
+    #[test]
+    fn the_steps_at_the_slice_s_geometry_are_stated_numbers() {
+        let geometry = MoeGeometry {
+            hidden: 2048,
+            intermediate: 768,
+            top: 8,
+            experts: 128,
+            tile: 128,
+        };
+        assert_eq!(
+            routing_bytes(15, geometry, DType::BF16).expect("the prefix"),
+            68_864
+        );
+        assert_eq!(
+            dense_bytes(15, geometry, DType::BF16).expect("the permuted pair"),
+            86_507_520
+        );
+        assert_eq!(
+            step_bytes(15, geometry, ScaleLayout::Linear, DType::BF16, false).expect("dense step"),
+            86_576_384
+        );
+        assert_eq!(
+            encoded_bytes(15, geometry, ScaleLayout::Linear, DType::BF16)
+                .expect("the encoded step"),
+            94_217_728
+        );
+        assert_eq!(
+            step_bytes(15, geometry, ScaleLayout::Linear, DType::BF16, true).expect("encoded step"),
+            94_286_592
+        );
+        assert_eq!(
+            encoded_scratch_bytes(15_360, 2048, 768),
+            995_348,
+            "the products' scratch, both entries' preambles included"
+        );
     }
 
     #[test]
