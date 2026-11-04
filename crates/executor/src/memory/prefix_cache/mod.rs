@@ -787,7 +787,8 @@ impl PrefixCache {
     pub fn store_state_page(
         &self,
         retained: &crate::memory::retained::Retained,
-        table: &GroupTable,
+        slot: u32,
+        units: &[ipc::UnitId],
         first_page: u32,
         pages: u32,
         state: crate::transfer::StateIdentity<'_>,
@@ -798,8 +799,21 @@ impl PrefixCache {
         let device = self.planes.device_of().ok_or_else(|| {
             Error::Invalid("a state page is retained from a device pool".to_owned())
         })?;
-        let (rows, runs) =
-            state::page_runs(plan, group, table, self.planes.units(), first_page, pages)?;
+        // The units are the mechanism's own statement of the slot's pages, page-major, so the
+        // cache never rebuilds a table it already holds to read them.
+        let (rows, runs) = state::page_runs_of(
+            plan,
+            group,
+            units,
+            group.units_per_page,
+            self.planes.units(),
+            pages,
+        )
+        .map_err(|error| {
+            Error::Invalid(format!(
+                "the state page of slot {slot} from page {first_page}: {error}"
+            ))
+        })?;
         if rows == 0 {
             return Err(Error::Invalid("a state page holds no block".into()));
         }
@@ -832,7 +846,7 @@ impl PrefixCache {
             // SAFETY: the retained block holds `rows * width` bytes and every source is one block
             // of the field's own checkpoint storage; the copy is ordered on the stream the
             // publisher synchronizes before it records the key.
-            unsafe { stream.copy(&batch) }.map_err(Error::from)
+            unsafe { stream.copy(&batch) }
         })?;
         Ok(key.0)
     }
