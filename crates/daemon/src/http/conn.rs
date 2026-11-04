@@ -268,21 +268,38 @@ impl Connection {
 
     /// Runs one request through the router, feeding its body as the handler
     /// polls it; `None` when the client disappeared while the handler ran.
+    ///
+    /// The handler asks for bytes by bumping the body's ask count, and the
+    /// connection serves every ask it has not served yet before it parks. The
+    /// count, not the notify, decides: a wakeup can find nothing to feed (the
+    /// body already ended, or the socket still owes bytes), and a handler that
+    /// parked on those bytes must not be left waiting on a notify that has
+    /// already been spent.
     async fn call(
         &mut self,
         request: Request<Body>,
         body: &mut RequestBody,
     ) -> anyhow::Result<Option<Response<Body>>> {
         let mut future = std::pin::pin!(self.app.clone().oneshot(request));
+        let mut served = body.asks();
         loop {
+            let asked = body.asks();
+            if asked != served {
+                served = asked;
+                self.pump(body).await?;
+                continue;
+            }
             tokio::select! {
+                // The handler runs before the connection parks, so bytes an
+                // earlier pump left for it are taken before anything waits.
+                biased;
                 response = &mut future => {
                     return match response {
                         Ok(response) => Ok(Some(response)),
                         Err(never) => match never {},
                     };
                 }
-                () = body.wanted.notified() => self.pump(body).await?,
+                () = body.wanted.notified() => {}
             }
         }
     }
@@ -342,10 +359,15 @@ impl Connection {
 
     /// De-frames more of the request's body for its reader, reading from the
     /// socket when the buffer holds none.
+    ///
+    /// It never waits on the socket while the reader holds bytes it has not
+    /// polled: returning lets the connection poll the handler first, so a body
+    /// the buffer already carries cannot leave the handler parked behind a
+    /// socket that owes nothing.
     async fn pump(&mut self, body: &mut RequestBody) -> anyhow::Result<()> {
         loop {
             let fed = body.de_frame(&mut self.buffer)?;
-            if body.complete() || fed {
+            if body.complete() || fed || body.unpolled() {
                 return Ok(());
             }
             if !self.read_more().await? {
@@ -1023,6 +1045,7 @@ impl RequestBody {
                 ready: BytesMut::new(),
                 ended,
                 reader: None,
+                asks: 0,
             })),
             wanted: Arc::new(Notify::new()),
             ended,
@@ -1055,6 +1078,16 @@ impl RequestBody {
     /// Whether the body ended, so that the connection serves another request.
     fn complete(&self) -> bool {
         self.ended
+    }
+
+    /// How many times the handler has asked for bytes it did not have.
+    fn asks(&self) -> u64 {
+        crate::leader::locked(&self.shared).asks
+    }
+
+    /// Whether the handler holds de-framed bytes it has not polled yet.
+    fn unpolled(&self) -> bool {
+        !crate::leader::locked(&self.shared).ready.is_empty()
     }
 
     /// Marks the body unreadable because the client stopped inside it.
@@ -1238,6 +1271,12 @@ struct BodyShared {
     ended: bool,
     /// The handler waits for bytes.
     reader: Option<Waker>,
+    /// How many times the handler asked for bytes it did not have.
+    ///
+    /// The connection serves every ask it has not served yet, so a wakeup that
+    /// finds nothing to feed (the body already ended, or the socket still owes
+    /// bytes) cannot leave the handler waiting on a notify already spent.
+    asks: u64,
 }
 
 /// Wakes the handler's reader, if it waits.
@@ -1264,6 +1303,7 @@ impl http_body::Body for BodySource {
             return Poll::Ready(None);
         }
         shared.reader = Some(cx.waker().clone());
+        shared.asks = shared.asks.wrapping_add(1);
         self.wanted.notify_one();
         Poll::Pending
     }
@@ -1488,6 +1528,60 @@ mod tests {
             .await;
         let second = client.read_response().await;
         assert_eq!(second.body, "hello");
+    }
+
+    #[tokio::test]
+    async fn a_handler_that_reads_its_body_last_sees_every_byte_the_connection_read_ahead() {
+        // The connection reads the request's body with its head, before the
+        // handler has asked for a byte, and parks on the handler's response.
+        // The handler polls its body only once the client has finished
+        // sending, so no further notify is coming for the bytes the connection
+        // already holds: they must still reach it.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let handler = Arc::clone(&gate);
+        let app = Router::new()
+            .route("/hello", get(|| async { "hello" }))
+            .route(
+                "/late-echo",
+                post(move |request: Request<Body>| {
+                    let gate = Arc::clone(&handler);
+                    async move {
+                        gate.notified().await;
+                        axum::body::to_bytes(request.into_body(), usize::MAX)
+                            .await
+                            .expect("the request body")
+                    }
+                }),
+            );
+        let mut client = serve_on_pair(app);
+
+        // One write: the request's head and body, then the next request's
+        // head, which the body's end leaves for the connection to serve.
+        let mut requests = head("POST /late-echo HTTP/1.1", "Content-Length: 5\r\n");
+        requests.push_str("hello");
+        requests.push_str(&head("GET /hello HTTP/1.1", ""));
+        client.send(requests.as_bytes()).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        gate.notify_waiters();
+
+        let first = client.read_response().await;
+        assert_eq!(first.status, 200);
+        assert_eq!(
+            first.body, "hello",
+            "the handler reads every byte the connection read ahead"
+        );
+        assert!(
+            first.headers.contains("connection: keep-alive"),
+            "{}",
+            first.headers
+        );
+
+        // The body the handler read was complete, so the connection serves the
+        // request that came behind it.
+        let second = client.read_response().await;
+        assert_eq!((second.status, second.body.as_str()), (200, "hello"));
     }
 
     #[tokio::test]

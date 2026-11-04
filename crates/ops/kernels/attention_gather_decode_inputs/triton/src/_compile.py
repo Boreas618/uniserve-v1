@@ -107,7 +107,15 @@ def compile_one(package, target, key, out, spec):
         for name, path in compiled.metadata_group.items()
         if name.endswith(".json")
     )
-    (out / "metadata.json").write_text(Path(metadata).read_text())
+    # The module states the parameters it takes at launch, in order and with their types, so `ops`
+    # can compare the operator's packed words against them and refuse a disagreement by name instead
+    # of leaving it to the driver. Triton drops a kernel's constexprs from its parameters, and so is
+    # this list: the signature the source was compiled from names them too, marked `"constexpr"`.
+    written = json.loads(Path(metadata).read_text())
+    written["signature"] = {
+        name: ty for name, ty in described["signature"].items() if ty != "constexpr"
+    }
+    (out / "metadata.json").write_text(json.dumps(written))
     print(
         json.dumps(
             {"descriptor": key, "target": target, "symbol": compiled.name}

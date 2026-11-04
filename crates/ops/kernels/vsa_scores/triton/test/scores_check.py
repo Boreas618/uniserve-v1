@@ -89,13 +89,15 @@ def run(module, *, heads, width, block, query_tiles, key_tiles, seed=23):
     error = (out - expected).abs()
     allowed = bound * expected.abs()
     unset = int(torch.isnan(out).sum())
-    violations = int((error > allowed).sum()) + unset
+    # `~(error <= allowed)` counts a NaN difference as outside, which also covers the scores the
+    # kernel never wrote — so `unset` is reported but not added.
+    violations = int((~(error <= allowed)).sum())
     if violations:
-        position = int(((error > allowed) | torch.isnan(out)).reshape(-1).nonzero()[0])
+        position = int((~(error <= allowed)).reshape(-1).nonzero()[0])
         raise SystemExit(
             f"heads {heads} width {width} block {block} "
             f"{query_tiles}x{key_tiles} tiles: {violations} of {out.numel()} scores outside the "
-            f"bound ({unset} never written); first at {position}: "
+            f"bound ({unset} not finite); first at {position}: "
             f"{float(out.reshape(-1)[position])} vs {float(expected.reshape(-1)[position])}, "
             f"rtol {bound:.3e}"
         )

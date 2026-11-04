@@ -122,12 +122,16 @@ impl Graphs {
         generations
     }
 
-    /// Drops every graph of a generation older than `generation`, in bucket order, and answers the
-    /// buckets it dropped.
+    /// Drops exactly `generation`'s graphs, in bucket order, and answers the buckets it dropped.
     ///
     /// This is purge's last step (7.3): a dropped graph releases its executable and its nodes,
-    /// and with them the last references that kept the old generation's kernels loaded. It runs
-    /// only after the last batch that used the old generation completed.
+    /// and with them the last references that kept that generation's kernels loaded. It runs only
+    /// after the last batch that used the generation completed.
+    ///
+    /// **Exactly that generation, not every older one.** A generation is released by name - a
+    /// switchover's replaced one, or one a revert abandoned - and a reverted generation's number is
+    /// *newer* than the serving one, so a rule of "everything older than this" would have released
+    /// the graphs of the generation that serves: the device would keep answering from nothing.
     ///
     /// The buckets come back so the caller can give each one's arena region to its graph pool:
     /// `Captured` guarantees that the executable goes first, so the regions are released only
@@ -136,7 +140,7 @@ impl Graphs {
         let stale: Vec<(Bucket, u64)> = self
             .captured
             .keys()
-            .filter(|(_, captured_generation)| *captured_generation < generation)
+            .filter(|(_, captured_generation)| *captured_generation == generation)
             .copied()
             .collect();
         let mut buckets: Vec<Bucket> = stale.iter().map(|(bucket, _)| *bucket).collect();

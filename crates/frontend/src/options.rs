@@ -48,27 +48,27 @@ pub struct Options {
     /// serves the API.
     pub node_rank: u32,
     /// The checkpoint reader (`load_config`).
-    pub load: Load,
+    pub load_config: LoadOptions,
     /// The HTTP server (`server_config`).
-    pub server: Server,
+    pub server_config: ServerOptions,
     /// What the frontend logs about serving (`logging_config`).
-    pub logging: Logging,
-    /// Chat models (`chat_config`).
-    pub chat: Chat,
+    pub logging_config: LoggingOptions,
+    /// ChatOptions models (`chat_config`).
+    pub chat_config: ChatOptions,
     /// Fetching input images of chat requests (`image_fetch_config`).
-    pub images: Images,
+    pub image_fetch_config: ImageFetchOptions,
     /// MiniMax-H3 video generation (`video_config`).
-    pub video: Video,
+    pub video_config: VideoOptions,
     /// Condition media of video requests (`media_config`).
-    pub media: Media,
+    pub media_config: MediaOptions,
     /// Finished video jobs (`video_job_config`).
-    pub video_jobs: VideoJobs,
+    pub video_job_config: VideoJobOptions,
     /// System One readouts (`readout_config`). The design retires it with the
     /// model families that serve readouts; it is carried while that code
     /// still exists.
-    pub readout: Readout,
+    pub readout_config: ReadoutOptions,
     /// Movement of token requests between epochs (`migration_config`).
-    pub migration: Migration,
+    pub migration_config: MigrationOptions,
 }
 
 impl Default for Options {
@@ -82,16 +82,16 @@ impl Default for Options {
             host_identity: "localhost".to_owned(),
             nnodes: NonZeroU32::MIN,
             node_rank: 0,
-            load: Load::default(),
-            server: Server::default(),
-            logging: Logging::default(),
-            chat: Chat::default(),
-            images: Images::default(),
-            video: Video::default(),
-            media: Media::default(),
-            video_jobs: VideoJobs::default(),
-            readout: Readout::default(),
-            migration: Migration::default(),
+            load_config: LoadOptions::default(),
+            server_config: ServerOptions::default(),
+            logging_config: LoggingOptions::default(),
+            chat_config: ChatOptions::default(),
+            image_fetch_config: ImageFetchOptions::default(),
+            video_config: VideoOptions::default(),
+            media_config: MediaOptions::default(),
+            video_job_config: VideoJobOptions::default(),
+            readout_config: ReadoutOptions::default(),
+            migration_config: MigrationOptions::default(),
         }
     }
 }
@@ -120,29 +120,36 @@ impl Options {
 
 /// The checkpoint reader (`load_config`).
 #[derive(Debug, Clone, PartialEq)]
-pub struct Load {
+pub struct LoadOptions {
     /// Checkpoint reader: `auto`, `safetensors`, `pt`, `layered` or `dummy`.
     pub format: LoadFormat,
+    /// Hugging Face cache root for repository models.
+    pub download_dir: Option<PathBuf>,
     /// Concurrent checkpoint file readers.
     pub threads: Option<NonZeroU32>,
     /// A plugin's weight source that streams the checkpoint's tensors in
     /// place of its files; the files when unset.
     pub weights: Option<String>,
+    /// The tensor- and expert-parallel degrees the deployment's
+    /// configurations use, which retained weight storage is chunked for.
+    pub parallel_degrees: Vec<NonZeroU32>,
 }
 
-impl Default for Load {
+impl Default for LoadOptions {
     fn default() -> Self {
         Self {
             format: LoadFormat::Auto,
+            download_dir: None,
             threads: None,
             weights: None,
+            parallel_degrees: Vec::new(),
         }
     }
 }
 
 /// The HTTP server (`server_config`).
 #[derive(Debug, Clone, PartialEq)]
-pub struct Server {
+pub struct ServerOptions {
     /// TCP address the server listens on.
     pub host: String,
     /// TCP port the server listens on.
@@ -164,7 +171,7 @@ pub struct Server {
     pub request_id_headers: bool,
 }
 
-impl Default for Server {
+impl Default for ServerOptions {
     fn default() -> Self {
         Self {
             host: "127.0.0.1".to_owned(),
@@ -181,14 +188,14 @@ impl Default for Server {
 
 /// What the frontend logs about serving (`logging_config`).
 #[derive(Debug, Clone, PartialEq)]
-pub struct Logging {
+pub struct LoggingOptions {
     /// Log a summary line for each completed request.
     pub log_requests: bool,
     /// Log scheduler statistics periodically.
     pub log_stats: bool,
 }
 
-impl Default for Logging {
+impl Default for LoggingOptions {
     fn default() -> Self {
         Self {
             log_requests: false,
@@ -197,15 +204,15 @@ impl Default for Logging {
     }
 }
 
-/// Chat models (`chat_config`).
+/// ChatOptions models (`chat_config`).
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct Chat {
-    /// Chat template, as a file path or the template itself.
+pub struct ChatOptions {
+    /// ChatOptions template, as a file path or the template itself.
     pub template: Option<String>,
     /// Keyword arguments bound into every chat-template render.
     pub template_kwargs: Option<HashMap<String, Value>>,
     /// How message content renders.
-    pub template_content_format: ChatTemplateContentFormat,
+    pub template_content_format: ChatTemplateContentFormatOption,
     /// How reasoning is split from content.
     pub reasoning_parser: ReasoningParser,
 }
@@ -213,7 +220,7 @@ pub struct Chat {
 /// How a chat message's content renders into the template
 /// (`chat_config.template_content_format`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ChatTemplateContentFormat {
+pub enum ChatTemplateContentFormatOption {
     /// Decide from the template.
     #[default]
     Auto,
@@ -236,7 +243,7 @@ pub enum ReasoningParser {
 
 /// Fetching input images of chat requests (`image_fetch_config`).
 #[derive(Debug, Clone, PartialEq)]
-pub struct Images {
+pub struct ImageFetchOptions {
     /// Time to fetch one `http(s)` image URL, redirects and body included.
     pub timeout: Duration,
     /// Largest input image, fetched or `data:`.
@@ -246,7 +253,7 @@ pub struct Images {
     pub allow_private: bool,
 }
 
-impl Default for Images {
+impl Default for ImageFetchOptions {
     fn default() -> Self {
         Self {
             timeout: Duration::from_secs(20),
@@ -259,7 +266,7 @@ impl Default for Images {
 
 /// MiniMax-H3 video generation (`video_config`).
 #[derive(Debug, Clone, PartialEq)]
-pub struct Video {
+pub struct VideoOptions {
     /// Longest admitted clip, 4 to 15 seconds.
     pub max_seconds: f64,
     /// Resolution classes startup prepares, each at every aspect ratio.
@@ -272,7 +279,7 @@ pub struct Video {
     pub max_condition_rows: Option<u32>,
 }
 
-impl Default for Video {
+impl Default for VideoOptions {
     fn default() -> Self {
         Self {
             max_seconds: models::video::plan::MAX_VIDEO_SECONDS,
@@ -286,7 +293,7 @@ impl Default for Video {
 
 /// Condition media of video requests (`media_config`).
 #[derive(Debug, Clone, PartialEq)]
-pub struct Media {
+pub struct MediaOptions {
     /// Directory `file://` condition media resolves under; `file://` is
     /// refused when unset.
     pub directory: Option<PathBuf>,
@@ -300,7 +307,7 @@ pub struct Media {
     pub ffmpeg: PathBuf,
 }
 
-impl Default for Media {
+impl Default for MediaOptions {
     fn default() -> Self {
         Self {
             directory: None,
@@ -315,14 +322,14 @@ impl Default for Media {
 
 /// Finished video jobs (`video_job_config`).
 #[derive(Debug, Clone, PartialEq)]
-pub struct VideoJobs {
+pub struct VideoJobOptions {
     /// Time a finished job stays retrievable.
     pub retention: Duration,
     /// Generated video the jobs keep in shared memory.
     pub max_bytes: usize,
 }
 
-impl Default for VideoJobs {
+impl Default for VideoJobOptions {
     fn default() -> Self {
         Self {
             retention: Duration::from_secs(3600),
@@ -334,7 +341,7 @@ impl Default for VideoJobs {
 
 /// System One readouts (`readout_config`).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct Readout {
+pub struct ReadoutOptions {
     /// `joint` packs questions into shared canvases; `independent` gives
     /// each its own prompt and canvas.
     pub layout: ReadoutLayout,
@@ -379,13 +386,13 @@ pub enum CandidateTokens {
 
 /// Movement of token requests between epochs (`migration_config`).
 #[derive(Debug, Clone, PartialEq)]
-pub struct Migration {
+pub struct MigrationOptions {
     /// Migrations caused by lost workers or a failed epoch that a request
     /// survives; it fails on the next.
     pub max_migrations: u32,
 }
 
-impl Default for Migration {
+impl Default for MigrationOptions {
     fn default() -> Self {
         Self { max_migrations: 3 }
     }
