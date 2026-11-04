@@ -289,6 +289,14 @@ impl EncoderCacheManager {
         freed
     }
 
+    /// When the entry `hash` now names was last used, if it is live.
+    ///
+    /// An entry's last use is its own clock: a re-use raises it, which is what
+    /// a policy's LRU reads to decide what to evict next.
+    pub(crate) fn last_used(&self, hash: &EncoderKey) -> Option<u64> {
+        self.entries.get(hash).map(|entry| entry.lru)
+    }
+
     /// Acquires a cached entry, pinning it against eviction while the request uses it.
     ///
     /// Returns `None` without pinning when `hash` has no active entry. Does not

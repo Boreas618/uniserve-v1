@@ -876,6 +876,23 @@ impl Recorder {
         recorded.prefetch_tokens = host_deepening;
     }
 
+    /// Notes that the mechanism re-used a page (§4.4's `Hit`).
+    ///
+    /// A policy's LRU reads this list to order evictions, so a page the
+    /// mechanism just re-used must move up it.
+    pub(crate) fn hit(&mut self, page: PageId) {
+        self.record(Event::Hit { page });
+    }
+
+    /// Notes that an encoder entry is live with the last use it now holds
+    /// (§4.4's `Encoded`).
+    ///
+    /// Emitted on creation, on re-activation and on every re-use: a policy's
+    /// LRU reads this list to order evictions, so a re-used entry must move.
+    pub(crate) fn encoded(&mut self, entry: EncodingView) {
+        self.record(Event::Encoded { entry });
+    }
+
     /// Notes an admission: the event, and the time the views report as
     /// `admitted_at`.
     pub(crate) fn admitted(&mut self, request: RequestId, at: Nanos) {

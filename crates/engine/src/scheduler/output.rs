@@ -900,6 +900,9 @@ impl Scheduler {
                             {
                                 free_products.push(freed);
                             }
+                            // The entry is live now, whether created or
+                            // re-activated; the policy's LRU is told.
+                            self.record_encoded(cache_key);
 
                             let stored = self.storage.encoder_cache.peek_product(cache_key)
                                 == Some(feature.clone());
@@ -941,6 +944,9 @@ impl Scheduler {
                                     product: product.clone(),
                                 });
                             }
+                            // Pinning it is a use: the entry moves in the order
+                            // the policy evicts by.
+                            self.record_encoded(cache_key);
                             product
                         } else if let Some(st) = self.running.get_mut(&id) {
                             st.transient_encoder_products.push(feature.clone());
