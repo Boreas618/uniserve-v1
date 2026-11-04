@@ -56,6 +56,10 @@ pub struct PoolPlacement {
 pub struct ExecutorInfo {
     /// Physical pool identities and their reported capabilities.
     pub workers: Vec<(WorkerGroupId, WorkerInfo)>,
+    /// The longest sequence the model was built for: the attention
+    /// descriptor's static bound on the keys one row reads, from the launch
+    /// arguments every group was started with. Zero when not stated.
+    pub max_model_len: u32,
     /// For each pool, what the engine launched it with. A pool absent from
     /// the map is placed with no components and a queue depth of one.
     ///
