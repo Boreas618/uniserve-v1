@@ -1167,6 +1167,16 @@ pub const VISUAL_CONDITION_TIME: f32 = 0.999;
 /// row after the reference.
 pub const AUDIO_CONDITION_TIME: f32 = 1.0;
 
+/// The seed the encoder samples every visual condition's posterior under
+/// (`uniserve/models/minimax_h3/encoding.py:29-32`: `POSTERIOR_SEED = 42`).
+///
+/// It is not the request's: the reference draws this noise from a fresh generator of its own, so a
+/// condition always encodes to the same latent, while the request's draw is the **anchor's** alone
+/// (`denoiser.py:524`, `encode_conditions(..., noise=...)`). One buffer for both would put an
+/// independent draw under every condition latent - `mean + std * eps` differs by
+/// `std * (eps_request - eps_42)` - and the rows that disagreement lands in feed every evaluation.
+pub const POSTERIOR_SEED: u64 = 42;
+
 /// A request's condition rows, each condition's visual view and its audio view.
 struct ConditionViews {
     pairs: Vec<(Option<TensorView>, Option<TensorView>)>,
@@ -2343,7 +2353,16 @@ impl Denoiser {
             DType::F32,
             Shape::new(&[video_channels, latent_frames, run_rows, run_columns]),
         )?;
-        encoders.video.posterior(f, moments, draw, latent)?;
+        // The posterior's own draw, at the module's seed and the latent's shape: a fresh generator
+        // per condition, element zero each time (`encoding.py:174-185`). The piece's draw is used
+        // below, for the anchor, and only there.
+        let posterior = f.arena().tensor(DType::F32, latent.shape)?;
+        let flat = posterior.reshape(Shape::new(&[
+            video_channels * latent_frames * run_rows,
+            run_columns,
+        ]));
+        nn::Noise::new().draw(f, flat, nn::NoiseKey::Scalar(POSTERIOR_SEED), 0, 0, 0)?;
+        encoders.video.posterior(f, moments, posterior, latent)?;
 
         // The latent becomes rows, the draw becomes rows - the draw is drawn at latent resolution,
         // so it takes the same mapping - and the anchor mixes them in place over the latent's rows.

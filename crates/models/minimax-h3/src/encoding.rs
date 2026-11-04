@@ -2006,6 +2006,9 @@ pub fn conditioning_arena(
         buffer("stitch", 2 * channels * voxels),
         buffer("moments", 2 * channels * voxels),
         buffer("sample", channels * voxels),
+        // The posterior's own draw, which the encoder samples under its module seed
+        // (`denoiser::POSTERIOR_SEED`), at the latent's shape.
+        buffer("posterior", channels * voxels),
         buffer("clean", patch_rows * channels * 4),
         buffer("anchored", patch_rows * channels * 4),
     ])
