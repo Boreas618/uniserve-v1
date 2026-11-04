@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 
 use minimax_h3::checkpoint::{Layout, Sidecars};
 use minimax_h3::config::Config;
+use minimax_h3::encoding::VideoEncoder;
 use minimax_h3::text_encoder::TextEncoder;
 use minimax_h3::vision::VisionTower;
 
