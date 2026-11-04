@@ -126,6 +126,7 @@ const OPERATORS: &[&str] = &[
     <crate::sequence_append::SequenceAppend as Op>::NAME,
     <crate::rope::RopeApply as Op>::NAME,
     <crate::pcm::PcmInterleave as Op>::NAME,
+    <crate::rgb::RgbBytes as Op>::NAME,
 ];
 
 /// `name`, interned, when this build has an operator by that name.
