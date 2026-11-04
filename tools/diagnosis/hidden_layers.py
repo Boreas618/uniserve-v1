@@ -215,6 +215,19 @@ def renormalization_note(actual, expected):
     factor and keeps the update's direction, which is exactly what a short block update with a
     preserved direction looks like.
     """
+    raw = np.asarray(actual, dtype=np.float64)
+    if raw.ndim == 2 and raw.shape[1] > 1:
+        # A flat row is its own signature, and it is not a small-scale one: eight equal weights are
+        # what a score vector whose top entries differ by less than a thousandth gives, and no
+        # selection can survive that spread without the ranking deciding the set.
+        spread_of_values = np.nanmax(raw, axis=1) / np.where(raw.min(axis=1) > 0.0, raw.min(axis=1), np.nan)
+        flat = int(np.sum(spread_of_values < 1.01))
+        if flat == raw.shape[0]:
+            return (
+                f"; every one of {raw.shape[0]} rows is flat to within 1% - eight equal weights. A"
+                " score vector merely multiplied by a small factor keeps its ranking and its set; a"
+                " set that also differs is a different score vector, not a smaller one"
+            )
     ours = np.asarray(actual, dtype=np.float64).sum(axis=1)
     reference = np.asarray(expected, dtype=np.float64).sum(axis=1)
     ratio = ours / np.where(reference == 0.0, np.nan, reference)
