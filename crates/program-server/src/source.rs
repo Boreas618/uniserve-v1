@@ -92,6 +92,17 @@ pub trait Source: Send + Sync {
         toolchain: &dyn Toolchain,
         dir: &Workspace,
     ) -> Result<Built>;
+
+    /// The module the installed revision already holds, written into `dir`, or
+    /// `None` when the module is made by compiling.
+    ///
+    /// A package that is built when it is installed (design section 6.2, the
+    /// wasm policy) carries its module beside its manifest; publishing it needs
+    /// no toolchain, so a host that cannot compile it can still serve it.
+    fn stored(&self, key: &str, target: &Target, dir: &Workspace) -> Result<Option<Built>> {
+        let _ = (key, target, dir);
+        Ok(None)
+    }
 }
 
 /// Makes the source a package's manifest names.
@@ -882,9 +893,27 @@ impl WasmSource {
     }
 }
 
+impl WasmSource {
+    /// The precompiled module an installed revision keeps beside its manifest.
+    fn artifact(&self, key: &str, target: &Target, dir: &Workspace) -> Result<Option<Built>> {
+        let installed = self.package.root.join(MODULE_WASM);
+        if !installed.is_file() {
+            return Ok(None);
+        }
+        std::fs::copy(&installed, dir.path().join(MODULE_WASM))?;
+        let mut files = vec![MODULE_WASM.to_owned()];
+        files.extend(copy_tuning(&self.package, key, target, dir)?);
+        Ok(Some(Built { files }))
+    }
+}
+
 impl Source for WasmSource {
     fn toolchain(&self) -> ToolchainKind {
         ToolchainKind::Wasm
+    }
+
+    fn stored(&self, key: &str, target: &Target, dir: &Workspace) -> Result<Option<Built>> {
+        self.artifact(key, target, dir)
     }
 
     fn build(
@@ -897,6 +926,16 @@ impl Source for WasmSource {
     ) -> Result<Built> {
         let package = &self.package;
         let log = build_log(dir);
+        // A policy is one module with no descriptor and no target, so it is
+        // built once, when the package is installed, and the revision keeps the
+        // precompiled artifact beside its manifest (design section 6.2). A
+        // `prepare` after a restart copies it and runs no compiler: the build
+        // that produced it belongs to the publisher's directory, which this
+        // host need not have.
+        if let Some(stored) = self.stored(key, target, dir)? {
+            return Ok(stored);
+        }
+        let output = dir.path().join(MODULE_WASM);
         // The raw module: either the package's own build writes it (it knows
         // how its guest crate is assembled), or the package is a crate that
         // `cargo build` compiles for wasm32 as it stands.
@@ -940,7 +979,6 @@ impl Source for WasmSource {
                       scheduling-precompile builds it"
                 .into(),
         })?;
-        let output = dir.path().join(MODULE_WASM);
         // A script may write the raw module under the output's own name; move
         // it aside so the precompiler does not overwrite its input.
         let raw = if raw == output {
