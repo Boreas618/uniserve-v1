@@ -6,8 +6,8 @@
 //! `[value, gate]` projection with its packed bias. The H3 block's MLP uses the packed form; the
 //! expert GEMMs use the separate forms.
 
+use ops::TensorView;
 use ops::activation::{self, Activation};
-use ops::{Op, TensorView};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -73,8 +73,8 @@ impl GatedActivation {
             stepwise: self.stepwise,
         };
         let args = activation::ActAndMulArgs { gate, value, out };
-        let kernel = f.kernels().op::<activation::ActAndMul>(&descriptor)?;
-        activation::ActAndMul::launch(kernel, &descriptor, args, f.stream).map_err(Error::from)
+
+        f.operate::<activation::ActAndMul>(&descriptor, args)
     }
 }
 
@@ -219,8 +219,8 @@ impl SwiGlu {
             out,
             partials,
         };
-        let kernel = f.kernels().op::<activation::Swiglu>(&descriptor)?;
-        activation::Swiglu::launch(kernel, &descriptor, args, f.stream).map_err(Error::from)
+
+        f.operate::<activation::Swiglu>(&descriptor, args)
     }
 }
 
@@ -296,10 +296,6 @@ impl PackedSwiGlu {
             out,
             partials,
         };
-        let kernel = f
-            .kernels()
-            .op::<activation::ValueFirstSwiglu>(&descriptor)?;
-        activation::ValueFirstSwiglu::launch(kernel, &descriptor, args, f.stream)
-            .map_err(Error::from)
+        f.operate::<activation::ValueFirstSwiglu>(&descriptor, args)
     }
 }

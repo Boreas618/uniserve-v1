@@ -5,11 +5,11 @@
 //! formed in FP32 and rounded once to the hidden dtype, so [`RmsNorm::forward_with_residual`] is one
 //! operator call and not an add followed by a norm.
 
+use ops::TensorView;
 use ops::norm::{
     self, AddRmsNorm, AddRmsNormDescriptor, LayerNorm as LayerNormOp, LayerNormDescriptor,
     RmsNorm as RmsNormOp, RmsNormDescriptor,
 };
-use ops::{Op, TensorView};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -76,8 +76,8 @@ impl RmsNorm {
             out,
             eps: self.eps,
         };
-        let kernel = f.kernels().op::<RmsNormOp>(&descriptor)?;
-        RmsNormOp::launch(kernel, &descriptor, args, f.stream).map_err(Error::from)
+
+        f.operate::<RmsNormOp>(&descriptor, args)
     }
 
     /// `residual_out = x + residual` in FP32, `out = rms_norm(residual_out)`.
@@ -123,8 +123,8 @@ impl RmsNorm {
             residual_out,
             eps: self.eps,
         };
-        let kernel = f.kernels().op::<AddRmsNorm>(&descriptor)?;
-        AddRmsNorm::launch(kernel, &descriptor, args, f.stream).map_err(Error::from)
+
+        f.operate::<AddRmsNorm>(&descriptor, args)
     }
 
     /// The bound two implementations of this normalization may differ by, for shadow execution.
@@ -192,7 +192,7 @@ impl LayerNorm {
             out,
             eps: self.eps,
         };
-        let kernel = f.kernels().op::<LayerNormOp>(&descriptor)?;
-        LayerNormOp::launch(kernel, &descriptor, args, f.stream).map_err(Error::from)
+
+        f.operate::<LayerNormOp>(&descriptor, args)
     }
 }

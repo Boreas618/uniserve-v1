@@ -20,9 +20,10 @@
 //! A single-threaded executor is what makes the interior cursor sound: one executor thread issues
 //! every job of its device, so two forwards never share an arena at one time.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
-use ops::{Generation, Stream};
+use ops::twins::Twins;
+use ops::{Generation, Op, Stream};
 
 use crate::error::{Error, Result};
 use crate::exchange::ExchangeViews;
@@ -118,6 +119,35 @@ impl Arena {
     }
 }
 
+/// The one operator a shadow forward runs twice (specs/worker.md 7.3).
+pub struct Shadow<'a> {
+    /// The operator whose programs are being compared, by `Op::NAME`.
+    pub operator: &'static str,
+    /// The descriptor key of the one call being compared.
+    pub descriptor_key: String,
+    /// The generation the previous program is resolved from.
+    pub previous: &'a Generation,
+    /// The twin buffers the new program writes into.
+    pub twins: RefCell<&'a mut Twins>,
+}
+
+impl<'a> Shadow<'a> {
+    /// The comparison of `operator`'s call whose descriptor key is `descriptor_key`.
+    pub fn new(
+        operator: &'static str,
+        descriptor_key: impl Into<String>,
+        previous: &'a Generation,
+        twins: &'a mut Twins,
+    ) -> Self {
+        Self {
+            operator,
+            descriptor_key: descriptor_key.into(),
+            previous,
+            twins: RefCell::new(twins),
+        }
+    }
+}
+
 /// The borrowed execution resources of one forward (specs/worker.md 4.3).
 pub struct Forward<'a> {
     /// The stream this forward's work is issued on.
@@ -130,6 +160,8 @@ pub struct Forward<'a> {
     pub group: Option<&'a Group>,
     /// The expert exchange's received views, when the block's experts are split across ranks.
     pub exchange: Option<&'a ExchangeViews>,
+    /// The operator this forward shadows, when it is a 7.3 comparison pass.
+    pub shadow: Option<Shadow<'a>>,
 }
 
 impl<'a> Forward<'a> {
@@ -141,6 +173,7 @@ impl<'a> Forward<'a> {
             arena,
             group: None,
             exchange: None,
+            shadow: None,
         }
     }
 
@@ -154,6 +187,40 @@ impl<'a> Forward<'a> {
     pub fn with_exchange(mut self, exchange: &'a ExchangeViews) -> Self {
         self.exchange = Some(exchange);
         self
+    }
+
+    /// The same forward as a shadow comparison of one operator's call.
+    pub fn with_shadow(mut self, shadow: Shadow<'a>) -> Self {
+        self.shadow = Some(shadow);
+        self
+    }
+
+    /// Resolve `O`'s kernel for this descriptor and launch it.
+    ///
+    /// When this forward shadows `O` at this descriptor key (specs/worker.md 7.3), the launch is
+    /// paired: the new kernel writes the twins and the previous generation's kernel writes the real
+    /// outputs last, so the forward continues on the outputs it was going to compute anyway.
+    /// Otherwise it is one launch of the current generation's kernel.
+    pub fn operate<'t, O: Op>(&self, descriptor: &O::Descriptor, args: O::Args<'t>) -> Result<()>
+    where
+        O::Args<'t>: Copy,
+    {
+        let shadow = self.shadow.as_ref().filter(|shadow| {
+            shadow.operator == O::NAME && shadow.descriptor_key == ops::descriptor::key(descriptor)
+        });
+        let Some(shadow) = shadow else {
+            let kernel = self.kernels.op::<O>(descriptor)?;
+            return O::launch(kernel, descriptor, args, self.stream).map_err(Error::from);
+        };
+        let current = self.kernels.op::<O>(descriptor)?;
+        let previous = shadow.previous.op::<O>(descriptor)?;
+        // Redirect the call's outputs into the twins and let the new program write them; the
+        // previous program then writes the real outputs, which the forward continues on.
+        let mut twins = shadow.twins.borrow_mut();
+        let redirected = O::shadow(args, &mut twins, self.stream);
+        O::launch(current, descriptor, redirected, self.stream).map_err(Error::from)?;
+        drop(twins);
+        O::launch(previous, descriptor, args, self.stream).map_err(Error::from)
     }
 
     /// The kernels generation this forward launches against.

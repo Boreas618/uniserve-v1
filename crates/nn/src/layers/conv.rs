@@ -7,11 +7,11 @@
 //! `tf32` flag is the model's numerical declaration for an FP32 convolution (the video VAE keeps it
 //! on, as the `quality` preset does).
 
+use ops::TensorView;
 use ops::conv::{
     Args, Conv1d as Conv1dOp, Conv3d as Conv3dOp, ConvTranspose1d as ConvTranspose1dOp, Descriptor,
     Geometry,
 };
-use ops::{Op, TensorView};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
@@ -255,18 +255,9 @@ fn launch(
         out,
     };
     match (rank, transposed) {
-        (3, false) => {
-            let kernel = f.kernels().op::<Conv3dOp>(&descriptor)?;
-            Conv3dOp::launch(kernel, &descriptor, args, f.stream).map_err(Error::from)
-        }
-        (1, false) => {
-            let kernel = f.kernels().op::<Conv1dOp>(&descriptor)?;
-            Conv1dOp::launch(kernel, &descriptor, args, f.stream).map_err(Error::from)
-        }
-        (1, true) => {
-            let kernel = f.kernels().op::<ConvTranspose1dOp>(&descriptor)?;
-            ConvTranspose1dOp::launch(kernel, &descriptor, args, f.stream).map_err(Error::from)
-        }
+        (3, false) => f.operate::<Conv3dOp>(&descriptor, args),
+        (1, false) => f.operate::<Conv1dOp>(&descriptor, args),
+        (1, true) => f.operate::<ConvTranspose1dOp>(&descriptor, args),
         (rank, transposed) => Err(Error::Unsupported(format!(
             "Conv: rank {rank} transposed={transposed} is not a convolution this layer builds"
         ))),
