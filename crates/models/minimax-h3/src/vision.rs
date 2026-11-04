@@ -72,11 +72,11 @@ const PREFIX: &str = "model.visual";
 /// One image block's row counts, as its forward and its tables see them.
 ///
 /// The grid's two spatial extents are a host fact of the *request*: they are known when the tables
-/// are prepared (`Geometry::of`) and are carried by the tables themselves at call time, because a
+/// are prepared (`BlockRows::of`) and are carried by the tables themselves at call time, because a
 /// model may not read `ImageInput.grid` back and a descriptor that only counts points does not need
-/// them (`Geometry::of_counts`).
+/// them (`BlockRows::of_counts`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Geometry {
+pub struct BlockRows {
     /// Temporal patches of the block: one for a still image.
     pub time: u32,
     /// Patch rows the block holds: `time * height * width`.
@@ -87,8 +87,8 @@ pub struct Geometry {
     pub sequence: u32,
 }
 
-impl Geometry {
-    /// The geometry of the grid `(time, height, width)` in patches.
+impl BlockRows {
+    /// The row counts of the grid `(time, height, width)` in patches.
     ///
     /// The grid is refused when a side is not a whole number of merge blocks (every merged token
     /// reads whole `merge x merge` blocks of patches). Nothing else bounds it here: the learned
@@ -130,7 +130,7 @@ impl Geometry {
         })
     }
 
-    /// The geometry a call's tables describe: `patches` rows of one time step each, over `time`
+    /// The row counts a call's tables describe: `patches` rows of one time step each, over `time`
     /// time steps.
     ///
     /// The tables are what a captured call has; their row counts fix `patches` (`cosine`'s rows)
@@ -296,7 +296,7 @@ impl Buffers {
         let intermediate = u64::from(config.intermediate_size);
         let merge = u64::from(config.spatial_merge_size);
         let blocks = rows / (merge * merge);
-        let width = u64::from(Geometry::merged_width(config));
+        let width = u64::from(BlockRows::merged_width(config));
         let reserve = |shape: Shape| -> Result<TensorView> {
             arena.tensor(dtype, shape).map_err(Error::from)
         };
@@ -362,7 +362,7 @@ impl Buffers {
         let intermediate = u64::from(config.intermediate_size);
         let merge = u64::from(config.spatial_merge_size);
         let blocks = rows / (merge * merge);
-        let width = u64::from(Geometry::merged_width(config));
+        let width = u64::from(BlockRows::merged_width(config));
         let element = crate::text_encoder::element_of(dtype);
         let mut plan = Vec::with_capacity(14);
         let mut push = |name: &str, elements: u64| {
@@ -423,7 +423,7 @@ pub struct ImageTables {
     /// `[time + 1]` I32: the attention offsets, one sequence per time step (`positions::vision_lengths`).
     pub lengths: TensorView,
     /// The block's row counts, as the tables state them.
-    pub geometry: Geometry,
+    pub rows: BlockRows,
     /// The patches the block reads, `[patches, tubelet]`.
     pub pixels: TensorView,
 }
@@ -455,7 +455,7 @@ impl ImageTables {
             cosine: *cosine,
             sine: *sine,
             lengths: *lengths,
-            geometry: Geometry::of_counts(config, patches, time)?,
+            rows: BlockRows::of_counts(config, patches, time)?,
             pixels: image.pixels,
         })
     }
@@ -515,11 +515,11 @@ impl Block {
         f: &Forward,
         image: &ImageTables,
         attention: &Attention,
-        geometry: &Geometry,
+        rows: &BlockRows,
         buffers: &Buffers,
     ) -> Result<()> {
         let heads = tower.config.num_heads;
-        let head_dim = Geometry::head_dim(&tower.config)?;
+        let head_dim = BlockRows::head_dim(&tower.config)?;
         let hidden = buffers.hidden;
 
         self.input_norm
@@ -556,7 +556,7 @@ impl Block {
             buffers.as_heads(buffers.value, heads, head_dim)?,
             Some(image.lengths),
             Some(image.lengths),
-            geometry.sequence,
+            rows.sequence,
             buffers.as_heads(buffers.attended, heads, head_dim)?,
         )?;
         self.output
@@ -609,7 +609,7 @@ impl Merger {
         config: &VisionConfig,
         normalizes_merged: bool,
     ) -> Result<Self> {
-        let width = u64::from(Geometry::merged_width(config));
+        let width = u64::from(BlockRows::merged_width(config));
         let out_hidden = u64::from(config.out_hidden_size);
         let norm_width = if normalizes_merged {
             width
@@ -701,7 +701,7 @@ pub struct VisionTower {
     position: Weight,
     /// The learned table's side and the side it is resampled from: one square grid.
     position_grid: u32,
-    /// The query/key geometry of one dense bidirectional call; its key bound is the grid's.
+    /// The query/key row counts of one dense bidirectional call; its key bound is the grid's.
     heads: u32,
     head_dim: u32,
     rotate: Rotate,
@@ -760,15 +760,15 @@ impl VisionTower {
         dtype: nn::DType,
     ) -> Result<Self> {
         let hidden = u64::from(config.hidden_size);
-        let tubelet = u64::from(Geometry::tubelet(config));
+        let tubelet = u64::from(BlockRows::tubelet(config));
         // The checkpoint's activation, and the merger's exact form, are two different GELUs.
         let blocks_gelu = match config.hidden_act {
             VisionActivation::GeluTanh => Gelu::tanh(),
         };
         let heads = config.num_heads;
-        let head_dim = Geometry::head_dim(config)?;
+        let head_dim = BlockRows::head_dim(config)?;
         // The position table must be a square grid: its rows are indexed by `row · side + column`.
-        let position_grid = Geometry::position_grid(config)?;
+        let position_grid = BlockRows::position_grid(config)?;
         let layers = (0..config.depth)
             .map(|index| Block::load(loader, config, index))
             .collect::<Result<Vec<_>>>()?;
@@ -859,7 +859,7 @@ impl VisionTower {
         buffers: &Buffers,
         out: Outputs<'_>,
     ) -> Result<()> {
-        let geometry = image.geometry;
+        let rows = image.rows;
         if out.deepstack.len() != self.deepstack.len() {
             return Err(invalid(
                 "VisionTower",
@@ -870,7 +870,7 @@ impl VisionTower {
                 ),
             ));
         }
-        self.check(image, &geometry, buffers, &out)?;
+        self.check(image, &rows, buffers, &out)?;
 
         // The patch embedding reads the tubelets the processor packed; the position blend is added
         // into the same rows, and the residual stream starts there.
@@ -906,7 +906,7 @@ impl VisionTower {
             self.head_dim,
             self.heads,
             self.heads,
-            geometry.sequence,
+            rows.sequence,
             false,
             None,
             (self.head_dim as f32).sqrt().recip(),
@@ -915,7 +915,7 @@ impl VisionTower {
 
         let mut next = 0;
         for (index, block) in self.layers.iter().enumerate() {
-            block.forward(self, f, image, &attention, &geometry, buffers)?;
+            block.forward(self, f, image, &attention, &rows, buffers)?;
             if self
                 .deepstack_layers
                 .get(next)
@@ -939,16 +939,16 @@ impl VisionTower {
     fn check(
         &self,
         image: &ImageTables,
-        geometry: &Geometry,
+        rows: &BlockRows,
         buffers: &Buffers,
         out: &Outputs<'_>,
     ) -> Result<()> {
-        let patches = u64::from(geometry.patches);
-        let merged = u64::from(geometry.merged);
+        let patches = u64::from(rows.patches);
+        let merged = u64::from(rows.merged);
         let hidden = u64::from(self.config.hidden_size);
-        let columns = u64::from(Geometry::head_dim(&self.config)? / 2);
-        let tubelet = u64::from(Geometry::tubelet(&self.config));
-        let width = u64::from(Geometry::merged_width(&self.config));
+        let columns = u64::from(BlockRows::head_dim(&self.config)? / 2);
+        let tubelet = u64::from(BlockRows::tubelet(&self.config));
+        let width = u64::from(BlockRows::merged_width(&self.config));
         let out_hidden = u64::from(self.config.out_hidden_size);
         let tables = [
             ("pixels", image.pixels, Shape::new(&[patches, tubelet])),
@@ -974,8 +974,8 @@ impl VisionTower {
                         "the {name} table is {:?} for a {}-patch block over {} time steps, \
                          {shape:?} expected",
                         view.shape.dims(),
-                        geometry.patches,
-                        geometry.time
+                        rows.patches,
+                        rows.time
                     ),
                 ));
             }
@@ -988,19 +988,19 @@ impl VisionTower {
                         "a DeepStack output is {:?} for a {}-patch block, [{merged}, {out_hidden}] \
                          expected",
                         deepstack.shape.dims(),
-                        geometry.patches
+                        rows.patches
                     ),
                 ));
             }
         }
-        let lengths = u64::from(geometry.time) + 1;
+        let lengths = u64::from(rows.time) + 1;
         if image.lengths.numel() != lengths {
             return Err(invalid(
                 "VisionTower",
                 format!(
                     "{} attention lengths for {} time steps",
                     image.lengths.numel(),
-                    geometry.time
+                    rows.time
                 ),
             ));
         }
@@ -1024,7 +1024,7 @@ impl VisionTower {
                     buffers.hidden.last(),
                     buffers.merged.rows(),
                     buffers.merged.last(),
-                    geometry.patches
+                    rows.patches
                 ),
             ));
         }
@@ -1204,21 +1204,21 @@ mod tests {
     fn one_image_is_one_time_step_of_whole_merge_blocks() {
         let config = config();
         let merge = config.spatial_merge_size;
-        let geometry = Geometry::of(&config, [1, 24, 24]).expect("a 24x24 patch grid");
+        let rows = BlockRows::of(&config, [1, 24, 24]).expect("a 24x24 patch grid");
         // A patch is one 16x16 pixel block, so a 24 by 24 patch grid is 24 * 24 of them, merged in
         // 2 by 2 blocks, with one sequence position per patch of the grid.
-        assert_eq!(geometry.patches, 24 * 24);
-        assert_eq!(geometry.merged, (24 / merge) * (24 / merge));
-        assert_eq!(geometry.sequence, geometry.patches);
+        assert_eq!(rows.patches, 24 * 24);
+        assert_eq!(rows.merged, (24 / merge) * (24 / merge));
+        assert_eq!(rows.sequence, rows.patches);
         // The tubelet is a patch's channels with its temporal depth, and a merged row is the merged
         // block's features - the two numbers the tower's first and last projections see.
         let patch = config.patch_size;
         assert_eq!(
-            Geometry::tubelet(&config),
+            BlockRows::tubelet(&config),
             config.in_channels * config.temporal_patch_size * patch * patch
         );
         assert_eq!(
-            Geometry::merged_width(&config),
+            BlockRows::merged_width(&config),
             config.hidden_size * merge * merge
         );
     }
@@ -1227,22 +1227,22 @@ mod tests {
     fn a_video_block_keeps_one_sequence_per_time_step() {
         let config = config();
         let merge = config.spatial_merge_size;
-        let geometry = Geometry::of(&config, [4, 16, 16]).expect("four time steps");
+        let rows = BlockRows::of(&config, [4, 16, 16]).expect("four time steps");
         // Four time steps of a 16 by 16 patch grid: every patch is a row, and the merged rows are the
         // 2 by 2 blocks of each step.
-        assert_eq!(geometry.patches, 4 * 16 * 16);
-        assert_eq!(geometry.merged, 4 * (16 / merge) * (16 / merge));
+        assert_eq!(rows.patches, 4 * 16 * 16);
+        assert_eq!(rows.merged, 4 * (16 / merge) * (16 / merge));
         // The attention sequence is one step's **patches**, not its merged rows: the tower attends
         // over patch rows and merges afterwards, so a video block runs four sequences of 16 * 16.
-        assert_eq!(geometry.sequence, 16 * 16);
-        assert_eq!(geometry.sequence, geometry.patches / geometry.time);
+        assert_eq!(rows.sequence, 16 * 16);
+        assert_eq!(rows.sequence, rows.patches / rows.time);
     }
 
     #[test]
     fn a_grid_outside_whole_merge_blocks_is_refused() {
         let config = config();
-        assert!(Geometry::of(&config, [1, 23, 24]).is_err());
-        assert!(Geometry::of(&config, [1, 24, 0]).is_err());
+        assert!(BlockRows::of(&config, [1, 23, 24]).is_err());
+        assert!(BlockRows::of(&config, [1, 24, 0]).is_err());
     }
 
     #[test]
@@ -1250,14 +1250,14 @@ mod tests {
         let config = config();
         // The tables state a block's patch rows and its time steps; the grid's split is a host fact
         // the tables already carry.
-        let of_grid = Geometry::of(&config, [4, 16, 24]).expect("four steps of 16x24");
+        let of_grid = BlockRows::of(&config, [4, 16, 24]).expect("four steps of 16x24");
         let of_counts =
-            Geometry::of_counts(&config, of_grid.patches, of_grid.time).expect("the same block");
+            BlockRows::of_counts(&config, of_grid.patches, of_grid.time).expect("the same block");
         assert_eq!(of_counts, of_grid);
-        assert!(Geometry::of_counts(&config, 1000, 3).is_err());
-        assert!(Geometry::of_counts(&config, 0, 1).is_err());
+        assert!(BlockRows::of_counts(&config, 1000, 3).is_err());
+        assert!(BlockRows::of_counts(&config, 0, 1).is_err());
         // A time step of six patches is not whole 2x2 merge blocks.
-        assert!(Geometry::of_counts(&config, 6, 1).is_err());
+        assert!(BlockRows::of_counts(&config, 6, 1).is_err());
     }
 
     #[test]
@@ -1265,15 +1265,15 @@ mod tests {
         let config = config();
         // The table is 48 x 48 entries; the served 768x1344 canvas is 48 x 84 patches, and the
         // processor's pixel cap allows far more, so the grid is never bounded by the table.
-        assert!(Geometry::of(&config, [1, 48, 48]).is_ok());
+        assert!(BlockRows::of(&config, [1, 48, 48]).is_ok());
         let merge = config.spatial_merge_size;
-        let keyframe = Geometry::of(&config, [1, 48, 84]).expect("a 768x1344 keyframe");
+        let keyframe = BlockRows::of(&config, [1, 48, 84]).expect("a 768x1344 keyframe");
         // One time step of a 48 by 84 patch grid, merged 2 by 2: the numbers a 768p 16:9 frame gives.
         assert_eq!(keyframe.patches, 48 * 84);
         assert_eq!(keyframe.merged, (48 / merge) * (84 / merge));
         assert_eq!(keyframe.sequence, 48 * 84);
         assert_eq!(keyframe.sequence, keyframe.patches / keyframe.time);
-        assert!(Geometry::of(&config, [1, 256, 256]).is_ok());
+        assert!(BlockRows::of(&config, [1, 256, 256]).is_ok());
     }
 
     #[test]
