@@ -63,6 +63,9 @@ pub enum Applied {
     },
     /// A new world executes on trial.
     World(serde_json::Value),
+    /// The epoch layer's switch runs on trial: the target's main processes
+    /// serve while the previous epoch is parked (§7.4).
+    Epoch(serde_json::Value),
 }
 
 #[cfg(test)]

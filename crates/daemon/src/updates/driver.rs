@@ -294,7 +294,7 @@ mod tests {
         let applied = driver
             .apply(&previous, &target, change(12), false)
             .expect("the epoch arm runs");
-        assert!(matches!(applied, Some(Applied::World(_))));
+        assert!(matches!(applied, Some(Applied::Epoch(_))));
         assert_eq!(driver.phase(), Some(Phase::Preparing));
 
         deliver(

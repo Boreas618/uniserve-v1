@@ -593,6 +593,7 @@ fn applied_result(
         Ok(Applied::InPlace(plan)) => Ok(json!({ "change": "in_place", "plan": plan })),
         Ok(Applied::Planned(plan)) => Ok(json!({ "change": "planned", "plan": plan })),
         Ok(Applied::World(report)) => Ok(json!({ "change": "world", "world": report })),
+        Ok(Applied::Epoch(report)) => Ok(json!({ "change": "epoch", "epoch": report })),
         Ok(Applied::Daemon { .. }) => Err((
             StatusCode::CONFLICT,
             "the daemon's own options changed again after its hot restart".to_owned(),
