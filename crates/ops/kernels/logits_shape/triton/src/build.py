@@ -1,46 +1,52 @@
-"""The sampler_shape package's compile script: one descriptor -> one module.
+"""The logits_shape package's compile script: one descriptor -> one module.
 
-A descriptor is the logits dtype, the number of extra tokens a row counts
-besides its slot's history (a verification row's draft tokens; none in
-ordinary decoding) and whether the rows are divided by their temperatures. The
-vocabulary and the block width are runtime values, so a new vocabulary or row
-count reuses the module.
+A descriptor is the input logits' dtype, the vocabulary width of a row, the
+columns one program shapes, how many extra token columns a row carries, whether
+the row is divided by its temperature and the dependent-launch flag. The row
+count stays a runtime value.
 """
 
 import _compile
-import sampler_shape as kernels
+import logits_shape as kernels
 
-#: The logits dtypes a row may hold; every row is read and penalized in FP32.
-DTYPES = {"bf16": "bf16", "fp16": "fp16", "fp32": "fp32"}
+#: The input logits' dtype; the shaped logits are FP32 in every case.
+DTYPES = {"bf16": "bf16", "fp16": "fp16", "fp32": "fp32", "f32": "fp32"}
+
+#: The largest column tile a program holds in registers in one step.
+LANES = 4096
 
 
 def spec(fields, parameters, target):
-    """The compilation of one sampler_shape descriptor."""
+    """The compilation of one logits_shape descriptor."""
+    block = int(fields["block"])
+    extras = int(fields["extras"])
+    pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
     return {
-        "kernel": kernels._shape_kernel,
+        "kernel": kernels._logits_shape_kernel,
         "signature": {
             "logits_ptr": "*" + DTYPES[fields["dtype"]],
             "counts_ptr": "*i32",
-            "slots_ptr": "*i64",
-            "params_ptr": "*fp32",
-            "extra_ptr": "*i64",
+            "slots_ptr": "*i32",
+            "parameters_ptr": "*fp32",
+            "extras_ptr": "*i32",
             "out_ptr": "*fp32",
-            "vocab": "i32",
-            "logits_stride": "i64",
-            "counts_stride": "i64",
-            "params_stride": "i64",
-            "extra_stride": "i64",
-            "out_stride": "i64",
-            "block": "constexpr",
-            "extras": "constexpr",
-            "divide": "constexpr",
+            "rows": "i64",
+            "vocabulary": "i32",
+            "divide": "i32",
+            "BLOCK": "constexpr",
+            "STEP": "constexpr",
+            "EXTRAS": "constexpr",
+            "DIVIDE": "constexpr",
+            "PDL": "constexpr",
         },
         "constexprs": {
-            "block": int(parameters["block"]),
-            "extras": int(fields["extras"]),
-            "divide": fields["divide"] == "true",
+            "BLOCK": block,
+            "STEP": min(block, LANES),
+            "EXTRAS": extras,
+            "DIVIDE": fields["divide"] == "true",
+            "PDL": pdl,
         },
-        "options": {"num_warps": int(parameters["warps"])},
+        "options": {"num_warps": 4, "launch_pdl": pdl},
     }
 
 

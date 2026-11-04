@@ -1,0 +1,52 @@
+# A program package the delivery test installs to exercise a *recapture* of the
+# engine's graphs: the same program the deployment already serves (`gemm`, the
+# `cublas_lt` backend), the same descriptor keys, and module bytes that differ in
+# the way that matters most — the module launches two kernels (the product into
+# FP32 scratch, then the alpha, the bias and the rounding) where the serving
+# program hands the whole product to cuBLASLt in one call.
+#
+# Installing this is a new revision of `gemm`/`cublas_lt`, not a new backend: the
+# deployment's unchanged configuration resolves it, and because its launches are
+# not the recorded ones, a graph built over the previous module cannot be replayed
+# as it stands. Its arithmetic is the operator's (FP32 contraction, the scalar
+# before the epilogue, the bias after it, one rounding into the output), so a
+# recaptured graph computes the same product inside `ops::Tolerance::dot(k)`.
+#
+# The keys are the Qwen3-MoE slice's dense-layer products. The element types,
+# weight order, epilogue and contraction length are compile-time: `src/build.py`
+# derives them from `UNISERVE_DESCRIPTOR`, and refuses a descriptor this fixture
+# does not implement (a non-FP32 accumulate, or an input and weight of different
+# element types) by name.
+#
+# `[toolchain] version` is the toolkit this fixture was written for. A host whose
+# nvcc is another build of the same CUDA version must set this line to its own
+# version, because a toolchain version change is a new revision (design 5.1).
+
+op = "gemm"
+backend = "cublas_lt"
+
+[toolchain]
+kind = "nvcc"
+version = "13.0.48"
+packages = []
+
+[module]
+form = "native"
+
+[module.entries]
+launch = "uniserve_gemm"
+
+[source]
+kind = "cuda"
+files = ["src/split_k.cu", "src/uniserve_gemm.h", "src/build.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_100f"]
+
+# `input_bf16_weight_bf16_accumulate_f32_output_bf16_order_nxk_epilogue_none_k_2048`.
+[kernel.descriptors]
+dimensions = { input = ["bf16", "f16", "f32"], weight = ["bf16", "f16", "f32"], accumulate = ["f32"], output = ["bf16", "f16", "f32"], order = ["nxk", "kxn"], epilogue = ["none", "bias"], k = ["768", "1536", "2048", "4096", "7168"] }
+
+[parameters]

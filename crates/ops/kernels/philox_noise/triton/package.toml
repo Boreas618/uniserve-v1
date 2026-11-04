@@ -1,0 +1,36 @@
+# The philox_noise operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
+# driver the Program Server runs for one descriptor and target).
+#
+# The draw's kind is part of the compilation, not of the call: a normal draw takes
+# one counter per element pair and a uniform draw one per element, so they read
+# different words from the same counter. The key is the one `NoiseDescriptor`'s
+# `Display` prints, e.g. `dtype_bf16_block_1024_kind_normal`.
+
+op = "philox_noise"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/philox_noise.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+[kernel.descriptors]
+dimensions = { dtype = ["bf16", "f16", "f32"], block = ["256", "512", "1024", "2048", "4096"], kind = ["normal", "uniform"] }
+
+[parameters]

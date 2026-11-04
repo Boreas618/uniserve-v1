@@ -1,0 +1,36 @@
+# The vsa_add_gated_tiles operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
+# driver the Program Server runs for one descriptor and target).
+#
+# The descriptor is the row pass's own: the element type, the rows of one tile, the
+# features per head and the rows one program handles; the heads are a launch
+# extent, not a compiled one. The key is the one `AddGatedTilesDescriptor`'s
+# `Display` prints, e.g. `dtype_bf16_tile_rows_64_width_128_block_rows_16`.
+
+op = "vsa_add_gated_tiles"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/vsa_add_gated_tiles.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+[kernel.descriptors]
+dimensions = { dtype = ["bf16", "f16", "f32"], tile_rows = ["64", "128"], width = ["64", "128"], block_rows = ["16"] }
+
+[parameters]
