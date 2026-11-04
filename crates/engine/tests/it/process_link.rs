@@ -16,10 +16,9 @@ use std::time::Duration;
 
 use engine::{PolicyProgram, PolicyReverted, ProcessLink};
 use proto::process::{
-    self, downstream, event, upstream, Command, Connection, Downstream, Event, Hello, Upstream,
-    Welcome,
+    self, downstream, event, upstream, Command, Downstream, Event, Hello, Upstream, Welcome,
 };
-use proto::Listener;
+use proto::{Connection, Listener};
 
 /// How long a step of the exchange may take, and how long the test's daemon
 /// waits for one message before it looks at the connection again.
