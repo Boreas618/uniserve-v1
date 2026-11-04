@@ -92,6 +92,16 @@ pub enum Quantization {
     NvFp4,
 }
 
+impl Quantization {
+    /// The element type this policy's encoded weights are stored in.
+    pub const fn encoding(self) -> DType {
+        match self {
+            Self::Fp8 | Self::Mxfp8 => DType::F8E4M3,
+            Self::NvFp4 => DType::U8,
+        }
+    }
+}
+
 impl fmt::Display for Quantization {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
@@ -542,20 +552,58 @@ impl<'a> WeightLoader<'a> {
         })
     }
 
-    /// Borrow this loader for another checkpoint: the same store, the same conversion, a
-    /// different shard set.
+    /// Borrow this loader for another checkpoint: the same store, the same element-type and
+    /// quantization policy, a different shard set.
     ///
-    /// A pipeline's components each keep their own index in their own directory (`transformer/`,
-    /// `vae/`, `text_encoder/`), so a model crate opens one [`Checkpoint`] per component and reads
-    /// each through one loader. Retained storage stays the loader's, so a weight converted once for
+    /// A pipeline root holds one component per subdirectory (`transformer/`, `vae/`,
+    /// `text_encoder/`, …), each with its own index and its own file identities, so a model crate
+    /// opens the root once and reads every component through one store: a weight converted once for
     /// one component is reused for another and never converted twice (specs/worker.md 8).
-    pub fn for_checkpoint<'b>(&'b mut self, checkpoint: &'b Checkpoint) -> WeightLoader<'b> {
-        WeightLoader {
+    ///
+    /// The policy is the loader's, not the component's, so a component that its policy does not
+    /// describe is refused here: an FP8-policy loader over a BF16 component, or a float policy over
+    /// a component whose weights are an FP8 or NVFP4 encoding, would read weights as something they
+    /// are not, which is a wrong answer rather than a convenience. A model that needs two policies
+    /// builds two loaders over the same store.
+    pub fn reborrow<'b>(&'b mut self, checkpoint: &'b Checkpoint) -> Result<WeightLoader<'b>> {
+        self.check_policy(checkpoint)?;
+        Ok(WeightLoader {
             checkpoint,
             store: self.store,
             dtype: self.dtype,
             quantization: self.quantization,
+        })
+    }
+
+    /// Whether this loader's policy describes `checkpoint`'s weights.
+    fn check_policy(&self, checkpoint: &Checkpoint) -> Result<()> {
+        let held = checkpoint.dtypes();
+        let listed = held
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        if let Some(quantization) = self.quantization {
+            let encoding = quantization.encoding();
+            if !held.contains(&encoding) {
+                return Err(Error::policy(format!(
+                    "a {quantization} policy encodes weights as {encoding}, and this checkpoint \
+                     holds {listed}"
+                )));
+            }
         }
+        if let Some(dtype) = self.dtype {
+            for encoded in [DType::F8E4M3, DType::F4E2M1] {
+                if held.contains(&encoded) {
+                    return Err(Error::policy(format!(
+                        "this checkpoint holds {encoded} encoded weights, which a {dtype} element \
+                         type does not describe; the quantization is the loader's policy, not its \
+                         element type"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Load a calibrated NVFP4 matrix: its packed E2M1 values, its block scales and its tensor
@@ -947,7 +995,9 @@ fn convert(from: DType, to: DType, bytes: &[u8], tensor: &str) -> Result<Vec<u8>
             }
         };
         match to {
-            DType::BF16 => converted.extend_from_slice(&(value.to_bits() >> 16).to_le_bytes()),
+            DType::BF16 => {
+                converted.extend_from_slice(&((value.to_bits() >> 16) as u16).to_le_bytes())
+            }
             DType::F16 => converted.extend_from_slice(&f32_to_half(value).to_le_bytes()),
             DType::F32 => converted.extend_from_slice(&value.to_le_bytes()),
             other => {
@@ -981,6 +1031,21 @@ fn from_f32(dtype: DType, values: &[f32], tensor: &str) -> Result<Vec<u8>> {
     convert(DType::F32, dtype, &bytes, tensor)
 }
 
+/// `value` divided by `2^shift`, rounded to nearest with ties to even.
+fn round_even(value: u32, shift: u32) -> u32 {
+    if shift == 0 {
+        return value;
+    }
+    let quotient = value >> shift;
+    let remainder = value & ((1 << shift) - 1);
+    let half = 1 << (shift - 1);
+    if remainder > half || (remainder == half && quotient & 1 == 1) {
+        quotient + 1
+    } else {
+        quotient
+    }
+}
+
 /// The `f32` value of an IEEE half-precision bit pattern.
 fn half_to_f32(half: u16) -> f32 {
     let sign = u32::from(half & 0x8000) << 16;
@@ -991,14 +1056,13 @@ fn half_to_f32(half: u16) -> f32 {
             if mantissa == 0 {
                 sign
             } else {
-                // A subnormal half is a normal float scaled by 2^-24.
-                let mut exponent = 127 - 15 - 10;
-                let mut mantissa = mantissa;
-                while mantissa & 0x0400 == 0 {
-                    mantissa <<= 1;
-                    exponent -= 1;
-                }
-                sign | ((exponent as u32) << 23) | ((mantissa & 0x03ff) << 13)
+                // A subnormal half is `mantissa · 2^-24`. Normalizing it left until the leading bit
+                // reaches the half's implicit position gives the float's exponent and fraction.
+                let leading = 31 - mantissa.leading_zeros();
+                let shift = 10 - leading;
+                let fraction = (mantissa << shift) & 0x03ff;
+                let exponent = 127 - 15 + 1 - shift as i32;
+                sign | ((exponent as u32) << 23) | (fraction << 13)
             }
         }
         0x1f => sign | 0x7f80_0000 | (mantissa << 13),
@@ -1021,19 +1085,35 @@ fn f32_to_half(value: f32) -> u16 {
     if exponent == 0xff {
         return sign | 0x7c00 | if mantissa == 0 { 0 } else { 0x0200 };
     }
-    // Round to nearest, ties to even, in the half's precision.
     let unbiased = exponent as i32 - 127;
     if unbiased > 15 {
         return sign | 0x7c00;
     }
-    if unbiased < -14 {
-        let subnormal = (mantissa | 0x0080_0000) >> ((-14 - unbiased + 1) as u32);
-        let rounded = (subnormal + 1) >> 1;
-        return sign | rounded as u16;
+    if unbiased >= -14 {
+        // A normal half: drop thirteen mantissa bits, round to nearest with ties to even, and let
+        // the rounding carry into the exponent — a carry out of the largest finite half is the
+        // infinity that nearest-rounding gives.
+        let half_exponent = ((unbiased + 15) as u32) << 10;
+        let total = half_exponent + round_even(mantissa, 13);
+        return if total >= 0x7c00 {
+            sign | 0x7c00
+        } else {
+            sign | total as u16
+        };
     }
-    let half_exponent = ((unbiased + 15) as u16) << 10;
-    let rounded = mantissa + 0x1000;
-    sign | half_exponent | ((rounded >> 13) as u16 & 0x03ff)
+    // A subnormal half is a whole number of `2^-24` units: the significand at the float's own scale
+    // (`1.m · 2^23`) divided by `2^(-unbiased - 1)`, rounded to nearest with ties to even.
+    let significand = mantissa | 0x0080_0000;
+    let shift = (-unbiased - 1) as u32;
+    if shift > 24 {
+        return sign;
+    }
+    let rounded = round_even(significand, shift);
+    if rounded >= 0x0400 {
+        // Rounded up out of the subnormals into the smallest normal.
+        return sign | 0x0400;
+    }
+    sign | rounded as u16
 }
 
 #[cfg(test)]
@@ -1042,14 +1122,53 @@ mod tests {
 
     #[test]
     fn half_round_trips_the_values_a_checkpoint_holds() {
-        for value in [0.0_f32, 1.0, -1.0, 0.5, 0.1, 65_504.0, 1e-5] {
-            let half = f32_to_half(value);
-            let back = half_to_f32(half);
+        // A subnormal half has an absolute precision of 2^-24, not a relative one, so the bound is
+        // half a unit there and relative only from the smallest normal upward.
+        const SMALLEST_NORMAL: f32 = 6.103_515_6e-5;
+        const HALF_UNIT: f32 = 2.980_232_2e-8;
+        for value in [0.0_f32, 1.0, -1.0, 0.5, 0.1, 65_504.0, 1e-5, 1.192_092_9e-7] {
+            let back = half_to_f32(f32_to_half(value));
+            let bound = if value.abs() < SMALLEST_NORMAL {
+                HALF_UNIT
+            } else {
+                value.abs() * 1e-3
+            };
+            assert!((back - value).abs() <= bound, "{value:e} became {back:e}");
+        }
+    }
+
+    #[test]
+    fn a_half_conversion_holds_the_subnormal_range_and_the_specials() {
+        // A quarter of the half's magnitude range is subnormal, and a checkpoint holds RMS weights
+        // and epsilon-like constants there; the encoding is a whole number of 2^-24 units.
+        for (value, units) in [
+            (1e-5_f32, 168_u16),
+            (5.960_464_5e-8, 1),
+            (1.192_092_9e-7, 2),
+            (6.097_555_6e-5, 1023),
+        ] {
+            assert_eq!(f32_to_half(value), units, "{value:e}");
             assert!(
-                (back - value).abs() <= value.abs() * 1e-3,
-                "{value} became {back}"
+                (half_to_f32(units) - value).abs() <= 5.960_464_5e-8,
+                "{value:e}"
             );
         }
+        // Below half a unit of the smallest subnormal the value is zero; past half a unit it is
+        // one, and exactly half a unit ties between 0 and 1, where even wins.
+        assert_eq!(f32_to_half(2.0e-8), 0);
+        assert_eq!(f32_to_half(-2.0e-8), 0x8000);
+        assert_eq!(f32_to_half(2.980_232_2e-8), 0);
+        assert_eq!(f32_to_half(4.5e-8), 1);
+        // A value that rounds up out of the subnormals becomes the smallest normal.
+        assert_eq!(f32_to_half(6.101e-5), 0x0400);
+        // Ties round to even, and the largest finite magnitude's neighbourhood rounds to infinity.
+        assert_eq!(half_to_f32(f32_to_half(65504.0)), 65504.0);
+        assert_eq!(f32_to_half(65_520.0), 0x7c00);
+        assert_eq!(f32_to_half(70_000.0), 0x7c00);
+        assert!(f32_to_half(f32::NAN) & 0x7c00 == 0x7c00);
+        assert!(f32_to_half(f32::NAN) & 0x03ff != 0);
+        assert_eq!(f32_to_half(f32::INFINITY), 0x7c00);
+        assert_eq!(half_to_f32(0x8000), -0.0);
     }
 
     #[test]

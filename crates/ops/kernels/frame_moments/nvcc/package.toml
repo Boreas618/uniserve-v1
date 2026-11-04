@@ -1,0 +1,45 @@
+# The frame_moments operator's CUDA backend: design 5.2's program package.
+#
+# One native module per descriptor: the per-frame group statistics of a video
+# convolution's input (`ops::frame::FrameMomentsCall`, 600 bytes), computed with
+# PyTorch's own Welford operator, block reduction and launch width so the mean and the
+# variance are bit for bit `torch.var_mean`'s over the same row.
+#
+# The module is a shared object carrying the two ATen reductions the reference
+# reuses, vendored under this package's own namespace because a module the Program
+# Server `dlopen`s cannot link torch. The descriptor names the element type and the
+# variance's epsilon, which the call also carries.
+
+op = "frame_moments"
+backend = "nvcc"
+
+[toolchain]
+kind = "nvcc"
+version = "13.0.48"
+packages = []
+
+[module]
+form = "native"
+
+[module.entries]
+launch = "uniserve_frame_moments"
+
+[source]
+kind = "cuda"
+files = [
+    "include/uniserve_frame_moments.h",
+    "src/aten_welford.cuh",
+    "src/aten_block_reduce.cuh",
+    "src/frame.cu",
+    "src/build.py",
+]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+[kernel.descriptors]
+dimensions = { dtype = ["f32"], epsilon = ["0x358637bd", "0x3727c5ac", "0x3eb0c6f7a0b5ed8d"] }
+
+[parameters]

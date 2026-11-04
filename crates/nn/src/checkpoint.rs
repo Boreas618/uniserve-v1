@@ -172,10 +172,17 @@ pub struct HostTensor {
     pub bytes: Vec<u8>,
 }
 
-/// A checkpoint: its mapped shards and the tensors they hold.
+/// A checkpoint: its mapped shards and the tensors they hold, or a pipeline's components.
+///
+/// A flat checkpoint is one shard set; a *pipeline* root holds one subdirectory per component
+/// (`transformer/`, `vae/`, `text_encoder/`, …), each with its own index and therefore its own file
+/// identities, which §8's retained keys name. Opening a root discovers which of the two it is: a
+/// root with a shard set of its own is flat and behaves as it always has, and a root without one is
+/// read as the components its subdirectories hold.
 pub struct Checkpoint {
     files: Vec<CheckpointFile>,
     tensors: BTreeMap<String, TensorLocation>,
+    components: BTreeMap<String, Checkpoint>,
 }
 
 impl Checkpoint {
@@ -187,8 +194,10 @@ impl Checkpoint {
         let index = root.join("model.safetensors.index.json");
         let paths = if index.is_file() {
             shards_from_index(&index)?
+        } else if let Some(paths) = shards_in(root)? {
+            paths
         } else {
-            shards_of_directory(root)?
+            return Self::pipeline(root);
         };
 
         let mut files = Vec::with_capacity(paths.len());
@@ -254,7 +263,87 @@ impl Checkpoint {
         Ok(Self {
             files,
             tensors: locations,
+            components: BTreeMap::new(),
         })
+    }
+
+    /// Open a pipeline root: one component per subdirectory that holds a shard set.
+    fn pipeline(root: &Path) -> Result<Self> {
+        let entries = std::fs::read_dir(root).map_err(|source| Error::Io {
+            path: root.to_path_buf(),
+            source,
+        })?;
+        let mut components = BTreeMap::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| Error::Io {
+                path: root.to_path_buf(),
+                source,
+            })?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if shards_in(&path)?.is_none() {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            components.insert(name, Self::open(&path)?);
+        }
+        if components.is_empty() {
+            return Err(Error::Checkpoint {
+                path: root.to_path_buf(),
+                problem: "no shard set here and none in a component below it".to_owned(),
+            });
+        }
+        Ok(Self {
+            files: Vec::new(),
+            tensors: BTreeMap::new(),
+            components,
+        })
+    }
+
+    /// Whether this is a pipeline root rather than one shard set.
+    pub fn is_pipeline(&self) -> bool {
+        !self.components.is_empty()
+    }
+
+    /// The component numbered `name`, with its own shards and file identities.
+    pub fn component(&self, name: &str) -> Result<&Checkpoint> {
+        self.components.get(name).ok_or_else(|| Error::Checkpoint {
+            path: PathBuf::from(name),
+            problem: format!(
+                "this checkpoint has no component `{name}`; it holds {}",
+                self.components
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        })
+    }
+
+    /// The names of the components, in order.
+    pub fn components(&self) -> impl Iterator<Item = &str> {
+        self.components.keys().map(String::as_str)
+    }
+
+    /// Every element type the checkpoint or one of its components holds, each once.
+    pub fn dtypes(&self) -> Vec<DType> {
+        let mut dtypes: Vec<DType> = Vec::new();
+        for dtype in self
+            .tensors
+            .values()
+            .map(|location| location.dtype)
+            .chain(self.components.values().flat_map(Checkpoint::dtypes))
+        {
+            if !dtypes.contains(&dtype) {
+                dtypes.push(dtype);
+            }
+        }
+        dtypes
     }
 
     /// The checkpoint's shards.
@@ -360,8 +449,15 @@ fn shards_from_index(index: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-/// The `*.safetensors` shards of a directory, in name order.
-fn shards_of_directory(root: &Path) -> Result<Vec<PathBuf>> {
+/// The `*.safetensors` shards of a directory in name order, or `None` when it holds none.
+///
+/// The index, when the directory has one, is what names the shards; a directory with neither is not
+/// a shard set at all, which a pipeline root's discovery uses to tell components from other files.
+fn shards_in(root: &Path) -> Result<Option<Vec<PathBuf>>> {
+    let index = root.join("model.safetensors.index.json");
+    if index.is_file() {
+        return shards_from_index(&index).map(Some);
+    }
     let mut paths = Vec::new();
     let entries = std::fs::read_dir(root).map_err(|source| Error::Io {
         path: root.to_path_buf(),
@@ -381,13 +477,7 @@ fn shards_of_directory(root: &Path) -> Result<Vec<PathBuf>> {
         }
     }
     paths.sort();
-    if paths.is_empty() {
-        return Err(Error::Checkpoint {
-            path: root.to_path_buf(),
-            problem: "no safetensors shard is here".to_owned(),
-        });
-    }
-    Ok(paths)
+    Ok((!paths.is_empty()).then_some(paths))
 }
 
 /// The index file's shape: the metadata block is not read.

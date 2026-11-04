@@ -1,0 +1,39 @@
+# The vsa_prepare_tiles operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
+# driver the Program Server runs for one descriptor and target).
+#
+# The descriptor names the layout as well as the arithmetic: the three row and head
+# stride pairs, since the operator accepts strided Q/K/V views, and the factor
+# table's row stride. `rotated` is zero when Q and K are used as they are, and
+# `norm` says whether the tiles are normalized and rotated before they are pooled.
+# `epsilon` prints as the hexadecimal bits of a float or double. The key is the one
+# `PrepareTilesDescriptor`'s `Display` prints, e.g.
+# `dtype_bf16_heads_32_width_128_rotated_128_tile_rows_64_block_rows_16_epsilon_0x358637bd_norm_true_query_row_stride_4096_query_head_stride_128_key_row_stride_4096_key_head_stride_128_value_row_stride_4096_value_head_stride_128_factor_stride_64`.
+
+op = "vsa_prepare_tiles"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/vsa_prepare_tiles.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+[kernel.descriptors]
+dimensions = { dtype = ["bf16", "f16"], heads = ["8", "16", "24", "32", "64"], width = ["64", "128"], rotated = ["0", "32", "64", "128"], tile_rows = ["64", "128"], block_rows = ["16"], epsilon = ["0x358637bd", "0x3eb0c6f7a0b5ed8d"], norm = ["true", "false"], query_row_stride = ["1024", "1536", "2048", "4096", "8192"], query_head_stride = ["64", "128"], key_row_stride = ["1024", "1536", "2048", "4096", "8192"], key_head_stride = ["64", "128"], value_row_stride = ["1024", "1536", "2048", "4096", "8192"], value_head_stride = ["64", "128"], factor_stride = ["0", "16", "32", "64"] }
+
+[parameters]
