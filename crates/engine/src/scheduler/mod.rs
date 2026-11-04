@@ -79,6 +79,10 @@ mod preemption;
 mod run;
 mod speculation;
 pub(crate) mod submission;
+/// Policy modules as WebAssembly text, and the quiet one a caller drives the
+/// mechanism with (`testing` feature; never part of a serving build).
+#[cfg(feature = "testing")]
+pub(crate) mod testing;
 
 /// The mechanism's door to the executor this process launched.
 pub(crate) fn submissions(executor: Box<dyn Executor>) -> submission::Submissions {
@@ -503,6 +507,10 @@ pub struct Scheduler {
     /// A load the executor published since the last decision: a new load is
     /// worth asking about at once, rather than after a full interval.
     expert_load_new: bool,
+    /// §7.3 step 2's paired pass: an update asked that the following step's
+    /// batches also run in shadow for a world generation, and the answer waits
+    /// for the step that shadows them.
+    shadow_pass: Option<control::ShadowPass>,
     /// The candidate a precopy is preparing on a blocking thread, while it runs
     /// (§7.3 step 2): loading and instantiating a policy must not hold the
     /// serving thread.

@@ -104,45 +104,6 @@ impl Table {
         })
     }
 
-    /// A `[rows, pages]` i32 table over a scratch set, filled once with the set's own page ids:
-    /// page `k` of row `r` is `r * pages + k`.
-    ///
-    /// The ids do not depend on a batch, so the table is written once rather than gathered per
-    /// step: a paired forward's pages are private to it (7.3), and every row of every batch reads
-    /// the same numbering.
-    fn new_scratch(
-        pools: &Arc<Mutex<Pools>>,
-        rows: u32,
-        pages: u32,
-        device: platform::DeviceId,
-        stream: &Stream,
-    ) -> Result<Self> {
-        let mut locked = pools
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let table = Self::new(&mut locked, rows, pages)?;
-        let mut ids = Vec::with_capacity(rows as usize * pages as usize);
-        for row in 0..rows {
-            for page in 0..pages {
-                ids.push(
-                    i32::try_from(row * pages + page)
-                        .map_err(|_| Error::Invalid("a scratch page id does not fit i32".into()))?,
-                );
-            }
-        }
-        let bytes = ids.len() * 4;
-        let mut host = platform::PinnedBuffer::new(device, bytes)?;
-        // SAFETY: the pinned buffer holds exactly `ids.len()` i32 and is written whole before it is
-        // read; the copy is stream-ordered before the first forward that reads the table.
-        unsafe {
-            let target = host.as_mut_slice();
-            let source = std::slice::from_raw_parts(ids.as_ptr().cast::<u8>(), ids.len() * 4);
-            target.copy_from_slice(source);
-            platform::memcpy_async(table.buffer.address(), host.address(), bytes, stream)?;
-        }
-        Ok(table)
-    }
-
     /// The `[rows, width]` i32 view over this table's storage.
     fn view(&self) -> TensorView {
         TensorView::new(
