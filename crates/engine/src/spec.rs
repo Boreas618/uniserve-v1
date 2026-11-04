@@ -20,7 +20,7 @@ use crate::core::{EngineConfig, WorkerGroupConfig};
 use crate::deployment::Deployment;
 use crate::executor::TransferConfig;
 use crate::scheduler::{
-    DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_NUM_BATCHED_TOKENS, RefillPolicy, SchedulerConfig,
+    DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_NUM_BATCHED_TOKENS, SchedulerConfig,
 };
 use crate::worker::WorkerProcessArgs;
 
@@ -52,21 +52,12 @@ pub(crate) fn scheduler_limits(scheduling: &Scheduling) -> anyhow::Result<Schedu
             .map(|requests| requests as usize),
         canvas: None,
         draft_tokens: 0,
-        refill: refill_policy(scheduling),
         // A `Configure` command states the scheduling limits, not the
         // deployment's graph catalog.
         graph_tiers: Vec::new(),
     })
 }
 
-/// The draft cache refill policy `scheduling` states: the values it states
-/// in place of the ones the world measures.
-pub(crate) fn refill_policy(scheduling: &Scheduling) -> RefillPolicy {
-    RefillPolicy {
-        expected_speedup: scheduling.expected_speedup,
-        token_cost: scheduling.refill_token_cost,
-    }
-}
 
 /// A list the spec states, `None` when absent.
 fn sizes(list: &Option<Sizes>) -> Option<Vec<u32>> {
@@ -306,8 +297,7 @@ impl EngineConfig {
             chunked_prefill_size: scheduling
                 .chunked_prefill_size
                 .map_or(DEFAULT_CHUNKED_PREFILL_SIZE, |size| size as usize),
-            refill: refill_policy(scheduling),
-            graph_tiers: {
+                graph_tiers: {
                 // The deployment's captured graph catalog, ascending and
                 // without duplicates: the largest of them bounds a batch's
                 // tokens (`Room.graph_tiers`).

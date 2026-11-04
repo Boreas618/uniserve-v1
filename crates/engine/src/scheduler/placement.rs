@@ -264,7 +264,13 @@ impl Placement {
         let (id, bound_component) = if call.component == DEFAULT_COMPONENT {
             self.worker_target(executor, info, call.request_key, call.kind, choice)
         } else {
-            self.component_target(executor, call.request_key, call.kind, &call.component, choice)
+            self.component_target(
+                executor,
+                call.request_key,
+                call.kind,
+                &call.component,
+                choice,
+            )
         }?;
         let target = (id.clone(), bound_component.to_owned());
         let pinned = if decodes(call.kind) {

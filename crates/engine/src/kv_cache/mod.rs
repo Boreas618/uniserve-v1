@@ -201,6 +201,12 @@ struct PoolInner {
     free_count: usize,
     /// Published pages keyed by their first unit.
     pages: HashMap<u32, PublishedPage>,
+    /// First units of the pages published since the last drain, in the order
+    /// they were published: the step's `Cached` events.
+    published_log: Vec<u32>,
+    /// First units of the pages that went since the last drain, in the order
+    /// they went: the step's `Freed` events.
+    freed_log: Vec<u32>,
     /// First units of every published page copy of a hash. Copies differ by
     /// group, source worker or, after a hash collision, by tokens.
     hash_to_pages: HashMap<u64, Vec<u32>>,
@@ -291,6 +297,7 @@ impl PoolInner {
         let Some(page) = self.pages.remove(&head) else {
             return;
         };
+        self.freed_log.push(head);
         for unit in page.units.iter() {
             let meta = &mut self.meta[unit.0 as usize];
             meta.published = None;
@@ -482,6 +489,8 @@ impl BlockPool {
             fq_tail: None,
             free_count: 0,
             pages: HashMap::new(),
+            published_log: Vec::new(),
+            freed_log: Vec::new(),
             hash_to_pages: HashMap::new(),
             stats: BlockPoolStats {
                 total: (num_units - 1 - scratch) as usize,
@@ -1010,6 +1019,7 @@ impl BlockPool {
             },
         );
         inner.hash_to_pages.entry(hash).or_default().push(head);
+        inner.published_log.push(head);
         if resume.is_none() {
             inner.stats.pages_stored += 1;
         }
@@ -1132,10 +1142,7 @@ impl BlockPool {
             .iter()
             .filter(|(_, page)| {
                 page.aliases.contains(&None)
-                    && page
-                        .units
-                        .iter()
-                        .any(|unit| wanted.contains(&unit.0))
+                    && page.units.iter().any(|unit| wanted.contains(&unit.0))
                     && page.units.iter().all(|unit| {
                         let meta = &inner.meta[unit.0 as usize];
                         meta.state == UnitState::Cached && meta.ref_cnt == 0
@@ -1178,6 +1185,26 @@ impl BlockPool {
         }
         inner.stats.free = inner.free_count;
         idle
+    }
+
+    /// Drains the pages that appeared and went since the last call: their
+    /// first units, in the order it happened.
+    ///
+    /// A page exists for a request only from its publication to its removal,
+    /// and the policy mirrors that from these two lists — one `Cached` and one
+    /// `Freed` event each — so no step has to walk the cache to learn what it
+    /// holds.
+    pub(crate) fn take_page_changes(&self) -> (Vec<u32>, Vec<u32>) {
+        let mut inner = lock(&self.inner);
+        (
+            std::mem::take(&mut inner.published_log),
+            std::mem::take(&mut inner.freed_log),
+        )
+    }
+
+    /// Whether a published page exists whose first unit is `head`.
+    pub(crate) fn holds_page(&self, head: u32) -> bool {
+        lock(&self.inner).pages.contains_key(&head)
     }
 
     /// Returns the number of published prefix pages, referenced or not.
