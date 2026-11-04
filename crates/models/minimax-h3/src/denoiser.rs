@@ -2851,6 +2851,20 @@ impl Denoiser {
         })
     }
 
+    /// Every checkpoint tensor this block's partition reads, as complete names.
+    ///
+    /// The refiner's, the stack's and the AdaLN cache's, in the order `load` reads them. The
+    /// condition encoders are **not** here: they are the `latent_encoder` component's, loaded from
+    /// their own checkpoint directories (`vae`, `audio_vae`) and answered by their own `keys`, even
+    /// though this block holds them once a deployment places them.
+    pub fn keys(config: &DenoiserConfig) -> Vec<String> {
+        let transformer = &config.transformer;
+        let mut keys = crate::conditioning::TokenRefiner::keys(transformer);
+        keys.extend(Transformer::keys(transformer, config.attention));
+        keys.extend(crate::modulation::AdaLnCache::keys(transformer));
+        keys
+    }
+
     /// The checkpoint this denoiser evaluates.
     pub const fn config(&self) -> &DenoiserConfig {
         &self.config
