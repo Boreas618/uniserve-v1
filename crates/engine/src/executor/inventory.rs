@@ -482,9 +482,14 @@ mod tests {
         );
         let error =
             ExecutorInfo::from_inventory(&[narrow, wide]).expect_err("two pools disagree");
+        let named = format!("{error:#}");
         assert!(
-            format!("{error:#}").contains("states"),
-            "the disagreement names both pools: {error:#}"
+            named.contains("pool media") && named.contains("pool text"),
+            "the disagreement names both pools: {named}"
+        );
+        assert!(
+            named.contains("8192") && named.contains("4096"),
+            "and the length each was built for: {named}"
         );
     }
 
