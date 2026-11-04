@@ -342,12 +342,11 @@ fn the_switch_passes_through_its_stages_and_a_revert_brings_the_previous_policy_
         .expect("the first program's precopy");
     let first = world.switch_over().expect("the first switchover");
     // A stage names the boundary it applied at: the step the scheduler had
-    // reached, which is zero before any policy step ran.
-    assert_eq!(
-        first.step,
-        world.step(),
-        "a switchover answers the step it applied at"
-    );
+    // reached, which is zero before any policy step ran. The scheduler runs on
+    // past that boundary as soon as a policy serves, so the answer is a step it
+    // has reached, not the one it is at when asked.
+    assert_eq!(first.step, 0, "the epoch's first switchover applies before any step ran");
+    assert!(world.step() >= first.step);
 
     // The next program is precopied while the first serves, then switched in;
     // the first is kept for a revert.
@@ -355,10 +354,11 @@ fn the_switch_passes_through_its_stages_and_a_revert_brings_the_previous_policy_
         .precopy("priority", 2, toy())
         .expect("the second program's precopy");
     let second = world.switch_over().expect("the second switchover");
-    assert_eq!(
-        second.step,
-        world.step(),
-        "a later switchover names the boundary it applied at as well"
+    assert!(
+        second.step >= first.step,
+        "a later switchover names a boundary no earlier than the first's: {} then {}",
+        first.step,
+        second.step
     );
 
     // A commit keeps the replaced policy until the next precopy (§7.3 step 5),
@@ -370,6 +370,60 @@ fn the_switch_passes_through_its_stages_and_a_revert_brings_the_previous_policy_
     assert!(
         world.revert().is_err(),
         "a second revert has no previous policy"
+    );
+}
+
+#[test]
+fn a_purge_drops_the_policy_a_revert_would_return_to() {
+    let world = World::start();
+    world
+        .precopy("fcfs", 1, toy())
+        .expect("the first program's precopy");
+    world.switch_over().expect("the first switchover");
+    world
+        .precopy("priority", 2, toy())
+        .expect("the second program's precopy");
+    world.switch_over().expect("the second switchover");
+
+    // §7.3 step 6: the generation before the serving one is released once no
+    // batch uses it, so the policy a revert would return to is gone.
+    answer(world.handle.purge_policy()).expect("the purge applies at a boundary");
+    assert!(
+        world.revert().is_err(),
+        "a purged generation cannot be reverted to"
+    );
+}
+
+#[test]
+fn the_engines_commands_reach_a_scheduler_and_name_what_is_not_its_own() {
+    let world = World::start();
+    world.precopy("fcfs", 1, toy()).expect("the precopy");
+
+    // A stage of §7.3 is a scheduler's: it applies at the next boundary.
+    let switchover = proto::process::Command {
+        kind: Some(proto::process::command::Kind::Switchover(
+            proto::process::Switchover { generation: 1 },
+        )),
+    };
+    answer(world.handle.engine_command(switchover))
+        .expect("a switchover applies at the scheduler's next boundary");
+
+    // A precopy's module comes from the Program Server, whose client the
+    // process holding it resolves: the command is answered with that.
+    let precopy = proto::process::Command {
+        kind: Some(proto::process::command::Kind::Precopy(
+            proto::process::Precopy {
+                kernels: Vec::new(),
+                policy: None,
+                generation: 2,
+            },
+        )),
+    };
+    let refused = answer(world.handle.engine_command(precopy))
+        .expect_err("a precopy is not one scheduler's to prepare");
+    assert!(
+        refused.contains("Program Server"),
+        "the refusal names the owner of the program: {refused}"
     );
 }
 

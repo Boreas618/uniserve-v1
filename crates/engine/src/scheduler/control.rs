@@ -149,6 +149,13 @@ impl Scheduler {
     /// refuse what the loaded workers cannot serve and report their own
     /// rejections.
     pub(super) fn handle_command(&mut self, cmd: Command) -> bool {
+        // Work that finished on another thread before this command arrived is
+        // taken first, so every answer describes the state the command found:
+        // the slot holds the candidate a precopy prepared by the time its
+        // answer was sent.
+        self.take_prepared_policy();
+        self.apply_policy_stage();
+
         match cmd {
             Command::Submit(submissions) => {
                 for Submission { request, event_tx } in submissions {
@@ -392,6 +399,54 @@ impl Scheduler {
                 let _ = answer.send(Err(format!("the precopy thread did not start: {error}")));
             }
         }
+    }
+
+    /// Installs `program` as this scheduler's policy without a control thread.
+    ///
+    /// §7.3's two stages run here on the calling thread: the precopy
+    /// instantiates the program on this boundary's state and trials every
+    /// decision of §4.4's table against it, and the switchover puts it in. A
+    /// world with no control thread — the integration tests, and a simulated
+    /// engine's — has no other way to have a policy, and a scheduler with no
+    /// policy decides nothing, so without this such a world schedules no work
+    /// at all.
+    ///
+    /// Production installs a policy through the `PrecopyPolicy` and
+    /// `StagePolicy` commands, with the load, the instantiation and the trial on
+    /// a blocking thread so the serving thread is never held; this is that pair
+    /// without the thread and without the blocking hop, and it is for tests
+    /// only: the caller pays the whole cost of the precopy.
+    ///
+    /// The stage is applied where a stage is always applied — at a boundary with
+    /// nothing in flight — so the first call happens before the world submits
+    /// anything.
+    pub fn install_policy(
+        &mut self,
+        program: PolicyProgram,
+        source: &dyn PolicySource,
+    ) -> Result<(), String> {
+        let state = views::trial_state(self, self.step, self.recorder.recorded());
+        let live = views::live(self, self.step, self.recorder.recorded());
+        let ceilings = ceilings_of(BatchCapacity::of(&self.info));
+        let engine = policy::process_engine().map_err(|error| error.to_string())?;
+        let room = state.room.clone();
+        let checked = mechanism::Checked::new(&live, &room);
+        let candidate = PolicySlot::prepare(
+            engine,
+            source,
+            program,
+            state,
+            &ceilings,
+            &checked,
+        )
+        .map_err(|error| error.to_string())?;
+        self.policy_prepared = Some(candidate);
+        self.request_stage(Stage::Switchover, None, None);
+        self.apply_policy_stage();
+        if self.policy.is_none() {
+            return Err("the policy did not become this scheduler's".to_owned());
+        }
+        Ok(())
     }
 
     /// Takes the candidate a precopy prepared, once its blocking thread is done.
