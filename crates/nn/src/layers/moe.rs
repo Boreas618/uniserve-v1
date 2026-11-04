@@ -41,14 +41,30 @@ use crate::forward::Forward;
 use crate::layers::Linear;
 use crate::weights::{QuantizedStack, Weight};
 
-/// Scratch the encoded expert products are handed.
+/// The scratch one grouped product of `routes` permuted rows and `width` columns needs, in bytes.
 ///
-/// The size the trtllm-gen batched-GEMM tactic actually needs is the artifact's, so this is a *floor*
-/// rather than a promise: the entry computes its own requirement from the call and allocates a larger
-/// buffer when this one is short, which costs one allocation instead of a wrong result. Sizing it for
-/// the largest Qwen3-MoE case we serve (128 experts, 8 routes, 7168 hidden) keeps the launch path
-/// allocation-free, which is what a captured graph needs.
-const MOE_WORKSPACE_BYTES: u64 = 16 << 20;
+/// The artifact states it, so it is read rather than guessed: `getWorkspaceSizesInBytes`
+/// (`trtllmGen_bmm_export/BatchedGemmInterface.h`) sums the gated activation's row-max planes, its
+/// tile bars and the persistent scheduler's counter, each of the first two padded to a kibibyte.
+/// `routes` is padded to whole MMA tiles because the program walks whole tiles.
+///
+/// The size is a property of the plan, not of the step: it is computed from the route count the plan
+/// states, so every replay of a captured bucket reserves the same number of bytes and nothing in a
+/// step grows a buffer.
+fn grouped_workspace_bytes(routes: u64, width: u64) -> u64 {
+    let token_tile = u64::from(MMA_TILE.0) * u64::from(MMA_CLUSTER.0);
+    let padded = routes.max(1).div_ceil(token_tile) * token_tile;
+    // One FP32 row maximum per 128 elements of the padded tile grid.
+    let row_max = width * padded / 128 * 4;
+    // One half-word of tile bars per (token tile, width tile) pair.
+    let bars = (padded / token_tile) * width.div_ceil(u64::from(MMA_TILE.1)) / 2 * 4;
+    pad_1k(row_max) + pad_1k(bars) + 4
+}
+
+/// `bytes` rounded up to a kibibyte, the artifact's padding of one workspace plane.
+const fn pad_1k(bytes: u64) -> u64 {
+    bytes.div_ceil(1024) * 1024
+}
 
 /// The tile geometry the grouped products' packages are compiled for.
 ///
@@ -678,6 +694,18 @@ impl Moe {
         }
     }
 
+    /// The scratch one launch of the encoded products needs, for `routes` permuted rows.
+    ///
+    /// One buffer serves both products — they run one after the other on the stream and neither keeps
+    /// a view past its launch — so the answer is the larger of the two products' requirements: the
+    /// gated first product writes `2 · intermediate` columns, the second `hidden`.
+    pub fn workspace_bytes(&self, routes: u64) -> u64 {
+        let width = u64::from(self.intermediate).saturating_mul(2);
+        let first = grouped_workspace_bytes(routes, width);
+        let second = grouped_workspace_bytes(routes, u64::from(self.hidden));
+        first.max(second)
+    }
+
     /// The first product's descriptor over an encoded stack: the block scale's element type and the
     /// scale layout are the weights', so they are arguments.
     pub fn gather_nvfp4_descriptor(
@@ -751,12 +779,24 @@ impl Moe {
         // 1-3. The same prefix the dense block runs.
         let routes = self.route(f, hidden)?;
 
-        // The two encoded products take scratch the program uses for its own bookkeeping. The size is
-        // the artifact's, not ours: both keys are trtllm-gen modules, and their entry computes what its
-        // tactic needs and grows this buffer itself when it is short. What a caller buys by sizing it
-        // is that no launch allocates. One buffer serves both products because they run one after the
-        // other on this stream and neither keeps a view past its launch.
-        let workspace = arena.tensor(DType::U8, Shape::new(&[MOE_WORKSPACE_BYTES]))?;
+        // The two encoded products take scratch the program uses for its own bookkeeping, sized from
+        // the plan's route count by the artifact's own arithmetic. Nothing grows it inside a step: a
+        // buffer that resized would be an allocation the captured graph does not own, so a plan whose
+        // arena cannot hold the scratch is refused here, naming the number of bytes it needs.
+        let bytes = self.workspace_bytes(routes.rows);
+        let available = arena.bytes().saturating_sub(arena.used());
+        let workspace = arena
+            .tensor(DType::U8, Shape::new(&[bytes]))
+            .map_err(|error| {
+                Error::shape(
+                    "Moe",
+                    format!(
+                        "the encoded products need {bytes} bytes of scratch for {} permuted rows, \
+                         and the arena has {available} left before it ends: {error}",
+                        routes.rows
+                    ),
+                )
+            })?;
 
         // 4. FC1 over the packed up/gate stack: the gated product of each permuted row.
         let gated = arena.tensor(hidden.dtype, Shape::new(&[routes.rows, intermediate]))?;
@@ -1196,6 +1236,23 @@ pub(super) mod tests {
             true,
             None,
         )
+    }
+
+    /// The scratch is the plan's, computed from the artifact's arithmetic: a bucket of 8 routes over
+    /// 128 experts costs the row-max planes and tile bars of the wider product, and a bucket twice as
+    /// wide costs more. What it must not be is a floor: the size the largest Qwen3-MoE case needs is
+    /// far below the sixteen mebibytes an earlier constant reserved for it.
+    #[test]
+    fn the_scratch_is_sized_from_the_route_count_and_not_from_a_floor() {
+        let quantized = quantized_block(2048, 768).unwrap();
+        let small = quantized.workspace_bytes(8);
+        let large = quantized.workspace_bytes(4096);
+        assert!(small > 0);
+        assert!(large > small, "{large} is not more than {small}");
+        // Both planes are kibibyte-padded and the scheduler's counter is four bytes, so every size
+        // the plan can ask for is congruent to four modulo a kibibyte.
+        assert_eq!(small % 1024, 4, "{small}");
+        assert!(large < 16 << 20, "{large} exceeds the floor it replaced");
     }
 
     #[test]
