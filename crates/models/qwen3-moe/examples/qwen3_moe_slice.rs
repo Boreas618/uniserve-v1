@@ -525,12 +525,8 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     let seq_lens = vec![i32::try_from(count).unwrap_or(0)];
     let query_offsets = vec![0_i32, i32::try_from(count).unwrap_or(0)];
     let logits_rows = vec![i32::try_from(count.saturating_sub(1)).unwrap_or(0)];
-    // The page table's width is the compiled module's, not this request's: `paged_attention` is
-    // compiled for `len_40960`, so the kernel walks `40960 / page_size` columns of every row and a
-    // narrower table is read past its end. The columns past this request's one page address page 0,
-    // which `seq_lens` never reaches.
-    let pages_per_row = i32::try_from(MAX_KV_LEN.div_ceil(page_size)).unwrap_or(1);
-    let block_table: Vec<i32> = vec![0; usize::try_from(pages_per_row).unwrap_or(1)];
+    let pages_per_row = i32::try_from(pages).unwrap_or(1);
+    let block_table: Vec<i32> = (0..pages_per_row).collect();
 
     let positions = upload_i32(&stream, &arena, &positions)?;
     let slot_mapping = upload_i32(&stream, &arena, &slots)?;
@@ -555,7 +551,7 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
         phase: PhaseKind::Prefill,
         page_size: u32::try_from(page_size).unwrap_or(64),
         num_tokens: u32::try_from(count).unwrap_or(0),
-        max_kv_len: u32::try_from(MAX_KV_LEN).unwrap_or(0),
+        max_kv_len: u32::try_from(pages.saturating_mul(page_size)).unwrap_or(0),
         draft_lens: None,
     };
 
@@ -729,10 +725,6 @@ fn download_f32(stream: &platform::Stream, view: TensorView, elements: usize) ->
     stream.synchronize()?;
     Ok(values)
 }
-
-/// The longest key sequence the attention modules are compiled for: the store's key says
-/// `len_40960`, and the page table's width is that length in pages.
-const MAX_KV_LEN: u64 = 40_960;
 
 /// The arena for one token's embedding: the plan's workspace plus the output row and slack.
 fn arena_bytes(plan: &qwen3_moe::Plan) -> u64 {
