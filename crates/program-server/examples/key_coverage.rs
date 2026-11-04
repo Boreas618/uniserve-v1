@@ -43,6 +43,7 @@ struct Covering {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut fixture = None;
+    let mut declared_blocked = false;
     let mut target = "sm_100a".to_owned();
     let mut kernels = PathBuf::from("crates/ops/kernels");
 
@@ -51,6 +52,9 @@ fn main() -> ExitCode {
         let value = || argv.clone().next().cloned();
         match flag.as_str() {
             "--fixture" => fixture = value(),
+            // The fixture's declared-blocked block: the rows no package fills yet, in the one form
+            // both the fixture and the store test read. One derivation, two consumers.
+            "--declared-blocked" => declared_blocked = true,
             "--target" => target = value().unwrap_or(target),
             "--kernels" => {
                 kernels = PathBuf::from(value().unwrap_or(kernels.display().to_string()))
@@ -82,15 +86,20 @@ fn main() -> ExitCode {
         }
     };
 
-    println!(
-        "# {} keys of {fixture} against {} packages, target {target}",
-        rows.len(),
-        packages.values().flatten().count()
-    );
+    if !declared_blocked {
+        println!(
+            "# {} keys of {fixture} against {} packages, target {target}",
+            rows.len(),
+            packages.values().flatten().count()
+        );
+    }
 
     let mut uncovered = 0;
     for (op, key) in &rows {
         match cover(&packages, op, key, &target) {
+            Ok(covering) if declared_blocked => {
+                let _ = covering;
+            }
             Ok(covering) => println!(
                 "covered\t{op}\t{}\t{}\t{}\t{key}",
                 covering.backend,
@@ -104,7 +113,11 @@ fn main() -> ExitCode {
             ),
             Err(reason) => {
                 uncovered += 1;
-                println!("MISSING\t{op}\t{reason}\t{key}");
+                if declared_blocked {
+                    println!("# blocked:\t{op}\t{key}\t{reason}");
+                } else {
+                    println!("MISSING\t{op}\t{reason}\t{key}");
+                }
             }
         }
     }
@@ -114,6 +127,13 @@ fn main() -> ExitCode {
     // second can never be installed, so every key of it is uncovered for a deeper reason.
     let declared: BTreeSet<&str> = ops::install::operators().iter().copied().collect();
     let filled: BTreeSet<&str> = packages.keys().map(String::as_str).collect();
+
+    // With `--declared-blocked` the output is the block itself: nothing else goes to stdout, so a
+    // regeneration of the fixture is a paste and not a transcription.
+    if declared_blocked {
+        eprintln!("{uncovered} blocked row(s) of {}", rows.len());
+        return ExitCode::SUCCESS;
+    }
 
     let orphaned: Vec<&str> = filled.difference(&declared).copied().collect();
     if !orphaned.is_empty() {

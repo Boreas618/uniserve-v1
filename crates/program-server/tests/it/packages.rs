@@ -2,7 +2,7 @@
 //! package in the tree parses as the design section 5.2 says, names the
 //! operator and backend of its directories, and its declared files exist.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use program_server::manifest::Manifest;
@@ -71,10 +71,7 @@ fn every_kernel_package_in_the_tree_is_a_package_the_server_can_install() {
 /// The file is generated, not committed (`cargo run -p ops --example
 /// qwen3_moe_keys` writes `.local/qwen3-moe-keys.txt`), so the test reports
 /// how to produce it when it is absent.
-fn slice_keys() -> Option<Vec<(String, String)>> {
-    // The committed copy first, so a clean checkout checks both fixtures; the
-    // generated one beside it is what the model's example writes, and a host
-    // that regenerated the keys today should be checking today's.
+fn slice_keys_text() -> Option<(std::path::PathBuf, String)> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let committed = root.join("notes/programs/qwen3-moe-keys.txt");
     let generated = root.join(".local/qwen3-moe-keys.txt");
@@ -90,23 +87,31 @@ fn slice_keys() -> Option<Vec<(String, String)>> {
         );
         return None;
     };
-    Some(
-        text.lines()
-            .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
-            .filter_map(|line| {
-                let (operator, key) = line.split_once('\t')?;
-                Some((operator.trim().to_owned(), key.trim().to_owned()))
-            })
-            .collect(),
-    )
+    Some((path, text))
 }
+
+/// The rows of a fixture's print: everything that is not a `#` comment, split at the tab.
+fn rows_of(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+        .filter_map(|line| {
+            let (operator, key) = line.split_once('\t')?;
+            Some((operator.trim().to_owned(), key.trim().to_owned()))
+        })
+        .collect()
+}
+
 
 #[test]
 fn every_qwen3_moe_key_of_the_slice_is_covered_by_its_operator_s_package() {
-    let Some(keys) = slice_keys() else {
+    let Some((_, text)) = slice_keys_text() else {
         return;
     };
+    let keys = rows_of(&text);
     assert!(!keys.is_empty(), "the slice's fixture names no keys");
+    // The rows this deployment needs and no package fills yet, which the fixture states with the
+    // coverage tool's own sentence. A fixture without the block keeps the strict rule.
+    let blocked = declared_blocked_with_reasons(&text);
 
     let mut manifests = Vec::new();
     for package in packages() {
@@ -115,38 +120,81 @@ fn every_qwen3_moe_key_of_the_slice_is_covered_by_its_operator_s_package() {
         }
     }
 
-    let mut failures = Vec::new();
+    let mut failures: Vec<((String, String), String)> = Vec::new();
     for (operator, key) in &keys {
         let mut covering = manifests
             .iter()
             .filter(|manifest| &manifest.op == operator)
             .peekable();
         if covering.peek().is_none() {
-            failures.push(format!("{operator}: no package of the tree fills it"));
+            failures.push((
+                (operator.clone(), key.clone()),
+                format!("{operator}: no package of the tree fills it"),
+            ));
             continue;
         }
         if !covering.any(|manifest| manifest.covers(key)) {
-            failures.push(format!(
-                "{operator}: no package covers {key} (its descriptors: {})",
-                manifests
-                    .iter()
-                    .filter(|manifest| &manifest.op == operator)
-                    .map(|manifest| format!(
-                        "{} {:?}",
-                        manifest.backend,
-                        manifest.kernel.as_ref().map(|kernel| &kernel.descriptors)
-                    ))
-                    .collect::<Vec<_>>()
-                    .join("; ")
+            failures.push((
+                (operator.clone(), key.clone()),
+                format!(
+                    "{operator}: no package covers {key} (its descriptors: {})",
+                    manifests
+                        .iter()
+                        .filter(|manifest| &manifest.op == operator)
+                        .map(|manifest| format!(
+                            "{} {:?}",
+                            manifest.backend,
+                            manifest.kernel.as_ref().map(|kernel| &kernel.descriptors)
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
             ));
         }
     }
+
+    // Sets of `(operator, key)`, never counts: ten failures with one row wrong and one row missing
+    // is a count of ten and a broken store. The reason is the fixture's; this compares membership.
+    let undeclared: Vec<&((String, String), String)> = failures
+        .iter()
+        .filter(|(row, _)| !blocked.contains_key(row))
+        .collect();
+    let stale: Vec<&(String, String)> = blocked
+        .keys()
+        .filter(|row| !failures.iter().any(|(failing, _)| failing == *row))
+        .collect();
+
     assert!(
-        failures.is_empty(),
-        "{} of {} slice keys are not covered:\n{}",
-        failures.len(),
+        undeclared.is_empty(),
+        "{} of {} slice keys are not covered and are not declared blocked:\n{}",
+        undeclared.len(),
         keys.len(),
-        failures.join("\n")
+        undeclared
+            .iter()
+            .map(|(row, message)| format!(
+                "row {}\t{} is not declared blocked and does not build: {message}",
+                row.0, row.1
+            ))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert!(
+        stale.is_empty(),
+        "{} row(s) are declared blocked and now build — delete them from the fixture's block:\n{}",
+        stale.len(),
+        stale
+            .iter()
+            .map(|row| format!(
+                "row {}\t{} is declared blocked and now builds{}",
+                row.0,
+                row.1,
+                blocked
+                    .get(*row)
+                    .map(|why| format!(" (it was: {why})"))
+                    .unwrap_or_default()
+            ))
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }
 
@@ -221,6 +269,20 @@ fn every_element_type_a_descriptor_can_carry_is_one_ops_prints() {
 
 /// The keys a fixture asks for, as `operator<TAB>key` lines: the H3 file is the one
 /// model commits, the slice's is generated.
+/// The blockers a fixture declares, keyed by `(operator, key)` with the tool's sentence.
+fn declared_blocked_with_reasons(text: &str) -> BTreeMap<(String, String), String> {
+    text.lines()
+        .filter_map(|line| line.strip_prefix("# blocked:\t"))
+        .filter_map(|row| {
+            let mut fields = row.split('\t');
+            let operator = fields.next()?.trim().to_owned();
+            let key = fields.next()?.trim().to_owned();
+            let why = fields.next().unwrap_or("").trim().to_owned();
+            Some(((operator, key), why))
+        })
+        .collect()
+}
+
 fn fixture_keys(path: &Path) -> Option<Vec<(String, String)>> {
     let Ok(text) = std::fs::read_to_string(path) else {
         eprintln!("SKIPPED (fixture): no {}", path.display());
@@ -288,12 +350,17 @@ fn every_fixture_key_parses_to_the_fields_its_operator_s_packages_declare() {
         root.join("../../.local/qwen3-moe-keys.txt"),
         root.join("../../notes/programs/minimax-h3-keys.txt"),
     ];
-    let mut failures = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
     let mut checked = 0usize;
     for fixture in &fixtures {
         let Some(keys) = fixture_keys(fixture) else {
             continue;
         };
+        // This fixture's declared-blocked rows: no package fills them yet, so a missing field is the
+        // coverage gate's finding, which the fixture states, not this parse gate's.
+        let text = std::fs::read_to_string(fixture).unwrap_or_default();
+        let blocked = declared_blocked_with_reasons(&text);
+        let mut failed_here: BTreeSet<(String, String)> = BTreeSet::new();
         for (operator, key) in keys {
             let declared: Vec<(String, BTreeMap<String, Vec<String>>)> = packages()
                 .into_iter()
@@ -335,6 +402,10 @@ fn every_fixture_key_parses_to_the_fields_its_operator_s_packages_declare() {
                 })
             });
             if !covering {
+                failed_here.insert((operator.clone(), key.clone()));
+                if blocked.contains_key(&(operator.clone(), key.clone())) {
+                    continue;
+                }
                 // Name what is wrong rather than that something is: a key whose
                 // values a package does not declare and a key whose field names
                 // are different are both "not covered", and the fix for each is
@@ -364,7 +435,24 @@ fn every_fixture_key_parses_to_the_fields_its_operator_s_packages_declare() {
                         }
                     })
                     .collect();
-                failures.push(format!("{operator}\t{key}: no package covers it; {}", why.join("; ")));
+                failures.push(format!(
+                    "row {operator}\t{key} is not declared blocked and does not build: no package covers it; {}",
+                    why.join("; ")
+                ));
+            }
+        }
+        for row in blocked.keys() {
+            if !failed_here.contains(row) {
+                failures.push(format!(
+                    "row {}\t{} is declared blocked and now builds{} — delete it from {}'s block",
+                    row.0,
+                    row.1,
+                    blocked
+                        .get(row)
+                        .map(|why| format!(" (it was: {why})"))
+                        .unwrap_or_default(),
+                    fixture.display()
+                ));
             }
         }
     }
