@@ -564,11 +564,7 @@ pub(crate) fn nanos_at(unix_secs: f64) -> Nanos {
 /// through its allocations (`Storage::request_pool`). A slot is free only when
 /// both have room, so the room is their minimum.
 fn free_slots(scheduler: &Scheduler) -> usize {
-    let held_rows = scheduler
-        .running
-        .values()
-        .filter(|state| state.allocations().is_some())
-        .count();
+    let held_rows = scheduler.rows_held;
     let by_rows = (scheduler.info.request_slots as usize).saturating_sub(held_rows);
     let by_requests = scheduler
         .config
