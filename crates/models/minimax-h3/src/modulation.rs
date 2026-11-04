@@ -33,7 +33,8 @@
 //! layers of [`crate::transformer`] index with it.
 
 use nn::layers::gather_rows;
-use nn::weights::Weight;
+use nn::weights::{Weight, WeightLoader, WeightRequest};
+use nn::Shape;
 use nn::{Forward, TensorView};
 
 use crate::{Error, Result};
@@ -263,6 +264,127 @@ pub fn entries(
         }
     }
     Ok((times, table))
+}
+
+
+/// The checkpoint projections the cache is built from, read once at load.
+///
+/// The reference builds the cache with one shared pair of FP32 linear maps over the sinusoidal
+/// timestep embedding and one projection per layer, then releases them
+/// (`uniserve/models/minimax_h3/modulation.py`, `TimestepEmbedding`). Nothing runs them per
+/// evaluation, so they are held only until [`Projections::fill`] has produced the tables once.
+pub struct Projections {
+    /// `time_embedder.linear_1`: `[time_hidden, frequency]`, FP32, with its bias.
+    first: (Weight, Weight),
+    /// `time_embedder.linear_2`: `[time_dim, time_hidden]`, FP32, with its bias.
+    second: (Weight, Weight),
+    /// One `adaln_proj.linear` per layer: `[18 * hidden, time_dim]`, with its bias.
+    layers: Vec<(Weight, Weight)>,
+    /// `norm_out.linear`: `[2 * hidden, time_dim]`, with its bias.
+    output: (Weight, Weight),
+    frequency_dim: u32,
+    time_hidden_dim: u32,
+    time_dim: u32,
+    hidden_size: u32,
+}
+
+impl Projections {
+    /// Read the cache's projections out of a DiT partition's checkpoint.
+    pub fn load(
+        config: &crate::config::TransformerConfig,
+        loader: &mut WeightLoader<'_>,
+    ) -> Result<Self> {
+        let hidden = u64::from(config.hidden_size);
+        let time_dim = u64::from(config.time_dim);
+        let time_hidden = u64::from(config.time_hidden_dim);
+        let frequency = u64::from(config.frequency_dim);
+        let layers = (0..config.num_hidden_layers)
+            .map(|index| {
+                let prefix = format!("transformer_blocks.{index}.adaln_proj.linear");
+                Ok((
+                    matrix(loader, &format!("{prefix}.weight"), VECTORS as u64 * hidden * u64::from(TAGS), time_dim)?,
+                    vector(loader, &format!("{prefix}.bias"), VECTORS as u64 * hidden * u64::from(TAGS))?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            first: (
+                matrix(loader, "time_embedder.linear_1.weight", time_hidden, frequency)?,
+                vector(loader, "time_embedder.linear_1.bias", time_hidden)?,
+            ),
+            second: (
+                matrix(loader, "time_embedder.linear_2.weight", time_dim, time_hidden)?,
+                vector(loader, "time_embedder.linear_2.bias", time_dim)?,
+            ),
+            layers,
+            output: (
+                matrix(loader, "norm_out.linear.weight", 2 * hidden, time_dim)?,
+                vector(loader, "norm_out.linear.bias", 2 * hidden)?,
+            ),
+            frequency_dim: config.frequency_dim,
+            time_hidden_dim: config.time_hidden_dim,
+            time_dim: config.time_dim,
+            hidden_size: config.hidden_size,
+        })
+    }
+
+    /// The sinusoidal embedding a step's network times need: `[groups, frequency_dim]` FP32.
+    ///
+    /// Half a pairwise spectrum over the timestep, `sin` on the even columns and `cos` on the odd
+    /// ones, at the frequencies `theta_high^(-2i / frequency_dim)`: the released recipe, written
+    /// here because it is the only part of the cache that is arithmetic on a host value.
+    pub fn frequencies(&self, times: &[f32]) -> Result<Vec<u8>> {
+        if times.is_empty() {
+            return Err(Error::checkpoint(
+                "a timestep embedding needs at least one time".to_owned(),
+            ));
+        }
+        let half = (self.frequency_dim / 2) as usize;
+        let mut bytes = Vec::with_capacity(times.len() * self.frequency_dim as usize * 4);
+        for time in times {
+            for index in 0..half {
+                let exponent = 2.0 * index as f64 / f64::from(self.frequency_dim);
+                let angle = f64::from(*time) * 10_000_f64.powf(-exponent);
+                bytes.extend_from_slice(&(angle.sin() as f32).to_le_bytes());
+                bytes.extend_from_slice(&(angle.cos() as f32).to_le_bytes());
+            }
+        }
+        Ok(bytes)
+    }
+
+    /// How many layers the projections cover.
+    pub fn layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// The network width the modulation tables are built for.
+    pub const fn hidden_size(&self) -> u32 {
+        self.hidden_size
+    }
+
+    /// The width of the timestep embedding's output.
+    pub const fn time_dim(&self) -> u32 {
+        self.time_dim
+    }
+}
+
+/// A `[rows, columns]` checkpoint weight.
+fn matrix(
+    loader: &mut WeightLoader<'_>,
+    name: &str,
+    rows: u64,
+    columns: u64,
+) -> Result<Weight> {
+    Ok(loader.load(&WeightRequest::region(
+        name,
+        0,
+        Shape::new(&[rows, columns]),
+    ))?)
+}
+
+/// A `[rows]` checkpoint weight.
+fn vector(loader: &mut WeightLoader<'_>, name: &str, rows: u64) -> Result<Weight> {
+    Ok(loader.load(&WeightRequest::region(name, 0, Shape::new(&[rows])))?)
 }
 
 #[cfg(test)]
