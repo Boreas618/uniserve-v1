@@ -111,13 +111,8 @@ impl Layer {
 
         // Attention: normalize, attend, and fold the gated update into `out` while normalizing the
         // feed-forward's input.
-        let attention_norm = ModulatedRmsNorm::new(
-            self.norm1,
-            shift_attention,
-            scale_attention,
-            None,
-            self.eps,
-        )?;
+        let attention_norm =
+            ModulatedRmsNorm::new(self.norm1, shift_attention, scale_attention, None, self.eps)?;
         attention_norm.forward(f, hidden, None, rows, normalized, None, None)?;
         self.attention
             .forward(f, normalized, factors, visible, total_rows, update)?;
