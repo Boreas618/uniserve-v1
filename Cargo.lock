@@ -3089,6 +3089,7 @@ dependencies = [
  "clap",
  "libc",
  "ops",
+ "platform",
  "prost",
  "prost-build",
  "protox",

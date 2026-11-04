@@ -404,7 +404,11 @@ impl Op for Nvfp4Gemm {
         // of two: `k` is the contraction the program actually runs, and a bound with two terms in
         // it was tighter than any correct kernel by the width of the reduction (programs measured
         // one element outside it on a correct program).
-        Tolerance::rounding(u64::from(descriptor.k), descriptor.accumulate, descriptor.output)
+        Tolerance::rounding(
+            u64::from(descriptor.k),
+            descriptor.accumulate,
+            descriptor.output,
+        )
     }
 }
 
