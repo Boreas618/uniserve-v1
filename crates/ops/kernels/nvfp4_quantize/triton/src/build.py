@@ -5,17 +5,17 @@ layout, the elements one program encodes and the dependent-launch flag. The row
 count comes from the grid, so one module serves every row count.
 """
 
+import triton
+
 import _compile
 import nvfp4_quantize as kernels
 
 #: The element types the operator encodes, as Triton spells them.
 DTYPES = {"bf16": "*bf16", "f16": "*fp16"}
 
-#: The block-scale layouts a program writes. Only the linear one is served: the
-#: swizzled layout pads rows to 128 and scale columns to 4, and those padding
-#: elements are part of the scale tensor the operator hands over, so writing it
-#: needs the padding in the same launch that writes the scales.
-LAYOUTS = {"linear"}
+#: The row block and scale-column group the swizzled layout interleaves.
+SWIZZLE_ROWS = 128
+SWIZZLE_COLUMNS = 4
 
 
 def warps_of(block):
@@ -27,10 +27,17 @@ def spec(fields, parameters, target):
     """The compilation of one nvfp4_quantize descriptor."""
     columns = int(fields["columns"])
     block = int(fields["block"])
-    if fields["layout"] not in LAYOUTS:
-        raise SystemExit(f"the {fields['layout']} scale layout is not served")
     if columns % block != 0:
         raise SystemExit(f"{block} elements do not divide a row of {columns}")
+    scale_columns = columns // 16
+    swizzled = fields["layout"] == "swizzled_128x4"
+    if fields["layout"] not in ("linear", "swizzled_128x4"):
+        raise SystemExit(f"the {fields['layout']} scale layout is not served")
+    padded_columns = (
+        (scale_columns + SWIZZLE_COLUMNS - 1) // SWIZZLE_COLUMNS * SWIZZLE_COLUMNS
+        if swizzled
+        else scale_columns
+    )
     pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
     return {
         "kernel": kernels._nvfp4_quantize_kernel,
@@ -43,11 +50,19 @@ def spec(fields, parameters, target):
             "COLUMNS": "constexpr",
             "BLOCK": "constexpr",
             "SCALE_COLUMNS": "constexpr",
+            "SWIZZLED": "constexpr",
+            "PADDED_COLUMNS": "constexpr",
+            "PADDED_TILE": "constexpr",
         },
         "constexprs": {
             "COLUMNS": columns,
             "BLOCK": block,
-            "SCALE_COLUMNS": columns // 16,
+            "SCALE_COLUMNS": scale_columns,
+            "SWIZZLED": swizzled,
+            "PADDED_COLUMNS": padded_columns,
+            # One program writes a whole padded row of zeros; the tile is the
+            # padded width rounded up to the power of two arange needs.
+            "PADDED_TILE": triton.next_power_of_2(max(padded_columns, 1)),
         },
         "options": {"num_warps": warps_of(block), "launch_pdl": pdl},
     }

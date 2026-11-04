@@ -18,10 +18,24 @@ than composed arithmetic:
 
 A block whose E4M3 scale rounds to zero encodes to zeros: the reciprocal of a
 zero scale is not a number, and the vendor encoder multiplies by zero there.
+
+The block scales are written in one of the two layouts a product reads: the
+linear matrix, whose rows are the matrix's own, or the 128x4 swizzle, which pads
+the rows to a multiple of 128 and the scale columns to a multiple of 4 and
+interleaves them. The padded entries are part of the tensor the operator hands
+over and the reference encoder writes them as zeros, so this kernel writes them
+too — inside the same launch, since the operator's grid is the matrix's elements.
 """
 
 import triton
 import triton.language as tl
+
+#: The row block the swizzled layout interleaves: 128 rows, in four groups of 32.
+SWIZZLE_ROWS = tl.constexpr(128)
+SWIZZLE_GROUPS = tl.constexpr(4)
+SWIZZLE_ROWS_PER_GROUP = tl.constexpr(32)
+#: The scale columns the swizzled layout groups.
+SWIZZLE_COLUMNS = tl.constexpr(4)
 
 
 @triton.jit
@@ -78,6 +92,27 @@ def _e2m1_pair(even, odd):
 
 
 @triton.jit
+def _swizzled_offset(rows, columns, PADDED_COLUMNS: tl.constexpr):
+    """Flat offsets of the 128x4 swizzle for rows and scale columns ``rows``/``columns``.
+
+    The layout groups the scale matrix into blocks of 128 rows and 4 scale
+    columns; within a block the 128 rows split into four groups of 32 and the
+    four columns are interleaved fastest.
+    """
+    block_row = rows // SWIZZLE_ROWS
+    within = rows % SWIZZLE_ROWS
+    group = within // SWIZZLE_ROWS_PER_GROUP
+    lane = within % SWIZZLE_ROWS_PER_GROUP
+    return (
+        block_row * (PADDED_COLUMNS * SWIZZLE_ROWS)
+        + (columns // SWIZZLE_COLUMNS) * (SWIZZLE_ROWS * SWIZZLE_COLUMNS)
+        + lane * (SWIZZLE_GROUPS * SWIZZLE_COLUMNS)
+        + group * SWIZZLE_COLUMNS
+        + (columns % SWIZZLE_COLUMNS)
+    )
+
+
+@triton.jit
 def _nvfp4_quantize_kernel(
     input_ptr,
     values_ptr,
@@ -87,13 +122,17 @@ def _nvfp4_quantize_kernel(
     COLUMNS: tl.constexpr,
     BLOCK: tl.constexpr,
     SCALE_COLUMNS: tl.constexpr,
+    SWIZZLED: tl.constexpr,
+    PADDED_COLUMNS: tl.constexpr,
+    PADDED_TILE: tl.constexpr,
 ):
     """Encode one program's whole K16 blocks of one row.
 
     ``input`` is ``[rows, COLUMNS]`` with contiguous rows, ``values``
-    ``[rows, COLUMNS / 2]`` bytes and ``scales`` ``[rows, SCALE_COLUMNS]``
-    bytes in the linear layout — ``SCALE_COLUMNS`` is ``COLUMNS / 16``.
-    ``global_scale`` is the reciprocal of the matrix's FP32 tensor scale.
+    ``[rows, COLUMNS / 2]`` bytes and ``scales`` bytes in the descriptor's
+    layout — ``[rows, SCALE_COLUMNS]`` linear, or ``[padded_rows,
+    PADDED_COLUMNS]`` swizzled. ``global_scale`` is the reciprocal of the
+    matrix's FP32 tensor scale.
     """
     # Each program owns one row's run of BLOCK elements, a whole number of K16
     # blocks, so a block never crosses a row.
@@ -123,5 +162,38 @@ def _nvfp4_quantize_kernel(
 
     value_columns = chunk * (BLOCK // 2) + tl.arange(0, BLOCK // 2)
     tl.store(values_ptr + row * (COLUMNS // 2) + value_columns, packed)
+
     scale_columns = chunk * (BLOCK // 16) + tl.arange(0, BLOCK // 16)
-    tl.store(scales_ptr + row * SCALE_COLUMNS + scale_columns, scale_bytes)
+    destination = row * SCALE_COLUMNS + scale_columns
+    if SWIZZLED:
+        destination = _swizzled_offset(row, scale_columns, PADDED_COLUMNS)
+    tl.store(scales_ptr + destination, scale_bytes)
+
+    if SWIZZLED:
+        # The tensor's padding is zeros, as the reference encoder writes it. Each
+        # program owns one row block of it: the last chunk of a row writes that
+        # row's padding columns, and the first programs of the grid write the
+        # padding rows, a whole padded row each.
+        padded_rows = tl.cdiv(rows, SWIZZLE_ROWS) * SWIZZLE_ROWS
+        padding_columns = tl.arange(0, SWIZZLE_COLUMNS)
+        if chunk == chunks - 1:
+            extra = SCALE_COLUMNS + padding_columns
+            keep = extra < PADDED_COLUMNS
+            tl.store(
+                scales_ptr + _swizzled_offset(row, extra, PADDED_COLUMNS),
+                tl.zeros([SWIZZLE_COLUMNS], tl.uint8),
+                mask=keep,
+            )
+        # One padded row per program, repeated until every padding row is written:
+        # a program's own row block starts after the matrix's rows.
+        padded = tl.arange(0, PADDED_TILE)
+        keep_column = padded < PADDED_COLUMNS
+        padding_row = rows + program
+        programs = tl.num_programs(0)
+        while padding_row < padded_rows:
+            tl.store(
+                scales_ptr + _swizzled_offset(padding_row, padded, PADDED_COLUMNS),
+                tl.zeros([PADDED_TILE], tl.uint8),
+                mask=keep_column,
+            )
+            padding_row += programs
