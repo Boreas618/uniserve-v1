@@ -142,6 +142,57 @@ impl Layer {
     }
 }
 
+/// One evaluation's selected layer outputs, as the caller's own diagnostic views.
+///
+/// The design's numeric diagnosis (`specs/worker.md` 10) compares one denoiser evaluation layer by
+/// layer. The model holds no host-to-device path and reads no environment, so the comparison's
+/// buffers are the caller's: this struct borrows them, and a forward with a `Trace` copies each
+/// named layer's packed output into its view. It is a diagnosis and never a gate: a forward with no
+/// `Trace` is byte-identical to the served one, because the copy is the only difference.
+pub struct Trace<'a> {
+    /// The layer indices to write, each below the stack's layer count.
+    pub layers: &'a [u32],
+    /// One `[tokens, hidden]` view per entry of `layers`, in the same order.
+    pub views: &'a [TensorView],
+    /// `[tokens]` int32 identities (`0..tokens`): the rows a copy of the output reads.
+    pub index: TensorView,
+}
+
+impl Trace<'_> {
+    /// Check the views against one forward's shape, so a mismatch is refused before the stack runs.
+    fn check(&self, layers: usize, tokens: u64, width: u64, dtype: nn::DType) -> Result<()> {
+        if self.layers.len() != self.views.len() {
+            return Err(Error::config(format!(
+                "the trace names {} layers and {} views",
+                self.layers.len(),
+                self.views.len()
+            )));
+        }
+        for (layer, view) in self.layers.iter().zip(self.views) {
+            if *layer as usize >= layers {
+                return Err(Error::config(format!(
+                    "the trace asks for layer {layer} of {layers}"
+                )));
+            }
+            if view.shape.dims() != [tokens, width] || view.dtype != dtype {
+                return Err(Error::Config(format!(
+                    "the trace's layer {layer} view is {:?} {}, [{tokens}, {width}] {dtype:?} \
+                     expected",
+                    view.shape.dims(),
+                    view.dtype
+                )));
+            }
+        }
+        if self.index.numel() != tokens {
+            return Err(Error::Config(format!(
+                "the trace's identity index covers {} rows and the pack has {tokens}",
+                self.index.numel()
+            )));
+        }
+        Ok(())
+    }
+}
+
 impl Transformer {
     /// Project one modality's patchified audio rows into the hidden width.
     pub fn project_audio(&self, f: &Forward, rows: TensorView, out: TensorView) -> Result<()> {
@@ -362,6 +413,7 @@ impl Transformer {
         visible: Option<&Visible>,
         segments: Option<&Segments>,
         total_rows: u32,
+        trace: Option<&Trace<'_>>,
     ) -> Result<()> {
         let groups = adaln.groups();
         let width = hidden.shape.last();
@@ -373,6 +425,9 @@ impl Transformer {
             hidden.dtype,
             Shape::new(&[u64::from(groups.count()) * 3, 6 * width]),
         )?;
+        if let Some(trace) = trace {
+            trace.check(self.layers.len(), tokens, width, hidden.dtype)?;
+        }
         let mut alternate = arena.tensor(hidden.dtype, Shape::new(&[tokens, width]))?;
         let scratch = Scratch::reserve(self, f, hidden, total_rows)?;
         let mut current = hidden;
@@ -382,6 +437,13 @@ impl Transformer {
                 f, current, alternate, modulation, rows, factors, visible, segments, &scratch,
             )?;
             std::mem::swap(&mut current, &mut alternate);
+            // A diagnosis reads the layer's packed output as it stands: the same rows the next
+            // layer reads, copied into the caller's view by an identity gather.
+            if let Some(trace) = trace
+                && let Some(position) = trace.layers.iter().position(|layer| *layer == index as u32)
+            {
+                nn::layers::gather_rows(f, current, trace.index, trace.views[position])?;
+            }
         }
         // An odd number of layers leaves the stack's output one buffer away from the caller's.
         if current.ptr != hidden.ptr {
@@ -467,4 +529,90 @@ fn projection_with_bias(
 /// A normalization's or projection's learned gain.
 fn gain(loader: &mut WeightLoader<'_>, name: &str, columns: u64) -> Result<Weight> {
     Ok(loader.load(&WeightRequest::region(name, 0, Shape::new(&[columns])))?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nn::DType;
+
+    fn view(tokens: u64, width: u64, dtype: DType) -> TensorView {
+        TensorView::new(nn::DevicePtr::new(0), dtype, Shape::new(&[tokens, width]))
+    }
+
+    fn index(tokens: u64) -> TensorView {
+        TensorView::new(nn::DevicePtr::new(0), DType::I32, Shape::new(&[tokens]))
+    }
+
+    #[test]
+    fn a_trace_matching_the_forward_is_accepted() {
+        let views = [view(4, 8, DType::BF16), view(4, 8, DType::BF16)];
+        let trace = Trace {
+            layers: &[0, 49],
+            views: &views,
+            index: index(4),
+        };
+        assert!(trace.check(50, 4, 8, DType::BF16).is_ok());
+    }
+
+    #[test]
+    fn a_trace_of_another_shape_or_dtype_is_refused() {
+        let views = [view(4, 8, DType::BF16)];
+        assert!(
+            Trace {
+                layers: &[0],
+                views: &views,
+                index: index(4),
+            }
+            .check(50, 4, 9, DType::BF16)
+            .is_err(),
+            "a view of another width"
+        );
+        assert!(
+            Trace {
+                layers: &[0],
+                views: &views,
+                index: index(4),
+            }
+            .check(50, 4, 8, DType::F32)
+            .is_err(),
+            "a view of another dtype"
+        );
+    }
+
+    #[test]
+    fn a_trace_naming_a_layer_the_stack_does_not_have_is_refused() {
+        let views = [view(4, 8, DType::BF16)];
+        let trace = Trace {
+            layers: &[50],
+            views: &views,
+            index: index(4),
+        };
+        assert!(trace.check(50, 4, 8, DType::BF16).is_err());
+    }
+
+    #[test]
+    fn a_trace_whose_lists_disagree_or_whose_index_is_short_is_refused() {
+        let views = [view(4, 8, DType::BF16)];
+        assert!(
+            Trace {
+                layers: &[0, 1],
+                views: &views,
+                index: index(4),
+            }
+            .check(50, 4, 8, DType::BF16)
+            .is_err(),
+            "two layers, one view"
+        );
+        assert!(
+            Trace {
+                layers: &[0],
+                views: &views,
+                index: index(3),
+            }
+            .check(50, 4, 8, DType::BF16)
+            .is_err(),
+            "a short identity index"
+        );
+    }
 }
