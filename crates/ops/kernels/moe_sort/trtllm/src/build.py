@@ -2,9 +2,9 @@
 
 The module is this package's routing pipeline (TensorRT-LLM's block path, see
 `src/routing.cu`) compiled with nvcc into a shared object exporting
-`uniserve_moe_sort`. A descriptor is the expert count, the routes per token, the
-local window, the tile and the route-weight type; the kernels read all of them at
-launch, so every descriptor of this package compiles the same object.
+`uniserve_moe_sort`. A descriptor is the expert count, the routes per token,
+the local window, the tile and the route-weight type; the kernels read all of
+them at launch, so every descriptor of this package compiles the same object.
 
 The Program Server runs this script with its own Python environment, its working
 directory the package root, and `UNISERVE_OP`, `UNISERVE_BACKEND`,
@@ -86,10 +86,16 @@ def main():
         text=True,
         check=True,
     )
-    symbols = {line.split()[-1] for line in exported.stdout.splitlines() if line.split()}
+    symbols = {
+        line.split()[-1]
+        for line in exported.stdout.splitlines()
+        if line.split()
+    }
     if ENTRY not in symbols:
         raise SystemExit(f"module.so does not export {ENTRY}")
-    print(json.dumps({"descriptor": descriptor, "target": target, "entry": ENTRY}))
+    print(
+        json.dumps({"descriptor": descriptor, "target": target, "entry": ENTRY})
+    )
 
 
 if __name__ == "__main__":

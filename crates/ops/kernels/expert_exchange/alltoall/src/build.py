@@ -98,11 +98,19 @@ def main():
         text=True,
         check=True,
     )
-    symbols = {line.split()[-1] for line in exported.stdout.splitlines() if line.split()}
+    symbols = {
+        line.split()[-1]
+        for line in exported.stdout.splitlines()
+        if line.split()
+    }
     missing = [entry for entry in ENTRIES if entry not in symbols]
     if missing:
         raise SystemExit(f"module.so does not export {', '.join(missing)}")
-    print(json.dumps({"descriptor": descriptor, "target": target, "entries": ENTRIES}))
+    print(
+        json.dumps(
+            {"descriptor": descriptor, "target": target, "entries": ENTRIES}
+        )
+    )
 
 
 if __name__ == "__main__":

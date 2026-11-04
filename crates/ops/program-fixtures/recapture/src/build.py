@@ -86,7 +86,9 @@ def element_type(key, name):
     """The `DType` number a descriptor's field names."""
     token = field(key, name)
     if token not in ELEMENT_TYPES:
-        raise SystemExit(f"{name} = {token!r} is not an element type the operator has")
+        raise SystemExit(
+            f"{name} = {token!r} is not an element type the operator has"
+        )
     return ELEMENT_TYPES[token]
 
 
@@ -95,7 +97,9 @@ def launch_entry(package):
     manifest = tomllib.loads((package / "package.toml").read_text())
     entry = manifest.get("module", {}).get("entries", {}).get("launch")
     if not entry:
-        raise SystemExit("the package's [module.entries] names no launch symbol")
+        raise SystemExit(
+            "the package's [module.entries] names no launch symbol"
+        )
     return entry
 
 
@@ -110,14 +114,24 @@ def main():
     order = field(descriptor, "order")
     epilogue = field(descriptor, "epilogue")
     if order not in ORDERS:
-        raise SystemExit(f"order = {order!r} is not a weight order the operator has")
+        raise SystemExit(
+            f"order = {order!r} is not a weight order the operator has"
+        )
     if epilogue not in EPILOGUES:
-        raise SystemExit(f"epilogue = {epilogue!r} is not an epilogue the operator has")
+        raise SystemExit(
+            f"epilogue = {epilogue!r} is not an epilogue the operator has"
+        )
     if accumulate != ELEMENT_TYPES["f32"]:
         raise SystemExit("this fixture accumulates in FP32 only")
     if input_type != weight_type:
-        raise SystemExit("this fixture takes one element type for its input and its weight")
-    if output_type not in {ELEMENT_TYPES["f16"], ELEMENT_TYPES["bf16"], ELEMENT_TYPES["f32"]}:
+        raise SystemExit(
+            "this fixture takes one element type for its input and its weight"
+        )
+    if output_type not in {
+        ELEMENT_TYPES["f16"],
+        ELEMENT_TYPES["bf16"],
+        ELEMENT_TYPES["f32"],
+    }:
         raise SystemExit("this fixture writes f16, bf16 or f32 products")
 
     out.mkdir(parents=True, exist_ok=True)
@@ -146,7 +160,9 @@ def main():
     print(" ".join(command), file=sys.stderr)
     built = subprocess.run(command, capture_output=True, text=True, check=False)
     if built.returncode != 0:
-        raise SystemExit(f"nvcc failed with {built.returncode}:\n{built.stderr[-4000:]}")
+        raise SystemExit(
+            f"nvcc failed with {built.returncode}:\n{built.stderr[-4000:]}"
+        )
 
     exported = subprocess.run(
         ["nm", "-D", "--defined-only", str(out / "module.so")],
@@ -154,10 +170,16 @@ def main():
         text=True,
         check=True,
     )
-    symbols = {line.split()[-1] for line in exported.stdout.splitlines() if line.split()}
+    symbols = {
+        line.split()[-1]
+        for line in exported.stdout.splitlines()
+        if line.split()
+    }
     if entry not in symbols:
         raise SystemExit(f"module.so does not export {entry}")
-    print(json.dumps({"descriptor": descriptor, "target": target, "entry": entry}))
+    print(
+        json.dumps({"descriptor": descriptor, "target": target, "entry": entry})
+    )
 
 
 if __name__ == "__main__":
