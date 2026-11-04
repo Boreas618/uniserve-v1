@@ -185,6 +185,23 @@ pub use ops::commit;
 /// the mechanism. The runner pads to the bucket it serves and never reorders what the mechanism
 /// wrote; a padded row carries `slot_mapping = -1` and a commit slot below zero, so it writes no
 /// cache page and keeps no token state.
+///
+/// # The three counts
+///
+/// Every column here follows exactly one of three counts, and a column compared with the wrong one
+/// is a mis-sized batch:
+///
+/// - **tokens** ([`BatchColumns::tokens`]): `input_ids` and the `[tokens]` columns of `rows` —
+///   positions, slot mapping;
+/// - **rows** ([`BatchColumns::rows`]): the sequences. `slots`, `parameters` and the `[rows]`
+///   columns of `rows` — lengths, query offsets, the sampling rows — are one entry per row, and a
+///   call may own several: a verification of three candidates is one call with three rows, and a
+///   call's `BatchRow::rows` span names them;
+/// - **calls** ([`BatchColumns::calls`]): the commit table, one row per call, because a call states
+///   once how its step advances the slot's device state however many rows it evaluated.
+///
+/// A mechanism that fills these columns and an executor that stages them both read this, so the
+/// rule is stated once; [`BatchColumns::check`] enforces it before a launch.
 #[derive(Clone, Default, Debug)]
 pub struct BatchColumns {
     /// The rows and their calls, as the model reads them: positions, slot mapping, lengths, query
@@ -229,9 +246,17 @@ impl BatchColumns {
 
     /// Whether every column has the length its field promises for `shape`, so that a mis-sized
     /// batch fails before a launch rather than after one.
+    ///
+    /// Three counts, not one: `input_ids` is as long as the batch's tokens, `slots` and
+    /// `parameters` as long as its rows — the sequences, which is `[rows]` in every per-row column
+    /// and what [`BatchColumns::rows`] answers — and `commit` is one row per *call*, since a call
+    /// states once how the step advances its slot however many rows it evaluated. A verify batch
+    /// of three candidates is one call and three rows, and comparing the per-row columns with the
+    /// call count refuses it.
     pub fn check(&self, shape: &Shape) -> Result<()> {
         let tokens = self.rows.tokens();
-        let rows = self.rows.calls.len();
+        let rows = self.rows();
+        let calls = self.calls();
         for (name, actual, expected) in [
             ("input_ids", self.input_ids.len(), tokens),
             ("slots", self.slots.len(), rows),
@@ -243,13 +268,14 @@ impl BatchColumns {
         ] {
             if actual != expected {
                 return Err(Error::Invalid(format!(
-                    "{name} has {actual} entries, the batch has {rows} rows and {tokens} tokens"
+                    "{name} has {actual} entries, the batch has {rows} rows and {tokens} tokens \
+                     in {calls} calls"
                 )));
             }
         }
-        if self.commit.len() % rows.max(1) != 0 {
+        if self.commit.len() % calls.max(1) != 0 {
             return Err(Error::Invalid(format!(
-                "commit has {} entries, not a whole number of columns over {rows} rows",
+                "commit has {} entries, not a whole number of columns over {calls} calls",
                 self.commit.len()
             )));
         }
