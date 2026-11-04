@@ -384,7 +384,7 @@ impl Leader {
         // A change of what the main processes build is the epoch layer's
         // (§7.4): one switch for the deployment, decided before either of the
         // other two layers looks at the change.
-        if let Some(applied) = self.apply_epoch(&current, &target, request.dry_run)? {
+        if let Some(applied) = self.apply_epoch(&current, &target, request.dry_run).await? {
             return Ok(applied);
         }
         // The program layer (§7.2): only what the serving epoch's processes
@@ -458,7 +458,7 @@ impl Leader {
     /// generation for the deployment (above every rank's standby, §2.5), the
     /// target's executable and the arguments every engine process of this
     /// daemon starts with.
-    fn apply_epoch(
+    async fn apply_epoch(
         &self,
         current: &ServeConfig,
         target: &ServeConfig,
@@ -511,6 +511,7 @@ impl Leader {
         // same for every host (the daemon's sockets travel with them).
         let replicas = self.replicas();
         let control = replicas[0].control.get().ok_or(UpdateError::NoEngine)?;
+        let serving_client = replicas[0].hold().client().ok_or(UpdateError::NoEngine)?;
         // One number for the whole deployment: every rank's counter is
         // advanced, and the highest is the generation each child of the epoch
         // is spawned at, so none collides with a rank's standby (§2.5). A dry
@@ -530,6 +531,22 @@ impl Leader {
             .map_err(UpdateError::Failed)?;
         let mut spec = target.engine_spec().map_err(UpdateError::Failed)?;
         spec.world = target_epoch;
+        // §7.4 step 1: the target's main processes start as the serving
+        // process's standby — they map the predecessor's cache read-only and
+        // park — so the storage of an epoch has one writer while both run.
+        // The predecessor's segments are the ones it holds now, which only its
+        // engine can state; without them the child would map nothing and the
+        // launch would be a serving process's, claiming the same scopes
+        // writably.
+        let cache = serving_client.describe_cache().await.map_err(|reason| {
+            UpdateError::Refused(format!(
+                "the serving epoch named no cache segments for its standby: {reason}"
+            ))
+        })?;
+        spec.predecessor = Some(wire::Predecessor {
+            world: serving.world,
+            segments: cache,
+        });
         let change = crate::updates::epoch::EpochChange {
             previous: previous_epoch,
             target: target_epoch,
