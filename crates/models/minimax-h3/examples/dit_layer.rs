@@ -558,7 +558,12 @@ fn stage_block(args: &Args) -> Result<()> {
     // 8. The forward. `--layers` layers, in place, at the schedule's first evaluation.
     println!("step    {evaluation} of the schedule");
     let total = u32::try_from(tokens).unwrap_or(u32::MAX);
-    stack.forward(
+    // The walk: what this forward binds, recorded rather than inferred. `tools/walk_gaps.py` diffs it
+    // against the store's key list, so a bound key the store has no program for is one command away
+    // instead of one device round.
+    let mut walk = Walk(Vec::new());
+    ops::capture::set_sink(Some(&mut walk));
+    let forward_result = stack.forward(
         &forward,
         &cache,
         step,
@@ -569,8 +574,18 @@ fn stage_block(args: &Args) -> Result<()> {
         None,
         total,
         None,
-    )?;
+    );
+    // Removed before the result is read: an installed sink is reported to by every later launch on
+    // this thread, and a failure must not leave one behind.
+    ops::capture::set_sink(None);
+    forward_result?;
     stream.synchronize()?;
+    if walk.0.is_empty() {
+        return Err(Failure::message(
+            "the walk recorded no launches: the forward replayed a captured graph, or no sink was \
+             installed",
+        ));
+    }
 
     // 9. What ran, written where `compare_blocks` reads it.
     //
@@ -619,6 +634,15 @@ fn stage_block(args: &Args) -> Result<()> {
     );
     std::fs::write(directory.join("case.json"), case)
         .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
+    let walk_path = args.out.join("walk.txt");
+    std::fs::write(&walk_path, walk.text())
+        .map_err(|error| Failure::message(format!("{}: {error}", walk_path.display())))?;
+    println!(
+        "walk    {} launches of {} distinct programs -> {}",
+        walk.0.len(),
+        walk.distinct(),
+        walk_path.display()
+    );
     println!(
         "wrote {} and {} ({} rows of {})",
         directory.join("stack_in.h3t").display(),
@@ -813,6 +837,47 @@ fn transpose_positions(
         }
     }
     upload_i32(stream, arena, Shape::new(&[3, tokens]), &values)
+}
+
+/// What one eager forward bound: every launch's operator and descriptor key, in launch order.
+///
+/// A captured graph replays without calling `operate`, so a sink installed around a replay records
+/// nothing; the stage this walks is an eager forward, which is why the walk belongs here. The
+/// recorder is the executor's own mechanism (`ops::capture`), installed for the duration of the
+/// forward and removed whether it succeeds or fails: a sink left installed would be reported to by
+/// every later launch on the thread.
+struct Walk(Vec<(&'static str, String)>);
+
+impl ops::capture::Sink for Walk {
+    fn launched(&mut self, operator: &'static str, key: &str) {
+        self.0.push((operator, key.to_owned()));
+    }
+}
+
+impl Walk {
+    /// The walk as the store's key list is written: one `operator<TAB>key` per launch, in order.
+    fn text(&self) -> String {
+        let mut text = String::new();
+        for (operator, key) in &self.0 {
+            text.push_str(operator);
+            text.push('\t');
+            text.push_str(key);
+            text.push('\n');
+        }
+        text
+    }
+
+    /// How many distinct programs the walk bound.
+    fn distinct(&self) -> usize {
+        let mut keys: Vec<(&str, &str)> = self
+            .0
+            .iter()
+            .map(|(operator, key)| (*operator, key.as_str()))
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        keys.len()
+    }
 }
 
 /// The `.h3t` container: magic, element type, rank, extents, then the payload.
