@@ -1330,3 +1330,68 @@ fn the_policy_fixture_installs_and_serves_without_a_compiler() {
 fn interpreter_fallback() -> PathBuf {
     python().unwrap_or_else(|| repository().join("crates/program-server/python/.venv/bin/python"))
 }
+
+/// Every path the command takes is absolute before the server sees it.
+///
+/// A build runs with its working directory set to the store's copy of a package, so a
+/// toolchain path typed relative to the shell's directory would name that copy instead
+/// of this host's compiler — and fail as `No such file or directory` from a directory
+/// the caller never named. The command is the place a person types those paths, so the
+/// command is where they are made absolute.
+#[test]
+fn the_command_makes_every_path_absolute_before_the_server_sees_it() {
+    let mut command = program_server::command::command();
+    let matches = command
+        .try_get_matches_from([
+            "program-server",
+            "serve",
+            "--socket",
+            "relative/program-server.sock",
+            "--package-root",
+            "relative/packages",
+            "--store-root",
+            "relative/store",
+            // Relative to the directory this test runs in, which is the crate's:
+            // the command resolves a path where it was typed.
+            "--python",
+            "python/.venv/bin/python",
+            "--wasm",
+            "target/debug/scheduling-precompile",
+        ])
+        .expect("the command's own flags parse");
+    let options = program_server::command::options(&matches).expect("the command's options");
+    assert!(
+        options.socket.is_absolute(),
+        "the socket stayed {}",
+        options.socket.display()
+    );
+    let program_server::command::Action::Serve(serve) = options.action else {
+        panic!("serve did not answer serve options");
+    };
+    for (name, path) in [
+        ("package root", &serve.package_root),
+        ("store root", &serve.store_roots[0]),
+        ("python", &serve.toolchains.python),
+        (
+            "wasm",
+            serve
+                .toolchains
+                .wasm
+                .as_ref()
+                .expect("a wasm precompiler was named"),
+        ),
+    ] {
+        assert!(
+            path.is_absolute(),
+            "the {name} stayed {}",
+            path.display()
+        );
+    }
+    if python().is_some() {
+        assert!(
+            serve.toolchains.python.is_file(),
+            "the relative interpreter {} names no program",
+            serve.toolchains.python.display()
+        );
+    }
+}
