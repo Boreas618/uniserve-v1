@@ -106,6 +106,22 @@ impl PolicyProgram {
             arguments: parameters,
         })
     }
+
+    /// The program a daemon's `Precopy` states for the scheduling policy
+    /// (§7.3 step 2): its `program` field, as the process interface carries it.
+    ///
+    /// The wire form is the Program Server's own `Program` — a backend, a
+    /// revision and the arguments as TOML text — so nothing about a program is
+    /// decided here: a name the interface does not have is refused, as it is by
+    /// [`Self::from_arguments`].
+    pub fn from_program(program: &proto::process::Program) -> Result<Self, PolicyError> {
+        let arguments: std::collections::BTreeMap<String, String> = program
+            .arguments
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        Self::from_arguments(program.backend.clone(), program.revision, &arguments)
+    }
 }
 
 /// One configured argument of a program, parsed as the type the policy
@@ -1694,6 +1710,31 @@ mod tests {
         assert_eq!(program.arguments.chunked_prefill_size, Some(2048));
         assert_eq!(program.arguments.max_batch, Some(16));
         assert_eq!(program.arguments.expected_speedup, Some(2.5));
+    }
+
+    #[test]
+    fn the_program_a_precopy_states_is_the_program_the_policy_runs() {
+        // The wire form is the Program Server's `Program`: a name, a revision,
+        // and each argument as its TOML text. Nothing about the program is
+        // decided by the mechanism on the way.
+        let stated = proto::process::Program {
+            backend: "priority".to_owned(),
+            revision: 7,
+            arguments: [
+                ("max_batch".to_owned(), "32".to_owned()),
+                ("timeout".to_owned(), "5".to_owned()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let program = PolicyProgram::from_program(&stated).expect("the program parses");
+        assert_eq!(program.backend, "priority");
+        assert_eq!(program.revision, 7);
+        assert_eq!(program.arguments.max_batch, Some(32));
+        assert_eq!(
+            program.arguments.timeout,
+            Some(scheduling::guest::time::Nanos(5))
+        );
     }
 
     #[test]
