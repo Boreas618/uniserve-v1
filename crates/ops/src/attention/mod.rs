@@ -186,6 +186,11 @@ pub struct Args {
     pub key: TensorView,
     /// `[pages, page_size, kv_heads, head_dim]` cached values.
     pub value: TensorView,
+    /// `[pages, 1, 1, 1]` f32: each page's key scale, required for a quantized `kv` and absent
+    /// otherwise. The page holds `key / scale`, and the kernel multiplies it back in FP32.
+    pub key_scale: Option<TensorView>,
+    /// `[pages, 1, 1, 1]` f32: each page's value scale, as `key_scale`.
+    pub value_scale: Option<TensorView>,
     /// `[batch, max_pages]` i32: each row's pages.
     pub page_table: TensorView,
     /// `[batch]` i32: keys visible to the row's last query.
@@ -220,6 +225,10 @@ pub struct Call {
     pub key: *const c_void,
     /// `[pages, page_size, kv_heads, head_dim]`.
     pub value: *const c_void,
+    /// `[pages, 1, 1, 1]` f32 key scales; null for an unquantized cache.
+    pub key_scale: *const c_void,
+    /// `[pages, 1, 1, 1]` f32 value scales; null for an unquantized cache.
+    pub value_scale: *const c_void,
     /// The program's transient workspace.
     pub workspace: *mut c_void,
     /// `[batch, max_pages]` i32.
@@ -282,40 +291,42 @@ pub struct Call {
 
 /// The size and field offsets the package's header must mirror, in bytes.
 pub const PAGED_ATTENTION_CALL_LAYOUT: CallLayout = CallLayout {
-    size: 768,
+    size: 784,
     out: 0,
     query: 8,
     key: 16,
     value: 24,
-    workspace: 32,
-    page_table: 40,
-    seq_lens: 48,
-    cum_seq_lens_q: 56,
-    batch: 64,
-    tokens: 72,
-    max_q_len: 80,
-    max_kv_len: 88,
-    num_pages: 96,
-    page_size: 104,
-    q_heads: 112,
-    kv_heads: 120,
-    head_dim: 128,
-    q_stride_tokens: 136,
-    q_stride_heads: 144,
-    kv_stride_page: 152,
-    kv_stride_tokens: 160,
-    kv_stride_heads: 168,
-    o_stride_tokens: 176,
-    o_stride_heads: 184,
-    scale: 192,
-    window_left: 200,
-    causal: 208,
-    workspace_bytes: 216,
-    dtype_query: 224,
-    dtype_key_value: 232,
-    dtype_output: 240,
-    phase: 248,
-    error: 256,
+    key_scale: 32,
+    value_scale: 40,
+    workspace: 48,
+    page_table: 56,
+    seq_lens: 64,
+    cum_seq_lens_q: 72,
+    batch: 80,
+    tokens: 88,
+    max_q_len: 96,
+    max_kv_len: 104,
+    num_pages: 112,
+    page_size: 120,
+    q_heads: 128,
+    kv_heads: 136,
+    head_dim: 144,
+    q_stride_tokens: 152,
+    q_stride_heads: 160,
+    kv_stride_page: 168,
+    kv_stride_tokens: 176,
+    kv_stride_heads: 184,
+    o_stride_tokens: 192,
+    o_stride_heads: 200,
+    scale: 208,
+    window_left: 216,
+    causal: 224,
+    workspace_bytes: 232,
+    dtype_query: 240,
+    dtype_key_value: 248,
+    dtype_output: 256,
+    phase: 264,
+    error: 272,
 };
 
 /// The layout of [`Call`], for the header's mirror and its test.
@@ -326,6 +337,8 @@ pub struct CallLayout {
     pub query: usize,
     pub key: usize,
     pub value: usize,
+    pub key_scale: usize,
+    pub value_scale: usize,
     pub workspace: usize,
     pub page_table: usize,
     pub seq_lens: usize,
@@ -534,6 +547,46 @@ impl Op for PagedAttention {
             }
         };
 
+        // A quantized cache holds each page divided by its own scale; the option is the cache's, so
+        // the descriptor's dtype decides whether the call carries them.
+        let (key_scale, value_scale) = match (
+            quantized(descriptor.key_value),
+            args.key_scale,
+            args.value_scale,
+        ) {
+            (false, None, None) => (std::ptr::null(), std::ptr::null()),
+            (true, Some(key), Some(value)) => {
+                for (name, view) in [("key_scale", key), ("value_scale", value)] {
+                    view.require_shape(Self::NAME, Shape::new(&[args.key.shape.dim(0), 1, 1, 1]))?;
+                    if view.dtype != DType::F32 {
+                        return Err(Error::argument(
+                            Self::NAME,
+                            format!("expected an f32 {name}, found {}", view.dtype),
+                        ));
+                    }
+                }
+                (
+                    address(key.ptr) as usize as *const c_void,
+                    address(value.ptr) as usize as *const c_void,
+                )
+            }
+            (true, _, _) => {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!(
+                        "a {} cache is read through one scale per page, and the call passes fewer",
+                        descriptor.key_value
+                    ),
+                ));
+            }
+            (false, _, _) => {
+                return Err(Error::argument(
+                    Self::NAME,
+                    "the call passes page scales for an unquantized cache",
+                ));
+            }
+        };
+
         let causal = match (descriptor.mask, args.causal) {
             (Mask::Causal, true) => 1_i64,
             (Mask::Dense, false) => 0_i64,
@@ -588,6 +641,8 @@ impl Op for PagedAttention {
             query: address(args.query.ptr) as usize as *const c_void,
             key: address(args.key.ptr) as usize as *const c_void,
             value: address(args.value.ptr) as usize as *const c_void,
+            key_scale,
+            value_scale,
             workspace: address(args.workspace.ptr) as usize as *mut c_void,
             page_table: address(args.page_table.ptr) as usize as *const i32,
             seq_lens: address(args.seq_lens.ptr) as usize as *const i32,
@@ -642,6 +697,11 @@ impl Op for PagedAttention {
         Tolerance::rounding(reduction, accumulate, descriptor.output)
             .with_atol((value_term * f64::from(VALUE_ENVELOPE)) as f32)
     }
+}
+
+/// Whether the cache's pages hold quantized elements that are read through a per-page scale.
+fn quantized(dtype: DType) -> bool {
+    matches!(dtype, DType::F8E4M3 | DType::F4E2M1)
 }
 
 /// The elements between consecutive rows of a view.
@@ -700,6 +760,22 @@ mod tests {
         );
     }
 
+    /// A quantized cache is another module of the same operator, and the dtype is what tells a
+    /// launch to expect the per-page scales.
+    #[test]
+    fn a_quantized_cache_is_another_module() {
+        let mut fp8 = decode();
+        fp8.key_value = DType::F8E4M3;
+        assert_ne!(decode().to_string(), fp8.to_string());
+        assert_eq!(
+            fp8.to_string(),
+            "phase_decode_dtype_bf16_kv_f8e4m3_out_bf16_head_dim_128_page_64_q_heads_4_kv_heads_1_mask_causal_window_false_len_40960"
+        );
+        assert!(quantized(fp8.key_value));
+        assert!(!quantized(decode().key_value));
+        assert!(!quantized(DType::F32));
+    }
+
     #[test]
     fn key_separates_page_sizes_and_phases() {
         let mut prefill = decode();
@@ -721,6 +797,8 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Call, query), layout.query);
         assert_eq!(std::mem::offset_of!(Call, key), layout.key);
         assert_eq!(std::mem::offset_of!(Call, value), layout.value);
+        assert_eq!(std::mem::offset_of!(Call, key_scale), layout.key_scale);
+        assert_eq!(std::mem::offset_of!(Call, value_scale), layout.value_scale);
         assert_eq!(std::mem::offset_of!(Call, workspace), layout.workspace);
         assert_eq!(std::mem::offset_of!(Call, page_table), layout.page_table);
         assert_eq!(std::mem::offset_of!(Call, seq_lens), layout.seq_lens);
