@@ -905,13 +905,21 @@ struct Operation {
 impl Operation {
     /// The whole operation: its three tensors, its convolution description,
     /// the operation itself, and the graph that holds it.
-    fn describe(api: &'static Api, convolution: &Convolution) -> Result<Self> {
+    ///
+    /// The graph names the device. `cudnn_graph_v9.h:567` marks
+    /// `CUDNN_ATTR_OPERATIONGRAPH_HANDLE` deprecated and cuDNN 9.8 stopped
+    /// requiring it to finalize a graph, but a search that must materialise
+    /// engine configurations needs it: without the handle the heuristic counts
+    /// configurations and fills none - success, zero elements, every slot
+    /// untouched - while with it the same graph, ops and mode list and fill
+    /// configurations for the shape.
+    fn describe(api: &'static Api, convolution: &Convolution, handle: &Handle) -> Result<Self> {
         let x = Self::tensor(api, &convolution.x, UID_X)?;
         let w = Self::tensor(api, &convolution.w, UID_W)?;
         let y = Self::tensor(api, &convolution.y, UID_Y)?;
         let kernel = Self::convolution(api, convolution)?;
         let forward = Self::forward(api, convolution, &kernel, &x, &w, &y)?;
-        let graph = Self::graph(api, &forward, None)?;
+        let graph = Self::graph(api, &forward, handle)?;
         Ok(Self {
             graph,
             _forward: forward,
@@ -1054,26 +1062,21 @@ impl Operation {
 
     /// The operation graph of one operation.
     ///
-    /// `handle` is cuDNN's deprecated `CUDNN_ATTR_OPERATIONGRAPH_HANDLE`,
-    /// which 9.8 stopped requiring: a plan is built without it, and
-    /// [`Cudnn::probe`] tries it to tell a library that still wants it from a
-    /// description cuDNN refuses.
-    fn graph(
-        api: &'static Api,
-        operation: &Descriptor,
-        handle: Option<&Handle>,
-    ) -> Result<Descriptor> {
+    /// The graph carries cuDNN's `CUDNN_ATTR_OPERATIONGRAPH_HANDLE`
+    /// (`cudnn_graph_v9.h:567`, marked deprecated): finalizing a graph no
+    /// longer needs it, but the engine search does, because materialising an
+    /// engine configuration carries knobs sized to a device - see
+    /// [`Operation::describe`].
+    fn graph(api: &'static Api, operation: &Descriptor, handle: &Handle) -> Result<Descriptor> {
         let graph = Descriptor::create(api, DESCRIPTOR_OPERATION_GRAPH)?;
         let call = "cudnnBackendSetAttribute";
-        if let Some(handle) = handle {
-            api.set_one(
-                &graph,
-                ATTR_OPERATIONGRAPH_HANDLE,
-                TYPE_HANDLE,
-                handle,
-                call,
-            )?;
-        }
+        api.set_one(
+            &graph,
+            ATTR_OPERATIONGRAPH_HANDLE,
+            TYPE_HANDLE,
+            handle,
+            call,
+        )?;
         api.set_one(
             &graph,
             ATTR_OPERATIONGRAPH_OPS,
@@ -1336,7 +1339,7 @@ impl Cudnn {
         convolution.check()?;
         let device = Device::new(self.device)?;
         let _context = device.enter()?;
-        let operation = Operation::describe(self.api, convolution)?;
+        let operation = Operation::describe(self.api, convolution, &self.handle)?;
         let proposal = self.configs(
             &operation.graph,
             limit,
@@ -1375,7 +1378,7 @@ impl Cudnn {
         convolution.check()?;
         let device = Device::new(self.device)?;
         let _context = device.enter()?;
-        let operation = Operation::describe(self.api, convolution)?;
+        let operation = Operation::describe(self.api, convolution, &self.handle)?;
         let exact = !convolution.allow_tf32;
         let mode = if engine.is_some() || exact {
             HEURISTIC_MODE_B
@@ -1640,46 +1643,10 @@ impl Cudnn {
             Operation::forward(self.api, convolution, &kernel, &x, &w, &y)
         );
         let graph = stage!(
-            "operation graph: ops, finalize",
-            Operation::graph(self.api, &forward, None)
+            "operation graph: ops and the handle, finalize",
+            Operation::graph(self.api, &forward, &self.handle)
         );
 
-        // The graph above names no device, which is legal since cuDNN 9.8 for
-        // building a plan. Counting engines needs no device either, but
-        // materialising an engine configuration does - it carries knobs sized
-        // to one - and "success, nothing written" is exactly how a search
-        // with no device to size results for would read. So the same ops are
-        // also finalized into a graph that carries the handle.
-        let named = stage!(
-            "operation graph: the same ops, carrying CUDNN_ATTR_OPERATIONGRAPH_HANDLE, finalize",
-            Operation::graph(self.api, &forward, Some(&self.handle))
-        );
-        let named_b = stage!(
-            "engine heuristic: mode B on the graph that names the device, finalize",
-            Self::heuristic(self.api, &named, HEURISTIC_MODE_B)
-        );
-        let named_listed = stage!(
-            "engine heuristic: the named graph's mode B, count the configurations",
-            self.api
-                .count(&named_b, ATTR_ENGINEHEUR_RESULTS, TYPE_BACKEND_DESCRIPTOR)
-        );
-        let line = match self.fill_once(
-            &named_b,
-            MAX_ENGINE_CONFIGS as i64,
-            MAX_ENGINE_CONFIGS,
-            -1,
-            false,
-        ) {
-            Ok(line) => line,
-            Err(error) => format!("refused: {error}"),
-        };
-        steps.push((
-            format!(
-                "engine heuristic fill 0 a graph carrying CUDNN_ATTR_OPERATIONGRAPH_HANDLE: \
-                 mode B listed {named_listed}; {line}"
-            ),
-            None,
-        ));
         let heuristic = stage!(
             "engine heuristic: mode A, operation graph, finalize",
             Self::heuristic(self.api, &graph, HEURISTIC_MODE_A)
@@ -1709,10 +1676,7 @@ impl Cudnn {
         // both shapes tried, which a mode-specific search should not do: a
         // number that matches this one in every mode would say the two
         // readings are not coming from different places.
-        for (label, descriptor) in [
-            ("the graph that names no device", &graph),
-            ("the graph that names the device", &named),
-        ] {
+        for (label, descriptor) in [("the graph", &graph)] {
             let mut global = 0i64;
             let line = match self.api.get(
                 descriptor,
@@ -1801,10 +1765,12 @@ impl Cudnn {
             format!("execution plan: {workspace_bytes} bytes of workspace"),
             None,
         ));
-        // The two deprecated handle attributes are asked last, and their
-        // refusal is recorded without ending the walk: a library that answers
-        // `CUDNN_STATUS_DEPRECATED` for them is telling us the same thing as
-        // one that accepts them.
+        // cuDNN's deprecated handle attribute of the execution plan is asked
+        // last, and its refusal is recorded without ending the walk: a library
+        // that answers `CUDNN_STATUS_DEPRECATED` for it is telling us the same
+        // thing as one that accepts it. The operation graph's own handle
+        // attribute is not asked here any more - every graph this crate builds
+        // carries it, because the engine search needs it.
         macro_rules! alternative {
             ($name:expr, $call:expr) => {
                 match $call {
@@ -1813,10 +1779,6 @@ impl Cudnn {
                 }
             };
         }
-        alternative!(
-            "operation graph with the deprecated handle attribute, finalize",
-            Operation::graph(self.api, &forward, Some(&self.handle))
-        );
         alternative!(
             "execution plan with the deprecated handle attribute, finalize",
             self.execution_plan(&config, Some(&self.handle))
