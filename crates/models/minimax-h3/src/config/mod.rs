@@ -62,6 +62,13 @@ pub const CLIP_LATENTS: u32 = 5;
 /// them.
 pub const DROPPED_LATENTS: u32 = 3;
 
+/// The longest generated clip a deployment's bounds are taken over, in frames.
+///
+/// One number serves video and the audio that accompanies it: every capacity a deployment sizes -
+/// the packed row bound, a decoder's canvas extent, the audio encoder's attention - is taken over a
+/// request no longer than this, so a track longer than it is refused rather than read past a bound.
+pub const MAX_FRAMES: u32 = 1024;
+
 /// Samples per second of the generated audio track.
 pub const AUDIO_SAMPLE_RATE: u32 = 32_000;
 

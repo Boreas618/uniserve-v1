@@ -37,16 +37,13 @@ use nn::capability::{LatentShape, Layout, StateTable, VideoRequest};
 use nn::{DType, Forward, Shape, TensorView, Weight, WeightLoader};
 
 use crate::attention::{Factors, Visible};
-use crate::config::{Canvas, DenoiserConfig};
+use crate::config::{Canvas, DenoiserConfig, MAX_FRAMES};
 use crate::modulation::{AdaLnCache, Groups, Projections};
 use crate::packing::{self, DensePacking};
 use crate::schedule::{Modality, Schedule};
 use crate::solver::Solver;
 use crate::transformer::Transformer;
 use crate::{Error, Result};
-
-/// The longest generated clip a deployment's bounds are taken over, in frames.
-const MAX_FRAMES: u32 = 1024;
 
 /// The modulation columns one AdaLN row holds: six affine vectors of three tags each.
 const ADALN_COLUMNS: u64 = 18;
@@ -113,13 +110,16 @@ impl Layouts {
 
     /// The elements the request's condition draws occupy, in request order.
     ///
-    /// A condition's noise is drawn at latent resolution - patched afterwards, so its packed rows
-    /// overcount by four - and its audio rows are already channel-major elements. The count is
-    /// computed from the conditions themselves, not from a packing, so it is total: every condition
-    /// whose raster and frame count are ones the packing would accept contributes exactly its
-    /// elements, and one it would refuse contributes none. A refused condition never reaches here -
-    /// the runner lays the request out, and that packing is the same function of the same values -
-    /// so a served request's offsets are exact.
+    /// A visual condition's noise is drawn at latent resolution - patched afterwards, so its packed
+    /// rows overcount by four. **An audio reference draws none**: the reference conditions it at its
+    /// VAE posterior's mean, and its stream position is not advanced
+    /// (`uniserve/models/minimax_h3/denoiser.py:452-472`), so counting its rows too would shift
+    /// every later draw of the request - the video's and the audio's - by a few thousand elements
+    /// and change the video silently. The count is computed from the conditions themselves, not
+    /// from a packing, so it is total: every condition whose raster and frame count are ones the
+    /// packing would accept contributes exactly its elements, and one it would refuse contributes
+    /// none. A refused condition never reaches here - the runner lays the request out, and that
+    /// packing is the same function of the same values - so a served request's offsets are exact.
     pub fn condition_elements(&self, conditions: &[packing::Condition], _canvas: &Canvas) -> u32 {
         let channels = u64::from(self.config.transformer.video_channels);
         let elements: u64 = conditions
@@ -141,9 +141,7 @@ impl Layouts {
                         Err(_) => 0,
                     }
                 });
-                let audio = u64::from(crate::config::AUDIO_CHANNELS)
-                    * u64::from(condition.audio_samples.div_ceil(crate::config::AUDIO_HOP));
-                visual + audio
+                visual
             })
             .sum();
         elements as u32
@@ -904,11 +902,42 @@ fn frame_count(latent_frames: u32) -> Result<u32> {
 
 /// The request's conditions in the geometry the packing places them by.
 fn conditions_of(request: &VideoRequest) -> Vec<packing::Condition> {
-    let _ = request;
-    // The conditions' roles and rasters arrive with `VideoRequest`'s condition shapes
-    // (nn::capability::ConditionShape); until they do, an unconditioned layout is the one this
-    // build can pack, which is `t2va`.
-    Vec::new()
+    // The request states each condition's role and the encoded raster it arrives at; the packing
+    // wants that raster as a canvas, which is the same reduction `canvas_of` makes of the request's
+    // own width and height. A condition without pixels is an audio reference and carries none.
+    request
+        .conditions
+        .iter()
+        .map(|shape| packing::Condition {
+            role: match shape.role {
+                ConditionRole::FirstFrame => packing::Role::FirstFrame,
+                ConditionRole::LastFrame => packing::Role::LastFrame,
+                ConditionRole::Reference => packing::Role::Reference,
+            },
+            frame: canvas_of_raster(shape.width, shape.height).map(|canvas| packing::Frame {
+                canvas,
+                num_frames: shape.frames,
+            }),
+            audio_samples: shape.audio_samples,
+        })
+        .collect()
+}
+
+/// The canvas a raster of `width` × `height` pixels is, or `None` without pixels.
+///
+/// The reduction is `canvas_of`'s: the short edge and the aspect, both exact. A raster no canvas
+/// can hold is refused by the packing that reads it, not here.
+fn canvas_of_raster(width: u32, height: u32) -> Option<Canvas> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let divisor = gcd(width, height);
+    Some(Canvas {
+        short_edge: width.min(height),
+        aspect: (width / divisor, height / divisor),
+        width,
+        height,
+    })
 }
 
 /// Round `value` up to the next multiple of `unit`.
