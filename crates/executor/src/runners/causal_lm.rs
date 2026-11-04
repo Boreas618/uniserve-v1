@@ -1347,10 +1347,12 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         if self
             .previous
             .as_ref()
-            .is_some_and(|previous| previous.number() < generation)
+            .is_some_and(|previous| previous.number() <= generation)
         {
-            // The last `Arc` of the old generation drops here; every kernel whose graph was
-            // rebound or destroyed unloads its library with it (7.3's purge).
+            // The last `Arc` of the purged generation drops here; every kernel whose graph was
+            // rebound or destroyed unloads its library with it (7.3's purge). The generation a
+            // revert kept is named by the purge too - it is the *newer* of the two then - so the
+            // test is "this generation or an older one", not "older than this".
             self.previous = None;
         }
     }
