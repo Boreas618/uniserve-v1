@@ -574,18 +574,26 @@ fn main() {
         .to_string(),
     );
     // The audio decoder's fused BigVGAN block, at the decoder's own rate and taps.
-    push(
-        "audio_activation",
-        ops::audio_activation::Descriptor {
-            dtype: DType::F32,
-            channels: DECODER_DIM,
-            kernel: ACTIVATION_KERNEL,
-            ratio: ACTIVATION_RATIO,
-            block: 1024,
-            pdl: PDL,
-        }
-        .to_string(),
-    );
+    //
+    // One launch per block activation, and each stage's blocks run at the stage's own width: the
+    // seven widths are 1024, 512, 256, 128, 64, 32 and 16 (`audio_vae.py`'s decoder widths), while
+    // the taps, the ratio and the program's block are the same at every stage (`ACTIVATION_*`), so
+    // the key differs only in its width. A single row at the first width would describe one of the
+    // seven launches and leave six without a program.
+    for channels in [1024_u32, 512, 256, 128, 64, 32, 16] {
+        push(
+            "audio_activation",
+            ops::audio_activation::Descriptor {
+                dtype: DType::F32,
+                channels,
+                kernel: ACTIVATION_KERNEL,
+                ratio: ACTIVATION_RATIO,
+                block: 1024,
+                pdl: PDL,
+            }
+            .to_string(),
+        );
+    }
     // The timestep embedding's activation, over the transformer's hidden width.
     push(
         "silu",
