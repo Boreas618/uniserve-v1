@@ -154,7 +154,9 @@ impl Dense {
         cosine: TensorView,
         sine: TensorView,
     ) -> Result<()> {
-        Ok(self.rotary.factors(f, positions, cosine, sine)?)
+        self.rotary
+            .factors(f, positions, cosine, sine)
+            .map_err(Error::from)
     }
 
     /// Attend `normalized` `[rows, hidden]` of this rank and write `[rows, hidden]`.
