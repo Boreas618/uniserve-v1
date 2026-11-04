@@ -184,7 +184,6 @@ impl Live<'static> {
         }
         live
     }
-
 }
 
 impl Live<'_> {
@@ -237,6 +236,22 @@ fn decodes(kind: PhaseKind) -> bool {
 /// policy failure.
 pub(crate) fn validate_plan(plan: &Plan, room: &Room, live: &Live<'_>) -> Result<(), PolicyError> {
     validate_admission(plan, live)?;
+    validate_after_admission(plan, room, live)
+}
+
+/// Checks the plan's work and its retirement against the state the mechanism
+/// holds once the plan's admission has been applied.
+///
+/// A step applies a plan's admission before it checks the rest, so that one
+/// plan can both admit a request and run it (§4.4); the work then names a
+/// resident request and nothing else. The admission itself is checked against
+/// the queue the policy was given, before it is applied — see
+/// [`validate_admission`].
+pub(crate) fn validate_after_admission(
+    plan: &Plan,
+    room: &Room,
+    live: &Live<'_>,
+) -> Result<(), PolicyError> {
     validate_work(plan, room, live)?;
     validate_release(plan, live)?;
     Ok(())
@@ -249,7 +264,12 @@ pub(crate) fn validate_plan(plan: &Plan, room: &Room, live: &Live<'_>) -> Result
 /// stops at the first request its hard limits refuse, which is how `fcfs`
 /// reproduces first-come-first-served while a policy that reorders the queue
 /// gets its own order. Membership is all that is validated here.
-fn validate_admission(plan: &Plan, live: &Live<'_>) -> Result<(), PolicyError> {
+/// Checks a plan's admission against the queue the policy was dispatched on.
+///
+/// Applying admission removes the named requests from the queue, so this is the
+/// one check that must run before it: a plan read against the state after its
+/// own admission would name requests the mechanism no longer queues.
+pub(crate) fn validate_admission(plan: &Plan, live: &Live<'_>) -> Result<(), PolicyError> {
     let mut admitted = BTreeSet::new();
     for id in &plan.admit {
         if !live.queued(*id) {
