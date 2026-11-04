@@ -483,6 +483,11 @@ pub struct Scheduler {
     /// The candidate a precopy prepared at this boundary, until the switchover
     /// puts it in.
     policy_prepared: Option<policy::Candidate>,
+    /// The stage §7.3 asked for and the answer to give once it is applied: a
+    /// stage changes the serving policy, so it waits for a boundary where no
+    /// batch and no submission is in flight.
+    policy_stage:
+        Option<(policy::Stage, Option<crossbeam_channel::Sender<Result<(), String>>>)>,
     /// The events and transitions a policy is told about (§4.4).
     recorder: mechanism::Recorder,
     /// The starvation watchdog: a resident request that does not advance

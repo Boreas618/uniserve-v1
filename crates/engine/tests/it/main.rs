@@ -12,6 +12,7 @@ mod media_occupancy;
 mod media_preemption;
 mod migration;
 mod multiproc_ipc;
+mod policy_switch;
 mod readout;
 mod speculation;
 mod support;

@@ -234,6 +234,7 @@ impl Scheduler {
             policy_report: None,
             policy_precopy: None,
             policy_prepared: None,
+            policy_stage: None,
             recorder: mechanism::Recorder::default(),
             watchdog: mechanism::Watchdog::default(),
             step: 0,
