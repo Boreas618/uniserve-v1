@@ -361,7 +361,15 @@ impl Sampler {
         }
     }
 
-    /// The candidate set: the `width` largest of each row.
+    /// The candidate set: the row's `width` candidates in descending score order.
+    ///
+    /// What the emission owes, because every later step reads it as an order rather than a set: each
+    /// row's first `width` lanes hold that row's candidates, `values` never increases along the row,
+    /// ties are ordered by ascending token id (a draw must not depend on which of two equal scores a
+    /// program happened to meet first), and the lanes past `width` in the buffers are not written.
+    /// `filter_candidates` reads the largest at lane 0 and the request's own `top_k` at index
+    /// `top_k - 1`, and `candidate_order` then sorts by id — so an emission that is a set and not an
+    /// order silently changes what a request draws.
     pub fn top_descriptor(&self) -> TopKDescriptor {
         TopKDescriptor {
             dtype: DType::F32,
