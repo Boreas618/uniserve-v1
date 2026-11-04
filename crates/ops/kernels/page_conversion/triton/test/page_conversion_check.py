@@ -27,12 +27,19 @@ be wrong without any build noticing:
 The scratch is `20·E + 8·S` bytes, and this check asserts every byte it does not name is untouched:
 the FP32 block past the span, the raw areas, and the scale rows.
 
-**The halves.** The scale-row arithmetic is integer and exact in FP32, so the interpreter runs it and
-the answer is a statement about the kernel. The decode is not: Triton's interpreter garbles an E4M3
-store (measured: `-126.4941` reads back `-64`, where the format says `-128`), so a green on an FP8
-source would be a statement about the tool, and the cases that decode E4M3 or round to a narrow
-logical type run only under `--device`. Without a device the script runs its half and says in one
-sentence which cases it left, and why.
+**The interpreter's E4M3 store is wrong and its E4M3 load is not.** Both measured on all 256 patterns
+of the format with one two-line kernel apiece:
+
+* a **store** of `-126.4941` writes the byte for `-64` where the format says `-128`, which is the
+  garbling that keeps every FP8-*writing* check off the interpreter;
+* a **load** widens **254 of 256** patterns to torch's own value — the two that differ are the two NaN
+  patterns (`0x7f`/`0xff`, which read back as `±480`), and **all 254 finite patterns agree**.
+
+This kernel only ever *loads* the source's elements and *stores* FP32 into the block, and no case
+carries a NaN pattern, so every case below is a statement about the kernel and runs without a device.
+The one interpreter quirk in play is the cast into a narrow logical type, which the two-model rule
+above measures instead of assuming. `--device` runs the same cases where a device exists, and there
+the rounding must be the operator's `nearest`.
 """
 
 import argparse
@@ -290,10 +297,10 @@ CASES = [
          source_block_size=1, source_offset=5, scale_heads=2, pages=2, seed=18),
 ]
 
-#: The cases the interpreter can answer: no E4M3 store, and no rounding into a narrow type.
-INTERPRETER_CASES = [
-    case for case in CASES if case["source"] == "bf16" and case["compute"] == "f32"
-]
+#: The interpreter answers every case: each one loads the source's elements and stores FP32 into the
+#: block, and an E4M3 *load* is faithful for every finite pattern. A case that stored E4M3 would have
+#: to move to `--device`, and none does.
+INTERPRETER_CASES = list(CASES)
 
 
 def main():
@@ -313,8 +320,9 @@ def main():
     options = parser.parse_args()
     if options.device and not torch.cuda.is_available():
         raise SystemExit(
-            "the device half decodes E4M3 and rounds into a narrow type, which needs the device the "
-            "module was built for; run this without --device for the scale-row half"
+            "the device half runs the same cases on the device the module was built for, where the "
+            "rounding into a narrow logical type must be the operator's `nearest` and nothing may "
+            "truncate; run this without --device for the interpreter"
         )
     module = load_kernel(options.package)
     cases = CASES if options.device else INTERPRETER_CASES
@@ -332,9 +340,9 @@ def main():
     if not options.device:
         left = len(CASES) - len(cases)
         print(
-            f"{left} cases are left for --device: they decode E4M3 or round into a narrow logical "
-            f"type, and Triton's interpreter garbles an E4M3 store, so a green from it would be a "
-            f"statement about the tool and not about the kernel"
+            f"{left} cases are left for --device; the interpreter's E4M3 load is faithful for all 254 "
+            f"finite patterns and its store is wrong, so a case that stored E4M3 would be the only "
+            f"reason to leave one"
         )
     return 0
 
