@@ -19,8 +19,8 @@
 //! there. A region that is too small therefore cannot turn into a comparison of a buffer against
 //! itself.
 
-use crate::platform::{Allocator, Buffer, DevicePtr, Stream};
-use crate::tensor::{DType, Shape, TensorView};
+use crate::platform::{Allocator, Buffer, PoolKind, Stream};
+use crate::tensor::{DType, DevicePtr, Shape, TensorView};
 use crate::{Error, Result, platform};
 
 /// The alignment every twin buffer starts at.
@@ -47,13 +47,15 @@ pub struct Twins {
 }
 
 impl Twins {
-    /// A twin region of `bytes` from `allocator`.
+    /// A twin region of `bytes` from `allocator`'s scratch pool.
     ///
     /// The size is the largest shadow set of the buckets the runner shadows; a paired execution
     /// whose operator needs more records the failure in the region rather than allocating during a
-    /// step.
-    pub fn new(allocator: &Allocator, bytes: u64) -> Result<Self> {
-        let buffer = allocator.allocate(bytes.max(ALIGNMENT))?;
+    /// step. The region is one scratch allocation of the executor's, freed with the `Twins`.
+    pub fn new(allocator: &mut Allocator, bytes: u64) -> Result<Self> {
+        let bytes = usize::try_from(bytes.max(ALIGNMENT))
+            .map_err(|_| Error::Shape("a twin region larger than usize::MAX".to_owned()))?;
+        let buffer = allocator.allocate(PoolKind::Scratch, bytes)?;
         Ok(Self {
             buffer,
             cursor: 0,
@@ -62,9 +64,14 @@ impl Twins {
         })
     }
 
+    /// The address of the region's first byte.
+    fn base(&self) -> DevicePtr {
+        DevicePtr::new(self.buffer.address())
+    }
+
     /// The number of bytes this region holds.
     pub fn capacity(&self) -> u64 {
-        self.buffer.size()
+        self.buffer.len() as u64
     }
 
     /// The bytes not yet handed out in this execution.
@@ -83,7 +90,7 @@ impl Twins {
                 self.fail(error);
                 // A view of the same geometry at the real region's start keeps the launch well
                 // defined; the failure recorded above stops the update from being committed.
-                TensorView::new(self.buffer.ptr(), dtype, shape)
+                TensorView::new(self.base(), dtype, shape)
             }
         }
     }
@@ -175,7 +182,7 @@ impl Twins {
             });
         }
         self.cursor = end;
-        Ok(platform::offset(self.buffer.ptr(), start))
+        Ok(platform::offset(self.base(), start))
     }
 
     fn fail(&mut self, error: Error) {

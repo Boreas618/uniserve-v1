@@ -56,6 +56,13 @@ pub enum Error {
         problem: String,
     },
 
+    /// A call the operator cannot express, e.g. a collective with a non-uniform count.
+    #[error("operator `{operator}`: {problem}")]
+    Unsupported {
+        operator: &'static str,
+        problem: String,
+    },
+
     /// A shape has more axes than the ABI holds, or a dtype has no whole-byte size.
     #[error("shape: {0}")]
     Shape(String),
@@ -67,16 +74,17 @@ pub enum Error {
         needed: u64,
         available: u64,
     },
-
-    /// This operator cannot express this call, e.g. a collective with a non-uniform count.
-    #[error("operator `{operator}`: {problem}")]
-    Unsupported {
-        operator: &'static str,
-        problem: String,
-    },
 }
 
 impl Error {
+    /// A call of `operator` this operator cannot express.
+    pub(crate) fn unsupported(operator: &'static str, problem: impl Into<String>) -> Self {
+        Self::Unsupported {
+            operator,
+            problem: problem.into(),
+        }
+    }
+
     /// An argument mismatch of `operator`.
     pub(crate) fn argument(operator: &'static str, problem: impl Into<String>) -> Self {
         Self::Argument {
