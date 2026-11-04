@@ -283,3 +283,17 @@ pub fn gather_rows(
 
     f.operate::<LogitsGather>(&descriptor, args)
 }
+
+/// The descriptor one row gather launches: the element type and the width of the rows it moves.
+///
+/// A diffusion block's modulation is a host table gathered per layer, so a walk states one program per
+/// table width it gathers rather than one per schedule row.
+pub fn gather_rows_descriptor(dtype: ops::DType, columns: u64) -> Result<GatherDescriptor> {
+    Ok(GatherDescriptor {
+        dtype,
+        columns: u32::try_from(columns)
+            .map_err(|_| Error::shape("gather_rows", "a hidden width above u32::MAX".to_owned()))?,
+        block: 1024,
+        pdl: crate::layers::launch::PDL,
+    })
+}

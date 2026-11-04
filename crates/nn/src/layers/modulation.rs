@@ -103,6 +103,40 @@ impl ModulatedRmsNorm {
     /// parameter row of each activation row; `out` is `[rows, width]` in the output element type
     /// (the activation's, or E4M3 with `output_scale` present); `retained`, when present, is
     /// `[rows, width]` and receives the normalized source.
+    /// The descriptor one modulated normalization launches, stated without a device.
+    ///
+    /// Which of the shapes it takes is the call's: `update`, `retain` and the gate's presence are
+    /// descriptor fields, so a block's attention norm (no update, no gate) and its feed-forward norm
+    /// (both) are two programs over one width. The three strides are the modulation tensor's row
+    /// width, which a walk reads from the layout the cache is gathered into.
+    #[allow(clippy::too_many_arguments)]
+    pub fn descriptor_of(
+        dtype: ops::DType,
+        output: ops::DType,
+        indices: ops::DType,
+        width: u32,
+        eps: f32,
+        gate_stride: u64,
+        shift_stride: u64,
+        scale_stride: u64,
+        update: bool,
+        retain: bool,
+    ) -> modulation::ModulatedRmsNormDescriptor {
+        modulation::ModulatedRmsNormDescriptor {
+            dtype,
+            output,
+            indices,
+            width,
+            block: row_tile(width),
+            epsilon: Float::from(eps),
+            gate_stride,
+            shift_stride,
+            scale_stride,
+            update,
+            retain,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
@@ -138,23 +172,21 @@ impl ModulatedRmsNorm {
             .map_err(|_| Error::shape("ModulatedRmsNorm", "a row wider than a u32".to_owned()))?;
         let shift = self.shift.view();
         let scale = self.scale.view();
-        let descriptor = modulation::ModulatedRmsNormDescriptor {
-            dtype: value.dtype,
-            output: out.dtype,
-            indices: row_indices.dtype,
-            width: width_u32,
-            block: row_tile(width_u32),
-            epsilon: Float::from(self.eps),
-            gate_stride: self
-                .gate
+        let descriptor = Self::descriptor_of(
+            value.dtype,
+            out.dtype,
+            row_indices.dtype,
+            width_u32,
+            self.eps,
+            self.gate
                 .as_ref()
                 .map(|gate| gate.view().strides.get(0))
                 .unwrap_or(0),
-            shift_stride: shift.strides.get(0),
-            scale_stride: scale.strides.get(0),
-            update: update.is_some(),
-            retain: retained.is_some(),
-        };
+            shift.strides.get(0),
+            scale.strides.get(0),
+            update.is_some(),
+            retained.is_some(),
+        );
         let args = modulation::Args {
             value,
             update,
@@ -183,6 +215,26 @@ pub struct GatedResidual {
 }
 
 impl GatedResidual {
+    /// The descriptor one gated residual over `width`-wide rows launches, stated without a device.
+    pub fn descriptor_of(
+        dtype: ops::DType,
+        indices: ops::DType,
+        width: u64,
+        gate_stride: u64,
+    ) -> Result<modulation::GatedResidualDescriptor> {
+        Ok(modulation::GatedResidualDescriptor {
+            dtype,
+            indices,
+            width: u32::try_from(width).map_err(|_| {
+                Error::shape(
+                    "GatedResidual",
+                    "a row wider than a descriptor holds".to_owned(),
+                )
+            })?,
+            gate_stride,
+        })
+    }
+
     /// The gates of `gate`'s width: one row per conditioning parameter.
     pub fn new(gate: Weight) -> Result<Self> {
         let view = gate.view();
@@ -235,17 +287,12 @@ impl GatedResidual {
                 format!("{} row indices for {rows} rows", row_indices.shape.numel()),
             ));
         }
-        let descriptor = modulation::GatedResidualDescriptor {
-            dtype: hidden.dtype,
-            indices: row_indices.dtype,
-            width: u32::try_from(width).map_err(|_| {
-                Error::shape(
-                    "GatedResidual",
-                    "a row wider than a descriptor holds".to_owned(),
-                )
-            })?,
-            gate_stride: self.gate.view().strides.get(0),
-        };
+        let descriptor = Self::descriptor_of(
+            hidden.dtype,
+            row_indices.dtype,
+            width,
+            self.gate.view().strides.get(0),
+        )?;
         let args = modulation::GatedResidualArgs {
             hidden,
             update,
