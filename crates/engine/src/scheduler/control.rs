@@ -10,6 +10,56 @@
 //! request when the control loop stops.
 
 use super::*;
+use crate::handle;
+
+/// What an engine command this scheduler does not apply itself is called, for
+/// the answer that names its owner.
+fn engine_command_name(kind: &proto::process::command::Kind) -> &'static str {
+    use proto::process::command::Kind;
+    match kind {
+        Kind::Park(_) => "park",
+        Kind::Promote(_) => "promote",
+        Kind::Precopy(_) => "precopy",
+        Kind::Switchover(_) => "switchover",
+        Kind::Commit(_) => "commit",
+        Kind::Revert(_) => "revert",
+        Kind::Purge(_) => "purge",
+        Kind::Drain(_) => "drain",
+        Kind::Serve(_) => "serve",
+        Kind::Pause(_) => "pause",
+    }
+}
+
+
+/// Who asked for a stage: the scheduler's own handle, which names the step
+/// the stage applied at, or an engine command, which is answered with
+/// whether it applied.
+///
+/// One path applies every stage; the answer shape is the only difference,
+/// so a stage has exactly one place where it changes the slot.
+#[derive(Debug)]
+pub(super) enum StageAnswer {
+    /// A handle's `stage`, answered with the step it applied at.
+    Step(crossbeam_channel::Sender<Result<handle::StageApplied, String>>),
+    /// An engine command, answered with whether it applied.
+    Applied(crossbeam_channel::Sender<Result<(), String>>),
+}
+
+impl StageAnswer {
+    /// Sends `result`, dropping either the step or the detail as the
+    /// caller's shape requires.
+    fn send(self, result: Result<handle::StageApplied, String>) {
+        match self {
+            Self::Step(answer) => {
+                let _ = answer.send(result);
+            }
+            Self::Applied(answer) => {
+                let _ = answer.send(result.map(|_| ()));
+            }
+        }
+    }
+}
+
 
 impl Scheduler {
     /// Removes a queued media request while preserving FIFO order for its peers.
@@ -243,12 +293,27 @@ impl Scheduler {
                 source,
                 answer,
             } => self.precopy_policy(program, source, answer),
-            Command::SwitchoverPolicy { answer } => {
-                self.request_stage(Stage::Switchover, Some(answer));
+            Command::StagePolicy { stage, answer } => {
+                self.request_stage(stage, Some(StageAnswer::Step(answer)));
             }
-            Command::CommitPolicy => self.request_stage(Stage::Commit, None),
-            Command::RevertPolicy { answer } => self.request_stage(Stage::Revert, Some(answer)),
-            Command::PurgePolicy { answer } => self.request_stage(Stage::Purge, Some(answer)),
+            Command::EngineCommand { command, answer } => {
+                self.engine_command(command, answer);
+            }
+            Command::Shadow { generation, answer } => {
+                let _ = answer.send(self.shadow(generation));
+            }
+            Command::Counters { answer } => {
+                let _ = answer.send(self.counters());
+            }
+            Command::PolicyPrograms { answer } => {
+                let _ = answer.send(handle::PolicyPrograms {
+                    running: self.policy.as_ref().map(|policy| policy.program().clone()),
+                    prepared: self
+                        .policy_prepared
+                        .as_ref()
+                        .map(|candidate| candidate.program().clone()),
+                });
+            }
             Command::DiscardPolicy => {
                 self.policy_prepared = None;
                 self.policy_stage = None;
@@ -333,22 +398,100 @@ impl Scheduler {
         }
     }
 
+    /// §7.3 step 2's shadow pass: the next step's batches would also run in
+    /// shadow for `generation`, the executor pairing the new generation against
+    /// the resident data without writing resident memory.
+    ///
+    /// A step submits its batches to the worker processes, whose submission
+    /// path carries no shadow run, so the pass cannot start yet: the answer
+    /// names that rather than reporting a comparison that never ran.
+    fn shadow(&mut self, generation: u64) -> Result<(), String> {
+        Err(format!(
+            "the shadow pass of generation {generation} starts when a step submits through \
+             executor::Batches; this scheduler still submits its batches to the worker processes"
+        ))
+    }
+
+    /// What this scheduler has done and what its policy has cost (§12).
+    fn counters(&self) -> handle::Counters {
+        let usage = self
+            .policy
+            .as_ref()
+            .map(policy::PolicySlot::usage)
+            .unwrap_or_default();
+        handle::Counters {
+            steps: self.step,
+            batches: self
+                .stats
+                .general
+                .steps
+                .load(std::sync::atomic::Ordering::Relaxed),
+            tokens: crate::lock(&self.stats.worker.forward_mode_tokens)
+                .values()
+                .sum(),
+            policy_fuel: usage.fuel,
+            policy_calls: usage.calls,
+            kernel_launches: 0,
+            device_ns: 0,
+        }
+    }
+
+    /// Applies an engine command that concerns this scheduler (§7.3).
+    ///
+    /// The steps of an update are one scheduler's to apply — a switchover, a
+    /// commit, a revert, a purge — so they are answered here. The rest belong to
+    /// the process that owns what they name: a precopy is resolved by the
+    /// process holding the Program Server (it instantiates one candidate per
+    /// scheduler), and a park, promote, drain, serve or pause is the engine
+    /// process's own lifecycle. Each answer names that rather than reporting
+    /// success for work that did not happen.
+    fn engine_command(
+        &mut self,
+        command: proto::process::Command,
+        answer: crossbeam_channel::Sender<Result<(), String>>,
+    ) {
+        use proto::process::command::Kind;
+
+        let stage = match command.kind {
+            Some(Kind::Switchover(_)) => Stage::Switchover,
+            Some(Kind::Commit(_)) => Stage::Commit,
+            Some(Kind::Revert(_)) => Stage::Revert,
+            Some(Kind::Purge(_)) => Stage::Purge,
+            Some(Kind::Precopy(_)) => {
+                let _ = answer.send(Err(
+                    "a precopy is resolved once per epoch by the process that holds the Program \
+                     Server, which then precopies each scheduler's policy"
+                        .to_owned(),
+                ));
+                return;
+            }
+            Some(other) => {
+                let _ = answer.send(Err(format!(
+                    "{} is the engine process's own command, not one scheduler's",
+                    engine_command_name(&other)
+                )));
+                return;
+            }
+            None => {
+                let _ = answer.send(Err("an engine command names no kind".to_owned()));
+                return;
+            }
+        };
+        self.request_stage(stage, Some(StageAnswer::Applied(answer)));
+    }
+
     /// Asks for a stage of §7.3, answered when it is applied.
     ///
     /// A stage changes the serving policy, so it is applied where no batch and
     /// no submission is in flight — never in the middle of one (§7.3: "在一个
     /// 批次边界（更新点）上"). A switchover with nothing prepared is refused at
     /// once: the daemon's precopy failed and the update is discarded.
-    fn request_stage(
-        &mut self,
-        stage: Stage,
-        answer: Option<crossbeam_channel::Sender<Result<(), String>>>,
-    ) {
+    fn request_stage(&mut self, stage: Stage, answer: Option<StageAnswer>) {
         if stage == Stage::Switchover {
             self.take_prepared_policy();
             if self.policy_prepared.is_none() {
                 if let Some(answer) = answer {
-                    let _ = answer.send(Err(
+                    answer.send(Err(
                         "a switchover arrived without a policy prepared by a precopy".to_owned(),
                     ));
                 }
@@ -372,12 +515,17 @@ impl Scheduler {
             return;
         };
         let state = views::trial_state(self, self.step, self.recorder.recorded());
+        // The step the stage applied at: the boundary this scheduler reached,
+        // where the policy it replaced had decided its last batch. The ranks of
+        // an expert group take their steps on the union's batches, so their
+        // boundaries carry the same number.
+        let applied_at = handle::StageApplied { step: self.step };
         let applied = match self.stage_policy(stage, &state) {
             Ok(report) => {
                 if let Some(report) = report {
                     self.policy_report = Some(report);
                 }
-                Ok(())
+                Ok(applied_at)
             }
             Err(reason) => {
                 let program = self.policy.as_ref().map(|policy| policy.program().clone());
@@ -393,7 +541,7 @@ impl Scheduler {
             }
         };
         if let Some(answer) = answer {
-            let _ = answer.send(applied);
+            answer.send(applied);
         }
     }
 
