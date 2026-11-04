@@ -21,13 +21,13 @@
 # task already makes (MP4 validity: canvas, frame count, frame rate, stereo
 # soundtrack) and the protected performance metrics; nothing else is added.
 #
-# No server states dtype or quantization: the checkpoint's own numerical
-# representation is the serving default (dtype auto, no quantization), which
-# for MiniMax-H3 is the quality preset (DiT and text encoder BF16, video VAE
-# decoder FP16). Naming bfloat16 explicitly would force the VAE decoder to
-# BF16 and change the generated output, and quantization_config and its
-# precision presets retire in favour of the checkpoint representation and
-# SGLang's quantization field.
+# No server states dtype or quantization_config: the launch's default dtype
+# is bfloat16 and an empty quantization_config loads the model's first
+# precision preset, quality (DiT and text encoder BF16, video VAE decoder
+# FP16), so the omitted selectors name exactly the representation the shipped
+# performance profiles state. quantization_config and its precision presets
+# retire in favour of the checkpoint representation and SGLang's
+# quantization field, so a check cell must not state them.
 #
 # No server pins --worker-executable either: the worker processes must run the
 # same build as the daemon, so a deployment launched with --executable runs the
