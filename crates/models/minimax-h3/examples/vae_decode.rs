@@ -471,6 +471,14 @@ fn stage_decode(args: &Args) -> Result<()> {
         let positions = positions.view();
         (decoder, positions, rows)
     };
+    // What the reservation was for, against what it held: the two numbers a reader needs to tell a
+    // tight pool from a wrong one, both about publishing and nothing else.
+    println!(
+        "weights: {} MiB published of {} MiB reserved, {} MiB mapped",
+        weights.bytes >> 20,
+        weights.reserved >> 20,
+        weights.pools.mapped_bytes(platform::PoolKind::Resident) >> 20
+    );
     println!(
         "decoder: {} frames out, {} position rows, {} latent channels, {dtype}",
         canvas.frames_out(&config.video_vae),
@@ -778,6 +786,10 @@ struct DeviceWeights {
     pools: platform::Allocator,
     buffers: Vec<platform::Buffer>,
     bytes: u64,
+    /// The reservation the pool was given, so a failed give-out can name it beside the bytes
+    /// published: both numbers then describe publishing, and a reader is not comparing a sum of
+    /// weights with a capacity that also holds something else.
+    reserved: u64,
 }
 
 impl DeviceWeights {
@@ -822,6 +834,7 @@ impl DeviceWeights {
             pools,
             buffers: Vec::new(),
             bytes: 0,
+            reserved,
         })
     }
 
@@ -868,9 +881,11 @@ impl RetainedWeights for DeviceWeights {
                     path: key.to_string().into(),
                     problem: format!(
                         "publishing this weight ({dtype} {shape}, {request} bytes) would reach \
-                         {total} bytes of the resident pool: {source}",
+                         {total} bytes published of {reserved} reserved, {mapped} mapped: {source}",
                         request = bytes.len(),
                         total = self.bytes + bytes.len() as u64,
+                        reserved = self.reserved,
+                        mapped = self.pools.mapped_bytes(platform::PoolKind::Resident),
                     ),
                 }
             })?;
