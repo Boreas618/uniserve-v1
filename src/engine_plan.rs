@@ -37,7 +37,7 @@ use ipc::PhaseId;
 use ops::DType;
 use ops::Generation;
 use platform::DeviceId;
-use proto::request::GraphPolicy;
+use proto::request::{GenerationFeatures, GenerationLimits, GraphPolicy};
 use program_server::Target;
 
 use crate::engine_main::Launch;
@@ -207,7 +207,7 @@ impl EpochPlan {
     /// the shadow pair's region are carved from (7.3). The resident pool is reserved by whoever
     /// carves it - `Memory`, through `Executor::pools()` - so the graph storage asks for none: a
     /// second figure here would be a second claim on the same bytes.
-    pub(crate) fn graph(&self, device: DeviceId) -> Result<GraphStorage> {
+    pub(crate) fn graph(&self, device: DeviceId, resident: u64) -> Result<GraphStorage> {
         let handle = platform::Device::new(device)
             .with_context(|| format!("opening device {}", device.0))?;
         let storage = handle.memory_info()?;
@@ -239,7 +239,7 @@ impl EpochPlan {
         // scratch. The second pool is a reservation until a preparation captures into it, so it is
         // not part of this test - a deployment with room for one pool starts and serves, and an
         // update that needs the second one is refused by name when it maps.
-        let needs = bytes / 2 + scratch;
+        let needs = bytes / 2 + scratch + resident;
         if budget < needs {
             bail!(
                 "device {} has {budget} bytes left of {total} once the model is mapped, at \
@@ -256,7 +256,11 @@ impl EpochPlan {
             // of it, so the graph reservation is not divided among streams.
             streams: 1,
             scratch,
-            resident: 0,
+            // The KV pool: the units the capacity plan fitted, each the size of a cache unit. This
+            // rank keeps its keys and values in the process - that is what a prefix cache is - so
+            // the figure is the plan's and not zero. A pool whose figure is zero is not reserved,
+            // and a KV provider that asks for it is refused by name.
+            resident,
         })
     }
 
@@ -276,18 +280,24 @@ impl EpochPlan {
     /// largest bucket is refused before a kernel runs, so the catalog is the admission bound), and,
     /// for the page size and the cache dtype, what was opened rather than what was asked for.
     ///
-    /// The facts no source states stay `None`, and that is the answer rather than a gap to fill
-    /// with a guess: `hosts` is the deployment's hosts in rank order, which the launch file does not
-    /// carry (`Launch::peers` is this node's peer addresses), and `bos`, `eos`, `end_of_image` and
-    /// `generation_limits` are the checkpoint's tokenizer and generation facts, which neither the
-    /// launch file nor the model's configuration states. `engine::EngineConfig::of` refuses each of
-    /// them by name, so a deployment that needs one fails with the fact it is missing.
+    /// Two facts are answered only as far as a launch file can answer them. `hosts` is one host
+    /// name per rank in rank order: a world of one states this node's own, because one node is one
+    /// host and the name is read from the machine rather than invented, while a world of more ranks
+    /// leaves the fact absent - the real names are the deployment's, and a launch file, which is per
+    /// node, does not carry them (`Launch::peers` is this node's peer addresses).
+    ///
+    /// The rest stay `None`, and that is the answer rather than a gap to fill with a guess: `bos`,
+    /// `eos`, `end_of_image` and `generation_limits` are the checkpoint's tokenizer and generation
+    /// facts, which neither the launch file nor the model's configuration states.
+    /// `engine::EngineConfig::of` refuses each absent fact by name, so a deployment that needs one
+    /// fails with the fact it is missing rather than planning against a made-up value.
     pub(crate) fn rank_facts(
         &self,
         memory: &Memory,
         model: &qwen3_moe::Qwen3Moe,
     ) -> Result<engine::RankFacts> {
         let (rows, tokens) = self.buckets.bounds();
+        let control = checkpoint_tokens(&self.checkpoint)?;
         // The graph sizes this rank captures, which is the tier a plan's batch must fit (§4.5).
         let graph_tiers = self
             .buckets
@@ -309,7 +319,19 @@ impl EpochPlan {
                     .map(|device| device.0.to_string())
                     .collect(),
             ),
-            hosts: None,
+            // The engine's facts want one host name per rank, and the launch file states the
+            // rank's devices but not which host each rank sits on - it cannot, a launch file is
+            // per node. A world of one therefore has exactly one host and this node is it; the
+            // name is the machine's own rather than an invented string, so a report, a log or a
+            // transfer that names the host names the host.
+            //
+            // A world of more ranks needs the real names for placement and for cross-host weight
+            // transfer, and a guess there would be worse than the refusal: the fact stays absent
+            // and `EngineConfig::of` names what the launch file owes it.
+            hosts: match self.world_size {
+                1 => Some(vec![host_name()?]),
+                _ => None,
+            },
             peers: None,
             max_running_requests: Some(self.build.max_running_requests.get()),
             max_batch: Some(rows as usize),
@@ -326,10 +348,18 @@ impl EpochPlan {
                 )?),
             },
             graph_tiers: Some(graph_tiers),
-            bos: None,
-            eos: None,
-            end_of_image: None,
-            generation_limits: None,
+            // The tokenizer facts are the checkpoint's (`checkpoint_tokens`): a launch file states
+            // where the checkpoint is, not what its vocabulary means, and the engine schedules
+            // against the ids themselves.
+            bos: Some(control.bos),
+            eos: Some(control.eos),
+            // A causal LM encodes no image, so no token closes encoded image content. `0` is the
+            // daemon's own value for a profile that states no generation controls:
+            // `crates/daemon/src/leader.rs:2400`, `let end_of_image = controls.map_or(0, |value|
+            // value.end_of_image);`. It is the absence of a token, not an invented one.
+            end_of_image: Some(0),
+            // What one request may be given to generate on this model; see `understanding_limits`.
+            generation_limits: Some(understanding_limits()),
             max_model_len: self.build.max_model_len.map(|length| length.get()),
             watchdog_timeout: Some(self.watchdog_timeout()),
         })
@@ -429,7 +459,7 @@ impl EpochPlan {
         &self,
         weights: &mut dyn nn::RetainedWeights,
         storage: &mut dyn executor::memory::retained::ExclusiveStorage,
-    ) -> Result<(Arc<qwen3_moe::Qwen3Moe>, Memory)> {
+    ) -> Result<(Arc<qwen3_moe::Qwen3Moe>, Memory, ipc::WorkerInfo)> {
         let placement = &self.placement;
         let class = architectural_class(&self.checkpoint)?;
         match class.as_str() {
@@ -452,8 +482,8 @@ impl EpochPlan {
                     &mut loader,
                     placement.load_options,
                 )?;
-                let memory = self.open_memory(&model, storage)?;
-                Ok((Arc::new(model), memory))
+                let (memory, info) = self.open_memory(&model, storage)?;
+                Ok((Arc::new(model), memory, info))
             }
             other => bail!(
                 "{} declares model class {other}, which this build cannot serve",
@@ -474,7 +504,7 @@ impl EpochPlan {
         &self,
         model: &qwen3_moe::Qwen3Moe,
         storage: &mut dyn executor::memory::retained::ExclusiveStorage,
-    ) -> Result<Memory> {
+    ) -> Result<(Memory, ipc::WorkerInfo)> {
         let device = *self
             .devices
             .first()
@@ -524,11 +554,18 @@ impl EpochPlan {
         let group = executor::parallel::host::HostGroup::single(self.rank as usize);
         let report = rank_report(device, &host)?;
         let planned = executor::capacity::plan_rank(&facts, report, &group)?;
-        let graph = self.graph(device)?;
+        // The keys and values the plan fitted are the process's resident pool: a unit is a cache
+        // unit, and the plan charged them all against the same device allowance the pools are
+        // booked against. A plan that fitted no cache (a rank that serves none) states zero.
+        let resident = match (&planned.plan.cache, planned.plan.info.prefix_cache.as_ref()) {
+            (Some(cache), Some(info)) => u64::from(info.num_units) * cache.unit_bytes,
+            _ => 0,
+        };
+        let graph = self.graph(device, resident)?;
         let pools = executor::device::Executor::open(device, &graph)?;
         let stream = platform::Stream::new(device)
             .with_context(|| format!("creating device {}'s stream", device.0))?;
-        executor::memory::open_memory(
+        let memory = executor::memory::open_memory(
             executor::memory::OpenMemory {
                 plan: &planned.plan,
                 // A causal-language rank keeps no per-slot bank: its per-request state is the KV
@@ -546,11 +583,27 @@ impl EpochPlan {
             },
             storage,
         )
-        .map_err(|error| error).context("opening the rank's resident memory")
+        .map_err(|error| error)
+        .context("opening the rank's resident memory")?;
+        // The plan's own account of this rank is what the scheduler is told about its pool: the
+        // capacities it fitted, the cache it holds and where it is. It is the same `WorkerInfo` the
+        // deployment's other ranks report, so the scheduler plans against one description of a
+        // rank rather than a second one derived here.
+        Ok((memory, planned.plan.info.clone()))
+    }
+
+    /// Requests this rank's scheduler may have in flight (launch: `scheduling.max_running_requests`).
+    pub(crate) fn queue_depth(&self) -> usize {
+        self.queue_depth
+    }
+
+    /// The ranks of this process's group; one process holds one pool, so it is the deployment's.
+    pub(crate) fn world_size(&self) -> usize {
+        self.world_size
     }
 
     /// The keys a row reads at most: the cache's bound, from the epoch's context length.
-    fn max_kv_len(&self, model: &qwen3_moe::Qwen3Moe) -> Result<u32> {
+    pub(crate) fn max_kv_len(&self, model: &qwen3_moe::Qwen3Moe) -> Result<u32> {
         match self.build.max_model_len {
             Some(length) => Ok(length.get()),
             None => u32::try_from(model.config().max_position_embeddings)
@@ -588,11 +641,180 @@ pub(crate) fn rank_report(
             ipc::CallKind::Forward(ipc::ForwardMode::Decode),
         ],
         media_components: std::collections::BTreeMap::new(),
+        // The component this rank holds, named as the placement names it (`schedulers` places one
+        // component over every rank). The scheduler routes a call by component name, so a rank that
+        // advertised a name of its own would hold nothing any pool asks for.
         components: vec![ipc::ComponentInfo {
-            name: "backbone".to_owned(),
+            name: ipc::DEFAULT_COMPONENT.to_owned(),
             outputs: Vec::new(),
         }],
     })
+}
+
+/// The control tokens a checkpoint states of itself: what begins its sequences and what ends them.
+#[derive(Debug)]
+struct ControlTokens {
+    /// The token that begins a sequence.
+    bos: u32,
+    /// The tokens that terminate generation, the primary one first.
+    eos: Vec<u32>,
+}
+
+/// Reads the control tokens from the checkpoint the launch file names.
+///
+/// A launch file states where the checkpoint is, not what its vocabulary means, so the ids come
+/// from the checkpoint's own files, in the order the engine reads them:
+///
+/// - `generation_config.json` states the generation defaults, and its `eos_token_id` is the primary
+///   end of generation;
+/// - `config.json` states the architecture's `bos_token_id` and `eos_token_id`, which may be one id
+///   or a list;
+/// - `tokenizer_config.json` names its special tokens and maps each to an id in
+///   `added_tokens_decoder`.
+///
+/// Qwen3 states no beginning-of-sequence token (`"bos_token_id": null`), so the beginning a text
+/// model has is the tokenizer's own end of text, `<|endoftext|>`, read from the file that names it
+/// rather than written here as a constant - and it joins the eos list for the same reason: a
+/// completion that emits the vocabulary's end of text must stop, and the engine acts only on the
+/// ids it is given.
+///
+/// The primary end of generation is `eos[0]`, because that is the token the engine gives a
+/// completion that commits none (`crates/daemon/src/leader.rs::special_token_ids`, whose rule this
+/// follows); the rest follow ascending.
+fn checkpoint_tokens(dir: &Path) -> Result<ControlTokens> {
+    let config = read_json(&dir.join("config.json"))?;
+    // Both files are optional: a checkpoint may state its generation defaults in the architecture's
+    // configuration alone, and an architecture that states a beginning states it there.
+    let generation = read_json(&dir.join("generation_config.json")).ok();
+    let tokenizer = read_json(&dir.join("tokenizer_config.json")).ok();
+    let end_of_text = tokenizer.as_ref().and_then(|value| added_token(value, "<|endoftext|>"));
+
+    let bos = token_id(config.get("bos_token_id"))
+        .or_else(|| generation.as_ref().and_then(|value| token_id(value.get("bos_token_id"))))
+        .or(end_of_text)
+        .with_context(|| {
+            format!(
+                "{} states no beginning-of-sequence token: `config.json` and \
+                 `generation_config.json` state no `bos_token_id`, and `tokenizer_config.json` \
+                 names no `<|endoftext|>`",
+                dir.display()
+            )
+        })?;
+
+    let mut eos = Vec::new();
+    for value in [
+        generation.as_ref().and_then(|value| value.get("eos_token_id")),
+        config.get("eos_token_id"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for id in token_ids(value) {
+            if !eos.contains(&id) {
+                eos.push(id);
+            }
+        }
+    }
+    if let Some(end_of_text) = end_of_text {
+        if !eos.contains(&end_of_text) {
+            eos.push(end_of_text);
+        }
+    }
+    anyhow::ensure!(
+        !eos.is_empty(),
+        "{} states no end-of-generation token: neither `config.json` nor \
+         `generation_config.json` states `eos_token_id`, and `tokenizer_config.json` names no \
+         `<|endoftext|>`",
+        dir.display()
+    );
+    Ok(ControlTokens { bos, eos })
+}
+
+/// Reads one JSON file of a checkpoint.
+fn read_json(path: &Path) -> Result<serde_json::Value> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+}
+
+/// One token id, whether the file writes it as a number or as a list of numbers.
+fn token_id(value: Option<&serde_json::Value>) -> Option<u32> {
+    let value = value?;
+    match value {
+        serde_json::Value::Number(number) => number.as_u64().and_then(|id| u32::try_from(id).ok()),
+        serde_json::Value::Array(ids) => ids
+            .first()
+            .and_then(|id| id.as_u64())
+            .and_then(|id| u32::try_from(id).ok()),
+        _ => None,
+    }
+}
+
+/// Every token id a field states, in the order it writes them; a single number is a list of one.
+fn token_ids(value: &serde_json::Value) -> Vec<u32> {
+    match value {
+        serde_json::Value::Number(number) => number
+            .as_u64()
+            .and_then(|id| u32::try_from(id).ok())
+            .into_iter()
+            .collect(),
+        serde_json::Value::Array(ids) => ids
+            .iter()
+            .filter_map(|id| id.as_u64())
+            .filter_map(|id| u32::try_from(id).ok())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The id a tokenizer gives the special token whose text is `content`.
+///
+/// The tokenizer states its added tokens as a map from id to token in `added_tokens_decoder`, and
+/// older checkpoints state them as a list of `{id, content}` in `added_tokens`; both are read, so a
+/// checkpoint of either shape resolves the same token.
+fn added_token(tokenizer: &serde_json::Value, content: &str) -> Option<u32> {
+    if let Some(decoder) = tokenizer
+        .get("added_tokens_decoder")
+        .and_then(serde_json::Value::as_object)
+    {
+        for (id, token) in decoder {
+            if token.get("content").and_then(serde_json::Value::as_str) == Some(content) {
+                return id.parse::<u32>().ok();
+            }
+        }
+    }
+    tokenizer
+        .get("added_tokens")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .find(|token| token.get("content").and_then(serde_json::Value::as_str) == Some(content))
+        .and_then(|token| token.get("id"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|id| u32::try_from(id).ok())
+}
+
+/// What one request may be given to generate on a text model.
+///
+/// This model understands a prompt and generates tokens, and it encodes no vision features and
+/// denoises no latents, so the served feature is `GenerationFeatures::UNDERSTANDING` and every
+/// **capacity** is zero: `max_latent_units`, `latent_bytes_per_unit`, `max_vae_grid_tokens`,
+/// `max_vit_grid_tokens`, `max_latent_feature_bytes`, `max_vision_feature_bytes`,
+/// `commit_marker_tokens` and `encoder_cache_entries`. A capacity of zero declares no capacity at
+/// all, which is what a model that encodes and denoises nothing has.
+///
+/// The two nonzero figures are **lower bounds that must be at least one**, not capacities, and they
+/// are the Qwen3 profile's own (`crates/frontend/src/model/generation.rs`, its `Qwen3` arm:
+/// `GenerationLimits { latent_downsample: 1, max_cfg_branches: 1, ..Default::default() }`):
+/// `latent_downsample` is a divisor, so zero would divide a pixel grid by it, and
+/// `max_cfg_branches` counts the branches a request may run, so one branch is the minimum a
+/// deployment admits rather than a media fact about this model.
+fn understanding_limits() -> GenerationLimits {
+    GenerationLimits {
+        features: GenerationFeatures::UNDERSTANDING,
+        latent_downsample: 1,
+        max_cfg_branches: 1,
+        ..GenerationLimits::default()
+    }
 }
 
 /// The element type the cache pool stores, from the deployment when it states one.
@@ -743,3 +965,85 @@ impl Placement {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A checkpoint directory holding the files a test states.
+    fn checkpoint(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let directory = tempfile::tempdir().expect("a temporary checkpoint directory");
+        for (name, body) in files {
+            std::fs::write(directory.path().join(name), body).expect("writing a checkpoint file");
+        }
+        directory
+    }
+
+    #[test]
+    fn a_qwen3_checkpoint_states_its_ends_and_its_tokenizer_names_the_beginning() {
+        let directory = checkpoint(&[
+            ("config.json", r#"{"bos_token_id": null, "eos_token_id": 151645}"#),
+            (
+                "tokenizer_config.json",
+                r#"{"added_tokens_decoder": {
+                    "151643": {"content": "<|endoftext|>"},
+                    "151645": {"content": "<|im_end|>"}
+                }}"#,
+            ),
+        ]);
+
+        let control = checkpoint_tokens(directory.path()).expect("the checkpoint's control tokens");
+
+        // The architecture states no beginning, so the tokenizer's own end of text is the
+        // beginning a text model has; the stated end of generation comes first and the vocabulary's
+        // end of text follows it, because a completion that emits it must stop.
+        assert_eq!(control.bos, 151643);
+        assert_eq!(control.eos, vec![151645, 151643]);
+    }
+
+    #[test]
+    fn the_stated_beginning_wins_and_the_generation_default_orders_the_ends() {
+        let directory = checkpoint(&[
+            ("config.json", r#"{"bos_token_id": 5, "eos_token_id": [3, 2]}"#),
+            ("generation_config.json", r#"{"eos_token_id": 2}"#),
+        ]);
+
+        let control = checkpoint_tokens(directory.path()).expect("the checkpoint's control tokens");
+
+        assert_eq!(control.bos, 5, "the architecture's own beginning is the one it means");
+        // `eos[0]` is what the engine gives a completion that commits none, so the generation
+        // default leads and the architecture's remaining ids follow, each stated once.
+        assert_eq!(control.eos, vec![2, 3]);
+    }
+
+    #[test]
+    fn a_checkpoint_that_states_no_end_of_generation_is_refused_by_name() {
+        let directory = checkpoint(&[("config.json", r#"{"bos_token_id": 5}"#)]);
+
+        let error = checkpoint_tokens(directory.path()).expect_err("an unstated eos token");
+        let message = format!("{error:#}");
+
+        assert!(
+            message.contains("states no end-of-generation token"),
+            "the refusal names what is missing: {message}"
+        );
+        assert!(
+            message.contains("config.json"),
+            "the refusal names the file that was read: {message}"
+        );
+    }
+
+    #[test]
+    fn a_text_model_states_understanding_and_no_media_capacity() {
+        let limits = understanding_limits();
+
+        assert!(limits.features.contains(GenerationFeatures::UNDERSTANDING));
+        assert!(!limits.features.contains(GenerationFeatures::IMAGE_GENERATION));
+        assert!(!limits.features.contains(GenerationFeatures::VISION_ENCODE));
+        // The two figures the Qwen3 profile states as one, because zero divides and admits nothing.
+        assert_eq!(limits.latent_downsample, 1);
+        assert_eq!(limits.max_cfg_branches, 1);
+        assert_eq!(limits.max_latent_units, 0);
+        assert_eq!(limits.max_vit_grid_tokens, 0);
+    }
+}

@@ -279,6 +279,187 @@ mod tests {
         Ok(())
     }
 
+    /// The fields `page_cells` names are exactly the storages the plan asks for: no state plane
+    /// reaches past the last one the pool allocates, which is what `state_fields` exists to say.
+    #[test]
+    fn the_fields_a_page_names_are_the_storages_the_plan_asks_for() -> Result<()> {
+        let state = group(2, 1, 2);
+        let plan = crate::memory::prefix_cache::plan::CachePlan {
+            columns: 2,
+            plane_bytes: 16,
+            quantized: false,
+            unit_bytes: 64,
+            dtype: ipc::PrefixCacheDtype::Float8E4m3Fn,
+            groups: vec![state.clone()],
+            states: Vec::new(),
+            checkpoints: vec![checkpoint(0, 5)],
+        };
+        // Two columns and one unit per page hold two planes per field, and five planes reach the
+        // third field.
+        assert_eq!(plan.state_fields(), 3);
+        let fields = page_cells(&state, plan.columns, 8, &plan.checkpoints[0], &[5, 6])?;
+        let last = fields
+            .iter()
+            .map(|(field, _)| *field)
+            .max()
+            .expect("five planes name a field");
+        assert!(
+            last < plan.state_fields() as usize,
+            "a page names field {last} while the pool allocates {}",
+            plan.state_fields()
+        );
+        Ok(())
+    }
+
+    /// The row's property on a device: a page's planes gather into the snapshot completely before
+    /// any target block is written, so a page whose source units are also its targets comes out a
+    /// swap and not two copies of one block.
+    ///
+    /// This is the reason the row exists. A copy that walked block by block, reading and writing
+    /// as it went, would report success on every non-overlapping page and silently lose state on
+    /// exactly the pages a prefix cache shares between an old and a new request.
+    ///
+    /// Run it on a GPU host, alone on the device:
+    ///
+    /// ```text
+    /// cargo test -p executor --lib state::tests -- --ignored --test-threads=1
+    /// ```
+    ///
+    /// It needs `nvcc` on `PATH`; `UNISERVE_PROBE_ARCH` names the architecture (default `sm_100a`).
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn a_state_page_whose_units_overlap_its_targets_comes_out_correct() {
+        use platform::{
+            Allocator, Budget, Device, DeviceId, Function, LaunchConfig, Library, PinnedBuffer,
+            PoolKind, Stream, memcpy_async,
+        };
+        use std::path::PathBuf;
+        use std::process::Command;
+
+        const DEVICE: DeviceId = DeviceId(0);
+        const BLOCKS: usize = 8;
+        const WIDTH: usize = 16;
+
+        #[derive(Default)]
+        struct Allowance;
+        impl Budget for Allowance {
+            fn book(
+                &self,
+                _device: DeviceId,
+                _pool: PoolKind,
+                _bytes: u64,
+            ) -> platform::Result<()> {
+                Ok(())
+            }
+        }
+
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/state_copy.cu");
+        let cubin = std::env::temp_dir().join(format!("state-copy-{}.cubin", std::process::id()));
+        let arch = std::env::var("UNISERVE_PROBE_ARCH").unwrap_or_else(|_| "sm_100a".to_owned());
+        let status = Command::new("nvcc")
+            .arg("-cubin")
+            .arg(format!("-arch={arch}"))
+            .arg("-o")
+            .arg(&cubin)
+            .arg(&source)
+            .status()
+            .expect("this probe compiles its kernels with nvcc, which must be on PATH");
+        assert!(status.success(), "nvcc failed on {}", source.display());
+
+        let device = Device::new(DEVICE).expect("a CUDA device");
+        let mut allocator =
+            Allocator::new(&device, std::sync::Arc::new(Allowance)).expect("an allocator");
+        allocator
+            .reserve(PoolKind::Graph, 1 << 20)
+            .expect("reserve the probe's pool");
+        let blocks = BLOCKS * WIDTH;
+        let field = allocator
+            .allocate(PoolKind::Graph, blocks)
+            .expect("the field's planes");
+        let snapshot = allocator
+            .allocate(PoolKind::Graph, blocks)
+            .expect("the snapshot's rows");
+        // Two index vectors: the page read and the page written, which is the page read reversed.
+        let read = allocator
+            .allocate(PoolKind::Graph, 2 * 8)
+            .expect("the source page's cells");
+        let write = allocator
+            .allocate(PoolKind::Graph, 2 * 8)
+            .expect("the target page's cells");
+        let stream = Stream::new(DEVICE).expect("a stream");
+        let image = std::fs::read(&cubin).expect("the compiled probe kernels");
+        let library = Library::load(&device, &image).expect("load the probe kernels");
+        let read_kernel = library.kernel("state_snapshot").expect("state_snapshot");
+        let write_kernel = library.kernel("state_scatter").expect("state_scatter");
+
+        // Block `k` holds `k * 10 + j` at byte `j`, so a swap is visible byte by byte.
+        let mut fill = PinnedBuffer::new(DEVICE, blocks).expect("staging");
+        for (index, byte) in unsafe { fill.as_mut_slice() }.iter_mut().enumerate() {
+            *byte = u8::try_from(index / WIDTH * 10 + index % WIDTH).expect("a byte");
+        }
+        unsafe { memcpy_async(field.address(), fill.address(), blocks, &stream) }
+            .expect("fill the field");
+        // Page A reads blocks 3 and 4; page B writes block 4 and then block 3.
+        for (buffer, cells) in [(&read, [3i64, 4]), (&write, [4i64, 3])] {
+            let mut stage = PinnedBuffer::new(DEVICE, 16).expect("staging");
+            let bytes = unsafe { stage.as_mut_slice() };
+            for (index, cell) in cells.iter().enumerate() {
+                bytes[index * 8..index * 8 + 8].copy_from_slice(&cell.to_ne_bytes());
+            }
+            unsafe { memcpy_async(buffer.address(), stage.address(), 16, &stream) }
+                .expect("write the cells");
+        }
+        stream.synchronize().expect("order the fills");
+
+        let launch = |kernel: &Function, destination: u64, cells: u64, source: u64| {
+            let mut rows = 2i32;
+            let mut width = WIDTH as i32;
+            let mut arguments: [*mut std::ffi::c_void; 5] = [
+                (destination as u64 as *mut std::ffi::c_void),
+                (cells as u64 as *mut std::ffi::c_void),
+                (source as u64 as *mut std::ffi::c_void),
+                (&raw mut rows).cast(),
+                (&raw mut width).cast(),
+            ];
+            kernel
+                .launch_ex(
+                    &stream,
+                    &LaunchConfig::new([2, 1, 1], [WIDTH as u32, 1, 1]),
+                    &mut arguments,
+                )
+                .expect("launch the copy");
+        };
+        // Gather every source block, then write every target block: the two launches the row
+        // guarantees, in this order and no other.
+        launch(
+            &read_kernel,
+            snapshot.address(),
+            read.address(),
+            field.address(),
+        );
+        launch(
+            &write_kernel,
+            field.address(),
+            write.address(),
+            snapshot.address(),
+        );
+        stream.synchronize().expect("order the copies");
+
+        let mut back = PinnedBuffer::new(DEVICE, blocks).expect("staging");
+        unsafe { memcpy_async(back.address(), field.address(), blocks, &stream) }
+            .expect("read the field back");
+        stream.synchronize().expect("synchronize");
+        let bytes = unsafe { back.as_slice() };
+        let block = |index: usize| bytes[index * WIDTH..(index + 1) * WIDTH].to_vec();
+        let pattern = |index: usize| -> Vec<u8> {
+            (0..WIDTH)
+                .map(|j| u8::try_from(index * 10 + j).expect("a byte"))
+                .collect()
+        };
+        assert_eq!(block(3), pattern(4), "block 3 did not take block 4's bytes");
+        assert_eq!(block(4), pattern(3), "block 4 did not take block 3's bytes");
+    }
+
     /// A page of two units asks the two units it was given, so a checkpoint that needs more
     /// planes than the page's units and fields hold is refused rather than wrapped.
     #[test]
