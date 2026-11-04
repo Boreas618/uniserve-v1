@@ -30,8 +30,10 @@ architectures = ["sm_100a", "sm_90a"]
 
 [kernel.descriptors]
 # The latents of the H3 deployment's decoding resolutions: one key per geometry.
-# The geometry pairs are the fixture's own: every (height, width) an evaluation decodes, not
+# The geometry pairs are the rasters an evaluation decodes, in both orientations: a landscape canvas
+# and its transposed portrait are different latent rasters, so the widths are enumerated with the
+# heights and not derived from one orientation. The pairs are the fixture's own, not
 # their cross product. A key cannot name a mode, because the operator has no mode to name.
-dimensions = { dtype = ["bf16", "f16", "f32"], channels = ["24"], height = ["30", "40", "42", "48", "52", "62", "64", "84", "96"], width = ["26", "30", "40", "42", "48", "52", "64"], block = ["1024"], pdl = ["false", "true"] }
+dimensions = { dtype = ["bf16", "f16", "f32"], channels = ["24"], height = ["26", "30", "40", "42", "48", "52", "62", "64", "84", "96"], width = ["26", "30", "40", "42", "48", "52", "62", "64", "84", "96"], block = ["1024"], pdl = ["false", "true"] }
 
 [parameters]
