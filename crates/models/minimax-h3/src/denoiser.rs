@@ -855,11 +855,12 @@ impl Denoiser {
         // The audio rows: one element per channel-step pair, projected like any other row.
         if let (Some(audio), Ok(audio_indices)) = (latents.audio, state(tables, "audio_indices")) {
             let audio_rows = u64::from(audio_indices.shape.dim(0) as u32);
+            let features = u64::from(self.config.transformer.audio_channels);
             let flat = TensorView::with_strides(
                 audio.ptr,
                 audio.dtype,
-                Shape::new(&[audio_rows, 1]),
-                nn::Strides::new(&[1, 1]),
+                Shape::new(&[audio_rows, features]),
+                nn::Strides::new(&[features, 1]),
             );
             let projected = arena.tensor(dtype, Shape::new(&[audio_rows, hidden_size]))?;
             self.transformer.project_audio(f, flat, projected)?;
@@ -933,7 +934,8 @@ impl Denoiser {
             nn::layers::gather_rows(f, hidden, audio_indices, audio_hidden)?;
             let audio_groups = arena.tensor(DType::I32, Shape::new(&[audio_rows]))?;
             nn::layers::gather_rows(f, state(tables, "groups")?, audio_indices, audio_groups)?;
-            let velocity = arena.tensor(dtype, Shape::new(&[audio_rows, 1]))?;
+            let features = u64::from(self.config.transformer.audio_channels);
+            let velocity = arena.tensor(dtype, Shape::new(&[audio_rows, features]))?;
             self.transformer.velocity(
                 f,
                 audio_hidden,
@@ -945,8 +947,8 @@ impl Denoiser {
             let flat = TensorView::with_strides(
                 audio.ptr,
                 audio.dtype,
-                Shape::new(&[audio_rows, 1]),
-                nn::Strides::new(&[1, 1]),
+                Shape::new(&[audio_rows, features]),
+                nn::Strides::new(&[features, 1]),
             );
             self.solver
                 .step(f, Modality::Audio, flat, velocity, step.index)?;
