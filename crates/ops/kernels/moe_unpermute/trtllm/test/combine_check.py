@@ -143,9 +143,16 @@ def run(
     scales_dtype,
     output_dtype,
     dropped,
+    poison_unused=False,
     seed=0,
 ):
-    """One launch and the operator's reference; `dropped` is a set of `(token, route)` to skip."""
+    """One launch and the operator's reference; `dropped` is a set of `(token, route)` to skip.
+
+    `poison_unused` fills every row of `routes` that no map entry names with a NaN before the
+    launch. Those rows are the padding a sort leaves behind, and the combine must never read one:
+    a kernel that indexed `token · top + route` in place of the map, or that fell back to row zero
+    for a `-1` route, would carry the NaN into `out`.
+    """
     torch.manual_seed(seed)
     device = torch.device("cuda")
     in_code, in_element = DTYPES[input_dtype]
@@ -166,6 +173,17 @@ def run(
     mapping = permuted.reshape(tokens, top).clone()
     for token, route in dropped:
         mapping[token, route] = -1
+    poisoned = 0
+    if poison_unused:
+        named = torch.zeros(routes_rows, dtype=torch.bool, device=device)
+        named[mapping[mapping >= 0].to(torch.int64)] = True
+        poisoned = int((~named).sum())
+        if poisoned == 0:
+            raise SystemExit(
+                "the padding case needs at least one row no map entry names: "
+                "drop a route so its permuted row is left behind"
+            )
+        routes[~named] = float("nan")
     out = torch.full(
         (tokens, hidden), float("nan"), dtype=out_element, device=device
     )
@@ -235,10 +253,21 @@ def run(
             )
     # A difference that is not a number is never inside a bound: `>` would say it is.
     violations = int((~(error[~empty] <= allowed[~empty])).sum())
+    if poison_unused:
+        # The padding rows are NaN and only the padding rows are: a NaN anywhere in `out` came from
+        # a row the map does not name, which is the inverse of the check's other cases.
+        carried = int(torch.isnan(got).sum())
+        if carried:
+            raise SystemExit(
+                f"{carried} combined values are not a number: a NaN from the {poisoned} padding "
+                f"rows reached the output"
+            )
     print(
         f"{input_dtype}/{scales_dtype}->{output_dtype} tokens {tokens} top {top} hidden {hidden}: "
         f"{len(dropped)} dropped routes, {int(empty.sum())} tokens with no route, "
-        f"max |out - reference| = {float(error[~empty].max()) if bool((~empty).any()) else 0.0:.6g}, "
+        f"{f'{poisoned} padding rows poisoned, ' if poison_unused else ''}"
+        f"max |out - reference| = "
+        f"{float(error[~empty].max()) if bool((~empty).any()) else 0.0:.6g}, "
         f"bound rtol {relative:.3e}"
     )
     if violations:
@@ -328,8 +357,18 @@ def main() -> int:
         },
         **shapes,
     )
+    # The inverse of the dropped-route story: the rows the sort padded and no map entry names hold
+    # NaNs, so reading one is visible in the output instead of being a plausible number.
+    checked += run(
+        entry,
+        stream,
+        dropped={(token, top - 1) for token in range(tokens)},
+        poison_unused=True,
+        **shapes,
+    )
     print(
-        f"ok: {checked} combined values over three route patterns, within dot(top)'s bound"
+        f"ok: {checked} combined values over four route patterns — three within dot(top)'s bound, "
+        f"one proving the padding rows are never read"
     )
     return 0
 
