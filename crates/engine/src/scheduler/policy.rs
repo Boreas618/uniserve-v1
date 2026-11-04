@@ -2009,11 +2009,20 @@ mod shipped_packages {
             "crates/scheduling/policies/priority/package.toml",
             "crates/ops/program-fixtures/policy/package.toml",
         ] {
-            let text = std::fs::read_to_string(root.join(package))
-                .unwrap_or_else(|error| panic!("{package}: {error}"));
-            let parsed: toml::Value = text
-                .parse()
-                .unwrap_or_else(|error| panic!("{package}: {error}"));
+            let path = root.join(package);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            let parsed: toml::Value = text.parse().unwrap_or_else(|error| {
+                // A parse error at 1:1 on a package that is valid in the tree
+                // means the run read an empty file: name the path and its size
+                // rather than leave the reader to guess which copy it was.
+                panic!(
+                    "{}: {error} ({} bytes, read from {})",
+                    package,
+                    text.len(),
+                    path.display()
+                )
+            });
             let backend = parsed
                 .get("backend")
                 .and_then(toml::Value::as_str)
