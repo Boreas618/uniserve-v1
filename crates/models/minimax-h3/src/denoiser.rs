@@ -45,6 +45,9 @@ use crate::solver::Solver;
 use crate::transformer::Transformer;
 use crate::{Error, Result};
 
+/// The longest generated clip a deployment's bounds are taken over, in frames.
+const MAX_FRAMES: u32 = 1024;
+
 /// The modulation columns one AdaLN row holds: six affine vectors of three tags each.
 const ADALN_COLUMNS: u64 = 18;
 
@@ -130,6 +133,49 @@ impl Layouts {
             })
             .sum();
         elements as u32
+    }
+
+    /// The largest packed row count any layout of this deployment reaches.
+    ///
+    /// The attention allocates its scratch per packed row at load, so `rows` must bound every layout
+    /// the deployment can be asked for - and the two packings differ: the sparse one pads to whole
+    /// tiles, so it is the larger number for the same frame count (46848 against 38080 at the
+    /// released canvases). Taking the maximum of both is the only safe bound when a checkpoint's
+    /// attention kind is not the only thing a capture may be built for.
+    pub fn rows_bound(&self) -> Result<u32> {
+        let mut bound = 0;
+        for canvas in self.config.offered_canvases() {
+            let mut frames = crate::CLIP_FRAMES + crate::CLIP_LATENTS;
+            while frames <= MAX_FRAMES {
+                if let Ok(packing) = packing::dense_packing(
+                    frames,
+                    canvas,
+                    self.arrangement.text_rows,
+                    self.arrangement.condition_rows,
+                    self.arrangement.shard,
+                ) {
+                    bound = bound.max(packing.padded_tokens);
+                }
+                let tile = self.config.attention.capacity_rows();
+                if let Ok(segment) = packing::segment_packing(
+                    frames,
+                    canvas,
+                    self.arrangement.text_rows,
+                    self.arrangement.condition_rows,
+                    tile,
+                    tile,
+                ) {
+                    bound = bound.max(segment.extent.padded_tokens);
+                }
+                frames += crate::CLIP_FRAMES;
+            }
+        }
+        if bound == 0 {
+            return Err(Error::config(
+                "a deployment offers no canvas a layout can be built for".to_owned(),
+            ));
+        }
+        Ok(bound)
     }
 
     /// The layout a request is laid out in, without packing it.
@@ -1281,6 +1327,32 @@ mod tests {
         let (mut layout, _) = rule.layout(&request(121, 1344, 768)).unwrap();
         layout.text_rows = 100;
         assert!(rule.packing_of(&layout).is_err());
+    }
+
+    #[test]
+    fn the_row_bound_covers_both_packings() {
+        let rule = layouts();
+        let bound = rule.rows_bound().unwrap();
+        // The bound is at least any layout the deployment can be asked for, and the sparse packing's
+        // whole-tile padding makes it strictly larger than the dense one at the same request.
+        let (dense, _) = rule.layout(&request(121, 1344, 768)).unwrap();
+        let dense_packing = rule.packing_of(&dense).unwrap();
+        assert!(bound >= dense_packing.padded_tokens);
+        let segment = packing::segment_packing(
+            121,
+            &Canvas {
+                short_edge: 768,
+                aspect: (7, 4),
+                width: 1344,
+                height: 768,
+            },
+            rule.arrangement().text_rows,
+            rule.arrangement().condition_rows,
+            64,
+            64,
+        )
+        .unwrap();
+        assert!(segment.extent.padded_tokens > dense_packing.padded_tokens);
     }
 
     #[test]
