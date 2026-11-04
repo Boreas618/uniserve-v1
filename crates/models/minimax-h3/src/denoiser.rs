@@ -1642,20 +1642,21 @@ pub fn denoise_arena(
                     tokens * inner,
                 );
             }
-            for name in [
-                "exchanged_query",
-                "exchanged_key",
-                "exchanged_value",
-                "attended",
-            ] {
-                push(
-                    &mut plan,
-                    &format!("attention.{name}"),
-                    element,
-                    tokens * local,
-                );
+            push(&mut plan, "attention.attended", element, tokens * local);
+            // A layer that does not communicate reserves nothing for the exchange: the three
+            // destinations and the gathered result are views of the buffers above, so one rank's
+            // plan is four entries shorter - 2.2 GiB at a served canvas.
+            if arrangement.shard > 1 {
+                for name in ["exchanged_query", "exchanged_key", "exchanged_value"] {
+                    push(
+                        &mut plan,
+                        &format!("attention.{name}"),
+                        element,
+                        tokens * local,
+                    );
+                }
+                push(&mut plan, "attention.gathered", element, tokens * inner);
             }
-            push(&mut plan, "attention.gathered", element, tokens * inner);
         }
         crate::config::AttentionKind::Sparse { .. } => {
             let inner = local_heads * head_dim;
@@ -2456,7 +2457,18 @@ mod tests {
         // charged four bytes an element (`Buffer::width`'s fallback) - both silent at a canvas, both
         // wrong for the whole deployment. The group count is an input: the plan scales two entries by
         // it and nothing else.
-        for rule in [layouts(), sparse_layouts()] {
+        // One rank has no exchange to reserve for, two do: the plan follows the layer, which reserves
+        // its exchange destinations only when it communicates.
+        let two_ranks = Layouts::new(
+            layouts().config,
+            Arrangement {
+                text_rows: 128,
+                condition_rows: 64,
+                shard: 2,
+            },
+        )
+        .unwrap();
+        for rule in [layouts(), sparse_layouts(), two_ranks] {
             let layout = rule.cover(&request(121, 1344, 768));
             let plan = denoise_arena(&rule.config, &rule.arrangement, 22, DType::BF16, &layout)
                 .expect("a plan for the released canvas");
@@ -2484,6 +2496,21 @@ mod tests {
                 "audio.velocity",
             ] {
                 assert!(names.contains(name), "{name} is not in the plan");
+            }
+            // A layer that does not communicate reserves nothing for the exchange, and its gathered
+            // result is the buffer it already holds: at one rank those four entries must be absent,
+            // because they cost `rows x inner` each and are never read.
+            for name in [
+                "attention.exchanged_query",
+                "attention.exchanged_key",
+                "attention.exchanged_value",
+                "attention.gathered",
+            ] {
+                assert!(
+                    names.contains(name) == (rule.arrangement.shard > 1),
+                    "{name} at shard {}",
+                    rule.arrangement.shard
+                );
             }
         }
     }

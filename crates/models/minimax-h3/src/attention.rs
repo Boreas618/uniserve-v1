@@ -403,17 +403,34 @@ impl Scratch {
         let local_inner = u64::from(layer.local_heads) * u64::from(layer.head_dim);
         let total = u64::from(total_rows);
         let arena = f.arena();
+        let query = arena.tensor(dtype, Shape::new(&[rows, inner]))?;
+        let key = arena.tensor(dtype, Shape::new(&[rows, inner]))?;
+        let value = arena.tensor(dtype, Shape::new(&[rows, inner]))?;
+        let attended = arena.tensor(dtype, Shape::new(&[total, local_inner]))?;
+        // A layer that does not communicate has no exchange destinations and no gathered result:
+        // the two branches that read them run only with an exchange, so on one rank the views are
+        // the buffers the layer already holds and nothing is reserved twice. Reserving them
+        // regardless cost four `rows x inner` buffers - 2.2 GiB at a served canvas.
+        let (exchanged_query, exchanged_key, exchanged_value, gathered) = match layer.exchange {
+            Some(_) => (
+                arena.tensor(dtype, Shape::new(&[total, local_inner]))?,
+                arena.tensor(dtype, Shape::new(&[total, local_inner]))?,
+                arena.tensor(dtype, Shape::new(&[total, local_inner]))?,
+                arena.tensor(dtype, Shape::new(&[rows, inner]))?,
+            ),
+            None => (query, key, value, attended),
+        };
         Ok(Self {
-            query: arena.tensor(dtype, Shape::new(&[rows, inner]))?,
-            key: arena.tensor(dtype, Shape::new(&[rows, inner]))?,
-            value: arena.tensor(dtype, Shape::new(&[rows, inner]))?,
+            query,
+            key,
+            value,
             rotated_query: arena.tensor(dtype, Shape::new(&[rows, inner]))?,
             rotated_key: arena.tensor(dtype, Shape::new(&[rows, inner]))?,
-            exchanged_query: arena.tensor(dtype, Shape::new(&[total, local_inner]))?,
-            exchanged_key: arena.tensor(dtype, Shape::new(&[total, local_inner]))?,
-            exchanged_value: arena.tensor(dtype, Shape::new(&[total, local_inner]))?,
-            attended: arena.tensor(dtype, Shape::new(&[total, local_inner]))?,
-            gathered: arena.tensor(dtype, Shape::new(&[rows, inner]))?,
+            exchanged_query,
+            exchanged_key,
+            exchanged_value,
+            attended,
+            gathered,
         })
     }
 }
