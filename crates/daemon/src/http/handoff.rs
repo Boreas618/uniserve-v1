@@ -342,7 +342,11 @@ mod tests {
         let paused = tokio::time::timeout(Duration::from_secs(10), handoff.pause())
             .await
             .expect("the pause ends once the responses in flight answered");
-        assert_eq!(paused.len(), 1, "only the response that froze is handed over");
+        assert_eq!(
+            paused.len(),
+            1,
+            "only the response that froze is handed over"
+        );
         assert_eq!(paused[0].request_id, "kept");
 
         // The restart's decision reaches the response that froze.
