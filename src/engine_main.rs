@@ -127,104 +127,135 @@ pub(crate) struct Epoch {
     /// The program revision the daemon numbered for the generation that serves
     /// once this node switches over (§7.3).
     pub generation: u64,
+    /// The host identity of the node this process runs on, which the daemon knows and which the
+    /// Storage Server's claim states.
+    pub host: String,
 }
 
-/// The options of `uniserve engine`.
+/// The options of `uniserve engine`: the launch file the daemon writes for this process (§2.3).
 ///
-/// The daemon launches one main process per node and epoch, from the epoch's
-/// build config: the options name where that config is and how this node takes
-/// part in the epoch, and nothing that the build config states.
+/// Everything else the process needs is that file's; the daemon's own account of who this process
+/// is, which build config it serves and where it reaches the epoch's interfaces. A flag beside it
+/// would be a second account of the same thing, and the two would drift.
 #[derive(Debug, Clone, Args)]
 pub(crate) struct EngineArgs {
-    /// The epoch's build config, which the daemon wrote: design 7.2's values
-    /// that fix an epoch (`daemon::epoch::BuildConfig`).
+    /// The launch file the daemon wrote for this main process.
     #[arg(long)]
-    pub build_config: PathBuf,
-    /// The checkpoint the epoch serves: a local directory.
-    #[arg(long)]
-    pub model: PathBuf,
-    /// The leader daemon's request interface, `unix:<path>` or `<host>:<port>`.
-    #[arg(long)]
-    pub requests: String,
-    /// The engine number the daemon started this main process under.
-    #[arg(long)]
-    pub engine: u64,
-    /// This node's rank in the deployment.
-    #[arg(long, default_value_t = 0)]
-    pub node_rank: u32,
-    /// This rank's worker group, which keys its storage claims.
-    #[arg(long, default_value = "model-0")]
-    pub group: String,
-    /// This rank's ordinal inside its group.
-    #[arg(long, default_value_t = 0)]
-    pub rank: u32,
-    /// The devices this node's rank serves, as CUDA ordinals.
-    #[arg(long = "device")]
-    pub devices: Vec<u32>,
-    /// The Storage Server's socket for this deployment.
-    #[arg(long)]
-    pub storage_socket: PathBuf,
-    /// The deployment's name, under which the Storage Servers key its claims.
-    #[arg(long)]
-    pub deployment: String,
-    /// The world the epoch executes, which keys the storage it creates.
-    #[arg(long)]
-    pub world: u64,
-    /// The write claim this rank presents to the Storage Server, 32 hex digits.
-    #[arg(long, default_value = "00000000000000000000000000000000")]
-    pub claim: String,
-    /// The Program Server's socket.
-    #[arg(long)]
-    pub program_server: PathBuf,
-    /// A job that runs longer than half of this is reported as `Stalled` (§2.4).
-    #[arg(long, default_value = "30")]
-    pub watchdog_timeout: f64,
-    /// The probation an update must survive before the daemon commits it (§7.3).
-    #[arg(long, default_value = "10")]
-    pub rollback: f64,
-    /// Whether this node holds the epoch's schedulers: a DP rank's scheduler
-    /// runs here and drives the other nodes' executors (§2.1).
-    #[arg(long)]
-    pub scheduler_node: bool,
-    /// The addresses on which this node accepts its peer main processes'
-    /// connections, when it accepts any.
-    #[arg(long = "peer")]
-    pub peers: Vec<String>,
+    pub launch: PathBuf,
 }
 
-impl EngineArgs {
-    /// This rank's Storage Server launch (`specs/worker.md` §8): the server's socket, the
-    /// deployment its claim belongs to, the claim itself and the world exclusive storages are
-    /// created in.
-    fn storage_launch(&self) -> Result<ipc::StorageLaunch> {
-        Ok(ipc::StorageLaunch {
-            socket: self.storage_socket.display().to_string(),
-            deployment: self.deployment.clone(),
-            claim: claim_token(&self.claim)?,
-            // The host KV cache and another host's reach are the deployment's; a rank that needs
-            // either is told so by the daemon that starts it.
-            host_kv_cache: false,
-            tcp: None,
-            peers: Vec::new(),
-            world: self.world,
-            standby: false,
-            standby_storage: ipc::StandbyStorage::Auto,
-        })
+/// One engine process's launch, as the daemon writes it (`notes` of the launch contract).
+///
+/// The claim token and the Storage Server's socket are not here: they are runtime facts of the node
+/// this process runs on, which the daemon answers when the process asks for them, so a launch file
+/// cannot carry a claim that has not been minted yet.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Launch {
+    /// The epoch's build config, as the daemon wrote it: a path, since the config is the epoch's and
+    /// not the process's.
+    pub build_config: PathBuf,
+    /// The checkpoint the epoch serves.
+    pub model: PathBuf,
+    /// The leader daemon's request interface, `unix:<path>` or `<host>:<port>`.
+    pub requests: String,
+    /// The engine number the daemon started this process under.
+    pub engine: u64,
+    /// The Program Server's socket.
+    pub program_server: String,
+    /// The devices this rank serves, as CUDA ordinals.
+    pub devices: Vec<u32>,
+    /// This rank's worker group, which keys its storage claims.
+    pub group: String,
+    /// This rank's ordinal inside its group.
+    pub rank: u32,
+    /// The deployment's name, under which the Storage Servers key its claims.
+    pub deployment: String,
+    /// The world the epoch executes, which keys the storage it creates.
+    pub world: u64,
+    /// Whether this node holds the epoch's schedulers.
+    #[serde(default)]
+    pub scheduler_node: bool,
+    /// The addresses on which this node accepts its peer main processes' connections.
+    #[serde(default)]
+    pub peers: Vec<String>,
+    /// How long a job may run without progress before it is reported `Stalled`, when the daemon
+    /// states it apart from the build config (§2.4).
+    #[serde(default)]
+    pub watchdog_timeout_s: Option<u64>,
+    /// The probation an update must survive before the daemon commits it (§7.3 step 4).
+    #[serde(default)]
+    pub rollback_s: Option<u64>,
+}
+
+impl Launch {
+    /// The launch file's contents.
+    fn read(path: &Path) -> Result<Self> {
+        let file = std::fs::File::open(path)
+            .with_context(|| format!("opening the launch file {}", path.display()))?;
+        serde_json::from_reader(file)
+            .with_context(|| format!("reading the launch file {}", path.display()))
     }
+
+    /// §2.4's watchdog bound: the launch's when the daemon states one apart from the build config.
+    fn watchdog_timeout(&self) -> Option<Duration> {
+        self.watchdog_timeout_s.map(Duration::from_secs)
+    }
+}
+
+/// Asks this node's daemon for the node's Storage Server (§8).
+///
+/// The socket and the claim are runtime facts of the node: the daemon mints the claim when it starts
+/// the server, so a launch file cannot carry either. The answer states the socket the server listens
+/// on, the token this rank presents, and where another host reaches its pages.
+fn claim(control: &mut Control, launch: &Launch, host: &str) -> Result<ipc::StorageLaunch> {
+    let request = proto::process::Request {
+        id: 1,
+        kind: Some(proto::process::request::Kind::Claim(proto::process::Claim {
+            host: host.to_owned(),
+            deployment: launch.deployment.clone(),
+            scopes: vec![proto::process::Scope {
+                group: launch.group.clone(),
+                rank: launch.rank,
+            }],
+            // A server the daemon starts for this claim takes the deployment's connector settings;
+            // the main process has none of its own to state.
+            server_arguments: Vec::new(),
+            world: launch.world,
+            retire: Vec::new(),
+        })),
+    };
+    control.daemon_mut().send(&request)?;
+    let reply: proto::process::Reply = control
+        .daemon_mut()
+        .recv(Duration::from_secs(60))?
+        .context("the daemon closed the request interface while this process claimed its storage")?;
+    if !reply.error.is_empty() {
+        bail!("the daemon refused this rank's claim: {}", reply.error);
+    }
+    let Some(proto::process::reply::Kind::Claimed(claimed)) = reply.kind else {
+        bail!("the daemon answered a claim with another reply");
+    };
+    Ok(ipc::StorageLaunch {
+        socket: claimed.socket,
+        deployment: launch.deployment.clone(),
+        claim: claim_token(&claimed.claim)?,
+        // The host KV cache is the deployment's, and a rank whose storage another host reaches is
+        // told so by the answer's `tcp`; the rest of the launch is the epoch's.
+        host_kv_cache: false,
+        tcp: (!claimed.tcp.is_empty()).then_some(claimed.tcp),
+        peers: Vec::new(),
+        world: launch.world,
+        standby: false,
+        standby_storage: ipc::StandbyStorage::Auto,
+    })
 }
 
 /// The 32 hex digits of a claim token, as the Storage Server takes it.
-fn claim_token(text: &str) -> Result<[u8; 16]> {
-    let text = text.trim();
-    if text.len() != 32 {
-        bail!("a claim is 32 hex digits, not {} characters", text.len());
-    }
-    let mut claim = [0_u8; 16];
-    for (index, byte) in claim.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16)
-            .with_context(|| format!("claim {text} is not hexadecimal"))?;
-    }
-    Ok(claim)
+fn claim_token(bytes: &[u8]) -> Result<[u8; 16]> {
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("a claim token is 16 bytes, not {}", bytes.len()))
 }
 
 /// Runs the `uniserve engine` command.
@@ -240,12 +271,18 @@ pub(crate) fn run(
         log.log_level_http.as_deref(),
     );
 
+    let launch = Launch::read(&args.launch)?;
     let build: BuildConfig = serde_json::from_reader(
-        std::fs::File::open(&args.build_config)
-            .with_context(|| format!("opening {}", args.build_config.display()))?,
+        std::fs::File::open(&launch.build_config)
+            .with_context(|| format!("opening {}", launch.build_config.display()))?,
     )
-    .with_context(|| format!("reading the build config {}", args.build_config.display()))?;
-    let mut main = MainProcess::start(args, &build)?;
+    .with_context(|| {
+        format!(
+            "reading the build config {}",
+            launch.build_config.display()
+        )
+    })?;
+    let mut main = MainProcess::start(&launch, &build)?;
     let ending = main.serve();
     main.close();
     if let Some(failure) = ending? {
@@ -297,43 +334,43 @@ impl MainProcess {
     /// Connects to the daemon, loads the epoch's model, and starts the epoch's
     /// threads in the order §2.4 lists.
     ///
-    /// The epoch's configuration is resolved against this node's arguments first
-    /// ([`EpochPlan`]), because three of the things the main process needs are
-    /// the node's rather than the epoch's: which devices it serves, where its
-    /// Program Server is, and what those devices measure.
-    fn start(args: &EngineArgs, build: &BuildConfig) -> Result<Self> {
-        let plan = EpochPlan::of(args, build)?;
+    /// The epoch's configuration is resolved against this process's launch first
+    /// ([`EpochPlan`]), because three of the things the main process needs are the
+    /// node's rather than the epoch's: which devices it serves, where its Program
+    /// Server is, and what those devices measure.
+    fn start(launch: &Launch, build: &BuildConfig) -> Result<Self> {
+        let plan = EpochPlan::of(launch, build)?;
         let mut control = Control::connect(
             &Endpoints {
-                requests: args.requests.clone(),
-                peers: args.peers.clone(),
+                requests: launch.requests.clone(),
+                peers: launch.peers.clone(),
             },
-            args.engine,
+            launch.engine,
         )?;
-        // The request interface's handshake: this process says who it is, and
-        // the daemon answers with the engine spec and the epoch record (§2.3).
-        let epoch = handshake(&mut control, args, build)?;
+        // The request interface's handshake: this process says who it is, and the
+        // daemon answers with the epoch this node serves (§2.3).
+        let epoch = handshake(&mut control, launch, build)?;
 
-        // §8: the rank's retained weights outlive every world of the epoch, so the store is built
-        // once, before the model loads, and keeps what it maps for the epoch's life.
-        let storage = Retained::connect(
-            &args.storage_launch()?,
-            &args.group,
-            args.rank,
-            epoch.generation,
-        )
-        .context("connecting to the Storage Server")?;
-        let mut weights = WeightStore::new(Arc::clone(&storage));
-        let placement = Placement::of(args, build)?;
+        // §8: the rank's Storage Server and its claim are the node's, which the daemon answers for;
+        // the retained weights outlive every world of the epoch, so the store is built once, before
+        // the model loads, and keeps what it maps for the epoch's life.
+        let storage = claim(&mut control, launch, &epoch.host)?;
+        let client = Retained::connect(&storage, &launch.group, launch.rank, epoch.generation)
+            .context("connecting to the Storage Server")?;
+        let mut weights = WeightStore::new(Arc::clone(&client));
+        let placement = Placement::of(launch, build)?;
         // One model per rank: every device's runner reads the same weights, so a second device costs
         // one `Arc` and not a second load.
         let model = Arc::new(
-            load_model(&args.model, &placement, &mut weights)
+            load_model(&launch.model, &placement, &mut weights)
                 .context("loading the epoch's model")?,
         );
 
         // The owners of §4 are opened before any thread that borrows them, and
-        // released in reverse order by `close`.
+        // released in reverse order by `close`. The weights are mapped before the capacity plan
+        // measures, so the plan sees a device with the model already in it - the figure it computes
+        // is what is left, not what was there before the load. Pools sized first and weights after
+        // would over-commit the device by exactly the model's size.
         let mut memory = plan.open_memory()?;
         let blocking = ThreadPool::new(plan.blocking_limits());
         let modules = blocking.lane::<Install>(BlockingKind::ModuleLoad)?;
@@ -342,19 +379,18 @@ impl MainProcess {
         // §2.4's watchdog exists before any device command: `start`'s own commands
         // are bounded by the same stall bound as every command the control thread
         // issues afterwards.
-        let watchdog = Watchdog::new(plan.watchdog_timeout())?;
+        let watchdog = Watchdog::new(
+            launch
+                .watchdog_timeout()
+                .unwrap_or_else(|| plan.watchdog_timeout()),
+        )?;
         let update = HotUpdate::new(epoch.generation);
 
         let mut executors = Vec::with_capacity(plan.devices().len());
         let mut generations = Vec::with_capacity(plan.devices().len());
         for device in plan.devices() {
             let generation = Arc::new(Generation::new(epoch.generation, std::iter::empty()));
-            let runners = plan.runners(
-                *device,
-                Arc::clone(&model),
-                &mut memory,
-                &generation,
-            )?;
+            let runners = plan.runners(*device, Arc::clone(&model), &mut memory, &generation)?;
             let executor =
                 Executor::spawn(*device, runners, plan.events(), plan.graph(*device)?)?;
             // §7.3 step 2 shadows a replaced operator beside the serving one, so the region it runs
@@ -1627,9 +1663,9 @@ fn device_command(
 /// daemon numbered for the generation that serves once this node switches over
 /// (§7.3). The build config is the one the daemon wrote for this node, read
 /// before the handshake; the welcome confirms it is the same epoch.
-fn handshake(control: &mut Control, args: &EngineArgs, build: &BuildConfig) -> Result<Epoch> {
+fn handshake(control: &mut Control, launch: &Launch, build: &BuildConfig) -> Result<Epoch> {
     control.daemon_mut().send(&proto::request::wire::Hello {
-        engine: args.engine,
+        engine: launch.engine,
         build: proto::BUILD.to_owned(),
         major: proto::PROTOCOL_MAJOR,
         minor: proto::PROTOCOL_MINOR,
@@ -1641,14 +1677,16 @@ fn handshake(control: &mut Control, args: &EngineArgs, build: &BuildConfig) -> R
     if !welcome.refusal.is_empty() {
         bail!("the daemon refused this main process: {}", welcome.refusal);
     }
-    // The epoch's programs and the revision that serves from the first
-    // switchover are front's fields on the welcome (`crates/proto`'s
-    // `Welcome`/`process.proto`); until they are in the schema this process
-    // serves nothing, which is the state a standby main process is in anyway.
+    let spec = welcome.spec.unwrap_or_default();
+    // The epoch's programs and the generation that serves at start are not in the spec yet: the
+    // programs arrive as the daemon's first `Precopy` (§7.3 step 2) and the generation number is the
+    // daemon's own. Until it states one, this process serves generation zero, whose `Precopy` names
+    // generation one - the daemon's next number (M951).
     Ok(Epoch {
         build: build.clone(),
         programs: Programs::new(),
         generation: 0,
+        host: spec.host,
     })
 }
 
@@ -1685,7 +1723,7 @@ impl Placement {
     /// routed experts of the deployment's schedulers. A rank's ordinal places it in both: its
     /// tensor rank is its position inside its scheduler's group, and its expert rank is which
     /// scheduler's share of the experts it keeps.
-    fn of(args: &EngineArgs, build: &BuildConfig) -> Result<Self> {
+    fn of(launch: &Launch, build: &BuildConfig) -> Result<Self> {
         let tensor_parallel = u32::try_from(build.tensor_parallel_size.get())
             .context("a tensor-parallel degree larger than u32::MAX")?;
         if tensor_parallel == 0 {
@@ -1696,9 +1734,9 @@ impl Placement {
         let expert_parallel = if build.expert_parallel { data_parallel } else { 1 };
         Ok(Self {
             tensor_parallel,
-            tensor_rank: args.rank % tensor_parallel,
+            tensor_rank: launch.rank % tensor_parallel,
             expert_parallel,
-            expert_rank: (args.rank / tensor_parallel) % expert_parallel,
+            expert_rank: (launch.rank / tensor_parallel) % expert_parallel,
             // The deployment's page size is the cache's (`kv_cache_config.block_size`), and the
             // attention program's workspace is the load config's; neither is ours to guess, so the
             // model's own defaults stand until the loader takes them from the build config.
