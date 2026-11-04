@@ -149,6 +149,35 @@ impl Graphs {
         buckets
     }
 
+    /// Drops exactly `generation`'s graphs, in bucket order, and answers the buckets it dropped.
+    ///
+    /// This is what a precopy that never switched over needs (7.3 step 2): the generation was
+    /// prepared - rebound or recaptured, its arena regions reserved - and then abandoned, so its
+    /// graphs and kernels have no owner left but the runner. It is not `purge`: purge drops what is
+    /// *older* than the serving generation, and an abandoned generation is newer than it, so
+    /// `purge` cannot reach it. Nothing a serving generation addresses is touched: the entries are
+    /// keyed by `(bucket, generation)` and only this generation's keys go.
+    ///
+    /// The buckets come back so the caller can release each one's arena region when no other
+    /// generation still holds it, in the same order `purge` uses: the executable goes first, so
+    /// the region is released only after the graphs that addressed it are gone.
+    pub fn discard(&mut self, generation: u64) -> Vec<Bucket> {
+        let stale: Vec<(Bucket, u64)> = self
+            .captured
+            .keys()
+            .filter(|(_, captured_generation)| *captured_generation == generation)
+            .copied()
+            .collect();
+        let mut buckets: Vec<Bucket> = stale.iter().map(|(bucket, _)| *bucket).collect();
+        buckets.sort_unstable();
+        buckets.dedup();
+        for key in stale {
+            // Dropping the entry drops the executable and then its nodes.
+            self.captured.remove(&key);
+        }
+        buckets
+    }
+
     /// How many graphs the runner holds, of every generation.
     pub fn len(&self) -> usize {
         self.captured.len()
