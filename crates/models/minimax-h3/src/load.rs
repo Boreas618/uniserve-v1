@@ -227,6 +227,22 @@ impl LoadOptions {
         self
     }
 
+    /// Check the deployment itself, before any checkpoint file is read.
+    ///
+    /// A block placed twice would be built twice on the same rank - two copies of a DiT's weights
+    /// for one device - so a deployment that repeats one is refused rather than loaded.
+    pub fn validate(&self) -> Result<()> {
+        for (index, component) in self.blocks.iter().enumerate() {
+            if self.blocks[..index].contains(component) {
+                return Err(Error::config(format!(
+                    "the deployment places the {} block twice; each block is placed once",
+                    component.name()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// The activation element type of `component`, the deployment's choice or the design's.
     pub fn activation(&self, component: Component) -> DType {
         self.dtype.unwrap_or_else(|| component.activation())
@@ -280,6 +296,10 @@ pub fn load(
     loader: &mut nn::weights::WeightLoader<'_>,
     options: LoadOptions,
 ) -> Result<nn::Model> {
+    // The deployment is checked before any checkpoint file is read, so a malformed one fails
+    // cheaply.
+    options.validate()?;
+
     // The checkpoint learns the pipeline root, so a directory of shards that states it is found
     // from the root the caller names.
     let checkpoint = nn::Checkpoint::open(root)?;
@@ -460,6 +480,23 @@ mod tests {
         // taken from the dense plan alone would under-size the scratch by 8768 rows.
         assert_eq!(dense_rows, 38080);
         assert_eq!(sparse_rows, 46848);
+    }
+
+    #[test]
+    fn a_deployment_that_places_a_block_twice_is_refused() {
+        let once = LoadOptions::new(vec![Component::TextEncoder, Component::Transformer]);
+        once.validate().expect("each block is placed once");
+
+        let twice = LoadOptions::new(vec![
+            Component::TextEncoder,
+            Component::Transformer,
+            Component::TextEncoder,
+        ]);
+        let error = twice.validate().err().expect("a block placed twice");
+        assert!(
+            matches!(error, Error::Config(ref problem) if problem.contains("text_encoder")),
+            "{error}"
+        );
     }
 
     #[test]
