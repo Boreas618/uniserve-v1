@@ -100,8 +100,10 @@ impl Op for Embedding {
             .u64(tokens)
             .u32(descriptor.hidden)
             .u32(descriptor.first)
-            .u32(descriptor.rows)
-            .flag(descriptor.pdl);
+            .u32(descriptor.rows);
+        // No dependent-launch word: the module takes that flag as a constexpr and the driver takes it
+        // as a launch attribute, and a parameter the module does not declare would push the two
+        // scratch addresses the compiler's launcher appends out of place.
         kernel.launch(
             LaunchGrid::covering(tokens, u64::from(descriptor.block))?,
             &mut arguments,

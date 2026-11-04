@@ -1210,7 +1210,7 @@ fn a_package_compiles_from_the_copy_its_install_kept() {
         .prepare(&request, &mut |progress| states.push(progress.state))
         .expect("the package compiles from the installed copy");
     assert!(
-        states.iter().any(|state| *state == BuildState::Committed),
+        states.contains(&BuildState::Committed),
         "the build of the installed copy committed nothing: {states:?}"
     );
     stop.store(true, Ordering::SeqCst);

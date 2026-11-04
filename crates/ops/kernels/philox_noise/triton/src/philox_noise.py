@@ -94,6 +94,7 @@ def _philox_noise_kernel(
     stage,
     draw,
     key,
+    offset,
     BLOCK: tl.constexpr,
     NORMAL: tl.constexpr,  # noqa: N803
     ROWS: tl.constexpr,
@@ -109,6 +110,11 @@ def _philox_noise_kernel(
 
     ``stage`` and ``draw`` are the processor stage and the draw index within the token and
     stage. Under the scalar form ``keys_ptr`` is null and is not read.
+
+    ``offset`` is where this call starts in the request's stream: element ``i`` of this call draws
+    element ``offset + i``, which is what lets a rank draw its own slice of one longer stream. It
+    shifts the address only, never the store: the buffer holds this call's own elements. An odd
+    offset is legal, since a normal draw's element is half a Philox word.
     """
     block = tl.program_id(1).to(tl.int64) if ROWS else tl.program_id(0).to(tl.int64)
     row = tl.program_id(0).to(tl.int64) if ROWS else tl.zeros((), tl.int64)
@@ -120,9 +126,10 @@ def _philox_noise_kernel(
     k0 = key.to(tl.uint64) & _MASK32
     k1 = (key >> 32).to(tl.uint64) & _MASK32
 
-    # Both elements of a pair share one counter; the uniform draw takes one element.
-    index = (lanes // 2) if NORMAL else lanes
-    index = index.to(tl.uint64)
+    # Both elements of a pair share one counter; the uniform draw takes one element. The stream index
+    # is this call's index advanced by the offset it starts at.
+    stream = lanes.to(tl.uint64) + offset.to(tl.uint64)
+    index = (stream // 2) if NORMAL else stream
     word0, word1 = _philox_words(
         index & _MASK32,
         (index >> 32) & _MASK32,
@@ -141,10 +148,11 @@ def _philox_noise_kernel(
         )
     else:
         value = first
-    # The row form's address is row-major; the scalar form's is the flat index it drew from.
-    offset = row * elements + lanes if ROWS else lanes
+    # The row form's address is row-major; the scalar form's is the flat index it drew from. Neither
+    # carries the stream offset: that addresses the draw, not the buffer.
+    target = row * elements + lanes if ROWS else lanes
     tl.store(
-        out_ptr + offset,
+        out_ptr + target,
         value.to(out_ptr.dtype.element_ty, fp_downcast_rounding="rtne"),
         mask=live,
     )

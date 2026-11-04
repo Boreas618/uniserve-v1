@@ -63,7 +63,7 @@ pub fn launched(operator: &'static str, key: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Sink, launched, set_sink};
+    use super::{Sink, installed, launched, set_sink};
 
     struct Recording(Vec<(String, String)>);
 
@@ -89,5 +89,15 @@ mod tests {
                 ("gemm".to_owned(), "input_bf16_k_2048".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn the_question_answers_for_the_sink_the_launch_would_reach() {
+        assert!(!installed(), "a fresh thread has no sink");
+        let mut recording = Recording(Vec::new());
+        set_sink(Some(&mut recording));
+        assert!(installed());
+        set_sink(None);
+        assert!(!installed());
     }
 }

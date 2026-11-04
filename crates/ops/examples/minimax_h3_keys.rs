@@ -96,10 +96,15 @@ const HIDDEN: u32 = 5376;
 const ROPE_FREQ_DIM: u32 = 16;
 const ROPE_AXES: u32 = 3;
 const ROTATED: u32 = ROPE_FREQ_DIM * ROPE_AXES * 2;
-const ROPE_THETA: f32 = 10_000.0;
 
 /// Elements one `rotary_factors` program handles (`launch::ROTARY_BLOCK`).
 const ROTARY_BLOCK: u32 = 256;
+
+/// Elements one `rows` program places: the layer's own `BLOCK` in `crates/nn/src/layers/rows.rs`.
+const ROWS_BLOCK: u32 = 1024;
+
+/// The video VAE decoder's token width: `decoder_num_attention_heads · decoder_attention_head_dim`.
+const VAE_WIDTH: u32 = 32 * 64;
 
 /// Tokens one `qk_norm_rope` program handles (`launch::QK_NORM_TOKENS`).
 const QK_NORM_TOKENS: u32 = 1;
@@ -132,6 +137,10 @@ const AUDIO_LATENT_DIM: u32 = 2048;
 
 /// The audio VAE's latent channels (`latent_channels`): the encoder's narrow width.
 const AUDIO_LATENT_CHANNELS: u32 = 32;
+
+/// The modulation table's chunks per row: shift, scale and gate for each of the two sublayers
+/// (`transformer.rs`'s `chunks` refuses a table wider or narrower than `6 · width`).
+const MODULATION_CHUNKS: u32 = 6;
 
 /// The transformer's normalizer epsilon (`norm_eps`, `qk_norm_eps`).
 const NORM_EPSILON: f32 = 1e-5;
@@ -213,17 +222,11 @@ fn main() {
 
     // ---- Media: the two programs whose variants do not depend on a resolution.
     //
-    // The audio path pads the ends of a waveform with one axis (`leading = batch · channels`).
-    push(
-        "replicate_pad",
-        ops::replicate_pad::Descriptor {
-            dtype: DType::F32,
-            axes: 1,
-            block: ELEMENTWISE_BLOCK,
-            pdl: PDL,
-        }
-        .to_string(),
-    );
+    // Padding is not one of them: the video VAE's replicate and reflect pads are `frame_pad`'s
+    // `reflect` flag (`crates/ops/src/frame.rs`), and the audio decoder's pads are fused into
+    // `audio_resample` and its convolutions. A general ATen `F.pad(mode="replicate")` over trailing
+    // axes has no caller in the reference, so it is not declared.
+    //
     // The video path's antialiased downscale of a packed uint8 frame, three colour channels.
     push(
         "antialiased_resize_uint8",
@@ -297,7 +300,9 @@ fn main() {
             positions: DType::I32,
             columns: ROTATED / 2,
             block: ROTARY_BLOCK,
-            scale: ops::Float::from(ROPE_THETA),
+            // The layer's scale, not the rope base: every H3 `Rotary` is built with 1.0 and the
+            // 1e4 base lives in the frequencies table the host fills.
+            scale: ops::Float::from(1.0_f32),
             pdl: PDL,
             axes: ROPE_AXES,
             sections: {
@@ -348,6 +353,21 @@ fn main() {
             scale_stride: u64::from(HIDDEN),
             update: true,
             retain: false,
+        }
+        .to_string(),
+    );
+    // The gated residual that closes each block: `hidden + gate[i] · update`. The block's
+    // modulation table is `[rows, 6 · hidden]` and the gate is the sixth chunk of a row
+    // (`transformer.rs`'s `chunks(modulation, width, 3)`, which takes the last of the three MLP
+    // chunks), so the gate's rows sit `6 · hidden` elements apart. The row count is the launch's,
+    // not the key's: it changes with the clip length.
+    push(
+        "gated_residual",
+        ops::modulation::GatedResidualDescriptor {
+            dtype: DType::BF16,
+            indices: DType::I32,
+            width: HIDDEN,
+            gate_stride: u64::from(MODULATION_CHUNKS) * u64::from(HIDDEN),
         }
         .to_string(),
     );
@@ -481,6 +501,21 @@ fn main() {
         }
         .to_string(),
     );
+    // The latent reorder: the video decoder writes channel-first and the media stage reads
+    // channel-last, so one strided copy moves the block. Two rows, because the two consumers work in
+    // different precisions — the VAE's latent is FP32 (its native precision) and the VSA compose's
+    // pooled block is BF16 — and the key names the element type and nothing else: the strides are
+    // launch values, so one program serves every clip geometry.
+    for dtype in [DType::F32, DType::BF16] {
+        push(
+            "copy_block",
+            ops::copy_block::Descriptor {
+                source: dtype,
+                out: dtype,
+            }
+            .to_string(),
+        );
+    }
     // The audio decoder's fused BigVGAN block, at the decoder's own rate and taps.
     push(
         "audio_activation",
@@ -1051,16 +1086,62 @@ fn main() {
         .to_string(),
     );
 
-    // Gaps this file does not fill, named rather than invented:
-    // - `bias_add`: the channel list per call site follows the stage widths above, but the call sites
-    //   are the decoder's and the video VAE's own composition, which is h3's to state.
-    // - `conv3d`: the video VAE's per-stage geometry (kernels 3, spatial strides from
-    //   `spatial_downsample_factors [2,2,2,2,1,1]`, temporal 1 or 2) is a construction inside
-    //   `diffusers`' `AutoencoderKLMiniMaxH3`, not a number in a config.
-    // - `embedding`, `act_and_mul`: the text encoder's shard rows and its gate/value strides are the
-    //   layer's layout choices, not the config's.
-    // - the five VSA operators, `gated_residual`, `frame_pad`/`frame_moments`/`frame_norm_pad`,
-    //   `position_interpolate`, `rope_apply`, `rows`, `paged_attention`: h3's packing and processor.
+    // Placing the rows a tower contributes into the sequence that reserved them. Four call sites
+    // exist and each is in a layer of `crates/models/minimax-h3`, all of them at the layer crate's
+    // one element block (its `rows.rs`'s `BLOCK`, 1024) and none on a dependent launch:
+    //
+    // - the text encoder's prompt reserves placeholder rows for its images and the tower's vision
+    //   rows *replace* them (`text_encoder.rs`, `Rows::replace`), at the language width;
+    // - a DeepStack tap *adds* a tower layer's rows into rows that already hold a residual
+    //   (`text_encoder.rs`, `Rows::add`), at the same width;
+    // - the denoiser scatters its packed video rows and its audio rows into the one sequence
+    //   (`denoiser.rs`, `Rows::replace`), at the transformer's hidden width — one key for both
+    //   modalities, because the operator reads only rows, columns and the index view;
+    // - the video VAE decoder starts its stream by placing the projected voxels, its register rows
+    //   and its zero row into the token rows (`video_vae.rs`, `Rows::replace`), at the decoder's
+    //   `decoder_num_attention_heads · decoder_attention_head_dim = 32 · 64` and in FP16.
+    //
+    // The merge that makes a language-width token out of a `2x2` block of patches is *not* here: it
+    // is a reshape of the contiguous `[patches, 1152]` hidden state into `[patches/4, 4608]`, so no
+    // rows are gathered and no program reads them.
+    for (dtype, mode, columns) in [
+        (DType::BF16, ops::rows::Mode::Replace, text_columns),
+        (DType::BF16, ops::rows::Mode::Add, text_columns),
+        (DType::BF16, ops::rows::Mode::Replace, HIDDEN),
+        (DType::F16, ops::rows::Mode::Replace, VAE_WIDTH),
+    ] {
+        push(
+            "rows",
+            ops::rows::Descriptor {
+                dtype,
+                mode,
+                columns,
+                block: ROWS_BLOCK,
+                pdl: PDL,
+            }
+            .to_string(),
+        );
+    }
+
+    // Gaps this file does not fill, named rather than invented. Each is a number the deployment
+    // owns, not one this file could read off a config:
+    // - `bias_add`: the audio decoder's channels are derivable and the video VAE's are not yet, and
+    //   in both cases the two flags belong to the layer that calls it. The audio decoder halves
+    //   `decoder_dim` once per upsample (`diffusers`' `MiniMaxH3AudioBigVGANDecoder.ups`:
+    //   `upsample_initial_channel // 2**i` into `// 2**(i+1)`, and its resblocks sit at the output
+    //   width), so its call sites are 1024, 512, 256, 128, 64, 32, 16 and 8; the video VAE's widths
+    //   come from its own stage list once that decoder is composed. `residual` and `residual_bias`
+    //   decide the key, and they are how the block folds its residual — the layer's, not the config's.
+    // - `paged_attention`: the decode attention is trtllm-gen, and its key follows the executor's
+    //   page geometry (page size, pages per sequence), which is scheduling and not the model's.
+    // - `vsa_select_tiles`: the number of key tiles one query tile may select is the deployment's
+    //   sparsity choice; `vsa_prepare_tiles`, `vsa_scores`, `vsa_add_gated_tiles` and
+    //   `vsa_zero_padding` are above, because their geometry is the checkpoint's.
+    // - `softmax`, `swiglu`, `scaled_residual_rms_norm`, `scaled_residual_layer_norm`,
+    //   `vsa_compose_gated_rows`: declared, and nothing in either model's code calls them yet, so
+    //   there is no geometry to key. They are named here rather than left to be found: the first two
+    //   belong to the sampler's chain and the Qwen3 slice, the two residuals to a stream that folds
+    //   its normalization in one launch, and the composition to the VSA chain's last step.
 
     // One key per line, the same key once: a variant two layers launch is packaged once.
     lines.sort();

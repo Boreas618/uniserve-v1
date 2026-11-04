@@ -63,8 +63,8 @@ impl Recipe {
     pub fn read(path: &Path) -> Result<Self, String> {
         let text = std::fs::read_to_string(path)
             .map_err(|error| format!("{}: {error}", path.display()))?;
-        let value: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
+        let value: serde_json::Value =
+            serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
         let module = text_of(&value, "module")
             .ok_or_else(|| format!("{}: a recipe names its module directory", path.display()))?;
         let entry = text_of(&value, "entry")
@@ -219,13 +219,14 @@ impl Parameter {
                 object.len()
             ));
         }
-        let (kind, value) = object.iter().next().expect("the object has one entry");
+        // The length was checked to be one, so the iteration answers exactly one entry.
+        let (kind, value) = match object.iter().next() {
+            Some(entry) => entry,
+            None => return Err("a parameter names exactly one kind, got none".to_owned()),
+        };
         match kind.as_str() {
             "pointer" => Ok(Self::Pointer(
-                value
-                    .as_str()
-                    .ok_or("a pointer names a buffer")?
-                    .to_owned(),
+                value.as_str().ok_or("a pointer names a buffer")?.to_owned(),
             )),
             "i32" => Ok(Self::Word {
                 bytes: signed(value, "i32")?.to_ne_bytes()[..4].to_vec(),
@@ -278,7 +279,9 @@ impl Parameter {
 }
 
 fn signed(value: &serde_json::Value, kind: &str) -> Result<i64, String> {
-    value.as_i64().ok_or_else(|| format!("{kind} takes an integer"))
+    value
+        .as_i64()
+        .ok_or_else(|| format!("{kind} takes an integer"))
 }
 
 fn unsigned(value: &serde_json::Value, kind: &str) -> Result<u64, String> {
@@ -289,7 +292,7 @@ fn unsigned(value: &serde_json::Value, kind: &str) -> Result<u64, String> {
 
 fn decode_hex(text: &str) -> Result<Vec<u8>, String> {
     let trimmed = text.trim();
-    if trimmed.len() % 2 != 0 {
+    if !trimmed.len().is_multiple_of(2) {
         return Err("bytes holds an even number of hex digits".to_owned());
     }
     (0..trimmed.len())
@@ -326,8 +329,8 @@ impl Metadata {
         let path = module.join("metadata.json");
         let text = std::fs::read_to_string(&path)
             .map_err(|error| format!("{}: {error}", path.display()))?;
-        let value: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
+        let value: serde_json::Value =
+            serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
         let number = |key: &str| {
             value
                 .get(key)
@@ -351,12 +354,7 @@ impl Metadata {
                 signature.as_object().map(|entries| {
                     entries
                         .iter()
-                        .map(|(name, kind)| {
-                            (
-                                name.clone(),
-                                kind.as_str().unwrap_or("").to_owned(),
-                            )
-                        })
+                        .map(|(name, kind)| (name.clone(), kind.as_str().unwrap_or("").to_owned()))
                         .collect()
                 })
             }),
@@ -390,8 +388,8 @@ impl Baked {
         }
         let text = std::fs::read_to_string(&path)
             .map_err(|error| format!("{}: {error}", path.display()))?;
-        let value: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
+        let value: serde_json::Value =
+            serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
         let object = value
             .as_object()
             .ok_or_else(|| format!("{}: baked constants are an object", path.display()))?;
