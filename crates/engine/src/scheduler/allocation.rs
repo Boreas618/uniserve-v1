@@ -363,6 +363,21 @@ impl MediaTensorAllocation {
 }
 
 impl MediaAllocations {
+    /// Releases the request rows, keeping the declared results the worker
+    /// still holds.
+    ///
+    /// A row is the scheduler's capacity, so it is handed back as soon as the
+    /// `Finish` that closes it has been submitted; a tensor is a span the
+    /// worker writes and reads until it has seen that `Finish`, so it stays in
+    /// the record until the acknowledgement releases it.
+    pub(super) fn close_rows(&mut self, storage: &mut Storage) -> Result<(), UnknownMediaWorker> {
+        let mut released = Ok(());
+        for (worker, allocation) in std::mem::take(&mut self.request_slots) {
+            released = released.and(storage.free_media_request(&worker, allocation));
+        }
+        released
+    }
+
     /// Returns the request row assigned in one physical worker address space.
     pub(super) fn request_slot(&self, worker: &crate::WorkerGroupId) -> u32 {
         self.request_slots[worker].index()
