@@ -2240,10 +2240,22 @@ impl<M: CausalLm> CausalLmRunner<M> {
             extras: None,
         };
         let samples = Samples::reserve(arena, DType::I32, rows, false)?;
-        sampling
-            .sampler
-            .forward(forward, logits, &state, self.columns.draws.device, &samples)
-            .map_err(Error::from)?;
+        // A greedy bucket takes each row's largest candidate; every other sampling bucket draws one
+        // from the row's distribution. The two are different launch sequences in the sampler layer
+        // (`Sampler::greedy` and `Sampler::forward`), and a draw cannot produce a greedy token: the
+        // candidates are ordered by token id before the inverse CDF, so a draw of zero selects the
+        // lowest id rather than the largest logit.
+        if bucket.variant.greedy() {
+            sampling
+                .sampler
+                .greedy(forward, logits, &state, &samples)
+                .map_err(Error::from)?;
+        } else {
+            sampling
+                .sampler
+                .forward(forward, logits, &state, self.columns.draws.device, &samples)
+                .map_err(Error::from)?;
+        }
         self.bucket_samples
             .borrow_mut()
             .insert(bucket, Sampled { tokens: samples.tokens });
