@@ -42,7 +42,9 @@
 //! §3.1) gives `|out − out_exact| ≤ (γₙ + u) V + u_out |out|` for `n` visible keys, and two
 //! implementations differ by twice that. The `V` term enters as an absolute term over the declared
 //! envelope [`VALUE_ENVELOPE`]; the reduction length is the descriptor's
-//! [`DenseDescriptor::max_kv_len`], the longest sequence a module serves, which bounds every launch.
+//! [`DenseDescriptor::max_kv_len`], the longest key extent a launch may declare. It is a bound and
+//! not a compiled value, so it is absent from the key: H3's dense attention is bidirectional over a
+//! `padded_tokens` bucket that varies per layout, and naming it would compile a program per bucket.
 //!
 //! # The package
 //!
@@ -90,7 +92,14 @@ pub struct DenseDescriptor {
     pub mask: Mask,
     /// Whether a history window is applied with the causal mask.
     pub windowed: bool,
-    /// The longest sequence (keys) the module serves.
+    /// The longest key extent a launch may declare: a bound the caller supplies per layout, **not**
+    /// a compiled value.
+    ///
+    /// It is deliberately absent from the key. H3's dense attention is full bidirectional over
+    /// `padded_tokens`, a bucket value that varies per layout and reaches 174,598, so naming it in
+    /// the key would compile a program per bucket. The program reads the extent from the key view;
+    /// this bound only refuses a launch beyond what the caller declared and gives the tolerance its
+    /// reduction length.
     pub max_kv_len: u32,
     /// Whether a launch carries `[batch + 1]` sequence offsets.
     ///
@@ -111,8 +120,7 @@ impl fmt::Display for DenseDescriptor {
             .field("q_heads", self.q_heads)
             .field("kv_heads", self.kv_heads)
             .field("mask", self.mask)
-            .field("window", self.windowed)
-            .field("len", self.max_kv_len);
+            .field("window", self.windowed);
         // Named only for the form without offsets, so every key the scheduled batch path compiles
         // stays byte-identical: one sequence is a new variant, not a renamed old one.
         let key = if self.cu_seq_lens {
@@ -638,11 +646,11 @@ mod tests {
     fn key_names_every_compiled_value() {
         assert_eq!(
             cross().to_string(),
-            "dtype_bf16_kv_bf16_out_bf16_head_dim_128_q_heads_24_kv_heads_8_mask_dense_window_false_len_8192"
+            "dtype_bf16_kv_bf16_out_bf16_head_dim_128_q_heads_24_kv_heads_8_mask_dense_window_false"
         );
         assert_eq!(
             fp32().to_string(),
-            "dtype_f32_kv_f32_out_f32_head_dim_64_q_heads_8_kv_heads_8_mask_dense_window_false_len_4096"
+            "dtype_f32_kv_f32_out_f32_head_dim_64_q_heads_8_kv_heads_8_mask_dense_window_false"
         );
     }
 
