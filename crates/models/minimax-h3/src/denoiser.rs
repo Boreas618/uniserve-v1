@@ -1379,9 +1379,16 @@ impl Denoiser {
     ///
     /// A visual condition is anchored as `t z + (1 - t) noise` at `t = VISUAL_CONDITION_TIME` and
     /// projected by the layer that projects the generated rows of its modality; an audio reference
-    /// is projected unchanged (`uniserve/models/minimax_h3/denoiser.py:510-532`). The anchoring's
-    /// sum is FP32 and stores the working dtype once, so what the DiT gathers is what the reference
-    /// rounds.
+    /// is projected unchanged (`uniserve/models/minimax_h3/denoiser.py:510-532`).
+    ///
+    /// **Precision, declared.** The reference patches, mixes and projects a visual condition in
+    /// FP32 and rounds once, at the copy into the prefix source. This build patches the draw and
+    /// stores the mix in the prefix source's dtype, so a visual condition's rows round twice: the
+    /// draw at the patch (its relative error is BF16's half-ulp) and the sum at the mix. The audio
+    /// reference rounds once, at its projection. The residual is a fraction of the conditioning
+    /// level's `1 - t` term and is far below the noise it is mixed with; an exact path needs an F32
+    /// column of the input projection (2 MB of widened weights at load) because the crate has no
+    /// F32→BF16 convert and `Patch` writes one dtype.
     ///
     /// The model allocates nothing: `out`, the latents and the draws are the runner's views, and
     /// the one scratch row buffer a visual condition needs comes from the forward pass's arena.
