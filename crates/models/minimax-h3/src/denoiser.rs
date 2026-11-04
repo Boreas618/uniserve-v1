@@ -266,8 +266,14 @@ impl Layouts {
                 height: raster.height,
                 width: raster.width,
             },
+            // The audio latent is the stereo pair of channel planes, channel-major:
+            // `[AUDIO_CHANNELS, audio_channels, steps]`, `2 * 32 * steps` elements. `channels * frames`
+            // is the buffer's size and the executor sizes a draw from that product, so the stereo
+            // factor belongs in `channels` - declaring `audio_channels` alone would state half the
+            // elements the denoiser reads as rows (`audio_rows = AUDIO_CHANNELS * steps`, each of
+            // `audio_channels` features).
             audio: Some(LatentShape {
-                channels: self.config.transformer.audio_channels,
+                channels: crate::config::AUDIO_CHANNELS * self.config.transformer.audio_channels,
                 frames: packing::audio_latent_frames(frames),
                 height: 1,
                 width: 1,
@@ -855,8 +861,13 @@ pub fn frames_of(request: &VideoRequest) -> u32 {
     packing::align_num_frames(request.frames)
 }
 
-/// The audio rows a layout holds: one element per channel and latent step.
-fn audio_rows(layout: Layout) -> Result<u64> {
+/// Elements of the audio latent a layout holds: `AUDIO_CHANNELS * audio_channels * steps`, the
+/// stereo pair of channel planes packed channel-major.
+///
+/// A rank's share of the *draw* is a share of the rows, not of the elements: the denoiser reads the
+/// latent as `[AUDIO_CHANNELS * steps, audio_channels]`, so `elements / audio_channels` rows is the
+/// row count a rank splits and a row is `audio_channels` elements wide.
+fn audio_elements(layout: Layout) -> Result<u64> {
     let audio = layout
         .audio
         .ok_or_else(|| Error::config("a layout without audio has no audio stream".to_owned()))?;
@@ -1190,11 +1201,14 @@ impl nn::capability::Denoiser for Denoiser {
         let condition = u64::from(layout.condition_elements);
         let video_offset =
             condition + self.first_row(video_rows).map_err(flattened)? * row_elements;
+        // A rank splits the audio latent by rows, as it splits the video's, and a row is
+        // `audio_channels` elements: an offset that forgot the width would put every rank after the
+        // first at the wrong place of the stream, and at one rank nothing would show.
+        let audio_width = u64::from(self.config.transformer.audio_channels);
+        let audio_rows = audio_elements(layout).map_err(flattened)? / audio_width;
         let audio_offset = condition
             + video_rows * row_elements
-            + self
-                .first_row(audio_rows(layout).map_err(flattened)?)
-                .map_err(flattened)?;
+            + self.first_row(audio_rows).map_err(flattened)? * audio_width;
         // A layout with an audio stream and no audio latents would draw the video's noise and leave
         // the audio's undrawn, which is a silent disagreement rather than an absent stream.
         match (layout.audio, out.audio) {
@@ -2297,6 +2311,30 @@ mod tests {
             conditions: &SHAPES,
             ..request(121, 832, 480)
         }
+    }
+
+    #[test]
+    fn the_layout_declares_every_element_the_audio_branch_reads() {
+        // The executor sizes the audio latent and its draw from `channels * frames`, so that product
+        // is what the denoiser must read as rows. The latent is the stereo pair of channel planes:
+        // `AUDIO_CHANNELS * audio_channels * steps` elements, read as `AUDIO_CHANNELS * steps` rows
+        // of `audio_channels`. Declaring `audio_channels` alone would state half of them.
+        let rule = layouts();
+        let (layout, _) = rule.layout(&request(121, 1344, 768)).unwrap();
+        let audio = layout
+            .audio
+            .expect("a request that produces audio carries its latent");
+        let channels = rule.config.transformer.audio_channels;
+        let steps = audio.frames;
+        assert_eq!(
+            u64::from(audio.channels) * u64::from(audio.frames),
+            u64::from(crate::config::AUDIO_CHANNELS) * u64::from(channels) * u64::from(steps)
+        );
+        // The rows the denoiser packs, and the width one of them spans.
+        assert_eq!(
+            audio_elements(layout).unwrap(),
+            u64::from(crate::config::AUDIO_CHANNELS * steps) * u64::from(channels)
+        );
     }
 
     #[test]
