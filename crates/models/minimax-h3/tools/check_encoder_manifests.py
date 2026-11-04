@@ -55,6 +55,18 @@ KEY_FIELDS: dict[str, tuple[str, ...]] = {
         "mask",
         "window",
     ),
+    # The same operator's FP32 backend declares its own descriptors, so a call at f32 is served by
+    # this package and not by `fa4` - reading it as a gap in `fa4` is reading the wrong manifest.
+    "dense_attention/f32": (
+        "dtype",
+        "kv",
+        "out",
+        "head_dim",
+        "q_heads",
+        "kv_heads",
+        "mask",
+        "window",
+    ),
     "qk_norm_rope/triton": (
         "dtype",
         "output",
@@ -113,6 +125,16 @@ def descriptor_blocks(path: pathlib.Path) -> list[dict[str, set[str]]]:
     return blocks
 
 
+def attention_package(dtype: str) -> str:
+    """The `dense_attention` backend that declares a call at `dtype`.
+
+    The operator has two packages and they do not overlap: `fa4` declares bf16 and f16, `f32`
+    declares the FP32 path (cuBLASLt SGEMM plus a softmax kernel). The store picks the module by the
+    descriptor's key, so the package a call is served by follows its element type.
+    """
+    return "dense_attention/f32" if dtype == "f32" else "dense_attention/fa4"
+
+
 def text_calls(text: dict, dtype: str) -> list[Call]:
     """Every descriptor call the text encoder's load and forward make."""
     hidden = text["hidden_size"]
@@ -133,7 +155,7 @@ def text_calls(text: dict, dtype: str) -> list[Call]:
         why = f"over {degree} tensor-parallel rank(s)"
         calls.append(
             (
-                "dense_attention/fa4",
+                attention_package(dtype),
                 {
                     "dtype": dtype,
                     "kv": dtype,
@@ -233,7 +255,7 @@ def tower_calls(vision: dict, dtype: str) -> list[Call]:
             "vision.rs: a block's norms",
         ),
         (
-            "dense_attention/fa4",
+            attention_package(dtype),
             {
                 "dtype": dtype,
                 "kv": dtype,
