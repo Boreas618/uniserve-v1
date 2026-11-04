@@ -149,12 +149,20 @@ STAGES = {
         "video_decoder",
         "run host: the reference's video decoder on the candidate's latents, one clip",
     ),
+    "encode_rows": (
+        "video_encoder",
+        "run host: the reference's video encoder on the candidate's pixels, its patch rows",
+    ),
 }
 
 # The precision the deployment declares per component, which is the default a stage runs in: the video
 # decoder is FP16 and every transformer block is BF16 (design section 1). A stage passes this as the
 # module's compute dtype, so a comparison in another dtype would measure the conversion.
-STAGE_DTYPES = {"decode_out": "torch.float16"}
+STAGE_DTYPES = {"decode_out": "torch.float16", "encode_rows": "torch.float32"}
+
+# The case's `dtype` word as `--dtype` spells it. An encode stage's case states the deployment's
+# type, and the reference must load at it: a comparison at another type would measure the fold.
+CASE_DTYPES = {"f32": "torch.float32", "f16": "torch.float16", "bf16": "torch.bfloat16"}
 
 
 def plan(probe: str) -> tuple[str, str, str]:
@@ -319,6 +327,8 @@ def run_stage(options) -> int:
     `case.json` beside it, so both sides compute over the same bytes. Nothing here draws an input,
     which is why a stage probe has no fixed input in the catalogue.
     """
+    if options.probe == "encode_rows":
+        return run_encode_rows(options)
     component, description = STAGES[options.probe]
     stack = options.stack
     if stack is None:
@@ -389,6 +399,145 @@ def run_stage(options) -> int:
     return 0
 
 
+def run_encode_rows(options) -> int:
+    """Encode the candidate's pixels with the reference's video encoder.
+
+    The candidate's stage writes `pixels.h3t`, FP32 `[channels, frames, rows, columns]` in the unit
+    range - the raster the encoder reads - and a `case.json` that names it. The reference encodes
+    RGB24 frames, so the raster is scaled back to bytes; the harness's pattern is an integer over
+    255, so the round trip is exact. The posterior draw is the encoder's own `draw_noise`, seeded
+    with the reference's `POSTERIOR_SEED` rather than with the request's seed, because the
+    reference fixes it so that a condition always encodes to the same latent - so this half has no
+    convention to reproduce beyond the pixels themselves.
+
+    The rows that come back are the conditioner's input, `[rows, channels * 4]` FP32. The crate's
+    stage writes the *projected* prefix instead, whose projection is the DiT's; when the crate
+    writes the same rows beside the pixels this compares them, and until then it writes the
+    reference side and says so.
+    """
+    component = "video_encoder"
+    stack = options.stack
+    if stack is None:
+        raise SystemExit(
+            "--probe encode_rows reads the candidate's tree:"
+            " --stack <out>/latent_encoder"
+        )
+    case_path = stack / "case.json"
+    if not case_path.is_file():
+        raise SystemExit(
+            f"{case_path} is missing; an encode stage writes `case.json`"
+            f" under its own directory"
+        )
+    case = json.loads(case_path.read_text())
+    stated = case.get("pixels")
+    if isinstance(stated, dict):
+        stated = stated.get("file")
+    pixels_path = (
+        Path(stated) if isinstance(stated, str) else Path("pixels.h3t")
+    )
+    if not pixels_path.is_absolute():
+        pixels_path = stack / pixels_path
+    if not pixels_path.is_file():
+        raise SystemExit(
+            f"{pixels_path} is missing; the encode stage writes the raster it"
+            f" read, so that both sides compute over one input rather than two"
+        )
+    pixels = read_tensor(pixels_path)
+    print(f"probe   encode_rows ({STAGES['encode_rows'][1]})")
+    print(f"stack   {stack}")
+    print(
+        f"case    canvas {case.get('canvas')}, dtype {case.get('dtype')},"
+        f" prefix rows {case.get('prefix_rows')}"
+    )
+    print(f"pixels  {pixels_path.name}: {tuple(pixels.shape)} {pixels.dtype}")
+    if pixels.dtype != torch.float32:
+        raise SystemExit(
+            f"{pixels_path} holds {pixels.dtype}; the crate's raster is FP32"
+        )
+    if pixels.ndim != 4:
+        raise SystemExit(
+            f"{pixels_path} holds {tuple(pixels.shape)};"
+            f" an encode reads [channels, frames, rows, columns]"
+        )
+    channels, frames, height, width = (int(extent) for extent in pixels.shape)
+    if channels != 3:
+        raise SystemExit(
+            f"{pixels_path} holds {channels} channels;"
+            f" the reference encodes RGB24 frames"
+        )
+    try:
+        from uniserve.media import image, video
+    except ImportError as error:
+        print(f"IMPORT FAILED: {type(error).__name__}: {error}")
+        print("  the reference's compiled extensions are not built in this environment")
+        return 1
+    if options.dtype is None:
+        stated_dtype = CASE_DTYPES.get(str(case.get("dtype")))
+        if stated_dtype is not None:
+            # The case states the deployment's element type and the reference loads
+            # at it, which is what makes this one computation rather than two types.
+            options.dtype = stated_dtype
+    print(f"dtype   {options.dtype or STAGE_DTYPES['encode_rows']}")
+    sidecars = read_sidecars(options.checkpoint)
+    module = load_module(component, build(component, sidecars), options)
+    device = torch.device(options.device)
+    size = video.Config(frames, image.Config(height, width))
+    layout = module.output_layout(size)["video"]
+    shape = tuple(int(extent) for extent in layout.shape)
+    print(f"layout  {shape}, the conditioner's input rows")
+    draw = torch.empty(module.posterior_shape(size), dtype=torch.float32, device=device)
+    module.draw_noise(size, draw)
+    # The pattern the harness writes is an integer over 255, so scaling back is exact.
+    frames_rgb = (
+        pixels.mul(255.0).round().clamp(0, 255).to(torch.uint8).permute(1, 2, 3, 0)
+    )
+    rows = torch.zeros(shape, dtype=torch.float32)
+    if hasattr(module, "load_kernels"):
+        module.load_kernels()
+    with torch.no_grad():
+        for interval in module.clips(frames):
+            piece = module.encode(
+                (frames_rgb[interval].contiguous().to(device),),
+                clips=(interval,),
+                num_frames=(frames,),
+                noise=(draw,),
+            )[0]
+            span = piece.layout.local_slice[0]
+            rows[span.start : span.stop] = piece.tensor.detach().to(torch.float32).cpu()
+            print(
+                f"clip    frames {interval.start}..{interval.stop}"
+                f" -> rows {span.start}..{span.stop}"
+            )
+    print(f"got     {tuple(rows.shape)} {rows.dtype}, mean |x| {rows.abs().mean():.4g}")
+    (options.out / component).mkdir(parents=True, exist_ok=True)
+    dump(options.out, f"{component}/rows_ref", rows)
+    (options.out / component / "case.json").write_text(case_path.read_text())
+    print(f"wrote   {options.out / (component + '/rows_ref.h3t')}")
+    candidate = stack / "rows.h3t"
+    if not candidate.is_file():
+        print(
+            "compare the crate writes no unprojected rows today - its stage"
+            " writes the projected prefix, whose projection is the DiT's. This"
+            " file is the reference side; the same rows written beside the"
+            " pixels make the comparison one command."
+        )
+        return 0
+    got = read_tensor(candidate).to(torch.float32)
+    if tuple(got.shape) != tuple(rows.shape):
+        print(
+            f"SHAPE   {candidate.name} is {tuple(got.shape)}, the reference's"
+            f" {tuple(rows.shape)}: the two rows cannot be compared"
+        )
+        return 1
+    difference = got - rows
+    relative = (difference.norm() / rows.norm().clamp_min(1e-12)).item()
+    print(
+        f"compare rows.h3t against rows_ref.h3t: rel L2 {relative:.3e},"
+        f" max |d| {difference.abs().max():.3e}"
+    )
+    return 0
+
+
 def load_module(component: str, module: nn.Module, options):
     """Load the checkpoint's own tensors into a built component, at the probe's dtype."""
     from uniserve.loading import loader, weights as weight_options
@@ -429,8 +578,9 @@ def main(argv: list[str] | None = None) -> int:
         "--stack",
         type=Path,
         help=(
-            "the candidate's stage directory, holding `latents.h3t` and"
-            " `case.json` (`--probe decode_out`)"
+            "the candidate's stage directory: `latents.h3t` and `case.json` for"
+            " `--probe decode_out`, `pixels.h3t` and `case.json` for `--probe"
+            " encode_rows`"
         ),
     )
     parser.add_argument(
