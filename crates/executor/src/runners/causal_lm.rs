@@ -1654,10 +1654,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
         self.with_kv(&slots, Some(pages), |cache| {
             self.model
                 .embed_input_ids(&forward, ids, hidden)
-                .map_err(|error| Error::Interface(error.to_string()))?;
+                .map_err(Error::from)?;
             self.model
                 .forward(&forward, &batch, cache, hidden)
-                .map_err(|error| Error::Interface(error.to_string()))
+                .map_err(Error::from)
         })
     }
 
@@ -1981,10 +1981,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
         self.with_kv(&slots, None, |cache| {
             self.model
                 .embed_input_ids(&forward, ids, hidden)
-                .map_err(|error| Error::Interface(error.to_string()))?;
+                .map_err(Error::from)?;
             self.model
                 .forward(&forward, &batch, cache, hidden)
-                .map_err(|error| Error::Interface(error.to_string()))?;
+                .map_err(Error::from)?;
             if bucket.variant.samples() {
                 self.sample(&forward, bucket, &arena, hidden)?;
             }
@@ -2019,14 +2019,14 @@ impl<M: CausalLm> CausalLmRunner<M> {
             ops::Shape::new(&[rows, u64::from(self.geometry.hidden)]),
         )?;
         nn::gather_rows(forward, hidden, self.columns.indices.device, gathered)
-            .map_err(|error| Error::Interface(error.to_string()))?;
+            .map_err(Error::from)?;
         let logits = arena.tensor(
             self.geometry.logits_dtype,
             ops::Shape::new(&[rows, u64::from(self.geometry.vocabulary)]),
         )?;
         self.model
             .logits(forward, gathered, logits)
-            .map_err(|error| Error::Interface(error.to_string()))?;
+            .map_err(Error::from)?;
         let state = SamplerState {
             counts: sampling.counts,
             parameters: self.columns.parameters.device,
@@ -2037,7 +2037,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         sampling
             .sampler
             .forward(forward, logits, &state, self.columns.draws.device, &samples)
-            .map_err(|error| Error::Interface(error.to_string()))?;
+            .map_err(Error::from)?;
         self.bucket_samples
             .borrow_mut()
             .insert(bucket, Sampled { tokens: samples.tokens });
@@ -2094,7 +2094,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         };
         forward
             .operate::<ops::commit::SlotCommit>(&descriptor, args)
-            .map_err(|error| Error::Interface(error.to_string()))
+            .map_err(Error::from)
     }
 
     /// Stages a batch of the bucket's full size with nothing to write: what a warmup capture
