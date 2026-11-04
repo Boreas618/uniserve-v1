@@ -1501,88 +1501,6 @@ fn a_matrix_product_runs_on_an_algorithm_the_heuristic_offers() {
     assert_eq!(restored.to_bytes(), record, "the tuning record round-trips");
 }
 
-/// A 1-D convolution through cuDNN computes the cross-correlation the tensors
-/// describe, and the plan's engine is the record a program carries.
-#[test]
-fn a_convolution_matches_the_arithmetic() {
-    let _driver = exclusive_driver();
-    let device = Device::new(DEVICE).unwrap();
-    let stream = Stream::new(DEVICE).unwrap();
-    // N=1, C=1, D=8 with filter [1, 0, -1]: y[i] = x[i] - x[i + 2] = -2.
-    let x: Vec<f32> = (0..8).map(|index| index as f32 + 1.0).collect();
-    let w: Vec<f32> = vec![1.0, 0.0, -1.0];
-    let expected = vec![-2f32; 6];
-
-    let convolution = Convolution::new(
-        Tensor::contiguous(vec![1, 1, 8], DataType::F32),
-        Tensor::contiguous(vec![1, 1, 3], DataType::F32),
-        Tensor::contiguous(vec![1, 1, 6], DataType::F32),
-        vec![0],
-        vec![1],
-        vec![1],
-    );
-    let bytes = convolution.bytes();
-    let cudnn = Cudnn::new(&device).unwrap();
-    let plan = cudnn.plan(&convolution, None).unwrap();
-
-    let x_device = DeviceAllocation::linear(DEVICE, bytes.x as usize).unwrap();
-    let w_device = DeviceAllocation::linear(DEVICE, bytes.w as usize).unwrap();
-    let y_device = DeviceAllocation::linear(DEVICE, bytes.y as usize).unwrap();
-    let workspace = if plan.workspace_bytes() > 0 {
-        DeviceAllocation::linear(DEVICE, plan.workspace_bytes()).unwrap()
-    } else {
-        DeviceAllocation::linear(DEVICE, 4).unwrap()
-    };
-    // SAFETY: the copies fill allocations of the tensors' sizes from live
-    // slices, and the stream is synchronized afterwards.
-    unsafe {
-        memcpy_async(x_device.address(), x.as_ptr() as u64, x.len() * 4, &stream).unwrap();
-        memcpy_async(w_device.address(), w.as_ptr() as u64, w.len() * 4, &stream).unwrap();
-        memset_d32(y_device.address(), 0, expected.len(), &stream).unwrap();
-    }
-    stream.synchronize().unwrap();
-
-    let args = ConvolutionArgs {
-        x: x_device.address(),
-        w: w_device.address(),
-        y: y_device.address(),
-        workspace: workspace.address(),
-    };
-    // SAFETY: each argument is a device allocation of the convolution's size and
-    // the workspace is the plan's own need.
-    unsafe { cudnn.run(&plan, args, &stream) }.unwrap();
-    stream.synchronize().unwrap();
-
-    let host = PinnedBuffer::new(DEVICE, expected.len() * 4).unwrap();
-    // SAFETY: the copy reads the output allocation into a pinned buffer of its
-    // size, and the stream is synchronized afterwards.
-    unsafe {
-        memcpy_async(
-            host.address(),
-            y_device.address(),
-            expected.len() * 4,
-            &stream,
-        )
-    }
-    .unwrap();
-    stream.synchronize().unwrap();
-    let result: Vec<f32> = read(&host)
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|word| f32::from_le_bytes(*word))
-        .collect();
-    assert_eq!(result, expected, "y = conv(x, [1, 0, -1])");
-
-    // The engine is the program's tuning record: 8 bytes that round-trip.
-    let record = plan.engine().to_bytes();
-    assert_eq!(
-        Engine::from_bytes(&record).unwrap(),
-        plan.engine(),
-        "the engine record round-trips"
-    );
-}
-
 /// The read half of a rebind walk: a template's node gives back the kernel it
 /// captured, its grid, block and the values of its arguments, and setting those
 /// on another executable's node runs the same work.
@@ -1990,6 +1908,19 @@ fn a_convolution_matches_the_definition_of_a_conv1d() {
     let observed = convolve(&cudnn, &stream, &convolution, &x, &w, expected.len(), None);
 
     assert_close(&observed, &expected);
+
+    // The plan's engine is the record a program carries: eight bytes that
+    // round-trip, and a plan built from the recorded engine runs the same
+    // shape.
+    let plan = cudnn.plan(&convolution, None).unwrap();
+    let record = plan.engine().to_bytes();
+    let recorded = Engine::from_bytes(&record).unwrap();
+    assert_eq!(recorded, plan.engine(), "the engine record round-trips");
+    assert_eq!(
+        cudnn.plan(&convolution, Some(recorded)).unwrap().engine(),
+        plan.engine(),
+        "the recorded engine is the one the heuristic proposes"
+    );
 }
 
 /// cuDNN's backward data pass computes the definition of a `ConvTranspose1d`,
