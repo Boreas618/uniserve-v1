@@ -39,13 +39,9 @@ def spec(fields, parameters, target):
             "width": "i32",
             "block": "i32",
             "pdl": "i32",
-            "PATCHIFY": "constexpr",
             "BLOCK": "constexpr",
         },
-        "constexprs": {
-            "PATCHIFY": fields["mode"] == "patchify",
-            "BLOCK": block,
-        },
+        "constexprs": {"BLOCK": block},
         "options": {
             "num_warps": warps_of(block),
             "launch_pdl": fields["pdl"] == "true",

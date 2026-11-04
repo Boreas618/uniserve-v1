@@ -45,7 +45,7 @@
 
 use std::ops::Range;
 
-use executor::batch::{commit, BatchColumns};
+use executor::batch::{BatchColumns, commit};
 use ipc::{Call, CallKind, ForwardMode};
 use nn::{BatchRow, BatchRows, RowKind};
 use proto::request::SamplingParams;
@@ -100,6 +100,11 @@ fn uses_penalties(sampling: &SamplingParams) -> bool {
 
 /// The sampler's columns per row, `ops::sampler::PARAMETER_COLUMNS`.
 pub(crate) const SAMPLER_PARAMETERS: usize = 8;
+
+/// The column of a row's parameters that states its temperature, in
+/// `ops::sampler`'s order (`ops::sampler::TEMPERATURE`, which the engine does
+/// not depend on directly).
+const TEMPERATURE_COLUMN: usize = 0;
 
 /// The columns of the batch formed by `requests`, whose calls' rows embed the
 /// tokens `inputs` states for them and sample with the parameters `sampling`
@@ -175,7 +180,8 @@ pub(crate) fn columns(
         }
 
         let first = u32::try_from(call.coordinates.logical_position).ok()?;
-        rows.positions.extend(slots::positions_of(first, tokens_of_call)?);
+        rows.positions
+            .extend(slots::positions_of(first, tokens_of_call)?);
 
         // One `-1` per token whose row writes no cache page: the write decision
         // is per row, so it expands over the row's tokens here and nowhere else.
@@ -313,6 +319,8 @@ pub(crate) fn columns(
     }
 
     // The table is column-major: one run of every column over the batch's rows.
+    // Column-major over the batch's calls: `ops::commit` reads `[column][row]`,
+    // and `commit::COMMIT_FIELDS` columns of one row each per call of the batch.
     let row_count = commit_rows.len();
     let mut commit = vec![0i64; commit::COMMIT_FIELDS * row_count];
     for (row, cells) in commit_rows.iter().enumerate() {
@@ -333,15 +341,59 @@ pub(crate) fn columns(
         rows,
         input_ids,
         slots,
-        // The sampler's parameters and the commit table are exec's to state
-        // (`M708`); filling them from a guess would change sampling silently
-        // rather than fail, so the batch is not submittable until they are set.
         parameters,
-        // Empty: the mechanism states no accepted progress yet (`M708`).
-        commit: Vec::new(),
+        commit,
         page_size: page.block_size,
         max_kv_len,
     })
+}
+
+/// The captured shape a batch of these columns is served from.
+///
+/// `rows` and `tokens` are the columns' own counts. The variant follows the two
+/// decisions the columns already state:
+///
+/// - a prefill projects last hidden states exactly when a row's logits are
+///   wanted, which `logits_rows` names with a row index or `-1`;
+/// - a decode is served greedily only when no row draws. `ops::sampler` divides
+///   a temperature-zero row by one and leaves its order, and **no draw path
+///   produces a greedy token** — `argmax` is a separate step of the sampler — so
+///   a greedy row served from the sampler graph would sample where its request
+///   asked for the largest candidate. One batch serves one variant, so a burst
+///   that mixes greedy and sampling rows is sampled.
+///
+/// A verification's candidates are decode-class rows: they draw, so they are
+/// sampled too.
+pub(crate) fn batch_shape(columns: &BatchColumns) -> executor::plan::Shape {
+    use executor::plan::Variant;
+
+    let rows = u32::try_from(columns.rows()).unwrap_or(u32::MAX);
+    let tokens = u32::try_from(columns.tokens()).unwrap_or(u32::MAX);
+    let prefill = columns
+        .rows
+        .calls
+        .iter()
+        .any(|call| matches!(call.kind, RowKind::Prefill));
+    let variant = if prefill {
+        if columns.rows.logits_rows.iter().any(|row| *row >= 0) {
+            Variant::PrefillOutput
+        } else {
+            Variant::PrefillWrite
+        }
+    } else if columns
+        .parameters
+        .chunks_exact(SAMPLER_PARAMETERS)
+        .all(|row| row[TEMPERATURE_COLUMN] == 0.0)
+    {
+        Variant::DecodeGreedy
+    } else {
+        Variant::DecodeSampled
+    };
+    executor::plan::Shape {
+        rows,
+        tokens,
+        variant,
+    }
 }
 
 #[cfg(test)]
@@ -398,10 +450,12 @@ mod tests {
     /// `slot`, writing the cache where `writes` says.
     fn placement(slot: u32, query_lens: &[u32], writes: &[bool]) -> RequestPlacement {
         let mut forward = ipc::ForwardBatch::default();
-        let mut seq_len = 8;
+        // `ForwardBatch::seq_lens` is a row's total attention length, cached
+        // prefix plus its own query, which is what the assembly states.
+        let mut prefix = 8;
         for (length, write) in query_lens.iter().zip(writes) {
-            forward.push(0, slot, seq_len, *length, *write);
-            seq_len += length;
+            forward.push(0, slot, prefix + length, *length, *write);
+            prefix += length;
         }
         RequestPlacement {
             worker: WorkerGroupId("w".to_owned()),
@@ -441,9 +495,10 @@ mod tests {
     }
 
     /// One cell of the commit table, which is column-major over the batch's
-    /// rows.
+    /// calls: a call states once how the step advances its slot, however many
+    /// rows it evaluated.
     fn commit_cell(columns: &BatchColumns, column: usize, row: usize) -> i64 {
-        columns.commit[column * columns.rows() + row]
+        columns.commit[column * columns.calls() + row]
     }
 
     fn decode() -> CallKind {
@@ -653,29 +708,33 @@ mod tests {
         let mut unsampled_decode = call(decode(), 12, &[1]);
         unsampled_decode.token_output = None;
         unsampled_decode.coordinates.cache_visible_len = 12;
-        assert!(columns(
-            &[(unsampled_decode, placement(1, &[1], &[true]))],
-            &[vec![1]],
-            &[&sampling()],
-            &[0],
-            page(),
-            2048,
-        )
-        .is_none());
+        assert!(
+            columns(
+                &[(unsampled_decode, placement(1, &[1], &[true]))],
+                &[vec![1]],
+                &[&sampling()],
+                &[0],
+                page(),
+                2048,
+            )
+            .is_none()
+        );
 
         // A prefill writing past the extent its block table covers is a
         // planning fault, not a clamped extent.
         let mut overlong = call(prefill(), 18, &[4]);
         overlong.coordinates.cache_visible_len = 18;
-        assert!(columns(
-            &[(overlong, placement(1, &[4], &[true]))],
-            &[vec![1, 2, 3, 4]],
-            &[&sampling()],
-            &[0],
-            page(),
-            2048,
-        )
-        .is_none());
+        assert!(
+            columns(
+                &[(overlong, placement(1, &[4], &[true]))],
+                &[vec![1, 2, 3, 4]],
+                &[&sampling()],
+                &[0],
+                page(),
+                2048,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -693,17 +752,19 @@ mod tests {
         // Call A: 4 tokens at position 8 (page 2, unit 7); call B: 2 tokens at
         // position 12 (page 3, unit 9).
         let requests = vec![
-            (
-                call(prefill(), 8, &[4]),
-                placement(1, &[4], &[true]),
-            ),
-            (
-                call(prefill(), 12, &[2]),
-                placement(2, &[2], &[true]),
-            ),
+            (call(prefill(), 8, &[4]), placement(1, &[4], &[true])),
+            (call(prefill(), 12, &[2]), placement(2, &[2], &[true])),
         ];
         let inputs = vec![vec![11, 12, 13, 14], vec![21, 22]];
-        let columns = columns(&requests, &inputs, &[&sampling(), &sampling()], &[0, 0], page(), 2048).expect("a prefill batch");
+        let columns = columns(
+            &requests,
+            &inputs,
+            &[&sampling(), &sampling()],
+            &[0, 0],
+            page(),
+            2048,
+        )
+        .expect("a prefill batch");
 
         assert_eq!(columns.rows(), 2, "one row per call");
         assert_eq!(columns.tokens(), 6);
@@ -733,21 +794,70 @@ mod tests {
         assert_eq!(columns.rows.query_offsets, vec![0, 4, 6]);
         assert_eq!(
             columns.rows.logits_rows,
-            vec![-1, 5],
-            "each prefill samples at its last query row"
+            vec![0, 1],
+            "one entry per row, each naming the row whose logits are read: both calls end \
+             their prompt, so each samples at its only row"
         );
         assert_eq!(columns.input_ids, vec![11, 12, 13, 14, 21, 22]);
         assert_eq!(columns.slots, vec![1, 2]);
     }
 
     #[test]
+    fn a_chunk_states_no_logits_row_and_a_multi_row_prefill_its_last() {
+        // `logits_rows` has one entry per row and names, in each, the row whose hidden
+        // state is projected: `-1` for a row that projects nothing, its own index for a
+        // row that samples. A chunk of a prompt that does not end samples nothing; a
+        // prefill that ends it samples at its last query row, not its first.
+        let mut chunk = call(prefill(), 8, &[3]);
+        chunk.token_output = None;
+        let requests = vec![
+            (chunk, placement(1, &[3], &[true])),
+            (
+                call(prefill(), 11, &[2, 2]),
+                placement(2, &[2, 2], &[true, true]),
+            ),
+        ];
+        let columns = columns(
+            &requests,
+            &[vec![1, 2, 3], vec![4, 5, 6, 7]],
+            &[&sampling(), &sampling()],
+            &[0, 0],
+            page(),
+            2048,
+        )
+        .expect("a chunk and a sampling prefill");
+
+        assert_eq!(
+            columns.rows(),
+            3,
+            "one row for the chunk, two for the prefill"
+        );
+        assert_eq!(columns.tokens(), 7);
+        assert_eq!(
+            columns.rows.logits_rows,
+            vec![-1, -1, 2],
+            "the chunk projects nothing, and the prefill's second row is its last query row"
+        );
+        let shape = batch_shape(&columns);
+        assert_eq!(
+            shape.variant,
+            executor::plan::Variant::PrefillOutput,
+            "the batch ends a prompt, so it projects logits"
+        );
+    }
+
+    #[test]
     fn a_filled_batch_states_one_sampler_row_per_row_and_passes_the_executors_check() {
-        let requests = vec![(
-            call(prefill(), 8, &[4]),
-            placement(1, &[4], &[true]),
-        )];
-        let columns = columns(&requests, &[vec![1, 2, 3, 4]], &[&sampling()], &[0], page(), 2048)
-            .expect("a prefill batch");
+        let requests = vec![(call(prefill(), 8, &[4]), placement(1, &[4], &[true]))];
+        let columns = columns(
+            &requests,
+            &[vec![1, 2, 3, 4]],
+            &[&sampling()],
+            &[0],
+            page(),
+            2048,
+        )
+        .expect("a prefill batch");
         assert_eq!(columns.parameters.len(), SAMPLER_PARAMETERS);
         assert_eq!(
             &columns.parameters[..7],
@@ -765,12 +875,114 @@ mod tests {
     }
 
     #[test]
-    fn a_row_that_writes_nothing_states_minus_one_for_its_tokens() {
+    fn a_prefills_shape_follows_whether_a_row_projects_logits() {
+        // A prefill that samples projects its last row's hidden state; one that
+        // writes only the cache leaves every logits row unwritten.
+        let requests = vec![(call(prefill(), 8, &[4]), placement(1, &[4], &[true]))];
+        let sampling_batch = columns(
+            &requests,
+            &[vec![1, 2, 3, 4]],
+            &[&sampling()],
+            &[0],
+            page(),
+            2048,
+        )
+        .expect("a sampling prefill");
+        let shape = batch_shape(&sampling_batch);
+        assert_eq!(shape.variant, executor::plan::Variant::PrefillOutput);
+        assert_eq!(
+            (shape.rows, shape.tokens),
+            (sampling_batch.rows() as u32, sampling_batch.tokens() as u32),
+            "the shape's counts are the columns' own"
+        );
+        sampling_batch
+            .check(&shape)
+            .expect("a sampling prefill is a well-formed PrefillOutput batch");
+
+        let mut chunk = call(prefill(), 8, &[4]);
+        chunk.token_output = None;
+        let requests = vec![(chunk, placement(1, &[4], &[true]))];
+        let writing_batch = columns(
+            &requests,
+            &[vec![1, 2, 3, 4]],
+            &[&sampling()],
+            &[0],
+            page(),
+            2048,
+        )
+        .expect("a chunked prefill");
+        let shape = batch_shape(&writing_batch);
+        assert_eq!(shape.variant, executor::plan::Variant::PrefillWrite);
+        writing_batch
+            .check(&shape)
+            .expect("a chunked prefill is a well-formed PrefillWrite batch");
+    }
+
+    #[test]
+    fn a_batch_is_served_greedily_only_when_no_row_draws() {
+        let greedy = SamplingParams {
+            temperature: 0.0,
+            ..SamplingParams::default()
+        };
+        let decode = CallKind::Forward(ForwardMode::Decode);
+        let requests = vec![(call(decode, 12, &[1]), placement(1, &[1], &[true]))];
+        let one_greedy = columns(&requests, &[vec![9]], &[&greedy], &[0], page(), 2048)
+            .expect("a greedy decode");
+        assert_eq!(
+            batch_shape(&one_greedy).variant,
+            executor::plan::Variant::DecodeGreedy,
+            "no draw path produces a greedy token, so a greedy row is served from the greedy bucket"
+        );
+
+        let one_sampling = columns(&requests, &[vec![9]], &[&sampling()], &[0], page(), 2048)
+            .expect("a sampling decode");
+        assert_eq!(
+            batch_shape(&one_sampling).variant,
+            executor::plan::Variant::DecodeSampled
+        );
+
+        // One batch serves one variant, so a burst that mixes the two is
+        // sampled even though one of its rows is greedy.
+        let mut second = call(decode, 12, &[1]);
+        second.request_key = ipc::RequestKey::new(2, ipc::RequestId(2), 1);
+        second.call_id = ipc::CallId::new(2, 1);
+        let requests = vec![
+            (call(decode, 12, &[1]), placement(1, &[1], &[true])),
+            (second, placement(2, &[1], &[true])),
+        ];
+        let mixed = columns(
+            &requests,
+            &[vec![9], vec![9]],
+            &[&greedy, &sampling()],
+            &[0, 0],
+            page(),
+            2048,
+        )
+        .expect("a mixed decode");
+        assert_eq!(
+            batch_shape(&mixed).variant,
+            executor::plan::Variant::DecodeSampled,
+            "the sampler graph serves both rows, and a greedy row's token is its argmax"
+        );
+
+        // A verification's candidates draw, so they are sampled too.
         let requests = vec![(
-            call(prefill(), 8, &[2]),
-            placement(1, &[2], &[false]),
+            call(verify(), 12, &[1, 1]),
+            placement(1, &[1, 1], &[true, true]),
         )];
-        let columns = columns(&requests, &[vec![1, 2]], &[&sampling()], &[0], page(), 64).expect("a prefill batch");
+        let verified = columns(&requests, &[vec![7, 8]], &[&greedy], &[0], page(), 2048)
+            .expect("a verification");
+        assert_eq!(
+            batch_shape(&verified).variant,
+            executor::plan::Variant::DecodeSampled
+        );
+    }
+
+    #[test]
+    fn a_row_that_writes_nothing_states_minus_one_for_its_tokens() {
+        let requests = vec![(call(prefill(), 8, &[2]), placement(1, &[2], &[false]))];
+        let columns = columns(&requests, &[vec![1, 2]], &[&sampling()], &[0], page(), 64)
+            .expect("a prefill batch");
         assert_eq!(columns.rows.slot_mapping, vec![-1, -1]);
     }
 
@@ -781,7 +993,15 @@ mod tests {
             call(verify(), 9, &[1, 1, 1]),
             placement(1, &[1, 1, 1], &[true, true, true]),
         )];
-        let columns = columns(&requests, &[vec![7, 8, 9]], &[&sampling()], &[0], page(), 64).expect("a verify batch");
+        let columns = columns(
+            &requests,
+            &[vec![7, 8, 9]],
+            &[&sampling()],
+            &[0],
+            page(),
+            64,
+        )
+        .expect("a verify batch");
         assert_eq!(columns.rows(), 3);
         assert_eq!(columns.tokens(), 3);
         assert_eq!(columns.rows.positions, vec![9, 10, 11]);
@@ -796,14 +1016,33 @@ mod tests {
             0..3,
             "one call owns all three rows"
         );
+        // The batch's two row counts stay distinct: the sampler's slots and
+        // parameters are per row, the commit table's are per call.
+        assert_eq!(columns.calls(), 1, "one call evaluates three rows");
+        assert_eq!(columns.slots.len(), 3);
+        assert_eq!(columns.commit.len(), commit::COMMIT_FIELDS);
+        columns
+            .check(&executor::plan::Shape::prefill(
+                3,
+                3,
+                executor::plan::Variant::PrefillWrite,
+            ))
+            .expect("the fill satisfies the executor's check for a multi-row call");
     }
 
     #[test]
     fn a_media_call_is_not_a_token_batch() {
         let media = call(ipc::CallKind::Media(ipc::MediaCall::Denoising), 0, &[1]);
         assert!(
-            columns(&[(media, placement(1, &[1], &[true]))], &[vec![0]], &[&sampling()], &[0], page(), 64)
-                .is_none(),
+            columns(
+                &[(media, placement(1, &[1], &[true]))],
+                &[vec![0]],
+                &[&sampling()],
+                &[0],
+                page(),
+                64
+            )
+            .is_none(),
             "a media call has no token row"
         );
     }
@@ -816,18 +1055,22 @@ mod tests {
         let mut decode = decode;
         decode.input_token_ids.clear();
         assert!(
-            columns(&[(decode, placement(1, &[1], &[true]))], &[Vec::new()], &[&sampling()], &[0], page(), 64)
-                .is_none()
+            columns(
+                &[(decode, placement(1, &[1], &[true]))],
+                &[Vec::new()],
+                &[&sampling()],
+                &[0],
+                page(),
+                64
+            )
+            .is_none()
         );
     }
 
     #[test]
     fn a_token_outside_its_table_is_a_fault_not_a_clamp() {
         // A call at position 20 lies past the table's last covered page.
-        let requests = vec![(
-            call(prefill(), 20, &[1]),
-            placement(1, &[1], &[true]),
-        )];
+        let requests = vec![(call(prefill(), 20, &[1]), placement(1, &[1], &[true]))];
         assert!(columns(&requests, &[vec![1]], &[&sampling()], &[0], page(), 64).is_none());
     }
 
@@ -841,15 +1084,29 @@ mod tests {
 
     #[test]
     fn the_inputs_must_name_one_token_per_token_the_rows_embed() {
-        let requests = vec![(
-            call(prefill(), 8, &[2]),
-            placement(1, &[2], &[true]),
-        )];
+        let requests = vec![(call(prefill(), 8, &[2]), placement(1, &[2], &[true]))];
         assert!(columns(&requests, &[vec![1]], &[&sampling()], &[0], page(), 64).is_none());
-        assert!(columns(&requests, &[vec![1, 2, 3]], &[&sampling()], &[0], page(), 64).is_none());
         assert!(
-            columns(&requests, &[vec![1, 2], vec![3]], &[&sampling(), &sampling()], &[0, 0], page(), 64)
-                .is_none(),
+            columns(
+                &requests,
+                &[vec![1, 2, 3]],
+                &[&sampling()],
+                &[0],
+                page(),
+                64
+            )
+            .is_none()
+        );
+        assert!(
+            columns(
+                &requests,
+                &[vec![1, 2], vec![3]],
+                &[&sampling(), &sampling()],
+                &[0, 0],
+                page(),
+                64
+            )
+            .is_none(),
             "an input list per call, not one more than there are calls"
         );
     }
