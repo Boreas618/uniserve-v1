@@ -853,6 +853,24 @@ fn main() {
         .to_string(),
     );
 
+    // The encoder's causal frame padding, in FP32 with reflect edges (`spatial_padding_mode`).
+    //
+    // **Its tile is a function of the raster's width**, not a constant: `FramePadDescriptor::tiles`
+    // takes `min(ROW_PIXELS 512, next_power_of_two(columns))` pixels per program and divides
+    // `ROW_ELEMENTS 2048` by it, so a raster at least 512 pixels wide gives the 512-pixel tile with
+    // four channels per program — every realistic clip width — and a narrower one re-keys to its own
+    // pixel block. This row is the wide case; a request whose width is under 512 compiles another.
+    push(
+        "frame_pad",
+        ops::frame::FramePadDescriptor {
+            dtype: DType::F32,
+            reflect: true,
+            block_pixels: 512,
+            block_channels: 4,
+        }
+        .to_string(),
+    );
+
     // ---- The audio decoder's and encoder's convolutions, in FP32 with TF32 declared on.
     //
     // The decoder's seven upsamplers are `ConvTranspose1d` with `kernel = decoder_kernel_sizes`,
