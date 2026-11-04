@@ -181,7 +181,7 @@ mod tests {
         Watchdog::new(Duration::from_secs(30)).expect("a positive watchdog timeout")
     }
 
-    fn job(rank: usize, batch: u64, since: Instant) -> Running {
+    fn never_shadowed(rank: usize, batch: u64, since: Instant) -> Running {
         Running {
             rank,
             batch: Some(batch),
@@ -205,7 +205,7 @@ mod tests {
     fn a_job_under_the_bound_is_not_reported() {
         let mut watchdog = watchdog();
         let now = Instant::now();
-        let job = job(0, 7, now - Duration::from_secs(14));
+        let job = never_shadowed(0, 7, now - Duration::from_secs(14));
         assert!(watchdog.stalls(now, &[job]).is_empty());
     }
 
@@ -213,7 +213,7 @@ mod tests {
     fn a_job_past_the_bound_is_reported_once_with_its_batch() {
         let mut watchdog = watchdog();
         let now = Instant::now();
-        let job = job(2, 7, now - Duration::from_secs(16));
+        let job = never_shadowed(2, 7, now - Duration::from_secs(16));
         let stalls = watchdog.stalls(now, &[job]);
         assert_eq!(stalls.len(), 1);
         assert_eq!(stalls[0].0, 2);
@@ -226,9 +226,9 @@ mod tests {
     fn a_new_job_of_a_reported_rank_is_reported_again() {
         let mut watchdog = watchdog();
         let now = Instant::now();
-        let first = job(0, 1, now - Duration::from_secs(16));
+        let first = never_shadowed(0, 1, now - Duration::from_secs(16));
         assert_eq!(watchdog.stalls(now, &[first]).len(), 1);
-        let next = job(0, 2, now - Duration::from_secs(16));
+        let next = never_shadowed(0, 2, now - Duration::from_secs(16));
         assert_eq!(watchdog.stalls(now, &[next]).len(), 1);
     }
 
@@ -236,7 +236,7 @@ mod tests {
     fn the_deadline_is_the_stall_bound_while_no_probe_ran() {
         let watchdog = watchdog();
         let now = Instant::now();
-        let job = job(0, 1, now);
+        let job = never_shadowed(0, 1, now);
         assert_eq!(watchdog.deadline(Some(job)), Some(now + Duration::from_secs(15)));
     }
 
@@ -244,7 +244,7 @@ mod tests {
     fn the_deadline_is_the_sooner_of_the_bound_and_the_probe() {
         let mut watchdog = watchdog();
         let now = Instant::now();
-        let job = job(0, 1, now - Duration::from_secs(10));
+        let job = never_shadowed(0, 1, now - Duration::from_secs(10));
         watchdog.probed(now - Duration::from_millis(200));
         // The probe is 800 ms away; the stall bound is 5 s away.
         assert_eq!(
@@ -265,9 +265,9 @@ mod tests {
     fn the_context_probe_waits_for_a_second_of_a_running_job() {
         let watchdog = watchdog();
         let now = Instant::now();
-        let job = job(0, 1, now - Duration::from_millis(999));
+        let job = never_shadowed(0, 1, now - Duration::from_millis(999));
         assert!(!watchdog.probe_due(now, Some(job)));
-        let job = job(0, 1, now - Duration::from_secs(1));
+        let job = never_shadowed(0, 1, now - Duration::from_secs(1));
         assert!(watchdog.probe_due(now, Some(job)));
         assert!(!watchdog.probe_due(now, None));
     }
@@ -276,7 +276,7 @@ mod tests {
     fn the_context_probe_runs_once_a_second() {
         let mut watchdog = watchdog();
         let now = Instant::now();
-        let job = job(0, 1, now - Duration::from_secs(5));
+        let job = never_shadowed(0, 1, now - Duration::from_secs(5));
         watchdog.probed(now);
         assert!(!watchdog.probe_due(now + Duration::from_millis(999), Some(job)));
         assert!(watchdog.probe_due(now + Duration::from_secs(1), Some(job)));
@@ -286,7 +286,7 @@ mod tests {
     fn settling_drops_the_reports_of_jobs_that_ended() {
         let mut watchdog = watchdog();
         let now = Instant::now();
-        let job = job(0, 1, now - Duration::from_secs(16));
+        let job = never_shadowed(0, 1, now - Duration::from_secs(16));
         assert_eq!(watchdog.stalls(now, &[job]).len(), 1);
         watchdog.settled(&[]);
         assert_eq!(watchdog.stalls(now, &[job]).len(), 1);
