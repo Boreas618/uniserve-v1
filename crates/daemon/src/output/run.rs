@@ -90,6 +90,8 @@ pub(crate) struct GenerationRun {
     context: ChatResponseContext,
     /// The request's statistics, recorded at its terminal output.
     outcome: RequestOutcome,
+    /// The engine replica that serves the request.
+    replica: u32,
     /// Whether the decoder's terminal event was consumed.
     ended: bool,
 }
@@ -143,6 +145,7 @@ impl GenerationRun {
             emitter: ChatStreamEmitter::new(&context, created),
             context,
             events,
+            replica: outcome.engine(),
             outcome,
             image_count: 0,
             image_steps: 0,
@@ -349,6 +352,7 @@ impl GenerationRun {
             emitter.resume(chunks);
         }
         let created = state.chunks.as_ref().map_or(0, |chunks| chunks.created);
+        let replica = outcome.engine();
         Ok(Self {
             request_id,
             created,
@@ -366,6 +370,7 @@ impl GenerationRun {
             image_count: assembly.images,
             image_steps: assembly.image_steps,
             context,
+            replica,
             outcome,
             ended: false,
         })
@@ -405,6 +410,7 @@ impl GenerationRun {
                 .engine_request_id()
                 .map(|id| id.0.to_string())
                 .unwrap_or_default(),
+            engine_replica: self.replica,
         })
     }
 }

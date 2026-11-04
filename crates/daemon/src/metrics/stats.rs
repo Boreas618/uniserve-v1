@@ -457,6 +457,11 @@ impl RequestOutcome {
         self.started
     }
 
+    /// Which engine replica serves the request.
+    pub(crate) fn engine(&self) -> u32 {
+        self.labels.engine
+    }
+
     /// Counts a request the client abandoned or a successor took over, so it
     /// is not counted twice and the in-flight gauge ends with this process.
     pub(crate) fn abandoned(&mut self) {

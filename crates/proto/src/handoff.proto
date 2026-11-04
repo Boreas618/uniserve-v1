@@ -103,6 +103,9 @@ message ChatStream {
   // successor takes over (with `consumed_events`) instead of submitting the
   // request again.
   string engine_request_id = 10;
+  // Which of the deployment's engine replicas serves the request: the
+  // successor's connection to that one takes the stream over.
+  uint32 engine_replica = 11;
 }
 
 // One chat completion answered as a single JSON body.
