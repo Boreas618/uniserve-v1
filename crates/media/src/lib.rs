@@ -46,9 +46,6 @@
 //! requests it is assembling, with every operation safe to run on a blocking
 //! pool thread.
 
-// The published interface and the FFmpeg shim's declarations are filled in
-// body by body; unused until their callers land.
-
 pub mod codec;
 pub mod config;
 pub mod error;
@@ -67,7 +64,7 @@ pub use config::MediaConfig;
 pub use error::{Error, Result};
 pub use mux::{Container, MuxSession};
 pub use read::{
-    AudioPlan, ConditionProducts, ConditionRead, ImagePlan, VideoClip, read_audio, read_conditions,
-    read_image, read_video,
+    AudioPlan, ConditionProducts, ConditionRead, DecodedVideo, ImagePlan, VideoClip, read_audio,
+    read_conditions, read_image, read_video,
 };
 pub use runner::MediaRunner;
