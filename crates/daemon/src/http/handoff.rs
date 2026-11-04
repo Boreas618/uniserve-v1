@@ -96,7 +96,10 @@ struct Inner {
     /// Whether a hot restart is handing the deployment over: a response that
     /// registers now pauses at once.
     pausing: AtomicBool,
-    streaming: Mutex<BTreeMap<u64, Arc<Registration>>>,
+    /// The responses in flight, weakly: the connection owns its registration,
+    /// and the registry must not keep one alive — a response that ended has to
+    /// reach `Drop` for the pause to see it go.
+    streaming: Mutex<BTreeMap<u64, std::sync::Weak<Registration>>>,
 }
 
 impl Handoff {
@@ -122,7 +125,7 @@ impl Handoff {
             report: Mutex::new(Some(report)),
             frozen: tokio::sync::Mutex::new(Some(frozen)),
         });
-        crate::leader::locked(&self.inner.streaming).insert(id, Arc::clone(&registration));
+        crate::leader::locked(&self.inner.streaming).insert(id, Arc::downgrade(&registration));
         // A restart that began pausing before this response started must not
         // hand over a connection whose next response is already being
         // written: ask this one to pause too.
@@ -154,8 +157,8 @@ impl Handoff {
                 let streaming = crate::leader::locked(&self.inner.streaming);
                 streaming
                     .values()
+                    .filter_map(std::sync::Weak::upgrade)
                     .filter(|registration| !asked.contains(&registration.id))
-                    .map(Arc::clone)
                     .collect()
             };
             if fresh.is_empty() {
@@ -167,8 +170,9 @@ impl Handoff {
                 // check, so yield and look again before concluding.
                 tokio::task::yield_now().await;
                 let all_asked = crate::leader::locked(&self.inner.streaming)
-                    .keys()
-                    .all(|id| asked.contains(id));
+                    .values()
+                    .filter_map(std::sync::Weak::upgrade)
+                    .all(|registration| asked.contains(&registration.id));
                 if all_asked {
                     return frozen;
                 }
@@ -183,6 +187,10 @@ impl Handoff {
                     let mut slot = registration.frozen.lock().await;
                     slot.take()
                 };
+                // This loop's own reference goes before the wait: a response
+                // that ends now must reach `Drop`, which is what tells the
+                // pause it left (the registry holds the registration weakly).
+                drop(registration);
                 let Some(answered) = answered else {
                     continue;
                 };
@@ -197,7 +205,10 @@ impl Handoff {
     /// written here.
     pub(crate) fn release(&self) {
         self.inner.pausing.store(false, Ordering::Release);
-        for registration in crate::leader::locked(&self.inner.streaming).values() {
+        for registration in crate::leader::locked(&self.inner.streaming)
+            .values()
+            .filter_map(std::sync::Weak::upgrade)
+        {
             registration.release();
         }
     }
@@ -362,26 +373,50 @@ mod tests {
 
     /// A pause hands over a response that registers while it is pausing, so
     /// the handed set is what is in flight when the pause ends.
+    ///
+    /// One response holds the pause open until the test says so, so a
+    /// registration that happens while the pause runs is a registration into a
+    /// pause that has not concluded — the condition §7.5.1 step 4 names for an
+    /// idle keep-alive connection that starts a request during the handover.
     #[tokio::test]
     async fn a_response_that_registers_during_the_pause_is_handed_over_too() {
         let handoff = Handoff::new();
+        let held = handoff.register();
+        let (go_on, released) = tokio::sync::oneshot::channel();
         let freezing = tokio::spawn({
-            let handoff = handoff.clone();
+            let held = Arc::clone(&held);
             async move {
-                tokio::task::yield_now().await;
-                let late = handoff.register();
-                assert!(late.pausing().await, "the late response is asked to pause");
-                let decision = late.report(Some(frozen(late.id(), "late"))).await;
-                (late, decision)
+                assert!(held.pausing().await, "the held response is asked to pause");
+                released.await.expect("the pause goes on");
+                held.report(Some(frozen(held.id(), "held"))).await
             }
         });
+        let pausing = tokio::spawn({
+            let handoff = handoff.clone();
+            async move { handoff.pause().await }
+        });
+        while !handoff.pausing() {
+            tokio::task::yield_now().await;
+        }
 
-        let paused = tokio::time::timeout(Duration::from_secs(10), handoff.pause())
+        let late = handoff.register();
+        let waiting = tokio::spawn(async move {
+            assert!(late.pausing().await, "the late response is asked to pause");
+            late.report(Some(frozen(late.id(), "late"))).await
+        });
+        go_on.send(()).expect("the pause goes on");
+
+        let paused = tokio::time::timeout(Duration::from_secs(10), pausing)
             .await
-            .expect("the pause ends");
+            .expect("the pause ends")
+            .expect("the pause task");
         assert!(
             paused.iter().any(|stream| stream.request_id == "late"),
             "the response registered during the pause is handed over"
+        );
+        assert!(
+            paused.iter().any(|stream| stream.request_id == "held"),
+            "the response that held the pause is handed over"
         );
         for stream in paused {
             stream
@@ -389,7 +424,10 @@ mod tests {
                 .send(Decision::Resume)
                 .expect("the response awaits its decision");
         }
-        let (_, decision) = freezing.await.expect("the late registration");
-        assert_eq!(decision, Decision::Resume);
+        assert_eq!(freezing.await.expect("the held response"), Decision::Resume);
+        assert_eq!(
+            waiting.await.expect("the late registration"),
+            Decision::Resume
+        );
     }
 }
