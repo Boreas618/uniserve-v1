@@ -2,53 +2,29 @@
 #
 # The default policy: requests in arrival order, which reproduces the rules the
 # current scheduler applies, item by item (design §4.4's table, last column).
-# The deployment selects it with `scheduler_config.policy = "fcfs"`.
+# The deployment selects it by naming its backend.
 
-# What this program fills: the scheduling policy of an epoch.
 op = "scheduling"
 backend = "fcfs"
 
-# The toolchain the package is built with. The Program Server precompiles the
-# wasm32 module for the host CPU with this wasmtime, and only an artifact from
-# the same engine configuration loads in the main process (design §5.1, §6.2).
 [toolchain]
 kind = "wasm"
 version = "50.0.1"
 
-# The module form: a wasm32 binary the Program Server precompiles
-# (`WasmSource`, design §6.2) and the scheduler thread instantiates.
 [module]
 form = "wasm"
 
-# The program's arguments and their defaults. Each is a field of
-# `scheduling_guest::Parameters`; a deployment that states none gets these,
-# which are the current scheduler's defaults (design §7.7).
-[arguments.chunked_prefill_size]
-default = 8192
-description = "Tokens of one prefill chunk."
+# The policy's arguments and their defaults, as `scheduling_guest::limits::Parameters`
+# reads them (design §7.7): a deployment that states none gets these, which are
+# the current scheduler's defaults. `max_queued_requests` is absent because
+# absent means unbounded, and `timeout` is absent because the guest's default is
+# the mechanism's own 30 s starvation cap.
+[parameters]
+chunked_prefill_size = 8192
+max_batch = 128
+max_num_batched_tokens = 8192
+prefetch_min_tokens = 256
 
-[arguments.max_queued_requests]
-default = "unbounded"
-description = "Bound on the waiting queue, counting token and media requests together."
-
-[arguments.max_batch]
-default = 128
-description = "Calls selected by one scheduling step."
-
-[arguments.max_num_batched_tokens]
-default = 8192
-description = "Token budget of one scheduling step."
-
-[arguments.prefetch_min_tokens]
-default = 256
-description = "Smallest prefix-hit deepening worth prefetching from the host KV cache."
-
-[arguments.timeout]
-default = "30s"
-description = "Longest a resident request may go without progressing before the mechanism treats it as starved."
-
-# `fcfs` is the first-come-first-served policy: it has no tuning data and no
-# GPU resources; its whole behaviour is the source below.
 # The package's build script: it compiles the crate to wasm32 and writes the raw
 # module the Program Server precompiles (design §5.2, §6.2).
 [source]

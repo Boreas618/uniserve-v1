@@ -1,8 +1,8 @@
 # The `priority` scheduling policy's package (design §5.2).
 #
 # Requests are admitted and batched by the priority they carry, then by
-# arrival; everything else is `fcfs`. The deployment selects it with
-# `scheduler_config.policy = "priority"`.
+# arrival; everything else is `fcfs`. The deployment selects it by naming its
+# backend.
 
 op = "scheduling"
 backend = "priority"
@@ -14,30 +14,16 @@ version = "50.0.1"
 [module]
 form = "wasm"
 
-# The same arguments as `fcfs`: the two policies differ only in their order.
-[arguments.chunked_prefill_size]
-default = 8192
-description = "Tokens of one prefill chunk."
-
-[arguments.max_queued_requests]
-default = "unbounded"
-description = "Bound on the waiting queue, counting token and media requests together."
-
-[arguments.max_batch]
-default = 128
-description = "Calls selected by one scheduling step."
-
-[arguments.max_num_batched_tokens]
-default = 8192
-description = "Token budget of one scheduling step."
-
-[arguments.prefetch_min_tokens]
-default = 256
-description = "Smallest prefix-hit deepening worth prefetching from the host KV cache."
-
-[arguments.timeout]
-default = "30s"
-description = "Longest a resident request may go without progressing before the mechanism treats it as starved."
+# The policy's arguments and their defaults, as `scheduling_guest::limits::Parameters`
+# reads them (design §7.7): a deployment that states none gets these, which are
+# the current scheduler's defaults. `max_queued_requests` is absent because
+# absent means unbounded, and `timeout` is absent because the guest's default is
+# the mechanism's own 30 s starvation cap.
+[parameters]
+chunked_prefill_size = 8192
+max_batch = 128
+max_num_batched_tokens = 8192
+prefetch_min_tokens = 256
 
 # The package's build script: it compiles the crate to wasm32 and writes the raw
 # module the Program Server precompiles (design §5.2, §6.2).
