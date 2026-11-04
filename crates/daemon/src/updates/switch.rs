@@ -883,6 +883,16 @@ impl Switch {
                     },
                 );
             }
+            // A target that faults while it prepares — a park that could not
+            // take, a device error — never becomes the epoch: the previous one
+            // serves on and the target is dropped, exactly as a failed precopy
+            // drops it. Without this arm the switch would wait in `Preparing`
+            // for a readiness no process of that generation will ever send.
+            (Phase::Preparing, _) if self.is_target(generation) => {
+                if let Some(failure) = Failure::of_report(&report) {
+                    self.failed(roster, failure);
+                }
+            }
             (Phase::Serving, _) if self.is_target(generation) => {
                 if let Some(failure) = Failure::of_report(&report) {
                     self.restore(roster, failure);
@@ -1378,6 +1388,51 @@ mod tests {
         assert_eq!(
             roster.commands_of(6, |kind| matches!(kind, process::command::Kind::Promote(_))),
             2
+        );
+    }
+
+    /// A target that faults while it prepares never becomes the epoch: a park
+    /// that could not take must not leave the switch waiting for a readiness
+    /// no process of that generation will send.
+    #[test]
+    fn a_fault_while_preparing_drops_the_target() {
+        let (epochs, mut switch) = setup();
+        let mut roster = Fake::default();
+        switch.start(&mut roster);
+        roster.scripted = vec![
+            hello("n0", 6, "2.0.0+new"),
+            report_event(
+                "n0",
+                6,
+                report(process::report::Kind::Fault(process::Fault {
+                    kind: "sticky".to_owned(),
+                    reason: "the park faulted the device".to_owned(),
+                    device: 0,
+                })),
+            ),
+        ];
+        switch.advance(&mut roster);
+
+        assert_eq!(switch.phase(), Phase::Abandoned);
+        assert_eq!(
+            switch.failure().map(|failure| failure.kind.as_str()),
+            Some("sticky")
+        );
+        assert_eq!(
+            epochs.get(12).map(|record| record.status),
+            Some(Status::Purged)
+        );
+        assert!(
+            !roster
+                .commands
+                .iter()
+                .any(|(_, _, kind)| matches!(kind, process::command::Kind::Promote(_))),
+            "the failed target was never promoted"
+        );
+        assert!(
+            roster
+                .stops
+                .contains(&("n0".to_owned(), "engine:0".to_owned(), Some(6)))
         );
     }
 
