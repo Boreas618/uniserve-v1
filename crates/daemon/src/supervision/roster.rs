@@ -99,7 +99,7 @@ pub(crate) struct ProcessRoster {
     /// arguments, for the fresh generation a restore may need.
     start: Option<(
         String,
-        Vec<String>,
+        crate::engine::launch::Launch,
         std::collections::HashMap<String, String>,
     )>,
     /// Events the adapter raised, ahead of the ones still on the wire.
@@ -315,21 +315,23 @@ impl ProcessRoster {
                 return;
             }
         }
-        let Some((executable, arguments, environment)) = self.start.clone() else {
+        let Some((executable, launch, environment)) = self.start.clone() else {
             return;
         };
         self.resuming.insert(generation, epoch);
+        // The fresh process's own number is the spawn's to set: `spawn`
+        // allocates it and writes the launch file that names it.
         let start = Spawn {
             host: host.to_owned(),
             group: group.to_owned(),
             rank: rank as u32,
             generation,
             executable,
-            arguments,
+            arguments: Vec::new(),
             environment,
             inherit: Vec::new(),
         };
-        if let Err(reason) = self.spawn(start) {
+        if let Err(reason) = self.spawn(start, &launch) {
             tracing::warn!(%host, generation, %reason, "starting the previous epoch for a restore failed");
             self.resuming.remove(&generation);
         }
@@ -364,11 +366,34 @@ impl Roster for ProcessRoster {
         }
     }
 
-    fn spawn(&mut self, spawn: Spawn) -> Result<u32, String> {
-        let generation = spawn.generation;
+    fn spawn(
+        &mut self,
+        mut spawn: Spawn,
+        launch: &crate::engine::launch::Launch,
+    ) -> Result<u32, String> {
+        // The process's own identity, from the deployment's one allocator: a
+        // launch file per process, so an epoch of two nodes never writes one
+        // number for two children (§2.3, §7.4), and a fresh generation of a
+        // restore never inherits the identity of the process it replaces.
+        let generation = self
+            .epochs
+            .next_generation(&spawn.group, u64::from(spawn.rank));
+        let mut launch = launch.clone();
+        launch.engine = generation;
+        let path =
+            crate::engine::launch::write(&crate::options::runtime_directory(), generation, &launch)
+                .map_err(|error| {
+                    format!("writing the launch file of engine {generation}: {error}")
+                })?;
+        spawn.generation = generation;
+        spawn.arguments = vec![
+            "engine".to_owned(),
+            "--launch".to_owned(),
+            path.display().to_string(),
+        ];
         self.start = Some((
             spawn.executable.clone(),
-            spawn.arguments.clone(),
+            launch.clone(),
             spawn.environment.clone(),
         ));
         self.launches.insert(
@@ -613,6 +638,28 @@ mod tests {
         }
     }
 
+    fn launch() -> crate::engine::launch::Launch {
+        crate::engine::launch::Launch {
+            build_config: "/run/build-config-1.json".into(),
+            model: "/models/qwen3".into(),
+            requests: "unix:/run/requests.sock".to_owned(),
+            processes: "unix:/run/processes.sock".to_owned(),
+            engine: 1,
+            program_server: "/run/programs.sock".to_owned(),
+            devices: vec![0],
+            group: "engine".to_owned(),
+            rank: 0,
+            deployment: "deployment".to_owned(),
+            world: 1,
+            scheduler_node: true,
+            peers: Vec::new(),
+            watchdog_timeout_s: None,
+            rollback_s: None,
+            queue_depth: 4,
+            world_size: 1,
+        }
+    }
+
     fn roster(epochs: &Arc<Epochs>, link: EpochLink) -> ProcessRoster {
         ProcessRoster::new(
             Arc::clone(epochs),
@@ -640,7 +687,9 @@ mod tests {
         }]);
 
         assert_eq!(
-            roster.spawn(spawn("n0", 7)).expect("the node starts it"),
+            roster
+                .spawn(spawn("n0", 7), &launch())
+                .expect("the node starts it"),
             4242
         );
         let rows = epochs.processes();
@@ -712,7 +761,9 @@ mod tests {
         let epochs = Arc::new(Epochs::new());
         let (service, link) = service(Arc::clone(&epochs));
         let mut roster = roster(&epochs, link);
-        roster.spawn(spawn("n0", 7)).expect("the node starts it");
+        roster
+            .spawn(spawn("n0", 7), &launch())
+            .expect("the node starts it");
         service
             .greetings
             .send((
@@ -752,8 +803,12 @@ mod tests {
         let epochs = Arc::new(Epochs::new());
         let (service, link) = service(Arc::clone(&epochs));
         let mut roster = roster(&epochs, link);
-        roster.spawn(spawn("n0", 7)).expect("the node starts it");
-        roster.spawn(spawn("n0", 8)).expect("the node starts it");
+        roster
+            .spawn(spawn("n0", 7), &launch())
+            .expect("the node starts it");
+        roster
+            .spawn(spawn("n0", 8), &launch())
+            .expect("the node starts it");
 
         roster.stop("n0", "engine", Some(7));
         let exit = |generation: u64, status: &str| Exit {

@@ -323,7 +323,11 @@ impl crate::updates::switch::Roster for Uncommanded {
         Ok(())
     }
 
-    fn spawn(&mut self, _spawn: proto::process::Spawn) -> Result<u32, String> {
+    fn spawn(
+        &mut self,
+        _spawn: proto::process::Spawn,
+        _launch: &crate::engine::launch::Launch,
+    ) -> Result<u32, String> {
         Ok(1)
     }
 
