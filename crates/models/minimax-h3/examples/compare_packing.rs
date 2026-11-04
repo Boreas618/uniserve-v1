@@ -4,20 +4,29 @@
 //! cargo run -p minimax-h3 --example compare_packing -- --case <case.json> --out <dir>
 //! ```
 //!
-//! It writes two tensors under `<dir>/denoiser/`, under the protocol's own names: `packed_rows`
-//! (`[rows, 4]` float32, each row's modulation tag followed by its three rotary coordinates) and
-//! `cu_seqlens` (`[2, 2]` int32, `{0, padded}` for the queries and `{0, used}` for the keys).
-//! `crates/models/minimax-h3/tools/dump_denoiser.py --probe rows` writes the same two names from
-//! today's implementation, so `tools/diagnosis/compare.py --ref <python dir> --got <this dir>`
-//! reports their difference - and a row order, a clock or a boundary that disagrees shows here,
-//! before any weight is read and without a device.
+//! **A dense case** writes two tensors under `<dir>/denoiser/`, under the protocol's own names:
+//! `packed_rows` (`[rows, 4]` float32, each row's modulation tag followed by its three rotary
+//! coordinates) and `cu_seqlens` (`[2, 2]` int32, `{0, padded}` for the queries and `{0, used}` for
+//! the keys). `crates/models/minimax-h3/tools/dump_denoiser.py --probe rows` writes the same two
+//! names from today's implementation.
+//!
+//! **A sparse case** writes the segment packing's own tables, which are the reference's
+//! `segment.`-prefixed names (`tools/dump_tables.py:139-161`): `position_ids` (`[padded, 3]`),
+//! `token_tags`, `groups` and `prefix_index` (`[padded]`), `variable_block_sizes`, `tile_segments`,
+//! `segment_starts` and `segment_keep` (`[tiles]`), `video_indices` and `video_raster_indices`
+//! (`[video rows]`), and five one-element counts (`audio_rows`, `audio_start`, `video_tiles`,
+//! `video_start`, `padded_tokens`). Those tables are what a sparse request's attention reads - the
+//! tile sizes, the keep rate's per-segment selection and every row's rotary coordinate - so a defect
+//! in the tiling or in the selection shows here as a table that disagrees, without a device.
+//!
+//! Either way `tools/diagnosis/compare.py --ref <python dir> --got <this dir>` matches them by
+//! relative path and reports their difference.
 //!
 //! No checkpoint and no device: the tables are host arithmetic ([`minimax_h3::packing`]), which is
 //! exactly the half a structural mistake shows in first.
 //!
 //! This is a **diagnosis, never an acceptance gate**: nothing is gated on the values. A run fails
-//! only when the case cannot be read, when the case asks for a layout this probe does not dump (the
-//! segment packing's rows are per tile and the protocol names them under `segment.`), or when the
+//! only when the case cannot be read, when a sparse case omits its tile or its sparsity, or when the
 //! tables cannot be built - because then there is nothing to compare.
 //!
 //! ## The case
@@ -61,22 +70,7 @@ fn main() -> ExitCode {
 fn run() -> Result<(), String> {
     let arguments = arguments()?;
     let case: Case = read_json(&arguments.case)?;
-    if !case.attention.kind.eq_ignore_ascii_case("dense") {
-        return Err(format!(
-            "the {} packing's rows are per tile and the protocol names them under `segment.`; \
-             this probe dumps the dense pair",
-            case.attention.kind
-        ));
-    }
     let canvas = canvas(&case.canvas);
-    let packing = packing::dense_packing(
-        case.num_frames,
-        &canvas,
-        case.text_capacity,
-        case.condition_capacity,
-        case.token_multiple,
-    )
-    .map_err(|error| format!("sizing the layout: {error}"))?;
     let spans: Vec<(u32, u32)> = case
         .vision_spans
         .iter()
@@ -86,13 +80,38 @@ fn run() -> Result<(), String> {
     let clip = clip(&case)?;
     let segments = packing::condition_segments(&conditions, &canvas, clip)
         .map_err(|error| format!("ordering the conditions: {error}"))?;
+    match case.attention.kind.to_ascii_lowercase().as_str() {
+        "dense" => dense(&case, &canvas, &arguments, &spans, &segments),
+        "sparse" => sparse(&case, &canvas, &arguments, &spans, &segments),
+        other => Err(format!(
+            "`{other}` is not an attention kind: dense or sparse"
+        )),
+    }
+}
+
+/// Dump a dense layout's row tables: the pair the protocol names, without a prefix.
+fn dense(
+    case: &Case,
+    canvas: &Canvas,
+    arguments: &Arguments,
+    spans: &[(u32, u32)],
+    segments: &[packing::Segment],
+) -> Result<(), String> {
+    let packing = packing::dense_packing(
+        case.num_frames,
+        canvas,
+        case.text_capacity,
+        case.condition_capacity,
+        case.token_multiple,
+    )
+    .map_err(|error| format!("sizing the layout: {error}"))?;
     let tables = packing::dense_tables(
         &packing,
         case.num_frames,
-        &canvas,
+        canvas,
         case.num_text_tokens,
-        &segments,
-        &spans,
+        segments,
+        spans,
     )
     .map_err(|error| format!("building the tables: {error}"))?;
 
@@ -133,6 +152,186 @@ fn run() -> Result<(), String> {
     println!("rows    padded {padded}, attended {used}, {} tables", 2);
     println!("wrote   {}", block.display());
     Ok(())
+}
+
+/// Dump a segment layout's tables: the reference's `segment.` names, one file each.
+///
+/// The names and the shapes are `tools/dump_tables.py`'s (`:139-161`), so the comparator pairs each
+/// one with the reference's; the values are this crate's own arithmetic. A sparse case must state
+/// its tile and its sparsity, because both change the layout rather than only its contents: the tile
+/// is the row count of a block, and the sparsity is the rate at which the selection drops generated
+/// video tiles.
+fn sparse(
+    case: &Case,
+    canvas: &Canvas,
+    arguments: &Arguments,
+    spans: &[(u32, u32)],
+    segments: &[packing::Segment],
+) -> Result<(), String> {
+    let tile = case
+        .attention
+        .tile
+        .ok_or_else(|| "a sparse case states its `tile`".to_owned())?;
+    let sparsity = case
+        .attention
+        .sparsity
+        .ok_or_else(|| "a sparse case states its `sparsity`".to_owned())?;
+    let layout = packing::segment_packing(
+        case.num_frames,
+        canvas,
+        case.text_capacity,
+        case.condition_capacity,
+        tile,
+        case.token_multiple,
+    )
+    .map_err(|error| format!("sizing the layout: {error}"))?;
+    let tables = packing::segment_tables(
+        &layout,
+        case.num_frames,
+        canvas,
+        case.num_text_tokens,
+        segments,
+        spans,
+        packing::Sparsity {
+            sparsity,
+            reference_keep: case.attention.reference_keep,
+        },
+    )
+    .map_err(|error| format!("building the tables: {error}"))?;
+
+    let extent = &layout.extent;
+    let padded = u64::from(extent.padded_tokens);
+    if tables.token_tags.len() as u64 != padded || tables.position_ids.len() as u64 != padded {
+        return Err(format!(
+            "the layout holds {padded} padded rows and the tables hold {} tags and {} positions",
+            tables.token_tags.len(),
+            tables.position_ids.len()
+        ));
+    }
+    let tiles = tables.tile_segments.len() as u64;
+    if tables.variable_block_sizes.len() as u64 != tiles
+        || tables.segment_starts.len() as u64 != tiles
+        || tables.segment_keep.len() as u64 != tiles
+    {
+        return Err(
+            "the layout's four per-tile tables disagree on how many tiles it has".to_owned(),
+        );
+    }
+    let video_rows = layout.video_indices.len() as u64;
+
+    // Three coordinates a row, in double precision: they are the raster's own cell positions, and a
+    // rounded float32 would blur a boundary that the comparison is meant to localise.
+    let mut coordinates = Vec::with_capacity(tables.position_ids.len() * 24);
+    for position in &tables.position_ids {
+        for coordinate in position {
+            coordinates.extend_from_slice(&coordinate.to_le_bytes());
+        }
+    }
+    let block = arguments.out.join("denoiser");
+    fs::create_dir_all(&block).map_err(|error| format!("making {}: {error}", block.display()))?;
+    write(
+        &block.join("segment.position_ids.npy"),
+        &npy("<f8", &[padded, 3], &coordinates),
+    )?;
+    write(
+        &block.join("segment.token_tags.npy"),
+        &npy("<i4", &[padded], &i32_bytes(&tables.token_tags)),
+    )?;
+    write(
+        &block.join("segment.groups.npy"),
+        &npy("<i4", &[padded], &i32_bytes(&tables.groups)),
+    )?;
+    write(
+        &block.join("segment.prefix_index.npy"),
+        &npy("<i4", &[padded], &i32_bytes(&tables.prefix_index)),
+    )?;
+    write(
+        &block.join("segment.variable_block_sizes.npy"),
+        &npy("<i4", &[tiles], &u32_bytes(&tables.variable_block_sizes)),
+    )?;
+    write(
+        &block.join("segment.tile_segments.npy"),
+        &npy("<i4", &[tiles], &i32_bytes(&tables.tile_segments)),
+    )?;
+    write(
+        &block.join("segment.segment_starts.npy"),
+        &npy("<i4", &[tiles], &i32_bytes(&tables.segment_starts)),
+    )?;
+    write(
+        &block.join("segment.segment_keep.npy"),
+        &npy("<i4", &[tiles], &i32_bytes(&tables.segment_keep)),
+    )?;
+    write(
+        &block.join("segment.video_indices.npy"),
+        &npy("<i4", &[video_rows], &u32_bytes(&layout.video_indices)),
+    )?;
+    write(
+        &block.join("segment.video_raster_indices.npy"),
+        &npy(
+            "<i4",
+            &[video_rows],
+            &u32_bytes(&layout.video_raster_indices),
+        ),
+    )?;
+    // The five counts the reference writes as one-element int64 tensors rather than as arrays.
+    for (name, value) in [
+        ("audio_rows", extent.audio_rows),
+        ("audio_start", extent.audio_start()),
+        ("video_tiles", extent.video_tiles),
+        ("video_start", extent.video_start()),
+        ("padded_tokens", extent.padded_tokens),
+    ] {
+        write(
+            &block.join(format!("segment.{name}.npy")),
+            &npy("<i8", &[1], &i64_bytes(&[i64::from(value)])),
+        )?;
+    }
+
+    let kept: i64 = tables
+        .segment_keep
+        .iter()
+        .map(|keep| i64::from(*keep))
+        .sum();
+    println!("case    {}", arguments.case.display());
+    println!("canvas  {}x{} pixels", canvas.width, canvas.height);
+    println!(
+        "layout  {tiles} tiles of {tile} rows, {video_rows} generated video rows, {padded} padded"
+    );
+    println!(
+        "kept    {kept} key tiles over {} segments",
+        extent.video_tiles
+    );
+    println!("wrote   {} (15 tables)", block.display());
+    Ok(())
+}
+
+/// An `i32` table's little-endian bytes.
+fn i32_bytes(values: &[i32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+/// An `i64` table's little-endian bytes.
+fn i64_bytes(values: &[i64]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(values.len() * 8);
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+/// A `u32` table as `i32`: the protocol's indices are non-negative and never above `i32::MAX`, and
+/// NumPy has no unsigned type the comparator pairs with the reference's signed tensors.
+fn u32_bytes(values: &[u32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+    for value in values {
+        let signed = i32::try_from(*value).unwrap_or(i32::MAX);
+        bytes.extend_from_slice(&signed.to_le_bytes());
+    }
+    bytes
 }
 
 /// The case's canvas from the pixel extents it states.
@@ -336,10 +535,20 @@ struct Size {
     width: u32,
 }
 
-/// The request's attention.
+/// The request's attention: its kind, and - for a sparse one - the tile and the rates.
 #[derive(Deserialize)]
 struct Attention {
+    /// `dense` or `sparse`.
     kind: String,
+    /// A sparse layout's tile: the row count of one block, a key of the reference's tile shapes.
+    #[serde(default)]
+    tile: Option<u32>,
+    /// The fraction of a generated video segment's tiles the selection drops.
+    #[serde(default)]
+    sparsity: Option<f64>,
+    /// The fraction of a reference segment's tiles the selection keeps.
+    #[serde(default)]
+    reference_keep: Option<f64>,
 }
 
 #[cfg(test)]
@@ -399,5 +608,95 @@ mod tests {
         assert!(tables.used <= packing.padded_tokens);
         // The canvas' name is in lowest terms: 1344x768 is 16:9.
         assert_eq!(canvas.aspect, (7, 4), "1344x768 in lowest terms is 7:4");
+    }
+
+    /// The segment layout's tables carry one entry per row, per tile and per generated video row -
+    /// the invariant the comparator needs, since it pairs each table with the reference's by name and
+    /// refuses a shape that differs.
+    #[test]
+    fn the_segment_tables_carry_one_entry_per_row_and_tile() {
+        let case: Case = serde_json::from_str(
+            r#"{
+                "canvas": {"height": 768, "width": 1344},
+                "num_frames": 22,
+                "text_capacity": 128,
+                "condition_capacity": 64,
+                "token_multiple": 64,
+                "num_text_tokens": 40,
+                "attention": {"kind": "sparse", "tile": 64, "sparsity": 0.8}
+            }"#,
+        )
+        .expect("a case");
+        let canvas = canvas(&case.canvas);
+        let tile = case.attention.tile.expect("the case states its tile");
+        let layout = packing::segment_packing(
+            case.num_frames,
+            &canvas,
+            case.text_capacity,
+            case.condition_capacity,
+            tile,
+            case.token_multiple,
+        )
+        .expect("a layout");
+        let tables = packing::segment_tables(
+            &layout,
+            case.num_frames,
+            &canvas,
+            case.num_text_tokens,
+            &[],
+            &[],
+            packing::Sparsity {
+                sparsity: 0.8,
+                reference_keep: None,
+            },
+        )
+        .expect("tables");
+
+        let padded = layout.extent.padded_tokens;
+        let tiles = padded / tile;
+        assert_eq!(padded % tile, 0, "a segment layout pads to whole tiles");
+        assert_eq!(tables.token_tags.len() as u32, padded);
+        assert_eq!(tables.position_ids.len() as u32, padded);
+        assert_eq!(tables.groups.len() as u32, padded);
+        assert_eq!(tables.prefix_index.len() as u32, padded);
+        assert_eq!(tables.variable_block_sizes.len() as u32, tiles);
+        assert_eq!(tables.tile_segments.len() as u32, tiles);
+        assert_eq!(tables.segment_starts.len() as u32, tiles);
+        assert_eq!(tables.segment_keep.len() as u32, tiles);
+
+        // Every generated video row lands in one packed row, in ascending order, and no segment
+        // keeps more key tiles than the layout has.
+        assert_eq!(
+            layout.video_indices.len(),
+            layout.video_raster_indices.len()
+        );
+        assert!(
+            layout
+                .video_indices
+                .windows(2)
+                .all(|pair| pair[0] < pair[1]),
+            "the generated video's packed rows ascend"
+        );
+        assert!(
+            layout.video_indices.iter().all(|row| *row < padded),
+            "every packed row is inside the layout"
+        );
+        let kept: i64 = tables
+            .segment_keep
+            .iter()
+            .map(|keep| i64::from(*keep))
+            .sum();
+        assert!(
+            kept <= i64::from(tiles) && kept >= 0,
+            "a layout of {tiles} tiles keeps {kept} key tiles"
+        );
+        // The prefix source holds the text capacity, the condition capacity and one row of zeros, and
+        // every packed row addresses one of its rows.
+        let prefix = case.text_capacity + case.condition_capacity + 1;
+        assert!(
+            tables.prefix_index.iter().all(|row| *row >= 0)
+                && tables.prefix_index.iter().all(|row| (*row as u32) < prefix),
+            "every packed row addresses a row of the prefix source"
+        );
     }
 }
