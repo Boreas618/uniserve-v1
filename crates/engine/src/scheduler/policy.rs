@@ -1988,3 +1988,47 @@ mod tests {
         }
     }
 }
+
+/// Each package the tree ships is a deployment's policy module, and its
+/// `[parameters]` table is the argument set `Precopy` delivers as TOML text
+/// (§5.1, §7.7). A parameter whose spelling this build cannot read fails every
+/// deployment that names that package, and it fails at the first `Precopy`
+/// rather than anywhere the deployment's configuration could be blamed.
+#[cfg(test)]
+mod shipped_packages {
+    use super::PolicyProgram;
+
+    #[test]
+    fn every_package_states_arguments_this_build_reads() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .unwrap_or_else(|| panic!("crates/engine lives two levels below the workspace root"));
+        for package in [
+            "crates/scheduling/policies/fcfs/package.toml",
+            "crates/scheduling/policies/priority/package.toml",
+            "crates/ops/program-fixtures/policy/package.toml",
+        ] {
+            let text = std::fs::read_to_string(root.join(package))
+                .unwrap_or_else(|error| panic!("{package}: {error}"));
+            let parsed: toml::Value = text
+                .parse()
+                .unwrap_or_else(|error| panic!("{package}: {error}"));
+            let backend = parsed
+                .get("backend")
+                .and_then(toml::Value::as_str)
+                .unwrap_or_else(|| panic!("{package} names no backend"));
+            let mut arguments = std::collections::BTreeMap::new();
+            for (name, value) in parsed
+                .get("parameters")
+                .and_then(toml::Value::as_table)
+                .into_iter()
+                .flatten()
+            {
+                arguments.insert(name.clone(), value.to_string());
+            }
+            PolicyProgram::from_arguments(backend, 0, &arguments)
+                .unwrap_or_else(|error| panic!("{package}: {error}"));
+        }
+    }
+}
