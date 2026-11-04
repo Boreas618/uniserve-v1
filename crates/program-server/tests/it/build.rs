@@ -1340,7 +1340,7 @@ fn interpreter_fallback() -> PathBuf {
 /// command is where they are made absolute.
 #[test]
 fn the_command_makes_every_path_absolute_before_the_server_sees_it() {
-    let mut command = program_server::command::command();
+    let command = program_server::command::command();
     let matches = command
         .try_get_matches_from([
             "program-server",
@@ -1387,11 +1387,14 @@ fn the_command_makes_every_path_absolute_before_the_server_sees_it() {
             path.display()
         );
     }
-    if python().is_some() {
-        assert!(
-            serve.toolchains.python.is_file(),
-            "the relative interpreter {} names no program",
-            serve.toolchains.python.display()
-        );
-    }
+    // The interpreter must resolve against the directory the command was typed in, not
+    // against whatever directory a build later runs in. This is path arithmetic and
+    // nothing else: it holds on a host whose Python environment was never created,
+    // which is every host but the one that ran `uv sync`.
+    let typed_in = std::env::current_dir().expect("the directory the test runs in");
+    assert_eq!(
+        serve.toolchains.python,
+        typed_in.join("python/.venv/bin/python"),
+        "the relative interpreter did not resolve against the directory it was typed in",
+    );
 }
