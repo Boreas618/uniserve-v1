@@ -66,6 +66,7 @@ use scheduling::guest::view::{
 };
 
 use super::*;
+use crate::scheduler::mechanism::Live;
 use crate::scheduler::placement::Placement;
 use crate::scheduler::policy::TrialState;
 
@@ -1100,6 +1101,30 @@ pub(crate) fn snapshot(scheduler: &Scheduler, step: u64, recorded: &RecordedTabl
         phases: phases(&scheduler.info),
         ranks: Vec::new(),
     }
+}
+
+/// The requests waiting for admission, in the mechanism's own order.
+pub(crate) fn queued(scheduler: &Scheduler) -> Vec<ViewRequestId> {
+    scheduler
+        .waiting
+        .iter()
+        .map(|state| ViewRequestId(state.req.request_id.0))
+        .chain(
+            scheduler
+                .waiting_media
+                .iter()
+                .map(|pending| ViewRequestId(pending.request.request_id.0)),
+        )
+        .collect()
+}
+
+/// The live state a step's validators read: this moment's snapshot, with the
+/// admission queue in the mechanism's own order.
+///
+/// The validators read a `Plan`'s names against it, so it is built at the step
+/// the plan belongs to and rebuilt after `reclaim` changes the state.
+pub(crate) fn live(scheduler: &Scheduler, step: u64, recorded: &RecordedTable) -> Live {
+    Live::of(&snapshot(scheduler, step, recorded), queued(scheduler))
 }
 
 /// The trial state of this moment: the snapshot, the room, and the decisions
