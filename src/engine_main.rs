@@ -519,6 +519,18 @@ pub(crate) struct MainProcess {
     /// own, one bucket per queue turn behind serving, and a model with many buckets warms for longer
     /// than the daemon waits for `Switched`.
     warming: Vec<(u32, Submission, u64)>,
+    /// How many switchovers this epoch has served (§7.3 step 3). The epoch's first one is what
+    /// installs a policy, so only it is checked for a policy that never arrived.
+    switchovers: u32,
+    /// When the next check for a serving policy is due, and since when none serves (§7.3 step 3).
+    ///
+    /// `crates/engine`'s first switchover with no prepared candidate adopts no policy, calls
+    /// `note_policy_serves` never, raises nothing and answers `Ok(None)`; a scheduler with no policy
+    /// forms no batch, so the epoch would sit with nothing running while the daemon believes the
+    /// cut-over succeeded. The check asks each scheduler's policy slot, which answers within its own
+    /// command timeout, and reads the answer in the watchdog's stall bound rather than waiting.
+    policy_probe_at: Option<Instant>,
+    policy_missing_since: Option<Instant>,
     /// The generations the last precopy built and the switchover has not taken:
     /// one per device, in `executors` order. A revert drops them, because the
     /// generation they hold never serves.
@@ -734,6 +746,9 @@ impl MainProcess {
             programs,
             precopy: None,
             warming: Vec::new(),
+            switchovers: 0,
+            policy_probe_at: None,
+            policy_missing_since: None,
             prepared: Vec::new(),
             retired: Vec::new(),
             generations,
@@ -878,6 +893,9 @@ impl MainProcess {
                 return Ok(Some(failure));
             }
             if let Some(failure) = self.watch_schedulers()? {
+                return Ok(Some(failure));
+            }
+            if let Some(failure) = self.advance_policy_check(&running)? {
                 return Ok(Some(failure));
             }
             if let Some(failure) = self.watch_probation()? {
@@ -1965,6 +1983,14 @@ impl MainProcess {
             self.open_admission()
                 .context("resuming for the epoch's first switchover")?;
         }
+        // The other silence of §7.3 step 3: a first switchover that installed no policy adopts
+        // nothing and says nothing, so this process asks the policy slots once and, if none serves,
+        // asks again one stall bound later before it names the failure. The check is queued here
+        // rather than run here, so the daemon's `Switched` is never delayed by it.
+        self.switchovers = self.switchovers.saturating_add(1);
+        if self.switchovers == 1 {
+            self.policy_probe_at = Some(Instant::now());
+        }
         Ok(ProgramStatus::Switched { generation })
     }
 
@@ -2124,6 +2150,69 @@ impl MainProcess {
         Ok(None)
     }
 
+    /// §7.3 step 3: a first switchover that installed no policy, said by name instead of waited for.
+    ///
+    /// A first switchover with no prepared candidate adopts no policy and answers `Ok(None)`; a
+    /// scheduler with no policy forms no batch, so the epoch sits with nothing running while the
+    /// daemon believes the cut-over succeeded - the same silence the missing startup report had.
+    /// The policy slot is asked whether one serves, and the answer is read rather than waited for:
+    /// a probe is due at once after the switchover and again one stall bound later, and the failure
+    /// is only spoken when no device has a job in flight, so a busy scheduler cannot be mistaken
+    /// for one that never adopted a policy.
+    fn advance_policy_check(&mut self, running: &[Running]) -> Result<Option<UpdateFailure>> {
+        let Some(due) = self.policy_probe_at else {
+            return Ok(None);
+        };
+        let now = Instant::now();
+        if now < due {
+            return Ok(None);
+        }
+        self.policy_probe_at = None;
+
+        let serving = self
+            .schedulers
+            .iter()
+            .filter(|scheduler| scheduler.policy_mut().running().is_some())
+            .count();
+        if serving == self.schedulers.len() {
+            if self.policy_missing_since.take().is_some() {
+                tracing::info!(serving, "the switchover's policy serves every scheduler");
+            }
+            return Ok(None);
+        }
+        if !running.is_empty() {
+            // A device is busy, so the slots' silence is not evidence: look again next pass.
+            self.policy_probe_at = Some(now + POLICY_PROBE_INTERVAL);
+            return Ok(None);
+        }
+        match self.policy_missing_since {
+            None => {
+                self.policy_missing_since = Some(now);
+                self.policy_probe_at = Some(now + self.watchdog.stall_bound());
+                tracing::warn!(
+                    serving,
+                    schedulers = self.schedulers.len(),
+                    "a switchover installed no policy on every scheduler; looking again in the watchdog's stall bound"
+                );
+                Ok(None)
+            }
+            Some(since) => {
+                self.policy_missing_since = None;
+                let failure = UpdateFailure::Policy {
+                    error: format!(
+                        "the epoch's first switchover installed no policy: {} of this node's {} \
+                         schedulers serve one after {}s, and a scheduler with no policy forms no \
+                         batch, so an admitted request cannot be planned",
+                        serving,
+                        self.schedulers.len(),
+                        since.elapsed().as_secs()
+                    ),
+                };
+                self.failure(failure)
+            }
+        }
+    }
+
     /// A scheduler thread that stopped ends the epoch's service, and the epoch says so.
     ///
     /// With no scheduler no batch is formed, so no job runs and no job can stall: the stall rule
@@ -2192,6 +2281,8 @@ impl MainProcess {
     /// generation and its nodes stayed through probation, so the revert is the
     /// reverse switchover and nothing has to be prepared again.
     fn revert(&mut self, generation: u64, failure: UpdateFailure) -> Result<ProgramStatus> {
+        self.policy_probe_at = None;
+        self.policy_missing_since = None;
         // The phase before the call decides what a device does with the update's generation: a
         // generation that was prepared but never cut over never served, so nothing goes back and it
         // is discarded; a generation on probation served, and its reverse switchover runs. The
@@ -3132,6 +3223,10 @@ const METRICS_EVERY: Duration = Duration::from_secs(1);
 /// expiry, and the control thread asks it at least this often. A rollback window is stated in whole
 /// seconds, so the poll costs a wake per tenth of a second for the length of the window.
 const PROBATION_POLL: Duration = Duration::from_millis(100);
+
+/// How often a device that is busy delays the question asked of the policy slots: a probe that finds
+/// a device running proves nothing about whether a policy serves, so it is asked again after this.
+const POLICY_PROBE_INTERVAL: Duration = Duration::from_millis(250);
 
 /// How long a metrics pass waits on one scheduler's counters: the report is sent once a second and a
 /// pass that waited longer than this would be reporting what the next pass reports anyway.
