@@ -204,12 +204,13 @@ pub struct TopKDescriptor {
     pub dtype: DType,
     /// The vocabulary width of a row.
     ///
-    /// A launch size, not a compilation: the program walks the row at runtime
-    /// (`do_not_specialize = ["rows", "vocabulary", "width"]`), so neither this nor `width` enters
-    /// the key. A key that named them would demand a module per vocabulary the deployment happens
-    /// to serve, and a manifest would have to declare every one of them.
+    /// A launch size, not a compilation: the program reads the row at runtime
+    /// (`do_not_specialize = ["rows", "vocabulary", "width"]`), so it does not enter the key - a
+    /// key that named it would demand a module per vocabulary the deployment happens to serve.
     pub vocabulary: u32,
-    /// How many candidates a row keeps; a launch size for the same reason as `vocabulary`.
+    /// How many candidates a row keeps. **A compilation**: the emission's buffers are `width`
+    /// wide and the final sort runs over `width` lanes, so `WIDTH` is the program's constexpr and
+    /// one module serves one candidate count.
     pub width: u32,
     /// Element type of the emitted vocabulary ids.
     pub ids: DType,
@@ -219,10 +220,12 @@ pub struct TopKDescriptor {
 
 impl fmt::Display for TopKDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // `vocabulary` and `width` are absent on purpose: the program takes both as runtime scalars,
-        // so one module serves every vocabulary and every candidate count.
+        // `vocabulary` is absent on purpose: the program takes it as a runtime scalar, so one module
+        // serves every vocabulary. `width` is present because it is the program's `WIDTH` - the
+        // emission's buffers and its final sort are that many lanes wide.
         Key::new()
             .field("dtype", self.dtype)
+            .field("width", self.width)
             .field("ids", self.ids)
             .field("pdl", self.pdl)
             .finish(formatter)
@@ -307,7 +310,13 @@ impl Op for TopK {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct FilterDescriptor {
     /// How many candidates a row carries.
+    ///
+    /// A runtime value, not a compilation: the program walks the row in `tile`-sized chunks, so one
+    /// module serves every candidate count and neither this nor the tile is a request the deployment
+    /// has to enumerate.
     pub width: u32,
+    /// The tile the program walks the row in: a chunk, never the row.
+    pub tile: u32,
     /// Element type of the emitted vocabulary ids.
     pub ids: DType,
     /// Launch with programmatic dependent launch.
@@ -318,6 +327,7 @@ impl fmt::Display for FilterDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
             .field("width", self.width)
+            .field("tile", self.tile)
             .field("ids", self.ids)
             .field("pdl", self.pdl)
             .finish(formatter)
@@ -381,10 +391,8 @@ impl Op for FilterCandidates {
             .view(args.ids)
             .view(args.parameters)
             .view(args.valid)
-            .u64(rows);
-        // The candidate width is compiled into the program, so it is not a parameter here: a word the
-        // module does not declare would push the two scratch addresses the compiler's launcher appends
-        // out of place.
+            .u64(rows)
+            .u64(width);
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 

@@ -1,9 +1,10 @@
 """The top_k package's compile script: one descriptor -> one module.
 
-A descriptor is the logits' dtype, the vocabulary width of a row, the candidates
-a row keeps, the candidate id dtype and the dependent-launch flag. The row count
-stays a runtime value and the vocabulary is a launch value, so one module serves
-every batch.
+A descriptor is the logits' dtype, the candidates a row keeps, the candidate id
+dtype and the dependent-launch flag. The row count and the vocabulary are launch
+values, so one module serves every batch and every vocabulary; the candidate count
+is the program's `WIDTH`, because the emission's buffers and its final sort are
+that many lanes wide.
 """
 
 import _compile
