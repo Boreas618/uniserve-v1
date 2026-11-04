@@ -167,7 +167,7 @@ impl Scheduler {
             .get(&id)
             .map(|state| RequestKey::new(self.engine_id, id, state.request_epoch))?;
         self.placement.worker_target(
-            self.executor.inner(),
+            &self.executor,
             &self.info,
             request_key,
             call.kind,
@@ -675,9 +675,11 @@ impl Scheduler {
             // A decode's rows embed the token the request's own state continues
             // from; every other token call states its tokens itself.
             let tokens: Vec<i32> = match call.kind {
-                ipc::CallKind::Forward(ipc::ForwardMode::Decode) => (0..placed.forward.query_lens.len())
-                    .map(|_| i32::try_from(state.next_token).unwrap_or(-1))
-                    .collect(),
+                ipc::CallKind::Forward(ipc::ForwardMode::Decode) => {
+                    (0..placed.forward.query_lens.len())
+                        .map(|_| i32::try_from(state.next_token).unwrap_or(-1))
+                        .collect()
+                }
                 _ => call
                     .input_token_ids
                     .iter()
@@ -688,8 +690,14 @@ impl Scheduler {
             sampling.push(&state.req.sampling);
             draws.push(state.sampling_position);
         }
-        batch.columns =
-            columns::columns(&batch.requests, &inputs, &sampling, &draws, page, max_kv_len);
+        batch.columns = columns::columns(
+            &batch.requests,
+            &inputs,
+            &sampling,
+            &draws,
+            page,
+            max_kv_len,
+        );
     }
 
     /// Determines the next call kind without mutating request or resource state.
