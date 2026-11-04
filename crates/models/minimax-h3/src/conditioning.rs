@@ -180,8 +180,8 @@ impl RefinerBlock {
             query,
             key,
             value,
-            visible.cu_seq_lens_q,
-            visible.cu_seq_lens_k,
+            Some(visible.cu_seq_lens_q),
+            Some(visible.cu_seq_lens_k),
             rows.attended,
         )?;
         let attended = self.gather(f, rows.attended, &rows)?;
