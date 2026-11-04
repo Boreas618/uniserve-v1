@@ -44,6 +44,32 @@
 //! request interface carries `Emitted` events, and the tokens come back with the
 //! scheduler's completed batch in logits order.
 //!
+//! ## The daemon's program-layer sequence
+//!
+//! A standby main process starts, and the daemon then drives one update per
+//! generation through the request interface, at no other entry point:
+//!
+//! 1. `ToEngine::Precopy { kernels, policy }`: the programs of the new
+//!    generation, as revisions. Each node runs [`MainProcess::precopy`] and
+//!    answers `FromEngine::Report::Precopied { generation }`, or
+//!    `PrecopyFailed { reason }`, which discards the generation and leaves
+//!    serving on the old one.
+//! 2. `ToEngine::Switchover { generation }`: the node swaps at the next batch
+//!    boundary and answers `Switched { generation }`. A main process serves
+//!    nothing before its first switchover; the daemon only lets the frontend
+//!    submit after it.
+//! 3. `Committed { generation }` ends probation; `Reverted { reason }` puts the
+//!    previous generation back and keeps the update unavailable until forced;
+//!    `Purged { generation }` releases a generation after its last batch.
+//!    `PolicyReverted { scheduler, backend, revision, reason, fatal }` is the
+//!    policy's own revert, and `Stalled`, `Fault` and `NonFiniteLogits` are
+//!    §7.3 step 4's automatic-revert failures.
+//!
+//! The two `ToEngine` variants and the report variants are front's additions to
+//! `crates/proto/src/request.proto`; this module reads and writes them under
+//! exactly those names. Nothing program-content crosses that protocol: a node
+//! resolves its modules from the Program Server itself.
+//!
 //! The executor's own calls (`Executor::{spawn, submit, precopy, switchover,
 //! purge, watchdog, probe, close}`, `Submission::wait`) are published in
 //! `crates/executor` and are used as they are written there.
@@ -66,7 +92,7 @@ use executor::watchdog::{Running, Watchdog};
 use ipc::{ProgramCommand, ProgramStatus, UpdateFailure};
 use nn::{Checkpoint, Model, Partition, WeightLoader};
 use ops::Generation;
-use program_server::{BuildConfig, Client, EpochRecord, Program, Programs};
+use program_server::{BuildConfig, Client, EpochRecord, Module, Program, Programs, Target};
 
 use crate::cli::LogLevels;
 use crate::logging;
@@ -218,8 +244,15 @@ impl MainProcess {
     /// arrived.
     fn serve(&mut self) -> Result<Option<UpdateFailure>> {
         let mut running = Vec::new();
+        let mut reported = Instant::now();
         loop {
             let deadline = self.watchdog.deadline(oldest(&running));
+            // One metrics report a second, and a final one on the way out
+            // (§7.3: the daemon exports the engine's counters as metrics).
+            if reported.elapsed() >= METRICS_EVERY {
+                self.send_metrics();
+                reported = Instant::now();
+            }
             for event in self.control.wait(deadline)? {
                 match event {
                     Ready::Daemon => {
@@ -287,7 +320,7 @@ impl MainProcess {
                     .find(|job| job.rank == rank)
                     .and_then(|job| job.batch);
                 let failure = UpdateFailure::Device {
-                    device: executor.device().0.unsigned_abs(),
+                    device: u32::try_from(executor.device().0).unwrap_or_default(),
                     error: error.to_string(),
                     batch,
                 };
@@ -436,7 +469,10 @@ impl MainProcess {
                 Ok(built) => next.push(built),
                 Err(error) => {
                     let failure = UpdateFailure::Precopy {
-                        reason: format!("resolving device {}: {error:#}", self.executors[index].device()),
+                        reason: format!(
+                            "resolving device {}: {error:#}",
+                            self.executors[index].device().0
+                        ),
                     };
                     return self.precopy_failed(generation, failure);
                 }
@@ -458,7 +494,10 @@ impl MainProcess {
             let prepared = self.executors[index].precopy(Arc::clone(built))?;
             if let Err(error) = completed(prepared.wait()) {
                 let failure = UpdateFailure::Precopy {
-                    reason: format!("preparing device {}: {error}", self.executors[index].device()),
+                    reason: format!(
+                        "preparing device {}: {error}",
+                        self.executors[index].device().0
+                    ),
                 };
                 return self.precopy_failed(generation, failure);
             }
@@ -498,10 +537,9 @@ impl MainProcess {
         programs: &Programs,
         current: &Arc<Generation>,
     ) -> Result<Arc<Generation>> {
-        let device = self.executors[index]
-            .device()
-            .device()
-            .with_context(|| format!("opening device {}", self.executors[index].device()))?;
+        let ordinal = self.executors[index].device();
+        let device = platform::Device::new(ordinal)
+            .with_context(|| format!("opening device {}", ordinal.0))?;
         let mut entries = Vec::new();
         for (slot, program) in &programs.kernels {
             let operator = ops::operator_name(&slot.op).ok_or_else(|| {
@@ -572,7 +610,7 @@ impl MainProcess {
         switchover_policy(&mut self.schedulers, generation, step)?;
         for executor in &self.executors {
             if let Err(error) = completed(executor.switchover(generation)?.wait()) {
-                bail!("switching device {}: {error}", executor.device());
+                bail!("switching device {}: {error}", executor.device().0);
             }
         }
         self.update.switchover(generation)?;
@@ -608,14 +646,14 @@ impl MainProcess {
                     if let Err(error) = completed(submission.wait()) {
                         tracing::error!(
                             %error,
-                            device = %executor.device(),
+                            device = executor.device().0,
                             "reverting a device's generation failed"
                         );
                     }
                 }
                 Err(error) => tracing::error!(
                     %error,
-                    device = %executor.device(),
+                    device = executor.device().0,
                     "queueing a device's revert failed"
                 ),
             }
@@ -636,7 +674,7 @@ impl MainProcess {
         }
         for executor in &self.executors {
             if let Err(error) = completed(executor.purge(generation)?.wait()) {
-                bail!("purging device {}: {error}", executor.device());
+                bail!("purging device {}: {error}", executor.device().0);
             }
         }
         self.update.purged(generation)?;
@@ -684,6 +722,44 @@ impl MainProcess {
             scheduler.engine_command(&command)?;
         }
         Ok(None)
+    }
+
+    /// Sends the engine's counters to the daemon, one report a second and a
+    /// final flush when the process ends.
+    ///
+    /// Sources: sched owns `steps`, `batches`, `tokens`, `policy_fuel` and
+    /// `policy_calls`; the executor owns `kernel_launches`, `device_ns` and
+    /// each rank's queue depth. Neither publishes counters yet (the executor
+    /// offers `watchdog` and `probe` only), so every field is reported as zero
+    /// rather than estimated: an honest zero the daemon can graph, not a guess.
+    fn send_metrics(&mut self) {
+        let metrics = proto::request::wire::Metrics {
+            steps: 0,
+            batches: 0,
+            tokens: 0,
+            kernel_launches: 0,
+            device_ns: 0,
+            queue: self
+                .executors
+                .iter()
+                .enumerate()
+                .map(|(rank, _)| proto::request::wire::QueueDepth {
+                    rank: rank as u32,
+                    depth: 0,
+                })
+                .collect(),
+            policy_fuel: 0,
+            policy_calls: 0,
+        };
+        if let Err(error) = self
+            .control
+            .daemon_mut()
+            .send(&proto::request::wire::FromEngine {
+                kind: Some(proto::request::wire::from_engine::Kind::Metrics(metrics)),
+            })
+        {
+            tracing::warn!(%error, "reporting the engine's metrics failed");
+        }
     }
 
     /// Reports a program-layer status to the daemon.
@@ -757,6 +833,44 @@ fn discard_policy(schedulers: &mut [Scheduler]) {
         if let Err(error) = scheduler.policy_mut().discard() {
             tracing::warn!(%error, "discarding a precopied scheduling policy failed");
         }
+    }
+}
+
+/// How often the engine reports its counters.
+const METRICS_EVERY: Duration = Duration::from_secs(1);
+
+/// The scheduling policy's source: sched's `PolicySource`, filled from this
+/// node's Program Server client (§7.3 step 2, §4.4).
+///
+/// A policy is a program like any other, and its module reaches the main process
+/// only from the Program Server: the daemon names the program's revision, never
+/// its bytes. A scheduling policy has no per-deployment descriptor, so the
+/// descriptor key is `"default"`.
+pub(crate) struct ProgramPolicy {
+    programs: Client,
+    targets: Vec<Target>,
+}
+
+impl ProgramPolicy {
+    /// One module per target, in `targets` order: the policy a node's schedulers
+    /// instantiate as their candidate.
+    pub(crate) fn load(&mut self, program: &Program) -> Result<Vec<Module>> {
+        let mut modules = Vec::with_capacity(self.targets.len());
+        for target in &self.targets {
+            modules.push(self.programs.resolve(
+                "scheduling",
+                program,
+                target,
+                "default",
+                &mut |progress| {
+                    tracing::debug!(
+                        state = ?progress.state,
+                        "resolving the scheduling policy"
+                    );
+                },
+            )?);
+        }
+        Ok(modules)
     }
 }
 
