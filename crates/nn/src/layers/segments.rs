@@ -282,7 +282,10 @@ impl VsaTiles {
             ));
         }
         let width = u32::try_from(pooled_query.shape.dim(2)).map_err(|_| {
-            Error::shape("VsaTiles", format!("{} features per head", pooled_query.shape.dim(2)))
+            Error::shape(
+                "VsaTiles",
+                format!("{} features per head", pooled_query.shape.dim(2)),
+            )
         })?;
         let descriptor = segments::ScoresDescriptor::new(
             pooled_query.dtype,
