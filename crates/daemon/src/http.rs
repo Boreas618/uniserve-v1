@@ -118,8 +118,17 @@ pub async fn serve(config: ServeConfig, stated: Stated, shutdown: CancellationTo
         }
         return stop_daemon(daemon).await;
     };
+    // The daemon's channel down to the main processes, which the epoch's
+    // first program switch commands through.
+    let commands = daemon
+        .lock()
+        .map_err(|_| anyhow::anyhow!("the daemon's lock is poisoned"))?
+        .as_ref()
+        .and_then(Daemon::commands);
     let engine = tokio::select! {
-        engine = Leader::start(&config, &stated, address) => engine.map(Arc::new),
+        engine = Leader::start(&config, &stated, address, commands.as_ref()) => {
+            engine.map(Arc::new)
+        }
         () = shutdown.cancelled() => return stop_daemon(daemon).await,
     };
     let engine = match engine {
@@ -317,6 +326,22 @@ async fn serve_on(
     );
     info!(%bind_address, model = engine.served_model_name(), "starting HTTP server");
 
+    // The responses the daemon this one replaced handed over go on here: each
+    // connection writes the bytes the predecessor did not write and then goes
+    // on with the resumed body (design §7.5.1 step 4).
+    for stream in crate::restart::streams::take_adopted() {
+        let app = app.clone();
+        tokio::spawn(async move {
+            crate::restart::streams::adopted(std::slice::from_ref(&stream));
+            let request_id = stream.request_id.clone();
+            let error = conn::adopt(stream.descriptor, stream.http, stream.body, app).await.err();
+            if let Some(error) = error {
+                tracing::warn!(%request_id, %error, "a handed-over connection ended");
+            }
+            crate::restart::streams::finished(&request_id);
+        });
+    }
+
     let serving = conn::serve(listener, app, accepting.clone());
     let drain = async {
         serving.await.context("HTTP server failed")?;
@@ -410,6 +435,7 @@ pub(crate) fn router(
                     Arc::clone(&engine),
                     Arc::clone(&jobs),
                     video_body_limit,
+                    Arc::clone(&handoff),
                 ));
             }
             Task::Readout => {
