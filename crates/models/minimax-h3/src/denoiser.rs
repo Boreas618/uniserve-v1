@@ -1153,14 +1153,6 @@ impl Denoiser {
         latents: nn::Latents,
         cond: nn::Conditioning<'_>,
     ) -> Result<()> {
-        // The sparse path's rows are tile-ordered and its attention reads the segment tables rather
-        // than the dense visibility pair; until `attention_sparse` is in the tree this deployment
-        // has no forward, and saying so beats failing on a table lookup three lines down.
-        if !self.config.attention.is_dense() {
-            return Err(Error::config(
-                "this deployment attends sparsely, and the sparse forward is not wired".to_owned(),
-            ));
-        }
         let tables = cond.state;
         let video = latents.video;
         let channels = video.shape.dim(0);
@@ -1217,11 +1209,33 @@ impl Denoiser {
         let sine = arena.tensor(DType::F32, Shape::new(&[tokens, rotated]))?;
         self.transformer
             .factors(f, state(tables, "position_ids")?, cosine, sine)?;
-        let visible = Visible {
-            cu_seq_lens_q: state(tables, "cu_seq_lens_q")?,
-            cu_seq_lens_k: state(tables, "cu_seq_lens_k")?,
-            key_rows: tokens as u32,
+        // The dense kind reads the whole packed sequence in one go; the sparse kind reads the
+        // segment tables instead and has no visibility pair at all.
+        let visible = self.config.attention.is_dense().then(|| {
+            Ok::<_, Error>(Visible {
+                cu_seq_lens_q: state(tables, "cu_seq_lens_q")?,
+                cu_seq_lens_k: state(tables, "cu_seq_lens_k")?,
+                key_rows: tokens as u32,
+            })
+        });
+        let visible = match visible {
+            None => None,
+            Some(visible) => Some(visible?),
         };
+        // A sparse deployment's layers read the valid rows of each tile, the segment of each tile,
+        // and the keep table.
+        let segments = self
+            .config
+            .attention
+            .is_dense()
+            .then_some(())
+            .map_or(Ok(None), |()| {
+                Ok::<_, Error>(Some(crate::attention_sparse::Segments {
+                    sizes: state(tables, "variable_block_sizes")?,
+                    segments: state(tables, "tile_segments")?,
+                    keep: state(tables, "segment_keep")?,
+                }))
+            })?;
 
         // The stack, conditioned by the step's gathered modulation.
         let step_index = state(tables, "step")?;
@@ -1232,7 +1246,8 @@ impl Denoiser {
             hidden,
             state(tables, "modulation_indices")?,
             Factors { cosine, sine },
-            &visible,
+            visible.as_ref(),
+            segments.as_ref(),
             tokens as u32,
         )?;
 

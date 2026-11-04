@@ -34,6 +34,7 @@
 //! the capability it implements.
 
 pub mod attention;
+pub mod attention_sparse;
 pub mod audio_vae;
 pub mod checkpoint;
 pub mod conditioning;

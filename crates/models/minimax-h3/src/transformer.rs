@@ -19,6 +19,7 @@
 //! through the borrow it is handed, never through state of its own.
 
 use crate::attention::{self, Factors, Visible};
+use crate::attention_sparse::Segments;
 use crate::config::{AttentionKind, TransformerConfig};
 use crate::modulation::AdaLnCache;
 use crate::partition::Partition;
@@ -38,7 +39,7 @@ pub const ROTATED_AXES: [u32; 3] = [32, 32, 32];
 pub struct Layer {
     norm1: Weight,
     norm2: Weight,
-    attention: attention::Dense,
+    attention: attention::Layer,
     gate_up: Linear,
     down: Linear,
     swiglu: PackedSwiGlu,
@@ -48,6 +49,7 @@ pub struct Layer {
 impl Layer {
     /// Read layer `index` of a partition.
     fn load(
+        kind: AttentionKind,
         index: u32,
         config: &TransformerConfig,
         rows: u32,
@@ -60,7 +62,8 @@ impl Layer {
         Ok(Self {
             norm1: gain(loader, &format!("{prefix}.norm1.weight"), hidden)?,
             norm2: gain(loader, &format!("{prefix}.norm2.weight"), hidden)?,
-            attention: attention::Dense::load(
+            attention: attention::Layer::load(
+                kind,
                 index,
                 config,
                 rows,
@@ -95,7 +98,8 @@ impl Layer {
         modulation: TensorView,
         rows: TensorView,
         factors: Factors,
-        visible: &Visible,
+        visible: Option<&Visible>,
+        segments: Option<&Segments>,
         scratch: &Scratch,
     ) -> Result<()> {
         let width = hidden.shape.last();
@@ -109,8 +113,15 @@ impl Layer {
         let attention_norm =
             ModulatedRmsNorm::new(self.norm1, shift_attention, scale_attention, None, self.eps)?;
         attention_norm.forward(f, hidden, None, rows, normalized, None, None)?;
-        self.attention
-            .forward(f, normalized, factors, visible, &scratch.attention, update)?;
+        self.attention.forward(
+            f,
+            normalized,
+            factors,
+            visible,
+            segments,
+            &scratch.attention,
+            update,
+        )?;
         let mlp_norm = ModulatedRmsNorm::new(
             self.norm2,
             shift_mlp,
@@ -290,18 +301,11 @@ impl Transformer {
                 config.output_heads
             )));
         }
-        if kind != AttentionKind::DENSE {
-            return Err(Error::Unsupported(
-                "the H3 partition's sparse attention is composed from nn::layers::SegmentAttention \
-                 and nn::layers::VsaTiles; this build composes the dense kind only"
-                    .to_owned(),
-            ));
-        }
         let hidden = u64::from(config.hidden_size);
         let video_in = u64::from(config.video_channels) * 4;
         let audio_in = u64::from(config.audio_channels);
         let layers = (0..config.num_hidden_layers)
-            .map(|index| Layer::load(index, config, rows, partition, loader))
+            .map(|index| Layer::load(kind, index, config, rows, partition, loader))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             proj_in: projection_with_bias(loader, "proj_in", hidden, video_in)?,
@@ -355,7 +359,8 @@ impl Transformer {
         hidden: TensorView,
         rows: TensorView,
         factors: Factors,
-        visible: &Visible,
+        visible: Option<&Visible>,
+        segments: Option<&Segments>,
         total_rows: u32,
     ) -> Result<()> {
         let groups = adaln.groups();
@@ -374,7 +379,7 @@ impl Transformer {
         for (index, layer) in self.layers.iter().enumerate() {
             adaln.layer(f, index, entries, modulation)?;
             layer.forward(
-                f, current, alternate, modulation, rows, factors, visible, &scratch,
+                f, current, alternate, modulation, rows, factors, visible, segments, &scratch,
             )?;
             std::mem::swap(&mut current, &mut alternate);
         }
@@ -399,7 +404,7 @@ pub struct Scratch {
     update: TensorView,
     packed: TensorView,
     mlp: TensorView,
-    attention: attention::Scratch,
+    attention: attention::LayerScratch,
 }
 
 impl Scratch {
@@ -423,7 +428,7 @@ impl Scratch {
             update: arena.tensor(dtype, Shape::new(&[tokens, width]))?,
             packed: arena.tensor(dtype, Shape::new(&[tokens, 2 * ffn]))?,
             mlp: arena.tensor(dtype, Shape::new(&[tokens, ffn]))?,
-            attention: attention::Scratch::reserve(&layer.attention, f, hidden, total_rows)?,
+            attention: layer.attention.reserve(f, hidden, total_rows)?,
         })
     }
 }
