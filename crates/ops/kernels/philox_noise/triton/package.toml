@@ -30,7 +30,13 @@ script = "src/build.py"
 target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
-[kernel.descriptors]
-dimensions = { dtype = ["bf16", "f16", "f32"], block = ["256", "512", "1024", "2048", "4096"], kind = ["normal", "uniform"], source = ["rows", "scalar"] }
+# Two shapes, because the operator prints two: a draw addressed by the rows' own keys names
+# `dtype`, `block` and `kind`, and the form that draws the whole buffer from one key adds
+# `source = scalar`. The per-row form is the default, so its key carries no `source` at all.
+[[kernel.descriptors]]
+dimensions = { dtype = ["bf16", "f16", "f32"], block = ["256", "512", "1024", "2048", "4096"], kind = ["normal", "uniform"] }
+
+[[kernel.descriptors]]
+dimensions = { dtype = ["bf16", "f16", "f32"], block = ["256", "512", "1024", "2048", "4096"], kind = ["normal", "uniform"], source = ["scalar"] }
 
 [parameters]

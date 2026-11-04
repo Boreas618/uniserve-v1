@@ -174,16 +174,18 @@ fn every_element_type_a_descriptor_can_carry_is_one_ops_prints() {
         let Some(kernel) = &manifest.kernel else {
             continue;
         };
-        for (field, values) in &kernel.descriptors.dimensions {
-            if !ELEMENT_TYPE_FIELDS.contains(&field.as_str()) {
-                continue;
-            }
-            for value in values {
-                if !names.contains(value) {
-                    failures.push(format!(
-                        "{} {}: {field} = {value:?} is not one of {names:?}",
-                        manifest.op, manifest.backend
-                    ));
+        for shape in kernel.descriptors.shapes() {
+            for (field, values) in &shape.dimensions {
+                if !ELEMENT_TYPE_FIELDS.contains(&field.as_str()) {
+                    continue;
+                }
+                for value in values {
+                    if !names.contains(value) {
+                        failures.push(format!(
+                            "{} {}: {field} = {value:?} is not one of {names:?}",
+                            manifest.op, manifest.backend
+                        ));
+                    }
                 }
             }
         }
@@ -283,10 +285,18 @@ fn every_fixture_key_parses_to_the_fields_its_operator_s_packages_declare() {
                 })
                 .filter_map(|package| {
                     let manifest = Manifest::load(&package).ok()?;
-                    let descriptors = manifest.kernel?.descriptors;
-                    Some((package.display().to_string(), descriptors.dimensions))
+                    // One entry per shape the package declares: a key has to
+                    // parse against *one* of an operator's shapes, not against a
+                    // merged table.
+                    let shapes = manifest.kernel?.descriptors.shapes().to_vec();
+                    Some(
+                        shapes
+                            .into_iter()
+                            .filter(|shape| !shape.dimensions.is_empty())
+                            .map(move |shape| (package.display().to_string(), shape.dimensions)),
+                    )
                 })
-                .filter(|(_, dimensions)| !dimensions.is_empty())
+                .flatten()
                 .collect();
             // An operator with no package at all is the coverage gate's business.
             if declared.is_empty() {

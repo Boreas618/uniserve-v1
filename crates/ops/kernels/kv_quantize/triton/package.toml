@@ -1,0 +1,36 @@
+# The kv_quantize operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py`.
+#
+# One program writes one block of one token's row into its page, deriving the
+# page from the slot; the token count comes from the grid. The operator is lossy
+# by contract: it stores `round_e4m3(source / scale[page])` with the
+# deployment's own static page scale, so its bound is the encoding's.
+
+op = "kv_quantize"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/kv_quantize.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+# `dtype_bf16_scale_f32_page_16_heads_8_head_dim_128_block_1024_pdl_false`.
+[kernel.descriptors]
+dimensions = { dtype = ["bf16", "f32"], scale = ["f32"], page = ["16", "64", "32"], heads = ["8", "1", "2", "4"], head_dim = ["128", "64"], block = ["1024"], pdl = ["true", "false"] }
+
+[parameters]

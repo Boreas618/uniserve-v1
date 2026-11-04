@@ -77,6 +77,7 @@ mod policy;
 mod preemption;
 mod run;
 mod speculation;
+mod submission;
 pub(crate) mod views;
 mod warming;
 mod world;
@@ -443,7 +444,7 @@ struct PendingMedia {
 
 /// Single-threaded owner of scheduling, storage, execution, and request state.
 pub struct Scheduler {
-    executor: Box<dyn Executor>,
+    executor: submission::Submissions,
     inflight: inflight::Inflight,
     /// Resident resource ownership and reservation accounting.
     storage: allocation::Storage,
@@ -501,7 +502,8 @@ pub struct Scheduler {
     /// batch and no submission is in flight.
     policy_stage: Option<(
         policy::Stage,
-        Option<crossbeam_channel::Sender<Result<(), String>>>,
+        Option<crate::handle::StageAnswer>,
+        Option<u64>,
     )>,
     /// The events and transitions a policy is told about (§4.4).
     recorder: mechanism::Recorder,

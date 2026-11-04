@@ -289,6 +289,11 @@ impl Op for MoeSort {
         }
     }
 
+    /// Exact: the sort moves integers and compares floats, and moves no value.
+    ///
+    /// It produces an index map and a tile count from the routing scores; nothing it writes is a
+    /// rounded number, so two implementations agree bit for bit and any difference is a defect
+    /// rather than a rounding.
     fn tolerance(_descriptor: &Self::Descriptor) -> Tolerance {
         Tolerance::exact()
     }

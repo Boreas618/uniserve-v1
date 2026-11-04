@@ -465,3 +465,105 @@ fn a_package_missing_its_manifest_is_refused() {
     let root: PathBuf = tempfile::tempdir().unwrap().keep();
     assert!(Manifest::load(Path::new(&root)).is_err());
 }
+
+/// A package whose operator's key shape varies by variant declares one table per
+/// shape, and covers each: an operator is served by one backend name, not by one
+/// per shape.
+///
+/// The two shapes here are `qk_norm_rope`'s: the wide rotation, whose key has no
+/// `rotated`, and the narrowed one, which does. A key of either is covered; a key
+/// that parses against neither is refused exactly as it is refused today.
+#[test]
+fn a_package_may_declare_one_descriptor_table_per_key_shape() {
+    let directory = tempfile::tempdir().unwrap();
+    let package = directory.path();
+    std::fs::create_dir_all(package.join("src")).unwrap();
+    std::fs::write(package.join("src/build.py"), "print('built')\n").unwrap();
+    std::fs::write(
+        package.join("package.toml"),
+        r#"op = "qk_norm_rope"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+
+[source]
+kind = "triton"
+files = ["src/build.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a"]
+
+[[kernel.descriptors]]
+dimensions = { dtype = ["bf16"], head_dim = ["128"], q_heads = ["56"], rotation = ["half"] }
+
+[[kernel.descriptors]]
+dimensions = { dtype = ["bf16"], head_dim = ["128"], q_heads = ["56"], rotation = ["interleaved"], rotated = ["96"] }
+"#,
+    )
+    .unwrap();
+
+    let manifest = program_server::manifest::Manifest::load(package).expect("the package loads");
+    assert_eq!(
+        manifest.descriptors().len(),
+        2,
+        "both shapes are kept, in the manifest's order"
+    );
+    let wide = "dtype_bf16_head_dim_128_q_heads_56_rotation_half";
+    let narrow = "dtype_bf16_head_dim_128_q_heads_56_rotation_interleaved_rotated_96";
+    assert!(manifest.covers(wide), "the wide key is covered");
+    assert!(manifest.covers(narrow), "the narrowed key is covered");
+    assert!(
+        !manifest.covers("dtype_bf16_head_dim_128_q_heads_56_rotation_half_rotated_96"),
+        "a key that parses against neither shape is not covered"
+    );
+}
+
+/// The one-table form is unchanged: a package that writes `[kernel.descriptors]`
+/// with a single `dimensions` table parses and covers as it always did.
+#[test]
+fn a_package_may_still_declare_one_descriptor_table() {
+    let directory = tempfile::tempdir().unwrap();
+    let package = directory.path();
+    std::fs::create_dir_all(package.join("src")).unwrap();
+    std::fs::write(package.join("src/build.py"), "print('built')\n").unwrap();
+    std::fs::write(
+        package.join("package.toml"),
+        r#"op = "bias_add"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+
+[source]
+kind = "triton"
+files = ["src/build.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a"]
+
+[kernel.descriptors]
+dimensions = { dtype = ["bf16"], channels = ["512"] }
+"#,
+    )
+    .unwrap();
+
+    let manifest = program_server::manifest::Manifest::load(package).expect("the package loads");
+    assert_eq!(manifest.descriptors().len(), 1);
+    assert!(manifest.covers("dtype_bf16_channels_512"));
+    assert!(!manifest.covers("dtype_bf16_channels_256"));
+}
