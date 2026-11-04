@@ -8,7 +8,7 @@
 use platform::DeviceId;
 
 use super::DescriptorError;
-use crate::tensor::MemoryKind;
+use crate::memory::allocation::MemoryKind;
 
 /// A device a rank computes on, parsed once from the launch descriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
