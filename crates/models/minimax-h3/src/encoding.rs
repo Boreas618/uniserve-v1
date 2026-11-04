@@ -10,6 +10,14 @@
 //! `uniserve/models/minimax_h3/video_vae.py` (`CausalCNN`, `Encoder`) and `uniserve/nn/vae/tiled.py`
 //! (`TiledEncoder`) are the reference.
 //!
+//! ## The encoder's input
+//!
+//! A reference video reaches the encoder as `[frames, height, width, 3]` **uint8** pixels — the same
+//! raster the decoder writes ([`crate::output::Rgb`]) — and is normalized per channel by
+//! `(pixel / 255 − mean) / std` with the ImageNet constants before the input convolution
+//! (`uniserve/models/minimax_h3/encoding.py`, `unpack_pixels`). A clip shorter than the checkpoint's
+//! [`crate::config::CLIP_FRAMES`] repeats its last frame; a single frame stays alone.
+//!
 //! ## Causal extents
 //!
 //! A stride-`s` temporal convolution pads two zero frames in front and none behind, so it maps `T`
@@ -233,6 +241,21 @@ impl Grid {
             .map(|overlap| overlap / SPATIAL_RATIO)
             .collect()
     }
+}
+
+/// One pixel's normalized channels: `(pixel / 255 − mean) / std`.
+///
+/// The inverse of [`crate::output::Rgb::quantize`], and the input the video encoder reads. A kernel
+/// that normalizes the raster computes this; the round trip through the decoder's quantization
+/// recovers the byte.
+pub fn normalize(pixel: [u8; 3]) -> [f32; 3] {
+    let mut values = [0.0f32; 3];
+    for (channel, byte) in pixel.iter().enumerate() {
+        values[channel] =
+            (f32::from(*byte) / crate::output::BYTE_MAX - crate::output::PIXEL_MEAN[channel])
+                / crate::output::PIXEL_STD[channel];
+    }
+    values
 }
 
 /// Every parameter of the video encoder, with the checkpoint key that fills it.
@@ -533,6 +556,24 @@ pub fn audio_sources(config: &crate::AudioVaeConfig) -> Result<Vec<crate::audio_
 mod tests {
     use super::*;
     use crate::video_vae::tests::video_config;
+
+    #[test]
+    fn a_pixel_normalizes_and_quantizes_back_to_itself() {
+        let rgb = crate::output::Rgb::of(1, 1, 1);
+        for pixel in [[0u8, 0, 0], [255, 255, 255], [124, 116, 104], [1, 2, 3], [200, 10, 77]] {
+            let restored = rgb.quantize(normalize(pixel));
+            for (channel, (got, want)) in restored.iter().zip(pixel.iter()).enumerate() {
+                assert!(
+                    got.abs_diff(*want) <= 1,
+                    "channel {channel}: {got} for {want} from {pixel:?}"
+                );
+            }
+        }
+        // The extremes are exact: the normalization maps 0 and 255 outside the [-1, 1] range the
+        // decoder works in, which is expected — the encoder reads the raster, not latents.
+        assert!(normalize([0, 0, 0])[0] < -2.0);
+        assert!(normalize([255, 255, 255])[0] > 2.0);
+    }
 
     #[test]
     fn a_clip_of_seventeen_frames_becomes_five_latent_frames() {
