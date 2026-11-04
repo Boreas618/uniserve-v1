@@ -50,19 +50,149 @@ use crate::Result;
 pub struct Memory {
     /// The KV cache planes, their block tables and their host pages.
     pub prefix_cache: PrefixCache,
-    /// The latent pages of diffusion and media calls.
-    pub latents: LatentStorage,
+    /// The latent pages of diffusion and media calls, on a rank that stores a pool.
+    pub latents: Option<LatentStorage>,
     /// The products of cross-call tensors.
     pub products: ProductStore,
     /// The banks of the layers a request keeps per slot.
     pub slots: RequestSlots,
-    /// The device buffers a call leases.
-    pub buffer: BufferPool,
     /// The page-locked host blocks copies go through.
     pub pinned: Arc<PinnedPool>,
 }
 
+/// What the main process hands [`Memory::new`]: the sized plan and the
+/// deployment's own values, so the control thread never assembles the owners
+/// itself.
+pub struct MemoryRequest<'a> {
+    /// The capacity plan this rank resolved (`capacity::Plan`).
+    pub plan: &'a crate::capacity::Plan,
+    /// The deployed blocks' slot fields, from the model.
+    pub slots: &'a [self::request_slots::SlotField],
+    /// The rank's device, or `None` for a host-only rank.
+    pub device: Option<platform::DeviceId>,
+    /// The device's stream: any reset the owners queue runs here, before the
+    /// executor thread exists, and a stream accepts work without one.
+    pub stream: Option<&'a Stream>,
+    /// The block-table width the batch plan holds.
+    pub width: u32,
+    /// The request slots the rank keeps.
+    pub request_pool_size: u32,
+    /// The devices the product store's arenas live on.
+    pub devices: Vec<crate::tensor::MemoryKind>,
+    /// The bytes of one product store entry.
+    pub max_feature_bytes: u64,
+    /// The relay entries per request slot.
+    pub relay_depth: usize,
+    /// The cache import workers the pool runs.
+    pub import_capacity: usize,
+    /// The conversion program the import path launches.
+    pub conversion: Arc<dyn prefix_cache::conversion::PageConversion>,
+    /// The pool's completion events.
+    pub events: Arc<crate::stream::EventPool>,
+}
+
 impl Memory {
+    /// Allocates every resident owner the plan sized, in one call: the cache
+    /// planes and block tables, the latent pages, the product store, the
+    /// request slots, the buffer pool and the page-locked blocks.
+    ///
+    /// `storage` is the rank's Storage Server client; it stays the main
+    /// process's, so `sleep` and `wake` are the only calls that reach the
+    /// ledger. The resets the owners queue run on `request.stream` before any
+    /// executor thread exists.
+    pub fn new(request: MemoryRequest<'_>, storage: &mut dyn ExclusiveStorage) -> Result<Self> {
+        let plan = request.plan;
+        let info = &plan.info;
+        let cache = match (plan.cache.as_ref(), plan.planes.as_ref()) {
+            (Some(cache), layout) => prefix_cache::PrefixCache::new(
+                Arc::clone(cache),
+                info.prefix_cache
+                    .as_ref()
+                    .ok_or_else(|| {
+                        crate::Error::Invariant(
+                            "a cache plan without the reported unit count".into(),
+                        )
+                    })?
+                    .num_units,
+                layout,
+                request.request_pool_size,
+                request.width,
+                request.import_capacity,
+                request.device,
+                request.stream,
+                storage,
+                Arc::clone(&request.conversion),
+            )?,
+            (None, _) => {
+                return Err(crate::Error::Invalid(
+                    "a rank without a cache plan needs no Memory".into(),
+                ));
+            }
+        };
+        let latents = match plan.latent.as_ref() {
+            Some(latent) => Some(LatentStorage::allocate(
+                latent,
+                request.device,
+                request.stream,
+                "latent",
+                storage,
+            )?),
+            None => None,
+        };
+        // One buffer pool per rank, given to the product store, which binds the scheduler's
+        // placements into it; a second pool would allocate the same bytes twice.
+        let buffer = BufferPool::allocate(
+            plan.info.buffer_pool_bytes.max(1),
+            &request.devices,
+            storage,
+        )?;
+        let products = ProductStore::new(
+            usize::try_from(plan.arena.device_product_bytes.max(1))
+                .map_err(|_| crate::Error::Invalid("product store capacity overflows".into()))?,
+            usize::try_from(plan.info.encoder_entry_bytes.max(1))
+                .map_err(|_| crate::Error::Invalid("product entry size overflows".into()))?,
+            request.devices.clone(),
+            usize::try_from(plan.info.request_slots).unwrap_or(0),
+            plan.arena.relay_depth,
+            buffer,
+            Arc::clone(&request.events),
+        )?;
+        let slots = RequestSlots::allocate(request.slots, plan.info.request_slots, request.device)?;
+        let pinned = PinnedPool::new(request.device);
+        Ok(Self {
+            prefix_cache: cache,
+            latents,
+            products,
+            slots,
+            pinned,
+        })
+    }
+
+    /// Releases every owner, in the design's order: the products and the
+    /// encoders first, then the cache planes (which give their segments back),
+    /// the latents, the slots, the buffer pool and the page-locked blocks.
+    ///
+    /// The owners' storage returns itself as each owner goes, so this needs no
+    /// storage handle; it is the main process's last call on `Memory`.
+    pub fn close(self) -> Result<()> {
+        let Memory {
+            mut prefix_cache,
+            latents,
+            mut products,
+            slots,
+            pinned,
+        } = self;
+        // The products go first: their reads retain views into the cache, and the cache's
+        // segments are the last thing an epoch gives back.
+        let drained = products.close();
+        drop(drained);
+        prefix_cache.close()?;
+        drop(latents);
+        drop(slots);
+        drop(pinned);
+        Ok(())
+    }
+
     /// Release the resident cache segments, which the Storage Server keeps for
     /// the next epoch: what a sleep gives back and a wake maps again.
     ///

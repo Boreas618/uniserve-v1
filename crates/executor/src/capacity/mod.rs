@@ -16,7 +16,7 @@ pub mod checks;
 pub mod device;
 mod plan;
 
-pub use plan::CapacityRequest;
+pub use plan::{CapacityRequest, MediaFacts, Plan, Report, TokenFacts};
 
 use ipc::Call;
 
