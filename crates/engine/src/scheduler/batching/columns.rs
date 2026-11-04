@@ -101,6 +101,11 @@ fn uses_penalties(sampling: &SamplingParams) -> bool {
 /// The sampler's columns per row, `ops::sampler::PARAMETER_COLUMNS`.
 pub(crate) const SAMPLER_PARAMETERS: usize = 8;
 
+/// The column of a row's parameters that states its temperature, in
+/// `ops::sampler`'s order (`ops::sampler::TEMPERATURE`, which the engine does
+/// not depend on directly).
+const TEMPERATURE_COLUMN: usize = 0;
+
 /// The columns of the batch formed by `requests`, whose calls' rows embed the
 /// tokens `inputs` states for them and sample with the parameters `sampling`
 /// states for them, all in call order.
@@ -341,6 +346,54 @@ pub(crate) fn columns(
         page_size: page.block_size,
         max_kv_len,
     })
+}
+
+/// The captured shape a batch of these columns is served from.
+///
+/// `rows` and `tokens` are the columns' own counts. The variant follows the two
+/// decisions the columns already state:
+///
+/// - a prefill projects last hidden states exactly when a row's logits are
+///   wanted, which `logits_rows` names with a row index or `-1`;
+/// - a decode is served greedily only when no row draws. `ops::sampler` divides
+///   a temperature-zero row by one and leaves its order, and **no draw path
+///   produces a greedy token** — `argmax` is a separate step of the sampler — so
+///   a greedy row served from the sampler graph would sample where its request
+///   asked for the largest candidate. One batch serves one variant, so a burst
+///   that mixes greedy and sampling rows is sampled.
+///
+/// A verification's candidates are decode-class rows: they draw, so they are
+/// sampled too.
+pub(crate) fn batch_shape(columns: &BatchColumns) -> executor::plan::Shape {
+    use executor::plan::Variant;
+
+    let rows = u32::try_from(columns.rows()).unwrap_or(u32::MAX);
+    let tokens = u32::try_from(columns.tokens()).unwrap_or(u32::MAX);
+    let prefill = columns
+        .rows
+        .calls
+        .iter()
+        .any(|call| matches!(call.kind, RowKind::Prefill));
+    let variant = if prefill {
+        if columns.rows.logits_rows.iter().any(|row| *row >= 0) {
+            Variant::PrefillOutput
+        } else {
+            Variant::PrefillWrite
+        }
+    } else if columns
+        .parameters
+        .chunks_exact(SAMPLER_PARAMETERS)
+        .all(|row| row[TEMPERATURE_COLUMN] == 0.0)
+    {
+        Variant::DecodeGreedy
+    } else {
+        Variant::DecodeSampled
+    };
+    executor::plan::Shape {
+        rows,
+        tokens,
+        variant,
+    }
 }
 
 #[cfg(test)]
@@ -774,6 +827,110 @@ mod tests {
         columns
             .check(&shape)
             .expect("the fill's columns are a well-formed batch of its shape");
+    }
+
+    #[test]
+    fn a_prefills_shape_follows_whether_a_row_projects_logits() {
+        // A prefill that samples projects its last row's hidden state; one that
+        // writes only the cache leaves every logits row unwritten.
+        let requests = vec![(call(prefill(), 8, &[4]), placement(1, &[4], &[true]))];
+        let sampling_batch = columns(
+            &requests,
+            &[vec![1, 2, 3, 4]],
+            &[&sampling()],
+            &[0],
+            page(),
+            2048,
+        )
+        .expect("a sampling prefill");
+        let shape = batch_shape(&sampling_batch);
+        assert_eq!(shape.variant, executor::plan::Variant::PrefillOutput);
+        assert_eq!(
+            (shape.rows, shape.tokens),
+            (sampling_batch.rows() as u32, sampling_batch.tokens() as u32),
+            "the shape's counts are the columns' own"
+        );
+        sampling_batch
+            .check(&shape)
+            .expect("a sampling prefill is a well-formed PrefillOutput batch");
+
+        let mut chunk = call(prefill(), 8, &[4]);
+        chunk.token_output = None;
+        let requests = vec![(chunk, placement(1, &[4], &[true]))];
+        let writing_batch = columns(
+            &requests,
+            &[vec![1, 2, 3, 4]],
+            &[&sampling()],
+            &[0],
+            page(),
+            2048,
+        )
+        .expect("a chunked prefill");
+        let shape = batch_shape(&writing_batch);
+        assert_eq!(shape.variant, executor::plan::Variant::PrefillWrite);
+        writing_batch
+            .check(&shape)
+            .expect("a chunked prefill is a well-formed PrefillWrite batch");
+    }
+
+    #[test]
+    fn a_batch_is_served_greedily_only_when_no_row_draws() {
+        let greedy = SamplingParams {
+            temperature: 0.0,
+            ..SamplingParams::default()
+        };
+        let decode = CallKind::Forward(ForwardMode::Decode);
+        let requests = vec![(call(decode, 12, &[1]), placement(1, &[1], &[true]))];
+        let one_greedy = columns(&requests, &[vec![9]], &[&greedy], &[0], page(), 2048)
+            .expect("a greedy decode");
+        assert_eq!(
+            batch_shape(&one_greedy).variant,
+            executor::plan::Variant::DecodeGreedy,
+            "no draw path produces a greedy token, so a greedy row is served from the greedy bucket"
+        );
+
+        let one_sampling = columns(&requests, &[vec![9]], &[&sampling()], &[0], page(), 2048)
+            .expect("a sampling decode");
+        assert_eq!(
+            batch_shape(&one_sampling).variant,
+            executor::plan::Variant::DecodeSampled
+        );
+
+        // One batch serves one variant, so a burst that mixes the two is
+        // sampled even though one of its rows is greedy.
+        let mut second = call(decode, 12, &[1]);
+        second.request_key = ipc::RequestKey::new(2, ipc::RequestId(2), 1);
+        second.call_id = ipc::CallId::new(2, 1);
+        let requests = vec![
+            (call(decode, 12, &[1]), placement(1, &[1], &[true])),
+            (second, placement(2, &[1], &[true])),
+        ];
+        let mixed = columns(
+            &requests,
+            &[vec![9], vec![9]],
+            &[&greedy, &sampling()],
+            &[0, 0],
+            page(),
+            2048,
+        )
+        .expect("a mixed decode");
+        assert_eq!(
+            batch_shape(&mixed).variant,
+            executor::plan::Variant::DecodeSampled,
+            "the sampler graph serves both rows, and a greedy row's token is its argmax"
+        );
+
+        // A verification's candidates draw, so they are sampled too.
+        let requests = vec![(
+            call(verify(), 12, &[1, 1]),
+            placement(1, &[1, 1], &[true, true]),
+        )];
+        let verified = columns(&requests, &[vec![7, 8]], &[&greedy], &[0], page(), 2048)
+            .expect("a verification");
+        assert_eq!(
+            batch_shape(&verified).variant,
+            executor::plan::Variant::DecodeSampled
+        );
     }
 
     #[test]
