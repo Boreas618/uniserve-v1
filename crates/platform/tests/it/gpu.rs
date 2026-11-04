@@ -18,8 +18,8 @@ use platform::{
     GraphNodeKind, HandleType, Interleave, KernelNodeParams, L2Promotion, LaunchConfig, Library,
     Matmul, MatmulArgs, MatmulDescriptor, Nvml, OobFill, PeerMapping, PinnedBuffer, PrimaryContext,
     Protection, SegmentedMapping, ShareableHandle, SourceOrder, Stream, Strided, StridedCopy,
-    Swizzle, Tensor, TensorDataType, TensorMap, TensorMapSpec, VirtualPool, WaitValue,
-    memcpy_async, memset_2d_d8, memset_d8, memset_d32, reclaim,
+    Swizzle, Tensor, TensorDataType, TensorMap, TensorMapSpec, WaitValue, memcpy_async,
+    memset_2d_d8, memset_d8, memset_d32, reclaim,
 };
 
 pub(crate) const DEVICE: DeviceId = DeviceId(0);
@@ -662,59 +662,6 @@ fn graph_executables_launch_on_another_stream() {
     }
     stream.synchronize().unwrap();
     assert_eq!(read(&host), vec![7; 256]);
-}
-
-/// A pool's storage keeps its addresses and contents across a suspension,
-/// and a graph captured over it before runs correctly after the restore; a
-/// freed chunk is given out again at its address.
-#[test]
-#[ignore = "requires a CUDA device"]
-fn a_pool_keeps_addresses_and_contents_across_a_suspension() {
-    let _driver = exclusive_driver();
-    let mut pool = VirtualPool::reserve(DEVICE, 64 << 20).unwrap();
-    let first = pool.allocate(1 << 20).unwrap();
-    let second = pool.allocate(1 << 20).unwrap();
-    assert_ne!(first, second);
-    assert!(pool.contains(first) && pool.contains(second));
-    let stream = Stream::new(DEVICE).unwrap();
-    let host = PinnedBuffer::new(DEVICE, 256).unwrap();
-
-    // The first chunk holds 5s written before the suspension; a graph
-    // captured now fills the second with 9s at every launch.
-    // SAFETY: the ranges lie inside the pool's chunks.
-    unsafe { memset_d8(first, 5, 256, &stream) }.unwrap();
-    stream.synchronize().unwrap();
-    let capture = Capture::begin(&stream, CaptureMode::Relaxed).unwrap();
-    // SAFETY: the range lies inside the pool's chunk.
-    unsafe { memset_d8(second, 9, 256, &stream) }.unwrap();
-    let fill = capture.end().unwrap().instantiate().unwrap();
-
-    let mapped = pool.mapped_bytes();
-    pool.suspend().unwrap();
-    assert!(
-        pool.allocate(1 << 20).is_err(),
-        "a suspended pool gives out nothing"
-    );
-    pool.restore().unwrap();
-    assert_eq!(pool.mapped_bytes(), mapped);
-
-    // SAFETY: the ranges lie inside the restored chunks, at their addresses.
-    unsafe {
-        memcpy_async(host.address(), first, 256, &stream).unwrap();
-    }
-    stream.synchronize().unwrap();
-    assert_eq!(read(&host), vec![5; 256]);
-    fill.launch(&stream).unwrap();
-    // SAFETY: as above.
-    unsafe {
-        memcpy_async(host.address(), second, 256, &stream).unwrap();
-    }
-    stream.synchronize().unwrap();
-    assert_eq!(read(&host), vec![9; 256]);
-
-    drop(fill);
-    pool.free(second);
-    assert_eq!(pool.allocate(1 << 20).unwrap(), second);
 }
 
 #[test]

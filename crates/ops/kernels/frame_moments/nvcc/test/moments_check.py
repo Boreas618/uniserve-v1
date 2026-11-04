@@ -17,6 +17,12 @@ the GPU host with the Program Server's own environment
 (``crates/program-server/python/.venv/bin/python``), which has torch. Without a device,
 ``--cpu-only`` checks the call structure and the entry's refusal on the host.
 
+**The strides are the model's layout.** The check builds `[1, channels, frames, height, width]`
+contiguous, which is `[B, C, T, H, W]` as the model holds it: one frame of one channel is `height ·
+width` elements apart and a channel of the sequence is `frames · height · width`. A module that
+required a frame to hold a whole group — frame-major storage — would refuse this, and that refusal
+is a module defect rather than a check defect, because no model produces that layout.
+
 **One sample per call.** The call structure carries no sample count and the entry's grid is one
 sample's rows, so the operator's caller runs one video sample per call; this check does the same
 and says so rather than pretending to check a batch.
@@ -94,14 +100,36 @@ def load(module_dir):
 
 
 def check_refusal(module_dir):
-    """The entry refuses a call with no values on the host, before it touches a device."""
+    """The entry refuses the two calls it must, on the host, before it touches a device."""
+    entry = load(module_dir)
     call = Call(values=0, mean=0x1000, rstd=0x1000, pixels=64, channels_per_group=4, groups=2)
-    if load(module_dir)(ctypes.byref(call), None) == 0:
+    if entry(ctypes.byref(call), None) == 0:
         raise SystemExit("the entry accepted a call with no values buffer")
     message = call.error.decode(errors="replace")
     if "needs the values" not in message:
         raise SystemExit(f"the entry refused with an unexpected message: {message!r}")
     print(f"entry: loads and refuses a call with no values — {message}")
+
+    # A frame shorter than one row of pixels would read past the tensor, and that is the only
+    # layout the entry may refuse: a frame holds one channel's pixels of the *sequence* in the
+    # layout H3 feeds ([B, C, T, H, W], where one frame of one channel is exactly `pixels`), so a
+    # guard stricter than this one refuses the operator's own calls.
+    short = Call(
+        values=0x1000,
+        mean=0x1000,
+        rstd=0x1000,
+        pixels=1024,
+        channels_per_group=8,
+        groups=4,
+        frames=2,
+        values_frame=64,
+    )
+    if entry(ctypes.byref(short), None) == 0:
+        raise SystemExit("the entry accepted a frame shorter than one row of pixels")
+    message = short.error.decode(errors="replace")
+    if "at least one row of pixels" not in message:
+        raise SystemExit(f"the entry refused a short frame with an unexpected message: {message!r}")
+    print(f"entry: refuses a frame shorter than a row — {message}")
 
 
 def reference(values, groups, epsilon):
