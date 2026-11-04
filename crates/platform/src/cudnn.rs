@@ -152,6 +152,7 @@ const ATTR_VARIANT_PACK_UNIQUE_IDS: i32 = 1000;
 const ATTR_VARIANT_PACK_DATA_POINTERS: i32 = 1001;
 const ATTR_VARIANT_PACK_WORKSPACE: i32 = 1003;
 const ATTR_ENGINE_GLOBAL_INDEX: i32 = 1301;
+const ATTR_ENGINE_NUMERICAL_NOTE: i32 = 1303;
 
 /// `cudnnBackendAttributeType_t`: the C type of each attribute's value.
 const TYPE_HANDLE: i32 = 0;
@@ -161,12 +162,17 @@ const TYPE_FLOAT: i32 = 4;
 const TYPE_VOID_PTR: i32 = 6;
 const TYPE_CONVOLUTION_MODE: i32 = 7;
 const TYPE_HEUR_MODE: i32 = 8;
+const TYPE_NUMERICAL_NOTE: i32 = 11;
 const TYPE_BACKEND_DESCRIPTOR: i32 = 15;
 
 /// `CUDNN_HEUR_MODE_A`: cuDNN's own heuristic, which measures nothing and
 /// returns the engines it knows for the shape, best first. This is how the
 /// tuning data is made (§5.4); service never calls it.
 const HEURISTIC_MODE_A: i32 = 3;
+/// `CUDNN_NUMERICAL_NOTE_DOWN_CONVERT_INPUTS`: an engine that reduces its
+/// inputs' precision before multiplying them — TF32 for FP32 inputs.
+const NUMERICAL_NOTE_DOWN_CONVERT_INPUTS: i32 = 1;
+
 /// `CUDNN_CROSS_CORRELATION`: the convolution PyTorch's `Conv*d` computes.
 const CROSS_CORRELATION: i32 = 1;
 
@@ -511,6 +517,11 @@ pub struct Convolution {
     /// The accumulation type; FP32 keeps the video VAE's precision while
     /// allowing TF32.
     pub compute: DataType,
+    /// Whether an engine that down-converts the inputs to TF32 may run the
+    /// convolution. True by default, which is what `torch.backends.cudnn`'s
+    /// `allow_tf32` gives an FP32 convolution; false restricts the engines to
+    /// the ones cuDNN does not mark as down-converting.
+    pub allow_tf32: bool,
 }
 
 impl Convolution {
@@ -535,6 +546,7 @@ impl Convolution {
             dilation,
             output_padding: Vec::new(),
             compute: DataType::F32,
+            allow_tf32: true,
         }
     }
 
@@ -574,6 +586,7 @@ impl Convolution {
             dilation,
             output_padding,
             compute: DataType::F32,
+            allow_tf32: true,
         }
     }
 
@@ -600,6 +613,13 @@ impl Convolution {
     /// The number of spatial dimensions.
     pub fn rank(&self) -> usize {
         self.x.rank().saturating_sub(2)
+    }
+
+    /// The same convolution, with engines that down-convert the inputs to
+    /// TF32 refused: what a model that declares full FP32 precision asks for.
+    pub fn with_tf32_allowed(mut self, allowed: bool) -> Self {
+        self.allow_tf32 = allowed;
+        self
     }
 
     /// The alignment each of the three tensors' addresses declares.
@@ -1213,7 +1233,7 @@ impl Cudnn {
         let device = Device::new(self.device)?;
         let _context = device.enter()?;
         let operation = Operation::describe(self.api, convolution)?;
-        let configs = self.configs(&operation, limit)?;
+        let configs = self.configs(&operation, limit, convolution.allow_tf32)?;
         if configs.is_empty() {
             return Err(Error::invalid(
                 "cuDNN's heuristic proposes no engine for this convolution",
@@ -1240,7 +1260,7 @@ impl Cudnn {
         let device = Device::new(self.device)?;
         let _context = device.enter()?;
         let operation = Operation::describe(self.api, convolution)?;
-        let mut configs = self.configs(&operation, MAX_ENGINE_CONFIGS)?;
+        let mut configs = self.configs(&operation, MAX_ENGINE_CONFIGS, convolution.allow_tf32)?;
         if configs.is_empty() {
             return Err(Error::invalid(
                 "cuDNN's heuristic proposes no engine for this convolution",
@@ -1594,7 +1614,12 @@ impl Cudnn {
     /// The engine configurations cuDNN's heuristic proposes for `operation`,
     /// best first: descriptors this module created for the library to fill,
     /// so it owns and destroys them.
-    fn configs(&self, operation: &Operation, limit: usize) -> Result<Vec<Descriptor>> {
+    fn configs(
+        &self,
+        operation: &Operation,
+        limit: usize,
+        allow_tf32: bool,
+    ) -> Result<Vec<Descriptor>> {
         let heuristic = Self::heuristic(self.api, &operation.graph)?;
         let available =
             self.api
@@ -1618,11 +1643,23 @@ impl Cudnn {
         // Keep the configurations the library filled; the rest are destroyed
         // with their `Descriptor`.
         configs.truncate(written);
-        Ok(configs)
+        if allow_tf32 {
+            return Ok(configs);
+        }
+        // A model that declares full FP32 precision refuses the engines cuDNN
+        // marks as down-converting their inputs, which is where TF32 lives.
+        let mut exact = Vec::with_capacity(configs.len());
+        for config in configs {
+            if self.down_converts_inputs(&config)? {
+                continue;
+            }
+            exact.push(config);
+        }
+        Ok(exact)
     }
 
-    /// The engine a finalized engine configuration names.
-    fn global_index(&self, config: &Descriptor) -> Result<Engine> {
+    /// The engine descriptor a finalized engine configuration names.
+    fn engine_of(&self, config: &Descriptor) -> Result<Descriptor> {
         let engine = Descriptor::create(self.api, DESCRIPTOR_ENGINE)?;
         let mut handles = [engine.raw];
         let written = self.api.get(
@@ -1637,6 +1674,33 @@ impl Cudnn {
                 "a cuDNN engine configuration names no engine",
             ));
         }
+        Ok(engine)
+    }
+
+    /// Whether `config`'s engine declares that it down-converts its inputs
+    /// (`CUDNN_NUMERICAL_NOTE_DOWN_CONVERT_INPUTS`), the note TF32 carries.
+    fn down_converts_inputs(&self, config: &Descriptor) -> Result<bool> {
+        let engine = self.engine_of(config)?;
+        let count = self
+            .api
+            .count(&engine, ATTR_ENGINE_NUMERICAL_NOTE, TYPE_NUMERICAL_NOTE)?;
+        let mut notes = vec![0i32; count];
+        if count == 0 {
+            return Ok(false);
+        }
+        self.api.get(
+            &engine,
+            ATTR_ENGINE_NUMERICAL_NOTE,
+            TYPE_NUMERICAL_NOTE,
+            &mut notes,
+            "cudnnBackendGetAttribute",
+        )?;
+        Ok(notes.contains(&NUMERICAL_NOTE_DOWN_CONVERT_INPUTS))
+    }
+
+    /// The engine a finalized engine configuration names.
+    fn global_index(&self, config: &Descriptor) -> Result<Engine> {
+        let engine = self.engine_of(config)?;
         let mut index = 0i64;
         self.api.get(
             &engine,
