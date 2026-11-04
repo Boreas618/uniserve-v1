@@ -540,6 +540,20 @@ fn stage_decode(args: &Args) -> Result<()> {
     std::fs::create_dir_all(&directory)
         .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
     let (latent_bytes, generated) = match &args.latents {
+        Some(path) if !path.exists() => {
+            // An input the caller named is read, never substituted - but the operating system's own
+            // message says only `No such file`, and a flag given a word that is not a path (`5`, or a
+            // variable that expanded empty) reads exactly like a missing file. Naming the flag, the
+            // value and what the stage expects is the difference between a command to correct and a
+            // defect to hunt.
+            return Err(Failure::message(format!(
+                "`--latents {}`: no such file. The flag takes the path of an `.h3t` container holding \
+                 the clip's `[1, {latent_channels}, {}, H, W]` latents - leave it out and the stage \
+                 draws its fixed pattern instead, and writes it to <out>/video_decoder/latents.h3t",
+                path.display(),
+                canvas.frames,
+            )));
+        }
         Some(path) => (
             read_h3t(
                 path,
