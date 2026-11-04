@@ -1,10 +1,12 @@
-//! The loading boundary of a deployment: which blocks a rank places, the precision choices of the
-//! load, and the per-component checkpoints those blocks read.
+//! The loading boundary of a deployment: which blocks a rank places and the precision choices of
+//! the load.
 //!
-//! An H3 checkpoint is a diffusers pipeline directory: each component is its own shard set under
-//! its own subdirectory, and a VAE directory holds both halves of one VAE. So the load opens one
-//! checkpoint per directory rather than one for the whole pipeline, and each block's weights come
-//! from the directory its component reads.
+//! An H3 checkpoint is a diffusers pipeline directory whose components are its subdirectories, and
+//! `nn::Checkpoint` learns such a root: `checkpoint.component("transformer")` gives one
+//! component's shard set with each shard's own identity, and `WeightLoader::reborrow` gives one
+//! loader per component over the same store and precision policy (specs/worker.md 8). So this
+//! module names components and their directories; the shard sets are the checkpoint's, not the
+//! selection's.
 //!
 //! ## Component names
 //!
@@ -20,13 +22,8 @@
 //! BF16 and the video VAE decoder is FP16, and each layer declares the precision it computes in
 //! (specs/worker.md 1, 9). An explicit choice converts every weight once, here, and never again.
 
-use std::collections::BTreeMap;
-use std::path::Path;
-
-use nn::weights::{Quantization, WeightLoader};
-use nn::{DType, RetainedWeights};
-
-use crate::{Error, Result};
+use nn::DType;
+use nn::weights::Quantization;
 
 /// One block a deployment places, by the name its deployment file gives it.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -116,69 +113,6 @@ impl LoadOptions {
     }
 }
 
-/// One open checkpoint per component directory a rank's blocks read.
-///
-/// Opening a checkpoint maps its shards read-only; it allocates no device storage. A directory two
-/// blocks share - a VAE's two halves, or the two condition encoders - is opened once.
-pub struct Components {
-    checkpoints: BTreeMap<&'static str, nn::Checkpoint>,
-}
-
-impl Components {
-    /// Open every directory the placed components read.
-    pub fn open(root: &Path, blocks: &[Component]) -> Result<Self> {
-        let mut checkpoints = BTreeMap::new();
-        for component in blocks {
-            for directory in component.directories() {
-                if checkpoints.contains_key(directory) {
-                    continue;
-                }
-                let checkpoint = nn::Checkpoint::open(&root.join(directory)).map_err(|error| {
-                    Error::checkpoint(format!(
-                        "the {directory} component of the checkpoint at {} could not be \
-                             opened: {error}",
-                        root.display()
-                    ))
-                })?;
-                checkpoints.insert(*directory, checkpoint);
-            }
-        }
-        Ok(Self { checkpoints })
-    }
-
-    /// The checkpoint of the component directory named `directory`.
-    pub fn checkpoint(&self, directory: &str) -> Result<&nn::Checkpoint> {
-        self.checkpoints.get(directory).ok_or_else(|| {
-            Error::checkpoint(format!(
-                "the load opened no {directory} checkpoint; the placed blocks read {}",
-                self.checkpoints
-                    .keys()
-                    .copied()
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ))
-        })
-    }
-
-    /// A loader over one component's checkpoint that publishes to `store`.
-    ///
-    /// The precision choices travel with it, so every component of one load converts the same way
-    /// and each weight is converted once (specs/worker.md 1).
-    pub fn loader<'a>(
-        &'a self,
-        directory: &str,
-        store: &'a mut dyn RetainedWeights,
-        options: &LoadOptions,
-    ) -> Result<WeightLoader<'a>> {
-        Ok(WeightLoader::new(
-            self.checkpoint(directory)?,
-            store,
-            options.dtype,
-            options.quantization,
-        ))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,58 +127,10 @@ mod tests {
     }
 
     #[test]
-    fn a_shared_vae_directory_is_named_once_per_half() {
+    fn a_shared_vae_directory_is_read_by_both_halves() {
         assert_eq!(Component::VideoDecoder.directories(), ["vae"]);
         assert_eq!(Component::AudioDecoder.directories(), ["audio_vae"]);
         assert_eq!(Component::LatentEncoder.directories(), ["vae", "audio_vae"]);
         assert_eq!(Component::TransformerRef.directories(), ["transformer_ref"]);
-    }
-
-    #[test]
-    fn a_placement_opens_each_directory_once() {
-        let root = tempfile::tempdir().expect("tempdir");
-        // A component directory with one shard of one two-element tensor.
-        let write_shard = |directory: &str| {
-            let path = root.path().join(directory);
-            std::fs::create_dir_all(&path).expect("create");
-            let mut bytes = Vec::new();
-            bytes.extend_from_slice(&0_u64.to_le_bytes());
-            // A minimal safetensors header: one BF16 tensor of two elements.
-            let header = r#"{"w":{"dtype":"BF16","shape":[2],"data_offsets":[0,4]}}"#;
-            bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
-            bytes.extend_from_slice(header.as_bytes());
-            bytes.extend_from_slice(&[0_u8; 4]);
-            std::fs::write(path.join("model.safetensors"), bytes).expect("write");
-        };
-        for directory in ["vae", "audio_vae"] {
-            write_shard(directory);
-        }
-        let components = Components::open(
-            root.path(),
-            &[
-                Component::VideoDecoder,
-                Component::AudioDecoder,
-                Component::LatentEncoder,
-            ],
-        )
-        .expect("the two VAE directories");
-        assert!(components.checkpoint("vae").is_ok());
-        assert!(components.checkpoint("audio_vae").is_ok());
-        let error = components
-            .checkpoint("transformer")
-            .err()
-            .expect("no DiT was placed");
-        assert!(
-            matches!(error, Error::Config(ref problem) if problem.contains("transformer")),
-            "{error}"
-        );
-
-        let error = Components::open(root.path(), &[Component::Transformer])
-            .err()
-            .expect("the DiT directory is missing");
-        assert!(
-            matches!(error, Error::Config(ref problem) if problem.contains("transformer")),
-            "{error}"
-        );
     }
 }
