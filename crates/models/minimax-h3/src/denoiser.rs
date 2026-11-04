@@ -178,10 +178,12 @@ impl Layouts {
                 dtype: nn::DType::I32,
                 shape: Shape::new(&[rows]),
             },
+            // Axis-major, `[axes, rows]`: `nn::Rotary`'s sectioned rotation reads one coordinate
+            // per axis per token and refuses a leading extent that is not the axis count.
             StateTable {
                 name: "position_ids",
                 dtype: nn::DType::F32,
-                shape: Shape::new(&[rows, 3]),
+                shape: Shape::new(&[3, rows]),
             },
             StateTable {
                 name: "prefix_index",
@@ -402,12 +404,15 @@ fn gcd(left: u32, right: u32) -> u32 {
     }
 }
 
-/// Coordinates as little-endian FP32.
+/// Coordinates as little-endian FP32, axis-major: every row's first axis, then every row's second.
+///
+/// The packing states one coordinate triple per row; `nn::Rotary`'s sectioned rotation indexes a
+/// table by `[axis, token]` and a row-major table would rotate each row by another row's angles.
 fn coordinates(points: &[[f64; 3]]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(points.len() * 3 * 4);
-    for point in points {
-        for value in point {
-            bytes.extend_from_slice(&(*value as f32).to_le_bytes());
+    for axis in 0..3 {
+        for point in points {
+            bytes.extend_from_slice(&(point[axis] as f32).to_le_bytes());
         }
     }
     bytes
@@ -536,7 +541,8 @@ mod tests {
             }
             assert_eq!(table.shape.dim(0), rows, "{}", table.name);
         }
-        assert_eq!(tables[2].shape.last(), 3);
+        // Axis-major: the rotation reads `[axis, token]`, so the axes are the leading extent.
+        assert_eq!(tables[2].shape.dims(), &[3, rows]);
     }
 
     #[test]
