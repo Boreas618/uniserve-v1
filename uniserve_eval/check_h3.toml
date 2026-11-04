@@ -21,13 +21,16 @@
 # task already makes (MP4 validity: canvas, frame count, frame rate, stereo
 # soundtrack) and the protected performance metrics; nothing else is added.
 #
-# No server states dtype or quantization_config: the launch's default dtype
-# is bfloat16 and an empty quantization_config loads the model's first
-# precision preset, quality (DiT and text encoder BF16, video VAE decoder
-# FP16), so the omitted selectors name exactly the representation the shipped
-# performance profiles state. quantization_config and its precision presets
-# retire in favour of the checkpoint representation and SGLang's
-# quantization field, so a check cell must not state them.
+# The launch's default dtype is bfloat16 and an empty quantization_config loads
+# the model's first precision preset, quality (DiT and text encoder BF16, video
+# VAE decoder FP16), so on most servers the omitted selectors name exactly the
+# representation the shipped performance profiles state, and stating them would
+# be redundant. `base-reference` is the measured exception: with the selectors
+# omitted, `check-base-ref2va` failed its warmup with a constant frame and
+# silence and wrote no MP4; with `dtype=bfloat16` and
+# `quantization_config.mode=quality` stated it passes (1/1 requests, an MP4 of
+# 219890 bytes). The two are therefore stated there and nowhere else, because a
+# check cell states only what its own path was measured to need.
 #
 # No server pins --worker-executable either: the worker processes must run the
 # same build as the daemon, so a deployment launched with --executable runs the
