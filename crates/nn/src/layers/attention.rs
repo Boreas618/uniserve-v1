@@ -632,6 +632,32 @@ impl Attention {
         Ok(())
     }
 
+    /// Check that the cache's page table is the batch's: one row per sequence, whole i32 pages.
+    ///
+    /// The operator sees only the table, so a table of another rank or another row count would read
+    /// another batch's pages there and the operator could not say so; the batch's arity is known
+    /// here, and the refusal names it. This is the check the first decode run needed and did not
+    /// have: a table built as a vector surfaced as `paged_attention: expected 2 axes, found 1`.
+    pub fn check_page_table(&self, table: TensorView, sequences: u64) -> Result<()> {
+        if table.shape.rank() != 2 || table.shape.dim(0) != sequences {
+            return Err(Error::shape(
+                "Attention::attend",
+                format!(
+                    "the page table is {:?}, [{sequences}, pages] expected: one row per sequence of \
+                     this batch",
+                    table.shape.dims()
+                ),
+            ));
+        }
+        if table.dtype != DType::I32 {
+            return Err(Error::shape(
+                "Attention::attend",
+                format!("the page table is {} pages, not i32", table.dtype),
+            ));
+        }
+        Ok(())
+    }
+
     /// The descriptor one paged attention launches with.
     ///
     /// `phase` is the batch's — a prefill reads a whole sequence and a decode one token — and the
@@ -743,27 +769,11 @@ impl Attention {
                 ));
             }
         }
-        // The page table is the cache's and it carries one row per sequence of this batch. The
-        // operator sees only the table, so a table of another rank or another row count would read
-        // another batch's pages there; the batch's arity is known here and is checked here.
-        let sequences = batch.query_offsets.numel().saturating_sub(1);
-        let table = group_view.block_tables;
-        if table.shape.rank() != 2 || table.shape.dim(0) != sequences {
-            return Err(Error::shape(
-                "Attention::attend",
-                format!(
-                    "the page table is {:?}, [{sequences}, pages] expected: one row per sequence \
-                     of this batch",
-                    table.shape.dims()
-                ),
-            ));
-        }
-        if table.dtype != DType::I32 {
-            return Err(Error::shape(
-                "Attention::attend",
-                format!("the page table is {} pages, not i32", table.dtype),
-            ));
-        }
+        // The page table is the cache's and it carries one row per sequence of this batch.
+        self.check_page_table(
+            group_view.block_tables,
+            batch.query_offsets.numel().saturating_sub(1),
+        )?;
         let descriptor = self.descriptor(phase, query.dtype, planes.key.dtype, out.dtype);
         // An FP8 plane stores each page divided by its own FP32 scale; the plane's element type
         // decides whether the call carries one, so a mismatch in either direction is an argument
@@ -835,6 +845,39 @@ mod tests {
         assert!(Attention::paged(128, 32, 5, 64, 40_960, None, 0.088).is_err());
         // A bound shorter than one page cannot address a page.
         assert!(Attention::paged(128, 32, 4, 64, 32, None, 0.088).is_err());
+    }
+
+    #[test]
+    fn a_page_table_is_one_i32_row_per_sequence_of_its_batch() {
+        let attention = Attention::paged(128, 32, 4, 64, 40_960, None, 0.088).unwrap();
+        let table = |dtype: DType, shape: &[u64]| {
+            TensorView::new(DevicePtr::new(0x2_0000), dtype, Shape::new(shape))
+        };
+        assert!(
+            attention
+                .check_page_table(table(DType::I32, &[15, 4]), 15)
+                .is_ok()
+        );
+        // A table built as a vector: the shape a harness gets wrong, named with the batch's own
+        // sequence count rather than as the operator's axis count.
+        let error = attention
+            .check_page_table(table(DType::I32, &[60]), 15)
+            .expect_err("a page table of rank one");
+        assert!(
+            format!("{error}").contains("one row per sequence"),
+            "{error}"
+        );
+        // Another batch's table, and pages that are not whole i32 words.
+        assert!(
+            attention
+                .check_page_table(table(DType::I32, &[8, 4]), 15)
+                .is_err()
+        );
+        assert!(
+            attention
+                .check_page_table(table(DType::BF16, &[15, 4]), 15)
+                .is_err()
+        );
     }
 
     #[test]
