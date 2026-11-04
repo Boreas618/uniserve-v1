@@ -427,7 +427,10 @@ impl Op for PagedAttention {
         let kv_heads = u64::from(descriptor.kv_heads);
         let page_size = u64::from(descriptor.page_size);
 
-        let tokens = args.query.rows();
+        // The token count is the first extent of a `[tokens, heads, head_dim]` query; `rows()` is
+        // the product of every extent but the last and would count tokens times heads, refusing a
+        // launch whose own views agree (the defect `qk_norm_rope` had).
+        let tokens = args.query.shape.dim(0);
         args.query
             .require_shape(Self::NAME, Shape::new(&[tokens, q_heads, head_dim]))?;
         args.query
