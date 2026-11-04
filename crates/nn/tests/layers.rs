@@ -7,7 +7,7 @@
 //! region that is never read, because construction only inspects extents and strides.
 
 use nn::{
-    AdaptivePool, DType, DevicePtr, FrameNormPad, KvGroup, KvPlanes, KvView, Linear,
+    AdaptivePool, DType, DevicePtr, FrameNormPad, GatedResidual, KvGroup, KvPlanes, KvView, Linear,
     ModulatedRmsNorm, Rotary, Rotation, ScaledResidual, ScaledResidualRmsNorm, Shape, Snake,
     SwiGlu, TensorView, VsaTiles, Weight, WeightedRmsNorm,
 };
@@ -221,4 +221,15 @@ fn the_audio_layers_hold_their_channels() {
     assert!(AdaptivePool::new(8, 256, 0).is_err());
     // Wider than the descriptor's fields hold.
     assert!(AdaptivePool::new(u64::from(u32::MAX) + 1, 256, 32).is_err());
+}
+
+/// The gate table of a diffusion block is one row per conditioning parameter, and a table of no
+/// rows or a vector is a loading error rather than a launch-time surprise.
+#[test]
+fn a_gated_residual_holds_the_gate_table_it_gates_with() {
+    assert!(GatedResidual::new(weight(&[4, 32])).is_ok());
+    let gate = GatedResidual::new(weight(&[4, 32])).unwrap();
+    assert_eq!(gate.width(), 32);
+    assert!(GatedResidual::new(weight(&[32])).is_err());
+    assert!(GatedResidual::new(weight(&[4, 0])).is_err());
 }
