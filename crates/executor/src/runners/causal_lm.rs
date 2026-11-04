@@ -1200,6 +1200,12 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
             // key of the same operator changes the launch structure of the buckets that launch the
             // operator at all, and only a walk over them can tell rebind from recapture (4.5).
             let mut launching = self.graphs.using(operator, self.generation.number());
+            // Whether the graphs could name the buckets that launch the operator. When they cannot,
+            // the walk is the only thing that knows, and the paired forward is not attempted: it
+            // needs a bucket that really launches the operator, and the graphs are exactly what
+            // cannot say which those are. The mechanism's own shadow batches (`Batches::shadow`)
+            // still compare the two kernels per operator, which is the check 7.3 step 2 asks for.
+            let named = !launching.is_empty();
             if launching.is_empty() {
                 // No captured graph names the operator, which means the launch annotation was not
                 // reported when the bucket was captured. The graph cannot say which buckets launch
@@ -1227,7 +1233,9 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 // (`Forward::operate` pairs on operator and key), so a key one of them does not hold
                 // - a new launch, or one whose descriptor changed - is left to the walk, which
                 // recaptures the bucket.
-                if next.kernel(operator, &key).is_ok() && self.generation.kernel(operator, &key).is_ok()
+                if named
+                    && next.kernel(operator, &key).is_ok()
+                    && self.generation.kernel(operator, &key).is_ok()
                 {
                     jobs.push(Job::Shadow {
                         runner: self.id,
