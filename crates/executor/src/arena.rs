@@ -20,7 +20,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use platform::{Allocator, Buffer, DevicePtr, PoolKind};
+use platform::{Allocator, Buffer, DeviceId, DevicePtr, PoolKind};
 
 use crate::plan::Bucket;
 use crate::{Error, Result};
@@ -189,6 +189,27 @@ impl Ledger {
             mapped: self.mapped(),
             budget: self.budget,
         }
+    }
+}
+
+/// The device's allowance, as the allocator books against it (4.1).
+///
+/// `platform::Allocator` calls `book` with the NEW CUMULATIVE TOTAL of one
+/// `(device, pool)` before it maps anything, so a total past the allowance is
+/// refused and nothing is mapped; the books are the allocator's, and this
+/// answers from the budget the graph pools were sized against. A refusal books
+/// nothing because there is nothing here to change: the total is the allocator's
+/// own figure, not a running count of ours that a failed call could leave
+/// inflated.
+impl platform::Budget for Ledger {
+    fn book(&self, device: DeviceId, pool: PoolKind, bytes: u64) -> platform::Result<()> {
+        if bytes > self.budget {
+            return Err(platform::Error::InvalidArgument(format!(
+                "{pool:?} on device {device:?} would hold {bytes} bytes of a {}-byte allowance",
+                self.budget
+            )));
+        }
+        Ok(())
     }
 }
 
