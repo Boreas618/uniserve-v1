@@ -1539,10 +1539,24 @@ impl CachePlanes {
         for &(from, to) in copies {
             self.require_unit(from.0)?;
             self.require_unit(to.0)?;
-            if from.0 == 0 || to.0 == 0 || from == to || inherited.contains(&to.0) {
-                return Err(Error::Invalid(
-                    "cache unit copies require a writable new destination".into(),
-                ));
+            // A refusal names the pair: the scheduler's allocation is what a caller has to look
+            // at, and "unit 0" or "already the source" is what tells them which entry is wrong.
+            let reason = if from.0 == 0 {
+                Some("the source is unit 0, the block tables' sentinel")
+            } else if to.0 == 0 {
+                Some("the destination is unit 0, the block tables' sentinel")
+            } else if from == to {
+                Some("the destination is the source")
+            } else if inherited.contains(&to.0) {
+                Some("the destination is an inherited read-only unit of the predecessor world")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                return Err(Error::Invalid(format!(
+                    "cache unit copy {} -> {} is refused: {reason}",
+                    from.0, to.0
+                )));
             }
             for column in 0..self.plan.columns {
                 for field in 0..2 {
@@ -1850,6 +1864,31 @@ mod layer_view_tests {
             .store(1, Ordering::Release);
         assert_eq!(pool.mapped_bytes(), full - 2 * 128);
         Ok(())
+    }
+
+    /// A refused copy names the pair and the reason: the deployment's reader has the scheduler's
+    /// allocation to look at, and "1 -> 0, the block tables' sentinel" is what tells them which
+    /// entry of it is wrong.
+    #[test]
+    fn a_refused_unit_copy_names_the_pair_and_the_reason() {
+        let pool = pool(vec![group(2, 1)], 2, 4, false);
+        let batch = crate::stream::recorded::Batch::new(None, crate::stream::EventPool::new());
+        let refused = |copies: &[(ipc::UnitId, ipc::UnitId)]| {
+            pool.copy_units(copies, batch.on().host())
+                .expect_err("this copy is refused")
+                .to_string()
+        };
+        let sentinel = refused(&[(ipc::UnitId(1), ipc::UnitId(0))]);
+        assert!(
+            sentinel.contains("1 -> 0"),
+            "the pair is not named: {sentinel}"
+        );
+        assert!(
+            sentinel.contains("sentinel"),
+            "the reason is not named: {sentinel}"
+        );
+        let same = refused(&[(ipc::UnitId(2), ipc::UnitId(2))]);
+        assert!(same.contains("the destination is the source"), "{same}");
     }
 
     /// A unit copy moves a page's bytes into the units a batch was newly given: after it, the
