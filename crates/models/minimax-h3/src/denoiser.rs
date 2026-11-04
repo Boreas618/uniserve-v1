@@ -25,6 +25,7 @@
 use nn::capability::{LatentShape, Layout, StateTable, VideoRequest};
 use nn::{DType, Forward, Shape, TensorView, Weight, WeightLoader};
 
+use crate::attention::{Factors, Visible};
 use crate::config::{Canvas, DenoiserConfig};
 use crate::modulation::{AdaLnCache, Groups, Projections};
 use crate::packing::{self, DensePacking};
@@ -536,7 +537,175 @@ pub struct Denoiser {
     evaluations: u32,
 }
 
+/// The state tables of a request, in the order [`Layouts::state_tables`] sorts them.
+const STATE_TABLES: [&str; 10] = [
+    "audio_indices",
+    "cu_seq_lens_k",
+    "cu_seq_lens_q",
+    "groups",
+    "modulation_indices",
+    "position_ids",
+    "prefix_index",
+    "step",
+    "token_tags",
+    "video_indices",
+];
+
+/// One state view of a request, by name.
+fn state(state: &[TensorView], name: &str) -> Result<TensorView> {
+    let position = STATE_TABLES
+        .iter()
+        .position(|table| *table == name)
+        .ok_or_else(|| Error::config(format!("{name} is not a state table")))?;
+    state
+        .get(position)
+        .copied()
+        .ok_or_else(|| Error::config(format!("the executor passed no {name} table")))
+}
+
 impl Denoiser {
+    /// One denoising step: the latents in, the model's velocity, and the schedule's update.
+    ///
+    /// The packed rows are assembled from the layout's tables: every row gathers its prefix source
+    /// (the refined text row it reads, or the zero row), then each modality's patchified latents are
+    /// projected and scattered into their own rows. The stack runs once, the step's modulation is
+    /// gathered from the AdaLN cache, and each modality's velocity is projected back, unpatched and
+    /// folded into its latents by the solver.
+    pub fn denoise(
+        &self,
+        f: &Forward,
+        step: &nn::Step,
+        latents: nn::Latents,
+        cond: nn::Conditioning<'_>,
+    ) -> Result<()> {
+        let tables = cond.state;
+        let video = latents.video;
+        let channels = video.shape.dim(0);
+        let frames = video.shape.dim(1);
+        let height = video.shape.dim(2);
+        let width = video.shape.dim(3);
+        let tokens = u64::from(state(tables, "groups")?.shape.dim(0) as u32);
+        let hidden_size = u64::from(self.config.transformer.hidden_size);
+        let dtype = cond.text.dtype;
+        let arena = f.arena();
+
+        // The packed rows: every row gathers its prefix source, so a generated row reads the zero
+        // row and a text row reads itself.
+        let hidden = arena.tensor(dtype, Shape::new(&[tokens, hidden_size]))?;
+        nn::layers::gather_rows(f, cond.text, state(tables, "prefix_index")?, hidden)?;
+
+        // The video rows: patchify, project, scatter.
+        let video_indices = state(tables, "video_indices")?;
+        let video_rows = u64::from(video_indices.shape.dim(0) as u32);
+        let patch = nn::layers::Patch::new(channels, height, width)?;
+        let patched = arena.tensor(dtype, Shape::new(&[video_rows, channels * 4]))?;
+        patch.forward(f, video, patched, frames, nn::layers::PatchMode::Patchify)?;
+        let projected = arena.tensor(dtype, Shape::new(&[video_rows, hidden_size]))?;
+        self.transformer.project(f, patched, projected)?;
+        nn::layers::Rows::new(dtype, hidden_size)?.replace(f, hidden, projected, video_indices)?;
+
+        // The audio rows: one element per channel-step pair, projected like any other row.
+        if let (Some(audio), Ok(audio_indices)) = (latents.audio, state(tables, "audio_indices")) {
+            let audio_rows = u64::from(audio_indices.shape.dim(0) as u32);
+            let flat = TensorView::with_strides(
+                audio.ptr,
+                audio.dtype,
+                Shape::new(&[audio_rows, 1]),
+                nn::Strides::new(&[1, 1]),
+            );
+            let projected = arena.tensor(dtype, Shape::new(&[audio_rows, hidden_size]))?;
+            self.transformer.project_audio(f, flat, projected)?;
+            nn::layers::Rows::new(dtype, hidden_size)?.replace(
+                f,
+                hidden,
+                projected,
+                audio_indices,
+            )?;
+        }
+
+        // The rotary tables and the visibility of the one packed sequence.
+        let rotated = 48_u64;
+        let cosine = arena.tensor(DType::F32, Shape::new(&[tokens, rotated]))?;
+        let sine = arena.tensor(DType::F32, Shape::new(&[tokens, rotated]))?;
+        self.transformer
+            .factors(f, state(tables, "position_ids")?, cosine, sine)?;
+        let visible = Visible {
+            cu_seq_lens_q: state(tables, "cu_seq_lens_q")?,
+            cu_seq_lens_k: state(tables, "cu_seq_lens_k")?,
+            key_rows: tokens as u32,
+        };
+
+        // The stack, conditioned by the step's gathered modulation.
+        let step_index = state(tables, "step")?;
+        self.transformer.forward(
+            f,
+            &self.cache,
+            step_index,
+            hidden,
+            state(tables, "modulation_indices")?,
+            Factors { cosine, sine },
+            &visible,
+            tokens as u32,
+        )?;
+
+        // The output: the step's final modulation, then each modality's head.
+        let groups = self.cache.groups().count() as u64;
+        let entries = arena.tensor(DType::I32, Shape::new(&[1, groups]))?;
+        self.cache.entries_of(f, step_index, entries)?;
+        let modulation = arena.tensor(DType::F32, Shape::new(&[groups, 2 * hidden_size]))?;
+        self.cache.output(f, entries, modulation)?;
+
+        let video_hidden = arena.tensor(dtype, Shape::new(&[video_rows, hidden_size]))?;
+        nn::layers::gather_rows(f, hidden, video_indices, video_hidden)?;
+        let video_groups = arena.tensor(DType::I32, Shape::new(&[video_rows]))?;
+        nn::layers::gather_rows(f, state(tables, "groups")?, video_indices, video_groups)?;
+        let velocity_rows = arena.tensor(dtype, Shape::new(&[video_rows, channels * 4]))?;
+        self.transformer.velocity(
+            f,
+            video_hidden,
+            Modality::Video,
+            modulation,
+            video_groups,
+            velocity_rows,
+        )?;
+        let velocity = arena.tensor(dtype, video.shape)?;
+        patch.forward(
+            f,
+            velocity,
+            velocity_rows,
+            frames,
+            nn::layers::PatchMode::Unpatchify,
+        )?;
+        self.solver
+            .step(f, Modality::Video, video, velocity, step.index)?;
+
+        if let (Some(audio), Ok(audio_indices)) = (latents.audio, state(tables, "audio_indices")) {
+            let audio_rows = u64::from(audio_indices.shape.dim(0) as u32);
+            let audio_hidden = arena.tensor(dtype, Shape::new(&[audio_rows, hidden_size]))?;
+            nn::layers::gather_rows(f, hidden, audio_indices, audio_hidden)?;
+            let audio_groups = arena.tensor(DType::I32, Shape::new(&[audio_rows]))?;
+            nn::layers::gather_rows(f, state(tables, "groups")?, audio_indices, audio_groups)?;
+            let velocity = arena.tensor(dtype, Shape::new(&[audio_rows, 1]))?;
+            self.transformer.velocity(
+                f,
+                audio_hidden,
+                Modality::Audio,
+                modulation,
+                audio_groups,
+                velocity,
+            )?;
+            let flat = TensorView::with_strides(
+                audio.ptr,
+                audio.dtype,
+                Shape::new(&[audio_rows, 1]),
+                nn::Strides::new(&[1, 1]),
+            );
+            self.solver
+                .step(f, Modality::Audio, flat, velocity, step.index)?;
+        }
+        Ok(())
+    }
+
     /// Read one DiT partition and everything around it.
     ///
     /// `rows` bounds the packed row count this deployment serves, which sizes the attention's

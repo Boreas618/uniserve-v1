@@ -143,6 +143,30 @@ impl Layer {
 }
 
 impl Transformer {
+    /// Project one modality's patchified audio rows into the hidden width.
+    pub fn project_audio(&self, f: &Forward, rows: TensorView, out: TensorView) -> Result<()> {
+        let audio = self.audio_proj_in.as_ref().ok_or_else(|| {
+            Error::Unsupported("this H3 partition has no audio input projection".to_owned())
+        })?;
+        Ok(audio.forward(f, rows, out)?)
+    }
+
+    /// The rotary factor tables of the packed rows, from their axis-major positions.
+    ///
+    /// Every layer rotates with the same table, so the first layer's rotary computes them.
+    pub fn factors(
+        &self,
+        f: &Forward,
+        positions: TensorView,
+        cosine: TensorView,
+        sine: TensorView,
+    ) -> Result<()> {
+        let layer = self.layers.first().ok_or_else(|| {
+            Error::Unsupported("an H3 partition with no layers has no rotary".to_owned())
+        })?;
+        Ok(layer.attention.factors(f, positions, cosine, sine)?)
+    }
+
     /// The final normalization and one modality's output projection: `hidden` in, velocity out.
     ///
     /// The final normalization is modulated like every other one: `[groups, 2 * hidden]` of shift
