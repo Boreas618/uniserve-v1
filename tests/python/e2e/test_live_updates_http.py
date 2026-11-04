@@ -1274,10 +1274,16 @@ def _restart_with_a_json_body(
     # successor is this restart's: the earlier freezes named another.
     records = _handoff_records(log)
     frozen = [
-        record for record in records["frozen"] if record["successor_pid"] == successor
+        record
+        for record in records["frozen"]
+        if record["successor_pid"] == successor
     ]
-    adopted = [record for record in records["adopted"] if record["pid"] == successor]
-    finished = [record for record in records["finished"] if record["pid"] == successor]
+    adopted = [
+        record for record in records["adopted"] if record["pid"] == successor
+    ]
+    finished = [
+        record for record in records["finished"] if record["pid"] == successor
+    ]
     assert len(frozen) == 1, frozen
     assert frozen[0]["adopted"], frozen
     assert frozen[0]["successor_pid"] == successor, frozen
