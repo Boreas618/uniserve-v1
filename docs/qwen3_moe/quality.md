@@ -95,4 +95,16 @@ The pre-flight prints `1319 gsm8k-00000 gsm8k-01318`. The baseline suite runs it
 
 ## Results
 
-The baseline run and the candidate comparison are pending. When both have run on the target deployment, this section records, per cell, both accuracies and counts, the difference, its standard error, the 95% interval and the verdict. No accuracy, interval or verdict is claimed here.
+The baselines of two cells are measured on today's implementation; the third baseline and every candidate cell are pending. A baseline is a measurement of one side, not a comparison: no interval and no verdict is claimed until a candidate cell has run on the same checkpoint, sample set and settings.
+
+| Cell | Commit | Requests | Correct | Accuracy | `decided_by_marker` / `decided_by_boxed` / `unparseable` |
+| --- | --- | --- | --- | --- | --- |
+| `qwen3-moe-gsm8k-bf16` | `0b47282ee` | 1319/1319 | 1248 | 0.946172 | not recorded at this commit; the 1249-row run at `5c6c06a0e` reported 1182 / 136 / 2 |
+| `qwen3-moe-gsm8k-nvfp4` | `becb9e9a5` | 1319/1319 | 1233 | 0.934799 | 1080 / 239 / 4 |
+| `qwen3-moe-gsm8k-bf16-fp8-kv` | pending | — | — | — | — |
+
+The three form counts are what each cell's `summary.json` reports, not a partition of the requests into four buckets: a prediction the extractor cannot parse is still counted under the form that was tried.
+
+The BF16 cell measured 1249 at the extractor commit `5c6c06a0e` and 1248 at `0b47282ee`; the one-row difference is a sampling record, not a protocol change, and the later commit's number is the baseline. The NVFP4 cell's commit carries the calibrated-checkpoint loader only; the later FP8 pooled-scratch commit leaves the dense BF16 and NVFP4 paths untouched, so its number stands there.
+
+The acceptance band is fixed before any candidate result, from n = 1319 per side and the baseline proportions: |Δ| ≤ 0.01722 (about 23 rows) against the BF16 baseline and |Δ| ≤ 0.01884 (about 25 rows) against NVFP4, by `|d| ≤ 1.959963985 · sqrt(p1(1−p1)/n1 + p2(1−p2)/n2)`. A candidate inside the band is accepted; one outside it is a measured regression, not noise.
