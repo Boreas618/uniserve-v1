@@ -73,6 +73,8 @@ pub struct Pools {
     pools: HashMap<StreamId, Pool>,
     /// How many streams share the reservation.
     streams: usize,
+    /// Whether the scratch pool the shadow pair's region comes from is reserved.
+    scratch_reserved: bool,
 }
 
 /// What a runner's graph pools hold, for the metrics report and item 5's invariant.
@@ -232,12 +234,34 @@ impl Pools {
             ledger: Ledger::new(bytes / streams as u64, budget),
             pools: HashMap::new(),
             streams,
+            scratch_reserved: false,
         })
     }
 
     /// The bytes each stream's range reserves.
     pub fn reserved(&self) -> u64 {
         self.ledger.reservation
+    }
+
+    /// The device's allocator, for the one other pool the executor carves from it.
+    ///
+    /// `ops::Twins` is allocator-backed (the shadow pair's region), so it is taken from the same
+    /// allocator the graph pool reserved: one allocator per device, so the device's budget books
+    /// the twins beside the graphs rather than behind a second ledger.
+    pub fn allocator(&mut self) -> &mut Allocator {
+        &mut self.allocator
+    }
+
+    /// Reserves the scratch pool the shadow pair's region comes from, once, on first use.
+    pub fn reserve_scratch(&mut self, bytes: u64) -> Result<()> {
+        if self.scratch_reserved {
+            return Ok(());
+        }
+        let size = usize::try_from(bytes)
+            .map_err(|_| Error::Resource("the shadow region is larger than memory".into()))?;
+        self.allocator.reserve(PoolKind::Scratch, size)?;
+        self.scratch_reserved = true;
+        Ok(())
     }
 
     /// The bytes the device's graph pool has mapped, as the allocator books them (4.1).

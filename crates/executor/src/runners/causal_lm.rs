@@ -29,6 +29,40 @@ use crate::batch::{Batch, BatchColumns, BatchOutput, CallId, Job, Jobs, SampledT
 use crate::captured::Captured;
 use crate::graph::Graphs;
 use crate::plan::{Bucket, Buckets, Shape};
+/// Writes `values` into `buffer` as the kernel ABI expects them, reusing its capacity.
+fn encode_i32(buffer: &mut Vec<u8>, values: &[i32]) {
+    buffer.clear();
+    for value in values {
+        buffer.extend_from_slice(&value.to_ne_bytes());
+    }
+}
+
+/// The same for f32 columns.
+fn encode_f32(buffer: &mut Vec<u8>, values: &[f32]) {
+    buffer.clear();
+    for value in values {
+        buffer.extend_from_slice(&value.to_ne_bytes());
+    }
+}
+
+/// `rows` uniform draws in `[0, 1)`, from the runner's generator into its own buffer.
+///
+/// The generator is the runner's (sampling state is the executor's, 4.5) and a seeded one is what
+/// makes a replay reproduce its tokens; the buffer is the runner's too, so a step allocates
+/// nothing.
+fn draw_uniforms(seed: &std::cell::Cell<u64>, draws: &mut Vec<f32>, rows: usize) {
+    draws.clear();
+    let mut state = seed.get();
+    while draws.len() < rows {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        // The top 24 bits are a value in [0, 1) that cannot round up to one in f32.
+        draws.push(((state >> 40) as f32) / ((1u64 << 24) as f32));
+    }
+    seed.set(state);
+}
+
 #[cfg(test)]
 use crate::plan::Variant;
 use crate::runner::{Runner, RunnerId};
@@ -110,20 +144,34 @@ impl Staging {
         let bucket_tokens = bucket.tokens as usize;
         let bucket_rows = bucket.rows as usize;
 
-        // Token columns: the mechanism's tokens, then padding that persists nowhere.
+        // Token columns: the mechanism's tokens, then padding that persists nowhere. Every column
+        // is copied into the staging's own buffers, whose capacity was taken at bind, so a step
+        // allocates nothing (4.5) and a captured graph's addresses cannot move under it.
         self.input_ids[..tokens].copy_from_slice(&columns.input_ids[..tokens]);
         for index in tokens..bucket_tokens {
             self.input_ids[index] = 0;
         }
-        self.rows = columns.rows.clone();
+        self.rows.clear();
+        self.rows.positions.extend_from_slice(&columns.rows.positions);
         self.rows.positions.resize(bucket_tokens, 0);
         for index in tokens..bucket_tokens {
             self.rows.positions[index] = 0;
         }
+        self.rows
+            .slot_mapping
+            .extend_from_slice(&columns.rows.slot_mapping);
         self.rows.slot_mapping.resize(bucket_tokens, -1);
         for index in tokens..bucket_tokens {
             self.rows.slot_mapping[index] = -1;
         }
+        self.rows.seq_lens.extend_from_slice(&columns.rows.seq_lens);
+        self.rows
+            .query_offsets
+            .extend_from_slice(&columns.rows.query_offsets);
+        self.rows
+            .logits_rows
+            .extend_from_slice(&columns.rows.logits_rows);
+        self.rows.calls.extend_from_slice(&columns.rows.calls);
 
         // Row columns: the mechanism's rows, then rows that sample nothing and commit nothing.
         self.slots[..rows].copy_from_slice(&columns.slots[..rows]);
@@ -181,8 +229,10 @@ impl Staging {
             )));
         }
 
-        // The commit table's padded rows keep their token state: a slot below zero.
-        self.commit = columns.commit.clone();
+        // The commit table's padded rows keep their token state: a slot below zero. As with the
+        // rows, the table is copied into the staging's buffer rather than cloned per step.
+        self.commit.clear();
+        self.commit.extend_from_slice(&columns.commit);
         if !columns.commit.is_empty() {
             let columns = columns.commit.len() / rows.max(1);
             self.commit.resize(columns * bucket_rows, 0);
@@ -553,6 +603,12 @@ pub struct CausalLmRunner<M: CausalLm> {
     /// replay's readback. Interior mutability because the walk's KV closure borrows the runner
     /// while it runs.
     bucket_samples: std::cell::RefCell<HashMap<Bucket, Sampled>>,
+    /// The host encode buffer every column is written through, so a step allocates no `Vec`.
+    encoded: Vec<u8>,
+    /// The gather indices a step writes, in the runner's own buffer.
+    indices: Vec<i32>,
+    /// The sampling draws a step writes, in the runner's own buffer.
+    draws: Vec<f32>,
     /// Where the batch's KV views come from: the resident cache, and a paired forward's scratch.
     kv: Arc<dyn KvProvider>,
     /// The sampling step's uniform generator, seeded by the engine so a run reproduces.
@@ -603,6 +659,9 @@ impl<M: CausalLm> CausalLmRunner<M> {
             columns,
             sampling,
             bucket_samples: std::cell::RefCell::new(HashMap::new()),
+            encoded: Vec::new(),
+            indices: Vec::new(),
+            draws: Vec::new(),
             kv,
             seed: std::cell::Cell::new(seed | 1),
         })
@@ -851,6 +910,10 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
 
     fn attach_pools(&mut self, pools: Arc<std::sync::Mutex<Pools>>) {
         self.pools = Some(pools);
+    }
+
+    fn attach_shadow(&mut self, shadow: crate::shadow::Shadow) {
+        self.set_shadow(shadow);
     }
 
     fn attach_counters(&mut self, counters: Arc<crate::device::SharedCounters>) {
@@ -1193,7 +1256,6 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let Some(samples) = self.bucket_samples.borrow().get(&bucket).copied() else {
             return Ok(BatchOutput::default());
         };
-        self.stream.synchronize()?;
         let rows = bucket.rows as usize;
         let bytes = rows * std::mem::size_of::<i32>();
         if bytes > self.columns.readback.len() {
@@ -1211,6 +1273,9 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 &self.stream,
             )?;
         }
+        // The one synchronization of a step's host boundary: the replay and the copy are ordered on
+        // the runner's stream, so this wait covers both, and it is what the mechanism waits on to
+        // build the next step's input ids.
         self.stream.synchronize()?;
         // SAFETY: the copy above filled `rows` i32 of pinned host memory with the sampled ids.
         let ids: &[i32] = unsafe {
@@ -1227,50 +1292,47 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// Uploads the staged batch into the device columns the captured graphs address.
     ///
     /// Every column is copied into a buffer allocated when the runner bound, sized for the largest
-    /// bucket, so a step writes fixed addresses and allocates nothing (4.5).
+    /// bucket, and the host-side encode indices and draw buffers are the runner's own: a step
+    /// writes fixed addresses and allocates nothing (4.5).
     fn upload(&mut self, bucket: Bucket) -> Result<()> {
         let rows = bucket.rows as usize;
         let tokens = bucket.tokens as usize;
         if self.staging.staged().is_none() {
             return Err(Error::State("a step needs a staged batch".into()));
         }
-        let encoded = |values: &[i32]| -> Vec<u8> {
-            values.iter().flat_map(|value| value.to_ne_bytes()).collect()
-        };
         let batch = self.staging.batch_rows();
-        self.columns.positions.write(&encoded(&batch.positions[..tokens]))?;
-        self.columns
-            .slot_mapping
-            .write(&encoded(&batch.slot_mapping[..tokens]))?;
-        self.columns.seq_lens.write(&encoded(&batch.seq_lens[..rows]))?;
-        self.columns
-            .query_offsets
-            .write(&encoded(&batch.query_offsets[..rows + 1]))?;
-        self.columns
-            .logits_rows
-            .write(&encoded(&batch.logits_rows[..rows]))?;
+
+        encode_i32(&mut self.encoded, &batch.positions[..tokens]);
+        self.columns.positions.write(&self.encoded)?;
+        encode_i32(&mut self.encoded, &batch.slot_mapping[..tokens]);
+        self.columns.slot_mapping.write(&self.encoded)?;
+        encode_i32(&mut self.encoded, &batch.seq_lens[..rows]);
+        self.columns.seq_lens.write(&self.encoded)?;
+        encode_i32(&mut self.encoded, &batch.query_offsets[..rows + 1]);
+        self.columns.query_offsets.write(&self.encoded)?;
+        encode_i32(&mut self.encoded, &batch.logits_rows[..rows]);
+        self.columns.logits_rows.write(&self.encoded)?;
+
         // A row that samples nothing still gathers some in-range token; its id is discarded.
-        let indices: Vec<i32> = batch.logits_rows[..rows]
-            .iter()
-            .map(|row| if *row < 0 { 0 } else { *row })
-            .collect();
-        self.columns.indices.write(&encoded(&indices))?;
-        self.columns.parameters.write(
-            &self
-                .staging
-                .parameters(rows)
+        self.indices.clear();
+        self.indices.extend(
+            batch.logits_rows[..rows]
                 .iter()
-                .flat_map(|value| value.to_ne_bytes())
-                .collect::<Vec<u8>>(),
-        )?;
-        self.columns.slots.write(&encoded(self.staging.slots(rows)))?;
-        self.columns.draws.write(
-            &self
-                .draw_uniforms(rows)
-                .iter()
-                .flat_map(|value| value.to_ne_bytes())
-                .collect::<Vec<u8>>(),
-        )?;
+                .map(|row| if *row < 0 { 0 } else { *row }),
+        );
+        encode_i32(&mut self.encoded, &self.indices);
+        self.columns.indices.write(&self.encoded)?;
+
+        encode_f32(&mut self.encoded, self.staging.parameters(rows));
+        self.columns.parameters.write(&self.encoded)?;
+
+        encode_i32(&mut self.encoded, self.staging.slots(rows));
+        self.columns.slots.write(&self.encoded)?;
+
+        draw_uniforms(&self.seed, &mut self.draws, rows);
+        encode_f32(&mut self.encoded, &self.draws);
+        self.columns.draws.write(&self.encoded)?;
+
         for column in [
             &self.columns.positions,
             &self.columns.slot_mapping,
@@ -1285,24 +1347,6 @@ impl<M: CausalLm> CausalLmRunner<M> {
             column.upload(&self.stream)?;
         }
         Ok(())
-    }
-
-    /// `rows` uniform draws in `[0, 1)` for the sampling step, from the runner's generator.
-    ///
-    /// The generator is the runner's own: sampling state is the executor's (4.5), and a seeded
-    /// generator is what makes a replay reproduce its tokens.
-    fn draw_uniforms(&self, rows: usize) -> Vec<f32> {
-        let mut state = self.seed.get();
-        let mut draws = Vec::with_capacity(rows);
-        while draws.len() < rows {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            // The top 24 bits are a value in [0, 1) that cannot round up to one in f32.
-            draws.push(((state >> 40) as f32) / ((1u64 << 24) as f32));
-        }
-        self.seed.set(state);
-        draws
     }
 
     /// The device-side `TokenBatch` of `bucket`: the bucket's extent of each column.
