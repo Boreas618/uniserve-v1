@@ -153,6 +153,23 @@ impl Scheduler {
     /// product reference and do not wait here for the producer to complete.
     /// Video and audio encoding wait until the call producing their input has
     /// completed, and muxing waits for completed encode rounds.
+    /// The media calls a request can run right now, in the graph's order: the
+    /// first is its next phase.
+    ///
+    /// `views.rs` reads this as a media request's `RequestView.phase` (§4.4: a
+    /// schedule addresses phases, and a video request's phases are the calls of
+    /// its graph). Empty when the request is not a resident media request or
+    /// has nothing ready.
+    pub(crate) fn media_ready_calls(&self, id: RequestId) -> Vec<CallKind> {
+        let Some(state) = self.media_state(id) else {
+            return Vec::new();
+        };
+        self.ready_calls(state)
+            .into_iter()
+            .map(CallKind::Media)
+            .collect()
+    }
+
     fn ready_calls(&self, state: &MediaFlowState) -> Vec<MediaCall> {
         let sampling = state.request.sampling;
         let graph = &state.graph;
