@@ -25,10 +25,39 @@
 //! type definitions first; the switch here is driven by it once that entry
 //! moves.
 
-use crate::leader::UpdateError;
-use crate::options::ServeConfig;
-
 pub(crate) mod change;
 pub(crate) mod driver;
+pub(crate) mod entry;
 pub(crate) mod epoch;
 pub(crate) mod switch;
+
+/// The update a change would collide with (§7.2: one update at a time): the
+/// switch a driver runs, or the program update on probation, whose epoch
+/// record is what decides who serves. Both layers' entries refuse through this
+/// one decision, so the sentence an operator reads does not depend on which
+/// layer asked.
+pub(crate) fn in_flight(running: bool, program: bool) -> Option<&'static str> {
+    match (running, program) {
+        (true, _) => Some("an epoch switch is running"),
+        (false, true) => Some("a program update is on probation"),
+        (false, false) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::in_flight;
+
+    /// The two layers' refusals share one decision: whichever update is in
+    /// flight, the second change is told which one it collided with.
+    #[test]
+    fn a_second_update_is_refused_by_the_one_in_flight() {
+        assert_eq!(in_flight(false, false), None);
+        assert_eq!(in_flight(true, false), Some("an epoch switch is running"));
+        assert_eq!(
+            in_flight(false, true),
+            Some("a program update is on probation")
+        );
+        assert_eq!(in_flight(true, true), Some("an epoch switch is running"));
+    }
+}
