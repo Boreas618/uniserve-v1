@@ -395,7 +395,13 @@ impl DecodeStream {
                             .to_string(),
                     });
                 }
-                if self.consume_tokens(&prompt_token_ids, &ids, Vec::new(), raw_stream, &mut events)? {
+                if self.consume_tokens(
+                    &prompt_token_ids,
+                    &ids,
+                    Vec::new(),
+                    raw_stream,
+                    &mut events,
+                )? {
                     return Ok(Decoded::ended(events));
                 }
             }
@@ -537,7 +543,11 @@ impl DecodeStream {
 
     /// Fails unless `Start` is emitted (by `start_event` or earlier) and no
     /// generated token awaits its logprobs.
-    fn ensure_output_ready_from(&self, events: &[DecodedTextEvent], event: &str) -> Result<(), Error> {
+    fn ensure_output_ready_from(
+        &self,
+        events: &[DecodedTextEvent],
+        event: &str,
+    ) -> Result<(), Error> {
         let starting = events
             .iter()
             .any(|event| matches!(event, DecodedTextEvent::Start { .. }));
@@ -812,7 +822,9 @@ pub async fn decoded_text_event_stream(
         }
     }
 
-    Err(Error::StreamClosedBeforeTerminalOutput { request_id: request })
+    Err(Error::StreamClosedBeforeTerminalOutput {
+        request_id: request,
+    })
 }
 
 /// Returns the suffix byte count retained to detect cross-chunk stop strings.
