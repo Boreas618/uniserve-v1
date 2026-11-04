@@ -124,6 +124,7 @@ const OPERATORS: &[&str] = &[
     <crate::audio_activation::AudioActivation as Op>::NAME,
     <crate::patch::Patch as Op>::NAME,
     <crate::unpatchify::Unpatchify as Op>::NAME,
+    <crate::copy_block::CopyBlock as Op>::NAME,
     <crate::cross_fade::CrossFade as Op>::NAME,
     <crate::sequence_append::SequenceAppend as Op>::NAME,
     <crate::rope::RopeApply as Op>::NAME,
