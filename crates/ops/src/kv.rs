@@ -27,7 +27,7 @@ use std::fmt;
 
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
-use crate::platform::Stream;
+use crate::platform::{Stream, address};
 use crate::tensor::{DType, Shape, TensorView};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
@@ -88,6 +88,44 @@ pub struct Args {
     pub key_initialized: TensorView,
     /// `[pages, 1, 1, 1]` i32 initialization flags of the value cache.
     pub value_initialized: TensorView,
+}
+
+/// The addresses and extents of a write, off unless `UNISERVE_ATTENTION_TRACE` asks for them.
+///
+/// A write and the read that follows it are separate launches, and the only thing that says they
+/// agree about *which* pages hold this layer is the cache address each was handed. A zero attention
+/// output that is not a harness fault is the shape of a reader looking at pages nothing wrote, so the
+/// two launches print the same field in the same form and the pair can be compared line by line
+/// without a device read-back.
+fn trace(descriptor: &Descriptor, args: &Args) {
+    if std::env::var_os("UNISERVE_ATTENTION_TRACE").is_none_or(|value| value.is_empty()) {
+        return;
+    }
+    eprintln!(
+        "kv_write trace: page {} heads {} head_dim {} pdl {} tokens {} | key {} at {:#x} value {} at {:#x}",
+        descriptor.page,
+        descriptor.heads,
+        descriptor.head_dim,
+        descriptor.pdl,
+        args.key.shape.dim(0),
+        args.key.dtype,
+        address(args.key.ptr),
+        args.value.dtype,
+        address(args.value.ptr),
+    );
+    eprintln!(
+        "kv_write trace: key_cache {} at {:#x} pages {} | value_cache {} at {:#x} pages {} | flags at \
+         {:#x} and {:#x}, slots at {:#x}",
+        args.key_cache.dtype,
+        address(args.key_cache.ptr),
+        args.key_cache.shape.dim(0),
+        args.value_cache.dtype,
+        address(args.value_cache.ptr),
+        args.value_cache.shape.dim(0),
+        address(args.key_initialized.ptr),
+        address(args.value_initialized.ptr),
+        address(args.slots.ptr),
+    );
 }
 
 /// Scatter of the current tokens into the paged cache.
@@ -181,6 +219,7 @@ impl Op for KvWrite {
             }
         }
 
+        trace(descriptor, &args);
         let mut arguments = Arguments::new();
         arguments
             .view(args.key)
