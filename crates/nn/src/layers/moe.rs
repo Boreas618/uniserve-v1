@@ -923,7 +923,9 @@ mod parallel_tests {
             expert_parallel_block(128, 0, 0).is_err(),
             "no resident expert"
         );
-        // The stacks hold the window, not the vocabulary.
-        assert!(expert_parallel_block(128, 32, 96).is_err());
+        // A window that ends exactly at the last expert is the last rank of a legal split.
+        let last = expert_parallel_block(128, 32, 96).unwrap();
+        assert_eq!(last.experts(), 128);
+        assert_eq!(last.local_experts(), 32);
     }
 }

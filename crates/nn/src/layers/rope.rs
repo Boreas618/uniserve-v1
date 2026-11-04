@@ -9,7 +9,7 @@
 
 use ops::TensorView;
 use ops::rope::{
-    FactorsArgs, FactorsDescriptor, QkNormRope, QkNormRopeArgs, QkNormRopeDescriptor,
+    FactorsArgs, FactorsDescriptor, MAX_AXES, QkNormRope, QkNormRopeArgs, QkNormRopeDescriptor,
     RotaryFactors, Rotation,
 };
 
@@ -17,6 +17,56 @@ use crate::error::{Error, Result};
 use crate::forward::Forward;
 use crate::layers::launch::{PDL, QK_NORM_TOKENS, ROTARY_BLOCK};
 use crate::weights::Weight;
+
+/// The position axes of a sectioned rotation: M-RoPE's cut of the head into one section per axis.
+///
+/// A multimodal transformer's positions are one coordinate per axis (time, height, width) and its
+/// head's rotated width is divided among them in this order, so each column rotates by the
+/// coordinate of the axis its section belongs to (specs/worker.md 9, "RoPE 因子").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sections {
+    widths: [u32; MAX_AXES],
+    axes: u32,
+}
+
+impl Sections {
+    /// The sections `widths`, in rotated elements per axis, in axis order.
+    ///
+    /// Every width must be a positive even number of elements, the widths must sum to the head's
+    /// rotated width, and there may be at most [`MAX_AXES`] of them.
+    pub fn new(widths: &[u32]) -> Result<Self> {
+        if widths.is_empty() || widths.len() > MAX_AXES {
+            return Err(Error::shape(
+                "Rotary::sections",
+                format!("{} sections, one to {MAX_AXES} axes", widths.len()),
+            ));
+        }
+        let mut stored = [0_u32; MAX_AXES];
+        for (slot, width) in stored.iter_mut().zip(widths) {
+            if *width == 0 || !width.is_multiple_of(2) {
+                return Err(Error::shape(
+                    "Rotary::sections",
+                    format!("a section of {width} elements has no rotation pair"),
+                ));
+            }
+            *slot = *width;
+        }
+        Ok(Self {
+            widths: stored,
+            axes: widths.len() as u32,
+        })
+    }
+
+    /// How many position axes the rotation reads.
+    pub const fn axes(&self) -> u32 {
+        self.axes
+    }
+
+    /// The rotated elements each axis owns, in axis order.
+    pub fn widths(&self) -> &[u32] {
+        &self.widths[..self.axes as usize]
+    }
+}
 
 /// Rotary embedding of `head_dim` with Q/K normalization.
 pub struct Rotary {
@@ -27,6 +77,7 @@ pub struct Rotary {
     epsilon: f32,
     rotation: Rotation,
     scale: f32,
+    sections: Option<Sections>,
 }
 
 impl Rotary {
@@ -72,7 +123,26 @@ impl Rotary {
             epsilon,
             rotation,
             scale,
+            sections: None,
         })
+    }
+
+    /// The same rotation, reading one position coordinate per axis (M-RoPE).
+    ///
+    /// The sections must cut the head's rotated width exactly: their widths sum to `head_dim`.
+    pub fn sectioned(mut self, sections: Sections) -> Result<Self> {
+        let covered: u32 = sections.widths().iter().sum();
+        if covered != self.head_dim {
+            return Err(Error::shape(
+                "Rotary::sectioned",
+                format!(
+                    "sections cover {covered} elements of a {} element head",
+                    self.head_dim
+                ),
+            ));
+        }
+        self.sections = Some(sections);
+        Ok(self)
     }
 
     /// The rotated width of one head.
@@ -86,6 +156,9 @@ impl Rotary {
     }
 
     /// Turn `positions` into `cosine` and `sine` tables, both `[tokens, head_dim / 2]` FP32.
+    ///
+    /// A one-dimensional rotation's `positions` is `[…, tokens]`; a sectioned rotation's is
+    /// `[axes, …, tokens]`, one coordinate per axis per token, and the tables cover the tokens.
     pub fn factors(
         &self,
         f: &Forward,
@@ -99,7 +172,30 @@ impl Rotary {
             .map_err(Error::from)?;
         sine.require_row("Rotary::factors", ops::DType::F32, columns)
             .map_err(Error::from)?;
-        let tokens = positions.numel();
+        let axes = self
+            .sections
+            .map_or(1, |sections| u64::from(sections.axes()));
+        if let Some(sections) = self.sections
+            && (positions.shape.rank() < 2 || positions.shape.dim(0) != u64::from(sections.axes()))
+        {
+            return Err(Error::shape(
+                "Rotary::factors",
+                format!(
+                    "sectioned positions need one leading coordinate per axis, {} in all",
+                    sections.axes()
+                ),
+            ));
+        }
+        if !positions.numel().is_multiple_of(axes) {
+            return Err(Error::shape(
+                "Rotary::factors",
+                format!(
+                    "{} position coordinates do not divide into {axes} axes",
+                    positions.numel()
+                ),
+            ));
+        }
+        let tokens = positions.numel() / axes;
         if cosine.rows() != tokens || sine.rows() != tokens {
             return Err(Error::shape(
                 "Rotary::factors",
@@ -117,6 +213,10 @@ impl Rotary {
             block: ROTARY_BLOCK,
             scale: self.scale.into(),
             pdl: PDL,
+            axes: self.sections.map_or(1, |sections| sections.axes()),
+            sections: self
+                .sections
+                .map_or([0; MAX_AXES], |sections| sections.widths),
         };
         let args = FactorsArgs {
             positions,
@@ -217,5 +317,32 @@ impl Rotary {
         };
 
         f.operate::<QkNormRope>(&descriptor, args)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Sections;
+
+    /// A sectioned rotation cuts the head exactly: the sections are the axes' shares of it.
+    #[test]
+    fn sections_cut_the_head_into_one_share_per_axis() {
+        let sections = Sections::new(&[16, 24, 24]).expect("three shares of a 128 element head");
+        assert_eq!(sections.axes(), 3);
+        assert_eq!(sections.widths(), &[16, 24, 24]);
+
+        assert!(Sections::new(&[]).is_err(), "no axis rotates nothing");
+        assert!(
+            Sections::new(&[16, 24, 23]).is_err(),
+            "an odd share has no pair"
+        );
+        assert!(
+            Sections::new(&[0, 64]).is_err(),
+            "an empty share rotates nothing"
+        );
+        assert!(
+            Sections::new(&[16, 16, 16, 16, 16]).is_err(),
+            "more axes than the kernel reads"
+        );
     }
 }

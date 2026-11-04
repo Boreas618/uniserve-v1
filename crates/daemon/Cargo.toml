@@ -22,6 +22,7 @@ platform.workspace = true
 engine.workspace = true
 fastokens.workspace = true
 fnv.workspace = true
+frontend.workspace = true
 futures.workspace = true
 hf-hub.workspace = true
 http-body.workspace = true
@@ -62,6 +63,8 @@ winnow.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+# The application crate's test fixtures, such as the byte tokenizer.
+frontend = { workspace = true, features = ["testing"] }
 engine = { workspace = true, features = ["testing"] }
 # Tests drive the request interface with in-process schedulers and build
 # their worker values.

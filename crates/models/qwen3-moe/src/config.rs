@@ -523,6 +523,37 @@ impl RawConfig {
 mod tests {
     use super::*;
 
+    /// The metadata of the deployment this crate was written for, when the machine has it.
+    ///
+    /// The path is the one `specs/worker.md` names for the local checkpoint; a machine without the
+    /// asset skips the test rather than failing, and a machine with it checks the parse against the
+    /// values the design's slice depends on.
+    #[test]
+    fn the_local_checkpoint_metadata_parses() {
+        let path = std::path::Path::new("/opt/uv/models/Qwen3-30B-A3B/config.json");
+        if !path.is_file() {
+            return;
+        }
+        let config = Config::read(path.parent().expect("a parent directory"))
+            .expect("the local Qwen3-30B-A3B metadata");
+        assert_eq!(config.vocab_size, 151936);
+        assert_eq!(config.hidden_size, 2048);
+        assert_eq!(config.intermediate_size, 6144);
+        assert_eq!(config.num_hidden_layers, 48);
+        assert_eq!(config.num_attention_heads, 32);
+        assert_eq!(config.num_key_value_heads, 4);
+        assert_eq!(config.head_dim, 128);
+        assert_eq!(config.num_experts, 128);
+        assert_eq!(config.num_experts_per_tok, 8);
+        assert_eq!(config.moe_intermediate_size, 768);
+        assert!(config.norm_topk_prob);
+        assert!(!config.attention_bias);
+        assert!(!config.tie_word_embeddings);
+        // Every layer of this checkpoint routes to experts.
+        assert!((0..config.num_hidden_layers).all(|layer| config.sparse(layer)));
+        assert!(!config.has_dense_layers());
+    }
+
     fn raw(value: serde_json::Value) -> RawConfig {
         serde_json::from_value(value).expect("a config object")
     }
