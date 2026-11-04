@@ -110,8 +110,9 @@ use engine::{PolicyProgram, PolicySource, ProgramSource};
 use ipc::{ProgramCommand, ProgramStatus, UpdateFailure};
 use ops::{Generation, KernelEntry};
 use program_server::program::Programs;
-use program_server::{Client, Descriptors, Module, PrepareRequest, Program, ProgramRequest, Selector,
-    Target};
+use program_server::{
+    Client, Descriptors, PrepareRequest, Program, ProgramRequest, Selector, Target,
+};
 
 /// The epoch as this node takes it at start.
 ///
@@ -188,7 +189,9 @@ pub(crate) struct Launch {
     /// states it apart from the build config (§2.4).
     #[serde(default)]
     pub watchdog_timeout_s: Option<u64>,
-    /// The probation an update must survive before the daemon commits it (§7.3 step 4).
+    /// The probation an update must survive before the daemon commits it (§7.3 step 4). The daemon
+    /// measures the probation and decides the commit; this process reports what happened and does
+    /// not judge it, so the field is read where the epoch is decided and not here.
     #[serde(default)]
     pub rollback_s: Option<u64>,
     /// The placement's queue depth for this rank's worker groups: how many batches the rank's
@@ -467,7 +470,10 @@ pub(crate) struct MainProcess {
     /// owns the instance, so every call the control thread makes goes through the handle and the
     /// command channel carries the mutation (§2.4).
     schedulers: Vec<engine::SchedulerHandle>,
-    executors: Vec<Executor>,
+    /// This node's device executors, shared with the schedulers that submit through them: one
+    /// executor thread per device, reached both by this process's own verbs (`precopy`,
+    /// `switchover`, `warmup`, `purge`) and by the scheduler's `Batches`.
+    executors: Vec<Arc<Executor>>,
     memory: Option<Memory>,
     blocking: ThreadPool,
     /// The blocking lane module loads run on (§2.4, §7.3 step 2).
@@ -616,7 +622,7 @@ impl MainProcess {
             let shadow = executor.set_shadow()?;
             device_command(&watchdog, *device, "shadow region", shadow)
                 .with_context(|| format!("mapping the shadow region of device {}", device.0))?;
-            executors.push(executor);
+            executors.push(Arc::new(executor));
             generations.push(generation);
         }
 
@@ -624,7 +630,7 @@ impl MainProcess {
         // above through `executor::Batches` (§2.4, §4.4). A node that holds none keeps an empty list
         // and serves only what its peers' schedulers ask of it; a node that is the scheduler node
         // and holds none would accept requests and dispatch nothing, which is refused by name.
-        let schedulers = schedulers(launch, &executors)?;
+        let schedulers = schedulers(&plan, launch, &memory, &model, &executors)?;
 
         Ok(Self {
             control,
@@ -1768,12 +1774,21 @@ impl MainProcess {
             };
             self.send_event(proto::request::wire::from_engine::Kind::Event(event));
         }
+        // The schedulers go first: their `Batches` holds a clone of every executor, and a device
+        // thread cannot be joined while a scheduler could still submit to it.
+        self.schedulers.clear();
         for executor in std::mem::take(&mut self.executors) {
+            let Some(executor) = Arc::into_inner(executor) else {
+                tracing::warn!(
+                    "a device executor is still held after its schedulers ended; its thread ends \
+                     when the last holder drops it"
+                );
+                continue;
+            };
             if let Err(error) = executor.close() {
                 tracing::warn!(%error, "closing a device executor failed");
             }
         }
-        self.schedulers.clear();
         for error in self.blocking.close() {
             tracing::warn!(%error, "closing a blocking lane failed");
         }
@@ -2251,53 +2266,9 @@ fn descriptor_keys(generation: &Generation, operator: &'static str) -> Vec<Strin
         .collect()
 }
 
-/// The scheduling policy's source: sched's `PolicySource`, filled from this
-/// node's Program Server client (§7.3 step 2, §4.4).
-///
-/// A policy is a program like any other, and its module reaches the main process
-/// only from the Program Server: the daemon names the program's revision, never
-/// its bytes. A scheduling policy has no per-deployment descriptor, so the
-/// descriptor key is `"default"`.
-pub(crate) struct ProgramPolicy {
-    programs: Client,
-    targets: Vec<Target>,
-}
-
-impl ProgramPolicy {
-    /// One module per target, in `targets` order: the policy a node's schedulers
-    /// instantiate as their candidate.
-    pub(crate) fn load(&mut self, program: &Program) -> Result<Vec<Module>> {
-        let mut modules = Vec::with_capacity(self.targets.len());
-        for target in &self.targets {
-            modules.push(self.programs.resolve(
-                "scheduling",
-                program,
-                target,
-                "default",
-                &mut |progress| {
-                    tracing::debug!(
-                        state = ?progress.state,
-                        "resolving the scheduling policy"
-                    );
-                },
-            )?);
-        }
-        Ok(modules)
-    }
-}
-
 /// The oldest of the executors' jobs.
 fn oldest(running: &[Running]) -> Option<Running> {
     running.iter().min_by_key(|job| job.since).copied()
-}
-
-/// Whether a submission completed successfully.
-fn completed<T>(outcome: Outcome<T>) -> Result<()> {
-    match outcome {
-        Outcome::Success(_) => Ok(()),
-        Outcome::Failed(error) => Err(anyhow::anyhow!("{error}")),
-        Outcome::Cancelled => bail!("the command was cancelled"),
-    }
 }
 
 /// Waits on one device command, and no longer than §2.4's stall bound.
@@ -2334,8 +2305,11 @@ fn device_command(
 /// it, and the scheduler reads the result - nothing crosses threads except the batch and its
 /// result.
 fn schedulers(
+    plan: &EpochPlan,
     launch: &Launch,
-    executors: &[Executor],
+    memory: &Memory,
+    model: &qwen3_moe::Qwen3Moe,
+    executors: &[Arc<Executor>],
 ) -> Result<Vec<engine::SchedulerHandle>> {
     if !launch.scheduler_node {
         return Ok(Vec::new());
@@ -2343,15 +2317,18 @@ fn schedulers(
     if executors.is_empty() {
         bail!("the scheduler node holds no device to serve a batch on");
     }
-    // The scheduler's own constructors are the one seam this file cannot supply: a scheduler is a
-    // thread over a mechanism whose state, limits and policy slot belong to `engine`, and building
-    // one here would duplicate the arithmetic that lays a rank's groups out.
-    let _ = executors;
-    bail!(
-        "this node is the scheduler node, and the scheduler constructors \
-         (`SchedulerHandle::over_batches`, `EngineConfig::of`) are not published in this build: \
-         the process would accept requests and dispatch none"
-    )
+    // One scheduler per scheduler thread: the configuration is this rank's, derived from what the
+    // launch states, the build config fixes and the model's own geometry, and it refuses by name
+    // when a fact it needs is one the launch file does not carry.
+    let facts = plan.rank_facts(memory, model)?;
+    let config = engine::EngineConfig::of(&facts)?;
+    // The scheduler submits through the same devices this process drives, so a batch and a
+    // switchover reach one executor thread per device and never two.
+    let batches: Arc<dyn executor::batch::Batches> = Arc::new(
+        executor::batch::Executors::shared(executors.iter().map(Arc::clone).collect())?,
+    );
+    let handle = engine::SchedulerHandle::over_batches(config, batches)?;
+    Ok(vec![handle])
 }
 
 /// The daemon states that this build may serve the epoch, this node's host identity, and, later,
@@ -2394,101 +2371,4 @@ fn handshake(control: &mut Control, launch: &Launch) -> Result<Epoch> {
 }
 
 
-/// The captured bucket set the epoch's runners are bound to (§4.5), and the same sizes as the
-/// capacity plan needs them.
-///
-/// A bucket set is fixed when the executor is bound, so a batch whose shape no bucket holds is a
-/// configuration error found at startup and never a scheduling surprise at the first odd-sized
-/// batch. The set comes from the build config's graph sizes, or from the deployment's catalog when
-/// they are unset, and every size is clamped to what the batch plan actually admits: a bucket larger
-/// than the batch bound would be captured and never used.
-struct GraphPlan {
-    /// What each runner captures, ascending.
-    buckets: executor::plan::Buckets,
-    /// Decode row counts, as the capacity plan sizes the decode graph pools.
-    decode: Vec<usize>,
-    /// Prefill token counts, as the capacity plan sizes the prefill graph pools.
-    prefill: Vec<usize>,
-    /// Media flow shapes `(tokens, latent)`.
-    flow: Vec<(usize, usize)>,
-}
-
-impl GraphPlan {
-    /// The plan for a deployment whose batch plan admits `rows` rows and `tokens` tokens.
-    ///
-    /// The sizes are the deployment's, or the executor's catalog where it names none, and every one
-    /// above the bound is dropped: a bucket is captured for each size, so a size no batch can fill
-    /// would cost a graph and its pool forever. Nothing fits is refused here, at startup. `sampled`
-    /// also captures the sampling variants, which a deployment that samples needs and one that
-    /// serves logits only does not pay for.
-    fn of(
-        graphs: &daemon::options::CudaGraphOptions,
-        rows: usize,
-        tokens: usize,
-        sampled: bool,
-    ) -> Result<Self> {
-        if graphs.policy == proto::request::GraphPolicy::Off {
-            return Ok(Self {
-                buckets: executor::plan::Buckets::default(),
-                decode: Vec::new(),
-                prefill: Vec::new(),
-                flow: Vec::new(),
-            });
-        }
-        let (rows, tokens) = (
-            u32::try_from(rows).context("a batch wider than u32::MAX rows")?,
-            u32::try_from(tokens).context("a batch longer than u32::MAX tokens")?,
-        );
-        let decode = graphs
-            .decode_batch_sizes
-            .as_ref()
-            .map(|sizes| sizes.iter().map(|size| size.get()).collect::<Vec<u32>>());
-        let prefill = graphs
-            .prefill_token_sizes
-            .as_ref()
-            .map(|sizes| sizes.iter().map(|size| size.get()).collect::<Vec<u32>>());
-        let buckets = executor::plan::Buckets::for_batch(
-            decode.as_deref(),
-            prefill.as_deref(),
-            rows,
-            tokens,
-            sampled,
-        )?;
-        // The capacity plan sizes the pools from the sizes the buckets were captured at, so the two
-        // cannot disagree about what the epoch captures.
-        let decode: Vec<usize> = decode
-            .unwrap_or_else(executor::plan::decode_catalog)
-            .into_iter()
-            .filter(|size| *size != 0 && *size <= rows)
-            .map(|size| size as usize)
-            .collect();
-        let prefill: Vec<usize> = prefill
-            .unwrap_or_else(executor::plan::prefill_catalog)
-            .into_iter()
-            .filter(|size| *size != 0 && *size <= tokens)
-            .map(|size| size as usize)
-            .collect();
-        let flow = graphs
-            .flow_shapes
-            .as_ref()
-            .map(|shapes| {
-                shapes
-                    .iter()
-                    .map(|shape| (shape.0[0] as usize, shape.0[1] as usize))
-                    .collect()
-            })
-            .unwrap_or_else(|| {
-                executor::plan::FLOW_CATALOG
-                    .into_iter()
-                    .map(|(height, width)| (height as usize, width as usize))
-                    .collect()
-            });
-        Ok(Self {
-            buckets,
-            decode,
-            prefill,
-            flow,
-        })
-    }
-}
 
