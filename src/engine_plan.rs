@@ -527,11 +527,16 @@ impl EpochPlan {
             // `nn::capability::Encoder` for the encode of a prompt's conditions,
             // `nn::capability::Denoiser` for one denoising step of a latent layout and
             // `nn::capability::Decoder` for one clip decoded from latents - plus the partition the
-            // checkpoint's own layout declares and three figures only the model can state: the
-            // resident cache's page size, the maximum KV length, and the state group's snapshot,
-            // which the scratch pool reserves beside the shadow region. Until they exist nothing
-            // can bind a `MiniMaxH3` model, and the update and serving paths must not pretend
-            // otherwise.
+            // checkpoint's own layout declares.
+            //
+            // This class keeps no paged key/value cache: the package holds no cache view and no
+            // page table, and the one cache in it is the denoiser's AdaLN modulation table, which
+            // is model memory the weight loader allocates (4.1's retained weights), not a pool a
+            // batch fills. So a media deployment's resident pool is zero - a pool figure of zero is
+            // not reserved, which is the honest answer and not a special case - and the only
+            // figure a binding still states is the state group's snapshot, when the denoiser
+            // allocates one, which the cache plan answers. Until the runners exist nothing can bind
+            // a `MiniMaxH3` model, and the update and serving paths must not pretend otherwise.
             "MiniMaxH3ModularPipeline" => bail!(
                 "{} declares model class {class}: the deployment selects MiniMaxH3ModularPipeline \
                  and its runners (encoder, denoiser, decoder) are not built into this process, so \
