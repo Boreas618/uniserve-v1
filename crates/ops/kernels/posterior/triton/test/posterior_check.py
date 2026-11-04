@@ -62,28 +62,55 @@ def bits(value):
     return struct.pack(">f", float(value)).hex()
 
 
-def run(kernel, positions, channels):
-    """Launch the kernel on the fixture, with the moments as one wide tensor cut in two."""
+def run(kernel, positions, channels, channels_last):
+    """Launch the kernel on the fixture in one of the two physical layouts.
+
+    ``channels_last`` describes the caller, not the kernel: the fixture's four elements are addressed
+    through (row stride, channel stride) pairs, and the kernel takes whichever pair it is given. A
+    channel-major caller -- the VAE's own rasters -- passes ``(1, positions)``; a channels-last one
+    passes ``(channels, 1)``. Both launches must produce the same bits.
+    """
     mean = torch.tensor(MEAN, dtype=torch.float32)
     log_variance = torch.tensor(LOG_VARIANCE, dtype=torch.float32)
     noise = torch.tensor(NOISE, dtype=torch.float32)
-    # The encoder's own layout: `[positions, 2 * channels]`, split on the channel axis. The two halves
-    # are views with a row stride of two channels, which is what the operator is built for.
-    moments = torch.cat([mean, log_variance], dim=1)
-    mean_half, variance_half = moments.chunk(2, dim=1)
-    out = torch.zeros_like(noise)
+    if channels_last:
+        # One row per position, the channel innermost -- the moments joined on that axis, so the two
+        # halves are views with a row stride of twice the channels.
+        moments = torch.cat([mean, log_variance], dim=1)
+        mean_half, variance_half = moments.chunk(2, dim=1)
+        layout = [
+            (mean_half, mean_half.stride(0), mean_half.stride(1)),
+            (variance_half, variance_half.stride(0), variance_half.stride(1)),
+            (noise, noise.stride(0), noise.stride(1)),
+        ]
+        out = torch.zeros_like(noise)
+    else:
+        # One column per position, the position innermost -- the encoder's NCTHW raster, with the
+        # moments as one 48-channel buffer whose two halves differ by an offset of 24 positions.
+        moments = torch.cat([mean, log_variance], dim=0)
+        mean_half, variance_half = moments.chunk(2, dim=0)
+        layout = [
+            (mean_half, mean_half.stride(0), mean_half.stride(1)),
+            (variance_half, variance_half.stride(0), variance_half.stride(1)),
+            (noise.t().contiguous().t(), 1, positions),
+        ]
+        out = torch.zeros_like(noise)
     total = positions * channels
     block = 1024
     kernel[((total + block - 1) // block,)](
-        mean_half,
-        variance_half,
-        noise,
+        layout[0][0],
+        layout[1][0],
+        layout[2][0],
         out,
         channels,
-        mean_half.stride(0),
-        variance_half.stride(0),
-        noise.stride(0),
+        layout[0][1],
+        layout[0][2],
+        layout[1][1],
+        layout[1][2],
+        layout[2][1],
+        layout[2][2],
         out.stride(0),
+        out.stride(1),
         total,
         0,
         BLOCK=block,
@@ -98,42 +125,41 @@ def main():
     arguments = parser.parse_args()
     kernel = load_kernel(arguments.package)
     positions, channels = len(MEAN), len(MEAN[0])
-    mean, log_variance, noise, out = run(kernel, positions, channels)
-
     failures = 0
-    expected = reference(mean, log_variance, noise)
-    for index in range(positions * channels):
-        row, column = divmod(index, channels)
-        got = out[row, column].item()
-        wanted = expected[row, column].item()
-        if bits(got) != bits(wanted):
-            failures += 1
-            print(
-                f"FAIL chain element {index}: {got!r} ({bits(got)}) but the reference gives "
-                f"{wanted!r} ({bits(wanted)})"
-            )
-    if not failures:
-        print(f"ok   chain: {positions * channels} elements, bit for bit")
-
-    # The affine a conditioner applies, in the reference's own order, and h3's recorded bits.
     latents_mean = torch.tensor(LATENTS_MEAN, dtype=torch.float32)
     latents_std = torch.tensor(LATENTS_STD, dtype=torch.float32)
-    normalised = (out - latents_mean) / latents_std
-    for index, recorded in enumerate(GROUND_TRUTH):
-        row, column = divmod(index, channels)
-        got = bits(normalised[row, column].item())
-        if got != recorded:
-            failures += 1
-            print(
-                f"FAIL fixture element {index}: the normalised sample is {got}, h3 recorded "
-                f"{recorded}"
-            )
-    if len(GROUND_TRUTH) == positions * channels and all(
-        bits((normalised[row, column]).item()) == recorded
-        for index, recorded in enumerate(GROUND_TRUTH)
-        for row, column in [divmod(index, channels)]
-    ):
-        print(f"ok   fixture: {len(GROUND_TRUTH)} elements match h3's recorded bits")
+    for name, channels_last in [("channels-last", True), ("channel-major", False)]:
+        mean, log_variance, noise, out = run(kernel, positions, channels, channels_last)
+        expected = reference(mean, log_variance, noise)
+        for index in range(positions * channels):
+            row, column = divmod(index, channels)
+            got = out[row, column].item()
+            wanted = expected[row, column].item()
+            if bits(got) != bits(wanted):
+                failures += 1
+                print(
+                    f"FAIL {name} chain element {index}: {got!r} ({bits(got)}) but the reference "
+                    f"gives {wanted!r} ({bits(wanted)})"
+                )
+        else:
+            print(f"ok   {name} chain: {positions * channels} elements, bit for bit")
+
+        # The affine a conditioner applies, in the reference's own order, and h3's recorded bits.
+        normalised = (out - latents_mean) / latents_std
+        matched = 0
+        for index, recorded in enumerate(GROUND_TRUTH):
+            row, column = divmod(index, channels)
+            got = bits(normalised[row, column].item())
+            if got != recorded:
+                failures += 1
+                print(
+                    f"FAIL {name} fixture element {index}: the normalised sample is {got}, h3 "
+                    f"recorded {recorded}"
+                )
+            else:
+                matched += 1
+        if matched == len(GROUND_TRUTH) == positions * channels:
+            print(f"ok   {name} fixture: {len(GROUND_TRUTH)} elements match h3's recorded bits")
     return 1 if failures else 0
 
 

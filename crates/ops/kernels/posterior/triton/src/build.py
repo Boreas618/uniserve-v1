@@ -4,9 +4,9 @@
 argument signature in the order the operator launches them, the compile-time values the descriptor
 dimensions give, and the compilation options.
 
-The block is compiled in as a constexpr. Nothing about the geometry is: the channel count, the four
-row strides and the element count are launch values, so one module serves every latent shape a
-request can have. The element type is always f32 and is not in the key: the reference's chain is f32
+The block is compiled in as a constexpr. Nothing about the geometry is: the channel count, the eight
+strides and the element count are launch values, so one module serves every latent shape and both
+physical layouts a request can have. The element type is always f32 and is not in the key: the reference's chain is f32
 throughout and the FP16 round trip is inside the kernel.
 """
 
@@ -35,9 +35,13 @@ def spec(fields, parameters, target):
             "out_ptr": POINTER,
             "channels": "u32",
             "mean_row": "u32",
+            "mean_channel": "u32",
             "log_variance_row": "u32",
+            "log_variance_channel": "u32",
             "noise_row": "u32",
+            "noise_channel": "u32",
             "out_row": "u32",
+            "out_channel": "u32",
             "total": "u64",
             "pdl": "i32",
             "BLOCK": "constexpr",
