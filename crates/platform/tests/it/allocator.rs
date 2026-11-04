@@ -375,8 +375,9 @@ fn a_restore_a_shrunk_budget_refuses_parks_every_pool_again() {
 /// block is given out again at its address.
 ///
 /// The bookings are part of the behaviour: mapping a block books the pool's
-/// total before the storage exists, and neither a suspend/restore pair nor the
-/// reuse of a freed block books anything new. (That a refused booking leaves
+/// total before the storage exists, a suspension books the pool down to
+/// nothing and the restore books it back, and giving out a freed block books
+/// nothing at all because it maps nothing. (That a refused booking leaves
 /// nothing mapped is
 /// [`an_allocation_over_the_device_budget_fails_before_it_maps_anything`].)
 #[test]
@@ -423,12 +424,18 @@ fn a_pool_keeps_addresses_and_contents_across_a_suspension() {
         allocator.allocate(PoolKind::Graph, 1 << 20).is_err(),
         "a suspended allocator gives out nothing"
     );
+    assert_eq!(
+        budget.booked(PoolKind::Graph),
+        Some(0),
+        "a suspended pool maps nothing, so the budget must stop counting it: an over-count \
+         would refuse an allocation that fits"
+    );
     allocator.restore().unwrap();
     assert_eq!(allocator.mapped_bytes(PoolKind::Graph), mapped);
     assert_eq!(
-        budget.bookings(),
-        bookings,
-        "a suspend/restore pair books nothing new: the storage comes back over the booking"
+        budget.booked(PoolKind::Graph),
+        Some(mapped as u64),
+        "the storage counts again once the restore has mapped it"
     );
 
     // SAFETY: the ranges lie inside the restored blocks, at their addresses.
