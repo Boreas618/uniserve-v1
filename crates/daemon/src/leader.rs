@@ -1934,6 +1934,13 @@ impl Replica {
     /// Fails when the process cannot be started or does not report that it
     /// stands by. The caller decides whether to retry.
     pub(crate) async fn keep_standby(self: &Arc<Self>) -> anyhow::Result<()> {
+        // `worker_config.standby` decides whether a standby exists at all
+        // (§2.5): each standby rank holds a CUDA context, graph pools and
+        // workspaces of its own, and a deployment that has not reserved them
+        // cannot hold a second engine of the same scope.
+        if !locked(&self.config).worker_config.standby {
+            return Ok(());
+        }
         let Some(control) = self.control.get().cloned() else {
             return Ok(());
         };
