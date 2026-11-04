@@ -356,6 +356,7 @@ fn main() {
         "filter_candidates".to_owned(),
         key(&ops::sampler::FilterDescriptor {
             width: CANDIDATE_WIDTH,
+            tile: CANDIDATE_TILE,
             ids: DType::I32,
             pdl: PDL,
         }),
