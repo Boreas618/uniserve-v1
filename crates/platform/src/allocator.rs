@@ -443,11 +443,18 @@ impl Allocator {
     pub fn restore(&mut self) -> Result<()> {
         let mut restored = [false; POOLS];
         for index in 0..POOLS {
+            // Only a pool that was parked can be a rollback candidate: a pool
+            // that was live all along must not be parked by another pool's
+            // failure.
             let outcome = match self.pools[index].as_mut() {
-                Some(pool) => pool.restore(),
+                Some(pool) => {
+                    let parked = pool.is_suspended();
+                    (parked, pool.restore())
+                }
                 None => continue,
             };
-            if let Err(error) = outcome {
+            let (was_parked, result) = outcome;
+            if let Err(error) = result {
                 let kind = PoolKind::from_index(index).unwrap_or(PoolKind::Graph);
                 let mut rollback = Ok(());
                 for (other, was_restored) in restored.iter().enumerate() {
@@ -474,7 +481,7 @@ impl Allocator {
                     )),
                 });
             }
-            restored[index] = true;
+            restored[index] = was_parked;
         }
         Ok(())
     }
