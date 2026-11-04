@@ -1009,7 +1009,8 @@ fn canvas_of_raster(width: u32, height: u32) -> Option<Canvas> {
 ///
 /// Both are the runner's: the encoders produce the rows and the request's Philox stream produces the
 /// draws, so the model reads views it allocated nothing for and writes only the prefix source it was
-/// given. A condition with pixels contributes one **normalized patch-row** view - `[rows, channels *
+/// given. **Every view here is FP32**, rows and draws alike: the reference widens both and anchors
+/// and projects in FP32, rounding once into the source (`denoiser.py:605-620`). A condition with pixels contributes one **normalized patch-row** view - `[rows, channels *
 /// 4]`, what the video encoder emits, not `[rows, channels]` - and, if it carries a soundtrack, one
 /// channel-major audio view after it (`[2 * frames, audio_channels]`); an audio-only reference
 /// contributes its audio view alone. The reference's tuple has the same shape and the same order
@@ -1017,8 +1018,13 @@ fn canvas_of_raster(width: u32, height: u32) -> Option<Canvas> {
 pub struct ConditionLatents<'a> {
     /// Each condition's encoded rows, in request order and in the order above.
     pub latents: &'a [TensorView],
-    /// One draw per visual condition, in packed order: `[channels, frames, height, width]` in the
-    /// prefix source's dtype, which is the dtype the anchoring and the projection work in.
+    /// One draw per visual condition, in packed order: `[channels, frames, height, width]`, **FP32**.
+    ///
+    /// The conditioned path works in FP32 from the draw to the projection, which is the reference's
+    /// precision (`uniserve/models/minimax_h3/denoiser.py:605-620`: the rows and the draw are
+    /// widened, the anchoring is FP32, and the projection's result is rounded once into the prefix
+    /// source's dtype). The model refuses a draw, a patch-row view or an audio view of another
+    /// dtype by name rather than rounding it silently.
     pub noise: &'a [TensorView],
 }
 
@@ -1909,6 +1915,13 @@ impl Denoiser {
                     ))
                 })?;
                 let count = u64::from(segment.audio_rows());
+                if audio.dtype != DType::F32 {
+                    return Err(Error::config(format!(
+                        "condition {}'s audio rows are {}, and the reference projects them in \
+                         FP32 (`denoiser.py:613-618`)",
+                        segment.condition, audio.dtype
+                    )));
+                }
                 if audio.shape.dims() != [count, audio_channels] {
                     return Err(Error::config(format!(
                         "condition {}'s audio rows are [{count}, {audio_channels}], got {:?}",
@@ -1931,6 +1944,13 @@ impl Denoiser {
                 ))
             })?;
             let count = u64::from(visual.rows());
+            if clean.dtype != DType::F32 {
+                return Err(Error::config(format!(
+                    "condition {}'s patch rows are {}, and the encoder's normalised rows are \
+                     FP32 (`denoiser.py:605`)",
+                    segment.condition, clean.dtype
+                )));
+            }
             if clean.shape.dims() != [count, width] {
                 return Err(Error::config(format!(
                     "condition {}'s visual patch rows are [{count}, {width}], got {:?}",
@@ -1957,9 +1977,18 @@ impl Denoiser {
                     draw.shape.dims()
                 )));
             }
-            // The draw becomes packed rows, then the anchoring mixes the condition's latents in
-            // at the conditioning level: `target = (1 - t) target + t clean`.
-            let anchor = f.arena().tensor(out.dtype, Shape::new(&[count, width]))?;
+            if draw.dtype != DType::F32 {
+                return Err(Error::config(format!(
+                    "condition {}'s draw is {}, and the reference anchors in FP32 \
+                     (`denoiser.py:609-615`)",
+                    segment.condition, draw.dtype
+                )));
+            }
+            // The draw becomes packed rows, then the anchoring mixes the condition's latents in at
+            // the conditioning level: `target = (1 - t) target + t clean`. The canvas is FP32
+            // because the reference's is: both operands are FP32 there, and the projection reads
+            // the anchored rows in FP32 and rounds once, into `out` (`denoiser.py:609-620`).
+            let anchor = f.arena().tensor(DType::F32, Shape::new(&[count, width]))?;
             nn::layers::Patch::new(video_channels, height, columns)?
                 .forward(f, *draw, anchor, frames)
                 .map_err(Error::from)?;
