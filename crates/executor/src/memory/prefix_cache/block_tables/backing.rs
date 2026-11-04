@@ -182,10 +182,15 @@ impl BlockTableStorage {
     /// dimensions a caller must index them by.
     ///
     /// A batch reads row `slot` of table `table` at
-    /// `(table * slots + slot) * width` words; a row the scheduler never
-    /// filled is zero words, which is page 0 of a group whose pages start at
-    /// one. The view borrows the tables' storage: a caller that reads rows
-    /// after a batch must keep the slot until it does.
+    /// `(table * slots + slot) * width` words, in the batch's row order.
+    ///
+    /// A row of the batch's `[rows, width]` view with fewer pages than `width`
+    /// is `-1`-filled, and that is the invariant the attention kernel relies
+    /// on: `seq_lens` bounds every row's key range, so an entry past the row's
+    /// length is never dereferenced.
+    ///
+    /// The view borrows the tables' storage: a caller that reads rows after a
+    /// batch must keep the slot until it does.
     pub fn unit_tables(&self) -> (StorageView, u32, u32) {
         (self.unit_tables.clone(), self.rows, self.width)
     }
