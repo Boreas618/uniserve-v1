@@ -3,7 +3,7 @@
 //! Run it with
 //!
 //! ```text
-//! cargo run -p ops --example minimax_h3_keys
+//! cargo run -p minimax-h3 --example minimax_h3_keys
 //! ```
 //!
 //! The output is `notes/programs/minimax-h3-keys.txt`: what a kernel program must package for
@@ -15,7 +15,7 @@
 //! check is a list nobody has asked whether it is complete:
 //!
 //! ```text
-//! cargo run -q -p ops --example minimax_h3_keys > notes/programs/minimax-h3-keys.txt
+//! cargo run -q -p minimax-h3 --example minimax_h3_keys > notes/programs/minimax-h3-keys.txt
 //! .venv/bin/python crates/models/minimax-h3/tools/check_encoder_manifests.py \
 //!     --against notes/programs/minimax-h3-keys.txt
 //! ```
@@ -51,10 +51,10 @@
 //! (`diffusers/models/autoencoders/autoencoder_kl_minimax_h3_audio.py:457-470`). The encoder doubles
 //! from `encoder_dim` at each of its five rates, so its `Snake` runs at 128 through 2048.
 //!
-//! The tile and block constants belong to the layer crate, which `ops` sits below and cannot call;
-//! they are mirrored here the way the Qwen3 fixture mirrors them
-//! (`crates/nn/src/layers/mod.rs`, module `launch`; `ops::residual::RESIDUAL_BLOCK`,
-//! `ops::noise::NOISE_BLOCK`). If the layer crate and this file disagree, the layer crate is right.
+//! The tile and block constants belong to the layer crate, and this program reads them: it lives in
+//! the model crate so that `nn` is a dependency, and every tile below is `nn::layers::tiles::*` or
+//! an `ops::*_BLOCK` the package owns. A constant restated here would make the fixture agree with
+//! this file and leave the layers free to disagree with both.
 //!
 //! ## What is deliberately not here yet
 //!
@@ -73,18 +73,17 @@
 //!
 //! They are added to this generator the hour the model names those numbers; nothing else waits.
 
+use nn::layers::tiles::{
+    ELEMENTWISE_BLOCK, EMBEDDING_TOKENS, LOGITS_BLOCK, PDL, POSITION_BLOCK, QK_NORM_TOKENS,
+    ROTARY_BLOCK, ROTATE_BLOCK, ROWS_BLOCK, UNPATCHIFY_BLOCK, row_tile,
+};
 use ops::DType;
 use ops::modulation::ModulatedRmsNormDescriptor;
 use ops::noise::NoiseDescriptor;
 use ops::residual::{ScaledResidualDescriptor, WeightedRmsNormDescriptor};
 
-/// Whether the layers' descriptors are the programmatic-dependent-launch variants.
-const PDL: bool = false;
-
-/// Elements one elementwise program handles: `snake`, `snake_beta`, `phased_residual`, `philox_noise`.
-const ELEMENTWISE_BLOCK: u32 = 1024;
-
-/// Samples one `audio_resample` program produces (`crates/nn/src/layers/`'s resampler tile).
+/// Samples one `audio_resample` program produces: the package's `block` dimension, which the
+/// reference's resampler takes as its hop (`crates/ops/kernels/audio_resample/*/package.toml`).
 const RESAMPLE_BLOCK: u32 = 256;
 
 /// The audio VAE decoder's initial width (`decoder_dim`).
@@ -118,21 +117,12 @@ const ROPE_FREQ_DIM: u32 = 16;
 const ROPE_AXES: u32 = 3;
 const ROTATED: u32 = ROPE_FREQ_DIM * ROPE_AXES * 2;
 
-/// Elements one `rotary_factors` program handles (`launch::ROTARY_BLOCK`).
-const ROTARY_BLOCK: u32 = 256;
-
-/// Elements one `rows` program places: the layer's own `BLOCK` in `crates/nn/src/layers/rows.rs`.
-const ROWS_BLOCK: u32 = 1024;
-
 /// The video VAE decoder's token width: `decoder_num_attention_heads · decoder_attention_head_dim`.
 const VAE_WIDTH: u32 = 32 * 64;
 
 /// The video VAE decoder feed-forward's packed width (`decoders.md`: the `mlp` buffer is
 /// `[rows, 8192]`).
 const VAE_MLP: u32 = 8192;
-
-/// Tokens one `qk_norm_rope` program handles (`launch::QK_NORM_TOKENS`).
-const QK_NORM_TOKENS: u32 = 1;
 
 /// The attention projections' inner width, `num_attention_heads · attention_head_dim = 7168`: the
 /// contraction length of the output projection (`attention.py`'s `RowParallelLinear(inner, hidden)`).
@@ -172,12 +162,6 @@ const MODULATION_CHUNKS: u32 = 6;
 
 /// The transformer's normalizer epsilon (`norm_eps`, `qk_norm_eps`).
 const NORM_EPSILON: f32 = 1e-5;
-
-/// The row width a row-wise kernel loads at a time: the width rounded up to a power of two
-/// (`crates/nn/src/layers/mod.rs::row_tile`).
-fn row_tile(columns: u32) -> u32 {
-    columns.max(1).next_power_of_two()
-}
 
 /// The activation element types a deployment may state. `dtype = "auto"` means the checkpoint's own
 /// representation (BF16 for the DiT, the text stack, the conditioner and the sampler), and a
@@ -454,7 +438,7 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
             ops::logits::GatherDescriptor {
                 dtype,
                 columns,
-                block: 1024,
+                block: LOGITS_BLOCK,
                 pdl: PDL,
             }
             .to_string(),
@@ -576,6 +560,8 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
         push(
             "sparse_attention",
             ops::attention::sparse::SparseDescriptor {
+                // The checkpoint's `vsa_tile_size`, read by the model's sparse launch; the layer
+                // takes the tile as a construction argument, so no crate owns it as a constant.
                 block: 64,
                 dtype: deployment,
                 output: deployment,
@@ -613,7 +599,7 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
                 ops::unpatchify::Descriptor {
                     dtype: vae,
                     affine,
-                    block: 1024,
+                    block: UNPATCHIFY_BLOCK,
                     pdl: PDL,
                 }
                 .to_string(),
@@ -627,7 +613,7 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
         ops::unpatchify::Descriptor {
             dtype: DType::F32,
             affine: false,
-            block: 1024,
+            block: UNPATCHIFY_BLOCK,
             pdl: PDL,
         }
         .to_string(),
@@ -701,6 +687,9 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
                 channels,
                 kernel: ACTIVATION_KERNEL,
                 ratio: ACTIVATION_RATIO,
+                // The decoder's widest stage, which is the model's own number
+                // (`AudioDecoder`'s channel schedule), not a layer constant: `nn`'s
+                // `AudioActivation` takes the block as a construction argument.
                 block: 1024,
                 pdl: PDL,
             }
@@ -713,7 +702,7 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
         ops::activation::SiluDescriptor {
             dtype: deployment,
             columns: HIDDEN,
-            block: 1024,
+            block: ELEMENTWISE_BLOCK,
             pdl: PDL,
         }
         .to_string(),
@@ -725,7 +714,7 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
             target: deployment,
             source: DType::F32,
             columns: HIDDEN,
-            block: 1024,
+            block: ops::residual::RESIDUAL_BLOCK,
         }
         .to_string(),
     );
@@ -747,7 +736,7 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
                 target: deployment,
                 source: DType::F32,
                 columns: TIME_DIM,
-                block: 1024,
+                block: ops::residual::RESIDUAL_BLOCK,
             }
             .to_string(),
         );
@@ -759,7 +748,7 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
                 target: DType::F32,
                 source: deployment,
                 columns,
-                block: 1024,
+                block: ops::residual::RESIDUAL_BLOCK,
             }
             .to_string(),
         );
@@ -773,7 +762,7 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
                 target,
                 source,
                 columns: 96,
-                block: 1024,
+                block: ops::residual::RESIDUAL_BLOCK,
             }
             .to_string(),
         );
@@ -921,7 +910,7 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
             heads: 16,
             rotation: ops::rope::Rotation::Half,
             rows: 8,
-            block: 128,
+            block: ROTATE_BLOCK,
             pdl: PDL,
             rotated: 72,
         }
@@ -936,7 +925,7 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
             dtype: deployment,
             channels: 1152,
             in_side: 48,
-            block: 1024,
+            block: POSITION_BLOCK,
             pdl: PDL,
         }
         .to_string(),
@@ -1129,7 +1118,7 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
                 epsilon: ops::Float::from(1.0e-6_f32),
                 rotated: 128,
                 rows: 1,
-                block: 128,
+                block: ROTATE_BLOCK,
                 affine: true,
                 pdl: PDL,
             }
@@ -1148,7 +1137,7 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
         ops::activation::ActAndMulDescriptor {
             dtype: deployment,
             width: 25600,
-            block: 1024,
+            block: ELEMENTWISE_BLOCK,
             activation: ops::activation::Activation::Silu,
             gate_stride: 25600,
             value_stride: 25600,
@@ -1166,7 +1155,7 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
         ops::activation::ActAndMulDescriptor {
             dtype: deployment,
             width: 14336,
-            block: 1024,
+            block: ELEMENTWISE_BLOCK,
             activation: ops::activation::Activation::Silu,
             gate_stride: 2 * 14336,
             value_stride: 2 * 14336,
@@ -1186,7 +1175,7 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
         ops::activation::ValueFirstSwigluDescriptor {
             dtype: deployment,
             width: 14336,
-            block: 1024,
+            block: ELEMENTWISE_BLOCK,
             input_stride: 2 * 14336,
             bias: false,
             absmax: false,
@@ -1199,7 +1188,7 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
             ops::activation::ValueFirstSwigluDescriptor {
                 dtype: vae,
                 width: VAE_MLP,
-                block: 1024,
+                block: ELEMENTWISE_BLOCK,
                 input_stride: 2 * u64::from(VAE_MLP),
                 bias: false,
                 absmax: false,
@@ -1218,7 +1207,7 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
             hidden: 5120,
             first: 0,
             rows: 151936,
-            block: 8,
+            block: EMBEDDING_TOKENS,
             pdl: PDL,
         }
         .to_string(),

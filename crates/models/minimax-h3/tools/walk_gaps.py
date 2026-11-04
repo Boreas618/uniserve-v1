@@ -2,7 +2,7 @@
 """What a forward binds and the store list does not hold - both directions.
 
 The store a caller builds comes from `notes/programs/minimax-h3-keys.txt`, which is generated from
-the code (`cargo run -p ops --example minimax_h3_keys`). Three checks read that file, and they answer
+the code (`cargo run -p minimax-h3 --example minimax_h3_keys`). Three checks read that file, and they answer
 three different questions:
 
 * `key_coverage` asks whether a **listed** key is buildable for a target;
