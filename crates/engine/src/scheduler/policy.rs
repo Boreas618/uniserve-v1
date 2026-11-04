@@ -521,6 +521,11 @@ pub struct PolicyUsage {
     /// only where the state names it, and the trial a precopy ran on the
     /// instance a switchover adopts. A policy that replaced another carries the
     /// replaced instance's counts forward, as `calls` and `fuel` do.
+    ///
+    /// The one difference from `calls`: a precopy whose candidate a later
+    /// precopy displaced is in `calls` and not here, since no instance of the
+    /// epoch's policy ever served under it. Its decision set is still the
+    /// mechanism's - it is a trial - but it is not a step the epoch took.
     pub decisions: scheduling::PolicyCost,
 }
 
