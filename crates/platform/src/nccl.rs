@@ -87,8 +87,12 @@ pub struct Communicator {
 }
 
 // SAFETY: a communicator may be used from any one thread at a time; NCCL
-// forbids concurrent calls on one communicator, which `&mut self` on every
-// operation enforces. It is therefore Send but not Sync.
+// forbids concurrent calls on one communicator. It is therefore Send and not
+// Sync: a `&Communicator` cannot cross to another thread, and the collectives
+// take `&self` because the ownership rules already keep two threads from
+// reaching one communicator at once — which is what lets design 4.3's
+// `Forward` hold `group: Option<&Communicator>` and issue collectives through
+// it.
 unsafe impl Send for Communicator {}
 
 impl Communicator {
@@ -149,8 +153,13 @@ impl Communicator {
     /// communicator's device and that `count` elements of `dtype` fit both
     /// ranges; the caller keeps the storage alive until the stream (or graph
     /// replay) completes.
+    ///
+    /// Takes `&self` so that a caller may hold the group as a shared reference
+    /// (design 4.3's `Forward`); the type is not `Sync`, so a shared reference
+    /// never reaches a second thread, which is the one-thread-at-a-time rule
+    /// NCCL requires of a communicator.
     pub fn all_reduce(
-        &mut self,
+        &self,
         stream: &Stream,
         send: DeviceRange,
         recv: DeviceRange,
@@ -162,6 +171,11 @@ impl Communicator {
         let needed = elements_bytes(count, dtype)?;
         require_room(send.bytes(), needed, "send")?;
         require_room(recv.bytes(), needed, "recv")?;
+        // NCCL launches on `stream`, which the driver accepts only with the
+        // stream's context current on the calling thread; entering it here is
+        // what lets any thread issue a collective.
+        let _guard = self.context.enter()?;
+
         let api = api()?;
         // SAFETY: the caller's ranges hold `count` elements of `dtype` and stay
         // valid until the stream completes, which the checks above establish.
@@ -185,7 +199,7 @@ impl Communicator {
     /// The checks are [`Self::all_reduce`]'s, with `size * count` elements
     /// required in `send` and `count` in `recv`.
     pub fn reduce_scatter(
-        &mut self,
+        &self,
         stream: &Stream,
         send: DeviceRange,
         recv: DeviceRange,
@@ -196,6 +210,11 @@ impl Communicator {
         self.ready(stream, "ncclReduceScatter")?;
         require_room(send.bytes(), ranks_bytes(count, dtype, self.size)?, "send")?;
         require_room(recv.bytes(), elements_bytes(count, dtype)?, "recv")?;
+        // NCCL launches on `stream`, which the driver accepts only with the
+        // stream's context current on the calling thread; entering it here is
+        // what lets any thread issue a collective.
+        let _guard = self.context.enter()?;
+
         let api = api()?;
         // SAFETY: as in `all_reduce`, with `size * count` elements in `send`.
         let status = unsafe {
@@ -217,7 +236,7 @@ impl Communicator {
     /// The checks are [`Self::all_reduce`]'s, with `count` elements required in
     /// `send` and `size * count` in `recv`.
     pub fn all_gather(
-        &mut self,
+        &self,
         stream: &Stream,
         send: DeviceRange,
         recv: DeviceRange,
@@ -227,6 +246,11 @@ impl Communicator {
         self.ready(stream, "ncclAllGather")?;
         require_room(send.bytes(), ranks_bytes(count, dtype, self.size)?, "send")?;
         require_room(recv.bytes(), ranks_bytes(count, dtype, self.size)?, "recv")?;
+        // NCCL launches on `stream`, which the driver accepts only with the
+        // stream's context current on the calling thread; entering it here is
+        // what lets any thread issue a collective.
+        let _guard = self.context.enter()?;
+
         let api = api()?;
         // SAFETY: as in `all_reduce`, with `size * count` elements in `recv`.
         let status = unsafe {
@@ -248,7 +272,7 @@ impl Communicator {
     /// The checks are [`Self::all_reduce`]'s, with `size * count` elements
     /// required in both ranges.
     pub fn all_to_all(
-        &mut self,
+        &self,
         stream: &Stream,
         send: DeviceRange,
         recv: DeviceRange,
@@ -259,6 +283,11 @@ impl Communicator {
         let needed = ranks_bytes(count, dtype, self.size)?;
         require_room(send.bytes(), needed, "send")?;
         require_room(recv.bytes(), needed, "recv")?;
+        // NCCL launches on `stream`, which the driver accepts only with the
+        // stream's context current on the calling thread; entering it here is
+        // what lets any thread issue a collective.
+        let _guard = self.context.enter()?;
+
         let api = api()?;
         let all_to_all = api.all_to_all.clone()?;
         // SAFETY: as in `all_reduce`, with `size * count` elements in both.
@@ -281,7 +310,7 @@ impl Communicator {
     /// communicator's ranks; `send` is read on `root` only but must hold
     /// `count` elements on every rank since the same call is posted there.
     pub fn broadcast(
-        &mut self,
+        &self,
         stream: &Stream,
         send: DeviceRange,
         recv: DeviceRange,
@@ -294,6 +323,11 @@ impl Communicator {
         let needed = elements_bytes(count, dtype)?;
         require_room(send.bytes(), needed, "send")?;
         require_room(recv.bytes(), needed, "recv")?;
+        // NCCL launches on `stream`, which the driver accepts only with the
+        // stream's context current on the calling thread; entering it here is
+        // what lets any thread issue a collective.
+        let _guard = self.context.enter()?;
+
         let api = api()?;
         // SAFETY: as in `all_reduce`, with `count` elements in both ranges.
         let status = unsafe {
@@ -316,7 +350,7 @@ impl Communicator {
     /// The checks are [`Self::all_reduce`]'s, and `peer` must be one of this
     /// communicator's ranks.
     pub fn send(
-        &mut self,
+        &self,
         stream: &Stream,
         data: DeviceRange,
         count: usize,
@@ -326,6 +360,11 @@ impl Communicator {
         self.ready(stream, "ncclSend")?;
         self.require_rank(peer, "peer")?;
         require_room(data.bytes(), elements_bytes(count, dtype)?, "data")?;
+        // NCCL launches on `stream`, which the driver accepts only with the
+        // stream's context current on the calling thread; entering it here is
+        // what lets any thread issue a collective.
+        let _guard = self.context.enter()?;
+
         let api = api()?;
         // SAFETY: as in `all_reduce`, with `count` elements in `data`.
         let status = unsafe {
@@ -346,7 +385,7 @@ impl Communicator {
     /// The checks are [`Self::all_reduce`]'s, and `peer` must be one of this
     /// communicator's ranks.
     pub fn recv(
-        &mut self,
+        &self,
         stream: &Stream,
         data: DeviceRange,
         count: usize,
@@ -356,6 +395,11 @@ impl Communicator {
         self.ready(stream, "ncclRecv")?;
         self.require_rank(peer, "peer")?;
         require_room(data.bytes(), elements_bytes(count, dtype)?, "data")?;
+        // NCCL launches on `stream`, which the driver accepts only with the
+        // stream's context current on the calling thread; entering it here is
+        // what lets any thread issue a collective.
+        let _guard = self.context.enter()?;
+
         let api = api()?;
         // SAFETY: as in `all_reduce`, with `count` elements in `data`.
         let status = unsafe {
