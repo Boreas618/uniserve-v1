@@ -149,7 +149,7 @@ impl Args {
             width: 1344,
             height: 768,
             text_tokens: 64,
-            arena_gib: 8,
+            arena_gib: 12,
             out: PathBuf::from("artifacts/h3-dit-layer0"),
         };
         let mut words = std::env::args().skip(1);
@@ -490,8 +490,12 @@ fn stage_block(args: &Args) -> Result<()> {
     };
 
     // 5. The arena: the stack's own temporaries are reserved inside the forward, so the region must
-    //    cover the rows it holds twice plus the attention's five buffers at the local head count.
-    let bytes = tokens * hidden * 2 * 16 + (256 << 20);
+    //    cover the rows it holds twice, the attention's five buffers at the whole head count and the
+    //    feed-forward's packed projection. `Denoiser::denoise_arena` is the authority on that sum and
+    //    needs a loaded denoiser to ask; this harness over-reserves by a wide factor instead of
+    //    keeping a second copy of the plan, and the forward's own reservation refuses by name if the
+    //    estimate is ever short.
+    let bytes = tokens * hidden * 2 * 24 + (256 << 20);
     let arena_bytes = bytes.max(args.arena_gib << 30);
     let allocator = weights.allocator();
     allocator.reserve(
