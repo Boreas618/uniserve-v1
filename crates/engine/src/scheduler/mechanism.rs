@@ -473,6 +473,18 @@ fn validate_work_entry(
             format!("{} is given no tokens to run", work.request.0),
         ));
     }
+    if by_this_plan {
+        // A request this plan admits has no resident view yet, so the work's
+        // own bounds cannot be checked against it: a queued view states no
+        // prompt length and no prefilled count, and a prefill chunk or a decode
+        // charge measured against those zeros would refuse every plan that
+        // admits a request and runs it in one step (§4.4). The live step
+        // applies the admission before it checks the rest, so that is where
+        // these bounds are decided — `validate_after_admission` on the state
+        // admission left — and the trial, which applies nothing, reads the
+        // same rule from the plan's own admission.
+        return Ok(());
+    }
     let Some(phase) = live.phases.get(&work.phase) else {
         return Err(invalid(
             Call::Dispatch,
