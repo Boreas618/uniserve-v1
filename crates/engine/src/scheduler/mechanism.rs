@@ -267,7 +267,7 @@ fn decodes(kind: PhaseKind) -> bool {
 /// waits for the next step, which is the mechanism's hard limit and not a
 /// policy failure.
 pub(crate) fn validate_plan(plan: &Plan, room: &Room, live: &Live<'_>) -> Result<(), PolicyError> {
-    validate_admission(plan, room, live)?;
+    validate_admission(plan, live)?;
     validate_after_admission(plan, room, live)
 }
 
@@ -301,24 +301,13 @@ pub(crate) fn validate_after_admission(
 /// Applying admission removes the named requests from the queue, so this is the
 /// one check that must run before it: a plan read against the state after its
 /// own admission would name requests the mechanism no longer queues.
-pub(crate) fn validate_admission(
-    plan: &Plan,
-    room: &Room,
-    live: &Live<'_>,
-) -> Result<(), PolicyError> {
-    // §4.4's hard limits include the free request slots the step states: the
-    // mechanism allocates slots itself, so a plan that admits more than the
-    // room holds is refused rather than partly applied.
-    if plan.admit.len() > room.slots {
-        return Err(invalid(
-            Call::Dispatch,
-            format!(
-                "the plan admits {} requests, the step has {} slots free",
-                plan.admit.len(),
-                room.slots
-            ),
-        ));
-    }
+pub(crate) fn validate_admission(plan: &Plan, live: &Live<'_>) -> Result<(), PolicyError> {
+    // §4.4 puts the slot limit in the mechanism's *stop*, not in a refusal:
+    // `admit_tokens`/`admit_media` admit in the plan's order until the first
+    // request that cannot be placed, and it and those after it stay queued. A
+    // plan that names more requests than there are slots free is exactly what
+    // `fcfs` states - it names every queued request - so refusing it here would
+    // stop every loaded world.
     let mut admitted = BTreeSet::new();
     for id in &plan.admit {
         if !live.queued(*id) {
@@ -1863,41 +1852,6 @@ mod tests {
         let refused = plan(vec![work]);
         let error = validate_plan(&refused, &room(), &live).expect_err("not resident");
         assert!(format!("{error}").contains("not resident"));
-    }
-
-    #[test]
-    fn a_plan_may_not_admit_more_than_the_steps_slots() {
-        // §4.4's hard limits include the free request slots the step states,
-        // and the mechanism allocates slots itself: a plan that admits past
-        // them is refused rather than partly applied. The step's slots are the
-        // fixture room's three.
-        let ids: Vec<RequestId> = (1..=4).map(RequestId).collect();
-        let live = live(
-            (1..=4)
-                .map(|id| request(id, RequestState::Queued))
-                .collect(),
-            ids.clone(),
-            &[],
-        );
-        let room = room();
-        assert_eq!(room.slots, 3, "the fixture room states three free slots");
-
-        let admitted = Plan {
-            admit: ids.clone(),
-            ..Plan::default()
-        };
-        let error =
-            validate_plan(&admitted, &room, &live).expect_err("four admissions, three slots");
-        assert!(
-            format!("{error}").contains("3 slots free"),
-            "the refusal names the step's slots: {error}"
-        );
-
-        let fits = Plan {
-            admit: ids[..3].to_vec(),
-            ..Plan::default()
-        };
-        validate_plan(&fits, &room, &live).expect("three admissions, three slots");
     }
 
     #[test]

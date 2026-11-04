@@ -656,7 +656,7 @@ impl Scheduler {
         // it, which is what lets one plan both admit and run a request (§4.4).
         // Applying it first would make its own names unqueued.
         let live = self.live();
-        if let Err(error) = mechanism::validate_admission(&plan, &room, &live) {
+        if let Err(error) = mechanism::validate_admission(&plan, &live) {
             return self.policy_failed(policy, error);
         }
         self.admit_plan(&plan);
