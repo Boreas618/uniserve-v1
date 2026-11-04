@@ -347,6 +347,65 @@ impl Projections {
         })
     }
 
+    /// Run the cache's projections over one embedding, `[groups, frequency_dim]` FP32.
+    ///
+    /// `layers_out` holds one view per transformer layer, `[groups, 18 * hidden]` each, and
+    /// `output_out` is `[groups, 2 * hidden]`: the tables a forward then gathers rows from. The
+    /// launch is captured with every other, so a table is computed once after loading and never
+    /// again - the times it is computed at are the schedule's, which do not change per request.
+    ///
+    /// The weights are the checkpoint's `[out, in]` matrices, so the geometry is `NxK`.
+    pub fn compute(
+        &self,
+        f: &Forward,
+        embedding: TensorView,
+        layers_out: &[TensorView],
+        output_out: TensorView,
+    ) -> Result<()> {
+        if layers_out.len() != self.layers.len() {
+            return Err(Error::checkpoint(format!(
+                "{} AdaLN layer views for {} layers",
+                layers_out.len(),
+                self.layers.len()
+            )));
+        }
+        let groups = embedding.shape.dim(0);
+        if embedding.shape.rank() != 2 || embedding.shape.last() != u64::from(self.frequency_dim) {
+            return Err(Error::config(format!(
+                "an AdaLN embedding of {:?} is not [groups, {}]",
+                embedding.shape.dims(),
+                self.frequency_dim
+            )));
+        }
+        let arena = f.arena();
+        let hidden = arena.tensor(
+            nn::DType::F32,
+            Shape::new(&[groups, u64::from(self.time_hidden_dim)]),
+        )?;
+        let activated = arena.tensor(
+            nn::DType::F32,
+            Shape::new(&[groups, u64::from(self.time_hidden_dim)]),
+        )?;
+        let time = arena.tensor(
+            nn::DType::F32,
+            Shape::new(&[groups, u64::from(self.time_dim)]),
+        )?;
+        let linear = |weights: &(Weight, Weight)| {
+            nn::layers::Linear::new(
+                weights.0.clone(),
+                Some(weights.1.clone()),
+                nn::layers::WeightOrder::NxK,
+            )
+        };
+        linear(&self.first)?.forward(f, embedding, hidden)?;
+        nn::layers::Silu.forward(f, hidden, activated)?;
+        linear(&self.second)?.forward(f, activated, time)?;
+        for (weights, out) in self.layers.iter().zip(layers_out) {
+            linear(weights)?.forward(f, time, *out)?;
+        }
+        Ok(linear(&self.output)?.forward(f, time, output_out)?)
+    }
+
     /// The sinusoidal embedding a step's network times need: `[groups, frequency_dim]` FP32.
     ///
     /// Half a pairwise spectrum over the timestep, `sin` on the even columns and `cos` on the odd
