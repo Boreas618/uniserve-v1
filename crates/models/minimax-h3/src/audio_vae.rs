@@ -448,6 +448,94 @@ pub fn sources(config: &AudioVaeConfig) -> Result<Vec<Source>> {
 /// The anti-aliased multi-periodicity blocks one decoder stage holds.
 pub const BLOCKS_PER_STAGE: usize = 3;
 
+/// One dilated branch of an anti-aliased multi-periodicity block: two convolutions with the same
+/// kernel, dilation and padding.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Branch {
+    /// The convolution's kernel.
+    pub kernel: u32,
+    /// Its dilation.
+    pub dilation: u32,
+    /// Its zero padding, `dilation · (kernel − 1) / 2`, which keeps the length.
+    pub padding: u32,
+}
+
+impl Branch {
+    /// The branch of `kernel` and `dilation`.
+    pub fn new(kernel: u32, dilation: u32) -> Result<Self> {
+        if kernel == 0 || dilation == 0 || !(kernel - 1).is_multiple_of(2) {
+            return Err(Error::config(format!(
+                "a branch of kernel {kernel} and dilation {dilation} has no whole padding"
+            )));
+        }
+        Ok(Self {
+            kernel,
+            dilation,
+            padding: dilation * (kernel - 1) / 2,
+        })
+    }
+}
+
+/// One anti-aliased multi-periodicity block.
+///
+/// A block runs its branches in parallel on the same input, sums them and divides by the branch
+/// count; each branch is an alias-free activation, a dilated convolution, a second activation and a
+/// one-by-one convolution back to the block's width.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Block {
+    /// The stage the block belongs to.
+    pub stage: usize,
+    /// The block's index within its stage.
+    pub index: usize,
+    /// Channels in and out: the stage's width.
+    pub channels: u32,
+    /// The branches, in the order the checkpoint names them.
+    pub branches: Vec<Branch>,
+}
+
+impl Block {
+    /// The divisor the summed branches are averaged by.
+    pub fn scale(&self) -> u32 {
+        self.branches.len() as u32
+    }
+}
+
+/// The decoder's blocks, in stage order: three per stage, one branch per residual kernel.
+pub fn blocks(config: &AudioVaeConfig) -> Result<Vec<Block>> {
+    let stages = stages(config)?;
+    let mut blocks = Vec::with_capacity(stages.len() * BLOCKS_PER_STAGE);
+    for (index, stage) in stages.iter().enumerate() {
+        for block in 0..BLOCKS_PER_STAGE {
+            let branches = config
+                .resblock_kernel_sizes
+                .iter()
+                .zip(config.resblock_dilation_sizes.iter())
+                .map(|(kernel, dilations)| {
+                    if dilations.len() != 1 {
+                        return Err(Error::config(format!(
+                            "the audio residual kernel {kernel} names {} dilations, not one",
+                            dilations.len()
+                        )));
+                    }
+                    Branch::new(*kernel, dilations[0])
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if branches.is_empty() {
+                return Err(Error::config(
+                    "the audio decoder has a block with no branch".to_owned(),
+                ));
+            }
+            blocks.push(Block {
+                stage: index,
+                index: block,
+                channels: stage.channels_out,
+                branches,
+            });
+        }
+    }
+    Ok(blocks)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -538,6 +626,54 @@ pub(crate) mod tests {
     fn the_receptive_field_is_the_references_thirty_latent_frames() {
         // Computed from the reference `receptive_field`: spread 58.31 output samples, one side 30.
         assert_eq!(receptive_field(&audio_config()).expect("field"), 30);
+    }
+
+    #[test]
+    fn every_block_has_one_branch_per_residual_kernel() {
+        let config = audio_config();
+        let table = blocks(&config).expect("the blocks");
+        // Seven stages of three blocks: BigVGAN's 21, with 126 convolutions between them.
+        assert_eq!(table.len(), 21);
+        let convolutions: usize = table
+            .iter()
+            .map(|block| block.branches.len() * 2)
+            .sum();
+        assert_eq!(convolutions, 126);
+        let first = &table[0];
+        assert_eq!((first.stage, first.index), (0, 0));
+        assert_eq!(first.channels, 512);
+        assert_eq!(first.scale(), 3);
+        assert_eq!(
+            first.branches,
+            vec![
+                Branch {
+                    kernel: 3,
+                    dilation: 1,
+                    padding: 1
+                },
+                Branch {
+                    kernel: 7,
+                    dilation: 3,
+                    padding: 9
+                },
+                Branch {
+                    kernel: 11,
+                    dilation: 5,
+                    padding: 25
+                },
+            ]
+        );
+        // A branch keeps its length: `length + 2·padding − dilation·(kernel − 1) = length`.
+        for branch in &first.branches {
+            let reach = branch.dilation * (branch.kernel - 1);
+            assert_eq!(2 * branch.padding, reach);
+        }
+        // The last stage is the narrowest.
+        assert_eq!(table.last().expect("a block").channels, 8);
+        // A kernel with two dilations is refused rather than silently taking the first.
+        let mut broken = config.clone();
+        broken.resblock_dilation_sizes[0].push(2);
+        assert!(blocks(&broken).is_err());
     }
 
     #[test]
