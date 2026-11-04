@@ -36,10 +36,7 @@ pub enum PolicyError {
     /// The policy trapped in a call: `unreachable`, an out-of-bounds access, a
     /// failed allocation, a panic in a Rust policy.
     #[error("the policy trapped in `{}`: {trap}", call.method())]
-    Trap {
-        call: Call,
-        trap: wasmtime::Trap,
-    },
+    Trap { call: Call, trap: wasmtime::Trap },
     /// The policy ran past the fuel its instance allows one call.
     #[error("the policy ran past its fuel in `{}`", call.method())]
     FuelExhausted { call: Call },

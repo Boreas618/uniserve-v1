@@ -120,7 +120,9 @@ where
     instance
         .get_typed_func::<Params, Results>(store, name)
         .map_err(|error| PolicyError::Instantiate {
-            message: format!("the module does not export `{name}` as the interface needs it: {error}"),
+            message: format!(
+                "the module does not export `{name}` as the interface needs it: {error}"
+            ),
         })
 }
 
@@ -139,16 +141,16 @@ impl PolicyInstance {
         ceilings: &Limits,
     ) -> Result<Self, PolicyError> {
         let mut store = Store::new(engine.inner(), ());
-        let instance = Instance::new(&mut store, module, &[]).map_err(|error| {
-            PolicyError::Instantiate {
+        let instance =
+            Instance::new(&mut store, module, &[]).map_err(|error| PolicyError::Instantiate {
                 message: format!("the policy module does not instantiate: {error}"),
-            }
-        })?;
-        let memory = instance
-            .get_memory(&mut store, "memory")
-            .ok_or_else(|| PolicyError::Instantiate {
-                message: "the module exports no `memory`".into(),
             })?;
+        let memory =
+            instance
+                .get_memory(&mut store, "memory")
+                .ok_or_else(|| PolicyError::Instantiate {
+                    message: "the module exports no `memory`".into(),
+                })?;
         let exports = Exports::bind(&mut store, &instance)?;
         let mut policy = Self {
             store,
@@ -445,12 +447,8 @@ fn decode<T: serde::de::DeserializeOwned>(
     let Some(reply) = reply else {
         return Err(malformed(call, "the policy answered nothing"));
     };
-    wire::decode(&reply).map_err(|error| {
-        malformed(
-            call,
-            format!("the answer does not decode: {error}"),
-        )
-    })
+    wire::decode(&reply)
+        .map_err(|error| malformed(call, format!("the answer does not decode: {error}")))
 }
 
 /// A protocol failure of the call's own making.
