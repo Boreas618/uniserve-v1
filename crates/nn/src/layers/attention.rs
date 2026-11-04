@@ -491,6 +491,29 @@ impl Attention {
                 ));
             }
         }
+        // Both writers address a token's row from the buffer pointer: `kv_write` scatters a row and
+        // `kv_quantize` reads one, and neither is handed a stride. A projection whose rows are
+        // contiguous is what a layer's output is; a strided one would be read as packed rows and
+        // land in the wrong slots, so it is refused here instead of silently.
+        for (name, view) in [("key", key), ("value", value)] {
+            let contiguous = view.strides.get(0) == heads * head_dim
+                && view.strides.get(1) == head_dim
+                && view.strides.last() == 1;
+            if !contiguous {
+                return Err(Error::shape(
+                    "Attention::write",
+                    format!(
+                        "{name} is {:?} at strides {}/{}/{}: the cache write addresses a token's \
+                         row from its pointer, so the projections must be packed rows of {heads} \
+                         heads × {head_dim}",
+                        view.shape.dims(),
+                        view.strides.get(0),
+                        view.strides.get(1),
+                        view.strides.last()
+                    ),
+                ));
+            }
+        }
         if key.shape.dim(0) != batch.tokens() || value.shape.dim(0) != batch.tokens() {
             return Err(Error::shape(
                 "Attention::write",
