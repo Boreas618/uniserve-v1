@@ -432,7 +432,8 @@ impl RequestEvents {
         )
     }
 
-    /// The request as submitted, for the handoff state's record.
+    /// The request as submitted, encoded as JSON for the handoff state's
+    /// record of what this process's pipeline processed.
     pub(crate) fn submitted(&self) -> Option<Vec<u8>> {
         let resumable = self.request.as_ref()?;
         let request = match resumable {
@@ -441,7 +442,7 @@ impl RequestEvents {
             }
             Resumable::Diffusion(diffusion) => Request::Diffusion(diffusion.clone()),
         };
-        Some(request.encode_to_vec())
+        serde_json::to_vec(&request).ok()
     }
 
     /// Ends this process's consumption of the request's events without
