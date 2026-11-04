@@ -16,6 +16,10 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+# The keys' own test builds a layer's geometry to ask which row a cache type compiles, and a layer
+# is `nn`'s type: the test names it directly rather than through a re-export the library does not
+# otherwise owe.
+nn = { path = "../../nn" }
 # The slice harness (`examples/qwen3_moe_slice.rs`) is the thing that owns runtime objects -- the
 # device, the allocator, the stream -- because a model may not. They are here, in a dev-dependency,
 # so the library's own dependency list stays `nn` and `ops`.
