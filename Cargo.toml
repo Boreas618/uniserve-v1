@@ -6,6 +6,7 @@ members = [
     "crates/engine",
     "crates/ipc",
     "crates/manager",
+    "crates/media",
     "crates/models",
     "crates/nixl",
     "crates/proto",
@@ -27,6 +28,7 @@ cuda = { path = "crates/cuda" }
 daemon = { path = "crates/daemon" }
 engine = { path = "crates/engine" }
 ipc = { path = "crates/ipc" }
+media = { path = "crates/media" }
 models = { path = "crates/models" }
 nixl = { path = "crates/nixl" }
 proto = { path = "crates/proto" }
