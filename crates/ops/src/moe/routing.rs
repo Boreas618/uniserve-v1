@@ -250,6 +250,24 @@ pub struct GatherArgs {
     pub out: TensorView,
 }
 
+/// What one compilation of `expert_gather` covers.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct GatherDescriptor {
+    /// Experts in the router's vocabulary: the length of the map.
+    pub experts: u32,
+    /// Routes per token: the entries of a row.
+    pub top: u32,
+}
+
+impl fmt::Display for GatherDescriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Key::new()
+            .field("experts", self.experts)
+            .field("top", self.top)
+            .finish(formatter)
+    }
+}
+
 /// The logical-to-physical expert map of an expert-parallel placement.
 pub struct ExpertGather;
 
@@ -257,7 +275,7 @@ impl Op for ExpertGather {
     const NAME: &'static str = "expert_gather";
 
     /// What one compilation covers: the expert vocabulary and the top-k it maps.
-    type Descriptor = TopkDescriptor;
+    type Descriptor = GatherDescriptor;
 
     type Args<'a> = GatherArgs;
 
