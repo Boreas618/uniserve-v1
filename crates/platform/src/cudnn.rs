@@ -143,6 +143,10 @@ const ATTR_OPERATION_CONVOLUTION_BWD_DATA_DX: i32 = 710;
 const ATTR_OPERATION_CONVOLUTION_BWD_DATA_DY: i32 = 711;
 const ATTR_OPERATIONGRAPH_HANDLE: i32 = 800;
 const ATTR_OPERATIONGRAPH_OPS: i32 = 801;
+/// How many engines the library holds for a graph at all, whatever a mode's
+/// search returned. It is read only as a cross-check: a graph that names no
+/// device can still say how many engines exist for its ops.
+const ATTR_OPERATIONGRAPH_ENGINE_GLOBAL_COUNT: i32 = 802;
 const ATTR_TENSOR_BYTE_ALIGNMENT: i32 = 900;
 const ATTR_TENSOR_DATA_TYPE: i32 = 901;
 const ATTR_TENSOR_DIMENSIONS: i32 = 902;
@@ -901,13 +905,21 @@ struct Operation {
 impl Operation {
     /// The whole operation: its three tensors, its convolution description,
     /// the operation itself, and the graph that holds it.
-    fn describe(api: &'static Api, convolution: &Convolution) -> Result<Self> {
+    ///
+    /// The graph names the device. `cudnn_graph_v9.h:567` marks
+    /// `CUDNN_ATTR_OPERATIONGRAPH_HANDLE` deprecated and cuDNN 9.8 stopped
+    /// requiring it to finalize a graph, but a search that must materialise
+    /// engine configurations needs it: without the handle the heuristic counts
+    /// configurations and fills none - success, zero elements, every slot
+    /// untouched - while with it the same graph, ops and mode list and fill
+    /// configurations for the shape.
+    fn describe(api: &'static Api, convolution: &Convolution, handle: &Handle) -> Result<Self> {
         let x = Self::tensor(api, &convolution.x, UID_X)?;
         let w = Self::tensor(api, &convolution.w, UID_W)?;
         let y = Self::tensor(api, &convolution.y, UID_Y)?;
         let kernel = Self::convolution(api, convolution)?;
         let forward = Self::forward(api, convolution, &kernel, &x, &w, &y)?;
-        let graph = Self::graph(api, &forward, None)?;
+        let graph = Self::graph(api, &forward, handle)?;
         Ok(Self {
             graph,
             _forward: forward,
@@ -1050,26 +1062,21 @@ impl Operation {
 
     /// The operation graph of one operation.
     ///
-    /// `handle` is cuDNN's deprecated `CUDNN_ATTR_OPERATIONGRAPH_HANDLE`,
-    /// which 9.8 stopped requiring: a plan is built without it, and
-    /// [`Cudnn::probe`] tries it to tell a library that still wants it from a
-    /// description cuDNN refuses.
-    fn graph(
-        api: &'static Api,
-        operation: &Descriptor,
-        handle: Option<&Handle>,
-    ) -> Result<Descriptor> {
+    /// The graph carries cuDNN's `CUDNN_ATTR_OPERATIONGRAPH_HANDLE`
+    /// (`cudnn_graph_v9.h:567`, marked deprecated): finalizing a graph no
+    /// longer needs it, but the engine search does, because materialising an
+    /// engine configuration carries knobs sized to a device - see
+    /// [`Operation::describe`].
+    fn graph(api: &'static Api, operation: &Descriptor, handle: &Handle) -> Result<Descriptor> {
         let graph = Descriptor::create(api, DESCRIPTOR_OPERATION_GRAPH)?;
         let call = "cudnnBackendSetAttribute";
-        if let Some(handle) = handle {
-            api.set_one(
-                &graph,
-                ATTR_OPERATIONGRAPH_HANDLE,
-                TYPE_HANDLE,
-                handle,
-                call,
-            )?;
-        }
+        api.set_one(
+            &graph,
+            ATTR_OPERATIONGRAPH_HANDLE,
+            TYPE_HANDLE,
+            handle,
+            call,
+        )?;
         api.set_one(
             &graph,
             ATTR_OPERATIONGRAPH_OPS,
@@ -1332,7 +1339,7 @@ impl Cudnn {
         convolution.check()?;
         let device = Device::new(self.device)?;
         let _context = device.enter()?;
-        let operation = Operation::describe(self.api, convolution)?;
+        let operation = Operation::describe(self.api, convolution, &self.handle)?;
         let proposal = self.configs(
             &operation.graph,
             limit,
@@ -1371,7 +1378,7 @@ impl Cudnn {
         convolution.check()?;
         let device = Device::new(self.device)?;
         let _context = device.enter()?;
-        let operation = Operation::describe(self.api, convolution)?;
+        let operation = Operation::describe(self.api, convolution, &self.handle)?;
         let exact = !convolution.allow_tf32;
         let mode = if engine.is_some() || exact {
             HEURISTIC_MODE_B
@@ -1636,10 +1643,42 @@ impl Cudnn {
             Operation::forward(self.api, convolution, &kernel, &x, &w, &y)
         );
         let graph = stage!(
-            "operation graph: ops, finalize",
-            Operation::graph(self.api, &forward, None)
+            "operation graph: ops and the handle, finalize",
+            Operation::graph(self.api, &forward, &self.handle)
         );
 
+        // The public path, exercised beside the walk: what `engines` offers
+        // for this shape and which engine `plan` picks. The walk above is the
+        // descriptor-by-descriptor story; these two are what ops and the model
+        // actually call, and they are the answer the convolution tests read.
+        match self.engines(convolution, 8) {
+            Ok(engines) => {
+                let indices: Vec<i64> =
+                    engines.iter().map(|engine| engine.global_index()).collect();
+                steps.push((
+                    format!(
+                        "engines: {} offered for this shape, global indices {indices:?}",
+                        engines.len()
+                    ),
+                    None,
+                ));
+            }
+            Err(error) => steps.push((String::from("engines"), Some(error.to_string()))),
+        }
+        match self.plan(convolution, None) {
+            Ok(plan) => steps.push((
+                format!(
+                    "plan: engine {}, {} bytes of workspace, x {} w {} y {} bytes",
+                    plan.engine().global_index(),
+                    plan.workspace_bytes(),
+                    plan.bytes().x,
+                    plan.bytes().w,
+                    plan.bytes().y
+                ),
+                None,
+            )),
+            Err(error) => steps.push((String::from("plan"), Some(error.to_string()))),
+        }
         let heuristic = stage!(
             "engine heuristic: mode A, operation graph, finalize",
             Self::heuristic(self.api, &graph, HEURISTIC_MODE_A)
@@ -1664,6 +1703,38 @@ impl Cudnn {
             self.api
                 .count(&mode_b, ATTR_ENGINEHEUR_RESULTS, TYPE_BACKEND_DESCRIPTOR)
         );
+        // The graph's own count of the engines it has at all. Read beside the
+        // heuristic's counts because the two modes answered the same number on
+        // both shapes tried, which a mode-specific search should not do: a
+        // number that matches this one in every mode would say the two
+        // readings are not coming from different places.
+        for (label, descriptor) in [("the graph", &graph)] {
+            let mut global = 0i64;
+            let line = match self.api.get(
+                descriptor,
+                ATTR_OPERATIONGRAPH_ENGINE_GLOBAL_COUNT,
+                TYPE_INT64,
+                std::slice::from_mut(&mut global),
+                "cudnnBackendGetAttribute",
+            ) {
+                Ok(_) => format!("{global}"),
+                Err(error) => format!("refused: {error}"),
+            };
+            steps.push((
+                format!("operation graph: {label}, engine global count: {line}"),
+                None,
+            ));
+        }
+        for (label, descriptor) in [("mode A", &heuristic), ("mode B", &mode_b)] {
+            let line = match self.mode_of(descriptor) {
+                Ok(mode) => format!(
+                    "the heuristic reads back as mode {mode} ({}), where A is {HEURISTIC_MODE_A} and B is {HEURISTIC_MODE_B}",
+                    mode_name(mode)
+                ),
+                Err(error) => format!("refused: {error}"),
+            };
+            steps.push((format!("engine heuristic: {label} {line}"), None));
+        }
         steps.extend(self.fill_variants(&graph, &mode_b, listed_b));
         let exhaustive = stage!(
             "engine heuristic: mode B, read up to eight configurations and their numerical notes",
@@ -1726,10 +1797,12 @@ impl Cudnn {
             format!("execution plan: {workspace_bytes} bytes of workspace"),
             None,
         ));
-        // The two deprecated handle attributes are asked last, and their
-        // refusal is recorded without ending the walk: a library that answers
-        // `CUDNN_STATUS_DEPRECATED` for them is telling us the same thing as
-        // one that accepts them.
+        // cuDNN's deprecated handle attribute of the execution plan is asked
+        // last, and its refusal is recorded without ending the walk: a library
+        // that answers `CUDNN_STATUS_DEPRECATED` for it is telling us the same
+        // thing as one that accepts it. The operation graph's own handle
+        // attribute is not asked here any more - every graph this crate builds
+        // carries it, because the engine search needs it.
         macro_rules! alternative {
             ($name:expr, $call:expr) => {
                 match $call {
@@ -1738,10 +1811,6 @@ impl Cudnn {
                 }
             };
         }
-        alternative!(
-            "operation graph with the deprecated handle attribute, finalize",
-            Operation::graph(self.api, &forward, Some(&self.handle))
-        );
         alternative!(
             "execution plan with the deprecated handle attribute, finalize",
             self.execution_plan(&config, Some(&self.handle))
@@ -1834,7 +1903,72 @@ impl Cudnn {
             format!("engine heuristic fill 6 a fresh descriptor, never counted, MAX_ENGINE_CONFIGS slots requested: {line}"),
             None,
         ));
+        // 7: two reads in a row from one descriptor. If the first fills and
+        // the second does not, the read consumes the list; if both fill, a
+        // read is repeatable and nothing about the count matters.
+        let twice = self
+            .fill_once(heuristic, listed as i64, listed.max(1), -1, false)
+            .and_then(|first| {
+                self.fill_once(heuristic, listed as i64, listed.max(1), -1, false)
+                    .map(|second| (first, second))
+            });
+        let line = match twice {
+            Ok((first, second)) => format!("first: {first}; second: {second}"),
+            Err(error) => format!("refused: {error}"),
+        };
+        steps.push((
+            format!(
+                "engine heuristic fill 7 two reads in a row from the counted descriptor: {line}"
+            ),
+            None,
+        ));
+        // 8: a zero request with a real array. If the library reads
+        // `requestedElementCount = 0` as "everything you have", this fills
+        // where every non-zero request did not.
+        let line = match self.fill_once(heuristic, 0, listed.max(1), -1, false) {
+            Ok(line) => line,
+            Err(error) => format!("refused: {error}"),
+        };
+        steps.push((
+            format!("engine heuristic fill 8 requestedElementCount 0 with a real array: {line}"),
+            None,
+        ));
+        // 9: the counted descriptor, finalized again, then filled. If the
+        // count query leaves the descriptor unable to fill, a second finalize
+        // puts that back and this fills where 1 and 2 did not.
+        let line = match self
+            .api
+            .finalize(heuristic, "cudnnBackendFinalize")
+            .and_then(|()| self.fill_once(heuristic, listed as i64, listed.max(1), -1, false))
+        {
+            Ok(line) => line,
+            Err(error) => format!("refused: {error}"),
+        };
+        steps.push((
+            format!("engine heuristic fill 9 finalized again before the fill: {line}"),
+            None,
+        ));
         steps
+    }
+
+    /// The heuristic mode a finalized heuristic descriptor holds, read back
+    /// from the attribute this crate set.
+    ///
+    /// A line of the probe, because the two modes answered the same number of
+    /// configurations on both shapes tried — a shortlist that matches the
+    /// exhaustive list exactly is not what the header describes, and an
+    /// attribute that did not reach the descriptor would look exactly like
+    /// that.
+    fn mode_of(&self, heuristic: &Descriptor) -> Result<i32> {
+        let mut mode = -1i32;
+        self.api.get(
+            heuristic,
+            ATTR_ENGINEHEUR_MODE,
+            TYPE_HEUR_MODE,
+            std::slice::from_mut(&mut mode),
+            "cudnnBackendGetAttribute",
+        )?;
+        Ok(mode)
     }
 
     /// One fill of the heuristic's results with the slots and the initial
@@ -2502,6 +2636,10 @@ mod tests {
                 (
                     "CUDNN_ATTR_OPERATIONGRAPH_OPS",
                     ATTR_OPERATIONGRAPH_OPS as i64,
+                ),
+                (
+                    "CUDNN_ATTR_OPERATIONGRAPH_ENGINE_GLOBAL_COUNT",
+                    ATTR_OPERATIONGRAPH_ENGINE_GLOBAL_COUNT as i64,
                 ),
                 (
                     "CUDNN_ATTR_TENSOR_BYTE_ALIGNMENT",
