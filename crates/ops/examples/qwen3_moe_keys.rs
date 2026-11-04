@@ -17,6 +17,22 @@
 //! cannot call it. If a value here and the layer crate's disagree, the layer crate is right and
 //! this file follows it. Candidate widths and the sampler's extras are the slice's own request
 //! state (`crates/nn/src/layers/sampler.rs`, `Sampler::new`).
+//!
+//! Gaps this file does not fill, named rather than invented, so that the 86 declared operators are
+//! accounted for between the two fixtures and these lines:
+//!
+//! - **The quantized export's family**: `nvfp4_gemm`, `nvfp4_quantize`, `gather_gemm_nvfp4`,
+//!   `route_gemm_nvfp4`, `act_and_mul_fp8`, `value_first_swiglu_fp8`, `kv_quantize` and
+//!   `expert_exchange`. Their descriptors carry the export's own choices — the block-scale dtype,
+//!   the expert packing, the exchange's ranks — and no NVFP4 shard exists in this workspace, so a
+//!   key here would be a guess about an artifact nobody has opened.
+//! - **The executor's path, not the model's**: `slot_commit` (its views are the sampler's state),
+//!   `attention_gather_rows`, `attention_gather_decode_inputs`, `page_conversion`,
+//!   `cache_block_snapshot`, `cache_block_scatter` and `cache_copy_region` (the page geometry and
+//!   the block shapes are the executor's scheduling), and `paged_attention`, whose decode attention
+//!   is trtllm-gen. These are keyed where the executor compiles its own plans.
+//! - `logprob_gather`, `logits_gather`, `vocab_unpad` and the sampler's chain are above: they are the
+//!   slice's, and the widths are its request state.
 
 use ops::attention::{Descriptor as AttentionDescriptor, Mask, Phase};
 use ops::moe;
