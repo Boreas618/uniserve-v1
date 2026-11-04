@@ -644,8 +644,11 @@ impl ChatCollector {
                 })
                 .collect(),
             prompt_token_ids: self.prompt_token_ids.clone(),
-            prompt_logprobs: None,
-            logprobs: None,
+            // The logprobs the response already collected are the response:
+            // the collector concatenated them as each update carried them, and
+            // no later update repeats an earlier position (§7.5.1 step 3).
+            prompt_logprobs: self.prompt_logprobs.as_ref().map(handoff_prompt_logprobs),
+            logprobs: self.logprobs.as_ref().map(handoff_logprobs),
             token_ids: self.token_ids.clone(),
             images: self
                 .images
@@ -704,6 +707,8 @@ impl ChatCollector {
         }
         self.message = message;
         self.prompt_token_ids.clone_from(&state.prompt_token_ids);
+        self.prompt_logprobs = state.prompt_logprobs.as_ref().map(decoded_prompt_logprobs);
+        self.logprobs = state.logprobs.as_ref().map(decoded_logprobs);
         self.token_ids.clone_from(&state.token_ids);
         self.images = state
             .images
@@ -718,6 +723,78 @@ impl ChatCollector {
             .collect();
         self.completed_image_ids = (0..state.images.len() as u32).collect();
         self.finished = None;
+    }
+}
+
+/// The generated-token logprobs a handoff carries (§7.5.1 step 3).
+fn handoff_logprobs(logprobs: &DecodedLogprobs) -> handoff::DecodedLogprobs {
+    handoff::DecodedLogprobs {
+        positions: logprobs.positions.iter().map(handoff_position).collect(),
+    }
+}
+
+/// One position's decoded candidates, as the handoff carries them.
+fn handoff_position(position: &DecodedPositionLogprobs) -> handoff::DecodedPositionLogprobs {
+    handoff::DecodedPositionLogprobs {
+        entries: position
+            .entries
+            .iter()
+            .map(|entry| handoff::DecodedTokenLogprob {
+                token_id: entry.token_id,
+                token: entry.token.clone(),
+                logprob: entry.logprob,
+                rank: entry.rank,
+            })
+            .collect(),
+    }
+}
+
+/// The prompt logprobs a handoff carries, as [`handoff_logprobs`].
+fn handoff_prompt_logprobs(logprobs: &DecodedPromptLogprobs) -> handoff::DecodedPromptLogprobs {
+    handoff::DecodedPromptLogprobs {
+        first_token_id: logprobs.first_token_id,
+        first_token: logprobs.first_token.clone(),
+        scored_positions: logprobs
+            .scored_positions
+            .iter()
+            .map(handoff_position)
+            .collect(),
+    }
+}
+
+/// The generated-token logprobs a collector resumes with.
+fn decoded_logprobs(state: &handoff::DecodedLogprobs) -> DecodedLogprobs {
+    DecodedLogprobs {
+        positions: state.positions.iter().map(decoded_position).collect(),
+    }
+}
+
+/// One position's decoded candidates, as a resumed collector holds them.
+fn decoded_position(position: &handoff::DecodedPositionLogprobs) -> DecodedPositionLogprobs {
+    DecodedPositionLogprobs {
+        entries: position
+            .entries
+            .iter()
+            .map(|entry| DecodedTokenLogprob {
+                token_id: entry.token_id,
+                token: entry.token.clone(),
+                logprob: entry.logprob,
+                rank: entry.rank,
+            })
+            .collect(),
+    }
+}
+
+/// The prompt logprobs a collector resumes with.
+fn decoded_prompt_logprobs(state: &handoff::DecodedPromptLogprobs) -> DecodedPromptLogprobs {
+    DecodedPromptLogprobs {
+        first_token_id: state.first_token_id,
+        first_token: state.first_token.clone(),
+        scored_positions: state
+            .scored_positions
+            .iter()
+            .map(decoded_position)
+            .collect(),
     }
 }
 
