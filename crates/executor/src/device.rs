@@ -32,6 +32,8 @@ pub struct Executor {
     /// The phases this device's runners serve, recorded here because the runners themselves live
     /// on the device thread and a router above the executors has to choose one without asking it.
     phases: Vec<ipc::PhaseId>,
+    /// What the device thread is performing, and `None` between commands (2.4).
+    activity: Arc<std::sync::Mutex<Option<String>>>,
     /// The media computations this device's runners plan to capture, recorded here for the same
     /// reason: the mechanism asks whether a media computation is served before it forms the batch,
     /// and that answer cannot be a round trip to the device thread (2.4).
@@ -159,6 +161,11 @@ impl Executor {
         scratch: u64,
     ) -> Result<Self> {
         let counters = Arc::new(SharedCounters::default());
+        // What the device thread is performing, read by whoever reports a stall from another thread
+        // (2.4): the thread that is stuck cannot say it, and a stall line naming the stage alone
+        // says nothing about which job never answered.
+        let activity: Arc<std::sync::Mutex<Option<String>>> =
+            Arc::new(std::sync::Mutex::new(None));
         let uncompared = Arc::new(std::sync::Mutex::new(Vec::new()));
         let storage = Arc::new(std::sync::Mutex::new(None));
         let phases: Vec<ipc::PhaseId> = runners
@@ -185,7 +192,8 @@ impl Executor {
             pools: Arc::clone(&pools),
             counters: Arc::clone(&counters),
             storage: Arc::clone(&storage),
-            current: None,
+            shadow_attached: false,
+            activity: Arc::clone(&activity),
             sticky: None,
         };
         let thread_queue = Arc::clone(&queue);
@@ -201,6 +209,7 @@ impl Executor {
             device,
             phases,
             media,
+            activity,
             queue,
             thread: Some(thread),
             pools,
@@ -220,6 +229,26 @@ impl Executor {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// What the device thread is performing, or `None` when it is between commands (2.4).
+    ///
+    /// Read by whoever reports a stall: the thread that is stuck cannot say what it is stuck in, and
+    /// a stall line that names only the stage says nothing about which job never answered.
+    pub fn performing(&self) -> Option<String> {
+        self.activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// How many graph captures are open in this process on any stream.
+    ///
+    /// A hang inside a capture and a hang inside a launch look identical from outside and are
+    /// different defects, so the stall report states this beside the job in hand (2.4). The count is
+    /// the driver's own: a capture opens when `Capture::begin` returns and closes when it ends.
+    pub fn capturing(&self) -> usize {
+        platform::open_captures()
     }
 
     /// The device this executor drives.
@@ -523,9 +552,12 @@ struct Device {
     pools: Arc<std::sync::Mutex<Pools>>,
     /// What the device thread has done, shared with the handle the control thread reads.
     counters: Arc<SharedCounters>,
-    /// What the job in hand is doing, for the report of a failed submission. The device thread is
-    /// the only place that knows it, and a failure crosses the thread boundary as a bare error.
-    current: Option<String>,
+    /// Whether this device's runners hold a shadow harness, so `SetShadow` is sent once (7.3).
+    shadow_attached: bool,
+    /// What the job in hand is doing, for the report of a failed submission and for a stall report
+    /// read from another thread. The device thread is the only place that knows it, and a failure
+    /// crosses the thread boundary as a bare error.
+    activity: Arc<std::sync::Mutex<Option<String>>>,
     /// The context's first sticky error, once one has been seen (2.4).
     ///
     /// A sticky error is not recoverable: every launch after it fails, so the executor issues
@@ -582,7 +614,11 @@ impl Device {
                     self.sticky = Some(sticky);
                 }
             }
-            let detail = self.current.take();
+            let detail = self
+                .activity
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
             queue.complete(entry, result, detail);
         }
         events.set_submitter(None);
@@ -646,6 +682,12 @@ impl Device {
                 // The shadow pair's region is allocator-backed and comes from the same device
                 // allocator as the graph pools, reserved on first use; the harness then goes to
                 // every runner, because the update may shadow an operator of any of them.
+                // A second send in one process keeps the harness the first made: the region's
+                // reservation is idempotent, but re-attaching twins would replace the `Shadow` an
+                // update may be mid-comparison with, so the command answers empty instead.
+                if self.shadow_attached {
+                    return Ok(Step::Done(BatchOutput::default()));
+                }
                 let mut pools = self
                     .pools
                     .lock()
@@ -657,6 +699,7 @@ impl Device {
                     let shadow = crate::shadow::Shadow::new(self.device, twins)?;
                     named.runner.attach_shadow(shadow);
                 }
+                self.shadow_attached = true;
                 Ok(Step::Done(BatchOutput::default()))
             }
             Command::Sleep => {
@@ -769,7 +812,11 @@ impl Device {
                 .ok_or_else(|| Error::Invariant("a serving job names no runner".into()))?;
             // The job in hand names the bucket, generation and operator a failure is about; the
             // command's label says which submission was running it.
-            self.current = Some(format!("{label}, {}", job.describe()));
+            *self
+                .activity
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(format!("{label}, {}", job.describe()));
             let started = Instant::now();
             let produced = self.runner_mut(runner)?.runner.serve(&job)?;
             self.synchronize()?;
