@@ -652,11 +652,16 @@ impl Moe {
         f.operate::<MoeSort>(&sort, args)?;
 
         // 5. FC1 and FC2 over the received rows, with this rank's experts.
+        //
+        // The products name the resident stack's expert count, not the vocabulary's: `up_gate` and
+        // `down` hold `local` experts, and the sort rebased every received route into that window
+        // with `local_offset`, so the vocabulary count would name a stack this rank does not hold
+        // (and the operator's shape check would refuse the launch).
         let gated = arena.tensor(hidden.dtype, Shape::new(&[rows, intermediate]))?;
         let first = GatherGemmDescriptor {
             hidden: self.hidden,
             intermediate: self.intermediate,
-            experts: self.experts,
+            experts: self.local,
             top: self.top,
             activation: self.activation,
             dtype: hidden.dtype,
@@ -680,7 +685,7 @@ impl Moe {
         let second = RouteGemmDescriptor {
             hidden: self.hidden,
             intermediate: self.intermediate,
-            experts: self.experts,
+            experts: self.local,
             top: self.top,
             dtype: hidden.dtype,
             tile: MMA_TILE,
