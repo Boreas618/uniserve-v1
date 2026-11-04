@@ -303,6 +303,8 @@ mod tests {
         assert_eq!(slots, [transfer.acknowledgment_slot("encoder-0", 1)]);
     }
 
+    /// The pairing of a deployment described by its pools' placed ranks: the
+    /// function itself reads only the ranks' hosts.
     fn pairing(
         placements: &[(
             &WorkerGroupId,
@@ -310,7 +312,17 @@ mod tests {
             &BTreeMap<String, ComponentConfig>,
         )],
     ) -> anyhow::Result<BTreeMap<WorkerGroupId, std::collections::BTreeSet<WorkerGroupId>>> {
-        video_unit_codecs(&routing(), placements)
+        let placed = placements
+            .iter()
+            .map(|(id, ranks, components)| {
+                (
+                    (*id).clone(),
+                    ranks.iter().map(|rank| rank.host.clone()).collect(),
+                    (*components).clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        video_unit_codecs(&routing(), &placed)
     }
 
     #[test]
