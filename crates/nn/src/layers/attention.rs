@@ -8,6 +8,8 @@
 //! types, the head and page geometry and the mask variant, while the batch, the lengths, the scale
 //! and the window travel in the call.
 
+use ops::attention::dense::{DenseArgs, DenseAttention, DenseDescriptor};
+use ops::attention::sparse::{SparseArgs, SparseAttention, SparseDescriptor};
 use ops::attention::{Args, Descriptor, Mask, PagedAttention, Phase};
 use ops::kv::{self, Descriptor as KvDescriptor, KvWrite};
 use ops::{Op, PhaseKind, TensorView};
@@ -45,6 +47,12 @@ pub struct Attention {
     window: Option<u32>,
     max_kv_len: u32,
     causal: bool,
+    /// Rows of one query tile and of one key block, for the sparse backend.
+    block: u32,
+    /// The largest key extent the sparse module serves.
+    max_keys: u32,
+    /// Whether the sparse call writes the log-sum-exp normalizer.
+    lse: bool,
 }
 
 impl Attention {
@@ -91,6 +99,9 @@ impl Attention {
             window,
             max_kv_len,
             causal: true,
+            block: 0,
+            max_keys: 0,
+            lse: false,
         })
     }
 
@@ -107,6 +118,285 @@ impl Attention {
     /// The longest key reduction the descriptor serves.
     pub const fn max_kv_len(&self) -> u32 {
         self.max_kv_len
+    }
+
+    /// Dense attention over a packed sequence: the language encoder, a cross-attention, the video
+    /// block's attention without the cache.
+    ///
+    /// `max_seq_len` is the longest key sequence the deployment serves and enters the descriptor
+    /// (one value per deployment, like the paged backend's bound). `causal` states the mask the
+    /// model's attention declares; `window` is an inclusive history window, which the causal mask
+    /// requires.
+    pub fn dense(
+        head_dim: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        max_seq_len: u32,
+        causal: bool,
+        window: Option<u32>,
+        scale: f32,
+    ) -> Result<Self> {
+        Self::dense_of(
+            AttentionBackend::Dense,
+            head_dim,
+            q_heads,
+            kv_heads,
+            max_seq_len,
+            causal,
+            window,
+            scale,
+        )
+    }
+
+    /// The FP32 dense attention of the `ref2va` audio encoder and the sparse compression branch:
+    /// the same call, with cuBLASLt SGEMM and a softmax kernel inside the package.
+    pub fn fp32(
+        head_dim: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        max_seq_len: u32,
+        scale: f32,
+    ) -> Result<Self> {
+        // The FP32 paths read a whole sequence at once, so their mask is dense.
+        Self::dense_of(
+            AttentionBackend::Fp32,
+            head_dim,
+            q_heads,
+            kv_heads,
+            max_seq_len,
+            false,
+            None,
+            scale,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a dense attention is named by the mask's, the head geometry and the bound's values"
+    )]
+    fn dense_of(
+        backend: AttentionBackend,
+        head_dim: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        max_seq_len: u32,
+        causal: bool,
+        window: Option<u32>,
+        scale: f32,
+    ) -> Result<Self> {
+        if head_dim == 0 || q_heads == 0 || kv_heads == 0 || max_seq_len == 0 {
+            return Err(Error::shape(
+                "Attention::dense",
+                "a head, a sequence bound and both head counts must be nonzero".to_owned(),
+            ));
+        }
+        if !q_heads.is_multiple_of(kv_heads) {
+            return Err(Error::shape(
+                "Attention::dense",
+                format!("{q_heads} query heads do not group {kv_heads} key heads"),
+            ));
+        }
+        if window.is_some() && !causal {
+            return Err(Error::shape(
+                "Attention::dense",
+                "a history window reads the causal mask only".to_owned(),
+            ));
+        }
+        if !scale.is_finite() || scale == 0.0 {
+            return Err(Error::shape(
+                "Attention::dense",
+                format!("a softmax scale of {scale}"),
+            ));
+        }
+        Ok(Self {
+            backend,
+            head_dim,
+            q_heads,
+            kv_heads,
+            page_size: 0,
+            scale,
+            window,
+            max_kv_len: max_seq_len,
+            causal,
+            block: 0,
+            max_keys: 0,
+            lse: false,
+        })
+    }
+
+    /// Video Sparse Attention: query tiles of `block` rows read the key blocks the selection names.
+    ///
+    /// `max_keys` is the longest key extent the deployment serves; `lse` asks for the log-sum-exp
+    /// normalizer of every query row.
+    pub fn sparse(
+        block: u32,
+        head_dim: u32,
+        heads: u32,
+        max_keys: u32,
+        lse: bool,
+        scale: f32,
+    ) -> Result<Self> {
+        if block == 0 || head_dim == 0 || heads == 0 || max_keys == 0 {
+            return Err(Error::shape(
+                "Attention::sparse",
+                "a tile, a head, a key bound and a head count must be nonzero".to_owned(),
+            ));
+        }
+        if !max_keys.is_multiple_of(block) {
+            return Err(Error::shape(
+                "Attention::sparse",
+                format!("a {max_keys}-key bound is not whole {block}-row tiles"),
+            ));
+        }
+        if !scale.is_finite() || scale == 0.0 {
+            return Err(Error::shape(
+                "Attention::sparse",
+                format!("a softmax scale of {scale}"),
+            ));
+        }
+        Ok(Self {
+            backend: AttentionBackend::Sparse,
+            head_dim,
+            q_heads: heads,
+            kv_heads: heads,
+            page_size: 0,
+            scale,
+            window: None,
+            max_kv_len: max_keys,
+            causal: false,
+            block,
+            max_keys,
+            lse,
+        })
+    }
+
+    /// Dense attention from packed queries to packed keys: `query [q_tokens, q_heads, head_dim]`,
+    /// `key`/`value [kv_tokens, kv_heads, head_dim]`, `cu_seq_lens_q`/`cu_seq_lens_k [rows + 1] i32`
+    /// (both written by the executor's scheduler), `out [q_tokens, q_heads, head_dim]`.
+    ///
+    /// Serves both the `Dense` and the `Fp32` backend; the element types the views carry decide the
+    /// descriptor, and the package behind it decides the tile and split heuristics.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the call's operands and its two offset tables are the design's argument list"
+    )]
+    pub fn attend_dense(
+        &self,
+        f: &Forward,
+        query: TensorView,
+        key: TensorView,
+        value: TensorView,
+        cu_seq_lens_q: TensorView,
+        cu_seq_lens_k: TensorView,
+        out: TensorView,
+    ) -> Result<()> {
+        if !matches!(
+            self.backend,
+            AttentionBackend::Dense | AttentionBackend::Fp32
+        ) {
+            return Err(Error::Unsupported(format!(
+                "Attention::attend_dense: the {:?} backend is not a dense attention",
+                self.backend
+            )));
+        }
+        let descriptor = DenseDescriptor {
+            query: query.dtype,
+            key_value: key.dtype,
+            output: out.dtype,
+            head_dim: self.head_dim,
+            q_heads: self.q_heads,
+            kv_heads: self.kv_heads,
+            mask: if self.causal {
+                Mask::Causal
+            } else {
+                Mask::Dense
+            },
+            windowed: self.window.is_some(),
+            max_kv_len: self.max_kv_len,
+        };
+        let args = DenseArgs {
+            query,
+            key,
+            value,
+            cu_seq_lens_q,
+            cu_seq_lens_k,
+            out,
+            scale: self.scale,
+            window_left: self.window.map_or(-1, |window| window as i32),
+            causal: self.causal,
+        };
+        let kernel = f.kernels().op::<DenseAttention>(&descriptor)?;
+        DenseAttention::launch(kernel, &descriptor, args, f.stream).map_err(Error::from)
+    }
+
+    /// Video Sparse Attention: `query [query_tiles · block, heads, head_dim]`,
+    /// `key`/`value [key_blocks · block, heads, head_dim]`, the selection `indices [heads,
+    /// query_tiles, selected]` i32 and its per-tile `counts [heads, query_tiles]` i32, the valid rows
+    /// of each key block `valid [key_blocks]` i32, the optional normalizer and `out`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the selection is three device-written tables and the normalizer is a fourth \
+                  optional output; grouping them would name the same values twice"
+    )]
+    pub fn attend_sparse(
+        &self,
+        f: &Forward,
+        query: TensorView,
+        key: TensorView,
+        value: TensorView,
+        indices: TensorView,
+        counts: TensorView,
+        valid: TensorView,
+        lse: Option<TensorView>,
+        out: TensorView,
+    ) -> Result<()> {
+        if self.backend != AttentionBackend::Sparse {
+            return Err(Error::Unsupported(format!(
+                "Attention::attend_sparse: the {:?} backend is not the sparse attention",
+                self.backend
+            )));
+        }
+        match (self.lse, lse) {
+            (true, None) => {
+                return Err(Error::shape(
+                    "Attention::attend_sparse",
+                    "the layer writes a normalizer and the call passes none".to_owned(),
+                ));
+            }
+            (false, Some(_)) => {
+                return Err(Error::shape(
+                    "Attention::attend_sparse",
+                    "the call passes a normalizer the layer does not write".to_owned(),
+                ));
+            }
+            _ => {}
+        }
+        let descriptor = SparseDescriptor {
+            block: self.block,
+            dtype: query.dtype,
+            output: out.dtype,
+            head_dim: self.head_dim,
+            lse: self.lse,
+            keys: self.max_keys,
+        };
+        let args = SparseArgs {
+            query,
+            key,
+            value,
+            indices,
+            counts,
+            valid,
+            lse,
+            out,
+            scale: self.scale,
+        };
+        let kernel = f.kernels().op::<SparseAttention>(&descriptor)?;
+        SparseAttention::launch(kernel, &descriptor, args, f.stream).map_err(Error::from)
+    }
+
+    /// The elements between consecutive rows of the query a sparse call reads.
+    pub const fn block(&self) -> u32 {
+        self.block
     }
 
     /// Write `key` and `value` into `planes`, then attend.
