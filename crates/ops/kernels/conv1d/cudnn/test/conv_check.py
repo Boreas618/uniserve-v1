@@ -23,6 +23,13 @@ products. Two things this check makes visible rather than hides:
 * A ``bf16``/``f16`` convolution keeps the same bound with ``u_out`` of its own
   element type.
 
+``--expect-refusal <phrase>`` inverts the run: it passes when the entry refuses the
+call with a message containing the phrase, and fails when the call is served. That is
+how the operator's rule that ``tf32`` is a permission for FP32 only is checked — a
+half-precision module given ``--tf32 true`` must refuse, because it has no such choice
+to make, while an FP32 module withholds the permission by being served an engine that
+does not narrow its inputs.
+
 Run it with the Program Server's environment
 (``crates/program-server/python/.venv/bin/python``), which has torch.
 """
