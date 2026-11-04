@@ -128,6 +128,10 @@ impl WeightLayout {
     /// A calibrated NVFP4 matrix's packed E2M1 values: `[rows, columns / 2]` U8, one byte per pair.
     pub const NVFP4_VALUES: Self = Self("nvfp4_values");
 
+    /// The same values after `shuffleMatrixA`: rows permuted inside blocks of sixteen or
+    /// thirty-two, which is the arrangement the trtllm-gen products read (`useShuffledMatrix`).
+    pub const NVFP4_VALUES_SHUFFLED: Self = Self("nvfp4_values_shuffled");
+
     /// A calibrated NVFP4 matrix's E4M3 block scales in the linear layout: `[rows, columns / 16]`.
     pub const NVFP4_SCALES_LINEAR: Self = Self("nvfp4_scales_linear");
 
@@ -470,6 +474,74 @@ impl RetainedWeights for HostStore {
         self.buffers.push(buffer);
         self.published.push((key.clone(), backing));
         Ok(backing)
+    }
+}
+
+/// The arrangement of a calibrated matrix's packed E2M1 values.
+///
+/// The values are two codes a byte along the contraction whichever arrangement they are in; what
+/// varies is the order of the **rows**, because the trtllm-gen products read their A operand with
+/// `useShuffledMatrix`: rows permuted inside blocks of sixteen or thirty-two so that the tile a
+/// thread block loads is contiguous. It is a permutation of the shard's own bytes, applied once at
+/// load — never a step, and never a kernel — and a matrix whose row count is not a whole number of
+/// blocks has no such arrangement, which the loader refuses by name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ValueLayout {
+    /// The shard's own row order.
+    Plain,
+    /// `shuffleMatrixA`'s row order, for a product whose epilogue tile is `epilogue_tile_m` rows.
+    Shuffled {
+        /// Rows one MMA tile of the product covers; the shuffle block is thirty-two rows when this
+        /// is a whole number of 128s and sixteen otherwise, as the reference's
+        /// `get_shuffle_block_size` states.
+        epilogue_tile_m: u32,
+    },
+}
+
+impl ValueLayout {
+    /// The layout name a weight published in this arrangement carries.
+    pub fn layout(self) -> WeightLayout {
+        match self {
+            Self::Plain => WeightLayout::NVFP4_VALUES,
+            Self::Shuffled { .. } => WeightLayout::NVFP4_VALUES_SHUFFLED,
+        }
+    }
+
+    /// The rows one shuffle block holds, or `None` when the arrangement is plain.
+    pub fn block(self) -> Option<u64> {
+        match self {
+            Self::Plain => None,
+            Self::Shuffled { epilogue_tile_m } => {
+                Some(if epilogue_tile_m % 128 == 0 { 32 } else { 16 })
+            }
+        }
+    }
+
+    /// `bytes` with every expert's rows moved into this arrangement.
+    ///
+    /// `bytes` holds `experts` packed matrices of `rows` rows by `row_bytes` bytes, one after
+    /// another; a plain arrangement is the bytes unchanged.
+    fn arrange(self, bytes: &[u8], experts: u64, rows: u64, row_bytes: u64) -> Vec<u8> {
+        let Some(block) = self.block() else {
+            return bytes.to_vec();
+        };
+        let mut arranged = bytes.to_vec();
+        let stride = row_bytes as usize;
+        for expert in 0..experts {
+            let base = expert * rows * row_bytes;
+            for row in 0..rows {
+                // The reference's maps in closed form: a source row `r` of a block moves to
+                // `(r % (block / 8)) * 8 + r / (block / 8)`, which is the interleave of eight-row
+                // groups the artifact's `srcToDstBlk16RowMap` and `srcToDstBlk32RowMap` list.
+                let lanes = block / 8;
+                let destination = (row % lanes) * 8 + row / lanes;
+                let destination = (row / block) * block + destination;
+                let source = (base + row * row_bytes) as usize;
+                let target = (base + destination * row_bytes) as usize;
+                arranged[target..target + stride].copy_from_slice(&bytes[source..source + stride]);
+            }
+        }
+        arranged
     }
 }
 
@@ -1092,6 +1164,7 @@ impl<'a> WeightLoader<'a> {
         projections: &[&str],
         experts: u32,
         names: Nvfp4Names,
+        values: ValueLayout,
         layout: ScaleLayout,
         input_scale: bool,
     ) -> Result<QuantizedStack> {
@@ -1244,6 +1317,22 @@ impl<'a> WeightLoader<'a> {
             ));
         }
 
+        // The values' row arrangement: a plain shard needs nothing, a shuffled one is permuted here
+        // once, at load. A product whose A operand is read with `useShuffledMatrix` cannot read a
+        // shard's own row order, so a row count that is not a whole number of shuffle blocks has no
+        // arrangement at all and is refused by name rather than published in an order nothing reads.
+        if let Some(block) = values.block()
+            && !rows.is_multiple_of(block)
+        {
+            return Err(Error::weight(
+                name,
+                format!(
+                    "a {values:?} arrangement permutes {block}-row blocks, and this stack's                      matrices have {rows} rows"
+                ),
+            ));
+        }
+        let values_bytes = values.arrange(&values_bytes, count, rows, (columns / 2).max(1));
+
         let values_shape = Shape::new(&[count, rows, columns / 2]);
         let scales_shape = Shape::new(&[count, per_expert_scales.dim(0), per_expert_scales.dim(1)]);
         // `reciprocals` was collected expert-major, in the checkpoint's own reading order; the
@@ -1267,7 +1356,7 @@ impl<'a> WeightLoader<'a> {
             WeightKey {
                 files: files.clone(),
                 dtype: DType::U8,
-                layout: WeightLayout::NVFP4_VALUES,
+                layout: values.layout(),
                 region: WeightRegion {
                     tensors: std::iter::once(format!("{name}__nvfp4_values"))
                         .chain(fields.iter().cloned())
