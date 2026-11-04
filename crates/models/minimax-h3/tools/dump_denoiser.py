@@ -462,10 +462,11 @@ def run_stack_out(stack: Path, checkpoint: Path, out: Path) -> int:
     layer count at the same step, so the comparison is about arithmetic rather than about who drew
     the noise or which packing produced the rows.
 
-    Three things it checks before it runs, each refused by name: the input's shape against the
-    case's `padded_tokens` and `hidden`, the checkpoint's hidden size against the case's, and the
-    case's `layers` against the layers it then runs (it runs the case's, so a case that says one
-    layer and a checkpoint that holds fifty runs one layer of that fifty). Two things it does not
+    Four things it checks before it runs, each refused by name: the input's shape against the
+    case's `padded_tokens` and `hidden`, the checkpoint's hidden size against the case's, the
+    case's `step` against the evaluations the checkpoint's schedule holds, and the case's `layers`
+    against the layers it then runs (it runs the case's, so a case that says one layer and a
+    checkpoint that holds fifty runs one layer of that fifty). Two things it does not
     check, because the case does not carry them: the alignment the candidate padded its row count
     to (only that the padding can hold the content rows), and a conditioned request's condition
     rows - a case whose task is not `t2va` is refused rather than packed as if it had none.
@@ -531,10 +532,19 @@ def run_stack_out(stack: Path, checkpoint: Path, out: Path) -> int:
         empty,
         empty,
     )
-    # The case carries no step, and the harness runs the schedule's first; a case that ever names
-    # another would need that field here rather than a second default.
-    step = torch.zeros(1, dtype=torch.int64)
-    print("step    0, the first evaluation of the checkpoint's schedule")
+    # The case's step is the evaluation both sides run. It is read rather than assumed, so a stage
+    # that ever runs another evaluation meets the same one here instead of a modulation difference
+    # that would look exactly like an arithmetic one; an index the schedule does not reach is
+    # refused, because the cache does not check it on the host.
+    steps = int(model.adaln_cache.groups.shape[0])
+    step_index = int(case.get("step", 0))
+    if not 0 <= step_index < steps:
+        raise SystemExit(
+            f"the case's step is {step_index}, and the checkpoint's schedule evaluates "
+            f"{steps} step(s): 0 to {steps - 1}"
+        )
+    step = torch.tensor([step_index], dtype=torch.int64)
+    print(f"step    {step_index} of {steps} in the checkpoint's schedule")
     modulation = model.adaln_cache(step)
     chunks = ((inputs.token_slice, hidden),)
     print(f"run     {layers} layer(s) at step 0, {rows} rows of {width}")
