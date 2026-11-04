@@ -2266,4 +2266,19 @@ mod tests {
         assert_eq!(report["processes"][1]["epoch"], Value::from(7));
         assert_eq!(report["processes"][1]["state"], Value::from("parked"));
     }
+
+    /// The epoch's build config is written by the daemon and read by the main
+    /// process through this same type, so what the writer serializes must read
+    /// back: an unset list is written as `null` and must be read as `None`,
+    /// not refused.
+    #[test]
+    fn a_build_config_reads_back_what_it_wrote() {
+        let config = ServeConfig::default();
+        let build = BuildConfig::of(&config);
+        assert!(build.cuda_graph.flow_shapes.is_none());
+        let text = serde_json::to_string(&build).expect("a build config is JSON");
+        let read: BuildConfig =
+            serde_json::from_str(&text).expect("the build config reads back through its writer");
+        assert_eq!(read, build);
+    }
 }
