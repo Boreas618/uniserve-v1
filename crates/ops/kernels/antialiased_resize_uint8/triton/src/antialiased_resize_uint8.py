@@ -4,7 +4,8 @@
 This is ``interpolate(scale, mode="bilinear" | "bicubic", antialias=True, align_corners=False)`` on a
 ``[rows, channels, height, width]`` uint8 frame, which is the video pipeline's downscaling. The filter
 is separable: for one output index ``i`` along an axis, ``center = (i + 0.5) · scale − 0.5``,
-``support = (bicubic ? 2 : 1) · max(1, scale)``, the taps are ``floor(center ± support + 0.5)``
+``support = (bicubic ? 2 : 1) · max(1, scale)``, the taps run from ``ceil(center - support)``
+through ``floor(center + support)``
 clamped to the input's extent, and a tap's weight is the kernel evaluated at its distance from the
 center over the scale, divided by the taps' sum so a constant image stays constant. The triangle is
 ``max(0, 1 − |x|)`` and the cubic is the one ATen's antialiased resize uses, α = −0.75.
@@ -108,8 +109,13 @@ def _antialiased_resize_uint8_kernel(
     # The vertical axis: one center for the lane, and its taps and weights.
     support_h = (2.0 if BICUBIC else 1.0) * tl.maximum(1.0, scale_h)
     center_h = (out_row.to(tl.float32) + _HALF) * scale_h - _HALF
-    start_h = tl.floor(center_h - support_h + _HALF).to(tl.int64)
-    count_h = tl.floor(center_h + support_h + _HALF).to(tl.int64) - start_h
+    # The window of contributing taps is `[center - support, center + support]`: its first integer is
+    # the ceiling and its last the floor, so a fractional centre keeps every tap the filter wants. An
+    # earlier version rounded both ends (`floor(center ± support + 0.5)`), which drops the last
+    # contributing tap whenever `center + support` is not near a half-integer: measured against torch,
+    # a bilinear 16 -> 11 came out 23.19 code values wrong at the worst pixel, and this form 0.0000.
+    start_h = tl.floor(center_h - support_h).to(tl.int64) + 1
+    count_h = tl.floor(center_h + support_h).to(tl.int64) - start_h + 1
     count_h = tl.minimum(count_h, MAX_TAPS)
     sum_h = tl.zeros((BLOCK,), dtype=tl.float32)
     for tap in tl.static_range(MAX_TAPS):
@@ -132,8 +138,8 @@ def _antialiased_resize_uint8_kernel(
     ) * width_of
     for out_column in tl.range(0, out_width_of):
         center_w = (out_column.to(tl.float32) + _HALF) * scale_w - _HALF
-        start_w = tl.floor(center_w - support_w + _HALF).to(tl.int64)
-        count_w = tl.floor(center_w + support_w + _HALF).to(tl.int64) - start_w
+        start_w = tl.floor(center_w - support_w).to(tl.int64) + 1
+        count_w = tl.floor(center_w + support_w).to(tl.int64) - start_w + 1
         count_w = tl.minimum(count_w, MAX_TAPS)
         total = tl.zeros((BLOCK,), dtype=tl.float32)
         sum_w = tl.zeros((BLOCK,), dtype=tl.float32)
