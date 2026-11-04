@@ -3,6 +3,7 @@
 
 #![cfg(test)]
 
+mod boot;
 mod cache_storage;
 mod canvas;
 mod control_plane;
