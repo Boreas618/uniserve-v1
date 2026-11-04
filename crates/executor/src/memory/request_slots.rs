@@ -150,6 +150,17 @@ mod tests {
         Ok(())
     }
 
+    /// A rank that declares no field maps nothing: no bank, no byte and no
+    /// padding row, so the engine may pass an empty list rather than a dummy.
+    #[test]
+    fn a_rank_without_fields_maps_nothing() -> Result<()> {
+        assert_eq!(RequestSlots::bytes(&[], 8)?, (0, 0));
+        let slots = RequestSlots::allocate(&[], 8, None)?;
+        assert!(slots.views().is_empty());
+        assert_eq!(slots.mapped_bytes(), 0);
+        Ok(())
+    }
+
     /// The resident figure is device storage only: a rank whose banks are host
     /// storage still allocates them, and maps nothing the device budget covers.
     #[test]
