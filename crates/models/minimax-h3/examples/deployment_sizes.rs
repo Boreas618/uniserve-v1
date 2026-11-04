@@ -176,11 +176,11 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         );
         let arena: u64 = minimax_h3::decoding::video_arena(&config.video_vae, &latent)?
             .iter()
-            .map(|buffer| buffer.elements * if buffer.element == "f16" { 2 } else { 4 })
+            .map(|buffer| buffer.bytes())
             .sum();
         if std::env::var("H3_ARENA_BUFFERS").is_ok() && canvas.width == 1536 {
             for buffer in minimax_h3::decoding::video_arena(&config.video_vae, &latent)? {
-                let bytes = buffer.elements * if buffer.element == "f16" { 2 } else { 4 };
+                let bytes = buffer.bytes();
                 println!("    {} {} {} B", buffer.name, buffer.element, bytes);
             }
         }
@@ -199,10 +199,7 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             &config.audio_vae,
             minimax_h3::packing::audio_latent_frames(frames),
         )?;
-        let bytes: u64 = plan
-            .iter()
-            .map(|buffer| buffer.elements * if buffer.element == "f16" { 2 } else { 4 })
-            .sum();
+        let bytes: u64 = plan.iter().map(|buffer| buffer.bytes()).sum();
         println!(
             "audio plan {frames} frames ({} latent steps): {} buffers, {} bytes = {} MiB",
             minimax_h3::packing::audio_latent_frames(frames),
@@ -212,7 +209,7 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         );
         if std::env::var("H3_PLAN_BUFFERS").is_ok() && frames == 124 {
             for buffer in &plan {
-                let size = buffer.elements * if buffer.element == "f16" { 2 } else { 4 };
+                let size = buffer.bytes();
                 println!(
                     "    {:32} {} {:>12} elements {:>10} B",
                     buffer.name, buffer.element, buffer.elements, size
@@ -236,7 +233,7 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             let bytes: u64 =
                 minimax_h3::encoding::video_encoder_tile_arena(&config.video_vae, extent)?
                     .iter()
-                    .map(|buffer| buffer.elements * 4)
+                    .map(|buffer| buffer.bytes())
                     .sum();
             total += bytes;
             if largest < bytes {
@@ -265,7 +262,7 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             };
             hoisted += minimax_h3::encoding::video_encoder_tile_arena(&config.video_vae, extent)?
                 .iter()
-                .map(|buffer| buffer.elements * 4)
+                .map(|buffer| buffer.bytes())
                 .sum::<u64>();
         }
         if std::env::var("H3_PLAN_TILES").is_ok() && width == 1344 {
@@ -301,7 +298,7 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             width,
         };
         let plan = minimax_h3::encoding::video_encoder_tile_arena(&config.video_vae, raster)?;
-        let bytes: u64 = plan.iter().map(|buffer| buffer.elements * 4).sum();
+        let bytes: u64 = plan.iter().map(|buffer| buffer.bytes()).sum();
         println!(
             "encoder tile {width}x{height} px: {} buffers, {} bytes = {} MiB",
             plan.len(),
@@ -312,7 +309,7 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     let tile = minimax_h3::video_vae::Canvas::clip(&config.video_vae, 16, 16);
     let one: u64 = minimax_h3::decoding::video_arena(&config.video_vae, &tile)?
         .iter()
-        .map(|buffer| buffer.elements * if buffer.element == "f16" { 2 } else { 4 })
+        .map(|buffer| buffer.bytes())
         .sum();
     println!("one tile: {}", mib(one / (1 << 20)));
     Ok(())
