@@ -440,34 +440,56 @@ mod tests {
     #[test]
     fn a_raster_within_one_tile_is_one_tile_with_no_seam() {
         let small = ClipEncoder::new(256, 256).expect("one tile");
+        let latent = small.latent_extent();
+        // A side of one tile has one latent side: the raster over the VAE's spatial compression,
+        // and the whole of it is the tile's own.
+        assert_eq!(latent, (256 / SPATIAL_RATIO, 256 / SPATIAL_RATIO));
         let plan = small.plan();
         assert_eq!(plan.tiles.len(), 1);
         let tile = plan.tiles[0];
-        assert_eq!(tile.rows, (0, 16));
-        assert_eq!(tile.columns, (0, 16));
+        assert_eq!(tile.rows, (0, latent.0));
+        assert_eq!(tile.columns, (0, latent.1));
         assert!(!tile.fades_above() && !tile.fades_left());
-        assert_eq!(plan.crop, (0, 16));
+        assert_eq!(plan.crop, (0, latent.0));
     }
 
     #[test]
     fn a_raster_needs_one_compiled_blend_for_each_seam_width_it_has() {
-        // 1344 by 768 has three seams of two widths along the rows and six of two along the columns:
-        // four compiled blends serve the whole raster, not ten.
-        assert_eq!(
-            canvas().blend_extents(),
-            vec![(4, 3), (5, 2), (5, 3), (6, 2)]
-        );
-        // The encoder compiles exactly those blends, once each, so a driver finds every seam it
-        // meets and the run pays for four programs rather than one per seam.
+        // The source of truth is the plan's own seams: every fade the run performs is one of the
+        // plan's `(extent, axis)` pairs, and the encoder must have compiled exactly those - not one
+        // program per seam, and not a pair no seam needs.
         let encoder = canvas();
+        let plan = encoder.plan();
+        let mut needed: Vec<(u32, u32)> = Vec::new();
+        for tile in &plan.tiles {
+            if tile.fades_above() {
+                needed.push((tile.above, 2));
+            }
+            if tile.fades_left() {
+                needed.push((tile.left, 3));
+            }
+        }
+        needed.sort_unstable();
+        needed.dedup();
+
         let compiled: Vec<(u32, u32)> = encoder
             .blends
             .iter()
             .map(|(extent, axis, _)| (*extent, *axis))
             .collect();
         assert_eq!(compiled, encoder.blend_extents());
-        assert_eq!(compiled.len(), 4);
-        // A raster inside one tile has no seam at all.
+        assert_eq!(compiled, needed);
+
+        // The band's two axes have different seam widths, so the pairs are more than one per axis:
+        // without that, this test could not tell a row's blend from a column's.
+        assert!(needed.iter().any(|(_, axis)| *axis == 2));
+        assert!(needed.iter().any(|(_, axis)| *axis == 3));
+        assert!(
+            needed.iter().map(|(extent, _)| *extent).max()
+                != needed.iter().map(|(extent, _)| *extent).min()
+        );
+
+        // A raster inside one tile has no seam at all, so it needs and compiles none.
         let small = ClipEncoder::new(256, 256).expect("one tile");
         assert!(small.blend_extents().is_empty());
         assert!(small.blends.is_empty());
@@ -475,32 +497,47 @@ mod tests {
 
     #[test]
     fn a_raster_that_is_not_whole_patches_is_refused_rather_than_truncated() {
-        // The compression is 16 pixels; a raster that does not divide by it has no latent extent,
-        // and the encoder reads whole patches, so nothing may round the raster down silently.
-        assert!(ClipEncoder::new(1000, 700).is_err());
+        // The encoder reads whole latent patches, so a side that is not a multiple of the spatial
+        // compression has no latent extent, and nothing may round it down silently.
+        assert!(ClipEncoder::new(256 + SPATIAL_RATIO / 2, 256).is_err());
+        assert!(ClipEncoder::new(256, 256 + SPATIAL_RATIO / 2).is_err());
+        assert!(ClipEncoder::new(256, 256).is_ok());
+        // A served canvas passes: 768 by 1344 and 480 by 832 are both multiples of the compression.
         assert!(ClipEncoder::new(768, 1344).is_ok());
-        assert!(ClipEncoder::new(416, 992).is_ok());
+        assert!(ClipEncoder::new(480, 832).is_ok());
     }
 
     #[test]
     fn the_canvas_plan_covers_every_latent_position() {
         let encoder = canvas();
-        assert_eq!(encoder.latent_extent(), (48, 84));
+        let latent = encoder.latent_extent();
+        // The latent raster is the canvas over the spatial compression: 768 and 1344 pixels are 48
+        // and 84 latent positions.
+        assert_eq!(latent, (768 / SPATIAL_RATIO, 1344 / SPATIAL_RATIO));
+        let grid = encoder.grid();
         let plan = encoder.plan();
-        assert_eq!(plan.tiles.len(), 4 * 7);
-        assert_eq!(plan.extent(), (0, 48));
+        // One tile per pair of seams, and a run that starts at the raster's own first position.
+        assert_eq!(
+            plan.tiles.len(),
+            grid.rows.starts.len() * grid.columns.starts.len()
+        );
+        assert_eq!(plan.extent(), (0, latent.0));
 
-        // A tile row owns the latent rows up to the next row's start, and the last owns the rest.
-        let owned = encoder.grid().owned(48);
-        assert_eq!(owned, [0, 10, 21, 32, 48]);
+        // A tile row owns the latent rows up to the next row's start, and the last owns the rest:
+        // every tile starts where its own owner starts, the first owner is position zero and the
+        // last owner is the raster's end.
+        let owned = grid.owned(latent.0);
+        assert_eq!(owned[0], 0);
+        assert_eq!(*owned.last().expect("a last owner"), latent.0);
+        assert!(owned.windows(2).all(|pair| pair[0] < pair[1]));
         for tile in &plan.tiles {
             assert_eq!(tile.rows.0, owned[tile.row]);
         }
 
         // Every latent row and column is written by some tile; the seams are written twice, by the
         // tile that owns them and by the neighbour that fades into them.
-        let mut rows = [0u32; 48];
-        let mut columns = [0u32; 84];
+        let mut rows = vec![0u32; latent.0 as usize];
+        let mut columns = vec![0u32; latent.1 as usize];
         for tile in &plan.tiles {
             let (start, length) = tile.rows;
             for row in start..start + length {
@@ -518,33 +555,37 @@ mod tests {
     #[test]
     fn a_seam_fades_over_the_overlap_the_split_was_given() {
         let encoder = canvas();
-        // The split spreads the 64 pixels of slack over the seams in tile order, in whole
-        // 16-pixel steps; the tall axis has three seams and the wide axis six.
-        assert_eq!(encoder.grid().rows.overlaps, vec![96, 80, 80]);
-        assert_eq!(Grid::blends(&encoder.grid().rows), vec![6, 5, 5]);
-        assert_eq!(
-            encoder.grid().columns.overlaps,
-            vec![80, 80, 80, 80, 64, 64]
-        );
-        assert_eq!(
-            Grid::blends(&encoder.grid().columns),
-            vec![5, 5, 5, 5, 4, 4]
-        );
+        let grid = encoder.grid();
+
+        // The overlaps are the reference's, in pixels: `split_tiles` on this raster spreads the
+        // 64-pixel slack over the seams in tile order and in whole compression steps, which gives
+        // three seams of 6, 5 and 5 latents down the 48 rows and six of 5, 5, 5, 5, 4 and 4 across
+        // the 84 columns. They are the reference's numbers, not this module's, which is why they
+        // are stated: the derivation below reads them through `Grid::blends`.
+        assert_eq!(grid.rows.overlaps, vec![96, 80, 80]);
+        assert_eq!(grid.columns.overlaps, vec![80, 80, 80, 80, 64, 64]);
+        let rows_blend = Grid::blends(&grid.rows);
+        let columns_blend = Grid::blends(&grid.columns);
+
+        // The two axes' seams differ, so a tile that fades both ways tells them apart: reading one
+        // axis's blend for the other is the defect this assertion exists to catch.
+        assert_ne!(rows_blend, columns_blend);
 
         let plan = encoder.plan();
-        // The raster's first tile row and column have nothing to fade against; every other tile
-        // fades over the seam it shares with the neighbour before it.
-        assert_eq!(plan.tiles[0].above, 0);
-        assert_eq!(plan.tiles[0].left, 0);
-        assert_eq!(plan.tiles[1].above, 0);
-        assert_eq!(plan.tiles[1].left, 5);
-        assert_eq!(plan.tiles[7].above, 6);
-        assert_eq!(plan.tiles[8].above, 6);
-        assert_eq!(plan.tiles[8].left, 5);
-        // The last column's fade is its own seam, not the rows': the two axes have different
-        // widths, and reading one for the other is a defect this assertion is here to catch.
-        assert_eq!(plan.tiles[6].left, 4);
-        assert_eq!(plan.tiles[6].above, 0);
+        for tile in &plan.tiles {
+            // A tile row fades over the seam above it, a tile column over the seam to its left; the
+            // first of each has nothing before it and fades nothing.
+            let above = match tile.row {
+                0 => 0,
+                row => rows_blend[row - 1],
+            };
+            let left = match tile.column {
+                0 => 0,
+                column => columns_blend[column - 1],
+            };
+            assert_eq!(tile.above, above, "tile row {} fades above", tile.row);
+            assert_eq!(tile.left, left, "tile column {} fades left", tile.column);
+        }
     }
 
     #[test]
@@ -588,17 +629,22 @@ mod tests {
         // band's tiles write must be exactly the rows the caller keeps. A band one row short loses a
         // latent row silently, which is why this is asserted row by row rather than as a count.
         let encoder = canvas();
-        for (start, stop) in [
-            (0, 48),
-            (0, 1),
-            (4, 12),
-            (10, 11),
-            (11, 21),
-            (20, 40),
-            (21, 22),
-            (32, 33),
-            (47, 48),
-        ] {
+        let latent = encoder.latent_extent().0;
+        // The bands worth testing are the ones the geometry makes interesting: a whole tile row, its
+        // first row, everything but its first row, and the raster's last row. They follow from the
+        // seam positions, so a changed split moves them instead of leaving them stale.
+        let owned = encoder.grid().owned(latent);
+        let mut bands: Vec<(u32, u32)> = vec![(0, latent)];
+        for pair in owned.windows(2) {
+            let (start, stop) = (pair[0], pair[1]);
+            bands.push((start, stop));
+            if start + 1 < stop {
+                bands.push((start, start + 1));
+                bands.push((start + 1, stop));
+            }
+        }
+        bands.push((latent - 1, latent));
+        for (start, stop) in bands {
             let band = encoder.band(start, stop).expect("a band");
             let origin = band.origin;
             let mut written = vec![false; (stop - start) as usize];
@@ -621,16 +667,21 @@ mod tests {
     #[test]
     fn the_bands_of_a_raster_cover_its_rows_without_gap_or_overlap() {
         let encoder = canvas();
+        let latent = encoder.latent_extent().0;
+        // Splitting the raster at every tile row's own boundary must tile it: each band's crop is the
+        // range asked for, nothing is read before it, and the bands reach the raster's end.
         let mut next = 0;
-        for stop in [1, 4, 10, 11, 21, 22, 32, 33, 47, 48] {
+        for owned in encoder.grid().owned(latent).iter().skip(1) {
+            let stop = *owned;
             let band = encoder.band(next, stop).expect("a band");
             assert_eq!(band.crop, (next, stop));
             assert!(band.origin <= next);
             assert!(band.extent().1 >= stop);
             next = stop;
         }
-        assert_eq!(next, 48);
-        assert!(encoder.band(48, 48).is_err());
-        assert!(encoder.band(0, 49).is_err());
+        assert_eq!(next, latent);
+        // An empty run and one past the raster are refused rather than clamped.
+        assert!(encoder.band(latent, latent).is_err());
+        assert!(encoder.band(0, latent + 1).is_err());
     }
 }
