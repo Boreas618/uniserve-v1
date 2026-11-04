@@ -155,10 +155,25 @@ impl VirtualPool {
         self.device
     }
 
-    /// The bytes of physical storage the pool maps, or would map once
-    /// restored.
+    /// The bytes of physical storage the pool maps now: every block whose
+    /// storage is mapped, and so exactly what its budget has booked for it.
     pub fn mapped_bytes(&self) -> usize {
-        self.chunks.iter().map(|chunk| chunk.bytes).sum()
+        self.chunks
+            .iter()
+            .filter(|chunk| chunk.block.is_some())
+            .map(|chunk| chunk.bytes)
+            .sum()
+    }
+
+    /// Books the pool's current total, after its storage changed. The storage
+    /// exists or is gone already, so a refusal cannot undo the change; the
+    /// caller reports the failure of the operation that made it.
+    fn rebook(&self) {
+        if let Some(booking) = &self.booking {
+            let _ = booking
+                .budget
+                .book(self.device, booking.kind, self.mapped_bytes() as u64);
+        }
     }
 
     /// Whether `address` lies in the pool's reservation.
@@ -239,9 +254,7 @@ impl VirtualPool {
         if let Some(booking) = &self.booking {
             let total = self.mapped_bytes() as u64 + bytes as u64;
             // The booking comes first: a refusal must leave nothing mapped.
-            if let Err(error) = booking.budget.book(self.device, booking.kind, total) {
-                return Err(error);
-            }
+            booking.budget.book(self.device, booking.kind, total)?;
         }
         let ordinal = self.device.handle()?;
         let address = self.address + offset;
@@ -301,11 +314,10 @@ impl VirtualPool {
                 // Nothing stayed mapped, so the pool's total is what it was
                 // before the booking; restoring it must not mask the failure.
                 if let Some(booking) = &self.booking {
-                    let _ = booking.budget.book(
-                        self.device,
-                        booking.kind,
-                        self.mapped_bytes() as u64,
-                    );
+                    let _ =
+                        booking
+                            .budget
+                            .book(self.device, booking.kind, self.mapped_bytes() as u64);
                 }
                 Err(error)
             }
@@ -327,23 +339,19 @@ impl VirtualPool {
             return Ok(());
         }
         let stream = Stream::new(self.device)?;
-        for chunk in &mut self.chunks {
-            let Some(block) = chunk.block.clone() else {
+        for index in 0..self.chunks.len() {
+            let Some(block) = self.chunks[index].block.clone() else {
                 continue;
             };
-            let saved = PinnedBuffer::new(self.device, chunk.bytes)?;
-            let address = self.address + chunk.offset;
+            let bytes = self.chunks[index].bytes;
+            let address = self.address + self.chunks[index].offset;
+            let saved = PinnedBuffer::new(self.device, bytes)?;
             in_context(self.context.raw(), |driver| {
                 // SAFETY: the chunk is mapped and idle; the host buffer is
                 // live and as long as the chunk.
                 driver.check(
                     unsafe {
-                        (driver.memcpy_async)(
-                            saved.address(),
-                            address,
-                            chunk.bytes,
-                            stream.handle(),
-                        )
+                        (driver.memcpy_async)(saved.address(), address, bytes, stream.handle())
                     },
                     "cuMemcpyAsync",
                 )
@@ -353,14 +361,17 @@ impl VirtualPool {
                 driver.check(
                     // SAFETY: the chunk was mapped by this pool and nothing
                     // addresses it while the pool is suspended.
-                    unsafe { (driver.mem_unmap)(address, chunk.bytes) },
+                    unsafe { (driver.mem_unmap)(address, bytes) },
                     "cuMemUnmap",
                 )?;
                 // SAFETY: the handle is this pool's reference.
                 driver.check(unsafe { (driver.mem_release)(block.raw()) }, "cuMemRelease")
             })?;
-            chunk.block = None;
-            chunk.saved = Some(saved);
+            self.chunks[index].block = None;
+            self.chunks[index].saved = Some(saved);
+            // The device maps this storage no longer, so its budget must stop
+            // counting it: an over-count would refuse an allocation that fits.
+            self.rebook();
         }
         self.suspended = true;
         Ok(())
@@ -409,6 +420,11 @@ impl VirtualPool {
 impl Drop for VirtualPool {
     fn drop(&mut self) {
         let context = self.context.clone();
+        let device = self.device;
+        let release = self
+            .booking
+            .as_ref()
+            .map(|booking| (booking.kind, Arc::clone(&booking.budget)));
         let (address, reserved) = (self.address, self.reserved);
         let mapped: Vec<(u64, usize, u64)> = self
             .chunks
@@ -423,7 +439,7 @@ impl Drop for VirtualPool {
         // The owner destroyed every graph that addresses the pool and
         // drained the streams they ran on.
         reclaim::defer(move || {
-            in_context(context.raw(), |driver| {
+            let outcome = in_context(context.raw(), |driver| {
                 let mut outcome = Ok(());
                 for (chunk, bytes, handle) in mapped {
                     // SAFETY: each chunk was mapped by this pool.
@@ -436,7 +452,14 @@ impl Drop for VirtualPool {
                 // SAFETY: the range was reserved by this pool.
                 let status = unsafe { (driver.mem_address_free)(address, reserved) };
                 outcome.and(driver.check(status, "cuMemAddressFree"))
-            })
+            });
+            // The pool's storage is gone, so the device's budget stops counting
+            // it. Releasing the last of a deployment's pools may outlive its
+            // ledger client, hence best effort.
+            if let Some((kind, budget)) = release {
+                let _ = budget.book(device, kind, 0);
+            }
+            outcome
         });
     }
 }
