@@ -163,8 +163,13 @@ pub(crate) struct Switch {
     target: u64,
     /// The previous epoch's number, which `Serve` and `Drain` name.
     previous: u64,
-    /// The launch generation the target's children are started at: the
-    /// serving generation's next one.
+    /// The launch generation the target's children are started at.
+    ///
+    /// The epoch layer chooses it and owes the switch one property: it is
+    /// above every live generation of the group and rank on every node,
+    /// including the serving epoch's parked standby, which occupies
+    /// `previous_generation + 1` (§2.5). A promoted standby must never reach
+    /// this number, or one number would name two epochs.
     spawn_generation: u64,
     /// The previous epoch's launch generation.
     previous_generation: u64,
@@ -210,8 +215,9 @@ pub(crate) struct Switch {
 
 impl Switch {
     /// A switch of epoch `previous` (launch generation `previous_generation`)
-    /// to epoch `target`, whose record is `record`. The target is started one
-    /// generation after the serving one; its own report is authoritative.
+    /// to epoch `target`, whose record is `record`, with the target's
+    /// children started at `spawn_generation` — above every live generation
+    /// of the group and rank, the serving epoch's standby included.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         epochs: Arc<Epochs>,
@@ -220,6 +226,7 @@ impl Switch {
         record: EpochRecord,
         previous: u64,
         previous_generation: u64,
+        spawn_generation: u64,
         group: String,
         nodes: Vec<Node>,
         start: Start,
@@ -233,7 +240,7 @@ impl Switch {
             update,
             target,
             previous,
-            spawn_generation: previous_generation + 1,
+            spawn_generation,
             previous_generation,
             generation: None,
             record,
@@ -380,7 +387,7 @@ impl Switch {
     /// storage and is ready to be promoted (`Report::Parked`). The caller's
     /// mapping from the wire is the one line; this input is the phase's.
     pub(crate) fn parked(&mut self, roster: &mut impl Roster, host: &str, generation: u64) {
-        if self.phase != Phase::Preparing || !self.accept(roster, host, generation) {
+        if self.phase != Phase::Preparing || !self.accept(generation) {
             return;
         }
         self.parked.insert(host.to_owned());
@@ -390,7 +397,7 @@ impl Switch {
     /// The target's main process of `generation` on `host` is promoted and
     /// serves in place (`Report::Promoted`).
     pub(crate) fn promoted(&mut self, roster: &mut impl Roster, host: &str, generation: u64) {
-        if self.phase != Phase::Promoting || !self.accept(roster, host, generation) {
+        if self.phase != Phase::Promoting || !self.accept(generation) {
             return;
         }
         self.promoted.insert(host.to_owned());
@@ -460,37 +467,19 @@ impl Switch {
         }
     }
 
-    /// Accepts `generation` as a target main process's, or refuses the node:
-    /// the child numbers the generation it prepared, so any number from the
-    /// one the switch spawned on names this epoch, and the highest reported
-    /// is the epoch's current generation. A lower number is another epoch's.
-    fn accept(&mut self, roster: &mut impl Roster, host: &str, generation: u64) -> bool {
+    /// Accepts `generation` as a target main process's: the child numbers the
+    /// generation it prepared, so any number from the one the switch spawned
+    /// on names this epoch, and the highest reported is its current
+    /// generation. A lower number belongs to another epoch — the serving
+    /// epoch or its promoted standby — and is ignored.
+    fn accept(&mut self, generation: u64) -> bool {
         if generation < self.spawn_generation {
-            self.refuse(roster, host, generation);
             return false;
         }
         if self.generation.is_none_or(|recorded| generation > recorded) {
             self.generation = Some(generation);
         }
         true
-    }
-
-    /// Stops a node's target whose report names an older generation, and
-    /// drops the target epoch.
-    fn refuse(&mut self, roster: &mut impl Roster, host: &str, generation: u64) {
-        roster.stop(host, &self.group, Some(generation));
-        self.failed(
-            roster,
-            Failure {
-                kind: "generation_mismatch".to_owned(),
-                reason: format!(
-                    "the main process on {host} reported generation {generation}, older than the \
-                 generation {} the target was spawned at",
-                    self.spawn_generation
-                ),
-                device: None,
-            },
-        );
     }
 
     /// The scopes a claim keeps: the node's own `(group, rank)`, which the
@@ -549,7 +538,18 @@ impl Switch {
             return;
         }
         // Its replacement must serve first: serving it before that would
-        // route requests to an epoch that is not running.
+        // route requests to an epoch that is not running. Until then the
+        // target keeps serving, on its previous program generation.
+        let generation = self.target_generation();
+        for node in &self.nodes {
+            roster.command(
+                &node.host,
+                generation,
+                command(process::command::Kind::Revert(process::Revert {
+                    reason: failure.reason.clone(),
+                })),
+            );
+        }
         self.pending_restore = Some(failure);
         self.phase = Phase::Reverting;
     }
@@ -572,9 +572,13 @@ impl Switch {
         self.phase = Phase::Abandoned;
     }
 
-    /// The previous epoch admits again after its drain.
+    /// The previous epoch admits again after its drain. A host whose process
+    /// died is skipped: its replacement serves already.
     fn resume(&mut self, roster: &mut impl Roster, reason: &str) {
         for node in &self.nodes {
+            if self.previous_dead.contains(&node.host) {
+                continue;
+            }
             roster.resume(&node.host, self.previous_generation, reason);
         }
     }
@@ -975,6 +979,7 @@ mod tests {
             record(),
             11,
             5,
+            6,
             "engine:0".to_owned(),
             nodes(),
             start(),
@@ -1200,26 +1205,45 @@ mod tests {
         assert_eq!(switch.discarded(), &[12]);
     }
 
-    /// A child that names a generation older than the one the target was
-    /// spawned at is another epoch's: it is refused, stopped, and the target
-    /// dropped. A later generation is this epoch's and is accepted.
+    /// The serving epoch's standby is promoted during the preparing, at the
+    /// generation right after the serving one; the target's own generation is
+    /// above it, so the promoted child never enters the target's sets.
     #[test]
-    fn an_older_generation_is_refused() {
-        let (_epochs, mut switch) = setup();
+    fn a_promoted_standby_of_the_previous_epoch_is_not_the_target() {
+        let epochs = Arc::new(Epochs::new());
+        let mut switch = Switch::new(
+            Arc::clone(&epochs),
+            Update::new(7, Deployment::of(ServeConfig::default())),
+            12,
+            record(),
+            11,
+            5,
+            7,
+            "engine:0".to_owned(),
+            nodes(),
+            start(),
+            "unix:/run/requests.sock".to_owned(),
+        );
         let mut roster = Fake::default();
         switch.start(&mut roster);
+        assert_eq!(roster.spawns[0].generation, 7);
+
+        // The previous epoch's parked standby (generation 6) is promoted while
+        // the target prepares.
+        switch.promoted(&mut roster, "n0", 6);
+        switch.parked(&mut roster, "n0", 6);
+        assert_eq!(switch.phase(), Phase::Preparing);
+        assert_eq!(switch.generation(), None, "6 is the previous epoch's");
+
         switch.parked(&mut roster, "n0", 7);
+        switch.parked(&mut roster, "n1", 7);
+        assert_eq!(switch.phase(), Phase::Promoting);
         assert_eq!(switch.generation(), Some(7));
-        switch.parked(&mut roster, "n1", 4);
-        assert_eq!(switch.phase(), Phase::Abandoned);
-        assert_eq!(
-            switch.failure().map(|failure| failure.kind.as_str()),
-            Some("generation_mismatch")
-        );
         assert!(
             roster
-                .stops
-                .contains(&("n1".to_owned(), "engine:0".to_owned(), Some(4)))
+                .commands
+                .iter()
+                .all(|(_, generation, _)| *generation == 7)
         );
     }
 
@@ -1288,6 +1312,11 @@ mod tests {
         assert!(
             roster.serves.is_empty(),
             "the replacement of the dead epoch must serve first"
+        );
+        assert_eq!(
+            roster.commands_of(6, |kind| matches!(kind, process::command::Kind::Revert(_))),
+            2,
+            "the target returns to its previous program generation meanwhile"
         );
 
         switch.serving(&mut roster, "n0", 7);
