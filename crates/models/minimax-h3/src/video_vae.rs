@@ -1471,13 +1471,10 @@ pub(crate) mod tests {
         table_bytes_into(&config, 42, 96, &mut wide).expect("the wide canvas");
         assert_eq!(vertical[0].len(), wide[0].len());
         let tables = table_specs(&config, 48, 84).expect("the one table");
-        assert_eq!(vertical[0].len() as u64, tables[0].shape.numel());
-        // Host bytes of an F32: the descriptor and the buffer agree, or the executor uploads a table
-        // of the wrong length.
-        assert_eq!(
-            vertical[0].len() as u64 * 8,
-            tables[0].shape.numel() * u64::from(tables[0].dtype.bits())
-        );
+        // The buffer is the descriptor's own expression: elements times the element's size. Written as
+        // a number it was `5,391` elements against `21,564` bytes - the same table in two units.
+        let expected = tables[0].shape.numel() * u64::from(tables[0].dtype.bits()) / 8;
+        assert_eq!(vertical[0].len() as u64, expected);
     }
 
     #[test]
