@@ -517,10 +517,15 @@ impl Layouts {
                 shape: Shape::new(&[rows]),
             },
             // Axis-major, `[axes, rows]`: `nn::Rotary`'s sectioned rotation reads one coordinate
-            // per axis per token and refuses a leading extent that is not the axis count.
+            // per axis per token and refuses a leading extent that is not the axis count. **The
+            // coordinates are integers** (`position_ids` in the reference is an `int64` table cut to
+            // its three axes), so the table is `i32` and the rotary's launch reads
+            // `positions_i32` - a table declared F32 is the same numbers in another type and the
+            // store has no such cell: `generation 1 has no kernel for rotary_factors
+            // descriptor dtype_f32_positions_f32_columns_48`.
             StateTable {
                 name: "position_ids",
-                dtype: DType::F32,
+                dtype: DType::I32,
                 shape: Shape::new(&[3, rows]),
             },
             StateTable {
@@ -592,7 +597,7 @@ impl Layouts {
             },
             StateTable {
                 name: "position_ids",
-                dtype: DType::F32,
+                dtype: DType::I32,
                 shape: Shape::new(&[3, rows]),
             },
             StateTable {
@@ -1300,10 +1305,12 @@ fn gcd(left: u32, right: u32) -> u32 {
 /// The packing states one coordinate triple per row; `nn::Rotary`'s sectioned rotation indexes a
 /// table by `[axis, token]` and a row-major table would rotate each row by another row's angles.
 fn coordinates(points: &[[f64; 3]]) -> Vec<u8> {
+    // Axis-major int32, which is the table's declared type: a coordinate is an index, not a
+    // measured value, and the rotary reads one integer per axis per token.
     let mut bytes = Vec::with_capacity(points.len() * 3 * 4);
     for axis in 0..3 {
         for point in points {
-            bytes.extend_from_slice(&(point[axis] as f32).to_le_bytes());
+            bytes.extend_from_slice(&(point[axis] as i32).to_le_bytes());
         }
     }
     bytes
@@ -1957,7 +1964,7 @@ pub fn denoise_arena(
 
     // The output's modulation and the solver's one staging word.
     push(&mut plan, "output.entries", "i32", groups);
-    push(&mut plan, "output.modulation", "f32", groups * 2 * hidden);
+    push(&mut plan, "output.modulation", element, groups * 2 * hidden);
     push(&mut plan, "coefficient", "f32", 1);
 
     // The video step: the rows gathered out of the packed sequence, their groups, the velocity
@@ -2811,7 +2818,11 @@ impl Denoiser {
         let groups = self.cache.groups().count() as u64;
         let entries = arena.tensor(DType::I32, Shape::new(&[1, groups]))?;
         self.cache.entries_of(f, step_index, entries)?;
-        let modulation = arena.tensor(DType::F32, Shape::new(&[groups, 2 * hidden_size]))?;
+        // The cache's tables are the deployment's type (`Projections::dtype`, the modulation
+        // projections' own), so the gather's destination is that type: an F32 buffer here is the
+        // same bytes in another type at a stated-FP32 deployment and a mixed pair at a BF16 one.
+        let modulation =
+            arena.tensor(self.cache.dtype(), Shape::new(&[groups, 2 * hidden_size]))?;
         self.cache.output(f, entries, modulation)?;
 
         // The solver's scale: one FP32 word the `step` table indexes into the coefficient table.

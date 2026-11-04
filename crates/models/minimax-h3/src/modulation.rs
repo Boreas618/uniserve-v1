@@ -224,6 +224,14 @@ impl AdaLnCache {
         Ok(gather_rows(f, self.output.view(), entries, out)?)
     }
 
+    /// The columns one entry's modulation table holds: the three interval tags of six vectors.
+    ///
+    /// A gather's output is `[entries, this]` - the shape the operator derives from the table -
+    /// while a block cuts one interval at a time out of the same bytes.
+    pub fn layer_width(&self) -> u64 {
+        u64::from(TAGS) * VECTORS as u64 * u64::from(self.hidden_size)
+    }
+
     /// Elements one layer's gathered modulation holds.
     pub fn layer_elements(&self) -> u64 {
         u64::from(self.groups.count())
