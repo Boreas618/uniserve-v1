@@ -73,6 +73,7 @@
 
 pub mod activation;
 pub mod attention;
+pub mod audio_resample;
 pub mod block_copy;
 pub mod capture;
 pub mod commit;
@@ -81,6 +82,7 @@ pub mod descriptor;
 pub mod embedding;
 pub mod error;
 pub mod exchange;
+pub mod fp4;
 pub mod frame;
 pub mod gemm;
 pub mod generation;
@@ -97,16 +99,20 @@ pub mod op;
 pub mod phase;
 pub mod platform;
 pub mod prefix_cache;
+pub mod replicate_pad;
 pub mod residual;
+pub mod resize;
 pub mod rope;
 pub mod sampler;
 pub mod segments;
+pub mod snake_beta;
 pub mod tensor;
 pub mod tolerance;
 pub mod twins;
 
 pub use descriptor::{Float, Key};
 pub use error::{Error, Result};
+pub use fp4::{Nvfp4Gemm, Nvfp4Quantize, ScaleLayout};
 pub use generation::{Generation, KernelEntry};
 pub use install::{Module, install, operator_name, operators};
 pub use kernel::{Arguments, CubinMetadata, Entry, Kernel, LaunchGrid, NativeCall, NativeEntry};

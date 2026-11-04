@@ -102,6 +102,8 @@ const OPERATORS: &[&str] = &[
     <crate::moe::routing::TopkSoftmax as Op>::NAME,
     <crate::moe::routing::ExpertGather as Op>::NAME,
     <crate::moe::sort::MoeSort as Op>::NAME,
+    <crate::fp4::Nvfp4Quantize as Op>::NAME,
+    <crate::fp4::Nvfp4Gemm as Op>::NAME,
 ];
 
 /// `name`, interned, when this build has an operator by that name.
