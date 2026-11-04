@@ -716,6 +716,8 @@ mod tests {
 
     #[test]
     fn a_tiles_placement_is_a_view_of_the_raster_and_its_blends_read_the_neighbour() {
+        // The served canvas's output width: the raster the tiles are placed into.
+        const WIDTH: u32 = 1344;
         // 768x1344 pixels: 48x84 latent positions, so the checkpoint's 256-pixel tiles and 64-pixel
         // minimum overlap give a grid of four columns and seven rows, each tile 16x16 latent.
         let config = crate::video_vae::tests::video_config();
@@ -729,7 +731,7 @@ mod tests {
         let dest = TensorView::new(
             ops::DevicePtr::new(0x1000),
             DType::F16,
-            Shape::new(&[3, u64::from(frames), 768, 1280]),
+            Shape::new(&[3, u64::from(frames), 768, u64::from(WIDTH)]),
         );
         let ratio = 16;
         let mut above_seams = 0;
@@ -742,7 +744,7 @@ mod tests {
                 .expect("the placement");
             // The block is the tile's canvas in pixels, and it sits where the seam table says.
             assert_eq!(view.shape.dims(), &[3, u64::from(frames), 256, 256]);
-            let origin = (first_row * 1280 + first_column) * 2;
+            let origin = (first_row * u64::from(WIDTH) + first_column) * 2;
             assert_eq!(view.ptr.address(), 0x1000 + origin);
             if tile.above != 0 {
                 let previous = clip
@@ -750,7 +752,7 @@ mod tests {
                     .expect("the row neighbour");
                 assert_eq!(
                     previous.ptr.address(),
-                    0x1000 + origin - u64::from(tile.above) * 1280 * 2
+                    0x1000 + origin - u64::from(tile.above) * u64::from(WIDTH) * 2
                 );
                 assert!(clip.blend(tile.above, 2).is_ok());
                 above_seams += 1;
