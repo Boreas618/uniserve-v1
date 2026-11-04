@@ -145,6 +145,40 @@ def dump(out: Path, name: str, values) -> None:
     write(block, name, values)
 
 
+# The words a case uses for an element type, and the torch types they mean. A case's `dtype` is the
+# element type the deployment computes in - the descriptor keys' own word (`dtype_f32`) - and it is
+# not `sample_dtype`, which is FP32 whatever the deployment states.
+CASE_DTYPES = {"f32": "float32", "f16": "float16", "bf16": "bfloat16"}
+
+
+def case_dtype(case: dict, checkpoint: Path):
+    """The element type the reference must build its model in for this case.
+
+    The case's `dtype` is the deployment's and is the authority for the pair: a reference built at
+    another type would compare two precisions, and the residual would read as arithmetic. A case
+    that predates the field gets the checkpoint's own answer from the transformer's shards, printed,
+    so the difference between a stated type and an observed one is never silent.
+    """
+    torch = reference("torch")
+    stated = case.get("dtype")
+    if stated is None:
+        from dump_encoder import shard_dtype
+
+        own = shard_dtype(checkpoint / "transformer")
+        print(
+            f"dtype   {str(own).removeprefix('torch.')}, the checkpoint's own (the case states"
+            f" none)"
+        )
+        return own
+    name = CASE_DTYPES.get(stated)
+    if name is None:
+        raise SystemExit(
+            f"the case states the element type {stated!r}; this probe knows f32, f16 and bf16"
+        )
+    print(f"dtype   {stated}, the case's (the deployment's)")
+    return getattr(torch, name)
+
+
 def canvas_of(size: dict):
     """The case's canvas as the reference's image configuration."""
     image = reference("uniserve.media.image")
@@ -458,7 +492,7 @@ def stack_model(case: dict, checkpoint: Path):
         (source,),
         mapping=lambda _root: (mapping,),
         device="cpu",
-        weights=weight_options.Config(dtype=torch.bfloat16),
+        weights=weight_options.Config(dtype=case_dtype(case, checkpoint)),
     )
     for report in reports:
         print(
@@ -672,7 +706,7 @@ def trajectory_denoiser(case: dict, checkpoint: Path, device: str):
             weights_module._denoiser_components("transformer", model)
         ),
         device=device,
-        weights=weight_options.Config(dtype=torch.bfloat16),
+        weights=weight_options.Config(dtype=case_dtype(case, checkpoint)),
     )
     for report in reports:
         print(
