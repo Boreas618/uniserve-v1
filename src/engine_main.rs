@@ -186,6 +186,17 @@ pub(crate) struct Launch {
     /// The probation an update must survive before the daemon commits it (§7.3 step 4).
     #[serde(default)]
     pub rollback_s: Option<u64>,
+    /// The placement's queue depth for this rank's worker groups: how many batches the rank's
+    /// schedulers keep in flight, which the capacity plan relays through (§4.1).
+    ///
+    /// Required, not defaulted: a zero depth plans a rank with no relay and silently halves the
+    /// pipeline's slack.
+    pub queue_depth: u32,
+    /// The number of ranks in this process's world, of which this group's rank is one.
+    ///
+    /// Required, not defaulted: a world of one on a multi-node deployment sizes this rank's storage
+    /// claim for one rank, and the second node's claim would collide with it.
+    pub world_size: u32,
 }
 
 impl Launch {
@@ -330,6 +341,8 @@ pub(crate) struct MainProcess {
     targets: Vec<Target>,
     /// The Program Server's socket, which a policy's source resolves its module through.
     program_server: PathBuf,
+    /// Set by the daemon's `Shutdown`: the epoch ends at the end of this pass (§2.3).
+    stopping: bool,
 }
 
 impl MainProcess {
@@ -396,11 +409,21 @@ impl MainProcess {
 
         let mut executors = Vec::with_capacity(plan.devices().len());
         let mut generations = Vec::with_capacity(plan.devices().len());
+        // The device's one pool set is the resident owners' allocator (§4.1): it is opened with the
+        // memory and handed to the executor thread, so every owner and every runner books against
+        // the same allowance.
+        let pools = memory.pools();
+        let scratch = plan.graph(memory.device())?.scratch;
         for device in plan.devices() {
             let generation = Arc::new(Generation::new(epoch.generation, std::iter::empty()));
             let runners = plan.runners(*device, Arc::clone(&model), &mut memory, &generation)?;
-            let executor =
-                Executor::spawn(*device, runners, plan.events(), plan.graph(*device)?)?;
+            let executor = Executor::spawn(
+                *device,
+                runners,
+                plan.events(),
+                Arc::clone(&pools),
+                scratch,
+            )?;
             // §7.3 step 2 shadows a replaced operator beside the serving one, so the region it runs
             // in is mapped before any batch: the executor books it from the scratch pool the graph
             // storage sized. Then §4.5's warmup runs every captured bucket once, so the first
@@ -437,6 +460,7 @@ impl MainProcess {
             generations,
             targets: plan.targets().to_vec(),
             program_server: plan.program_server().to_path_buf(),
+            stopping: false,
         })
     }
 
@@ -449,6 +473,9 @@ impl MainProcess {
         let mut running = Vec::new();
         let mut reported = Instant::now();
         loop {
+            if self.stopping {
+                return Ok(None);
+            }
             let deadline = self.watchdog.deadline(oldest(&running));
             // One metrics report a second, and a final one on the way out
             // (§7.3: the daemon exports the engine's counters as metrics).
@@ -627,12 +654,19 @@ impl MainProcess {
         command: proto::process::Command,
     ) -> Result<Option<UpdateFailure>> {
         let current = self.update.current();
-        let Some(command) = ProgramCommand::from_command(command, current)? else {
-            // Park, Promote, Drain, Pause and Serve are the epoch layer's, not the program
-            // layer's; the daemon's own path runs them.
+        let Some(program) = ProgramCommand::from_command(command.clone(), current)? else {
+            // Park, Promote, Drain, Pause, Serve and Shutdown are the epoch layer's: every scheduler
+            // applies them at its own next boundary, and answers when it did (§2.5, §7.3 step 6).
+            for scheduler in &self.schedulers {
+                answer(
+                    scheduler.engine_command(command.clone()),
+                    self.watchdog.stall_bound(),
+                    "an engine command",
+                )?;
+            }
             return Ok(None);
         };
-        match self.program(command, None)? {
+        match self.program(program, None)? {
             // A precopy answers when its installs finish, from `advance_precopy`.
             None => Ok(None),
             Some(status) => {
@@ -875,20 +909,20 @@ impl MainProcess {
                 // The policy's module is built on each scheduler's blocking thread, so its answer
                 // arrives here as well: a policy that did not prepare fails the update before any
                 // device cuts over, which is what §4.4's dry run is for.
-                match poll_policies(&precopy.policies) {
-                    PolicyStage::Pending => {
+                match poll_answers(&precopy.policies) {
+                    Some(StageFailure::Pending) => {
                         precopy.stage = PrecopyStage::Executors(submissions);
                         self.precopy = Some(precopy);
                         return Ok(());
                     }
-                    PolicyStage::Failed(reason) => {
+                    Some(StageFailure::Failed(reason)) => {
                         return self.abandon_precopy(
                             generation,
                             UpdateFailure::Policy { error: reason },
                             precopy.reply,
                         );
                     }
-                    PolicyStage::Prepared => {}
+                    None => {}
                 }
                 if let Some(failure) = unfinished(&submissions, "preparing this node's devices") {
                     match failure {
@@ -907,46 +941,35 @@ impl MainProcess {
                     }
                 }
 
-                // Shadow execution: one batch per occupied bucket on the
-                // resident requests, sent to every rank of the group that holds
-                // them (§7.3 step 2).
-                let mut batches = Vec::new();
+                // Shadow execution: every scheduler shadows one step of its own resident requests
+                // against the prepared generation, in the buckets those requests occupy, and
+                // answers once that step ran (§7.3 step 2). The paired kernels compare themselves
+                // by `Op::tolerance` and never write resident memory.
+                let mut shadow = Vec::with_capacity(self.schedulers.len());
                 for scheduler in &self.schedulers {
-                    batches.extend(scheduler.shadow(generation)?);
-                }
-                let mut shadow = Vec::with_capacity(batches.len());
-                for batch in batches {
-                    let Some(executor) = self.executors.get(batch.rank) else {
-                        return self.abandon_precopy(
-                            generation,
-                            UpdateFailure::Precopy {
-                                reason: format!("a shadow batch named rank {}", batch.rank),
-                            },
-                            precopy.reply,
-                        );
-                    };
-                    shadow.push(executor.submit(batch.batch)?);
+                    shadow.push(scheduler.shadow(generation));
                 }
                 precopy.stage = PrecopyStage::Shadow(shadow);
                 self.precopy = Some(precopy);
                 Ok(())
             }
-            PrecopyStage::Shadow(submissions) => {
-                if let Some(failure) = unfinished(&submissions, "a shadow batch") {
-                    match failure {
-                        StageFailure::Pending => {
-                            precopy.stage = PrecopyStage::Shadow(submissions);
-                            self.precopy = Some(precopy);
-                            return Ok(());
-                        }
-                        StageFailure::Failed(reason) => {
-                            return self.abandon_precopy(
-                                generation,
-                                UpdateFailure::Precopy { reason },
-                                precopy.reply,
-                            );
-                        }
+            PrecopyStage::Shadow(answers) => {
+                // The shadow pass runs on the scheduler's own thread, one step of the batches it
+                // formed, so the serve pass polls it rather than waiting (§2.4).
+                match poll_answers(&answers) {
+                    Some(StageFailure::Pending) => {
+                        precopy.stage = PrecopyStage::Shadow(answers);
+                        self.precopy = Some(precopy);
+                        return Ok(());
                     }
+                    Some(StageFailure::Failed(reason)) => {
+                        return self.abandon_precopy(
+                            generation,
+                            UpdateFailure::Precopy { reason },
+                            precopy.reply,
+                        );
+                    }
+                    None => {}
                 }
 
                 // The generations built here are *prepared*, not serving: `generations` is what each
@@ -1177,7 +1200,11 @@ impl MainProcess {
     /// the rank of every request it accepted.
     fn request_command(&mut self, command: proto::request::wire::Command) -> Result<()> {
         match self.schedulers.as_slice() {
-            [scheduler] => scheduler.command(command),
+            [scheduler] => answer(
+                scheduler.request_command(command),
+                self.watchdog.stall_bound(),
+                "a request command",
+            ),
             [] => bail!("a request command arrived at a node that holds no scheduler"),
             schedulers => bail!(
                 "a request command needs the rank the request was routed to, among {} schedulers",
@@ -1192,8 +1219,14 @@ impl MainProcess {
         &mut self,
         command: proto::request::wire::EngineCommand,
     ) -> Result<Option<UpdateFailure>> {
-        for scheduler in &self.schedulers {
-            scheduler.engine_command(&command)?;
+        // The request connection carries the epoch's own lifecycle commands. `Shutdown` ends the
+        // epoch: every request finishes as aborted, the workers close and the process exits, which
+        // is what `close` does in the order the owners need (§2.3). The rest are the routing's and
+        // the daemon's successor machinery's - they apply to connections this node does not hold -
+        // while the epoch layer's Park, Promote, Serve, Drain and Pause arrive on the process
+        // connection, where the schedulers take them.
+        if let Some(proto::request::wire::engine_command::Kind::Shutdown(_)) = command.kind {
+            self.stopping = true;
         }
         Ok(None)
     }
@@ -1361,31 +1394,26 @@ impl MainProcess {
     }
 }
 
-/// What polling a precopy's policy answers found.
-enum PolicyStage {
-    /// At least one scheduler has not answered yet.
-    Pending,
-    /// A scheduler's policy did not prepare.
-    Failed(String),
-    /// Every scheduler prepared its candidate.
-    Prepared,
-}
-
-/// Whether every scheduler answered, and if not, why the first failure did (§7.3 step 2).
-fn poll_policies(
-    policies: &[crossbeam_channel::Receiver<std::result::Result<(), String>>],
-) -> PolicyStage {
-    for receiver in policies {
+/// Polls one set of scheduler answers (§7.3 steps 2 and 3).
+///
+/// The schedulers answer at their own boundary, so the serve pass polls them: the control thread
+/// may not wait on a stage whose length the daemon's load decides (§2.4).
+fn poll_answers(
+    answers: &[crossbeam_channel::Receiver<std::result::Result<(), String>>],
+) -> Option<StageFailure> {
+    for receiver in answers {
         match receiver.try_recv() {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => return PolicyStage::Failed(error),
-            Err(crossbeam_channel::TryRecvError::Empty) => return PolicyStage::Pending,
+            Ok(Err(reason)) => return Some(StageFailure::Failed(reason)),
+            Err(crossbeam_channel::TryRecvError::Empty) => return Some(StageFailure::Pending),
             Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                return PolicyStage::Failed("a scheduler that was preparing the policy is gone".to_owned());
+                return Some(StageFailure::Failed(
+                    "a scheduler of the group is gone".to_owned(),
+                ));
             }
         }
     }
-    PolicyStage::Prepared
+    None
 }
 
 /// Waits on one scheduler's answer, no longer than the stall bound (§2.4).
@@ -1628,9 +1656,9 @@ enum PrecopyStage {
     Modules(Vec<Arc<HostTask<Install>>>),
     /// The executors rebind or recapture their buckets.
     Executors(Vec<Submission>),
-    /// The shadow batches compare the new implementations on the resident
-    /// requests.
-    Shadow(Vec<Submission>),
+    /// The shadow pass compares the new implementations on the resident requests, one step per
+    /// scheduler; each answers when its step ran.
+    Shadow(Vec<crossbeam_channel::Receiver<std::result::Result<(), String>>>),
     /// A stage being replaced; the driver never observes it.
     Done,
 }
