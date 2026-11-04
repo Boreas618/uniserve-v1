@@ -350,6 +350,35 @@ fn the_message_is_written_into_the_module() {
     assert_eq!(message[0], b'[');
 }
 
+/// An artifact outlives the engine that made it: the Program Server
+/// precompiles a policy with one engine, a scheduler thread loads it with
+/// another built by `Engine::new()`, and the target `new` pins is what makes
+/// the two agree (a module from a differently targeted engine does not load).
+#[test]
+fn a_precompiled_module_loads_and_runs_in_another_engine() {
+    let artifact = engine().precompile(Toy::new().wat().as_bytes()).unwrap();
+    // A second engine of the same process: the store's artifact is not tied to
+    // the compiling engine, only to the target both are built for.
+    let second = engine();
+    let module = PolicyModule::load(&second, &artifact).unwrap();
+    let policy = module
+        .instantiate(
+            &Snapshot::default(),
+            &Parameters::default(),
+            &Limits::default(),
+        )
+        .unwrap();
+
+    assert!(policy.failure().is_none());
+    // The module answers the limits it was initialized with, so the call runs.
+    let limits = policy.limits();
+    assert_eq!(limits.max_batch, Limits::default().max_batch);
+    assert_eq!(
+        limits.max_num_batched_tokens,
+        Limits::default().max_num_batched_tokens
+    );
+}
+
 #[test]
 fn fuel_is_renewed_for_every_call() {
     let engine = engine();
