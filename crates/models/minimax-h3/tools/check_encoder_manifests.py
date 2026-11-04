@@ -423,7 +423,10 @@ def called_keys(calls: list[Call]) -> tuple[list[tuple[str, str]], list[str]]:
         order = KEY_FIELDS.get(package)
         if order is None:
             unknown.append(
-                f"NOT EMITTED {package}: this tool does not model its field set [{reason}]"
+                f"NOT EMITTED {package}: this tool does not model its field set, and the"
+                f" fields it lacks are functions of the layers' own helpers - `row_tile` of the"
+                f" width, `BLOCK`, `ROWS` - so a value computed here would be a second"
+                f" implementation of `nn` [{reason}]"
             )
             continue
         missing = [field for field in order if field not in fields]
