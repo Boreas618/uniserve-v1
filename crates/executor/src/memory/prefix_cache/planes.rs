@@ -1680,7 +1680,12 @@ mod layer_view_tests {
         quantized: bool,
     ) -> CachePlanes {
         let cells = usize::try_from(u64::from(columns) * u64::from(num_units)).unwrap();
-        let [key, value] = [0, 1].map(|_| Storage::host(cells.max(1)));
+        // A field holds `cells` planes of the plan's `plane_bytes`, the flags one byte per cell
+        // and the scales four: a view reads the last cell, so a storage of `cells` bytes would
+        // address past its end.
+        let plane_bytes = 16;
+        let [key, value] = [0, 1].map(|_| Storage::host(cells.max(1) * plane_bytes));
+        let flags = || Storage::host(cells.max(1));
         CachePlanes {
             plan: Arc::new(CachePlan {
                 columns,
@@ -1696,8 +1701,13 @@ mod layer_view_tests {
             num_units,
             segmenting: None,
             values: [Arc::clone(&key), Arc::clone(&value)],
-            scales: quantized.then(|| [Storage::host(cells.max(1)), Storage::host(cells.max(1))]),
-            initialized: [Arc::clone(&key), Arc::clone(&value)],
+            scales: quantized.then(|| {
+                [
+                    Storage::host(cells.max(1) * 4),
+                    Storage::host(cells.max(1) * 4),
+                ]
+            }),
+            initialized: [flags(), flags()],
             fields: Vec::new(),
         }
     }
