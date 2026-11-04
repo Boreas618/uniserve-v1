@@ -221,6 +221,19 @@ impl Nvfp4Linear {
                 format!("a contraction of {k} elements is not whole sixteen-element blocks"),
             ));
         }
+        // One layout governs a product: it states both how the activation's block scales are
+        // arranged and, by naming the product, how the weight's are read. A checkpoint whose
+        // block scales answer another layout would be contracted by a program that reads them
+        // transposed, and the product's own check does not look at the weight's field.
+        if layout != weight.layout {
+            return Err(Error::shape(
+                "Nvfp4Linear",
+                format!(
+                    "the activation scales are {layout} and the checkpoint's weight scales are {}:                      one layout governs both sides of a product",
+                    weight.layout
+                ),
+            ));
+        }
         let expected = weight.layout.shape(n, k);
         if weight.scales.shape() != expected {
             return Err(Error::shape(
@@ -478,6 +491,17 @@ mod tests {
         let mut unpacked = packed(8, 64, ScaleLayout::Swizzled128X4);
         unpacked.packed = weight(DType::BF16, &[8, 32]);
         assert!(refuse(unpacked, ScaleLayout::Swizzled128X4, DType::BF16, 128).is_err());
+        // The activation and the weight answer one layout: a program that reads the weight's
+        // scales as the product's own would read another arrangement's bytes.
+        assert!(
+            refuse(
+                packed(8, 64, ScaleLayout::Linear),
+                ScaleLayout::Swizzled128X4,
+                DType::BF16,
+                128
+            )
+            .is_err()
+        );
         // The scales answer the layout's own shape, so a matrix of them is not one.
         let mut unscaled = packed(8, 64, ScaleLayout::Swizzled128X4);
         unscaled.scales = weight(DType::U8, &[8, 4]);
