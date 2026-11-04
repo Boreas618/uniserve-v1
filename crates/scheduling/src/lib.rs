@@ -75,4 +75,24 @@ mod tests {
             "Cargo.toml does not pin {pin}: the declared wasmtime version and the dependency drifted"
         );
     }
+
+    /// The default policies' packages declare the same wasmtime version: the
+    /// Program Server precompiles a package with the toolchain its manifest
+    /// names, and a module precompiled by another version does not load.
+    #[test]
+    fn the_default_policies_declare_the_same_wasmtime_version() {
+        let decl = format!("version = \"{WASMTIME_VERSION}\"");
+        for (backend, manifest) in [
+            ("fcfs", include_str!("../policies/fcfs/package.toml")),
+            (
+                "priority",
+                include_str!("../policies/priority/package.toml"),
+            ),
+        ] {
+            assert!(
+                manifest.contains(&decl),
+                "the {backend} package does not declare {decl}"
+            );
+        }
+    }
 }

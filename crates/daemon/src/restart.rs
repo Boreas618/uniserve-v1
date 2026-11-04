@@ -602,6 +602,7 @@ async fn prepared_successor(
         prepare.processes.clone(),
         config.host_identity.clone(),
         config.served_model_name().to_owned(),
+        config.program_server.clone(),
     )?;
     send(
         channel,
