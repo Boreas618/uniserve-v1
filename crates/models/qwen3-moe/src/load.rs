@@ -44,7 +44,18 @@ pub fn load(
     loader: &mut WeightLoader<'_>,
     options: LoadOptions,
 ) -> Result<Qwen3Moe> {
-    load_with(root, partition, loader, options, Quantization::Bf16)
+    // The experts' encoding is a property of this entry point, not of the caller's options: `load`
+    // reads dense stacks, so the plan reserves no encoded step whatever the options said.
+    load_with(
+        root,
+        partition,
+        loader,
+        LoadOptions {
+            experts_encoded: false,
+            ..options
+        },
+        Quantization::Bf16,
+    )
 }
 
 /// Load a model whose expert stacks are stored encoded (NVFP4).
@@ -60,11 +71,17 @@ pub fn load_encoded(
     options: LoadOptions,
     layout: ScaleLayout,
 ) -> Result<Qwen3Moe> {
+    // Likewise for the encoded stacks: this entry point is the one that reads them, so the plan's
+    // reservation follows from the call rather than from a second statement the caller could get
+    // wrong.
     load_with(
         root,
         partition,
         loader,
-        options,
+        LoadOptions {
+            experts_encoded: true,
+            ..options
+        },
         Quantization::Nvfp4(layout),
     )
 }
@@ -714,10 +731,16 @@ pub fn rotary_recipe(config: &Config) -> Result<(Vec<f32>, f32)> {
         .map(|index| 1.0 / base.powf(2.0 * index as f64 / dim as f64))
         .collect();
 
+    // The score scale `ops` takes is the **softmax scale applied to `q · k`** (`ops::attention::
+    // DenseArgs::scale`), not a multiplier on top of a default: the reference divides by
+    // `sqrt(head_dim)` and a recipe multiplies that. Returning the recipe alone set the exponent
+    // 11.3 times too large for this model (1.0 against 1/sqrt(128)) — a sharper distribution that
+    // still reads as a plausible answer.
+    let denominator = (dim as f64).sqrt();
     let Some(yarn) = &config.rope_scaling else {
         return Ok((
             extrapolation.iter().map(|&value| value as f32).collect(),
-            1.0,
+            (1.0 / denominator) as f32,
         ));
     };
 
@@ -765,7 +788,10 @@ pub fn rotary_recipe(config: &Config) -> Result<(Vec<f32>, f32)> {
         (None, ..) => yarn_mscale(factor, mscale),
     };
     let attention = attention as f32;
-    Ok((frequencies, attention * attention))
+    Ok((
+        frequencies,
+        (f64::from(attention * attention) / denominator) as f32,
+    ))
 }
 
 /// transformers' `_yarn_get_mscale`.
@@ -900,7 +926,9 @@ mod tests {
         // table is computed in before it is narrowed.
         let second = (1.0 / 1_000_000_f64.powf(2.0 / 128.0)) as f32;
         assert!((frequencies[1] - second).abs() < 1e-9);
-        assert_eq!(scale, 1.0);
+        // `1/sqrt(head_dim)`, because that is what the attention kernel is handed: the reference's
+        // `scaling` is `head_dim ** -0.5` and `ops`' field is documented as the softmax scale.
+        assert!((scale - (1.0 / 128.0_f32.sqrt())).abs() < 1e-9);
         assert!(frequencies.windows(2).all(|pair| pair[0] > pair[1]));
     }
 
@@ -928,7 +956,7 @@ mod tests {
         // Every pair is between the extrapolated and the interpolated value, and the table falls.
         assert!(frequencies.windows(2).all(|pair| pair[0] > pair[1]));
         // attention_factor = 0.1 · ln(10) + 1, squared into the score multiplier.
-        let expected = (0.1 * 10.0_f32.ln() + 1.0).powi(2);
+        let expected = (0.1 * 10.0_f32.ln() + 1.0).powi(2) / 128.0_f32.sqrt();
         assert!((scale - expected).abs() < 1e-6);
     }
 

@@ -522,6 +522,17 @@ mod tests {
             .expect("a decode batch");
 
         assert_eq!(columns.commit.len(), commit::COMMIT_FIELDS * columns.rows());
+        // The row's rotary position is the call's logical position, not the batch row it lands in:
+        // a decode of the token at position 12 states 12, and one row of a bucket is row 0. The
+        // model reads this column verbatim into its factor tables, so a row index here would put
+        // every decode at RoPE angle zero and produce plausible, wrong logits.
+        assert_eq!(columns.rows.positions, vec![12]);
+        // The row's attention length is the placement's `ForwardBatch::seq_lens` - cached prefix plus
+        // this row's queries - and not the call's position: this fixture states a prefix of 8 for a
+        // call at position 12, so the column carries 9. The two are separate inputs on purpose (a
+        // retained cache can be shorter than the sequence), and a live decode states them equal.
+        assert_eq!(columns.rows.seq_lens, vec![9]);
+        assert_eq!(columns.rows.query_offsets, vec![0, 1]);
         assert_eq!(commit_cell(&columns, commit::column::SLOT, 0), 3);
         assert_eq!(
             commit_cell(&columns, commit::column::MODE, 0),
