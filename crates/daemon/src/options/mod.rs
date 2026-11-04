@@ -1488,7 +1488,9 @@ impl ServeConfig {
 
 /// The user's runtime directory, where this node's sockets lie beside its
 /// Storage Server's.
-fn runtime_directory() -> PathBuf {
+/// The directory this daemon keeps its runtime files in: its sockets, and the
+/// launch and build-config files its main processes read.
+pub(crate) fn runtime_directory() -> PathBuf {
     storage::socket::default_socket()
         .parent()
         .map_or_else(std::env::temp_dir, Path::to_path_buf)

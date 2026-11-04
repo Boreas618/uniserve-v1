@@ -1362,16 +1362,23 @@ impl Leader {
             .max()
             .unwrap_or(0);
         let target_epoch = previous_epoch + 1;
+        // The epoch's own build config is written once, and the launch file
+        // every process of it reads names that path (§2.3). The world is the
+        // epoch's identity, which the switch claims.
+        control
+            .write_build_config(target_epoch, &next.build_config)
+            .map_err(UpdateError::Failed)?;
+        let mut spec = target.engine_spec().map_err(UpdateError::Failed)?;
+        spec.world = target_epoch;
         let change = crate::updates::epoch::EpochChange {
             previous: previous_epoch,
             target: target_epoch,
             // The update's number is the epoch it creates: epochs only grow.
             update: crate::epoch::Update::new(target_epoch, next.clone()),
             group: group.to_owned(),
-            start: control.epoch_start(
-                &target.worker_config.executable.display().to_string(),
-                spawn_generation,
-            ),
+            start: control
+                .epoch_start(&spec, spawn_generation)
+                .map_err(UpdateError::Failed)?,
             previous_generation,
             spawn_generation,
         };
