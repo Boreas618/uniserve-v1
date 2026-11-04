@@ -454,13 +454,14 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
     //
     // The DiT's three modulated norms, each from its own call site in `transformer.rs`. The six
     // modulation vectors are cut from a `[rows, 18 · hidden]` table, so a vector's row stride is
-    // `6 · hidden` (32256); the attention norm folds no gate and passes no update (`:158`), the MLP
-    // norm folds the sixth vector's gate and the block's update (`:169`), and the output norm reads
-    // a `[rows, 2 · hidden]` table instead, stride `2 · hidden` (10752) with neither (`:610`).
-    for (gate_stride, shift_stride, scale_stride, update) in [
-        (0_u32, 6 * HIDDEN, 6 * HIDDEN, false),
-        (6 * HIDDEN, 6 * HIDDEN, 6 * HIDDEN, true),
-        (0, 2 * HIDDEN, 2 * HIDDEN, false),
+    // `6 · hidden` (32256); the attention norm folds no gate and passes no update, the MLP norm
+    // folds the sixth vector's gate, the block's update **and** retains the gated sum (the block's
+    // second residual reads it after the down projection has overwritten `update`), and the output
+    // norm reads a `[rows, 2 · hidden]` table instead, stride `2 · hidden` (10752) with neither.
+    for (gate_stride, shift_stride, scale_stride, update, retain) in [
+        (0_u32, 6 * HIDDEN, 6 * HIDDEN, false, false),
+        (6 * HIDDEN, 6 * HIDDEN, 6 * HIDDEN, true, true),
+        (0, 2 * HIDDEN, 2 * HIDDEN, false, false),
     ] {
         push(
             "modulated_rms_norm",
@@ -475,7 +476,7 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
                 shift_stride: u64::from(shift_stride),
                 scale_stride: u64::from(scale_stride),
                 update,
-                retain: false,
+                retain,
             }
             .to_string(),
         );
