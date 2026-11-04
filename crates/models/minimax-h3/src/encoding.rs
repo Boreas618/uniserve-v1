@@ -1226,6 +1226,113 @@ struct LevelSet {
 }
 
 impl VideoEncoder {
+
+    /// The programs the video encoder launches, from the configuration alone and one list of rasters.
+    ///
+    /// **The raster is load-bearing here, unlike everywhere else in this model**: three of the
+    /// encoder's operators key on classes derived from a frame's extent — the statistics' reduction
+    /// (`channels/groups · pixels`, padded to a power of two), the fused normalize-pad's same class
+    /// with its layout and affine flags, and each block's residual add over its level's whole extent.
+    /// So a walk states a raster and gets the rows that raster launches.
+    ///
+    /// Every convolution runs FP32 with TF32 allowed, the design's declared row for this VAE, so there
+    /// is no dtype argument.
+    pub fn programs(
+        config: &crate::VideoVaeConfig,
+        rasters: &[(u32, u32)],
+    ) -> Result<Vec<(String, String)>> {
+        use crate::programs::Programs;
+        use ops::conv::Conv3d as Conv3dOp;
+        use ops::frame::{FrameMoments as FrameMomentsOp, FrameNormPad as FrameNormPadOp};
+        use ops::posterior::Posterior as PosteriorOp;
+        use ops::residual::ScaledAdd as ScaledAddOp;
+
+        let stack = Stack::of(config)?;
+        let groups = u64::from(config.norm_num_groups);
+        let epsilon = config.norm_eps;
+        let dtype = DType::F32;
+        let mut programs = Programs::default();
+
+        // Every convolution of the network — the input, each block's two, each level's downsampler, the
+        // output and the two of the posterior head — takes the same key: element types and a bias.
+        programs.launch::<Conv3dOp>(&Conv3d::descriptor_of(
+            dtype,
+            dtype,
+            true,
+            dtype,
+            crate::audio_vae::geometry(3, 1, 1)?,
+            true,
+        ));
+        // The head's sample: the moments and the noise, one operator.
+        programs.launch::<PosteriorOp>(&Posterior::new().descriptor());
+
+        for (height, width) in rasters {
+            let extents = stack.extents(Extent {
+                frames: stack.clip.frames,
+                height: *height,
+                width: *width,
+            });
+            // Each level's blocks run at the level's incoming extent and its incoming width.
+            for (index, out) in stack.widths.iter().enumerate() {
+                let extent = extents[index];
+                let channels = if index == 0 {
+                    stack.input_channels
+                } else {
+                    stack.widths[index - 1]
+                };
+                let pixels = u64::from(extent.height) * u64::from(extent.width);
+                let padded = (u64::from(extent.height) + 2) * (u64::from(extent.width) + 2);
+                // Each block takes the statistics of its input and then the fused normalize-pad of the
+                // same frame; the classes follow from the frame and are deduplicated by `finish`.
+                for _ in 0..stack.blocks {
+                    programs.launch::<FrameMomentsOp>(&FrameMoments::descriptor_of(
+                        dtype,
+                        u64::from(channels),
+                        pixels,
+                        groups,
+                        epsilon,
+                    ));
+                    programs.launch::<FrameNormPadOp>(&FrameNormPad::descriptor_of(
+                        dtype,
+                        u64::from(channels),
+                        pixels,
+                        groups,
+                        false,
+                        true,
+                        padded,
+                    ));
+                    // The block's residual add covers the whole level: `frames · extent · channels`.
+                    let columns = u64::from(extent.frames) * pixels * u64::from(*out);
+                    if let Ok(descriptor) = ScaledAdd.descriptor(dtype, dtype, columns) {
+                        programs.launch::<ScaledAddOp>(&descriptor);
+                    }
+                }
+            }
+            // The output normalization convolves the last level's extent at the last width.
+            let last = extents[stack.widths.len()];
+            let channels = *stack.widths.last().unwrap_or(&stack.input_channels);
+            let pixels = u64::from(last.height) * u64::from(last.width);
+            programs.launch::<FrameMomentsOp>(&FrameMoments::descriptor_of(
+                dtype,
+                u64::from(channels),
+                pixels,
+                groups,
+                epsilon,
+            ));
+            programs.launch::<FrameNormPadOp>(&FrameNormPad::descriptor_of(
+                dtype,
+                u64::from(channels),
+                pixels,
+                groups,
+                false,
+                true,
+                (u64::from(last.height) + 2) * (u64::from(last.width) + 2),
+            ));
+        }
+
+        Ok(programs.finish())
+    }
+
     /// Encode one raster into the posterior moments of its latent.
     ///
     /// One tile, with its buffers reserved for the call: a driver of several tiles reserves once with
@@ -2443,6 +2550,59 @@ impl GeGlu {
 
 #[cfg(test)]
 mod tests {
+
+    /// The video encoder states its programs from its configuration and the rasters it serves: one
+    /// convolution whatever the window or stride, the statistics and the fused normalize-pad of each
+    /// frame, the posterior head's sample, and one residual per block at its level's own extent.
+    ///
+    /// **The raster reaches these rows through the residual and not through the frame operators**: a
+    /// frame's reduction class is a declared bound in the descriptor and not part of the key, which is
+    /// what lets one program serve every raster a deployment serves.
+    #[test]
+    fn the_video_encoder_states_its_programs_from_its_config_and_raster() {
+        let config = crate::video_vae::tests::video_config();
+        let raster = [(480, 832)];
+        let programs = VideoEncoder::programs(&config, &raster).expect("the video encoder's programs");
+        let count = |operator: &str| {
+            programs
+                .iter()
+                .filter(|(name, _)| name == operator)
+                .count()
+        };
+        assert_eq!(count("conv3d"), 1, "one program whatever the window or stride");
+        assert_eq!(count("posterior"), 1);
+        assert_eq!(
+            count("frame_moments"),
+            1,
+            "the reduction is a bound, not a key: {programs:?}"
+        );
+        assert_eq!(count("frame_norm_pad"), 1);
+        assert!(
+            count("scaled_add") > 1,
+            "each level's residual is its own width: {programs:?}"
+        );
+        for (operator, key) in &programs {
+            assert!(
+                key.contains("f32") || operator == "posterior" || operator == "scaled_add",
+                "{operator} {key} is not FP32"
+            );
+        }
+
+        // A different raster is different residual programs — same frame-operator rows.
+        let other = VideoEncoder::programs(&config, &[(480, 448)]).expect("a narrower raster");
+        assert_ne!(other, programs);
+        assert_eq!(
+            other
+                .iter()
+                .filter(|(name, _)| name != "scaled_add")
+                .collect::<Vec<_>>(),
+            programs
+                .iter()
+                .filter(|(name, _)| name != "scaled_add")
+                .collect::<Vec<_>>(),
+            "a raster changes the residuals' extent and not the frame operators' rows"
+        );
+    }
 
     /// The audio encoder states its programs from its own configuration: one convolution, one Snake per
     /// channel width it runs at, the projection's two normalizations and its pool, the FP32 attention,

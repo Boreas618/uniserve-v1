@@ -184,6 +184,28 @@ impl FrameNormPad {
         self
     }
 
+    /// The descriptor one normalize-pad launch takes from numbers: the frame's channels and pixels,
+    /// the groups its statistics are taken over, the layout it writes, whether the affine parameters
+    /// are present, and the padded frame's pixel count (one pixel is a class of its own).
+    pub fn descriptor_of(
+        dtype: ops::DType,
+        channels: u64,
+        pixels: u64,
+        groups: u64,
+        channels_last: bool,
+        affine: bool,
+        padded_pixels: u64,
+    ) -> frame::FrameNormPadDescriptor {
+        frame::FrameNormPadDescriptor {
+            dtype,
+            // The same reduction `frame_moments` takes of the same frame.
+            reduction: frame::frame_reduction_class(channels / groups.max(1), pixels),
+            channels_last,
+            centered: !affine,
+            single_pixel: padded_pixels == 1,
+        }
+    }
+
     /// Normalize `values` by the frame statistics, pad and activate them into `out`.
     ///
     /// `values` is `[batch, channels, frames, height, width]` FP32 with each frame's pixels
@@ -236,18 +258,16 @@ impl FrameNormPad {
                     .to_owned(),
             ));
         }
-        let single_pixel = out.shape.dim(height_axis) == 1 && out.shape.dim(width_axis) == 1;
-        let descriptor = frame::FrameNormPadDescriptor {
-            dtype: values.dtype,
-            // The same reduction `frame_moments` takes of the same frame, from the frame's shape.
-            reduction: frame::frame_reduction_class(
-                values.shape.dim(1) / self.groups.max(1),
-                values.shape.dim(3) * values.shape.dim(4),
-            ),
-            channels_last: self.channels_last,
-            centered: self.weight.is_none(),
-            single_pixel,
-        };
+        let padded_pixels = out.shape.dim(height_axis) * out.shape.dim(width_axis);
+        let descriptor = Self::descriptor_of(
+            values.dtype,
+            values.shape.dim(1),
+            values.shape.dim(3) * values.shape.dim(4),
+            self.groups,
+            self.channels_last,
+            self.weight.is_some(),
+            padded_pixels,
+        );
         let args = frame::FrameNormPadArgs {
             values,
             mean,
