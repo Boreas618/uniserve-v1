@@ -310,6 +310,7 @@ fn main() {
             // "neox RoPE": adjacent pairs rotate together.
             rotation: ops::rope::Rotation::Interleaved,
             epsilon: ops::Float::from(NORM_EPSILON),
+            rotated: ROTATED,
             rows: QK_NORM_TOKENS,
             block: row_tile(HEAD_DIM).min(1024),
             affine: true,

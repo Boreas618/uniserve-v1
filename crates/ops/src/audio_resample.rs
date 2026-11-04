@@ -401,8 +401,20 @@ mod tests {
         );
         // A downsample describes its own pads and takes no other.
         assert!(expected_width("audio_resample", Mode::Downsample, 200, 12, 2, 5, 5, 6).is_err());
-        // A span shorter than the filter has nothing to convolve.
-        assert!(expected_width("audio_resample", Mode::Downsample, 4, 12, 2, 0, 5, 6).is_err());
+        // The floor is not a divisibility rule: `4 + 5 + 6 = 15` against a 12-tap filter is
+        // `floor(3 / 2) + 1 = 2` samples, and the reference accepts it.
+        assert_eq!(
+            expected_width("audio_resample", Mode::Downsample, 4, 12, 2, 0, 5, 6).unwrap(),
+            2
+        );
+        // The boundary is the filter's own length: a span of exactly 12 gives one sample …
+        assert_eq!(
+            expected_width("audio_resample", Mode::Downsample, 1, 12, 2, 0, 5, 6).unwrap(),
+            1
+        );
+        // … and a span below it has nothing to convolve, so it is refused rather than floored to
+        // zero.
+        assert!(expected_width("audio_resample", Mode::Downsample, 0, 12, 2, 0, 5, 6).is_err());
     }
 
     #[test]
