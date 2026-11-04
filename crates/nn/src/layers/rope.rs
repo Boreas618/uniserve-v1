@@ -193,9 +193,9 @@ impl Rotary {
         Ok(self)
     }
 
-    /// The width of one head.
-    pub const fn head_dim(&self) -> u32 {
-        self.head_dim
+    /// The query heads: the rank the factors and the per-head norm are applied at.
+    pub const fn heads(&self) -> u32 {
+        self.q_heads
     }
 
     /// The rotated width of one head: `head_dim` unless the rotation was narrowed.
