@@ -469,6 +469,93 @@ mod tests {
         assert_eq!(pcm.bytes(), 3200);
     }
 
+    /// The clip raster test views are built on: one contiguous `[3, 25, rows, columns]` F16 block, so
+    /// the offsets a view answers are the ones the arithmetic would read on the device.
+    fn raster_view(height: u32, width: u32) -> TensorView {
+        let shape = Shape::new(&[
+            u64::from(Rgb::CHANNELS),
+            u64::from(CLIP_OUTPUT_FRAMES),
+            u64::from(height),
+            u64::from(width),
+        ]);
+        TensorView::new(nn::DevicePtr::new(0), nn::DType::F16, shape)
+    }
+
+    #[test]
+    fn a_clip_view_reads_the_body_and_the_tail_and_never_the_padding() {
+        let (height, width) = (4, 6);
+        let clip = raster_view(height, width);
+        let raster = Raster::of(clip).expect("a clip raster");
+        let per_frame = u64::from(height) * u64::from(width);
+        let per_channel = u64::from(CLIP_OUTPUT_FRAMES) * per_frame;
+        // The body is the clip's first frames of every channel: the channel stride stays the whole
+        // clip's, so the second channel is one channel into the block, not one body into it.
+        let body = raster.body(clip, &Splice::CLIP);
+        assert_eq!(
+            body.shape.dims(),
+            [
+                u64::from(Rgb::CHANNELS),
+                u64::from(CLIP_FRAMES),
+                u64::from(height),
+                u64::from(width),
+            ]
+        );
+        assert_eq!(
+            body.strides.as_slice(),
+            [per_channel, per_frame, u64::from(width), 1]
+        );
+        assert_eq!(body.element(&[1, 0, 0, 0]), clip.element(&[1, 0, 0, 0]));
+        // The tail's first frame is the frame after the three padding frames, with the same channel
+        // stride - the offset that a wrong range would take from the padding instead.
+        let tail = raster.written(clip, Splice::LAST.overlap);
+        assert_eq!(tail.shape.dim(1), u64::from(OVERLAP_FRAMES));
+        assert_eq!(tail.strides.as_slice(), body.strides.as_slice());
+        assert_eq!(
+            tail.element(&[0, 0, 0, 0]),
+            clip.element(&[0, u64::from(CLIP_OUTPUT_FRAMES - OVERLAP_FRAMES), 0, 0])
+        );
+        // The body and the tail do not meet: the frames between them belong to neither.
+        let body_last = body.element(&[0, u64::from(CLIP_FRAMES) - 1, 0, 0]);
+        assert_ne!(body_last, tail.element(&[0, 0, 0, 0]));
+        assert_eq!(
+            body_last,
+            clip.element(&[0, u64::from(CLIP_FRAMES) - 1, 0, 0])
+        );
+    }
+
+    #[test]
+    fn a_clip_view_refuses_a_raster_that_is_not_one_clip() {
+        // A view whose frames axis is not the checkpoint's 25 is refused before any launch.
+        let short = TensorView::new(
+            nn::DevicePtr::new(0),
+            nn::DType::F16,
+            Shape::new(&[3, 24, 4, 6]),
+        );
+        assert!(Raster::of(short).is_err());
+        // And a raster that is not three channels is refused too.
+        let grey = TensorView::new(
+            nn::DevicePtr::new(0),
+            nn::DType::F16,
+            Shape::new(&[1, u64::from(CLIP_OUTPUT_FRAMES), 4, 6]),
+        );
+        assert!(Raster::of(grey).is_err());
+        // The output view is `[kept frames, rows, columns, channels]` bytes.
+        let raster = Raster::of(raster_view(4, 6)).expect("a clip raster");
+        let kept = Splice::LAST.frames();
+        let out = TensorView::new(
+            nn::DevicePtr::new(0),
+            nn::DType::U8,
+            Shape::new(&[u64::from(kept), 4, 6, 3]),
+        );
+        assert!(raster.check_out(out, &Splice::LAST).is_ok());
+        let short_out = TensorView::new(
+            nn::DevicePtr::new(0),
+            nn::DType::U8,
+            Shape::new(&[u64::from(kept) - 1, 4, 6, 3]),
+        );
+        assert!(raster.check_out(short_out, &Splice::LAST).is_err());
+    }
+
     #[test]
     fn the_raster_sizes_follow_the_layout() {
         let rgb = Rgb::of(107, 768, 1344);
