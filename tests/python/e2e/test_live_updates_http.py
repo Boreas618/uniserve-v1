@@ -81,6 +81,11 @@ pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
 # that engines start in about a minute, and a small device KV cache.
 OPTIONS = (
     "dtype=bfloat16",
+    # The attention program the deployment's paged attention executes, as a
+    # package name (``KERNEL_PACKAGES``). ``auto`` names no package, so the
+    # deployment names the backend design 9's default choice picks for this
+    # shape: trtllm-gen.
+    "attention_backend=trtllm",
     "kv_cache_config.max_tokens=32768",
     "chat_config.reasoning_parser=none",
     "cuda_graph_config.prefill_token_sizes=[512]",
@@ -115,11 +120,29 @@ PLUGIN_ENTRY_POINTS = (
 )
 
 
-# The package this file installs: the scheduling policy the deployments serve.
-# Every deployment needs a policy, a policy's module comes only from this
-# host's Program Server, and the leader resolves it before the main processes
-# serve (design 5.1, 6.1).
+# The packages this file installs: the scheduling policy, and one kernel
+# package for every operator the deployment selects. A deployment's epoch is
+# resolved at this host's Program Server before its main processes serve
+# (design 5.1, 6.1): the policy fills the scheduling slot, and the operators
+# the build config names fill theirs, so a server that has the policy alone
+# refuses the epoch by the first kernel it lacks.
+#
+# ``FilledPrograms::of`` (``crates/daemon/src/epoch.rs``) fills paged attention
+# with the attention program's backend, and the expert exchange with
+# ``moe_config.exchange`` — ``alltoall`` by default, for every deployment, since
+# the slot is filled whether or not the model routes. ``moe_runner_backend`` is
+# unset here, so no grouped expert GEMM is filled.
+#
+# A program's backend is a package's name: the Program Server selects a program
+# by the backend its manifest declares, and no package is named ``auto``. The
+# deployment therefore states the attention backend it means (``OPTIONS``), and
+# it is the one design 9's default choice resolves to for this shape — BF16, no
+# window, head_dim 128, 64-token pages, one rank: trtllm-gen.
 POLICY_PACKAGE = "crates/ops/program-fixtures/policy"
+KERNEL_PACKAGES = (
+    "crates/ops/kernels/paged_attention/trtllm",
+    "crates/ops/kernels/expert_exchange/alltoall",
+)
 
 #: The socket of the module's Program Server, which every deployment of this
 #: file reaches through ``--program-server``. Set by :func:`program_server`.
@@ -172,13 +195,21 @@ def _precompiler() -> Path:
 
 @pytest.fixture(scope="module", autouse=True)
 def program_server(tmp_path_factory: pytest.TempPathFactory):
-    """The host's Program Server, with the deployment's policy installed.
+    """The host's Program Server, with the deployment's programs installed.
 
     Autouse and module-scoped because every deployment of this file needs it:
     the daemon's leader resolves each epoch's programs at this server, and a
-    policy's module exists nowhere else. The policy is installed once, built
-    for wasm32 by the package's own script while the tree it came from exists
-    (design 6.2); a deployment that never reaches the server never serves.
+    program's module exists nowhere else. Every package the deployment selects
+    is installed once, here — the policy and ``KERNEL_PACKAGES`` — because the
+    epoch is refused by the first slot no installed program fills.
+
+    The package root and the store live as long as the module, and every test
+    of the module deploys against this one server, so a module is built once and
+    every later deployment of the module reuses it (design 5.3). They are not
+    shared with another run: a store entry is keyed by operator, backend,
+    revision, target and descriptor, and a revision counts from 1 in a fresh
+    package root, so a store kept across runs would answer a changed package
+    with the module the older source built.
     """
     global PROGRAM_SERVER
     binary = require_uniserve_binary()
@@ -218,24 +249,27 @@ def program_server(tmp_path_factory: pytest.TempPathFactory):
     else:
         raise TimeoutError(f"the Program Server left no socket at {socket}")
 
-    installed = subprocess.run(
-        [
-            str(binary),
-            "program-server",
-            "install",
-            "--socket",
-            str(socket),
-            str(_repository() / POLICY_PACKAGE),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=3600,
-    )
-    if installed.returncode != 0:
-        raise AssertionError(
-            "installing the scheduling policy failed: "
-            f"{installed.stdout}\n{installed.stderr}"
+    for package in (POLICY_PACKAGE, *KERNEL_PACKAGES):
+        installed = subprocess.run(
+            [
+                str(binary),
+                "program-server",
+                "install",
+                "--socket",
+                str(socket),
+                str(_repository() / package),
+            ],
+            capture_output=True,
+            text=True,
+            # A kernel package builds its modules on the first prepare, not
+            # here: installing copies the source and registers its revision.
+            timeout=3600,
         )
+        if installed.returncode != 0:
+            raise AssertionError(
+                f"installing {package} failed: "
+                f"{installed.stdout}\n{installed.stderr}"
+            )
     PROGRAM_SERVER = socket
     try:
         yield socket
