@@ -1766,12 +1766,14 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 .get(index)
                 .map(|call| call.rows.start as usize)
                 .unwrap_or(0);
-            // A padded call names no slot, so the commit table states nothing about it.
+            // A call whose slot is below zero states nothing about the row it would advance; every
+            // other call reads its own row of the commit table, which is indexed by call and not by
+            // the slot the call writes to.
             let slot = row_slots.get(row).copied().unwrap_or(-1);
             states.push(if slot < 0 {
                 RowState::default()
             } else {
-                let at = slot as usize;
+                let at = index;
                 RowState {
                     // For text the slot's trajectory position is the number of tokens it has
                     // committed, which the table keeps in the sampling column; a latent
@@ -2231,8 +2233,12 @@ impl ops::capture::Sink for Recording {
 
 /// The non-negative length a per-slot table column holds for `slot`, or zero when the table has no
 /// such slot: a length is never negative, and a padded row names no slot at all.
-fn length_at(column: &[i32], slot: usize) -> u32 {
-    column.get(slot).copied().unwrap_or(0).max(0) as u32
+/// One row of a commit table column: the call at `row`, whose lengths a completion reports.
+///
+/// A row the table does not hold reads as zero rather than as a neighbour's value, so a batch that
+/// outgrew its bucket is a state of zero length and not another call's trajectory.
+fn length_at(column: &[i32], row: usize) -> u32 {
+    column.get(row).copied().unwrap_or(0).max(0) as u32
 }
 
 /// Names each call's tokens and trajectory position: the step's output in the mechanism's order
