@@ -1023,6 +1023,7 @@ dependencies = [
  "ipc",
  "libc",
  "libloading",
+ "nvtx",
  "platform",
  "proto",
  "rustix",
