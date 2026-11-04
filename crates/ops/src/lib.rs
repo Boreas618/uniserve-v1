@@ -74,6 +74,7 @@
 pub mod activation;
 pub mod attention;
 pub mod audio_resample;
+pub mod bias;
 pub mod block_copy;
 pub mod capture;
 pub mod commit;
