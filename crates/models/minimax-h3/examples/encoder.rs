@@ -739,6 +739,14 @@ fn stage_encode(args: &Args) -> Result<()> {
         usize::try_from(bytes).unwrap_or(usize::MAX),
     )?;
     let arena = Arena::new(DevicePtr::new(region.address()), bytes);
+    // Said out loud because the number is not a measurement: a deployment row must come from a plan
+    // function or from a run, and a harness's headroom that looked like a plan has already written
+    // one row wrong.
+    println!(
+        "arena: {rows_bound} rows bound, {} MiB reserved - the harness's over-reserve, not a \
+         measured plan",
+        bytes >> 20
+    );
     let forward = Forward::new(&stream, &generation, &arena);
 
     // 4. The batch: one unpadded sequence of `tokens` rows, no cache, no draft.
