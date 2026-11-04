@@ -25,6 +25,13 @@
 //! the pieces and the packing decides the order; the DiT reads no other conditioning view, so a
 //! condition the source does not carry cannot reach the model.
 //!
+//! Two model calls fill it, in either order, because they write disjoint rows and neither reads the
+//! other's: the text encoder's own features and the zero row are the encoder stage's, and then
+//! [`Denoiser::encode_conditions`] projects each condition's latents into the condition rows, and
+//! [`Denoiser::prepare_conditioning`] refines the prompt's rows in place. The condition projection
+//! needs the request's declared condition shapes and therefore the stage that holds the request;
+//! the refinement needs only the buffer, which is why it is the denoiser's own per-request hook.
+//!
 //! ## Host bytes
 //!
 //! Everything a request changes arrives as device tables the executor allocates: the rotary
@@ -1365,6 +1372,11 @@ impl nn::capability::Denoiser for Denoiser {
         // text passes through it once, in place over the runner's `text` buffer, and the encoder's
         // own features arrive in `source`. A request with no source has no conditioning to refine -
         // and no text either, since the encoder always writes what the refiner reads.
+        //
+        // The prompt's rows only. A conditioned request's condition rows are
+        // [`Self::encode_conditions`]'s, written into the same buffer by the stage that holds the
+        // request's declared condition shapes; they are disjoint from these rows, and this method
+        // neither reads nor writes them.
         let Some(source) = cond.source else {
             return Ok(());
         };
