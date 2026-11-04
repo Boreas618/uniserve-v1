@@ -22,8 +22,12 @@
 //! BF16 and the video VAE decoder is FP16, and each layer declares the precision it computes in
 //! (specs/worker.md 1, 9). An explicit choice converts every weight once, here, and never again.
 
+use std::path::PathBuf;
+
 use nn::DType;
 use nn::weights::Quantization;
+
+use crate::{Error, Result};
 
 /// One block a deployment places, by the name its deployment file gives it.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -80,6 +84,25 @@ impl Component {
         }
     }
 
+    /// The activation element type this block computes in when a deployment states none.
+    ///
+    /// The design's default `dtype = "auto"` converts nothing at load, so each block computes in
+    /// the checkpoint's own representation: BF16 for the text encoder and the DiT partitions,
+    /// FP16 for the video VAE decoder (`specs/worker.md` 1; the `quality` preset of
+    /// `uniserve/models/minimax_h3/precision.py`, which is that representation). The design names
+    /// no representation for the audio VAE or the condition encoders, so they take BF16 like the
+    /// blocks beside them rather than a conversion the design did not ask for.
+    pub const fn activation(self) -> DType {
+        match self {
+            Self::VideoDecoder => DType::F16,
+            Self::TextEncoder
+            | Self::Transformer
+            | Self::TransformerRef
+            | Self::AudioDecoder
+            | Self::LatentEncoder => DType::BF16,
+        }
+    }
+
     /// The component a deployment file names, when it names one of these.
     pub fn named(name: &str) -> Option<Self> {
         Self::ALL
@@ -100,6 +123,12 @@ pub struct LoadOptions {
     pub dtype: Option<DType>,
     /// An explicit quantization, or `None` to keep the checkpoint's own representation.
     pub quantization: Option<Quantization>,
+    /// The base pipeline of an export that holds only the components it changed.
+    ///
+    /// `FastVideo-FastH3-Omni-8-Step-V1` states a hub revision of the base release and carries
+    /// only its reference DiT and its schedules; a load of it reads every other component from the
+    /// base pipeline's directory. `None` for a root that holds everything.
+    pub base: Option<PathBuf>,
 }
 
 impl LoadOptions {
@@ -109,6 +138,42 @@ impl LoadOptions {
             blocks,
             dtype: None,
             quantization: None,
+            base: None,
+        }
+    }
+
+    /// The activation element type of `component`, the deployment's choice or the design's.
+    pub fn activation(&self, component: Component) -> DType {
+        self.dtype.unwrap_or_else(|| component.activation())
+    }
+
+    /// The checkpoint `directory`'s weights come from, in the root or in the base pipeline.
+    ///
+    /// An export holds only what it changed and states the base release it continues, so a
+    /// directory the root omits is read from `base`. A directory neither holds is refused, naming
+    /// both, rather than skipped: a load that silently omitted a component would fail much later,
+    /// on the device.
+    pub fn source<'a>(
+        &self,
+        root: &'a nn::Checkpoint,
+        base: Option<&'a nn::Checkpoint>,
+        directory: &str,
+    ) -> Result<&'a nn::Checkpoint> {
+        if let Ok(component) = root.component(directory) {
+            return Ok(component);
+        }
+        match base.and_then(|base| base.component(directory).ok()) {
+            Some(component) => Ok(component),
+            None => Err(Error::checkpoint(format!(
+                "the checkpoint holds no {directory} component and {}",
+                match base {
+                    Some(base) => {
+                        let held = base.components().collect::<Vec<_>>().join(", ");
+                        format!("its base pipeline holds none either (it holds {held})")
+                    }
+                    None => "no base pipeline was given to read it from".to_owned(),
+                }
+            ))),
         }
     }
 }
@@ -132,5 +197,83 @@ mod tests {
         assert_eq!(Component::AudioDecoder.directories(), ["audio_vae"]);
         assert_eq!(Component::LatentEncoder.directories(), ["vae", "audio_vae"]);
         assert_eq!(Component::TransformerRef.directories(), ["transformer_ref"]);
+    }
+
+    /// A pipeline root of `components` directories, each with one BF16 shard of one tensor.
+    fn pipeline(components: &[&str]) -> tempfile::TempDir {
+        let root = tempfile::tempdir().expect("tempdir");
+        for directory in components {
+            let path = root.path().join(directory);
+            std::fs::create_dir_all(&path).expect("create");
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&0_u64.to_le_bytes());
+            let header = r#"{"w":{"dtype":"BF16","shape":[2],"data_offsets":[0,4]}}"#;
+            bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(header.as_bytes());
+            bytes.extend_from_slice(&[0_u8; 4]);
+            std::fs::write(path.join("model.safetensors"), bytes).expect("write");
+        }
+        root
+    }
+
+    #[test]
+    fn the_designs_own_representation_is_each_blocks_activation_type() {
+        let options = LoadOptions::new(Component::ALL.to_vec());
+        // `dtype = "auto"`: no conversion, so the blocks compute where the checkpoint stores.
+        assert_eq!(Component::VideoDecoder.activation(), DType::F16);
+        for component in Component::ALL {
+            if component != Component::VideoDecoder {
+                assert_eq!(component.activation(), DType::BF16, "{}", component.name());
+            }
+        }
+        assert_eq!(options.activation(Component::VideoDecoder), DType::F16);
+        let explicit = LoadOptions {
+            dtype: Some(DType::F32),
+            ..LoadOptions::new(vec![Component::VideoDecoder])
+        };
+        assert_eq!(explicit.activation(Component::VideoDecoder), DType::F32);
+    }
+
+    #[test]
+    fn an_export_reads_what_it_omits_from_its_base_pipeline() {
+        let export = pipeline(&["transformer_ref", "scheduler"]);
+        let pipeline_root = pipeline(&[
+            "text_encoder",
+            "transformer",
+            "transformer_ref",
+            "vae",
+            "audio_vae",
+        ]);
+        let root = nn::Checkpoint::open(export.path()).expect("the export");
+        let base = nn::Checkpoint::open(pipeline_root.path()).expect("the base pipeline");
+        let options = LoadOptions {
+            base: Some(pipeline_root.path().to_path_buf()),
+            ..LoadOptions::new(Component::ALL.to_vec())
+        };
+
+        // What the export holds is read from it, what it omits from the base.
+        assert!(std::ptr::eq(
+            options
+                .source(&root, Some(&base), "transformer_ref")
+                .expect("the export holds its own reference DiT"),
+            root.component("transformer_ref").expect("a component"),
+        ));
+        assert!(std::ptr::eq(
+            options
+                .source(&root, Some(&base), "vae")
+                .expect("the base holds the video VAE"),
+            base.component("vae").expect("a component"),
+        ));
+
+        // A directory neither holds is refused, not skipped.
+        let empty = LoadOptions::new(vec![Component::AudioDecoder]);
+        let error = empty
+            .source(&root, None, "audio_vae")
+            .err()
+            .expect("no audio VAE in the export");
+        assert!(
+            matches!(error, Error::Checkpoint(ref problem) if problem.contains("audio_vae")),
+            "{error}"
+        );
     }
 }
