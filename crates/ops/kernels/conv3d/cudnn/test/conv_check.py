@@ -282,6 +282,9 @@ def main() -> int:
     taps *= group_channels
     got = out.double()
     difference = (got - expected).abs()
+    # A difference that is not a number is never inside a bound: `>` would say it is, and a
+    # NaN anywhere makes the tensor's maximum NaN, which hides every other error in it.
+    worst = difference.nan_to_num(nan=float("inf")).max().item()
     fp32 = bound(taps, arguments.dtype, False)
     tf32 = bound(taps, arguments.dtype, True)
     largest = expected.abs().max().item()
@@ -291,14 +294,14 @@ def main() -> int:
         f"{taps} taps"
     )
     print(
-        f"max |out - exact| = {difference.max().item():.6g}, "
+        f"max |out - exact| = {worst:.6g}, "
         f"largest value {largest:.6g}"
     )
     print(
         f"operator's bound {fp32:.3g} relative; with TF32 permitted {tf32:.3g}"
     )
     allowed = fp32 * expected.abs().max().item()
-    if difference.max().item() > allowed:
+    if not worst <= allowed:
         print(
             "the module exceeds the operator's FP32 bound"
             + (
