@@ -24,6 +24,13 @@
 //! programs; the retry finds them in the store. Progress an abandoned
 //! attempt reported is not undone: a phase's progress report may name a step
 //! twice.
+//!
+//! The wall-clock bound of a wait is `attempts × (delay + one attempt)`, not
+//! `attempts × delay`: a restart ends the attempt in flight, so each attempt
+//! after the first adds the time the server needs for the request, and a cold
+//! module build can take minutes. A caller that needs a deadline chooses
+//! `attempts` against the slowest attempt it expects, or wraps the call in an
+//! outer deadline of its own.
 
 use std::io::ErrorKind;
 use std::num::NonZeroU32;
