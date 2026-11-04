@@ -52,6 +52,9 @@ use ops::{DType, Float};
 /// Whether the layers' descriptors are the programmatic-dependent-launch variants.
 const PDL: bool = false;
 
+/// The lanes one `top_k` ordering pass reads, matching `nn::layers::sampler`'s own chunk.
+const TOP_TILE: u32 = 2048;
+
 /// Tokens one `embedding` program handles (`launch::EMBEDDING_TOKENS`).
 const EMBEDDING_TOKENS: u32 = 8;
 
@@ -352,6 +355,9 @@ fn main() {
             dtype: DType::F32,
             vocabulary: VOCABULARY,
             width: CANDIDATE_WIDTH,
+            // The chunk one ordering pass reads: the only size `top_k`'s key names now that the
+            // kept count is a launch value and the ordering walks the row instead of sorting it.
+            tile: TOP_TILE,
             ids: DType::I32,
             pdl: PDL,
         }),
