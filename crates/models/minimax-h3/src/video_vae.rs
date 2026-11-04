@@ -536,6 +536,36 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_latent_statistics_fold_into_the_projection_that_follows() {
+        // Two outputs of two inputs: the identity, with the statistics of channels 1 and 2.
+        let weight = [1.0, 0.0, 0.0, 1.0];
+        let bias = [0.5, -0.5];
+        let std = [2.0, 3.0];
+        let mean = [10.0, 20.0];
+        let (folded, shift) = fold_statistics(&weight, &bias, &std, &mean).expect("the fold");
+        assert_eq!(folded, vec![2.0, 0.0, 0.0, 3.0]);
+        assert_eq!(shift, vec![10.5, 19.5]);
+        // The fold restores what the two steps compute separately: `W (std x + mean) + b`.
+        let latent = [0.25f32, -0.5];
+        let restored = [latent[0] * std[0] + mean[0], latent[1] * std[1] + mean[1]];
+        for output in 0..2 {
+            let separate = weight[output * 2] * restored[0]
+                + weight[output * 2 + 1] * restored[1]
+                + bias[output];
+            let together =
+                folded[output * 2] * latent[0] + folded[output * 2 + 1] * latent[1] + shift[output];
+            assert!(
+                (separate - together).abs() < 1e-5,
+                "{separate} vs {together}"
+            );
+        }
+        // A projection of the wrong extent, or non-finite statistics, is refused.
+        assert!(fold_statistics(&weight, &bias, &[2.0], &mean).is_err());
+        assert!(fold_statistics(&weight[..3], &bias, &std, &mean).is_err());
+        assert!(fold_statistics(&weight, &bias, &[f32::NAN, 3.0], &mean).is_err());
+    }
+
+    #[test]
     fn three_quarters_of_a_head_rotate_over_three_axes() {
         let config = video_config();
         let (width, sections) = rotary(&config).expect("a rotation");
@@ -692,4 +722,50 @@ pub(crate) mod tests {
         });
         VideoVaeConfig::parse(&sidecar).expect("the checkpoint's video VAE sidecar")
     }
+}
+
+/// Fold the latent statistics into the projection that follows them.
+///
+/// The decoder's first step restores a latent channel (`value · std + mean`) and then applies the
+/// checkpoint's one-by-one post-quantization convolution. The two compose into one affine:
+/// `W · (std ⊙ x + mean) + b`, i.e. a weight whose input column `i` is scaled by `std[i]` and a bias
+/// shifted by `W · mean`. Folding them at the loading boundary keeps one element type and one
+/// operator, with the checkpoint's own rounding of the stored result.
+///
+/// `weight` is `[out, in]` row-major, `bias` is `[out]`, and `std`/`mean` are `[in]`. The result is the
+/// folded `(weight, bias)`; a checkpoint whose extents disagree is refused rather than read past.
+pub fn fold_statistics(
+    weight: &[f32],
+    bias: &[f32],
+    std: &[f32],
+    mean: &[f32],
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    let out = bias.len();
+    if out == 0 || mean.len() != std.len() || mean.is_empty() {
+        return Err(Error::config(
+            "the latent statistics and the projection's channels disagree".to_owned(),
+        ));
+    }
+    let channels = mean.len();
+    if weight.len() != out * channels {
+        return Err(Error::config(format!(
+            "a {}-element projection for {out} outputs of {channels} inputs",
+            weight.len()
+        )));
+    }
+    if std.iter().any(|value| !value.is_finite()) || mean.iter().any(|value| !value.is_finite()) {
+        return Err(Error::config(
+            "the latent statistics are not finite".to_owned(),
+        ));
+    }
+    let mut folded = weight.to_vec();
+    let mut shift = bias.to_vec();
+    for channel in 0..channels {
+        for output in 0..out {
+            let at = output * channels + channel;
+            folded[at] = weight[at] * std[channel];
+            shift[output] += weight[at] * mean[channel];
+        }
+    }
+    Ok((folded, shift))
 }
