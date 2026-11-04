@@ -733,6 +733,68 @@ fn main() {
         .to_string(),
     );
 
+    // ---- The video VAE's encoder, `vae/config.json` and `encoding.rs`'s own construction.
+    //
+    // The encoder is FP32 and every convolution passes `tf32 = true` at `Conv3d::new`, so the flag is
+    // the model's declaration rather than a preset's inference. Its geometry is cubic with zero
+    // padding and unit dilation (`encoding.rs::geometry`), and the downsampler of a stage strides by
+    // that stage's factors: `spatial_downsample_factors [2,2,2,2,1,1]` against
+    // `temporal_downsample_factors [1,2,2,1,1,1]` gives three distinct pairs — `[1,2,2]`, `[2,2,2]`
+    // and the two stages whose product is 1, which carry no downsampler at all — so four rows cover
+    // every convolution of the encoder and the whole of `quant_conv`.
+    for (kernel, stride) in [
+        ([3_u32, 3, 3], [1_u32, 1, 1]),
+        ([3, 3, 3], [1, 2, 2]),
+        ([3, 3, 3], [2, 2, 2]),
+        ([1, 1, 1], [1, 1, 1]),
+    ] {
+        push(
+            "conv3d",
+            ops::conv::Descriptor {
+                input: DType::F32,
+                weight: DType::F32,
+                output: DType::F32,
+                geometry: ops::conv::Geometry {
+                    kernel,
+                    stride,
+                    padding: [0, 0, 0],
+                    dilation: [1, 1, 1],
+                    groups: 1,
+                },
+                bias: true,
+                tf32: true,
+                rank: 3,
+                transposed: false,
+            }
+            .to_string(),
+        );
+    }
+    // Its per-frame group statistics over `norm_num_groups 32` with `norm_eps 1e-6`.
+    push(
+        "frame_moments",
+        ops::frame::FrameMomentsDescriptor {
+            dtype: DType::F32,
+            epsilon: ops::descriptor::Float::from(1e-6_f32),
+        }
+        .to_string(),
+    );
+    // Its normalize-then-pad, with the affine parameters the checkpoint carries (`centered` is the
+    // form without them) and `spatial_padding_mode reflect`. `single_pixel` is the descriptor's form
+    // for a one-pixel raster, which needs no padding at all: both are listed because which one a
+    // request takes depends on the clip's latent grid, not on a compiled choice.
+    for single_pixel in [false, true] {
+        push(
+            "frame_norm_pad",
+            ops::frame::FrameNormPadDescriptor {
+                dtype: DType::F32,
+                channels_last: false,
+                centered: false,
+                single_pixel,
+            }
+            .to_string(),
+        );
+    }
+
     // ---- The audio decoder's and encoder's convolutions, in FP32 with TF32 declared on.
     //
     // The decoder's seven upsamplers are `ConvTranspose1d` with `kernel = decoder_kernel_sizes`,
