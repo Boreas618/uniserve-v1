@@ -229,9 +229,17 @@ impl BatchColumns {
 
     /// Whether every column has the length its field promises for `shape`, so that a mis-sized
     /// batch fails before a launch rather than after one.
+    ///
+    /// Three counts, not one: `input_ids` is as long as the batch's tokens, `slots` and
+    /// `parameters` as long as its rows — the sequences, which is `[rows]` in every per-row column
+    /// and what [`BatchColumns::rows`] answers — and `commit` is one row per *call*, since a call
+    /// states once how the step advances its slot however many rows it evaluated. A verify batch
+    /// of three candidates is one call and three rows, and comparing the per-row columns with the
+    /// call count refuses it.
     pub fn check(&self, shape: &Shape) -> Result<()> {
         let tokens = self.rows.tokens();
-        let rows = self.rows.calls.len();
+        let rows = self.rows();
+        let calls = self.calls();
         for (name, actual, expected) in [
             ("input_ids", self.input_ids.len(), tokens),
             ("slots", self.slots.len(), rows),
@@ -243,13 +251,14 @@ impl BatchColumns {
         ] {
             if actual != expected {
                 return Err(Error::Invalid(format!(
-                    "{name} has {actual} entries, the batch has {rows} rows and {tokens} tokens"
+                    "{name} has {actual} entries, the batch has {rows} rows and {tokens} tokens \
+                     in {calls} calls"
                 )));
             }
         }
-        if self.commit.len() % rows.max(1) != 0 {
+        if self.commit.len() % calls.max(1) != 0 {
             return Err(Error::Invalid(format!(
-                "commit has {} entries, not a whole number of columns over {rows} rows",
+                "commit has {} entries, not a whole number of columns over {calls} calls",
                 self.commit.len()
             )));
         }

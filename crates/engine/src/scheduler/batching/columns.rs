@@ -803,44 +803,37 @@ mod tests {
     }
 
     #[test]
-    fn a_chunk_states_no_logits_row_and_a_multi_row_prefill_its_last() {
-        // `logits_rows` has one entry per row and names, in each, the row whose hidden
-        // state is projected: `-1` for a row that projects nothing, its own index for a
-        // row that samples. A chunk of a prompt that does not end samples nothing; a
-        // prefill that ends it samples at its last query row, not its first.
+    fn a_chunk_states_no_logits_row_and_the_chunk_that_ends_the_prompt_its_own() {
+        // `logits_rows` has one entry per row and names, in each, the row whose
+        // hidden state is projected: `-1` for a row that projects nothing, its
+        // own index for a row that samples. A prefill call is one row per
+        // request, so a chunk of a prompt that does not end samples nothing and
+        // the chunk that ends it samples at its own row.
         let mut chunk = call(prefill(), 8, &[3]);
         chunk.token_output = None;
         let requests = vec![
             (chunk, placement(1, &[3], &[true])),
-            (
-                call(prefill(), 11, &[2, 2]),
-                placement(2, &[2, 2], &[true, true]),
-            ),
+            (call(prefill(), 11, &[2]), placement(2, &[2], &[true])),
         ];
         let columns = columns(
             &requests,
-            &[vec![1, 2, 3], vec![4, 5, 6, 7]],
+            &[vec![1, 2, 3], vec![4, 5]],
             &[&sampling(), &sampling()],
             &[0, 0],
             page(),
             2048,
         )
-        .expect("a chunk and a sampling prefill");
+        .expect("a chunk and the chunk that ends a prompt");
 
-        assert_eq!(
-            columns.rows(),
-            3,
-            "one row for the chunk, two for the prefill"
-        );
-        assert_eq!(columns.tokens(), 7);
+        assert_eq!(columns.rows(), 2, "one row per call");
+        assert_eq!(columns.tokens(), 5);
         assert_eq!(
             columns.rows.logits_rows,
-            vec![-1, -1, 2],
-            "the chunk projects nothing, and the prefill's second row is its last query row"
+            vec![-1, 1],
+            "the chunk projects nothing, and the prompt's last chunk projects its own row"
         );
-        let shape = batch_shape(&columns);
         assert_eq!(
-            shape.variant,
+            batch_shape(&columns).variant,
             executor::plan::Variant::PrefillOutput,
             "the batch ends a prompt, so it projects logits"
         );
@@ -965,15 +958,23 @@ mod tests {
             "the sampler graph serves both rows, and a greedy row's token is its argmax"
         );
 
-        // A verification's candidates draw, so they are sampled too.
+        // A verification is served from a decode bucket, and which one follows
+        // the same rule: a greedy verification argmaxes each candidate row, and
+        // one whose rows draw takes the sampler graph.
         let requests = vec![(
             call(verify(), 12, &[1, 1]),
             placement(1, &[1, 1], &[true, true]),
         )];
-        let verified = columns(&requests, &[vec![7, 8]], &[&greedy], &[0], page(), 2048)
-            .expect("a verification");
+        let greedy_verify = columns(&requests, &[vec![7, 8]], &[&greedy], &[0], page(), 2048)
+            .expect("a greedy verification");
         assert_eq!(
-            batch_shape(&verified).variant,
+            batch_shape(&greedy_verify).variant,
+            executor::plan::Variant::DecodeGreedy
+        );
+        let sampling_verify = columns(&requests, &[vec![7, 8]], &[&sampling()], &[0], page(), 2048)
+            .expect("a sampling verification");
+        assert_eq!(
+            batch_shape(&sampling_verify).variant,
             executor::plan::Variant::DecodeSampled
         );
     }
