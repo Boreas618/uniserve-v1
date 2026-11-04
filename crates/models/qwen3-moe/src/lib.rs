@@ -27,7 +27,7 @@ pub mod weights;
 
 pub use config::{Activation, Config, RopeScaling, YaRn};
 pub use load::load;
-pub use model::{LoadOptions, Plan, Qwen3Moe, Substage};
+pub use model::{LoadOptions, Plan, Qwen3Moe, Run, Substage};
 pub use partition::Partition;
 
 /// What this crate can fail with.
