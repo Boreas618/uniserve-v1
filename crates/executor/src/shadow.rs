@@ -294,6 +294,54 @@ pub fn tolerance_of<O: ops::Op>(descriptor: &O::Descriptor) -> Tolerance {
 pub type Region = Arc<Twins>;
 
 
+/// The KV slots a paired forward writes, all of them in the scratch range and none resident.
+///
+/// A paired forward must not write a resident page: the batch it walks is a served batch, and its
+/// KV would be overwritten by the new kernel's (7.3). So every row that writes cache pages in a
+/// served batch gets scratch pages here, taken from the run after the resident cache: `resident`
+/// is the number of slots the resident cache holds, and the slots come back from `resident`
+/// upward, `ceil(row tokens / page size)` per row and in row order.
+///
+/// `first_slot` is the slot at which the scratch range begins in the model's KV view. The result
+/// holds one slot per page a row writes, concatenated over the rows, which is what the KV write
+/// kernel reads as `slot_mapping`.
+pub fn scratch_slots(
+    row_tokens: &[u32],
+    page_size: u32,
+    resident: u64,
+    first_slot: i64,
+) -> Result<Vec<i64>> {
+    if page_size == 0 {
+        return Err(Error::Invariant("a scratch page size of zero".into()));
+    }
+    if first_slot < 0 {
+        return Err(Error::Invariant(
+            "the scratch range must start at a non-negative slot".into(),
+        ));
+    }
+    let mut slots = Vec::new();
+    let mut next = first_slot as u64;
+    for tokens in row_tokens {
+        let pages = u64::from(ceildiv(u64::from(*tokens), u64::from(page_size)));
+        for _ in 0..pages {
+            if next < resident {
+                return Err(Error::Invariant(
+                    "the scratch range overlaps the resident cache".into(),
+                ));
+            }
+            slots.push(next as i64);
+            next = next.checked_add(1).ok_or_else(|| {
+                Error::Invariant("the scratch page table exhausted the slot space".into())
+            })?;
+        }
+    }
+    Ok(slots)
+}
+
+fn ceildiv(value: u64, divisor: u64) -> u64 {
+    value.div_ceil(divisor)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,5 +425,27 @@ mod tests {
         let short = f32s(&[1.0]);
         compare_buffers(DType::F32, 2, &real, &short, tolerance(0.0, 0.0))
             .expect_err("a short copy is refused");
+    }
+
+    /// A paired forward's pages are scratch: as many as the rows need, unique, and every one above
+    /// the resident cache, so the new kernel cannot overwrite a page a request reads (7.3).
+    #[test]
+    fn scratch_slots_never_name_a_resident_page() {
+        let slots = scratch_slots(&[1, 17, 0, 33], 16, 4096, 4096).expect("a valid table");
+        // Rows of 1, 17, 0 and 33 tokens need 1, 2, 0 and 3 pages.
+        assert_eq!(slots.len(), 6);
+        for slot in &slots {
+            assert!(*slot >= 4096, "slot {slot} is inside the resident cache");
+        }
+        let mut unique = slots.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), slots.len(), "two rows were given the same page");
+
+        // The scratch range may begin past the resident one; it still may not overlap it.
+        let further = scratch_slots(&[2], 16, 10, 100).expect("a valid table");
+        assert_eq!(further, vec![100i64]);
+        scratch_slots(&[2], 16, 10, 9).expect_err("a range below the resident cache is refused");
+        scratch_slots(&[2], 0, 10, 100).expect_err("a page size of zero is refused");
     }
 }
