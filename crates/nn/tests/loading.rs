@@ -512,6 +512,8 @@ fn the_block_scales_must_have_the_layout_s_shape() {
 /// An expert stack is its experts' encoded tensors concatenated in the operator's reading order —
 /// expert-major, up before gate — and its tensor scales become one reciprocal per expert **and
 /// projection**, because the checkpoint gives each expert's up and gate their own `weight_scale_2`.
+/// The scales are published the other way round: one packed table per projection, which is what the
+/// batched-GEMM entry reads and what the checkpoint itself says a tensor at a time.
 #[test]
 fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection() {
     let directory = tempfile::tempdir().unwrap();
@@ -573,7 +575,7 @@ fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection
     assert_eq!(
         stack.global_scale.shape().dims(),
         &[2, 2],
-        "two experts, and one scalar per projection within each"
+        "one packed table per projection, of two experts each"
     );
     assert_eq!(stack.global_scale.dtype(), DType::F32);
     // The store received the values in reading order, then the scales, then the reciprocals.
@@ -590,8 +592,8 @@ fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection
         .collect();
     assert_eq!(
         reciprocals,
-        [2.0, 2.0, 1.0, 1.0],
-        "1 / (0.5 · (e + 1)), expert-major and then projection-major"
+        [2.0, 1.0, 2.0, 1.0],
+        "1 / (0.5 · (e + 1)) as one packed row per projection: up's two experts, then gate's"
     );
 
     // A second load of the same checkpoint publishes nothing: the three keys hit the store.
@@ -1144,7 +1146,7 @@ fn a_calibrated_stack_names_its_fields_with_its_exports_suffixes() {
         )
         .expect("an export that states weight_packed and weight_tensor_scale loads as such");
     assert_eq!(stack.values.shape().dims(), &[2, 4, 32]);
-    assert_eq!(stack.global_scale.shape().dims(), &[2, 1]);
+    assert_eq!(stack.global_scale.shape().dims(), &[1, 2]);
 
     // Read as the other spelling the stack asks for names this checkpoint does not have, and the
     // refusal names the field and the export it expected.
