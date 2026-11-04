@@ -20,10 +20,10 @@ use ::storage::protocol::{PageShape, Reply, Request};
 use ipc::EncoderPoolInfo;
 use platform::DeviceId;
 
-use crate::memory::allocation::{Storage, StorageView};
-use crate::memory::retained::Retained;
 use crate::memory::allocation::Backing;
 use crate::memory::allocation::ElementType;
+use crate::memory::allocation::{Storage, StorageView};
+use crate::memory::retained::Retained;
 use crate::{Error, Result};
 
 /// The version of the page encoding: an output's bytes, rows in order,

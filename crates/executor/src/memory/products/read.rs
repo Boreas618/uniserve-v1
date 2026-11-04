@@ -1,9 +1,9 @@
 //! Read leases of committed products.
 
 use super::*;
+use crate::memory::allocation::MemoryKind;
 use crate::memory::allocation::StorageView;
 use crate::stream::Issue;
-use crate::memory::allocation::MemoryKind;
 use crate::{Error, Result};
 use ipc::CallId;
 use ipc::TensorRef;

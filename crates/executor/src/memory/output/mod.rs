@@ -17,11 +17,11 @@ use std::time::Instant;
 use ipc::TokenLogprob;
 use platform::{DeviceId, Event};
 
+use crate::memory::allocation::Backing;
+use crate::memory::allocation::ElementType;
 use crate::memory::allocation::{Storage, StorageView};
 use crate::stream::EventPool;
 use crate::stream::Issue;
-use crate::memory::allocation::Backing;
-use crate::memory::allocation::ElementType;
 use crate::{Error, Result, lock};
 
 mod logprobs;
@@ -775,9 +775,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{LogprobLayout, OutputBuffer, OutputPool};
+    use crate::memory::allocation::ElementType;
     use crate::memory::allocation::StorageView;
     use crate::stream::EventPool;
-    use crate::memory::allocation::ElementType;
     use crate::{Result, lock};
 
     /// Write `values` into the lent host words `lent`, as the executor

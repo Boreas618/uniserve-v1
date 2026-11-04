@@ -1,10 +1,10 @@
 //! A product's buffer: its views, metadata and shape.
 
 use super::*;
+use crate::memory::allocation::ElementType;
+use crate::memory::allocation::MemoryKind;
 use crate::memory::allocation::StorageView;
 use crate::memory::buffer::BufferBinding;
-use crate::memory::allocation::ElementType;
-use crate::memory::allocation::{MemoryKind};
 use crate::transfer::{ReadRef, Retirement};
 use crate::{Error, Result};
 use ipc::{BufferId, DimBound, TensorRef};

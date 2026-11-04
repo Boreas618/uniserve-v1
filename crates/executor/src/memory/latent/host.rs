@@ -27,10 +27,10 @@ use ipc::{LatentPageCopy, LatentPoolInfo, LatentPoolRef};
 use platform::{DeviceAttribute, DeviceId};
 use sha2::{Digest, Sha256};
 
-use crate::memory::allocation::{Storage, StorageView};
-use crate::memory::retained::Retained;
 use crate::memory::allocation::Backing;
 use crate::memory::allocation::ElementType;
+use crate::memory::allocation::{Storage, StorageView};
+use crate::memory::retained::Retained;
 use crate::{Error, Result};
 
 /// The version of the page encoding above: pages of another version are

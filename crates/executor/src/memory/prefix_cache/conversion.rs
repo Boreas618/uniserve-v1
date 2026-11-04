@@ -21,8 +21,8 @@ use std::sync::Arc;
 use platform::Stream;
 
 use crate::Result;
-use crate::memory::allocation::{Storage, StorageView};
 use crate::memory::allocation::ElementType;
+use crate::memory::allocation::{Storage, StorageView};
 
 /// One source span to convert, and the destination units to write it into.
 pub(crate) struct ConversionRequest<'a> {

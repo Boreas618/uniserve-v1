@@ -1,9 +1,9 @@
 //! Binding a batch's outputs and writing products.
 
 use super::*;
+use crate::memory::allocation::MemoryKind;
 use crate::memory::allocation::StorageView;
 use crate::stream::Issue;
-use crate::memory::allocation::MemoryKind;
 use crate::transfer::{Spans, copy_planner};
 use crate::{Error, Result};
 use ipc::{BufferAllocation, BufferId, RequestKey, TensorRef};

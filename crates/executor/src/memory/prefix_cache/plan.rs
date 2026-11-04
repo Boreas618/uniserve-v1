@@ -16,8 +16,8 @@ use ipc::PrefixCacheInfo;
 use ipc::{CacheGroup, CacheGroupKind, PrefixCacheDtype};
 
 use crate::memory::GroupShape;
-use crate::memory::request_slots::SlotField;
 use crate::memory::allocation::ElementType;
+use crate::memory::request_slots::SlotField;
 /// One field of a cache layer kept per request slot: `name` is
 /// `layer/field`, `shape` one slot's extent.
 #[derive(Clone, Debug, PartialEq, Eq)]
