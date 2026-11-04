@@ -6,7 +6,7 @@ use std::ffi::c_void;
 
 use ffi::{Handle, RawUniqueId, api};
 
-use crate::{DeviceId, Error, PrimaryContext, Result, Stream};
+use crate::{DType, DeviceId, Error, PrimaryContext, Result, Stream};
 
 /// `ncclCommSuspend`'s flag that releases the communicator's dynamic device
 /// storage.
@@ -31,24 +31,6 @@ impl UniqueId {
         api.check(unsafe { (api.get_unique_id)(&mut id) }, "ncclGetUniqueId")?;
         Ok(Self(id.bytes))
     }
-}
-
-/// `ncclDataType_t`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(i32)]
-pub enum DataType {
-    Int8 = 0,
-    Uint8 = 1,
-    Int32 = 2,
-    Uint32 = 3,
-    Int64 = 4,
-    Uint64 = 5,
-    Float16 = 6,
-    Float32 = 7,
-    Float64 = 8,
-    Bfloat16 = 9,
-    Float8E4M3 = 10,
-    Float8E5M2 = 11,
 }
 
 /// `ncclRedOp_t` (built-in reductions).
@@ -167,7 +149,7 @@ impl Communicator {
         send: u64,
         recv: u64,
         count: usize,
-        dtype: DataType,
+        dtype: DType,
         op: ReduceOp,
         stream: &Stream,
     ) -> Result<()> {
@@ -178,7 +160,7 @@ impl Communicator {
                 pointer(send),
                 pointer(recv),
                 count,
-                dtype as i32,
+                dtype.nccl(),
                 op as i32,
                 self.raw,
                 stream.handle(),
@@ -198,7 +180,7 @@ impl Communicator {
         send: u64,
         recv: u64,
         count: usize,
-        dtype: DataType,
+        dtype: DType,
         op: ReduceOp,
         stream: &Stream,
     ) -> Result<()> {
@@ -209,7 +191,7 @@ impl Communicator {
                 pointer(send),
                 pointer(recv),
                 count,
-                dtype as i32,
+                dtype.nccl(),
                 op as i32,
                 self.raw,
                 stream.handle(),
@@ -228,7 +210,7 @@ impl Communicator {
         send: u64,
         recv: u64,
         count: usize,
-        dtype: DataType,
+        dtype: DType,
         stream: &Stream,
     ) -> Result<()> {
         let api = api()?;
@@ -238,7 +220,7 @@ impl Communicator {
                 pointer(send),
                 pointer(recv),
                 count,
-                dtype as i32,
+                dtype.nccl(),
                 self.raw,
                 stream.handle(),
             )
@@ -257,7 +239,7 @@ impl Communicator {
         send: u64,
         recv: u64,
         count: usize,
-        dtype: DataType,
+        dtype: DType,
         stream: &Stream,
     ) -> Result<()> {
         let api = api()?;
@@ -268,7 +250,7 @@ impl Communicator {
                 pointer(send),
                 pointer(recv),
                 count,
-                dtype as i32,
+                dtype.nccl(),
                 self.raw,
                 stream.handle(),
             )
@@ -286,7 +268,7 @@ impl Communicator {
         send: u64,
         recv: u64,
         count: usize,
-        dtype: DataType,
+        dtype: DType,
         root: i32,
         stream: &Stream,
     ) -> Result<()> {
@@ -297,7 +279,7 @@ impl Communicator {
                 pointer(send),
                 pointer(recv),
                 count,
-                dtype as i32,
+                dtype.nccl(),
                 root,
                 self.raw,
                 stream.handle(),
@@ -314,7 +296,7 @@ impl Communicator {
         &mut self,
         data: u64,
         count: usize,
-        dtype: DataType,
+        dtype: DType,
         peer: i32,
         stream: &Stream,
     ) -> Result<()> {
@@ -324,7 +306,7 @@ impl Communicator {
             (api.send)(
                 pointer(data),
                 count,
-                dtype as i32,
+                dtype.nccl(),
                 peer,
                 self.raw,
                 stream.handle(),
@@ -341,7 +323,7 @@ impl Communicator {
         &mut self,
         data: u64,
         count: usize,
-        dtype: DataType,
+        dtype: DType,
         peer: i32,
         stream: &Stream,
     ) -> Result<()> {
@@ -351,7 +333,7 @@ impl Communicator {
             (api.recv)(
                 pointer(data),
                 count,
-                dtype as i32,
+                dtype.nccl(),
                 peer,
                 self.raw,
                 stream.handle(),

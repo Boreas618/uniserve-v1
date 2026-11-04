@@ -10,7 +10,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use platform::nccl::{Communicator, DataType, ReduceOp, UniqueId};
+use platform::nccl::{Communicator, ReduceOp, UniqueId};
 use platform::{
     Capture, CaptureMode, CaptureStatus, Cluster, CopyBatch, Device, DeviceAllocation,
     DeviceAttribute, DeviceId, Error, Event, EventFlags, FunctionAttribute, GraphNodeKind,
@@ -838,7 +838,7 @@ fn single_rank_communicators_run_collectives() {
                 data.address(),
                 data.address(),
                 4,
-                DataType::Int32,
+                platform::DType::I32,
                 ReduceOp::Min,
                 &stream,
             )
@@ -848,7 +848,7 @@ fn single_rank_communicators_run_collectives() {
                 data.address(),
                 data.address(),
                 4,
-                DataType::Int32,
+                platform::DType::I32,
                 0,
                 &stream,
             )

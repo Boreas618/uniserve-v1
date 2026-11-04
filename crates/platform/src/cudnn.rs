@@ -61,7 +61,7 @@ use std::sync::{Arc, OnceLock};
 use libloading::Library;
 
 use crate::driver::Handle;
-use crate::{DataType, Device, DeviceId, Error, Result, Stream};
+use crate::{DType, Device, DeviceId, Error, Result, Stream};
 
 const LIBCUDNN: &str = "libcudnn.so.9";
 
@@ -351,13 +351,13 @@ impl Api {
 pub struct Tensor {
     pub dims: Vec<i64>,
     pub strides: Vec<i64>,
-    pub dtype: DataType,
+    pub dtype: DType,
 }
 
 impl Tensor {
     /// A tensor with exactly the dimensions it has, whose strides are the
     /// row-major (contiguous) strides of those dimensions.
-    pub fn contiguous(dims: Vec<i64>, dtype: DataType) -> Self {
+    pub fn contiguous(dims: Vec<i64>, dtype: DType) -> Self {
         let mut strides = vec![1i64; dims.len()];
         for index in (0..dims.len().saturating_sub(1)).rev() {
             strides[index] = strides[index + 1].saturating_mul(dims[index + 1]);
@@ -424,7 +424,7 @@ pub struct Convolution {
     pub dilation: Vec<i64>,
     /// The accumulation type; FP32 keeps the video VAE's precision while
     /// allowing TF32.
-    pub compute: DataType,
+    pub compute: DType,
 }
 
 impl Convolution {
@@ -446,7 +446,7 @@ impl Convolution {
             padding,
             stride,
             dilation,
-            compute: DataType::F32,
+            compute: DType::F32,
         }
     }
 
@@ -542,7 +542,7 @@ impl Convolution {
                 )));
             }
         }
-        if self.compute != DataType::F32 {
+        if self.compute != DType::F32 {
             return Err(Error::invalid(format!(
                 "a convolution accumulates in FP32, not {:?}",
                 self.compute
@@ -1151,9 +1151,9 @@ mod tests {
 
     fn conv1d(x: Vec<i64>, w: Vec<i64>, y: Vec<i64>) -> Convolution {
         Convolution::new(
-            Tensor::contiguous(x, DataType::F32),
-            Tensor::contiguous(w, DataType::F32),
-            Tensor::contiguous(y, DataType::F32),
+            Tensor::contiguous(x, DType::F32),
+            Tensor::contiguous(w, DType::F32),
+            Tensor::contiguous(y, DType::F32),
             vec![1],
             vec![1],
             vec![1],
@@ -1162,7 +1162,7 @@ mod tests {
 
     #[test]
     fn a_contiguous_tensor_has_row_major_strides() {
-        let tensor = Tensor::contiguous(vec![2, 3, 4, 5], DataType::F32);
+        let tensor = Tensor::contiguous(vec![2, 3, 4, 5], DType::F32);
 
         assert_eq!(tensor.strides, vec![60, 20, 5, 1]);
         assert_eq!(tensor.rank(), 4);
@@ -1171,9 +1171,9 @@ mod tests {
     #[test]
     fn a_convolution_needs_one_padding_per_spatial_dimension() {
         let mut convolution = Convolution::new(
-            Tensor::contiguous(vec![1, 8, 4, 4, 4], DataType::F32),
-            Tensor::contiguous(vec![8, 8, 3, 3, 3], DataType::F32),
-            Tensor::contiguous(vec![1, 8, 4, 4, 4], DataType::F32),
+            Tensor::contiguous(vec![1, 8, 4, 4, 4], DType::F32),
+            Tensor::contiguous(vec![8, 8, 3, 3, 3], DType::F32),
+            Tensor::contiguous(vec![1, 8, 4, 4, 4], DType::F32),
             vec![1, 1, 1],
             vec![1, 1, 1],
             vec![1, 1, 1],
@@ -1191,9 +1191,9 @@ mod tests {
     fn the_output_dimensions_follow_padding_stride_and_dilation() {
         // A three-dimensional convolution with padding, stride and dilation.
         let mut convolution = Convolution::new(
-            Tensor::contiguous(vec![1, 4, 8, 8, 8], DataType::F32),
-            Tensor::contiguous(vec![8, 4, 3, 3, 3], DataType::F32),
-            Tensor::contiguous(vec![1, 8, 4, 4, 4], DataType::F32),
+            Tensor::contiguous(vec![1, 4, 8, 8, 8], DType::F32),
+            Tensor::contiguous(vec![8, 4, 3, 3, 3], DType::F32),
+            Tensor::contiguous(vec![1, 8, 4, 4, 4], DType::F32),
             vec![1, 1, 1],
             vec![2, 2, 2],
             vec![1, 1, 1],
@@ -1225,7 +1225,7 @@ mod tests {
         assert!(error.to_string().contains("give 508"), "{error}");
 
         convolution.y.dims[2] = 508;
-        convolution.compute = DataType::Bf16;
+        convolution.compute = DType::Bf16;
         let error = convolution
             .check()
             .expect_err("a convolution accumulates in FP32");
@@ -1234,7 +1234,7 @@ mod tests {
 
     #[test]
     fn a_tensor_needs_a_stride_per_dimension() {
-        let mut tensor = Tensor::contiguous(vec![1, 6, 512], DataType::F32);
+        let mut tensor = Tensor::contiguous(vec![1, 6, 512], DType::F32);
         tensor.strides.truncate(2);
 
         let error = tensor.check().expect_err("two strides for three dims");
@@ -1244,9 +1244,9 @@ mod tests {
     #[test]
     fn the_bytes_of_each_tensor_follow_its_dimensions() {
         let convolution = Convolution::new(
-            Tensor::contiguous(vec![1, 2, 2, 2, 2], DataType::F32),
-            Tensor::contiguous(vec![2, 2, 1, 1, 1], DataType::F32),
-            Tensor::contiguous(vec![1, 2, 2, 2, 2], DataType::F32),
+            Tensor::contiguous(vec![1, 2, 2, 2, 2], DType::F32),
+            Tensor::contiguous(vec![2, 2, 1, 1, 1], DType::F32),
+            Tensor::contiguous(vec![1, 2, 2, 2, 2], DType::F32),
             vec![0, 0, 0],
             vec![1, 1, 1],
             vec![1, 1, 1],
