@@ -269,6 +269,24 @@ fn compute_dtype(checkpoint: &Checkpoint, component: &str, stated: Option<DType>
     }
 }
 
+/// The element type `--dtype` states, or `None` for `auto`.
+///
+/// `None` is the design's rule - the checkpoint's own representation and no conversion - and a
+/// stated type is the deployment's decision, applied once by the loader. Both stages resolve the
+/// flag through this one function, so a stage cannot honour it in its plan and forget it at the
+/// weights: a weight that is never asked for at the stated type is the mixed-cell signature.
+fn stated_dtype(args: &Args) -> Result<Option<DType>> {
+    match args.dtype.as_deref() {
+        None | Some("auto") => Ok(None),
+        Some("bf16") => Ok(Some(DType::BF16)),
+        Some("f16") => Ok(Some(DType::F16)),
+        Some("f32") => Ok(Some(DType::F32)),
+        Some(other) => Err(Failure::message(format!(
+            "--dtype takes `auto`, `bf16`, `f16` or `f32`, not `{other}`"
+        ))),
+    }
+}
+
 /// The names the export's `text_encoder` index holds.
 fn index_names(root: &Path) -> Result<Vec<String>> {
     let path = root
@@ -320,9 +338,10 @@ fn stage_weights(args: &Args) -> Result<()> {
 
     let checkpoint = Checkpoint::open(&args.root)?;
     let source = checkpoint.component("text_encoder")?;
-    let dtype = compute_dtype(&checkpoint, TEXT_ENCODER, None)?;
+    let stated = stated_dtype(&args)?;
+    let dtype = compute_dtype(&checkpoint, TEXT_ENCODER, stated)?;
     let mut store = HostStore::new();
-    let mut loader = WeightLoader::new(source, &mut store, None, None);
+    let mut loader = WeightLoader::new(source, &mut store, stated, None);
     let encoder = TextEncoder::load(&mut loader, text, &Partition::single(), dtype)?;
     println!("loaded: text encoder at {}", encoder.dtype());
     println!(
@@ -766,17 +785,7 @@ fn stage_encode(args: &Args) -> Result<()> {
     })?;
     // The flag, the checkpoint and the element type are host checks: they run before a device is
     // opened, so a typo costs a second rather than a device.
-    let stated = match args.dtype.as_deref() {
-        None | Some("auto") => None,
-        Some("bf16") => Some(DType::BF16),
-        Some("f16") => Some(DType::F16),
-        Some("f32") => Some(DType::F32),
-        Some(other) => {
-            return Err(Failure::message(format!(
-                "--dtype takes `auto`, `bf16`, `f16` or `f32`, not `{other}`"
-            )));
-        }
-    };
+    let stated = stated_dtype(&args)?;
     let checkpoint = Checkpoint::open(&args.root)?;
     let source = checkpoint.component("text_encoder")?;
     let dtype = compute_dtype(&checkpoint, TEXT_ENCODER, stated)?;
@@ -793,7 +802,7 @@ fn stage_encode(args: &Args) -> Result<()> {
     //
     let mut weights = DeviceWeights::new(&device, 0)?;
     let encoder = {
-        let mut loader = WeightLoader::new(source, &mut weights, None, None);
+        let mut loader = WeightLoader::new(source, &mut weights, stated, None);
         TextEncoder::load(&mut loader, text, &Partition::single(), dtype)?
     };
     // The type the weights came back in, beside the one asked for: a loader that quietly widened or
