@@ -2458,7 +2458,6 @@ mod tests {
         ]);
         let mut staging = Staging::new();
         staging.reserve(&buckets)?;
-        let commit_rows = largest_rows(&buckets)?;
 
         staging.stage(
             &prefill_columns(),
