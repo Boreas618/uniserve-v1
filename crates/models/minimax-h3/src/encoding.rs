@@ -925,6 +925,21 @@ fn rows(view: TensorView) -> Result<TensorView> {
     Ok(view.reshape(Shape::new(&[rows, columns])))
 }
 
+/// The distinct extents of a run, in the order they are first named.
+///
+/// A grid names every tile's extent and a uniform grid names the same one 28 times; the reservation is per
+/// distinct extent, so this is what keeps a uniform run to one set. The order is first-seen because a
+/// plan's sets are reported in reservation order.
+fn distinct(extents: &[Extent]) -> Vec<Extent> {
+    let mut seen: Vec<Extent> = Vec::with_capacity(extents.len());
+    for extent in extents {
+        if !seen.contains(extent) {
+            seen.push(*extent);
+        }
+    }
+    seen
+}
+
 /// The buffers one tile extent's encode works in, reserved once for a whole run of tiles.
 ///
 /// A run's tiles are not uniform - the right and bottom edges of a grid are shorter - so a scratch holds
@@ -1014,11 +1029,8 @@ impl VideoEncoder {
             ));
         }
         let mut sets: Vec<(Extent, EncoderSet)> = Vec::new();
-        for extent in extents {
-            if sets.iter().any(|(known, _)| known == extent) {
-                continue;
-            }
-            sets.push((*extent, self.set(f, *extent)?));
+        for extent in distinct(extents) {
+            sets.push((extent, self.set(f, extent)?));
         }
         Ok(EncoderScratch { sets })
     }
@@ -1939,6 +1951,32 @@ impl GeGlu {
 mod tests {
     use super::*;
     use crate::video_vae::tests::video_config;
+
+    #[test]
+    fn a_run_reserves_one_set_per_distinct_tile_extent() {
+        let tile = |height: u32, width: u32| Extent {
+            frames: 25,
+            height,
+            width,
+        };
+        // A uniform grid names one extent many times and reserves once; a grid with shorter edges names
+        // two, in the order they first appear.
+        assert_eq!(distinct(&[tile(256, 256); 28]), vec![tile(256, 256)]);
+        assert_eq!(
+            distinct(&[
+                tile(256, 256),
+                tile(256, 192),
+                tile(256, 256),
+                tile(256, 192)
+            ]),
+            vec![tile(256, 256), tile(256, 192)]
+        );
+        assert_eq!(
+            distinct(&[tile(192, 192), tile(256, 256)]),
+            vec![tile(192, 192), tile(256, 256)],
+            "the order is the order they are named"
+        );
+    }
 
     #[test]
     fn the_video_encoders_tile_plan_is_one_tile_and_says_so() {
