@@ -777,6 +777,145 @@ impl PrefixCache {
         self.copy_runs(generation, &runs, snapshot, stream, snapshot_direction)
     }
 
+    /// Publishes a slot's state page under the key the deployment derives (design 4.5, 8): the
+    /// blocks of `pages` pages from `first_page`, gathered from this rank's own units into a
+    /// retained device block the Storage Server names, so a later world maps those bytes by handle
+    /// instead of copying them.
+    ///
+    /// This runs between steps - at a precopy, before the generation is published as serving -
+    /// and never inside one: nothing here may allocate or talk to the server during a replay.
+    pub fn store_state_page(
+        &self,
+        retained: &crate::memory::retained::Retained,
+        slot: u32,
+        units: &[ipc::UnitId],
+        first_page: u32,
+        pages: u32,
+        state: crate::transfer::StateIdentity<'_>,
+    ) -> Result<[u8; 32]> {
+        let plan = self.planes.plan();
+        let group_index = self.state_group()?;
+        let group = &plan.groups[group_index];
+        let device = self.planes.device_of().ok_or_else(|| {
+            Error::Invalid("a state page is retained from a device pool".to_owned())
+        })?;
+        // The units are the mechanism's own statement of the slot's pages, page-major, so the
+        // cache never rebuilds a table it already holds to read them.
+        let (rows, runs) = state::page_runs_of(
+            plan,
+            group,
+            units,
+            group.units_per_page,
+            self.planes.units(),
+            pages,
+        )
+        .map_err(|error| {
+            Error::Invalid(format!(
+                "the state page of slot {slot} from page {first_page}: {error}"
+            ))
+        })?;
+        if rows == 0 {
+            return Err(Error::Invalid("a state page holds no block".into()));
+        }
+        let width = plan.plane_bytes;
+        let layers = u64::from(group.axis.offset)
+            ..u64::from(group.axis.offset) + group.layer_ids.len() as u64;
+        let key = crate::keys::state_key(
+            state.prefix,
+            &state.representation,
+            state.split,
+            &crate::keys::Region::new([layers]),
+        );
+        retained.store_state(device, &key.0, rows, width, |staging, stream| {
+            let mut batch = platform::CopyBatch::new(platform::SourceOrder::Stream);
+            let mut offset = 0_u64;
+            for (field, cells) in &runs {
+                let field_storage = self.planes.state_storage(*field)?;
+                let base = crate::memory::allocation::Backing::address(field_storage.as_ref());
+                for cell in cells {
+                    let cell = u64::try_from(*cell)
+                        .map_err(|_| Error::Invariant("a state cell index is negative".into()))?;
+                    batch.push(
+                        crate::memory::allocation::Backing::address(staging.as_ref()) + offset,
+                        base + cell * width,
+                        width as usize,
+                    );
+                    offset += width;
+                }
+            }
+            // SAFETY: the retained block holds `rows * width` bytes and every source is one block
+            // of the field's own checkpoint storage; the copy is ordered on the stream the
+            // publisher synchronizes before it records the key.
+            unsafe { stream.copy(&batch) }
+        })?;
+        Ok(key.0)
+    }
+
+    /// Reads a transfer's state page back under its key and scatters it into this rank's own
+    /// units: the import's half of the pair.
+    ///
+    /// The bytes are mapped by handle from the storage the publisher retained, so nothing is
+    /// copied but the page itself; `page` is the destination's own page, already checked against
+    /// the transfer's stated shape, and the scatter refuses a snapshot that does not fit it.
+    pub fn load_state_page(
+        &self,
+        retained: &crate::memory::retained::Retained,
+        entry: &ipc::StateTransfer,
+        page: &StatePage,
+        snapshot: Option<&mut Snapshot>,
+        generation: &ops::Generation,
+        stream: &Stream,
+    ) -> Result<()> {
+        // A runner binds one snapshot per state group before its first capture, because a step
+        // allocates nothing (4.5). A transfer that carries state reaching a runner with none is a
+        // model change, and it is refused rather than scattered into nothing.
+        let snapshot = snapshot.ok_or_else(|| {
+            Error::Invariant(
+                "this runner holds no state snapshot: a model with a state group binds one before \
+                 its first capture"
+                    .into(),
+            )
+        })?;
+        let device = self
+            .planes
+            .device_of()
+            .ok_or_else(|| Error::Invalid("a state page is mapped by a device pool".to_owned()))?;
+        let key: [u8; 32] = entry
+            .key
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::Invalid("a state page's key is not 32 bytes".into()))?;
+        let Some(storage) = retained.state_page(device, &key, page.rows, page.width)? else {
+            return Err(Error::Invalid(format!(
+                "no state page is retained under {} for rank {}: the transfer names a snapshot \
+                 this scope does not hold",
+                hex(&key),
+                entry.rank
+            )));
+        };
+        let bytes = u64::from(page.rows) * page.width;
+        if bytes > snapshot.bytes() {
+            return Err(Error::Invalid(format!(
+                "a state page of {bytes} bytes does not fit the snapshot's {} bytes",
+                snapshot.bytes()
+            )));
+        }
+        let bytes_usize = usize::try_from(bytes)
+            .map_err(|_| Error::Invalid("a state page is larger than this host can copy".into()))?;
+        // SAFETY: the retained block holds at least `bytes` and the snapshot holds `bytes`; the
+        // copy is ordered on the caller's stream, and the scatter below runs after it on the same
+        // stream, so the rows are complete before they are written.
+        unsafe {
+            platform::memcpy_async(
+                snapshot.address(),
+                crate::memory::allocation::Backing::address(storage.as_ref()),
+                bytes_usize,
+                stream,
+            )?;
+        }
+        self.scatter_state_page(page, snapshot, generation, stream)
+    }
+
     /// Writes a checked state page into this rank's own units: the last step of an import, once
     /// the page's rows are in `snapshot`.
     ///

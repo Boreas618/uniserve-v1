@@ -66,7 +66,7 @@ fn draw_uniforms(seed: &std::cell::Cell<u64>, draws: &mut Vec<f32>, rows: usize)
 
 #[cfg(test)]
 use crate::plan::Variant;
-use crate::runner::{Runner, RunnerId};
+use crate::runner::{Binding, Runner, RunnerId};
 use crate::{Error, Result};
 
 /// The host columns of one batch, padded to a bucket and held for the upload.
@@ -214,10 +214,10 @@ impl Staging {
                 "the batch states no query offsets for its {rows} rows"
             )));
         }
-        if tokens < bucket_tokens {
-            if let Some(last) = self.rows.query_offsets.last_mut() {
-                *last = bucket_tokens as i32;
-            }
+        if tokens < bucket_tokens
+            && let Some(last) = self.rows.query_offsets.last_mut()
+        {
+            *last = bucket_tokens as i32;
         }
         while self.rows.query_offsets.len() <= bucket_rows {
             let end = self
@@ -441,11 +441,16 @@ struct Columns {
     draws: Column,
     /// `[rows]` the sampled ids, read back after a replay.
     readback: platform::PinnedBuffer,
+    /// One row of logits, `[vocabulary]`, read back for a greedy request whose first token is taken
+    /// on the host (see `read_sampled`): a bucket is homogeneous in its sampling path, so a prefill
+    /// bucket that ends a greedy prompt cannot argmax in its graph - the graph draws.
+    logits_row: platform::PinnedBuffer,
 }
 
 impl Columns {
-    /// Allocates the columns for the largest bucket `buckets` holds.
-    fn new(device: DeviceId, buckets: &Buckets) -> Result<Self> {
+    /// Allocates the columns for the largest bucket `buckets` holds, with `vocabulary` as the width
+    /// of the logits row the greedy first token is taken from.
+    fn new(device: DeviceId, buckets: &Buckets, vocabulary: u32) -> Result<Self> {
         let largest = buckets
             .iter()
             .max_by_key(|bucket| (bucket.rows, bucket.tokens))
@@ -467,6 +472,10 @@ impl Columns {
             slots: Column::new(device, DType::I32, rows)?,
             draws: Column::new(device, DType::F32, rows)?,
             readback: platform::PinnedBuffer::new(device, (rows * 4) as usize)?,
+            logits_row: platform::PinnedBuffer::new(
+                device,
+                (u64::from(vocabulary) * 4) as usize,
+            )?,
         })
     }
 }
@@ -751,6 +760,29 @@ impl CommitColumns {
 struct Sampled {
     /// `[rows]` i32 sampled token ids, in the bucket's row order.
     tokens: TensorView,
+    /// `[rows, vocabulary]` the bucket's raw logits, kept for a bucket that may hold a greedy
+    /// request's prompt ending: its first token is the argmax of that row, which the captured graph
+    /// cannot produce because a bucket is homogeneous in its sampling path.
+    ///
+    /// `None` for a decode bucket, whose variant already states which path it takes.
+    logits: Option<TensorView>,
+}
+
+/// The largest candidate of one row: a greedy request's token.
+///
+/// The first finite value wins ties (the lowest token id, which is what `torch.max` answers for a
+/// row of distinct logits and what keeps two runs alike for a tied one), and a row whose values are
+/// all non-finite answers candidate zero rather than an arbitrary index. This is the same rule the
+/// captured `argmax` operator applies on the device, and it is here in one place so the host path
+/// and its test cannot disagree about it.
+fn argmax(values: &[f32]) -> usize {
+    let mut best = 0_usize;
+    for (index, value) in values.iter().enumerate() {
+        if value.is_finite() && (*value > values[best] || !values[best].is_finite()) {
+            best = index;
+        }
+    }
+    best
 }
 
 /// The sampling step's own device state: the slot histories its penalties read.
@@ -867,6 +899,15 @@ pub trait KvProvider: Send + Sync {
         Ok(())
     }
 
+    /// The cache this provider reads, when it reads one: the handle a sleep gives back and a wake
+    /// maps again (2.5).
+    ///
+    /// One call per cache, not per runner: two runners of a device that share one cache must be
+    /// woken once, and the caller dedups by the handle's address.
+    fn cache(&self) -> Option<&Arc<std::sync::Mutex<crate::memory::prefix_cache::PrefixCache>>> {
+        None
+    }
+
     /// Applies what the mechanism allocated for this batch's cache pages, on `stream`, before the
     /// batch's forward reads them.
     ///
@@ -978,6 +1019,10 @@ pub struct CausalLmRunner<M: CausalLm> {
     pools: Option<Arc<std::sync::Mutex<Pools>>>,
     /// The device's counters, when the executor handed them over (7.3's metrics).
     counters: Option<Arc<crate::device::SharedCounters>>,
+    /// The device's record of the operators an update could not compare, each with its reason
+    /// (7.3 step 2). The control thread reports it when the precopy finishes, so an update that
+    /// has no evidence for an operator says so rather than leaving it to the log.
+    uncompared: Option<Arc<std::sync::Mutex<Vec<String>>>>,
     /// The host columns of the batch being staged.
     staging: Staging,
     /// The device the runner computes on.
@@ -1074,21 +1119,24 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// It captures nothing here: the device executor's warmup captures every bucket after the
     /// runner is bound, largest first, so the pools' plans exist before serving starts.
     pub fn new(
-        id: RunnerId,
-        phases: Vec<PhaseId>,
+        binding: Binding,
         model: M,
         generation: Arc<Generation>,
         buckets: Buckets,
-        device: DeviceId,
-        stream: platform::Stream,
         geometry: Geometry,
         kv: Box<dyn KvProvider>,
         seed: u64,
     ) -> Result<Self> {
+        let Binding {
+            id,
+            phases,
+            device,
+            stream,
+        } = binding;
         let mut staging = Staging::new();
         staging.reserve(&buckets)?;
         let commit_rows = largest_rows(&buckets)?;
-        let columns = Columns::new(device, &buckets)?;
+        let columns = Columns::new(device, &buckets, geometry.vocabulary)?;
         let sampling = if buckets.iter().any(|bucket| bucket.variant.samples()) {
             Some(Sampling::new(device, &stream, geometry)?)
         } else {
@@ -1105,6 +1153,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             graphs: Graphs::new(),
             pools: None,
             counters: None,
+            uncompared: None,
             staging,
             device,
             stream,
@@ -1164,6 +1213,32 @@ impl<M: CausalLm> CausalLmRunner<M> {
         self.shadow = Some(shadow);
     }
 
+    /// Records that a program-layer update could not compare `entry` (7.3 step 2), once.
+    ///
+    /// The same operator is shadowed once per bucket the update's requests occupy, so the record
+    /// keeps the first statement of each fact and drops its repeats.
+    fn note_uncompared(&self, entry: String) {
+        let Some(sink) = &self.uncompared else {
+            return;
+        };
+        let mut sink = sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !sink.contains(&entry) {
+            sink.push(entry);
+        }
+    }
+
+    /// Starts a new update's record of what it could not compare.
+    fn clear_uncompared(&self) {
+        let Some(sink) = &self.uncompared else {
+            return;
+        };
+        sink.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
     /// The shape of the bucket a batch is served from.
     fn bucket_for(&self, shape: &Shape) -> Result<Bucket> {
         self.buckets.require(shape)
@@ -1171,6 +1246,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
 }
 
 impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
+    fn cache(&self) -> Option<Arc<std::sync::Mutex<crate::memory::prefix_cache::PrefixCache>>> {
+        self.kv.cache().cloned()
+    }
+
     fn phases(&self) -> &[PhaseId] {
         &self.phases
     }
@@ -1217,16 +1296,26 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         let next = self.generation_named(batch.generation)?;
         let mut jobs = Vec::new();
         for (operator, key, kernel) in self.generation.iter() {
-            let Ok(candidate) = next.kernel(operator, key) else {
-                // The new generation has no program under this key: its program for the operator
-                // is a different descriptor, whose kernel output cannot be paired with this one.
-                // The precopy's walk recaptures such a bucket; there is nothing to compare here.
-                tracing::debug!(
-                    operator,
-                    key,
-                    "the prepared generation has no program under this key; no paired forward"
-                );
-                continue;
+            let candidate = match next.kernel(operator, key) {
+                Ok(candidate) => candidate,
+                // A recapture replaces the operator's program by another compilation, whose
+                // descriptor text may differ. The comparison pairs by operator (7.3 step 2), and
+                // the previous program is resolved by the key it served with, so the update is
+                // still compared rather than silently committed. The walk has already recaptured
+                // this bucket for the new descriptor; the comparison is what measures the program.
+                Err(_) => {
+                    let Some(other) = next.keys(operator).next() else {
+                        // The operator left the deployment: no program of the prepared generation
+                        // launches it, so there is nothing for a comparison to pair.
+                        tracing::debug!(
+                            operator,
+                            key,
+                            "the prepared generation holds no program for this operator; no paired forward"
+                        );
+                        continue;
+                    };
+                    next.kernel(operator, other)?
+                }
             };
             if Arc::ptr_eq(candidate, kernel) {
                 continue;
@@ -1238,6 +1327,20 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 bucket,
                 generation: batch.generation,
             });
+        }
+        // An operator the prepared generation *adds* has no program in the serving generation to
+        // be compared against: the update's evidence does not cover it, and saying so is the
+        // difference between an update that was measured and one that merely ran.
+        for (operator, key, _) in next.iter() {
+            if self.generation.keys(operator).next().is_some() {
+                continue;
+            }
+            self.note_uncompared(format!(
+                "operator {operator} is new in generation {}: the serving generation holds no \
+                 program of it, so there is nothing to compare it against (its {key} program is \
+                 unmeasured)",
+                batch.generation
+            ));
         }
         Ok(Jobs::new(jobs))
     }
@@ -1260,19 +1363,22 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
     }
 
     fn precopy(&mut self, next: &Arc<Generation>) -> Result<Jobs> {
+        // One update's evidence: a new precopy starts its record empty, so an operator this
+        // update compares is never reported from the one before it.
+        self.clear_uncompared();
         // One update at a time: a second generation prepared while the first is still waiting for
         // its switchover would leave the first one's graphs unreachable and unaccounted for. The
         // daemon discards an update before starting the next, so this is a disagreement, not a
         // sequence to support.
-        if let Some(prepared) = &self.next {
-            if prepared.number() != next.number() {
-                return Err(Error::Invariant(format!(
-                    "precopy of generation {} while generation {} is prepared and has not been \
-                     switched over or discarded",
-                    next.number(),
-                    prepared.number()
-                )));
-            }
+        if let Some(prepared) = &self.next
+            && prepared.number() != next.number()
+        {
+            return Err(Error::Invariant(format!(
+                "precopy of generation {} while generation {} is prepared and has not been \
+                 switched over or discarded",
+                next.number(),
+                prepared.number()
+            )));
         }
         // Which (operator, key) pairs changed between the serving generation and `next` (7.3
         // step 1). A kernel is unchanged when it is the same `Arc`, so an untouched program keeps
@@ -1442,6 +1548,10 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         self.counters = Some(counters);
     }
 
+    fn attach_uncompared(&mut self, sink: Arc<std::sync::Mutex<Vec<String>>>) {
+        self.uncompared = Some(sink);
+    }
+
     fn discard(&mut self, generation: u64) -> Result<()> {
         // A generation in service is not a prepared one: discarding it would take the graphs that
         // serve batches away and leave the device able to answer nothing. The engine discards the
@@ -1595,7 +1705,7 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 generation,
                 ..
             } => self
-                .shadow(*operator, key, *bucket, *generation)
+                .shadow(operator, key, *bucket, *generation)
                 .map(|()| BatchOutput::default()),
             Job::Rebind {
                 bucket, generation, ..
@@ -1642,11 +1752,14 @@ impl<M: CausalLm> CausalLmRunner<M> {
         kernels: &Arc<ops::Generation>,
     ) -> Result<Walked> {
         let stream = self.stream.clone();
-        let capture = Arc::new(std::sync::Mutex::new(platform::Capture::begin(
+        // One thread records and takes the capture back: an `Arc`/`Mutex` here would say the
+        // handle is shared across threads, which it is not, and the allocator is right to warn
+        // about a non-`Send` handle in an `Arc`.
+        let capture = std::rc::Rc::new(std::cell::RefCell::new(platform::Capture::begin(
             &stream,
             platform::CaptureMode::Relaxed,
         )?));
-        let mut recording = Recording::new(Arc::clone(&capture));
+        let mut recording = Recording::new(std::rc::Rc::clone(&capture));
         // The forward runs with the generation being walked and the bucket's arena, so every
         // operator launch becomes a node of the template and is reported to `recording`.
         ops::capture::set_sink(Some(&mut recording));
@@ -1657,10 +1770,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
             return Err(failure.into());
         }
         walked?;
-        let capture = Arc::try_unwrap(capture)
-            .map_err(|_| Error::Invariant("the capture is still shared by its recorder".into()))?
-            .into_inner()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let capture = std::rc::Rc::try_unwrap(capture).map_err(|_| {
+            Error::Invariant("the capture is still shared by its recorder".into())
+        })?;
+        let capture = capture.into_inner();
         let template = capture.end()?;
         // The node table comes from the capture sink, and the template is the record of what was
         // actually launched: the two can only be compared here. A graph that launched kernels and
@@ -1811,11 +1924,36 @@ impl<M: CausalLm> CausalLmRunner<M> {
         // which the calling device command reports.
         harness.reset();
         self.shadow = Some(harness);
+        // A pair the two programs could not be compared over, and a forward that carved no twin at
+        // all, are both statements of what this update has no evidence for: the operator is named
+        // in the update's answer rather than left to the log (7.3 step 2).
+        if let Ok(summary) = &compared {
+            for entry in &summary.incomparable {
+                self.note_uncompared(format!(
+                    "operator {operator} {key} of generation {generation} in the bucket of {} \
+                     tokens and {} rows: {entry}",
+                    bucket.tokens, bucket.rows
+                ));
+            }
+            if summary.pairs == 0 {
+                self.note_uncompared(format!(
+                    "operator {operator} of generation {generation} was shadowed in the bucket of \
+                     {} tokens and {} rows and its launch carved no twin, so nothing was compared",
+                    bucket.tokens, bucket.rows
+                ));
+            }
+        }
         compared.map(|_| ())
     }
 
     /// Walks one bucket's forward with two kernels of `operator`: `previous`'s on the real outputs
     /// and `next`'s on the twins (7.3).
+    ///
+    /// The pair is the operator's, not the descriptor's: `key` is the key the serving generation
+    /// stored the previous program under, and every launch of the operator in this bucket is
+    /// compared against it (or against the serving program under the launch's own key, when that
+    /// generation still holds one - an operator served under several descriptors is compared
+    /// program for program).
     ///
     /// The paired forward runs over a scratch KV: every page it writes is a scratch page, so the
     /// new kernel cannot touch a page a serving request reads. The model's `Forward::operate` does
@@ -1902,6 +2040,83 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// so the device segment is measured from the launch to this wait and the host segment from
     /// there to the output.
     ///
+    /// Replaces a greedy row's drawn token with the argmax of its logits row, taken on the host.
+    ///
+    /// A request whose temperature is zero asks for its largest candidate, and the captured graph of
+    /// a prefill bucket draws for every row of the bucket (a bucket is homogeneous in its sampling
+    /// path, and a greedy prefill variant would double the largest graphs' memory to decide one
+    /// token). The host has the logits - the arena buffer is live until the next `begin` - so the
+    /// decision is made here, once per request, before the token leaves this process.
+    ///
+    /// The penalties are no-ops for a row whose slot has committed nothing, which is what a prompt
+    /// ending is: a row whose slot already holds committed tokens would need the penalized logits,
+    /// which the graph computes and this path does not, so it is **refused by name** rather than
+    /// argmaxed over the raw row.
+    fn greedy_first_tokens(
+        &mut self,
+        logits: TensorView,
+        rows: usize,
+        sampling: &[i32],
+    ) -> Result<()> {
+        if logits.dtype != DType::F32 {
+            return Err(Error::Invalid(format!(
+                "a greedy request's first token is argmaxed on the host, which reads f32 logits, \
+                 and this deployment's logits are {}",
+                logits.dtype
+            )));
+        }
+        let width = u64::from(self.geometry.vocabulary);
+        let row_bytes = (width * 4) as usize;
+        if row_bytes > self.columns.logits_row.len() {
+            return Err(Error::Invariant(
+                "the logits row buffer is narrower than the vocabulary".into(),
+            ));
+        }
+        let columns = ops::sampler::PARAMETER_COLUMNS as usize;
+        for row in 0..rows {
+            let samples_nothing = self.staging.logits_rows()[row] < 0;
+            let greedy = self.staging.parameters(rows)[row * columns + ops::sampler::TEMPERATURE as usize]
+                == 0.0;
+            if samples_nothing || !greedy {
+                continue;
+            }
+            let slot = self.staging.slots(rows)[row];
+            let position = usize::try_from(slot)
+                .ok()
+                .and_then(|slot| sampling.get(slot).copied())
+                .unwrap_or(0);
+            if position > 0 {
+                return Err(Error::Invalid(format!(
+                    "a greedy row of slot {slot} ends a prompt that already holds {position} \
+                     committed token(s): its token is the argmax of its penalized logits, which only \
+                     the captured sampler computes"
+                )));
+            }
+            let source = logits.ptr.address() + row as u64 * width * 4;
+            // SAFETY: the source is the row's `width` f32 inside the logits tensor the graph wrote,
+            // the destination is this runner's pinned row buffer of that length, and the stream has
+            // completed the launch that wrote it.
+            unsafe {
+                platform::memcpy_async(self.columns.logits_row.address(), source, row_bytes, &self.stream)?;
+            }
+            self.stream.synchronize()?;
+            // SAFETY: the copy above filled `width` f32 in the pinned row buffer, and the token
+            // buffer holds one i32 per row of this bucket.
+            // SAFETY: the copy above filled `width` f32 in the pinned row buffer.
+            let best = unsafe {
+                argmax(std::slice::from_raw_parts(
+                    self.columns.logits_row.as_ptr().cast::<f32>(),
+                    width as usize,
+                ))
+            };
+            // SAFETY: the readback buffer holds `rows` i32 and `row` is inside it.
+            unsafe {
+                *self.columns.readback.as_ptr().cast::<i32>().add(row) = best as i32;
+            }
+        }
+        Ok(())
+    }
+
     /// A bucket that samples nothing answers with an empty output: nothing was measured and no call
     /// produced a token.
     fn read_sampled(&mut self, bucket: Bucket, launched: Instant) -> Result<BatchOutput> {
@@ -1965,6 +2180,17 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 ),
             )
         };
+        // A greedy request's first token is the argmax of its prompt-ending row, taken here on the
+        // host: the bucket is homogeneous in its sampling path, so a prefill bucket's graph draws,
+        // and a draw cannot produce a greedy token (the candidates are in token-id order before the
+        // inverse CDF). Only a bucket that kept its logits view can answer this - a decode bucket's
+        // variant already states that it is greedy, and its graph argmaxes. The tokens are corrected
+        // in place, in the buffer the copy above filled, so a step allocates nothing (4.5).
+        if let Some(logits) = samples.logits
+            && !bucket.variant.is_decode()
+        {
+            self.greedy_first_tokens(logits, rows, sampling)?;
+        }
         let states = states_of(
             self.staging.slots(rows),
             self.staging.batch_rows(),
@@ -2240,13 +2466,33 @@ impl<M: CausalLm> CausalLmRunner<M> {
             extras: None,
         };
         let samples = Samples::reserve(arena, DType::I32, rows, false)?;
-        sampling
-            .sampler
-            .forward(forward, logits, &state, self.columns.draws.device, &samples)
-            .map_err(Error::from)?;
+        // A greedy bucket takes each row's largest candidate; every other sampling bucket draws one
+        // from the row's distribution. The two are different launch sequences in the sampler layer
+        // (`Sampler::greedy` and `Sampler::forward`), and a draw cannot produce a greedy token: the
+        // candidates are ordered by token id before the inverse CDF, so a draw of zero selects the
+        // lowest id rather than the largest logit.
+        if bucket.variant.greedy() {
+            sampling
+                .sampler
+                .greedy(forward, logits, &state, &samples)
+                .map_err(Error::from)?;
+        } else {
+            sampling
+                .sampler
+                .forward(forward, logits, &state, self.columns.draws.device, &samples)
+                .map_err(Error::from)?;
+        }
+        // A prefill bucket may end a greedy request's prompt, whose first token is the argmax of the
+        // row - a decision the graph cannot make for one row of a bucket that draws. The view is kept
+        // (the arena's buffer is live until the next `begin`, and `read_sampled` runs before that);
+        // a decode bucket's variant already states its path.
+        let logits = (!bucket.variant.is_decode()).then_some(logits);
         self.bucket_samples
             .borrow_mut()
-            .insert(bucket, Sampled { tokens: samples.tokens });
+            .insert(bucket, Sampled {
+                tokens: samples.tokens,
+                logits,
+            });
         self.commit_step(forward, bucket, &samples)?;
         Ok(())
     }
@@ -2386,14 +2632,14 @@ fn hold_kernels(
 /// Public because a device test of the rebind mechanism must record with the sink the runner
 /// captures with: a copy of it in a test would measure the copy.
 pub struct Recording {
-    capture: Arc<std::sync::Mutex<platform::Capture>>,
+    capture: std::rc::Rc<std::cell::RefCell<platform::Capture>>,
     nodes: crate::captured::Nodes,
     failure: Option<platform::Error>,
 }
 
 impl Recording {
     /// Records into `capture`, which the caller installs as the sink and takes back afterwards.
-    pub fn new(capture: Arc<std::sync::Mutex<platform::Capture>>) -> Self {
+    pub fn new(capture: std::rc::Rc<std::cell::RefCell<platform::Capture>>) -> Self {
         Self {
             capture,
             nodes: Vec::new(),
@@ -2419,13 +2665,7 @@ impl Recording {
 
 impl ops::capture::Sink for Recording {
     fn launched(&mut self, operator: &'static str, key: &str) {
-        let recorded = {
-            let mut capture = self
-                .capture
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            capture.record()
-        };
+        let recorded = self.capture.borrow_mut().record();
         match recorded {
             Ok(nodes) => self.nodes.push((operator, key.to_owned(), nodes)),
             Err(error) => {
@@ -2584,6 +2824,27 @@ mod tests {
             error.to_string().contains("never copied"),
             "the refusal does not say what would go wrong: {error}"
         );
+    }
+
+    /// The host argmax of a greedy row is the same rule the captured `argmax` operator applies: the
+    /// largest finite value, ties to the lowest index, and a row of non-finite values answering
+    /// candidate zero rather than an arbitrary index.
+    ///
+    /// The end-to-end proof - a greedy request whose prompt spans several prefill chunks taking the
+    /// argmax of that chunk's row - belongs to the caller's run, which must compare against a
+    /// recomputed argmax and not merely against a rerun of this code: a drawn token is just as
+    /// deterministic.
+    #[test]
+    fn the_host_argmax_is_the_largest_finite_candidate_and_ties_go_to_the_lowest() {
+        assert_eq!(argmax(&[1.0, 3.0, 2.0]), 1);
+        assert_eq!(argmax(&[3.0, 1.0, 1.0]), 0);
+        // Two equal maxima: the first wins, so two runs and two implementations agree.
+        assert_eq!(argmax(&[0.5, 2.0, 2.0]), 1);
+        // A non-finite value is never a candidate, at the head or in the middle.
+        assert_eq!(argmax(&[f32::NAN, 1.5, 1.0]), 1);
+        assert_eq!(argmax(&[1.0, f32::INFINITY, 2.0]), 2);
+        // Every value non-finite: answer zero rather than an index that came from nowhere.
+        assert_eq!(argmax(&[f32::NAN, f32::NAN]), 0);
     }
 
     /// A provider that holds no cache refuses a slot row by name, because the gather would otherwise

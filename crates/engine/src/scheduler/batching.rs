@@ -440,8 +440,7 @@ impl Scheduler {
                 // calls.
                 if let CallKind::Media(media_call) = call.kind {
                     let demand = self.image_demand(call.request_key, media_call);
-                    let occupancy =
-                        media_occupancy.get_or_insert_with(|| self.media_occupancy());
+                    let occupancy = media_occupancy.get_or_insert_with(|| self.media_occupancy());
                     if !occupancy.admits(&demand, id, self) {
                         self.record_domain_backpressure(kind);
                         continue;

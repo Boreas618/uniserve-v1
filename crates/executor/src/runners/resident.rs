@@ -330,6 +330,10 @@ struct Scratch {
 }
 
 impl KvProvider for ResidentCache {
+    fn cache(&self) -> Option<&Arc<Mutex<PrefixCache>>> {
+        Some(&self.cache)
+    }
+
     /// Writes each slot row into the cache's pooled table, on the batch's stream.
     ///
     /// `PrefixCache::install` validates the tables (the slot inside the request pool and not the

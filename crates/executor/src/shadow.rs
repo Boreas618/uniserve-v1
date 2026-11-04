@@ -34,12 +34,19 @@ use platform::{DeviceId, PinnedBuffer, Stream};
 use crate::{Error, Result};
 
 /// What one paired forward compared.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Summary {
     /// How many twin buffers were compared.
     pub pairs: usize,
     /// How many elements were compared, over all pairs.
     pub elements: u64,
+    /// The pairs that could not be compared because the two programs wrote outputs of different
+    /// extents, each with the sentence that states it (7.3 step 2).
+    ///
+    /// An operator whose programs are not comparable is skipped, not failed: the operating system
+    /// has nothing to say about which of the two is right, so the update proceeds and states what
+    /// it has no evidence for rather than claiming a comparison it could not make.
+    pub incomparable: Vec<String>,
 }
 
 /// The paired-execution harness of one runner.
@@ -100,13 +107,24 @@ impl Shadow {
         let mut summary = Summary {
             pairs: pairs.len(),
             elements: 0,
+            incomparable: Vec::new(),
         };
         for pair in pairs {
             let bytes = pair.real.byte_len()?;
             if bytes != pair.shadow.byte_len()? {
-                return Err(Error::Invariant(
-                    "the twin and the real buffer have different sizes".into(),
+                // The two programs wrote outputs of different extents: they are not comparable, and
+                // an update is not refused for it - the pair is skipped and named, so the update's
+                // evidence states what it could not measure (7.3 step 2).
+                summary.incomparable.push(format!(
+                    "the twin and the real buffer have different sizes: the real output holds \
+                     {bytes} bytes of {} and the twin {} of {}, so the two programs are not \
+                     comparable",
+                    pair.real.dtype,
+                    pair.shadow.byte_len()?,
+                    pair.shadow.dtype,
                 ));
+                summary.pairs -= 1;
+                continue;
             }
             let bytes = usize::try_from(bytes)
                 .map_err(|_| Error::Invariant("a twin buffer is larger than memory".into()))?;
@@ -131,6 +149,11 @@ impl Shadow {
 /// twin, `numel` elements of `dtype` each. The comparison is what 7.3 requires of a shadow run:
 /// element by element, in the dtype's own value domain, within the operator's [`Tolerance`], with
 /// two NaNs agreeing and a NaN against a number not.
+///
+/// A difference names the operator's bound as well as the measurement - how many elements
+/// differ, the widest one's reference and candidate, its absolute difference, and the `atol` and
+/// `rtol` it left - because "the kernels differ" does not say whether a program is wrong or was
+/// compiled twice.
 pub fn compare_buffers(
     dtype: DType,
     numel: u64,
@@ -159,6 +182,11 @@ pub fn compare_buffers(
             "a twin buffer's copy has an unexpected size".into(),
         ));
     }
+    // Every element is compared, not only up to the first difference: the reason an update is
+    // refused states how far apart the two programs are and how many elements that is, which is
+    // what tells a wrong kernel from a rounding, and the scan is host memory over a bucket.
+    let mut differing: u64 = 0;
+    let mut widest: Option<(usize, f32, f32, f32)> = None;
     for index in 0..numel as usize {
         let offset = index * width;
         // Each arm reads the element through `element`, which names the offset a buffer too short
@@ -203,12 +231,24 @@ pub fn compare_buffers(
             tolerance.allows(reference, candidate)
         };
         if !agree {
-            return Err(Error::Invariant(format!(
-                "element {index} differs beyond tolerance: reference {reference}, candidate \
-                 {candidate}, tolerance atol {} rtol {}",
-                tolerance.atol, tolerance.rtol
-            )));
+            differing += 1;
+            // `total_cmp` orders the non-finite differences too, so a NaN or an infinity is
+            // selected as the widest and named rather than dropped by a comparison that would
+            // answer false for it.
+            let difference = (reference - candidate).abs();
+            let wider = widest.is_none_or(|(_, _, _, widest)| difference.total_cmp(&widest).is_gt());
+            if wider {
+                widest = Some((index, reference, candidate, difference));
+            }
         }
+    }
+    if let Some((index, reference, candidate, difference)) = widest {
+        return Err(Error::Invariant(format!(
+            "{differing} of {numel} elements differ beyond tolerance: the widest is element \
+             {index}: reference {reference}, candidate {candidate}, |difference| {difference}, \
+             tolerance atol {} rtol {}",
+            tolerance.atol, tolerance.rtol
+        )));
     }
     Ok(numel)
 }

@@ -1160,20 +1160,23 @@ class RouteGroupedGemmKernel:
 
                 meta_pipeline.producer_acquire(meta_producer_state)
                 meta_stage = meta_producer_state.index
-                # Strided row assignment keeps the permuted_idx loads and smem
-                # stores coalesced (each fixed j: 32 lanes touch 32 contiguous
-                # rows). Rows at or past mn_limit are padding; the epilogue
+                # Strided row assignment keeps the smem stores coalesced (each fixed j: 32 lanes
+                # touch 32 contiguous rows). Rows at or past mn_limit are padding; the epilogue
                 # never stores them, so their staged index is irrelevant.
+                #
+                # The destination row is the **permuted** row: this product's row `p` is the sort's
+                # permuted row `p`, the same row of gated activations the tile read, so the
+                # consumer (`moe_unpermute`, which compiles `kInputIsExpanded = false`) finds every
+                # route through `expanded_to_permuted` and no map is inverted here. The Blackwell
+                # example this kernel descends from stores expanded rows (`t · top + k`), which is
+                # the other convention and would need the inverse map; the identity needs none.
                 for j in cutlass.range(
                     self.cta_tile_shape_mnk[0] // self.threads_per_warp,
                     unroll_full=True,
                 ):
                     r = meta_lane + j * self.threads_per_warp
                     permuted_row = tile_m_start + r
-                    expanded_idx = permuted_idx_to_expanded_idx[permuted_row]
-                    s_route_row[(r, meta_stage)] = cutlass.max(
-                        expanded_idx, cutlass.Int32(0)
-                    )
+                    s_route_row[(r, meta_stage)] = permuted_row
                 cute.arch.fence_proxy("async.shared", space="cta")
                 meta_pipeline.producer_commit(meta_producer_state)
                 meta_producer_state.advance()
