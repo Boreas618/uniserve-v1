@@ -237,6 +237,10 @@ struct State {
     written: BTreeSet<Key>,
     /// Every tensor the worker uses, which its startup retains.
     used: BTreeSet<Key>,
+    /// The weights this rank has mapped, by device and key: a repeated fetch
+    /// answers the mapping it already holds rather than mapping the region
+    /// twice.
+    weights: BTreeMap<(i32, Key), Arc<Storage>>,
     /// A standby worker's exclusive storages, until it is promoted; `None`
     /// for a worker that takes write access at once.
     standby: Option<Standby>,
@@ -313,6 +317,7 @@ impl Retained {
                 gpus: BTreeMap::new(),
                 written: BTreeSet::new(),
                 used: BTreeSet::new(),
+                weights: BTreeMap::new(),
                 standby: launch.standby.then(Standby::default),
                 inherited: Vec::new(),
             }),
@@ -506,6 +511,48 @@ impl Retained {
             }
         }
         Ok(())
+    }
+
+    /// The bytes already retained under `key`, mapped read-only on `device`,
+    /// or `None` when the server holds nothing under it.
+    ///
+    /// `key` is a weight's §8 key and nothing else is mixed in: the bytes
+    /// outlive the world that wrote them, so their record carries no segment
+    /// and no world, and a rank that finds them answers the region another rank
+    /// published rather than publishing its own. A miss is not an error - it is
+    /// the loader's cue to convert the checkpoint and store it.
+    ///
+    /// One mapping per (device, key): a repeated fetch answers the region the
+    /// first one mapped, so a rank that serves two GPUs maps a shared weight
+    /// once on each and never twice on one.
+    pub(crate) fn weight(&self, device: DeviceId, key: Key) -> Result<Option<Arc<Storage>>> {
+        let mut state = lock(&self.state);
+        if let Some(storage) = state.weights.get(&(device.0, key)) {
+            return Ok(Some(Arc::clone(storage)));
+        }
+        let got = state
+            .client
+            .get(vec![key], Mode::Read, Vec::new())
+            .map_err(|error| storage_error("taking a retained weight", error))?;
+        let Some(tensor) = got.tensors.iter().find(|tensor| tensor.key == key) else {
+            return Ok(None);
+        };
+        let index = tensor.storage as usize;
+        let (record, descriptor) = got
+            .storages
+            .into_iter()
+            .nth(index)
+            .ok_or_else(|| Error::Interface("a retained weight names no storage".into()))?;
+        let storage = Storage::import(
+            descriptor,
+            record.bytes as usize,
+            device,
+            &[],
+            Protection::ReadOnly,
+        )?;
+        state.used.insert(key);
+        state.weights.insert((device.0, key), Arc::clone(&storage));
+        Ok(Some(storage))
     }
 
     /// Release the scope's read-only tensors the worker does not bind
