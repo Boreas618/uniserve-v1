@@ -2582,17 +2582,32 @@ fn report_of(status: &ProgramStatus) -> Option<proto::process::Report> {
 /// descriptor is what the model's forward computes for a bucket and nothing outside the forward can
 /// list them.
 fn missing_kernel(submissions: &[Submission]) -> Option<(String, String)> {
+    /// The kernel an error names as missing, whether it reached the executor as an operator's
+    /// error or wrapped in the model layer's: a capture reports it through
+    /// `nn::Forward::operate`, which resolves the kernel and converts the operator's error into the
+    /// layer's own. Matching only the operator's arm would leave every capture's miss unrecognised,
+    /// and the discovery loop would abandon a generation it could have completed.
+    fn named(error: &executor::Error) -> Option<(&'static str, &str)> {
+        let ops = match error {
+            executor::Error::Ops(ops) => ops,
+            executor::Error::Nn(nn::Error::Ops(ops)) => ops,
+            _ => return None,
+        };
+        match ops {
+            ops::Error::MissingKernel {
+                operator,
+                descriptor,
+                ..
+            } => Some((operator, descriptor.as_str())),
+            _ => None,
+        }
+    }
     for submission in submissions {
         let Some(Outcome::Failed(error)) = submission.outcome() else {
             continue;
         };
-        if let executor::Error::Ops(ops::Error::MissingKernel {
-            operator,
-            descriptor,
-            ..
-        }) = &*error
-        {
-            return Some(((*operator).to_owned(), descriptor.clone()));
+        if let Some((operator, descriptor)) = named(&error) {
+            return Some((operator.to_owned(), descriptor.to_owned()));
         }
     }
     None
