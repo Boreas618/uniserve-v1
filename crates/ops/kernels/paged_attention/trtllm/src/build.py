@@ -240,6 +240,33 @@ def main():
         shutil.rmtree(staging, ignore_errors=True)
 
 
+def compiler_and_version():
+    """The CUDA compiler this build names, and the version line it prints.
+
+    ``CUDACXX`` wins over ``nvcc`` on ``PATH`` over the toolkit's own path, so a
+    host with several toolkits can name the one it means. A candidate that does
+    not answer ``--version`` with CUDA's own line is refused here rather than
+    producing a module from the host compiler.
+    """
+    candidates = [
+        os.environ.get("CUDACXX"),
+        shutil.which("nvcc"),
+        "/usr/local/cuda/bin/nvcc",
+    ]
+    tried = []
+    for candidate in candidates:
+        if not candidate or not pathlib.Path(candidate).is_file():
+            continue
+        answered = subprocess.run([candidate, "--version"], capture_output=True, text=True)
+        if answered.returncode == 0 and "Cuda compilation tools" in answered.stdout:
+            return candidate, answered.stdout.strip().splitlines()[-1].strip()
+        tried.append(f"{candidate}: {answered.stdout[-300:]}{answered.stderr[-300:]}")
+    raise SystemExit(
+        "no CUDA compiler: name one with CUDACXX, or put nvcc on PATH"
+        + (f"\ntried:\n" + "\n".join(tried) if tried else "")
+    )
+
+
 def build(package, descriptor, fields, target, out, data, artifact):
     """Compile one descriptor's module and publish the cubins it can select."""
     header_path = artifact / "include/flashInferMetaInfo.h"
@@ -250,7 +277,7 @@ def build(package, descriptor, fields, target, out, data, artifact):
     print(f"published {len(names)} cubins", file=sys.stderr)
 
     metainfo_hash = hashlib.sha256(header_path.read_bytes()).hexdigest()
-    compiler = shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
+    compiler, version = compiler_and_version()
     includes = [
         artifact / "include",
         data / "include",
@@ -264,32 +291,34 @@ def build(package, descriptor, fields, target, out, data, artifact):
         data / "cccl/thrust",
     ]
     unit = out / "entry.o"
-    compiled = subprocess.run(
-        [
-            compiler,
-            "-c",
-            "-x",
-            "cu",
-            "-O3",
-            "-std=c++17",
-            f"-arch={target}",
-            "--expt-relaxed-constexpr",
-            "-Xcompiler",
-            "-fPIC",
-            *[f"-D{one}" for one in DEFINES],
-            f'-DTLLM_GEN_FMHA_CUBIN_PATH="."',
-            f'-DTLLM_GEN_FMHA_METAINFO_HASH="{metainfo_hash}"',
-            *[f"-I{one}" for one in includes],
-            "-o",
-            str(unit),
-            str(package / "src/entry.cpp"),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    command = [
+        compiler,
+        "-c",
+        "-x",
+        "cu",
+        "-O3",
+        "-std=c++17",
+        f"-arch={target}",
+        "--expt-relaxed-constexpr",
+        "-Xcompiler",
+        "-fPIC",
+        *[f"-D{one}" for one in DEFINES],
+        f'-DTLLM_GEN_FMHA_CUBIN_PATH="."',
+        f'-DTLLM_GEN_FMHA_METAINFO_HASH="{metainfo_hash}"',
+        *[f"-I{one}" for one in includes],
+        "-o",
+        str(unit),
+        str(package / "src/entry.cpp"),
+    ]
+    compiled = subprocess.run(command, capture_output=True, text=True, check=False)
     if compiled.returncode != 0:
-        raise SystemExit(f"compiling the entry unit failed:\n{compiled.stderr[-6000:]}")
+        # The command and the compiler's identity are part of the failure: a
+        # module that builds on one host and not another is a defect of the
+        # package, and this is what the next reader needs to see it.
+        raise SystemExit(
+            "compiling the entry unit failed with "
+            f"{compiler} ({version}):\n{' '.join(command)}\n{compiled.stderr[-6000:]}"
+        )
 
     module = out / "module.so"
     linked = subprocess.run(
