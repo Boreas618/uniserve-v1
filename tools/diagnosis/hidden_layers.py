@@ -245,7 +245,10 @@ def main():
     lines = []
     uncorrelated = []
     measured_order = []
-    print(f"{'file':<16} {'shape':<12} {'rel':>10} {'rms':>10} {'increment':>10}  worst row")
+    print(
+        f"{'file':<16} {'shape':<12} {'rel':>10} {'rms':>10} {'max|diff|':>10} {'increment':>10}"
+        "  worst row"
+    )
     # One order for both: a cut the dump holds and the reference lacks still belongs where the walk
     # reaches it, or the table's "reads as the walk" promise breaks.
     for path in sorted(files + missing, key=order_of):
@@ -267,7 +270,17 @@ def main():
             if first is None:
                 first = path.name
             continue
-        if expected.dtype.kind in "iu":
+        # A file that *says* it holds ids is compared exactly whatever its dtype: a writer that
+        # stored them as floats would otherwise be handed back to the relative metric, which is the
+        # defect this rule exists to prevent.
+        named_exact = path.stem.endswith("_ids")
+        if expected.dtype.kind in "iu" or named_exact:
+            stored = expected.dtype if expected.dtype.kind not in "iu" else actual.dtype
+            if named_exact and stored.kind not in "iu":
+                print(
+                    f"note: {path.name} is written as {stored}, not an integer; ids are compared "
+                    "exactly anyway"
+                )
             # An index is not a quantity: nothing about `17` is "3% away" from `18`. It is equal or
             # it is not, and the only informative summary is how many differ and where.
             differ = np.argwhere(actual != expected)
@@ -280,7 +293,10 @@ def main():
                     f"{differ.shape[0]} of {total} differ; first at {row}: "
                     f"{int(actual[row])} against the reference's {int(expected[row])}"
                 )
-            print(f"{path.name:<16} {str(expected.shape):<12} {'exact':>10} {'-':>10} {'-':>10}  {reading}")
+            lines.append(
+                f"{path.name:<16} {str(expected.shape):<12} {'exact':>10} {'-':>10} {'-':>10}"
+                f" {'-':>10}  {reading}"
+            )
             if differ.size and first is None:
                 first = path.name
             continue
@@ -328,8 +344,11 @@ def main():
         if growth > largest[1]:
             largest = (path.name, growth)
         prefix_text = "" if prefix is None else f"  (prefix {prefix:.3e})"
+        # The absolute peak is the number a small operand needs: the router's weights sit near 1/8,
+        # so a relative figure says nothing about whether a difference is a rounding or a defect.
+        absolute = float(np.max(np.abs(actual.astype(np.float64) - expected.astype(np.float64))))
         lines.append(
-            f"{path.name:<16} {str(expected.shape):<12} {rel:10.3e} {rms:10.3e}"
+            f"{path.name:<16} {str(expected.shape):<12} {rel:10.3e} {rms:10.3e} {absolute:10.3e}"
             f" {increment:10.3e}  {worst} ({rows[worst]:.3e}){flag}{prefix_text}"
         )
 
