@@ -118,13 +118,17 @@ impl Executor {
         graph: GraphStorage,
     ) -> Result<Self> {
         let handle = platform::Device::new(device)?;
-        let allocator = platform::Allocator::new(&handle, Arc::new(GraphBudget { bytes: graph.budget }))?;
-        let pools = Arc::new(std::sync::Mutex::new(Pools::with_pools(
+        // One book per device (4.1): the allocator books every pool kind against the same
+        // allowance, so the three kinds cannot sum past it.
+        let totals = Arc::new(Pools::totals_of(graph.budget));
+        let allocator =
+            platform::Allocator::new(&handle, Arc::clone(&totals) as Arc<dyn platform::Budget>)?;
+        let pools = Arc::new(std::sync::Mutex::new(Pools::new(
             allocator,
+            totals,
             graph.bytes,
             graph.scratch,
             graph.resident,
-            graph.budget,
             graph.streams,
         )?));
         let counters = Arc::new(SharedCounters::default());
@@ -398,22 +402,6 @@ enum Step {
 }
 
 /// The device's graph-storage budget, as the allocator books against it (4.1).
-struct GraphBudget {
-    /// Bytes the device may map for captured graphs.
-    bytes: u64,
-}
-
-impl platform::Budget for GraphBudget {
-    fn book(&self, _device: DeviceId, _pool: platform::PoolKind, bytes: u64) -> platform::Result<()> {
-        if bytes > self.bytes {
-            return Err(platform::Error::InvalidArgument(format!(
-                "a graph pool of {bytes} bytes exceeds the device's {} bytes",
-                self.bytes
-            )));
-        }
-        Ok(())
-    }
-}
 
 /// What a sticky-error probe found (2.4).
 #[derive(Debug)]
