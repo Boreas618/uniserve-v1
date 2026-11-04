@@ -12,6 +12,7 @@ Each kind has a directory with a `cases.txt` (one case per line) and, per case,
 
 - `lanczos/cases.txt`:   `name channels in_h in_w out_h out_w`, RGB24 rows.
 - `bicubic/cases.txt`:   `name channels in_h in_w out_h out_w`, planar CHW u8.
+- `bicubic_f32/cases.txt`: the same extents, planar CHW float32.
 - `sinc/cases.txt`:      `name channels orig_freq new_freq length`, planar f32.
 """
 
@@ -52,7 +53,7 @@ def write_case(kind: str, name: str, case: str, source: bytes, expected: bytes) 
 
 
 def clean() -> None:
-    for kind in ("lanczos", "bicubic", "sinc"):
+    for kind in ("lanczos", "bicubic", "bicubic_f32", "sinc"):
         directory = os.path.join(ROOT, kind)
         os.makedirs(directory, exist_ok=True)
         for entry in os.listdir(directory):
@@ -111,6 +112,34 @@ def bicubic_cases() -> None:
         )
 
 
+def bicubic_f32_cases() -> None:
+    """torch's antialiased bicubic resize of a float32 CHW tensor."""
+    cases = {
+        "upscale": (3, 5, 7, 11, 13),
+        "downscale": (3, 16, 9, 5, 3),
+        "aspect": (3, 9, 7, 12, 4),
+        "wide": (3, 24, 17, 6, 4),
+        "single": (1, 5, 7, 11, 13),
+    }
+    for name, (channels, height, width, out_height, out_width) in cases.items():
+        pixels = pattern(channels, height, width).astype(np.float32) / 255.0
+        source = torch.from_numpy(pixels.copy())
+        expected = torch.nn.functional.interpolate(
+            source[None],
+            size=[out_height, out_width],
+            mode="bicubic",
+            align_corners=False,
+            antialias=True,
+        )[0]
+        write_case(
+            "bicubic_f32",
+            name,
+            f"{name} {channels} {height} {width} {out_height} {out_width}",
+            pixels.tobytes(),
+            expected.contiguous().numpy().tobytes(),
+        )
+
+
 def sinc_cases() -> None:
     """torchaudio's bandlimited sinc resample of planar float32 audio."""
     cases = {
@@ -146,9 +175,10 @@ def main() -> None:
     clean()
     lanczos_cases()
     bicubic_cases()
+    bicubic_f32_cases()
     sinc_cases()
     total = 0
-    for kind in ("lanczos", "bicubic", "sinc"):
+    for kind in ("lanczos", "bicubic", "bicubic_f32", "sinc"):
         directory = os.path.join(ROOT, kind)
         total += sum(
             os.path.getsize(os.path.join(directory, entry))

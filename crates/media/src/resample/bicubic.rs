@@ -54,7 +54,11 @@ fn filter(input: usize, output: usize) -> Filter {
     let scale = input as f64 / output as f64;
     // A downscaling filter widens with the scale, so it averages every source
     // pixel the output pixel covers.
-    let support = if scale >= 1.0 { SUPPORT * scale } else { SUPPORT };
+    let support = if scale >= 1.0 {
+        SUPPORT * scale
+    } else {
+        SUPPORT
+    };
     let width = support.ceil() as usize * 2 + 1;
     let inverse_scale = if scale >= 1.0 { 1.0 / scale } else { 1.0 };
 
@@ -68,13 +72,11 @@ fn filter(input: usize, output: usize) -> Filter {
         // zero before the clamps.
         let start = ((center - support + 0.5) as i64).max(0) as usize;
         let end = ((center + support + 0.5) as i64).min(input as i64) as usize;
-        let count = end
-            .saturating_sub(start)
-            .min(width);
+        let count = end.saturating_sub(start).min(width);
         let mut weights = vec![0.0f64; count];
         let mut total = 0.0;
         for (index, weight) in weights.iter_mut().enumerate() {
-            *weight = cubic((index + start) as f64 - center + 0.5) * inverse_scale;
+            *weight = cubic(((index + start) as f64 - center + 0.5) * inverse_scale);
             total += *weight;
         }
         if total != 0.0 {
@@ -119,6 +121,14 @@ fn filter(input: usize, output: usize) -> Filter {
 }
 
 /// Applies the filter along one axis of a planar 8-bit image.
+///
+/// The axis being filtered is given by `horizontal`; the two extents are both
+/// needed because a pass keeps the other axis' extent and derives its source
+/// strides from it, so the grid cannot be dropped.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one pass needs both extents, the channel count and the axis"
+)]
 fn pass(
     axis: &Filter,
     source: &[u8],
@@ -160,8 +170,9 @@ fn pass(
                 for channel in 0..channels {
                     let mut sum = bias;
                     for (index, weight) in weights.iter().enumerate() {
-                        let sample =
-                            source[(start + index) * input_width * channels + column * channels + channel];
+                        let sample = source[(start + index) * input_width * channels
+                            + column * channels
+                            + channel];
                         sum += i32::from(sample) * i32::from(*weight);
                     }
                     out_row[column * channels + channel] = (sum >> shift).clamp(0, 255) as u8;
@@ -185,7 +196,7 @@ fn pass(
 ///
 /// Returns [`Error::Plan`] when a dimension or channel count is zero, or the
 /// input is not `channels * width * height` bytes.
-pub fn bicubic_antialias(
+pub(super) fn bicubic_antialias_u8(
     source: &[u8],
     channels: usize,
     height: u32,
@@ -193,8 +204,12 @@ pub fn bicubic_antialias(
     out_height: u32,
     out_width: u32,
 ) -> Result<Vec<u8>> {
-    let (height, width, out_height, out_width) =
-        (height as usize, width as usize, out_height as usize, out_width as usize);
+    let (height, width, out_height, out_width) = (
+        height as usize,
+        width as usize,
+        out_height as usize,
+        out_width as usize,
+    );
     if channels == 0 || width == 0 || height == 0 || out_width == 0 || out_height == 0 {
         return Err(Error::Plan(
             "an image raster and its channel count must be positive".to_owned(),
@@ -227,6 +242,209 @@ pub fn bicubic_antialias(
     if out_height != height {
         Ok(pass(
             &filter(height, out_height),
+            &horizontal,
+            out_width,
+            height,
+            out_width,
+            out_height,
+            channels,
+            false,
+        ))
+    } else {
+        Ok(horizontal)
+    }
+}
+
+// ---- the float32 path ----------------------------------------------------
+//
+// A float32 image takes torch's floating-point path: the same antialiased
+// filter grid, computed and applied in the tensor's own dtype, with no fixed
+// point and no rounding between the passes.
+
+/// One axis' float32 filter.
+struct Filter32 {
+    starts: Vec<usize>,
+    counts: Vec<usize>,
+    weights: Vec<f32>,
+    width: usize,
+}
+
+/// Keys' cubic convolution in float32, the reference's `aa_filter<float>`.
+fn cubic32(x: f32) -> f32 {
+    let a = A as f32;
+    let x = x.abs();
+    if x < 1.0 {
+        ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0
+    } else if x < 2.0 {
+        ((a * x - 5.0 * a) * x + 8.0 * a) * x - 4.0 * a
+    } else {
+        0.0
+    }
+}
+
+/// The reference's `_compute_index_ranges_weights<float>` for antialiasing.
+fn filter32(input: usize, output: usize) -> Filter32 {
+    let scale = input as f32 / output as f32;
+    let support = if scale >= 1.0 {
+        SUPPORT as f32 * scale
+    } else {
+        SUPPORT as f32
+    };
+    let width = support.ceil() as usize * 2 + 1;
+    let inverse_scale = if scale >= 1.0 { 1.0f32 / scale } else { 1.0 };
+
+    let mut starts = Vec::with_capacity(output);
+    let mut counts = Vec::with_capacity(output);
+    let mut weights = vec![0.0f32; output * width];
+    let mut raw = Vec::with_capacity(width);
+    for out in 0..output {
+        let center = scale * (out as f32 + 0.5);
+        let start = ((center - support + 0.5) as i64).max(0) as usize;
+        let end = ((center + support + 0.5) as i64).min(input as i64) as usize;
+        let count = end.saturating_sub(start).min(width);
+
+        raw.clear();
+        let mut total = 0.0f32;
+        for index in 0..count {
+            let weight = cubic32(((index + start) as f32 - center + 0.5) * inverse_scale);
+            raw.push(weight);
+            total += weight;
+        }
+        if total != 0.0 {
+            for weight in &mut raw {
+                *weight /= total;
+            }
+        }
+        weights[out * width..][..count].copy_from_slice(&raw);
+        starts.push(start);
+        counts.push(count);
+    }
+    Filter32 {
+        starts,
+        counts,
+        weights,
+        width,
+    }
+}
+
+/// Applies a float32 filter along one axis of a planar image.
+///
+/// Same grid as [`pass`]: a pass keeps the other axis' extent and derives its
+/// strides from it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one pass needs both extents, the channel count and the axis"
+)]
+fn pass32(
+    axis: &Filter32,
+    source: &[f32],
+    input_width: usize,
+    input_height: usize,
+    output_width: usize,
+    output_height: usize,
+    channels: usize,
+    horizontal: bool,
+) -> Vec<f32> {
+    if horizontal {
+        let mut out = vec![0.0f32; output_width * input_height * channels];
+        for row in 0..input_height {
+            let source_row = &source[row * input_width * channels..][..input_width * channels];
+            let out_row = &mut out[row * output_width * channels..][..output_width * channels];
+            for column in 0..output_width {
+                let start = axis.starts[column];
+                let weights = &axis.weights[column * axis.width..][..axis.counts[column]];
+                for channel in 0..channels {
+                    let mut sum = 0.0f32;
+                    for (index, weight) in weights.iter().enumerate() {
+                        sum += source_row[(start + index) * channels + channel] * weight;
+                    }
+                    out_row[column * channels + channel] = sum;
+                }
+            }
+        }
+        out
+    } else {
+        let mut out = vec![0.0f32; output_height * output_width * channels];
+        for row in 0..output_height {
+            let start = axis.starts[row];
+            let weights = &axis.weights[row * axis.width..][..axis.counts[row]];
+            let out_row = &mut out[row * output_width * channels..][..output_width * channels];
+            for column in 0..output_width {
+                for channel in 0..channels {
+                    let mut sum = 0.0f32;
+                    for (index, weight) in weights.iter().enumerate() {
+                        let sample = source[(start + index) * input_width * channels
+                            + column * channels
+                            + channel];
+                        sum += sample * weight;
+                    }
+                    out_row[column * channels + channel] = sum;
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Resizes a planar float32 image with torch's antialiased bicubic filter.
+///
+/// `source` is `channels` planes of `height` rows of `width` samples; the
+/// output has the same channel count at `out_width` x `out_height`. The
+/// weights and the accumulation are float32, as in
+/// `torch.nn.functional.interpolate(..., mode = "bicubic", align_corners =
+/// false, antialias = true)`; the horizontal pass comes first and an unchanged
+/// axis skips its pass.
+///
+/// # Errors
+///
+/// Returns [`Error::Plan`] when a dimension or channel count is zero, or the
+/// input is not `channels * width * height` samples.
+pub(super) fn bicubic_antialias_f32(
+    source: &[f32],
+    channels: usize,
+    height: u32,
+    width: u32,
+    out_height: u32,
+    out_width: u32,
+) -> Result<Vec<f32>> {
+    let (height, width, out_height, out_width) = (
+        height as usize,
+        width as usize,
+        out_height as usize,
+        out_width as usize,
+    );
+    if channels == 0 || width == 0 || height == 0 || out_width == 0 || out_height == 0 {
+        return Err(Error::Plan(
+            "an image raster and its channel count must be positive".to_owned(),
+        ));
+    }
+    if source.len() != channels * width * height {
+        return Err(Error::Plan(format!(
+            "a {channels}-channel image of {width}x{height} needs {} samples, {} were given",
+            channels * width * height,
+            source.len()
+        )));
+    }
+    if (width, height) == (out_width, out_height) {
+        return Ok(source.to_vec());
+    }
+    let horizontal = if out_width != width {
+        pass32(
+            &filter32(width, out_width),
+            source,
+            width,
+            height,
+            out_width,
+            height,
+            channels,
+            true,
+        )
+    } else {
+        source.to_vec()
+    };
+    if out_height != height {
+        Ok(pass32(
+            &filter32(height, out_height),
             &horizontal,
             out_width,
             height,
