@@ -1,14 +1,11 @@
 # The route_gemm operator's CuTe DSL backend: design 5.2's program package.
 #
 # One module covers one descriptor of `[kernel.descriptors]` for one
-# architecture of `[kernel.architectures]`, built by `src/build.py` (the
-# compile driver the Program Server runs for one descriptor and target).
+# architecture of `[kernel.architectures]`, built by `src/build.py`.
 #
-# FC2 of a mixture of experts: multiply each permuted row by its expert's down
-# projection and store the unweighted result at the row's expanded index, so
-# the output holds every token's uncombined routes and the MoE unpermute
-# combines them. UniServe's own CuTe DSL FC2 kernel (derived from FlashInfer
-# 0.6.18's contiguous grouped GEMM).
+# One native module per descriptor: the compiled CuTe DSL specialization, its
+# cubin and the exported host launcher, behind the C entry `entry.h` declares for
+# the operator's `moe::grouped::RouteCall`.
 
 op = "route_gemm"
 backend = "cute_dsl"
@@ -16,13 +13,11 @@ backend = "cute_dsl"
 [toolchain]
 kind = "cute_dsl"
 version = "4.6.2"
-packages = [{ name = "cutlass-dsl", version = "4.6.2" }, { name = "flashinfer-python", version = "0.6.18" }]
+packages = []
 
 [module]
 form = "native"
-
-[module.entries]
-launch = "uniserve_route_gemm"
+entries = { launch = "uniserve_route_gemm" }
 
 [source]
 kind = "cute_dsl"
@@ -33,12 +28,13 @@ script = "src/build.py"
 target = "arch"
 architectures = ["sm_100a"]
 
-# `tactic_m128n128_k_768_n_2048_experts_128`.
+# `hidden_2048_intermediate_768_experts_128_top_8_dtype_bf16_tile_128x128_cluster_1x1`.
 [kernel.descriptors]
-dimensions = { tactic = ["m128n128", "m128n256", "m256n128", "m256n256"], k = ["768"], n = ["2048"], experts = ["128"] }
+dimensions = { hidden = ["2048", "7168", "4096"], intermediate = ["768", "1536", "512"], experts = ["128", "256", "64"], top = ["8", "4", "2"], dtype = ["bf16"], tile = ["128x128", "256x128", "128x256", "256x256"], cluster = ["1x1", "2x1", "1x2", "2x2"] }
 
 [parameters]
-# Representative problem sizes the module is compiled for; pointers and sizes
-# are runtime arguments, so one module serves every bucket.
-rows = 32768
+# The representative problem the compile describes: the metadata and the output
+# rows are runtime sizes, and the kernel's grids derive from the tile count.
+permuted_rows = 32768
+expanded_rows = 32768
 max_active_clusters = 1
