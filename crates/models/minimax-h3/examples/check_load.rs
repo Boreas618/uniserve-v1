@@ -30,6 +30,7 @@ use nn::weights::{HostStore, WeightLoader};
 
 use minimax_h3::checkpoint::{Layout, Sidecars};
 use minimax_h3::config::Config;
+use minimax_h3::denoiser::ConditionEncoders;
 use minimax_h3::load;
 use minimax_h3::partition::{Component, Components, Partition};
 
@@ -173,17 +174,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // One component, one partition: the load path is the deployment's, and what it places is
         // narrowed so that one component's weights are what the store holds.
+        //
+        // The condition encoders are the one exception, and it is why `--component latent_encoder`
+        // exists at all: they are the denoiser's conditioning half, so a partition holding them
+        // alone is not a deployment and `Partition::validate` refuses it by name. What this probe
+        // asks is whether their names answer the export, and `ConditionEncoders::load` is the call
+        // the deployment loader makes for them in a pass of its own - so it is called directly.
         let partition = serving.placing(Components::of([component]));
         let mut store = HostStore::new();
-        {
+        let outcome = {
             let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
-            if let Err(error) = load(&checkpoint, partition, &mut loader) {
-                println!("  load refused: {error}");
-                failures.push(format!("{} refused to load: {error}", component.name()));
-                continue;
+            if matches!(component, Component::LatentEncoder) {
+                ConditionEncoders::load(&config, &checkpoint, &mut loader).map(|_| ())
+            } else {
+                load(&checkpoint, partition, &mut loader).map(|_| ())
             }
+        };
+        if let Err(error) = outcome {
+            println!("  load refused: {error}");
+            failures.push(format!("{} refused to load: {error}", component.name()));
+            continue;
         }
         println!("  {} weight regions published", store.len());
+        // What the load published is the load's own statement of what it asked for. A component
+        // that publishes nothing read nothing, whatever its keys say, and that is a finding.
+        if store.is_empty() {
+            failures.push(format!(
+                "{} published no weight region: its load asked the checkpoint for no tensor",
+                component.name()
+            ));
+        }
 
         // The claims are per component, so nothing is merged by bare name: a base root and a
         // reference root may both carry `transformer_blocks.0.*`, and each is reported against the
@@ -201,13 +221,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 reading.unread.len()
             );
             if reading.read.is_empty() {
-                // The load opened this directory and asked for none of its tensors: either the
-                // component reads somewhere else or its loader named names this export does not
-                // hold. Both are findings, and neither is visible from an index walk.
-                failures.push(format!(
-                    "{} declares {directory} and the load read none of its {total} tensors",
-                    component.name()
-                ));
+                // The reading record is kept by a claim the loader takes per name, and a loader
+                // that reads bytes without claiming leaves it empty - so this is printed and not
+                // failed on: the published-region count above is the load's own statement. What
+                // the column answers, when it is filled, is which tensors a component left alone.
+                println!("    (no per-name claims recorded; the published count is the verdict)");
             }
             for name in reading.unread.iter().take(8) {
                 println!("    unread {name}");
