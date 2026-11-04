@@ -108,6 +108,8 @@ struct Args {
     latent_height: u32,
     latent_width: u32,
     latents: Option<PathBuf>,
+    /// An explicit arena size in GiB. Zero - the default - means the plan's own number, which is what
+    /// a correct run needs; a stated size may only grow the reservation and the line says it did.
     arena_gib: u64,
     out: PathBuf,
 }
@@ -122,7 +124,7 @@ impl Args {
             latent_height: 16,
             latent_width: 16,
             latents: None,
-            arena_gib: 4,
+            arena_gib: 0,
             out: PathBuf::from("artifacts/h3-vae-decode"),
         };
         let mut words = std::env::args().skip(1);
@@ -403,7 +405,13 @@ fn stage_decode(args: &Args) -> Result<()> {
     // rather than reinterpreted.
     let container = element_of(dtype)?;
     let latent_channels = u64::from(config.video_vae.latent_channels);
-    let mut weights = DeviceWeights::new(&device, 0)?;
+    // The resident pool's size is the decode's own weights, summed from the index before a byte is
+    // mapped: the pool reserves once and gives out of that reservation, so a reservation short of the
+    // weights fails inside a publish and names a buffer rather than the plan. At a stated FP32 the
+    // decoder is 9.7 GB, which no floor guessed here could cover (`--arena-gib` never sized it either:
+    // that flag is the graph arena's).
+    let needed = resident_bytes(component, VideoDecoder::keys(&config.video_vae)?)?;
+    let mut weights = DeviceWeights::new(&device, needed)?;
     let (decoder, positions, rows) = {
         let mut loader = WeightLoader::new(component, &mut weights, None, None);
         let weight = loader.constant(
@@ -472,6 +480,9 @@ fn stage_decode(args: &Args) -> Result<()> {
     for buffer in &plan {
         planned += buffer.elements * buffer.width()?;
     }
+    // The plan's own number. A stated `--arena-gib` may raise it - a real over-reserve is honest if it
+    // says so - and the line below prints both, so a short plan is visible as a number rather than as
+    // a reservation failure inside the decode.
     let arena_bytes = planned.max(args.arena_gib << 30);
     let allocator = weights.allocator();
     allocator.reserve(
@@ -485,10 +496,15 @@ fn stage_decode(args: &Args) -> Result<()> {
     let arena = Arena::new(DevicePtr::new(region.address()), arena_bytes);
     let forward = Forward::new(&stream, &generation, &arena);
     println!(
-        "arena: {} buffers, {} MiB planned, {} MiB reserved",
+        "arena: {} buffers, {} MiB planned, {} MiB reserved{}",
         plan.len(),
         planned >> 20,
-        arena_bytes >> 20
+        arena_bytes >> 20,
+        if arena_bytes > planned {
+            " (the flag raised it; the plan alone is what the decode needs)"
+        } else {
+            ""
+        }
     );
 
     // 6. The latents: the file the reference's own decoder is called with, packed into the rows this
@@ -554,6 +570,21 @@ fn stage_decode(args: &Args) -> Result<()> {
     ops::capture::set_sink(None);
     decode_result?;
     stream.synchronize()?;
+    // The plan against what the decode actually bumped. `video_arena` is a sum of named buffers and
+    // the arena only grows, so its cursor is the peak: an arena used past its plan would otherwise
+    // surface as a pool refusing a give-out inside a layer, naming a buffer rather than the plan. This
+    // line is the one that says which of the two happened.
+    let peak = arena.used();
+    println!(
+        "arena used: {} MiB of {} MiB planned{}",
+        peak >> 20,
+        planned >> 20,
+        if peak > planned {
+            " - THE PLAN IS SHORT BY THE DIFFERENCE"
+        } else {
+            ""
+        }
+    );
     if walk.0.is_empty() {
         return Err(Failure::message(
             "the walk recorded no launches: the decode replayed a captured graph, or no sink was \
@@ -704,6 +735,26 @@ impl RetainedWeights for HostWeights {
     }
 }
 
+/// The bytes the decoder's weight iterations publish, summed from the index before a byte is read.
+///
+/// The pool reserves once, so this is the number that keeps a publish from failing: an index entry's
+/// own `shape · dtype` is what the loader hands over for every tensor it reads verbatim. A weight-norm
+/// pair is the exception - two tensors fold into the one weight the layer holds, so the pair's second
+/// tensor is counted here and not published, and the sum is larger than the pool needs by those
+/// vectors. Erring larger is the only direction that is safe: a sum short of the weights is the
+/// failure this function exists to prevent.
+fn resident_bytes(component: &nn::Checkpoint, keys: Vec<String>) -> Result<u64> {
+    let mut total = 0_u64;
+    for key in keys {
+        let Some(location) = component.tensor(&key) else {
+            // Absent names are the loader's to refuse, with the block that asks for them.
+            continue;
+        };
+        total += location.shape.numel() * u64::from(location.dtype.bits()) / 8;
+    }
+    Ok(total)
+}
+
 /// Device storage for weights: a resident pool, one buffer per tensor, and every publish waited on.
 struct DeviceWeights {
     pools: platform::Allocator,
@@ -715,7 +766,9 @@ impl DeviceWeights {
     fn new(device: &platform::Device, requested: u64) -> Result<Self> {
         let budget = std::sync::Arc::new(NoLimit);
         let mut pools = platform::Allocator::new(device, budget)?;
-        let mut wanted = requested.max(8 << 30);
+        // The requested size is the weights' own; a zero request - a caller that did not measure -
+        // gets a floor, and the line below prints both numbers either way.
+        let mut wanted = requested.max(1 << 30);
         let mut reserved = None;
         while wanted >= (1 << 30) {
             if pools
@@ -736,7 +789,16 @@ impl DeviceWeights {
                  weights cannot be held on this device",
             )
         })?;
-        println!("resident pool: {} GiB reserved", reserved >> 30);
+        println!(
+            "resident pool: {} MiB needed (the index), {} MiB reserved{}",
+            requested >> 20,
+            reserved >> 20,
+            if reserved < requested {
+                " - a short reservation refuses inside a publish, so an over-reserve here is the one                  that is honest"
+            } else {
+                ""
+            }
+        );
         Ok(Self {
             pools,
             buffers: Vec::new(),
