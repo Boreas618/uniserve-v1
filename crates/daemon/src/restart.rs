@@ -252,6 +252,11 @@ impl Restarter {
         };
         // No world change, rollback or relaunch replaces the engine meanwhile.
         let _quiet = leader.quiesce().await;
+        // The parked standbys are this daemon's processes (§2.5): the successor
+        // numbers and starts its own once it has adopted the engines, so ending
+        // them here keeps a second engine's memory off the device across the
+        // handover instead of leaving the old daemon's copies parked behind it.
+        leader.end_standbys().await;
         let handoff = leader.engine_handoff()?;
         let (ours, theirs) = UnixStream::pair().context("creating the handoff socket")?;
         // The persistent reply reader must yield to the continuations it
@@ -782,6 +787,10 @@ async fn prepared_successor(
     *crate::leader::locked(&first.config) = options;
     first.adopt_pause(handed.paused, handed.asleep, handed.sleep_paused);
     first.adopt_unavailable(handed.unavailable);
+    // §2.5 continues across the handoff: the successor adopts the engines and
+    // then keeps a standby of its own, or the deployment would serve without one
+    // until the next restart.
+    first.start_standby();
     for (index, (handed, options, served, observer, client)) in adopted.enumerate() {
         let replica = crate::leader::Replica::new(
             &options,
@@ -796,6 +805,7 @@ async fn prepared_successor(
         replica.adopt_pause(handed.paused, handed.asleep, handed.sleep_paused);
         replica.adopt_unavailable(handed.unavailable);
         replica.monitor();
+        replica.start_standby();
         leader
             .replicas
             .serving
