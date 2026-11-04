@@ -123,9 +123,7 @@ impl PrimaryContext {
                 "cuStreamCreateWithPriority",
             )
         });
-        if let Err(error) = created {
-            return Err(error);
-        }
+        created?;
         let shared = *self.retained.probe.get_or_init(|| raw as usize);
         if shared == raw as usize {
             return Ok(raw);
