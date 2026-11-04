@@ -711,12 +711,24 @@ impl Scheduler {
             );
             return;
         }
+        let id = request.request_id;
         self.queue_media(PendingMedia {
             request,
             graph,
             event_tx,
             queued_at,
         });
+        // The policy sees a media request as it arrived, exactly as it sees a
+        // token request's arrival: nothing has happened to it yet, so every
+        // feature but the submitted ones is empty. Without this the policy has
+        // no view of a media request at all - not its class, its prompt or its
+        // reservation - and cannot plan its work.
+        if let Some(view) = views::requests(self, self.recorder.recorded())
+            .into_iter()
+            .find(|view| view.id.0 == id.0)
+        {
+            self.recorder.record(views::arrived(view));
+        }
     }
 
     /// Queues `pending` for admission: a request that resumes a stored
