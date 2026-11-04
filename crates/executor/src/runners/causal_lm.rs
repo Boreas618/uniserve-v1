@@ -493,9 +493,24 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
     }
 
     fn purge(&mut self, generation: u64) {
+        // The graphs go first, then their arena regions: `Captured` guarantees that order, and a
+        // region released under a live executable would be reused by the next generation's
+        // capture while the old graph still addressed it.
         let dropped = self.graphs.purge(generation);
+        let mut released = 0u64;
+        for bucket in &dropped {
+            match self.pools.release_bucket(StreamId(0), *bucket) {
+                Ok(bytes) => released += bytes,
+                // A pool that cannot shrink keeps the bytes mapped until the executor closes;
+                // the purge itself still holds, so this is not a reason to fail the command.
+                Err(error) => {
+                    tracing::warn!(%error, %bucket, "releasing a purged bucket's arena region");
+                }
+            }
+        }
         tracing::debug!(
-            dropped,
+            dropped = dropped.len(),
+            released,
             generation,
             "purged graphs of a replaced generation"
         );
