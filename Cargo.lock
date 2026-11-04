@@ -908,6 +908,7 @@ dependencies = [
  "expect-test",
  "fastokens",
  "fnv",
+ "frontend",
  "futures",
  "hf-hub 0.5.0",
  "http-body",
