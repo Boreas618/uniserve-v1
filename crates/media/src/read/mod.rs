@@ -27,6 +27,7 @@
 //! carry their orientation and all eight EXIF cases are applied.
 
 use std::borrow::Cow;
+use std::io::{Seek as _, SeekFrom};
 use std::ops::Range;
 use std::os::unix::fs::FileExt as _;
 use std::path::Path;
@@ -70,7 +71,9 @@ pub struct VideoClip {
     pub frame_rate: u32,
     /// The clip's `(width, height)` canvas.
     pub canvas: (u32, u32),
-    /// Kept frames, starting at `start_frame`.
+    /// Kept frames, starting at `start_frame`: the encoded frames the
+    /// condition's pixel rows cover (the reference's `vae_frames`, which may be
+    /// fewer than the frames the decoded clip holds).
     pub frames: u32,
     /// First kept frame in the video's own rate.
     pub start_frame: u32,
@@ -312,9 +315,14 @@ pub fn read_video(
     // The shared-memory object or file is a seekable file FFmpeg reads
     // directly; it is the child's standard input, which the `fd:` demuxer
     // reads without a pipe in between.
-    let input = source
+    let mut input = source
         .try_clone()
         .map_err(|error| Error::io("opening a reference video", error))?;
+    // `fd:` reads from the current position; a fresh open (the reference's
+    // `/dev/shm/<name>`) starts at zero.
+    input
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| Error::io("positioning a reference video", error))?;
     let process = Command::new(ffmpeg)
         .args([
             "-v",
