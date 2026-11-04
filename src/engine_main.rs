@@ -607,8 +607,9 @@ impl MainProcess {
 
         // This node's schedulers, one thread per DP rank, each handing its batches to the executors
         // above through `executor::Batches` (§2.4, §4.4). A node that holds none keeps an empty list
-        // and serves only what its peers' schedulers ask of it.
-        let schedulers: Vec<engine::SchedulerHandle> = Vec::new();
+        // and serves only what its peers' schedulers ask of it; a node that is the scheduler node
+        // and holds none would accept requests and dispatch nothing, which is refused by name.
+        let schedulers = schedulers(launch, &executors)?;
 
         Ok(Self {
             control,
@@ -2164,6 +2165,34 @@ fn device_command(
 /// The handshake with the daemon, which answers with the epoch this node serves
 /// (`specs/worker.md` §2.3).
 ///
+/// This node's scheduler threads, one per DP rank (§2.4, §4.4).
+///
+/// A node that is not the scheduler node serves only what its peers' schedulers ask of it, so it
+/// builds none. The scheduler node builds one thread per data-parallel rank, each handed this
+/// node's executors through `executor::Batches`: the scheduler forms a batch, the executor issues
+/// it, and the scheduler reads the result - nothing crosses threads except the batch and its
+/// result.
+fn schedulers(
+    launch: &Launch,
+    executors: &[Executor],
+) -> Result<Vec<engine::SchedulerHandle>> {
+    if !launch.scheduler_node {
+        return Ok(Vec::new());
+    }
+    if executors.is_empty() {
+        bail!("the scheduler node holds no device to serve a batch on");
+    }
+    // The scheduler's own constructors are the one seam this file cannot supply: a scheduler is a
+    // thread over a mechanism whose state, limits and policy slot belong to `engine`, and building
+    // one here would duplicate the arithmetic that lays a rank's groups out.
+    let _ = executors;
+    bail!(
+        "this node is the scheduler node, and the scheduler constructors \
+         (`SchedulerHandle::over_batches`, `EngineConfig::of`) are not published in this build: \
+         the process would accept requests and dispatch none"
+    )
+}
+
 /// The daemon states that this build may serve the epoch, this node's host identity, and, later,
 /// the program revision of the generation it prepares (§7.3). The programs themselves never come
 /// through this interface: the daemon names them and this process resolves their modules from the
