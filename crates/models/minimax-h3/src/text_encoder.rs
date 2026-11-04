@@ -50,6 +50,7 @@ use ops::rope::Rotation;
 use std::sync::Arc;
 
 use crate::config::TextEncoderConfig;
+use crate::decoding::Buffer;
 use crate::load::Component;
 use crate::partition::Partition;
 use crate::positions::{self, Mrope};
@@ -191,6 +192,16 @@ impl Plan {
                 .ok_or_else(|| Error::config("an encoder plan larger than a u64".to_owned()))?;
         }
         Ok(bytes)
+    }
+}
+
+/// The plan names' element for `dtype`: the vocabulary `crate::decoding::Buffer` holds.
+pub(crate) fn element_of(dtype: nn::DType) -> &'static str {
+    match dtype {
+        nn::DType::BF16 => "bf16",
+        nn::DType::F16 => "f16",
+        nn::DType::F32 => "f32",
+        _ => "bf16",
     }
 }
 
@@ -361,6 +372,53 @@ impl Buffers {
         })
     }
 
+    /// The named plan of exactly the buffers [`Buffers::new`] reserves.
+    ///
+    /// Each reservation above has one line here, in the same order, so an executor's name-keyed
+    /// arena and a deployment row read the same object. The sum must equal [`Buffers::bytes`]: that
+    /// equality is what makes a name added twice - the class that aliased 8.9 MB with 52,992 B in
+    /// the audio plan - or a buffer this list forgot show up as two numbers that disagree instead of
+    /// as one number nobody can check.
+    fn plan(plan: &Plan, dtype: nn::DType) -> Vec<Buffer> {
+        let tokens = u64::from(plan.rows);
+        let hidden = u64::from(plan.hidden);
+        let query = u64::from(plan.query);
+        let key_value = u64::from(plan.key_value);
+        let intermediate = u64::from(plan.intermediate);
+        let factors = u64::from(plan.head_dim / 2);
+        let merged = u64::from(plan.merged);
+        let element = element_of(dtype);
+        let mut plan_out = Vec::with_capacity(16);
+        let mut push = |name: &str, element: &'static str, elements: u64| {
+            plan_out.push(Buffer {
+                name: name.to_owned(),
+                element,
+                elements,
+            });
+        };
+        push("prompt.normalized", element, tokens * hidden);
+        push("prompt.query", element, tokens * query);
+        push("prompt.rotated_query", element, tokens * query);
+        push("prompt.key", element, tokens * key_value);
+        push("prompt.rotated_key", element, tokens * key_value);
+        push("prompt.value", element, tokens * key_value);
+        push("prompt.attended", element, tokens * query);
+        push("prompt.projected", element, tokens * hidden);
+        push("prompt.gate", element, tokens * intermediate);
+        push("prompt.up", element, tokens * intermediate);
+        push("prompt.activated", element, tokens * intermediate);
+        push("prompt.down", element, tokens * hidden);
+        push("prompt.cosine", "f32", tokens * factors);
+        push("prompt.sine", "f32", tokens * factors);
+        push("prompt.features", element, merged * hidden);
+        push(
+            "prompt.deepstack",
+            element,
+            u64::from(plan.deepstack) * merged * hidden,
+        );
+        plan_out
+    }
+
     /// The bytes [`Buffers::new`] reserves.
     fn bytes(plan: &Plan, dtype: nn::DType) -> Result<u64> {
         let arena = Arena::new(DevicePtr::new(0), u64::MAX);
@@ -375,6 +433,15 @@ impl Buffers {
         dtype: nn::DType,
     ) -> Result<u64> {
         crate::vision::Buffers::bytes(config, patches, dtype)
+    }
+
+    /// The tower's named reservations for one image, at the encoder's element type.
+    fn tower_plan(
+        config: &crate::config::VisionConfig,
+        patches: u32,
+        dtype: nn::DType,
+    ) -> Vec<Buffer> {
+        crate::vision::Buffers::plan(config, patches, dtype)
     }
 
     /// `view`'s rows as `[rows, heads, head_dim]` for the rotation and attention operators.
@@ -1092,6 +1159,35 @@ impl TextEncoder {
     }
 }
 
+impl TextEncoder {
+    /// The arena one encode of `layout` reserves, buffer by buffer.
+    ///
+    /// This is the same sum [`Plan::bytes`] returns, decomposed by name: the prompt's buffers once
+    /// (the stack reuses one set across all its layers), then one set per image the layout carries,
+    /// because the tower runs once per image. A deployment row reads the sum of these entries, and
+    /// the equality with `Plan::bytes` is what the module's test holds it to - the arena is what
+    /// every served request reserves before the denoiser runs, so a plan that disagreed with the
+    /// arithmetic would be a reservation nobody could check.
+    pub fn encode_arena(&self, layout: &EncoderLayout) -> Result<Vec<Buffer>> {
+        let grids = layout
+            .images
+            .iter()
+            .map(|image| image.grid)
+            .collect::<Vec<_>>();
+        let plan = self.plan(layout.tokens, &grids)?;
+        let mut buffers = Buffers::plan(&plan, self.dtype);
+        for (index, &patches) in plan.images.iter().enumerate() {
+            for buffer in Buffers::tower_plan(&self.config.vision, patches, self.dtype) {
+                buffers.push(Buffer {
+                    name: format!("image{index}.{}", buffer.name),
+                    ..buffer
+                });
+            }
+        }
+        Ok(buffers)
+    }
+}
+
 impl Encoder for TextEncoder {
     /// The layout of a batch and its images.
     ///
@@ -1665,6 +1761,48 @@ mod tests {
         // One embedding, then eleven tensors per retained layer: four projections, two per-head
         // norms, two layer norms and the gated MLP's three.
         assert_eq!(keys.len(), 11 * config.num_retained_layers as usize + 1);
+    }
+
+    /// The named plan is the byte plan: every reservation has one line, and no line twice.
+    ///
+    /// The two halves are checked against the totals they claim to decompose - `Buffers::bytes` for
+    /// the prompt and `vision::Buffers::bytes` for one image - because a name added twice or a
+    /// buffer left out is otherwise invisible: the arena would reserve the wrong region and the only
+    /// symptom would be a launch that refused in the middle of a served request.
+    #[test]
+    fn the_named_plan_sums_to_the_byte_plan() {
+        let config = config();
+        for tokens in [1_u32, 6, 15, 128] {
+            let plan = Plan::new(&config, &Partition::single(), tokens, &[]).expect("a plan");
+            let named = Buffers::plan(&plan, nn::DType::BF16);
+            let sum: u64 = named.iter().map(Buffer::bytes).sum();
+            assert_eq!(
+                sum,
+                Buffers::bytes(&plan, nn::DType::BF16).expect("the byte plan"),
+                "the named plan for {tokens} tokens disagrees with the byte plan"
+            );
+            let names: std::collections::BTreeSet<&String> =
+                named.iter().map(|buffer| &buffer.name).collect();
+            assert_eq!(names.len(), named.len(), "a buffer is named twice");
+        }
+    }
+
+    /// The tower's named plan is its byte plan, for a block of patches.
+    #[test]
+    fn the_tower_named_plan_sums_to_its_byte_plan() {
+        let config = config();
+        let patches = 16 * 16;
+        let named = crate::vision::Buffers::plan(&config.vision, patches, nn::DType::BF16);
+        let sum: u64 = named.iter().map(Buffer::bytes).sum();
+        assert_eq!(
+            sum,
+            crate::vision::Buffers::bytes(&config.vision, patches, nn::DType::BF16)
+                .expect("the tower's byte plan"),
+            "the tower's named plan disagrees with its byte plan"
+        );
+        let names: std::collections::BTreeSet<&String> =
+            named.iter().map(|buffer| &buffer.name).collect();
+        assert_eq!(names.len(), named.len(), "a buffer is named twice");
     }
 
     /// The released text encoder's configuration.
