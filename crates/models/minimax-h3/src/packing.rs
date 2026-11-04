@@ -123,6 +123,25 @@ pub fn video_latent_frames(num_frames: u32) -> Result<u32> {
     Ok(clips * CLIP_LATENTS + 2)
 }
 
+/// The generated frame count of a latent frame count: the inverse of [`video_latent_frames`].
+///
+/// A decode of `5n + 2` latent frames produces the `17n + 5` frames those latents were encoded from, so
+/// the decoder's tables can be derived from a layout's latent extents without knowing the request's
+/// frame rule. Refuses a latent count no clip timeline produces.
+pub fn video_output_frames(latent_frames: u32) -> Result<u32> {
+    let aligned = latent_frames.checked_sub(2).ok_or_else(|| {
+        Error::config(format!(
+            "an H3 latent timeline holds at least {CLIP_LATENTS} latent frames, got {latent_frames}"
+        ))
+    })?;
+    if aligned % CLIP_LATENTS != 0 {
+        return Err(Error::config(format!(
+            "an H3 latent frame count has the form {CLIP_LATENTS}n + 2, got {latent_frames}"
+        )));
+    }
+    Ok((aligned / CLIP_LATENTS) * CLIP_FRAMES + CLIP_FRAMES)
+}
+
 /// Audio latent steps of a generated frame count: the duration in 40 Hz latents, rounded to the
 /// nearest step.
 ///
@@ -357,8 +376,19 @@ pub fn clip_rows(attention: AttentionKind, num_frames: u32, canvas: &Canvas) -> 
 /// Dense packing keeps the raster order; a sparse layout orders the rows tile-major, which depends
 /// on neither the prompt nor the conditions.
 pub fn video_order(attention: AttentionKind, num_frames: u32, canvas: &Canvas) -> Result<Vec<u32>> {
-    let raster = latent_raster(canvas)?;
-    let frames = video_latent_frames(num_frames)?;
+    video_order_of(
+        attention,
+        video_latent_frames(num_frames)?,
+        latent_raster(canvas)?,
+    )
+}
+
+/// The same order, from the latent extents a layout states rather than a pixel canvas.
+pub fn video_order_of(
+    attention: AttentionKind,
+    frames: u32,
+    raster: LatentRaster,
+) -> Result<Vec<u32>> {
     match attention {
         AttentionKind::Dense => Ok((0..frames * raster.patch_rows()).collect()),
         AttentionKind::Sparse { tile, .. } => {
