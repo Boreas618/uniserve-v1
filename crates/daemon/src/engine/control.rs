@@ -1371,6 +1371,19 @@ mod tests {
         assert_eq!(start.launch.queue_depth, 4);
         assert_eq!(start.launch.world_size, 1);
 
+        // The launch states whether the child stands by (§2.5): a standby has
+        // to know the role before it claims storage, and a serving child must
+        // not read the file as one.
+        assert!(!start.launch.standby);
+        spec.predecessor = Some(wire::Predecessor {
+            world: 3,
+            segments: Vec::new(),
+        });
+        let standby = control.epoch_start(&spec, 10).unwrap();
+        assert!(standby.launch.standby);
+        assert_eq!(standby.launch.world, 3);
+        spec.predecessor = None;
+
         spec.workers.as_mut().unwrap().executable = "/opt/uniserve-b".to_owned();
         let other = control.epoch_start(&spec, 9).unwrap();
         assert_eq!(other.build, None);
