@@ -158,6 +158,25 @@ impl Captured {
         Ok(nodes.len())
     }
 
+    /// Whether `nodes` is the same launch structure as this graph's: the same launches, in the
+    /// same order, each adding the same number of graph nodes.
+    ///
+    /// This is 4.5's rebind condition. A launch that added a different number of nodes - a
+    /// split-K reduction kernel beside the main one, a native library that launched more than one
+    /// kernel inside - is a structure change, and its bucket is recaptured instead of rebound.
+    /// Descriptor keys are not compared: a new program under a new key of the same operator is
+    /// exactly the rebind case, and the parameters are what the walk recomputes.
+    pub fn same_structure(&self, nodes: &Nodes) -> bool {
+        self.nodes.len() == nodes.len()
+            && self
+                .nodes
+                .iter()
+                .zip(nodes)
+                .all(|((operator, _, mine), (walked, _, theirs))| {
+                    operator == walked && mine.len() == theirs.len()
+                })
+    }
+
     /// How many launches of `operator` the capture recorded.
     pub fn launches(&self, operator: &'static str) -> usize {
         self.nodes
