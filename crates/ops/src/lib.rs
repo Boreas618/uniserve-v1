@@ -101,6 +101,7 @@ pub mod noise;
 pub mod norm;
 pub mod op;
 pub mod patch;
+pub mod pcm;
 pub mod phase;
 pub mod platform;
 pub mod position;
