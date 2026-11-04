@@ -27,12 +27,12 @@
 //! and it reads the predecessor's tail, which a single clip's decode never sees.
 
 use crate::config::VideoVaeConfig;
-use crate::video_vae::{Canvas, Tile, Tiles};
+use crate::video_vae::{Canvas, Tile};
 use crate::{
     Error, Result,
     config::{CLIP_FRAMES, CLIP_LATENTS},
 };
-use nn::layers::{CrossFade, RgbBytes, UnpatchifyVideo};
+use nn::layers::{CrossFade, UnpatchifyVideo};
 use nn::{DType, Forward, Shape, TensorView};
 
 /// The frames one decoded clip holds: a 17-frame body, three padding frames and a five-frame tail.
@@ -354,23 +354,11 @@ pub struct ClipDecoder {
     /// Elements of one token: `out_channels · temporal · spatial²`, the row width every tile's decode
     /// writes and the unpatchify reads.
     patch: u64,
-    /// The raster's frames: a latent frame decodes to `temporal` of them, and every tile spans them
-    /// all.
-    frames: u32,
-    /// The de-normalization into bytes: the ImageNet constants and the rounding, in the decoder's own
-    /// element type so the fade's result is quantized without a conversion.
-    rgb: RgbBytes,
 }
 
 impl ClipDecoder {
     /// The output path of `canvas`, whose tiles the caller decodes in [`Tile`] order.
-    pub fn new(
-        config: &VideoVaeConfig,
-        canvas: &Canvas,
-        mean: nn::Weight,
-        std: nn::Weight,
-    ) -> Result<Self> {
-        let tiles = Tiles::of(config, canvas)?;
+    pub fn new(config: &VideoVaeConfig) -> Result<Self> {
         let spatial = config.spatial_compression();
         let unpatchify = UnpatchifyVideo::new(
             DType::F16,
@@ -382,32 +370,25 @@ impl ClipDecoder {
             * u64::from(config.temporal_compression())
             * u64::from(spatial)
             * u64::from(spatial);
-        // The grid spreads its slack over the seams, so the overlaps are not all equal; one compiled
-        // blend serves every seam of the same width, and a decoder fades both ways needs both axes.
-        let mut extents: Vec<u32> = tiles
-            .rows
-            .overlaps
-            .iter()
-            .chain(tiles.columns.overlaps.iter())
-            .copied()
-            .filter(|extent| *extent != 0)
-            .collect();
-        extents.sort_unstable();
-        extents.dedup();
-        let mut blends = Vec::with_capacity(2 * extents.len());
-        for extent in extents {
+        // The grid spreads its slack over the seams, so the overlaps are not all equal: a seam is at
+        // least `MINIMUM_OVERLAP` pixels and grows by an alignment step as the slack is spread, and it
+        // always fits its tile. One compiled blend serves every seam of one width, so the table is
+        // built for every width a grid of this tile size can produce, in latent positions - a seam is
+        // only ever as wide as the tile allows. Building it once, at load, is what lets one decoder
+        // block serve every canvas: the grid itself is arithmetic and is recomputed per request.
+        let minimum = crate::video_vae::MINIMUM_OVERLAP / spatial;
+        let widest = crate::video_vae::TILE_PIXELS / spatial - 1;
+        let mut blends = Vec::new();
+        for extent in minimum..=widest {
             for axis in [2, 3] {
                 blends.push((extent, axis, CrossFade::new(DType::F16, extent, axis)?));
             }
         }
-        let rgb = RgbBytes::new(DType::F16, crate::output::Rgb::CHANNELS, mean, std)?;
         Ok(Self {
             unpatchify,
             patch,
             blends,
             ratio: spatial,
-            frames: canvas.frames_out(config),
-            rgb,
         })
     }
 
@@ -506,7 +487,9 @@ impl ClipDecoder {
             .ok_or_else(|| Error::config("a blend starts left of the raster".to_owned()))?;
         let shape = Shape::new(&[
             dest.shape.dim(0),
-            u64::from(self.frames),
+            // The raster's own frames: every tile spans them all, so the placement reads the extent
+            // from the buffer rather than from a canvas the blend table was built against.
+            dest.shape.dim(1),
             u64::from(tile.canvas.height) * ratio,
             u64::from(tile.canvas.width) * ratio,
         ]);
@@ -598,79 +581,14 @@ impl ClipDecoder {
         }
         Ok(())
     }
-
-    /// Quantize one clip's stitched raster into the request's frame range.
-    ///
-    /// `blended` is the clip's raster — `[channels, frames, rows, columns]` in the decoder's element
-    /// type — and `out` the slice of the request's byte raster the clip's frames land in,
-    /// `[frames, rows, columns, channels] u8`. The layer de-normalizes with the ImageNet constants,
-    /// clamps and rounds, and writes through `out`'s strides, so a clip whose frames are a sub-block of
-    /// a larger raster needs no copy.
-    pub fn quantize(&self, f: &Forward, blended: TensorView, out: TensorView) -> Result<()> {
-        let shape = blended.shape;
-        if shape.rank() != 4 || shape.dim(0) != u64::from(crate::output::Rgb::CHANNELS) {
-            return Err(Error::config(format!(
-                "{:?} is not a [{}, frames, rows, columns] raster",
-                shape.dims(),
-                crate::output::Rgb::CHANNELS
-            )));
-        }
-        if shape.dim(1) != u64::from(self.frames) {
-            return Err(Error::config(format!(
-                "the clip decodes {} frames, the raster holds {}",
-                self.frames,
-                shape.dim(1)
-            )));
-        }
-        self.rgb.forward(f, blended, out)?;
-        Ok(())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::video_vae::Tiles;
 
     /// The ImageNet constants as the model publishes them: host memory, one f32 per channel.
-    fn constants(values: [f32; 3]) -> nn::Weight {
-        let mut bytes = Vec::with_capacity(12);
-        for value in values {
-            bytes.extend_from_slice(&value.to_le_bytes());
-        }
-        let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
-        let ptr = nn::DevicePtr::new(bytes.as_ptr() as u64);
-        nn::Weight {
-            backing: nn::Backing::new(ptr, bytes.len() as u64),
-            view: TensorView::new(ptr, DType::F32, Shape::new(&[3])),
-        }
-    }
-
-    fn mean() -> nn::Weight {
-        constants(crate::output::PIXEL_MEAN)
-    }
-
-    fn std() -> nn::Weight {
-        constants(crate::output::PIXEL_STD)
-    }
-
-    #[test]
-    fn the_output_path_refuses_constants_that_are_not_three_channels() {
-        let config = crate::video_vae::tests::video_config();
-        let canvas = Canvas::clip(&config, 48, 84);
-        assert!(ClipDecoder::new(&config, &canvas, mean(), std()).is_ok());
-        // Two channels cannot de-normalize an RGB raster; the layer refuses at construction rather than
-        // reading past the constant.
-        let two = {
-            let bytes: &'static [u8] = Box::leak(vec![0u8; 8].into_boxed_slice());
-            let ptr = nn::DevicePtr::new(bytes.as_ptr() as u64);
-            nn::Weight {
-                backing: nn::Backing::new(ptr, bytes.len() as u64),
-                view: TensorView::new(ptr, DType::F32, Shape::new(&[2])),
-            }
-        };
-        assert!(ClipDecoder::new(&config, &canvas, two, std()).is_err());
-    }
-
     #[test]
     fn a_four_second_video_is_six_clips() {
         // 4 s at 24 fps rounds to 96 frames, extended to the next 17n + 5: 107.
@@ -960,7 +878,7 @@ mod tests {
         // minimum overlap give a grid of four columns and seven rows, each tile 16x16 latent.
         let config = crate::video_vae::tests::video_config();
         let canvas = Canvas::clip(&config, 48, 84);
-        let clip = ClipDecoder::new(&config, &canvas, mean(), std()).expect("the output path");
+        let clip = ClipDecoder::new(&config).expect("the output path");
         let tiles = Tiles::of(&config, &canvas)
             .expect("the grid")
             .tiles(&config, &canvas);
