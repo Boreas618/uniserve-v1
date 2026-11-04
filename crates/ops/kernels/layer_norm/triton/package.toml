@@ -1,0 +1,36 @@
+# The layer_norm operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the compile
+# driver the Program Server runs for one descriptor and target).
+#
+# Whether the layer has a bias is part of the compilation: a program without one
+# reads two affine parameters and skips an addition. The key is the one
+# `LayerNormDescriptor`'s `Display` prints, e.g.
+# `dtype_bf16_columns_2048_tile_2048_bias_true_pdl_false`.
+
+op = "layer_norm"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/layer_norm.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+[kernel.descriptors]
+dimensions = { dtype = ["bf16", "f16", "f32"], columns = ["256", "512", "768", "1024", "1280", "2048", "3072", "4096"], tile = ["256", "512", "1024", "2048", "4096"], bias = ["true", "false"], pdl = ["true", "false"] }
+
+[parameters]
