@@ -72,7 +72,17 @@ fn every_kernel_package_in_the_tree_is_a_package_the_server_can_install() {
 /// qwen3_moe_keys` writes `.local/qwen3-moe-keys.txt`), so the test reports
 /// how to produce it when it is absent.
 fn slice_keys() -> Option<Vec<(String, String)>> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.local/qwen3-moe-keys.txt");
+    // The committed copy first, so a clean checkout checks both fixtures; the
+    // generated one beside it is what the model's example writes, and a host
+    // that regenerated the keys today should be checking today's.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let committed = root.join("notes/programs/qwen3-moe-keys.txt");
+    let generated = root.join(".local/qwen3-moe-keys.txt");
+    let path = if committed.is_file() {
+        committed
+    } else {
+        generated
+    };
     let Ok(text) = std::fs::read_to_string(&path) else {
         eprintln!(
             "SKIPPED (fixture): no {}; write it with `cargo run -p ops --example qwen3_moe_keys`",
