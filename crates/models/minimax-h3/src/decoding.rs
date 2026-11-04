@@ -153,14 +153,28 @@ pub struct Buffer {
 }
 
 impl Buffer {
+    /// The width of one element, by the name the plans use.
+    ///
+    /// The four names below are the whole set a plan may declare; `f16` and `bf16` are two bytes each and
+    /// `f32` is four, which is the difference between a 200 MiB buffer and a 400 MiB one. An unknown name
+    /// is refused rather than assumed, because the assumption - four bytes - would be half the budget for
+    /// a reduced-precision buffer.
+    pub fn width(&self) -> Result<u64> {
+        match self.element {
+            "u8" => Ok(1),
+            "f16" | "bf16" => Ok(2),
+            "f32" => Ok(4),
+            other => Err(Error::config(format!(
+                "{other} is not an element type a plan declares: u8, f16, bf16 or f32"
+            ))),
+        }
+    }
+
     /// The bytes the buffer occupies.
     pub fn bytes(&self) -> u64 {
-        let width = match self.element {
-            "u8" => 1,
-            "f16" => 2,
-            _ => 4,
-        };
-        self.elements * width
+        // A plan with an unknown element name is caught by [`Self::width`]; this answers for the four
+        // names the crate's plans use and treats anything else as four bytes so a *report* never panics.
+        self.elements * self.width().unwrap_or(4)
     }
 }
 
@@ -618,6 +632,24 @@ mod tests {
     use crate::video_vae::Tiles;
 
     /// The ImageNet constants as the model publishes them: host memory, one f32 per channel.
+    #[test]
+    fn a_plans_element_names_are_the_four_the_arena_holds() {
+        // A reduced-precision buffer counted as four bytes doubles its budget, and an unknown name used to
+        // fall through to that same four, so the set is closed here and every width is stated.
+        let buffer = |element: &'static str| Buffer {
+            name: format!("probe.{element}"),
+            element,
+            elements: 1024,
+        };
+        for (element, width) in [("u8", 1), ("f16", 2), ("bf16", 2), ("f32", 4)] {
+            let buffer = buffer(element);
+            assert_eq!(buffer.width().expect(element), width, "{element}");
+            assert_eq!(buffer.bytes(), 1024 * width, "{element}");
+        }
+        // Anything else is refused rather than assumed, at the widths a budget depends on.
+        assert!(buffer("f64").width().is_err());
+    }
+
     #[test]
     fn a_four_second_video_is_six_clips() {
         // 4 s at 24 fps rounds to 96 frames, extended to the next 17n + 5: 107.
