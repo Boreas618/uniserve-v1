@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use executor::blocking::{BlockingKind, LaneLimits, Limits};
-use executor::capacity::{graph_storage_bytes, quota};
+use executor::capacity::{graph_storage_budget_bytes, graph_storage_bytes, quota};
 use executor::device::GraphStorage;
 use executor::memory::Memory;
 use executor::plan::{Buckets, Variant};
@@ -213,17 +213,20 @@ impl EpochPlan {
         let storage = handle.memory_info()?;
         let total = storage.total;
         // The graph reservation is the design's share of the whole device (4.1), so its base is
-        // the device's total and not what is left of it. One pool is opened here, for the serving
-        // generation: `online-operations.md` states a preparation's cost as a SECOND pool of the
-        // same size, and that reservation belongs to the preparation, not to the epoch's open - a
-        // deployment that never prepares must not pay for a pool no generation uses. A recapture
-        // that finds no room for its second pool is refused by name at the ledger, and §7.3's
-        // `precopy` reports it as the update's failure rather than the rank's.
-        let bytes = capacity::graph_storage_bytes(i64::try_from(total)?, false, false);
+        // the device's total and not what is left of it. Two pools are reserved and, per
+        // `online-operations.md`, that is one for the serving generation and one for a preparation
+        // beside it - the successor recaptures on the same stream, so its plans map beside the
+        // serving generation's and its buckets stay addressable through a revert.
+        //
+        // A reservation is virtual address space, not a booking (`capacity::graph_storage_bytes`'s
+        // own contract): the bytes are booked when a graph maps, so reserving the second pool costs
+        // a device nothing until an update needs it, and the refusal for a preparation with no room
+        // comes from the ledger's book at capture time - the update's failure, not the rank's.
+        let bytes = graph_storage_bytes(i64::try_from(total)?, true, false);
         if bytes == 0 {
             bail!("device {} reports no memory to capture graphs in", device.0);
         }
-        let scratch = bytes / 8;
+        let scratch = graph_storage_budget_bytes(i64::try_from(total)?) / 8;
         // Every pool on this device is booked against `budget`, so `budget` is what the device has
         // left to give: the epoch's weights are device-resident retained storage, mapped before
         // this call (4.1), and an allowance drawn from the total would let the graph, scratch and
@@ -232,13 +235,18 @@ impl EpochPlan {
         // rules is the allowance: a deployment that asks for a smaller share gets it, and a device
         // already holding the weights gets only what remains.
         let budget = quota(total, self.build.mem_fraction_static).min(storage.free);
-        if budget < bytes + scratch {
+        // What a rank must be able to map to serve at all: one generation's graph pool and its
+        // scratch. The second pool is a reservation until a preparation captures into it, so it is
+        // not part of this test - a deployment with room for one pool starts and serves, and an
+        // update that needs the second one is refused by name when it maps.
+        let needs = bytes / 2 + scratch;
+        if budget < needs {
             bail!(
                 "device {} has {budget} bytes left of {total} once the model is mapped, at \
-                 mem_fraction_static {}, less than the graph and scratch reservation of {}",
+                 mem_fraction_static {}, less than the graph pool and scratch of {needs} a rank \
+                 maps to serve",
                 device.0,
                 self.build.mem_fraction_static,
-                bytes + scratch
             );
         }
         Ok(GraphStorage {
