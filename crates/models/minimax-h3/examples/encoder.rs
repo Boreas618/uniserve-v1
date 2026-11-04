@@ -324,6 +324,7 @@ fn stage_weights(args: &Args) -> Result<()> {
     let mut store = HostStore::new();
     let mut loader = WeightLoader::new(source, &mut store, None, None);
     let encoder = TextEncoder::load(&mut loader, text, &Partition::single(), dtype)?;
+    println!("loaded: text encoder at {}", encoder.dtype());
     println!(
         "load: published {} weight regions on the host, {} retained layers",
         store.len(),
@@ -795,6 +796,13 @@ fn stage_encode(args: &Args) -> Result<()> {
         let mut loader = WeightLoader::new(source, &mut weights, None, None);
         TextEncoder::load(&mut loader, text, &Partition::single(), dtype)?
     };
+    // The type the weights came back in, beside the one asked for: a loader that quietly widened or
+    // narrowed a component would show here rather than in a page nobody can attribute.
+    println!(
+        "loaded: text encoder at {}, {} requested",
+        encoder.dtype(),
+        dtype
+    );
 
     // 3. The arena. The encoder's own temporaries are reserved inside the forward, so this region
     //    only has to be large enough: a wide factor over the prompt's own rows, and the forward's
