@@ -244,6 +244,8 @@ pub fn inverse_frequencies(dim: u32, theta: f32) -> Result<Vec<f32>> {
 /// `(time, height, width)` covers `time` runs of one time step each, because Qwen3-VL presents
 /// every temporal patch of a video behind its own text timestamp.
 ///
+/// The reference is `uniserve/models/qwen3_vl/positions.py:21-149` (`rope_index`).
+///
 /// Text advances all three axes together from the running origin. A block of grid `(t, h, w)` has
 /// `t * (h/merge) * (w/merge)` merged tokens; the token at merged coordinates `(i, j, k)` takes
 /// `origin + (i, j, k)` in raster order, and the origin then advances by `max(h, w) / merge`.
@@ -376,6 +378,20 @@ pub fn placeholder_rows(ids: &[u32], image_token_id: u32, video_token_id: u32) -
         .collect()
 }
 
+/// The prompt position of every merged vision row, in prompt order.
+///
+/// The inverse of [`placeholder_rows`], and the table the row operator reads
+/// (`ops::rows`: `destination[indices[j]] = source[j]`, `indices` `[count] i32`, `count` the number
+/// of source rows). Entry `k` is the prompt row the `k`-th merged vision row takes, so the prompt's
+/// placeholders are visited in the order the tower emits its tokens and a text row never appears.
+pub fn vision_destinations(ids: &[u32], image_token_id: u32, video_token_id: u32) -> Vec<i32> {
+    ids.iter()
+        .enumerate()
+        .filter(|(_, id)| **id == image_token_id || **id == video_token_id)
+        .map(|(row, _)| row as i32)
+        .collect()
+}
+
 /// The row and column of every patch of a grid, in merge-block order.
 ///
 /// A merging encoder serializes a `height x width` patch grid block by block: the `merge x merge`
@@ -426,12 +442,14 @@ pub fn rotary_coordinates(height: u32, width: u32, merge: u32) -> Result<Vec<[i6
 /// The table is a `side x side` grid of learned rows; a `height x width` patch grid samples it with
 /// its corners aligned: patch row `i` reads table row `i * (side - 1) / (height - 1)` (an FP32
 /// `linspace`), and likewise for columns. Each patch blends its four neighbouring table rows with
-/// FP32 bilinear weights (`uniserve/nn/vision/position.py::PositionEmbedding.interpolate`).
+/// FP32 bilinear weights (`uniserve/nn/vision/position.py:167-200`,
+/// `PositionEmbedding.interpolate`).
 ///
 /// Returns, per patch row (in merge-block order), the four table row indices of the top-left,
 /// top-right, bottom-left and bottom-right neighbours and their weights. A device kernel blends the
 /// table's rows with these (`ops::position::Interpolate`); the tables are one image's, so they are
-/// per image block.
+/// per image block, and a temporal grid repeats them once per time step - every time step samples
+/// the same `height x width` grid (`PositionEmbedding.interpolate(...).repeat(time, 1)`).
 pub fn position_samples(
     side: u32,
     height: u32,
@@ -692,6 +710,28 @@ mod tests {
         assert!(rope_index(&ids, &[[1, 2, 2]], &[], IMAGE_TOKEN, VIDEO_TOKEN, 2).is_err());
         let ids = [IMAGE_TOKEN];
         assert!(rope_index(&ids, &[[1, 2, 2]], &[], IMAGE_TOKEN, VIDEO_TOKEN, 2).is_err());
+    }
+
+    #[test]
+    fn the_vision_destinations_are_the_placeholders_in_prompt_order() {
+        let ids = [7, IMAGE_TOKEN, 8, VIDEO_TOKEN, VIDEO_TOKEN, 9, IMAGE_TOKEN];
+        assert_eq!(
+            vision_destinations(&ids, IMAGE_TOKEN, VIDEO_TOKEN),
+            vec![1, 3, 4, 6]
+        );
+        // The two directions agree: the k-th placeholder takes row k, so inverting the destination
+        // list through the placeholder map returns the rows in order.
+        let rows = placeholder_rows(&ids, IMAGE_TOKEN, VIDEO_TOKEN);
+        let destinations = vision_destinations(&ids, IMAGE_TOKEN, VIDEO_TOKEN);
+        let mut next = 0;
+        for (token, row) in rows.iter().enumerate() {
+            if *row >= 0 {
+                assert_eq!(destinations[*row as usize], token as i32);
+                next += 1;
+            }
+        }
+        assert_eq!(next, destinations.len());
+        assert!(vision_destinations(&[1, 2, 3], IMAGE_TOKEN, VIDEO_TOKEN).is_empty());
     }
 
     #[test]
