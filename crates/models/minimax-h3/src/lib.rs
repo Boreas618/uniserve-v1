@@ -43,6 +43,7 @@ pub mod denoiser;
 pub mod encoding;
 pub mod load;
 pub mod modulation;
+pub mod output;
 pub mod packing;
 pub mod partition;
 pub mod positions;
