@@ -27,7 +27,7 @@
 //!
 //! Two model calls fill it, in either order, because they write disjoint rows and neither reads the
 //! other's: the text encoder's own features and the zero row are the encoder stage's, and then
-//! [`Denoiser::encode_conditions`] projects each condition's latents into the condition rows, and
+//! [`Denoiser::encode_conditions`] projects each condition's own rows into the condition rows, and
 //! [`Denoiser::prepare_conditioning`] refines the prompt's rows in place. The condition projection
 //! needs the request's declared condition shapes and therefore the stage that holds the request;
 //! the refinement needs only the buffer, which is why it is the denoiser's own per-request hook.
