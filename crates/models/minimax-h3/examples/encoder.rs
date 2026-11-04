@@ -470,6 +470,10 @@ fn write_h3t(path: &Path, shape: &[u64], dtype: u8, payload: &[u8]) -> Result<()
 struct DeviceWeights {
     pools: platform::Allocator,
     buffers: Vec<platform::Buffer>,
+    /// Every region, in publication order, with the key it was published under: the load asks for
+    /// one key twice when two layers share a weight, and a store that published it twice would hand
+    /// them two buffers and charge two blocks for one tensor.
+    published: Vec<(WeightKey, Backing)>,
     bytes: u64,
 }
 
@@ -502,6 +506,7 @@ impl DeviceWeights {
         Ok(Self {
             pools,
             buffers: Vec::new(),
+            published: Vec::new(),
             bytes: 0,
         })
     }
@@ -534,9 +539,37 @@ impl RetainedWeights for DeviceWeights {
         shape: Shape,
         bytes: &[u8],
     ) -> nn::Result<Backing> {
+        // One key is one region. The load asks for a key twice where two layers share a weight, and
+        // the host store this harness measures with (`nn::HostStore`) answers the first region - so a
+        // device store that published the second would both hand two layers two buffers for one
+        // weight and charge the pool a block the measurement had counted once.
+        if let Some((_, existing)) = self.published.iter().find(|(asked, _)| asked == key) {
+            // The second ask must be the same tensor: a key asked for twice in two shapes would be
+            // two different weights under one name, and answering the first would hide it.
+            let held = existing.bytes();
+            if held != bytes.len() as u64 {
+                return Err(nn::Error::Weight {
+                    tensor: key.to_string(),
+                    problem: format!(
+                        "asked for twice: the first region holds {held} bytes and this ask carries \
+                         {} for {dtype} {shape:?}",
+                        bytes.len()
+                    ),
+                });
+            }
+            return Ok(*existing);
+        }
         let buffer = self
             .pools
-            .allocate(platform::PoolKind::Resident, bytes.len())?;
+            .allocate(platform::PoolKind::Resident, bytes.len())
+            .map_err(|error| nn::Error::Weight {
+                tensor: key.to_string(),
+                problem: format!(
+                    "region {} of the load, {} bytes, past the resident pool's reservation: {error}",
+                    self.published.len() + 1,
+                    bytes.len(),
+                ),
+            })?;
         // The publish is synchronous with respect to the host: the copy is issued on the device's
         // default stream and waited on before the backing is handed out, because the loader keeps no
         // stream and a later launch may use another one.
@@ -555,7 +588,7 @@ impl RetainedWeights for DeviceWeights {
         backing.view(dtype, shape)?;
         self.bytes += bytes.len() as u64;
         self.buffers.push(buffer);
-        let _ = key;
+        self.published.push((key.clone(), backing));
         Ok(backing)
     }
 }
