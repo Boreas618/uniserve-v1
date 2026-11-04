@@ -177,6 +177,26 @@ fn a_module_path_is_made_of_names_that_cannot_leave_their_root() {
 }
 
 #[test]
+fn a_build_may_not_publish_a_file_outside_the_module_directory() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = store(temporary.path());
+    let cubin = workspace(temporary.path(), &[("module.cubin", b"bytes")]);
+
+    for name in ["/etc/passwd", "../escape", "tuning/../../escape"] {
+        let refused = store.publish(&path(), &cubin, &[name.to_owned()]);
+        assert!(refused.is_err(), "{name:?} escapes the module directory");
+        assert!(!store.contains(&path()));
+    }
+    // A file in a subdirectory of the module is a name, not an escape.
+    let tuning = workspace(temporary.path(), &[("tuning/tactics.json", b"{}")]);
+    store
+        .publish(&path(), &tuning, &["tuning/tactics.json".to_owned()])
+        .unwrap();
+    let files = store.files(&path()).unwrap().unwrap();
+    assert_eq!(files[0].name, "tuning/tactics.json");
+}
+
+#[test]
 fn an_empty_store_root_set_is_refused() {
     assert!(matches!(Store::open(Vec::new()), Err(Error::Io(_))));
 }

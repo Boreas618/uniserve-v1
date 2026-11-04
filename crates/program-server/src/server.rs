@@ -874,8 +874,27 @@ impl Queue {
     }
 
     /// Runs one build and tells its waiters, and the driver, how it ended.
+    ///
+    /// A build that panics fails like one that returned an error: the
+    /// failure is the build's log, and the queue keeps its slot.
     fn build(self: Arc<Self>, job: Arc<BuildJob>) {
-        let outcome = self.compile(&job).map_err(|error| error.to_string());
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.compile(&job)))
+            .unwrap_or_else(|panic| {
+                let message = panic
+                    .downcast_ref::<&str>()
+                    .map(|message| (*message).to_owned())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "the build panicked".to_owned());
+                Err(Error::Build {
+                    op: job.path.op.clone(),
+                    backend: job.path.backend.clone(),
+                    revision: job.path.revision,
+                    target: job.path.target.clone(),
+                    descriptor: job.path.descriptor.clone(),
+                    message: format!("the build panicked: {message}"),
+                })
+            })
+            .map_err(|error| error.to_string());
         let mut state = self.lock();
         let ended: Option<Build> = state.builder.finish(&job.path, outcome);
         state.jobs.remove(&job.path);
@@ -1095,6 +1114,7 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
             std::os::unix::fs::symlink(target, &destination)?;
         } else {
             fs::copy(&source, &destination)?;
+            fs::File::open(&destination)?.sync_all()?;
         }
     }
     Ok(())
