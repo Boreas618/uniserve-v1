@@ -353,9 +353,16 @@ def compare_ids(actual, expected, scores):
                      "reference's own logits, so either selection is right)")
     if unexplained:
         row = unexplained[0]
+        # Where our picks sit in the reference's own ordering, and what the boundary gap is: a set
+        # that is the reference's top six plus ranks nine and eleven is a different score vector,
+        # while ranks one to eight in a different order is the same one.
+        rank_of = {int(expert): place for place, expert in enumerate(np.argsort(-np.asarray(scores[row]), kind="stable"))}
+        ranks = [rank_of.get(int(expert), -1) for expert in actual[row]]
+        ordered = np.asarray(scores[row], dtype=np.float64)[np.argsort(-np.asarray(scores[row]), kind="stable")]
         parts.append(
             f"{len(unexplained)} unexplained; first at row {row}: {actual[row].tolist()} against the "
-            f"reference's {expected[row].tolist()}"
+            f"reference's {expected[row].tolist()}; our picks are the reference's ranks {ranks}, and "
+            f"its {top}/{top + 1} gap is {float(ordered[top - 1] - ordered[top]):.4f}"
         )
     return f"{len(differing)} of {len(sets_agree)} rows select a different set: " + "; ".join(parts)
 
