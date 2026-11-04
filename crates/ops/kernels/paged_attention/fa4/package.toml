@@ -17,10 +17,10 @@ backend = "fa4"
 
 [toolchain]
 kind = "cute_dsl"
-version = "4.5.0"
+version = "4.6.2"
 packages = [
     { name = "flash-attn", version = "4.0.0" },
-    { name = "torch", version = "2.9.1" },
+    { name = "torch", version = "2.13.0" },
 ]
 
 [module]
