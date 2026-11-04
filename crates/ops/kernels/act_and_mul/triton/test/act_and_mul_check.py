@@ -116,7 +116,8 @@ def check(case, device):
     bound = ROUNDINGS[case["activation"]] * UNIT_ROUNDOFF[case["dtype"]]
     difference = (got - expected).abs()
     allowed = bound * expected.abs()
-    outside = (difference > allowed).sum().item()
+    # A difference that is not a number is never inside a bound: `>` says otherwise.
+    outside = (~(difference <= allowed)).sum().item()
     largest = (
         (difference / expected.abs().clamp(min=1e-30)).max().item()
         if expected.numel()

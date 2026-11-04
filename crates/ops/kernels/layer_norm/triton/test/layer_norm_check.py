@@ -142,9 +142,9 @@ def check(case, device):
     difference = (got - expected).abs()
     relative = bound(columns, case["dtype"]) * expected.abs()
     floor = absolute_floor(weight, bias, case["dtype"])
-    declared_outside = (difference > relative).sum().item()
-    scaled_outside = (difference > relative + floor).sum().item()
-    largest = (difference / expected.abs().clamp(min=1e-30)).max().item()
+    declared_outside = (~(difference <= relative)).sum().item()
+    scaled_outside = (~(difference <= relative + floor)).sum().item()
+    largest = (difference / expected.abs().clamp(min=1e-30)).nan_to_num(nan=float("inf")).max().item()
     deciding = (
         declared_outside if case["bound"] == "declared" else scaled_outside
     )
@@ -153,7 +153,7 @@ def check(case, device):
         f"{case['tile']}, {case['dtype']}, "
         f"bias {str(case['bias']).lower()}"
         f"{', interpreter cast truncated' if case['truncate'] else ''} — "
-        f"max absolute {difference.max().item():.3e}, max relative {largest:.3e}, "
+        f"max absolute {difference.nan_to_num(nan=float('inf')).max().item():.3e}, max relative {largest:.3e}, "
         f"declared bound {bound(columns, case['dtype']):.3e} "
         f"({declared_outside} outside), with the {floor:.3e} absolute floor the operands "
         f"imply ({scaled_outside} outside)"

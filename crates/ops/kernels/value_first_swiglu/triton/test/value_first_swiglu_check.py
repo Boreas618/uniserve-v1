@@ -159,8 +159,8 @@ def check(scenario, case, device):
         return 0
     difference = (got - expected).abs()
     allowed = ROUNDINGS * UNIT_ROUNDOFF[case["dtype"]] * expected.abs()
-    outside = (difference > allowed).sum().item()
-    largest = (difference / expected.abs().clamp(min=1e-30)).max().item()
+    outside = (~(difference <= allowed)).sum().item()
+    largest = (difference / expected.abs().clamp(min=1e-30)).nan_to_num(nan=float("inf")).max().item()
 
     magnitude_failures = 0
     if case["absmax"]:
