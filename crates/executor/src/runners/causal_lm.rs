@@ -51,8 +51,11 @@ pub struct Staging {
     max_kv_len: u32,
     /// The mechanism's call ids of the staged rows, in the order `rows.calls` lists them.
     calls: Vec<CallId>,
-    /// The shape staged by the last [`Staging::stage`].
-    staged: Option<Shape>,
+    /// The bucket the last [`Staging::stage`] padded the columns to.
+    /// The bucket the held columns were padded to. A capture must reuse a batch of exactly the
+    /// bucket it captures: two buckets of one variant differ in size, and a graph captured from
+    /// the other one's staging would address the wrong extents.
+    staged: Option<Bucket>,
 }
 
 impl Staging {
@@ -195,12 +198,12 @@ impl Staging {
         self.calls.extend_from_slice(call_ids);
         self.calls.resize(bucket_rows, CallId(u64::MAX));
 
-        self.staged = Some(bucket.shape());
+        self.staged = Some(bucket);
         Ok(bucket.shape())
     }
 
     /// The shape staged by the last [`Staging::stage`], if any.
-    pub fn staged(&self) -> Option<Shape> {
+    pub fn staged(&self) -> Option<Bucket> {
         self.staged
     }
 
@@ -861,7 +864,13 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         let dropped = self.graphs.purge(generation);
         let dropped_count = dropped.len();
         let mut released = 0u64;
-        for bucket in &dropped {
+        // Both generations' graphs can address one bucket's plan: the pool records a plan per
+        // bucket, not per generation, so a purged generation's bucket keeps its region while the
+        // serving (or probation's) generation still has a graph for it.
+        for bucket in dropped
+            .iter()
+            .filter(|bucket| !self.graphs.holds(**bucket))
+        {
             let released_bucket = self
                 .pool()
                 .and_then(|mut pools| pools.release_bucket(self.stream_id(), *bucket));
@@ -1123,7 +1132,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
     ) -> Result<()> {
         let stream = self.stream.clone();
         match self.staging.staged() {
-            Some(staged) if staged.variant == bucket.variant => {}
+            Some(staged) if staged == bucket => {}
             _ => {
                 self.stage_warm(bucket)?;
             }
@@ -1367,7 +1376,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
     fn walk(&mut self, bucket: Bucket, generation: &Arc<Generation>) -> Result<()> {
         let stream = self.stream.clone();
         match self.staging.staged() {
-            Some(staged) if staged.variant == bucket.variant => {}
+            Some(staged) if staged == bucket => {}
             _ => {
                 self.stage_warm(bucket)?;
             }

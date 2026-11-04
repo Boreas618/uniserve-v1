@@ -90,6 +90,14 @@ impl Graphs {
         buckets
     }
 
+    /// Whether any generation still has a graph of `bucket`.
+    ///
+    /// A bucket's arena plan is shared by every generation's graph of that bucket (the pool records
+    /// one plan per bucket), so a purge may release the plan only while this answers false.
+    pub fn holds(&self, bucket: Bucket) -> bool {
+        self.captured.keys().any(|(held, _)| *held == bucket)
+    }
+
     /// Every bucket captured for `generation`, in bucket order.
     pub fn buckets(&self, generation: u64) -> Vec<Bucket> {
         let mut buckets: Vec<Bucket> = self
