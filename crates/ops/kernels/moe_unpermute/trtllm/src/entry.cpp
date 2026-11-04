@@ -38,14 +38,14 @@ int32_t combine(const uniserve_unpermute_call* call, cudaStream_t stream, int32_
         cute_dsl::moeUnpermute<__nv_bfloat16, float>(
             static_cast<__nv_bfloat16 const*>(call->routes), static_cast<__nv_bfloat16*>(call->out),
             call->expanded_to_permuted, static_cast<float const*>(call->scales), tokens, hidden, top,
-            kExpanded, kEnablePdl, cuda_stream);
+            kExpanded, kEnablePdl, stream);
         return 0;
       }
       if (call->scales_dtype == UNISERVE_DTYPE_BF16) {
         cute_dsl::moeUnpermute<__nv_bfloat16, __nv_bfloat16>(
             static_cast<__nv_bfloat16 const*>(call->routes), static_cast<__nv_bfloat16*>(call->out),
             call->expanded_to_permuted, static_cast<__nv_bfloat16 const*>(call->scales), tokens, hidden,
-            top, kExpanded, kEnablePdl, cuda_stream);
+            top, kExpanded, kEnablePdl, stream);
         return 0;
       }
       return refuse(const_cast<uniserve_unpermute_call*>(call), "moe_unpermute serves bf16 routes with f32 or bf16 scales");
@@ -55,20 +55,19 @@ int32_t combine(const uniserve_unpermute_call* call, cudaStream_t stream, int32_
         cute_dsl::moeUnpermute<__half, float>(
             static_cast<__half const*>(call->routes), static_cast<__half*>(call->out),
             call->expanded_to_permuted, static_cast<float const*>(call->scales), tokens, hidden, top,
-            kExpanded, kEnablePdl, cuda_stream);
+            kExpanded, kEnablePdl, stream);
         return 0;
       }
       if (call->scales_dtype == UNISERVE_DTYPE_F16) {
         cute_dsl::moeUnpermute<__half, __half>(
             static_cast<__half const*>(call->routes), static_cast<__half*>(call->out),
             call->expanded_to_permuted, static_cast<__half const*>(call->scales), tokens, hidden, top,
-            kExpanded, kEnablePdl, cuda_stream);
+            kExpanded, kEnablePdl, stream);
         return 0;
       }
       return refuse(const_cast<uniserve_unpermute_call*>(call), "moe_unpermute serves f16 routes with f32 or f16 scales");
     }
-    return refuse(const_cast<uniserve_unpermute_call*>(call), "moe_unpermute serves bf16 or f16 routes");
-  }
+  return refuse(const_cast<uniserve_unpermute_call*>(call), "moe_unpermute serves bf16 or f16 routes");
 }
 
 }  // namespace

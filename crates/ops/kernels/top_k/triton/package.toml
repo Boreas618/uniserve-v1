@@ -4,8 +4,9 @@
 # architecture of `[kernel.architectures]`, built by `src/build.py`.
 #
 # One program per row selects the row's `width` largest logits by four radix
-# passes and one emission pass, then sorts them; the vocabulary and the row count
-# are launch values.
+# passes, compacts them into its scratch and orders them with eight stable radix
+# passes. The vocabulary, the row count and the kept count are launch values; the
+# key names the element types and the chunk one pass reads.
 
 op = "top_k"
 backend = "triton"
@@ -28,8 +29,8 @@ script = "src/build.py"
 target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
-# `dtype_f32_vocabulary_151936_width_2048_ids_i32_pdl_false`.
+# `dtype_f32_tile_2048_ids_i32_pdl_false`.
 [kernel.descriptors]
-dimensions = { dtype = ["f32", "bf16", "f16"], width = ["128", "1024", "2048", "4096", "8192", "262144"], ids = ["i32", "i64"], pdl = ["true", "false"] }
+dimensions = { dtype = ["f32", "bf16", "f16"], tile = ["1024", "2048", "4096", "8192"], ids = ["i32", "i64"], pdl = ["true", "false"] }
 
 [parameters]
