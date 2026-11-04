@@ -448,17 +448,17 @@ impl Scheduler {
                     self.offload_units(&[unit]);
                 }
             }
-            // Preempting a request for want of capacity needs a cause the
-            // protocol does not name yet: `MigrationCause` has `Drain` and
-            // `Loss`, and a request ended for either reason is not the same
-            // thing as one the mechanism preempted to give its units away.
-            // Until a cause exists, the list is executed as far as it goes and
-            // the starvation stands: the watchdog bounds it (§4.4).
+            // Today's capacity preemption, which the design keeps: a request
+            // that must give its units away is marked migratable with `Drain`,
+            // as `recompute_starved` does when it withdraws the units its
+            // requests hold. `Drain` asks the engine to hold the world the
+            // stream is in, and there is no world change here, so the daemon
+            // resubmits the request as a continuation carrying the state it
+            // reached. Only a migratable request is marked: one the daemon
+            // could not resubmit would be lost. The request retires at its next
+            // call boundary, and what it holds returns then.
             scheduling::guest::Victim::Request(request) => {
-                tracing::warn!(
-                    request = request.0,
-                    "a request victim cannot be preempted for want of capacity yet"
-                );
+                self.migrate_running(MigrationCause::Drain, |id| id.0 == request.0);
             }
         }
     }
