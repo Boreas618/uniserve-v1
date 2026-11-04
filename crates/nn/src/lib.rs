@@ -61,7 +61,7 @@ pub use capability::{
     ImageInput, ImageShape, KvGroup, KvPlanes, KvView, Latents, Layout, RowKind, Seed, StateTable,
     Step, TokenBatch, VideoRequest, VideoTask,
 };
-pub use checkpoint::{Checkpoint, CheckpointFile, FileIdentity, TensorLocation};
+pub use checkpoint::{Checkpoint, CheckpointFile, FileIdentity, Reading, TensorLocation};
 pub use error::{Error, Result};
 pub use exchange::ExchangeViews;
 pub use forward::{Arena, Forward};
