@@ -110,13 +110,23 @@ impl Layer {
 
         // Attention: normalize, attend, and fold the gated update into `out` while normalizing the
         // feed-forward's input.
-        let attention_norm =
-            ModulatedRmsNorm::new(self.norm1.clone(), shift_attention, scale_attention, None, self.eps)?;
+        let attention_norm = ModulatedRmsNorm::new(
+            self.norm1.clone(),
+            shift_attention,
+            scale_attention,
+            None,
+            self.eps,
+        )?;
         attention_norm.forward(f, hidden, None, rows, normalized, None, None)?;
         self.attention
             .forward(f, normalized, factors, visible, total_rows, update)?;
-        let mlp_norm =
-            ModulatedRmsNorm::new(self.norm2.clone(), shift_mlp, scale_mlp, Some(gate_attention), self.eps)?;
+        let mlp_norm = ModulatedRmsNorm::new(
+            self.norm2.clone(),
+            shift_mlp,
+            scale_mlp,
+            Some(gate_attention),
+            self.eps,
+        )?;
         mlp_norm.forward(f, hidden, Some(update), rows, normalized, None, Some(out))?;
 
         // Feed-forward: the packed value and gate halves, the gated activation, the down
@@ -226,7 +236,10 @@ impl Transformer {
                 audio_in,
             )?),
             layers,
-            norm_out: RmsNorm::new(gain(loader, "norm_out.norm.weight", hidden)?, config.norm_eps)?,
+            norm_out: RmsNorm::new(
+                gain(loader, "norm_out.norm.weight", hidden)?,
+                config.norm_eps,
+            )?,
             video_out: projection_with_bias(loader, "proj_out", video_in, hidden)?,
             audio_out: Some(projection_with_bias(
                 loader,
@@ -273,17 +286,11 @@ impl Transformer {
         let width = hidden.shape.last();
         let tokens = hidden.shape.dim(0);
         let arena = f.arena();
-        let entries = arena.tensor(
-            nn::DType::I32,
-            Shape::new(&[1, u64::from(groups.count())]),
-        )?;
+        let entries = arena.tensor(nn::DType::I32, Shape::new(&[1, u64::from(groups.count())]))?;
         adaln.entries_of(f, step, entries)?;
         let modulation = arena.tensor(
             hidden.dtype,
-            Shape::new(&[
-                u64::from(groups.count()) * 3,
-                6 * width,
-            ]),
+            Shape::new(&[u64::from(groups.count()) * 3, 6 * width]),
         )?;
         let mut alternate = arena.tensor(hidden.dtype, Shape::new(&[tokens, width]))?;
         let mut current = hidden;

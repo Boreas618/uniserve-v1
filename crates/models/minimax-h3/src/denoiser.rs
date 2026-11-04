@@ -22,8 +22,8 @@
 //! in the order [`Layouts::state_tables`] names them; nothing of a request reaches a capture as a
 //! host value, and no table is uploaded from inside a forward.
 
-use nn::capability::{Layout, LatentShape, StateTable, VideoRequest};
 use nn::Shape;
+use nn::capability::{LatentShape, Layout, StateTable, VideoRequest};
 
 use crate::config::{Canvas, DenoiserConfig};
 use crate::packing::{self, DensePacking};
@@ -42,7 +42,12 @@ pub struct Arrangement {
 
 impl Arrangement {
     /// A deployment's arrangement, checked against the attention kind's capacity unit.
-    pub fn new(config: &DenoiserConfig, text_rows: u32, condition_rows: u32, shard: u32) -> Result<Self> {
+    pub fn new(
+        config: &DenoiserConfig,
+        text_rows: u32,
+        condition_rows: u32,
+        shard: u32,
+    ) -> Result<Self> {
         let unit = config.attention.capacity_rows();
         if shard == 0 || !shard.is_power_of_two() {
             return Err(Error::config(format!(
@@ -466,8 +471,14 @@ mod tests {
     fn layouts() -> Layouts {
         let config = DenoiserConfig {
             transformer: transformer(),
-            schedule: ScheduleSpec::uniform(50, Shifts { video: 12.0, audio: 3.0 })
-                .expect("the base checkpoint's schedule"),
+            schedule: ScheduleSpec::uniform(
+                50,
+                Shifts {
+                    video: 12.0,
+                    audio: 3.0,
+                },
+            )
+            .expect("the base checkpoint's schedule"),
             attention: AttentionKind::DENSE,
             tasks: vec![nn::capability::VideoTask::TextToVideoAudio],
             canvases: None,
@@ -562,7 +573,12 @@ mod tests {
         // generated row takes the prefix's zero row.
         let prefix: Vec<i32> = decode_i32(&out[3]);
         assert_eq!(prefix.len(), tables[3].shape.dim(0) as usize);
-        assert!(prefix[..12].iter().enumerate().all(|(row, column)| *column == row as i32));
+        assert!(
+            prefix[..12]
+                .iter()
+                .enumerate()
+                .all(|(row, column)| *column == row as i32)
+        );
         // The modulation index of the first text row is `3 * video_group + text`.
         let indices = decode_i32(&out[1]);
         assert_eq!(indices[0], 1);
@@ -636,7 +652,9 @@ mod tests {
         let tables = rule.state_tables(&layout).unwrap();
         let mut out: Vec<Vec<u8>> = tables
             .iter()
-            .map(|table| vec![0_u8; table.shape.numel() as usize * table.dtype.bytes().unwrap() as usize])
+            .map(|table| {
+                vec![0_u8; table.shape.numel() as usize * table.dtype.bytes().unwrap() as usize]
+            })
             .collect();
         let refused = rule.prepare_state(&request, 129, &layout, &mut out);
         assert!(refused.is_err());

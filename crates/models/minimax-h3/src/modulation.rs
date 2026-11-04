@@ -32,9 +32,9 @@
 //! executor's per-request `modulation_indices` table holds that value for every packed row, and the
 //! layers of [`crate::transformer`] index with it.
 
+use nn::Shape;
 use nn::layers::gather_rows;
 use nn::weights::{Weight, WeightLoader, WeightRequest};
-use nn::Shape;
 use nn::{Forward, TensorView};
 
 use crate::{Error, Result};
@@ -198,7 +198,10 @@ impl AdaLnCache {
 
     /// Elements one layer's gathered modulation holds.
     pub fn layer_elements(&self) -> u64 {
-        u64::from(self.groups.count()) * u64::from(self.hidden_size) * VECTORS as u64 * u64::from(TAGS)
+        u64::from(self.groups.count())
+            * u64::from(self.hidden_size)
+            * VECTORS as u64
+            * u64::from(TAGS)
     }
 
     /// Elements the gathered final modulation holds.
@@ -214,7 +217,6 @@ impl AdaLnCache {
     }
 }
 
-
 /// The distinct noise levels the cache holds and the entry each step's group reads.
 ///
 /// The cache is indexed by *value*, not by step: the generated video and audio have their own
@@ -226,11 +228,7 @@ impl AdaLnCache {
 ///
 /// The result is `(times, entries)`: one FP32 network time per entry, and one entry index per
 /// `(step, group)` in step-major order, ready to be published as the `[steps, groups]` table.
-pub fn entries(
-    video: &[f32],
-    audio: &[f32],
-    groups: Groups,
-) -> Result<(Vec<f32>, Vec<i32>)> {
+pub fn entries(video: &[f32], audio: &[f32], groups: Groups) -> Result<(Vec<f32>, Vec<i32>)> {
     if video.is_empty() || video.len() != audio.len() {
         return Err(Error::checkpoint(format!(
             "{} video and {} audio noise levels are not one schedule's",
@@ -251,7 +249,10 @@ pub fn entries(
             levels.push(1.0);
         }
         for level in levels {
-            let position = match times.iter().position(|other| other.to_bits() == level.to_bits()) {
+            let position = match times
+                .iter()
+                .position(|other| other.to_bits() == level.to_bits())
+            {
                 Some(position) => position,
                 None => {
                     times.push(level);
@@ -265,7 +266,6 @@ pub fn entries(
     }
     Ok((times, table))
 }
-
 
 /// The checkpoint projections the cache is built from, read once at load.
 ///
@@ -302,18 +302,37 @@ impl Projections {
             .map(|index| {
                 let prefix = format!("transformer_blocks.{index}.adaln_proj.linear");
                 Ok((
-                    matrix(loader, &format!("{prefix}.weight"), VECTORS as u64 * hidden * u64::from(TAGS), time_dim)?,
-                    vector(loader, &format!("{prefix}.bias"), VECTORS as u64 * hidden * u64::from(TAGS))?,
+                    matrix(
+                        loader,
+                        &format!("{prefix}.weight"),
+                        VECTORS as u64 * hidden * u64::from(TAGS),
+                        time_dim,
+                    )?,
+                    vector(
+                        loader,
+                        &format!("{prefix}.bias"),
+                        VECTORS as u64 * hidden * u64::from(TAGS),
+                    )?,
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             first: (
-                matrix(loader, "time_embedder.linear_1.weight", time_hidden, frequency)?,
+                matrix(
+                    loader,
+                    "time_embedder.linear_1.weight",
+                    time_hidden,
+                    frequency,
+                )?,
                 vector(loader, "time_embedder.linear_1.bias", time_hidden)?,
             ),
             second: (
-                matrix(loader, "time_embedder.linear_2.weight", time_dim, time_hidden)?,
+                matrix(
+                    loader,
+                    "time_embedder.linear_2.weight",
+                    time_dim,
+                    time_hidden,
+                )?,
                 vector(loader, "time_embedder.linear_2.bias", time_dim)?,
             ),
             layers,
@@ -369,12 +388,7 @@ impl Projections {
 }
 
 /// A `[rows, columns]` checkpoint weight.
-fn matrix(
-    loader: &mut WeightLoader<'_>,
-    name: &str,
-    rows: u64,
-    columns: u64,
-) -> Result<Weight> {
+fn matrix(loader: &mut WeightLoader<'_>, name: &str, rows: u64, columns: u64) -> Result<Weight> {
     Ok(loader.load(&WeightRequest::region(
         name,
         0,
@@ -404,7 +418,6 @@ mod tests {
         assert_eq!(VECTORS, 6);
         assert_eq!(Groups::Conditioned.count() * TAGS, 12);
     }
-
 
     #[test]
     fn the_entries_are_the_distinct_noise_levels() {

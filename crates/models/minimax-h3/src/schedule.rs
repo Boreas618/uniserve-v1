@@ -201,7 +201,11 @@ impl Schedule {
                 "H3 parallel-decoding block {block} is outside the schedule's {blocks} blocks"
             )));
         }
-        let weights = block_increments(*intervals, f64::from(*max_t), f64::from(self.shift(modality)));
+        let weights = block_increments(
+            *intervals,
+            f64::from(*max_t),
+            f64::from(self.shift(modality)),
+        );
         let start = nodes[block as usize] as usize;
         let end = nodes[block as usize + 1] as usize;
         let total: f64 = weights[start..end].iter().sum();
@@ -245,7 +249,9 @@ fn deduplicate(values: Vec<f32>) -> Vec<f32> {
 /// `linspace(start, end, count)` in FP64: `start + i · (end - start) / (count - 1)`.
 fn linspace(start: f64, end: f64, count: usize) -> Vec<f64> {
     let step = (end - start) / (count - 1) as f64;
-    (0..count).map(|index| start + index as f64 * step).collect()
+    (0..count)
+        .map(|index| start + index as f64 * step)
+        .collect()
 }
 
 /// The released uniform grid's sigma points for one modality.
@@ -441,8 +447,12 @@ mod tests {
         assert_eq!(schedule.num_steps().expect("aligned modalities"), 8);
         // The shift's fixed point is max_t, so the first node is the same level for both
         // modalities.
-        let video = schedule.start_sigma(Modality::Video).expect("a start level");
-        let audio = schedule.start_sigma(Modality::Audio).expect("a start level");
+        let video = schedule
+            .start_sigma(Modality::Video)
+            .expect("a start level");
+        let audio = schedule
+            .start_sigma(Modality::Audio)
+            .expect("a start level");
         assert!((video - 0.999).abs() < 1e-6);
         assert!((audio - 0.999).abs() < 1e-6);
     }

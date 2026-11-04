@@ -101,12 +101,7 @@ impl RefinerBlock {
             2 * ffn,
             hidden,
         )?;
-        let down = projection(
-            loader,
-            &format!("{prefix}.ff.net.2.weight"),
-            hidden,
-            ffn,
-        )?;
+        let down = projection(loader, &format!("{prefix}.ff.net.2.weight"), hidden, ffn)?;
 
         let local_heads = partition.denoiser_heads(config.num_attention_heads);
         let attention = Attention::dense(
@@ -122,8 +117,18 @@ impl RefinerBlock {
         Ok(Self {
             dtype: query_dtype,
             intermediate_size: config.intermediate_size,
-            norm1: norm(loader, &format!("{prefix}.norm1.weight"), hidden, config.norm_eps)?,
-            norm2: norm(loader, &format!("{prefix}.norm2.weight"), hidden, config.norm_eps)?,
+            norm1: norm(
+                loader,
+                &format!("{prefix}.norm1.weight"),
+                hidden,
+                config.norm_eps,
+            )?,
+            norm2: norm(
+                loader,
+                &format!("{prefix}.norm2.weight"),
+                hidden,
+                config.norm_eps,
+            )?,
             query_norm: norm(
                 loader,
                 &format!("{prefix}.attn.norm_q.weight"),
@@ -172,8 +177,7 @@ impl RefinerBlock {
         self.query.forward(f, rows.normed, rows.query)?;
         self.key.forward(f, rows.normed, rows.key)?;
         self.value.forward(f, rows.normed, rows.value)?;
-        self.query_norm
-            .forward(f, rows.query, rows.query_normed)?;
+        self.query_norm.forward(f, rows.query, rows.query_normed)?;
         self.key_norm.forward(f, rows.key, rows.key_normed)?;
 
         let (query, key, value) = self.exchange(f, &rows)?;
@@ -209,11 +213,7 @@ impl RefinerBlock {
         rows: &'a Rows,
     ) -> Result<(TensorView, TensorView, TensorView)> {
         match &self.exchange {
-            None => Ok((
-                rows.query_normed,
-                rows.key_normed,
-                rows.value,
-            )),
+            None => Ok((rows.query_normed, rows.key_normed, rows.value)),
             Some(exchange) => {
                 exchange.scatter(f, rows.query_normed, rows.exchanged_query)?;
                 exchange.scatter(f, rows.key_normed, rows.exchanged_key)?;
@@ -321,9 +321,10 @@ impl TokenRefiner {
         }
         // The whole refined document is the chain of blocks over a working buffer; the input
         // projection is the same dtype as the features it reads.
-        let working = f
-            .arena()
-            .tensor(features.dtype, Shape::new(&[u64::from(local_rows), u64::from(self.hidden_size)]))?;
+        let working = f.arena().tensor(
+            features.dtype,
+            Shape::new(&[u64::from(local_rows), u64::from(self.hidden_size)]),
+        )?;
         self.input.forward(f, features, working)?;
         for block in &self.blocks {
             block.forward(f, working, visible, total_rows)?;
@@ -353,7 +354,12 @@ struct Rows {
 }
 
 impl Rows {
-    fn reserve(block: &RefinerBlock, f: &Forward, local_rows: u32, total_rows: u32) -> Result<Self> {
+    fn reserve(
+        block: &RefinerBlock,
+        f: &Forward,
+        local_rows: u32,
+        total_rows: u32,
+    ) -> Result<Self> {
         let dtype = block.dtype;
         let hidden = u64::from(block.hidden_size);
         let head = u64::from(block.head_dim);
@@ -401,17 +407,17 @@ fn exchange(partition: &Partition) -> Option<UlyssesExchange> {
 /// The identity residual: every channel's update added unchanged.
 fn identity(loader: &mut WeightLoader<'_>) -> Result<ScaledResidual> {
     let one = 1.0f32.to_le_bytes();
-    let scale = loader.constant("refiner.identity_scale", nn::DType::F32, Shape::new(&[1]), &one)?;
+    let scale = loader.constant(
+        "refiner.identity_scale",
+        nn::DType::F32,
+        Shape::new(&[1]),
+        &one,
+    )?;
     Ok(ScaledResidual::new(scale, None)?)
 }
 
 /// A `[rows, columns]` weight of the checkpoint.
-fn matrix(
-    loader: &mut WeightLoader<'_>,
-    name: &str,
-    rows: u64,
-    columns: u64,
-) -> Result<Weight> {
+fn matrix(loader: &mut WeightLoader<'_>, name: &str, rows: u64, columns: u64) -> Result<Weight> {
     Ok(loader.load(&WeightRequest::region(
         name,
         0,

@@ -212,14 +212,20 @@ impl Dense {
     fn rotate(&self, f: &Forward, factors: Factors, scratch: &Scratch) -> Result<()> {
         Ok(self.rotary.apply(
             f,
-            scratch.query.reshape(heads(self.local_heads, self.head_dim)),
+            scratch
+                .query
+                .reshape(heads(self.local_heads, self.head_dim)),
             scratch.key.reshape(heads(self.local_heads, self.head_dim)),
             Some(self.query_gain.view()),
             Some(self.key_gain.view()),
             factors.cosine,
             factors.sine,
-            scratch.rotated_query.reshape(heads(self.local_heads, self.head_dim)),
-            scratch.rotated_key.reshape(heads(self.local_heads, self.head_dim)),
+            scratch
+                .rotated_query
+                .reshape(heads(self.local_heads, self.head_dim)),
+            scratch
+                .rotated_key
+                .reshape(heads(self.local_heads, self.head_dim)),
         )?)
     }
 }
@@ -239,7 +245,12 @@ struct Scratch {
 }
 
 impl Scratch {
-    fn reserve(layer: &Dense, f: &Forward, normalized: TensorView, total_rows: u32) -> Result<Self> {
+    fn reserve(
+        layer: &Dense,
+        f: &Forward,
+        normalized: TensorView,
+        total_rows: u32,
+    ) -> Result<Self> {
         let dtype = normalized.dtype;
         let rows = normalized.shape.dim(0);
         let inner = u64::from(layer.heads) * u64::from(layer.head_dim);
@@ -301,7 +312,11 @@ fn projection(
     rows: u64,
     columns: u64,
 ) -> Result<Linear> {
-    let weight = loader.load(&WeightRequest::region(name, 0, Shape::new(&[rows, columns])))?;
+    let weight = loader.load(&WeightRequest::region(
+        name,
+        0,
+        Shape::new(&[rows, columns]),
+    ))?;
     Ok(Linear::new(weight, None, WeightOrder::NxK)?)
 }
 
