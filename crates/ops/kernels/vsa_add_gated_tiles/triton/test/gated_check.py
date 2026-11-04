@@ -159,6 +159,20 @@ def main():
         help="the package directory holding src/vsa_add_gated_tiles.py",
     )
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--row-stride",
+        type=int,
+        default=0,
+        help="override the first case's row stride; 0 keeps the case's own. A stride wider than "
+        "heads · width is a layout that is not the identity, which a tile walk assuming "
+        "contiguity fails",
+    )
+    parser.add_argument(
+        "--tile-stride",
+        type=int,
+        default=0,
+        help="override the first case's tile stride; 0 keeps the case's own",
+    )
     options = parser.parse_args()
     if options.device != "cuda" or not torch.cuda.is_available():
         raise SystemExit(
@@ -168,7 +182,14 @@ def main():
 
     module = load_kernel(options.package)
     checked = 0
-    checked += run(module, dtype="bf16", rows=128, heads=4, width=64, tile=64, block=16)
+    row_stride = options.row_stride or None
+    tile_stride = options.tile_stride or None
+    if row_stride is not None and row_stride == 4 * 64:
+        raise SystemExit("a row stride equal to heads · width is the identity layout; pass a wider one")
+    checked += run(
+        module, dtype="bf16", rows=128, heads=4, width=64, tile=64, block=16,
+        row_stride=row_stride, tile_stride=tile_stride,
+    )
     checked += run(
         module, dtype="bf16", rows=128, heads=4, width=64, tile=64, block=16, contraction_trap=True
     )

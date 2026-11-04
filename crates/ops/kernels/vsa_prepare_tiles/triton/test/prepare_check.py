@@ -231,11 +231,20 @@ def compare(what, mine, theirs):
     )
 
 
-def check_fixture_geometry(module, reference, device):
-    """The fixture's cell against the tree's kernel, on a strided buffer."""
+def check_fixture_geometry(module, reference, device, row_stride=1200):
+    """The fixture's cell against the tree's kernel, on a strided buffer.
+
+    `row_stride` must be wider than `heads · width` for the case to be about strides at all: a tile
+    walk that assumed contiguity passes every identity case.
+    """
+    if row_stride <= 8 * 128:
+        raise SystemExit(
+            f"a row stride of {row_stride} is not wider than heads · width (1024), so this case "
+            f"would not exercise the strides the descriptor carries"
+        )
     case = Case(
         device=device, dtype="f16", rows=128, heads=8, width=128, rotated=96, tile=64, block=16,
-        norm=True, sizes=[64, 37], row_stride=1200,
+        norm=True, sizes=[64, 37], row_stride=row_stride,
     )
     mine_buffers, their_buffers = clone(case), clone(case)
     mine = launch(module._prepare_tiles_kernel, case, mine_buffers)
@@ -334,6 +343,24 @@ def check_empty_tile(module, reference, device):
     return 3 * mine[0].numel()
 
 
+def check_small_valid(module, reference, device, row_stride=1200):
+    """A tile whose valid size is smaller than one row block: the masked tail inside a block."""
+    case = Case(
+        device=device, dtype="f16", rows=64, heads=2, width=128, rotated=96, tile=64, block=16,
+        norm=True, sizes=[5], row_stride=row_stride,
+    )
+    mine_buffers, their_buffers = clone(case), clone(case)
+    mine = launch(module._prepare_tiles_kernel, case, mine_buffers)
+    theirs = launch(reference, case, their_buffers)
+    for name, a, b in zip(("query", "key", "value"), mine, theirs):
+        compare(f"the pooled {name} of a tile with 5 valid rows", a, b)
+    # The mean divides by the valid size, not by the tile's row count.
+    sizes = torch.tensor(case.sizes, dtype=torch.int32, device=device)
+    expected = pool(case.rows_view(mine_buffers["query"]), sizes, case.tile)
+    compare("the pooled query of a tile with 5 valid rows", mine[0], expected)
+    return 3 * mine[0].numel()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -343,6 +370,13 @@ def main():
         help="the package directory holding src/vsa_prepare_tiles.py",
     )
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--row-stride",
+        type=int,
+        default=1200,
+        help="the query/key/value row stride of the fixture case; the fixture's own is 7168, and "
+        "any value wider than heads · width is a stride set that is not the identity",
+    )
     options = parser.parse_args()
 
     device = torch.device(options.device)
@@ -356,7 +390,8 @@ def main():
     reference = reference_kernel()
 
     checked = 0
-    checked += check_fixture_geometry(module, reference, device)
+    checked += check_fixture_geometry(module, reference, device, options.row_stride)
+    checked += check_small_valid(module, reference, device, options.row_stride)
     checked += check_pass_through(module, reference, device)
     checked += check_no_norm(module, reference, device)
     checked += check_empty_tile(module, reference, device)

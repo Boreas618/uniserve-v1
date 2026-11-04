@@ -48,11 +48,16 @@ def stored(element, exact):
     comparison exact instead of leaving a two-ulp allowance, which would judge the interpreter
     rather than the kernel.
     """
-    rounded = exact.to(torch.float32)
+    exact = exact.to(torch.float64)
     if element is torch.bfloat16:
-        truncated = rounded.contiguous().view(torch.int32) & -65536
-        return truncated.view(torch.float32).to(torch.bfloat16)
-    return rounded.to(element)
+        # Clear the low 45 bits of the **FP64** mantissa — BF16 keeps seven explicit ones of the
+        # fifty-two — and never a narrower type in between: rounding to FP32 first carries a value
+        # sitting just below a BF16 boundary up onto it, which puts the reference one ulp above a
+        # correct kernel. The cast that follows is exact, because the value already sits on the
+        # BF16 grid.
+        truncated = exact.contiguous().view(torch.int64) & -(1 << 45)
+        return truncated.view(torch.float64).to(torch.bfloat16)
+    return exact.to(element)
 
 
 def load_kernel(package):
