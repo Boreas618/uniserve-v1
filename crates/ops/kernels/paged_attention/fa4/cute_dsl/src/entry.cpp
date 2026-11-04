@@ -50,8 +50,29 @@ extern "C" int32_t uniserve_paged_attention(const uniserve_paged_attention_call*
     return refuse(const_cast<uniserve_paged_attention_call*>(call), message);
   };
 
+  // The compiled pass is one geometry: its element type, head width, page size,
+  // head counts, mask and key length are the descriptor's, so a call of another
+  // geometry is refused here rather than run against tiles sized for it.
   if (call->phase != UNISERVE_PHASE_PREFILL) {
     return refuse_call("the fa4 module is compiled for whole-query prefill");
+  }
+  if (call->dtype_query != UNISERVE_FA4_DTYPE) {
+    return refuse_call("the fa4 module is compiled for another element type");
+  }
+  if (call->head_dim != UNISERVE_FA4_HEAD_DIM) {
+    return refuse_call("the fa4 module is compiled for another head width");
+  }
+  if (call->page_size != UNISERVE_FA4_PAGE) {
+    return refuse_call("the fa4 module is compiled for another page size");
+  }
+  if (call->q_heads != UNISERVE_FA4_Q_HEADS || call->kv_heads != UNISERVE_FA4_KV_HEADS) {
+    return refuse_call("the fa4 module is compiled for other head counts");
+  }
+  if ((call->causal != 0) != (UNISERVE_FA4_CAUSAL != 0)) {
+    return refuse_call("the fa4 module is compiled for the other mask");
+  }
+  if (call->max_kv_len > UNISERVE_FA4_MAX_KV_LEN) {
+    return refuse_call("the fa4 module is compiled for a shorter key cache");
   }
   if (call->dtype_query != call->dtype_key_value || call->dtype_query != call->dtype_output) {
     return refuse_call("the fa4 module serves one element type for query, cache and output");
