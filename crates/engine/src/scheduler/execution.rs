@@ -454,12 +454,11 @@ impl Scheduler {
 
     /// This step's room.
     ///
-    /// `views.rs` builds every fact; the two it cannot are open items of the
-    /// mechanism until the owning subsystem exposes them: the captured graph
-    /// tiers the build config states, and the pages an epoch's precopy claimed
-    /// (`warming::Warming::reserved`, which `views.rs` reads directly).
+    /// `views.rs` builds every fact but one: the captured graph tiers, which
+    /// the build config states (the spec's `cuda_graphs`).
     fn room(&self) -> Room {
-        let facts = views::room_facts(self, self.step);
+        let mut facts = views::room_facts(self, self.step);
+        facts.graph_tiers = self.config.graph_tiers.clone();
         views::room_view(facts)
     }
 

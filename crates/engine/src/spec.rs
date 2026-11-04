@@ -54,6 +54,9 @@ pub(crate) fn scheduler_limits(scheduling: &Scheduling) -> anyhow::Result<Schedu
         canvas: None,
         draft_tokens: 0,
         refill: refill_policy(scheduling),
+        // A `Configure` command states the scheduling limits, not the
+        // deployment's graph catalog.
+        graph_tiers: Vec::new(),
     })
 }
 
@@ -305,6 +308,17 @@ impl EngineConfig {
                 .chunked_prefill_size
                 .map_or(DEFAULT_CHUNKED_PREFILL_SIZE, |size| size as usize),
             refill: refill_policy(scheduling),
+            graph_tiers: {
+                // The deployment's captured graph catalog, ascending and
+                // without duplicates: the largest of them bounds a batch's
+                // tokens (`Room.graph_tiers`).
+                let mut tiers: Vec<u32> =
+                    sizes(&graphs.decode_batch_sizes).unwrap_or_default();
+                tiers.extend(sizes(&graphs.prefill_token_sizes).unwrap_or_default());
+                tiers.sort_unstable();
+                tiers.dedup();
+                tiers
+            },
             prefix_cache: kv_cache.prefix_caching,
             boundary_interval: kv_cache
                 .boundary_interval

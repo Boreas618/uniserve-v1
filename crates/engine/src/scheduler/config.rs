@@ -61,7 +61,7 @@ impl RefillPolicy {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 /// Sequence, token, and queue limits for scheduling.
 pub struct SchedulerConfig {
     /// Waiting-queue ordering policy.
@@ -92,6 +92,16 @@ pub struct SchedulerConfig {
     pub draft_tokens: usize,
     /// When a request whose draft cache is missing has it refilled.
     pub refill: RefillPolicy,
+    /// The captured graph sizes the deployment states, in tokens (the spec's
+    /// `cuda_graphs` decode batch sizes and prefill token sizes), ascending and
+    /// without duplicates: `Room.graph_tiers`, the bound a plan's batch must
+    /// fit.
+    ///
+    /// Empty when the spec states none, and on a reconfigure, which carries no
+    /// graph catalog: a worker then runs its own captured catalog or eagerly,
+    /// and the tier bound is honest but vacuous. The worker echoing the graph
+    /// sizes it actually launched is the open item that closes it.
+    pub graph_tiers: Vec<u32>,
 }
 
 impl Default for SchedulerConfig {
@@ -106,6 +116,7 @@ impl Default for SchedulerConfig {
             canvas: None,
             draft_tokens: 0,
             refill: RefillPolicy::default(),
+            graph_tiers: Vec::new(),
         }
     }
 }
