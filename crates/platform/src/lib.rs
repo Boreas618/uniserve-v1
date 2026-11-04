@@ -27,6 +27,7 @@
 //! Releasing storage never synchronizes on the dropping thread; see
 //! [`reclaim`].
 
+mod allocator;
 mod context;
 mod copy;
 mod cublas;
@@ -50,6 +51,7 @@ mod stream;
 mod tensormap;
 mod vmm;
 
+pub use allocator::{Allocator, Budget, Buffer, PoolKind};
 pub use context::{DeviceGuard, PrimaryContext};
 pub use copy::{
     CopyBatch, Pitched, PitchedBatch, SourceOrder, Strided, StridedCopy, memcpy_async,

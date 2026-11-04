@@ -20,7 +20,7 @@ use platform::{
     memset_2d_d8, memset_d8, memset_d32, reclaim,
 };
 
-const DEVICE: DeviceId = DeviceId(0);
+pub(crate) const DEVICE: DeviceId = DeviceId(0);
 
 /// Serializes the tests of this binary.
 ///
@@ -32,11 +32,11 @@ const DEVICE: DeviceId = DeviceId(0);
 /// test may use the driver meanwhile, so every test takes this lock first.
 static DRIVER: Mutex<()> = Mutex::new(());
 
-fn exclusive_driver() -> MutexGuard<'static, ()> {
+pub(crate) fn exclusive_driver() -> MutexGuard<'static, ()> {
     DRIVER.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn read(buffer: &PinnedBuffer) -> Vec<u8> {
+pub(crate) fn read(buffer: &PinnedBuffer) -> Vec<u8> {
     // SAFETY: callers synchronize the stream that wrote the buffer first.
     unsafe { buffer.as_slice() }.to_vec()
 }
