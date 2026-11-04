@@ -12,14 +12,15 @@ The codec calls go through one C shim (`src/ffi/shim.c`) over FFmpeg 8.1.2's
 headers. The crate builds against a **shared** FFmpeg 8.1.2 that has libx264:
 the environment's installation at `/opt/uv/ffmpeg-8.1.2` is static and was
 configured without external libraries, so it has no H.264 encoder. The
-runtime the crate links is provisioned by `artifacts/native/build.sh` in this
-worktree, which builds libx264 and then FFmpeg 8.1.2
-(`--enable-shared --enable-libx264 --enable-version3`) from the environment's
-FFmpeg source into `artifacts/native/prefix`. That directory is git-ignored;
-rebuild it with:
+runtime the crate links is provisioned by the committed script
+`crates/media/native/build.sh`, which builds libx264 (pinned by SHA-256) and
+then FFmpeg 8.1.2 (`--enable-shared --enable-libx264 --enable-version3`) from
+the environment's FFmpeg source into `artifacts/native/prefix`. That directory
+is git-ignored; rebuild it with:
 
 ```sh
-artifacts/native/build.sh
+crates/media/native/build.sh            # into artifacts/native/prefix
+crates/media/native/build.sh /some/prefix
 ```
 
 The build script finds the runtime in `UNISERVE_FFMPEG_DIR` when set, and in
