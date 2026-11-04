@@ -1148,10 +1148,11 @@ fn check_table(table: &[Source], bound: &[String]) -> Result<()> {
 }
 
 impl Decoder for AudioDecoder {
-    fn layout_tables(&self, _layout: &nn::capability::Layout) -> Vec<StateTable> {
+    fn layout_tables(&self, _layout: &nn::capability::Layout) -> nn::Result<Vec<StateTable>> {
         // Every table this decoder reads is a weight, bound at load: nothing follows from the
-        // layout, so the runner uploads nothing for it.
-        Vec::new()
+        // layout, so the runner uploads nothing for it. `Ok` of nothing for every layout is the
+        // correct answer, and different from a failure to answer.
+        Ok(Vec::new())
     }
 
     fn prepare_layout(

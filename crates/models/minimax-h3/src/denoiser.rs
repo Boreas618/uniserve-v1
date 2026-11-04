@@ -1505,10 +1505,10 @@ impl nn::capability::Denoiser for Denoiser {
         Denoiser::prepare_constants(self, f, out).map_err(flattened)
     }
 
-    fn layout_tables(&self, _layout: &Layout) -> Vec<StateTable> {
+    fn layout_tables(&self, _layout: &Layout) -> nn::Result<Vec<StateTable>> {
         // Every table this denoiser reads is a request's: the layout's are its packing's, which the
         // model derives rather than stores.
-        Vec::new()
+        Ok(Vec::new())
     }
 
     fn prepare_layout(&self, _layout: &Layout, out: &mut [Vec<u8>]) -> nn::Result<()> {
