@@ -191,6 +191,33 @@ impl Executor {
             named.runner.attach_counters(Arc::clone(&counters));
             named.runner.attach_uncompared(Arc::clone(&uncompared));
         }
+        // What the next generation captures and what it is planned in, stated before the first
+        // capture rather than discovered by paying for it: the first generation of an epoch has no
+        // serving generation to compare against, so every bucket is captured and every operator of
+        // it is new. The figures are the count and the pool's reservation, and the two are not
+        // summed with each other: a stream's buckets share one mapped range and the pool maps the
+        // largest of them, so a capture too large for the pool is one bucket's extent past the
+        // reservation - refused by name at that bucket, before it writes past the range.
+        let captures: Vec<crate::plan::Bucket> = runners
+            .iter()
+            .flat_map(|named| named.runner.capture_plan())
+            .collect();
+        if !captures.is_empty() {
+            let reservation = pools
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .reserved();
+            let widest = captures.iter().max_by_key(|bucket| bucket.tokens);
+            tracing::info!(
+                device = device.0,
+                captures = captures.len(),
+                streams = 1,
+                graph_reservation = reservation,
+                widest = widest.map(|bucket| bucket.to_string()).unwrap_or_default(),
+                "the next generation captures one graph per bucket, largest first, and the pool \
+                 reserves its activations as one range shared by every bucket of a stream"
+            );
+        }
         let queue = JobQueue::new(device, Arc::clone(&events));
         let state = Device {
             device,

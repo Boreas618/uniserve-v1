@@ -2119,7 +2119,7 @@ impl MainProcess {
             tracing::warn!(
                 generation,
                 stage = entered,
-                waiting_on = %pending_work(&precopy.stage, &self.executors),
+                waiting_on = %pending_work(&precopy.stage, &self.executors, &precopy.policies),
                 waited_s = precopy.since.elapsed().as_secs(),
                 "the precopy has stood in this stage past the watchdog's stall bound and nothing \
                  has answered: the Program Server, a device or a scheduler is the one to look at"
@@ -2128,7 +2128,7 @@ impl MainProcess {
         // What the stage was waiting on, read before the stage is taken out: a bound that named
         // `no stage` because the driver had already replaced it would say nothing at all, which is
         // the opposite of what the line is for.
-        let pending = pending_work(&precopy.stage, &self.executors);
+        let pending = pending_work(&precopy.stage, &self.executors, &precopy.policies);
         let stage = std::mem::replace(&mut precopy.stage, PrecopyStage::Done);
 
         match stage {
@@ -4370,41 +4370,70 @@ enum StageFailure {
 /// lane holds one task per device, the executor stage one submission per device, and the shadow
 /// stage one step per scheduler. The stall line prints the counts so a run names the wait that
 /// never answered without a second run built for the purpose.
-fn pending_work(stage: &PrecopyStage, executors: &[Arc<Executor>]) -> String {
+/// What a device stage is waiting on: each unanswered device's own account, and each scheduler's
+/// answer to the policy it was asked to build.
+///
+/// The two waits live in one stage, and a report that names only the devices says "the device thread
+/// is the one to look at" while the device has answered and a policy build is what never came back -
+/// which is a wrong name, worse than none. The policy figure is stated first for that reason: it is
+/// the wait the devices' own account cannot show.
+fn device_work(
+    submissions: &[Submission],
+    executors: &[Arc<Executor>],
+    policies: &[crossbeam_channel::Receiver<std::result::Result<(), String>>],
+) -> String {
+    // The label alone says which stage stood; the device thread's own account says whether it is
+    // working (a capture in progress, a bucket being recaptured) or waiting on something outside it.
+    // A capture is open or it is not, and the two look identical from the control thread without it.
+    let mut pending = Vec::new();
+    for (rank, submission) in submissions.iter().enumerate() {
+        if submission.outcome().is_some() {
+            continue;
+        }
+        let Some(executor) = executors.get(rank) else {
+            pending.push(format!("rank {rank}: no executor"));
+            continue;
+        };
+        let performing = executor
+            .performing()
+            .unwrap_or_else(|| "nothing".to_owned());
+        pending.push(format!(
+            "rank {rank}: {performing}, {} open capture(s)",
+            executor.capturing()
+        ));
+    }
+    let answered = submissions.len() - pending.len();
+    let devices = format!(
+        "{answered} of {} device preparation(s) answered ({})",
+        submissions.len(),
+        pending.join("; ")
+    );
+    let policies: String = if policies.is_empty() {
+        "no policy build was asked for".to_owned()
+    } else {
+        let answered = policies
+            .iter()
+            .filter(|answer| !answer.is_empty())
+            .count();
+        format!(
+            "{answered} of {} policy build(s) answered",
+            policies.len()
+        )
+    };
+    format!("{devices}; {policies}")
+}
+
+fn pending_work(
+    stage: &PrecopyStage,
+    executors: &[Arc<Executor>],
+    policies: &[crossbeam_channel::Receiver<std::result::Result<(), String>>],
+) -> String {
     match stage {
         PrecopyStage::Modules(tasks) => {
             let answered = tasks.iter().filter(|task| task.outcome().is_some()).count();
             format!("{answered} of {} kernel load(s) answered", tasks.len())
         }
-        PrecopyStage::Executors(submissions) => {
-            // The label alone says which stage stood; the device thread's own account says whether
-            // it is working (a capture in progress, a bucket being recaptured) or waiting on
-            // something outside it. A capture is open or it is not, and the two look identical
-            // from the control thread without this.
-            let mut pending = Vec::new();
-            for (rank, submission) in submissions.iter().enumerate() {
-                if submission.outcome().is_some() {
-                    continue;
-                }
-                let Some(executor) = executors.get(rank) else {
-                    pending.push(format!("rank {rank}: no executor"));
-                    continue;
-                };
-                let performing = executor
-                    .performing()
-                    .unwrap_or_else(|| "nothing".to_owned());
-                pending.push(format!(
-                    "rank {rank}: {performing}, {} open capture(s)",
-                    executor.capturing()
-                ));
-            }
-            format!(
-                "{} of {} device preparation(s) answered ({})",
-                submissions.len() - pending.len(),
-                submissions.len(),
-                pending.join("; ")
-            )
-        }
+        PrecopyStage::Executors(submissions) => device_work(submissions, executors, policies),
         PrecopyStage::Shadow(answers) => {
             let answered = answers.iter().filter(|answer| !answer.is_empty()).count();
             format!("{answered} of {} shadow step(s) answered", answers.len())
