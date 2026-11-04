@@ -1,0 +1,23 @@
+# The `fixture` policy package: the program layer's delivery test publishes and
+# precompiles it, and the mechanism instantiates it like any policy (design
+# §4.4, §5.2, §5.3). It fills the scheduling policy with the arrival-order body.
+op = "scheduling"
+backend = "fcfs"
+
+[toolchain]
+kind = "wasm"
+version = "50.0.1"
+packages = []
+
+[module]
+form = "wasm"
+
+[source]
+kind = "wasm"
+files = ["Cargo.toml", "src/lib.rs"]
+
+[parameters]
+chunked_prefill_size = 8192
+max_batch = 128
+max_num_batched_tokens = 8192
+prefetch_min_tokens = 256

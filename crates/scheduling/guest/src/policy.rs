@@ -10,10 +10,14 @@ use crate::view::{
     CallView, ExpertLoad, ExpertOrder, RankView, ReplicaView, RequestView, Snapshot,
 };
 
-/// What the mechanism hands a policy at instantiation: the policy program's
-/// arguments (design §5.1) and the state of everything already running.
+/// The message the mechanism hands a policy module at instantiation: the
+/// program's arguments (design §5.1) and the state of everything already
+/// running.
+///
+/// The arguments construct the policy ([`From<Parameters>`]); the state is what
+/// [`Policy::init`] receives, exactly as design §4.4 writes that method.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct Init {
+pub struct Instantiation {
     /// The program's arguments, from the deployment configuration.
     #[serde(default)]
     pub parameters: Parameters,
@@ -33,8 +37,14 @@ pub struct Init {
 /// policy's only way to fail.
 pub trait Policy {
     /// Called once at instantiation with the whole current state, so a policy
-    /// put in mid-flight knows everything that already exists.
-    fn init(&mut self, init: &Init);
+    /// put in mid-flight knows everything that already exists (design §4.4:
+    /// `fn init(&mut self, state: &Snapshot)`).
+    ///
+    /// The program's arguments reach the policy before this call: a module is
+    /// constructed from its [`Parameters`] (`From<Parameters>`), then
+    /// initialized with the state. The arguments are part of the program
+    /// (§5.1), so they are not a second state argument here.
+    fn init(&mut self, state: &Snapshot);
 
     /// Once per step: every event since the previous step, in order.
     fn observe(&mut self, events: &[Event]);

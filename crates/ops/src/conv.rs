@@ -392,6 +392,8 @@ impl Op for Conv1d {
     }
 
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
+        // A non-transposed convolution: each output sums exactly `kernel` taps of its input channel
+        // in FP32 — the stride changes which taps, not how many — rounded once into the output.
         Tolerance::dot(
             u64::from(descriptor.geometry.kernel[0]),
             DType::F32,
