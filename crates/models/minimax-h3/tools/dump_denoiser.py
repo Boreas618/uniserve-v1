@@ -558,9 +558,13 @@ def run_stack_out(stack: Path, checkpoint: Path, out: Path) -> int:
     print(f"got     {tuple(output.shape)} {output.dtype}")
     dump(out, "stack_out", output)
     print(f"wrote   {out / 'denoiser' / 'stack_out.h3t'}")
+    # The comparator recurses and keys each tensor by its path relative to the root it was given,
+    # so the two outer directories are passed: every name then keeps its block prefix, and a file
+    # present on one side only is listed rather than counted as a difference.
+    candidate = stack.parent if stack.name == "denoiser" else stack
     print(
-        f"compare cargo run -p minimax-h3 --example compare_blocks -- --reference "
-        f"{out / 'denoiser'} --candidate {stack} --out {out / 'denoiser' / 'report.md'}"
+        f"compare cargo run -p minimax-h3 --example compare_blocks -- --reference {out} "
+        f"--candidate {candidate} --out {out / 'report.md'}"
     )
     return 0
 
