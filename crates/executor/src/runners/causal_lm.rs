@@ -177,6 +177,11 @@ impl Staging {
             .logits_rows
             .extend_from_slice(&columns.rows.logits_rows);
         self.rows.calls.extend_from_slice(&columns.rows.calls);
+        if self.rows.calls.is_empty() || rows > bucket_rows || calls > bucket_rows {
+            return Err(Error::Invariant(format!(
+                "the batch has {rows} rows in {calls} calls and does not fit {bucket_rows} rows"
+            )));
+        }
 
         // Row columns: the mechanism's rows, then rows that sample nothing and commit nothing.
         self.slots[..rows].copy_from_slice(&columns.slots[..rows]);
@@ -198,23 +203,31 @@ impl Staging {
             self.rows.logits_rows[index] = -1;
         }
 
-        // Padding tokens belong to the last call's token range, and padding rows are appended
-        // after it, each evaluating the padding token that follows.
-        let mut cursor = tokens;
-        if let Some(last) = self.rows.calls.last_mut() {
-            if tokens < bucket_tokens {
-                last.rows.end = bucket_tokens as u32;
-                cursor = bucket_tokens;
-            }
+        // Padding tokens belong to the last row the batch staged - a row's token extent is the gap
+        // between its two `query_offsets` entries - and every row the bucket holds beyond the
+        // batch's own is a call of its own that owns that row and no token. A call's `rows` names
+        // rows of the batch's device columns and not tokens, so padding never widens a call's range
+        // past the row axis: a prefilling bucket has four rows and sixty-four tokens.
+        self.rows.query_offsets.truncate(rows + 1);
+        if tokens < bucket_tokens {
+            *self
+                .rows
+                .query_offsets
+                .last_mut()
+                .expect("a batch states its rows' offsets") = bucket_tokens as i32;
         }
-        while self.rows.calls.len() < bucket_rows {
-            let start = cursor as u32;
-            let end = if bucket.variant.is_decode() && cursor < bucket_tokens {
-                cursor += 1;
-                cursor as u32
-            } else {
-                start
-            };
+        while self.rows.query_offsets.len() <= bucket_rows {
+            let end = *self
+                .rows
+                .query_offsets
+                .last()
+                .expect("a batch states its rows' offsets");
+            self.rows.query_offsets.push(end);
+        }
+        let mut owned = self.rows.calls.last().map(|call| call.rows.end).unwrap_or(0);
+        while (owned as usize) < bucket_rows {
+            let start = owned;
+            owned += 1;
             self.rows.calls.push(nn::BatchRow {
                 request: 0,
                 kind: if bucket.variant.is_decode() {
@@ -223,13 +236,8 @@ impl Staging {
                     nn::RowKind::Prefill
                 },
                 cache_group: 0,
-                rows: start..end,
+                rows: start..owned,
             });
-        }
-        if self.rows.calls.is_empty() || calls > bucket_rows {
-            return Err(Error::Invariant(format!(
-                "the batch has {calls} calls and does not fit {bucket_rows} rows"
-            )));
         }
 
         // The commit table states one row per call. Its padded rows are inert rows by the
@@ -2359,7 +2367,7 @@ mod tests {
                     request: 0,
                     kind: nn::RowKind::Prefill,
                     cache_group: 0,
-                    rows: 0..3,
+                    rows: 0..1,
                 }],
             },
             input_ids: vec![1, 2, 3],
