@@ -33,7 +33,7 @@ use nn::layers::{
     AudioActivation, Conv1d, ConvGeometry, ConvTranspose1d, PcmInterleave, ScaledAdd,
 };
 use nn::weights::WeightRequest;
-use nn::{DType, Forward, Shape, TensorView, Weight, WeightLoader};
+use nn::{DType, DecodedMedia, Decoder, Forward, Shape, TensorView, Weight, WeightLoader};
 
 /// One upsampling stage of the decoder.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -997,6 +997,50 @@ fn check_table(table: &[Source], bound: &[String]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+impl Decoder for AudioDecoder {
+    /// Decode one run of latent frames into interleaved PCM.
+    ///
+    /// The audio decoder has no layout constants: every table it reads is a weight, bound at load, so
+    /// `state` must be empty and the runner uploads nothing for it. `out.audio` is the request's
+    /// `[samples, 2]` i16 window and `out.video` must be absent — this path decodes sound only.
+    ///
+    /// **Refused at the capability:** a `state` entry of any kind, a request with no audio window, and a
+    /// request that asks for video as well. The window's length is the latent's frames times the product
+    /// of the seven stages' rates, and sizing it is the runner's.
+    fn decode(
+        &self,
+        f: &Forward,
+        latents: TensorView,
+        state: &[TensorView],
+        out: DecodedMedia,
+    ) -> nn::Result<()> {
+        if !state.is_empty() {
+            return Err(nn::Error::Shape {
+                owner: "AudioDecoder",
+                problem: format!(
+                    "the audio decoder reads no layout table, {} were given",
+                    state.len()
+                ),
+            });
+        }
+        let audio = out.audio.ok_or_else(|| nn::Error::Shape {
+            owner: "AudioDecoder",
+            problem: "an audio decode writes the request's PCM window".to_owned(),
+        })?;
+        if out.video.is_some() {
+            return Err(nn::Error::Shape {
+                owner: "AudioDecoder",
+                problem: "the audio decoder writes no video raster".to_owned(),
+            });
+        }
+        self.forward(f, latents, audio)
+            .map_err(|error| nn::Error::Shape {
+                owner: "AudioDecoder",
+                problem: format!("{error}"),
+            })
+    }
 }
 
 /// The 1-d convolution geometry: `kernel` taps, `stride`, `padding`, no dilation of its own, one group.
