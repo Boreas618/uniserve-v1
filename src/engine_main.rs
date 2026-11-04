@@ -2015,10 +2015,19 @@ fn handshake(control: &mut Control, launch: &Launch, build: &BuildConfig) -> Res
         bail!("the daemon refused this main process: {}", welcome.refusal);
     }
     let spec = welcome.spec.unwrap_or_default();
-    // The epoch's programs and the generation that serves at start are not in the spec yet: the
+    // The epoch's programs and the generation that serves at start are not in the spec: the
     // programs arrive as the daemon's first `Precopy` (§7.3 step 2) and the generation number is the
     // daemon's own. Until it states one, this process serves generation zero, whose `Precopy` names
-    // generation one - the daemon's next number (M951).
+    // the daemon's next number.
+    //
+    // The host identity is the daemon's fact and nothing else can supply it: the Storage Server
+    // keys this rank's claim by it, so an empty one would mint a claim on a host that does not
+    // exist and every peer would compare its products against the wrong node.
+    if spec.host.is_empty() {
+        bail!(
+            "the daemon's welcome states no host identity, which this rank's storage claim is keyed by"
+        );
+    }
     Ok(Epoch {
         build: build.clone(),
         programs: Programs::new(),
