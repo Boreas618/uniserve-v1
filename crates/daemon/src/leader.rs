@@ -65,6 +65,15 @@ use crate::output::RequestOutputStream;
 /// module progress, say whether the selection is working or stopped.
 const PREPARE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
 
+/// How often a wait on the epoch's programs says it is still waiting.
+///
+/// The budgets below are longer than a run, on purpose: a cold store's modules
+/// are minutes of compiler work, and an experiment that lasts fifteen minutes
+/// would otherwise end without a single line saying where the daemon was. The
+/// heartbeat turns a wait that outlives the run into a trail of lines that name
+/// the step the daemon is in and how long it has been in it.
+const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// How long the main processes may take to take the epoch's programs.
 ///
 /// A backstop beyond the engine's own budget for the steps (§7.3: the precopy
@@ -657,14 +666,25 @@ impl Leader {
                     &recorded,
                 )
             });
-            match tokio::time::timeout(PREPARE_TIMEOUT, preparing).await {
-                Ok(joined) => joined.context("preparing the epoch's programs")?,
-                Err(_) => anyhow::bail!(
-                    "the epoch's Program Servers selected nothing within {} s: \
-                     the daemon was {}",
-                    PREPARE_TIMEOUT.as_secs(),
-                    steps.describe()
-                ),
+            let started = tokio::time::Instant::now();
+            let deadline = started + PREPARE_TIMEOUT;
+            let mut preparing = preparing;
+            loop {
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                match tokio::time::timeout(left.min(HEARTBEAT), &mut preparing).await {
+                    Ok(joined) => break joined.context("the epoch's programs")?,
+                    Err(_) if left <= HEARTBEAT => anyhow::bail!(
+                        "the epoch's Program Servers selected nothing within {} s: \
+                         the daemon was {}",
+                        PREPARE_TIMEOUT.as_secs(),
+                        steps.describe()
+                    ),
+                    Err(_) => tracing::info!(
+                        waited_s = started.elapsed().as_secs(),
+                        step = %steps.describe(),
+                        "still preparing the epoch's programs"
+                    ),
+                }
             }
             .context("preparing the epoch's programs")?
         };
@@ -1636,29 +1656,41 @@ impl Leader {
                     &recorded,
                 )
             });
-            match tokio::time::timeout(PREPARE_TIMEOUT, preparing).await {
-                Ok(joined) => joined
-                    .map_err(|error| {
-                        UpdateError::Failed(anyhow::anyhow!(
-                            "preparing the target's programs: {error}"
-                        ))
-                    })?
-                    .map_err(|error| {
-                        UpdateError::Refused(format!("preparing the target's programs: {error:#}"))
-                    })?,
-                // Not a refusal: the deployment asked for nothing the
-                // Program Server turned down — the server did not answer at
-                // all. The change may be legitimate, so this is the
-                // deployment's failure (500), not the request's (400).
-                Err(_) => {
-                    return Err(UpdateError::Failed(anyhow::anyhow!(
-                        "preparing the target's programs: no Program Server answered within \
-                         {} s: the daemon was {}",
-                        PREPARE_TIMEOUT.as_secs(),
-                        steps.describe()
-                    )));
+            let started = tokio::time::Instant::now();
+            let deadline = started + PREPARE_TIMEOUT;
+            let mut preparing = preparing;
+            let prepared = loop {
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                match tokio::time::timeout(left.min(HEARTBEAT), &mut preparing).await {
+                    Ok(joined) => {
+                        break joined.map_err(|error| {
+                            UpdateError::Failed(anyhow::anyhow!(
+                                "preparing the target's programs: {error}"
+                            ))
+                        })?;
+                    }
+                    // Not a refusal: the deployment asked for nothing the
+                    // Program Server turned down — the server did not answer
+                    // at all. The change may be legitimate, so this is the
+                    // deployment's failure (500), not the request's (400).
+                    Err(_) if left <= HEARTBEAT => {
+                        return Err(UpdateError::Failed(anyhow::anyhow!(
+                            "preparing the target's programs: no Program Server answered \
+                             within {} s: the daemon was {}",
+                            PREPARE_TIMEOUT.as_secs(),
+                            steps.describe()
+                        )));
+                    }
+                    Err(_) => tracing::info!(
+                        waited_s = started.elapsed().as_secs(),
+                        step = %steps.describe(),
+                        "still preparing the target's programs"
+                    ),
                 }
-            }
+            };
+            prepared.map_err(|error| {
+                UpdateError::Refused(format!("preparing the target's programs: {error:#}"))
+            })?
         };
         let next = crate::epoch::Deployment {
             config: target.clone(),
