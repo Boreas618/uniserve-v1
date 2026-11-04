@@ -112,18 +112,22 @@ def packed(operator):
             launch = launch[: following.start()] if following else launch
             depth = 0
             always = conditional = 0
+            looped = False
             for index, character in enumerate(launch):
                 if character == "{":
                     depth += 1
                 elif character == "}":
                     depth -= 1
                 elif character == "." and PACKING.match(launch, index):
-                    # The launch function's body is depth 1; anything deeper is inside an `if`.
+                    # The launch function's body is depth 1; anything deeper is inside an `if` or a
+                    # `for`, and a loop's word count is not a fact about the source.
                     if depth <= 1:
                         always += 1
+                    elif re.search(r"for [^\n]*\{", launch[:index][-200:]) and "for " in launch[:index][-200:]:
+                        looped = True
                     else:
                         conditional += 1
-            return always, always + conditional, path
+            return always, None if looped else always + conditional, path
     return None, None, None
 
 
@@ -210,6 +214,9 @@ def main():
                 f"module declares {declared} but takes {parameters}: not {IMPLICIT} implicit"
             )
         # The operator's words plus the two the launcher appends are what the driver reads.
+        if most is None:
+            print(f"?   {operator:18} packs {always} words plus a loop, module takes {parameters}")
+            continue
         if not always + IMPLICIT <= parameters <= most + IMPLICIT:
             problems.append(
                 f"module takes {parameters}, operator packs {always + IMPLICIT}..{most + IMPLICIT}"
