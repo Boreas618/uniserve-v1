@@ -146,8 +146,10 @@ impl MuxSession {
 
     /// Appends encoded units in request order without decoding them.
     ///
-    /// Excess units are rejected before any packet is written; a failed
-    /// append closes the session.
+    /// Excess units are rejected before any packet is written. A refused
+    /// append leaves the session usable, as the reference container does: the
+    /// caller learns that the request cannot be assembled and discards it, and
+    /// the units of a request that may still be completed stay accepted.
     ///
     /// # Errors
     ///
@@ -162,14 +164,7 @@ impl MuxSession {
                 "artifact assembly received more media units than the request",
             ));
         }
-        let result = self.append_units(units);
-        if result.is_err() {
-            // The container is no longer consistent with the request's
-            // timeline, so the session takes no further work.
-            self.closed = true;
-            self.container = None;
-        }
-        result
+        self.append_units(units)
     }
 
     /// Appends the admitted units, opening the container from the first one.
@@ -290,13 +285,10 @@ mod tests {
         // runs in this test.
         let units = vec![vec![0u8; 4], vec![0u8; 4]];
         assert!(matches!(session.append(&units), Err(Error::Plan(_))));
-        assert!(matches!(
-            session.set_audio(vec![0u8; 4]),
-            Err(Error::Plan(_))
-        ));
-        assert!(matches!(session.finish(), Err(Error::Plan(_))));
-
+        // A refused call leaves the session usable: the request may still be
+        // assembled from the units that remain.
         assert!(session.append(&[]).is_ok());
+        assert!(matches!(session.finish(), Err(Error::Plan(_))));
         assert!(session.set_audio(vec![0u8; 4]).is_ok());
         assert!(matches!(
             session.set_audio(vec![0u8; 4]),
