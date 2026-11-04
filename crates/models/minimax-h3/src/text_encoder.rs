@@ -52,7 +52,7 @@ use crate::config::TextEncoderConfig;
 use crate::load::Component;
 use crate::partition::Partition;
 use crate::positions::{self, Mrope};
-use crate::vision::{ones, Geometry, ImageTables, Outputs, ROPE_THETA, VisionTower};
+use crate::vision::{Geometry, ImageTables, Outputs, ROPE_THETA, VisionTower, ones};
 use crate::{Error, Result};
 
 /// The language layers' gate: the checkpoint states `hidden_act: "silu"` and H3 fixes it.
@@ -118,9 +118,9 @@ impl Plan {
         let mut merged = 0_u32;
         for &grid in grids {
             let geometry = Geometry::of(&config.vision, grid)?;
-            merged = merged
-                .checked_add(geometry.merged)
-                .ok_or_else(|| Error::config("the images merge to more than a u32 of rows".to_owned()))?;
+            merged = merged.checked_add(geometry.merged).ok_or_else(|| {
+                Error::config("the images merge to more than a u32 of rows".to_owned())
+            })?;
             images.push(geometry.patches);
             time.push(geometry.time);
         }
@@ -339,7 +339,10 @@ impl Buffers {
             cosine: factors_of(factors)?,
             sine: factors_of(factors)?,
             features: reserve(Shape::new(&[merged, out_hidden]))?,
-            deepstack: reserve(Shape::new(&[u64::from(plan.deepstack) * merged, out_hidden]))?,
+            deepstack: reserve(Shape::new(&[
+                u64::from(plan.deepstack) * merged,
+                out_hidden,
+            ]))?,
         })
     }
 
@@ -362,11 +365,7 @@ impl Buffers {
     /// `view`'s rows as `[rows, heads, head_dim]` for the rotation and attention operators.
     fn as_heads(&self, view: TensorView, heads: u32, head_dim: u32) -> Result<TensorView> {
         let rows = view.rows();
-        Ok(view.reshape(Shape::new(&[
-            rows,
-            u64::from(heads),
-            u64::from(head_dim),
-        ])))
+        Ok(view.reshape(Shape::new(&[rows, u64::from(heads), u64::from(head_dim)])))
     }
 
     /// The `count` elements of a one-dimensional view starting at `first`.
@@ -588,6 +587,9 @@ impl Layer {
                 buffers.as_heads(buffers.value, heads.1, encoder.config.head_dim)?,
                 Some(offsets),
                 Some(offsets),
+                u32::try_from(buffers.value.rows()).map_err(|_| {
+                    invalid_input("a prompt longer than a key bound counts".to_owned())
+                })?,
                 buffers.as_heads(buffers.attended, heads.0, encoder.config.head_dim)?,
             )
             .map_err(Error::from)?;
@@ -597,13 +599,7 @@ impl Layer {
         encoder.reduce(f, buffers.projected)?;
 
         self.post_norm
-            .forward_with_residual(
-                f,
-                buffers.projected,
-                residual,
-                residual,
-                buffers.normalized,
-            )
+            .forward_with_residual(f, buffers.projected, residual, residual, buffers.normalized)
             .map_err(Error::from)?;
 
         self.gate
@@ -620,7 +616,6 @@ impl Layer {
             .map_err(Error::from)?;
         encoder.reduce(f, buffers.down)
     }
-
 }
 
 /// The Qwen3-VL text encoder of H3, its vision tower included.
@@ -700,7 +695,7 @@ impl TextEncoder {
         let sections = Sections::new(&widths)?;
         Ok(Self {
             config: config.clone(),
-            partition: partition.clone(),
+            partition: *partition,
             dtype,
             embedding,
             rotary: Rotary::new(
@@ -770,135 +765,6 @@ impl TextEncoder {
         table_specs(&self.config, rows, &plan.images, &plan.time, plan.merged)
     }
 
-    /// Write the host bytes of every table of `layout`, in [`TextEncoder::tables`]' order.
-    ///
-    /// The arithmetic is the reference's request arithmetic, evaluated in FP32 on the host
-    /// (`positions::*`): a captured call reads only the device copies. Nothing here allocates or
-    /// touches the device.
-    fn state_bytes(
-        &self,
-        prompt: &EncoderPrompt<'_>,
-        layout: &EncoderLayout,
-        out: &mut [Vec<u8>],
-    ) -> Result<()> {
-        let plan = Plan::of_layout(&self.config, &self.partition, layout)?;
-        let tables = self.tables(&plan, layout.rows);
-        if out.len() != tables.len() {
-            return Err(Error::config(format!(
-                "{} buffers for {} tables",
-                out.len(),
-                tables.len()
-            )));
-        }
-        let vision = &self.config.vision;
-        let merge = vision.spatial_merge_size;
-        let tokens = plan.rows as usize;
-        if prompt.ids.len() != tokens {
-            return Err(Error::config(format!(
-                "{} token ids for a {tokens} token prompt",
-                prompt.ids.len()
-            )));
-        }
-
-        // A vision grid reaches `rope_index` in the shape the prompt presents it: an image block is
-        // one run of `time · rows · columns` placeholders with its whole grid, a video block is one
-        // run per temporal patch, each of `rows · columns` placeholders on a single time step
-        // (`uniserve/models/qwen3_vl/positions.py:31-52`).
-        let (image_grids, video_grids) = run_grids(
-            prompt.ids,
-            &plan.grids,
-            self.config.image_token_id,
-            self.config.video_token_id,
-            merge,
-        )?;
-        let coordinates = positions::rope_index(
-            prompt.ids,
-            &image_grids,
-            &video_grids,
-            self.config.image_token_id,
-            self.config.video_token_id,
-            merge,
-        )?;
-        // `[tokens][3]` to the operator's `[axes, tokens]`.
-        let axes = self.config.mrope_sections.len();
-        let mut positions = vec![0_i32; axes * tokens];
-        for (token, coordinate) in coordinates.iter().enumerate() {
-            for axis in 0..axes {
-                positions[axis * tokens + token] = i32::try_from(coordinate[axis]).map_err(|_| {
-                    Error::config("an M-RoPE coordinate wider than an i32".to_owned())
-                })?;
-            }
-        }
-        write_i32(&mut out[0], &positions, "prompt_positions")?;
-
-        let destinations = positions::vision_destinations(
-            prompt.ids,
-            self.config.image_token_id,
-            self.config.video_token_id,
-        );
-        if destinations.len() != plan.merged as usize {
-            return Err(Error::config(format!(
-                "{} placeholders for {} merged vision rows",
-                destinations.len(),
-                plan.merged
-            )));
-        }
-        write_i32(&mut out[1], &destinations, "vision_destinations")?;
-        if plan.images.is_empty() {
-            return Ok(());
-        }
-
-        let side = Geometry::position_grid(vision)?;
-        let head_dim = Geometry::head_dim(vision)?;
-        let rotary = positions::VisionRotary::new(head_dim)?;
-        let frequencies = positions::inverse_frequencies(head_dim / 2, ROPE_THETA)?;
-        let mut index = Vec::new();
-        let mut weight = Vec::new();
-        let mut cosine = Vec::new();
-        let mut sine = Vec::new();
-        let mut lengths = Vec::new();
-        for (grid, patches) in plan.grids.iter().zip(&plan.images) {
-            let [time, height, width] = *grid;
-            let (step_index, step_weight) = positions::position_samples(side, height, width, merge)?;
-            let step_coordinates = positions::rotary_coordinates(height, width, merge)?;
-            let columns = (head_dim / 2) as usize;
-            for _ in 0..time {
-                index.extend(step_index.iter().flatten().copied());
-                weight.extend(step_weight.iter().flatten().copied());
-                let mut step_cosine = vec![0.0_f32; step_coordinates.len() * columns];
-                let mut step_sine = vec![0.0_f32; step_coordinates.len() * columns];
-                rotary
-                    .factors(
-                        &step_coordinates,
-                        &frequencies,
-                        &mut step_cosine,
-                        &mut step_sine,
-                    )
-                    .map_err(|error| {
-                        Error::config(format!("the rotary factors of {grid:?}: {error}"))
-                    })?;
-                cosine.extend_from_slice(&step_cosine);
-                sine.extend_from_slice(&step_sine);
-            }
-            lengths.extend_from_slice(&positions::vision_lengths(time, height, width)?);
-            let expected = *patches as usize;
-            if index.len() != expected * positions::POSITION_TAPS as usize
-                || weight.len() != expected * positions::POSITION_TAPS as usize
-                || cosine.len() != expected * columns
-            {
-                return Err(Error::config(format!(
-                    "the tables of {grid:?} cover {} patches, {expected} expected",
-                    cosine.len() / columns
-                )));
-            }
-        }
-        write_i32(&mut out[2], &index, "vision_position_index")?;
-        write_f32(&mut out[3], &weight, "vision_position_weight")?;
-        write_f32(&mut out[4], &cosine, "vision_cosine")?;
-        write_f32(&mut out[5], &sine, "vision_sine")?;
-        write_i32(&mut out[6], &lengths, "vision_lengths")
-    }
-
     /// The encoder's tables read the way a call reads them.
     fn prepared<'a>(&self, inputs: &EncoderInputs<'a>, plan: &Plan) -> Result<Prepared<'a>> {
         let tables = self.tables(plan, plan.rows);
@@ -929,6 +795,16 @@ impl TextEncoder {
         })
     }
 
+    /// Write the host bytes of every table of `layout`, in [`TextEncoder::tables`]' order.
+    fn prepare_state_bytes(
+        &self,
+        prompt: &EncoderPrompt<'_>,
+        layout: &EncoderLayout,
+        out: &mut [Vec<u8>],
+    ) -> Result<()> {
+        write_state(&self.config, prompt.ids, layout, out)
+    }
+
     /// The encoder as the executor sees it: one block under the deployment's component name.
     pub fn into_block(self) -> (BlockName, Block) {
         (
@@ -956,12 +832,7 @@ impl TextEncoder {
     ///
     /// The tables are checked against their declared shapes by [`TextEncoder::prepared`]; this
     /// checks the three host values a captured call is addressed by.
-    fn check(
-        &self,
-        inputs: &EncoderInputs<'_>,
-        out: &EncoderOutputs,
-        plan: &Plan,
-    ) -> Result<()> {
+    fn check(&self, inputs: &EncoderInputs<'_>, out: &EncoderOutputs, plan: &Plan) -> Result<()> {
         let layout = inputs.layout;
         let tokens = u64::from(plan.rows);
         if layout.tokens != plan.rows {
@@ -1166,8 +1037,7 @@ impl TextEncoder {
                 if merged > 0 {
                     let features =
                         Buffers::rows_of(buffers.deepstack, next as u64 * merged, merged);
-                    self.rows
-                        .add(f, hidden, features, prepared.destinations)?;
+                    self.rows.add(f, hidden, features, prepared.destinations)?;
                 }
                 carried = None;
                 next += 1;
@@ -1188,7 +1058,7 @@ impl Encoder for TextEncoder {
     /// The encoder writes one row per presented token, so the row capacity is the batch's; a grid
     /// that cannot be served is refused where a failure can be reported - [`Encoder::prepare_state`]
     /// and [`Encoder::encode`] - because this method answers with the layout alone.
-    fn prepare_layout(&self, batch: &nn::capability::TokenBatch, images: &[ImageShape]) -> EncoderLayout {
+    fn layout(&self, batch: &nn::capability::TokenBatch, images: &[ImageShape]) -> EncoderLayout {
         EncoderLayout {
             rows: batch.num_tokens,
             tokens: batch.num_tokens,
@@ -1215,7 +1085,8 @@ impl Encoder for TextEncoder {
         layout: &EncoderLayout,
         out: &mut [Vec<u8>],
     ) -> nn::Result<()> {
-        self.state_bytes(prompt, layout, out).map_err(capability)
+        self.prepare_state_bytes(prompt, layout, out)
+            .map_err(capability)
     }
 
     fn encode(
@@ -1238,6 +1109,145 @@ struct Prepared<'a> {
     vision: &'a [TensorView],
 }
 
+/// Write the host bytes of every table of `layout`, in the order `table_specs` declares them.
+///
+/// The arithmetic is the reference's request arithmetic, evaluated in FP32 on the host
+/// (`positions::*`): a captured call reads only the device copies. Nothing here allocates device
+/// memory, synchronizes or reads anything back - `out` holds the executor's host buffers.
+fn write_state(
+    config: &TextEncoderConfig,
+    ids: &[u32],
+    layout: &EncoderLayout,
+    out: &mut [Vec<u8>],
+) -> Result<()> {
+    let grids = layout
+        .images
+        .iter()
+        .map(|image| image.grid)
+        .collect::<Vec<_>>();
+    let plan = Plan::new(config, &Partition::single(), layout.tokens, &grids)?;
+    if plan.rows != layout.rows {
+        return Err(Error::config(format!(
+            "the layout reserves {} output rows for a {} token prompt",
+            layout.rows, plan.rows
+        )));
+    }
+    let tables = table_specs(config, layout.rows, &plan.images, &plan.time, plan.merged);
+    if out.len() != tables.len() {
+        return Err(Error::config(format!(
+            "{} buffers for {} tables",
+            out.len(),
+            tables.len()
+        )));
+    }
+    let vision = &config.vision;
+    let merge = vision.spatial_merge_size;
+    let tokens = plan.rows as usize;
+    if ids.len() != tokens {
+        return Err(Error::config(format!(
+            "{} token ids for a {tokens} token prompt",
+            ids.len()
+        )));
+    }
+
+    // A vision grid reaches `rope_index` in the shape the prompt presents it: an image block is
+    // one run of `time · rows · columns` placeholders with its whole grid, a video block is one
+    // run per temporal patch, each of `rows · columns` placeholders on a single time step
+    // (`uniserve/models/qwen3_vl/positions.py:31-52`).
+    let (image_grids, video_grids) = run_grids(
+        ids,
+        &plan.grids,
+        config.image_token_id,
+        config.video_token_id,
+        merge,
+    )?;
+    let coordinates = positions::rope_index(
+        ids,
+        &image_grids,
+        &video_grids,
+        config.image_token_id,
+        config.video_token_id,
+        merge,
+    )?;
+    // `[tokens][3]` to the operator's `[axes, tokens]`.
+    let axes = config.mrope_sections.len();
+    let mut positions = vec![0_i32; axes * tokens];
+    for (token, coordinate) in coordinates.iter().enumerate() {
+        for axis in 0..axes {
+            positions[axis * tokens + token] = i32::try_from(coordinate[axis])
+                .map_err(|_| Error::config("an M-RoPE coordinate wider than an i32".to_owned()))?;
+        }
+    }
+    write_i32(&mut out[0], &positions, "prompt_positions")?;
+
+    let destinations =
+        positions::vision_destinations(ids, config.image_token_id, config.video_token_id);
+    if destinations.len() != plan.merged as usize {
+        return Err(Error::config(format!(
+            "{} placeholders for {} merged vision rows",
+            destinations.len(),
+            plan.merged
+        )));
+    }
+    write_i32(&mut out[1], &destinations, "vision_destinations")?;
+    if plan.images.is_empty() {
+        return Ok(());
+    }
+
+    let side = Geometry::position_grid(vision)?;
+    let head_dim = Geometry::head_dim(vision)?;
+    let rotary = positions::VisionRotary::new(head_dim)?;
+    let frequencies = positions::inverse_frequencies(head_dim / 2, ROPE_THETA)?;
+    let mut index = Vec::new();
+    let mut weight = Vec::new();
+    let mut cosine = Vec::new();
+    let mut sine = Vec::new();
+    let mut lengths = Vec::new();
+    for (grid, patches) in plan.grids.iter().zip(&plan.images) {
+        let [time, height, width] = *grid;
+        let (step_index, step_weight) = positions::position_samples(side, height, width, merge)?;
+        let step_coordinates = positions::rotary_coordinates(height, width, merge)?;
+        let columns = (head_dim / 2) as usize;
+        for _ in 0..time {
+            index.extend(step_index.iter().flatten().copied());
+            weight.extend(step_weight.iter().flatten().copied());
+            let mut step_cosine = vec![0.0_f32; step_coordinates.len() * columns];
+            let mut step_sine = vec![0.0_f32; step_coordinates.len() * columns];
+            rotary
+                .factors(
+                    &step_coordinates,
+                    &frequencies,
+                    &mut step_cosine,
+                    &mut step_sine,
+                )
+                .map_err(|error| {
+                    Error::config(format!("the rotary factors of {grid:?}: {error}"))
+                })?;
+            cosine.extend_from_slice(&step_cosine);
+            sine.extend_from_slice(&step_sine);
+        }
+        lengths.extend_from_slice(&positions::vision_lengths(time, height, width)?);
+        let expected = *patches as usize;
+        if index.len() != expected * positions::POSITION_TAPS as usize
+            || weight.len() != expected * positions::POSITION_TAPS as usize
+            || cosine.len() != expected * columns
+        {
+            return Err(Error::config(format!(
+                "the tables of {grid:?} cover {} patches, {expected} expected",
+                cosine.len() / columns
+            )));
+        }
+    }
+    write_i32(&mut out[2], &index, "vision_position_index")?;
+    write_f32(&mut out[3], &weight, "vision_position_weight")?;
+    write_f32(&mut out[4], &cosine, "vision_cosine")?;
+    write_f32(&mut out[5], &sine, "vision_sine")?;
+    write_i32(&mut out[6], &lengths, "vision_lengths")
+}
+
+/// The grids [`positions::rope_index`] reads: one list per placeholder kind, in prompt order.
+type GridRuns = (Vec<[u32; 3]>, Vec<[u32; 3]>);
+
 /// The five vision tables' names and shapes for a concatenation of `patches` patch rows over
 /// `time` time steps.
 ///
@@ -1254,11 +1264,8 @@ fn table_specs(
     let patch_rows: u64 = patches.iter().map(|patches| u64::from(*patches)).sum();
     let steps: u64 = time.iter().map(|time| u64::from(*time) + 1).sum();
     let columns = u64::from(config.head_dim / 2);
-    let table = |name: &'static str, dtype: nn::DType, shape: Shape| StateTable {
-        name,
-        dtype,
-        shape,
-    };
+    let table =
+        |name: &'static str, dtype: nn::DType, shape: Shape| StateTable { name, dtype, shape };
     let mut tables = vec![
         table(
             "prompt_positions",
@@ -1335,7 +1342,7 @@ fn run_grids(
     image_token_id: u32,
     video_token_id: u32,
     merge: u32,
-) -> Result<(Vec<[u32; 3]>, Vec<[u32; 3]>)> {
+) -> Result<GridRuns> {
     if merge == 0 {
         return Err(Error::config("the merge side must be positive".to_owned()));
     }
@@ -1417,8 +1424,8 @@ fn write_i32(buffer: &mut [u8], values: &[i32], name: &'static str) -> Result<()
             buffer.len()
         )));
     }
-    for (chunk, value) in buffer.chunks_exact_mut(4).zip(values) {
-        chunk.copy_from_slice(&value.to_le_bytes());
+    for (chunk, value) in buffer.as_chunks_mut::<4>().0.iter_mut().zip(values) {
+        *chunk = value.to_le_bytes();
     }
     Ok(())
 }
@@ -1432,8 +1439,8 @@ fn write_f32(buffer: &mut [u8], values: &[f32], name: &'static str) -> Result<()
             buffer.len()
         )));
     }
-    for (chunk, value) in buffer.chunks_exact_mut(4).zip(values) {
-        chunk.copy_from_slice(&value.to_le_bytes());
+    for (chunk, value) in buffer.as_chunks_mut::<4>().0.iter_mut().zip(values) {
+        *chunk = value.to_le_bytes();
     }
     Ok(())
 }
@@ -1473,7 +1480,11 @@ fn sharded(
     columns: u64,
 ) -> Result<Weight> {
     loader
-        .load(&WeightRequest::region(name, start, Shape::new(&[rows, columns])))
+        .load(&WeightRequest::region(
+            name,
+            start,
+            Shape::new(&[rows, columns]),
+        ))
         .map_err(Error::from)
 }
 
@@ -1498,8 +1509,12 @@ fn sharded_projection(
     rows: u64,
     columns: u64,
 ) -> Result<Linear> {
-    Linear::new(sharded(loader, name, start, rows, columns)?, None, WeightOrder::NxK)
-        .map_err(Error::from)
+    Linear::new(
+        sharded(loader, name, start, rows, columns)?,
+        None,
+        WeightOrder::NxK,
+    )
+    .map_err(Error::from)
 }
 
 /// A normalization of `width` channels with the checkpoint's epsilon.
@@ -1541,6 +1556,10 @@ fn frequencies(loader: &mut WeightLoader<'_>, config: &TextEncoderConfig) -> Res
 mod tests {
     use super::*;
 
+    /// The checkpoint's placeholder token ids.
+    const IMAGE: u32 = 151_655;
+    const VIDEO: u32 = 151_656;
+
     /// The released text encoder's configuration.
     fn config() -> TextEncoderConfig {
         crate::config::tests_support::released_config().text_encoder
@@ -1574,7 +1593,10 @@ mod tests {
         assert_eq!(rank.key_value, 2 * 128);
         assert_eq!(rank.intermediate, 6_400);
         // The third rank's rows of the query projection start after two whole shards.
-        assert_eq!(rank.row_start(rank.query, config.hidden_size), 2 * 2048 * 5120);
+        assert_eq!(
+            rank.row_start(rank.query, config.hidden_size),
+            2 * 2048 * 5120
+        );
         // Its columns of the output projection start after two shards of the head split.
         assert_eq!(rank.column_start(rank.query), 2 * 2048);
         let (first, stop) = rank.vocabulary;
@@ -1597,6 +1619,259 @@ mod tests {
             tensor_rank: 4,
         };
         assert!(Rank::new(&config, &out_of_range).is_err());
+    }
+
+    /// A host buffer of the size `table` states.
+    fn buffer_for(table: &StateTable) -> Vec<u8> {
+        let width = table.dtype.bytes().expect("a whole number of bytes");
+        vec![0_u8; (table.shape.numel() * width) as usize]
+    }
+
+    /// The `index`-th i32 of a host table.
+    fn i32_at(bytes: &[u8], index: usize) -> i32 {
+        i32::from_le_bytes(
+            bytes[index * 4..index * 4 + 4]
+                .try_into()
+                .expect("four bytes"),
+        )
+    }
+
+    /// The `index`-th f32 of a host table.
+    fn f32_at(bytes: &[u8], index: usize) -> f32 {
+        f32::from_le_bytes(
+            bytes[index * 4..index * 4 + 4]
+                .try_into()
+                .expect("four bytes"),
+        )
+    }
+
+    #[test]
+    fn a_text_prompt_needs_the_two_prompt_tables_only() {
+        let config = config();
+        let tables = table_specs(&config, 5, &[], &[], 0);
+        assert_eq!(tables.len(), 2);
+        assert_eq!(tables[0].name, "prompt_positions");
+        assert_eq!(tables[0].shape.dims(), &[3, 5]);
+        assert_eq!(tables[1].name, "vision_destinations");
+        assert!(tables[1].shape.numel() == 0);
+
+        let ids = [7, 8, 9, 10, 11];
+        let layout = EncoderLayout {
+            rows: 5,
+            tokens: 5,
+            images: Vec::new(),
+        };
+        let mut out = tables.iter().map(buffer_for).collect::<Vec<_>>();
+        write_state(&config, &ids, &layout, &mut out).expect("a text prompt");
+
+        // The positions are the reference's own, axis-major: axis `a`'s coordinates start at
+        // `a * tokens`.
+        let coordinates = positions::rope_index(
+            &ids,
+            &[],
+            &[],
+            config.image_token_id,
+            config.video_token_id,
+            config.vision.spatial_merge_size,
+        )
+        .expect("positions");
+        for (token, coordinate) in coordinates.iter().enumerate() {
+            for (axis, value) in coordinate.iter().enumerate() {
+                assert_eq!(i32_at(&out[0], axis * 5 + token), *value as i32);
+            }
+        }
+    }
+
+    #[test]
+    fn an_images_tables_are_one_time_steps_samples_repeated_over_its_grid() {
+        let config = config();
+        let merge = config.vision.spatial_merge_size;
+        let side = Geometry::position_grid(&config.vision).expect("a square table");
+        let head_dim = Geometry::head_dim(&config.vision).expect("a head width");
+        // One 4x6 image block: 24 patches, 6 merged rows, after three prompt tokens.
+        let ids = [7, 8, 9, IMAGE, IMAGE, IMAGE, IMAGE, IMAGE, IMAGE, 10];
+        let layout = EncoderLayout {
+            rows: 10,
+            tokens: 10,
+            images: vec![ImageShape { grid: [1, 4, 6] }],
+        };
+        let tables = table_specs(&config, 10, &[24], &[1], 6);
+        assert_eq!(tables.len(), 7);
+        let mut out = tables.iter().map(buffer_for).collect::<Vec<_>>();
+        write_state(&config, &ids, &layout, &mut out).expect("an image prompt");
+
+        // The six merged rows take the six placeholders, in order.
+        let destinations = (3..9)
+            .map(|row| i32_at(&out[1], row - 3))
+            .collect::<Vec<_>>();
+        assert_eq!(destinations, vec![3, 4, 5, 6, 7, 8]);
+
+        // The resample's taps are one time step's, in merge-block patch order.
+        let (index, weight) = positions::position_samples(side, 4, 6, merge).expect("samples");
+        for patch in 0..24 {
+            for tap in 0..4 {
+                assert_eq!(i32_at(&out[2], patch * 4 + tap), index[patch][tap]);
+                assert_eq!(f32_at(&out[3], patch * 4 + tap), weight[patch][tap]);
+            }
+        }
+        // The rotary factors are the 2-D rotation of each patch's own coordinates.
+        let coordinates = positions::rotary_coordinates(4, 6, merge).expect("coordinates");
+        let frequencies = positions::inverse_frequencies(head_dim / 2, crate::vision::ROPE_THETA)
+            .expect("frequencies");
+        let rotary = positions::VisionRotary::new(head_dim).expect("a rotary head");
+        let columns = (head_dim / 2) as usize;
+        let mut cosine = vec![0.0_f32; coordinates.len() * columns];
+        let mut sine = vec![0.0_f32; coordinates.len() * columns];
+        rotary
+            .factors(&coordinates, &frequencies, &mut cosine, &mut sine)
+            .expect("factors");
+        for element in 0..cosine.len() {
+            assert_eq!(f32_at(&out[4], element), cosine[element]);
+            assert_eq!(f32_at(&out[5], element), sine[element]);
+        }
+        // One time step is one attention sequence.
+        assert_eq!(i32_at(&out[6], 0), 0);
+        assert_eq!(i32_at(&out[6], 1), 24);
+
+        // The prompt's positions start the block at the running origin.
+        let coordinates = positions::rope_index(
+            &ids,
+            &[[1, 4, 6]],
+            &[],
+            config.image_token_id,
+            config.video_token_id,
+            merge,
+        )
+        .expect("positions");
+        assert_eq!(i32_at(&out[0], 3), coordinates[3][0] as i32);
+        assert_eq!(i32_at(&out[0], 10 + 3), coordinates[3][1] as i32);
+    }
+
+    #[test]
+    fn a_video_is_one_run_per_temporal_patch_and_two_time_steps() {
+        let config = config();
+        let merge = config.vision.spatial_merge_size;
+        // Two temporal patches of a 4x6 video: six placeholders each, behind a timestamp.
+        let ids = [
+            7, VIDEO, VIDEO, VIDEO, VIDEO, VIDEO, VIDEO, 8, VIDEO, VIDEO, VIDEO, VIDEO, VIDEO,
+            VIDEO, 9,
+        ];
+        let layout = EncoderLayout {
+            rows: 15,
+            tokens: 15,
+            images: vec![ImageShape { grid: [2, 4, 6] }],
+        };
+        let tables = table_specs(&config, 15, &[48], &[2], 12);
+        let mut out = tables.iter().map(buffer_for).collect::<Vec<_>>();
+        write_state(&config, &ids, &layout, &mut out).expect("a video prompt");
+
+        // 48 patches merge to 12 rows, on the twelve placeholders.
+        let destinations = (0..12).map(|row| i32_at(&out[1], row)).collect::<Vec<_>>();
+        assert_eq!(destinations, vec![1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13]);
+        // Two time steps, each one sequence of 24 patches.
+        assert_eq!(i32_at(&out[6], 0), 0);
+        assert_eq!(i32_at(&out[6], 1), 24);
+        assert_eq!(i32_at(&out[6], 2), 48);
+
+        // The reference reads a video as one single-step grid per temporal patch, and each run
+        // advances the origin.
+        let (images, videos) = run_grids(
+            &ids,
+            &[[2, 4, 6]],
+            config.image_token_id,
+            config.video_token_id,
+            merge,
+        )
+        .expect("runs");
+        assert!(images.is_empty());
+        assert_eq!(videos, vec![[1, 4, 6], [1, 4, 6]]);
+        let coordinates = positions::rope_index(
+            &ids,
+            &images,
+            &videos,
+            config.image_token_id,
+            config.video_token_id,
+            merge,
+        )
+        .expect("positions");
+        // The first run's patches sit on coordinates `(0, i, j)` around origin 0, and the first
+        // run leaves the origin three merged rows further (max(4, 6) / 2); the timestamp token
+        // then takes the origin, and the second run starts from the origin the timestamp left.
+        assert_eq!(coordinates[1], [0, 0, 0]);
+        assert_eq!(coordinates[7], [3, 3, 3]);
+        assert_eq!(coordinates[8][0], 4);
+    }
+
+    #[test]
+    fn a_run_that_does_not_hold_its_grid_is_refused() {
+        let config = config();
+        let merge = config.vision.spatial_merge_size;
+        // A 4x6 image block merges to six rows; five placeholders are one short.
+        let ids = [7, IMAGE, IMAGE, IMAGE, IMAGE, IMAGE];
+        assert!(
+            run_grids(
+                &ids,
+                &[[1, 4, 6]],
+                config.image_token_id,
+                config.video_token_id,
+                merge
+            )
+            .is_err()
+        );
+        // A grid with no run left, and a run with no grid, are both refused.
+        assert!(
+            run_grids(
+                &[7, 8],
+                &[[1, 4, 6]],
+                config.image_token_id,
+                config.video_token_id,
+                merge
+            )
+            .is_err()
+        );
+        assert!(
+            run_grids(
+                &[7, IMAGE, IMAGE, IMAGE, IMAGE, IMAGE, IMAGE, 8],
+                &[],
+                config.image_token_id,
+                config.video_token_id,
+                merge
+            )
+            .is_err()
+        );
+        // A video grid of two time steps needs two runs.
+        assert!(
+            run_grids(
+                &[7, VIDEO, VIDEO, VIDEO, VIDEO, VIDEO, VIDEO, 8],
+                &[[2, 4, 6]],
+                config.image_token_id,
+                config.video_token_id,
+                merge
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_buffer_of_the_wrong_size_is_refused() {
+        let config = config();
+        let layout = EncoderLayout {
+            rows: 3,
+            tokens: 3,
+            images: Vec::new(),
+        };
+        let tables = table_specs(&config, 3, &[], &[], 0);
+        let mut out = tables.iter().map(buffer_for).collect::<Vec<_>>();
+        out[0].truncate(8);
+        assert!(write_state(&config, &[1, 2, 3], &layout, &mut out).is_err());
+        // A layout that reserves rows the prompt does not present is refused too.
+        let mut out = tables.iter().map(buffer_for).collect::<Vec<_>>();
+        let wide = EncoderLayout {
+            rows: 4,
+            tokens: 3,
+            images: Vec::new(),
+        };
+        assert!(write_state(&config, &[1, 2, 3], &wide, &mut out).is_err());
     }
 
     #[test]
@@ -1646,9 +1921,8 @@ mod tests {
     #[test]
     fn the_frequency_table_is_the_checkpoints_rotary_recipe() {
         let config = config();
-        let frequencies =
-            crate::positions::inverse_frequencies(config.head_dim, config.rope_theta)
-                .expect("the released recipe");
+        let frequencies = crate::positions::inverse_frequencies(config.head_dim, config.rope_theta)
+            .expect("the released recipe");
         assert_eq!(frequencies.len(), config.head_dim as usize / 2);
         assert_eq!(frequencies[0], 1.0);
         assert!(frequencies[63] < frequencies[0]);

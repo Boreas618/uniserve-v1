@@ -40,6 +40,9 @@ pub const MAX_AXES: usize = 4;
 /// The table rows one bilinear sample reads: four, the corners of one cell.
 pub const POSITION_TAPS: u64 = 4;
 
+/// One merged row's bilinear sample: the four learned-table rows it blends, and their weights.
+pub type PositionSamples = (Vec<[i32; 4]>, Vec<[f32; 4]>);
+
 /// The M-RoPE cut of a head's rotation: one width per axis, interleaved.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Mrope {
@@ -129,7 +132,14 @@ impl Mrope {
         sine: &mut [f32],
     ) -> Result<()> {
         let columns = (self.head_dim / 2) as usize;
-        check_factors("Mrope::factors", positions.len(), columns, frequencies, cosine, sine)?;
+        check_factors(
+            "Mrope::factors",
+            positions.len(),
+            columns,
+            frequencies,
+            cosine,
+            sine,
+        )?;
         let axes = self.frequency_axes();
         for (token, position) in positions.iter().enumerate() {
             for frequency in 0..columns {
@@ -205,7 +215,13 @@ impl VisionRotary {
                 ),
             ));
         }
-        check_len("VisionRotary::factors", coordinates.len(), columns, cosine, sine)?;
+        check_len(
+            "VisionRotary::factors",
+            coordinates.len(),
+            columns,
+            cosine,
+            sine,
+        )?;
         for (patch, coordinate) in coordinates.iter().enumerate() {
             for frequency in 0..columns {
                 let axis = if frequency < per_axis { 0 } else { 1 };
@@ -403,7 +419,12 @@ pub fn vision_destinations(ids: &[u32], image_token_id: u32, video_token_id: u32
 /// merged token reads `merge**2` consecutive patch rows
 /// (`uniserve/nn/vision/position.py::merged_grid_coordinates`).
 pub fn merged_coordinates(height: u32, width: u32, merge: u32) -> Result<(Vec<u32>, Vec<u32>)> {
-    if merge == 0 || height == 0 || width == 0 || height % merge != 0 || width % merge != 0 {
+    if merge == 0
+        || height == 0
+        || width == 0
+        || !height.is_multiple_of(merge)
+        || !width.is_multiple_of(merge)
+    {
         return Err(invalid(
             "merged_coordinates",
             format!("a {height}x{width} patch grid is not whole {merge}x{merge} blocks"),
@@ -413,8 +434,7 @@ pub fn merged_coordinates(height: u32, width: u32, merge: u32) -> Result<(Vec<u3
     let columns = (width / merge) as usize;
     let side = merge as usize;
     let mut row = Vec::with_capacity(rows * columns * side * side);
-    let mut column = Vec::new();
-    column.reserve(rows * columns * side * side);
+    let mut column = Vec::with_capacity(rows * columns * side * side);
     for block_row in 0..rows {
         for block_column in 0..columns {
             for inner_row in 0..side {
@@ -454,12 +474,7 @@ pub fn rotary_coordinates(height: u32, width: u32, merge: u32) -> Result<Vec<[i6
 /// table's rows with these (`ops::position::Interpolate`); the tables are one image's, so they are
 /// per image block, and a temporal grid repeats them once per time step - every time step samples
 /// the same `height x width` grid (`PositionEmbedding.interpolate(...).repeat(time, 1)`).
-pub fn position_samples(
-    side: u32,
-    height: u32,
-    width: u32,
-    merge: u32,
-) -> Result<(Vec<[i32; 4]>, Vec<[f32; 4]>)> {
+pub fn position_samples(side: u32, height: u32, width: u32, merge: u32) -> Result<PositionSamples> {
     if side == 0 {
         return Err(invalid(
             "position_samples",
@@ -530,7 +545,9 @@ pub fn merged_rows(time: u32, height: u32, width: u32, merge: u32) -> Result<u32
     if merge == 0 || patches % block != 0 {
         return Err(invalid(
             "merged_rows",
-            format!("{patches} patches of a {time}x{height}x{width} grid are not whole {merge}x{merge} blocks"),
+            format!(
+                "{patches} patches of a {time}x{height}x{width} grid are not whole {merge}x{merge} blocks"
+            ),
         ));
     }
     u32::try_from(patches / block)
@@ -670,10 +687,19 @@ mod tests {
     #[test]
     fn an_image_block_advances_by_its_wider_side() {
         // Two text tokens, a 4x6 patch grid merged 2x2 (6 merged tokens), one text token.
-        let ids = [10, 11, IMAGE_TOKEN, IMAGE_TOKEN, IMAGE_TOKEN, IMAGE_TOKEN, IMAGE_TOKEN,
-            IMAGE_TOKEN, 12];
-        let positions = rope_index(&ids, &[[1, 4, 6]], &[], IMAGE_TOKEN, VIDEO_TOKEN, 2)
-            .expect("positions");
+        let ids = [
+            10,
+            11,
+            IMAGE_TOKEN,
+            IMAGE_TOKEN,
+            IMAGE_TOKEN,
+            IMAGE_TOKEN,
+            IMAGE_TOKEN,
+            IMAGE_TOKEN,
+            12,
+        ];
+        let positions =
+            rope_index(&ids, &[[1, 4, 6]], &[], IMAGE_TOKEN, VIDEO_TOKEN, 2).expect("positions");
         assert_eq!(positions.len(), 9);
         // The block starts where the text clock is (2) and is stored in merge-block order.
         assert_eq!(positions[2], [2, 2, 2]);
@@ -811,9 +837,11 @@ mod tests {
         assert!((cosine[second] - 1.0f32.cos()).abs() < 1e-7);
         assert!((cosine[second + 1] - (2.0f32 * frequencies[1]).cos()).abs() < 1e-7);
         assert!((sine[second + 2] - (3.0f32 * frequencies[2]).sin()).abs() < 1e-7);
-        assert!(sections
-            .factors(&positions, &frequencies[..63], &mut cosine, &mut sine)
-            .is_err());
+        assert!(
+            sections
+                .factors(&positions, &frequencies[..63], &mut cosine, &mut sine)
+                .is_err()
+        );
     }
 
     #[test]
