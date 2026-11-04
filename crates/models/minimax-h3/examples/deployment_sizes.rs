@@ -179,12 +179,28 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             mib(rows * width * 2 / (1 << 20))
         );
         if let minimax_h3::config::AttentionKind::Sparse { tile, .. } = denoiser.attention {
+            // The tile bound is the deployment's own maximum over every layout it serves, and it
+            // is the model's (`Layouts::tiles_bound`) - a scratch figure derived here from one
+            // request's rows would be a second statement of it and could size the sparse stack's
+            // buffer short.
+            let arrangement = minimax_h3::partition::Partition::single().arrangement(denoiser)?;
+            let bound =
+                minimax_h3::denoiser::Layouts::new(denoiser.clone(), arrangement)?.tiles_bound()?;
             let heads = u64::from(denoiser.transformer.num_attention_heads);
-            let tiles = rows.div_ceil(u64::from(tile));
+            let bound = u64::from(bound);
             println!(
-                "  sparse scratch {} (tiles^2 x heads x 2 B, {tiles} tiles)",
-                mib(tiles * tiles * heads * 2 / (1 << 20))
+                "  sparse scratch {} at the deployment's bound (tiles^2 x heads x 2 B, {bound} tiles)",
+                mib(bound * bound * heads * 2 / (1 << 20))
             );
+            // This request's own tile count, for comparison: the buffer is sized by the bound, so a
+            // request under it must not be read as the size.
+            println!(
+                "    this request's rows span {} tiles of {} rows",
+                rows.div_ceil(u64::from(tile)),
+                tile
+            );
+        } else {
+            println!("  sparse scratch: this DiT attends densely, so no tile bound applies");
         }
     }
 
