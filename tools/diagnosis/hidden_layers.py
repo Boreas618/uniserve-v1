@@ -6,9 +6,11 @@ device-free view of two directories, for a dump kept from an earlier run and for
 that the run's one-line verdict does not carry. It needs no GPU and no store.
 
 One run of the model's slice with `--dump DIR` writes `hidden_00.npy` (the embedding's output),
-`hidden_NN.npy` for `NN = 01..48` (layer `NN - 1`'s output) and `logits.npy` (the last row), all
-float32, row-major, `[rows, hidden]`. The reference writes the same names from the same prompt, so a
-defect is located by the first name whose numbers leave the reference's own rounding floor.
+`hidden_NN.npy` for `NN = 01..47` (layer `NN - 1`'s output), `hidden_48.npy` (the whole run's output
+after the final norm) and `logits.npy` (the last row), all float32, row-major, `[rows, hidden]`. The
+reference writes the same names from the same prompt, so a defect is located by the first name whose
+numbers leave the reference's own rounding floor. `hidden_48` is the run's own last stage and not
+layer 47's output: the reference does not hold that one, so the last layer is read through its cuts.
 
     python tools/diagnosis/hidden_layers.py \
         --reference notes/reference/qwen3-hidden --dump artifacts/qwen3-hidden-dump
@@ -72,11 +74,13 @@ def per_row(actual, expected):
 def names(reference):
     """Every file the reference holds, in the order a run reaches them.
 
-    A stage's file is `hidden_NN.npy`, which is layer `NN - 1`'s output, and the embedding's is
-    `hidden_00.npy`. A layer cut open inside holds `hidden_NN_<cut>.npy` for the cuts this run
-    asked the model to stop at (`normalized`, `attended`, `mlp`, in that order), so the cut files of
-    layer `NN - 1` sort between `hidden_{NN-1}.npy` and `hidden_NN.npy` and the table reads as the
-    walk that produced it.
+    The stage files are the reference's own set: `hidden_00.npy` is the embedding, `hidden_NN.npy`
+    for `NN` from 1 to the last is layer `NN - 1`'s output, and the last file is the **whole run's**
+    output after the final norm - not the last layer's, which has no file of its own because the
+    reference does not hold it. A layer cut open inside holds `hidden_NN_<cut>.npy` for the cuts the
+    run asked the model to stop at (`normalized`, `attended`, `mlp`, in that order), so the cut files
+    of layer `NN - 1` sort between `hidden_{NN-1}.npy` and `hidden_NN.npy` and the table reads as the
+    walk that produced it. The last layer is read through its cuts for that reason.
     """
     def order(path):
         parts = path.stem.split("_")
