@@ -129,3 +129,22 @@ FastH3 OmniRef runs on H200 with the SM90 kernel of its 128-row sparse-attention
 .venv/bin/uniserve-eval --config uniserve_eval/minimax_h3.toml run h200-8-omniref-refs --reuse-deployment
 .venv/bin/uniserve-eval --config uniserve_eval/minimax_h3.toml run h200-8-omniref-refs-enlarged --reuse-deployment
 ```
+
+## Fixed check set
+
+MiniMax-H3's quality is confirmed by a person watching and listening to the videos a fixed set of requests generates, not by an automatic quality gate. The set covers every combination the service offers — the `t2va`, `fl2va` and `ref2va` tasks against FastH3 DMD, FastH3 OmniRef and base MiniMax-H3 — as six cells. FastH3 DMD serves `t2va` and `fl2va`, FastH3 OmniRef serves `ref2va`, and the base release serves `t2va` and `fl2va` through its `transformer` partition and `ref2va` through its `transformer_ref` partition.
+
+Each cell sends one unmeasured warmup at seed 42 and one measured request at seed 0, the seed-0 rows of W1, W3 and W4 of [MiniMax-H3 workloads](#minimax-h3-workloads): `t2va` with the official prompt at 16:9 for 5 seconds, `fl2va` with the official first keyframe on its automatic canvas for 8 seconds, and `ref2va` with the reference image and voice for 5 seconds. The rows are frozen in `uniserve_eval/workloads/minimax_h3/check-*.jsonl` and their `-warmup.jsonl` companions as copies of the W1, W3 and W4 rows, so the set does not follow later changes to the performance workloads. `uniserve_eval/check_h3.toml` names the six cells.
+
+Every measured video is written to a fixed path under `artifacts/`, `artifacts/minimax_h3/check/<checkpoint>-<task>/<request id>.mp4`, so a confirmed cell keeps the path a person watches and no cell writes into another's directory: `<checkpoint>` is `fasth3-dmd`, `fasth3-omniref` or `base`, `<task>` is `t2va`, `fl2va` or `ref2va`, and `<request id>` is the row's ID, such as `w1-measured-seed0`. Each point's bundle, with its requests, media index and summary, is under `artifacts/minimax_h3/check/results/<point>`.
+
+The automatic checks are the two this document defines for every video point and nothing more: MP4 validity (canvas, frame count, frame rate and stereo 32-kHz soundtrack, which the `video` task validates) and the performance metrics the profile marks as protected, each checked to be finite and positive. The set adds no gate, tolerance or metric; the confirmation is the person's judgement of the six videos.
+
+The four servers place four GPUs each, with `configs/minimax_h3/ulysses4.toml` for the two transformer partitions and `configs/minimax_h3/ulysses4-reference.toml` for the two reference partitions, and use port 18083 one server at a time. `--reuse-deployment` keeps a checkpoint loaded across its consecutive points, so the four checkpoints load once each. The profile reads `UNISERVE_FAST_H3_MODEL` from the [FastH3 post](#fasth3-post) and `UNISERVE_MINIMAX_H3_MODEL`, `UNISERVE_MINIMAX_H3_OMNIREF`, `UNISERVE_MINIMAX_H3_INPUTS` and `UNISERVE_MINIMAX_H3_FFMPEG` from [MiniMax-H3 workloads](#minimax-h3-workloads):
+
+```bash
+.venv/bin/uniserve-eval --config uniserve_eval/check_h3.toml plan check-h3
+.venv/bin/uniserve-eval --config uniserve_eval/check_h3.toml run check-h3 --reuse-deployment
+```
+
+A run on a changed service moves `artifacts/minimax_h3/check/` and `artifacts/minimax_h3/check/results/` aside first: the evaluator refuses a non-empty result directory and never replaces a different MP4 at an existing fixed path.
