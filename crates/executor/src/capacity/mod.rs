@@ -398,31 +398,6 @@ pub fn graph_storage_bytes(total_device_bytes: i64, prepares: bool, eager_prepar
     }
 }
 
-/// The scratch a rank reserves beside the shadow region for the state snapshots it copies pages
-/// through (design 4.5): one snapshot per state group, as the cache plan states it.
-///
-/// A snapshot is Scratch and never resident: it is a temporary copy of one unit's state on its way
-/// to the Storage Server, so it must not look like model state to anything that reads the budget.
-///
-/// # Errors
-///
-/// [`Error::Resource`] naming the state group's shape and the budget when the deployment's scratch
-/// cannot hold it - at plan time, not at the first export.
-pub fn state_snapshot_bytes(cache: &crate::memory::CachePlan, scratch_budget: u64) -> Result<u64> {
-    let bytes = cache.state_snapshot_bytes();
-    if bytes > scratch_budget {
-        tracing::warn!(
-            bytes,
-            scratch_budget,
-            "the state group's snapshot does not fit the scratch pool"
-        );
-        return Err(Error::Resource(
-            "the state group's snapshot does not fit the scratch pool",
-        ));
-    }
-    Ok(bytes)
-}
-
 /// A deployment's quota of a device of `total` bytes for `fraction` of it:
 /// `⌊total × fraction⌋`.
 pub fn quota(total: u64, fraction: f64) -> u64 {
