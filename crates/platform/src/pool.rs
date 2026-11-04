@@ -422,6 +422,12 @@ impl VirtualPool {
     /// none until [`Self::restore`]. Suspending a suspended pool does
     /// nothing.
     ///
+    /// A caller that exported a chunk with `Buffer::export` drains whoever
+    /// imported it first: the importer holds its own reference to the storage
+    /// this call releases, so its mapping outlives the suspension and keeps the
+    /// contents the copy took — while [`Self::restore`] maps new storage at the
+    /// same address, which the importer's mapping is not.
+    ///
     /// # Errors
     ///
     /// Fails when a copy or an unmap fails; the chunks suspended before the
