@@ -109,7 +109,10 @@ pub fn load(
                 // Every tensor this partition's denoiser reads, asked of the block itself: `load`
                 // states no name of its own. A name the checkpoint lacks is refused here rather
                 // than surfacing as a read error deep in `Denoiser::load`, so the report names the
-                // block, its directory and every absent tensor at once.
+                // block, its directory and every absent tensor at once. The list is rank-independent
+                // because the DiT shards the sequence and never the weights - `Denoiser::load` takes
+                // the partition for its exchange rank, not for a weight slice - so one rank's check
+                // answers for every rank of the deployment.
                 let keys = Denoiser::keys(denoiser);
                 let missing = crate::checkpoint::absent(&keys, |key| source.tensor(key).is_some());
                 if !missing.is_empty() {
