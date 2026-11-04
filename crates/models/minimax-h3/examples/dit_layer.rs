@@ -44,7 +44,7 @@ use std::process::ExitCode;
 
 use minimax_h3::attention::{Factors, Visible};
 use minimax_h3::checkpoint::Dit;
-use minimax_h3::config::{Canvas, Config};
+use minimax_h3::config::Config;
 use minimax_h3::denoiser::{Denoiser, Layouts};
 use minimax_h3::modulation::{self, AdaLnCache, Groups, Projections};
 use minimax_h3::packing;
@@ -485,9 +485,9 @@ fn stage_denoise(args: &Args) -> Result<()> {
         conditions: &[],
         vision_spans: &[],
     };
-    let (layout, packing) = layouts.layout(&request)?;
+    let (_, packing) = layouts.layout(&request)?;
     let frames = packing::align_num_frames(request.frames);
-    let canvas = canvas_of_layout(&layout)?;
+    let canvas = layouts.canvas(&request)?;
     let tables = packing::dense_tables(&packing, frames, &canvas, request.text_tokens, &[], &[])?;
     let tokens = u64::from(packing.padded_tokens);
     println!(
@@ -985,13 +985,12 @@ fn stage_block(args: &Args) -> Result<()> {
         conditions: &[],
         vision_spans: &[],
     };
-    let (layout, packing) = layouts.layout(&request)?;
+    let (_, packing) = layouts.layout(&request)?;
     let frames = packing::align_num_frames(request.frames);
-    // The canvas comes back from the layout rather than from the request: the layout has already
-    // rounded the pixels to `CANVAS_MULTIPLE` and derived the latent raster, and coordinates
-    // computed against a second rounding of the same request could describe a different canvas than
-    // the rows they belong to. The reconstruction is checked against the layout's own extents.
-    let canvas = canvas_of_layout(&layout)?;
+    // The canvas is the model's answer for the request - one rounding of the pixels, the same one
+    // the layout's rows were computed from. A canvas reconstructed from the layout would be a second
+    // statement of that rounding, right only where the rounding is the identity.
+    let canvas = layouts.canvas(&request)?;
     let tables = packing::dense_tables(&packing, frames, &canvas, request.text_tokens, &[], &[])?;
     let tokens = u64::from(packing.padded_tokens);
     if tables.position_ids.len() as u64 != tokens || tables.groups.len() as u64 != tokens {
@@ -1290,30 +1289,6 @@ fn cache_projections(f: &Forward, projections: &Projections, memory: &AdaLnMemor
     let views: Vec<TensorView> = memory.layers.iter().map(nn::Weight::view).collect();
     projections.compute(f, memory.frequencies.view(), &views, memory.output.view())?;
     Ok(())
-}
-
-/// The pixel canvas a layout came from.
-///
-/// The latent extents are pixels over the VAE's sixteen-pixel compression, so the canvas is exactly
-/// recoverable; `packing::latent_raster` then proves it, because a canvas whose raster does not
-/// reproduce the layout's extents would give every row coordinates from another canvas.
-fn canvas_of_layout(layout: &nn::capability::Layout) -> Result<Canvas> {
-    let canvas = Canvas {
-        short_edge: (layout.video.height * 16).min(layout.video.width * 16),
-        aspect: (layout.video.width, layout.video.height),
-        width: layout.video.width * 16,
-        height: layout.video.height * 16,
-    };
-    let raster = packing::latent_raster(&canvas)?;
-    if raster.height != layout.video.height || raster.width != layout.video.width {
-        return Err(Failure::message(format!(
-            "the layout's {}x{} latent raster is not the one its canvas re-derives ({:?})",
-            layout.video.height,
-            layout.video.width,
-            (raster.height, raster.width)
-        )));
-    }
-    Ok(canvas)
 }
 
 /// The rotary width of one row: the three axes' shares of a head.
