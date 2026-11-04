@@ -324,18 +324,24 @@ pub struct QuantizedWeight {
 /// A calibrated NVFP4 **stack of experts**, as `gather_gemm_nvfp4` and `route_gemm_nvfp4` read it.
 ///
 /// A model's expert block multiplies whole stacks: its weights are `[experts, rows, columns/2]` U8,
-/// its block scales carry one entry per expert, and the tensor scale varies per expert — so the
-/// scalar [`QuantizedWeight::global_scale`] cannot serve it, and a model may not build the table
-/// itself (constructing a weight is the loader's, not a model's). The loader publishes all three
-/// from the checkpoint's per-expert tensors: the encoded values and scales concatenated in the
-/// operator's reading order, and the reciprocals as a `[experts]` f32 weight.
+/// its block scales carry one entry per expert, and the tensor scale varies per expert **and per
+/// projection** — so the scalar [`QuantizedWeight::global_scale`] cannot serve it, and a model may
+/// not build the table itself (constructing a weight is the loader's, not a model's). The loader
+/// publishes all three from the checkpoint's per-expert, per-projection tensors: the encoded values
+/// and scales concatenated in the operator's reading order, and the reciprocals as an
+/// `[experts, projections]` f32 weight.
+///
+/// The stack fused from an expert's `up_proj` and `gate_proj` is why the second axis exists: each of
+/// those has its own `weight_scale_2` in the checkpoint, so one scalar per expert would dequantize
+/// the gate half with the up half's scale and be wrong by the ratio of the two, silently.
 #[derive(Clone, Copy, Debug)]
 pub struct QuantizedStack {
     /// `[experts, rows, columns/2]` U8: two E2M1 codes a byte, packed along the contraction.
     pub values: Weight,
     /// `[experts, ...]` U8: the block scales in [`Self::layout`], one per sixteen elements.
     pub scales: Weight,
-    /// `[experts]` f32: the reciprocal of each expert's checkpoint tensor scale.
+    /// `[experts, projections]` f32, row-major, in the stack's own projection order: the reciprocal
+    /// of each expert's **per-projection** checkpoint tensor scale.
     pub global_scale: Weight,
     /// The layout the block scales are stored in.
     pub layout: ScaleLayout,
@@ -708,9 +714,13 @@ impl<'a> WeightLoader<'a> {
     /// The checkpoint stores each expert's projection as its own tensor, so a stack is a
     /// concatenation: expert-major, and within an expert the projections in `projections`' order
     /// (the gated product reads up first, gate second). The three fields answer the three the
-    /// operators take — packed values, block scales, and one reciprocal per expert — and all three
-    /// are published through retained storage under one key per field, so a second load of the same
-    /// checkpoint costs nothing.
+    /// operators take — packed values, block scales, and one reciprocal per **expert and
+    /// projection** — and all three are published through retained storage under one key per field,
+    /// so a second load of the same checkpoint costs nothing.
+    ///
+    /// The tensor scales are two per expert for a fused `up`/`gate` stack: the checkpoint gives each
+    /// projection its own `weight_scale_2`, and dequantizing the gate half with the up half's scale
+    /// would be wrong by the ratio of the two with nothing to show for it.
     ///
     /// `name` names the stack in keys and errors and must not collide with a tensor's: a computed
     /// weight needs its own name. A block-scale layout whose per-expert entry is padded, or a
@@ -901,11 +911,11 @@ impl<'a> WeightLoader<'a> {
                         .chain(names.iter().cloned())
                         .collect(),
                     start: 0,
-                    shape: Shape::new(&[count]),
+                    shape: Shape::new(&[count, per]),
                     stride: None,
                 },
             },
-            Shape::new(&[count]),
+            Shape::new(&[count, per]),
             &scale_bytes,
         )?;
         Ok(QuantizedStack {
