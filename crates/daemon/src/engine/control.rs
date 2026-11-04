@@ -1078,25 +1078,22 @@ impl<'a> ProgramSwitch<'a> {
         generations.clear();
         for process in processes.iter() {
             send(commands, process, command.clone(), "Precopy")?;
-            let prepared =
-                await_report(
-                    commands,
-                    process,
-                    update,
-                    PRECOPY_TIMEOUT,
-                    "Precopy",
-                    |report| match report.kind.as_ref() {
-                        Some(report::Kind::Precopied(precopied)) => Some(Ok(precopied.generation)),
-                        Some(report::Kind::PrecopyFailed(failed)) => {
-                            Some(Err(crate::epoch::Failure {
-                                kind: "precopy_failed".to_owned(),
-                                reason: failed.reason.clone(),
-                                device: None,
-                            }))
-                        }
-                        _ => None,
-                    },
-                );
+            let prepared = await_report(
+                commands,
+                process,
+                update,
+                PRECOPY_TIMEOUT,
+                "Precopy",
+                |report| match report.kind.as_ref() {
+                    Some(report::Kind::Precopied(precopied)) => Some(Ok(precopied.generation)),
+                    Some(report::Kind::PrecopyFailed(failed)) => Some(Err(crate::epoch::Failure {
+                        kind: "precopy_failed".to_owned(),
+                        reason: failed.reason.clone(),
+                        device: None,
+                    })),
+                    _ => None,
+                },
+            );
             match prepared {
                 Ok(generation) => generations.push(generation),
                 Err(failure) => {
