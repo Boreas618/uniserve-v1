@@ -157,8 +157,16 @@ pub(crate) struct Launch {
     pub build_config: PathBuf,
     /// The checkpoint the epoch serves.
     pub model: PathBuf,
-    /// The leader daemon's request interface, `unix:<path>` or `<host>:<port>`.
+    /// The leader daemon's request interface, `unix:<path>` or `<host>:<port>`. It speaks the
+    /// request vocabulary: `wire::{Hello, Welcome, ToEngine, FromEngine}` - the epoch's
+    /// submissions, its per-request commands, and this process's accepted requests, events and
+    /// metrics.
     pub requests: String,
+    /// The daemon's process interface, `unix:<path>` or `<host>:<port>`: the supervision frames
+    /// this process claims its storage with and reports to, and the one place a program-layer
+    /// command can reach it. It speaks `process::{Hello, Welcome, Upstream, Downstream}`, which is
+    /// a different vocabulary from `requests`, not a second address of the same one.
+    pub processes: String,
     /// The engine number the daemon started this process under.
     pub engine: u64,
     /// The Program Server's socket.
@@ -214,12 +222,150 @@ impl Launch {
     }
 }
 
+/// This process's connection to its daemon's process interface (§2.3).
+///
+/// The daemon has two interfaces and they are two sockets with two vocabularies: the request one
+/// carries the epoch's requests, their events and the metrics, and this one carries the supervision
+/// frames - the storage claim, the §7.3 reports, and every command the daemon sends an epoch. A
+/// frame of one sent on the other is unreadable at the far end, which is why the claim and the
+/// reports live here and not on the request connection.
+struct ProcessInterface {
+    connection: proto::Connection,
+    /// The commands read while waiting for the answer to something else. A daemon may send a
+    /// `Precopy` while a claim is outstanding, and dropping it would lose the epoch's first
+    /// generation.
+    pending: std::collections::VecDeque<proto::process::Command>,
+}
+
+impl ProcessInterface {
+    /// Connects to `address` and states this process's identity, which the daemon answers with the
+    /// deployment's nodes or a refusal (§2.3).
+    fn connect(address: &str, deployment: &str) -> Result<Self> {
+        let mut connection = proto::Connection::connect(address).with_context(|| {
+            format!("connecting to the daemon's process interface at {address}")
+        })?;
+        connection.send(&proto::process::Hello {
+            major: proto::PROTOCOL_MAJOR,
+            minor: proto::PROTOCOL_MINOR,
+            build: proto::BUILD.to_owned(),
+            peer: Some(proto::process::hello::Peer::Engine(proto::process::Engine {
+                deployment: deployment.to_owned(),
+            })),
+        })?;
+        // The welcome is the daemon's acceptance of this process: a node that has not admitted it
+        // would mint a claim for a process it does not supervise, so nothing is asked before it
+        // arrives.
+        let welcome: proto::process::Welcome = connection
+            .recv(HANDSHAKE_TIMEOUT)?
+            .context("the daemon did not answer this main process's process handshake")?;
+        if !welcome.refusal.is_empty() {
+            bail!(
+                "the daemon refused this main process's process connection: {}",
+                welcome.refusal
+            );
+        }
+        Ok(Self {
+            connection,
+            pending: std::collections::VecDeque::new(),
+        })
+    }
+
+    /// Receives one `Downstream` message, waiting no longer than `timeout`.
+    fn receive(
+        connection: &mut proto::Connection,
+        timeout: Duration,
+        what: &str,
+    ) -> Result<proto::process::Downstream> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!("the daemon did not answer {what} within {timeout:?}");
+            }
+            connection.wait(remaining)?;
+            if let Some(message) = connection.try_recv::<proto::process::Downstream>()? {
+                return Ok(message);
+            }
+        }
+    }
+
+    /// Sends one request and answers its reply, filing every command that arrives meanwhile.
+    fn request(
+        &mut self,
+        request: proto::process::Request,
+        timeout: Duration,
+    ) -> Result<proto::process::Reply> {
+        let id = request.id;
+        self.connection.send(&proto::process::Upstream {
+            kind: Some(proto::process::upstream::Kind::Request(request)),
+        })?;
+        loop {
+            let message = Self::receive(&mut self.connection, timeout, "a claim")?;
+            match message.kind {
+                Some(proto::process::downstream::Kind::Reply(reply)) if reply.id == id => {
+                    return Ok(reply);
+                }
+                Some(proto::process::downstream::Kind::Reply(reply)) => {
+                    tracing::warn!(id = reply.id, "an answer to a request this process did not send");
+                }
+                Some(proto::process::downstream::Kind::Event(event)) => self.file(event),
+                None => {}
+            }
+        }
+    }
+
+    /// Sends one report of this process's state, which the daemon needs no answer to (§7.3).
+    fn report(&mut self, report: proto::process::Report) -> Result<()> {
+        self.connection.send(&proto::process::Upstream {
+            kind: Some(proto::process::upstream::Kind::Report(report)),
+        })?;
+        Ok(())
+    }
+
+    /// The daemon's next command for this epoch, if one has arrived (§7.3).
+    ///
+    /// Nothing waits here: a command that has not arrived is one the next serve pass looks for.
+    fn take_command(&mut self) -> Result<Option<proto::process::Command>> {
+        while let Some(message) = self.connection.try_recv::<proto::process::Downstream>()? {
+            match message.kind {
+                Some(proto::process::downstream::Kind::Event(event)) => self.file(event),
+                Some(proto::process::downstream::Kind::Reply(reply)) => {
+                    tracing::warn!(id = reply.id, "an answer to a request this process did not send");
+                }
+                None => {}
+            }
+        }
+        Ok(self.pending.pop_front())
+    }
+
+    /// Files what the daemon sent unasked.
+    fn file(&mut self, event: proto::process::Event) {
+        match event.kind {
+            Some(proto::process::event::Kind::Command(command)) => self.pending.push_back(command),
+            // A group's exit is a worker's report; this process supervises no group.
+            Some(proto::process::event::Kind::Exit(exit)) => {
+                tracing::warn!(
+                    group = %exit.group,
+                    rank = exit.rank,
+                    status = %exit.status,
+                    "an exit report names a group this process does not supervise"
+                );
+            }
+            None => {}
+        }
+    }
+}
+
 /// Asks this node's daemon for the node's Storage Server (§8).
 ///
 /// The socket and the claim are runtime facts of the node: the daemon mints the claim when it starts
 /// the server, so a launch file cannot carry either. The answer states the socket the server listens
 /// on, the token this rank presents, and where another host reaches its pages.
-fn claim(control: &mut Control, launch: &Launch, host: &str) -> Result<ipc::StorageLaunch> {
+fn claim(
+    process: &mut ProcessInterface,
+    launch: &Launch,
+    host: &str,
+) -> Result<ipc::StorageLaunch> {
     let request = proto::process::Request {
         id: 1,
         kind: Some(proto::process::request::Kind::Claim(proto::process::Claim {
@@ -236,11 +382,7 @@ fn claim(control: &mut Control, launch: &Launch, host: &str) -> Result<ipc::Stor
             retire: Vec::new(),
         })),
     };
-    control.daemon_mut().send(&request)?;
-    let reply: proto::process::Reply = control
-        .daemon_mut()
-        .recv(Duration::from_secs(60))?
-        .context("the daemon closed the request interface while this process claimed its storage")?;
+    let reply = process.request(request, CLAIM_TIMEOUT)?;
     if !reply.error.is_empty() {
         bail!("the daemon refused this rank's claim: {}", reply.error);
     }
@@ -341,6 +483,9 @@ pub(crate) struct MainProcess {
     targets: Vec<Target>,
     /// The Program Server's socket, which a policy's source resolves its module through.
     program_server: PathBuf,
+    /// The daemon's process interface: the claim, the §7.3 reports and every command the daemon
+    /// sends this epoch (§2.3).
+    process: ProcessInterface,
     /// Set by the daemon's `Shutdown`: the epoch ends at the end of this pass (§2.3).
     stopping: bool,
     /// The admitted requests' event streams, by the daemon's request identity: the scheduler
@@ -369,11 +514,15 @@ impl MainProcess {
         // The request interface's handshake: this process says who it is, and the
         // daemon answers with the epoch this node serves (§2.3).
         let epoch = handshake(&mut control, launch, build)?;
+        // The daemon's two interfaces are two sockets: the epoch's requests and metrics travel on
+        // the request connection above, and everything the daemon asks of this process - the claim,
+        // the reports of §7.3, and every command of the program layer - travels on this one.
+        let mut process = ProcessInterface::connect(&launch.processes, &launch.deployment)?;
 
         // §8: the rank's Storage Server and its claim are the node's, which the daemon answers for;
         // the retained weights outlive every world of the epoch, so the store is built once, before
         // the model loads, and keeps what it maps for the epoch's life.
-        let storage = claim(&mut control, launch, &epoch.host)?;
+        let storage = claim(&mut process, launch, &epoch.host)?;
         let client = Retained::connect(&storage, &launch.group, launch.rank, epoch.generation)
             .context("connecting to the Storage Server")?;
         // A weight's region is one device's address, so the store maps on the device this rank's
@@ -468,6 +617,7 @@ impl MainProcess {
             generations,
             targets: plan.targets().to_vec(),
             program_server: plan.program_server().to_path_buf(),
+            process,
             stopping: false,
             streams: Vec::new(),
         })
@@ -513,6 +663,15 @@ impl MainProcess {
 
             // What the admitted requests produced since the last pass.
             self.forward_events();
+
+            // The daemon's commands for this epoch: the program layer's stages, the epoch layer's
+            // park and serve, and the shutdown. They arrive on the process interface, so a pass
+            // that did not look for them would never see an update (§7.3).
+            while let Some(command) = self.process.take_command()? {
+                if let Some(failure) = self.process_command(command)? {
+                    return Ok(Some(failure));
+                }
+            }
 
             // A precopy in flight advances one stage per pass, never waiting on
             // its builds or its devices (§7.3 step 2).
@@ -1461,10 +1620,7 @@ impl MainProcess {
     /// A report is unasked, so a failure to state it costs the daemon's record and not this
     /// process's service: it is logged, and the epoch's own transition has already happened.
     fn send_report(&mut self, report: proto::process::Report) {
-        let upstream = proto::process::Upstream {
-            kind: Some(proto::process::upstream::Kind::Report(report)),
-        };
-        if let Err(error) = self.control.daemon_mut().send(&upstream) {
+        if let Err(error) = self.process.report(report) {
             tracing::warn!(%error, "reporting this epoch's state to the daemon failed");
         }
     }
@@ -1656,6 +1812,14 @@ fn answer(
 
 /// How often the engine reports its counters.
 const METRICS_EVERY: Duration = Duration::from_secs(1);
+
+/// How long the daemon's process interface may take to answer the handshake, which it answers at
+/// once: the wait exists to fail a wrong address rather than hang the process.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the daemon may take to answer this rank's storage claim (§8): starting a Storage
+/// Server for the node is the slow part, and it is the daemon's to do.
+const CLAIM_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The program slot that holds the epoch's scheduling policy (§4.4, §5.1).
 const SCHEDULING: &str = "scheduling";
