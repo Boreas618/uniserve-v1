@@ -200,6 +200,16 @@ pub trait Backing: Send + Sync + 'static {
     }
 }
 
+/// The strides, in elements, of a contiguous tensor of `shape`: the last axis
+/// is the innermost.
+pub fn contiguous_strides(shape: &[i64]) -> Vec<i64> {
+    let mut strides = vec![1; shape.len()];
+    for axis in (0..shape.len().saturating_sub(1)).rev() {
+        strides[axis] = strides[axis + 1] * shape[axis + 1];
+    }
+    strides
+}
+
 /// A borrowed view of storage: an address, an element type, a shape and the
 /// strides between elements. Owning neither the storage nor the shape, it is
 /// valid only while its [`Backing`] and its shape and stride arrays live.
@@ -270,6 +280,13 @@ mod tests {
         assert_eq!(MemoryKind::Cuda(DeviceId(3)).locator_name(), "cuda:3");
         assert!(MemoryKind::from_locator("cuda").is_err());
         assert!(MemoryKind::from_locator("tpu:0").is_err());
+    }
+
+    #[test]
+    fn contiguous_strides_run_from_the_inner_axis_out() {
+        assert_eq!(contiguous_strides(&[4, 3, 2]), vec![6, 2, 1]);
+        assert_eq!(contiguous_strides(&[7]), vec![1]);
+        assert_eq!(contiguous_strides(&[]), Vec::<i64>::new());
     }
 
     #[test]

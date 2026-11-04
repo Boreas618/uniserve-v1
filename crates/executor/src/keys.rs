@@ -406,7 +406,12 @@ mod tests {
                 "dense",
                 &Region::whole()
             ),
-            weight_key(&[file], element, "dense", &Region::new(std::iter::once(0..1)))
+            weight_key(
+                &[file],
+                element,
+                "dense",
+                &Region::new(std::iter::once(0..1))
+            )
         );
     }
 
