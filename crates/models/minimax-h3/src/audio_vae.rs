@@ -536,6 +536,60 @@ pub fn blocks(config: &AudioVaeConfig) -> Result<Vec<Block>> {
     Ok(blocks)
 }
 
+/// One buffer of the decoder's forward: the samples and channels it holds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Workspace {
+    /// The stage the buffer belongs to: 0 is the input projection and the pre-convolution, `i + 1` is
+    /// the output of stage `i`, and the last entry is the decoder's single output channel.
+    pub stage: u32,
+    /// Samples the buffer holds.
+    pub samples: u32,
+    /// Channels the buffer holds.
+    pub channels: u32,
+}
+
+impl Workspace {
+    /// The elements the buffer holds.
+    pub fn elements(&self) -> u64 {
+        u64::from(self.samples) * u64::from(self.channels)
+    }
+}
+
+/// The buffers one decode of `latent_frames` needs, in the order the stages run.
+///
+/// The reference decodes a track's whole latent timeline at once, so the runner sizes these from the
+/// request; a window shorter than the track carries the halo [`receptive_field`] states on each side.
+pub fn workspace(config: &AudioVaeConfig, latent_frames: u32) -> Result<Vec<Workspace>> {
+    if latent_frames == 0 {
+        return Err(Error::config(
+            "an audio decode of no latent frame has no workspace".to_owned(),
+        ));
+    }
+    let stages = stages(config)?;
+    let mut buffers = vec![Workspace {
+        stage: 0,
+        samples: latent_frames,
+        channels: config.latent_dim,
+    }];
+    let mut samples = latent_frames;
+    for (index, stage) in stages.iter().enumerate() {
+        samples = samples
+            .checked_mul(stage.rate)
+            .ok_or_else(|| Error::config("the audio track's length overflows".to_owned()))?;
+        buffers.push(Workspace {
+            stage: index as u32 + 1,
+            samples,
+            channels: stage.channels_out,
+        });
+    }
+    buffers.push(Workspace {
+        stage: stages.len() as u32 + 1,
+        samples,
+        channels: 1,
+    });
+    Ok(buffers)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -626,6 +680,29 @@ pub(crate) mod tests {
     fn the_receptive_field_is_the_references_thirty_latent_frames() {
         // Computed from the reference `receptive_field`: spread 58.31 output samples, one side 30.
         assert_eq!(receptive_field(&audio_config()).expect("field"), 30);
+    }
+
+    #[test]
+    fn the_workspace_grows_to_one_stereo_track() {
+        let config = audio_config();
+        let buffers = workspace(&config, 1).expect("workspace");
+        // One latent frame is 800 samples: the projection, the pre-convolution, seven stages and the
+        // mono output.
+        assert_eq!(buffers.len(), 2 + 7 + 1);
+        assert_eq!(buffers[0].samples, 1);
+        assert_eq!(buffers[0].channels, 2048);
+        let samples: Vec<u32> = buffers.iter().map(|buffer| buffer.samples).collect();
+        assert_eq!(samples, vec![1, 5, 25, 50, 100, 200, 400, 800, 800]);
+        let channels: Vec<u32> = buffers.iter().map(|buffer| buffer.channels).collect();
+        assert_eq!(
+            channels,
+            vec![2048, 1024, 512, 256, 128, 64, 32, 16, 1]
+        );
+        // A whole second of audio is forty latent frames and 32000 samples.
+        let buffers = workspace(&config, 40).expect("workspace");
+        assert_eq!(buffers.last().expect("the output").samples, 32000);
+        assert_eq!(buffers.last().expect("the output").channels, 1);
+        assert!(workspace(&config, 0).is_err());
     }
 
     #[test]
