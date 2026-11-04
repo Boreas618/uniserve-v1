@@ -68,6 +68,10 @@ namespace {
 /// first proposal.
 constexpr int64_t kFirstEngine = -1;
 
+// Whether this module's input element type is FP32, the only precision whose
+// convolution has a TF32 choice to make.
+constexpr bool kFp32Inputs = UNISERVE_CONV_INPUT_DTYPE == UNISERVE_CONV_DTYPE_F32;
+
 // cuDNN 9's backend API, loaded at run time: the module carries no cuDNN headers
 // and no link-time dependency, so it runs against the library the host ships.
 constexpr const char* kLibrary = "libcudnn.so.9";
@@ -120,6 +124,7 @@ constexpr int32_t kAttrVariantPackUniqueIds = 1000;
 constexpr int32_t kAttrVariantPackDataPointers = 1001;
 constexpr int32_t kAttrVariantPackWorkspace = 1003;
 constexpr int32_t kAttrEngineGlobalIndex = 1301;
+constexpr int32_t kAttrEngineNumericalNote = 1303;
 
 // `cudnnBackendAttributeType_t`.
 constexpr int32_t kTypeDataType = 1;
@@ -128,6 +133,7 @@ constexpr int32_t kTypeFloat = 4;
 constexpr int32_t kTypeVoidPtr = 6;
 constexpr int32_t kTypeConvolutionMode = 7;
 constexpr int32_t kTypeHeurMode = 8;
+constexpr int32_t kTypeNumericalNote = 11;
 constexpr int32_t kTypeBackendDescriptor = 15;
 
 // `CUDNN_DATA_FLOAT`: the compute type of every convolution here.
@@ -138,6 +144,12 @@ constexpr int32_t kHeuristicModeA = 3;
 constexpr int32_t kCrossCorrelation = 1;
 // The number of engine configurations one heuristic query returns.
 constexpr int64_t kMaxEngineConfigs = 32;
+// `CUDNN_NUMERICAL_NOTE_DOWN_CONVERT_INPUTS`: the engine narrows its inputs before
+// computing with them, which for FP32 inputs is TF32 and nothing else. It is the only
+// note that distinguishes a convolution that may use TF32 from one that may not.
+constexpr int32_t kNumericalNoteDownConvertInputs = 1;
+// The notes one engine can carry, as `cudnnBackendGetAttribute` returns them.
+constexpr int64_t kMaxNumericalNotes = 16;
 // The unique ids tying the operation graph's tensors to a variant pack.
 constexpr int64_t kUidX = 0;
 constexpr int64_t kUidW = 1;
@@ -396,30 +408,71 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
       *status = refuse(error, "cuDNN's heuristic proposes no engine for this convolution");
       built = false;
     }
-    int64_t take = 0;
-    if (built && UNISERVE_CONV_ENGINE != kFirstEngine) {
-      bool hosted = false;
-      for (int64_t at = 0; at < count && !hosted; ++at) {
-        void* engine = nullptr;
-        int64_t index = 0;
-        if (library.backend_get(configs[at], kAttrEngineCfgEngine, kTypeBackendDescriptor, 1,
-                                nullptr, &engine) == kSuccess &&
-            engine != nullptr &&
-            library.backend_get(engine, kAttrEngineGlobalIndex, kTypeInt64, 1, nullptr, &index) ==
-                kSuccess) {
-          hosted = index == UNISERVE_CONV_ENGINE;
-          take = at;
-        }
-        library.backend_destroy(engine);
+    // The engine: the one the tuning data names, else the heuristic's first proposal
+    // that keeps the call's numerics. With `tf32` clear, an engine that narrows FP32
+    // inputs is not a candidate — that is what makes the permission mean something.
+    const bool exact_fp32 = kFp32Inputs && call.tf32 == 0;
+    auto narrows_inputs = [&library](void* engine, bool* narrows) {
+      int32_t notes[kMaxNumericalNotes] = {};
+      int64_t notes_count = 0;
+      if (library.backend_get(engine, kAttrEngineNumericalNote, kTypeNumericalNote,
+                              kMaxNumericalNotes, &notes_count, notes) != kSuccess) {
+        return false;
       }
-      if (!hosted) {
+      *narrows = false;
+      for (int64_t at = 0; at < notes_count && at < kMaxNumericalNotes; ++at) {
+        *narrows = *narrows || notes[at] == kNumericalNoteDownConvertInputs;
+      }
+      return true;
+    };
+    int64_t take = -1;
+    bool hosted = false;
+    bool named_narrows = false;
+    for (int64_t at = 0; at < count && built; ++at) {
+      void* engine = nullptr;
+      if (library.backend_get(configs[at], kAttrEngineCfgEngine, kTypeBackendDescriptor, 1,
+                              nullptr, &engine) != kSuccess ||
+          engine == nullptr) {
+        continue;
+      }
+      bool narrows = false;
+      const bool readable = narrows_inputs(engine, &narrows);
+      int64_t index = 0;
+      const bool named =
+          UNISERVE_CONV_ENGINE != kFirstEngine &&
+          library.backend_get(engine, kAttrEngineGlobalIndex, kTypeInt64, 1, nullptr, &index) ==
+              kSuccess &&
+          index == UNISERVE_CONV_ENGINE;
+      // An unreadable note is not a reason to give up the exactness the call asked
+      // for: only an engine that says it does not narrow its inputs is usable then.
+      const bool numerics = !exact_fp32 || (readable && !narrows);
+      if (named) {
+        hosted = true;
+        named_narrows = readable && narrows;
+      }
+      if (numerics && (UNISERVE_CONV_ENGINE == kFirstEngine || named) && take < 0) {
+        take = at;
+      }
+      library.backend_destroy(engine);
+    }
+    if (built && take < 0) {
+      if (UNISERVE_CONV_ENGINE != kFirstEngine && !hosted) {
         std::snprintf(error, 512,
                       "cuDNN proposes no engine %lld for this convolution, which the package's "
                       "tuning data names",
                       static_cast<long long>(UNISERVE_CONV_ENGINE));
-        *status = 1;
-        built = false;
+      } else if (UNISERVE_CONV_ENGINE != kFirstEngine && named_narrows) {
+        std::snprintf(error, 512,
+                      "engine %lld converts this convolution's FP32 inputs and the call forbids "
+                      "TF32: the package's tuning data names an engine the call cannot use",
+                      static_cast<long long>(UNISERVE_CONV_ENGINE));
+      } else {
+        std::snprintf(error, 512,
+                      "no engine cuDNN proposes computes this FP32 convolution without converting "
+                      "its inputs, and the call forbids TF32");
       }
+      *status = 1;
+      built = false;
     }
     if (built) {
       built = make(kDescriptorExecutionPlan, &plan) &&
@@ -528,6 +581,8 @@ std::string plan_key(const uniserve_conv_call& call, int32_t device) {
   key += std::to_string(UNISERVE_CONV_OUTPUT_DTYPE);
   key += '_';
   key += std::to_string(UNISERVE_CONV_ENGINE);
+  // The engine the plan holds depends on the call's TF32 permission.
+  key += call.tf32 != 0 ? "_tf32" : "_exact";
   key += "_device_";
   key += std::to_string(device);
   return key;
@@ -540,6 +595,18 @@ extern "C" int32_t UNISERVE_CONV_ENTRY(const uniserve_conv_call* call, void* str
     return 1;
   }
   char* error = const_cast<char*>(call->error);
+  // `tf32` is a permission, not a requirement: it says an FP32 convolution *may*
+  // narrow its inputs to TF32. A convolution whose inputs are half precision has no
+  // such choice, so asking for it there is not a call this module can honour. An FP32
+  // convolution may both grant and withhold the permission, and the engine selection
+  // below is what makes the withholding real: with `tf32` clear, only an engine that
+  // does not narrow its inputs is used.
+  if (call->tf32 != 0 && !kFp32Inputs) {
+    return refuse(error,
+                  "a convolution's tf32 value describes FP32 inputs only: this module's input "
+                  "element type cannot use it");
+  }
+
   if (call->input == nullptr || call->weight == nullptr || call->out == nullptr) {
     return refuse(error, "a convolution needs the addresses of its input, filter and output");
   }
@@ -582,18 +649,6 @@ extern "C" int32_t UNISERVE_CONV_ENTRY(const uniserve_conv_call* call, void* str
       return refuse(error, "a convolution's output extents are positive");
     }
   }
-  // `tf32` is the descriptor's statement about the numerics of an FP32
-  // convolution. cuDNN 9's backend API chooses the engine's arithmetic from the
-  // engine it proposes and exposes no math-type knob, so an FP32 convolution here
-  // runs whatever that engine does with FP32, and a half-precision one has no
-  // such choice. A descriptor that says otherwise is not one this module runs.
-  const bool fp32 = UNISERVE_CONV_INPUT_DTYPE == UNISERVE_CONV_DTYPE_F32;
-  if (fp32 != (call->tf32 != 0)) {
-    return refuse(error,
-                  "a convolution's tf32 value describes FP32 inputs only: this module's input "
-                  "element type and the descriptor's tf32 disagree");
-  }
-
   int32_t device = 0;
   if (cudaGetDevice(&device) != cudaSuccess) {
     return refuse(error, "a convolution needs the caller's device");

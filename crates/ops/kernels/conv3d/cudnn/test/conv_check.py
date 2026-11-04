@@ -23,6 +23,13 @@ products. Two things this check makes visible rather than hides:
 * A ``bf16``/``f16`` convolution keeps the same bound with ``u_out`` of its own
   element type.
 
+``--expect-refusal <phrase>`` inverts the run: it passes when the entry refuses the
+call with a message containing the phrase, and fails when the call is served. That is
+how the operator's rule that ``tf32`` is a permission for FP32 only is checked — a
+half-precision module given ``--tf32 true`` must refuse, because it has no such choice
+to make, while an FP32 module withholds the permission by being served an engine that
+does not narrow its inputs.
+
 Run it with the Program Server's environment
 (``crates/program-server/python/.venv/bin/python``), which has torch.
 """
@@ -107,17 +114,64 @@ def main() -> int:
     parser.add_argument(
         "--length", type=int, default=17, help="spatial extent per axis"
     )
-    parser.add_argument(
-        "--kernel", type=int, default=3, help="filter extent per axis"
-    )
-    parser.add_argument("--stride", type=int, default=1)
-    parser.add_argument("--padding", type=int, default=1)
-    parser.add_argument("--dilation", type=int, default=1)
+    for name, default, help in (
+        (
+            "--kernel",
+            "3",
+            "filter extent: one axis, or all three as `a x b x c`",
+        ),
+        ("--stride", "1", "filter stride: one axis, or all three"),
+        ("--padding", "1", "padding: one axis, or all three"),
+        ("--dilation", "1", "dilation: one axis, or all three"),
+    ):
+        parser.add_argument(
+            name,
+            default=default,
+            help=f"{help}; the axes beyond the operator's rank stay as they are "
+            "written, because a convolution's cell names all three",
+        )
     parser.add_argument("--groups", type=int, default=1)
     parser.add_argument("--bias", choices=["true", "false"], default="true")
+    parser.add_argument(
+        "--expect-key",
+        default=None,
+        help="the descriptor key the module was built for, to check the flags against",
+    )
     arguments = parser.parse_args()
-    if arguments.tf32 == "true" and arguments.dtype != "f32":
-        parser.error("a TF32 permission applies to FP32 activations only")
+
+    # The directory `resolve` hands a runner is named by the descriptor the module was
+    # built for, so the flags are held against it: a check that tested its own defaults
+    # against a module built for other flags would report a kernel defect that is not one.
+    axes = 3 if arguments.op == "conv3d" else 1
+
+    def topology(text):
+        """A geometry axis triplet, from one axis' value or all three written out."""
+        parts = [int(part) for part in text.split("x")]
+        if len(parts) not in (1, 3):
+            parser.error(f"{text!r} is neither one value nor three axes")
+        # A rank-1 convolution is a three-axis convolution whose other axes are 1,
+        # which is what the operator's key spells and what its module was built for.
+        return "x".join(str(part) for part in parts + [1] * (3 - len(parts)))
+
+    key = (
+        f"input_{arguments.dtype}_weight_{arguments.dtype}"
+        f"_output_{arguments.dtype}"
+        f"_geometry_kernel_{topology(arguments.kernel)}"
+        f"_stride_{topology(arguments.stride)}"
+        f"_padding_{topology(arguments.padding)}"
+        f"_dilation_{topology(arguments.dilation)}"
+        f"_groups_{arguments.groups}_bias_{arguments.bias}"
+        f"_tf32_{arguments.tf32}_rank_{axes}"
+        f"_transposed_{'true' if arguments.op == 'conv_transpose1d' else 'false'}"
+    )
+    print(f"descriptor: {key}")
+    named = arguments.expect_key or (
+        arguments.module.name if "_geometry_" in arguments.module.name else None
+    )
+    if named is not None and named != key:
+        parser.error(
+            f"the flags name {key}, and the module was built for {named}"
+        )
 
     entry_name = {
         "conv1d": "uniserve_conv1d",
@@ -134,10 +188,16 @@ def main() -> int:
     rank = 1 if arguments.op != "conv3d" else 3
     dtype = TORCH_TYPES[arguments.dtype]
     spatial = [arguments.length] * rank
-    kernel = [arguments.kernel] * rank
-    stride = [arguments.stride] * rank
-    padding = [arguments.padding] * rank
-    dilation = [arguments.dilation] * rank
+
+    def axes(text):
+        """The three-axis geometry array a call passes, from the flag's triplet."""
+        parts = [int(part) for part in text.split("x")]
+        return parts + [1] * (3 - len(parts))
+
+    kernel = axes(arguments.kernel)[:rank]
+    stride = axes(arguments.stride)[:rank]
+    padding = axes(arguments.padding)[:rank]
+    dilation = axes(arguments.dilation)[:rank]
     input_channels = arguments.channels
     out_channels = arguments.out_channels
     group_channels = input_channels // arguments.groups
@@ -198,10 +258,10 @@ def main() -> int:
     call.input_shape = (ctypes.c_int64 * 5)(*padded(x.shape))
     call.weight_shape = (ctypes.c_int64 * 5)(*padded(weight.shape))
     call.out_shape = (ctypes.c_int64 * 5)(*padded(out_shape))
-    call.kernel = (ctypes.c_int32 * 3)(*(kernel + [1] * (3 - rank)))
-    call.stride = (ctypes.c_int32 * 3)(*(stride + [1] * (3 - rank)))
-    call.padding = (ctypes.c_int32 * 3)(*(padding + [1] * (3 - rank)))
-    call.dilation = (ctypes.c_int32 * 3)(*(dilation + [1] * (3 - rank)))
+    call.kernel = (ctypes.c_int32 * 3)(*axes(arguments.kernel))
+    call.stride = (ctypes.c_int32 * 3)(*axes(arguments.stride))
+    call.padding = (ctypes.c_int32 * 3)(*axes(arguments.padding))
+    call.dilation = (ctypes.c_int32 * 3)(*axes(arguments.dilation))
     call.groups = arguments.groups
     call.transposed = 1 if arguments.op == "conv_transpose1d" else 0
     call.tf32 = 1 if arguments.tf32 == "true" else 0
