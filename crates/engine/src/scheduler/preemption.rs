@@ -131,7 +131,7 @@ impl Scheduler {
             .map_or(DEFAULT_COMPONENT, String::as_str);
         let (_, bound, _) = self
             .placement
-            .component_candidates(self.executor.as_ref(), kind, component)
+            .component_candidates(self.executor.inner(), kind, component)
             .next()?;
         self.placement
             .affinity
@@ -478,7 +478,7 @@ impl Scheduler {
         let stored = state.req.trajectory.clone();
         let trajectory = image_trajectory(stored.id, state.image_id);
         let worker = self.placement.place(
-            self.executor.as_ref(),
+            self.executor.inner(),
             &self.info,
             request_key,
             CallKind::Media(MediaCall::LatentPreparation),
