@@ -1802,11 +1802,13 @@ fn forward_reference(
                 let mut total = 0.0f64;
                 for c in 0..channels {
                     for j in 0..kernel {
-                        let i = (o as i64 + padding - j as i64 * dilation) / stride;
-                        let aligned = i >= 0
-                            && (i < length as i64)
-                            && o as i64 == i * stride - padding + j as i64 * dilation;
-                        if aligned {
+                        // The definition of a cross-correlation: output `o`
+                        // reads the input at `o·stride − padding +
+                        // j·dilation`, the whole tap position and nothing
+                        // divided into it. A position outside the input is the
+                        // padding and contributes nothing.
+                        let i = o as i64 * stride - padding + j as i64 * dilation;
+                        if i >= 0 && i < length as i64 {
                             let value = x[(n * channels + c) * length + i as usize];
                             let weight = w[(k * channels + c) * kernel + j];
                             total += f64::from(value) * f64::from(weight);
@@ -2134,23 +2136,25 @@ fn forward_reference_3d(
     let mut y = vec![0.0f32; batch * filters * out_d * out_h * out_w];
     for n in 0..batch {
         for k in 0..filters {
+            // The same definition as the one-dimensional reference: in each
+            // axis, output `o` reads the input at `o + j − padding`.
             for od in 0..out_d {
                 for oh in 0..out_h {
                     for ow in 0..out_w {
                         let mut total = 0.0f64;
                         for c in 0..channels {
                             for jd in 0..kernel_d {
-                                let d = od as i64 + padding as i64 - jd as i64;
+                                let d = od as i64 - padding as i64 + jd as i64;
                                 if d < 0 || d >= depth as i64 {
                                     continue;
                                 }
                                 for jh in 0..kernel_h {
-                                    let h = oh as i64 + padding as i64 - jh as i64;
+                                    let h = oh as i64 - padding as i64 + jh as i64;
                                     if h < 0 || h >= height as i64 {
                                         continue;
                                     }
                                     for jw in 0..kernel_w {
-                                        let w_index = ow as i64 + padding as i64 - jw as i64;
+                                        let w_index = ow as i64 - padding as i64 + jw as i64;
                                         if w_index < 0 || w_index >= width as i64 {
                                             continue;
                                         }
