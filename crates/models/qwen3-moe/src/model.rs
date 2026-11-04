@@ -218,7 +218,8 @@ impl Plan {
                         tile: u64::from(TILE_ROWS),
                     },
                     ops::fp4::ScaleLayout::Linear,
-                )
+                    dtype,
+                )?
             } else {
                 0
             },
