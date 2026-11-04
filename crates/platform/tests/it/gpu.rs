@@ -1071,9 +1071,12 @@ const KERNELS: &str = "\
 
 /// The words of `buffer`, read after the writing stream was synchronized.
 fn words(buffer: &PinnedBuffer) -> Vec<u32> {
-    read(buffer)
-        .chunks_exact(4)
-        .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+    let bytes = read(buffer);
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| u32::from_le_bytes(*word))
         .collect()
 }
 
@@ -1220,10 +1223,11 @@ fn launch_ex_carries_the_grid_shared_memory_and_launch_attributes() {
         // SAFETY: as above.
         unsafe { memcpy_async(host.address(), storage.address(), 4 * 28, &stream) }.unwrap();
         stream.synchronize().unwrap();
-        for (block, record) in words(&host).chunks_exact(7).enumerate() {
+        let observed = words(&host);
+        for (block, record) in observed.as_chunks::<7>().0.iter().enumerate() {
             let block = block as u32;
             assert_eq!(
-                record,
+                *record,
                 [block % 2, block / 2, 0, 0, 0, 0, 0],
                 "block {block} of a clustered launch"
             );
