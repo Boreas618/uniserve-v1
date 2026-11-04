@@ -657,6 +657,25 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
                 digests[0], digests[1]
             )));
         }
+        // One layer against the reference, without walking the stack: the same comparison the
+        // decode stage makes, at a hundredth of the cost, for when a stage has already been named and
+        // the question is what one layer does.
+        if args.reference.is_some() || args.dump.is_some() {
+            let rows = model.forward_through(&forward, &batch, &cache, hidden, layer)?;
+            stream.synchronize()?;
+            let width = usize::try_from(plan.hidden).unwrap_or(0);
+            let values = download_bf16(&stream, rows, tokens_usize(&batch), width)?;
+            let mut first_above = None;
+            report_stage(
+                &args,
+                &format!("hidden_{:02}.npy", layer + 1),
+                layer + 1,
+                &values,
+                tokens_usize(&batch),
+                width,
+                &mut first_above,
+            )?;
+        }
         return Ok(());
     }
     // With `--dump`, every stage's output is written as float32 `.npy` for a comparison against a
