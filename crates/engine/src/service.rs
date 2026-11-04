@@ -2987,10 +2987,22 @@ fn apply_process_command(
                 generations.previous = None;
             }
             let forgotten = generations.named.remove(&generation);
+            // A candidate the purged number named is dropped with it: the purge
+            // forgets the generation, so a policy prepared under it is not one a
+            // switchover may still put in.
+            let purged_candidate = forgotten
+                .as_ref()
+                .is_some_and(|key| generations.candidate.as_ref() == Some(key));
+            if purged_candidate {
+                generations.candidate = None;
+            }
             let drop_modules = forgotten
-                .map(|key| !generations.still_named(&key))
-                .unwrap_or(false);
+                .as_ref()
+                .is_some_and(|key| !generations.still_named(key));
             drop(generations);
+            if purged_candidate {
+                policy.discard();
+            }
             if drop_modules {
                 if let Err(reason) = policy.purge() {
                     return Some(proto::process::Report {
@@ -3428,6 +3440,42 @@ mod tests {
             precopy(Vec::new()),
         ));
         assert_eq!(policy.calls().len(), before, "nothing was prepared twice");
+    }
+
+    #[test]
+    fn a_purge_drops_the_policy_a_precopy_prepared_under_that_number() {
+        use proto::process::report::Kind;
+
+        let policy = Recording::default();
+        let generations = Mutex::new(Generations::default());
+        let store = store();
+        let mut run = |command| apply_process_command(&policy, &generations, Some(&store), command);
+        let first = |report| match answered(report) {
+            Kind::Precopied(precopied) => precopied.generation,
+            other => panic!("a precopy is answered by Precopied, not {other:?}"),
+        };
+
+        let one = first(run(precopy(Vec::new())));
+        assert!(matches!(answered(run(switchover(one))), Kind::Switched(_)));
+        let two = first(run(precopy_of("priority", 5, Vec::new())));
+        assert_ne!(two, one, "a program prepared under its own number");
+
+        // The update is withdrawn before its switchover: the purge forgets the
+        // number, and the policy prepared under it is dropped rather than left
+        // waiting to be put in.
+        assert!(matches!(
+            answered(run(purge(two))),
+            Kind::Purged(purged) if purged.generation == two
+        ));
+        assert!(
+            policy.calls().iter().any(|call| call == "discard"),
+            "the prepared policy is dropped with its number"
+        );
+        // Its number names nothing any more, so a switchover to it is refused.
+        assert!(matches!(
+            answered(run(switchover(two))),
+            Kind::Fault(fault) if fault.reason.contains("was not prepared")
+        ));
     }
 
     #[test]
