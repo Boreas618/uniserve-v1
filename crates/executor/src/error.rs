@@ -25,6 +25,12 @@ pub enum Error {
     /// A CUDA driver or NCCL call failed.
     #[error(transparent)]
     Cuda(#[from] platform::Error),
+    /// An operator's launch or a kernel's load failed.
+    #[error(transparent)]
+    Ops(#[from] ops::Error),
+    /// A model layer's computation failed.
+    #[error(transparent)]
+    Nn(#[from] nn::Error),
     #[error("{0}")]
     Invalid(String),
     #[error("{0}")]
@@ -229,6 +235,9 @@ fn kind_code(error: &Error) -> ErrorCode {
         Error::Unsupported(_) | Error::Interface(_) => ErrorCode::UnsupportedSetup,
         Error::Invariant(_) => ErrorCode::InvariantViolation,
         Error::Transport { .. } | Error::Cuda(_) | Error::State(_) => ErrorCode::ComputeError,
+        // An operator or model failure is a computation failure, unless its own
+        // kind says otherwise; the message carries the library's text.
+        Error::Ops(_) | Error::Nn(_) => ErrorCode::ComputeError,
     }
 }
 
