@@ -1,0 +1,22 @@
+[package]
+name = "minimax-h3"
+description = "MiniMax-H3: configuration, partition and the numerical model (base, FastH3 DMD, OmniRef)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The numerical model composes `nn` layers; `nn` re-exports the `ops` kernel ABI. The loader reads
+# checkpoint metadata at this boundary, so the model's own types stay plain and typed.
+[dependencies]
+nn = { path = "../../nn" }
+ops = { path = "../../ops" }
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
