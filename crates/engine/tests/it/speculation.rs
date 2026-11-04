@@ -97,6 +97,11 @@ impl World {
             // takes, and a refilled token's cost in decode steps. The
             // mechanism measures both, but a policy reads stated parameters
             // (design §7.7), so the world states what it measures.
+            //
+            // Leaving them unstated is not the same world: `refill_due` has no
+            // value to weigh then and refills whatever the steps cost, so the
+            // two cases below measure the stated path only. A deployment that
+            // does not state both refills regardless of whether it pays.
             engine::Parameters {
                 expected_speedup: Some(
                     (speculation.accepted + 1) as f64
