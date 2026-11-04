@@ -28,6 +28,7 @@
 
 use std::fmt;
 
+use ops::fp4::ScaleLayout;
 use ops::{DType, Shape, TensorView};
 
 use crate::checkpoint::{Checkpoint, FileIdentity};
@@ -50,6 +51,15 @@ impl WeightLayout {
 
     /// A routed expert's second projection: `[experts, hidden, intermediate]`.
     pub const DOWN: Self = Self("down");
+
+    /// A calibrated NVFP4 matrix's packed E2M1 values: `[rows, columns / 2]` U8, one byte per pair.
+    pub const NVFP4_VALUES: Self = Self("nvfp4_values");
+
+    /// A calibrated NVFP4 matrix's E4M3 block scales in the linear layout: `[rows, columns / 16]`.
+    pub const NVFP4_SCALES_LINEAR: Self = Self("nvfp4_scales_linear");
+
+    /// The same scales in the swizzled 128x4 layout the cuDNN product reads.
+    pub const NVFP4_SCALES_SWIZZLED: Self = Self("nvfp4_scales_swizzled_128x4");
 
     /// The layout named `name`.
     pub const fn named(name: &'static str) -> Self {
@@ -105,6 +115,23 @@ pub enum WeightSource {
         /// The region's extents.
         shape: Shape,
     },
+    /// `shape` elements of `tensor` whose last axis begins at element `start` and repeats every
+    /// `stride` elements.
+    ///
+    /// A tensor-parallel rank reads one column block of a row-parallel projection: every row of the
+    /// checkpoint's tensor contributes `shape.last()` elements, and consecutive rows start `stride`
+    /// elements apart. The loader gathers those rows and converts them like any other weight, so
+    /// the retained storage of a shard is contiguous like the rest.
+    Strided {
+        /// The checkpoint tensor's name.
+        tensor: String,
+        /// The first element of the first row, in the tensor's row-major order.
+        start: u64,
+        /// The gathered region's extents.
+        shape: Shape,
+        /// Elements between the first elements of consecutive rows.
+        row_stride: u64,
+    },
     /// The row-major concatenation of `parts` along their first axis, viewed as `shape`.
     ///
     /// Every part must have the same extents after its first axis. This is how a routed expert's
@@ -147,6 +174,22 @@ impl WeightRequest {
         }
     }
 
+    /// A weight gathered from `tensor`'s rows, each row starting `stride` elements after the last.
+    pub fn strided(tensor: impl Into<String>, start: u64, shape: Shape, row_stride: u64) -> Self {
+        let tensor = tensor.into();
+        Self {
+            source: WeightSource::Strided {
+                tensor: tensor.clone(),
+                start,
+                shape,
+                row_stride,
+            },
+            tensor,
+            layout: WeightLayout::ROW_MAJOR,
+            shape,
+        }
+    }
+
     /// A weight fused from `parts`, viewed as `shape`, in `layout`.
     pub fn parts(
         tensor: impl Into<String>,
@@ -178,6 +221,9 @@ pub struct WeightRegion {
     pub start: u64,
     /// The logical tensor's extents.
     pub shape: Shape,
+    /// The source rows' stride in elements, when the region is a strided sub-matrix. Two gatherings
+    /// of one tensor differ in it, so they cannot collide in retained storage.
+    pub stride: Option<u64>,
 }
 
 impl fmt::Display for WeightRegion {
@@ -189,7 +235,11 @@ impl fmt::Display for WeightRegion {
             self.start,
             self.start + self.shape.numel()
         )?;
-        write!(formatter, "{:?}", self.shape.dims())
+        write!(formatter, "{:?}", self.shape.dims())?;
+        if let Some(stride) = self.stride {
+            write!(formatter, "|stride_{stride}")?;
+        }
+        Ok(())
     }
 }
 
@@ -243,6 +293,22 @@ pub trait RetainedWeights {
         shape: Shape,
         bytes: &[u8],
     ) -> Result<Backing>;
+}
+
+/// A calibrated NVFP4 matrix, as the `nvfp4_gemm` operator reads it.
+///
+/// The two weights are the encoded fields of the checkpoint, retained like any other weight; the
+/// global scale is a plain value because it enters a kernel as a launch scalar.
+#[derive(Clone, Copy, Debug)]
+pub struct QuantizedWeight {
+    /// `[rows, columns / 2]` U8: two E2M1 codes a byte, packed along the contraction.
+    pub packed: Weight,
+    /// `ScaleLayout::shape(rows, columns)` U8: one E4M3 block scale per sixteen elements.
+    pub scales: Weight,
+    /// The reciprocal of the checkpoint's FP32 tensor scale.
+    pub global_scale: f32,
+    /// The layout the block scales are stored in.
+    pub layout: ScaleLayout,
 }
 
 /// A weight a layer reads: its view and the region that keeps the bytes alive.
@@ -310,13 +376,19 @@ impl<'a> WeightLoader<'a> {
             )));
         }
 
-        let (names, start, source_shape) = match &request.source {
+        let (names, start, source_shape, stride) = match &request.source {
             WeightSource::Region {
                 tensor,
                 start,
                 shape,
-            } => (vec![tensor.clone()], *start, *shape),
-            WeightSource::Parts { parts, shape } => (parts.clone(), 0, *shape),
+            } => (vec![tensor.clone()], *start, *shape, None),
+            WeightSource::Strided {
+                tensor,
+                start,
+                shape,
+                row_stride,
+            } => (vec![tensor.clone()], *start, *shape, Some(*row_stride)),
+            WeightSource::Parts { parts, shape } => (parts.clone(), 0, *shape, None),
         };
         if let WeightSource::Parts { shape, .. } = &request.source
             && !request.shape.matches(shape)
@@ -331,11 +403,13 @@ impl<'a> WeightLoader<'a> {
         }
 
         let files = self.identities(&names)?;
+        let source_dtype = self.checkpoint_dtype(&names)?;
         let dtype = self.target_dtype(&names)?;
         let region = WeightRegion {
             tensors: names.clone(),
             start,
             shape: source_shape,
+            stride,
         };
         let key = WeightKey {
             files,
@@ -352,11 +426,12 @@ impl<'a> WeightLoader<'a> {
         }
 
         let bytes = self.source_bytes(&request.source, &key)?;
-        let bytes = match self.dtype {
-            Some(target) if target != key.dtype => {
-                convert(key.dtype, target, &bytes, &request.tensor)?
-            }
-            _ => bytes,
+        // The key carries the retained element type; the bytes still hold the checkpoint's, so the
+        // conversion is decided by the source, not by the key.
+        let bytes = if source_dtype != dtype {
+            convert(source_dtype, dtype, &bytes, &request.tensor)?
+        } else {
+            bytes
         };
         let expected = request
             .shape
@@ -384,6 +459,178 @@ impl<'a> WeightLoader<'a> {
         Ok(Weight {
             view: backing.view(dtype, request.shape)?,
             backing,
+        })
+    }
+
+    /// Publish the weight-normalized form of `v` and `g` as one weight.
+    ///
+    /// A checkpoint stores a weight-normalized convolution as two tensors: `v` with the weight's
+    /// extents and `g` with one magnitude per output channel (PyTorch keeps it as `[channels, 1,
+    /// 1]`). The weight the convolution reads is `v · g / ‖v‖`, where the norm reduces every axis
+    /// but the first per channel; spec 9 computes it once at loading, so a loaded model never
+    /// carries the pair. The computation is FP32 and the result keeps the checkpoint's element type
+    /// unless the loader was given another.
+    ///
+    /// `name` is the logical tensor the key records; the key also names both sources, so it cannot
+    /// be confused with a plain region of either.
+    pub fn weight_norm(&mut self, name: &str, v: &str, g: &str) -> Result<Weight> {
+        let value = self.checkpoint.read(v)?;
+        let gain = self.checkpoint.read(g)?;
+        if value.shape.rank() == 0 {
+            return Err(Error::weight(
+                name,
+                "a weight-normalized tensor has an axis".to_owned(),
+            ));
+        }
+        let channels = value.shape.dim(0);
+        if gain.shape.numel() != channels {
+            return Err(Error::weight(
+                name,
+                format!(
+                    "a gain of {} elements for {channels} output channels",
+                    gain.shape.numel()
+                ),
+            ));
+        }
+        let dtype = self.dtype.unwrap_or(value.dtype);
+        if !dtype.is_float() || !value.dtype.is_float() {
+            return Err(Error::weight(
+                name,
+                format!(
+                    "weight normalization of {} is not floating point",
+                    value.dtype
+                ),
+            ));
+        }
+        let names = vec![v.to_owned(), g.to_owned()];
+        let key = WeightKey {
+            files: self.identities(&names)?,
+            dtype,
+            layout: WeightLayout::ROW_MAJOR,
+            region: WeightRegion {
+                // The logical name first: the double underscore marks a computed weight, so the key
+                // is a region neither source names on its own.
+                tensors: vec![format!("{name}__weight_norm"), v.to_owned(), g.to_owned()],
+                start: 0,
+                shape: value.shape,
+                stride: None,
+            },
+        };
+        if let Some(backing) = self.store.retained(&key)? {
+            return Ok(Weight {
+                view: backing.view(dtype, value.shape)?,
+                backing,
+            });
+        }
+
+        let values = to_f32(value.dtype, &value.bytes, v)?;
+        let gains = to_f32(gain.dtype, &gain.bytes, g)?;
+        let per_channel = usize::try_from(value.shape.numel() / channels.max(1))
+            .map_err(|_| Error::weight(name, "more elements than a usize".to_owned()))?;
+        let mut normalized = Vec::with_capacity(values.len());
+        for (channel, gain) in gains.iter().enumerate() {
+            let rows = &values[channel * per_channel..][..per_channel];
+            let sum = rows.iter().map(|value| value * value).sum::<f32>();
+            let scale = gain / sum.sqrt();
+            normalized.extend(rows.iter().map(|value| value * scale));
+        }
+        let bytes = from_f32(dtype, &normalized, name)?;
+        let backing = self.store.publish(&key, dtype, value.shape, &bytes)?;
+        Ok(Weight {
+            view: backing.view(dtype, value.shape)?,
+            backing,
+        })
+    }
+
+    /// Borrow this loader for another checkpoint: the same store, the same conversion, a
+    /// different shard set.
+    ///
+    /// A pipeline's components each keep their own index in their own directory (`transformer/`,
+    /// `vae/`, `text_encoder/`), so a model crate opens one [`Checkpoint`] per component and reads
+    /// each through one loader. Retained storage stays the loader's, so a weight converted once for
+    /// one component is reused for another and never converted twice (specs/worker.md 8).
+    pub fn for_checkpoint<'b>(&'b mut self, checkpoint: &'b Checkpoint) -> WeightLoader<'b> {
+        WeightLoader {
+            checkpoint,
+            store: self.store,
+            dtype: self.dtype,
+            quantization: self.quantization,
+        }
+    }
+
+    /// Load a calibrated NVFP4 matrix: its packed E2M1 values, its block scales and its tensor
+    /// scale.
+    ///
+    /// A calibrated checkpoint already holds the encoded fields (`values`, `block_scale`,
+    /// `tensor_scale`, `uniserve/quantization/quantizer.py`), so nothing is quantized here: the
+    /// three are published through retained storage under keys naming the scale layout, and a
+    /// deployment that asks to quantize a BF16 checkpoint at load does it with the
+    /// `nvfp4_quantize` operator on the device, which is where the reference encodes too.
+    ///
+    /// `values` is `[rows, columns / 2]` U8 (two E2M1 codes a byte), `scales` holds the block
+    /// scales in the layout `ops::fp4::ScaleLayout::shape(rows, columns)` names — U8, as every
+    /// program reads them — and `global_scale` is the reciprocal of the checkpoint's FP32 tensor
+    /// scale, the scalar `nvfp4_quantize` takes. The product op's `alpha` is the two tensor
+    /// scales' product, which the runner copies into one device scalar once at load.
+    pub fn nvfp4(
+        &mut self,
+        values: &WeightRequest,
+        scales: &WeightRequest,
+        layout: ScaleLayout,
+        global_scale: f32,
+    ) -> Result<QuantizedWeight> {
+        if !(global_scale.is_finite() && global_scale > 0.0) {
+            return Err(Error::weight(
+                &values.tensor,
+                format!("a global scale of {global_scale} is not a positive number"),
+            ));
+        }
+        if values.shape.last() == 0 {
+            return Err(Error::weight(
+                &values.tensor,
+                "a packed NVFP4 matrix has a contraction axis".to_owned(),
+            ));
+        }
+        let rows = values.shape.numel() / values.shape.last();
+        let columns = values.shape.last() * 2;
+        let expected = layout.shape(rows, columns);
+        if scales.shape != expected {
+            return Err(Error::weight(
+                &scales.tensor,
+                format!(
+                    "the {layout} block scales of a [{rows}, {columns}] matrix are {:?}, not {:?}",
+                    expected.dims(),
+                    scales.shape.dims()
+                ),
+            ));
+        }
+        let scale_layout = match layout {
+            ScaleLayout::Linear => WeightLayout::NVFP4_SCALES_LINEAR,
+            ScaleLayout::Swizzled128X4 => WeightLayout::NVFP4_SCALES_SWIZZLED,
+        };
+        let mut values_request = values.clone().with_layout(WeightLayout::NVFP4_VALUES);
+        let mut scales_request = scales.clone().with_layout(scale_layout);
+        values_request.shape = Shape::new(&[rows, columns / 2]);
+        scales_request.shape = expected;
+        let packed = self.load(&values_request)?;
+        if packed.dtype() != DType::U8 {
+            return Err(Error::weight(
+                &values_request.tensor,
+                format!("packed E2M1 values are U8 bytes, not {}", packed.dtype()),
+            ));
+        }
+        let scales = self.load(&scales_request)?;
+        if scales.dtype() != DType::U8 {
+            return Err(Error::weight(
+                &scales_request.tensor,
+                format!("block scales are U8 bytes, not {}", scales.dtype()),
+            ));
+        }
+        Ok(QuantizedWeight {
+            packed,
+            scales,
+            global_scale,
+            layout,
         })
     }
 
@@ -427,6 +674,7 @@ impl<'a> WeightLoader<'a> {
                 tensors: vec![name.to_owned()],
                 start: 0,
                 shape,
+                stride: None,
             },
         };
         let backing = match self.store.retained(&key)? {
@@ -481,6 +729,11 @@ impl<'a> WeightLoader<'a> {
     fn target_dtype(&self, names: &[String]) -> Result<DType> {
         let checkpoint = self.checkpoint_dtype(names)?;
         let dtype = self.dtype.unwrap_or(checkpoint);
+        // A representation that is not converted (BF16 kept as BF16, a packed NVFP4 field of
+        // bytes kept as bytes) is read as it is; only a stated change goes through `convert`.
+        if dtype == checkpoint {
+            return Ok(dtype);
+        }
         if !dtype.is_float() || !checkpoint.is_float() {
             return Err(Error::weight(
                 names.first().map(String::as_str).unwrap_or(""),
@@ -524,6 +777,58 @@ impl<'a> WeightLoader<'a> {
                     ));
                 }
                 Ok(bytes[begin..end].to_vec())
+            }
+            WeightSource::Strided {
+                tensor,
+                start,
+                shape,
+                row_stride,
+            } => {
+                let location = self
+                    .checkpoint
+                    .tensor(tensor)
+                    .ok_or_else(|| Error::MissingTensor(tensor.clone()))?;
+                let element = location.dtype.bytes().ok_or_else(|| {
+                    Error::weight(tensor, format!("{} has no whole-byte size", location.dtype))
+                })?;
+                if shape.rank() == 0 {
+                    return Err(Error::weight(
+                        tensor,
+                        "a gathered weight has an axis".to_owned(),
+                    ));
+                }
+                let row = shape.last();
+                if *row_stride < row {
+                    return Err(Error::weight(
+                        tensor,
+                        format!("a stride of {row_stride} overlaps rows of {row} elements"),
+                    ));
+                }
+                let rows = shape.numel() / row.max(1);
+                let bytes = self.checkpoint.bytes(location)?;
+                let mut gathered =
+                    Vec::with_capacity(usize::try_from(shape.numel() * element).unwrap_or(0));
+                for index in 0..rows {
+                    let begin = start + index * row_stride;
+                    let from = usize::try_from(begin * element).map_err(|_| {
+                        Error::weight(tensor, "a gathered row starts past usize::MAX")
+                    })?;
+                    let to = usize::try_from((begin + row) * element).map_err(|_| {
+                        Error::weight(tensor, "a gathered row ends past usize::MAX")
+                    })?;
+                    if to > bytes.len() {
+                        return Err(Error::weight(
+                            tensor,
+                            format!(
+                                "row {index} (elements {begin}..{}) reaches past the tensor's {} bytes",
+                                begin + row,
+                                bytes.len()
+                            ),
+                        ));
+                    }
+                    gathered.extend_from_slice(&bytes[from..to]);
+                }
+                Ok(gathered)
             }
             WeightSource::Parts { parts, .. } => {
                 let mut fused = Vec::new();
@@ -576,13 +881,18 @@ fn check_layout(tensor: &str, source: &WeightSource, layout: WeightLayout) -> Re
         WeightLayout::ROW_MAJOR => Ok(()),
         WeightLayout::UP_GATE | WeightLayout::DOWN => match source {
             WeightSource::Parts { .. } => Ok(()),
-            WeightSource::Region { .. } => Err(Error::weight(
+            WeightSource::Region { .. } | WeightSource::Strided { .. } => Err(Error::weight(
                 tensor,
                 format!(
                     "layout {layout} fuses several projections; a single region cannot produce it"
                 ),
             )),
         },
+        // The NVFP4 fields are byte buffers: a packed matrix, a fused stack of packed experts or
+        // the strided rows of either are all the same bytes to the product.
+        WeightLayout::NVFP4_VALUES
+        | WeightLayout::NVFP4_SCALES_LINEAR
+        | WeightLayout::NVFP4_SCALES_SWIZZLED => Ok(()),
         other => Err(Error::weight(
             tensor,
             format!("layout `{other}` is not one this loader produces"),
@@ -651,6 +961,26 @@ fn convert(from: DType, to: DType, bytes: &[u8], tensor: &str) -> Result<Vec<u8>
     Ok(converted)
 }
 
+/// The `f32` values of `bytes`, which hold `dtype` elements.
+fn to_f32(dtype: DType, bytes: &[u8], tensor: &str) -> Result<Vec<f32>> {
+    let converted = convert(dtype, DType::F32, bytes, tensor)?;
+    Ok(converted
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
+        .collect())
+}
+
+/// `values` as `dtype` elements.
+fn from_f32(dtype: DType, values: &[f32], tensor: &str) -> Result<Vec<u8>> {
+    let bytes: Vec<u8> = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    convert(DType::F32, dtype, &bytes, tensor)
+}
+
 /// The `f32` value of an IEEE half-precision bit pattern.
 fn half_to_f32(half: u16) -> f32 {
     let sign = u32::from(half & 0x8000) << 16;
@@ -683,6 +1013,11 @@ fn f32_to_half(value: f32) -> u16 {
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exponent = (bits >> 23) & 0xff;
     let mantissa = bits & 0x007f_ffff;
+    if exponent == 0 {
+        // A zero or subnormal `f32` underflows to a signed zero in the half's exponent range; the
+        // largest half subnormal is still an order of magnitude above the largest `f32` subnormal.
+        return sign;
+    }
     if exponent == 0xff {
         return sign | 0x7c00 | if mantissa == 0 { 0 } else { 0x0200 };
     }
@@ -731,6 +1066,7 @@ mod tests {
                 tensors: vec!["up".to_owned(), "gate".to_owned()],
                 start: 0,
                 shape: Shape::new(&[128, 1536, 2048]),
+                stride: None,
             },
         };
         let text = key.to_string();

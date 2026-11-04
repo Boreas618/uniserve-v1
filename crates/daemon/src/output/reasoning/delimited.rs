@@ -188,6 +188,24 @@ impl DelimitedReasoningParser {
         true
     }
 
+    /// The state machine's state, for a response that moves to another
+    /// process (design §7.5.1). Its delimiters, labels and region default are
+    /// configuration, which the request's model family restates.
+    pub(crate) fn state(&self) -> proto::handoff::Reasoning {
+        proto::handoff::Reasoning {
+            in_reasoning: self.current_in_reasoning,
+            label_pending: self.label_pending,
+            buffer: self.buffer.clone(),
+        }
+    }
+
+    /// Restores the state machine's state.
+    pub(crate) fn resume(&mut self, state: &proto::handoff::Reasoning) {
+        self.current_in_reasoning = state.in_reasoning;
+        self.label_pending = state.label_pending;
+        self.buffer.clone_from(&state.buffer);
+    }
+
     /// Returns the longest trailing suffix that could still complete a
     /// delimiter.
     ///
@@ -255,6 +273,16 @@ impl ReasoningParser for DelimitedReasoningParser {
     /// region, and a section's complete label is stripped.
     fn finish(&mut self) -> ReasoningDelta {
         self.parse_buffer(true)
+    }
+
+    /// The state machine's state, as the inherent method reports it.
+    fn state(&self) -> Option<proto::handoff::Reasoning> {
+        Some(DelimitedReasoningParser::state(self))
+    }
+
+    /// Restores the state machine's state.
+    fn resume(&mut self, state: &proto::handoff::Reasoning) {
+        DelimitedReasoningParser::resume(self, state);
     }
 }
 

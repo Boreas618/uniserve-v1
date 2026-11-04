@@ -34,9 +34,11 @@ use winnow::prelude::*;
 use winnow::stream::{Partial, Stream};
 use winnow::token::literal;
 
+use proto::handoff;
+
 use super::utils::{
-    JsonObjectScanState, MAX_BUFFER_BYTES, json_str, parse_buffered_event, safe_text_len,
-    take_json_object,
+    JsonObjectScanPhase, JsonObjectScanState, MAX_BUFFER_BYTES, json_str, parse_buffered_event,
+    safe_text_len, take_json_object,
 };
 use super::{Result, ToolCallDelta, ToolParserOutput};
 
@@ -108,6 +110,83 @@ impl JsonToolCallParser {
             active_tool_index: None,
             emitted_tool_count: 0,
         }
+    }
+
+    /// The parser's state, as `JsonToolCall`'s fields hold it.
+    fn state(&self) -> handoff::JsonToolCall {
+        let mode = match &self.mode {
+            JsonToolCallMode::Text => handoff::JsonToolMode {
+                kind: handoff::JsonToolModeKind::JsonToolModeText as i32,
+                scan: None,
+            },
+            JsonToolCallMode::Header => handoff::JsonToolMode {
+                kind: handoff::JsonToolModeKind::JsonToolModeHeader as i32,
+                scan: None,
+            },
+            JsonToolCallMode::Arguments { json_scan } => handoff::JsonToolMode {
+                kind: handoff::JsonToolModeKind::JsonToolModeArguments as i32,
+                scan: Some(handoff::JsonObjectScan {
+                    object_depth: json_scan.object_depth as u64,
+                    array_depth: json_scan.array_depth as u64,
+                    in_string: json_scan.in_string,
+                    escape: json_scan.escape,
+                    phase: match json_scan.phase {
+                        JsonObjectScanPhase::Initial => {
+                            handoff::json_object_scan::Phase::JsonObjectPhaseInitial
+                        }
+                        JsonObjectScanPhase::Scanning => {
+                            handoff::json_object_scan::Phase::JsonObjectPhaseScanning
+                        }
+                        JsonObjectScanPhase::Complete => {
+                            handoff::json_object_scan::Phase::JsonObjectPhaseComplete
+                        }
+                    } as i32,
+                }),
+            },
+        };
+        handoff::JsonToolCall {
+            buffer: self.buffer.clone(),
+            mode: Some(mode),
+            active_tool_index: self.active_tool_index.map(|index| index as u64),
+            emitted_tool_count: self.emitted_tool_count as u64,
+        }
+    }
+
+    /// Takes over a state this parser produced (`JsonToolCallParser::state`).
+    fn resume(&mut self, state: &handoff::JsonToolCall) {
+        self.buffer.clone_from(&state.buffer);
+        let mode = state.mode.as_ref().map_or(JsonToolCallMode::Text, |mode| {
+            let kind = handoff::JsonToolModeKind::try_from(mode.kind)
+                .unwrap_or(handoff::JsonToolModeKind::JsonToolModeText);
+            match kind {
+                handoff::JsonToolModeKind::JsonToolModeArguments => {
+                    let scan = mode.scan.as_ref().map_or_else(
+                        JsonObjectScanState::default,
+                        |scan: &handoff::JsonObjectScan| JsonObjectScanState {
+                            object_depth: scan.object_depth as usize,
+                            array_depth: scan.array_depth as usize,
+                            in_string: scan.in_string,
+                            escape: scan.escape,
+                            phase: match handoff::json_object_scan::Phase::try_from(scan.phase) {
+                                Ok(handoff::json_object_scan::Phase::JsonObjectPhaseScanning) => {
+                                    JsonObjectScanPhase::Scanning
+                                }
+                                Ok(handoff::json_object_scan::Phase::JsonObjectPhaseComplete) => {
+                                    JsonObjectScanPhase::Complete
+                                }
+                                _ => JsonObjectScanPhase::Initial,
+                            },
+                        },
+                    );
+                    JsonToolCallMode::Arguments { json_scan: scan }
+                }
+                handoff::JsonToolModeKind::JsonToolModeHeader => JsonToolCallMode::Header,
+                handoff::JsonToolModeKind::JsonToolModeText => JsonToolCallMode::Text,
+            }
+        });
+        self.mode = mode;
+        self.active_tool_index = state.active_tool_index.map(|index| index as usize);
+        self.emitted_tool_count = state.emitted_tool_count as usize;
     }
 
     /// Advances incremental parsing and appends every complete event to `output`.

@@ -9,6 +9,7 @@
 //! parser for Bagel. `output::assembly` feeds the processor and frames its
 //! [`AssistantEvent`]s as content blocks and tool calls (`structured`).
 
+use proto::handoff;
 use uuid::Uuid;
 
 use crate::output::chat::{AssistantBlockKind, Error, Result};
@@ -66,6 +67,36 @@ impl ChatOutputProcessor {
         Self {
             reasoning,
             tools: tools.map(ToolStage::new),
+        }
+    }
+
+    /// The parsers' state, for the process that goes on writing the response
+    /// after a handoff (design §7.5.1 step 3); `None` when a parser of this
+    /// processor cannot be continued, in which case the response cannot be
+    /// handed over.
+    pub fn state(&self) -> Option<handoff::Processor> {
+        let reasoning = match self.reasoning.as_ref() {
+            Some(reasoning) => Some(reasoning.state()?),
+            None => None,
+        };
+        let tools = match self.tools.as_ref() {
+            Some(tools) => Some(tools.state()?),
+            None => None,
+        };
+        Some(handoff::Processor { reasoning, tools })
+    }
+
+    /// Puts the parsers back where `state` left them: the successor builds
+    /// the same processor for the request (its family and its tools) and
+    /// resumes the parsers from the state the predecessor handed over.
+    pub fn resume(&mut self, state: &handoff::Processor) {
+        if let (Some(reasoning), Some(reasoning_state)) =
+            (self.reasoning.as_mut(), state.reasoning.as_ref())
+        {
+            reasoning.resume(reasoning_state);
+        }
+        if let (Some(tools), Some(tools_state)) = (self.tools.as_mut(), state.tools.as_ref()) {
+            tools.resume(tools_state);
         }
     }
 
