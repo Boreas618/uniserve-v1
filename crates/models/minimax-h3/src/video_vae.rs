@@ -763,7 +763,7 @@ impl VideoDecoder {
         let heads = config.decoder_num_attention_heads;
         let ffn = width * config.decoder_ffn_mult;
         let (rotated, sections) = rotary(config)?;
-        let stitch = crate::decoding::ClipDecoder::new(config)?;
+        let stitch = crate::decoding::ClipDecoder::new(config, dtype)?;
         let out_channels = config.out_channels
             * config.temporal_compression()
             * config.spatial_compression()
