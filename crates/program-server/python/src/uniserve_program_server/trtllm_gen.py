@@ -24,6 +24,7 @@ stages the header, the checksums and the artifact's description into ``DIR``;
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import concurrent.futures
 import hashlib
 import json
@@ -36,7 +37,43 @@ import urllib.request
 from pathlib import Path
 from typing import Iterable
 
-#: The artifact's name, as the design and the package manifests call it.
+@dataclasses.dataclass(frozen=True)
+class Artifact:
+    """One of trtllm-gen's published kernel libraries."""
+
+    #: The name the package manifests and this module's `--artifact` use.
+    name: str
+    #: The pin inside the repository: the directory holding `checksums.txt`,
+    #: `include/` and the cubins.
+    pin: str
+    #: The sha256 of that directory's `checksums.txt`, which identifies it.
+    sha256: str
+    #: The generated header carrying the kernel table the launch code compiles
+    #: against.
+    header: str
+
+
+#: The artifacts this module knows. The FMHA library is the attention kernels
+#: (`trtllm_batch_decode_with_kv_cache`'s); the batched-GEMM library is the
+#: grouped and routed MoE product (`trtllm_fp4_block_scale_routed_moe`'s), whose
+#: export headers come in the artifact itself.
+ARTIFACTS: dict[str, Artifact] = {
+    "trtllm-gen-fmha": Artifact(
+        name="trtllm-gen-fmha",
+        pin="2d6a5a029eefcc388ec0ceb87efb55d8bcce5c3c/fmha/trtllm-gen/",
+        sha256="d79b5c51fc8597fac57dae0da4afa114fb2014575e4ec3df099ad856d97cabc3",
+        header="include/flashInferMetaInfo.h",
+    ),
+    "trtllm-gen-bmm": Artifact(
+        name="trtllm-gen-bmm",
+        pin="8ec29a98612c3670f9f28825d1ed19f09496073b/batched_gemm-fa419f4-31ee4e5/",
+        sha256="011635d3c36756addcdc148eea90c984f2d7611ba375626aaaf466d355c80e50",
+        header="include/flashinferMetaInfo.h",
+    ),
+}
+
+#: The artifact this module was first written for: the default of every entry
+#: point, so the existing callers keep working unchanged.
 ARTIFACT = "trtllm-gen-fmha"
 
 #: Where NVIDIA publishes the kernel library's generic artifacts.
@@ -45,15 +82,24 @@ REPOSITORY = os.environ.get(
     "https://edge.urm.nvidia.com/artifactory/sw-kernelinferencelibrary-public-generic-local/",
 )
 
-#: The artifact's pin inside the repository: the directory that holds
-#: ``checksums.txt``, ``include/`` and the cubins.
-PIN = "2d6a5a029eefcc388ec0ceb87efb55d8bcce5c3c/fmha/trtllm-gen/"
+#: The default artifact, as the record above names it.
+PIN = ARTIFACTS[ARTIFACT].pin
 
-#: The sha256 of the pin's ``checksums.txt``, which identifies the artifact.
-SHA256 = "d79b5c51fc8597fac57dae0da4afa114fb2014575e4ec3df099ad856d97cabc3"
+#: The default artifact's manifest digest.
+SHA256 = ARTIFACTS[ARTIFACT].sha256
 
 #: The header the launch code includes.
-METADATA_HEADER = "include/flashInferMetaInfo.h"
+METADATA_HEADER = ARTIFACTS[ARTIFACT].header
+
+#: The artifact this process works on. `main` sets it from `--artifact`; the
+#: helpers below read it so one process serves whichever library a package
+#: names, with the default above when nothing names one.
+_ACTIVE: Artifact = ARTIFACTS[ARTIFACT]
+
+
+def active() -> Artifact:
+    """The artifact the helpers below address."""
+    return _ACTIVE
 
 #: The manifest that lists every file of the artifact with its sha256.
 CHECKSUMS = "checksums.txt"
@@ -80,7 +126,7 @@ def cache_root() -> Path:
 def artifact_dir() -> Path:
     """The cache directory of the pinned artifact: content-addressed by its
     checksum manifest."""
-    return cache_root() / SHA256
+    return cache_root() / active().sha256
 
 
 def sha256_of(data: bytes) -> str:
@@ -96,7 +142,7 @@ def sha256_of_file(path: Path) -> str:
 
 
 def url_of(relative: str) -> str:
-    return f"{REPOSITORY.rstrip('/')}/{PIN}{relative}"
+    return f"{REPOSITORY.rstrip('/')}/{active().pin}{relative}"
 
 
 def download(relative: str, destination: Path) -> None:
@@ -131,25 +177,25 @@ def checksums(offline: bool = False) -> dict[str, str]:
     path = artifact_dir() / CHECKSUMS
     if path.is_file():
         digest = sha256_of_file(path)
-        if digest == SHA256:
+        if digest == active().sha256:
             return parse_checksums(path)
         if offline:
             raise ArtifactError(
-                f"{path} is not the pinned {ARTIFACT} manifest: it has {digest}, the pin is "
-                f"{SHA256}"
+                f"{path} is not the pinned {active().name} manifest: it has {digest}, the "
+                f"pin is {active().sha256}"
             )
         # A wrong or truncated manifest is replaced, not trusted.
         path.unlink()
     if offline:
         raise ArtifactError(
-            f"{ARTIFACT} is not cached at {artifact_dir()} and --offline was given"
+            f"{active().name} is not cached at {artifact_dir()} and --offline was given"
         )
     download(CHECKSUMS, path)
     digest = sha256_of_file(path)
-    if digest != SHA256:
+    if digest != active().sha256:
         path.unlink()
         raise ArtifactError(
-            f"{url_of(CHECKSUMS)} has sha256 {digest}, the pin expects {SHA256}"
+            f"{url_of(CHECKSUMS)} has sha256 {digest}, the pin expects {active().sha256}"
         )
     return parse_checksums(path)
 
@@ -247,9 +293,9 @@ def describe(files: dict[str, str], staged: list[str]) -> dict[str, object]:
     cubins = sorted(name for name in files if name.endswith(".cubin"))
     headers = sorted(name for name in files if not name.endswith(".cubin"))
     return {
-        "artifact": ARTIFACT,
-        "pin": PIN,
-        "sha256": SHA256,
+        "artifact": active().name,
+        "pin": active().pin,
+        "sha256": active().sha256,
         "cache": str(artifact_dir()),
         "manifest": str(artifact_dir() / CHECKSUMS),
         "include": str(artifact_dir() / "include"),
@@ -262,7 +308,13 @@ def describe(files: dict[str, str], staged: list[str]) -> dict[str, object]:
 def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="python -m uniserve_program_server.trtllm_gen",
-        description="fetch, verify, cache and stage the pinned trtllm-gen FMHA artifact",
+        description="fetch, verify, cache and stage a pinned trtllm-gen artifact",
+    )
+    parser.add_argument(
+        "--artifact",
+        choices=sorted(ARTIFACTS),
+        default=ARTIFACT,
+        help="which trtllm-gen library to address (default the FMHA kernels)",
     )
     parser.add_argument(
         "--out",
@@ -301,6 +353,8 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     options = arguments(argv)
+    global _ACTIVE
+    _ACTIVE = ARTIFACTS[options.artifact]
     if options.cache:
         os.environ["UNISERVE_ARTIFACT_CACHE"] = str(options.cache)
     try:
@@ -308,7 +362,7 @@ def main(argv: list[str] | None = None) -> int:
         # The header is what a native launcher compiles against; it is always
         # fetched. Cubins are fetched when asked for, or all of them when the
         # artifact must be complete.
-        wanted = {METADATA_HEADER}
+        wanted = {active().header}
         for name in options.cubin:
             if name not in files:
                 raise ArtifactError(f"the artifact has no {name}")
@@ -326,7 +380,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(description, indent=2))
         return 0
     except ArtifactError as error:
-        print(f"{ARTIFACT}: {error}", file=sys.stderr)
+        print(f"{active().name}: {error}", file=sys.stderr)
         return 1
 
 
