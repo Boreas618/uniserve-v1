@@ -43,7 +43,9 @@ def spec(fields, parameters, target):
             "BLOCK": "constexpr",
         },
         "constexprs": {
-            "PATCHIFY": fields["mode"] == "patchify",
+            # This package fills the patching direction only; the inverse is
+            # `unpatchify_video`, which has its own descriptor and package.
+            "PATCHIFY": True,
             "BLOCK": block,
         },
         "options": {
