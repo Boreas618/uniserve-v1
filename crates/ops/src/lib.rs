@@ -94,6 +94,7 @@ pub mod noise;
 pub mod norm;
 pub mod op;
 pub mod phase;
+pub mod prefix_cache;
 pub mod platform;
 pub mod residual;
 pub mod rope;
