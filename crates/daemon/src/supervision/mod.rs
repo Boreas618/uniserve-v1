@@ -773,6 +773,8 @@ mod tests {
                 build: proto::BUILD.to_owned(),
                 peer: Some(hello::Peer::Engine(Engine {
                     deployment: "model".to_owned(),
+                    // A test client that asks for a spawn, not a main process.
+                    engine: 0,
                 })),
             })
             .unwrap();
