@@ -362,11 +362,20 @@ fn stage_weights(args: &Args) -> Result<()> {
     // and this is the only place the region set is known before a device is opened. It is written
     // beside the page so the encode stage sizes its pool from a measurement rather than from a bound
     // over the regions a key list cannot count.
-    let mut sizes: Vec<u64> = Vec::with_capacity(store.len());
-    for key in store.keys() {
-        let element = key.dtype.bytes().unwrap_or(0);
-        sizes.push(key.region.shape.numel().saturating_mul(element));
+    // Each region is named with its size, taken from the bytes the load published rather than
+    // recomputed from the key: a size the encoder cannot reproduce is a size the encode stage would
+    // reserve for a region that holds something else.
+    let keys: Vec<WeightKey> = store.keys().cloned().collect();
+    let mut named: Vec<(String, u64)> = Vec::with_capacity(keys.len());
+    for key in &keys {
+        let backing = store.retained(key)?.ok_or_else(|| {
+            Failure(format!(
+                "the host store lists region `{key}` and cannot answer it"
+            ))
+        })?;
+        named.push((key.to_string(), backing.bytes()));
     }
+    let sizes: Vec<u64> = named.iter().map(|(_, bytes)| *bytes).collect();
     let total: u64 = sizes.iter().sum();
     println!(
         "load: published {} weight regions on the host, {} retained layers, {} MiB",
@@ -384,8 +393,18 @@ fn stage_weights(args: &Args) -> Result<()> {
         .map(u64::to_string)
         .collect::<Vec<String>>()
         .join(", ");
-    std::fs::write(&written, format!("{{\n  \"sizes\": [{listed}]\n}}\n"))
-        .map_err(|error| Failure::message(format!("{}: {error}", written.display())))?;
+    // The keys are written beside the sizes so the encode stage can compare the two *sets* in the
+    // same run: a size list alone cannot say which region it is missing.
+    let quoted = named
+        .iter()
+        .map(|(key, _)| format!("{key:?}"))
+        .collect::<Vec<String>>()
+        .join(", ");
+    std::fs::write(
+        &written,
+        format!("{{\n  \"keys\": [{quoted}],\n  \"sizes\": [{listed}]\n}}\n"),
+    )
+    .map_err(|error| Failure::message(format!("{}: {error}", written.display())))?;
     println!("wrote   {}", written.display());
     drop(encoder);
     Ok(())
@@ -599,6 +618,34 @@ impl RetainedWeights for DeviceWeights {
         self.published.push((key.clone(), backing));
         Ok(backing)
     }
+}
+
+/// The regions a `--stage weights` run measured: each key with the bytes its load published.
+///
+/// The file is the weights stage's own record, so a run that sizes a pool from it and a load that
+/// publishes into it can be compared rather than assumed to agree. An unreadable file is `None` and
+/// the caller falls back to a bound, printing which it used.
+fn measured_regions(path: &Path) -> Option<(Vec<String>, Vec<u64>)> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let list = |field: &str| -> Option<Vec<&str>> {
+        let needle = format!("\"{field}\"");
+        let start = text.find(&needle)?;
+        let open = text[start..].find('[')? + start;
+        let close = text[open..].find(']')? + open;
+        Some(text[open + 1..close].split(',').map(str::trim).collect())
+    };
+    // A file written before the keys were recorded still sizes a pool: the sizes are the charge, and
+    // the comparison below says that it cannot pair them.
+    let names: Vec<String> = list("keys")
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|item| item.strip_prefix('"')?.strip_suffix('"').map(str::to_owned))
+        .collect();
+    let sizes: Vec<u64> = list("sizes")?
+        .into_iter()
+        .filter_map(|item| item.parse().ok())
+        .collect();
+    (!sizes.is_empty()).then_some((names, sizes))
 }
 
 fn json_field(text: &str, field: &str) -> Option<String> {
@@ -933,18 +980,9 @@ fn stage_encode(args: &Args) -> Result<()> {
     // bounded. Otherwise the number below is what its name says.
     const REGION_EXCESS: u64 = 512;
     let measured = args.out.join("text_encoder").join("weights.json");
-    let from_regions = std::fs::read_to_string(&measured).ok().and_then(|text| {
-        let start = text.find("\"sizes\"")?;
-        let open = text[start..].find('[')? + start;
-        let close = text[open..].find(']')? + open;
-        let sizes: Vec<u64> = text[open + 1..close]
-            .split(',')
-            .filter_map(|item| item.trim().parse::<u64>().ok())
-            .collect();
-        (!sizes.is_empty()).then_some(sizes)
-    });
+    let from_regions = measured_regions(&measured);
     let mut needed = match &from_regions {
-        Some(sizes) => sizes
+        Some((_, sizes)) => sizes
             .iter()
             .map(|bytes| bytes.max(&1).next_multiple_of(granularity.max(1)))
             .sum::<u64>(),
@@ -958,7 +996,7 @@ fn stage_encode(args: &Args) -> Result<()> {
         needed = mib.saturating_mul(1 << 20);
     }
     match (&from_regions, pool_mib) {
-        (Some(sizes), _) => println!(
+        (Some((_, sizes)), _) => println!(
             "weights: {} regions from {}, {} MiB in {} MiB blocks",
             sizes.len(),
             measured.display(),
@@ -998,10 +1036,67 @@ fn stage_encode(args: &Args) -> Result<()> {
     // index does not hold), so it is the measurement that sizes the next run's `--pool-mib`.
     println!(
         "pool: {} weight regions published, {} MiB of {} MiB reserved",
-        weights.buffers.len(),
+        weights.published.len(),
         weights.bytes >> 20,
         needed >> 20
     );
+    // The measurement and the load are two computations of one region set, and a pool sized from one
+    // of them stops inside a publish when they disagree - which the run at `575a17576` did by one
+    // block. Comparing them here names the region instead, in the run that sized the pool.
+    match &from_regions {
+        Some((names, sizes)) if names.len() != sizes.len() => println!(
+            "regions: {} published, {} measured, the file names no keys and cannot be paired",
+            weights.published.len(),
+            sizes.len()
+        ),
+        Some((names, sizes)) => {
+            let mut first: Option<String> = None;
+            for (key, backing) in &weights.published {
+                let name = key.to_string();
+                match names.iter().position(|asked| asked == &name) {
+                    Some(index) if sizes[index] == backing.bytes() => {}
+                    Some(index) => {
+                        first = first.or(Some(format!(
+                            "`{name}`: {} bytes published, {} bytes measured",
+                            backing.bytes(),
+                            sizes[index]
+                        )))
+                    }
+                    None => {
+                        first = first.or(Some(format!(
+                            "`{name}`: published, not measured ({} bytes)",
+                            backing.bytes()
+                        )));
+                    }
+                }
+            }
+            if first.is_none() {
+                for name in names {
+                    if !weights
+                        .published
+                        .iter()
+                        .any(|(key, _)| key.to_string() == *name)
+                    {
+                        first = Some(format!("`{name}`: measured, not published"));
+                        break;
+                    }
+                }
+            }
+            match first {
+                None => println!(
+                    "regions: {} published, {} measured, sizes agree",
+                    weights.published.len(),
+                    names.len()
+                ),
+                Some(difference) => println!(
+                    "regions: {} published, {} measured, first difference {difference}",
+                    weights.published.len(),
+                    names.len()
+                ),
+            }
+        }
+        None => {}
+    }
 
     // 3. The arena. The encoder's own temporaries are reserved inside the forward, so this region
     //    only has to be large enough: a wide factor over the prompt's own rows, and the forward's
