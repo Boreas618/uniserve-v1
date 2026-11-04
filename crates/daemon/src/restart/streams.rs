@@ -212,7 +212,15 @@ impl super::Restarter {
                 ),
             }
         }
-        info!(count = records.len(), "the responses in flight are paused");
+        // Two counts, because they differ exactly when a response cannot be
+        // handed over: every registration paused, and the ones whose socket
+        // travelled. A paused response with no descriptor resumes here, and
+        // the deployment's restart test counts the handed ones.
+        info!(
+            paused = frozen.len(),
+            handed = records.len(),
+            "the responses in flight are paused"
+        );
         Paused {
             records,
             descriptors,
@@ -481,10 +489,7 @@ mod tests {
             adoption.streams.is_empty(),
             "a response that cannot be read is taken over by nobody"
         );
-        assert!(
-            take_adopted().is_empty(),
-            "nothing is reported as adopted"
-        );
+        assert!(take_adopted().is_empty(), "nothing is reported as adopted");
         assert!(
             !socket_taken,
             "the successor takes no socket of a response it did not take over"
