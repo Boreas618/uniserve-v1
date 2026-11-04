@@ -744,7 +744,20 @@ impl MainProcess {
                 self.send_metrics();
                 return Ok(None);
             }
-            let deadline = self.watchdog.deadline(oldest(&running));
+            // Two obligations the control thread has that no event announces: the counters' report,
+            // and a probation running out. An idle epoch has no events at all, so a deadline naming
+            // only the stall rule would leave both to whatever traffic arrived - the dashboard would
+            // see nothing of a server nobody is asking, and a generation nobody accepted would sit
+            // on probation past the window that reverts it (§7.3 step 4). Only a pending probation
+            // adds its poll, so an idle epoch without one keeps waking for its counters alone.
+            let stall = self.watchdog.deadline(oldest(&running));
+            let mut due = reported + METRICS_EVERY;
+            if self.rollback.is_some()
+                && matches!(self.update.phase(), executor::hot_update::Phase::Probation { .. })
+            {
+                due = due.min(Instant::now() + PROBATION_POLL);
+            }
+            let deadline = Some(stall.map_or(due, |stall| stall.min(due)));
             // One metrics report a second, and a final one on the way out
             // (§7.3: the daemon exports the engine's counters as metrics).
             if reported.elapsed() >= METRICS_EVERY {
@@ -1758,6 +1771,9 @@ impl MainProcess {
             ),
         };
         tracing::info!(seconds = window.as_secs(), "an update outlived its probation and is reverted");
+        // A device that cannot put the generation that served back is a device with no generation at
+        // all: the revert's refusal is the epoch's, and it ends by that name rather than continuing to
+        // serve a generation the process has just decided it cannot stand behind.
         let generation = self.update.current();
         self.revert(generation, failure)?;
         Ok(None)
@@ -2554,6 +2570,11 @@ fn engine_command_name(kind: &proto::request::wire::engine_command::Kind) -> &'s
 
 /// How often the engine reports its counters.
 const METRICS_EVERY: Duration = Duration::from_secs(1);
+
+/// How closely an update's probation is watched while one is pending: the phase machine states an
+/// expiry, and the control thread asks it at least this often. A rollback window is stated in whole
+/// seconds, so the poll costs a wake per tenth of a second for the length of the window.
+const PROBATION_POLL: Duration = Duration::from_millis(100);
 
 /// How long a metrics pass waits on one scheduler's counters: the report is sent once a second and a
 /// pass that waited longer than this would be reporting what the next pass reports anyway.
