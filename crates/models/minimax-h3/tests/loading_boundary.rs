@@ -9,7 +9,7 @@
 use std::io::Write;
 use std::path::Path;
 
-use minimax_h3::load::stored_dtype;
+use minimax_h3::load::{stored_dtype, tensor_dtype};
 use nn::{Checkpoint, DType};
 
 /// The format's name for an element type; a header states the name, not a number.
@@ -149,6 +149,46 @@ fn a_mixed_text_and_dit_pair_is_refused() {
         .expect_err("a bf16 encoder over an f32 DiT is one mixed gemm")
         .to_string();
     for named in ["BF16", "F32", "transformer", "refiner", "gemm"] {
+        assert!(
+            message.contains(named),
+            "the refusal must name {named}, and it says: {message}"
+        );
+    }
+}
+
+/// One tensor's type is a question about that tensor: a component of two answers it, and a name the
+/// component lacks is refused rather than answered with the component's other type.
+///
+/// This is the shape the reference's loading derivations have - the timestep pair read FP32 while the
+/// AdaLN projections are read BF16 out of the same component - so a boundary that can only answer
+/// "the component's type" cannot express them.
+#[test]
+fn a_tensors_own_type_is_answered_by_that_tensor() {
+    let root = tempfile::tempdir().unwrap();
+    component(
+        root.path(),
+        "transformer",
+        &[
+            ("time_embedder.linear_1.weight", DType::F32, 5),
+            ("time_embedder.linear_2.weight", DType::BF16, 5),
+            ("proj_in.weight", DType::BF16, 5),
+        ],
+    );
+    let checkpoint = Checkpoint::open(root.path()).unwrap();
+
+    assert_eq!(
+        tensor_dtype(&checkpoint, "transformer", "time_embedder.linear_1.weight").unwrap(),
+        DType::F32
+    );
+    assert_eq!(
+        tensor_dtype(&checkpoint, "transformer", "time_embedder.linear_2.weight").unwrap(),
+        DType::BF16
+    );
+
+    let message = tensor_dtype(&checkpoint, "transformer", "time_embedder.linear_3.weight")
+        .expect_err("a name the index lacks has no type to read")
+        .to_string();
+    for named in ["transformer", "time_embedder.linear_3.weight"] {
         assert!(
             message.contains(named),
             "the refusal must name {named}, and it says: {message}"
