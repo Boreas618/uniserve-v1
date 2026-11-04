@@ -162,6 +162,13 @@ fn element_type_names() -> Vec<String> {
 
 /// The descriptor fields whose values are element types (`ops`' `DType`
 /// `Display`), across the operators of design section 9.
+///
+/// A name here does not settle what a package's field means: `output` is a
+/// convolution's output element type and also `adaptive_pool`'s pooled width, and
+/// `input` is a `gemm`'s activations' type and would be a count anywhere else. So a
+/// value in one of these fields is examined only when it is not a bare integer —
+/// which is what tells an element type (`bf16`, and a package's mistake `float16`)
+/// from a width or an extent (`32`).
 const ELEMENT_TYPE_FIELDS: [&str; 7] =
     ["dtype", "input", "weight", "output", "accumulate", "scores", "scales"];
 
@@ -180,6 +187,10 @@ fn every_element_type_a_descriptor_can_carry_is_one_ops_prints() {
                     continue;
                 }
                 for value in values {
+                    if value.parse::<u64>().is_ok() {
+                        // A width or an extent, not an element type.
+                        continue;
+                    }
                     if !names.contains(value) {
                         failures.push(format!(
                             "{} {}: {field} = {value:?} is not one of {names:?}",

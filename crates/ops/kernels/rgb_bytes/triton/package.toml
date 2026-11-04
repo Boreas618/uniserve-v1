@@ -1,0 +1,46 @@
+# The rgb_bytes operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one architecture
+# of `[kernel.architectures]`, built by `src/build.py` (the compile driver the
+# Program Server runs for one descriptor and target).
+#
+# This is the video path's last step: an ImageNet-normalized, channel-major float
+# raster to packed 8-bit RGB, `round_half_to_even(clamp((x · std + mean) · 255, 0,
+# 255))` in FP32 whatever the input's element type. The rounding is visible in the
+# artifact and the operator's tolerance is one byte, so this module rounds with one
+# `rint` and the check script compares bytes exactly, its samples including ties.
+#
+# The key names the input's element type, the channel count, the block and whether
+# the module was compiled for programmatic dependent launch. The raster's frame
+# count, sides and strides are launch values — a clip's geometry varies while the
+# arithmetic does not — so no resolution makes a new module, e.g.
+# `dtype_f16_channels_3_block_1024_pdl_false`.
+
+op = "rgb_bytes"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/rgb_bytes.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a", "sm_100f"]
+
+[kernel.descriptors]
+# `f16` is what the video VAE's raster is (`uniserve/models/minimax_h3/output.py`'s
+# state buffer); `bf16` and `f32` are accepted because the arithmetic is the same
+# either way and the reference converts to FP32 before the de-normalization.
+dimensions = { dtype = ["f16", "bf16", "f32"], channels = ["3"], block = ["1024", "2048"], pdl = ["true", "false"] }
+
+[parameters]
