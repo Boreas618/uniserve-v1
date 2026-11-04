@@ -690,10 +690,10 @@ pub fn audio_sources(config: &crate::AudioVaeConfig) -> Result<Vec<crate::audio_
 use nn::Forward;
 use nn::layers::{
     AdaptivePool, Attention, Conv1d, Conv3d, ConvGeometry, FrameMoments, FrameNormPad, FramePad,
-    GatedActivation, LayerNorm, Linear, ScaledAdd, Snake, Transpose, WeightOrder,
+    GatedActivation, LayerNorm, Linear, Posterior, ScaledAdd, Snake, Transpose, WeightOrder,
 };
 use nn::weights::{Weight, WeightLoader, WeightRequest};
-use nn::{DType, Shape, TensorView};
+use nn::{DType, Shape, Strides, TensorView};
 
 /// One causal convolution of the encoder and the normalization that feeds it.
 ///
@@ -742,6 +742,10 @@ pub struct VideoEncoder {
     output: Normalized,
     /// The one-by-one projection after the moments.
     moments: Conv3d,
+    /// The latent space's per-channel affine, `(sample − mean) / std` as a one-by-one convolution.
+    normalize: Conv3d,
+    /// The posterior's epilogue: the sample a condition reads, from the projected moments.
+    sampler: Posterior,
     /// Whether the spatial padding mirrors the edge rows and columns (the checkpoint's mode) or
     /// replicates them.
     reflect: bool,
@@ -767,6 +771,145 @@ fn read(loader: &mut WeightLoader, name: &str, shape: &[u64]) -> Result<Weight> 
         0,
         Shape::new(shape),
     ))?)
+}
+
+/// The per-channel affine of the latent space, in the encoder's direction: `(sample − mean) / std`.
+///
+/// Multiplying by `1 / std` and shifting by `−mean / std` is a one-by-one convolution whose weight is
+/// the diagonal, so the encoder undoes the decoder's `value · std + mean` with one operator of the
+/// same shape as the projection beside it (`audio_vae::denormalize_tables` is that other direction).
+///
+/// **Declared deviation.** The reference's `(lat - mean) / std` is a subtraction and a division in
+/// f32 - two roundings - while a convolution's multiply-add is one. The values agree to at most 1 ulp
+/// of the f32 sample (6e-8 relative), against the 1e-4 the conditioned path is compared at; the
+/// epilogue before it is bit-exact, so this is the only step that differs from torch.
+pub fn normalize_tables(mean: &[f32], std: &[f32]) -> Result<(Vec<f32>, Vec<f32>)> {
+    let channels = mean.len();
+    if channels == 0 || std.len() != channels {
+        return Err(Error::config(format!(
+            "the latent statistics hold {} means and {} deviations",
+            mean.len(),
+            std.len()
+        )));
+    }
+    let mut scale = vec![0.0_f32; channels * channels];
+    let mut shift = vec![0.0_f32; channels];
+    for channel in 0..channels {
+        let deviation = std[channel];
+        if !deviation.is_finite() || deviation <= 0.0 {
+            return Err(Error::config(format!(
+                "latent channel {channel} has a deviation of {deviation}, which cannot be divided by"
+            )));
+        }
+        scale[channel * channels + channel] = 1.0 / deviation;
+        shift[channel] = -mean[channel] / deviation;
+    }
+    Ok((scale, shift))
+}
+
+/// A constant weight of `values` in FP32, published once at load.
+///
+/// The checkpoint has no tensor for the latent statistics: they are config fields, and this is where
+/// arithmetic on them becomes a weight the convolution can read. `audio_vae::constants` publishes the
+/// decoder's pair the same way.
+fn constants(
+    loader: &mut WeightLoader<'_>,
+    name: &str,
+    shape: Shape,
+    values: &[f32],
+) -> Result<Weight> {
+    let bytes: Vec<u8> = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    Ok(loader.constant(name, DType::F32, shape, &bytes)?)
+}
+
+/// The geometry of one posterior sample: the positions it reads and the channels it writes.
+///
+/// The sample is `[latent_channels, frames, rows, columns]` like every other raster here, and
+/// `ops::posterior` reads `[positions, channels]` - so the call states the positions
+/// (`frames · rows · columns`) once, here, and both the strides and the operator's channel count come
+/// from it. Every refusal is on this type rather than inside a forward, because a raster of the wrong
+/// channel count is a configuration mistake and not a runtime condition.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Sample {
+    /// Positions the sample has: `frames · rows · columns`.
+    pub positions: u64,
+    /// Latent channels of one position.
+    pub channels: u64,
+}
+
+impl Sample {
+    /// The sample of `latent_channels` channels over the raster `moments`, `noise` and `out` share.
+    ///
+    /// `moments` holds both fields of the posterior, so it has twice the sample's channels; `noise` and
+    /// `out` hold the sample's own. All three are FP32 rasters of one geometry, packed as the encoder
+    /// writes them: the call addresses them through two strides, and a plane that is not packed has no
+    /// single pair of them.
+    pub fn of(
+        latent_channels: u32,
+        moments: TensorView,
+        noise: TensorView,
+        out: TensorView,
+    ) -> Result<Self> {
+        let channels = u64::from(latent_channels);
+        if channels == 0 {
+            return Err(Error::config(
+                "a latent raster with no channels has no sample".to_owned(),
+            ));
+        }
+        let wide = 2 * channels;
+        for (name, view, expected) in [
+            ("moments", moments, wide),
+            ("noise", noise, channels),
+            ("out", out, channels),
+        ] {
+            if view.dtype != DType::F32 {
+                return Err(Error::config(format!(
+                    "the {name} raster is {}, and a condition's posterior is FP32 throughout: the \
+                     reference draws and samples in f32",
+                    view.dtype
+                )));
+            }
+            if view.shape.rank() != 4 {
+                return Err(Error::config(format!(
+                    "the {name} raster is {:?}, a [channels, frames, rows, columns] raster expected",
+                    view.shape.dims()
+                )));
+            }
+            if view.shape.dim(0) != expected {
+                return Err(Error::config(format!(
+                    "the {name} raster has {} channels, {expected} expected for a {latent_channels}-\
+                     channel latent",
+                    view.shape.dim(0)
+                )));
+            }
+            let packed = Strides::row_major(view.shape);
+            if view.strides != packed {
+                return Err(Error::config(format!(
+                    "the {name} raster's strides are {:?} over {:?}: a channel-major sample \
+                     addresses a packed raster through two strides, and a view is refused rather than \
+                     copied",
+                    view.strides.as_slice(),
+                    view.shape.dims()
+                )));
+            }
+        }
+        if noise.shape != out.shape || moments.shape.dims()[1..] != out.shape.dims()[1..] {
+            return Err(Error::config(format!(
+                "the posterior's rasters disagree: moments {:?}, noise {:?}, out {:?}",
+                moments.shape.dims(),
+                noise.shape.dims(),
+                out.shape.dims()
+            )));
+        }
+        let positions = moments.shape.dims()[1..].iter().product::<u64>();
+        Ok(Self {
+            positions,
+            channels,
+        })
+    }
 }
 
 /// Read one convolution of the checkpoint: `from` input channels, `to` output, `kernel` taps.
@@ -919,12 +1062,33 @@ impl VideoEncoder {
             1,
             [1; 3],
         )?;
+        // The latent space's affine: the checkpoint states its statistics, not a tensor for them.
+        let latent = u64::from(stack.latent_channels);
+        let (scale, shift) = normalize_tables(&config.latents_mean, &config.latents_std)?;
+        let normalize = Conv3d::new(
+            constants(
+                loader,
+                "video_vae.normalize.weight",
+                Shape::new(&[latent, latent, 1, 1, 1]),
+                &scale,
+            )?,
+            Some(constants(
+                loader,
+                "video_vae.normalize.bias",
+                Shape::new(&[latent]),
+                &shift,
+            )?),
+            geometry(1, [1; 3])?,
+            true,
+        )?;
         Ok(Self {
             stack,
             input,
             levels,
             output,
             moments,
+            normalize,
+            sampler: Posterior::new(),
             reflect,
         })
     }
@@ -1278,6 +1442,49 @@ impl VideoEncoder {
     /// the same shape. Nothing is reserved: the projection reads and writes the caller's views.
     pub fn project(&self, f: &Forward, moments: TensorView, out: TensorView) -> Result<()> {
         self.moments.forward(f, moments, out).map_err(Error::from)
+    }
+
+    /// The posterior sample a condition reads: `moments` and the runner's `noise` to `out`.
+    ///
+    /// The reference's `DiagonalGaussian` and the tail of `LatentEncoder`: the channel axis splits into
+    /// mean and log-variance, the log-variance is clamped to `(-30, 20)`, scaled by `exp(0.5 · ·)`,
+    /// mixed with the noise and added to the mean; the sum is rounded through FP16 **as a step**; and
+    /// the per-channel affine of [`normalize_tables`] turns it into the latent the conditioner reads.
+    /// The epilogue is `ops::posterior`, exact by contract, so the only rounding that differs from
+    /// torch is the affine's fused multiply-add ([`normalize_tables`] declares it).
+    ///
+    /// `moments` is the projected moments of the whole stitched raster and `out` is the condition's
+    /// latent, both `[channels, frames, rows, columns]` FP32; `noise` is the runner's draw in the same
+    /// order - the reference's `condition_noise_shapes` is channel-major and the draw is addressed by
+    /// element index, so that order is what reproduces it. The operator addresses every operand
+    /// through two strides, so a channel-major raster needs **no copy and no transpose**: the moments'
+    /// two halves are one buffer cut by an offset, the sample is written into one scratch raster (the
+    /// affine cannot read and write `out` at once), and the affine reads that raster into `out`.
+    pub fn posterior(
+        &self,
+        f: &Forward,
+        moments: TensorView,
+        noise: TensorView,
+        out: TensorView,
+    ) -> Result<()> {
+        let sample = Sample::of(self.stack.latent_channels, moments, noise, out)?;
+        let positions = sample.positions;
+        let channels = sample.channels;
+        // A channel-major raster: neighbouring positions are neighbouring elements, and one channel is
+        // one whole plane away. The two halves of the moments differ by exactly `channels` planes.
+        let strides = Strides::new(&[1, positions]);
+        let view = |ptr| {
+            TensorView::with_strides(ptr, DType::F32, Shape::new(&[positions, channels]), strides)
+        };
+        let drawn = f.arena().tensor(DType::F32, out.shape)?;
+        self.sampler.forward(
+            f,
+            view(moments.ptr),
+            view(moments.offset_elements(channels * positions)),
+            view(noise.ptr),
+            view(drawn.ptr),
+        )?;
+        self.normalize.forward(f, drawn, out).map_err(Error::from)
     }
 
     /// One residual block: two normalized convolutions, added to the input or its projection.
@@ -2225,6 +2432,83 @@ mod tests {
             assert!(low < -1.0, "channel {channel}: {low} from zero");
             assert!(high > 1.0, "channel {channel}: {high} from 255");
         }
+    }
+
+    /// A raster view of `channels` over one frame's `rows × columns`, for the shape tests: nothing
+    /// reads it, so the pointer is the null one.
+    fn raster(channels: u64, frames: u64, rows: u64, columns: u64, dtype: DType) -> TensorView {
+        TensorView::new(
+            nn::DevicePtr::new(0),
+            dtype,
+            Shape::new(&[channels, frames, rows, columns]),
+        )
+    }
+
+    #[test]
+    fn the_posterior_sample_is_the_rasters_own_geometry() {
+        let config = video_config();
+        let channels = u64::from(config.latent_channels);
+        let moments = raster(2 * channels, 7, 30, 52, DType::F32);
+        let noise = raster(channels, 7, 30, 52, DType::F32);
+        let out = raster(channels, 7, 30, 52, DType::F32);
+        let sample = Sample::of(config.latent_channels, moments, noise, out).expect("a sample");
+        assert_eq!(sample.channels, channels);
+        assert_eq!(sample.positions, 7 * 30 * 52);
+        // The moments' rows are twice the sample's, which is what makes the two fields one tensor.
+        assert_eq!(moments.shape.dim(0), 2 * sample.channels);
+
+        // A moments raster of the sample's own width has no log-variance to read.
+        let narrow = raster(channels, 7, 30, 52, DType::F32);
+        assert!(Sample::of(config.latent_channels, narrow, noise, out).is_err());
+        // A noise raster of the moments' width is two draws where the sample wants one.
+        assert!(Sample::of(config.latent_channels, moments, narrow, out).is_err());
+        // An FP16 raster is the decoder's precision, not the encoder's posterior.
+        let half = raster(channels, 7, 30, 52, DType::F16);
+        assert!(Sample::of(config.latent_channels, moments, half, out).is_err());
+        // A view whose planes overlap has no single channel stride.
+        let strided = TensorView::with_strides(
+            nn::DevicePtr::new(0),
+            DType::F32,
+            Shape::new(&[channels, 7, 30, 52]),
+            Strides::new(&[30 * 52, 30 * 52, 52, 1]),
+        );
+        assert!(Sample::of(config.latent_channels, moments, strided, out).is_err());
+        // A noise raster of another clip is a different sample.
+        let other = raster(channels, 5, 30, 52, DType::F32);
+        assert!(Sample::of(config.latent_channels, moments, other, out).is_err());
+    }
+
+    #[test]
+    fn the_encoders_affine_inverts_the_latent_statistics() {
+        let config = video_config();
+        let channels = config.latents_mean.len();
+        let (scale, shift) =
+            normalize_tables(&config.latents_mean, &config.latents_std).expect("the affine");
+        assert_eq!(scale.len(), channels * channels);
+        assert_eq!(shift.len(), channels);
+        for channel in 0..channels {
+            assert_eq!(
+                scale[channel * channels + channel],
+                1.0 / config.latents_std[channel]
+            );
+            assert_eq!(
+                shift[channel],
+                -config.latents_mean[channel] / config.latents_std[channel]
+            );
+        }
+        // Off the diagonal there is nothing: each channel scales on its own.
+        let off = scale
+            .iter()
+            .enumerate()
+            .filter(|(index, value)| index % (channels + 1) != 0 && **value != 0.0)
+            .count();
+        assert_eq!(off, 0);
+
+        // A deviation of zero cannot be divided by, and a shorter table names the wrong channel count.
+        let mut zeroed = config.latents_std.clone();
+        zeroed[3] = 0.0;
+        assert!(normalize_tables(&config.latents_mean, &zeroed).is_err());
+        assert!(normalize_tables(&config.latents_mean, &config.latents_std[..2]).is_err());
     }
 
     #[test]
