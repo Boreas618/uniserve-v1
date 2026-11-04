@@ -56,7 +56,12 @@ The factor is the two-sided 95% normal quantile the evaluator computes, `statist
 
 ## FP8 KV pages
 
-The FP8 KV cell is the BF16 checkpoint with `kv_cache_config.dtype = float8_e4m3fn`. It is the only cell that names an attention provider: `--set attention_backend=${UNISERVE_QWEN3_FP8_ATTENTION_BACKEND:-torch}`, because only the torch provider reads per-block FP8 pages at head dimension 128 and the automatic selection raises for them. Both runs use the `torch` provider: the baseline through the unset default, the candidate by naming it or by leaving the variable unset. A candidate provider that reads per-block FP8 pages may be named instead, but the automatic selection does not serve them: every native paged provider refuses a per-block FP8 cache. The BF16 and NVFP4 cells name no attention backend, so each implementation selects the provider it has.
+The FP8 KV cell is the BF16 checkpoint with `kv_cache_config.dtype = float8_e4m3fn`. It is the only cell that names an attention provider, and **the two implementations name different ones**, because a provider is a name in each implementation's own registry:
+
+- **The baseline** (today's implementation) uses `torch`, the only provider that reads per-block FP8 pages at head dimension 128; the automatic selection raises for them, and every native paged provider refuses a per-block FP8 cache. The cell states it as `--set attention_backend=${UNISERVE_QWEN3_FP8_ATTENTION_BACKEND:-torch}`.
+- **The candidate** names the rewrite's own attention program that takes FP8 planes — not `torch`, which does not exist in the rewrite's registry. The name is the rewrite's to state: the candidate FP8 cell is run with `UNISERVE_QWEN3_FP8_ATTENTION_BACKEND` set to that program. **If the rewrite has no attention program that reads per-block FP8 pages, the third confirmation cannot run on the candidate yet** — that is a finding to report, not a reason to run the cell with a provider that cannot read the planes.
+
+The BF16 and NVFP4 cells name no attention backend, so each implementation selects the provider it has.
 
 ## Running the confirmation
 
