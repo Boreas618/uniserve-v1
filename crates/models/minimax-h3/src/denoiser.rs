@@ -953,6 +953,33 @@ pub struct ConditionLatents<'a> {
     pub noise: &'a [TensorView],
 }
 
+/// The conditioned path's own diagnostic views, which a caller fills by offering them.
+///
+/// The design's numeric diagnosis compares one evaluation layer by layer, and on a conditioned
+/// request that comparison cannot localise a fault: a wrong conditioning input makes **every** layer
+/// output self-consistently wrong, so the stack agrees with itself and the video merely differs. The
+/// tensors below are the ones that decide it, and they are dumped before the stack reads them.
+///
+/// Nothing is written unless a view is offered: a forward with no trace is the served path, launch
+/// for launch. The design is explicit that this is a diagnosis and never a gate
+/// (`specs/worker.md` 10) - a difference here is evidence about where two implementations part
+/// company, not a verdict on either.
+pub struct ConditionTrace<'a> {
+    /// `[condition rows, hidden]`: the prefix source's condition rows as the projection left them,
+    /// in packed order - audio before video within a segment (`notes/h3/conditioned-diagnosis.md`).
+    pub source: Option<TensorView>,
+    /// `[prompt tokens, hidden]`: the refiner's rows the pack gathers. The source's rows above the
+    /// prompt are never read (`prefix_index` sends every padding row to the zero row), so they are
+    /// not part of the trace and a report must not compare them.
+    pub refined: Option<TensorView>,
+    /// One `[rows, channels * 4]` view per visual condition, in packed order: the patched draw,
+    /// before the anchoring mixes the condition's own rows in.
+    pub draws: &'a [TensorView],
+    /// One `[rows, channels * 4]` view per visual condition, in packed order: the condition's latents
+    /// as they arrived, so a report can tell a wrong draw from a wrong condition.
+    pub clean: &'a [TensorView],
+}
+
 /// The level a visual condition is anchored at: `t z + (1 - t) noise` with `t` this
 /// (`uniserve/models/minimax_h3/denoiser.py:102`), and the level its modulation group sits at
 /// until the generated video is cleaner than it ([`crate::modulation::entries`]).
@@ -1008,6 +1035,17 @@ impl ConditionViews {
     fn of(&self, condition: u32) -> (Option<TensorView>, Option<TensorView>) {
         self.pairs[condition as usize]
     }
+}
+
+/// Refuse a diagnostic view whose shape is not the tensor it is meant to hold.
+fn check_trace_view(view: TensorView, rows: u64, columns: u64, name: &str) -> Result<()> {
+    if view.shape.dims() != [rows, columns] {
+        return Err(Error::config(format!(
+            "the condition trace's {name} view is [{rows}, {columns}], got {:?}",
+            view.shape.dims()
+        )));
+    }
+    Ok(())
 }
 
 /// `rows` rows of `source` starting at `start`, addressed by the same layout.
@@ -1366,6 +1404,7 @@ impl Denoiser {
         source: TensorView,
         text: TensorView,
         state: &[TensorView],
+        trace: Option<TensorView>,
     ) -> Result<()> {
         let tables = Tables::new(self.config.attention, state);
         let documents = crate::conditioning::Documents {
@@ -1375,7 +1414,29 @@ impl Denoiser {
         };
         let total = u32::try_from(text.shape.dim(0))
             .map_err(|_| Error::checkpoint("a conditioning row count above u32::MAX".to_owned()))?;
-        self.refiner.forward(f, source, &documents, total, text)
+        self.refiner.forward(f, source, &documents, total, text)?;
+        if let Some(trace) = trace {
+            // The prompt's rows only: whatever the refiner wrote above them is unreachable and a
+            // report that compared it would differ with nothing wrong.
+            let tokens = trace.shape.dim(0);
+            if tokens > text.shape.dim(0) {
+                return Err(Error::config(format!(
+                    "the refiner's trace is {tokens} rows of a {}-row source",
+                    text.shape.dim(0)
+                )));
+            }
+            if trace.shape.dim(1) != text.shape.dim(1) {
+                return Err(Error::config(format!(
+                    "the refiner's trace is {} wide and the source {}",
+                    trace.shape.dim(1),
+                    text.shape.dim(1)
+                )));
+            }
+            nn::layers::ScaledAdd
+                .forward(f, trace, row_range(text, 0, tokens)?, 1.0, 0.0)
+                .map_err(Error::from)?;
+        }
+        Ok(())
     }
 
     /// Project a request's conditions into its prefix source.
@@ -1409,6 +1470,7 @@ impl Denoiser {
         layout: Layout,
         conditions: ConditionLatents<'_>,
         out: TensorView,
+        trace: Option<&ConditionTrace<'_>>,
     ) -> Result<()> {
         let canvas = canvas_of_latents(&layout)?;
         let declared = conditions_of(request);
@@ -1431,6 +1493,20 @@ impl Denoiser {
         let audio_channels = u64::from(self.config.transformer.audio_channels);
         let width = video_channels * 4;
         let views = ConditionViews::new(&declared, conditions.latents)?;
+        let visual = segments
+            .iter()
+            .filter(|segment| segment.visual.is_some())
+            .count();
+        if let Some(trace) = trace
+            && (trace.draws.len() != visual || trace.clean.len() != visual)
+        {
+            return Err(Error::config(format!(
+                "the condition trace offers {} draws and {} latents for {visual} visual conditions",
+                trace.draws.len(),
+                trace.clean.len()
+            )));
+        }
+        let mut traced = 0usize;
         let mut draws = conditions.noise.iter();
         let mut row = packing.text_rows;
         for segment in &segments {
@@ -1499,6 +1575,19 @@ impl Denoiser {
             nn::layers::Patch::new(video_channels, height, columns)?
                 .forward(f, *draw, anchor, frames)
                 .map_err(Error::from)?;
+            if let Some(trace) = trace {
+                // The two operands before the mix: `target = 0 * target + 1 * source` writes the
+                // view without reading what it held.
+                check_trace_view(trace.draws[traced], count, width, "draw")?;
+                check_trace_view(trace.clean[traced], count, width, "clean")?;
+                nn::layers::ScaledAdd
+                    .forward(f, trace.draws[traced], anchor, 1.0, 0.0)
+                    .map_err(Error::from)?;
+                nn::layers::ScaledAdd
+                    .forward(f, trace.clean[traced], clean, 1.0, 0.0)
+                    .map_err(Error::from)?;
+                traced += 1;
+            }
             nn::layers::ScaledAdd
                 .forward(
                     f,
@@ -1511,6 +1600,19 @@ impl Denoiser {
             self.transformer
                 .project(f, anchor, row_range(out, row, count)?)?;
             row += visual.rows();
+        }
+        if let Some(source) = trace.and_then(|trace| trace.source) {
+            let rows = u64::from(packing.condition_rows);
+            check_trace_view(source, rows, hidden, "source")?;
+            nn::layers::ScaledAdd
+                .forward(
+                    f,
+                    source,
+                    row_range(out, packing.text_rows, rows)?,
+                    1.0,
+                    0.0,
+                )
+                .map_err(Error::from)?;
         }
         Ok(())
     }
