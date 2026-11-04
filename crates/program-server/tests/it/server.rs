@@ -4,10 +4,10 @@
 
 use std::path::{Path, PathBuf};
 
-use program_server::builder::Limits;
+use program_server::builder::{BuildState, Limits};
 use program_server::protocol::{Descriptors, PrepareRequest, ProgramRequest, Selector};
 use program_server::server::{ProgramServer, ServerConfig};
-use program_server::store::Root;
+use program_server::store::{ModulePath, Root};
 use program_server::target::{Device, Target};
 use program_server::toolchain::ToolchainConfig;
 use program_server::{Error, Program, ProgramSlot};
@@ -193,10 +193,6 @@ form = "wasm"
 [source]
 kind = "wasm"
 files = ["src/lib.rs"]
-
-[kernel]
-architectures = ["wasm32"]
-descriptors = { keys = ["default"] }
 "#;
 
 #[test]
@@ -215,7 +211,7 @@ fn a_policy_module_is_listed_as_the_wasm_module_it_is() {
         .path
         .join("scheduling/fcfs/1/wasm32/default");
     std::fs::create_dir_all(&module).unwrap();
-    std::fs::write(module.join("module.cwasm"), b"a precompiled module").unwrap();
+    std::fs::write(module.join("module.wasm"), b"a precompiled module").unwrap();
     std::fs::write(module.join(".committed"), b"").unwrap();
 
     let server = ProgramServer::open(&configuration).unwrap();
@@ -230,6 +226,120 @@ fn a_policy_module_is_listed_as_the_wasm_module_it_is() {
         package.modules[0].form,
         program_server::manifest::ModuleForm::Wasm
     );
+}
+
+#[test]
+fn prepare_builds_a_scheduling_policy_once_for_wasm32() {
+    let temporary = tempfile::tempdir().unwrap();
+    let configuration = config(temporary.path(), None);
+    let package_root = configuration
+        .package_root
+        .join("scheduling")
+        .join("fcfs")
+        .join("1");
+    std::fs::create_dir_all(package_root.join("src")).unwrap();
+    std::fs::write(package_root.join("package.toml"), POLICY).unwrap();
+    std::fs::write(package_root.join("src/lib.rs"), b"// the policy\n").unwrap();
+    let module = configuration.store_roots[0]
+        .path
+        .join("scheduling/fcfs/1/wasm32/default");
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::write(module.join("module.wasm"), b"a precompiled module").unwrap();
+    std::fs::write(module.join(".committed"), b"").unwrap();
+
+    let server = ProgramServer::open(&configuration).unwrap();
+    let request = PrepareRequest {
+        // The daemon names no target: each host builds for its own devices,
+        // and a policy is built for wasm32 whatever those are.
+        targets: Vec::new(),
+        programs: vec![ProgramRequest {
+            slot: ProgramSlot::all("scheduling"),
+            selector: Selector::Latest {
+                backend: "fcfs".into(),
+                arguments: toml::Table::new(),
+            },
+        }],
+        descriptors: vec![Descriptors {
+            op: "scheduling".into(),
+            keys: vec!["default".into()],
+        }],
+    };
+    let mut progress = Vec::new();
+    let prepared = server
+        .prepare(&request, &mut |step| progress.push(step))
+        .unwrap();
+
+    assert_eq!(prepared.programs.len(), 1);
+    assert_eq!(progress.len(), 1);
+    assert_eq!(
+        progress[0].path,
+        ModulePath::new("scheduling", "fcfs", 1, "wasm32", "default").unwrap()
+    );
+    assert_eq!(progress[0].state, BuildState::Committed);
+}
+
+#[test]
+fn a_policy_module_resolves_for_wasm32_only() {
+    let temporary = tempfile::tempdir().unwrap();
+    let configuration = config(temporary.path(), None);
+    let package_root = configuration
+        .package_root
+        .join("scheduling")
+        .join("fcfs")
+        .join("1");
+    std::fs::create_dir_all(package_root.join("src")).unwrap();
+    std::fs::write(package_root.join("package.toml"), POLICY).unwrap();
+    std::fs::write(package_root.join("src/lib.rs"), b"// the policy\n").unwrap();
+    let module = configuration.store_roots[0]
+        .path
+        .join("scheduling/fcfs/1/wasm32/default");
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::write(module.join("module.wasm"), b"a precompiled module").unwrap();
+    std::fs::write(module.join(".committed"), b"").unwrap();
+
+    let server = ProgramServer::open(&configuration).unwrap();
+    let program = Program {
+        backend: "fcfs".into(),
+        revision: 1,
+        arguments: toml::Table::new(),
+    };
+    let resolved = server
+        .resolve(
+            "scheduling",
+            &program,
+            &Target::new("wasm32"),
+            "default",
+            &mut |_| {},
+        )
+        .unwrap();
+    assert_eq!(resolved.form, program_server::manifest::ModuleForm::Wasm);
+    assert_eq!(resolved.files.len(), 1);
+    assert_eq!(resolved.files[0].name, "module.wasm");
+    assert!(resolved.metadata.is_none());
+    assert!(resolved.entry.is_none());
+
+    // A policy is not built for a GPU architecture, and a policy names no
+    // descriptor other than `default`.
+    assert!(matches!(
+        server.resolve(
+            "scheduling",
+            &program,
+            &Target::new("sm_100a"),
+            "default",
+            &mut |_| {}
+        ),
+        Err(Error::Build { .. })
+    ));
+    assert!(matches!(
+        server.resolve(
+            "scheduling",
+            &program,
+            &Target::new("wasm32"),
+            "dtype_bf16",
+            &mut |_| {}
+        ),
+        Err(Error::UnsupportedDescriptor { .. })
+    ));
 }
 
 #[test]

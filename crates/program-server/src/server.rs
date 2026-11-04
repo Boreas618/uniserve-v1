@@ -430,7 +430,7 @@ impl ProgramServer {
                 }
             }
             for key in keys {
-                if !package.manifest.kernel.descriptors.covers(&key) {
+                if !package.manifest.covers(&key) {
                     return Err(Error::UnsupportedDescriptor {
                         op: chosen.slot.op.clone(),
                         backend: chosen.program.backend.clone(),
@@ -524,13 +524,7 @@ impl ProgramServer {
         progress: &mut dyn FnMut(Progress),
     ) -> Result<Module> {
         let package = self.package(op, program)?;
-        if !package
-            .manifest
-            .kernel
-            .architectures
-            .iter()
-            .any(|architecture| architecture == target.as_str())
-        {
+        if !package.manifest.builds_for(target.as_str()) {
             return Err(Error::Build {
                 op: op.to_owned(),
                 backend: program.backend.clone(),
@@ -538,12 +532,23 @@ impl ProgramServer {
                 target: target.to_string(),
                 descriptor: descriptor.to_owned(),
                 message: format!(
-                    "the package builds for {:?}",
-                    package.manifest.kernel.architectures
+                    "the package builds for {}",
+                    if package.manifest.kernel.is_some() {
+                        format!(
+                            "{:?}",
+                            package
+                                .manifest
+                                .kernel
+                                .as_ref()
+                                .map(|kernel| &kernel.architectures)
+                        )
+                    } else {
+                        crate::manifest::WASM_TARGET.to_owned()
+                    }
                 ),
             });
         }
-        if !package.manifest.kernel.descriptors.covers(descriptor) {
+        if !package.manifest.covers(descriptor) {
             return Err(Error::UnsupportedDescriptor {
                 op: op.to_owned(),
                 backend: program.backend.clone(),
@@ -719,9 +724,32 @@ impl ProgramServer {
 
     /// The targets a package is built for: those the request names, checked
     /// against this host, or every target of the host that the package
-    /// supports (design section 5.3).
+    /// supports (design section 5.3). A scheduling policy is built once, for
+    /// wasm32, whatever the host's GPUs are.
     fn targets(&self, package: &Package, requested: &[Target]) -> Result<Vec<Target>> {
-        let kind = package.manifest.kernel.target;
+        let wasm = Target::new(crate::manifest::WASM_TARGET);
+        if package.manifest.kernel.is_none() {
+            if !requested.is_empty()
+                && !requested
+                    .iter()
+                    .any(|target| target.as_str() == crate::manifest::WASM_TARGET)
+            {
+                return Err(Error::Build {
+                    op: package.manifest.op.clone(),
+                    backend: package.manifest.backend.clone(),
+                    revision: 0,
+                    target: requested
+                        .iter()
+                        .map(Target::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    descriptor: String::new(),
+                    message: "a scheduling policy is built for wasm32 alone".into(),
+                });
+            }
+            return Ok(vec![wasm]);
+        }
+        let kind = package.manifest.target_kind();
         let host = target::targets(&self.devices, kind);
         let wanted = if requested.is_empty() {
             host.clone()
@@ -729,13 +757,9 @@ impl ProgramServer {
             target::check(&self.devices, kind, requested)?;
             requested.to_vec()
         };
-        let supported: Vec<&String> = package.manifest.kernel.architectures.iter().collect();
         let mut selected = Vec::new();
         for wanted in wanted {
-            if supported
-                .iter()
-                .any(|architecture| architecture.as_str() == wanted.as_str())
-            {
+            if package.manifest.builds_for(wanted.as_str()) {
                 selected.push(wanted);
             } else if !requested.is_empty() {
                 // A target the epoch names and the package cannot build for
@@ -748,8 +772,12 @@ impl ProgramServer {
                     target: wanted.to_string(),
                     descriptor: String::new(),
                     message: format!(
-                        "the package builds for {:?} and the epoch needs {wanted}",
-                        package.manifest.kernel.architectures
+                        "the package builds for {:?}",
+                        package
+                            .manifest
+                            .kernel
+                            .as_ref()
+                            .map(|kernel| &kernel.architectures)
                     ),
                 });
             }
@@ -763,7 +791,12 @@ impl ProgramServer {
                 descriptor: String::new(),
                 message: format!(
                     "the package builds for {:?} and this host builds for {:?}",
-                    package.manifest.kernel.architectures, host
+                    package
+                        .manifest
+                        .kernel
+                        .as_ref()
+                        .map(|kernel| &kernel.architectures),
+                    host
                 ),
             });
         }

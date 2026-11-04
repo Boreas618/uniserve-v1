@@ -198,6 +198,14 @@ impl SourceSpec {
 /// key.
 pub const DESCRIPTOR_PLACEHOLDER: &str = "{descriptor}";
 
+/// The descriptor key of a scheduling policy's one module: a policy covers a
+/// whole interface, not a set of shapes.
+pub const POLICY_DESCRIPTOR: &str = "default";
+
+/// The target of a scheduling policy's module: wasm32, precompiled for this
+/// host's CPU, not a GPU architecture.
+pub const WASM_TARGET: &str = "wasm32";
+
 /// The descriptors a package covers (design section 4.2 and 5.2).
 ///
 /// A descriptor is the set of parameter values one compilation covers; its
@@ -313,7 +321,10 @@ pub struct Manifest {
     /// The package's sources.
     pub source: SourceSpec,
     /// The kernel program's architectures, descriptors and selection rules.
-    pub kernel: KernelSpec,
+    /// A scheduling policy has no kernel program: it names no architecture
+    /// and one descriptor, [`POLICY_DESCRIPTOR`] (design section 5.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel: Option<KernelSpec>,
     /// The program's parameters and their default values (design section
     /// 5.2). An argument the configuration gives replaces its default.
     #[serde(default)]
@@ -347,10 +358,19 @@ impl Manifest {
                 "the operator and backend names must not be empty".into(),
             ));
         }
-        if self.kernel.architectures.is_empty() {
-            return Err(ManifestError::Invalid(
-                "the package must name the architectures it supports".into(),
-            ));
+        match (&self.kernel, self.module.form) {
+            (Some(kernel), _) if kernel.architectures.is_empty() => {
+                return Err(ManifestError::Invalid(
+                    "the package must name the architectures it supports".into(),
+                ));
+            }
+            (None, ModuleForm::Wasm) => {}
+            (None, _) => {
+                return Err(ManifestError::Invalid(
+                    "only a wasm program may omit the kernel program it fills".into(),
+                ));
+            }
+            _ => {}
         }
         let missing: Vec<&String> = self
             .source
@@ -378,6 +398,34 @@ impl Manifest {
             ));
         }
         Ok(())
+    }
+
+    /// Whether this package covers a descriptor key: a kernel program by its
+    /// declared dimensions or keys, a scheduling policy by its one module.
+    pub fn covers(&self, key: &str) -> bool {
+        match &self.kernel {
+            Some(kernel) => kernel.descriptors.covers(key),
+            None => key == POLICY_DESCRIPTOR,
+        }
+    }
+
+    /// Whether this package builds for a target: a kernel program by its
+    /// declared architectures, a scheduling policy for wasm32 alone.
+    pub fn builds_for(&self, target: &str) -> bool {
+        match &self.kernel {
+            Some(kernel) => kernel
+                .architectures
+                .iter()
+                .any(|architecture| architecture == target),
+            None => target == WASM_TARGET,
+        }
+    }
+
+    /// How this package names its target.
+    pub fn target_kind(&self) -> TargetKind {
+        self.kernel
+            .as_ref()
+            .map_or(TargetKind::Arch, |kernel| kernel.target)
     }
 
     /// The source of this package, ready to build its descriptors.
