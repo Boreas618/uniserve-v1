@@ -43,13 +43,22 @@ fn main() -> ExitCode {
 fn run() -> Result<String, String> {
     let mut arguments = std::env::args().skip(1);
     let mut dumps: Option<PathBuf> = None;
+    let mut reference: Option<PathBuf> = None;
+    let mut candidate: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--dumps" => dumps = arguments.next().map(PathBuf::from),
+            "--reference" => reference = arguments.next().map(PathBuf::from),
+            "--candidate" => candidate = arguments.next().map(PathBuf::from),
             "--out" => out = arguments.next().map(PathBuf::from),
             other => return Err(format!("unknown argument {other}")),
         }
+    }
+    if let Some(reference) = reference {
+        let candidate = candidate
+            .ok_or("--candidate <dir> names the second tensor dump directory to compare")?;
+        return compare_tensor_dumps(&reference, &candidate, out.as_deref());
     }
     let dumps = dumps.ok_or("--dumps <dir> names the dump directory to compare against")?;
     let case: Case = serde_json::from_str(
@@ -137,8 +146,10 @@ fn run() -> Result<String, String> {
                 case.num_text_tokens,
                 &segments,
                 &spans,
-                sparsity,
-                reference_keep,
+                packing::Sparsity {
+                    sparsity,
+                    reference_keep,
+                },
             )
             .map_err(problem)?;
             let extent: &SegmentExtent = &plan.extent;
@@ -225,7 +236,8 @@ fn run() -> Result<String, String> {
     }
 
     let mut report = Report {
-        dumps: dumps.clone(),
+        heading: format!("# H3 layout diagnosis: {}", dumps.display()),
+        source: dumps.display().to_string(),
         tensors: Vec::new(),
         missing: Vec::new(),
         extra: Vec::new(),
@@ -469,9 +481,57 @@ fn read_dump(path: &Path) -> Result<Dump, String> {
         }
         2 => Values::Signed(read_signed(payload, 8, &shape).map_err(|error| broken(&error))?),
         3 => Values::Signed(read_signed(payload, 4, &shape).map_err(|error| broken(&error))?),
+        // Half-precision tensors keep the dtype their producer computed them in: a traced BF16
+        // activation is twice its f32 width on disk if it is widened before writing, and a
+        // fifty-layer trace is already the largest thing this harness moves. Widening here costs
+        // one shift and changes no comparison, because the widened bits are the producer's own.
+        4 => Values::Float(read_half(payload, 2, &shape, true).map_err(|error| broken(&error))?),
+        5 => Values::Float(read_half(payload, 2, &shape, false).map_err(|error| broken(&error))?),
         other => return Err(broken(&format!("unknown dtype {other}"))),
     };
     Ok(Dump { shape, values })
+}
+
+/// Read a half-precision payload as `f64`. A BF16 element is the high half of the `f32` it stands
+/// for, so widening is a shift; an F16 element is widened exactly by the interpreter.
+fn read_half(payload: &[u8], width: usize, shape: &[u64], brain: bool) -> Result<Vec<f64>, String> {
+    let count: u64 = shape.iter().product();
+    if payload.len() != count as usize * width {
+        return Err("a payload that does not match its shape".to_owned());
+    }
+    Ok(payload
+        .chunks_exact(width)
+        .map(|chunk| {
+            let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+            if brain {
+                f64::from(f32::from_bits(u32::from(bits) << 16))
+            } else {
+                f64::from(f16_to_f32(bits))
+            }
+        })
+        .collect())
+}
+
+/// An IEEE binary16 bit pattern as the `f32` it stands for: exact, including subnormals and the
+/// two infinities. NaNs stay NaNs, which compare unequal to everything and so count as differences
+/// - the right reading for a diagnosis.
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = u32::from(bits & 0x8000) << 16;
+    let exponent = u32::from(bits >> 10) & 0x1f;
+    let mantissa = u32::from(bits) & 0x3ff;
+    let widened = match (exponent, mantissa) {
+        (0, 0) => sign,
+        (0, mantissa) => {
+            // A subnormal: renormalize into the f32 exponent range.
+            let shift = mantissa.leading_zeros() - 21;
+            let mantissa = (mantissa << shift) & 0x3ff;
+            let exponent = 127 - 15 - shift + 1;
+            sign | (exponent << 23) | (mantissa << 13)
+        }
+        (0x1f, _) => sign | 0x7f80_0000 | (mantissa << 13),
+        (exponent, _) => sign | ((exponent + 127 - 15) << 23) | (mantissa << 13),
+    };
+    f32::from_bits(widened)
 }
 
 fn read_signed(payload: &[u8], width: usize, shape: &[u64]) -> Result<Vec<i64>, String> {
@@ -509,21 +569,40 @@ struct Comparison {
 }
 
 fn compare(named: &Named, dumped: &Dump) -> Comparison {
+    compare_values(
+        named.name,
+        &named.shape,
+        &named.values,
+        &dumped.shape,
+        &dumped.values,
+    )
+}
+
+/// Compare two sets of values that carry the same name: exact for integers, and the largest
+/// absolute and relative difference for floats. A shape that differs is reported as such and no
+/// entry is counted, because there is no entry-by-entry meaning to count.
+fn compare_values(
+    name: &str,
+    shape: &[u64],
+    mine: &Values,
+    dumped_shape: &[u64],
+    dumped: &Values,
+) -> Comparison {
     let mut comparison = Comparison {
-        name: named.name.to_owned(),
-        shape: named.shape.clone(),
-        dumped_shape: dumped.shape.clone(),
-        entries: named.values.len(),
+        name: name.to_owned(),
+        shape: shape.to_vec(),
+        dumped_shape: dumped_shape.to_vec(),
+        entries: mine.len(),
         differing: 0,
         largest: 0.0,
         largest_relative: 0.0,
         first: Vec::new(),
     };
-    if named.shape != dumped.shape {
+    if shape != dumped_shape {
         return comparison;
     }
-    for index in 0..named.values.len() {
-        let (difference, shown) = match (&named.values, &dumped.values) {
+    for index in 0..mine.len() {
+        let (difference, shown) = match (mine, dumped) {
             (Values::Signed(mine), Values::Signed(theirs)) => {
                 let difference = (mine[index] - theirs[index]).abs();
                 (
@@ -563,7 +642,10 @@ fn compare(named: &Named, dumped: &Dump) -> Comparison {
 
 /// The whole run's report, printed and optionally written as JSON.
 struct Report {
-    dumps: PathBuf,
+    /// The report's first line: which comparison this is and what it read.
+    heading: String,
+    /// The same statement as one line, for the JSON block.
+    source: String,
     tensors: Vec<Comparison>,
     missing: Vec<String>,
     extra: Vec<String>,
@@ -572,10 +654,7 @@ struct Report {
 impl Report {
     fn render(&self) -> String {
         let mut text = String::new();
-        text.push_str(&format!(
-            "# H3 layout diagnosis: {}\n\n",
-            self.dumps.display()
-        ));
+        text.push_str(&format!("{}\n\n", self.heading));
         text.push_str(
             "Diagnosis, not an acceptance gate (specs/worker.md 10): the numbers are recorded as\n\
              they are. `differing` counts entries that are not equal, exactly for the integer\n\
@@ -635,7 +714,7 @@ impl Report {
         text.push_str(&format!(
             "\n```json\n{}\n```\n",
             serde_json::to_string_pretty(&json!({
-                "dumps": self.dumps.display().to_string(),
+                "source": &self.source,
                 "tensors": self.tensors.iter().map(|tensor| json!({
                     "name": &tensor.name,
                     "shape": &tensor.shape,
@@ -652,6 +731,88 @@ impl Report {
         ));
         text
     }
+}
+
+/// Compare two directories of block tensors, file by file, in the same container the layout dumps
+/// use. Both sides are dumps: this crate's traced views and the reference implementation's shadow
+/// pass write the same files, and this reads them - so it needs no device and no checkpoint.
+///
+/// Every tensor under `reference/` is looked for under `candidate/`; integer tensors are compared
+/// exactly, floats by their largest absolute and relative difference, and nothing is gated. A file
+/// present on one side only is listed instead of being counted as a difference, because a missing
+/// block means the walk did not reach it rather than that two numbers disagree.
+fn compare_tensor_dumps(
+    reference: &Path,
+    candidate: &Path,
+    out: Option<&Path>,
+) -> Result<String, String> {
+    let theirs = tensors_in(reference)?;
+    let ours = tensors_in(candidate)?;
+    let mut report = Report {
+        heading: format!(
+            "# H3 block diagnosis: {} against {}",
+            candidate.display(),
+            reference.display()
+        ),
+        source: format!("{} vs {}", candidate.display(), reference.display()),
+        tensors: Vec::new(),
+        missing: Vec::new(),
+        extra: Vec::new(),
+    };
+    for name in &theirs {
+        if !ours.iter().any(|ours| ours == name) {
+            report.missing.push(name.clone());
+            continue;
+        }
+        let theirs = read_dump(&reference.join(format!("{name}.h3t")))?;
+        let ours = read_dump(&candidate.join(format!("{name}.h3t")))?;
+        report.tensors.push(compare_values(
+            name,
+            &ours.shape,
+            &ours.values,
+            &theirs.shape,
+            &theirs.values,
+        ));
+    }
+    for name in &ours {
+        if !theirs.iter().any(|theirs| theirs == name) {
+            report.extra.push(name.clone());
+        }
+    }
+
+    let text = report.render();
+    if let Some(out) = out {
+        fs::write(out, &text).map_err(|error| format!("{}: {error}", out.display()))?;
+    }
+    Ok(text)
+}
+
+/// Every `.h3t` under `root`, named by its path relative to `root` without the suffix, sorted so a
+/// report reads the same way twice.
+fn tensors_in(root: &Path) -> Result<Vec<String>, String> {
+    let mut names = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let entries = fs::read_dir(&directory)
+            .map_err(|error| format!("{}: {error}", directory.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("{}: {error}", directory.display()))?;
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            let Ok(relative) = path.strip_prefix(root) else {
+                continue;
+            };
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            if let Some(name) = relative.strip_suffix(".h3t") {
+                names.push(name.to_owned());
+            }
+        }
+    }
+    names.sort();
+    Ok(names)
 }
 
 fn shape_text(shape: &[u64]) -> String {

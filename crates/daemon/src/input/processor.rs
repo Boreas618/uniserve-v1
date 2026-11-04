@@ -148,7 +148,21 @@ pub(crate) async fn pipeline_tokenizer(
     Ok(tokenizer)
 }
 
-impl ModelConfig {
+/// How this deployment loads a checkpoint: its tokenizer, its template
+/// resources and the facts its engine is configured with.
+///
+/// The model is the frontend's (delivery item 2); loading it is the request
+/// processing's, which moves with `input/` in stage A — until then it is an
+/// extension trait here, so the daemon names no inherent impl of a foreign
+/// type.
+pub(crate) trait LoadModel {
+    fn load(
+        config: &crate::options::ServeConfig,
+    ) -> impl std::future::Future<Output = std::result::Result<LoadedModel, ModelResolutionError>>;
+}
+
+impl LoadModel for ModelConfig {
+
     /// Loads model facts and the tokenizer/template resources needed by preprocessing.
     ///
     /// A diffusers pipeline has no chat template and carries its conditioner's
@@ -156,7 +170,7 @@ impl ModelConfig {
     /// configured one, else, for a root configuration, its
     /// `max_position_embeddings` or `ModelConfig::DEFAULT_MAX_MODEL_LEN`,
     /// and for a pipeline the model's default prompt limit.
-    pub(crate) async fn load(
+    async fn load(
         config: &crate::options::ServeConfig,
     ) -> std::result::Result<LoadedModel, ModelResolutionError> {
         let max_model_len = config.max_model_len.map(std::num::NonZeroU32::get);
@@ -223,52 +237,15 @@ impl ModelConfig {
             },
         })
     }
-
-    /// Vocabulary markers used by multimodal scheduling and prompt construction.
-    pub(crate) fn generation_controls(&self) -> Option<&models::omni::GenerationControls> {
-        match &self.parameters {
-            ModelParameters::SenseNova(value) => Some(&value.controls),
-            ModelParameters::Bagel(value) => Some(&value.controls),
-            ModelParameters::Qwen3
-            | ModelParameters::MiniMaxH3
-            | ModelParameters::DiffusionGemma(_) => None,
-        }
-    }
-
-    /// Model facts used at startup before the loaded workers' capacities and
-    /// served features are applied (`resolve_generation_limits`).
-    pub(crate) fn generation_limits(
-        &self,
-        model_dtype: proto::request::ModelDtype,
-    ) -> proto::request::GenerationLimits {
-        match &self.parameters {
-            ModelParameters::Qwen3 | ModelParameters::MiniMaxH3 => {
-                proto::request::GenerationLimits {
-                    latent_downsample: 1,
-                    max_cfg_branches: 1,
-                    ..Default::default()
-                }
-            }
-            ModelParameters::SenseNova(profile) => profile.runtime_limits(model_dtype),
-            ModelParameters::Bagel(_) => BagelProfile::runtime_limits(model_dtype),
-            // A readout prefills text and encoded images and denoises its
-            // canvases once over them. An image writes one cache entry per soft
-            // token; the worker's encoder entries bound the feature bytes and
-            // the number of cached encodings, so the model states no bound of
-            // its own for either.
-            ModelParameters::DiffusionGemma(profile) => proto::request::GenerationLimits {
-                latent_downsample: 1,
-                max_vit_grid_tokens: profile.images.max_soft_tokens,
-                max_vision_feature_bytes: u64::MAX,
-                max_cfg_branches: 1,
-                encoder_cache_entries: u32::MAX,
-                ..Default::default()
-            },
-        }
-    }
 }
 
 impl InputProcessor {
+    /// The model's tokenizer, which a process continuing a response builds
+    /// its incremental decoder from (design `specs/worker.md` §7.5.1).
+    pub fn tokenizer(&self) -> DynTokenizer {
+        Arc::clone(&self.tokenizer)
+    }
+
     /// Binds model resources to the generation limits the started workers
     /// report in their handshake, without rebuilding model data.
     ///
@@ -772,6 +749,7 @@ impl InputProcessor {
 
 #[cfg(test)]
 mod tests {
+    use crate::input::processor::LoadModel as _;
     use std::fs;
 
     use proto::request::CanvasSampling;

@@ -18,7 +18,7 @@ use platform::{
     GraphNodeKind, HandleType, Interleave, KernelNodeParams, L2Promotion, LaunchConfig, Library,
     Matmul, MatmulArgs, MatmulDescriptor, Nvml, OobFill, PeerMapping, PinnedBuffer, PrimaryContext,
     Protection, SegmentedMapping, ShareableHandle, SourceOrder, Stream, Strided, StridedCopy,
-    Swizzle, Tensor, TensorDataType, TensorMap, TensorMapSpec, VirtualPool, memcpy_async,
+    Swizzle, Tensor, TensorDataType, TensorMap, TensorMapSpec, WaitValue, memcpy_async,
     memset_2d_d8, memset_d8, memset_d32, reclaim,
 };
 
@@ -226,6 +226,84 @@ fn strided_copies_match_the_reference_in_every_direction() {
     }
     stream.synchronize().unwrap();
     assert_eq!(read(&host), pattern);
+}
+
+/// One stream tells another that work is done by writing a 32-bit flag the
+/// other waits on, and nothing on the host polls or synchronizes in between: the
+/// reading stream's copy observes the fill only because the wait held it until
+/// the writer's write landed, and the two conditions exercised release on the
+/// value they name.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn a_wait_on_a_written_flag_orders_one_stream_behind_another() {
+    let _driver = exclusive_driver();
+    let writing = Stream::new(DEVICE).unwrap();
+    let reading = Stream::new(DEVICE).unwrap();
+    let data = DeviceAllocation::linear(DEVICE, 4096).unwrap();
+    let flag = DeviceAllocation::linear(DEVICE, 4).unwrap();
+    let host = PinnedBuffer::new(DEVICE, 4096).unwrap();
+    let flag_address = DevicePtr::from_address(flag.address());
+
+    // The flag starts at zero before either side of the handoff is queued, so
+    // the wait below cannot be satisfied by whatever the allocation happened to
+    // contain.
+    // SAFETY: the flag lies inside `flag`, which outlives the synchronization.
+    unsafe { memset_d32(flag.address(), 0, 1, &writing) }.unwrap();
+    writing.synchronize().unwrap();
+
+    // The reader queues its wait before the writer queues anything, so a pass
+    // says the wait did the ordering rather than the order of submission.
+    // SAFETY: every range lies inside an allocation that outlives the
+    // synchronization below.
+    unsafe {
+        reading
+            .wait_value32(flag_address, 1, WaitValue::Equal)
+            .unwrap();
+        memcpy_async(host.address(), data.address(), 4096, &reading).unwrap();
+        memset_d32(data.address(), 0x5a5a_5a5a, 1024, &writing).unwrap();
+        writing.write_value32(flag_address, 1).unwrap();
+    }
+    reading.synchronize().unwrap();
+
+    assert!(
+        read(&host).iter().all(|byte| *byte == 0x5a),
+        "the reader observed the fill because the flag ordered it"
+    );
+
+    // The flag reads back as written, so the wait released on the value it
+    // names rather than on something else.
+    // SAFETY: the copy reads inside `flag`, and the host buffer holds four bytes.
+    unsafe { memcpy_async(host.address(), flag.address(), 4, &reading) }.unwrap();
+    reading.synchronize().unwrap();
+    assert_eq!(u32::from_ne_bytes(read(&host)[..4].try_into().unwrap()), 1);
+
+    // The bit-test condition holds while no bit of the value is set and
+    // releases once one is: an event recorded behind the wait says whether the
+    // stream got past it, so the wait is observed without a host block.
+    let passed = Event::new(EventFlags::default());
+    // SAFETY: the flag lies inside `flag`, which outlives this block.
+    unsafe { memset_d32(flag.address(), 0, 1, &writing) }.unwrap();
+    writing.synchronize().unwrap();
+    // SAFETY: the wait names the same flag the writer just wrote.
+    reading
+        .wait_value32(flag_address, 2, WaitValue::AnyBitSet)
+        .unwrap();
+    passed.record(&reading).unwrap();
+    thread::sleep(Duration::from_millis(20));
+    assert!(
+        !passed.query().unwrap(),
+        "a flag without the named bit leaves the wait outstanding"
+    );
+
+    // SAFETY: as above, and the write is ordered behind nothing the reader
+    // needs beyond the flag itself.
+    unsafe { memset_d32(flag.address(), 2, 1, &writing) }.unwrap();
+    writing.write_value32(flag_address, 2).unwrap();
+    reading.synchronize().unwrap();
+    assert!(
+        passed.query().unwrap(),
+        "the wait releases once the flag has the named bit"
+    );
 }
 
 #[test]
@@ -584,59 +662,6 @@ fn graph_executables_launch_on_another_stream() {
     }
     stream.synchronize().unwrap();
     assert_eq!(read(&host), vec![7; 256]);
-}
-
-/// A pool's storage keeps its addresses and contents across a suspension,
-/// and a graph captured over it before runs correctly after the restore; a
-/// freed chunk is given out again at its address.
-#[test]
-#[ignore = "requires a CUDA device"]
-fn a_pool_keeps_addresses_and_contents_across_a_suspension() {
-    let _driver = exclusive_driver();
-    let mut pool = VirtualPool::reserve(DEVICE, 64 << 20).unwrap();
-    let first = pool.allocate(1 << 20).unwrap();
-    let second = pool.allocate(1 << 20).unwrap();
-    assert_ne!(first, second);
-    assert!(pool.contains(first) && pool.contains(second));
-    let stream = Stream::new(DEVICE).unwrap();
-    let host = PinnedBuffer::new(DEVICE, 256).unwrap();
-
-    // The first chunk holds 5s written before the suspension; a graph
-    // captured now fills the second with 9s at every launch.
-    // SAFETY: the ranges lie inside the pool's chunks.
-    unsafe { memset_d8(first, 5, 256, &stream) }.unwrap();
-    stream.synchronize().unwrap();
-    let capture = Capture::begin(&stream, CaptureMode::Relaxed).unwrap();
-    // SAFETY: the range lies inside the pool's chunk.
-    unsafe { memset_d8(second, 9, 256, &stream) }.unwrap();
-    let fill = capture.end().unwrap().instantiate().unwrap();
-
-    let mapped = pool.mapped_bytes();
-    pool.suspend().unwrap();
-    assert!(
-        pool.allocate(1 << 20).is_err(),
-        "a suspended pool gives out nothing"
-    );
-    pool.restore().unwrap();
-    assert_eq!(pool.mapped_bytes(), mapped);
-
-    // SAFETY: the ranges lie inside the restored chunks, at their addresses.
-    unsafe {
-        memcpy_async(host.address(), first, 256, &stream).unwrap();
-    }
-    stream.synchronize().unwrap();
-    assert_eq!(read(&host), vec![5; 256]);
-    fill.launch(&stream).unwrap();
-    // SAFETY: as above.
-    unsafe {
-        memcpy_async(host.address(), second, 256, &stream).unwrap();
-    }
-    stream.synchronize().unwrap();
-    assert_eq!(read(&host), vec![9; 256]);
-
-    drop(fill);
-    pool.free(second);
-    assert_eq!(pool.allocate(1 << 20).unwrap(), second);
 }
 
 #[test]
@@ -1026,6 +1051,10 @@ const KERNELS: &str = "\
 .version 8.0\n\
 .target sm_90\n\
 .address_size 64\n\
+.visible .entry nothing()\n\
+{\n\
+    ret;\n\
+}\n\
 .visible .entry report(.param .u64 out)\n\
 {\n\
     .reg .u64 %rd<4>;\n\
@@ -1165,6 +1194,57 @@ fn libraries_load_a_binary_image_and_launch_its_kernel() {
     stream.synchronize().unwrap();
 
     assert_eq!(words(&host), vec![3; 8]);
+}
+
+/// A function reports the parameters of its own signature as the driver
+/// declares them: the byte offset each value sits at in the packed layout a
+/// captured kernel node stores, and the bytes it occupies. A caller that
+/// publishes an entry point to another process takes the declaration from the
+/// driver instead of copying a header.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn a_function_reports_the_parameters_of_its_signature() {
+    let _driver = exclusive_driver();
+    let device = Device::new(DEVICE).unwrap();
+    let library = Library::load(&device, KERNELS.as_bytes()).unwrap();
+
+    // `write(.param .u64 out, .param .u32 value)`: eight bytes, then four.
+    let write = library.kernel("write").unwrap();
+    let parameters = write.parameters().unwrap();
+    let layout: Vec<(usize, usize)> = parameters
+        .iter()
+        .map(|parameter| (parameter.offset(), parameter.size()))
+        .collect();
+    assert_eq!(layout, vec![(0, 8), (8, 4)]);
+    assert_eq!(write.parameter(1).unwrap(), Some(parameters[1]));
+    assert_eq!(write.parameter(2).unwrap(), None);
+
+    // `report(.param .u64 out)`: one eight-byte parameter.
+    let report = library.kernel("report").unwrap();
+    let declared = report.parameters().unwrap();
+    let layout: Vec<(usize, usize)> = declared
+        .iter()
+        .map(|parameter| (parameter.offset(), parameter.size()))
+        .collect();
+    assert_eq!(layout, vec![(0, 8)]);
+
+    // A kernel that takes nothing reports an empty signature rather than
+    // failing at the end of its walk.
+    let nothing = library.kernel("nothing").unwrap();
+    assert!(nothing.parameters().unwrap().is_empty());
+    assert_eq!(nothing.parameter(0).unwrap(), None);
+
+    // The declaration comes from the loaded image, not from the PTX text: a
+    // kernel of a cubin image reports the same layout.
+    let fatbin = Library::load(&device, include_bytes!("../fixtures/add_constant.fatbin")).unwrap();
+    let add_constant = fatbin.kernel("add_constant").unwrap();
+    let layout: Vec<(usize, usize)> = add_constant
+        .parameters()
+        .unwrap()
+        .iter()
+        .map(|parameter| (parameter.offset(), parameter.size()))
+        .collect();
+    assert_eq!(layout, vec![(0, 8), (8, 4)]);
 }
 
 /// One launch carries a three-dimensional grid and block, the dynamic
@@ -1414,6 +1494,7 @@ fn rebinding_changes_a_kernel_node_function_and_arguments() {
 /// A row-major matrix product runs on an algorithm cuBLASLt's heuristic
 /// offers, and its result is the arithmetic the descriptor names.
 #[test]
+#[ignore = "requires a CUDA device"]
 fn a_matrix_product_runs_on_an_algorithm_the_heuristic_offers() {
     let _driver = exclusive_driver();
     let device = Device::new(DEVICE).unwrap();
@@ -1526,6 +1607,7 @@ fn a_matrix_product_runs_on_an_algorithm_the_heuristic_offers() {
 /// captured, its grid, block and the values of its arguments, and setting those
 /// on another executable's node runs the same work.
 #[test]
+#[ignore = "requires a CUDA device"]
 fn kernel_node_params_read_back_what_a_capture_recorded() {
     let _driver = exclusive_driver();
     let device = Device::new(DEVICE).unwrap();
@@ -1802,11 +1884,13 @@ fn forward_reference(
                 let mut total = 0.0f64;
                 for c in 0..channels {
                     for j in 0..kernel {
-                        let i = (o as i64 + padding - j as i64 * dilation) / stride;
-                        let aligned = i >= 0
-                            && (i < length as i64)
-                            && o as i64 == i * stride - padding + j as i64 * dilation;
-                        if aligned {
+                        // The definition of a cross-correlation: output `o`
+                        // reads the input at `o·stride − padding +
+                        // j·dilation`, the whole tap position and nothing
+                        // divided into it. A position outside the input is the
+                        // padding and contributes nothing.
+                        let i = o as i64 * stride - padding + j as i64 * dilation;
+                        if i >= 0 && i < length as i64 {
                             let value = x[(n * channels + c) * length + i as usize];
                             let weight = w[(k * channels + c) * kernel + j];
                             total += f64::from(value) * f64::from(weight);
@@ -1818,6 +1902,65 @@ fn forward_reference(
         }
     }
     y
+}
+
+/// The host reference is the definition the device is compared against, so it
+/// is checked against values computed by hand: a reference that is wrong in
+/// the same way for every input would let a wrong device result pass, and one
+/// that is merely wrong turns a correct device result into a failure (which is
+/// how the tap position, divided by the stride, was found).
+#[test]
+fn the_one_dimensional_reference_is_the_definition() {
+    // x[1, 2, 5] as two channels of five, w[3, 2, 3] as KCRS, stride 2,
+    // padding 1, dilation 1: the taps of output 0 sit at input -1 (the
+    // padding), 0 and 1.
+    let x = [-1.0f32, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5];
+    let w = [
+        -0.5f32, 0.25, -0.25, 0.5, 0.0, -0.5, // filter 0
+        0.25, -0.25, 0.5, 0.0, -0.5, 0.25, // filter 1
+        -0.25, 0.5, 0.0, -0.5, 0.25, -0.25, // filter 2
+    ];
+    let y = forward_reference(&x, [1, 2, 5], &w, [3, 2, 3], [1, 3, 3], 2, 1, 1);
+    // Output 0 of filter 0: x[0][0]·w[0][0][1] + x[0][1]·w[0][0][2] +
+    // x[1][0]·w[0][1][1] + x[1][1]·w[0][1][2]
+    // = -1·0.25 + -0.5·-0.25 + 1.5·0.0 + 2.0·-0.5 = -0.25 + 0.125 - 1.0.
+    assert_eq!(y[0], -1.125);
+    // Output 1 reads inputs 1, 2 and 3: channel 0 gives
+    // -0.5·-0.5 + 0·0.25 + 0.5·-0.25 = 0.125, channel 1 gives
+    // 2·0.5 + 2.5·0.0 + 3·-0.5 = -0.5, and the sum is -0.375.
+    assert_eq!(y[1], -0.375);
+}
+
+/// The other two host references, against values computed by hand from the same
+/// definitions: the three-dimensional one takes its taps at `o − padding + j`
+/// in each axis, and the transposed one scatters `i·stride − padding + j·dilation`.
+/// Each had, or could have, the tap sign reversed in silence.
+#[test]
+fn the_three_dimensional_and_transposed_references_are_the_definitions() {
+    // One channel, a kernel of three along the width, padding 1, so output 0
+    // reads the padding and inputs 0 and 1: 0·1 + 1·10 + 2·100 = 210. Output 1
+    // reads all three: 1·1 + 2·10 + 3·100 = 321. Output 2 reads inputs 1 and 2
+    // and the padding: 2·1 + 3·10 = 32. The reversed tap (`o + padding − j`)
+    // would answer 12, 123 and 230 instead.
+    let x = [1.0f32, 2.0, 3.0];
+    // A 3×3×3 filter whose only non-zero plane is the centre one, so the
+    // hand values below are the width taps alone: a filter that is one deep
+    // has no centre plane to reach through the padding.
+    let mut w = [0.0f32; 27];
+    w[12] = 1.0;
+    w[13] = 10.0;
+    w[14] = 100.0;
+    let y = forward_reference_3d(&x, [1, 1, 1, 1, 3], &w, [1, 1, 3, 3, 3], [1, 1, 1, 1, 3], 1);
+    assert_eq!(y, vec![210.0, 321.0, 32.0]);
+
+    // The transposed reference on the transposed test's own inputs, generated
+    // as that test generates them: output 0 is scattered to by
+    // `i·2 − 1 + j = 0`, which is `i = 0, j = 1` only — x[0]·w[0][0][1] =
+    // -0.5·0 = 0 and x[1]·w[1][0][1] = 0.5·-0.25 = -0.125.
+    let xt: Vec<f32> = (0..8).map(|i| (i % 5) as f32 * 0.25 - 0.5).collect();
+    let wt: Vec<f32> = (0..24).map(|i| ((i * 7) % 5) as f32 * 0.25 - 0.5).collect();
+    let z = transposed_reference(&xt, [1, 2, 4], &wt, [2, 3, 4], [1, 3, 8], 2, 1, 1);
+    assert_eq!(z[0], -0.125);
 }
 
 /// The definition of a one-dimensional transposed convolution, computed on
@@ -2134,23 +2277,25 @@ fn forward_reference_3d(
     let mut y = vec![0.0f32; batch * filters * out_d * out_h * out_w];
     for n in 0..batch {
         for k in 0..filters {
+            // The same definition as the one-dimensional reference: in each
+            // axis, output `o` reads the input at `o + j − padding`.
             for od in 0..out_d {
                 for oh in 0..out_h {
                     for ow in 0..out_w {
                         let mut total = 0.0f64;
                         for c in 0..channels {
                             for jd in 0..kernel_d {
-                                let d = od as i64 + padding as i64 - jd as i64;
+                                let d = od as i64 - padding as i64 + jd as i64;
                                 if d < 0 || d >= depth as i64 {
                                     continue;
                                 }
                                 for jh in 0..kernel_h {
-                                    let h = oh as i64 + padding as i64 - jh as i64;
+                                    let h = oh as i64 - padding as i64 + jh as i64;
                                     if h < 0 || h >= height as i64 {
                                         continue;
                                     }
                                     for jw in 0..kernel_w {
-                                        let w_index = ow as i64 + padding as i64 - jw as i64;
+                                        let w_index = ow as i64 - padding as i64 + jw as i64;
                                         if w_index < 0 || w_index >= width as i64 {
                                             continue;
                                         }

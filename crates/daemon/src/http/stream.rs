@@ -221,7 +221,15 @@ impl ResponseStream {
         }
         let mut paused = paused;
         let state = loop {
+            // The driver always answers the pause before it ends the body, so
+            // an answer already given outranks a body that ended: without the
+            // bias both branches are ready in the same poll when the state
+            // cannot be frozen and the body then ends, and the pause would
+            // report `Complete` instead of `Ended` about half the time —
+            // leaving the report of the registry unsent and the handoff
+            // waiting for it.
             tokio::select! {
+                biased;
                 state = &mut paused => break match state {
                     Ok(Some(state)) => state,
                     Ok(None) => return Pause::Ended,

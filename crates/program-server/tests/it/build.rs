@@ -1216,3 +1216,185 @@ fn a_package_compiles_from_the_copy_its_install_kept() {
     stop.store(true, Ordering::SeqCst);
     thread.join().unwrap();
 }
+
+/// The policy fixture the delivery test installs: a real policy crate, built for
+/// wasm32 when the package is installed, precompiled for this host's CPU, and then
+/// served by a second server that has no precompiler and no tree.
+///
+/// This is the whole path the engine's program-layer test walks: `install` a
+/// package whose `op`/`backend` are the deployment's policy, so the program's
+/// revision moves; the module the daemon then resolves is the one the install
+/// built. The package itself carries neither a wasm binary nor the policy's
+/// source — the build asks cargo for sched's own crate — which is why the install
+/// is the step that must have the tree.
+#[test]
+fn the_policy_fixture_installs_and_serves_without_a_compiler() {
+    let precompiler = match std::env::var_os("SCHEDULING_PRECOMPILE") {
+        Some(path) => PathBuf::from(path),
+        None => repository().join("target/programs-builder01/debug/scheduling-precompile"),
+    };
+    if !precompiler.is_file() {
+        eprintln!(
+            "SKIPPED (provisioning): no scheduling-precompile; \
+             `cargo build -p scheduling-precompile` builds it"
+        );
+        return;
+    }
+    let package = repository().join("crates/ops/program-fixtures/policy");
+    if !package.join("package.toml").is_file() {
+        eprintln!("SKIPPED: the tree holds no policy fixture");
+        return;
+    }
+
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("packages");
+    std::fs::create_dir_all(&root).unwrap();
+    let store = temporary.path().join("store");
+    std::fs::create_dir_all(&store).unwrap();
+    let with_precompiler = ServerConfig {
+        socket: temporary.path().join("first.sock"),
+        package_root: root.clone(),
+        store_roots: vec![Root {
+            path: store.clone(),
+            writable: true,
+        }],
+        upstream: None,
+        limits: Limits::default(),
+        toolchains: ToolchainConfig {
+            nvcc: None,
+            python: interpreter_fallback(),
+            wasm: Some(precompiler),
+            max_jobs: 2,
+        },
+        devices: vec![Device {
+            arch: Target::new("sm_100a"),
+            model: Target::new("b200"),
+        }],
+    };
+    let (_server, stop, thread) = start(&with_precompiler);
+    let mut client = Client::connect(&with_precompiler.socket).unwrap();
+    let installed = client.install(&package).expect("the policy fixture installs");
+    assert_eq!(installed.package.op, "scheduling");
+    assert_eq!(installed.package.backend, "fcfs");
+    assert_eq!(installed.package.revision, 1);
+    stop.store(true, Ordering::SeqCst);
+    thread.join().unwrap();
+
+    // The precompiled module is beside the installed manifest, and it is wasmtime's
+    // artifact rather than the raw module the policy crate produced.
+    let revision = root.join("scheduling").join("fcfs").join("1");
+    let artifact = revision.join("module.wasm");
+    assert!(
+        artifact.is_file(),
+        "the install kept no module beside the manifest at {}",
+        revision.display()
+    );
+    let bytes = std::fs::metadata(&artifact).unwrap().len();
+    assert!(
+        bytes > 512 * 1024,
+        "the artifact is {bytes} bytes, too small to be a precompiled policy"
+    );
+
+    // A server with no precompiler — the deployment's serving host — serves it.
+    let mut without_precompiler = with_precompiler.clone();
+    without_precompiler.socket = temporary.path().join("second.sock");
+    without_precompiler.toolchains.wasm = None;
+    let (_server, stop, thread) = start(&without_precompiler);
+    let mut client = Client::connect(&without_precompiler.socket).unwrap();
+    let program = program_server::Program {
+        backend: "fcfs".to_owned(),
+        revision: 1,
+        arguments: toml::Table::new(),
+    };
+    let module = client
+        .resolve(
+            "scheduling",
+            &program,
+            &Target::new(program_server::manifest::WASM_TARGET),
+            program_server::manifest::POLICY_DESCRIPTOR,
+            &mut |_| {},
+        )
+        .expect("the installed policy resolves without a compiler");
+    assert_eq!(module.form, ModuleForm::Wasm);
+    assert_eq!(
+        file_of(&module, program_server::source::MODULE_WASM).len() as u64,
+        bytes,
+        "the resolved module is the artifact the install kept"
+    );
+    stop.store(true, Ordering::SeqCst);
+    thread.join().unwrap();
+}
+
+/// The interpreter the policy fixture's install needs: it runs a Python script, so
+/// the environment must be there; a witness that gets here without one skips.
+fn interpreter_fallback() -> PathBuf {
+    python().unwrap_or_else(|| repository().join("crates/program-server/python/.venv/bin/python"))
+}
+
+/// Every path the command takes is absolute before the server sees it.
+///
+/// A build runs with its working directory set to the store's copy of a package, so a
+/// toolchain path typed relative to the shell's directory would name that copy instead
+/// of this host's compiler — and fail as `No such file or directory` from a directory
+/// the caller never named. The command is the place a person types those paths, so the
+/// command is where they are made absolute.
+#[test]
+fn the_command_makes_every_path_absolute_before_the_server_sees_it() {
+    let command = program_server::command::command();
+    let matches = command
+        .try_get_matches_from([
+            "program-server",
+            "serve",
+            "--socket",
+            "relative/program-server.sock",
+            "--package-root",
+            "relative/packages",
+            "--store-root",
+            "relative/store",
+            // Relative to the directory this test runs in, which is the crate's:
+            // the command resolves a path where it was typed.
+            "--python",
+            "python/.venv/bin/python",
+            "--wasm",
+            "target/debug/scheduling-precompile",
+        ])
+        .expect("the command's own flags parse");
+    let options = program_server::command::options(&matches).expect("the command's options");
+    assert!(
+        options.socket.is_absolute(),
+        "the socket stayed {}",
+        options.socket.display()
+    );
+    let program_server::command::Action::Serve(serve) = options.action else {
+        panic!("serve did not answer serve options");
+    };
+    for (name, path) in [
+        ("package root", &serve.package_root),
+        ("store root", &serve.store_roots[0]),
+        ("python", &serve.toolchains.python),
+        (
+            "wasm",
+            serve
+                .toolchains
+                .wasm
+                .as_ref()
+                .expect("a wasm precompiler was named"),
+        ),
+    ] {
+        assert!(
+            path.is_absolute(),
+            "the {name} stayed {}",
+            path.display()
+        );
+    }
+    // The interpreter must resolve against the directory the command was typed in, not
+    // against whatever directory a build later runs in. This is path arithmetic and
+    // nothing else: it holds on a host whose Python environment was never created,
+    // which is every host but the one that ran `uv sync`.
+    let typed_in = std::env::current_dir().expect("the directory the test runs in");
+    assert_eq!(
+        serve.toolchains.python,
+        typed_in.join("python/.venv/bin/python"),
+        "the relative interpreter did not resolve against the directory it was typed in",
+    );
+}

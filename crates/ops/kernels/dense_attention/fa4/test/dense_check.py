@@ -102,7 +102,14 @@ def main() -> int:
     parser.add_argument("--q-heads", type=int, default=32)
     parser.add_argument("--kv-heads", type=int, default=4)
     parser.add_argument("--head-dim", type=int, default=128)
+    parser.add_argument(
+        "--mask",
+        default="causal",
+        choices=("causal", "dense"),
+        help="the descriptor's mask: the fixture has both cells",
+    )
     arguments = parser.parse_args()
+    causal = arguments.mask == "causal"
 
     library = ctypes.CDLL(str(arguments.module / "module.so"))
     entry = library.uniserve_dense_attention
@@ -153,7 +160,7 @@ def main() -> int:
     call.o_stride_heads = head_dim
     call.scale = 1.0 / math.sqrt(head_dim)
     call.window_left = -1  # no window
-    call.causal = 1
+    call.causal = 1 if causal else 0
     call.dtype_query = BF16
     call.dtype_key_value = BF16
     call.dtype_output = BF16
@@ -165,12 +172,16 @@ def main() -> int:
         print(f"the entry refused the call: {call.error.decode(errors='replace')}", file=sys.stderr)
         return 1
 
-    expected = reference(query, key, value, cu_seqlens_q, cu_seqlens_k, call.scale, True).to(
+    expected = reference(query, key, value, cu_seqlens_q, cu_seqlens_k, call.scale, causal).to(
         torch.bfloat16
     )
     error = (out.float() - expected.float()).abs().max().item()
     largest = expected.float().abs().max().item()
-    print(f"max |out - exact attention| = {error:.6g} (largest value {largest:.6g})")
+    print(
+        f"{arguments.mask} mask, {head_dim}-element heads, {q_heads}/{kv_heads} query/key heads, "
+        f"longest keys {int(lengths.max())}: max |out - exact attention| = {error:.6g} "
+        f"(largest value {largest:.6g})"
+    )
     if error > 0.05 * max(largest, 1.0):
         print("the dense pass does not match exact attention", file=sys.stderr)
         return 1

@@ -32,6 +32,9 @@ KINDS = {
     "none": -1,
 }
 
+#: The element type each storage kind reads, spelled as a module's signature spells one.
+POINTERS = {"f32": "fp32", "fp32": "fp32", "bf16": "bf16", "f16": "fp16", "fp16": "fp16"}
+
 
 def arguments():
     """The package, descriptor, target and output directory of one build."""
@@ -117,6 +120,12 @@ def main():
         "--threads=1",
         f"-DUNISERVE_ITERATIONS={iterations}",
         f"-DUNISERVE_TOP={butterfly}",
+        # The descriptor's own numbers, so the kernel can refuse a call that
+        # arrives with a different expert count or a wider top-k: `experts` and
+        # `top` are launch arguments, and a cubin has no error channel, so the
+        # kernel traps instead of reducing over part of the vocabulary.
+        f"-DUNISERVE_EXPERTS={experts}",
+        f"-DUNISERVE_MAX_TOP={top}",
         "-o",
         str(out / "module.cubin"),
         str(package / "src" / "topk_softmax.cu"),
@@ -135,8 +144,45 @@ def main():
         "launch_cooperative_grid": False,
         "global_scratch_size": 0,
         "global_scratch_align": 1,
+        # The parameters the kernel takes at launch, in order and with their types, so `ops` can
+        # compare the operator's packed words against them: this cubin's list is hand-written on both
+        # sides and one word of it is optional, which is the kind that drifts. The last two are the
+        # scale, a pointer even when the call has none (the operator passes a null one), and its
+        # storage kind.
+        "signature": {
+            "scores": "*" + POINTERS[fields["scores"]],
+            "score_kind": "i32",
+            "row_stride": "i64",
+            "rows": "i32",
+            "experts": "i32",
+            "top": "i32",
+            "renormalize": "i32",
+            # A pointer even when the call has no scale: the operator passes a null one, and a
+            # pointer slot filled with a scalar is exactly what `ops` refuses by name.
+            "scale": "*" + POINTERS.get(fields["scale"], "fp32"),
+            "scale_kind": "i32",
+            "ids": "*i32",
+            "weights": "*fp32",
+        },
     }
     (out / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    # The constants this cubin was built with, beside it: a check compares them
+    # with its own flags and refuses a module built for another descriptor
+    # before it allocates anything, which is the only way to observe the guard
+    # in the kernel without a device. Kept out of `metadata.json`, whose fields
+    # the loader reads as the launch's own.
+    (out / "baked.json").write_text(
+        json.dumps(
+            {
+                "experts": experts,
+                "top": top,
+                "iterations": iterations,
+                "butterfly": butterfly,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
     print(
         json.dumps(
             {
@@ -145,6 +191,8 @@ def main():
                 "symbol": metadata["name"],
                 "iterations": iterations,
                 "butterfly": butterfly,
+                "experts": experts,
+                "max_top": top,
             }
         )
     )

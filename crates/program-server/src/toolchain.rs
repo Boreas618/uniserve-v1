@@ -273,6 +273,9 @@ impl Nvcc {
             .or_else(|| find("nvcc"))
             .or_else(|| existing("/usr/local/cuda/bin/nvcc"))
             .ok_or_else(|| "no nvcc on this host: install the CUDA toolkit".to_owned())?;
+        // A configured path may be relative to where the server was started; a build
+        // runs elsewhere (the store's copy of a package), so it is made absolute once.
+        let path = resolve(&path);
         let reported = Command::new(&path)
             .arg("--version")
             .output()
@@ -428,6 +431,7 @@ impl Wasm {
                  builds it"
                     .to_owned()
             })?;
+        let precompiler = resolve(&precompiler);
         let version = wasmtime_version(&precompiler)?;
         Ok(Wasm {
             precompiler,
@@ -600,23 +604,44 @@ fn existing(path: &str) -> Option<PathBuf> {
 }
 
 /// Resolves a configured program the way a command started from the
-/// workspace root would: as given; and, when it is relative and not there,
-/// from each directory above the current one, so the default
-/// `python/.venv/bin/python` is found whether the server was started at the
-/// repository root or inside `crates/program-server`.
+/// workspace root would: as given; and, when it is relative, from each
+/// directory above the current one, so the default `python/.venv/bin/python`
+/// is found whether the server was started at the repository root or inside
+/// `crates/program-server`.
+///
+/// It answers an **absolute** path whenever the host has the program, because a
+/// build runs with its working directory set to the store's copy of a package:
+/// a path left relative would name that copy instead of this host's toolchain and
+/// fail with `No such file or directory` from a directory the caller never named.
+/// A program that is nowhere returns its absolute form, so the failure says where
+/// it looked.
 fn resolve(configured: &Path) -> PathBuf {
-    if configured.is_absolute() || configured.is_file() {
+    match std::env::current_dir() {
+        Ok(current) => resolve_in(configured, &current),
+        Err(_) => configured.to_path_buf(),
+    }
+}
+
+/// [`resolve`] against an explicit starting directory, which is what makes it a
+/// function a test can call without moving the process's working directory.
+fn resolve_in(configured: &Path, current: &Path) -> PathBuf {
+    if configured.is_absolute() {
         return configured.to_path_buf();
     }
-    if let Ok(current) = std::env::current_dir() {
-        for ancestor in current.ancestors() {
-            let candidate = ancestor.join(configured);
-            if candidate.is_file() {
-                return candidate;
-            }
+    // `current` is absolute, so every ancestor's join is. The current directory is
+    // its own first ancestor.
+    for ancestor in current.ancestors() {
+        let candidate = ancestor.join(configured);
+        if candidate.is_file() {
+            return candidate;
         }
     }
-    configured.to_path_buf()
+    if configured.is_file() {
+        // The starting directory is not absolute, so this is the best the host can
+        // say; `execute` reports the directory it runs in when the spawn fails.
+        return configured.to_path_buf();
+    }
+    std::path::absolute(configured).unwrap_or_else(|_| configured.to_path_buf())
 }
 
 /// The environment a compiler process runs with: the toolchain's own, with
@@ -638,7 +663,27 @@ pub fn execute(job: &ToolJob, max_jobs: usize) -> Result<()> {
         .envs(environment(job, max_jobs))
         .stdout(log)
         .stderr(error_log)
-        .status()?;
+        .status()
+        .map_err(|error| Error::Build {
+            op: String::new(),
+            backend: String::new(),
+            revision: 0,
+            target: String::new(),
+            descriptor: String::new(),
+            // A build that cannot find its compiler names the program, its arguments
+            // and the directory it was started in: an errno alone says none of them,
+            // and the log is empty because the process never ran.
+            message: format!(
+                "could not run {} {} in {}: {error}",
+                job.program.display(),
+                job.arguments
+                    .iter()
+                    .map(|argument| argument.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                job.directory.display()
+            ),
+        })?;
     if status.success() {
         Ok(())
     } else {
@@ -656,7 +701,65 @@ pub fn execute(job: &ToolJob, max_jobs: usize) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_nvcc_version;
+    use super::{execute, parse_nvcc_version, resolve_in, ToolJob};
+    use std::path::Path;
+
+    /// A build whose compiler is not where the host said names the program, its
+    /// arguments and the directory it ran in. An errno alone says none of them and the
+    /// log is empty, because the process never started: that combination is what made
+    /// a relative toolchain path cost an hour to diagnose.
+    #[test]
+    fn a_build_that_cannot_find_its_program_names_the_program_and_where_it_ran() {
+        let temporary = std::env::temp_dir().join(format!(
+            "uniserve-tooljob-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temporary).unwrap();
+        let log = temporary.join("build.log");
+        let job = ToolJob::new(Path::new("/no-such-toolchain/python"), &temporary, &log)
+            .argument("--version");
+        let error = execute(&job, 2).expect_err("a missing program cannot run");
+        let text = error.to_string();
+        assert!(text.contains("/no-such-toolchain/python"), "{text}");
+        assert!(text.contains("--version"), "{text}");
+        assert!(text.contains(&temporary.display().to_string()), "{text}");
+        let _ = std::fs::remove_dir_all(&temporary);
+    }
+
+    /// A relative toolchain path is answered absolute, and absolute *before* a build
+    /// uses it: a build runs with its working directory set to the store's copy of a
+    /// package, so a path that stayed relative would name that copy instead of this
+    /// host's compiler — which fails as `No such file or directory` from a directory
+    /// the caller never named.
+    #[test]
+    fn a_relative_toolchain_path_is_answered_absolute() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("the repository root above the crate");
+        let configured = Path::new("crates/program-server/python/.venv/bin/python");
+        if !root.join(configured).is_file() {
+            eprintln!("SKIPPED (provisioning): no Python environment in this tree");
+            return;
+        }
+        let resolved = resolve_in(configured, root);
+        assert!(
+            resolved.is_absolute(),
+            "{} was answered as {}",
+            configured.display(),
+            resolved.display()
+        );
+        assert!(resolved.is_file(), "{} is not a program", resolved.display());
+        // The starting directory's own ancestors are searched, so a server started
+        // inside the crate still finds it.
+        let inside = resolve_in(configured, &root.join("crates/program-server"));
+        assert_eq!(inside, resolved);
+        // A program that is nowhere still answers an absolute path, so the failure
+        // that follows names a path rather than a bare name.
+        let missing = resolve_in(Path::new("no-such-toolchain/nvcc"), root);
+        assert!(missing.is_absolute(), "{}", missing.display());
+    }
+
 
     #[test]
     fn nvcc_version_is_the_v_token() {

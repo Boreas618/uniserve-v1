@@ -33,6 +33,7 @@
 //! - `config`, `stats`, and `stats_report`: limits and statistics.
 //! - `image_artifact`: metadata of worker-produced PNG artifacts.
 
+mod completion;
 mod config;
 mod stats;
 pub(crate) mod stats_report;
@@ -45,9 +46,9 @@ pub(crate) use execution::generation_consuming_calls;
 use ipc::{ForwardMode, MediaCall, TransferMode};
 pub(crate) use policy::process_engine;
 pub use policy::{
-    Arrival, BatchCapacity, Candidate, PREFETCH_FLOOR_TOKENS, PolicyBytes, PolicyProgram,
-    PolicyReverted, PolicySlot, PolicySource, PolicyUsage, ProgramSource, Progress, RoutePolicy,
-    RouteTrial, Stage, TrialState, Validators, arrival_view, ceilings_of,
+    Arrival, BatchCapacity, Candidate, Limits, PREFETCH_FLOOR_TOKENS, Parameters, PolicyBytes,
+    PolicyProgram, PolicyReverted, PolicySlot, PolicySource, PolicyUsage, ProgramSource, Progress,
+    RoutePolicy, RouteTrial, Stage, TrialState, Validators, arrival_view, ceilings_of,
 };
 pub(crate) use run::{MAX_GUIDANCE_PREFIX_ROWS, guidance_prefix_rows};
 pub use stats::{
@@ -77,6 +78,24 @@ mod policy;
 mod preemption;
 mod run;
 mod speculation;
+pub(crate) mod submission;
+/// Policy modules as WebAssembly text, and the quiet one a caller drives the
+/// mechanism with (`testing` feature; never part of a serving build).
+#[cfg(feature = "testing")]
+pub(crate) mod testing;
+
+/// The mechanism's door to the executor this process launched.
+pub(crate) fn submissions(executor: Box<dyn Executor>) -> submission::Submissions {
+    submission::Submissions::new(executor)
+}
+
+/// The mechanism's door to the executor crate's batch path, the in-process
+/// submission path of §2.4 and §7.3's splice.
+pub(crate) fn submissions_over(
+    batches: Arc<dyn executor::batch::Batches>,
+) -> anyhow::Result<submission::Submissions> {
+    submission::Submissions::over_batches(batches)
+}
 pub(crate) mod views;
 mod warming;
 mod world;
@@ -402,7 +421,7 @@ struct HostTrajectory {
     offloading: bool,
     /// How each denoising rank's pages hold the trajectory's samples, by
     /// rank, as its latent preparation reported them
-    /// (`CallOutput::latent_layouts`): a stored trajectory's pages are
+    /// (`CallCompletion::latent_layouts`): a stored trajectory's pages are
     /// keyed and recorded by them.
     layouts: BTreeMap<u32, String>,
 }
@@ -443,7 +462,7 @@ struct PendingMedia {
 
 /// Single-threaded owner of scheduling, storage, execution, and request state.
 pub struct Scheduler {
-    executor: Box<dyn Executor>,
+    executor: submission::Submissions,
     inflight: inflight::Inflight,
     /// Resident resource ownership and reservation accounting.
     storage: allocation::Storage,
@@ -488,6 +507,10 @@ pub struct Scheduler {
     /// A load the executor published since the last decision: a new load is
     /// worth asking about at once, rather than after a full interval.
     expert_load_new: bool,
+    /// §7.3 step 2's paired pass: an update asked that the following step's
+    /// batches also run in shadow for a world generation, and the answer waits
+    /// for the step that shadows them.
+    shadow_pass: Option<control::ShadowPass>,
     /// The candidate a precopy is preparing on a blocking thread, while it runs
     /// (§7.3 step 2): loading and instantiating a policy must not hold the
     /// serving thread.
@@ -496,12 +519,25 @@ pub struct Scheduler {
     /// The candidate a precopy prepared at this boundary, until the switchover
     /// puts it in.
     policy_prepared: Option<policy::Candidate>,
+    /// The generation this scheduler's batches are stamped with (§7.3): the one
+    /// the epoch last switched to, written by the control thread's switchover
+    /// arm while it holds the generations' lock, read once per step.
+    generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Set once a policy instance actually serves this scheduler (§7.3).
+    ///
+    /// Before the epoch's first switchover the mechanism decides nothing — a
+    /// scheduler with no policy forms no batch — so the serving path's warm-up
+    /// (and anything else that must run once serving is real) waits on this
+    /// rather than on startup. It is a `watch` because the waiters outlive the
+    /// stage that sets it and never need the value to change back.
+    serving: tokio::sync::watch::Sender<bool>,
     /// The stage §7.3 asked for and the answer to give once it is applied: a
     /// stage changes the serving policy, so it waits for a boundary where no
     /// batch and no submission is in flight.
     policy_stage: Option<(
         policy::Stage,
-        Option<crossbeam_channel::Sender<Result<(), String>>>,
+        Option<crate::handle::StageAnswer>,
+        Option<u64>,
     )>,
     /// The events and transitions a policy is told about (§4.4).
     recorder: mechanism::Recorder,
@@ -509,6 +545,13 @@ pub struct Scheduler {
     /// `Cached`/`Freed` announcements of each step: the table `Live` checks a
     /// named page against, without a step walking the prefix cache.
     pages: std::collections::BTreeMap<scheduling::guest::PageId, scheduling::guest::PageView>,
+    /// The resident requests that hold a row of the request pool: what
+    /// `Room::slots` subtracts from the pool's rows.
+    ///
+    /// Maintained where a request's allocations are installed (admission) and
+    /// taken (the end of its execution), because a step must not walk the
+    /// residents to count them (design §4.4).
+    rows_held: usize,
     /// Whether `pages` was built yet. It is built on the first step that
     /// announces a change, from `views::page_index`, which is the one walk.
     pages_seeded: bool,

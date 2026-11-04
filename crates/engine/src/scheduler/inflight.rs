@@ -12,6 +12,7 @@
 //! `InflightInput::Media` that does not advance state, which applies as soon
 //! as the producers of its tensor inputs have left the queue.
 
+use crate::scheduler::completion::CallCompletion;
 use super::*;
 use ipc::MediaCall;
 
@@ -36,7 +37,7 @@ pub(super) struct InflightCall {
 
 /// Completion held until earlier request calls are applied.
 pub(super) struct PendingCompletion {
-    pub(super) record: ipc::CallOutput,
+    pub(super) record: CallCompletion,
     /// Claimed media storage stays alive while its result waits or is discarded.
     pub(super) media: Option<Arc<SharedMedia>>,
     /// Engine-wide arrival order (`Inflight::next_arrival`), used to order

@@ -23,6 +23,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crate::executor::{Executor, TransferConfig, WorkerGroupId};
+// The executor crate's device-side submission path, named here rather than
+// through this process's worker-process executor.
+use executor::batch::Batches;
 use crate::handle::{CommandSender, EventRx, SubmitError};
 #[cfg(feature = "testing")]
 use crate::scheduler::{
@@ -436,6 +439,221 @@ pub struct EngineConfig {
     pub received_weights: BTreeMap<String, ipc::ReceivedWeights>,
 }
 
+/// The launch-file and build-config facts a main process holds about the ranks
+/// its schedulers run, and nothing else.
+///
+/// [`EngineConfig::of`] derives every other field of [`EngineConfig`] from
+/// these: from the model's own configuration where the launch file states it,
+/// from the build configuration's constants, or from the platform's defaults. A
+/// fact the derivation needs and these facts do not state is refused by name,
+/// never defaulted: a scheduler built on a guessed shape would decide on work
+/// it does not run.
+///
+/// Each field names its source: *launch* is the launch file the daemon writes
+/// for this world (`EngineSpec`, and the deployment it places), *model* is the
+/// model's own configuration the launcher reads at the model path and states in
+/// the launch file, and *build config* is what this build was compiled for.
+/// Nothing here is a scheduling decision: those belong to the policy program
+/// (§4.4).
+#[derive(Clone, Debug, Default)]
+pub struct RankFacts {
+    /// The model's path or served name (*launch*: `model`).
+    pub model: Option<String>,
+    /// The model's numerical dtype (*launch*: `worker_config.dtype`).
+    pub dtype: Option<crate::ModelDtype>,
+    /// The world the ranks execute (*launch*: `world`).
+    pub world: Option<u64>,
+    /// The worker group's identity (*launch*: `placement_config`).
+    pub group: Option<String>,
+    /// This process's rank within the group (*launch*: `placement_config`).
+    pub rank: Option<usize>,
+    /// The group's rank count (*launch*: `placement_config`).
+    pub world_size: Option<usize>,
+    /// The group's devices, in rank order (*launch*: `placement_config`).
+    pub devices: Option<Vec<String>>,
+    /// The group's hosts, in rank order (*launch*: `placement_config`).
+    pub hosts: Option<Vec<String>>,
+    /// The groups this rank's group exchanges state with, each with the
+    /// components it serves (*launch*: `placement_config`'s edges).
+    pub peers: Option<BTreeMap<String, BTreeMap<String, ComponentConfig>>>,
+    /// Resident request slots per scheduler (*launch*:
+    /// `scheduling.max_running_requests`).
+    pub max_running_requests: Option<usize>,
+    /// Calls one step may assemble (*launch*: `scheduling.max_batch`).
+    pub max_batch: Option<usize>,
+    /// Tokens one step may carry (*launch*: `scheduling.max_num_batched_tokens`).
+    pub max_num_batched_tokens: Option<usize>,
+    /// The KV cache's block size in tokens (*launch*: `kv_cache_config.block_size`).
+    pub block_size: Option<u32>,
+    /// The KV cache's dtype (*launch*: `kv_cache_config.dtype`).
+    pub kv_cache_dtype: Option<ipc::PrefixCacheDtype>,
+    /// The host KV cache's size (*launch*: `kv_cache_config.host_ratio` and
+    /// `host_bytes`); `None` for a deployment that states none.
+    pub host_cache: Option<crate::kv_cache::HostCacheSize>,
+    /// The captured graph sizes in tokens, ascending (*launch*:
+    /// `cuda_graphs.decode_batch_sizes` and `prefill_token_sizes`).
+    pub graph_tiers: Option<Vec<u32>>,
+    /// Beginning-of-sequence token (*model*: the tokenizer's).
+    pub bos: Option<u32>,
+    /// The tokens that terminate generation (*model*: the tokenizer's).
+    pub eos: Option<Vec<u32>>,
+    /// The token that ends encoded image content (*model*: the model's
+    /// configuration).
+    pub end_of_image: Option<u32>,
+    /// What one request may be given to generate (*model*: the model's own
+    /// generation limits).
+    pub generation_limits: Option<GenerationLimits>,
+    /// The model's context length in tokens (*model*: the model's
+    /// configuration).
+    pub max_model_len: Option<u32>,
+    /// The watchdog timeout a job may run without progress (*launch*:
+    /// `worker_config.watchdog_timeout_ms`).
+    pub watchdog_timeout: Option<std::time::Duration>,
+}
+
+/// A fact the derivation needs, named with where it comes from.
+fn fact<'a, T>(
+    value: &'a Option<T>,
+    name: &str,
+    source: &str,
+) -> anyhow::Result<&'a T> {
+    value.as_ref().with_context(|| {
+        format!("the engine's facts state no {name}, which is the {source}'s to state")
+    })
+}
+
+impl EngineConfig {
+    /// Builds the configuration of the schedulers a main process runs over
+    /// its ranks, from the facts it holds ([`RankFacts`]).
+    ///
+    /// Everything not stated there is derived here: the KV cache's host size,
+    /// the page boundaries, the batch and token budgets the workers are
+    /// launched with, the transfer edges between the group's ranks, and the
+    /// capture catalog's bounds. A fact the derivation needs and the facts do
+    /// not state fails with the fact's name and its source.
+    pub fn of(facts: &RankFacts) -> anyhow::Result<Self> {
+        let model = fact(&facts.model, "model", "launch file")?.clone();
+        let dtype = *fact(&facts.dtype, "dtype", "launch file")?;
+        let world = *fact(&facts.world, "world", "launch file")?;
+        let group = fact(&facts.group, "worker group identity", "launch file")?.clone();
+        let rank = *fact(&facts.rank, "rank", "launch file")?;
+        let world_size = *fact(&facts.world_size, "world size", "launch file")?;
+        let devices = fact(&facts.devices, "devices", "launch file")?.clone();
+        let hosts = fact(&facts.hosts, "hosts", "launch file")?.clone();
+        anyhow::ensure!(
+            devices.len() == world_size && hosts.len() == world_size,
+            "the engine's facts state {world_size} ranks but {} devices and {} hosts: \
+             the launch file places every rank on one device of one host",
+            devices.len(),
+            hosts.len()
+        );
+        anyhow::ensure!(
+            rank < world_size,
+            "the engine's facts place rank {rank} of a group of {world_size}"
+        );
+        let max_running_requests = *fact(
+            &facts.max_running_requests,
+            "max_running_requests",
+            "launch file",
+        )?;
+        let max_batch = *fact(&facts.max_batch, "max_batch", "launch file")?;
+        let max_num_batched_tokens = *fact(
+            &facts.max_num_batched_tokens,
+            "max_num_batched_tokens",
+            "launch file",
+        )?;
+        anyhow::ensure!(
+            max_batch > 0 && max_num_batched_tokens > 0 && max_running_requests > 0,
+            "the engine's batch, token, and request budgets must be positive"
+        );
+
+        let ranks: Vec<WorkerRank> = hosts
+            .into_iter()
+            .zip(devices)
+            .map(|(host, device)| WorkerRank { host, device })
+            .collect();
+        let components = WorkerGroupConfig::single_component(DEFAULT_COMPONENT, world_size);
+        let group_config = WorkerGroupConfig {
+            id: WorkerGroupId(group.clone()),
+            role: crate::WorkerGroupRole::Model,
+            ranks: ranks.clone(),
+            components: components.clone(),
+            // In process the ranks are the executor's own jobs: nothing is
+            // launched, and no run is queued.
+            queue_depth: 1,
+            mem_fraction_static: None,
+        };
+        group_config.validate()?;
+        let worker_groups = vec![group_config];
+        let transfer = TransferConfig::default().with_worker_defaults(&worker_groups)?;
+
+        let worker_process = WorkerProcessArgs {
+            model: model.clone(),
+            dtype,
+            ranks: ranks.clone(),
+            host: ranks
+                .get(rank)
+                .map(|rank| rank.host.clone())
+                .unwrap_or_default(),
+            role: crate::WorkerGroupRole::Model,
+            components,
+            peers: facts.peers.clone().unwrap_or_default(),
+            watchdog_timeout: facts
+                .watchdog_timeout
+                .unwrap_or_else(|| WorkerProcessArgs::default().watchdog_timeout),
+            queue_depth: 1,
+            block_size: facts.block_size,
+            kv_cache_dtype: facts.kv_cache_dtype,
+            max_batch_calls: u32::try_from(max_batch)
+                .context("`max_batch` exceeds the worker field width")?,
+            max_batch_tokens: u32::try_from(max_num_batched_tokens)
+                .context("`max_num_batched_tokens` exceeds the worker field width")?,
+            max_request_pool_size: u32::try_from(max_running_requests)
+                .context("`max_running_requests` exceeds the worker field width")?,
+            max_model_len: facts.max_model_len.unwrap_or(0),
+            world,
+            ..WorkerProcessArgs::default()
+        };
+
+        Ok(Self {
+            generation_limits: fact(
+                &facts.generation_limits,
+                "generation limits",
+                "model's own configuration",
+            )?
+            .clone(),
+            max_batch,
+            max_num_batched_tokens,
+            max_running_requests,
+            max_queued_requests: None,
+            graph_tiers: fact(&facts.graph_tiers, "graph tiers", "launch file")?.clone(),
+            chunked_prefill_size: crate::scheduler::DEFAULT_CHUNKED_PREFILL_SIZE,
+            prefix_cache: true,
+            boundary_interval: crate::kv_cache::DEFAULT_BOUNDARY_INTERVAL,
+            state_interval: crate::kv_cache::DEFAULT_STATE_INTERVAL,
+            host_cache: facts.host_cache.clone().unwrap_or_default(),
+            worker_groups,
+            transfer,
+            data_parallel_size: 1,
+            expert_parallel: None,
+            worker_process,
+            bos: *fact(&facts.bos, "bos token", "model's tokenizer")?,
+            eos: fact(&facts.eos, "eos tokens", "model's tokenizer")?.clone(),
+            end_of_image: *fact(
+                &facts.end_of_image,
+                "image end token",
+                "model's own configuration",
+            )?,
+            world,
+            predecessor: None,
+            stage_cache: false,
+            cache_keys: Vec::new(),
+            segments: BTreeMap::new(),
+            received_weights: BTreeMap::new(),
+        })
+    }
+}
+
 impl EngineConfig {
     /// Builds a minimal configuration for the CPU simulation backend.
     ///
@@ -466,7 +684,7 @@ impl EngineConfig {
             max_num_batched_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS,
             max_running_requests: DEFAULT_MAX_RUNNING_REQUESTS,
             max_queued_requests: None,
-            chunked_prefill_size: DEFAULT_CHUNKED_PREFILL_SIZE,
+            chunked_prefill_size: crate::scheduler::DEFAULT_CHUNKED_PREFILL_SIZE,
             graph_tiers: Vec::new(),
             prefix_cache: true,
             boundary_interval: crate::kv_cache::DEFAULT_BOUNDARY_INTERVAL,
@@ -542,7 +760,20 @@ pub struct SchedulerHandle {
     /// Whether the scheduler started on trial, as a successor world's do;
     /// its commit ends the trial.
     trial: bool,
-    next_id: AtomicU64,
+    /// The device-side submission path of the executor's own crate, when this
+    /// handle was started with one (`SchedulerHandle::start`). A handle built
+    /// over the worker-process executor has none; the shadow pass and the
+    /// in-process submission both need it.
+    batches: Option<Arc<dyn Batches>>,
+    /// Request ids, shared with the warm-up's view of this scheduler.
+    next_id: Arc<AtomicU64>,
+    /// Set once a policy instance actually serves (§7.3); see `wait_serving`.
+    serving: tokio::sync::watch::Receiver<bool>,
+    /// The generation each of this scheduler's batches is stamped with: the
+    /// number the control thread's switchover arm last wrote (§7.3). One cell
+    /// per rank, shared with the scheduler thread and the in-process submission
+    /// path, which reads it once per step.
+    generation: Arc<std::sync::atomic::AtomicU64>,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -821,6 +1052,73 @@ impl SchedulerHandle {
     /// group, when the workers of a token runtime hold too few request rows
     /// for `max_running_requests` running requests, or when a group cannot
     /// be launched, a scheduler cannot be built or its warmup fails.
+    /// Starts one scheduler thread — the rank `config` names — over the
+    /// device-side submission path `batches` states, and returns its handle.
+    ///
+    /// One handle is one scheduler thread, so `config` names one rank's worker
+    /// groups: a data-parallel config's ranks start together with
+    /// [`Self::start_all`]. The mechanism still plans from its worker group's
+    /// capabilities and completes from its reports; `batches` is the executor
+    /// crate's own submission path, which the shadow pass of §7.3 step 2 and,
+    /// once the splice lands, the step's own submissions go through.
+    pub fn start(
+        config: EngineConfig,
+        batches: Arc<dyn Batches>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            config.data_parallel_size == 1,
+            "one handle is one scheduler thread, but the config states {} ranks: start a \
+             data-parallel config with start_all",
+            config.data_parallel_size
+        );
+        let GroupArguments {
+            arguments,
+            per_core,
+            transfers,
+            max_running_requests,
+            model_workers,
+            expert_workers,
+        } = Self::group_arguments(&config)?;
+        anyhow::ensure!(
+            model_workers.len() == per_core,
+            "the config holds {} model groups against {per_core} per scheduler, so it is several \
+             ranks': one handle takes one rank's groups",
+            model_workers.len()
+        );
+        let transfer = transfers
+            .into_iter()
+            .next()
+            .context("the config states no transfer edges")?;
+        // `spawn_all` returns groups in argument order, which pairs each with
+        // its identity: the rank's model groups, then its expert groups.
+        let launched = WorkerGroup::spawn_all(arguments)?;
+        let workers = model_workers
+            .iter()
+            .chain(&expert_workers)
+            .map(|worker| worker.id.clone())
+            .zip(launched)
+            .collect::<Vec<_>>();
+        let mut placement = model_workers;
+        placement.extend(expert_workers);
+        let core_config = EngineConfig {
+            worker_groups: placement,
+            transfer,
+            data_parallel_size: 1,
+            expert_parallel: None,
+            ..config
+        };
+        let mut handle = Self::launch(&core_config, max_running_requests, workers)?;
+        handle.batches = Some(batches);
+        if core_config.predecessor.is_none() {
+            handle
+                .publish_world()
+                .recv()
+                .context("the scheduler stopped before publication")?
+                .map_err(anyhow::Error::msg)?;
+        }
+        Ok(handle)
+    }
+
     pub fn start_all(config: EngineConfig) -> anyhow::Result<Vec<Self>> {
         let GroupArguments {
             arguments,
@@ -851,23 +1149,6 @@ impl SchedulerHandle {
             if index == 0 {
                 workers.append(&mut shared);
             }
-            let executor = WorkerExecutor::try_new(workers, transfer.clone())?;
-
-            // A token runtime serves `max_running_requests` running requests only while
-            // its workers hold that many request rows beyond the reserve; the
-            // scheduler would otherwise lower the limit. Workers without a prefix
-            // cache fit their request pools to device storage, and the
-            // scheduler bounds their requests by the rows they report.
-            let info = executor.info().runtime_info()?;
-            let request_rows = info.request_slots as usize;
-            let needed_rows = max_running_requests + guidance_prefix_rows(&info);
-            anyhow::ensure!(
-                !info.uses_cache() || request_rows >= needed_rows,
-                "the workers hold {request_rows} request rows, but {max_running_requests} running \
-                 requests need {needed_rows}"
-            );
-
-            let waker = executor.command_waker();
             let mut placement = core_group.to_vec();
             if index == 0 {
                 placement.extend(expert_workers.iter().cloned());
@@ -879,12 +1160,7 @@ impl SchedulerHandle {
                 expert_parallel: None,
                 ..config.clone()
             };
-            let scheduler = Self::assemble(core_config.clone(), Box::new(executor), waker)?;
-            // Each scheduler's serving path runs the requests its workers'
-            // reports call for before the scheduler serves; a successor's
-            // run on units of its own world while its predecessor serves.
-            crate::warmup::warm(&scheduler, &core_config)?;
-            cores.push(scheduler);
+            cores.push(Self::launch(&core_config, max_running_requests, workers)?);
         }
         if config.predecessor.is_none() {
             cores[0]
@@ -894,6 +1170,78 @@ impl SchedulerHandle {
                 .map_err(anyhow::Error::msg)?;
         }
         Ok(cores)
+    }
+
+    /// Starts one rank's workers and the scheduler that commands them.
+    ///
+    /// `config` names that rank's groups alone; its transfer edges are the ones
+    /// `config.transfer` states.
+    fn launch(
+        config: &EngineConfig,
+        max_running_requests: usize,
+        workers: Vec<(WorkerGroupId, WorkerGroup)>,
+    ) -> anyhow::Result<Self> {
+        let executor = WorkerExecutor::try_new(workers, config.transfer.clone())?;
+        let info = executor.info().runtime_info()?;
+        Self::check_rows(&info, max_running_requests)?;
+        let waker = executor.command_waker();
+        let scheduler = Self::assemble(config.clone(), Box::new(executor), waker)?;
+        // The serving path's warm-up is the serving path's: a scheduler with no
+        // policy forms no batch, so it can only run once the epoch's first
+        // policy serves. It is recorded here, on a thread of its own, and
+        // startup — and the daemon's readiness contract — does not wait for it.
+        crate::warmup::after_serving(&scheduler, config);
+        Ok(scheduler)
+    }
+
+    /// Starts one scheduler thread over the executor crate's batch path — the
+    /// in-process submission path of §2.4 — and returns its handle.
+    ///
+    /// No worker group is launched: the pool's capabilities come from what the
+    /// executor reports (`Batches::inventory`), the batches go to `batches`
+    /// itself, and the threads, the command channel and the handle's surface are
+    /// exactly what [`Self::start`] gives. The scheduler decides nothing until a
+    /// policy serves it: the daemon's first `Precopy` and `Switchover` install
+    /// one (§7.3), and until then a step forms no batch.
+    ///
+    /// Fails when the config names more than one rank, when the executor reports
+    /// no pool or pools that disagree about a component, when a pool serves fewer
+    /// request rows than `max_running_requests` running requests need, or when
+    /// the scheduler's thread cannot be started.
+    pub fn over_batches(
+        config: EngineConfig,
+        batches: Arc<dyn Batches>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            config.data_parallel_size == 1,
+            "one handle is one scheduler thread, but the config states {} ranks: start one \
+             handle per rank",
+            config.data_parallel_size
+        );
+        let info = crate::executor::ExecutorInfo::from_inventory(batches.inventory())?;
+        Self::check_pools(&config, &info)?;
+        let runtime = info.runtime_info()?;
+        Self::check_rows(&runtime, config.max_running_requests)?;
+        let tokens = config.control_tokens();
+        let scheduler = Scheduler::new(
+            crate::scheduler::submissions_over(Arc::clone(&batches))?,
+            tokens,
+            Self::scheduler_config(&config),
+            config.worker_process.dtype,
+            config.generation_limits.clone(),
+        )?;
+        let scheduler = Self::configured(scheduler, &config)?;
+        let mut handle = Self::spawn(
+            scheduler,
+            config.worker_process.model.clone(),
+            CommandWaker::noop(),
+        )?;
+        handle.batches = Some(batches);
+        // The serving path's warm-up is the serving path's: it runs once the
+        // epoch's first policy serves, on a thread of its own, and startup does
+        // not wait for it.
+        crate::warmup::after_serving(&handle, &config);
+        Ok(handle)
     }
 
     /// Runs a scheduler over an executor supplied by a higher composition
@@ -909,28 +1257,113 @@ impl SchedulerHandle {
         Self::assemble(config, executor, CommandWaker::noop())
     }
 
+    /// Refuses a token runtime whose workers hold fewer request rows than
+    /// `max_running_requests` running requests need.
+    ///
+    /// A token runtime serves those requests only while its workers hold that
+    /// many rows beyond the guidance prefix's; the scheduler would otherwise
+    /// lower the limit. Workers without a prefix cache fit their request pools
+    /// to device storage, and the scheduler bounds their requests by the rows
+    /// they report.
+    fn check_rows(info: &WorkerInfo, max_running_requests: usize) -> anyhow::Result<()> {
+        let request_rows = info.request_slots as usize;
+        let needed_rows = max_running_requests + guidance_prefix_rows(info);
+        anyhow::ensure!(
+            !info.uses_cache() || request_rows >= needed_rows,
+            "the workers hold {request_rows} request rows, but {max_running_requests} running \
+             requests need {needed_rows}"
+        );
+        Ok(())
+    }
+
+    /// Refuses a config whose pools are not the ones the executor reports.
+    ///
+    /// A scheduler configured for a pool the executor does not serve, or for a
+    /// rank count it does not serve, would place calls on ranks it does not
+    /// have; the config and the executor are two statements of one deployment,
+    /// so they are compared before anything runs.
+    fn check_pools(
+        config: &EngineConfig,
+        info: &crate::executor::ExecutorInfo,
+    ) -> anyhow::Result<()> {
+        for group in &config.worker_groups {
+            anyhow::ensure!(
+                info.workers.iter().any(|(served, _)| *served == group.id),
+                "the config names the pool {}, which the executor does not serve",
+                group.id.0
+            );
+            // `from_inventory` states every pool's launched rank count; an
+            // executor that reports none places the pool on one rank.
+            let served = info
+                .placements
+                .get(&group.id)
+                .map_or(1, |placement| placement.ranks);
+            anyhow::ensure!(
+                served as usize == group.ranks.len(),
+                "the config places {} ranks of pool {}, but the executor serves {served}",
+                group.ranks.len(),
+                group.id.0
+            );
+        }
+        Ok(())
+    }
+
+    /// The scheduler configuration `config` states: its budgets, its capture
+    /// catalog and its generation sizes.
+    fn scheduler_config(config: &EngineConfig) -> SchedulerConfig {
+        SchedulerConfig {
+            max_batch: config.max_batch,
+            max_num_batched_tokens: config.max_num_batched_tokens.max(1),
+            max_running_requests: config.max_running_requests.max(1),
+            max_queued_requests: config.max_queued_requests,
+            chunked_prefill_size: config.chunked_prefill_size.max(1),
+            canvas: config.worker_process.canvas_sampling,
+            draft_tokens: config.worker_process.draft_tokens as usize,
+            graph_tiers: config.graph_tiers.clone(),
+        }
+    }
+
+    /// The handle a main process that holds its own devices serves from: the
+    /// configuration its launch file's facts state, over the executor's own
+    /// batch path (§2.4, §7.3).
+    ///
+    /// The three steps are the boot's whole shape and are stated here once so
+    /// that a call site cannot take two of them and forget the third:
+    /// [`EngineConfig::of`] derives the configuration from the facts — refusing
+    /// by name and source any fact it needs and the launch file does not state —
+    /// and [`Self::over_batches`] builds the scheduler over `batches`, whose
+    /// inventory is where the executor states the pools it serves. No worker
+    /// group is launched: the ranks are `batches`' own.
+    pub fn boot(facts: &RankFacts, batches: Arc<dyn Batches>) -> anyhow::Result<Self> {
+        let config = EngineConfig::of(facts)?;
+        Self::over_batches(config, batches)
+    }
+
     /// Builds the scheduler `config` states over `executor` and runs it.
     fn assemble(
         config: EngineConfig,
         executor: Box<dyn Executor>,
         waker: CommandWaker,
     ) -> anyhow::Result<Self> {
-        let mut scheduler = Scheduler::new(
-            executor,
-            config.control_tokens(),
-            SchedulerConfig {
-                max_batch: config.max_batch,
-                max_num_batched_tokens: config.max_num_batched_tokens.max(1),
-                max_running_requests: config.max_running_requests.max(1),
-                max_queued_requests: config.max_queued_requests,
-                chunked_prefill_size: config.chunked_prefill_size.max(1),
-                canvas: config.worker_process.canvas_sampling,
-                draft_tokens: config.worker_process.draft_tokens as usize,
-                graph_tiers: config.graph_tiers.clone(),
-            },
+        let tokens = config.control_tokens();
+        let scheduler = Scheduler::new(
+            crate::scheduler::submissions(executor),
+            tokens,
+            Self::scheduler_config(&config),
             config.worker_process.dtype,
-            config.generation_limits,
+            config.generation_limits.clone(),
         )?;
+        let scheduler = Self::configured(scheduler, &config)?;
+        Self::spawn(scheduler, config.worker_process.model.clone(), waker)
+    }
+
+    /// Applies `config`'s per-world settings to a freshly built scheduler: its
+    /// world identity, its prefix reuse and state interval, its prefill groups,
+    /// and the host storages its ranks map.
+    fn configured(
+        mut scheduler: Scheduler,
+        config: &EngineConfig,
+    ) -> anyhow::Result<Scheduler> {
         scheduler.set_world(config.world);
         scheduler.set_prefix_reuse(config.prefix_cache);
         scheduler.set_state_interval(config.state_interval);
@@ -971,7 +1404,7 @@ impl SchedulerHandle {
             config.world,
             &config.worker_process.host,
         );
-        Self::spawn(scheduler, config.worker_process.model, waker)
+        Ok(scheduler)
     }
 
     /// Runs `scheduler`, which serves `model`, on a thread of its own.
@@ -997,6 +1430,9 @@ impl SchedulerHandle {
         let latent_seed = scheduler.latent_seed();
         let stats = scheduler.stats_handle();
         let failure = scheduler.failure_handle();
+        // Taken before the scheduler moves onto its thread.
+        let serving = scheduler.serving_receiver();
+        let generation = scheduler.generation_handle();
         let trial = scheduler.on_trial();
 
         let (sender, receiver) = crossbeam_channel::unbounded();
@@ -1024,9 +1460,138 @@ impl SchedulerHandle {
             dead,
             failure,
             trial,
-            next_id: AtomicU64::new(1),
+            batches: None,
+            next_id: Arc::new(AtomicU64::new(1)),
+            serving,
+            generation,
             thread: Mutex::new(Some(thread)),
         })
+    }
+
+    /// Everything the serving path's warm-up submits through, so a thread of
+    /// the engine's can warm this rank without holding the handle it owns.
+    pub(crate) fn warmup(&self) -> crate::warmup::Warm {
+        crate::warmup::Warm {
+            info: self.info.clone(),
+            generation_limits: self.generation_limits.clone(),
+            next_id: Arc::clone(&self.next_id),
+            dead: Arc::clone(&self.dead),
+            failure: Arc::clone(&self.failure),
+            commands: self.commands.clone(),
+        }
+    }
+
+    /// The generation this scheduler's batches carry: the one the epoch last
+    /// switched to and has not purged (§7.3).
+    ///
+    /// The cell is shared with the scheduler thread, which reads it once per
+    /// step; the control thread's switchover arm writes it while it holds the
+    /// generations' lock, so a step never mixes two generations.
+    pub fn generation(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.generation)
+    }
+
+    /// Records the serving generation, from the control thread's switchover arm.
+    pub(crate) fn set_generation(&self, generation: u64) {
+        self.generation
+            .store(generation, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The generation serving now.
+    pub fn serving_generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Blocks until a policy instance actually serves this scheduler, or the
+    /// scheduler stops first (§7.3).
+    ///
+    /// Before the epoch's first switchover the mechanism decides nothing, so a
+    /// scheduler with no policy forms no batch; whatever must run under a
+    /// policy — the serving path's warm-up, above all — waits here instead of at
+    /// startup.
+    pub fn wait_serving(&self) {
+        crate::warmup::wait_serving(self.serving.clone());
+    }
+
+    /// The scheduler's serving signal, for a thread that waits on it without
+    /// holding the handle ([`crate::warmup::after_serving`]).
+    pub(crate) fn serving(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.serving.clone()
+    }
+
+    /// The policy slot of this scheduler, as the control thread holds it (§7.3):
+    /// the program serving and the one a precopy prepared.
+    ///
+    /// The slot lives on the scheduler thread, which alone instantiates, adopts
+    /// and reverts a policy; the handle asks that thread.
+    pub fn policy_mut(&self) -> crate::handle::PolicySlotHandle {
+        crate::handle::PolicySlotHandle::new(self.commands.clone())
+    }
+
+    /// One of §7.3's steps 3 to 6, applied at this scheduler's next boundary
+    /// where no batch and no submission is in flight, and answered with the step
+    /// it applied at.
+    pub fn stage(
+        &self,
+        stage: crate::scheduler::Stage,
+    ) -> crossbeam_channel::Receiver<Result<crate::handle::StageApplied, String>> {
+        self.commands.stage(stage)
+    }
+
+    /// §7.3 step 2's shadow pass for the model generation `generation` (front's
+    /// two axes: the model's generation, not a launch's): the following step's
+    /// batches also run in shadow, against the resident data and without
+    /// writing it.
+    ///
+    /// Answered once one step's batches have been shadowed, or with the reason
+    /// the pass could not run.
+    pub fn shadow(&self, generation: u64) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.commands.shadow(generation)
+    }
+
+    /// One of the daemon's request commands, applied to the request it names,
+    /// answered when it was enqueued.
+    ///
+    /// A command whose bookkeeping is the connection's — a consumer's position,
+    /// a takeover — is answered with that reason: the engine's routing holds the
+    /// request's stream, not a scheduler.
+    pub fn request_command(
+        &self,
+        command: proto::request::wire::Command,
+    ) -> crossbeam_channel::Receiver<Result<(), String>> {
+        let (answer, done) = crossbeam_channel::bounded(1);
+        let _ = answer.send(self.commands.request_command(command));
+        done
+    }
+
+    /// One command of the program-layer update (§2.3, §7.3), as this scheduler
+    /// applies it: the stages, at the boundary they name.
+    ///
+    /// A `Switchover` that names the step its expert group agreed is applied at
+    /// that step alone; one that arrives after it is refused rather than applied
+    /// at a boundary the other ranks did not take.
+    pub fn command(
+        &self,
+        command: ipc::ProgramCommand,
+    ) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.commands.program_command(command)
+    }
+
+    /// One of the epoch's engine commands, as this scheduler applies it (§7.3):
+    /// a stage is answered when it applies; the commands that belong to the
+    /// engine process or to the process holding the Program Server are answered
+    /// with that reason.
+    pub fn engine_command(
+        &self,
+        command: proto::process::Command,
+    ) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.commands.engine_command(command)
+    }
+
+    /// What this scheduler has done and what its policy has cost (§12), answered
+    /// by the scheduler thread.
+    pub fn counters(&self) -> crossbeam_channel::Receiver<crate::handle::Counters> {
+        self.commands.counters()
     }
 
     /// Returns the worker-reported runtime capabilities.
@@ -1228,8 +1793,8 @@ impl SchedulerHandle {
 
     /// §7.3 step 5: probation ended; the replaced policy stays until the next
     /// precopy.
-    pub fn commit_policy(&self) {
-        self.commands.commit_policy();
+    pub fn commit_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.commands.commit_policy()
     }
 
     /// §7.3 step 4: the previous policy answers again, on the state this
@@ -1461,6 +2026,96 @@ impl Drop for SchedulerHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The facts a launch file and the model's configuration state for one
+    /// rank of a one-rank group.
+    fn rank_facts() -> RankFacts {
+        RankFacts {
+            model: Some("Qwen/Qwen3-4B".to_owned()),
+            dtype: Some(crate::ModelDtype::BFloat16),
+            world: Some(7),
+            group: Some("model".to_owned()),
+            rank: Some(0),
+            world_size: Some(1),
+            devices: Some(vec!["cuda:0".to_owned()]),
+            hosts: Some(vec!["node-a".to_owned()]),
+            max_running_requests: Some(24),
+            max_batch: Some(32),
+            max_num_batched_tokens: Some(4096),
+            block_size: Some(128),
+            graph_tiers: Some(vec![16, 32]),
+            bos: Some(1),
+            eos: Some(vec![2, 3]),
+            end_of_image: Some(4),
+            generation_limits: Some(GenerationLimits::default()),
+            max_model_len: Some(32768),
+            ..RankFacts::default()
+        }
+    }
+
+    /// What the facts state is the configuration, and what they do not state
+    /// comes from the build configuration and the platform's defaults.
+    #[test]
+    fn a_rank_of_facts_builds_its_schedulers_configuration() -> anyhow::Result<()> {
+        let config = EngineConfig::of(&rank_facts())?;
+        assert_eq!(config.max_batch, 32);
+        assert_eq!(config.max_num_batched_tokens, 4096);
+        assert_eq!(config.max_running_requests, 24);
+        assert_eq!(config.world, 7);
+        assert_eq!(config.bos, 1);
+        assert_eq!(config.eos, [2, 3]);
+        assert_eq!(config.graph_tiers, [16, 32]);
+        // One group, placed as the launch file places it, with the component
+        // the group's ranks divide.
+        let [group] = &config.worker_groups[..] else {
+            panic!("the facts name one group");
+        };
+        assert_eq!(group.id.0, "model");
+        assert_eq!(group.ranks.len(), 1);
+        assert_eq!(group.ranks[0].host, "node-a");
+        assert_eq!(group.ranks[0].device, "cuda:0");
+        assert_eq!(config.data_parallel_size, 1);
+        // Derived: the build configuration's prefill chunk, the platform's
+        // prefix cache, and no predecessor.
+        assert_eq!(
+            config.chunked_prefill_size,
+            crate::scheduler::DEFAULT_CHUNKED_PREFILL_SIZE
+        );
+        assert!(config.prefix_cache);
+        assert!(config.predecessor.is_none());
+        assert_eq!(config.worker_process.model, "Qwen/Qwen3-4B");
+        assert_eq!(config.worker_process.max_model_len, 32768);
+        Ok(())
+    }
+
+    /// A fact the configuration needs and the facts do not state is refused by
+    /// name, with where it comes from: never defaulted to a guess.
+    #[test]
+    fn a_missing_fact_is_refused_by_name_and_source() {
+        let mut facts = rank_facts();
+        facts.generation_limits = None;
+        let refused = EngineConfig::of(&facts).expect_err("the limits are needed");
+        let refused = format!("{refused:#}");
+        assert!(refused.contains("generation limits"), "{refused}");
+        assert!(refused.contains("model's own configuration"), "{refused}");
+
+        let mut facts = rank_facts();
+        facts.world = None;
+        let refused = EngineConfig::of(&facts).expect_err("the world is needed");
+        let refused = format!("{refused:#}");
+        assert!(refused.contains("world"), "{refused}");
+        assert!(refused.contains("launch file"), "{refused}");
+    }
+
+    /// The placement must name one device and one host per rank.
+    #[test]
+    fn a_placement_that_does_not_cover_every_rank_is_refused() {
+        let mut facts = rank_facts();
+        facts.world_size = Some(2);
+        let refused = EngineConfig::of(&facts).expect_err("two ranks need two devices");
+        let refused = format!("{refused:#}");
+        assert!(refused.contains("2 ranks"), "{refused}");
+    }
 
     /// Entries covering the shapes a placement must validate: one component
     /// parallel over every rank, one dividing its output into units, and one

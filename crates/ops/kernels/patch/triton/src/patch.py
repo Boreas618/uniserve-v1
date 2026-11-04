@@ -1,16 +1,18 @@
 """Packed rows against the diffusion transformer's latent: the ``patch`` operator's Triton source.
 
 The DiT reads packed rows — `[video | audio | prefix | padding]` — and one video row is one
-``1×2×2`` patch of the latent's channels, so a row is ``channels · 4`` values wide. The two
-directions are one index arithmetic:
+``1×2×2`` patch of the latent's channels, so a row is ``channels · 4`` values wide:
 
 ```text
-patchify    x [channels, frames, height, width] -> r [rows, channels · 4]
-            row    = ((f · height/2) + i) · (width/2) + j      f, i, j in raster order
-            column = ((c · 2) + a) · 2 + b                     c major, then the patch's (a, b)
-            r[row, column] = x[c, f, 2·i + a, 2·j + b]
-unpatchify  r [rows, channels · 4] -> x [channels, frames, height, width]   the exact inverse
+x [channels, frames, height, width] -> r [rows, channels · 4]
+row    = ((f · height/2) + i) · (width/2) + j      f, i, j in raster order
+column = ((c · 2) + a) · 2 + b                     c major, then the patch's (a, b)
+r[row, column] = x[c, f, 2·i + a, 2·j + b]
 ```
+
+One direction only: the latent is packed once per evaluation before the denoiser reads it, and the
+inverse raster is ``unpatchify_video``, so there is one inverse in the tree rather than a second
+2×2-only one beside it.
 
 A program covers one packed row's slice of ``BLOCK`` columns, which is the grid the operator
 launches. Every destination element is written by exactly one program and its source is a single
@@ -34,15 +36,14 @@ def _patch_kernel(
     width,
     block,
     pdl,
-    PATCHIFY: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Move one packed row's ``BLOCK`` columns to or from the latent.
+    """Read one packed row's ``BLOCK`` columns from the latent and store them.
 
-    ``PATCHIFY`` reads the latent in ``x`` and writes the packed rows in ``out``; without it the
-    direction and the two views swap, as the operator's arguments say. ``rows``, ``block`` and
-    ``pdl`` are the launch's words: the grid already names the row and the column slice, the
-    block width is ``BLOCK``, and programmatic dependent launch is a launching decision.
+    ``frames`` and ``rows`` are the launch's words — a request's frame count varies while the
+    geometry is the model's, so one program serves every request of a geometry. ``block`` and
+    ``pdl`` are launching decisions: the grid already names the row and the column slice, and the
+    block width is ``BLOCK``.
     """
     row = tl.program_id(0).to(tl.int64)
     slice_index = tl.program_id(1).to(tl.int64)
@@ -69,9 +70,5 @@ def _patch_kernel(
               + (2 * patch_row + inner_row)) * width.to(tl.int64) + 2 * patch_column + inner_column
     packed = row * row_width + columns
 
-    if PATCHIFY:
-        value = tl.load(x_ptr + latent, mask=live)
-        tl.store(out_ptr + packed, value, mask=live)
-    else:
-        value = tl.load(x_ptr + packed, mask=live)
-        tl.store(out_ptr + latent, value, mask=live)
+    value = tl.load(x_ptr + latent, mask=live)
+    tl.store(out_ptr + packed, value, mask=live)

@@ -14,12 +14,15 @@
 op = "dense_attention"
 backend = "fa4"
 
+# The CuTe DSL this package is written for, as the toolchain reports it (`cutlass.__version__`);
+# the Program Server refuses a package whose version no host here has, so this must name the
+# environment the tree installs.
 [toolchain]
 kind = "cute_dsl"
-version = "4.5.0"
+version = "4.6.2"
 packages = [
     { name = "flash-attn", version = "4.0.0" },
-    { name = "torch", version = "2.9.1" },
+    { name = "torch", version = "2.13.0" },
 ]
 
 [module]
@@ -42,7 +45,12 @@ architectures = ["sm_100a", "sm_100f"]
 # field. `max_kv_len` is a bound the caller supplies, deliberately absent from the key, so it
 # is a build parameter here and not a dimension.
 [kernel.descriptors]
-dimensions = { dtype = ["bf16", "f16"], kv = ["bf16", "f16"], out = ["bf16", "f16"], head_dim = ["128", "64"], q_heads = ["56", "32", "24", "16"], kv_heads = ["56", "4", "8", "2"], mask = ["causal", "dense"], window = ["false"] }
+# `head_dim` 72 is the audio encoder's head, which FlashAttention-4's own interface accepts on
+# SM100: `_validate_head_dims` admits any head dimension in 8..128 that is a multiple of the
+# alignment (16 bytes = 8 BF16 elements), so 72 is served by the standard kernel rather than by a
+# padded last tile this package would have to mask itself. `kv_heads` 16 with `q_heads` 16 is the
+# equal-heads case that its grouped-query path degenerates to (`num_head % num_head_kv == 0`).
+dimensions = { dtype = ["bf16", "f16"], kv = ["bf16", "f16"], out = ["bf16", "f16"], head_dim = ["128", "64", "72"], q_heads = ["56", "32", "24", "16"], kv_heads = ["56", "16", "4", "8", "2"], mask = ["causal", "dense"], window = ["false"] }
 
 [parameters]
 # The representative problem the vendor's configuration is chosen for: the batch and

@@ -72,7 +72,17 @@ fn every_kernel_package_in_the_tree_is_a_package_the_server_can_install() {
 /// qwen3_moe_keys` writes `.local/qwen3-moe-keys.txt`), so the test reports
 /// how to produce it when it is absent.
 fn slice_keys() -> Option<Vec<(String, String)>> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.local/qwen3-moe-keys.txt");
+    // The committed copy first, so a clean checkout checks both fixtures; the
+    // generated one beside it is what the model's example writes, and a host
+    // that regenerated the keys today should be checking today's.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let committed = root.join("notes/programs/qwen3-moe-keys.txt");
+    let generated = root.join(".local/qwen3-moe-keys.txt");
+    let path = if committed.is_file() {
+        committed
+    } else {
+        generated
+    };
     let Ok(text) = std::fs::read_to_string(&path) else {
         eprintln!(
             "SKIPPED (fixture): no {}; write it with `cargo run -p ops --example qwen3_moe_keys`",
@@ -162,6 +172,13 @@ fn element_type_names() -> Vec<String> {
 
 /// The descriptor fields whose values are element types (`ops`' `DType`
 /// `Display`), across the operators of design section 9.
+///
+/// A name here does not settle what a package's field means: `output` is a
+/// convolution's output element type and also `adaptive_pool`'s pooled width, and
+/// `input` is a `gemm`'s activations' type and would be a count anywhere else. So a
+/// value in one of these fields is examined only when it is not a bare integer —
+/// which is what tells an element type (`bf16`, and a package's mistake `float16`)
+/// from a width or an extent (`32`).
 const ELEMENT_TYPE_FIELDS: [&str; 7] =
     ["dtype", "input", "weight", "output", "accumulate", "scores", "scales"];
 
@@ -174,16 +191,22 @@ fn every_element_type_a_descriptor_can_carry_is_one_ops_prints() {
         let Some(kernel) = &manifest.kernel else {
             continue;
         };
-        for (field, values) in &kernel.descriptors.dimensions {
-            if !ELEMENT_TYPE_FIELDS.contains(&field.as_str()) {
-                continue;
-            }
-            for value in values {
-                if !names.contains(value) {
-                    failures.push(format!(
-                        "{} {}: {field} = {value:?} is not one of {names:?}",
-                        manifest.op, manifest.backend
-                    ));
+        for shape in kernel.descriptors.shapes() {
+            for (field, values) in &shape.dimensions {
+                if !ELEMENT_TYPE_FIELDS.contains(&field.as_str()) {
+                    continue;
+                }
+                for value in values {
+                    if value.parse::<u64>().is_ok() {
+                        // A width or an extent, not an element type.
+                        continue;
+                    }
+                    if !names.contains(value) {
+                        failures.push(format!(
+                            "{} {}: {field} = {value:?} is not one of {names:?}",
+                            manifest.op, manifest.backend
+                        ));
+                    }
                 }
             }
         }
@@ -283,10 +306,18 @@ fn every_fixture_key_parses_to_the_fields_its_operator_s_packages_declare() {
                 })
                 .filter_map(|package| {
                     let manifest = Manifest::load(&package).ok()?;
-                    let descriptors = manifest.kernel?.descriptors;
-                    Some((package.display().to_string(), descriptors.dimensions))
+                    // One entry per shape the package declares: a key has to
+                    // parse against *one* of an operator's shapes, not against a
+                    // merged table.
+                    let shapes = manifest.kernel?.descriptors.shapes().to_vec();
+                    Some(
+                        shapes
+                            .into_iter()
+                            .filter(|shape| !shape.dimensions.is_empty())
+                            .map(move |shape| (package.display().to_string(), shape.dimensions)),
+                    )
                 })
-                .filter(|(_, dimensions)| !dimensions.is_empty())
+                .flatten()
                 .collect();
             // An operator with no package at all is the coverage gate's business.
             if declared.is_empty() {
@@ -304,17 +335,36 @@ fn every_fixture_key_parses_to_the_fields_its_operator_s_packages_declare() {
                 })
             });
             if !covering {
-                let fields: Vec<String> = declared
+                // Name what is wrong rather than that something is: a key whose
+                // values a package does not declare and a key whose field names
+                // are different are both "not covered", and the fix for each is
+                // different work by a different actor.
+                let why: Vec<String> = declared
                     .iter()
-                    .map(|(package, dimensions)| {
-                        let names: Vec<&str> = dimensions.keys().map(String::as_str).collect();
-                        format!("{package} declares [{}]", names.join(", "))
+                    .map(|(package, dimensions)| match parse_key(dimensions, key.as_str()) {
+                        None => {
+                            let names: Vec<&str> = dimensions.keys().map(String::as_str).collect();
+                            format!("{package} names the fields [{}]", names.join(", "))
+                        }
+                        Some(fields) => {
+                            let missing: Vec<String> = fields
+                                .iter()
+                                .filter(|(name, value)| {
+                                    !dimensions
+                                        .get(name)
+                                        .is_some_and(|allowed| allowed.iter().any(|one| one == value))
+                                })
+                                .map(|(name, value)| format!("{name}_{value}"))
+                                .collect();
+                            if missing.is_empty() {
+                                format!("{package} declares every value")
+                            } else {
+                                format!("{package} does not declare {}", missing.join(", "))
+                            }
+                        }
                     })
                     .collect();
-                failures.push(format!(
-                    "{operator}\t{key}: no package declares this key's fields exactly; {}",
-                    fields.join("; ")
-                ));
+                failures.push(format!("{operator}\t{key}: no package covers it; {}", why.join("; ")));
             }
         }
     }
@@ -394,4 +444,166 @@ fn every_shipping_package_declares_its_toolchain_version() {
         empty > 0,
         "no fixture takes the empty version the rule exists for"
     );
+}
+
+/// The expert exchange's topology is a descriptor dimension, so the store keeps the
+/// group sizes apart — and the package covers exactly the one a host can serve today.
+///
+/// `ranks` being in the module key is what stops a module built for one group from
+/// being resolved for another. The larger groups have no module on purpose: the
+/// executor's `group` interface, over which a package would exchange peer handles,
+/// is not named yet, and `create` refuses those groups by name rather than falling
+/// back to one rank (`test/create_check.py` in the package checks that refusal).
+#[test]
+fn the_exchange_covers_one_group_size_and_no_other() {
+    let package = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/ops/kernels/expert_exchange/alltoall");
+    let manifest = Manifest::load(&package).expect("the exchange's package parses");
+    let key = |ranks: u32| {
+        format!(
+            "mode_dispatch_hidden_2048_top_8_experts_128_max_tokens_8192_ranks_{ranks}_dtype_bf16"
+        )
+    };
+    assert!(
+        manifest.covers(&key(1)),
+        "the package must build the module of the one rank it serves"
+    );
+    for ranks in [2, 4, 8] {
+        assert!(
+            !manifest.covers(&key(ranks)),
+            "the package declares a module for a group of {ranks} ranks, which no host \
+             can serve: the transport for a group is not named yet"
+        );
+    }
+}
+
+/// Every package names an operator the `ops` crate declares.
+///
+/// A package is requested by its operator's name — `install` and `prepare` take an operator name,
+/// and a program slot is built from one — so a package published under a name no operator carries
+/// is a program nothing can ever request. The names move: an operator renamed in `crates/ops`
+/// leaves its package behind, and nothing else in the tree would notice, because the store builds
+/// a package by its manifest and never asks whether an operator exists.
+#[test]
+fn every_package_names_an_operator_the_ops_crate_declares() {
+    let operators = ops::operators();
+    let mut failures = Vec::new();
+    for package in packages() {
+        let Ok(manifest) = Manifest::load(&package) else {
+            continue;
+        };
+        if !operators.contains(&manifest.op.as_str()) {
+            failures.push(format!(
+                "{}: op `{}` is no operator of `crates/ops`",
+                package.display(),
+                manifest.op
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "a package under a name no operator carries is a program nothing can request:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// The three convolution packages are one source in three places, and the store builds
+/// each package from its own copy of its root, so a source shared by path is not
+/// available to them. Identity in bytes is the invariant that keeps them one program:
+/// the entry differs only by the package's `[kernel.entry]`, and the element types only
+/// by the build script's defines. A divergence would make one backend compute what the
+/// other two do not, which no per-package check could see.
+#[test]
+fn the_convolutions_are_one_source_in_three_packages() {
+    const CONVOLUTIONS: [&str; 3] = ["conv1d", "conv3d", "conv_transpose1d"];
+    const SHARED: [&str; 4] = [
+        "src/conv.cu",
+        "include/uniserve_conv.h",
+        "test/conv_check.py",
+        "test/refusal_check.py",
+    ];
+    for shared in SHARED {
+        let sources = CONVOLUTIONS.map(|op| {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../ops/kernels")
+                .join(op)
+                .join("cudnn")
+                .join(shared);
+            std::fs::read(&path).unwrap_or_else(|error| {
+                panic!("{shared} of {op} is not readable at {}: {error}", path.display())
+            })
+        });
+        assert!(
+            sources[0] == sources[1] && sources[1] == sources[2],
+            "{shared} differs between the three convolution packages"
+        );
+    }
+}
+
+/// Operators that are one computation with one difference share one check script, and each
+/// set of packages must carry the same bytes of it: whoever edits the reference, the
+/// interpreter's truncation or a case edits every copy, or they diverge and one operator's
+/// evidence quietly stops being the others'.
+#[test]
+fn a_family_of_operators_shares_one_check() {
+    const FAMILIES: [(&str, &[&str]); 6] = [
+        (
+            "triton/test/row_norm_check.py",
+            &["rms_norm", "add_rms_norm"],
+        ),
+        ("triton/test/softmax_check.py", &["softmax", "log_softmax"]),
+        (
+            "triton/test/swiglu_check.py",
+            &["swiglu", "value_first_swiglu"],
+        ),
+        (
+            "triton/test/modulation_check.py",
+            &["modulated_rms_norm", "gated_residual"],
+        ),
+        (
+            "triton/test/fused_row_norm_check.py",
+            &["scaled_residual_rms_norm", "scaled_residual_layer_norm"],
+        ),
+        (
+            "triton/test/sampling_check.py",
+            &[
+                "logits_gather",
+                "vocab_unpad",
+                "logits_shape",
+                "filter_candidates",
+                "inverse_cdf",
+                "argmax",
+                "logprob_gather",
+                "top_k",
+            ],
+        ),
+    ];
+    for (shared, operators) in FAMILIES {
+        let scripts: Vec<String> = operators
+            .iter()
+            .map(|op| {
+                let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../ops/kernels")
+                    .join(op)
+                    .join(shared);
+                std::fs::read_to_string(&path).unwrap_or_else(|error| {
+                    panic!("{op}'s check is not readable at {}: {error}", path.display())
+                })
+            })
+            .collect();
+        for (index, script) in scripts.iter().enumerate().skip(1) {
+            assert!(
+                script == &scripts[0],
+                "{shared} differs between {} and {}",
+                operators[0],
+                operators[index]
+            );
+        }
+        for op in operators {
+            assert!(
+                scripts[0].contains("--op") && scripts[0].contains(op),
+                "{shared} does not name {op} on its command line"
+            );
+        }
+    }
 }

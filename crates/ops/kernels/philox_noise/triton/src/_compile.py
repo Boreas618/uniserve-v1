@@ -69,6 +69,29 @@ def parse_key(key, dimensions):
     return fields
 
 
+def descriptor_fields(key, descriptors):
+    """The fields of ``key`` under the descriptor shape that declares it.
+
+    A package may declare several shapes — ``[kernel.descriptors]`` with one
+    table of dimensions, or ``[[kernel.descriptors]]`` repeated — because an
+    operator prints different fields for different variants of the same
+    program. The shape whose declared dimensions parse the whole key is the one
+    the key belongs to; a key no shape declares is the caller's mistake and is
+    reported with every shape's dimensions.
+    """
+    shapes = descriptors if isinstance(descriptors, list) else [descriptors]
+    for shape in shapes:
+        dimensions = shape.get("dimensions", {})
+        try:
+            return parse_key(key, dimensions)
+        except SystemExit:
+            continue
+    declared = " | ".join(
+        ", ".join(sorted(shape.get("dimensions", {}))) for shape in shapes
+    )
+    raise SystemExit(f"{key}: no descriptor shape declares it; the shapes declare {declared}")
+
+
 def compile_one(package, target, key, out, spec):
     """Compile descriptor ``key`` of ``package`` for ``target`` into ``out``.
 
@@ -78,7 +101,7 @@ def compile_one(package, target, key, out, spec):
     compilation options.
     """
     manifest = tomllib.loads((package / "package.toml").read_text())
-    fields = parse_key(key, manifest["kernel"]["descriptors"]["dimensions"])
+    fields = descriptor_fields(key, manifest["kernel"]["descriptors"])
     described = spec(fields, manifest.get("parameters", {}), target)
     compiled = triton.compile(
         ASTSource(
@@ -95,7 +118,15 @@ def compile_one(package, target, key, out, spec):
     metadata = next(
         path for name, path in compiled.metadata_group.items() if name.endswith(".json")
     )
-    (out / "metadata.json").write_text(Path(metadata).read_text())
+    # The module states the parameters it takes at launch, in order and with their types, so `ops`
+    # can compare the operator's packed words against them and refuse a disagreement by name instead
+    # of leaving it to the driver. Triton drops a kernel's constexprs from its parameters, and so is
+    # this list: the signature the source was compiled from names them too, marked `"constexpr"`.
+    written = json.loads(Path(metadata).read_text())
+    written["signature"] = {
+        name: ty for name, ty in described["signature"].items() if ty != "constexpr"
+    }
+    (out / "metadata.json").write_text(json.dumps(written))
     print(json.dumps({"descriptor": key, "target": target, "symbol": compiled.name}))
 
 

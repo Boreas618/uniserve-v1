@@ -29,8 +29,12 @@ use super::{
 };
 use crate::capacity::graph_storage_budget_bytes;
 use crate::config::Device;
-use crate::memory::prefix_cache::planes::PlaneLayout;
+use crate::memory::prefix_cache::planes::{PlaneLayout, UnitColumn};
 use crate::memory::{CachePlan, LatentPlan};
+
+/// Unit columns the computations over the prefix cache bind beside the import
+/// workers': one, on the device's primary stream.
+const COMPUTATION_COLUMNS: usize = 1;
 use crate::parallel::host::HostGroup;
 use crate::{Error, Result};
 
@@ -315,6 +319,203 @@ pub(crate) struct TokenLayout {
     latent: Option<LatentPlan>,
     planes: Option<PlaneLayout>,
     warmup_units: u32,
+}
+
+/// The three numbers a dense cache's geometry is stated by, as
+/// [`CacheDescription::dense`](crate::memory::CacheDescription::dense)
+/// takes them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CacheGeometry {
+    pub layers: u32,
+    pub kv_heads: u32,
+    pub head_dim: u32,
+}
+
+/// Everything the engine states about the rank it starts.
+///
+/// Every figure here is one the engine owns or has already agreed; nothing is
+/// inferred, because a wrong admission bound or memory fraction is a silently
+/// smaller cache rather than an error.
+pub struct RankFacts<'a> {
+    pub device: Device,
+    /// The rank's host endpoint, as it advertises itself.
+    pub host: &'a str,
+    pub world: u64,
+    /// The deployment's rank count, which no peer list states.
+    pub world_size: usize,
+    /// Requests the scheduler may have in flight, which the daemon places.
+    pub queue_depth: usize,
+    /// Tokens per logical cache page, when the deployment fixed it.
+    pub block_size: Option<u32>,
+    /// Most calls and most tokens one batch may carry: the largest bucket of
+    /// the rank's catalog, which is its admission bound because a larger batch
+    /// is refused before a kernel runs.
+    pub max_batch_calls: usize,
+    pub max_batch_tokens: usize,
+    /// Request slots the rank keeps.
+    pub max_request_pool_size: usize,
+    /// The model's longest request.
+    pub max_model_len: usize,
+    /// Fraction of the device's storage the epoch may hold.
+    pub mem_fraction_static: f64,
+    pub cache: CacheGeometry,
+    pub kv_dtype: ipc::PrefixCacheDtype,
+}
+
+/// A rank's plan with the one figure no owner states: the widest block table a
+/// request needs, which follows from the block size the plan chose.
+pub struct TokenPlan {
+    pub plan: Plan,
+    pub width: u32,
+}
+
+impl TokenPlan {
+    /// The tokens one page of the served cache holds.
+    pub fn block_size(&self) -> u32 {
+        self.plan
+            .cache
+            .as_ref()
+            .and_then(|cache| cache.groups.first().map(|group| group.block_size))
+            .unwrap_or(0)
+    }
+}
+
+/// Resolve a token rank's capacity plan: the buffers, products and latents
+/// sized, the block size agreed over `group`, the cache pool fitted to the
+/// device grant.
+///
+/// `cache` is the model's geometry: called with a candidate block size, it
+/// answers that size's plan, or `None` when the model cannot serve it. It is
+/// called at least once per candidate size until the ranks agree, so a caller
+/// memoizes it.
+///
+/// `width` is the widest block table a request of the model's length needs,
+/// which the caller derives from its own `max_model_len`; `total_bytes` is the
+/// device's total storage (zero on CPU) and `granularity` its allocation
+/// granularity, in whose granules a device pool splits its planes.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the request, the measured report, the model's facts and the agreement"
+)]
+pub fn token_plan(
+    request: &CapacityRequest,
+    report: Report,
+    facts: &TokenFacts,
+    queue_depth: usize,
+    width: u32,
+    total_bytes: u64,
+    granularity: Option<u64>,
+    group: &HostGroup,
+    mut cache: impl FnMut(usize) -> Result<Option<Arc<CachePlan>>>,
+) -> Result<Plan> {
+    let mut layout = TokenLayout::new(report, request, queue_depth, facts)?;
+    let block_size =
+        resolve_block_size(request.block_size, |size| Ok(cache(size)?.is_some()), group)?;
+    let plan = cache(block_size)?.ok_or_else(|| {
+        Error::Invariant(format!(
+            "the model served block size {block_size} while the ranks agreed it"
+        ))
+    })?;
+
+    // The cache's fixed storage beside its units: block tables, import scratch
+    // and the request-slot banks. Every unit index column is charged with each
+    // unit instead, because the unit count is not known until the pool is
+    // fitted - so no column may be charged here as well.
+    let fixed = crate::memory::prefix_cache::PrefixCache::fixed_bytes(
+        &plan,
+        0,
+        layout.info().request_slots,
+        width,
+        layout.info().max_unresolved_calls as usize,
+        0,
+    )?;
+    layout.reserve(request.device, fixed);
+
+    // Every unit index column holds one index per unit and is charged with each
+    // unit: the import workers' columns and the streams the computations over
+    // the cache bind. Charging them here and not in the fixed figure is what
+    // keeps a unit's bytes the same whether the pool is fitted before or after
+    // its size is known.
+    let workers = crate::memory::prefix_cache::PrefixCache::import_workers(
+        layout.info().max_unresolved_calls as usize,
+    ) as u64;
+    let unit_overhead = (workers + COMPUTATION_COLUMNS as u64) * UnitColumn::bytes(1);
+    layout.fit_cache(
+        &plan,
+        unit_overhead,
+        request,
+        total_bytes,
+        granularity,
+        group,
+    )?;
+    Ok(layout.finish(Some(plan)))
+}
+
+/// Resolve a token rank's plan from what the engine states, agreeing the block
+/// size and the slot count over `group` and fitting the cache pool to the
+/// device's grant.
+///
+/// The cache geometry is the model's own three numbers: the plan's page size
+/// may come out lower than the requested one, because every layer's attention
+/// must be able to read it, and the answer states the width a batch's block
+/// table needs at that page size.
+pub fn plan_rank(facts: &RankFacts<'_>, report: Report, group: &HostGroup) -> Result<TokenPlan> {
+    let total_bytes = match facts.device {
+        Device::Cuda(index) => crate::capacity::device::total_bytes(index)?,
+        Device::Cpu => 0,
+    };
+    let request = CapacityRequest {
+        device: facts.device,
+        block_size: facts.block_size.map(|size| size as usize),
+        pool_storage_bytes: None,
+        pool_storage_full_bytes: None,
+        mem_fraction_static: facts.mem_fraction_static,
+        max_batch_calls: facts.max_batch_calls,
+        max_batch_tokens: facts.max_batch_tokens,
+        max_total_tokens: Some(facts.max_model_len),
+        max_request_pool_size: facts.max_request_pool_size,
+        encoder_cache_entries: 0,
+        segments: None,
+        stage_cache: false,
+        predecessor: None,
+        world: facts.world,
+        world_size: facts.world_size,
+        decode_graph_batch_sizes: Vec::new(),
+        prefill_graph_token_sizes: Vec::new(),
+        flow_graph_shapes: Vec::new(),
+    };
+    let token_facts = TokenFacts {
+        image_processor: false,
+        vision_feature_bytes: 0,
+        latent_feature_bytes: 0,
+        latent: None,
+    };
+    let plan = token_plan(
+        &request,
+        report,
+        &token_facts,
+        facts.queue_depth,
+        0,
+        total_bytes,
+        None,
+        group,
+        |size| {
+            Ok(Some(Arc::new(crate::memory::CachePlan::new(
+                crate::memory::CacheDescription::dense(
+                    size as u32,
+                    facts.cache.layers,
+                    facts.cache.kv_heads,
+                    facts.cache.head_dim,
+                    facts.kv_dtype,
+                ),
+            )?)))
+        },
+    )?;
+    let mut answer = TokenPlan { plan, width: 0 };
+    let block = answer.block_size().max(1);
+    answer.width = u32::try_from(facts.max_model_len.div_ceil(block as usize))
+        .map_err(|_| Error::Invalid("the model's length states too many pages".into()))?;
+    Ok(answer)
 }
 
 impl TokenLayout {
@@ -725,4 +926,182 @@ pub(crate) fn slot_requirements(
         );
     }
     Ok(requirements)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Device;
+    use crate::memory::{CacheDescription, CachePlan};
+    use crate::parallel::host::HostGroup;
+    use platform::DeviceId;
+
+    /// An 8 GiB device, which is enough for a small dense cache and leaves room
+    /// for the fixed storage to be visible in the answer.
+    const TOTAL: u64 = 8 << 30;
+
+    fn report() -> Report {
+        Report {
+            endpoint: ipc::WorkerEndpoint {
+                host: "rank".to_owned(),
+                address_space: "space".to_owned(),
+                incarnation: "incarnation".to_owned(),
+            },
+            device_exports: false,
+            fabric_handles: false,
+            supported_calls: Vec::new(),
+            media_components: Default::default(),
+            components: Vec::new(),
+        }
+    }
+
+    fn request() -> CapacityRequest {
+        CapacityRequest {
+            device: Device::Cuda(DeviceId(0)),
+            block_size: Some(64),
+            pool_storage_bytes: None,
+            pool_storage_full_bytes: None,
+            mem_fraction_static: 0.5,
+            max_batch_calls: 16,
+            max_batch_tokens: 2048,
+            max_total_tokens: Some(4096),
+            max_request_pool_size: 8,
+            encoder_cache_entries: 0,
+            segments: None,
+            stage_cache: false,
+            predecessor: None,
+            world: 0,
+            world_size: 1,
+            decode_graph_batch_sizes: Vec::new(),
+            prefill_graph_token_sizes: Vec::new(),
+            flow_graph_shapes: Vec::new(),
+        }
+    }
+
+    fn facts() -> TokenFacts {
+        TokenFacts {
+            image_processor: false,
+            vision_feature_bytes: 0,
+            latent_feature_bytes: 0,
+            latent: None,
+        }
+    }
+
+    fn dense(facts: CacheGeometry) -> impl FnMut(usize) -> Result<Option<Arc<CachePlan>>> {
+        move |size| {
+            Ok(Some(Arc::new(CachePlan::new(CacheDescription::dense(
+                size as u32,
+                facts.layers,
+                facts.kv_heads,
+                facts.head_dim,
+                ipc::PrefixCacheDtype::BFloat16,
+            ))?)))
+        }
+    }
+
+    fn geometry() -> CacheGeometry {
+        CacheGeometry {
+            layers: 2,
+            kv_heads: 4,
+            head_dim: 64,
+        }
+    }
+
+    fn plan(geometry: CacheGeometry) -> Plan {
+        token_plan(
+            &request(),
+            report(),
+            &facts(),
+            1,
+            /* width */ 64,
+            TOTAL,
+            None,
+            &HostGroup::single(0),
+            dense(geometry),
+        )
+        .unwrap_or_else(|error| {
+            panic!("token_plan refused a dense plan of an 8 GiB device: {error}")
+        })
+    }
+
+    /// The pool the plan fits plus its fixed storage is what the plan books,
+    /// and it stays inside the fraction of the device the process may hold.
+    /// The fixed figure is what the cache pool's own owner charges for its
+    /// tables and unit columns, so the two books agree by construction only if
+    /// the caller charges them the same way - which is the point of the rule.
+    #[test]
+    fn the_pool_and_its_fixed_storage_stay_inside_the_grant() {
+        let plan = plan(geometry());
+        let cache = plan.cache.as_ref().expect("the model's cache is planned");
+        let units = u64::from(
+            plan.info
+                .prefix_cache
+                .as_ref()
+                .expect("the rank advertises its cache")
+                .num_units,
+        );
+        let fixed = plan.fixed_device_bytes[&Device::Cuda(DeviceId(0))];
+        let booked = fixed + units * cache.unit_bytes;
+        let grant = crate::capacity::quota(TOTAL, request().mem_fraction_static);
+        assert!(
+            booked <= grant,
+            "the pool books {booked} bytes of a {grant}-byte grant"
+        );
+    }
+
+    /// Every unit a layer's planes are made of is charged: a deeper model holds
+    /// fewer units in the same grant and a larger fixed figure.
+    #[test]
+    fn a_deeper_model_holds_fewer_units_of_a_larger_unit() {
+        let shallow = plan(CacheGeometry {
+            layers: 2,
+            ..geometry()
+        });
+        let deep = plan(CacheGeometry {
+            layers: 16,
+            ..geometry()
+        });
+        let units = |plan: &Plan| plan.info.prefix_cache.as_ref().unwrap().num_units;
+        assert!(units(&deep) < units(&shallow));
+        assert!(
+            deep.cache.as_ref().unwrap().unit_bytes > shallow.cache.as_ref().unwrap().unit_bytes
+        );
+    }
+
+    /// Every stream column is charged once per unit: a rank that admits more
+    /// imports fits fewer units of the same grant, and its fixed figure does not
+    /// grow by the same bytes - the columns follow the unit count, not the
+    /// tables.
+    #[test]
+    fn more_import_workers_hold_fewer_units_of_the_same_grant() {
+        let plan = |calls: usize| {
+            let mut request = request();
+            request.max_batch_calls = calls;
+            token_plan(
+                &request,
+                report(),
+                &facts(),
+                1,
+                64,
+                TOTAL,
+                None,
+                &HostGroup::single(0),
+                dense(geometry()),
+            )
+            .expect("the device has room for this cache")
+        };
+        let narrow = plan(1);
+        let wide = plan(16);
+        let units = |plan: &Plan| plan.info.prefix_cache.as_ref().unwrap().num_units;
+        assert!(
+            units(&wide) < units(&narrow),
+            "a rank admitting 16 calls fits {} units, one admitting 1 fits {}: the import \
+             workers' columns are not charged per unit",
+            units(&wide),
+            units(&narrow)
+        );
+        // The fixed figure moves too - an import worker's own scratch is fixed - so what the
+        // units' difference proves is that the columns are charged per unit: were they charged
+        // with the tables, both ranks would fit the same units.
+    }
 }

@@ -29,6 +29,9 @@ use crate::{Error, Result};
 /// A device executor's handle.
 pub struct Executor {
     device: DeviceId,
+    /// The phases this device's runners serve, recorded here because the runners themselves live
+    /// on the device thread and a router above the executors has to choose one without asking it.
+    phases: Vec<ipc::PhaseId>,
     queue: Arc<JobQueue>,
     thread: Option<JoinHandle<()>>,
     /// The device's graph pools, shared by every runner that issues here (4.1).
@@ -105,29 +108,48 @@ pub struct GraphStorage {
 impl Executor {
     /// Starts the device thread, which owns the runners and the arena their graphs use.
     ///
-    /// The graph storage arrives as [`GraphStorage`]: the engine sizes it, the executor reserves it
-    /// on the device's thread and hands the one `Pools` set to every runner that issues here.
+    /// The pool set arrives from [`Executor::open`], which the engine calls while it opens the
+    /// resident owners: it is the one allocator of the device, so every owner and every runner that
+    /// issues here books against the same allowance (4.1). `scratch` is the shadow pair's region,
+    /// which the engine sized beside the graph pool.
     ///
     /// From this call on the calling thread issues no device work for this device: everything
     /// reaches the device through [`Executor::submit`], the program-layer calls, and the storage
     /// owners' recorded jobs.
+    /// Opens the device's one pool set, before anything that allocates on the device exists.
+    ///
+    /// The resident owners (4.1) carve their storage from this allocator, and they are opened
+    /// before the executor thread - the runner that serves batches is built from them - so the pool
+    /// set is built here and handed to [`Executor::spawn`] rather than built inside it.
+    pub fn open(device: DeviceId, graph: &GraphStorage) -> Result<Arc<std::sync::Mutex<Pools>>> {
+        let handle = platform::Device::new(device)?;
+        // One book per device (4.1): the allocator books every pool kind against the same
+        // allowance, so the three kinds cannot sum past it.
+        let totals = Arc::new(Pools::totals_of(graph.budget));
+        let allocator =
+            platform::Allocator::new(&handle, Arc::clone(&totals) as Arc<dyn platform::Budget>)?;
+        Ok(Arc::new(std::sync::Mutex::new(Pools::new(
+            allocator,
+            totals,
+            graph.bytes,
+            graph.scratch,
+            graph.resident,
+            graph.streams,
+        )?)))
+    }
+
     pub fn spawn(
         device: DeviceId,
         mut runners: Vec<NamedRunner>,
         events: Arc<EventPool>,
-        graph: GraphStorage,
+        pools: Arc<std::sync::Mutex<Pools>>,
+        scratch: u64,
     ) -> Result<Self> {
-        let handle = platform::Device::new(device)?;
-        let allocator = platform::Allocator::new(&handle, Arc::new(GraphBudget { bytes: graph.budget }))?;
-        let pools = Arc::new(std::sync::Mutex::new(Pools::with_pools(
-            allocator,
-            graph.bytes,
-            graph.scratch,
-            graph.resident,
-            graph.budget,
-            graph.streams,
-        )?));
         let counters = Arc::new(SharedCounters::default());
+        let phases: Vec<ipc::PhaseId> = runners
+            .iter()
+            .flat_map(|named| named.phases.iter().copied())
+            .collect();
         for named in &mut runners {
             named.runner.attach_pools(Arc::clone(&pools));
             named.runner.attach_counters(Arc::clone(&counters));
@@ -137,9 +159,10 @@ impl Executor {
             device,
             runners,
             queue: Arc::clone(&queue),
-            scratch: graph.scratch,
+            scratch,
             pools: Arc::clone(&pools),
             counters: Arc::clone(&counters),
+            current: None,
             sticky: None,
         };
         let thread_queue = Arc::clone(&queue);
@@ -153,6 +176,7 @@ impl Executor {
             })?;
         Ok(Self {
             device,
+            phases,
             queue,
             thread: Some(thread),
             pools,
@@ -254,6 +278,36 @@ impl Executor {
         Ok(submission)
     }
 
+    /// Releases everything that references `generation`, which was prepared and never served (7.3
+    /// step 2).
+    ///
+    /// A failed precopy abandons the generation it prepared: its kernels unload with it, and the
+    /// graphs and arena regions the runner rebound or recaptured for it are released here. `purge`
+    /// cannot do this, because purge drops what is *older* than the serving generation and an
+    /// abandoned generation is newer than it.
+    pub fn discard(&self, generation: u64) -> Result<Submission> {
+        let id = SubmissionId(self.queue.next_submission());
+        let (submission, _) = Submission::pending(id);
+        self.queue.submit(
+            Command::Discard(generation),
+            &submission,
+            JobKind::Discard,
+            None,
+        )?;
+        Ok(submission)
+    }
+
+    /// Whether one of this device's runners serves `phase` (4.4): what a router above the executors
+    /// asks before it hands a batch over.
+    pub fn serves(&self, phase: ipc::PhaseId) -> bool {
+        self.phases.contains(&phase)
+    }
+
+    /// The phases this device's runners serve, in the order they were spawned.
+    pub fn phases(&self) -> &[ipc::PhaseId] {
+        &self.phases
+    }
+
     /// The device's one pool set, for an owner that carves its own storage from the same allocator
     /// (the storage owners' resident planes, the paired forward's scratch pages).
     ///
@@ -263,26 +317,11 @@ impl Executor {
         Arc::clone(&self.pools)
     }
 
-    /// The device's graph pools as their ledger books them: the reserved range, the bytes mapped
-    /// and the budget they are booked against (4.1, item 5's invariant).
-    ///
-    /// This is the device's figure and not a sum over its runners: one `Pools` is shared by every
-    /// runner on the device, so summing runners would count the same mapping twice. The pools are
-    /// created when the executor starts, so this is `Some` from then on; the answer stays an
-    /// `Option` for a caller that reads a device it has not yet started serving.
-    pub fn pool_metrics(&self) -> Option<crate::arena::PoolMetrics> {
-        Some(
-            self.pools
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .metrics(),
-        )
-    }
-
     /// The device's mapped bytes per pool kind, from the one allocator that books them (4.1).
     ///
-    /// The figures are one booking's totals rather than a sum over owners, so item 5's
-    /// `graph + scratch + resident <= budget` is decided by one book.
+    /// The figures are one booking's totals rather than a sum over owners - one `Pools` is shared
+    /// by every runner on the device, so a sum over runners would count the same mapping twice -
+    /// and item 5's `graph + scratch + resident <= budget` is therefore decided by one book.
     pub fn memory(&self) -> crate::arena::DeviceMemory {
         self.pools
             .lock()
@@ -319,7 +358,7 @@ impl Executor {
         if let Some(thread) = self.thread.take() {
             thread
                 .join()
-                .map_err(|_| Error::State("the executor thread panicked".into()))?;
+                .map_err(|_| Error::State("the executor thread panicked"))?;
         }
         Ok(())
     }
@@ -378,24 +417,6 @@ enum Step {
     Requeued,
 }
 
-/// The device's graph-storage budget, as the allocator books against it (4.1).
-struct GraphBudget {
-    /// Bytes the device may map for captured graphs.
-    bytes: u64,
-}
-
-impl platform::Budget for GraphBudget {
-    fn book(&self, _device: DeviceId, _pool: platform::PoolKind, bytes: u64) -> platform::Result<()> {
-        if bytes > self.bytes {
-            return Err(platform::Error::InvalidArgument(format!(
-                "a graph pool of {bytes} bytes exceeds the device's {} bytes",
-                self.bytes
-            )));
-        }
-        Ok(())
-    }
-}
-
 /// What a sticky-error probe found (2.4).
 #[derive(Debug)]
 pub enum Probe {
@@ -417,6 +438,9 @@ struct Device {
     pools: Arc<std::sync::Mutex<Pools>>,
     /// What the device thread has done, shared with the handle the control thread reads.
     counters: Arc<SharedCounters>,
+    /// What the job in hand is doing, for the report of a failed submission. The device thread is
+    /// the only place that knows it, and a failure crosses the thread boundary as a bare error.
+    current: Option<String>,
     /// The context's first sticky error, once one has been seen (2.4).
     ///
     /// A sticky error is not recoverable: every launch after it fails, so the executor issues
@@ -438,7 +462,11 @@ impl Device {
             if let Some(sticky) = &self.sticky {
                 // The context is unusable: the command is not issued, and its submission fails
                 // with the sticky error rather than with a launch error that would hide it.
-                queue.complete(entry, Err(Error::Cuda(sticky.clone())));
+                queue.complete(
+                    entry,
+                    Err(Error::Cuda(sticky.clone())),
+                    Some("the device's context already had a sticky error".to_owned()),
+                );
                 continue;
             }
             let result = self.serve(&entry);
@@ -467,7 +495,8 @@ impl Device {
                     self.sticky = Some(sticky);
                 }
             }
-            queue.complete(entry, result);
+            let detail = self.current.take();
+            queue.complete(entry, result, detail);
         }
         events.set_submitter(None);
     }
@@ -486,41 +515,42 @@ impl Device {
     /// rest back at the tail of the queue, so a serving batch the scheduler submitted meanwhile is
     /// served between two of its jobs (4.5's interleaving).
     fn serve(&mut self, entry: &crate::job::Entry) -> Result<Step> {
+        let label = entry.label.clone();
         match &entry.command {
             Command::Batch(batch) => {
                 let runner = self.runner_of(phase_of(batch))?;
                 let jobs = self.runner_mut(runner)?.runner.submit(batch.clone())?;
                 // A batch's jobs are its replay and nothing else: serving it is one turn, because
                 // the mechanism waits on this submission to build the next step.
-                self.perform(jobs_of(runner, jobs)).map(Step::Done)
+                self.perform(&label, jobs_of(runner, jobs)).map(Step::Done)
             }
             Command::Warmup => {
                 let mut jobs = Vec::new();
                 for named in &mut self.runners {
                     jobs.extend(jobs_of(named.id, named.runner.warmup()?));
                 }
-                self.steps(entry, None, jobs)
+                self.steps(entry, &label, None, jobs)
             }
             Command::Shadow(batch) => {
                 let runner = self.runner_of(phase_of(batch))?;
                 let jobs = self.runner_mut(runner)?.runner.shadow(batch.clone())?;
                 // A shadow batch is a set of independent paired forwards, one per changed operator:
                 // they interleave with serving batches like a precopy's steps (7.3 step 2).
-                self.steps(entry, Some(batch.generation), jobs_of(runner, jobs))
+                self.steps(entry, &label, Some(batch.generation), jobs_of(runner, jobs))
             }
             Command::Precopy(next) => {
                 let mut jobs = Vec::new();
                 for named in &mut self.runners {
                     jobs.extend(jobs_of(named.id, named.runner.precopy(next)?));
                 }
-                self.steps(entry, Some(next.number()), jobs)
+                self.steps(entry, &label, Some(next.number()), jobs)
             }
             Command::Steps { generation, jobs } => {
-                self.steps(entry, *generation, jobs.clone())
+                self.steps(entry, &label, *generation, jobs.clone())
             }
             Command::Switchover(generation) => {
                 for named in &mut self.runners {
-                    named.runner.switchover(*generation);
+                    named.runner.switchover(*generation)?;
                 }
                 self.synchronize()?;
                 Ok(Step::Done(BatchOutput::default()))
@@ -556,10 +586,10 @@ impl Device {
                 self.synchronize()?;
                 Ok(Step::Done(BatchOutput::default()))
             }
-            Command::Issue(work) => {
-                work.lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .perform()?;
+            Command::Discard(generation) => {
+                for named in &mut self.runners {
+                    named.runner.discard(*generation)?;
+                }
                 self.synchronize()?;
                 Ok(Step::Done(BatchOutput::default()))
             }
@@ -581,13 +611,19 @@ impl Device {
     /// one turn would stop serving for the whole set, which is the long pause the design forbids.
     /// One job per turn lets whatever the scheduler submitted in between be served first, and a
     /// quiet queue still runs the steps back to back.
-    fn steps(&mut self, entry: &crate::job::Entry, generation: Option<u64>, jobs: Vec<Job>) -> Result<Step> {
+    fn steps(
+        &mut self,
+        entry: &crate::job::Entry,
+        label: &str,
+        generation: Option<u64>,
+        jobs: Vec<Job>,
+    ) -> Result<Step> {
         let mut jobs = jobs;
         if jobs.is_empty() {
             return Ok(Step::Done(BatchOutput::default()));
         }
         let first = jobs.remove(0);
-        let output = self.perform(vec![first])?;
+        let output = self.perform(label, vec![first])?;
         if jobs.is_empty() {
             return Ok(Step::Done(output));
         }
@@ -599,18 +635,21 @@ impl Device {
     ///
     /// The answer is the output of the jobs that produced one; a job list with no output (every
     /// program-layer command) answers empty.
-    fn perform(&mut self, jobs: Vec<Job>) -> Result<BatchOutput> {
+    fn perform(&mut self, label: &str, jobs: Vec<Job>) -> Result<BatchOutput> {
         let mut output = BatchOutput::default();
         for job in jobs {
             let runner = job
                 .runner()
                 .ok_or_else(|| Error::Invariant("a serving job names no runner".into()))?;
+            // The job in hand names the bucket, generation and operator a failure is about; the
+            // command's label says which submission was running it.
+            self.current = Some(format!("{label}, {}", job.describe()));
             let started = Instant::now();
             let produced = self.runner_mut(runner)?.runner.serve(&job)?;
             self.synchronize()?;
             self.counters.time(started.elapsed());
-            if !produced.tokens.is_empty() {
-                if !output.tokens.is_empty() {
+            if !produced.calls.is_empty() {
+                if !output.calls.is_empty() {
                     return Err(Error::Invariant(
                         "two jobs of one command produced tokens".into(),
                     ));

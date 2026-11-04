@@ -38,24 +38,51 @@ const WEIGHT_KEY_DOMAIN: &[u8] = b"uniserve-retained-weight\0";
 pub trait WeightStorage: Send + Sync {
     /// The bytes already retained under `key`, mapped read-only, or `None` when the Storage Server
     /// holds none.
-    fn fetch(&self, key: &[u8; 32]) -> Result<Option<Backing>>;
+    fn fetch(&self, device: platform::DeviceId, key: &[u8; 32]) -> Result<Option<Backing>>;
 
-    /// Store `bytes` under `key` and answer the read-only region they are mapped at.
+    /// The allocation granularity the Storage Server imports a retained allocation in, on
+    /// `device`: the length it retains must be a positive multiple of it (§8).
+    fn granularity(&self, device: platform::DeviceId) -> Result<usize>;
+
+    /// Retain `bytes` under `key` in an allocation of `allocation` bytes and answer the read-only
+    /// region they are mapped at.
+    ///
+    /// `bytes.len()` is the weight's true length, which is its shape's and is rarely a granule;
+    /// `allocation` is that length rounded up, and is what the server imports. The bytes past
+    /// `bytes.len()` are a tail nothing reads. A store that publishes the true length instead is
+    /// refused by the server's import, which is why the rounding happens in [`WeightStore::publish`]
+    /// rather than in the store.
     ///
     /// Storing a key twice is the caller's error; a store may publish it again or answer the region
     /// it already holds.
-    fn store(&self, key: &[u8; 32], bytes: &[u8]) -> Result<Backing>;
+    fn store(
+        &self,
+        device: platform::DeviceId,
+        key: &[u8; 32],
+        bytes: &[u8],
+        allocation: usize,
+    ) -> Result<Backing>;
 }
 
 /// A shared storage, as two owners of one rank's client use it: the store itself and whatever else
 /// the rank maps weights through.
 impl<S: WeightStorage + ?Sized> WeightStorage for std::sync::Arc<S> {
-    fn fetch(&self, key: &[u8; 32]) -> Result<Option<Backing>> {
-        (**self).fetch(key)
+    fn fetch(&self, device: platform::DeviceId, key: &[u8; 32]) -> Result<Option<Backing>> {
+        (**self).fetch(device, key)
     }
 
-    fn store(&self, key: &[u8; 32], bytes: &[u8]) -> Result<Backing> {
-        (**self).store(key, bytes)
+    fn granularity(&self, device: platform::DeviceId) -> Result<usize> {
+        (**self).granularity(device)
+    }
+
+    fn store(
+        &self,
+        device: platform::DeviceId,
+        key: &[u8; 32],
+        bytes: &[u8],
+        allocation: usize,
+    ) -> Result<Backing> {
+        (**self).store(device, key, bytes, allocation)
     }
 }
 
@@ -81,17 +108,26 @@ pub fn retained_key(weight: &WeightKey) -> [u8; 32] {
 /// serves.
 pub struct WeightStore<S: WeightStorage> {
     storage: S,
+    /// The device this store's weights are mapped on. A `Backing` is one device's address, so a
+    /// rank that serves two devices holds one store per device: the storage is the same client.
+    device: platform::DeviceId,
     /// Every weight this rank has mapped, by storage key.
     mapped: BTreeMap<[u8; 32], Backing>,
 }
 
 impl<S: WeightStorage> WeightStore<S> {
-    /// A store over `storage`, with nothing mapped yet.
-    pub fn new(storage: S) -> Self {
+    /// A store over `storage` that maps every weight on `device`, with nothing mapped yet.
+    pub fn new(storage: S, device: platform::DeviceId) -> Self {
         Self {
             storage,
+            device,
             mapped: BTreeMap::new(),
         }
+    }
+
+    /// The device this store maps on.
+    pub fn device(&self) -> platform::DeviceId {
+        self.device
     }
 
     /// How many weights this rank holds, for the metrics report and for tests.
@@ -104,6 +140,33 @@ impl<S: WeightStorage> WeightStore<S> {
         &self.storage
     }
 
+    /// The allocation a weight of `bytes` bytes is retained in: its true length rounded up to the
+    /// granularity the Storage Server imports a retained allocation in (§8).
+    ///
+    /// The weight's length is its shape's, so it is a whole number of granules only by accident: an
+    /// embedding of 622329856 bytes against a 2097152-byte granule is refused by the import. The
+    /// rounded length is what the store allocates and publishes; the tensor keeps `bytes`, and a
+    /// reader maps the allocation and reads only the weight.
+    fn allocation_length(&self, bytes: usize) -> Result<usize> {
+        let granularity = self
+            .storage
+            .granularity(self.device)
+            .map_err(|error| Error::State(format!("the granularity of {}: {error}", self.device).leak()))?;
+        if granularity == 0 {
+            return Err(Error::Invariant(
+                "the storage states a zero allocation granularity".into(),
+            ));
+        }
+        bytes
+            .div_ceil(granularity)
+            .checked_mul(granularity)
+            .ok_or_else(|| {
+                Error::Invalid(format!(
+                    "a weight of {bytes} bytes has no whole-granule allocation"
+                ))
+            })
+    }
+
     /// The backing of `key`, mapped if this rank has not mapped it yet.
     fn backing(&mut self, key: &WeightKey) -> Result<Option<Backing>> {
         let storage_key = retained_key(key);
@@ -112,8 +175,10 @@ impl<S: WeightStorage> WeightStore<S> {
         }
         let Some(backing) = self
             .storage
-            .fetch(&storage_key)
-            .map_err(|error| Error::State(format!("mapping retained weight {key}: {error}").leak()))?
+            .fetch(self.device, &storage_key)
+            .map_err(|error| {
+                Error::State(format!("mapping retained weight {key}: {error}").leak())
+            })?
         else {
             return Ok(None);
         };
@@ -167,9 +232,12 @@ impl<S: WeightStorage> RetainedWeights for WeightStore<S> {
         if let Some(backing) = self.mapped.get(&storage_key) {
             return Ok(*backing);
         }
+        let allocation = self.allocation_length(bytes.len()).map_err(|error| {
+            nn::Error::Unsupported(format!("sizing weight {key}: {error}"))
+        })?;
         let backing = self
             .storage
-            .store(&storage_key, bytes)
+            .store(self.device, &storage_key, bytes, allocation)
             .map_err(|error| nn::Error::Unsupported(format!("publishing weight {key}: {error}")))?;
         self.mapped.insert(storage_key, backing);
         Ok(backing)
@@ -181,22 +249,48 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use nn::{FileIdentity, WeightLayout};
     use nn::weights::WeightRegion;
+    use nn::{FileIdentity, WeightLayout};
 
     use super::*;
 
     /// A storage that keeps bytes in host memory and hands out fake device addresses, so the key
     /// and the store's bookkeeping are tested without a device.
-    #[derive(Default)]
     struct FakeStorage {
         published: Mutex<BTreeMap<[u8; 32], Vec<u8>>>,
         fetches: AtomicUsize,
         stores: AtomicUsize,
         next_address: AtomicUsize,
+        /// The granule the driver imports a retained allocation in. One byte unless a test states
+        /// otherwise, so a test that is not about rounding is not about rounding.
+        granularity: usize,
+        /// What the last store was handed: the weight's true length and its allocation.
+        handed: Mutex<Option<(usize, usize)>>,
+    }
+
+    impl Default for FakeStorage {
+        fn default() -> Self {
+            Self {
+                published: Mutex::new(BTreeMap::new()),
+                fetches: AtomicUsize::new(0),
+                stores: AtomicUsize::new(0),
+                next_address: AtomicUsize::new(0),
+                granularity: 1,
+                handed: Mutex::new(None),
+            }
+        }
     }
 
     impl FakeStorage {
+        /// A storage whose import, like the driver's, takes whole granules and refuses anything
+        /// else - the refusal that ended an epoch's model load.
+        fn with_granularity(granularity: usize) -> Self {
+            Self {
+                granularity,
+                ..Self::default()
+            }
+        }
+
         fn address(&self) -> u64 {
             // An address that is never dereferenced: the test reads the keys and the lengths only.
             self.next_address.fetch_add(1 << 20, Ordering::Relaxed) as u64 + 0x1000
@@ -204,7 +298,7 @@ mod tests {
     }
 
     impl WeightStorage for FakeStorage {
-        fn fetch(&self, key: &[u8; 32]) -> Result<Option<Backing>> {
+        fn fetch(&self, _device: platform::DeviceId, key: &[u8; 32]) -> Result<Option<Backing>> {
             self.fetches.fetch_add(1, Ordering::Relaxed);
             Ok(self.published.lock().unwrap().get(key).map(|bytes| {
                 let _ = bytes;
@@ -212,26 +306,53 @@ mod tests {
             }))
         }
 
-        fn store(&self, key: &[u8; 32], bytes: &[u8]) -> Result<Backing> {
+        fn granularity(&self, _device: platform::DeviceId) -> Result<usize> {
+            Ok(self.granularity)
+        }
+
+        fn store(
+            &self,
+            _device: platform::DeviceId,
+            key: &[u8; 32],
+            bytes: &[u8],
+            allocation: usize,
+        ) -> Result<Backing> {
             self.stores.fetch_add(1, Ordering::Relaxed);
-            self.published
-                .lock()
-                .unwrap()
-                .insert(*key, bytes.to_vec());
+            *self.handed.lock().unwrap() = Some((bytes.len(), allocation));
+            if allocation < bytes.len() || allocation % self.granularity != 0 {
+                return Err(Error::Invalid(format!(
+                    "a retained allocation of {allocation} bytes is not a positive multiple of \
+                     the {}-byte granularity",
+                    self.granularity
+                )));
+            }
+            self.published.lock().unwrap().insert(*key, bytes.to_vec());
             Ok(Backing::new(
                 ops::DevicePtr::new(self.address()),
-                bytes.len() as u64,
+                allocation as u64,
             ))
         }
     }
 
-    /// The identity of a checkpoint file the test writes once per name, so two names are two
-    /// checkpoint files and the same name is one file read twice (`FileIdentity::of` is the only
-    /// constructor, and it derives the identity from the file itself).
+    /// The identity of a checkpoint file, as a Hugging Face cache stores it.
+    ///
+    /// A file under `blobs/` is identified by its name alone, so the fixture states identity
+    /// without waiting for a write to settle: `FileIdentity::of` gives a file younger than a second
+    /// an identity that matches no later read, and a checkpoint under test must not depend on that.
     fn identity(name: &str) -> FileIdentity {
-        let directory = std::env::temp_dir().join("uniserve-weight-key-tests");
+        let directory = std::env::temp_dir()
+            .join("uniserve-weight-key-tests")
+            .join("blobs");
         std::fs::create_dir_all(&directory).expect("a temporary directory");
-        let path = directory.join(name);
+        // A blob's name is a 64-digit hexadecimal content hash; the content is the fixture's own.
+        let digest: String = name
+            .bytes()
+            .flat_map(|byte| format!("{byte:02x}").into_bytes())
+            .map(char::from)
+            .take(64)
+            .collect();
+        let blob = format!("{digest:0<64}");
+        let path = directory.join(blob);
         if !path.exists() {
             std::fs::write(&path, name).expect("a temporary checkpoint file");
         }
@@ -299,7 +420,7 @@ mod tests {
 
     #[test]
     fn a_published_weight_is_a_hit_and_asks_the_storage_once() {
-        let mut store = WeightStore::new(FakeStorage::default());
+        let mut store = WeightStore::new(FakeStorage::default(), platform::DeviceId(0));
         let weight = key("blob:aaa", DType::BF16, "model.layers.0.mlp.up");
         let bytes = vec![0_u8; 4 * 8 * 2];
         let published = store
@@ -321,12 +442,12 @@ mod tests {
         let bytes = vec![0_u8; 4 * 8 * 2];
 
         // Another rank of the deployment publishes it first.
-        let mut other = WeightStore::new(Shared(Arc::clone(&storage)));
+        let mut other = WeightStore::new(Shared(Arc::clone(&storage)), platform::DeviceId(0));
         other
             .publish(&weight, DType::BF16, ops::Shape::new(&[4, 8]), &bytes)
             .expect("a well-formed weight");
 
-        let mut mine = WeightStore::new(Shared(Arc::clone(&storage)));
+        let mut mine = WeightStore::new(Shared(Arc::clone(&storage)), platform::DeviceId(0));
         assert!(mine.retained(&weight).expect("a hit").is_some());
         assert!(mine.retained(&weight).expect("a hit").is_some());
         assert_eq!(storage.fetches.load(Ordering::Relaxed), 1);
@@ -335,7 +456,7 @@ mod tests {
 
     #[test]
     fn a_weight_nothing_published_is_a_miss_that_is_not_remembered() {
-        let mut store = WeightStore::new(FakeStorage::default());
+        let mut store = WeightStore::new(FakeStorage::default(), platform::DeviceId(0));
         let weight = key("blob:aaa", DType::BF16, "model.layers.0.mlp.up");
         assert!(store.retained(&weight).expect("a miss").is_none());
         assert!(store.retained(&weight).expect("a miss").is_none());
@@ -346,7 +467,7 @@ mod tests {
 
     #[test]
     fn publishing_under_a_key_of_another_element_type_is_refused() {
-        let mut store = WeightStore::new(FakeStorage::default());
+        let mut store = WeightStore::new(FakeStorage::default(), platform::DeviceId(0));
         let weight = key("blob:aaa", DType::BF16, "model.layers.0.mlp.up");
         let error = store
             .publish(&weight, DType::F32, ops::Shape::new(&[4, 8]), &[0_u8; 128])
@@ -357,7 +478,7 @@ mod tests {
 
     #[test]
     fn publishing_a_byte_count_the_shape_does_not_state_is_refused() {
-        let mut store = WeightStore::new(FakeStorage::default());
+        let mut store = WeightStore::new(FakeStorage::default(), platform::DeviceId(0));
         let weight = key("blob:aaa", DType::BF16, "model.layers.0.mlp.up");
         let error = store
             .publish(&weight, DType::BF16, ops::Shape::new(&[4, 8]), &[0_u8; 7])
@@ -368,7 +489,7 @@ mod tests {
 
     #[test]
     fn publishing_the_same_weight_twice_answers_the_region_it_holds() {
-        let mut store = WeightStore::new(FakeStorage::default());
+        let mut store = WeightStore::new(FakeStorage::default(), platform::DeviceId(0));
         let weight = key("blob:aaa", DType::BF16, "model.layers.0.mlp.up");
         let bytes = vec![0_u8; 4 * 8 * 2];
         let first = store
@@ -381,16 +502,61 @@ mod tests {
         assert_eq!(store.storage().stores.load(Ordering::Relaxed), 1);
     }
 
+    /// A weight's byte length is its shape's, so it is a whole number of granules only by accident;
+    /// the Storage Server imports a retained allocation in whole granules and refuses the rest.
+    #[test]
+    fn a_weight_whose_length_is_not_a_granule_is_retained_in_a_rounded_allocation() {
+        const GRANULE: usize = 1 << 21;
+        let storage = std::sync::Arc::new(FakeStorage::with_granularity(GRANULE));
+        let mut store = WeightStore::new(Shared(std::sync::Arc::clone(&storage)), platform::DeviceId(0));
+        // The embedding that ended the epoch's model load is 622329856 bytes against a 2097152-byte
+        // granule, which is 296 granule and 190210304 bytes over; this is the same shape, small.
+        let bytes = vec![3_u8; 30];
+        let published = store
+            .publish(
+                &key("blob:aaa", DType::BF16, "model.embed_tokens"),
+                DType::BF16,
+                ops::Shape::new(&[3, 5]),
+                &bytes,
+            )
+            .expect("a weight retained in a rounded allocation");
+        // What the store was handed: the true length to state, and the granule to import.
+        let (length, allocation) = storage.handed.lock().unwrap().expect("a store");
+        assert_eq!(length, 30);
+        assert_eq!(allocation, GRANULE);
+        assert_eq!(published.bytes(), GRANULE as u64);
+        // A reader maps the allocation, and a second publication answers the same region.
+        let again = store
+            .publish(
+                &key("blob:aaa", DType::BF16, "model.embed_tokens"),
+                DType::BF16,
+                ops::Shape::new(&[3, 5]),
+                &bytes,
+            )
+            .expect("the region it holds");
+        assert_eq!(published.address(), again.address());
+    }
+
     /// A storage shared by two stores, as two ranks of one deployment share the Storage Server.
     struct Shared(std::sync::Arc<FakeStorage>);
 
     impl WeightStorage for Shared {
-        fn fetch(&self, key: &[u8; 32]) -> Result<Option<Backing>> {
-            self.0.fetch(key)
+        fn fetch(&self, _device: platform::DeviceId, key: &[u8; 32]) -> Result<Option<Backing>> {
+            self.0.fetch(platform::DeviceId(0), key)
         }
 
-        fn store(&self, key: &[u8; 32], bytes: &[u8]) -> Result<Backing> {
-            self.0.store(key, bytes)
+        fn granularity(&self, _device: platform::DeviceId) -> Result<usize> {
+            self.0.granularity(platform::DeviceId(0))
+        }
+
+        fn store(
+            &self,
+            _device: platform::DeviceId,
+            key: &[u8; 32],
+            bytes: &[u8],
+            allocation: usize,
+        ) -> Result<Backing> {
+            self.0.store(platform::DeviceId(0), key, bytes, allocation)
         }
     }
 }

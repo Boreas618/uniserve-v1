@@ -19,7 +19,7 @@
 //! without retaining it, and on a `WorkerFailure` computes the calls,
 //! requests, and buffers the failure invalidates.
 
-mod codecs;
+pub(crate) mod codecs;
 mod failure;
 mod results;
 
@@ -288,6 +288,12 @@ impl WorkerExecutor {
                 .map(|worker| (worker.0.clone(), worker.1.info().clone()))
                 .collect(),
         )?;
+        // The attention descriptor's static bound is the launch's, not a
+        // report: every group of the deployment was started for the same
+        // longest sequence.
+        executor_info.max_model_len = workers
+            .first()
+            .map_or(0, |(_, worker)| worker.process_args().max_model_len);
         // Each rank reports the buffer bytes it backs.
         executor_info.rank_buffer_bytes = workers
             .iter()
@@ -345,7 +351,13 @@ impl WorkerExecutor {
             .iter()
             .map(|(id, worker)| {
                 let (ranks, components) = worker.placement();
-                (id, ranks, components)
+                // The pairing is a host question: a media unit must be
+                // encoded where it was decoded.
+                (
+                    id.clone(),
+                    ranks.iter().map(|rank| rank.host.clone()).collect(),
+                    components.clone(),
+                )
             })
             .collect::<Vec<_>>();
         executor_info.video_codecs = video_unit_codecs(&media_routing, &placements)?;
@@ -764,6 +776,9 @@ impl WorkerExecutor {
             input_transfers: inputs,
             cache_inputs,
             page_offloads: batch.page_offloads.clone(),
+            // The columns are the mechanism's statement to an in-process
+            // executor; a worker projection carries no device layout.
+            columns: None,
         }
         .into_protocol(collective_seq)?;
 

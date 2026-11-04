@@ -9,9 +9,9 @@ use std::ops::Range;
 
 use platform::{CopyBatch, DeviceId, PitchedBatch, SourceOrder, Stream, StridedCopy, memcpy_async};
 
-use crate::memory::allocation::StorageView;
 use crate::memory::allocation::ElementType;
-use crate::memory::allocation::{MemoryKind};
+use crate::memory::allocation::MemoryKind;
+use crate::memory::allocation::StorageView;
 use crate::{Error, Result};
 
 /// Ordered first-axis spans of one logical tensor. Every span has the same
@@ -275,8 +275,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::memory::allocation::Storage;
     use crate::memory::allocation::Backing;
+    use crate::memory::allocation::Storage;
 
     fn write_floats(storage: &Arc<dyn Backing>, values: &[f32]) {
         // SAFETY: test storage is host storage owned by the caller.

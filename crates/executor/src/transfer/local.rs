@@ -13,8 +13,8 @@ use super::export_table::ExportTable;
 use super::read::{self, NativeRead, Read, ReadCall};
 use super::transport::{ExportView, Transport, producer, read_destination, within};
 use super::{ByteReservation, ReadReservation, Spans};
-use crate::stream::Issue;
 use crate::memory::allocation::MemoryKind;
+use crate::stream::Issue;
 use crate::{Error, Result, lock};
 
 impl Transport {

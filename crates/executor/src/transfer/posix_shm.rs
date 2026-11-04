@@ -22,10 +22,10 @@ use super::{
     ACK_SLOTS, ACKNOWLEDGED, ByteReservation, CLAIMED, DRAIN_LIMIT, Spans, copy_planner,
     drain_event,
 };
+use crate::memory::allocation::Backing;
+use crate::memory::allocation::MemoryKind;
 use crate::memory::allocation::StorageView;
 use crate::stream::Issue;
-use crate::memory::allocation::Backing;
-use crate::memory::allocation::{MemoryKind};
 use crate::{Error, Result};
 
 pub(crate) const SHM_HEADER_BYTES: usize = 512;

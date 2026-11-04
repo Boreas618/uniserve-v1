@@ -64,7 +64,12 @@ pub(crate) fn generation_router(engine: Arc<Leader>, body_limit: usize) -> Route
 ///
 /// Job creation takes condition media inline like the synchronous route, so
 /// `POST /v1/videos` has the same `body_limit`.
-pub(crate) fn job_router(engine: Arc<Leader>, jobs: Arc<VideoJobs>, body_limit: usize) -> Router {
+pub(crate) fn job_router(
+    engine: Arc<Leader>,
+    jobs: Arc<VideoJobs>,
+    body_limit: usize,
+    handoff: Arc<crate::http::handoff::Handoff>,
+) -> Router {
     Router::new()
         .route(
             "/v1/videos",
@@ -76,6 +81,7 @@ pub(crate) fn job_router(engine: Arc<Leader>, jobs: Arc<VideoJobs>, body_limit: 
         .route("/v1/videos/{id}", get(videos_get).delete(videos_delete))
         .route("/v1/videos/{id}/content", get(videos_content))
         .route("/v1/capabilities", get(capabilities))
+        .layer(Extension(handoff))
         .with_state(JobState { engine, jobs })
 }
 
@@ -392,7 +398,11 @@ async fn videos_delete(State(state): State<JobState>, Path(id): Path<String>) ->
 /// `RetainedMedia`, so the mapping and its share of the retained-byte budget
 /// stay reserved until the download ends, even if the job is deleted or
 /// expires meanwhile.
-async fn videos_content(State(state): State<JobState>, Path(id): Path<String>) -> Response {
+async fn videos_content(
+    State(state): State<JobState>,
+    Extension(handoff): Extension<Arc<crate::http::handoff::Handoff>>,
+    Path(id): Path<String>,
+) -> Response {
     let Some(media) = state.jobs.content(&id) else {
         return if state.jobs.get(&id).is_some() {
             ApiError::conflict("video has no completed content").into_response()
@@ -401,14 +411,30 @@ async fn videos_content(State(state): State<JobState>, Path(id): Path<String>) -
         };
     };
     let length = media.len();
-    (
-        [
-            (header::CONTENT_TYPE, "video/mp4".to_owned()),
-            (header::CONTENT_LENGTH, length.to_string()),
-        ],
-        media_body(media),
-    )
-        .into_response()
+    // The body registers before it writes a chunk, so a hot restart pauses it
+    // between two chunks and the successor goes on streaming the same
+    // artifact from the byte this process reached (design §7.5.1).
+    let registration = handoff.register();
+    let stream = crate::http::stream::ResponseStream::start(
+        Box::new(crate::output::run::VideoContentRun::new(
+            id.clone(),
+            "video/mp4".to_owned(),
+            media,
+        )),
+        false,
+    );
+    let Some(body) = crate::http::stream::HandedBody::new(stream, Some(registration), id) else {
+        return ApiError::server_error("the response cannot be handed over".to_string())
+            .into_response();
+    };
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "video/mp4")
+        .header(header::CONTENT_LENGTH, length.to_string())
+        .body(Body::empty())
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    crate::http::stream::attach(&mut response, body);
+    response
 }
 
 /// A generated artifact's bytes as a response body reads them.

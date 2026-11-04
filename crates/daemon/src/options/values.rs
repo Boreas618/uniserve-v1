@@ -254,6 +254,57 @@ pub(super) mod list {
 pub(super) mod optional_list {
     use super::*;
 
+    /// Reads an optional list from every form [`ListVisitor`] takes, and from
+    /// `null`: a serialized `None` is written as `null`, so a value the daemon
+    /// wrote (a build config, an epoch record) must read back through the same
+    /// type that wrote it.
+    struct OptionalListVisitor<T>(PhantomData<T>);
+
+    impl<'de, T> Visitor<'de> for OptionalListVisitor<T>
+    where
+        T: DeserializeOwned + FromStr,
+        T::Err: fmt::Display,
+    {
+        type Value = Option<Vec<T>>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("an array, a comma-separated string, one element or null")
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D: Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer
+                .deserialize_any(ListVisitor(PhantomData))
+                .map(Some)
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, sequence: A) -> Result<Self::Value, A::Error> {
+            ListVisitor::<T>(PhantomData).visit_seq(sequence).map(Some)
+        }
+
+        fn visit_str<E: de::Error>(self, text: &str) -> Result<Self::Value, E> {
+            ListVisitor::<T>(PhantomData).visit_str(text).map(Some)
+        }
+
+        fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
+            ListVisitor::<T>(PhantomData).visit_u64(value).map(Some)
+        }
+
+        fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
+            ListVisitor::<T>(PhantomData).visit_i64(value).map(Some)
+        }
+    }
+
     pub(in crate::options) fn deserialize<'de, D, T>(
         deserializer: D,
     ) -> Result<Option<Vec<T>>, D::Error>
@@ -262,7 +313,7 @@ pub(super) mod optional_list {
         T: DeserializeOwned + FromStr,
         T::Err: fmt::Display,
     {
-        list::deserialize(deserializer).map(Some)
+        deserializer.deserialize_any(OptionalListVisitor(PhantomData))
     }
 }
 

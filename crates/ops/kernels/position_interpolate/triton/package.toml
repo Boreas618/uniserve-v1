@@ -1,0 +1,35 @@
+# The position_interpolate operator's Triton backend: design 5.2's program package.
+#
+# A learned [in_side², channels] position table resampled to another grid: the caller hands four tap
+# indices (i32) and four FP32 weights per output point, and the program gathers four table rows and
+# writes their weighted sum. No alignment rule, no clamp and no division live here — a shared operator
+# must not bake one caller's convention in — and the weights are the caller's normalization.
+#
+# `channels` and `block` are compiled tiles; `points`, `channels`, `block` and the PDL flag travel at
+# launch, so one module serves every target grid.
+
+op = "position_interpolate"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+
+[source]
+kind = "triton"
+files = ["src/position_interpolate.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+# `dtype_bf16_channels_1152_in_side_48_block_1024_pdl_false`.
+[kernel.descriptors]
+dimensions = { dtype = ["bf16", "f16", "f32"], channels = ["1152"], in_side = ["48"], block = ["1024"], pdl = ["false", "true"] }
+
+[parameters]

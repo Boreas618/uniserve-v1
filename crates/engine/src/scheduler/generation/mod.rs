@@ -20,6 +20,7 @@
 
 pub(crate) mod continuation;
 
+use crate::scheduler::completion::CallCompletion;
 use super::{EncoderCachePin, GuidancePrefixState, Phase, RequestAllocations, TerminalIntent};
 use crate::kv_cache::{BlockTable, CacheAllocation};
 
@@ -27,7 +28,7 @@ use ipc::{ForwardMode, MediaCall, TransferMode};
 
 use crate::{GenerationRequest, ImageEncoderInput, ImageInput};
 use ipc::{
-    Bounds, BufferId, Call, CallId, CallKind, CallOutput, CallStatus, CanvasStep, DType, DimBound,
+    Bounds, BufferId, Call, CallId, CallKind, CallStatus, CanvasStep, DType, DimBound,
     Readout, RequestKey, SamplingState, ShapeBound, TensorRef, VisionInput,
 };
 use ipc::{CanvasSampling, RequestId, SamplingParams};
@@ -267,7 +268,7 @@ impl RequestState {
     pub(crate) fn process_generation_result(
         &mut self,
         call: &Call,
-        record: &CallOutput,
+        record: &CallCompletion,
     ) -> Result<(), GenerationResultError> {
         if call.call_id.batch_id == 0 {
             return Err(GenerationResultError::MissingCallId);
@@ -510,6 +511,22 @@ impl RequestState {
                 self.replayable = false;
             }
             _ => {}
+        }
+
+        // A sampling call draws once from the request's stream, which is what
+        // the next commit's sampling position must state: a decode draws for
+        // its token, and a prefill draws when it samples its last row. A
+        // verification installs the tokens a drafter proposed without drawing,
+        // and a prompt chunk that samples nothing draws nothing either. The
+        // call declares that it sampled by carrying the output it sampled into
+        // (`Call::token_output`); `consumer_slots` is the worker's, filled after
+        // this call was planned and never reported back.
+        if matches!(
+            call.kind,
+            CallKind::Forward(ForwardMode::Decode) | CallKind::Forward(ForwardMode::Prefill)
+        ) && call.token_output.is_some()
+        {
+            self.sampling_position = self.sampling_position.saturating_add(1);
         }
         Ok(())
     }
@@ -1240,7 +1257,7 @@ pub(crate) fn validate_generation_result(
     call: &Call,
     image_cache: Option<(u32, Option<u32>)>,
     state: &RequestState,
-    record: &CallOutput,
+    record: &CallCompletion,
     canvas: Option<&CanvasSampling>,
 ) -> Result<(), GenerationResultError> {
     let request = &state.req;
@@ -1661,6 +1678,14 @@ pub(crate) struct RequestState {
     /// rejected drafts, so this exceeds the visible extent until the next
     /// forward makes exactly what it initializes visible.
     pub(super) cache_computed_len: u32,
+    /// Draws the request's sampler has made. The slot's device state advances
+    /// its own sampling position as it installs a call's tokens; this is the
+    /// host copy the mechanism states in the commit table, and it advances
+    /// exactly as the reference counts draws: once for a decode and once for a
+    /// prefill that samples, and not at all for a verification, whose accepted
+    /// span installs tokens without drawing, nor for a prompt chunk that
+    /// samples nothing.
+    pub(super) sampling_position: u32,
     /// Committed token the next decode or `CloseCache` write continues from.
     pub(super) next_token: u32,
     pub(super) num_generated_tokens: usize,

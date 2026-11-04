@@ -34,10 +34,11 @@ call's alpha (the product of the two tensor scales, a device value the kernel
 reads) in FP32 before the one rounding that writes the tile.
 
 The operand layouts are the operator's: the activations and the weight are
-``[rows, k / 2]`` packed bytes with unit stride on ``k``, the activation scales
-are the linear ``[m, k / 16]`` E4M3 matrix, the weight scales are the 128x4
-swizzled matrix CUTLASS's FP4 product reads, and the product is ``[m, n]`` with
-unit stride on ``n``.
+``[rows, k / 2]`` packed bytes with unit stride on ``k``, both scale fields are
+E4M3 in the 128x4 interleaved atom the block scaled tensor-core instructions
+read (``tile_atom_to_shape_SF``: the atom tiled over the operand's shape, rows
+padded to a multiple of 128 and scale columns to a multiple of 4), and the
+product is ``[m, n]`` with unit stride on ``n``.
 """
 
 from typing import Tuple

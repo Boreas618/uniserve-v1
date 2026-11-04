@@ -102,8 +102,12 @@ impl Schedule {
     /// The sigma points of one modality: decreasing, starting from its noise level and ending at
     /// the clean endpoint `0`.
     ///
-    /// Consecutive equal FP32 values - which a strong shift can produce - collapse into one point,
-    /// as the released `unique_consecutive` does.
+    /// Consecutive equal FP32 values collapse into one point, as the released grid's
+    /// `unique_consecutive` does (`schedule.py:140-146`) - a uniform grid's strong shift can produce
+    /// them and its point count is a statement, not a count of evaluations. A **DMD ladder** is not
+    /// deduplicated by the reference (`schedule.py:154-174`): its rungs are one evaluation each and
+    /// its length must equal the fused per-step head tables' count, so collapsing two rungs would
+    /// silently misalign every step's heads.
     pub fn sigmas(&self, modality: Modality) -> Vec<f32> {
         let shift = f64::from(self.shift(modality));
         match &self.spec.grid {
@@ -184,6 +188,15 @@ impl Schedule {
     /// The sum is the block's node-sigma increment, so an ordinary Euler step between the two node
     /// sigmas applies that prediction. The other grids have one head, so a block of them is refused.
     pub fn block_weights(&self, modality: Modality, block: u32) -> Result<Vec<f64>> {
+        Ok(self.block_span(modality, block)?.1)
+    }
+
+    /// One evaluation block's first fine interval and its normalized integration weights.
+    ///
+    /// A parallel-decoding student stacks one output head per fine interval, so a block's fused head
+    /// sums the heads that start at this interval, weighted the way [`Schedule::block_weights`]
+    /// returns them.
+    pub fn block_span(&self, modality: Modality, block: u32) -> Result<(u32, Vec<f64>)> {
         let ScheduleGrid::Blocks {
             intervals,
             nodes,
@@ -215,10 +228,13 @@ impl Schedule {
                     .to_owned(),
             ));
         }
-        Ok(weights[start..end]
-            .iter()
-            .map(|weight| weight / total)
-            .collect())
+        Ok((
+            start as u32,
+            weights[start..end]
+                .iter()
+                .map(|weight| weight / total)
+                .collect(),
+        ))
     }
 }
 
@@ -250,7 +266,13 @@ fn deduplicate(values: Vec<f32>) -> Vec<f32> {
 fn linspace(start: f64, end: f64, count: usize) -> Vec<f64> {
     let step = (end - start) / (count - 1) as f64;
     (0..count)
-        .map(|index| start + index as f64 * step)
+        // Both endpoints are exact: the clean end of a schedule must be zero and not the residue
+        // that `start + n * step` leaves, which would scale the final sample by it.
+        .map(|index| match index {
+            0 => start,
+            last if last == count - 1 => end,
+            _ => start + index as f64 * step,
+        })
         .collect()
 }
 
@@ -271,7 +293,10 @@ fn ladder_sigmas(rungs: &[u32], num_train_timesteps: f64, shift: f64) -> Vec<f32
         .map(|rung| shifted(f64::from(*rung) / num_train_timesteps, shift) as f32)
         .collect();
     sigmas.push(0.0);
-    deduplicate(sigmas)
+    // Not deduplicated: the reference keeps one sigma per trained rung (`schedule.py:154-174`), and
+    // a collapsed rung would leave the schedule with fewer evaluations than the checkpoint has head
+    // tables. Only the uniform grid collapses equal points.
+    sigmas
 }
 
 /// A parallel-decoding student's node sigmas for one modality.
@@ -439,6 +464,20 @@ mod tests {
         assert_eq!(*video.last().expect("the clean endpoint"), 0.0);
         // A rung is unshifted on the training schedule and shifted once here.
         assert_eq!(video[0], shifted(999.0 / 1000.0, 10.0) as f32);
+    }
+
+    #[test]
+    fn a_dmd_ladder_keeps_one_evaluation_per_rung_though_two_round_together() {
+        // Two rungs a nanosecond apart under a strong shift collapse to one FP32 sigma. The reference
+        // keeps both (`schedule.py:154-174`): a ladder's length is its evaluations, and it must match
+        // the checkpoint's fused per-step head tables, so a collapse would misalign every step.
+        let spec = ScheduleSpec::dmd(vec![999_999_999, 1_000_000_000], 1_000_000_000.0, shifts())
+            .expect("a ladder of two rungs");
+        let schedule = Schedule::new(&spec).expect("a ladder of two rungs");
+        let video = schedule.sigmas(Modality::Video);
+        assert_eq!(video.len(), 3);
+        assert_eq!(video[0], video[1]);
+        assert_eq!(schedule.num_steps().expect("aligned modalities"), 2);
     }
 
     #[test]

@@ -1,0 +1,35 @@
+# The cross_fade operator's Triton backend: design 5.2's program package.
+#
+# One module per descriptor: the seam between two decoded video tiles, blended over the leading
+# `extent` positions of the height (axis 2) or the width (axis 3) of a
+# [channels, frames, height, width] tile. The weights are the decoded dtype's own arithmetic, so the
+# operator's tolerance is exact and one implementation produces the reference's bits.
+#
+# The axis and the block are compiled; `extent`, the tile's four extents, the destination's three
+# outer strides and the PDL flag are the launch's words. `out` may alias `current`.
+
+op = "cross_fade"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+
+[source]
+kind = "triton"
+files = ["src/cross_fade.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+# `dtype_f16_extent_5_axis_2_block_1024_pdl_false`.
+[kernel.descriptors]
+dimensions = { dtype = ["f16", "bf16", "f32"], extent = ["3", "4", "5", "6", "8"], axis = ["2", "3"], block = ["1024"], pdl = ["false", "true"] }
+
+[parameters]

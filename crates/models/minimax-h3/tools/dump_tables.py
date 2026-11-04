@@ -42,7 +42,12 @@ ROLES = {
 
 
 def dump(out: Path, name: str, values) -> None:
-    """Write one tensor in the H3D1 container."""
+    """Write one tensor twice: as H3D1 for the Rust comparator, and as `.npy` for the Python one.
+
+    `examples/compare_blocks.rs` reads the self-describing H3D1 file; a `.npy`-per-tensor tree is
+    what `tools/diagnosis/compare.py` reads. Both are written from the same array, so the two
+    comparators can never disagree about what a dump holds.
+    """
     if isinstance(values, torch.Tensor):
         array = values.detach().cpu().numpy()
     else:
@@ -52,6 +57,7 @@ def dump(out: Path, name: str, values) -> None:
     header = b"H3D1" + bytes([code, array.ndim])
     header += struct.pack(f"<{array.ndim}Q", *array.shape)
     (out / f"{name}.h3t").write_bytes(header + array.tobytes())
+    np.save(out / f"{name}.npy", array)
 
 
 def canvas_of(size: dict) -> image.Config:

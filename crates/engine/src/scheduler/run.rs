@@ -6,6 +6,8 @@
 //! drain commands, take one nonblocking scheduling step, and park in the
 //! executor only when the step made no progress.
 
+use std::sync::Arc;
+
 use super::*;
 use ipc::{ForwardMode, MediaCall};
 
@@ -96,16 +98,16 @@ impl Scheduler {
     ///
     /// Fails when the executor exposes an invalid aggregate capacity view.
     pub fn new(
-        executor: Box<dyn Executor>,
+        submissions: super::submission::Submissions,
         special_tokens: SpecialTokenIds,
         mut config: SchedulerConfig,
         model_dtype: crate::ModelDtype,
         generation_limits: crate::GenerationLimits,
     ) -> anyhow::Result<Self> {
-        let info = executor.info().runtime_info()?;
+        let info = submissions.info().runtime_info()?;
         let generation_limits = resolve_generation_limits(generation_limits, &info);
         let latent_dtype = worker_float_dtype(Some(model_dtype));
-        let media_storage = executor
+        let media_storage = submissions
             .info()
             .workers
             .iter()
@@ -118,7 +120,7 @@ impl Scheduler {
             .map(|(id, worker)| {
                 // The ranks back the results of the components the engine
                 // placed on them, not a component list a rank reports.
-                let components = executor
+                let components = submissions
                     .info()
                     .placements
                     .get(id)
@@ -128,7 +130,7 @@ impl Scheduler {
                     id.clone(),
                     MediaStorage::new(
                         worker.request_slots as usize,
-                        &executor.info().rank_buffer_bytes(id),
+                        &submissions.info().rank_buffer_bytes(id),
                         &components,
                         &info.media_components,
                     ),
@@ -197,7 +199,7 @@ impl Scheduler {
         // Runtime state remains single-owner; executors receive immutable batch
         // inputs assembled from these queues and request records.
         Ok(Self {
-            executor,
+            executor: submissions,
             inflight: inflight::Inflight::new(),
             placement: placement::Placement::default(),
             storage: allocation::Storage {
@@ -222,6 +224,7 @@ impl Scheduler {
             running_media: HashMap::new(),
             speculation_meter: Default::default(),
             retiring_requests: HashMap::new(),
+            rows_held: 0,
             transfer_capacity,
             latent_dtype,
             engine_id: 1,
@@ -232,6 +235,9 @@ impl Scheduler {
             output: output::OutputSender::default(),
             policy: None,
             policy_report: None,
+            shadow_pass: None,
+            serving: tokio::sync::watch::Sender::new(false),
+            generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             expert_load: None,
             expert_order: None,
             expert_asked: None,
@@ -261,6 +267,32 @@ impl Scheduler {
             failure: Arc::default(),
             stats,
         })
+    }
+
+    /// The generation the epoch serves, which the batches of a step carry: the
+    /// number the control thread's switchover arm last wrote here (§7.3).
+    ///
+    /// Read once per step, never per batch, so a switchover between two batches
+    /// of one step cannot split them across generations.
+    pub(super) fn serving_generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The serving generation's cell, for the handle that writes it.
+    pub fn generation_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.generation)
+    }
+
+    /// A receiver for [`Self::note_policy_serves`], for whoever waits until a
+    /// policy actually serves this scheduler (§7.3).
+    pub fn serving_receiver(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.serving.subscribe()
+    }
+
+    /// Reports that a policy instance serves from here on. Idempotent: a later
+    /// switchover reports it too, and a waiter only waits for the first.
+    pub(super) fn note_policy_serves(&self) {
+        self.serving.send_replace(true);
     }
 
     /// Returns the effective scheduler configuration.
@@ -731,6 +763,10 @@ impl Scheduler {
             }
 
             let progressed = self.step_nonblocking();
+            // An update's shadow pass is answered once the step that ran it has
+            // ended (§7.3 step 2): the answer never claims a comparison the
+            // step has not finished.
+            self.settle_shadow();
             if !self.fatal && !progressed {
                 self.park_for_progress();
             }

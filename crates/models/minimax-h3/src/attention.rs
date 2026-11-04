@@ -20,8 +20,19 @@
 //! is no key. [`Kind::Sparse`] is FastH3's video sparse attention over the segment packing; it is
 //! composed from `nn::layers::VsaTiles` and `nn::layers::SegmentAttention` and lands with them
 //! (see `crate::transformer`'s note on the sparse preset).
+//!
+//! ## Precision
+//!
+//! The dense attention runs in the checkpoint's own representation - BF16 activations with FP32
+//! accumulation inside the fused kernels - which is the FlashAttention row of the design's numerics
+//! table; nothing here declares an FP32 attention and no layer casts to one. The sparse path's
+//! **compression** branch is the other row: the design requires FP32 there (cuBLASLt SGEMM plus a
+//! softmax program), and the reference computes its tile means, scores and weighting in FP32
+//! throughout (`uniserve/nn/attention/vsa/segments.py:60-77`, `:429-468`), so that branch declares
+//! FP32 when it lands - in its layer's dtype and in this doc - while the fine sparse attention over
+//! the prepared rows stays in the checkpoint's dtype like the dense one.
 
-use nn::layers::{Attention, Linear, Rotary, Rotation, Sections, UlyssesExchange};
+use nn::layers::{Attention as Flash, Linear, Rotary, Rotation, Sections, UlyssesExchange};
 use nn::weights::{Weight, WeightLoader, WeightRequest};
 use nn::{Forward, Shape, TensorView};
 use ops::gemm::WeightOrder;
@@ -37,6 +48,134 @@ pub enum Kind {
     Dense,
     /// Video sparse attention over the segment packing: FastH3's DMD students.
     Sparse,
+}
+
+/// One layer's attention, of whichever kind its checkpoint composes.
+pub enum Layer {
+    /// Full bidirectional attention over the packed sequence.
+    Dense(Box<Dense>),
+    /// FastH3's video sparse attention over the segment packing.
+    Sparse(Box<crate::attention_sparse::Sparse>),
+}
+
+impl Layer {
+    /// Read layer `index`'s attention of a DiT partition, of the kind the deployment composes.
+    pub fn load(
+        kind: crate::config::AttentionKind,
+        index: u32,
+        config: &TransformerConfig,
+        rows: u32,
+        rotated_axes: &[u32],
+        partition: &Partition,
+        loader: &mut WeightLoader<'_>,
+    ) -> Result<Self> {
+        match kind {
+            crate::config::AttentionKind::Dense => Ok(Self::Dense(Box::new(Dense::load(
+                index,
+                config,
+                rows,
+                rotated_axes,
+                partition,
+                loader,
+            )?))),
+            crate::config::AttentionKind::Sparse { tile, .. } => Ok(Self::Sparse(Box::new(
+                crate::attention_sparse::Sparse::load(
+                    index,
+                    config,
+                    rows,
+                    rotated_axes,
+                    tile,
+                    partition,
+                    loader,
+                )?,
+            ))),
+        }
+    }
+
+    /// The rotary factor tables of `positions`: one table serves either kind.
+    pub fn factors(
+        &self,
+        f: &Forward,
+        positions: TensorView,
+        cosine: TensorView,
+        sine: TensorView,
+    ) -> Result<()> {
+        match self {
+            Self::Dense(dense) => dense.factors(f, positions, cosine, sine),
+            Self::Sparse(sparse) => sparse.factors(f, positions, cosine, sine),
+        }
+    }
+
+    /// Reserve the scratch this layer's kind reads, once for the whole stack.
+    pub fn reserve(
+        &self,
+        f: &Forward,
+        normalized: TensorView,
+        total_rows: u32,
+    ) -> Result<LayerScratch> {
+        Ok(match self {
+            Self::Dense(dense) => LayerScratch::Dense(Box::new(Scratch::reserve(
+                dense, f, normalized, total_rows,
+            )?)),
+            Self::Sparse(sparse) => {
+                LayerScratch::Sparse(Box::new(crate::attention_sparse::Scratch::reserve(
+                    sparse,
+                    f,
+                    normalized,
+                    u32::try_from(normalized.shape.dim(0) / u64::from(sparse.tile_rows))
+                        .map_err(|_| Error::config("more tiles than a u32".to_owned()))?,
+                )?))
+            }
+        })
+    }
+
+    /// Attend `normalized` `[rows, hidden]` of this rank and write `[rows, hidden]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward(
+        &self,
+        f: &Forward,
+        normalized: TensorView,
+        factors: Factors,
+        visible: Option<&Visible>,
+        segments: Option<&crate::attention_sparse::Segments>,
+        scratch: &LayerScratch,
+        out: TensorView,
+    ) -> Result<()> {
+        match (self, scratch) {
+            (Self::Dense(dense), LayerScratch::Dense(scratch)) => {
+                let visible = visible.ok_or_else(|| {
+                    Error::Unsupported("a dense layer needs the sequence's visibility".to_owned())
+                })?;
+                dense.forward(f, normalized, factors, visible, scratch, out)
+            }
+            (Self::Sparse(sparse), LayerScratch::Sparse(scratch)) => {
+                let views = segments.ok_or_else(|| {
+                    Error::Unsupported(
+                        "a sparse deployment's layers need the segment views".to_owned(),
+                    )
+                })?;
+                sparse.forward(
+                    f,
+                    normalized,
+                    factors,
+                    views.sizes,
+                    views.segments,
+                    views.keep,
+                    scratch,
+                    out,
+                )
+            }
+            _ => Err(Error::Unsupported(
+                "a layer's scratch is of its attention kind".to_owned(),
+            )),
+        }
+    }
+}
+
+/// The scratch of whichever kind a stack's layers are.
+pub enum LayerScratch {
+    Dense(Box<Scratch>),
+    Sparse(Box<crate::attention_sparse::Scratch>),
 }
 
 /// The rows one attention call reads, as device boundary tables.
@@ -74,7 +213,7 @@ pub struct Dense {
     rotary: Rotary,
     query_gain: Weight,
     key_gain: Weight,
-    attention: Attention,
+    attention: Flash,
     exchange: Option<UlyssesExchange>,
     heads: u32,
     local_heads: u32,
@@ -130,7 +269,7 @@ impl Dense {
             rotary,
             query_gain,
             key_gain,
-            attention: Attention::dense(
+            attention: Flash::dense(
                 config.head_dim,
                 local_heads,
                 local_heads,
@@ -160,20 +299,20 @@ impl Dense {
     }
 
     /// Attend `normalized` `[rows, hidden]` of this rank and write `[rows, hidden]`.
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         f: &Forward,
         normalized: TensorView,
         factors: Factors,
         visible: &Visible,
-        total_rows: u32,
+        scratch: &Scratch,
         out: TensorView,
     ) -> Result<()> {
-        let scratch = Scratch::reserve(self, f, normalized, total_rows)?;
         self.query.forward(f, normalized, scratch.query)?;
         self.key.forward(f, normalized, scratch.key)?;
         self.value.forward(f, normalized, scratch.value)?;
-        self.rotate(f, factors, &scratch)?;
+        self.rotate(f, factors, scratch)?;
 
         let (query, key, value) = match &self.exchange {
             None => (scratch.rotated_query, scratch.rotated_key, scratch.value),
@@ -233,21 +372,26 @@ impl Dense {
 }
 
 /// One layer's projection scratch, reserved from the forward's arena.
-struct Scratch {
-    query: TensorView,
-    key: TensorView,
-    value: TensorView,
-    rotated_query: TensorView,
-    rotated_key: TensorView,
-    exchanged_query: TensorView,
-    exchanged_key: TensorView,
-    exchanged_value: TensorView,
-    attended: TensorView,
-    gathered: TensorView,
+pub struct Scratch {
+    pub query: TensorView,
+    pub key: TensorView,
+    pub value: TensorView,
+    pub rotated_query: TensorView,
+    pub rotated_key: TensorView,
+    pub exchanged_query: TensorView,
+    pub exchanged_key: TensorView,
+    pub exchanged_value: TensorView,
+    pub attended: TensorView,
+    pub gathered: TensorView,
 }
 
 impl Scratch {
-    fn reserve(
+    /// Reserve one layer's scratch for `normalized` and a key set of `total_rows` rows.
+    ///
+    /// The shapes do not depend on the layer, and the executor's arena is a bump allocator reset
+    /// once per forward, so the stack reserves this once rather than once per layer: 50 layers of
+    /// ten change-shaped buffers is what a served canvas cannot hold.
+    pub fn reserve(
         layer: &Dense,
         f: &Forward,
         normalized: TensorView,

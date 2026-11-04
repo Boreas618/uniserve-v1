@@ -10,6 +10,81 @@
 //! request when the control loop stops.
 
 use super::*;
+use crate::handle;
+
+/// The name a stage's refusal uses.
+fn stage_name(stage: Stage) -> &'static str {
+    match stage {
+        Stage::Switchover => "switchover",
+        Stage::Commit => "commit",
+        Stage::Revert => "revert",
+        Stage::Purge => "purge",
+    }
+}
+
+/// What an engine command this scheduler does not apply itself is called, for
+/// the answer that names its owner.
+fn engine_command_name(kind: &proto::process::command::Kind) -> &'static str {
+    use proto::process::command::Kind;
+    match kind {
+        Kind::Park(_) => "park",
+        Kind::Promote(_) => "promote",
+        Kind::Precopy(_) => "precopy",
+        Kind::Switchover(_) => "switchover",
+        Kind::Commit(_) => "commit",
+        Kind::Revert(_) => "revert",
+        Kind::Purge(_) => "purge",
+        Kind::Drain(_) => "drain",
+        Kind::Serve(_) => "serve",
+        Kind::Pause(_) => "pause",
+    }
+}
+
+/// Who asked for a stage: the scheduler's own handle, which names the step
+/// the stage applied at, or an engine command, which is answered with
+/// whether it applied.
+///
+/// One path applies every stage; the answer shape is the only difference,
+/// so a stage has exactly one place where it changes the slot.
+#[derive(Debug)]
+pub(super) enum StageAnswer {
+    /// A handle's `stage`, answered with the step it applied at.
+    Step(crossbeam_channel::Sender<Result<handle::StageApplied, String>>),
+    /// An engine command, answered with whether it applied.
+    Applied(crossbeam_channel::Sender<Result<(), String>>),
+}
+
+impl StageAnswer {
+    /// Sends `result`, dropping either the step or the detail as the
+    /// caller's shape requires.
+    fn send(self, result: Result<handle::StageApplied, String>) {
+        match self {
+            Self::Step(answer) => {
+                let _ = answer.send(result);
+            }
+            Self::Applied(answer) => {
+                let _ = answer.send(result.map(|_| ()));
+            }
+        }
+    }
+}
+
+/// An update's ask that the following step's batches also run in shadow for a
+/// world generation (§7.3 step 2), with the answer that waits for the step which
+/// shadows them.
+///
+/// The ask is kept until it is answered: a refused shadow submission answers it
+/// at once with the executor's reason, and a submitted one answers it when its
+/// step has ended, so an answer never claims a pass that has not run.
+pub(super) struct ShadowPass {
+    /// The world generation whose operators the shadow pass runs.
+    pub(super) generation: u64,
+    /// One of the step's batches was submitted as a shadow: the step that owns
+    /// the answer has begun, and ends before the answer is sent.
+    pub(super) shadowed: bool,
+    /// Where the ask's answer goes, in the shape every stage's answer takes.
+    pub(super) answer: StageAnswer,
+}
 
 impl Scheduler {
     /// Removes a queued media request while preserving FIFO order for its peers.
@@ -88,6 +163,13 @@ impl Scheduler {
     /// refuse what the loaded workers cannot serve and report their own
     /// rejections.
     pub(super) fn handle_command(&mut self, cmd: Command) -> bool {
+        // Work that finished on another thread before this command arrived is
+        // taken first, so every answer describes the state the command found:
+        // the slot holds the candidate a precopy prepared by the time its
+        // answer was sent.
+        self.take_prepared_policy();
+        self.apply_policy_stage();
+
         match cmd {
             Command::Submit(submissions) => {
                 for Submission { request, event_tx } in submissions {
@@ -243,12 +325,30 @@ impl Scheduler {
                 source,
                 answer,
             } => self.precopy_policy(program, source, answer),
-            Command::SwitchoverPolicy { answer } => {
-                self.request_stage(Stage::Switchover, Some(answer));
+            Command::StagePolicy { stage, answer } => {
+                self.request_stage(stage, Some(answer), None);
             }
-            Command::CommitPolicy => self.request_stage(Stage::Commit, None),
-            Command::RevertPolicy { answer } => self.request_stage(Stage::Revert, Some(answer)),
-            Command::PurgePolicy { answer } => self.request_stage(Stage::Purge, Some(answer)),
+            Command::EngineCommand { command, answer } => {
+                self.engine_command(command, answer);
+            }
+            Command::ProgramCommand { command, answer } => {
+                self.program_command(command, answer);
+            }
+            Command::Shadow { generation, answer } => {
+                self.ask_shadow(generation, StageAnswer::Applied(answer));
+            }
+            Command::Counters { answer } => {
+                let _ = answer.send(self.counters());
+            }
+            Command::PolicyPrograms { answer } => {
+                let _ = answer.send(handle::PolicyPrograms {
+                    running: self.policy.as_ref().map(|policy| policy.program().clone()),
+                    prepared: self
+                        .policy_prepared
+                        .as_ref()
+                        .map(|candidate| candidate.program().clone()),
+                });
+            }
             Command::DiscardPolicy => {
                 self.policy_prepared = None;
                 self.policy_stage = None;
@@ -315,6 +415,47 @@ impl Scheduler {
         }
     }
 
+    /// Installs `program` as this scheduler's policy without a control thread.
+    ///
+    /// §7.3's two stages run here on the calling thread: the precopy
+    /// instantiates the program on this boundary's state and trials every
+    /// decision of §4.4's table against it, and the switchover puts it in. A
+    /// world with no control thread — the integration tests, and a simulated
+    /// engine's — has no other way to have a policy, and a scheduler with no
+    /// policy decides nothing, so without this such a world schedules no work
+    /// at all.
+    ///
+    /// Production installs a policy through the `PrecopyPolicy` and
+    /// `StagePolicy` commands, with the load, the instantiation and the trial on
+    /// a blocking thread so the serving thread is never held; this is that pair
+    /// without the thread and without the blocking hop, and it is for tests
+    /// only: the caller pays the whole cost of the precopy.
+    ///
+    /// The stage is applied where a stage is always applied — at a boundary with
+    /// nothing in flight — so the first call happens before the world submits
+    /// anything.
+    pub fn install_policy(
+        &mut self,
+        program: PolicyProgram,
+        source: &dyn PolicySource,
+    ) -> Result<(), String> {
+        let state = views::trial_state(self, self.step, self.recorder.recorded());
+        let live = views::live(self, self.step, self.recorder.recorded());
+        let ceilings = ceilings_of(BatchCapacity::of(&self.info));
+        let engine = policy::process_engine().map_err(|error| error.to_string())?;
+        let room = state.room.clone();
+        let checked = mechanism::Checked::new(&live, &room);
+        let candidate = PolicySlot::prepare(engine, source, program, state, &ceilings, &checked)
+            .map_err(|error| error.to_string())?;
+        self.policy_prepared = Some(candidate);
+        self.request_stage(Stage::Switchover, None, None);
+        self.apply_policy_stage();
+        if self.policy.is_none() {
+            return Err("the policy did not become this scheduler's".to_owned());
+        }
+        Ok(())
+    }
+
     /// Takes the candidate a precopy prepared, once its blocking thread is done.
     ///
     /// The scheduler that is about to switch reads it; a candidate that failed
@@ -333,29 +474,218 @@ impl Scheduler {
         }
     }
 
+    /// §7.3 step 2's shadow pass: the following step's batches also run in
+    /// shadow for `generation`, the executor pairing that world's operators
+    /// against the serving one's resident data without writing resident memory.
+    ///
+    /// The ask is kept until a step has shadowed its batches, which is when it
+    /// is answered; a shadow submission the executor refuses answers it at once
+    /// with the executor's reason. Only the in-process arm shadows: a
+    /// worker-process executor shadows a world on its own workers, so the ask is
+    /// refused there rather than left waiting for a step that cannot run it.
+    fn ask_shadow(&mut self, generation: u64, answer: StageAnswer) {
+        if !self.executor.serves_in_process() {
+            answer.send(Err(format!(
+                "the shadow pass of generation {generation} starts when a step submits through \
+                 executor::Batches; this scheduler still submits its batches to the worker processes"
+            )));
+            return;
+        }
+        if let Some(pending) = self.shadow_pass.as_ref() {
+            answer.send(Err(format!(
+                "the shadow pass of generation {} is waiting for the step that runs it",
+                pending.generation
+            )));
+            return;
+        }
+        self.shadow_pass = Some(ShadowPass {
+            generation,
+            shadowed: false,
+            answer,
+        });
+    }
+
+    /// The world generation the following step's batches also run in shadow
+    /// for, if an update asked (§7.3 step 2). The step reads it before it
+    /// submits, since it names the kernels the shadow pass compares against.
+    pub(super) fn shadow_generation(&self) -> Option<u64> {
+        self.shadow_pass.as_ref().map(|pass| pass.generation)
+    }
+
+    /// Records that a batch of this step was submitted as a shadow pass: the
+    /// ask is answered when the step ends, so an answer never claims a pass
+    /// that has not run.
+    pub(super) fn note_shadowed(&mut self) {
+        if let Some(pass) = self.shadow_pass.as_mut() {
+            pass.shadowed = true;
+        }
+    }
+
+    /// A shadow submission the executor refused: a shadow pass's failure is the
+    /// update's (§7.3 step 2), so the ask is answered with it and the epoch
+    /// serves on.
+    pub(super) fn shadow_failed(&mut self, reason: impl Into<String>) {
+        if let Some(pass) = self.shadow_pass.take() {
+            pass.answer.send(Err(reason.into()));
+        }
+    }
+
+    /// Answers an ask whose step has shadowed its batches: the step that owned
+    /// the answer has ended by now, and its number is the boundary the pass ran
+    /// at.
+    pub(super) fn settle_shadow(&mut self) {
+        let shadowed = self.shadow_pass.as_ref().is_some_and(|pass| pass.shadowed);
+        if !shadowed {
+            return;
+        }
+        let step = self.step;
+        if let Some(pass) = self.shadow_pass.take() {
+            pass.answer.send(Ok(handle::StageApplied { step }));
+        }
+    }
+
+    /// What this scheduler has done and what its policy has cost (§12).
+    fn counters(&self) -> handle::Counters {
+        let usage = self
+            .policy
+            .as_ref()
+            .map(policy::PolicySlot::usage)
+            .unwrap_or_default();
+        handle::Counters {
+            steps: self.step,
+            batches: self
+                .stats
+                .general
+                .steps
+                .load(std::sync::atomic::Ordering::Relaxed),
+            tokens: crate::lock(&self.stats.worker.forward_mode_tokens)
+                .values()
+                .sum(),
+            policy_fuel: usage.fuel,
+            policy_calls: usage.calls,
+            kernel_launches: 0,
+            device_ns: 0,
+        }
+    }
+
+    /// Applies one command of the program-layer update (§2.3, §7.3) to this
+    /// scheduler.
+    ///
+    /// The stages are a scheduler's: it cuts over at the boundary the command
+    /// names, ends probation, reverts, and drops the generation before the
+    /// serving one. A `Precopy` arrives with the operator programs, which are
+    /// the program layer's, and the scheduling policy, whose module comes from
+    /// the Program Server: the process that holds that source resolves it once
+    /// and precopies each scheduler (`SchedulerHandle::precopy_policy`), so the
+    /// command itself is answered with that rather than half applied here.
+    fn program_command(
+        &mut self,
+        command: ipc::ProgramCommand,
+        answer: crossbeam_channel::Sender<Result<(), String>>,
+    ) {
+        let (stage, at) = match command {
+            ipc::ProgramCommand::Switchover { step, .. } => (Stage::Switchover, step),
+            ipc::ProgramCommand::Commit { .. } => (Stage::Commit, None),
+            ipc::ProgramCommand::Revert { .. } => (Stage::Revert, None),
+            ipc::ProgramCommand::Purge { .. } => (Stage::Purge, None),
+            ipc::ProgramCommand::Precopy { .. } => {
+                let _ = answer.send(Err(
+                    "a precopy's policy is resolved through the Program Server by the process \
+                     that holds its client, which then precopies each scheduler's policy"
+                        .to_owned(),
+                ));
+                return;
+            }
+        };
+        self.request_stage(stage, Some(handle::StageAnswer::Applied(answer)), at);
+    }
+
+    /// Applies an engine command that concerns this scheduler (§7.3).
+    ///
+    /// The steps of an update are one scheduler's to apply — a switchover, a
+    /// commit, a revert, a purge — so they are answered here. The rest belong to
+    /// the process that owns what they name: a precopy is resolved by the
+    /// process holding the Program Server (it instantiates one candidate per
+    /// scheduler), and a park, promote, drain, serve or pause is the engine
+    /// process's own lifecycle. Each answer names that rather than reporting
+    /// success for work that did not happen.
+    fn engine_command(
+        &mut self,
+        command: proto::process::Command,
+        answer: crossbeam_channel::Sender<Result<(), String>>,
+    ) {
+        use proto::process::command::Kind;
+
+        let stage = match command.kind {
+            Some(Kind::Switchover(_)) => Stage::Switchover,
+            Some(Kind::Commit(_)) => Stage::Commit,
+            Some(Kind::Revert(_)) => Stage::Revert,
+            Some(Kind::Purge(_)) => Stage::Purge,
+            Some(Kind::Precopy(_)) => {
+                let _ = answer.send(Err(
+                    "a precopy is resolved once per epoch by the process that holds the Program \
+                     Server, which then precopies each scheduler's policy"
+                        .to_owned(),
+                ));
+                return;
+            }
+            Some(other) => {
+                let _ = answer.send(Err(format!(
+                    "{} is the engine process's own command, not one scheduler's",
+                    engine_command_name(&other)
+                )));
+                return;
+            }
+            None => {
+                let _ = answer.send(Err("an engine command names no kind".to_owned()));
+                return;
+            }
+        };
+        self.request_stage(stage, Some(handle::StageAnswer::Applied(answer)), None);
+    }
+
     /// Asks for a stage of §7.3, answered when it is applied.
     ///
     /// A stage changes the serving policy, so it is applied where no batch and
     /// no submission is in flight — never in the middle of one (§7.3: "在一个
     /// 批次边界（更新点）上"). A switchover with nothing prepared is refused at
     /// once: the daemon's precopy failed and the update is discarded.
+    ///
+    /// `at` is the step an expert group agreed to cut over at, when a peer main
+    /// process named it: the stage then waits for that step and refuses to apply
+    /// at any other.
     fn request_stage(
         &mut self,
         stage: Stage,
-        answer: Option<crossbeam_channel::Sender<Result<(), String>>>,
+        answer: Option<handle::StageAnswer>,
+        at: Option<u64>,
     ) {
+        // One stage owns the next boundary. A second one is refused with the
+        // first's name rather than replacing it: replacing it would drop the
+        // first caller's answer, and applying both would change the serving
+        // policy twice on one boundary.
+        if let Some((waiting, _, _)) = &self.policy_stage {
+            let waiting = *waiting;
+            if let Some(answer) = answer {
+                answer.send(Err(format!(
+                    "a {} is already waiting for the boundary that applies it",
+                    stage_name(waiting)
+                )));
+            }
+            return;
+        }
         if stage == Stage::Switchover {
             self.take_prepared_policy();
             if self.policy_prepared.is_none() {
                 if let Some(answer) = answer {
-                    let _ = answer.send(Err(
+                    answer.send(Err(
                         "a switchover arrived without a policy prepared by a precopy".to_owned(),
                     ));
                 }
                 return;
             }
         }
-        self.policy_stage = Some((stage, answer));
+        self.policy_stage = Some((stage, answer, at));
         self.apply_policy_stage();
     }
 
@@ -368,16 +698,47 @@ impl Scheduler {
         if !ready {
             return;
         }
-        let Some((stage, answer)) = self.policy_stage.take() else {
+        // A command that names the step its expert group agreed applies at that
+        // step alone: before it, the stage waits; after it, the boundary the
+        // other ranks took never comes here, so it is refused rather than
+        // applied at a boundary they did not take.
+        let agreed = match &self.policy_stage {
+            Some((_, _, at)) => *at,
+            None => return,
+        };
+        if let Some(at) = agreed {
+            if self.step < at {
+                return;
+            }
+            if self.step > at {
+                let Some((stage, answer, _)) = self.policy_stage.take() else {
+                    return;
+                };
+                if let Some(answer) = answer {
+                    answer.send(Err(format!(
+                        "the {} was to apply at step {at}, which this scheduler passed at step {}",
+                        stage_name(stage),
+                        self.step
+                    )));
+                }
+                return;
+            }
+        }
+        let Some((stage, answer, _at)) = self.policy_stage.take() else {
             return;
         };
         let state = views::trial_state(self, self.step, self.recorder.recorded());
+        // The step the stage applied at: the boundary this scheduler reached,
+        // where the policy it replaced had decided its last batch. The ranks of
+        // an expert group take their steps on the union's batches, so their
+        // boundaries carry the same number.
+        let applied_at = handle::StageApplied { step: self.step };
         let applied = match self.stage_policy(stage, &state) {
             Ok(report) => {
                 if let Some(report) = report {
                     self.policy_report = Some(report);
                 }
-                Ok(())
+                Ok(applied_at)
             }
             Err(reason) => {
                 let program = self.policy.as_ref().map(|policy| policy.program().clone());
@@ -393,7 +754,7 @@ impl Scheduler {
             }
         };
         if let Some(answer) = answer {
-            let _ = answer.send(applied);
+            answer.send(applied);
         }
     }
 
@@ -413,16 +774,26 @@ impl Scheduler {
             let engine = policy::process_engine().map_err(|error| error.to_string())?;
             let ceilings = ceilings_of(BatchCapacity::of(&self.info));
             self.adopt(PolicySlot::from_candidate(engine, ceilings, candidate));
+            // From here the mechanism decides: a scheduler with no policy
+            // forms no batch, and the serving path's warm-up waits for this.
+            self.note_policy_serves();
             return Ok(None);
         };
+        let mut serves = false;
         if stage == Stage::Switchover {
             let Some(candidate) = self.policy_prepared.take() else {
                 return Err("a switchover arrived without a prepared policy".to_owned());
             };
             policy.adopt(candidate);
+            serves = true;
         }
         policy.request(stage);
-        policy.boundary(state).map_err(|error| error.to_string())
+        let applied = policy.boundary(state).map_err(|error| error.to_string());
+        if serves {
+            // A policy instance serves from this boundary on (§7.3 step 3).
+            self.note_policy_serves();
+        }
+        applied
     }
 
     /// Selects commands with available destinations without bypassing an older
@@ -454,6 +825,20 @@ impl Scheduler {
         selected
     }
 
+    /// Tells the policy that a request ended, when the mechanism ended it
+    /// itself.
+    ///
+    /// A policy's state is append-only: it learns a request from `Arrived` and
+    /// nothing else about it unless the mechanism says so. A queued request the
+    /// mechanism drops without an `End` stays in the policy's own queue, and
+    /// the next `dispatch` names it in `admit`, where the mechanism refuses it
+    /// as "not queued" — a policy failure, on a name the policy could not have
+    /// known was stale. So every pop of a queue the policy did not fill is
+    /// announced here, with the end that pop means.
+    pub(super) fn announce_end(&mut self, id: RequestId, end: scheduling::guest::event::End) {
+        self.recorder.record(views::ended(id, end));
+    }
+
     /// Records cancellation or abortion across queued, media, and running request states.
     ///
     /// A queued request finishes here with `Aborted` or `Cancelled`. A running
@@ -469,6 +854,9 @@ impl Scheduler {
             } else {
                 FinishReason::Cancelled
             };
+            // Both reasons are the client's will: it cancelled the request, or
+            // it asked for it to be dropped, and the epoch goes on either way.
+            self.announce_end(id, scheduling::guest::event::End::Cancelled);
             let _ = submission.event_tx.send(Event::Finished {
                 reason,
                 stop_reason: None,
@@ -507,6 +895,7 @@ impl Scheduler {
         }
         // A request not yet admitted leaves the waiting queue with its reason.
         if let Some(st) = self.remove_waiting(id) {
+            self.announce_end(id, scheduling::guest::event::End::Cancelled);
             let reason = if abort {
                 FinishReason::Aborted
             } else {
@@ -572,6 +961,7 @@ impl Scheduler {
             .collect();
         for id in queued {
             if let Some(st) = self.remove_waiting(id) {
+                self.announce_end(id, scheduling::guest::event::End::Migratable);
                 let _ = st.output.events.event_tx.send(Event::Migratable {
                     cause,
                     denoised_steps: 0,

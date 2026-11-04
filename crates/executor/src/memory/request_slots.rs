@@ -11,7 +11,7 @@ use crate::{Error, Result};
 /// One field of per-slot state a model declares: `shape` is one slot's
 /// extent; host fields live in page-locked host storage.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SlotField {
+pub struct SlotField {
     pub name: String,
     pub dtype: ElementType,
     pub shape: Vec<i64>,
@@ -147,6 +147,17 @@ mod tests {
             shapes,
             [("tokens".into(), vec![3, 4]), ("seed".into(), vec![3])]
         );
+        Ok(())
+    }
+
+    /// A rank that declares no field maps nothing: no bank, no byte and no
+    /// padding row, so the engine may pass an empty list rather than a dummy.
+    #[test]
+    fn a_rank_without_fields_maps_nothing() -> Result<()> {
+        assert_eq!(RequestSlots::bytes(&[], 8)?, (0, 0));
+        let slots = RequestSlots::allocate(&[], 8, None)?;
+        assert!(slots.views().is_empty());
+        assert_eq!(slots.mapped_bytes(), 0);
         Ok(())
     }
 

@@ -524,6 +524,33 @@ impl ProcessClient {
             .map(|exit| format!("{} on host {}", exit.status, exit.host))
     }
 
+    /// Files one message of the process interface that arrived unasked, waiting
+    /// at most `timeout` for one (§7.3's commands and exit events).
+    ///
+    /// # Errors
+    ///
+    /// Fails when the connection failed or the daemon closed it.
+    pub(crate) fn poll(&mut self, timeout: Duration) -> anyhow::Result<()> {
+        match self.connection.try_recv::<Downstream>() {
+            Ok(Some(message)) => {
+                let _ = self.receive(message);
+            }
+            Ok(None) => self
+                .connection
+                .wait(timeout)
+                .context("waiting on the process interface")?,
+            Err(proto::Error::Closed) => anyhow::bail!("the daemon closed the process interface"),
+            Err(error) => return Err(error).context("reading the process interface"),
+        }
+        Ok(())
+    }
+
+    /// Closes the process interface, so the daemon sees this main process leave
+    /// after the `stop` of a world change.
+    pub(crate) fn close(&mut self) {
+        self.connection.close();
+    }
+
     /// Files the exits the connection holds, without waiting.
     fn pump(&mut self) {
         while let Ok(Some(message)) = self.connection.try_recv::<Downstream>() {
@@ -536,9 +563,17 @@ impl ProcessClient {
         match message.kind {
             Some(downstream::Kind::Reply(reply)) => Some(reply),
             Some(downstream::Kind::Event(event)) => {
-                if let Some(event::Kind::Exit(exit)) = event.kind {
-                    tracing::warn!(group = %exit.group, rank = exit.rank, host = %exit.host, status = %exit.status, "a worker exited");
-                    self.exits.file(exit);
+                match event.kind {
+                    Some(event::Kind::Exit(exit)) => {
+                        tracing::warn!(group = %exit.group, rank = exit.rank, host = %exit.host, status = %exit.status, "a worker exited");
+                        self.exits.file(exit);
+                    }
+                    // The daemon's command for this main process (§7.3): filed
+                    // for its one reader, whoever connected the link.
+                    Some(event::Kind::Command(command)) => {
+                        let _ = command_channel().sender.try_send(command);
+                    }
+                    None => {}
                 }
                 None
             }

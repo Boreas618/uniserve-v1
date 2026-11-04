@@ -1,0 +1,36 @@
+# The rows operator's Triton backend: design 5.2's program package.
+#
+# Place or accumulate the rows a model picks out by index. `replace` copies a source row into the
+# destination row its index names; `add` accumulates it with one rounding into the destination's
+# dtype. The mode is a compilation because the two are different arithmetic with different
+# tolerances, and `columns` is the row width the program addresses with.
+#
+# One program is one (source row, block of columns), which is the operator's own grid. A repeated
+# index is allowed by the operator and lands two source rows in two blocks with no order between
+# them: the package states that rather than pretending the scheduler preserves it.
+
+op = "rows"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+
+[source]
+kind = "triton"
+files = ["src/rows.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+# `dtype_bf16_mode_replace_columns_5120_block_1024_pdl_false`, and the slice's own widths.
+[kernel.descriptors]
+dimensions = { dtype = ["bf16", "f16", "f32"], mode = ["replace", "add"], columns = ["5120", "5376", "2048"], block = ["1024"], pdl = ["false", "true"] }
+
+[parameters]

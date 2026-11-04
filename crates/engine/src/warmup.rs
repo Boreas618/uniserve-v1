@@ -1,9 +1,17 @@
-//! Startup warmup through the scheduler.
+//! Serving warmup through the scheduler.
 //!
-//! Once the workers have reported, the engine admits real requests of the
-//! shapes they prepared for, so the serving path of every captured row
-//! count, guidance-branch count and diffusion LM step has run before the
-//! first client request. The scheduler and its allocators form every batch
+//! Once the epoch's first policy serves, the engine admits real requests of the
+//! shapes the workers prepared for, so the serving path of every captured row
+//! count, guidance-branch count and diffusion LM step has run before the first
+//! client request that needs it.
+//!
+//! It runs after the first policy, not at startup, because it is the serving
+//! path that is warmed and the serving path is the policy's: a scheduler with no
+//! policy forms no batch, so a warm-up at startup would wait forever for
+//! requests nothing could decide. Startup therefore records the intent
+//! ([`after_serving`]) and does not wait for it, and a warm-up that fails is
+//! logged while serving continues — a device that cannot run these shapes fails
+//! the first client request that needs them, in the open. The scheduler and its allocators form every batch
 //! as they form a client's; a rank states only the shapes
 //! (`WorkerInfo::image_warmups`, `diffusion_lm_step_rows`) and takes no part
 //! in forming them. The ranks warmed their kernels and captured their graphs
@@ -54,29 +62,117 @@ const IMAGE_STEPS: u16 = 2;
 ///
 /// Warmup runs only where the workers execute on CUDA devices: a CPU or stub
 /// worker has no kernels or graphs to warm.
-pub(crate) fn warm(core: &SchedulerHandle, config: &EngineConfig) -> anyhow::Result<()> {
-    let on_cuda = config
-        .worker_groups
-        .iter()
-        .flat_map(|worker| &worker.ranks)
-        .any(|rank| rank.device == "cuda" || rank.device.starts_with("cuda:"));
-    if config.worker_process.stub || !on_cuda {
-        return Ok(());
+/// What a warm-up needs of a scheduler, so a thread of the engine's can warm a
+/// rank without holding the handle the engine serves with.
+pub(crate) struct Warm {
+    /// The rank's reported capabilities, which state the shapes to warm.
+    pub(crate) info: ipc::WorkerInfo,
+    /// The generation limits its requests are admitted under.
+    pub(crate) generation_limits: crate::GenerationLimits,
+    /// The scheduler's request ids, shared with the handle that owns them.
+    pub(crate) next_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Set when the scheduler stops fatally; see [`Warm::is_dead`].
+    pub(crate) dead: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The scheduler's first fatal error, if it has one.
+    pub(crate) failure: std::sync::Arc<std::sync::OnceLock<String>>,
+    /// The scheduler's command channel, which the requests are submitted on.
+    pub(crate) commands: crate::CommandSender,
+}
+
+impl Warm {
+    /// The rank's reported capabilities.
+    fn info(&self) -> &ipc::WorkerInfo {
+        &self.info
     }
 
-    let info = core.info();
-    let limits = core.generation_limits();
+    /// The generation limits a request of the deployment's shapes is admitted
+    /// under.
+    fn generation_limits(&self) -> crate::GenerationLimits {
+        self.generation_limits.clone()
+    }
+
+    /// A request id of this scheduler's, so warm-up requests are numbered with
+    /// a client's.
+    fn next_request_id(&self) -> ipc::RequestId {
+        ipc::RequestId(self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Whether the scheduler stopped fatally, which ends a warm-up.
+    fn is_dead(&self) -> bool {
+        self.dead.load(std::sync::atomic::Ordering::SeqCst) || self.failure.get().is_some()
+    }
+
+    /// Submits the warm-up's requests together, as a client's arrival would.
+    fn submit_all(&self, requests: Vec<Request>) -> Result<Vec<EventRx>, crate::SubmitError> {
+        if self.is_dead() {
+            return Err(crate::SubmitError::Dead);
+        }
+        self.commands.submit_all(requests)
+    }
+}
+
+/// Runs the warm-up once the epoch's first policy serves, on a thread of its own
+/// ([`Warm`] is what it holds).
+pub(crate) fn after_serving(core: &SchedulerHandle, config: &EngineConfig) {
+    let intent = core.warmup();
+    let serving = core.serving();
+    let config = config.clone();
+    let spawned = std::thread::Builder::new()
+        .name("warmup".to_owned())
+        .spawn(move || {
+            wait_serving(serving);
+            if let Err(error) = warm(&intent, &config) {
+                // Serving continues: the shapes this warms are the ones a client
+                // request reaches anyway, where its failure is visible.
+                tracing::warn!(%error, "the serving path's warm-up failed; the engine serves on");
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::warn!(%error, "the warm-up thread could not start; the engine serves on");
+    }
+}
+
+/// Blocks until a policy instance serves, given the scheduler's serving signal.
+///
+/// The signal is the scheduler's `watch`, polled: the waiters are ordinary
+/// threads (the warm-up's), and a closed channel means the scheduler is gone.
+pub(crate) fn wait_serving(mut serving: tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if *serving.borrow_and_update() {
+            return;
+        }
+        if serving.has_changed().is_err() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// One group of warm-up requests: the shapes one part of the serving path runs,
+/// submitted together and awaited together.
+pub(crate) struct Group {
+    /// What the group warms, for the log: a token model's prefill and decode,
+    /// a diffusion LM's row count, an image shape.
+    pub(crate) what: String,
+    /// The requests, submitted in one command so the scheduler queues all of
+    /// them before it forms its next batch.
+    pub(crate) requests: Vec<GenerationRequest>,
+}
+
+/// The warm-up requests this deployment's ranks call for, in the order they run.
+///
+/// The set is kept apart from submitting it: the submission needs a policy —
+/// a scheduler with no policy forms no batch — while the requests a
+/// deployment's shapes call for can be stated, and checked, without one.
+/// `limits` are the deployment's resolved generation limits, so a shape serving
+/// could not reach is left out here as well.
+pub(crate) fn groups(
+    config: &EngineConfig,
+    info: &ipc::WorkerInfo,
+    limits: &crate::GenerationLimits,
+    mut next_id: impl FnMut() -> ipc::RequestId,
+) -> anyhow::Result<Vec<Group>> {
     let supports = |kind| info.supported_calls.contains(&kind);
-    let request = |tokens: usize| {
-        warmup_request(
-            config,
-            core.next_request_id(),
-            GenerationConstraint::UndOnly,
-            tokens,
-            ImageParams::default(),
-            Vec::new(),
-        )
-    };
     // Keeps the requests clients could submit, naming what it leaves out.
     let servable = |what: &str, requests: Vec<GenerationRequest>| {
         // A deployment with block sampling generates every request but a
@@ -88,7 +184,7 @@ pub(crate) fn warm(core: &SchedulerHandle, config: &EngineConfig) -> anyhow::Res
             } else {
                 request.required_features()
             };
-            limits.features.contains(needs) && request.validate_resources(&limits).is_ok()
+            limits.features.contains(needs) && request.validate_resources(limits).is_ok()
         });
         if !refused.is_empty() {
             tracing::info!(
@@ -98,6 +194,19 @@ pub(crate) fn warm(core: &SchedulerHandle, config: &EngineConfig) -> anyhow::Res
         }
         kept
     };
+    let mut und = |tokens: usize| {
+        warmup_request(
+            config,
+            next_id(),
+            GenerationConstraint::UndOnly,
+            tokens,
+            ImageParams::default(),
+            Vec::new(),
+            0,
+        )
+    };
+
+    let mut groups = Vec::new();
 
     // The token request: a prefill followed by a decode over its token. A
     // diffusion LM deployment, whose limits grant no understanding feature,
@@ -105,10 +214,12 @@ pub(crate) fn warm(core: &SchedulerHandle, config: &EngineConfig) -> anyhow::Res
     let decodes = supports(CallKind::Forward(ForwardMode::Prefill))
         && supports(CallKind::Forward(ForwardMode::Decode));
     if decodes {
-        let requests = servable("token", vec![request(2)]);
+        let requests = servable("token", vec![und(2)]);
         if !requests.is_empty() {
-            run(core, "token", requests)?;
-            tracing::info!("completed token runtime warmup");
+            groups.push(Group {
+                what: "token".to_owned(),
+                requests,
+            });
         }
     }
 
@@ -121,29 +232,26 @@ pub(crate) fn warm(core: &SchedulerHandle, config: &EngineConfig) -> anyhow::Res
         // shortest finishes: each commits its block in its own batch, and
         // whether two of them step together again depends on timing. So each
         // row count is its own group of equal requests.
-        let mut warmed = false;
         for rows in (1..=info.diffusion_lm_step_rows as usize).rev() {
             let blocks = if rows == 1 { 2 } else { 1 };
             let requests = servable(
                 "diffusion LM",
                 // The scheduler generates every such request in canvases of
                 // the deployment's block sampling.
-                (0..rows).map(|_| request(blocks * length)).collect(),
+                (0..rows).map(|_| und(blocks * length)).collect(),
             );
             if !requests.is_empty() {
-                run(core, "diffusion LM", requests)?;
-                warmed = true;
+                groups.push(Group {
+                    what: "diffusion LM".to_owned(),
+                    requests,
+                });
             }
-        }
-        if warmed {
-            tracing::info!("completed diffusion LM generation warmup");
         }
     }
 
     let images = supports(CallKind::Media(MediaCall::LatentPreparation))
         && supports(CallKind::Media(MediaCall::Denoising));
     if images {
-        let mut warmed = false;
         for shape in &info.image_warmups {
             let (cfg_text_scale, cfg_img_scale) = ImageParams::guidance_scales(shape.branches)
                 .with_context(|| {
@@ -169,21 +277,37 @@ pub(crate) fn warm(core: &SchedulerHandle, config: &EngineConfig) -> anyhow::Res
                 &what,
                 vec![warmup_request(
                     config,
-                    core.next_request_id(),
+                    next_id(),
                     GenerationConstraint::GenOnly,
                     0,
                     image,
                     shape.negative_token_ids.clone(),
+                    1,
                 )],
             );
             if !requests.is_empty() {
-                run(core, "image", requests)?;
-                warmed = true;
+                groups.push(Group { what, requests });
             }
         }
-        if warmed {
-            tracing::info!("completed image runtime warmup");
-        }
+    }
+    Ok(groups)
+}
+
+pub(crate) fn warm(core: &Warm, config: &EngineConfig) -> anyhow::Result<()> {
+    let on_cuda = config
+        .worker_groups
+        .iter()
+        .flat_map(|worker| &worker.ranks)
+        .any(|rank| rank.device == "cuda" || rank.device.starts_with("cuda:"));
+    if config.worker_process.stub || !on_cuda {
+        return Ok(());
+    }
+
+    let info = core.info().clone();
+    let limits = core.generation_limits();
+    for group in groups(config, &info, &limits, || core.next_request_id())? {
+        run(core, &group.what, group.requests)?;
+        tracing::info!(warmup = %group.what, "completed a serving path warm-up group");
     }
     Ok(())
 }
@@ -203,6 +327,7 @@ fn warmup_request(
     tokens: usize,
     image: ImageParams,
     negative_token_ids: Vec<u32>,
+    images: u16,
 ) -> GenerationRequest {
     GenerationRequest {
         request_id,
@@ -218,8 +343,10 @@ fn warmup_request(
             ..SamplingParams::default()
         },
         image,
-        // One generated image, the budget a client's image request states.
-        max_images: 1,
+        // The images the request asks for: one for an image shape, none for a
+        // request that only generates tokens, since a text deployment has no
+        // image path to run and no shape to read.
+        max_images: images,
         max_und_tokens: tokens,
         stop_strings: Vec::new(),
         stop_token_ids: Vec::new(),
@@ -255,7 +382,7 @@ fn warmup_request(
 /// before it forms its next batch, as it would concurrent clients that all
 /// arrived before that batch.
 fn run(
-    core: &SchedulerHandle,
+    core: &Warm,
     group: &str,
     requests: Vec<GenerationRequest>,
 ) -> anyhow::Result<()> {
@@ -270,7 +397,7 @@ fn run(
 }
 
 /// Reads one request's events until its terminal event.
-fn await_finish(core: &SchedulerHandle, group: &str, stream: &mut EventRx) -> anyhow::Result<()> {
+fn await_finish(core: &Warm, group: &str, stream: &mut EventRx) -> anyhow::Result<()> {
     loop {
         match stream.try_recv() {
             Ok(Event::Finished { reason, .. }) => {
@@ -300,52 +427,33 @@ fn await_finish(core: &SchedulerHandle, group: &str, stream: &mut EventRx) -> an
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     use crate::{GenerationFeatures, GenerationLimits};
     use ipc::CanvasSampling;
-    use ipc::{BatchCommand, ImageWarmup};
+    use ipc::ImageWarmup;
 
     use super::*;
-    use crate::executor::ExecutionBatch;
-    use crate::sim::{BatchEvent, SimEngine, SimExecutor};
+    use crate::sim::{SimEngine, SimExecutor};
 
-    /// Runs `warm` on `sim`, reported to run on a CUDA device, in the
-    /// deployment `deployment` adjusts, and returns every batch the executor
-    /// accepted.
-    fn warmed(sim: SimEngine, deployment: impl FnOnce(&mut EngineConfig)) -> Vec<ExecutionBatch> {
-        let mut executor = SimExecutor::new(sim);
-        let boundary = executor.observe();
+    /// The warm-up's groups on `sim`, which reports running on a CUDA device, in
+    /// the deployment `deployment` adjusts.
+    ///
+    /// The requests are stated without being submitted: a scheduler with no
+    /// policy forms no batch, so a warm-up only runs once the epoch's first
+    /// policy serves, and what a deployment's shapes ask for is checked here.
+    fn groups_of(sim: SimEngine, deployment: impl FnOnce(&mut EngineConfig)) -> Vec<Group> {
         let mut config = EngineConfig::sim("warmup");
         config.worker_groups[0].ranks[0].device = "cuda:0".to_owned();
         deployment(&mut config);
+        let executor = SimExecutor::new(sim);
         let core = SchedulerHandle::with_executor(config.clone(), Box::new(executor)).unwrap();
-
-        let result = warm(&core, &config);
+        let mut id = 0;
+        let groups = groups(&config, core.info(), &core.generation_limits(), || {
+            id += 1;
+            ipc::RequestId(id)
+        })
+        .expect("the deployment's warm-up requests are stated");
         core.shutdown();
-        result.unwrap();
-        boundary
-            .try_iter()
-            .filter_map(|event| match event {
-                BatchEvent::Submitted(batch) => Some(batch),
-                BatchEvent::Resolved { .. } => None,
-            })
-            .collect()
-    }
-
-    /// The batches that ran calls of `kind`, by their call count.
-    fn calls(batches: &[ExecutionBatch], kind: CallKind) -> Vec<usize> {
-        batches
-            .iter()
-            .map(|batch| {
-                batch
-                    .requests
-                    .iter()
-                    .filter(|(call, _)| call.kind == kind)
-                    .count()
-            })
-            .filter(|&count| count > 0)
-            .collect()
+        groups
     }
 
     fn shape(height: u32, width: u32, branches: u8, negative_token_ids: Vec<u32>) -> ImageWarmup {
@@ -365,85 +473,103 @@ mod tests {
     }
 
     #[test]
-    fn a_token_deployment_runs_a_prefill_and_a_decode() {
-        let batches = warmed(SimEngine::new(), |_| {});
-        assert_eq!(
-            calls(&batches, CallKind::Forward(ForwardMode::Prefill)),
-            [1]
-        );
-        assert_eq!(calls(&batches, CallKind::Forward(ForwardMode::Decode)), [1]);
-        assert!(calls(&batches, CallKind::Media(MediaCall::Denoising)).is_empty());
+    fn a_token_deployment_warms_a_prefill_and_a_decode() {
+        let groups = groups_of(SimEngine::new(), |_| {});
+        assert_eq!(groups.len(), 1, "one group: the token runtime's");
+        assert_eq!(groups[0].what, "token");
+        // A one-token prompt and two generated tokens: the prefill, then a
+        // decode that consumes its token.
+        let [request] = &groups[0].requests[..] else {
+            panic!("the token warm-up is one request");
+        };
+        assert_eq!(request.prompt_token_ids.len(), 1);
+        assert_eq!(request.max_und_tokens, 2);
+        assert_eq!(request.max_images, 0, "no image in a token request");
     }
 
     #[test]
     fn a_cpu_deployment_runs_no_warmup() {
-        let mut executor = SimExecutor::new(SimEngine::new());
-        let boundary = executor.observe();
+        // `EngineConfig::sim` runs on CPU, where no serving path is captured.
         let config = EngineConfig::sim("warmup");
+        let executor = SimExecutor::new(SimEngine::new());
         let core = SchedulerHandle::with_executor(config.clone(), Box::new(executor)).unwrap();
-
-        let result = warm(&core, &config);
+        let intent = core.warmup();
+        let result = warm(&intent, &config);
         core.shutdown();
-        result.unwrap();
-        assert_eq!(boundary.try_iter().count(), 0);
+        result.expect("a CPU deployment has nothing to warm");
     }
 
     #[test]
     fn each_image_shape_runs_both_denoising_steps_and_decodes_its_image() {
-        let sim = image_rank(vec![
-            shape(64, 64, 1, Vec::new()),
-            shape(64, 128, 2, vec![11, 12]),
-            shape(128, 64, 3, vec![11, 12]),
-        ]);
-        let batches = warmed(sim, |_| {});
-
-        // The denoiser runs one request at a time: one call per batch,
-        // two steps and one decode per shape.
-        assert_eq!(
-            calls(&batches, CallKind::Media(MediaCall::Denoising)),
-            [1; 6]
+        let groups = groups_of(
+            image_rank(vec![
+                shape(64, 64, 1, Vec::new()),
+                shape(64, 128, 2, vec![11, 12]),
+                shape(128, 64, 3, vec![11, 12]),
+            ]),
+            |_| {},
         );
+
+        // The token runtime's group comes first; the shapes follow, one group
+        // each, because the denoiser runs one request at a time.
+        let images: Vec<&Group> = groups.iter().filter(|group| group.what != "token").collect();
+        assert_eq!(images.len(), 3, "one group per shape");
+        for group in &images {
+            let [request] = &group.requests[..] else {
+                panic!("an image warm-up group holds one request");
+            };
+            assert_eq!(request.image.steps, IMAGE_STEPS, "every denoising step");
+            assert_eq!(request.max_images, 1, "and one decoded image");
+        }
+        let shapes: Vec<(u32, u32)> = images
+            .iter()
+            .map(|group| {
+                let request = &group.requests[0];
+                (request.image.height, request.image.width)
+            })
+            .collect();
         assert_eq!(
-            calls(&batches, CallKind::Media(MediaCall::ImageDecoding)),
-            [1; 3]
+            shapes,
+            [(64, 64), (64, 128), (128, 64)],
+            "the rank's prepared shapes, each once, in the order it prepared them"
         );
     }
 
     #[test]
     fn a_guided_shape_admits_the_negative_tokens_its_rank_frames() {
-        let sim = image_rank(vec![shape(64, 64, 2, vec![11, 12, 13])]);
-
         // The rank conditions the text-unconditional branch on exactly the
-        // admitted negative tokens, and the engine sizes that prefix from
-        // them, so the request carries the model's framing of an empty
-        // negative prompt as a client's request does.
-        let admitted = warmed(sim, |_| {})
+        // admitted negative tokens, and the engine sizes that prefix from them,
+        // so the request carries the model's framing of an empty negative
+        // prompt as a client's request does.
+        let groups = groups_of(image_rank(vec![shape(64, 64, 2, vec![11, 12, 13])]), |_| {});
+        let image = groups
             .iter()
-            .flat_map(|batch| &batch.commands)
-            .filter_map(|command| match command {
-                BatchCommand::Start { request } if request.image.is_some() => request
-                    .generation
-                    .as_ref()
-                    .map(|generation| generation.negative_token_ids.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(admitted, [vec![11, 12, 13]]);
+            .find(|group| group.what == "64x64 image of 2 branches")
+            .expect("the rank's guided shape is warmed");
+        assert_eq!(
+            image.requests[0].negative_prompt_token_ids,
+            [11, 12, 13],
+            "the shape's negative tokens travel in the request"
+        );
     }
 
     #[test]
     fn a_shape_the_limits_refuse_is_not_warmed() {
-        let sim = image_rank(vec![
-            shape(64, 64, 1, Vec::new()),
-            shape(64, 64, 3, vec![11]),
-        ]);
-
-        // At most two guidance branches: no client can submit the
-        // three-branch shape either.
-        let batches = warmed(sim, |config| config.generation_limits.max_cfg_branches = 2);
+        let groups = groups_of(
+            image_rank(vec![shape(64, 64, 1, Vec::new()), shape(64, 64, 3, vec![11])]),
+            // At most two guidance branches: no client can submit the
+            // three-branch shape either.
+            |config| config.generation_limits.max_cfg_branches = 2,
+        );
+        let images: Vec<&str> = groups
+            .iter()
+            .map(|group| group.what.as_str())
+            .filter(|what| *what != "token")
+            .collect();
         assert_eq!(
-            calls(&batches, CallKind::Media(MediaCall::Denoising)),
-            [1; 2]
+            images,
+            ["64x64 image of 1 branches"],
+            "the shape the deployment's limits refuse is left out"
         );
     }
 
@@ -469,22 +595,32 @@ mod tests {
         // The ranks are launched with the deployment's block sampling.
         sim.set_canvas_sampling(canvas);
 
-        let batches = warmed(sim, |config| {
+        let groups = groups_of(sim, |config| {
             config.generation_limits = GenerationLimits {
                 features: GenerationFeatures::UNDERSTANDING | GenerationFeatures::TOKEN_DENOISING,
                 ..config.generation_limits.clone()
             };
             config.worker_process.canvas_sampling = Some(canvas);
         });
-        let steps = calls(&batches, CallKind::Forward(ForwardMode::TokenDenoising));
+
+        let rows: Vec<usize> = groups
+            .iter()
+            .filter(|group| group.what == "diffusion LM")
+            .map(|group| group.requests.len())
+            .collect();
         assert_eq!(
-            steps.iter().copied().collect::<BTreeSet<_>>(),
-            BTreeSet::from([1, 2, 3])
+            rows,
+            [3, 2, 1],
+            "every row count from the rank's largest down to one, as its own group"
         );
-        // Each group prefills its prompts together; the one-row request's
-        // first block is committed by a prefill of its own.
-        let prefills = calls(&batches, CallKind::Forward(ForwardMode::Prefill));
-        assert!(prefills.contains(&3) && prefills.contains(&2));
-        assert!(prefills.iter().filter(|&&rows| rows == 1).count() >= 2);
+        // Each group asks for its own number of blocks of the canvas; the
+        // one-row request asks for two, so its committed block runs the prefill
+        // of a commit.
+        let blocks: Vec<usize> = groups
+            .iter()
+            .filter(|group| group.what == "diffusion LM")
+            .map(|group| group.requests[0].max_und_tokens / canvas.canvas_length as usize)
+            .collect();
+        assert_eq!(blocks, [1, 1, 2]);
     }
 }

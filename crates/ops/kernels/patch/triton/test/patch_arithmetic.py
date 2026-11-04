@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
-"""Execute the patch kernel's index arithmetic on the CPU and check both directions.
+"""Execute the patch kernel's index arithmetic on the CPU and check it.
 
 The kernel is a permutation, so it can be run without a GPU: Triton's interpreter executes the
 kernel body with numpy-backed tensors, one program at a time, and the result is compared against
 the operator's own definition from ``crates/ops/src/patch.rs``, written out in torch:
 
-    patchify    x [channels, frames, height, width] -> r [rows, channels · 4]
-                row = ((f · height/2) + i) · (width/2) + j,  column = ((c · 2) + a) · 2 + b
-                r[row, column] = x[c, f, 2·i + a, 2·j + b]
+    x [channels, frames, height, width] -> r [rows, channels · 4]
+    row    = ((f · height/2) + i) · (width/2) + j,  column = ((c · 2) + a) · 2 + b
+    r[row, column] = x[c, f, 2·i + a, 2·j + b]
+
+One direction, because the operator has one: the inverse raster is ``unpatchify_video``, whose own
+check covers it.
 
 Run it where Triton is installed (the Program Server's own environment):
 
     TRITON_INTERPRET=1 python patch_arithmetic.py [--channels 24] [--frames 3]
 
-The interpreter is slow — one program at a time — so the check covers a few geometries rather
-than a production one. It is the arithmetic that is under test: the grid, the two decodings and
-the two directions, which is what a GPU run could only confirm again.
+The interpreter is slow — one program at a time — so the check covers a few geometries rather than
+a production one. It is the arithmetic that is under test: the grid, the two decodings and the
+store, which is what a GPU run could only confirm again.
 """
 
 import argparse
@@ -32,7 +35,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))  # 
 import patch as kernels  # noqa: E402
 
 
-def launch(x, out, frames, rows, channels, height, width, block, patchify):
+def launch(x, out, frames, rows, channels, height, width, block):
     """Run the kernel over its whole grid, one interpreter program at a time."""
     grid = (rows, (channels * 4 + block - 1) // block, 1)
     kernels._patch_kernel[grid](
@@ -45,12 +48,11 @@ def launch(x, out, frames, rows, channels, height, width, block, patchify):
         width,
         block,
         0,
-        PATCHIFY=patchify,
         BLOCK=block,
     )
 
 
-def reference(latent, rows, patchify, channels, frames, height, width):
+def reference(latent, rows, channels, frames, height, width):
     """The operator's mapping, in torch, from the formulas in `crates/ops/src/patch.rs`."""
     stacked = torch.zeros(rows, channels * 4, dtype=latent.dtype)
     for row in range(rows):
@@ -67,23 +69,21 @@ def reference(latent, rows, patchify, channels, frames, height, width):
 
 
 def one(channels, frames, height, width, block):
-    """Check both directions at one geometry."""
+    """Check the packing at one geometry."""
     rows = frames * (height // 2) * (width // 2)
     latent = torch.arange(
         channels * frames * height * width, dtype=torch.float32
     ).reshape(channels, frames, height, width)
-    packed = reference(latent, rows, True, channels, frames, height, width)
+    packed = reference(latent, rows, channels, frames, height, width)
 
     packed_out = torch.full((rows, channels * 4), -1.0)
-    launch(latent, packed_out, frames, rows, channels, height, width, block, True)
+    launch(latent, packed_out, frames, rows, channels, height, width, block)
     if not torch.equal(packed_out, packed):
-        print(f"patchify differs at {channels}×{frames}×{height}×{width}", file=sys.stderr)
+        print(f"differs at {channels}×{frames}×{height}×{width}", file=sys.stderr)
         return False
-
-    latent_out = torch.full_like(latent, -1.0)
-    launch(packed, latent_out, frames, rows, channels, height, width, block, False)
-    if not torch.equal(latent_out, latent):
-        print(f"unpatchify differs at {channels}×{frames}×{height}×{width}", file=sys.stderr)
+    # A permutation writes every destination element: an untouched sentinel is a hole in the mapping.
+    if bool((packed_out == -1.0).any()):
+        print(f"left elements unwritten at {channels}×{frames}×{height}×{width}", file=sys.stderr)
         return False
     print(f"ok channels={channels} frames={frames} {height}×{width} rows={rows} block={block}")
     return True

@@ -12,7 +12,7 @@
 //! the deployment's Storage Server claims (`claims`).
 
 pub(crate) mod claims;
-mod executor;
+pub(crate) mod executor;
 mod group;
 mod incarnations;
 mod process;

@@ -10,6 +10,22 @@
 //! `uniserve/models/minimax_h3/video_vae.py` (`CausalCNN`, `Encoder`) and `uniserve/nn/vae/tiled.py`
 //! (`TiledEncoder`) are the reference.
 //!
+//! ## Precision
+//!
+//! Every convolution of the video encoder runs FP32 with TF32 allowed — `specs/worker.md` 9's
+//! `conv3d` row — because the checkpoint's VAE encoder is evaluated at the quality preset. The audio
+//! encoder's convolutions and its `Snake` activations run FP32 and keep no TF32: its magnitudes are
+//! amplitudes, where the reference compares samples, not feature maps.
+//!
+//! **The audio encoder's attention is FP32 throughout** — query, key and value projections, the
+//! scores, the softmax and the output — whatever the checkpoint's preset says. `specs/worker.md` 9
+//! states the row in its own words: 「FP32 注意力（`ref2va` 的音频编码器、VSA 压缩分支） | cuBLASLt
+//! SGEMM 加 softmax kernel program」 — FP32 attention for `ref2va`'s audio encoder and the VSA
+//! compression branch, as a cuBLASLt SGEMM plus a softmax kernel program. It is the declaration §9
+//! asks the model to make instead of leaning on `torch.autocast`, and it is the opposite of the
+//! video VAE decoder's rule (one FP16 element type for parameters and residual). The layer is
+//! [`nn::layers::Attention::fp32`]; no call site may construct the dense backend for these blocks.
+//!
 //! ## The encoder's input
 //!
 //! A reference video reaches the encoder as `[frames, height, width, 3]` **uint8** pixels — the same
@@ -33,8 +49,12 @@
 //! decoded pixels, the encoder blends latents. A band of latent rows can be encoded on its own: the
 //! tile rows it reads are chosen so that the band's rows equal those rows of the whole encoding.
 
+use crate::audio_vae::Binder;
+
+/// `nn.LayerNorm`'s default epsilon, which the reference's audio projection does not override.
+const NORM_EPS: f32 = 1e-5;
 use crate::config::VideoVaeConfig;
-use crate::video_vae::{MINIMUM_OVERLAP, Seams, TILE_PIXELS};
+use crate::video_vae::{Seams, MINIMUM_OVERLAP, TILE_PIXELS};
 use crate::{Error, Result};
 
 /// The spatial compression of the video encoder: input pixels per latent position.
@@ -428,19 +448,35 @@ impl AudioStack {
         lengths
     }
 
-    /// The latent frames a track of `samples` encodes to, which must be a whole number of frames.
+    /// The latent frames a track of `samples` encodes to, and the length the stack must be given.
     pub fn latent_frames(&self, samples: u32) -> Result<u32> {
-        if !samples.is_multiple_of(self.samples_per_latent) {
-            return Err(Error::config(format!(
-                "{samples} samples are not whole {} sample latent frames",
-                self.samples_per_latent
-            )));
-        }
-        self.lengths(samples)
-            .last()
-            .copied()
-            .ok_or_else(|| Error::config("the audio encoder's stack has no stage".to_owned()))
+        let frames = audio_latent_frames(u64::from(samples), u64::from(self.samples_per_latent))?;
+        u32::try_from(frames)
+            .map_err(|_| Error::config(format!("{samples} samples exceed a latent frame count")))
     }
+}
+
+/// The latent frames a track of `samples` encodes to: `ceil(samples / hop)`.
+///
+/// One statement of the rule, because two callers need it: the stack's geometry and the encoder's own
+/// output extent. The ceiling is the reference's (`encoding.py:244`), and it is a ceiling because its
+/// `unpack_samples` right-pads the track with zeros to [`padded_samples`] first, so every strided
+/// convolution divides exactly and the last latent frame reads those zeros.
+pub fn audio_latent_frames(samples: u64, hop: u64) -> Result<u64> {
+    if samples == 0 || hop == 0 {
+        return Err(Error::config(
+            "an audio track of no samples encodes to no latent frames".to_owned(),
+        ));
+    }
+    Ok(samples.div_ceil(hop))
+}
+
+/// The length the encoder must be given for a track of `samples`: the ceiling's own multiple.
+///
+/// The padding is [`audio_latent_frames`]' multiple less the track, so a whole-frame track is unchanged
+/// and any other is right-padded with zeros exactly as the reference's `unpack_samples` does.
+pub fn padded_samples(samples: u64, hop: u64) -> Result<u64> {
+    Ok(audio_latent_frames(samples, hop)? * hop)
 }
 
 /// Every parameter of the audio encoder, with the checkpoint keys that fill it.
@@ -511,10 +547,26 @@ pub fn audio_sources(config: &crate::AudioVaeConfig) -> Result<Vec<crate::audio_
                 at(&format!("units.{unit}.convs.1.bias")),
                 format!("{base}.{unit}.block.3.bias"),
             );
+            // Each residual unit's two Snakes carry one frequency per channel.
+            for (side, slot) in [("0", 0), ("1", 2)] {
+                region(
+                    &mut sources,
+                    at(&format!("units.{unit}.snakes.{side}.alpha")),
+                    format!("{base}.{unit}.block.{slot}.alpha"),
+                );
+            }
         }
         normalized(&mut sources, at("widen.weight"), format!("{base}.5"));
         region(&mut sources, at("widen.bias"), format!("{base}.5.bias"));
+        // The stage's own Snake sits between the last unit and the widening convolution.
+        region(&mut sources, at("snake.alpha"), format!("{base}.4.alpha"));
     }
+    // The network ends with a Snake and the output convolution.
+    region(
+        &mut sources,
+        "output_snake.alpha".to_owned(),
+        format!("encoder.block.{}.alpha", stack.rates.len() + 1),
+    );
     let last = stack.rates.len() + 2;
     normalized(
         &mut sources,
@@ -570,227 +622,16 @@ pub fn audio_sources(config: &crate::AudioVaeConfig) -> Result<Vec<crate::audio_
     Ok(sources)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::video_vae::tests::video_config;
-
-    #[test]
-    fn a_pixel_normalizes_and_quantizes_back_to_itself() {
-        let rgb = crate::output::Rgb::of(1, 1, 1);
-        for pixel in [
-            [0u8, 0, 0],
-            [255, 255, 255],
-            [124, 116, 104],
-            [1, 2, 3],
-            [200, 10, 77],
-        ] {
-            let restored = rgb.quantize(normalize(pixel));
-            for (channel, (got, want)) in restored.iter().zip(pixel.iter()).enumerate() {
-                assert!(
-                    got.abs_diff(*want) <= 1,
-                    "channel {channel}: {got} for {want} from {pixel:?}"
-                );
-            }
-        }
-        // The extremes are exact: the normalization maps 0 and 255 outside the [-1, 1] range the
-        // decoder works in, which is expected — the encoder reads the raster, not latents.
-        assert!(normalize([0, 0, 0])[0] < -2.0);
-        assert!(normalize([255, 255, 255])[0] > 2.0);
-    }
-
-    #[test]
-    fn a_clip_of_seventeen_frames_becomes_five_latent_frames() {
-        let stack = Stack::of(&video_config()).expect("the stack");
-        let extents = stack.extents(Extent {
-            frames: 17,
-            height: 256,
-            width: 256,
-        });
-        // 17 frames, then 17, 9, 5, 5, 5, 5: one 17-frame clip is five latent frames.
-        assert_eq!(
-            extents
-                .iter()
-                .map(|extent| extent.frames)
-                .collect::<Vec<_>>(),
-            vec![17, 17, 9, 5, 5, 5, 5]
-        );
-        // 256 pixels halve four times: the 16-pixel compression.
-        assert_eq!(
-            extents
-                .iter()
-                .map(|extent| extent.height)
-                .collect::<Vec<_>>(),
-            vec![256, 128, 64, 32, 16, 16, 16]
-        );
-        assert_eq!(stack.moments(extents[0]).expect("moments").frames, 5);
-        // A single frame stays one latent frame.
-        let single = stack
-            .moments(Extent {
-                frames: 1,
-                height: 16,
-                width: 16,
-            })
-            .expect("moments");
-        assert_eq!(single.frames, 1);
-        assert_eq!((single.height, single.width), (1, 1));
-    }
-
-    #[test]
-    fn the_encoder_is_one_hundred_and_eighteen_tensors() {
-        let config = video_config();
-        let table = sources(&config).expect("the encoder's parameters");
-        assert_eq!(table.len(), 118);
-        let names: Vec<&str> = table
-            .iter()
-            .map(|source| source.parameter.as_str())
-            .collect();
-        for expected in [
-            "quant_conv.weight",
-            "input.weight",
-            "norm.bias",
-            "output.weight",
-            "stages.0.blocks.1.norms.0.weight",
-            "stages.5.blocks.0.convolutions.1.bias",
-            "stages.1.blocks.0.shortcut.weight",
-            "stages.3.downsample.weight",
-        ] {
-            assert!(names.contains(&expected), "{expected} is missing");
-        }
-        // The stages whose width is unchanged carry no shortcut, and the last two stride nothing.
-        assert!(!names.contains(&"stages.0.blocks.0.shortcut.weight"));
-        assert!(!names.contains(&"stages.5.blocks.1.shortcut.weight"));
-        assert!(!names.contains(&"stages.4.downsample.weight"));
-        assert!(!names.contains(&"stages.5.downsample.weight"));
-        let mut unique = names.clone();
-        unique.sort_unstable();
-        unique.dedup();
-        assert_eq!(unique.len(), names.len());
-    }
-
-    #[test]
-    fn the_tile_grid_is_the_decoders_grid_in_input_pixels() {
-        let grid = Grid::of(1344, 768).expect("the grid");
-        // The decoder's grid at 16 pixels per latent position: seven rows of 256 with overlaps
-        // [80, 80, 80, 80, 64, 64] and four columns with [96, 80, 80].
-        assert_eq!(grid.rows.starts, vec![0, 176, 352, 528, 704, 896, 1088]);
-        assert_eq!(grid.rows.overlaps, vec![80, 80, 80, 80, 64, 64]);
-        assert_eq!(grid.columns.starts, vec![0, 160, 336, 512]);
-        // Every seam spans whole latent positions: 80/16 = 5, 64/16 = 4, 96/16 = 6.
-        assert_eq!(Grid::blends(&grid.rows), vec![5, 5, 5, 5, 4, 4]);
-        assert_eq!(Grid::blends(&grid.columns), vec![6, 5, 5]);
-        // The rows a raster of tiles owns: each start in latent rows, then the height.
-        assert_eq!(grid.owned(84), vec![0, 11, 22, 33, 44, 56, 68, 84]);
-    }
-
-    #[test]
-    fn a_band_reads_the_tile_rows_it_cross_fades_with() {
-        let grid = Grid::of(1344, 768).expect("the grid");
-        let latent_height = 1344 / SPATIAL_RATIO;
-        assert_eq!(latent_height, 84);
-        // The first band starts at the top: no row above it.
-        assert_eq!(grid.band(84, 0, 11).expect("band"), (0, 0));
-        // A band that starts on a row's own first latent row reads only that row and below.
-        assert_eq!(grid.band(84, 16, 33).expect("band"), (1, 2));
-        // A band that starts inside a row's cross-fade reads the row above.
-        let owned = grid.owned(84);
-        assert_eq!(owned[1], 11);
-        assert_eq!(grid.rows.overlaps[0] / SPATIAL_RATIO, 5);
-        assert_eq!(grid.band(84, 13, 20).expect("band"), (0, 1));
-        // Past the end is refused.
-        assert!(grid.band(84, 80, 90).is_err());
-        assert!(grid.band(84, 5, 5).is_err());
-    }
-
-    #[test]
-    fn the_audio_encoder_stages_land_on_whole_latent_frames() {
-        let stack = AudioStack::of(&crate::audio_vae::tests::audio_config()).expect("the stack");
-        assert_eq!(stack.samples_per_latent, 800);
-        assert_eq!(stack.lengths(800), vec![800, 400, 100, 25, 5, 1]);
-        assert_eq!(stack.lengths(1600), vec![1600, 800, 200, 50, 10, 2]);
-        assert_eq!(stack.latent_frames(800).expect("one frame"), 1);
-        assert_eq!(stack.latent_frames(24000).expect("thirty frames"), 30);
-        // A partial frame is refused: the encoder's output is whole latent frames.
-        assert!(stack.latent_frames(801).is_err());
-        // Each stage doubles the width from the input convolution's.
-        assert_eq!(stack.widths, vec![128, 256, 512, 1024, 2048]);
-        assert_eq!(stack.latent_dim, 2048);
-    }
-
-    #[test]
-    fn the_audio_encoder_table_names_every_parameter() {
-        let table = audio_sources(&crate::audio_vae::tests::audio_config())
-            .expect("the encoder's parameters");
-        // The input pair, five stages of twenty-one, the output pair, the projection's twenty-two and
-        // the mean convolution's pair.
-        assert_eq!(table.len(), 3 + 5 * 21 + 3 + 22);
-        let names: Vec<&str> = table
-            .iter()
-            .map(|source| source.parameter.as_str())
-            .collect();
-        for expected in [
-            "input.weight",
-            "stages.0.units.0.convs.0.weight",
-            "stages.4.units.2.convs.1.bias",
-            "stages.4.widen.weight",
-            "output.weight",
-            "projection.qkv.weight",
-            "projection.qkv.bias",
-            "projection.mlp.gate.weight",
-            "mean_projection.bias",
-        ] {
-            assert!(names.contains(&expected), "{expected} is missing");
-        }
-        let mut unique = names.clone();
-        unique.sort_unstable();
-        unique.dedup();
-        assert_eq!(unique.len(), names.len());
-        // Every convolution is weight-normalized: four per stage plus the input, the output and the
-        // mean convolution.
-        let normalized = table
-            .iter()
-            .filter(|source| matches!(source.tensor, crate::audio_vae::Tensor::Normalized { .. }))
-            .count();
-        assert_eq!(normalized, 3 + 5 * 7 + 3);
-        // The fused query-key-value bias names its three checkpoint vectors in order.
-        let bias = table
-            .iter()
-            .find(|source| source.parameter == "projection.qkv.bias")
-            .expect("the fused bias");
-        match &bias.tensor {
-            crate::audio_vae::Tensor::Parts(parts) => assert_eq!(
-                parts,
-                &vec![
-                    "pre_block.attn.q_bias".to_owned(),
-                    "pre_block.attn.zero_k_bias".to_owned(),
-                    "pre_block.attn.v_bias".to_owned(),
-                ]
-            ),
-            other => panic!("the fused bias is {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_stack_with_no_stage_is_refused() {
-        let mut config = video_config();
-        config.block_out_channels.clear();
-        assert!(Stack::of(&config).is_err());
-        let mut config = video_config();
-        config.spatial_downsample_factors.pop();
-        assert!(Stack::of(&config).is_err());
-        let mut config = video_config();
-        config.temporal_downsample_factors[1] = 0;
-        assert!(Stack::of(&config).is_err());
-    }
-}
-
 // ---------------------------------------------------------------------------------------------
 // The video encoder's device path.
 // ---------------------------------------------------------------------------------------------
 
-use nn::Forward;
-use nn::layers::{Conv3d, ConvGeometry, FrameMoments, FrameNormPad, FramePad, ScaledAdd};
+use nn::layers::{
+    AdaptivePool, Attention, Conv1d, Conv3d, ConvGeometry, FrameMoments, FrameNormPad, FramePad,
+    GatedActivation, LayerNorm, Linear, ScaledAdd, Snake, Transpose, WeightOrder,
+};
 use nn::weights::{Weight, WeightLoader, WeightRequest};
+use nn::Forward;
 use nn::{DType, Shape, TensorView};
 
 /// One causal convolution of the encoder and the normalization that feeds it.
@@ -1182,7 +1023,12 @@ impl VideoEncoder {
 
         // The moment convolution writes `2 · latent_channels`; the one-by-one projection narrows it to
         // the latent's own channels, which is the posterior the caller reads.
-        let moments = f.arena().tensor(DType::F32, out.shape)?;
+        // The moment convolution writes `2 * latent_channels`; the one-by-one projection after it
+        // narrows that to the latent's own channels. The scratch is the moment extent, which is twice
+        // the output's channel count - sizing it from `out` would half it.
+        let mut moment_extent = out.shape.dims().to_vec();
+        moment_extent[1] = 2 * u64::from(self.stack.latent_channels);
+        let moments = f.arena().tensor(DType::F32, Shape::new(&moment_extent))?;
         self.output.run(f, hidden, moments)?;
         Ok(self.moments.forward(f, moments, out)?)
     }
@@ -1205,5 +1051,804 @@ impl VideoEncoder {
         // commutes, so `(values + bias) + residual` here is the same rounded value
         // (`video_vae.py:852-859`, `:1009-1020`).
         Ok(ScaledAdd.forward(f, rows(out)?, rows(residual)?, 1.0, 1.0)?)
+    }
+}
+
+/// The longest track the model supports, in latent frames.
+///
+/// A request is at most [`crate::config::MAX_FRAMES`] frames of video at [`crate::config::FPS`], and its
+/// audio lasts as long, so the longest track is that duration at [`crate::config::AUDIO_LATENTS_PER_SECOND`]
+/// latents, rounded up to the next latent. The encoder's attention is built for this bound and a longer
+/// track is refused rather than read past it.
+pub const LONGEST_TRACK: u32 = (crate::config::MAX_FRAMES
+    * crate::config::AUDIO_LATENTS_PER_SECOND)
+    .div_ceil(crate::config::FPS);
+
+/// The DAC-style audio encoder `ref2va` conditions on: a waveform's posterior mean as latent frames.
+///
+/// `[1, 1, samples]` mono audio in, `[latent_channels, frames]` latents out, with `frames =
+/// samples / 800` — the product of the checkpoint's encoder rates `(2, 4, 4, 5, 5)` and the hop the
+/// decoder inverts. The network is the reference's `Encoder`: an input convolution of width
+/// `encoder_dim`, five stages that each run three dilated residual units at the incoming width and then
+/// a strided widening convolution, a Snake and a convolution to `latent_dim`, and then the attention
+/// projection that every frame of the track attends over its predecessors.
+///
+/// **The projection's attention is causal** (`DenseInput(causal=True)` in the reference), which is what
+/// makes a latent frame depend only on the audio before it. It runs in FP32 like everything else in this
+/// encoder, on the deployment's longest track, which `load` takes as the attention's key bound.
+pub struct AudioEncoder {
+    config: crate::AudioVaeConfig,
+    /// The most latent frames one track may have: the attention's key bound.
+    frames: u32,
+    input: Conv1d,
+    stages: Vec<EncoderStage>,
+    tail: Snake,
+    tail_alpha: Weight,
+    output: Conv1d,
+    projection: Projection,
+    mean: Conv1d,
+    transpose: Transpose,
+}
+
+/// One encoder stage: three dilated residual units at `inner`, then a widening strided convolution.
+struct EncoderStage {
+    /// The width the units and the Snake run at: half the stage's output width.
+    inner: u32,
+    /// Latent samples divide by this.
+    rate: u32,
+    units: Vec<EncoderUnit>,
+    snake: Snake,
+    alpha: Weight,
+    widen: Conv1d,
+}
+
+/// One residual unit: snake, dilated convolution, snake, one-by-one-wide convolution, added back.
+struct EncoderUnit {
+    convs: [Conv1d; 2],
+    snakes: [Snake; 2],
+    alphas: [Weight; 2],
+}
+
+/// The attention projection that narrows latent features to the latent channels.
+struct Projection {
+    shortcut_norm: LayerNorm,
+    shortcut: Linear,
+    attention_norm: LayerNorm,
+    /// Three matrices over the checkpoint's fused query-key-value weight, so each head group is one
+    /// contiguous block the attention can read.
+    query: Linear,
+    key: Linear,
+    value: Linear,
+    attention: Attention,
+    attention_output: Linear,
+    /// The head average and the head width pooled down to the latent channels, in one pass.
+    pool: AdaptivePool,
+    mlp_norm: LayerNorm,
+    mlp: GeGlu,
+}
+
+/// A normalized tanh-GELU gated linear unit: the reference's `GeGLU`.
+struct GeGlu {
+    norm: LayerNorm,
+    gate: Linear,
+    value: Linear,
+    output: Linear,
+    /// `gelu_tanh(gate) · value`, the reference's `F.gelu(gate, approximate="tanh") * value`.
+    product: GatedActivation,
+}
+
+impl AudioEncoder {
+    /// The latent frames `samples` samples encode to: `ceil(samples / hop)`.
+    ///
+    /// This is the reference's rule (`encoding.py:244`) and the reason it is a ceiling is the pad its
+    /// own `unpack_samples` applies first: a track that is not a whole number of latent frames is
+    /// **right-padded with zeros** to `ceil(samples / hop) · hop`, so every stage's strided convolution
+    /// divides exactly and the last latent frame reads those zeros. A track of any positive length
+    /// therefore encodes, and [`Self::encode`] states what it needs to do the same.
+    pub fn frames(&self, samples: u64) -> Result<u64> {
+        let frames = audio_latent_frames(samples, self.hop())?;
+        if frames > u64::from(LONGEST_TRACK) {
+            return Err(Error::config(format!(
+                "{frames} latent frames exceed the {LONGEST_TRACK}-frame track the encoder's \
+                 attention is built for"
+            )));
+        }
+        Ok(frames)
+    }
+
+    /// The samples one latent frame covers: the product of the encoder's rates.
+    pub fn hop(&self) -> u64 {
+        self.stages
+            .iter()
+            .map(|stage| u64::from(stage.rate))
+            .product()
+    }
+
+    /// Bind the encoder every checkpoint field it has, through [`audio_sources`].
+    ///
+    /// The attention is built for [`LONGEST_TRACK`], the longest track the model supports; a longer
+    /// track is refused by [`Self::frames`] rather than read past the bound. The table is consumed
+    /// exactly, the same discipline the audio decoder's load keeps.
+    pub fn load(config: &crate::AudioVaeConfig, loader: &mut WeightLoader) -> Result<Self> {
+        let frames = LONGEST_TRACK;
+        let table = audio_sources(config)?;
+        let mut binder = Binder::new(loader, table);
+        let mut width = config.encoder_dim;
+        let input = Conv1d::new(
+            binder.normalized("input.weight")?,
+            Some(binder.region("input.bias", &[u64::from(width)])?),
+            crate::audio_vae::geometry(7, 1, 3)?,
+            false,
+        )?;
+
+        let mut stages = Vec::with_capacity(config.encoder_rates.len());
+        for (index, rate) in config.encoder_rates.iter().enumerate() {
+            let inner = width;
+            width = width.checked_mul(2).ok_or_else(|| {
+                Error::config("the encoder's widths overflow a descriptor".to_owned())
+            })?;
+            let at = |name: &str| format!("stages.{index}.{name}");
+            let mut units = Vec::with_capacity(3);
+            // The three units are the same shape at dilations 1, 3 and 9; the first convolution is the
+            // dilated one, whose padding keeps the length, and the second returns to it.
+            for (unit, dilation) in [1u32, 3, 9].into_iter().enumerate() {
+                let name = |slot: &str| at(&format!("units.{unit}.{slot}"));
+                let first = Conv1d::new(
+                    binder.normalized(&name("convs.0.weight"))?,
+                    Some(binder.region(&name("convs.0.bias"), &[u64::from(inner)])?),
+                    crate::audio_vae::dilated_geometry(7, 1, 3 * dilation, dilation)?,
+                    false,
+                )?;
+                let second = Conv1d::new(
+                    binder.normalized(&name("convs.1.weight"))?,
+                    Some(binder.region(&name("convs.1.bias"), &[u64::from(inner)])?),
+                    crate::audio_vae::geometry(7, 1, 3)?,
+                    false,
+                )?;
+                units.push(EncoderUnit {
+                    convs: [first, second],
+                    snakes: [Snake::new(u64::from(inner))?, Snake::new(u64::from(inner))?],
+                    alphas: [
+                        binder.region(&name("snakes.0.alpha"), &[u64::from(inner)])?,
+                        binder.region(&name("snakes.1.alpha"), &[u64::from(inner)])?,
+                    ],
+                });
+            }
+            let snake = Snake::new(u64::from(inner))?;
+            let alpha = binder.region(&at("snake.alpha"), &[u64::from(inner)])?;
+            let widen = Conv1d::new(
+                binder.normalized(&at("widen.weight"))?,
+                Some(binder.region(&at("widen.bias"), &[u64::from(width)])?),
+                crate::audio_vae::geometry(2 * rate, *rate, rate.div_ceil(2))?,
+                false,
+            )?;
+            stages.push(EncoderStage {
+                inner,
+                rate: *rate,
+                units,
+                snake,
+                alpha,
+                widen,
+            });
+        }
+
+        let tail = Snake::new(u64::from(width))?;
+        let tail_alpha = binder.region("output_snake.alpha", &[u64::from(width)])?;
+        // The network's last convolution is three wide, not seven: the reference's `Conv1d(width,
+        // latent_dim, 3, padding=1)`.
+        let output = Conv1d::new(
+            binder.normalized("output.weight")?,
+            Some(binder.region("output.bias", &[u64::from(config.latent_dim)])?),
+            crate::audio_vae::geometry(3, 1, 1)?,
+            false,
+        )?;
+
+        let projection = Projection::load(config, &mut binder, frames)?;
+        let channels = u64::from(config.latent_channels);
+        let mean = Conv1d::new(
+            binder.region("mean_projection.weight", &[channels, channels])?,
+            Some(binder.region("mean_projection.bias", &[channels])?),
+            crate::audio_vae::geometry(1, 1, 0)?,
+            false,
+        )?;
+        binder.finish()?;
+        Ok(Self {
+            config: config.clone(),
+            frames,
+            input,
+            stages,
+            tail,
+            tail_alpha,
+            output,
+            projection,
+            mean,
+            transpose: Transpose::new(DType::F32)?,
+        })
+    }
+
+    /// Encode a `[batch, 1, length]` track into `out [batch · frames, latent_channels]` F32 rows.
+    ///
+    /// The reference's encoder is mono per batch row (`audio_vae.py:448-452`, "encode mono
+    /// `[batch, 1, samples]` waveforms") and its latent is a **two-row batch**: a stereo reference
+    /// arrives as `[2, 1, samples]` and its latent is `[2, latent_channels, frames]`, the same two-row
+    /// shape the audio decoder reads. The rows are written channel-major, `[batch · frames,
+    /// latent_channels]` with batch outermost, because that is the form the DiT's audio conditioning
+    /// reads (`denoiser.py:518`, `[2 · frames, audio_channels]`) - so no caller transposes.
+    ///
+    /// The length must be a whole number of hops and no longer than the deployment's bound. The
+    /// activation of every stage runs at the stage's inner width, which is half of the width the
+    /// widening convolution writes. The projection attends over frame 2, so it runs once per batch row
+    /// and never mixes them.
+    pub fn encode(&self, f: &Forward, samples: TensorView, out: TensorView) -> Result<()> {
+        let shape = samples.shape;
+        if shape.rank() != 3 || shape.dim(0) == 0 || shape.dim(1) != 1 {
+            return Err(Error::config(format!(
+                "the audio encoder reads a [batch, 1, samples] track, not {:?}",
+                shape.dims()
+            )));
+        }
+        let batch = shape.dim(0);
+        let length = shape.dim(2);
+        let frames = self.frames(length)?;
+        // The network's stages divide the length exactly, so a track that is not a whole number of
+        // latent frames is right-padded with zeros to one, which is what the reference's
+        // `unpack_samples` does before it convolves. Writing that pad needs a zero-fill the operator set
+        // does not have yet (a `zero_pad` over the trailing axis); until it exists this is refused by
+        // name rather than truncated, because truncating drops the last latent frame.
+        let hop = self.hop();
+        if !length.is_multiple_of(hop) {
+            let padded = padded_samples(length, hop)?;
+            return Err(Error::config(format!(
+                "{length} samples is not a whole number of {hop}-sample latent frames: the reference \
+                 right-pads the track with zeros to {padded} samples and this build has no zero-fill \
+                 program"
+            )));
+        }
+        if frames > u64::from(self.frames) {
+            return Err(Error::config(format!(
+                "a {frames}-frame track is longer than the {} the deployment declared",
+                self.frames
+            )));
+        }
+        let channels = u64::from(self.config.latent_channels);
+        let rows = batch
+            .checked_mul(frames)
+            .ok_or_else(|| Error::config("the audio latent's row count overflows".to_owned()))?;
+        if out.shape.rank() != 2 || out.shape.dims() != [rows, channels] {
+            return Err(Error::config(format!(
+                "the audio encoder writes [{rows}, {channels}] channel-major rows, not {:?}",
+                out.shape.dims()
+            )));
+        }
+
+        let width = u64::from(self.config.encoder_dim);
+        let mut hidden = f
+            .arena()
+            .tensor(DType::F32, Shape::new(&[batch, width, length]))?;
+        self.input.forward(f, samples, hidden)?;
+
+        // A stage runs its three units at the stage's inner width, which is the width it receives, then
+        // snaked and widened into the next width. Each unit needs three buffers: the residual stream, and
+        // two for its two convolutions, because the sum reads what the first snake read.
+        let mut extent = length;
+        for stage in &self.stages {
+            let inner = u64::from(stage.inner);
+            let inner_shape = Shape::new(&[batch, inner, extent]);
+            for unit in &stage.units {
+                let first = f.arena().tensor(DType::F32, inner_shape)?;
+                let second = f.arena().tensor(DType::F32, inner_shape)?;
+                unit.snakes[0].forward(f, hidden, unit.alphas[0].view(), first)?;
+                unit.convs[0].forward(f, first, second)?;
+                unit.snakes[1].forward(f, second, unit.alphas[1].view(), first)?;
+                unit.convs[1].forward(f, first, second)?;
+                let residual = matrix(hidden)?;
+                ScaledAdd.forward(f, residual, matrix(second)?, 1.0, 1.0)?;
+            }
+            let widened = extent / u64::from(stage.rate);
+            let next = f.arena().tensor(
+                DType::F32,
+                Shape::new(&[batch, u64::from(self.width_of(stage)), widened]),
+            )?;
+            let scratch = f.arena().tensor(DType::F32, inner_shape)?;
+            stage
+                .snake
+                .forward(f, hidden, stage.alpha.view(), scratch)?;
+            stage.widen.forward(f, scratch, next)?;
+            hidden = next;
+            extent = widened;
+        }
+
+        // The tail Snake and the convolution to the latent width.
+        let wide = u64::from(self.config.latent_dim);
+        let tail_shape = Shape::new(&[batch, wide, extent]);
+        let tail_scratch = f.arena().tensor(DType::F32, tail_shape)?;
+        self.tail
+            .forward(f, hidden, self.tail_alpha.view(), tail_scratch)?;
+        let features = f.arena().tensor(DType::F32, tail_shape)?;
+        self.output.forward(f, tail_scratch, features)?;
+
+        // The projection attends over the frame axis, so it runs once per batch row and never mixes
+        // rows: a row's features are a `[wide, extent]` matrix, transposed to frame-major for the
+        // attention, and the mean head's `[channels, extent]` is transposed again into the row-major
+        // channel-major block the conditioning reads.
+        let per_row = wide * extent;
+        for row in 0..batch {
+            let features = TensorView::new(
+                features.ptr.offset(row * per_row * 4),
+                DType::F32,
+                Shape::new(&[wide, extent]),
+            );
+            let frames_view = f.arena().tensor(DType::F32, Shape::new(&[extent, wide]))?;
+            self.transpose.forward(f, features, frames_view)?;
+            let pooled = self.projection.forward(f, frames_view, extent)?;
+            let pooled_matrix = f
+                .arena()
+                .tensor(DType::F32, Shape::new(&[channels, extent]))?;
+            self.transpose.forward(f, pooled, pooled_matrix)?;
+            let batched = TensorView::new(
+                pooled_matrix.ptr,
+                DType::F32,
+                Shape::new(&[1, channels, extent]),
+            );
+            let narrowed = f
+                .arena()
+                .tensor(DType::F32, Shape::new(&[1, channels, extent]))?;
+            self.mean.forward(f, batched, narrowed)?;
+            // One row's latent, channel-major rows: `[extent, channels]` at the row's place in `out`.
+            let plane = TensorView::new(narrowed.ptr, DType::F32, Shape::new(&[channels, extent]));
+            let written = TensorView::new(
+                out.ptr.offset(row * extent * channels * 4),
+                DType::F32,
+                Shape::new(&[extent, channels]),
+            );
+            self.transpose.forward(f, plane, written)?;
+        }
+        Ok(())
+    }
+
+    /// The width a stage writes: its inner width doubled.
+    fn width_of(&self, stage: &EncoderStage) -> u32 {
+        stage.inner * 2
+    }
+}
+
+/// A `[batch, rows, columns]` view as `[batch · rows, columns]`: the row axis the operators that work
+/// a row at a time read.
+///
+/// Valid for a contiguous view, which every arena tensor and every slice of one is: the batch axis is
+/// the outermost, so folding it into the row axis keeps every row where it is.
+fn matrix(view: TensorView) -> Result<TensorView> {
+    if view.shape.rank() != 3 || view.shape.dim(0) == 0 {
+        return Err(Error::config(format!(
+            "{:?} is not a batched matrix",
+            view.shape.dims()
+        )));
+    }
+    let rows = view.shape.dim(0) * view.shape.dim(1);
+    Ok(TensorView::new(
+        view.ptr,
+        view.dtype,
+        Shape::new(&[rows, view.shape.dim(2)]),
+    ))
+}
+
+impl Projection {
+    /// Bind the attention projection at the latent width.
+    fn load(
+        config: &crate::AudioVaeConfig,
+        binder: &mut Binder<'_, '_>,
+        frames: u32,
+    ) -> Result<Self> {
+        let wide = u64::from(config.latent_dim);
+        let channels = u64::from(config.latent_channels);
+        let heads = u64::from(config.num_attention_heads);
+        if heads == 0 || !wide.is_multiple_of(heads) {
+            return Err(Error::config(format!(
+                "{wide} latent channels over {heads} attention heads"
+            )));
+        }
+        let norm = |binder: &mut Binder<'_, '_>, name: &str| -> Result<LayerNorm> {
+            let weight = binder.region(&format!("projection.{name}.weight"), &[wide])?;
+            let bias = binder.region(&format!("projection.{name}.bias"), &[wide])?;
+            Ok(LayerNorm::new(weight, Some(bias), NORM_EPS)?)
+        };
+        let shortcut_norm = norm(binder, "shortcut_norm")?;
+        let attention_norm = norm(binder, "attention_norm")?;
+        let shortcut = Linear::new(
+            binder.region("projection.shortcut.weight", &[channels, wide])?,
+            Some(binder.region("projection.shortcut.bias", &[channels])?),
+            WeightOrder::NxK,
+        )?;
+        // The checkpoint fuses query, key and value into one `[3 · wide, wide]` matrix and one
+        // `[3 · wide]` bias; each third is contiguous, so each head group is its own layer.
+        let third = wide;
+        let slice = |binder: &mut Binder<'_, '_>,
+                     name: &str,
+                     index: u64,
+                     shape: &[u64]|
+         -> Result<Weight> {
+            binder.slice(name, index * shape.iter().product::<u64>(), shape)
+        };
+        let linear = |binder: &mut Binder<'_, '_>, index: u64| -> Result<Linear> {
+            let weight = slice(binder, "projection.qkv.weight", index, &[third, wide])?;
+            let bias = slice(binder, "projection.qkv.bias", index, &[third])?;
+            Ok(Linear::new(weight, Some(bias), WeightOrder::NxK)?)
+        };
+        let query = linear(binder, 0)?;
+        let key = linear(binder, 1)?;
+        let value = linear(binder, 2)?;
+        let head_dim = u32::try_from(wide / heads)
+            .map_err(|_| Error::config("a head wider than a launch holds".to_owned()))?;
+        let heads_u32 = u32::try_from(heads)
+            .map_err(|_| Error::config("more heads than a launch holds".to_owned()))?;
+        let attention = Attention::dense(
+            head_dim,
+            heads_u32,
+            heads_u32,
+            frames,
+            true,
+            None,
+            1.0 / (head_dim as f32).sqrt(),
+        )?;
+        let attention_output = Linear::new(
+            binder.region("projection.attention_output.weight", &[channels, channels])?,
+            Some(binder.region("projection.attention_output.bias", &[channels])?),
+            WeightOrder::NxK,
+        )?;
+        let pool = AdaptivePool::new(heads, wide / heads, channels)?;
+        let mlp_norm = LayerNorm::new(
+            binder.region("projection.mlp_norm.weight", &[channels])?,
+            Some(binder.region("projection.mlp_norm.bias", &[channels])?),
+            NORM_EPS,
+        )?;
+        let mlp = GeGlu::load(config, binder)?;
+        Ok(Self {
+            shortcut_norm,
+            shortcut,
+            attention_norm,
+            query,
+            key,
+            value,
+            attention,
+            attention_output,
+            pool,
+            mlp_norm,
+            mlp,
+        })
+    }
+
+    /// Project `values [frames, latent_dim]` to `[frames, latent_channels]`.
+    fn forward(&self, f: &Forward, values: TensorView, frames: u64) -> Result<TensorView> {
+        let shape = values.shape;
+        let channels = u64::from(self.pool.output());
+        let heads = shape.dim(1) / u64::from(self.attention.head_dim());
+        let shortcut = f
+            .arena()
+            .tensor(DType::F32, Shape::new(&[frames, channels]))?;
+        let normed = f.arena().tensor(DType::F32, shape)?;
+        self.shortcut_norm.forward(f, values, normed)?;
+        self.shortcut.forward(f, normed, shortcut)?;
+        self.attention_norm.forward(f, values, normed)?;
+        // Three contiguous head-group blocks, then causal attention over the frames.
+        let attended = f.arena().tensor(
+            DType::F32,
+            Shape::new(&[frames, heads, u64::from(self.attention.head_dim())]),
+        )?;
+        let mut head_views = Vec::with_capacity(3);
+        for linear in [&self.query, &self.key, &self.value] {
+            let out = f.arena().tensor(DType::F32, shape)?;
+            linear.forward(f, normed, out)?;
+            head_views.push(out);
+        }
+        self.attention.attend_dense(
+            f,
+            head_views[0],
+            head_views[1],
+            head_views[2],
+            None,
+            None,
+            u32::try_from(frames)
+                .map_err(|_| Error::config("a track longer than a launch bound".to_owned()))?,
+            attended,
+        )?;
+        let pooled = f
+            .arena()
+            .tensor(DType::F32, Shape::new(&[frames, channels]))?;
+        self.pool.forward(f, attended, pooled)?;
+        let projected = f
+            .arena()
+            .tensor(DType::F32, Shape::new(&[frames, channels]))?;
+        self.attention_output.forward(f, pooled, projected)?;
+        ScaledAdd.forward(f, shortcut, projected, 1.0, 1.0)?;
+        // The normalized GeGLU residual.
+        let normed = f
+            .arena()
+            .tensor(DType::F32, Shape::new(&[frames, channels]))?;
+        self.mlp_norm.forward(f, shortcut, normed)?;
+        let updated = f
+            .arena()
+            .tensor(DType::F32, Shape::new(&[frames, channels]))?;
+        self.mlp.forward(f, normed, updated)?;
+        ScaledAdd.forward(f, shortcut, updated, 1.0, 1.0)?;
+        Ok(shortcut)
+    }
+}
+
+impl GeGlu {
+    /// Bind a normalized tanh-GELU gated linear unit over the latent channels.
+    fn load(config: &crate::AudioVaeConfig, binder: &mut Binder<'_, '_>) -> Result<Self> {
+        let channels = u64::from(config.latent_channels);
+        let hidden = 2 * channels;
+        let norm = LayerNorm::new(
+            binder.region("projection.mlp.norm.weight", &[channels])?,
+            Some(binder.region("projection.mlp.norm.bias", &[channels])?),
+            NORM_EPS,
+        )?;
+        let linear = |binder: &mut Binder<'_, '_>, name: &str, out: u64| -> Result<Linear> {
+            Ok(Linear::new(
+                binder.region(&format!("projection.mlp.{name}.weight"), &[out, channels])?,
+                Some(binder.region(&format!("projection.mlp.{name}.bias"), &[out])?),
+                WeightOrder::NxK,
+            )?)
+        };
+        let gate = linear(binder, "gate", hidden)?;
+        let value = linear(binder, "value", hidden)?;
+        let output = Linear::new(
+            binder.region("projection.mlp.output.weight", &[channels, hidden])?,
+            Some(binder.region("projection.mlp.output.bias", &[channels])?),
+            WeightOrder::NxK,
+        )?;
+        Ok(Self {
+            norm,
+            gate,
+            value,
+            output,
+            product: GatedActivation::new(ops::activation::Activation::GeluTanh),
+        })
+    }
+
+    /// `output(gelu_tanh(gate(norm(x))) · value(norm(x)))` into `out`.
+    fn forward(&self, f: &Forward, x: TensorView, out: TensorView) -> Result<()> {
+        let (frames, hidden) = (x.shape.dim(0), 2 * x.shape.dim(1));
+        let normed = f
+            .arena()
+            .tensor(DType::F32, Shape::new(&[frames, x.shape.dim(1)]))?;
+        self.norm.forward(f, x, normed)?;
+        let gate = f
+            .arena()
+            .tensor(DType::F32, Shape::new(&[frames, hidden]))?;
+        let value = f
+            .arena()
+            .tensor(DType::F32, Shape::new(&[frames, hidden]))?;
+        self.gate.forward(f, normed, gate)?;
+        self.value.forward(f, normed, value)?;
+        let product = f
+            .arena()
+            .tensor(DType::F32, Shape::new(&[frames, hidden]))?;
+        self.product.forward(f, gate, value, product)?;
+        Ok(self.output.forward(f, product, out)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::video_vae::tests::video_config;
+
+    #[test]
+    fn a_pixel_normalizes_and_quantizes_back_to_itself() {
+        let rgb = crate::output::Rgb::of(1, 1, 1);
+        for pixel in [
+            [0u8, 0, 0],
+            [255, 255, 255],
+            [124, 116, 104],
+            [1, 2, 3],
+            [200, 10, 77],
+        ] {
+            let restored = rgb.quantize(normalize(pixel));
+            for (channel, (got, want)) in restored.iter().zip(pixel.iter()).enumerate() {
+                assert!(
+                    got.abs_diff(*want) <= 1,
+                    "channel {channel}: {got} for {want} from {pixel:?}"
+                );
+            }
+        }
+        // The extremes are exact: the normalization maps 0 and 255 outside the [-1, 1] range the
+        // decoder works in, which is expected — the encoder reads the raster, not latents.
+        assert!(normalize([0, 0, 0])[0] < -2.0);
+        assert!(normalize([255, 255, 255])[0] > 2.0);
+    }
+
+    #[test]
+    fn a_clip_of_seventeen_frames_becomes_five_latent_frames() {
+        let stack = Stack::of(&video_config()).expect("the stack");
+        let extents = stack.extents(Extent {
+            frames: 17,
+            height: 256,
+            width: 256,
+        });
+        // 17 frames, then 17, 9, 5, 5, 5, 5: one 17-frame clip is five latent frames.
+        assert_eq!(
+            extents
+                .iter()
+                .map(|extent| extent.frames)
+                .collect::<Vec<_>>(),
+            vec![17, 17, 9, 5, 5, 5, 5]
+        );
+        // 256 pixels halve four times: the 16-pixel compression.
+        assert_eq!(
+            extents
+                .iter()
+                .map(|extent| extent.height)
+                .collect::<Vec<_>>(),
+            vec![256, 128, 64, 32, 16, 16, 16]
+        );
+        assert_eq!(stack.moments(extents[0]).expect("moments").frames, 5);
+        // A single frame stays one latent frame.
+        let single = stack
+            .moments(Extent {
+                frames: 1,
+                height: 16,
+                width: 16,
+            })
+            .expect("moments");
+        assert_eq!(single.frames, 1);
+        assert_eq!((single.height, single.width), (1, 1));
+    }
+
+    #[test]
+    fn the_encoder_is_one_hundred_and_eighteen_tensors() {
+        let config = video_config();
+        let table = sources(&config).expect("the encoder's parameters");
+        assert_eq!(table.len(), 118);
+        let names: Vec<&str> = table
+            .iter()
+            .map(|source| source.parameter.as_str())
+            .collect();
+        for expected in [
+            "quant_conv.weight",
+            "input.weight",
+            "norm.bias",
+            "output.weight",
+            "stages.0.blocks.1.norms.0.weight",
+            "stages.5.blocks.0.convolutions.1.bias",
+            "stages.1.blocks.0.shortcut.weight",
+            "stages.3.downsample.weight",
+        ] {
+            assert!(names.contains(&expected), "{expected} is missing");
+        }
+        // The stages whose width is unchanged carry no shortcut, and the last two stride nothing.
+        assert!(!names.contains(&"stages.0.blocks.0.shortcut.weight"));
+        assert!(!names.contains(&"stages.5.blocks.1.shortcut.weight"));
+        assert!(!names.contains(&"stages.4.downsample.weight"));
+        assert!(!names.contains(&"stages.5.downsample.weight"));
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len());
+    }
+
+    #[test]
+    fn the_tile_grid_is_the_decoders_grid_in_input_pixels() {
+        let grid = Grid::of(1344, 768).expect("the grid");
+        // The decoder's grid at 16 pixels per latent position: seven rows of 256 with overlaps
+        // [80, 80, 80, 80, 64, 64] and four columns with [96, 80, 80].
+        assert_eq!(grid.rows.starts, vec![0, 176, 352, 528, 704, 896, 1088]);
+        assert_eq!(grid.rows.overlaps, vec![80, 80, 80, 80, 64, 64]);
+        assert_eq!(grid.columns.starts, vec![0, 160, 336, 512]);
+        // Every seam spans whole latent positions: 80/16 = 5, 64/16 = 4, 96/16 = 6.
+        assert_eq!(Grid::blends(&grid.rows), vec![5, 5, 5, 5, 4, 4]);
+        assert_eq!(Grid::blends(&grid.columns), vec![6, 5, 5]);
+        // The rows a raster of tiles owns: each start in latent rows, then the height.
+        assert_eq!(grid.owned(84), vec![0, 11, 22, 33, 44, 56, 68, 84]);
+    }
+
+    #[test]
+    fn a_band_reads_the_tile_rows_it_cross_fades_with() {
+        let grid = Grid::of(1344, 768).expect("the grid");
+        let latent_height = 1344 / SPATIAL_RATIO;
+        assert_eq!(latent_height, 84);
+        // The first band starts at the top: no row above it.
+        assert_eq!(grid.band(84, 0, 11).expect("band"), (0, 0));
+        // A band that starts on a row's own first latent row reads only that row and below.
+        assert_eq!(grid.band(84, 16, 33).expect("band"), (1, 2));
+        // A band that starts inside a row's cross-fade reads the row above.
+        let owned = grid.owned(84);
+        assert_eq!(owned[1], 11);
+        assert_eq!(grid.rows.overlaps[0] / SPATIAL_RATIO, 5);
+        assert_eq!(grid.band(84, 13, 20).expect("band"), (0, 1));
+        // Past the end is refused.
+        assert!(grid.band(84, 80, 90).is_err());
+        assert!(grid.band(84, 5, 5).is_err());
+    }
+
+    #[test]
+    fn the_audio_encoder_stages_land_on_whole_latent_frames() {
+        let stack = AudioStack::of(&crate::audio_vae::tests::audio_config()).expect("the stack");
+        assert_eq!(stack.samples_per_latent, 800);
+        assert_eq!(stack.lengths(800), vec![800, 400, 100, 25, 5, 1]);
+        assert_eq!(stack.lengths(1600), vec![1600, 800, 200, 50, 10, 2]);
+        assert_eq!(stack.latent_frames(800).expect("one frame"), 1);
+        assert_eq!(stack.latent_frames(24000).expect("thirty frames"), 30);
+        // A partial frame rounds up, and the length the network is given is the ceiling's own multiple:
+        // the reference right-pads the track with zeros, so nothing is dropped.
+        assert_eq!(stack.latent_frames(801).expect("rounds up"), 2);
+        assert_eq!(padded_samples(801, 800).expect("padded"), 1600);
+        assert_eq!(padded_samples(1600, 800).expect("whole"), 1600);
+        // Each stage doubles the width from the input convolution's.
+        assert_eq!(stack.widths, vec![128, 256, 512, 1024, 2048]);
+        assert_eq!(stack.latent_dim, 2048);
+    }
+
+    #[test]
+    fn the_audio_encoder_table_names_every_parameter() {
+        let table = audio_sources(&crate::audio_vae::tests::audio_config())
+            .expect("the encoder's parameters");
+        // The input pair, five stages of twenty-one — eighteen for the three residual units, two for
+        // the widening convolution and one for the stage's Snake — the output Snake and its pair, and
+        // the projection block with the mean convolution: twenty-one tensors and the fused
+        // query-key-value bias.
+        assert_eq!(table.len(), 2 + 5 * 21 + 3 + 22);
+        let names: Vec<&str> = table
+            .iter()
+            .map(|source| source.parameter.as_str())
+            .collect();
+        for expected in [
+            "input.weight",
+            "stages.0.units.0.convs.0.weight",
+            "stages.4.units.2.convs.1.bias",
+            "stages.4.widen.weight",
+            "stages.4.units.2.snakes.0.alpha",
+            "stages.4.snake.alpha",
+            "output_snake.alpha",
+            "output.weight",
+            "projection.qkv.weight",
+            "projection.qkv.bias",
+            "projection.mlp.gate.weight",
+            "mean_projection.bias",
+        ] {
+            assert!(names.contains(&expected), "{expected} is missing");
+        }
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len());
+        // Seven weight-normalized convolutions per stage — six in the three residual units and the
+        // widening one — plus the input and the output convolution. The projection block's weights and
+        // the mean convolution are plain, as the checkpoint stores them.
+        let normalized = table
+            .iter()
+            .filter(|source| matches!(source.tensor, crate::audio_vae::Tensor::Normalized { .. }))
+            .count();
+        assert_eq!(normalized, 1 + 5 * 7 + 1);
+        // The fused query-key-value bias names its three checkpoint vectors in order.
+        let bias = table
+            .iter()
+            .find(|source| source.parameter == "projection.qkv.bias")
+            .expect("the fused bias");
+        match &bias.tensor {
+            crate::audio_vae::Tensor::Parts(parts) => assert_eq!(
+                parts,
+                &vec![
+                    "pre_block.attn.q_bias".to_owned(),
+                    "pre_block.attn.zero_k_bias".to_owned(),
+                    "pre_block.attn.v_bias".to_owned(),
+                ]
+            ),
+            other => panic!("the fused bias is {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_stack_with_no_stage_is_refused() {
+        let mut config = video_config();
+        config.block_out_channels.clear();
+        assert!(Stack::of(&config).is_err());
+        let mut config = video_config();
+        config.spatial_downsample_factors.pop();
+        assert!(Stack::of(&config).is_err());
+        let mut config = video_config();
+        config.temporal_downsample_factors[1] = 0;
+        assert!(Stack::of(&config).is_err());
     }
 }

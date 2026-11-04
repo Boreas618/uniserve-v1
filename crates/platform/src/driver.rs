@@ -247,6 +247,8 @@ driver_table! {
         stream_synchronize = "cuStreamSynchronize": fn(Handle);
         stream_destroy = "cuStreamDestroy_v2": fn(Handle);
         stream_wait_event = "cuStreamWaitEvent": fn(Handle, Handle, u32);
+        stream_write_value32 = "cuStreamWriteValue32_v2": fn(Handle, u64, u32, u32);
+        stream_wait_value32 = "cuStreamWaitValue32_v2": fn(Handle, u64, u32, u32);
         launch_host_func = "cuLaunchHostFunc": fn(Handle, HostFn, Handle);
         graph_launch = "cuGraphLaunch": fn(Handle, Handle);
         graph_instantiate = "cuGraphInstantiateWithFlags": fn(*mut Handle, Handle, u64);
@@ -561,6 +563,18 @@ mod tests {
                 (
                     "CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE",
                     CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE as i64,
+                ),
+                (
+                    "CU_STREAM_WAIT_VALUE_GEQ",
+                    crate::stream::CU_STREAM_WAIT_VALUE_GEQ as i64,
+                ),
+                (
+                    "CU_STREAM_WAIT_VALUE_EQ",
+                    crate::stream::CU_STREAM_WAIT_VALUE_EQ as i64,
+                ),
+                (
+                    "CU_STREAM_WAIT_VALUE_AND",
+                    crate::stream::CU_STREAM_WAIT_VALUE_AND as i64,
                 ),
                 (
                     "CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION",

@@ -908,7 +908,13 @@ impl CachePlanes {
     /// scales one. The values of segmented planes fill column by column: a
     /// fill's rows may not span a segment given back, which the driver
     /// refuses although no row touches it.
-    fn reset_units(&self, first: u32, count: u32, values: bool, stream: impl Issue) -> Result<()> {
+    pub(crate) fn reset_units(
+        &self,
+        first: u32,
+        count: u32,
+        values: bool,
+        stream: impl Issue,
+    ) -> Result<()> {
         if count == 0 {
             return Ok(());
         }
@@ -951,6 +957,57 @@ impl CachePlanes {
             }
         }
         Ok(())
+    }
+
+    /// Sets units `[first, first + count)` "initialized" flag of every column to one on
+    /// `stream`: the unit's values and scales are in place and a reader may use them.
+    pub(crate) fn mark_units_initialized(
+        &self,
+        first: u32,
+        count: u32,
+        stream: impl Issue,
+    ) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        self.require_unit(first + count - 1)?;
+        let units = self.num_units as usize;
+        let columns = self.plan.columns as usize;
+        let (first, count) = (first as usize, count as usize);
+        for initialized in &self.initialized {
+            // SAFETY: the fill lies inside the flag allocation owned by this
+            // pool, whose units the caller has mapped; the caller orders the
+            // fills.
+            unsafe {
+                stream.memset_2d(RowFill {
+                    address: initialized.address() + first as u64,
+                    pitch: units,
+                    value: 1,
+                    width: 1,
+                    count,
+                    height: columns,
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The units this pool holds, the sentinel included.
+    pub(crate) fn units(&self) -> u32 {
+        self.num_units
+    }
+
+    /// The whole value storage of `field`, cell-major: `columns * units` planes of
+    /// `CachePlan::plane_bytes` bytes, the shape the block copy reads.
+    pub(crate) fn value_storage(&self, field: usize) -> Result<&Arc<Storage>> {
+        self.values
+            .get(field)
+            .ok_or_else(|| Error::Invalid(format!("a cache pool holds no field {field}")))
+    }
+
+    /// The device the planes live on, or `None` for a host pool.
+    pub(crate) fn device_of(&self) -> Option<DeviceId> {
+        self.device
     }
 
     pub(crate) fn plan(&self) -> &Arc<CachePlan> {
@@ -1494,6 +1551,12 @@ pub struct UnitColumn {
 
 impl UnitColumn {
     /// Bind the resets of `planes` to `stream` (`None` for a host pool).
+    /// Bytes one column of `num_units` unit indices occupies: one `i64` per
+    /// unit.
+    pub(crate) fn bytes(num_units: u32) -> u64 {
+        u64::from(num_units) * ElementType::I64.bytes() as u64
+    }
+
     pub(crate) fn bind(planes: &Arc<CachePlanes>, stream: Option<&Stream>) -> Result<Self> {
         if planes.device.is_some() != stream.is_some() {
             return Err(Error::Invalid(
@@ -1539,18 +1602,42 @@ impl UnitColumn {
         if !plan.quantized {
             return Ok(());
         }
-        for &unit in units {
-            self.planes.reset_units(unit, 1, false, stream)?;
+        // One fill per run of consecutive units per column, in the order the
+        // caller gave them: a reused unit's scales are one again, so a later
+        // import re-converts it, and a scattered release costs its runs and not
+        // its units.
+        let mut units = units.to_vec();
+        units.sort_unstable();
+        units.dedup();
+        let mut start = 0;
+        while start < units.len() {
+            let mut end = start + 1;
+            while end < units.len() && units[end] == units[end - 1] + 1 {
+                end += 1;
+            }
+            self.planes
+                .reset_units(units[start], (end - start) as u32, false, stream)?;
+            start = end;
         }
         Ok(())
     }
 
     /// Commit transferred values and scales of whole units: set both fields'
-    /// initialization flags in every column.
+    /// initialization flags in every column, in runs like `recycle`.
     pub(crate) fn mark_initialized(&self, units: &[u32], stream: impl Issue) -> Result<()> {
         self.require_stream(stream)?;
-        for &unit in units {
-            self.planes.reset_units(unit, 1, false, stream)?;
+        let mut units = units.to_vec();
+        units.sort_unstable();
+        units.dedup();
+        let mut start = 0;
+        while start < units.len() {
+            let mut end = start + 1;
+            while end < units.len() && units[end] == units[end - 1] + 1 {
+                end += 1;
+            }
+            self.planes
+                .mark_units_initialized(units[start], (end - start) as u32, stream)?;
+            start = end;
         }
         Ok(())
     }
@@ -1593,7 +1680,12 @@ mod layer_view_tests {
         quantized: bool,
     ) -> CachePlanes {
         let cells = usize::try_from(u64::from(columns) * u64::from(num_units)).unwrap();
-        let [key, value] = [0, 1].map(|_| Storage::host(cells.max(1)));
+        // A field holds `cells` planes of the plan's `plane_bytes`, the flags one byte per cell
+        // and the scales four: a view reads the last cell, so a storage of `cells` bytes would
+        // address past its end.
+        let plane_bytes = 16;
+        let [key, value] = [0, 1].map(|_| Storage::host(cells.max(1) * plane_bytes));
+        let flags = || Storage::host(cells.max(1));
         CachePlanes {
             plan: Arc::new(CachePlan {
                 columns,
@@ -1609,8 +1701,13 @@ mod layer_view_tests {
             num_units,
             segmenting: None,
             values: [Arc::clone(&key), Arc::clone(&value)],
-            scales: quantized.then(|| [Storage::host(cells.max(1)), Storage::host(cells.max(1))]),
-            initialized: [Arc::clone(&key), Arc::clone(&value)],
+            scales: quantized.then(|| {
+                [
+                    Storage::host(cells.max(1) * 4),
+                    Storage::host(cells.max(1) * 4),
+                ]
+            }),
+            initialized: [flags(), flags()],
             fields: Vec::new(),
         }
     }

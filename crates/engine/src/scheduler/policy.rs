@@ -30,7 +30,7 @@ use std::sync::OnceLock;
 use scheduling::guest::decision::{Plan, Room, Shortage, Victim};
 use scheduling::guest::event::Event;
 use scheduling::guest::ids::PageId;
-use scheduling::guest::limits::{Limits, Parameters};
+pub use scheduling::guest::limits::{Limits, Parameters};
 use scheduling::guest::policy::Instantiation;
 use scheduling::guest::view::{
     CallView, ExpertLoad, ExpertOrder, RankView, ReplicaView, RequestState, RequestView, Snapshot,
@@ -145,10 +145,20 @@ impl PolicyProgram {
 
 /// One configured argument of a program, parsed as the type the policy
 /// parameter has.
+///
+/// The program states each argument as TOML text of the value itself — `2048`,
+/// `2.5` — so it is parsed as a TOML value and turned into the parameter's type,
+/// not read as a document.
 fn argument<T: serde::de::DeserializeOwned>(value: &str, name: &str) -> Result<T, PolicyError> {
-    toml::from_str(&format!("value = {value}")).map_err(|error| PolicyError::Load {
+    let failure = |error: String| PolicyError::Load {
         message: format!("the policy argument `{name} = {value}` does not parse: {error}"),
-    })
+    };
+    let parsed: toml::Value = value.trim().parse().map_err(|error: toml::de::Error| {
+        failure(error.to_string())
+    })?;
+    parsed
+        .try_into()
+        .map_err(|error: toml::de::Error| failure(error.to_string()))
 }
 
 /// The build config's hard bounds on what one step may be given to run (§4.4):
@@ -475,6 +485,21 @@ pub struct Candidate {
     /// knowledge starts from, which the mechanism seeds the recorder with when
     /// the candidate starts serving (§4.4).
     state: Snapshot,
+    /// The pages the candidate asked to warm, in its own order (§4.4's warming
+    /// row). The decision is taken and validated here and performed by the KV
+    /// storage client, which serves no page-addressed load yet; keeping it on
+    /// the candidate is what distinguishes "the policy decided" from "the
+    /// mechanism dropped it" — see `mechanism.rs`'s "Validated and deferred".
+    warm: Vec<scheduling::guest::PageId>,
+}
+
+impl Candidate {
+    /// The pages the candidate asked to warm, in its own order — the decision
+    /// §4.4's warming row calls for, waiting on the storage client that
+    /// performs it.
+    pub fn warm(&self) -> &[scheduling::guest::PageId] {
+        &self.warm
+    }
 }
 
 /// What an epoch's policy has cost so far, in the two counters `Metrics`
@@ -488,6 +513,20 @@ pub struct PolicyUsage {
     /// has had: a switchover carries its predecessor's total forward, so the
     /// counters only ever grow.
     pub fuel: u64,
+    /// Those calls by decision, the instance serving now and every one it
+    /// replaced (§4.4).
+    ///
+    /// This is the epoch's call discipline as a caller can see it: one `observe`
+    /// and one `dispatch` per step whatever they answer, each optional decision
+    /// only where the state names it, and the trial a precopy ran on the
+    /// instance a switchover adopts. A policy that replaced another carries the
+    /// replaced instance's counts forward, as `calls` and `fuel` do.
+    ///
+    /// The one difference from `calls`: a precopy whose candidate a later
+    /// precopy displaced is in `calls` and not here, since no instance of the
+    /// epoch's policy ever served under it. Its decision set is still the
+    /// mechanism's - it is a trial - but it is not a step the epoch took.
+    pub decisions: scheduling::PolicyCost,
 }
 
 /// What one scheduler tells the control thread's counters on a statistics tick:
@@ -513,6 +552,9 @@ struct Cost {
     /// Fuel of the instances that stopped serving, and of the trials whose
     /// candidates were adopted.
     spent: u64,
+    /// The decisions of the instances that stopped serving; the serving
+    /// instance's own are read from it, as its fuel is.
+    decisions: scheduling::PolicyCost,
 }
 
 impl Cost {
@@ -531,12 +573,14 @@ impl Cost {
         PolicyUsage {
             calls: self.calls,
             fuel: self.spent + instance.fuel_consumed(),
+            decisions: self.decisions + instance.cost(),
         }
     }
 
     /// An instance stops serving: its fuel stays in the total.
     fn replace(&mut self, instance: &PolicyInstance) {
         self.spent += instance.fuel_consumed();
+        self.decisions = self.decisions + instance.cost();
     }
 
     /// A trial's calls are counted when its candidate is adopted: they are
@@ -691,6 +735,12 @@ impl PolicySlot {
     /// prepared: §7.3's policy for a fresh epoch, whose precopy ran before any
     /// policy served.
     pub fn from_candidate(engine: &Engine, ceilings: Limits, candidate: Candidate) -> Self {
+        // The epoch's first policy serves under the trial its precopy ran, so
+        // those calls are the epoch's policy's, counted as an adopted
+        // candidate's are (§12): a counter that dropped them would report an
+        // epoch whose first policy never called the guest.
+        let mut cost = Cost::default();
+        cost.trial(candidate.calls);
         Self {
             engine: engine.clone(),
             ceilings,
@@ -701,7 +751,7 @@ impl PolicySlot {
             candidate: None,
             pending: None,
             state: candidate.state,
-            cost: Cost::default(),
+            cost,
         }
     }
 
@@ -860,6 +910,10 @@ impl PolicySlot {
         let pages = instance.warm(&room)?;
         calls += 1;
         validators.warm(&pages)?;
+        tracing::debug!(
+            pages = pages.len(),
+            "the precopy policy named the pages to warm, in its order"
+        );
         if let Some(load) = &expert_load {
             let order = instance.experts(load)?;
             calls += 1;
@@ -872,6 +926,10 @@ impl PolicySlot {
             instance,
             calls,
             state: init.state,
+            // A route-only precopy asks no warming decision: the room it has
+            // is the routing one, and warming belongs to the precopy that
+            // prepares a serving policy.
+            warm: Vec::new(),
         })
     }
 
@@ -1137,6 +1195,10 @@ impl RoutePolicy {
     /// The route instance an epoch's first switchover installs from the
     /// candidate its precopy prepared.
     pub fn from_candidate(engine: &Engine, ceilings: Limits, candidate: Candidate) -> Self {
+        // Its trial's calls are the epoch's policy's, as a scheduler's first
+        // policy counts them (§12).
+        let mut cost = Cost::default();
+        cost.trial(candidate.calls);
         Self {
             engine: engine.clone(),
             ceilings,
@@ -1146,7 +1208,7 @@ impl RoutePolicy {
             previous: None,
             candidate: None,
             state: candidate.state,
-            cost: Cost::default(),
+            cost,
         }
     }
 
@@ -1220,6 +1282,10 @@ impl RoutePolicy {
             instance,
             calls,
             state: init.state,
+            // A route-only precopy asks no warming decision: the room it has
+            // is the routing one, and warming belongs to the precopy that
+            // prepares a serving policy.
+            warm: Vec::new(),
         })
     }
 
@@ -1313,8 +1379,6 @@ mod tests {
     //! switch rather than a mock of it: a trap, a fuel run-out, a limit outside
     //! the build config, an invalid decision, and the stages of §7.3.
 
-    use serde::Serialize;
-
     use scheduling::guest::decision::{Plan, Shortage, Storage, Victim};
     use scheduling::guest::ids::{PageId, RequestId};
     use scheduling::guest::time::Nanos;
@@ -1322,132 +1386,7 @@ mod tests {
 
     use super::*;
 
-    /// Where the toy keeps its message buffer and its replies.
-    const MESSAGE: u32 = 4096;
-    const PLAN: u32 = 8192;
-    const LIMITS: u32 = 12288;
-    const VICTIMS: u32 = 16384;
-    const PAGES: u32 = 20480;
-    const EXPERTS: u32 = 24576;
-
-    /// The answer a toy policy module gives, and the one call it fails in.
-    struct Toy {
-        plan: Plan,
-        limits: Limits,
-        victims: Vec<Victim>,
-        pages: Vec<PageId>,
-        experts: ExpertOrder,
-        /// The call whose export traps (`unreachable`).
-        trap: Option<Call>,
-        /// The call whose export never returns.
-        spin: Option<Call>,
-    }
-
-    impl Default for Toy {
-        fn default() -> Self {
-            Self {
-                plan: Plan::default(),
-                limits: fitting_limits(),
-                victims: Vec::new(),
-                pages: Vec::new(),
-                experts: ExpertOrder::default(),
-                trap: None,
-                spin: None,
-            }
-        }
-    }
-
-    /// The module bytes of `toy`.
-    fn toy_module(toy: &Toy) -> Vec<u8> {
-        let bodies = [
-            (Call::Dispatch, PLAN, json(&toy.plan)),
-            (Call::Reclaim, VICTIMS, json(&toy.victims)),
-            (Call::Warm, PAGES, json(&toy.pages)),
-            (Call::Experts, EXPERTS, json(&toy.experts)),
-        ];
-        let mut functions = vec![
-            format!("(func (export \"sched_alloc\") (param i32) (result i32) i32.const {MESSAGE})"),
-            "(func (export \"sched_free\") (param i32 i32))".to_owned(),
-            "(func (export \"sched_init\") (param i32 i32) (result i64) i64.const 0)".to_owned(),
-            "(func (export \"sched_observe\") (param i32 i32) (result i64) i64.const 0)".to_owned(),
-        ];
-        let mut data = vec![format!(
-            "(data (i32.const {PLAN}) \"{}\")",
-            escape(&json(&toy.plan))
-        )];
-        for (call, offset, answer) in bodies {
-            data.push(format!(
-                "(data (i32.const {offset}) \"{}\")",
-                escape(&answer)
-            ));
-            functions.push(buffered(call, offset, answer.len(), toy));
-        }
-        functions.push(buffered(Call::Limits, LIMITS, json(&toy.limits).len(), toy));
-        data.push(format!(
-            "(data (i32.const {LIMITS}) \"{}\")",
-            escape(&json(&toy.limits))
-        ));
-        for (call, index) in [(Call::Route, 0), (Call::Place, 0)] {
-            functions.push(indexed(call, index, toy));
-        }
-        let source = format!(
-            "(module (memory (export \"memory\") 1) {} {})",
-            data.join(" "),
-            functions.join(" ")
-        );
-        wat::parse_str(&source).expect("the toy policy module is valid WebAssembly text")
-    }
-
-    /// The export of a call that answers with a reply buffer.
-    fn buffered(call: Call, offset: u32, len: usize, toy: &Toy) -> String {
-        let params = if call == Call::Limits {
-            String::new()
-        } else {
-            "(param i32 i32)".to_owned()
-        };
-        let packed = (u64::from(offset) << 32) | u64::try_from(len).expect("a reply fits u64");
-        if toy.trap == Some(call) {
-            format!(
-                "(func (export \"{}\") {params} (result i64) unreachable)",
-                call.export()
-            )
-        } else if toy.spin == Some(call) {
-            format!(
-                "(func (export \"{}\") {params} (result i64) (loop br 0) unreachable)",
-                call.export()
-            )
-        } else {
-            format!(
-                "(func (export \"{}\") {params} (result i64) i64.const {packed})",
-                call.export()
-            )
-        }
-    }
-
-    /// The export of a call that answers with the chosen index.
-    fn indexed(call: Call, index: u32, toy: &Toy) -> String {
-        if toy.trap == Some(call) {
-            format!(
-                "(func (export \"{}\") (param i32 i32) (result i32) unreachable)",
-                call.export()
-            )
-        } else {
-            format!(
-                "(func (export \"{}\") (param i32 i32) (result i32) i32.const {index})",
-                call.export()
-            )
-        }
-    }
-
-    /// `value` as the protocol's JSON.
-    fn json<T: Serialize>(value: &T) -> String {
-        serde_json::to_string(value).expect("an interface value is JSON")
-    }
-
-    /// `text` escaped for a WebAssembly text data segment.
-    fn escape(text: &str) -> String {
-        text.replace('\\', "\\\\").replace('"', "\\\"")
-    }
+    use crate::scheduler::testing::{Toy, fitting_limits, toy_module};
 
     /// A `PolicySource` of one toy module.
     fn source(toy: &Toy) -> PolicyBytes {
@@ -1469,16 +1408,6 @@ mod tests {
         Plan {
             refill: vec![RequestId(request)],
             ..Plan::default()
-        }
-    }
-
-    /// A policy's limits that fit `ceilings`.
-    fn fitting_limits() -> Limits {
-        Limits {
-            chunked_prefill_size: 256,
-            max_batch: 4,
-            max_num_batched_tokens: 512,
-            ..Limits::default()
         }
     }
 
@@ -2028,7 +1957,7 @@ mod tests {
         // rest, so the source carries exactly what the daemon named.
         let arguments = std::collections::BTreeMap::from([
             ("max_batch".to_owned(), "16".to_owned()),
-            ("timeout".to_owned(), "\"5s\"".to_owned()),
+            ("timeout".to_owned(), "5000000000".to_owned()),
         ]);
         let built = PolicyProgram::from_arguments("fcfs", 7, &arguments)
             .expect("the arguments are the policy's");
@@ -2038,7 +1967,7 @@ mod tests {
         assert_eq!(server.backend, "fcfs");
         assert_eq!(server.revision, 7);
         assert_eq!(server.arguments["max_batch"].as_integer(), Some(16));
-        assert_eq!(server.arguments["timeout"].as_str(), Some("5s"));
+        assert_eq!(server.arguments["timeout"].as_integer(), Some(5_000_000_000));
         assert_eq!(server.arguments.len(), 2);
     }
 

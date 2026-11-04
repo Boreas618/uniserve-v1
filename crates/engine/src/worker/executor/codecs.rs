@@ -25,9 +25,9 @@ use crate::executor::WorkerGroupId;
 pub(crate) fn video_unit_codecs(
     routing: &std::collections::BTreeMap<ipc::MediaCall, String>,
     placements: &[(
-        &WorkerGroupId,
-        &[crate::WorkerRank],
-        &std::collections::BTreeMap<String, crate::ComponentConfig>,
+        WorkerGroupId,
+        Vec<String>,
+        std::collections::BTreeMap<String, crate::ComponentConfig>,
     )],
 ) -> anyhow::Result<
     std::collections::BTreeMap<WorkerGroupId, std::collections::BTreeSet<WorkerGroupId>>,
@@ -45,7 +45,7 @@ pub(crate) fn video_unit_codecs(
             .filter_map(|(id, ranks, components)| {
                 components
                     .get(component)
-                    .map(|config| (*id, *ranks, config))
+                    .map(|config| (id.clone(), ranks, config))
             })
             .collect::<Vec<_>>()
     };
@@ -72,10 +72,10 @@ pub(crate) fn video_unit_codecs(
                 let encoding_rank = encoder_config.ranks[position / per_encoder];
                 let decoding_host = decoder_ranks
                     .get(decoding_rank)
-                    .map_or("<unplaced>", |rank| rank.host.as_str());
+                    .map_or("<unplaced>", String::as_str);
                 let encoding_host = encoder_ranks
                     .get(encoding_rank)
-                    .map_or("<unplaced>", |rank| rank.host.as_str());
+                    .map_or("<unplaced>", String::as_str);
                 (decoding_host != encoding_host).then(|| {
                     format!(
                         "media unit {position} is decoded by rank {decoding_rank} of worker \
@@ -87,7 +87,7 @@ pub(crate) fn video_unit_codecs(
             match crossing {
                 Some(refusal) => refusals.push(refusal),
                 None => {
-                    admissible.insert((*encoder_worker).clone());
+                    admissible.insert(encoder_worker.clone());
                 }
             }
         }
@@ -303,6 +303,8 @@ mod tests {
         assert_eq!(slots, [transfer.acknowledgment_slot("encoder-0", 1)]);
     }
 
+    /// The pairing of a deployment described by its pools' placed ranks: the
+    /// function itself reads only the ranks' hosts.
     fn pairing(
         placements: &[(
             &WorkerGroupId,
@@ -310,7 +312,17 @@ mod tests {
             &BTreeMap<String, ComponentConfig>,
         )],
     ) -> anyhow::Result<BTreeMap<WorkerGroupId, std::collections::BTreeSet<WorkerGroupId>>> {
-        video_unit_codecs(&routing(), placements)
+        let placed = placements
+            .iter()
+            .map(|(id, ranks, components)| {
+                (
+                    (*id).clone(),
+                    ranks.iter().map(|rank| rank.host.clone()).collect(),
+                    (*components).clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        video_unit_codecs(&routing(), &placed)
     }
 
     #[test]

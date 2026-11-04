@@ -13,10 +13,10 @@ use platform::SourceOrder;
 use super::read::{NativeRead, ReadCall, payload};
 use super::transport::{ExportView, Staged, Transport, producer, read_destination};
 use super::{Spans, copy_planner};
+use crate::memory::allocation::Backing;
+use crate::memory::allocation::MemoryKind;
 use crate::memory::allocation::{Storage, StorageView};
 use crate::stream::Issue;
-use crate::memory::allocation::Backing;
-use crate::memory::allocation::{MemoryKind};
 use crate::{Error, Result};
 
 impl Transport {

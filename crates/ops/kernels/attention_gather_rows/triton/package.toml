@@ -1,0 +1,47 @@
+# The attention_gather_rows operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one architecture
+# of `[kernel.architectures]`, built by `src/build.py` (the compile driver the
+# Program Server runs for one descriptor and target).
+#
+# This is the paged-decode step's metadata: one launch per call fills the batch's
+# block tables, start pages, lengths, offsets and slot mapping from the request
+# slots' resident unit tables and one int64 column array the host wrote. Every
+# output is an index or a copy of one, so the operator's tolerance is `exact()` and
+# the checks compare bits.
+#
+# **Every stride in the key is compiled in**, because each one is index arithmetic
+# in the program; the counts a call changes — rows, tokens, cell programs and the
+# selected width — are runtime values, so a new batch size loads no other module.
+#
+# The declared configuration is one call shape: a graph bucket of 256 rows
+# (`row_stride` 257, the array's end included), one table, 256 units per slot, 512
+# slots, 1024 tokens. `token_section` is `(ROW_SECTIONS + tables) · row_stride`,
+# which the operator refuses to see otherwise; `row_block` is `row_stride` rounded up
+# to a power of two, and `block` is the cells or tokens one program copies.
+
+op = "attention_gather_rows"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/attention_gather_rows.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a", "sm_100f"]
+
+[kernel.descriptors]
+dimensions = { column_dtype = ["i32"], index = ["i32"], tables = ["1"], row_stride = ["257"], token_section = ["1799"], unit_table_stride = ["131072"], unit_row_stride = ["256"], request_width = ["256"], start_group_stride = ["512"], block_table_stride = ["65536"], block_table_row_stride = ["256"], start_page_stride = ["256"], write_stride = ["1024"], row_block = ["512"], block = ["256"] }
+
+[parameters]
