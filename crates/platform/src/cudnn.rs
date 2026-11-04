@@ -1672,7 +1672,6 @@ impl Cudnn {
                 ),
                 Err(error) => format!("refused: {error}"),
             };
-            steps.push((format!("engine heuristic: {label} read back"), None));
             steps.push((format!("engine heuristic: {label} {line}"), None));
         }
         steps.extend(self.fill_variants(&graph, &mode_b, listed_b));
