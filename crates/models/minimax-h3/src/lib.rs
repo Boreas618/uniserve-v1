@@ -63,8 +63,8 @@ pub use config::{
     ScheduleSpec, Shifts, SpatialPadding, TextEncoderConfig, TransformerConfig,
     UNIFORM_GRID_POINTS, VideoVaeConfig, VisionConfig,
 };
-pub use load::{Capacity, Component, LoadOptions, load};
-pub use partition::Partition;
+pub use load::load;
+pub use partition::{Component, Partition};
 
 /// What this crate can fail with.
 #[derive(Debug, thiserror::Error)]
