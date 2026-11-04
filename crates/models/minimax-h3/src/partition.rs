@@ -11,8 +11,9 @@
 //! the model is told how many ranks the exchange runs over, and the layer that shards a tensor
 //! reads only the degree and the rank's position in it.
 
-use nn::DType;
+use nn::{DType, VideoTask};
 
+use crate::checkpoint::TASK_DITS;
 use crate::denoiser::Arrangement;
 use crate::{Error, Result, config::Config};
 
@@ -307,6 +308,59 @@ impl Partition {
         }
     }
 
+    /// The blocks a deployment serving `task` places over a checkpoint holding `config`.
+    ///
+    /// A server places **one** DiT partition, so the task decides which: `t2va` and `fl2va` run the
+    /// base `transformer`, `ref2va` the `transformer_ref`. A checkpoint that holds both therefore
+    /// serves the tasks of one partition per deployment, not all three.
+    ///
+    /// The decoders are placed for every task, because every task returns video and audio. The
+    /// condition encoders are placed for the tasks that carry conditions - `fl2va`'s keyframes and
+    /// `ref2va`'s references and keyframes - and not for `t2va`, whose request has none.
+    pub fn serving(
+        config: &Config,
+        task: VideoTask,
+        ulysses_degree: usize,
+        tensor_parallel: usize,
+        tensor_rank: usize,
+    ) -> Result<Self> {
+        let dit = TASK_DITS
+            .iter()
+            .find_map(|(served, dit)| (*served == task).then_some(*dit))
+            .ok_or_else(|| Error::config(format!("no MiniMax-H3 deployment serves {task:?}")))?;
+        if !config.denoisers.contains_key(&dit) {
+            return Err(Error::config(format!(
+                "the checkpoint holds no {} DiT, so it cannot serve {task:?} (it holds {})",
+                dit.directory(),
+                config
+                    .denoisers
+                    .keys()
+                    .map(|dit| dit.directory())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        let mut blocks = Components::of([
+            Component::TextEncoder,
+            Component::VideoDecoder,
+            Component::AudioDecoder,
+        ])
+        .with(match dit {
+            crate::checkpoint::Dit::Base => Component::Transformer,
+            crate::checkpoint::Dit::Reference => Component::TransformerRef,
+        });
+        if matches!(
+            task,
+            VideoTask::FirstLastToVideoAudio | VideoTask::ReferenceToVideoAudio
+        ) {
+            blocks = blocks.with(Component::LatentEncoder);
+        }
+        let partition =
+            Self::new(config, ulysses_degree, tensor_parallel, tensor_rank)?.placing(blocks);
+        partition.validate(config)?;
+        Ok(partition)
+    }
+
     /// The same partition, placing `blocks`.
     ///
     /// A deployment that serves `ref2va` places [`Component::TransformerRef`] and drops
@@ -578,5 +632,51 @@ mod tests {
             ..Partition::single()
         };
         one.validate(&config).expect("one denoiser");
+    }
+
+    #[test]
+    fn a_deployment_places_one_denoiser_and_the_encoders_its_task_needs() {
+        let config = config();
+
+        // `t2va` carries no conditions, so it needs no condition encoder.
+        let t2va = Partition::serving(&config, VideoTask::TextToVideoAudio, 1, 1, 0).expect("t2va");
+        assert_eq!(
+            t2va.blocks,
+            Components::of([
+                Component::TextEncoder,
+                Component::Transformer,
+                Component::VideoDecoder,
+                Component::AudioDecoder,
+            ])
+        );
+
+        // A keyframe is a condition unit, so `fl2va` runs the encoders; it shares `t2va`'s DiT.
+        let fl2va =
+            Partition::serving(&config, VideoTask::FirstLastToVideoAudio, 1, 1, 0).expect("fl2va");
+        assert!(fl2va.blocks.contains(Component::LatentEncoder));
+        assert!(fl2va.blocks.contains(Component::Transformer));
+        assert!(!fl2va.blocks.contains(Component::TransformerRef));
+
+        // `ref2va` is the reference partition, and its references and keyframes need the encoders.
+        let ref2va =
+            Partition::serving(&config, VideoTask::ReferenceToVideoAudio, 1, 1, 0).expect("ref2va");
+        assert!(ref2va.blocks.contains(Component::TransformerRef));
+        assert!(!ref2va.blocks.contains(Component::Transformer));
+        assert!(ref2va.blocks.contains(Component::LatentEncoder));
+    }
+
+    #[test]
+    fn a_deployment_a_checkpoint_cannot_fill_is_refused() {
+        // An OmniRef export holds only the reference partition: it serves `ref2va` and nothing else.
+        let mut config = config();
+        config
+            .denoisers
+            .remove(&crate::checkpoint::Dit::Base)
+            .expect("the base partition");
+        let error = Partition::serving(&config, VideoTask::TextToVideoAudio, 1, 1, 0)
+            .expect_err("no transformer");
+        assert!(error.to_string().contains("transformer"), "{error}");
+        Partition::serving(&config, VideoTask::ReferenceToVideoAudio, 1, 1, 0)
+            .expect("the reference partition is held");
     }
 }
