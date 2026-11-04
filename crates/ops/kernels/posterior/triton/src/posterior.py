@@ -11,9 +11,13 @@ clamp, and the FP16 round trip after the sum. A kernel that keeps the sample in 
 and rounds once at the end produces a different tensor -- `0.25000014901161194` is stored as `0.25`
 by this chain and would not be by that one -- which is why the operator's tolerance is exact.
 
-**Every operand is read through its own row stride.** The two moments are the halves of the encoder's
-`[positions, 2 · channels]` output, cut on the channel axis, so their rows are twice as wide as the
-sample's and a kernel that assumed a contiguous row would read the noise as a variance.
+**Every operand is read through its own two strides**, a row stride and a channel stride, so both
+physical layouts are one launch rather than one kernel: a channels-last caller passes
+`(row = channels, channel = 1)`, and a channel-major one -- the VAE's rasters are
+`[channels, frames, rows, columns]` because that is what every convolution reads -- passes
+`(row = 1, channel = positions)`. The two moments are then the halves of one buffer cut by an offset,
+with no transpose and no second buffer. A kernel that assumed either layout would force the other
+caller to copy.
 
 **Nothing is fused in.** The per-channel affine a conditioner applies afterwards is a diagonal `1×1`
 convolution and belongs to the model, not here: this kernel's arithmetic must not depend on a weight
@@ -39,31 +43,38 @@ def _posterior_kernel(
     out_ptr,
     channels,
     mean_row,
+    mean_channel,
     log_variance_row,
+    log_variance_channel,
     noise_row,
+    noise_channel,
     out_row,
+    out_channel,
     total,
     pdl,
     BLOCK: tl.constexpr,
     PDL: tl.constexpr,
 ):
-    """One element a lane, addressed through its operand's own row stride.
+    """One element a lane, addressed through each operand's own two strides.
 
-    The flat index is the element's position in the sample's `[positions, channels]` layout; the row
-    comes from dividing by the channel count and the column from what is left, and each of the four
-    operands turns that pair into its own offset. The casts to int64 are not decoration: the extents
-    and strides arrive unsigned and the index is signed, and Triton refuses the modulo across two
-    signednesses rather than guessing.
+    The flat index is the element's place in the sample's `[positions, channels]` block; the position
+    comes from dividing by the channel count and the channel from what is left, and each of the four
+    operands turns that pair into its own offset -- `position · row + channel · channel_stride`, which
+    is a layout, not a mode. The casts to int64 are not decoration: the extents and strides arrive
+    unsigned and the index is signed, and Triton refuses the modulo across two signednesses rather
+    than guessing.
     """
     index = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
     live = index < total
     channels = channels.to(tl.int64)
     row = index // channels
     column = index - row * channels
-    mean_offset = row * mean_row.to(tl.int64) + column
-    log_variance_offset = row * log_variance_row.to(tl.int64) + column
-    noise_offset = row * noise_row.to(tl.int64) + column
-    out_offset = row * out_row.to(tl.int64) + column
+    mean_offset = row * mean_row.to(tl.int64) + column * mean_channel.to(tl.int64)
+    log_variance_offset = (
+        row * log_variance_row.to(tl.int64) + column * log_variance_channel.to(tl.int64)
+    )
+    noise_offset = row * noise_row.to(tl.int64) + column * noise_channel.to(tl.int64)
+    out_offset = row * out_row.to(tl.int64) + column * out_channel.to(tl.int64)
 
     mean = tl.load(mean_ptr + mean_offset, mask=live, other=0.0)
     log_variance = tl.load(log_variance_ptr + log_variance_offset, mask=live, other=0.0)

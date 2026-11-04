@@ -65,9 +65,12 @@ impl fmt::Display for Descriptor {
 
 /// The arguments of one sample.
 ///
-/// All four views are `[positions, channels]` and every one of them is read or written through its own
-/// row stride: the two moments are the halves of the encoder's `[positions, 2 · channels]` output, cut
-/// on the channel axis, so their rows are twice as wide as the sample's.
+/// All four views are `[positions, channels]` and every one of them is read or written through **its
+/// own two strides**. The reference's rasters are channel-major (`[channels, frames, rows, columns]`,
+/// because that is what every convolution reads), so a caller there passes a row stride of one and a
+/// channel stride of the position count; a channels-last caller passes the same two words the other way
+/// round. Either way the moments' two halves are one buffer cut by an offset, with no transpose and no
+/// second buffer, which is what the strides are in the signature for.
 #[derive(Clone, Copy)]
 pub struct Args {
     /// `[positions, channels]` f32: the mean half of the moments.
@@ -114,14 +117,37 @@ impl Op for Posterior {
                 ),
             ));
         }
-        for view in [args.mean, args.log_variance, args.noise] {
+        // The element type and the channel count, but not the innermost stride: a channel-major caller
+        // advances by the position count between channels, and refusing that is what forced three
+        // transposes before these words existed.
+        for (name, view) in [
+            ("mean", args.mean),
+            ("log_variance", args.log_variance),
+            ("noise", args.noise),
+            ("out", args.out),
+        ] {
             view.require_shape(Self::NAME, args.mean.shape)?;
-            view.require_row(Self::NAME, DType::F32, channels)?;
+            if view.dtype != DType::F32 {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!("expected {} {name}, found {}", DType::F32, view.dtype),
+                ));
+            }
+            if view.shape.dim(1) != channels {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!(
+                        "expected {channels} channels in the {name}, found {}",
+                        view.shape.dim(1)
+                    ),
+                ));
+            }
         }
-        args.out.require_shape(Self::NAME, args.mean.shape)?;
-        args.out.require_row(Self::NAME, DType::F32, channels)?;
-        // Every view is addressed a row at a time, so a row may be wider than the sample but not
-        // narrower: a row stride under `channels` would have two rows share channels.
+        // Each view is addressed through two strides, and the pair must not have two elements of the
+        // block land on one address: either the channels are packed inside a position (a row of at
+        // least `channels · channel stride`) or the positions are packed inside a channel (a channel
+        // stride of at least `positions · row stride`). Both physical layouts are legal; a stride pair
+        // that overlaps is not, because which write won would depend on the block's order.
         for (name, view) in [
             ("mean", args.mean),
             ("log_variance", args.log_variance),
@@ -129,12 +155,16 @@ impl Op for Posterior {
             ("out", args.out),
         ] {
             let row = view.strides.get(0);
-            if row < channels || !row.is_multiple_of(channels) {
+            let channel = view.strides.get(1);
+            let packed_channels = row >= channels * channel;
+            let packed_positions = channel >= positions * row;
+            if !packed_channels && !packed_positions {
                 return Err(Error::argument(
                     Self::NAME,
                     format!(
-                        "the {name}'s row advances by {row} elements for {channels} channels: a row \
-                         must hold whole samples, and a moments half advances by twice its channels"
+                        "the {name} advances by {row} elements per position and {channel} per channel \
+                         over {positions} positions and {channels} channels: no single element per \
+                         (position, channel) fits, so two of them would share an address"
                     ),
                 ));
             }
@@ -160,6 +190,15 @@ impl Op for Posterior {
                     ),
                 )
             })?)
+            .u32(u32::try_from(args.mean.strides.get(1)).map_err(|_| {
+                Error::argument(
+                    Self::NAME,
+                    format!(
+                        "the mean's channel stride {} does not fit a kernel parameter",
+                        args.mean.strides.get(1)
+                    ),
+                )
+            })?)
             .u32(
                 u32::try_from(args.log_variance.strides.get(0)).map_err(|_| {
                     Error::argument(
@@ -167,6 +206,17 @@ impl Op for Posterior {
                         format!(
                             "the log-variance's row stride {} does not fit a kernel parameter",
                             args.log_variance.strides.get(0)
+                        ),
+                    )
+                })?,
+            )
+            .u32(
+                u32::try_from(args.log_variance.strides.get(1)).map_err(|_| {
+                    Error::argument(
+                        Self::NAME,
+                        format!(
+                            "the log-variance's channel stride {} does not fit a kernel parameter",
+                            args.log_variance.strides.get(1)
                         ),
                     )
                 })?,
@@ -180,12 +230,30 @@ impl Op for Posterior {
                     ),
                 )
             })?)
+            .u32(u32::try_from(args.noise.strides.get(1)).map_err(|_| {
+                Error::argument(
+                    Self::NAME,
+                    format!(
+                        "the noise's channel stride {} does not fit a kernel parameter",
+                        args.noise.strides.get(1)
+                    ),
+                )
+            })?)
             .u32(u32::try_from(args.out.strides.get(0)).map_err(|_| {
                 Error::argument(
                     Self::NAME,
                     format!(
                         "the sample's row stride {} does not fit a kernel parameter",
                         args.out.strides.get(0)
+                    ),
+                )
+            })?)
+            .u32(u32::try_from(args.out.strides.get(1)).map_err(|_| {
+                Error::argument(
+                    Self::NAME,
+                    format!(
+                        "the sample's channel stride {} does not fit a kernel parameter",
+                        args.out.strides.get(1)
                     ),
                 )
             })?)
