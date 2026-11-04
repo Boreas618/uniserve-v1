@@ -48,6 +48,21 @@
 //! and the current implementation keeps that precision (§9). The audio
 //! decoder's convolutions use the same FP32 type.
 //!
+//! # Layouts, bias and groups
+//!
+//! [`Tensor`] carries strides as well as dimensions, so a tensor's layout is
+//! whatever its strides say: contiguous `NCDHW`, or channels-last `NDHWC`
+//! with strides `(D·H·W·C, 1, H·W·C, W·C, C)`, which is the layout the video
+//! VAE keeps its weights and activations in. cuDNN proposes engines only for
+//! the layouts it supports, so a layout it has none for is a plan that names
+//! no engine.
+//!
+//! A convolution here has no bias and no groups: PyTorch adds a cuDNN
+//! convolution's bias in a separate pass, so the caller adds it, and cuDNN's
+//! backend convolution descriptor has no group field, so a grouped
+//! convolution (the audio decoder's depthwise alias-free resamplers, which
+//! design §9 fuses into kernel programs) is not served by this binding.
+//!
 //! # Streams and graphs
 //!
 //! Every call enters the device's primary context on the calling thread, so
