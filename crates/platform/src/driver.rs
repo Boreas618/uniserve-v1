@@ -565,10 +565,6 @@ mod tests {
                     CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE as i64,
                 ),
                 (
-                    "CU_STREAM_WRITE_VALUE_NO_MEMORY_BARRIER",
-                    crate::stream::CU_STREAM_WRITE_VALUE_NO_MEMORY_BARRIER as i64,
-                ),
-                (
                     "CU_STREAM_WAIT_VALUE_GEQ",
                     crate::stream::CU_STREAM_WAIT_VALUE_GEQ as i64,
                 ),
