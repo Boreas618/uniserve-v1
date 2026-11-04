@@ -1293,38 +1293,16 @@ pub(crate) fn call(
     (!candidates.is_empty()).then(|| (call_view(request, kind), candidates))
 }
 
+/// One entry per worker the world reports, in the order `WorkerGroup::spawn_all`
+/// returned them — the same length and order as the control thread's
+/// `routing.slots`, so an index into this list and an index into that one name
+/// the same rank. The two are built on different threads and carry different
+/// fields (a rank's in-flight count and liveness exist only on the control
+/// thread), so this contract is stated here rather than enforced by a type.
+
 /// Every replica a `place` decision may choose, for `Snapshot::replicas`: one
 /// per worker of the world, in the executor's order.
 pub(crate) fn replica_catalog(scheduler: &Scheduler) -> Vec<ReplicaView> {
-    catalog_facts(scheduler)
-        .into_iter()
-        .map(|(view, _, _)| view)
-        .collect()
-}
-
-/// The workers [`replica_catalog`] lists, in the same order and of the same
-/// length: the control thread's half of a routing decision.
-///
-/// A policy's `route` answers an index into [`replica_catalog`] and the control
-/// thread turns it into the worker the request is sent to. Both come from
-/// [`catalog_facts`], so the list a policy was shown and the worker chosen are
-/// one list.
-pub(crate) fn replica_catalog_targets(
-    scheduler: &Scheduler,
-) -> Vec<(crate::WorkerGroupId, String)> {
-    catalog_facts(scheduler)
-        .into_iter()
-        .map(|(_, worker, bound)| (worker, bound))
-        .collect()
-}
-
-/// The world's workers with the component each binds by default, as views.
-///
-/// The catalog is every worker the world reports, not the candidates of one
-/// call's kind: routing happens before a request has a call, and the policy
-/// reads each worker's phases and capacity to choose. One construction, which
-/// [`replica_catalog`] and [`replica_catalog_targets`] are two views of.
-fn catalog_facts(scheduler: &Scheduler) -> Vec<(ReplicaView, crate::WorkerGroupId, String)> {
     let executor = scheduler.executor.as_ref();
     let table = world_blocks(executor);
     executor
@@ -1337,7 +1315,7 @@ fn catalog_facts(scheduler: &Scheduler) -> Vec<(ReplicaView, crate::WorkerGroupI
                 .components
                 .first()
                 .map_or(DEFAULT_COMPONENT, |component| component.name.as_str());
-            let view = replica_view(ReplicaFacts {
+            replica_view(ReplicaFacts {
                 index,
                 block: block_id(&table, bound).unwrap_or(ComponentId(0)),
                 kinds: worker_phases(info),
@@ -1346,8 +1324,7 @@ fn catalog_facts(scheduler: &Scheduler) -> Vec<(ReplicaView, crate::WorkerGroupI
                 holds_request: false,
                 prefills_only: scheduler.placement.prefill_groups.contains(worker),
                 holds_component: false,
-            });
-            (view, worker.clone(), bound.to_owned())
+            })
         })
         .collect()
 }
