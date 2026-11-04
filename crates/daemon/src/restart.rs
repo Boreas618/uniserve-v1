@@ -56,6 +56,7 @@ use crate::options::Stated;
 use crate::supervision::{Daemon, HandedService};
 
 pub(crate) mod requests;
+pub(crate) mod streams;
 
 /// The descriptor a successor finds the handoff socket at.
 pub const PREDECESSOR_DESCRIPTOR: i32 = 3;
@@ -77,6 +78,14 @@ enum Message {
     /// Daemon to successor: everything it serves, with the descriptors of
     /// [`Takeover`].
     Takeover(Box<Takeover>),
+    /// Successor to daemon: the responses in flight it took over, which the
+    /// predecessor answers: a response named here is the successor's from
+    /// then on, and one the successor does not name resumes in the
+    /// predecessor (design §7.5.1 step 4).
+    Adopted {
+        pid: u32,
+        streams: Vec<streams::Taken>,
+    },
     /// Successor to daemon: it serves; its process id.
     Serving { pid: u32 },
     /// A predecessor asks the admission owner for its next engine front.
@@ -124,6 +133,10 @@ struct Prepare {
 /// descriptors, then each completed job's artifact.
 #[derive(Debug, Serialize, Deserialize)]
 struct Takeover {
+    /// The responses in flight, which the successor takes over before it
+    /// serves; their sockets follow the other descriptors, in this order.
+    #[serde(default)]
+    streams: Vec<streams::StreamHandoff>,
     listener: HandedListener,
     replicas: Vec<ReplicaHandoff>,
     adapters: std::collections::BTreeMap<String, crate::leader::Adapter>,
@@ -316,6 +329,11 @@ impl Restarter {
                 unavailable: replica.unavailable.clone(),
             });
         }
+        // Stop every response in flight at its next engine event boundary, so
+        // its state and its socket travel with the takeover (design §7.5.1).
+        let mut paused = self.pause_streams().await;
+        let mut stream_descriptors = std::mem::take(&mut paused.descriptors);
+        let stream_records = std::mem::take(&mut paused.records);
         let writer = requests::writer(&channel)?;
         // Serialize the snapshot before any later job update uses the same
         // stream. Continuation requests share this writer after handoff.
@@ -335,10 +353,14 @@ impl Restarter {
                 };
                 job_records.push((record, artifact));
             }
+            // The responses' sockets go last, so the successor reads them
+            // after every other descriptor.
+            descriptors.append(&mut stream_descriptors);
             let borrowed: Vec<BorrowedFd<'_>> = descriptors.iter().map(|fd| fd.as_fd()).collect();
             send(
                 &mut sending,
                 &Message::Takeover(Box::new(Takeover {
+                    streams: stream_records,
                     listener,
                     replicas,
                     adapters: crate::leader::locked(&leader.replicas.adapters).clone(),
@@ -359,13 +381,33 @@ impl Restarter {
             replica.client.attach(&requests);
         }
 
-        let pid = match recv(&mut channel).await? {
-            (Message::Serving { pid }, _) => pid,
-            (Message::Failed { reason }, _) => {
-                anyhow::bail!("the successor took the service and gave up: {reason}")
+        let (pid, taken) = 'serving: loop {
+            match recv(&mut channel).await? {
+                (Message::Adopted { pid, streams }, _) => {
+                    info!(
+                        count = streams.len(),
+                        "the successor took the responses in flight over"
+                    );
+                    break 'serving (0, Some((pid, streams)));
+                }
+                (Message::Serving { pid }, _) => break (pid, None),
+                (Message::Failed { reason }, _) => {
+                    anyhow::bail!("the successor took the service and gave up: {reason}")
+                }
+                (other, _) => anyhow::bail!("the successor answered {other:?}"),
             }
-            (other, _) => anyhow::bail!("the successor answered {other:?}"),
         };
+        match taken {
+            Some((successor_pid, streams)) => paused.decide(&streams, successor_pid),
+            // A successor that serves without taking any response over: every
+            // response in flight stays here.
+            None => {
+                let pid = std::process::id();
+                let _ = pid;
+                paused.decide(&[], std::process::id());
+            }
+        }
+        let pid = pid;
         info!(
             pid,
             "the successor serves; this daemon finishes its requests"
@@ -617,6 +659,7 @@ async fn prepared_successor(
         (other, _) => anyhow::bail!("the daemon sent {other:?}"),
     };
     let Takeover {
+        streams,
         listener,
         replicas,
         adapters,
@@ -762,6 +805,26 @@ async fn prepared_successor(
             record,
             media.map(|media| Arc::new(media) as Arc<dyn proto::request::ArtifactMedia>),
         );
+    }
+    // The responses in flight go over once their engine streams do: a
+    // response only moves when the engine serves it, and the predecessor
+    // answers these before it stops writing anything.
+    if !streams.is_empty() {
+        let adopting = Arc::clone(&leader);
+        let mut sockets = std::iter::from_fn(|| next().ok());
+        let adopted = streams::adopt(&adopting, streams, &mut || {
+            sockets
+                .next()
+                .context("the takeover lacks a response's descriptor")
+        });
+        send(
+            channel,
+            &Message::Adopted {
+                pid: std::process::id(),
+                streams: adopted.streams,
+            },
+            &[],
+        )?;
     }
     send(
         channel,

@@ -1018,6 +1018,62 @@ impl Leader {
         Ok((events, output, compile_us, outcome))
     }
 
+    /// The model's tokenizer, which a successor builds a handed-over body's
+    /// decoder from.
+    pub(crate) fn tokenizer(&self) -> crate::tokenizer::DynTokenizer {
+        self.processor.tokenizer()
+    }
+
+    /// The statistics recorder of a request this process takes over, under
+    /// the replica that serves it and the instant it entered the deployment.
+    pub(crate) fn request_outcome(
+        &self,
+        request_id: &str,
+        replica: u32,
+        started: std::time::Instant,
+    ) -> crate::metrics::stats::RequestOutcome {
+        let labels = EngineLabels {
+            model_name: self.model_name.clone(),
+            engine: replica,
+        };
+        let log = self.log_requests.then(|| request_id.to_owned());
+        crate::metrics::stats::RequestOutcome::new(labels, started, log)
+    }
+
+    /// Takes one request's engine event stream over from the process that
+    /// consumed it, going on after the position it reached (design §7.5.1
+    /// step 4): the request keeps generating in the engine that serves it,
+    /// and is neither cancelled nor submitted again.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the state names no replica or no engine identity, that
+    /// replica serves no requests, or the engine refuses the takeover.
+    pub(crate) fn take_over_request(
+        &self,
+        chat: &proto::handoff::ChatStream,
+    ) -> anyhow::Result<RequestEvents> {
+        let replica = self
+            .replicas()
+            .get(chat.engine_replica as usize)
+            .cloned()
+            .with_context(|| {
+                format!("the handed response names replica {}", chat.engine_replica)
+            })?;
+        let client = replica
+            .hold
+            .client()
+            .context("the handed response's replica has no engine connection")?;
+        let id = proto::request::RequestId(
+            chat.engine_request_id
+                .parse()
+                .context("the handed response's engine identity")?,
+        );
+        let consumed = chat.consumed_events;
+        let stream = client.take_over(id, consumed)?;
+        Ok(RequestEvents::taken_over(stream, consumed))
+    }
+
     /// Fetches, probes and plans a video request's media, presents its
     /// prompt, and streams its output.
     ///
