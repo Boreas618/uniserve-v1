@@ -210,3 +210,51 @@ fn a_layout_a_single_region_cannot_produce_is_refused() {
     assert!(loader.load(&request).is_err());
     assert!(store.published.is_empty());
 }
+
+#[test]
+fn a_computed_constant_is_published_once_and_needs_its_own_name() {
+    let dir = tempfile::tempdir().unwrap();
+    shard(
+        dir.path(),
+        "model.safetensors",
+        &[("weight", vec![1], bf16(&[1.0]))],
+    );
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let mut store = Recording::default();
+    let table: Vec<u8> = [0.5_f32, 0.25]
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+
+    let first = {
+        let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+        loader
+            .constant("rotary.inv_freq", DType::F32, Shape::new(&[2]), &table)
+            .unwrap()
+    };
+    let second = {
+        let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+        loader
+            .constant("rotary.inv_freq", DType::F32, Shape::new(&[2]), &table)
+            .unwrap()
+    };
+    assert_eq!(store.published.len(), 1);
+    assert_eq!(first.view().ptr, second.view().ptr);
+    assert!(store.published[0].0.files.is_empty());
+
+    // The same bytes under another name are another constant.
+    let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+    loader
+        .constant("other.inv_freq", DType::F32, Shape::new(&[2]), &table)
+        .unwrap();
+    assert_eq!(store.published.len(), 2);
+
+    // A byte count that does not match the extents is refused before anything is published.
+    let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+    assert!(
+        loader
+            .constant("short.inv_freq", DType::F32, Shape::new(&[2]), &table[..4])
+            .is_err()
+    );
+    assert_eq!(store.published.len(), 2);
+}
