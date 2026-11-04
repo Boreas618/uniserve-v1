@@ -18,6 +18,16 @@
 //! this file follows it. Candidate widths and the sampler's extras are the slice's own request
 //! state (`crates/nn/src/layers/sampler.rs`, `Sampler::new`).
 //!
+//! **Which side launches a row.** A row exists because a call site launches that key, never because
+//! a kernel exists. Two families make up this file:
+//!
+//! - **the model's**, which `Qwen3Moe::keys()` reproduces from the layers' own descriptor
+//!   accessors (`crates/models/qwen3-moe/src/keys.rs`); if this generator and that walk disagree,
+//!   the walk is right;
+//! - **the executor's**, whose geometry is request and scheduling state the model does not hold:
+//!   the sampler's chain and the logits gathers. Those are keyed where the executor compiles its
+//!   plans, and the rows here are its list, not this file's invention.
+//!
 //! Gaps this file does not fill, named rather than invented, so that the 85 declared operators are
 //! accounted for between the two fixtures and these lines:
 //!
@@ -194,18 +204,19 @@ fn main() {
         }),
     ));
 
-    // Normalization, rotation and the embedding.
-    for columns in [HIDDEN, HEAD_DIM] {
-        lines.push((
-            "rms_norm".to_owned(),
-            key(&ops::norm::RmsNormDescriptor {
-                dtype,
-                columns,
-                tile: row_tile(columns),
-                pdl: PDL,
-            }),
-        ));
-    }
+    // Normalization, rotation and the embedding. One `rms_norm` width: the model's three
+    // normalizations are all `[hidden]` — the output norm and every layer's two pre-norms. A head's
+    // 128 features are normalized inside `qk_norm_rope`, which is a program of its own, so a
+    // 128-wide `rms_norm` is a module nothing launches.
+    lines.push((
+        "rms_norm".to_owned(),
+        key(&ops::norm::RmsNormDescriptor {
+            dtype,
+            columns: HIDDEN,
+            tile: row_tile(HIDDEN),
+            pdl: PDL,
+        }),
+    ));
     lines.push((
         "add_rms_norm".to_owned(),
         key(&ops::norm::AddRmsNormDescriptor {
