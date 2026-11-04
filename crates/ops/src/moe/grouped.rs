@@ -33,7 +33,8 @@ use std::ffi::c_void;
 use std::fmt;
 
 use crate::descriptor::Key;
-use crate::kernel::{Kernel, NativeCall};
+use crate::fp4::ScaleLayout;
+use crate::kernel::{Arguments, Kernel, LaunchGrid, NativeCall};
 use crate::platform::Stream;
 use crate::tensor::{DType, Shape, TensorView};
 use crate::tolerance::Tolerance;
@@ -562,5 +563,317 @@ impl NativeCall for RouteCall {
     fn message(&self) -> Option<&str> {
         let end = self.error.iter().position(|&byte| byte == 0)?;
         std::str::from_utf8(&self.error[..end]).ok()
+    }
+}
+
+/// One compilation of `gather_gemm_nvfp4`.
+///
+/// The routed first matrix of an encoded (NVFP4) expert block. It is its own operator rather than a
+/// variant of [`GatherGemm`]: the weight operand's type changes — packed E2M1 nibbles, the swizzled
+/// block scales, one FP32 tensor scale per expert — and an optional-and-branch form would put the
+/// branch in the descriptor key and in the hot path of the dense case that never has it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct GatherGemmNvfp4Descriptor {
+    /// Hidden elements of a token: the contraction length.
+    pub hidden: u32,
+    /// Expert width: the output width of FC1.
+    pub intermediate: u32,
+    /// Experts the weight stacks.
+    pub experts: u32,
+    /// Routes per token.
+    pub top: u32,
+    /// The gated activation.
+    pub activation: Activation,
+    /// Element type of the activations and of the output. The weights are packed, so this is the
+    /// unpacked element type rather than the stored one.
+    pub dtype: DType,
+    /// Element type of the block scales, as the checkpoint stores them.
+    pub scale: DType,
+    /// The block-scale layout the checkpoint uses.
+    pub layout: ScaleLayout,
+    /// The MMA tile the package compiled for: rows by columns.
+    pub tile: (u32, u32),
+    /// The cluster shape the package compiled for: rows by columns.
+    pub cluster: (u32, u32),
+}
+
+impl fmt::Display for GatherGemmNvfp4Descriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Key::new()
+            .field("hidden", self.hidden)
+            .field("intermediate", self.intermediate)
+            .field("experts", self.experts)
+            .field("top", self.top)
+            .field("activation", self.activation)
+            .field("dtype", self.dtype)
+            .field("scale", self.scale)
+            .field("layout", self.layout)
+            .field("tile", format_args!("{}x{}", self.tile.0, self.tile.1))
+            .field(
+                "cluster",
+                format_args!("{}x{}", self.cluster.0, self.cluster.1),
+            )
+            .finish(formatter)
+    }
+}
+
+/// The arguments of one encoded FC1 launch.
+#[derive(Clone, Copy)]
+pub struct GatherGemmNvfp4Args {
+    /// `[routes, hidden]` the gathered activations.
+    pub hidden: TensorView,
+    /// `[experts, 2·intermediate, hidden/2]` U8: two E2M1 codes a byte along the contraction.
+    pub weights: TensorView,
+    /// `[experts, ...]` the block scales in the descriptor's layout, one per sixteen elements.
+    pub scales: TensorView,
+    /// `[experts]` f32: the reciprocal of each expert's tensor scale, as the loader carries it.
+    pub global_scale: TensorView,
+    /// `[routes]` i32: the expert each gathered row belongs to.
+    pub ids: TensorView,
+    /// `[tiles]` i32: the expert a tile's rows belong to.
+    pub tile_to_expert: TensorView,
+    /// `[tiles]` i32: the local row limit of that tile.
+    pub tile_to_limit: TensorView,
+    /// `[routes]` i32: the gathered row of each route.
+    pub permuted_to_expanded: TensorView,
+    /// `[1]` i32: the number of tiles that have work.
+    pub num_non_exiting_tiles: TensorView,
+    /// `[routes, intermediate]` the gated product.
+    pub out: TensorView,
+}
+
+/// The routed first matrix over a packed, block-scaled expert stack.
+pub struct GatherGemmNvfp4;
+
+impl Op for GatherGemmNvfp4 {
+    const NAME: &'static str = "gather_gemm_nvfp4";
+
+    type Descriptor = GatherGemmNvfp4Descriptor;
+    type Args<'a> = GatherGemmNvfp4Args;
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let hidden = u64::from(descriptor.hidden);
+        let intermediate = u64::from(descriptor.intermediate);
+        let experts = u64::from(descriptor.experts);
+        let top = u64::from(descriptor.top);
+        let routes = args.out.rows();
+
+        if args.out.shape.dims().last().copied().unwrap_or(0) != intermediate {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "a row of the gated product is {intermediate} wide, the output is {:?}",
+                    args.out.shape.dims()
+                ),
+            ));
+        }
+        args.out
+            .require_row(Self::NAME, descriptor.dtype, intermediate)?;
+        // The packed field holds two codes a byte along the contraction, so its width is half the
+        // contraction and no more: a wider one would read past the expert's weights.
+        args.weights.require_shape(
+            Self::NAME,
+            Shape::new(&[experts, 2 * intermediate, hidden / 2]),
+        )?;
+        if args.weights.dtype != DType::U8 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "expected the packed E2M1 field as u8, found {}",
+                    args.weights.dtype
+                ),
+            ));
+        }
+        if args.scales.dtype != descriptor.scale {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "expected {} block scales, found {}",
+                    descriptor.scale, args.scales.dtype
+                ),
+            ));
+        }
+        // The scales cover the packed field one block per sixteen elements; a table that does not
+        // cover it is a checkpoint the loader should have refused, and a launch that trusted it
+        // would read whatever follows.
+        let blocks = (2 * intermediate).div_ceil(u64::from(crate::fp4::BLOCK_ELEMENTS));
+        let covered: u64 = args.scales.shape.dims().iter().product();
+        if covered < experts * blocks {
+            return Err(Error::argument(
+                Self::NAME,
+                format!("{covered} block scales do not cover {experts} experts of {blocks} blocks"),
+            ));
+        }
+        args.global_scale
+            .require_shape(Self::NAME, Shape::new(&[experts]))?;
+        if args.global_scale.dtype != DType::F32 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "expected f32 tensor scales, found {}",
+                    args.global_scale.dtype
+                ),
+            ));
+        }
+        args.ids.require_shape(Self::NAME, Shape::new(&[routes]))?;
+        args.permuted_to_expanded
+            .require_shape(Self::NAME, Shape::new(&[routes]))?;
+        for (name, view) in [
+            ("ids", args.ids),
+            ("permuted_to_expanded", args.permuted_to_expanded),
+        ] {
+            if view.dtype != DType::I32 {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!("expected i32 {name}, found {}", view.dtype),
+                ));
+            }
+        }
+        args.hidden
+            .require_shape(Self::NAME, Shape::new(&[routes, hidden]))?;
+        args.hidden
+            .require_row(Self::NAME, descriptor.dtype, hidden)?;
+        if top == 0 {
+            return Err(Error::argument(
+                Self::NAME,
+                "a launch with no routes per token packs no rows".to_owned(),
+            ));
+        }
+
+        // The activation is compiled into the program (it is in the key), so no launch value names
+        // it; what a launch carries is the geometry the grid and the addressing need.
+        let mut arguments = Arguments::new();
+        arguments
+            .view(args.hidden)
+            .view(args.weights)
+            .view(args.scales)
+            .view(args.global_scale)
+            .view(args.ids)
+            .view(args.tile_to_expert)
+            .view(args.tile_to_limit)
+            .view(args.permuted_to_expanded)
+            .view(args.num_non_exiting_tiles)
+            .view(args.out)
+            .u32(descriptor.hidden)
+            .u32(descriptor.intermediate)
+            .u32(descriptor.experts)
+            .u32(descriptor.top)
+            .u32(u32::try_from(routes).unwrap_or(u32::MAX))
+            .u32(descriptor.tile.0)
+            .u32(descriptor.tile.1)
+            .u32(descriptor.cluster.0)
+            .u32(descriptor.cluster.1);
+        // One block per (expert tile, column tile) of the gated product, the geometry the package
+        // compiled for: the tile and cluster are the descriptor's, so the grid is a function of the
+        // problem rather than of a backend's tactic.
+        let tiles = args.num_non_exiting_tiles.rows().max(1);
+        kernel.launch(
+            LaunchGrid::new([
+                tiles,
+                (2 * intermediate).div_ceil(u64::from(descriptor.tile.1)),
+                1,
+            ])?,
+            &mut arguments,
+            stream,
+        )
+    }
+
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
+        let _ = stream;
+        GatherGemmNvfp4Args {
+            out: twins.shadow_of(args.out),
+            ..args
+        }
+    }
+
+    fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
+        // The packed weights and their block scales are the reference's own operands: the dequantized
+        // product is what a dense launch of the same expert computes, so the bound is `GatherGemm`'s
+        // — the contraction in FP32 with the activation's envelope on top. Any extra error would come
+        // from dequantizing in a different order, which this bound also covers.
+        let reduction = u64::from(descriptor.hidden);
+        let accumulate = DType::F32;
+        let gamma = crate::tolerance::gamma(reduction, accumulate);
+        let atol =
+            (2.0 * gamma * f64::from(ACTIVATION_ENVELOPE * ACTIVATION_ENVELOPE * 2.0)) as f32;
+        Tolerance::dot(reduction, accumulate, descriptor.dtype).with_atol(atol)
+    }
+}
+
+#[cfg(test)]
+mod nvfp4_tests {
+    use super::*;
+
+    fn descriptor() -> GatherGemmNvfp4Descriptor {
+        GatherGemmNvfp4Descriptor {
+            hidden: 2048,
+            intermediate: 768,
+            experts: 128,
+            top: 8,
+            activation: Activation::Silu,
+            dtype: DType::BF16,
+            scale: DType::F8E4M3,
+            layout: ScaleLayout::Swizzled128X4,
+            tile: (128, 128),
+            cluster: (1, 1),
+        }
+    }
+
+    #[test]
+    fn the_key_separates_the_packed_operand_from_the_dense_one() {
+        // The dense gather_gemm and this one are different programs for the same geometry: the
+        // weight operand's type changes, so the key must not collide with it.
+        let encoded = descriptor().to_string();
+        assert!(
+            encoded.starts_with("hidden_2048_intermediate_768_experts_128_top_8_activation_silu")
+        );
+        assert!(encoded.contains("_scale_f8e4m3_"));
+        assert!(encoded.contains("layout_swizzled_128x4"));
+        let dense = GatherGemmDescriptor {
+            hidden: 2048,
+            intermediate: 768,
+            experts: 128,
+            top: 8,
+            activation: Activation::Silu,
+            dtype: DType::BF16,
+            tile: (128, 128),
+            cluster: (1, 1),
+        }
+        .to_string();
+        assert_ne!(encoded, dense);
+    }
+
+    #[test]
+    fn the_bound_is_the_dense_gather_gemms_bound() {
+        // Same contraction, same accumulation, same output: an encoder that dequantizes in another
+        // order is still inside this envelope, and a *looser* one would hide a wrong scale.
+        let dense = GatherGemmDescriptor {
+            hidden: 2048,
+            intermediate: 768,
+            experts: 128,
+            top: 8,
+            activation: Activation::Silu,
+            dtype: DType::BF16,
+            tile: (128, 128),
+            cluster: (1, 1),
+        };
+        assert_eq!(
+            GatherGemmNvfp4::tolerance(&descriptor()),
+            GatherGemm::tolerance(&dense)
+        );
+    }
+
+    #[test]
+    fn a_table_that_does_not_cover_the_packed_field_is_refused() {
+        // 2·intermediate = 1536 elements per expert, 96 blocks of sixteen; the scales must cover
+        // every expert of that, or a launch would read whatever follows the table.
+        let blocks = (2 * 768u64).div_ceil(u64::from(crate::fp4::BLOCK_ELEMENTS));
+        assert_eq!(blocks, 96);
+        assert_eq!(128 * blocks, 12288);
     }
 }

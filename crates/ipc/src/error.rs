@@ -29,6 +29,13 @@ pub enum EncodingError {
     /// example a message of another type or of another build.
     #[error("worker message encoding error: decoding a message")]
     Decode(#[source] rmp_serde::decode::Error),
+    /// A program could not cross the wire: an argument is not the TOML value
+    /// its slot states, or a field the wire form requires is absent.
+    #[error("program wire error: {what}")]
+    Program {
+        /// What the wire form could not carry.
+        what: Cow<'static, str>,
+    },
     /// The encoded message is longer than a frame's length field can state.
     #[error(
         "worker message encoding error: a message of {length} bytes exceeds the largest frame of {limit} bytes"
