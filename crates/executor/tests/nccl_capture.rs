@@ -52,9 +52,9 @@ struct RankReport {
 
 /// What one rank does on its own thread.
 ///
-/// Both ranks write `16 * (rank + 1)` into four f32 and sum in place, so a rank that received both
-/// reads `4 * (16 + 32) = 192`; a rank that only saw itself reads \(4 \times 16\) or
-/// \(4 \times 32\), which the caller's assertion rejects.
+/// Both ranks write `16 * (rank + 1)` into each of four f32 and sum in place, so a rank that
+/// received both reads 48 in every element; a rank that only saw itself reads 16 or 32, which the
+/// assertion rejects.
 fn run_rank(
     device: DeviceId,
     rank: i32,
@@ -238,7 +238,9 @@ fn one_process_captures_a_collective_across_two_devices() {
 
 /// Asserts what the executor's design needs and prints the answer.
 fn assert_probe_answer(reports: &[RankReport]) {
-    let expected = 4.0 * (16.0 + 32.0);
+    // Each rank's four elements hold its own value (16 for rank 0, 32 for rank 1), so a sum over
+    // both ranks leaves every element at 48. A rank that saw only itself reads 16 or 32.
+    let expected = 16.0 + 32.0;
     let rank0 = reports
         .iter()
         .find(|report| report.rank == 0)
