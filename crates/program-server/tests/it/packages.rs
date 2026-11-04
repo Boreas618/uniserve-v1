@@ -447,3 +447,33 @@ fn the_exchange_covers_one_group_size_and_no_other() {
         );
     }
 }
+
+/// Every package names an operator the `ops` crate declares.
+///
+/// A package is requested by its operator's name — `install` and `prepare` take an operator name,
+/// and a program slot is built from one — so a package published under a name no operator carries
+/// is a program nothing can ever request. The names move: an operator renamed in `crates/ops`
+/// leaves its package behind, and nothing else in the tree would notice, because the store builds
+/// a package by its manifest and never asks whether an operator exists.
+#[test]
+fn every_package_names_an_operator_the_ops_crate_declares() {
+    let operators = ops::operators();
+    let mut failures = Vec::new();
+    for package in packages() {
+        let Ok(manifest) = Manifest::load(&package) else {
+            continue;
+        };
+        if !operators.contains(&manifest.op.as_str()) {
+            failures.push(format!(
+                "{}: op `{}` is no operator of `crates/ops`",
+                package.display(),
+                manifest.op
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "a package under a name no operator carries is a program nothing can request:\n{}",
+        failures.join("\n")
+    );
+}
