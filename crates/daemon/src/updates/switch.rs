@@ -1101,6 +1101,11 @@ mod tests {
         );
 
         switch.drained(&mut roster, "n0", 11);
+        assert_eq!(
+            switch.phase(),
+            Phase::Serving,
+            "one host's report does not end the drain"
+        );
         switch.drained(&mut roster, "n1", 11);
         assert_eq!(switch.phase(), Phase::Probation);
         assert_eq!(
