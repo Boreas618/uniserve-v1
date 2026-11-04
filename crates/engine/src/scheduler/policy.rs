@@ -25,6 +25,7 @@
 //! per-tenant usage routes on what each rank actually served.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use scheduling::guest::decision::{Plan, Room, Shortage, Victim};
 use scheduling::guest::event::Event;
@@ -202,6 +203,22 @@ pub fn ceilings_of(capacity: BatchCapacity) -> Limits {
         // starvation deadline (30 s, as sched_ext caps `timeout_ms`).
         prefetch_min_tokens: PREFETCH_FLOOR_TOKENS,
         timeout: scheduling::MAX_STARVATION_TIMEOUT,
+    }
+}
+
+/// The process's WASM engine: one engine for every policy instance the main
+/// process runs, the scheduler threads' and the control thread's.
+///
+/// An engine holds the compiler and its configuration, not a module's state; a
+/// failure to build it is the deployment's, and every precopy reports it the
+/// same way.
+pub(crate) fn process_engine() -> Result<&'static Engine, PolicyError> {
+    static ENGINE: OnceLock<Result<Engine, String>> = OnceLock::new();
+    match ENGINE.get_or_init(|| Engine::new().map_err(|error| error.to_string())) {
+        Ok(engine) => Ok(engine),
+        Err(message) => Err(PolicyError::Load {
+            message: message.clone(),
+        }),
     }
 }
 
@@ -416,8 +433,10 @@ impl Candidate {
 /// to serve under.
 #[derive(Clone, Debug)]
 pub struct PolicyReverted {
-    /// The scheduler whose instance failed; `None` for the control thread's
-    /// route instance.
+    /// The scheduler whose instance failed; `None` while the scheduler thread
+    /// reports it, since a scheduler does not know its index, and `None` for the
+    /// control thread's route instance. The control thread names the scheduler
+    /// it took a report from.
     pub scheduler: Option<usize>,
     /// The program that failed.
     pub program: PolicyProgram,
@@ -511,20 +530,13 @@ pub struct PolicySlot {
     candidate: Option<(PolicyProgram, PolicyModule, PolicyInstance)>,
     /// The stage asked for and not yet applied, applied at the next boundary.
     pending: Option<Stage>,
-    /// The scheduler index this slot serves, named in a revert report.
-    scheduler: Option<usize>,
 }
 
 impl PolicySlot {
     /// The slot a first switchover puts in place from the candidate its precopy
     /// prepared: §7.3's policy for a fresh epoch, whose precopy ran before any
     /// policy served.
-    pub fn from_candidate(
-        engine: &Engine,
-        ceilings: Limits,
-        candidate: Candidate,
-        scheduler: Option<usize>,
-    ) -> Self {
+    pub fn from_candidate(engine: &Engine, ceilings: Limits, candidate: Candidate) -> Self {
         Self {
             engine: engine.clone(),
             ceilings,
@@ -534,7 +546,6 @@ impl PolicySlot {
             previous: None,
             candidate: None,
             pending: None,
-            scheduler,
         }
     }
 
@@ -550,7 +561,6 @@ impl PolicySlot {
         program: PolicyProgram,
         state: &TrialState,
         ceilings: &Limits,
-        scheduler: Option<usize>,
     ) -> Result<Self, PolicyError> {
         let init = init_of(&program, state);
         let module = PolicyModule::load(engine, &source.bytes(&program)?)?;
@@ -564,7 +574,6 @@ impl PolicySlot {
             previous: None,
             candidate: None,
             pending: None,
-            scheduler,
         })
     }
 
@@ -771,10 +780,7 @@ impl PolicySlot {
     /// place: the daemon's precopy failed and the update is discarded.
     fn switch_over(&mut self) {
         let Some((program, module, instance)) = self.candidate.take() else {
-            tracing::warn!(
-                scheduler = ?self.scheduler,
-                "a policy switchover arrived without a policy prepared by a precopy"
-            );
+            tracing::warn!("a policy switchover arrived without a policy prepared by a precopy");
             return;
         };
         let replaced_program = std::mem::replace(&mut self.program, program);
@@ -825,7 +831,7 @@ impl PolicySlot {
         state: &TrialState,
     ) -> Result<PolicyReverted, PolicyError> {
         let report = PolicyReverted {
-            scheduler: self.scheduler,
+            scheduler: None,
             program: self.program.clone(),
             reason: error.to_string(),
             fatal: false,
@@ -1415,7 +1421,6 @@ mod tests {
             program("a", 1),
             &state(),
             &ceilings(),
-            Some(0),
         )
         .expect("the toy policy installs")
     }
@@ -1460,7 +1465,6 @@ mod tests {
             program("a", 1),
             &state(),
             &ceilings(),
-            Some(0),
         );
         assert!(matches!(installed, Err(PolicyError::BadLimits { .. })));
     }

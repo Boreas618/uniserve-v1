@@ -231,15 +231,16 @@ impl Routing {
     /// state of an epoch that holds nothing yet.
     fn precopy_route(
         &self,
-        engine: &scheduling::Engine,
         source: &dyn PolicySource,
         program: PolicyProgram,
-    ) -> Result<(), PolicyError> {
+    ) -> Result<(), String> {
+        let engine = crate::scheduler::process_engine().map_err(|error| error.to_string())?;
         let ceilings = self.ceilings();
         let ranks = self.ranks();
         let state = self.policy_state(&ranks).unwrap_or_default();
         let candidate =
-            RoutePolicy::prepare(engine, source, program, &state, &ceilings, &RouteTrial)?;
+            RoutePolicy::prepare(engine, source, program, &state, &ceilings, &RouteTrial)
+                .map_err(|error| error.to_string())?;
         let mut route = crate::lock(&self.route);
         route.engine = Some(engine.clone());
         route.ceilings = ceilings;
@@ -248,13 +249,10 @@ impl Routing {
     }
 
     /// §7.3 step 3 on the control thread: the prepared instance answers.
-    fn switchover_route(&self) -> Result<(), PolicyError> {
+    fn switchover_route(&self) -> Result<(), String> {
         let mut state = crate::lock(&self.route);
         let Some(candidate) = state.candidate.take() else {
-            return Err(PolicyError::invalid(
-                scheduling::guest::wire::Call::Init,
-                "a route policy switchover arrived without a prepared instance",
-            ));
+            return Err("a route policy switchover arrived without a prepared instance".to_owned());
         };
         match state.instance.as_mut() {
             Some(policy) => {
@@ -263,10 +261,7 @@ impl Routing {
             }
             None => {
                 let engine = state.engine.clone().ok_or_else(|| {
-                    PolicyError::invalid(
-                        scheduling::guest::wire::Call::Init,
-                        "a route policy switchover arrived before its program was loaded",
-                    )
+                    "a route policy switchover arrived before its program was loaded".to_owned()
                 })?;
                 state.instance = Some(RoutePolicy::from_candidate(
                     &engine,
@@ -280,18 +275,15 @@ impl Routing {
 
     /// §7.3 step 4 on the control thread: the previous policy answers again,
     /// instantiated on the state the schedulers hold now.
-    fn revert_route(&self) -> Result<(), PolicyError> {
+    fn revert_route(&self) -> Result<(), String> {
         let ranks = self.ranks();
         let Some(current) = self.policy_state(&ranks) else {
-            return Err(PolicyError::invalid(
-                scheduling::guest::wire::Call::Init,
-                "no scheduler holds a state to revert the route policy on",
-            ));
+            return Err("no scheduler holds a state to revert the route policy on".to_owned());
         };
         let mut state = crate::lock(&self.route);
         state.candidate = None;
         match state.instance.as_mut() {
-            Some(policy) => policy.revert(&current),
+            Some(policy) => policy.revert(&current).map_err(|error| error.to_string()),
             None => Ok(()),
         }
     }

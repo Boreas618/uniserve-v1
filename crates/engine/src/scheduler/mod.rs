@@ -43,6 +43,7 @@ pub use config::{
 };
 pub(crate) use execution::generation_consuming_calls;
 use ipc::{ForwardMode, MediaCall, TransferMode};
+pub(crate) use policy::process_engine;
 pub use policy::{
     Arrival, BatchCapacity, Candidate, PREFETCH_FLOOR_TOKENS, PolicyBytes, PolicyProgram,
     PolicyReverted, PolicySlot, PolicySource, PolicyStore, RoutePolicy, RouteTrial, Stage,
@@ -474,6 +475,14 @@ pub struct Scheduler {
     /// The report of a policy failure the mechanism did not take from `fail`'s
     /// answer, for the control thread.
     policy_report: Option<policy::PolicyReverted>,
+    /// The candidate a precopy is preparing on a blocking thread, while it runs
+    /// (§7.3 step 2): loading and instantiating a policy must not hold the
+    /// serving thread.
+    policy_precopy:
+        Option<crossbeam_channel::Receiver<Result<policy::Candidate, scheduling::PolicyError>>>,
+    /// The candidate a precopy prepared at this boundary, until the switchover
+    /// puts it in.
+    policy_prepared: Option<policy::Candidate>,
     /// The events and transitions a policy is told about (§4.4).
     recorder: mechanism::Recorder,
     /// The starvation watchdog: a resident request that does not advance
