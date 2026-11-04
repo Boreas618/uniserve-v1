@@ -266,7 +266,9 @@ impl World {
     fn refuse(&self, failing: Toy) -> String {
         let program = PolicyProgram {
             backend: "fcfs".to_owned(),
-            revision: 2,
+            // A revision past any a case installed, so the trial is of a new
+            // program rather than a name already serving.
+            revision: 3,
             arguments: Default::default(),
             stated: Default::default(),
         };
@@ -436,20 +438,26 @@ fn limits_over_the_build_ceiling_fail_the_policy() {
 #[test]
 fn an_invalid_decision_fails_the_policy_and_applies_nothing() {
     // The serving program admits the request and gives it no work, so the
-    // state the trial judges holds it as a resident: a plan naming a request
-    // that never arrived is refused for that, which is a different decision
-    // from the one this case states, and a plan naming a queued one would be
-    // exempt (§4.4) because its own admission would make the work legal.
+    // state the trial judges holds it as a resident and the refused plan's
+    // work is judged against that view.
     let mut admitting = Toy::idle();
     admitting.plan = Plan {
         admit: vec![scheduling::guest::RequestId(1)],
         ..Plan::default()
     };
-    let world = World::serving(admitting);
+    // A program may admit only a queued request (§4.4), and the trial of the
+    // first program runs before this request exists. So the world serves an
+    // idle program first, the request arrives, and the admitting program is
+    // installed over it: the world this case is about is one whose serving
+    // program has admitted the request and given it no work.
+    let world = World::serving(Toy::idle());
     world
         .handle
         .submit(text_request(1, 8, 4))
         .expect("the request is submitted");
+    world
+        .install("fcfs", 2, admitting)
+        .expect("the good program serves");
     stepped_past(&world, world.step());
     let reason = world
         .refuse(Toy {
