@@ -44,6 +44,7 @@ clap.workspace = true
 daemon.workspace = true
 engine.workspace = true
 executor.workspace = true
+frontend.workspace = true
 ipc.workspace = true
 nn.workspace = true
 ops.workspace = true
