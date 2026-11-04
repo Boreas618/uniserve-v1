@@ -210,6 +210,18 @@ impl HotUpdate {
             Phase::Precopied {
                 generation: expected,
             } if expected == generation => {
+                // One generation is held for purge at a time. A second switchover before the last
+                // purge would overwrite the record of the generation still holding device storage,
+                // and `request_purge` could then never name it: the purge of a whole generation
+                // would be lost silently. The design orders the purge after the last batch of the
+                // generation it releases, so a switchover that finds one still waiting is a caller
+                // that skipped a step, and it is refused by name.
+                if let Some(pending) = self.previous {
+                    return Err(Error::Invalid(format!(
+                        "generation {pending} is still awaiting its purge and cannot be replaced \
+                         by generation {generation}"
+                    )));
+                }
                 self.previous = Some(self.current);
                 self.current = generation;
                 self.phase = Phase::Probation { generation };
@@ -572,6 +584,32 @@ mod tests {
     /// A revert before the switchover discards the prepared generation and leaves the purge slot
     /// free: the generation never served, so nothing about it can be purged, and a later update's
     /// purge must still be able to run.
+    /// One generation is held for purge at a time: a switchover that finds the last one still
+    /// waiting is refused by name rather than overwriting the record of the storage it holds.
+    #[test]
+    fn a_switchover_refuses_to_drop_a_generation_awaiting_its_purge() {
+        let mut update = update();
+        update.begin_precopy(8).expect("a fresh update");
+        update.precopied(8).expect("precopy finished");
+        update.switchover(8, Instant::now()).expect("switchover");
+        update.commit(8).expect("commit");
+
+        update.begin_precopy(9).expect("a second update");
+        update.precopied(9).expect("precopy finished");
+        let error = update
+            .switchover(9, Instant::now())
+            .expect_err("generation 7 was never purged");
+        assert!(matches!(error, Error::Invalid(_)), "{error:?}");
+
+        update
+            .request_purge(7)
+            .expect("the generation the first switchover replaced");
+        update.purged(7).expect("purged");
+        update
+            .switchover(9, Instant::now())
+            .expect("with nothing awaiting purge the switchover runs");
+    }
+
     #[test]
     fn a_revert_before_switchover_leaves_the_purge_slot_free() {
         let mut update = update();
