@@ -531,7 +531,7 @@ mod tests {
         assert_ne!(first_identity, second_identity);
 
         // A second read of the same settled file is the same identity.
-        let mut settled = root.path().join("settled.safetensors");
+        let settled = root.path().join("settled.safetensors");
         std::fs::write(&settled, b"one").expect("the file");
         settle(&settled);
         assert_eq!(
