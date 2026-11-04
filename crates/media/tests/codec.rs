@@ -212,9 +212,10 @@ fn encode(width: u32, height: u32, frames: usize, shade: u8) -> Vec<u8> {
     .expect("a media unit encodes")
 }
 
-/// A full-scale random stereo track, whose encoded average the AAC encoder
-/// drives to its configured bit rate (a tone or silence compresses far below
-/// it).
+/// A random stereo track at a high level (about -6 dBFS, as the reference
+/// probe of the encoder's bit rate used), whose encoded average the AAC
+/// encoder drives to its configured bit rate; a tone or silence compresses far
+/// below it.
 fn noise(samples: usize) -> Vec<i16> {
     let mut state = 0x2545_f491_4f6c_dd1du64;
     let mut pcm = Vec::with_capacity(samples * 2);
@@ -222,7 +223,8 @@ fn noise(samples: usize) -> Vec<i16> {
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
-        pcm.push((state >> 48) as i16);
+        // xorshift gives a full-range word; map it onto [-20000, 20000].
+        pcm.push((((state >> 48) % 40_001) as i32 - 20_000) as i16);
     }
     pcm
 }
