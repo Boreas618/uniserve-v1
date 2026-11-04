@@ -554,16 +554,8 @@ pub fn read_conditions(
     }
     match pixels.as_deref() {
         Some(product) => {
-            // The product is bytes and the conditions' ranges are rows of
-            // three bytes each, so the two are compared in rows.
-            if product.len() % 3 != 0 {
-                return Err(Error::Plan(
-                    "the condition pixel product is not whole RGB24 rows".to_owned(),
-                ));
-            }
-            let rows = product.len() / 3;
-            check_ranges(&declared_pixels, rows, "pixels")?;
-            if pixel_rows != rows {
+            check_ranges(&declared_pixels, product.len(), "pixels")?;
+            if pixel_rows != product.len() {
                 return Err(Error::Plan(
                     "the request's conditions leave their pixels unfilled".to_owned(),
                 ));
@@ -578,16 +570,8 @@ pub fn read_conditions(
     }
     match samples.as_deref() {
         Some(product) => {
-            // The product is interleaved stereo samples and the conditions'
-            // ranges are stereo rows, so the two are compared in rows.
-            if product.len() % 2 != 0 {
-                return Err(Error::Plan(
-                    "the condition sample product is not whole stereo samples".to_owned(),
-                ));
-            }
-            let rows = product.len() / 2;
-            check_ranges(&declared_samples, rows, "samples")?;
-            if sample_rows != rows {
+            check_ranges(&declared_samples, product.len(), "samples")?;
+            if sample_rows != product.len() {
                 return Err(Error::Plan(
                     "the request's conditions leave their samples unfilled".to_owned(),
                 ));
