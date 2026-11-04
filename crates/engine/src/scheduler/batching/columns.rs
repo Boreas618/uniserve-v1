@@ -794,11 +794,56 @@ mod tests {
         assert_eq!(columns.rows.query_offsets, vec![0, 4, 6]);
         assert_eq!(
             columns.rows.logits_rows,
-            vec![-1, 5],
-            "each prefill samples at its last query row"
+            vec![0, 1],
+            "one entry per row, each naming the row whose logits are read: both calls end \
+             their prompt, so each samples at its only row"
         );
         assert_eq!(columns.input_ids, vec![11, 12, 13, 14, 21, 22]);
         assert_eq!(columns.slots, vec![1, 2]);
+    }
+
+    #[test]
+    fn a_chunk_states_no_logits_row_and_a_multi_row_prefill_its_last() {
+        // `logits_rows` has one entry per row and names, in each, the row whose hidden
+        // state is projected: `-1` for a row that projects nothing, its own index for a
+        // row that samples. A chunk of a prompt that does not end samples nothing; a
+        // prefill that ends it samples at its last query row, not its first.
+        let mut chunk = call(prefill(), 8, &[3]);
+        chunk.token_output = None;
+        let requests = vec![
+            (chunk, placement(1, &[3], &[true])),
+            (
+                call(prefill(), 11, &[2, 2]),
+                placement(2, &[2, 2], &[true, true]),
+            ),
+        ];
+        let columns = columns(
+            &requests,
+            &[vec![1, 2, 3], vec![4, 5, 6, 7]],
+            &[&sampling(), &sampling()],
+            &[0, 0],
+            page(),
+            2048,
+        )
+        .expect("a chunk and a sampling prefill");
+
+        assert_eq!(
+            columns.rows(),
+            3,
+            "one row for the chunk, two for the prefill"
+        );
+        assert_eq!(columns.tokens(), 7);
+        assert_eq!(
+            columns.rows.logits_rows,
+            vec![-1, -1, 2],
+            "the chunk projects nothing, and the prefill's second row is its last query row"
+        );
+        let shape = batch_shape(&columns);
+        assert_eq!(
+            shape.variant,
+            executor::plan::Variant::PrefillOutput,
+            "the batch ends a prompt, so it projects logits"
+        );
     }
 
     #[test]
