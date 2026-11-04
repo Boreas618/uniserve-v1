@@ -46,13 +46,18 @@ import numpy as np
 
 #: The three cuts a layer is walked through, in the order the layer runs them. A reference that sets
 #: `hidden_NN_normalized.npy` and the two after it lets one layer be read operator by operator.
-CUTS = ["normalized", "attended", "router_ids", "router_weights", "mlp_out"]
+CUTS = ["normalized", "attended", "gate_in", "router_ids", "router_weights", "mlp_out"]
 
 #: The reference's own module at which each cut's tensor is read, so a cut's file name states which
 #: site wrote it and a comparison never rests on two hands agreeing what a word means.
 CUT_SITES = [
     ("normalized", "input_layernorm's output (its residual add is already in it)"),
     ("attended", "self_attn's output, element [0], before the residual add"),
+    (
+        "gate_in",
+        "post_attention_layernorm's output - the gate's and the experts' input, and the last tensor "
+        "before them that anything compares",
+    ),
     ("router_ids", "the router's selected experts, as ids - compared exactly, never by rms"),
     ("router_weights", "the router's renormalized weights, in the reference's own dtype (bf16)"),
     ("mlp_out", "mlp's output, before the residual add"),
