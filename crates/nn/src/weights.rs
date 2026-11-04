@@ -377,6 +377,7 @@ impl<'a> WeightLoader<'a> {
         }
 
         let files = self.identities(&names)?;
+        let source_dtype = self.checkpoint_dtype(&names)?;
         let dtype = self.target_dtype(&names)?;
         let region = WeightRegion {
             tensors: names.clone(),
@@ -399,11 +400,12 @@ impl<'a> WeightLoader<'a> {
         }
 
         let bytes = self.source_bytes(&request.source, &key)?;
-        let bytes = match self.dtype {
-            Some(target) if target != key.dtype => {
-                convert(key.dtype, target, &bytes, &request.tensor)?
-            }
-            _ => bytes,
+        // The key carries the retained element type; the bytes still hold the checkpoint's, so the
+        // conversion is decided by the source, not by the key.
+        let bytes = if source_dtype != dtype {
+            convert(source_dtype, dtype, &bytes, &request.tensor)?
+        } else {
+            bytes
         };
         let expected = request
             .shape
@@ -883,6 +885,11 @@ fn f32_to_half(value: f32) -> u16 {
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exponent = (bits >> 23) & 0xff;
     let mantissa = bits & 0x007f_ffff;
+    if exponent == 0 {
+        // A zero or subnormal `f32` underflows to a signed zero in the half's exponent range; the
+        // largest half subnormal is still an order of magnitude above the largest `f32` subnormal.
+        return sign;
+    }
     if exponent == 0xff {
         return sign | 0x7c00 | if mantissa == 0 { 0 } else { 0x0200 };
     }
