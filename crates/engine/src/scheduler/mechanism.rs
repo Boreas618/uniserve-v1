@@ -44,11 +44,19 @@
 //!   mechanism may not have. The owner is the storage side's host page report,
 //!   and the acceptance is: the pages a `Warming` entry names become `on_host`,
 //!   and a `warm` order that names them is performed in the policy's order.
-//! - `experts(load)` answers a placement of experts on ranks, which the
-//!   executor's world setup applies (§7.6), not the scheduler. The owner is the
-//!   executor's edge — `Executor::commit_experts` is the method that retains an
-//!   order — reached by whoever takes the order (`CommandSender::take_expert_order`);
-//!   the load itself is deferred by ruling.
+//! - `experts(load)` answers a placement of experts on ranks. **The mechanism's
+//!   half is done:** it is called on the mechanism's own interval
+//!   (`Scheduler::EXPERT_REBALANCE_STEPS` steps, so a program never reads time), the
+//!   placement is validated against the ranks the load states
+//!   ([`validate_experts`]), and the order is handed over with
+//!   `Command::TakeExpertOrder` — `SchedulerHandle::take_expert_order` is that
+//!   hand-off. **The application is the executor's**, and it is deferred on
+//!   that side with a named owner (§7.6): applying a placement moves weights
+//!   across ranks and pools, which is device and world state, and the mechanism
+//!   owns none of it; `Executor::commit_experts` is the method that retains an
+//!   order. Nothing in this tree takes the order yet, so until the executor
+//!   applies it the order changes nothing — stated here so the row is not a
+//!   surprise to a reader rather than dropped by the mechanism.
 
 use std::collections::{BTreeMap, BTreeSet};
 
