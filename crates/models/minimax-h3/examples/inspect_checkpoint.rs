@@ -173,15 +173,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "model.visual.deepstack_merger_list.",
             ],
         ),
-        (
-            "transformer",
-            "denoiser",
-            &["transformer_blocks.", "token_refiner."],
-        ),
     ];
     let mut names_by_directory = std::collections::BTreeMap::new();
-    for (directory, _, _) in prefixes {
-        if names_by_directory.contains_key(*directory) {
+    // The DiT partitions are checked against their own `keys`, not against prefixes, so their
+    // directories are read here whether or not the prefix table names them.
+    let dit_directories = config
+        .denoisers
+        .keys()
+        .map(|dit| dit.directory())
+        .collect::<Vec<_>>();
+    let prefix_directories = prefixes
+        .iter()
+        .map(|(directory, _, _)| *directory)
+        .chain(dit_directories.iter().copied())
+        .collect::<Vec<_>>();
+    for directory in prefix_directories {
+        if names_by_directory.contains_key(directory) {
             continue;
         }
         let mut names = Vec::new();
@@ -198,9 +205,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        names_by_directory.insert((*directory).to_owned(), names);
+        names_by_directory.insert(directory.to_owned(), names);
     }
+    // A DiT partition states its own keys, so this half is exact in both directions: every name
+    // the block asks for is in the index, and every name in the index is asked for. A prefix table
+    // could say the first of the two only.
     let mut missing = Vec::new();
+    for (dit, denoiser) in &config.denoisers {
+        let block = format!("{} DiT", dit.directory());
+        let names = &names_by_directory[dit.directory()];
+        if names.is_empty() {
+            println!(
+                "keys {block}: {} states no index here, so its keys are unread",
+                dit.directory()
+            );
+            continue;
+        }
+        let keys = minimax_h3::denoiser::Denoiser::keys(denoiser);
+        let absent =
+            minimax_h3::checkpoint::absent(&keys, |key| names.iter().any(|name| name == key));
+        let unread = names
+            .iter()
+            .filter(|name| !keys.iter().any(|key| key == *name))
+            .count();
+        println!(
+            "keys {block}: {} asked, {} in the index, {} missing, {} unread",
+            keys.len(),
+            keys.len() - absent.len(),
+            absent.len(),
+            unread
+        );
+        for key in absent {
+            missing.push(format!("{block} asks for {key} and its index holds none"));
+        }
+    }
     for (directory, block, groups) in prefixes {
         let names = &names_by_directory[*directory];
         if names.is_empty() {
@@ -220,7 +258,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if !missing.is_empty() {
         for line in &missing {
-            eprintln!("missing key group: {line}");
+            eprintln!("missing key: {line}");
         }
         return Err(format!("{} key groups the blocks ask for are absent", missing.len()).into());
     }
