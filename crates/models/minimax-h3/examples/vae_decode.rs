@@ -412,11 +412,14 @@ fn stage_decode(args: &Args) -> Result<()> {
     // that flag is the graph arena's).
     let granularity =
         u64::try_from(platform::HandleType::Descriptor.granularity(device.id())?).unwrap_or(1);
+    // The loader also publishes what the export does not hold: the input affine it folds on the host
+    // (`folded_input`), whose two tensors the pool gives blocks for like any other.
+    let synthesized = (width * latent_channels + width) * u64::from(dtype.bits()) / 8;
     let needed = resident_bytes(
         component,
         VideoDecoder::keys(&config.video_vae)?,
         granularity,
-    )?;
+    )? + synthesized.max(1).next_multiple_of(granularity);
     let mut weights = DeviceWeights::new(&device, needed, granularity)?;
     let (decoder, positions, rows) = {
         let mut loader = WeightLoader::new(component, &mut weights, None, None);
@@ -760,12 +763,11 @@ impl RetainedWeights for HostWeights {
 fn resident_bytes(component: &nn::Checkpoint, keys: Vec<String>, granularity: u64) -> Result<u64> {
     let mut total = 0_u64;
     for key in keys {
-        // A weight-norm pair publishes one folded weight, whose bytes are the second tensor's: the
-        // gain is read and multiplied in, never stored, so counting it would reserve a block the
-        // loader never asks for - and pairs are the commonest thing in this component.
-        if key.ends_with(".weight_g") {
-            continue;
-        }
+        // Every key of the block's own list counts, gain tensors included. Skipping a `.weight_g` on
+        // the assumption that the fold publishes one tensor was wrong by exactly the amount that
+        // failed: the pool charges a block for every publish it is given, and a reservation that
+        // leaves one class of them out is short by that class however exact the rest is. The
+        // reservation and the give-out must be one sum over one set.
         let Some(location) = component.tensor(&key) else {
             // Absent names are the loader's to refuse, with the block that asks for them.
             continue;
