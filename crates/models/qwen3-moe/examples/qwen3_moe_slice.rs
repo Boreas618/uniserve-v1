@@ -204,10 +204,11 @@ fn load_declared<R: RetainedWeights>(
         Partition::single(),
         &mut loader,
         LoadOptions::default(),
-        // The scale layout is the one the compiled NVFP4 programs read - `swizzled_128x4` in their
-        // key - and a checkpoint written in the other layout would dequantize with the wrong
-        // block's scale.
-        ScaleLayout::Swizzled128X4,
+        // The argument is the **checkpoint's** block-scale layout and not the product's: a ModelOpt
+        // export writes `weight_scale` as `[rows, columns / 16]` row-major, the loader builds the
+        // swizzled 128x4 table the programs read once at load, and it refuses a checkpoint that
+        // already holds a converted table rather than swizzle it twice (`load.rs:562`).
+        ScaleLayout::Linear,
     )?;
     Ok((model, declared))
 }
