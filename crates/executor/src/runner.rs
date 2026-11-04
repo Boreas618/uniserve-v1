@@ -55,6 +55,14 @@ pub trait Runner: Send {
     /// its kernels and graphs. The runner keeps the previous generation for a revert (7.3).
     fn switchover(&mut self, generation: u64);
 
+    /// Reverts a prepared generation: it never takes over, the serving generation stays, and its
+    /// graphs are released (7.3 step 4).
+    ///
+    /// This is `switchover`'s reverse for an update that did not commit. Design 4.5's method list
+    /// does not name it and a failed precopy cannot do without it, so it is a filled silence beside
+    /// `serve` and `warmup`.
+    fn revert(&mut self, generation: u64);
+
     /// Releases everything that references a generation older than `generation` (7.3): the graphs
     /// and the kernels they held. It runs after the last batch of the old generation completed.
     fn purge(&mut self, generation: u64);
