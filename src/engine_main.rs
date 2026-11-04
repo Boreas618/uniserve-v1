@@ -2001,6 +2001,7 @@ impl MainProcess {
             tracing::warn!(
                 generation,
                 stage = entered,
+                waiting_on = %pending_work(&precopy.stage),
                 waited_s = precopy.since.elapsed().as_secs(),
                 "the precopy has stood in this stage past the watchdog's stall bound and nothing \
                  has answered: the Program Server, a device or a scheduler is the one to look at"
@@ -4155,6 +4156,37 @@ enum StageFailure {
 
 /// Whether every submission finished, and if not, why the first unfinished or
 /// failed one did not.
+/// What one stage is still waiting for, in one phrase.
+///
+/// A stage's name says where a hang is, not which of the stage's several waits it is: the module
+/// lane holds one task per device, the executor stage one submission per device, and the shadow
+/// stage one step per scheduler. The stall line prints the counts so a run names the wait that
+/// never answered without a second run built for the purpose.
+fn pending_work(stage: &PrecopyStage) -> String {
+    match stage {
+        PrecopyStage::Modules(tasks) => {
+            let answered = tasks.iter().filter(|task| task.outcome().is_some()).count();
+            format!("{answered} of {} kernel load(s) answered", tasks.len())
+        }
+        PrecopyStage::Executors(submissions) => {
+            let answered = submissions
+                .iter()
+                .filter(|submission| submission.outcome().is_some())
+                .count();
+            format!(
+                "{answered} of {} device preparation(s) answered",
+                submissions.len()
+            )
+        }
+        PrecopyStage::Shadow(answers) => {
+            let answered = answers.iter().filter(|answer| !answer.is_empty()).count();
+            format!("{answered} of {} shadow step(s) answered", answers.len())
+        }
+        // The driver replaces the stage with this before it looks at it, so it is never the wait.
+        PrecopyStage::Done => "no stage".to_owned(),
+    }
+}
+
 fn unfinished(submissions: &[Submission], what: &str) -> Option<StageFailure> {
     for submission in submissions {
         match submission.outcome() {
