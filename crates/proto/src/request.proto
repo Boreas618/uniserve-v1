@@ -209,6 +209,10 @@ message Command {
     // its consumer took, so a slow consumer holds its request's output
     // back in the engine, whose scheduler then stalls the request.
     Consumed consumed = 6;
+    // The daemon handed this request's response to the engine that took over:
+    // `events` is how many of its events the previous engine sent, which is
+    // the position the new one resumes after (design 7.5.1).
+    Takeover takeover = 7;
   }
 }
 
@@ -219,6 +223,9 @@ message Acknowledge {
 }
 message Abort {}
 message Consumed {
+  uint64 events = 1;
+}
+message Takeover {
   uint64 events = 1;
 }
 
