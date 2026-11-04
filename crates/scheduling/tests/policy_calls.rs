@@ -344,8 +344,13 @@ fn fuel_is_renewed_for_every_call() {
     let mut policy = policy(&engine, toy);
     policy.set_call_fuel(1_000);
 
+    let mut consumed = policy.fuel_consumed();
     for _ in 0..8 {
         assert!(policy.dispatch(&Room::default()).unwrap().work.is_empty());
+        // The fuel a step's calls used is the measurement §12 asks for.
+        assert!(policy.fuel_consumed() > consumed);
+        consumed = policy.fuel_consumed();
+        assert!(consumed < 1_000 * 8);
     }
 }
 
