@@ -24,6 +24,19 @@ use crate::options::ServeConfig;
 use crate::updates::change::Applied;
 use crate::updates::switch::{Node, Roster, Start, Switch};
 
+/// A configuration a revert marked unavailable, and why: a target that failed
+/// on probation keeps its build from being tried again until an operator says
+/// otherwise (§7.4).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Unavailable {
+    pub digest: String,
+    /// The world that executed it and was rolled back.
+    pub world: u64,
+    pub reason: String,
+    /// Seconds since the Unix epoch.
+    pub at: f64,
+}
+
 /// What `apply` hands the epoch arm that the two deployments cannot state.
 pub(crate) struct EpochChange {
     /// The epoch that serves now, whose record the target's keeps as its

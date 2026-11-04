@@ -66,6 +66,7 @@ use crate::options::{PreviousWorld, RollbackOptions, ServeConfig};
 // `crate::updates` in builder02's routing commit.
 pub(crate) use crate::observe::{Observer, Rates, Sample};
 pub(crate) use crate::updates::change::{Applied, ApplyRequest, InFlight, resolve};
+pub(crate) use crate::updates::epoch::Unavailable;
 
 mod change;
 pub(crate) mod group;
@@ -126,17 +127,6 @@ pub(crate) struct Trial {
     /// prepared (`update_config.eager_prepare`): its graphs replay again if
     /// it resumes.
     pub(crate) eager: bool,
-}
-
-/// A configuration a rollback marked unavailable, and why.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Unavailable {
-    pub digest: String,
-    /// The world that executed it and was rolled back.
-    pub world: u64,
-    pub reason: String,
-    /// Seconds since the Unix epoch.
-    pub at: f64,
 }
 
 /// A world change in progress, as the status reports it.
