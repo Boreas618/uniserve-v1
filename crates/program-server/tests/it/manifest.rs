@@ -105,7 +105,9 @@ version = "13.0"
 
 [module]
 form = "native"
-entry = "uniserve_paged_attention_launch"
+
+[module.entries]
+launch = "uniserve_paged_attention_launch"
 
 [source]
 kind = "cubin"
@@ -129,6 +131,55 @@ fn a_manifest_that_names_a_file_the_package_lacks_is_refused() {
         refused.is_err(),
         "compile.py and the tuning data are missing"
     );
+}
+
+#[test]
+fn a_native_module_names_a_launch_entry_and_any_lifecycle_entries() {
+    let text = r#"
+op = "expert_exchange"
+backend = "deepep"
+
+[toolchain]
+kind = "nvcc"
+version = "13.0"
+
+[module]
+form = "native"
+
+[module.entries]
+launch = "uniserve_exchange_launch"
+create = "uniserve_exchange_create"
+suspend = "uniserve_exchange_suspend"
+restore = "uniserve_exchange_restore"
+
+[source]
+kind = "cuda"
+files = ["src/exchange.cu"]
+
+[kernel]
+architectures = ["sm_100a"]
+descriptors = { dimensions = { dtype = ["bf16"] } }
+"#;
+    let root = package(text, &["src/exchange.cu"]);
+    let manifest = Manifest::load(root.path()).unwrap();
+    assert_eq!(
+        manifest.module.entries.get("launch").map(String::as_str),
+        Some("uniserve_exchange_launch")
+    );
+    assert_eq!(manifest.module.entries.len(), 4);
+}
+
+#[test]
+fn a_cubin_module_with_a_c_entry_is_refused() {
+    let text = REASONABLE.replace(
+        "metadata = \"metadata.json\"",
+        "metadata = \"metadata.json\"\n[module.entries]\nlaunch = \"nope\"",
+    );
+    let root = package(
+        &text,
+        &["src/rms.py", "src/compile.py", "tuning/tactics.json"],
+    );
+    assert!(Manifest::load(root.path()).is_err());
 }
 
 #[test]
@@ -203,7 +254,9 @@ version = "13.0"
 
 [module]
 form = "native"
-entry = "uniserve_paged_attention_launch"
+
+[module.entries]
+launch = "uniserve_paged_attention_launch"
 
 [source]
 kind = "cubin"
@@ -247,7 +300,7 @@ files = ["src/lib.rs"]
     let manifest = Manifest::load(root.path()).unwrap();
     assert_eq!(manifest.module.form, ModuleForm::Wasm);
     assert!(manifest.module.metadata.is_none());
-    assert!(manifest.module.entry.is_none());
+    assert!(manifest.module.entries.is_empty());
     assert!(manifest.covers("default"));
 }
 

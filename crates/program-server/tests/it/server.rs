@@ -316,7 +316,7 @@ fn a_policy_module_resolves_for_wasm32_only() {
     assert_eq!(resolved.files.len(), 1);
     assert_eq!(resolved.files[0].name, "module.wasm");
     assert!(resolved.metadata.is_none());
-    assert!(resolved.entry.is_none());
+    assert!(resolved.entries.is_empty());
 
     // A policy is not built for a GPU architecture, and a policy names no
     // descriptor other than `default`.

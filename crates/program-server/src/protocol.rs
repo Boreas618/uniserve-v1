@@ -139,8 +139,10 @@ pub struct Module {
     /// A cubin module's launch metadata, as the metadata JSON's file name
     /// among [`Self::files`].
     pub metadata: Option<String>,
-    /// A native module's C entry symbol, which its package declares.
-    pub entry: Option<String>,
+    /// A native module's C entry symbols by role, which its package declares
+    /// (design section 4.2): [`LAUNCH_ENTRY`](crate::manifest::LAUNCH_ENTRY)
+    /// and any lifecycle entries around it.
+    pub entries: std::collections::BTreeMap<String, String>,
 }
 
 /// One module a listing names.
@@ -634,7 +636,7 @@ impl Client {
                         form,
                         files,
                         metadata: (!resolved.metadata.is_empty()).then_some(resolved.metadata),
-                        entry: (!resolved.entry.is_empty()).then_some(resolved.entry),
+                        entries: resolved.entries.into_iter().collect(),
                     });
                 }
                 wire::server_message::Message::Refused(refused) => {

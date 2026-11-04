@@ -168,9 +168,13 @@ message Prepared {
 message Resolved {
   ModuleForm form = 1;
   repeated ModuleFile files = 2;
-  // The C entry symbol a native module's package declares (design section
-  // 4.2): what the main process calls after `dlopen`.
+  // Superseded by `entries`; no longer sent. Kept so the schema stays
+  // append-only.
   string entry = 3;
+  // A native module's C entry symbols by role (design section 4.2): `launch`
+  // launches the kernel, and the other roles are lifecycle entries with the
+  // same calling convention around it.
+  map<string, string> entries = 5;
   // The name of the metadata JSON among the files, for a cubin module: the
   // launch metadata the main process reads (design section 5.3).
   string metadata = 4;

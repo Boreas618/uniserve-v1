@@ -277,7 +277,9 @@ impl ProgramServer {
                         message: Some(wire::server_message::Message::Resolved(wire::Resolved {
                             form: wire::ModuleForm::from(module.form) as i32,
                             files,
-                            entry: module.entry.unwrap_or_default(),
+                            // Field 3 is superseded by `entries` and left empty.
+                            entry: String::new(),
+                            entries: module.entries.into_iter().collect(),
                             metadata: module.metadata.unwrap_or_default(),
                         })),
                     },
@@ -615,7 +617,7 @@ impl ProgramServer {
             form: package.manifest.module.form,
             files: module_files,
             metadata: package.manifest.module.metadata.clone(),
-            entry: package.manifest.module.entry.clone(),
+            entries: package.manifest.module.entries.clone(),
         })
     }
 
