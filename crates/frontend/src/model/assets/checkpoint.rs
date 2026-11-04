@@ -200,6 +200,10 @@ async fn hub_range(
 /// Serializes a safetensors file holding zero-filled BF16 tensors of the
 /// given shapes, for tests that need a checkpoint header.
 #[cfg(any(test, feature = "testing"))]
+#[expect(
+    clippy::unwrap_used,
+    reason = "a fixture whose header does not serialize is a test failure"
+)]
 pub fn bf16_safetensors(tensors: &[(&str, &[u64])]) -> Vec<u8> {
     let mut header = serde_json::Map::new();
     let mut offset = 0_u64;
