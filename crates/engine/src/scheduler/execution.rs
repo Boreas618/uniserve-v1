@@ -225,14 +225,13 @@ impl Scheduler {
         if !kv_offload.holds() {
             return answered;
         }
-        let waiting = &self.waiting;
+        let waiting: HashSet<RequestId> = self
+            .waiting
+            .iter()
+            .map(|state| state.req.request_id)
+            .collect();
         let running = &self.running;
-        kv_offload.sweep(|request| {
-            running.contains_key(&request)
-                || waiting
-                    .iter()
-                    .any(|state| state.req.request_id == request)
-        });
+        kv_offload.sweep(|request| waiting.contains(&request) || running.contains_key(&request));
         answered
     }
 
