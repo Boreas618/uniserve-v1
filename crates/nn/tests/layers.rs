@@ -7,7 +7,8 @@
 //! region that is never read, because construction only inspects extents and strides.
 
 use nn::{
-    AdaptivePool, DType, DevicePtr, FrameNormPad, GatedResidual, KvGroup, KvPlanes, KvView, Linear,
+    AdaptivePool, Conv1d, Conv3d, ConvGeometry, ConvTranspose1d, DType, DevicePtr, FrameNormPad,
+    GatedResidual, KvGroup, KvPlanes, KvView, Linear,
     ModulatedRmsNorm, Patch, Rotary, Rotate, Rotation, ScaledResidual, ScaledResidualRmsNorm,
     Shape, Snake, SwiGlu, TensorView, VsaTiles, Weight, WeightedRmsNorm,
 };
@@ -326,4 +327,40 @@ fn a_layer_reads_the_planes_its_own_index_names() {
         .err()
         .expect("a second group in a one-group cache");
     assert!(format!("{group}").contains("the cache has 1"), "{group}");
+}
+
+/// The three convolutions' weightless descriptors are the ones their launches take: the walk that
+/// asks a deployment which programs it needs reads these, so a drift between them would be a store
+/// built for programs the model never launches.
+#[test]
+fn a_convolution_states_the_descriptor_its_launch_takes() {
+    let geometry = ConvGeometry::new(1, [3, 0, 0], [1, 0, 0], [1, 0, 0], [1, 0, 0], 1).unwrap();
+    let spatial = ConvGeometry::new(3, [2, 2, 2], [1, 1, 1], [0, 0, 0], [1, 1, 1], 1).unwrap();
+    let one_dimensional = weight(&[8, 4, 3]);
+    let transposed_weight = weight(&[4, 8, 3]);
+    let spatial_weight = weight(&[8, 4, 2, 2, 2]);
+
+    let conv1d = Conv1d::new(one_dimensional, None, geometry, false).unwrap();
+    assert_eq!(
+        conv1d.descriptor(DType::F32, DType::F32),
+        Conv1d::descriptor_of(DType::F32, DType::F32, false, DType::F32, geometry, false)
+    );
+
+    let transposed =
+        ConvTranspose1d::new(transposed_weight, None, geometry, false).unwrap();
+    assert_eq!(
+        transposed.descriptor(DType::F32, DType::F32),
+        ConvTranspose1d::descriptor_of(DType::F32, DType::F32, false, DType::F32, geometry, false)
+    );
+
+    let conv3d = Conv3d::new(spatial_weight, None, spatial, false).unwrap();
+    assert_eq!(
+        conv3d.descriptor(DType::F32, DType::F32),
+        Conv3d::descriptor_of(DType::F32, DType::F32, false, DType::F32, spatial, false)
+    );
+    // A weight in another type is the descriptor's weight operand, not the launch's input.
+    assert_ne!(
+        Conv3d::descriptor_of(DType::F32, DType::F32, false, DType::F32, spatial, false),
+        Conv3d::descriptor_of(DType::F32, DType::BF16, false, DType::F32, spatial, false)
+    );
 }

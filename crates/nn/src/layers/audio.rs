@@ -129,16 +129,33 @@ impl AudioActivation {
         self.ratio
     }
 
-    /// The descriptor's view of the geometry, which states the expected output length.
-    fn descriptor(&self) -> audio_activation::Descriptor {
+    /// The descriptor a block of this geometry launches, stated without its weights.
+    ///
+    /// A deployment answers "which programs must be compiled for me?" before any weight is read, and
+    /// the geometry is what the key names — the signal's length is a launch value and not part of it.
+    pub fn descriptor_of(
+        dtype: DType,
+        channels: u32,
+        kernel: u32,
+        ratio: u32,
+        block: u32,
+    ) -> audio_activation::Descriptor {
         audio_activation::Descriptor {
-            dtype: self.dtype,
-            channels: self.channels,
-            kernel: self.kernel,
-            ratio: self.ratio,
-            block: self.block,
+            dtype,
+            channels,
+            kernel,
+            ratio,
+            block,
             pdl: PDL,
         }
+    }
+
+    /// The descriptor's view of the geometry, which states the expected output length.
+    ///
+    /// One construction with [`AudioActivation::descriptor_of`], so the walk and the launch cannot
+    /// state different descriptors for the same block.
+    fn descriptor(&self) -> audio_activation::Descriptor {
+        Self::descriptor_of(self.dtype, self.channels, self.kernel, self.ratio, self.block)
     }
 
     /// The samples one channel has after the block, for an input of `length` samples.

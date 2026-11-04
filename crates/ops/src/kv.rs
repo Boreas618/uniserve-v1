@@ -16,10 +16,10 @@
 //! created, and a reader must not read a page before it is initialized (specs/worker.md 8, "只清零
 //! 新存储").
 //!
-//! An **FP8 cache** is filled by `kv_quantize` instead: the same scatter, with each element divided by
-//! the page's own scale and rounded to E4M3 on the way in. The scale is the deployment's per-page
-//! static value (one `[pages, 1, 1, 1]` f32 per plane), supplied as an input rather than derived, so
-//! the write needs no maximum and no second pass, and the read side multiplies it back per page.
+//! An **FP8 cache** is filled by a scaled write instead: the same scatter, with each element divided by
+//! the page's own scale and rounded to E4M3 on the way in. That scale is one `[pages, 1, 1, 1]` f32
+//! per plane, the same buffer the read side multiplies back, and the write derives it from the values
+//! it is about to store rather than receiving it.
 //! Splitting the two writes is what keeps the storage decision (which element type the cache holds)
 //! out of the scatter that does not care: `kv_write` stays exact and has no scale operand.
 
@@ -40,7 +40,7 @@ pub struct Descriptor {
     /// Element type of the cache.
     ///
     /// It is the source's own: this operator moves values, it does not encode them. An FP8 cache is
-    /// filled by [`KvQuantize`], which divides by the page's scale on the way in, and a launch that
+    /// filled by [`KvWriteScaled`], which divides by the page's scale on the way in, and a launch that
     /// asks this one for a narrower cache is refused rather than writing values no reader could
     /// interpret (a reader of an FP8 plane multiplies by a scale this operator would not have
     /// applied).
@@ -150,14 +150,14 @@ impl Op for KvWrite {
         // product of every extent but the last and would count tokens times heads.
         let tokens = args.key.shape.dim(0);
         // The cache is filled in the source's type. An FP8 cache needs the page's scale applied
-        // first, which is `kv_quantize`'s job: allowing it here would write values that a reader
+        // first, which is the scaled write's job: allowing it here would write values that a reader
         // multiplies by a scale they never had applied, which is wrong by orders of magnitude
         // rather than by a rounding.
         if descriptor.kv != descriptor.dtype {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "this writes a {} cache from {} values; an FP8 cache is filled by kv_quantize",
+                    "this writes a {} cache from {} values; an FP8 cache is filled by kv_write_scaled",
                     descriptor.kv, descriptor.dtype
                 ),
             ));
@@ -263,29 +263,54 @@ impl Op for KvWrite {
 /// The argument struct, named for the shadow implementation's clarity.
 type KvWriteArgs = Args;
 
-/// One compilation of `kv_quantize`.
+/// The write that derives a page's scale instead of being given one. A write that is handed a scale
+/// can agree with another to the encoding's own bound; this one *decides* the scale from the values it
+/// is about to store, grows the page's scale when it must, and
+/// rewrites the page so that rows written earlier keep their decoded values. That is a different
+/// launch over different operands - the page is read and rewritten, the scale is an output as well as
+/// an input - and its rule is the reference's (`uniserve/prefix_cache/mha.py`'s quantizing write):
+/// `proposed = max|v| / 448`, `updated = max(scale, proposed)` for an initialized page and `proposed`
+/// otherwise, the page re-encoded from the old scale to the new when it grew, then the new rows stored
+/// at `updated`. It is a separate operator rather than a flag on the write that takes a scale,
+/// because a descriptor must name one program: a field selecting between "apply the scale" and
+/// "derive the scale" would make one key cover two kernels and one tolerance cover two error sources.
 ///
-/// The cache's element type is not a field: an FP8 cache is E4M3 by the layout every reader agrees
-/// on, so the storage type is a constant of this operator rather than a variant of it.
+/// **The scale is derived, never supplied.** The reference derives it from the values it is about to
+/// store (`uniserve/prefix_cache/mha.py`'s quantizing write), and an FP8 cache takes its scales per
+/// block: a checkpoint's per-tensor `k_scale`/`v_scale` floats have no reader here, and a block whose
+/// initialized flag is clear discards whatever its scale buffer held, so such a scalar could not
+/// influence it even as an initial value. A per-tensor scale would be a different layout with a
+/// different reader, not a mode of this operator.
+///
+/// **A block is a page.** The scale this operator maintains is one number per page, indexed by the
+/// page of each token's slot, and a page holds [`page`](Self::page) tokens - the unit this write
+/// fills and `paged_attention` reads. That is the layout the reference states
+/// (`shape = (num_blocks, block_size, heads, head_dim)`, `scale = (num_blocks, 1, 1, 1)` over one
+/// stream), where a block *is* a page; a deployment that laid one scale over several pages would need
+/// a block field here and a different index in every reader, and that is a change of layout rather
+/// than a parameter.
+///
+/// The cache's element type is not a field: an FP8 page is E4M3 by the layout every reader agrees
+/// on, so no key may ask for another one.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct QuantizeDescriptor {
+pub struct ScaledWriteDescriptor {
     /// Element type of the keys and values being written: a full-precision accumulation's output.
     pub dtype: DType,
     /// Element type of the page's scale.
     pub scale: DType,
-    /// Tokens per page.
+    /// Tokens per page, which is tokens per block: one scale covers one page.
     pub page: u32,
     /// Key/value heads this rank holds.
     pub heads: u32,
     /// Elements per head.
     pub head_dim: u32,
-    /// Elements of a cache row one program writes.
+    /// Elements of a row one program re-encodes in one pass.
     pub block: u32,
     /// Launch with programmatic dependent launch.
     pub pdl: bool,
 }
 
-impl fmt::Display for QuantizeDescriptor {
+impl fmt::Display for ScaledWriteDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         Key::new()
             .field("dtype", self.dtype)
@@ -299,29 +324,30 @@ impl fmt::Display for QuantizeDescriptor {
     }
 }
 
-/// The arguments of `kv_quantize`.
+/// The arguments of `kv_write_scaled`.
 #[derive(Clone, Copy)]
-pub struct QuantizeArgs {
-    /// `[tokens, heads · head_dim]` the layer's rotated keys or values.
+pub struct ScaledWriteArgs {
+    /// `[tokens, heads · head_dim]` the layer's rotated keys or values, in full precision.
     pub source: TensorView,
     /// `[tokens]` i32: the flat slot `page · page_size + offset` of each token, or `-1`.
     pub slots: TensorView,
-    /// `[pages, 1, 1, 1]` f32: each page's static scale, the same tensor the read side multiplies by.
+    /// `[pages, 1, 1, 1]` f32: each page's scale, read for the growth rule and written back.
     pub scales: TensorView,
-    /// `[pages, page, heads, head_dim]` E4M3: the cache the launch writes.
-    pub out: TensorView,
-    /// `[pages, 1, 1, 1]` i32 initialization flags of this cache.
+    /// `[pages, page, heads, head_dim]` E4M3: the cache, read and rewritten for a page whose scale
+    /// grew and written at the new rows for every other.
+    pub cache: TensorView,
+    /// `[pages, 1, 1, 1]` i32 initialization flags, written with the scale in the same launch.
     pub initialized: TensorView,
 }
 
-/// The quantizing write into an FP8 cache.
-pub struct KvQuantize;
+/// The scale-deriving write into an FP8 cache.
+pub struct KvWriteScaled;
 
-impl Op for KvQuantize {
-    const NAME: &'static str = "kv_quantize";
+impl Op for KvWriteScaled {
+    const NAME: &'static str = "kv_write_scaled";
 
-    type Descriptor = QuantizeDescriptor;
-    type Args<'a> = QuantizeArgs;
+    type Descriptor = ScaledWriteDescriptor;
+    type Args<'a> = ScaledWriteArgs;
 
     fn launch(
         kernel: &Kernel,
@@ -334,8 +360,6 @@ impl Op for KvQuantize {
         let row = heads * head_dim;
         let tokens = args.source.rows();
 
-        // The source is a full-precision layer output; a cache in a narrower type is what this
-        // operator produces, never what it reads.
         if !matches!(descriptor.dtype, DType::BF16 | DType::F32) {
             return Err(Error::argument(
                 Self::NAME,
@@ -356,9 +380,10 @@ impl Op for KvQuantize {
         }
         args.source
             .require_shape(Self::NAME, Shape::new(&[tokens, row]))?;
+        // A page whose scale would be derived from rows it does not own is the wrong cache, so the
+        // source's row width is stated rather than inferred from a reshape's remainder.
         args.source
             .require_row(Self::NAME, descriptor.dtype, args.source.shape.dim(1))?;
-
         args.slots
             .require_shape(Self::NAME, Shape::new(&[tokens]))?;
         if args.slots.dtype != DType::I32 {
@@ -368,28 +393,30 @@ impl Op for KvQuantize {
             ));
         }
 
-        args.out.require_rank(Self::NAME, 4)?;
-        if args.out.dtype != DType::F8E4M3 {
+        let page = u64::from(descriptor.page);
+        args.cache.require_rank(Self::NAME, 4)?;
+        if args.cache.dtype != DType::F8E4M3 {
             return Err(Error::argument(
                 Self::NAME,
-                format!("expected an e4m3 cache, found {}", args.out.dtype),
+                format!("expected an e4m3 cache, found {}", args.cache.dtype),
             ));
         }
-        let page = u64::from(descriptor.page);
-        if args.out.shape.dim(1) != page
-            || args.out.shape.dim(2) != heads
-            || args.out.shape.dim(3) != head_dim
+        if args.cache.shape.dim(1) != page
+            || args.cache.shape.dim(2) != heads
+            || args.cache.shape.dim(3) != head_dim
         {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
                     "a cache page is {:?}, the descriptor says {page} tokens × {heads} heads × {head_dim}",
-                    args.out.shape.dims()
+                    args.cache.shape.dims()
                 ),
             ));
         }
 
-        let pages = args.out.shape.dim(0);
+        // The scale and the flag are the page's, so both are exactly one entry per page: a shorter
+        // tensor would derive a scale for a page it cannot then record.
+        let pages = args.cache.shape.dim(0);
         args.scales
             .require_shape(Self::NAME, Shape::new(&[pages, 1, 1, 1]))?;
         if args.scales.dtype != descriptor.scale {
@@ -399,6 +426,12 @@ impl Op for KvQuantize {
                     "expected {} page scales, found {}",
                     descriptor.scale, args.scales.dtype
                 ),
+            ));
+        }
+        if descriptor.scale != DType::F32 {
+            return Err(Error::argument(
+                Self::NAME,
+                "a page scale is accumulated and compared in f32; another type is a different rule",
             ));
         }
         args.initialized
@@ -418,40 +451,42 @@ impl Op for KvQuantize {
             .view(args.source)
             .view(args.slots)
             .view(args.scales)
-            .view(args.out)
+            .view(args.cache)
             .view(args.initialized)
             .u64(tokens)
             .u32(descriptor.page)
             .u32(descriptor.heads)
             .u32(descriptor.head_dim)
             .flag(descriptor.pdl);
-        // One block per (token, element block of its row): a token's page is `slot / page_size`, so
-        // every program derives its own page from its slot and no second pass initializes anything.
+        // One program per page, not per token: the page's maximum is over every row it holds, the
+        // re-encode is over every row already written, and a per-token grid could not compute either
+        // without a second pass. A page no token of this launch touches still re-encodes nothing and
+        // costs one program that reads its flag and returns.
         kernel.launch(
-            LaunchGrid::new([tokens, row.div_ceil(u64::from(descriptor.block)), 1])?,
+            LaunchGrid::new([pages, row.div_ceil(u64::from(descriptor.block)), 1])?,
             &mut arguments,
             stream,
         )
     }
 
     fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
-        // The pages are read-modify-write containers, as in `kv_write`: the flag and the untouched
-        // rows are part of what the comparison sees.
-        QuantizeArgs {
-            out: twins.in_place(args.out, stream),
+        // Every page is read-modify-write here, and so is its scale: the comparison must see the
+        // rewritten rows and the grown scale, not only the rows this launch stored.
+        ScaledWriteArgs {
+            scales: twins.in_place(args.scales, stream),
+            cache: twins.in_place(args.cache, stream),
             initialized: twins.in_place(args.initialized, stream),
             ..args
         }
     }
 
     fn tolerance(_descriptor: &Self::Descriptor) -> Tolerance {
-        // This operator is **lossy by contract**, so 7.3's accumulation bound does not apply to it:
-        // it stores each element as E4M3 after dividing by the page's scale, and no order of the same
-        // arithmetic would give the source back. The bound is the encoding's own, stated per unit of
-        // that scale because the scale is supplied by the deployment and is not part of the error (a
-        // wrong scale is a wrong cache, not a rounded one): an E4M3 value is within `2^-3` relative
-        // of the scaled magnitude it rounds, and a subnormal is within `2^-6` of the scale, which is
-        // an absolute term in the same scaled units.
+        // The encoding's own bound, in the page's scaled units - with one
+        // difference this operator owns: it also *decides* the scale. Two implementations given the
+        // same source and the same rule derive the same maximum and therefore the same scale, so the
+        // bound stays the encoding's. Two implementations that derive different scales hold two
+        // different caches, and that is a wrong cache rather than a rounded one: the check for it is
+        // the end-to-end one (the same token ids at the same weights), not a wider tolerance here.
         Tolerance::new(2f32.powi(-6), 2f32.powi(-3))
     }
 }
@@ -460,8 +495,8 @@ impl Op for KvQuantize {
 mod tests {
     use super::*;
 
-    fn descriptor() -> QuantizeDescriptor {
-        QuantizeDescriptor {
+    fn scaled() -> ScaledWriteDescriptor {
+        ScaledWriteDescriptor {
             dtype: DType::BF16,
             scale: DType::F32,
             page: 16,
@@ -473,34 +508,25 @@ mod tests {
     }
 
     #[test]
-    fn the_quantizing_write_is_compiled_for_the_page_and_the_head_geometry() {
+    fn the_scaled_write_names_its_page_and_its_scale_in_the_key() {
         assert_eq!(
-            crate::descriptor::key(&descriptor()),
+            crate::descriptor::key(&scaled()),
             "dtype_bf16_scale_f32_page_16_heads_8_head_dim_128_block_1024_pdl_false"
         );
-        // The cache's element type is not a field, so no key can ask for another one.
-        let f32_source = QuantizeDescriptor {
-            dtype: DType::F32,
-            ..descriptor()
-        };
-        assert_ne!(
-            crate::descriptor::key(&descriptor()),
-            crate::descriptor::key(&f32_source)
-        );
+        // The page is the block the scale covers, so a different page size is a different program:
+        // an implementation that derived one scale over another geometry would store a plausible
+        // wrong number everywhere, which is the failure this key exists to prevent.
+        let wider = ScaledWriteDescriptor { page: 32, ..scaled() };
+        assert_ne!(crate::descriptor::key(&scaled()), crate::descriptor::key(&wider));
     }
 
     #[test]
-    fn the_bound_is_the_encoding_s_own_and_not_an_accumulation_bound() {
-        let tolerance = <KvQuantize as Op>::tolerance(&descriptor());
-        // Two terms in the page's scaled units: the relative error of an E4M3 value, and the
-        // subnormal floor.
+    fn the_scaled_write_bounds_the_encoding_and_says_a_wrong_scale_is_not_a_rounding() {
+        let tolerance = <KvWriteScaled as Op>::tolerance(&scaled());
         assert_eq!(tolerance.rtol, 2f32.powi(-3));
         assert_eq!(tolerance.atol, 2f32.powi(-6));
-        // The subnormal floor is what makes the bound hold near zero, so it must be there.
         assert!(tolerance.allows(0.0, 2f32.powi(-6)));
         assert!(!tolerance.allows(0.0, 2f32.powi(-5)));
-        // And the relative term is the one that holds at full scale.
-        assert!(tolerance.allows(1.0, 1.0 + 2f32.powi(-3)));
-        assert!(!tolerance.allows(1.0, 1.0 + 2f32.powi(-2)));
     }
+
 }

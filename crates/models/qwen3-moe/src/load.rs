@@ -23,7 +23,10 @@ use std::collections::HashMap;
 use std::f64::consts::PI;
 use std::path::Path;
 
-use nn::layers::{Attention, Embedding, Linear, Moe, ParallelLMHead, RmsNorm, Rotary, SwiGlu};
+use nn::layers::{
+    ENCODE_CHUNK, Attention, Embedding, Linear, Moe, Nvfp4Linear, ParallelLMHead, RmsNorm, Rotary,
+    SwiGlu,
+};
 use nn::weights::{Nvfp4Names, QuantizedStack, Weight, WeightLayout, WeightLoader, WeightRequest};
 use nn::{DType, Shape};
 use ops::fp4::ScaleLayout;
@@ -31,7 +34,8 @@ use ops::gemm::WeightOrder;
 use ops::moe::grouped::Activation as MoeActivation;
 use ops::rope::Rotation;
 
-use crate::model::{AttentionLayer, DecoderLayer, DenseMlp, LoadOptions, Mlp, Qwen3Moe};
+use crate::model::{AttentionLayer, DecoderLayer, DenseMlp, LoadOptions, Mlp, Projection, Qwen3Moe};
+use crate::representation::{self, Adopted, Representation, Role};
 use crate::{Activation, Config, Error, Partition, Result};
 
 /// Load a `Qwen3MoeForCausalLM` checkpoint from `root`.
@@ -55,6 +59,7 @@ pub fn load(
             ..options
         },
         Quantization::Bf16,
+        &Representation::Dense,
     )
 }
 
@@ -83,7 +88,67 @@ pub fn load_encoded(
             ..options
         },
         Quantization::Nvfp4(layout),
+        &Representation::read(root)?,
     )
+}
+
+/// Load a checkpoint in the representation it declares about itself.
+///
+/// A calibrated export states its representation in its metadata (`quantization_config` in
+/// `config.json`, or a sibling `hf_quant_config.json`); this entry point reads that statement and
+/// dispatches, so the encoding is the checkpoint's fact rather than the caller's guess. Two
+/// refusals happen before a tensor is opened:
+///
+/// - a representation this tree cannot serve at all (an algorithm, a method, or two files that
+///   disagree) — [`Representation::read`] names it;
+/// - a parameter the declaration quantizes whose *role* this model still builds dense. Reading such
+///   a parameter as dense would read packed E2M1 as a matrix and produce a model that runs and
+///   measures nothing, so it is refused by name instead.
+///
+/// `layout` is the deployment's: the block-scale layout its programs are compiled for, which an
+/// encoded checkpoint's stored layout must equal (the expert stacks refuse a mismatch themselves).
+pub fn load_checkpoint(
+    root: &Path,
+    partition: Partition,
+    loader: &mut WeightLoader<'_>,
+    options: LoadOptions,
+    layout: ScaleLayout,
+) -> Result<Qwen3Moe> {
+    let representation = Representation::read(root)?;
+    refuse_dense_parameters(root, &representation)?;
+    match representation {
+        Representation::Dense => load(root, partition, loader, options),
+        Representation::Nvfp4 { .. } => load_encoded(root, partition, loader, options, layout),
+    }
+}
+
+/// Refuse a declaration that quantizes a parameter this model builds as a dense module.
+///
+/// Every parameter of the model is asked, layer by layer, because an exclusion list is matched by
+/// module pattern and a pattern can exclude layer 0's projection without excluding layer 3's: one
+/// representative per role would miss exactly the checkpoints worth refusing.
+fn refuse_dense_parameters(root: &Path, representation: &Representation) -> Result<()> {
+    if !representation.is_encoded() {
+        return Ok(());
+    }
+    let config = Config::read(root)?;
+    for (parameter, role) in representation::parameters(&config) {
+        let parameter = parameter.as_str();
+        // A *quantized projection* is the one shape this entry point cannot serve yet: its packed
+        // product is keyed by the row count, which `keys()` has no input for. The refusal says so
+        // rather than reading the parameter as dense.
+        // A packed *projection* is served: the loader builds it as an encoder and a product, so only
+        // a role this tree has no encoded form for is refused here.
+        match (representation.adopts(parameter, role)?, role) {
+            (Adopted::Source, _) | (Adopted::Quantized, Role::Projection) => {}
+            (Adopted::Quantized, _) => {
+                return Err(Error::Config(format!(
+                    "the checkpoint's calibration quantizes `{parameter}`, and this model builds it                      as a dense projection: the encoded projection path needs its packed product                      compiled per row count, which the key walk does not enumerate yet. Load a                      checkpoint whose calibration excludes the attention and dense-MLP projections,                      or wait for that half; reading it as dense would read packed E2M1 as a matrix"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// How a checkpoint stores its expert stacks.
@@ -101,7 +166,17 @@ fn load_with(
     loader: &mut WeightLoader<'_>,
     options: LoadOptions,
     quantization: Quantization,
+    declaration: &Representation,
 ) -> Result<Qwen3Moe> {
+    // The layout a packed projection's programs read, which is the deployment's choice and the same
+    // one the expert stacks use. A dense deployment never builds one, so the value is unreachable
+    // there and states the slice's choice rather than inventing one per checkpoint.
+    let layout = match quantization {
+        Quantization::Nvfp4(layout) => layout,
+        // A dense deployment builds no packed projection, so the value is unreachable there; it is
+        // the checkpoint's own arrangement, which is what every loader call takes.
+        Quantization::Bf16 => ops::fp4::ScaleLayout::Linear,
+    };
     let config = Config::read(root)?;
     partition.validate(&config)?;
     // The plan reserves the encoded step's buffers from this option, so a deployment that names the
@@ -239,6 +314,8 @@ fn load_with(
                 query,
                 hidden,
                 config.attention_bias,
+                declaration,
+                layout,
             )?,
             k_proj: projection(
                 loader,
@@ -248,6 +325,8 @@ fn load_with(
                 key_value,
                 hidden,
                 config.attention_bias,
+                declaration,
+                layout,
             )?,
             v_proj: projection(
                 loader,
@@ -257,6 +336,8 @@ fn load_with(
                 key_value,
                 hidden,
                 config.attention_bias,
+                declaration,
+                layout,
             )?,
             o_proj: output_projection(
                 loader,
@@ -266,6 +347,8 @@ fn load_with(
                 hidden,
                 query,
                 config.attention_bias,
+                declaration,
+                layout,
             )?,
             q_norm: region(
                 loader,
@@ -316,7 +399,14 @@ fn load_with(
             )?)
         } else {
             Mlp::Dense(Box::new(dense_block(
-                loader, &sources, &partition, &config, &parameter, hidden,
+                loader,
+                &sources,
+                &partition,
+                &config,
+                &parameter,
+                hidden,
+                declaration,
+                layout,
             )?))
         };
 
@@ -373,8 +463,176 @@ fn region(
         .map_err(Error::from)
 }
 
-/// One row-sharded projection: `[rows, columns]` starting at this rank's row block.
+/// One projection, in the representation the checkpoint declares for it.
+///
+/// The declaration is the checkpoint's own statement, so this is the one place a representation
+/// becomes a type: a projection the calibration left alone is the checkpoint's matrix, and one it
+/// packed is an activation encoder and a packed product with the weight's tensor scale as the
+/// product's alpha. Reading a packed tensor as dense would read E2M1 codes as a matrix, which is why
+/// the choice is made here and not left to a caller.
+#[allow(clippy::too_many_arguments)]
 fn projection(
+    loader: &mut WeightLoader<'_>,
+    sources: &HashMap<String, String>,
+    parameter: &str,
+    partition: &Partition,
+    rows: u64,
+    columns: u64,
+    bias: bool,
+    declaration: &Representation,
+    layout: ScaleLayout,
+) -> Result<Projection> {
+    let weight = format!("{parameter}.weight");
+    match declaration.adopts(&weight, Role::Projection)? {
+        Adopted::Source => Ok(Projection::Dense(dense_projection(
+            loader, sources, parameter, partition, rows, columns, bias,
+        )?)),
+        Adopted::Quantized => {
+            encoded_projection(loader, sources, parameter, partition, rows, columns, bias, layout)
+        }
+    }
+}
+
+/// One row-sharded encoded projection: the packed pair `[rows, columns]` at this rank's row block.
+///
+/// The checkpoint stores two E2M1 codes a byte along the contraction, so a row is `columns / 2` bytes
+/// and the block scales are `columns / 16` of them; the row block is the same in both.
+#[allow(clippy::too_many_arguments)]
+fn encoded_projection(
+    loader: &mut WeightLoader<'_>,
+    sources: &HashMap<String, String>,
+    parameter: &str,
+    partition: &Partition,
+    rows: u64,
+    columns: u64,
+    bias: bool,
+    layout: ScaleLayout,
+) -> Result<Projection> {
+    let rank = as_u64(partition.tensor_rank, "the tensor rank")?;
+    let values = WeightRequest::region(
+        checkpoint_name(sources, &format!("{parameter}.weight"))?,
+        rank * rows * (columns / 2),
+        Shape::new(&[rows, columns / 2]),
+    );
+    let scales = WeightRequest::region(
+        &packed_field(&values, Nvfp4Names::vllm().block_scale)?,
+        rank * rows * (columns / 16),
+        Shape::new(&[rows, columns / 16]),
+    );
+    encoded(loader, parameter, values, scales, bias, layout)
+}
+
+/// One row-parallel encoded projection: this rank's `columns` of a `[rows, columns × ranks]` matrix.
+#[allow(clippy::too_many_arguments)]
+fn encoded_output_projection(
+    loader: &mut WeightLoader<'_>,
+    sources: &HashMap<String, String>,
+    parameter: &str,
+    partition: &Partition,
+    rows: u64,
+    columns: u64,
+    bias: bool,
+    layout: ScaleLayout,
+) -> Result<Projection> {
+    let rank = as_u64(partition.tensor_rank, "the tensor rank")?;
+    let ranks = as_u64(partition.tensor_parallel, "the tensor parallel width")?;
+    let values = WeightRequest::strided(
+        checkpoint_name(sources, &format!("{parameter}.weight"))?,
+        rank * (columns / 2),
+        Shape::new(&[rows, columns / 2]),
+        columns * ranks / 2,
+    );
+    let scales = WeightRequest::strided(
+        &packed_field(&values, Nvfp4Names::vllm().block_scale)?,
+        rank * (columns / 16),
+        Shape::new(&[rows, columns / 16]),
+        columns * ranks / 16,
+    );
+    encoded(loader, parameter, values, scales, bias, layout)
+}
+
+/// The packed weight and the product's alpha, from the checkpoint's four tensors.
+///
+/// The weight's `weight_scale_2` is one positive float and its reciprocal is what the product takes,
+/// so it is read once here and published as the layer's `[1]` F32 alpha; the activation's
+/// `input_scale` is the encoder's, which the loader keeps as its own operand. Neither is invented: a
+/// checkpoint that states no calibration cannot serve a packed projection and is refused where the
+/// tensor is asked for.
+#[allow(clippy::too_many_arguments)]
+fn encoded(
+    loader: &mut WeightLoader<'_>,
+    parameter: &str,
+    values: WeightRequest,
+    scales: WeightRequest,
+    bias: bool,
+    layout: ScaleLayout,
+) -> Result<Projection> {
+    if bias {
+        return Err(Error::Config(format!(
+            "{parameter} is packed and asks for a bias, and no calibrated NVFP4 export writes one"
+        )));
+    }
+    let tensor_scale = WeightRequest::region(
+        &packed_field(&values, Nvfp4Names::vllm().tensor_scale)?,
+        0,
+        Shape::new(&[1]),
+    );
+    let global_scale = loader.tensor_scale(&tensor_scale)?;
+    let input_scale = WeightRequest::region(
+        &packed_field(&values, Nvfp4Names::vllm().input_scale)?,
+        0,
+        Shape::new(&[1]),
+    );
+    // `layout` is the **checkpoint's** arrangement — linear, one scale per sixteen elements — and
+    // not the product's, which the loader is given separately and states back in
+    // `QuantizedWeight::layout`, so the two cannot be confused for one another.
+    // The file's arrangement is the checkpoint's; the product's is the one `nvfp4_gemm`'s
+    // compilation serves, and the loader permutes between them.
+    let quantized = loader.nvfp4(
+        &values,
+        &scales,
+        Some(&input_scale),
+        Nvfp4Names::vllm(),
+        layout,
+        ScaleLayout::Swizzled128X4,
+        global_scale,
+    )?;
+    let alpha = loader.constant(
+        &format!("{parameter}.alpha"),
+        DType::F32,
+        Shape::new(&[1]),
+        &quantized.global_scale.to_le_bytes(),
+    )?;
+    let linear = Nvfp4Linear::new(&quantized, None, quantized.layout, DType::BF16, ENCODE_CHUNK)?;
+    Ok(Projection::Encoded {
+        linear: Box::new(linear),
+        alpha,
+    })
+}
+
+/// The checkpoint field a packed projection's values name, beside them.
+///
+/// A calibrated export spells the encoded fields as suffixes of the parameter's own stem —
+/// `…q_proj.weight`, `…q_proj.weight_scale`, `…q_proj.weight_scale_2`, `…q_proj.input_scale` — and the
+/// mapping states only the first, because it is the only one a dense checkpoint has. The other three
+/// are derived here from the same spelling the loader is told to read them in.
+fn packed_field(values: &WeightRequest, suffix: &str) -> Result<String> {
+    let stem = values.tensor.strip_suffix(Nvfp4Names::vllm().values).ok_or_else(|| {
+        Error::Config(format!(
+            "the packed values of {} are not spelled `….{}`, so their block scales and tensor scale \
+             cannot be named beside them",
+            values.tensor,
+            Nvfp4Names::vllm().values
+        ))
+    })?;
+    // The spelling's suffixes are bare words, so the stem loses the dot that joined the values to
+    // their own name: `…q_proj.weight` + `weight_scale` is `…q_proj.weight_scale`, not `..`.
+    let stem = stem.strip_suffix('.').unwrap_or(stem);
+    Ok(format!("{stem}.{suffix}"))
+}
+
+/// One row-sharded projection: `[rows, columns]` starting at this rank's row block.
+fn dense_projection(
     loader: &mut WeightLoader<'_>,
     sources: &HashMap<String, String>,
     parameter: &str,
@@ -410,7 +668,32 @@ fn projection(
 /// The checkpoint stores the whole `[hidden, reduction × ranks]` matrix row-major, so this rank's
 /// block is every row's own `reduction` elements: a gather of rows `reduction × ranks` apart,
 /// which the loader converts into one contiguous retained weight. The bias is not sharded.
+/// One row-parallel projection, in the representation the checkpoint declares.
+#[allow(clippy::too_many_arguments)]
 fn output_projection(
+    loader: &mut WeightLoader<'_>,
+    sources: &HashMap<String, String>,
+    parameter: &str,
+    partition: &Partition,
+    hidden: u64,
+    reduction: u64,
+    bias: bool,
+    declaration: &Representation,
+    layout: ScaleLayout,
+) -> Result<Projection> {
+    let weight = format!("{parameter}.weight");
+    match declaration.adopts(&weight, Role::Projection)? {
+        Adopted::Source => Ok(Projection::Dense(dense_output_projection(
+            loader, sources, parameter, partition, hidden, reduction, bias,
+        )?)),
+        Adopted::Quantized => {
+            encoded_output_projection(loader, sources, parameter, partition, hidden, reduction, bias, layout)
+        }
+    }
+}
+
+/// The dense row-parallel form, which the dispatcher above serves when the checkpoint is not packed.
+fn dense_output_projection(
     loader: &mut WeightLoader<'_>,
     sources: &HashMap<String, String>,
     parameter: &str,
@@ -644,6 +927,7 @@ fn row_parallel_region(
 }
 
 /// One dense layer's feed-forward block.
+#[allow(clippy::too_many_arguments)]
 fn dense_block(
     loader: &mut WeightLoader<'_>,
     sources: &HashMap<String, String>,
@@ -651,6 +935,8 @@ fn dense_block(
     config: &Config,
     parameter: &str,
     hidden: u64,
+    declaration: &Representation,
+    layout: ScaleLayout,
 ) -> Result<DenseMlp> {
     let intermediate = as_u64(config.intermediate_size, "intermediate_size")?;
     let gate_proj = projection(
@@ -661,6 +947,8 @@ fn dense_block(
         intermediate,
         hidden,
         false,
+        declaration,
+        layout,
     )?;
     let up_proj = projection(
         loader,
@@ -670,6 +958,8 @@ fn dense_block(
         intermediate,
         hidden,
         false,
+        declaration,
+        layout,
     )?;
     let down_proj = output_projection(
         loader,
@@ -679,6 +969,8 @@ fn dense_block(
         hidden,
         intermediate,
         false,
+        declaration,
+        layout,
     )?;
     Ok(DenseMlp {
         gate_proj,
@@ -690,7 +982,7 @@ fn dense_block(
 }
 
 /// The operator's name for the checkpoint's activation.
-fn activation(activation: Activation) -> Result<MoeActivation> {
+pub(crate) fn activation(activation: Activation) -> Result<MoeActivation> {
     match activation {
         Activation::Silu => Ok(MoeActivation::Silu),
         Activation::GeluTanh => Ok(MoeActivation::GeluTanh),
