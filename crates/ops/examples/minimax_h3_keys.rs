@@ -128,6 +128,9 @@ const VSA_TILE_ROWS: u32 = 64;
 /// kernel's own tiling inside a tile, compiled in.
 const VSA_BLOCK_ROWS: u32 = 16;
 
+/// The key tiles of the deployment's longest sparse reduction: 40960 keys at `VSA_TILE_ROWS`.
+const VSA_MAX_TILES: u32 = 640;
+
 /// The transformer's feed-forward width (`ffn_dim`).
 const FFN: u32 = 14336;
 
@@ -1032,6 +1035,23 @@ fn main() {
         "vsa_scores",
         ops::segments::ScoresDescriptor::new(HEADS, HEAD_DIM, HEAD_DIM.next_power_of_two(), PDL)
             .to_string(),
+    );
+
+    // The compression the gate adds to every query row: one softmax over the key tiles. `max_tiles`
+    // is the deployment's longest sparse reduction — 40960 keys at the 64-key tile — because it is
+    // the block the softmax reduces in, and so the reduction length the tolerance is written
+    // against. The pooled scores and values are FP32, so the result's type is the whole of `dtype`.
+    push(
+        "vsa_compress_pooled",
+        ops::segments::CompressPooledDescriptor::new(
+            DType::BF16,
+            HEADS,
+            HEAD_DIM,
+            VSA_MAX_TILES,
+            HEAD_DIM.next_power_of_two(),
+            PDL,
+        )
+        .to_string(),
     );
 
     // The pooling that feeds it, and the two tile passes around the attention, all at the tile the
