@@ -157,11 +157,20 @@ impl Toy {
     }
 }
 
-/// A work entry naming the request in `WORK`, for the invalid-decision case.
+/// A work entry naming request 1 — the request the invalid-decision case
+/// submits first — in a phase this epoch does not have.
+///
+/// The request must exist in the state the trial judges: a plan naming a
+/// request that was never submitted is refused for that, which is a different
+/// decision from the one the case is about.
 fn unknown_phase() -> Plan {
     Plan {
+        // The request is queued when the trial judges the plan: admitting it is
+        // what makes the work legal for the same plan (§4.4), so the refusal
+        // that follows is the phase's and not the request's.
+        admit: vec![scheduling::guest::RequestId(1)],
         work: vec![Work {
-            request: scheduling::guest::RequestId(9),
+            request: scheduling::guest::RequestId(1),
             phase: PhaseId(999),
             tokens: 4,
         }],
@@ -177,6 +186,18 @@ fn packed(offset: u32, len: usize) -> u64 {
 /// `text` escaped for a WebAssembly text data segment.
 fn escape(text: &str) -> String {
     text.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Waits until the scheduler has taken a step past `from`.
+///
+/// A submission is a command, and the scheduler handles commands before it
+/// steps: once a step past the submission has run, the request is in the state
+/// the next decision is judged against. `from` is read with [`World::step`].
+fn stepped_past(world: &World, from: u64) {
+    eventually(|| {
+        let progress = world.handle.progress().recv().ok()?;
+        (progress.step > from).then_some(())
+    });
 }
 
 /// A scheduler thread serving one program, with the one it replaced kept for a
@@ -230,11 +251,15 @@ impl World {
     /// Offers `failing` as the epoch's next program and answers the trial's
     /// reason for refusing it.
     ///
-    /// §4.4's first five failures are decided here rather than live: the trial
-    /// asks every decision on the mechanism's current state, and a program
-    /// whose answers trap, run past their fuel, declare limits above the build
-    /// config's ceilings, or name something that does not exist never becomes
-    /// the serving one.
+    /// §4.4's first failures are decided here rather than live: the trial asks
+    /// every decision the state names on the mechanism's current state, and a
+    /// program whose answers run past their fuel, declare limits above the
+    /// build config's ceilings, or name something that does not exist never
+    /// becomes the serving one.
+    ///
+    /// `observe` is not one of them: at a boundary there are no events to
+    /// observe, so a program that traps there passes its trial and fails the
+    /// first real step - see `a_trap_in_observe_fails_the_policy`.
     fn refuse(&self, failing: Toy) -> String {
         let program = PolicyProgram {
             backend: "fcfs".to_owned(),
@@ -248,6 +273,15 @@ impl World {
             Ok(()) => panic!("the trial refuses this program, and it did not"),
             Err(reason) => reason,
         }
+    }
+
+    /// The step this scheduler reached, or zero before its first.
+    fn step(&self) -> u64 {
+        self.handle
+            .progress()
+            .recv()
+            .expect("the scheduler answers its progress")
+            .step
     }
 
     /// Asserts a program that was never served left no live failure behind.
@@ -316,20 +350,46 @@ fn eventually<T>(mut poll: impl FnMut() -> Option<T>) -> T {
 
 #[test]
 fn a_trap_in_observe_fails_the_policy() {
-    let world = World::serving(Toy::idle());
-    let reason = world.refuse(Toy {
-        observe: Observe::Traps,
-        ..Toy::idle()
-    });
-    let reason = reason.to_lowercase();
+    // `observe` is the one decision a precopy cannot ask: at a boundary there
+    // are no events to observe, so a program that traps in it passes its trial
+    // and fails the first real step that hands it one. That is the live
+    // failure, and the program before it serves on.
+    let world = World::with_previous(
+        Toy::idle(),
+        Toy {
+            observe: Observe::Traps,
+            ..Toy::idle()
+        },
+    );
+    let mut events = world
+        .handle
+        .submit(text_request(1, 8, 4))
+        .expect("the request is submitted");
+    let report = world.failed();
+    let reason = report.reason.to_lowercase();
     assert!(
         reason.contains("trap") && reason.contains("observ"),
         "the reason names the failed call: {reason}"
     );
-    // The serving program answers the next decision, and nothing reverted: a
-    // program the trial refused never held the slot.
+    // The program before the trapping one answers the next decision: its
+    // placement is the one handed over, and the failed program's is not.
     assert_eq!(world.serving_order().placement, vec![1, 0]);
-    world.no_failure();
+    assert!(
+        world
+            .handle
+            .take_policy_report()
+            .recv()
+            .ok()
+            .flatten()
+            .is_none(),
+        "a policy fails once, not on every step"
+    );
+    // A failed policy ends no request: the one that arrived is the previous
+    // program's to serve now.
+    assert!(
+        !events.try_recv().is_ok_and(|event| event.is_terminal()),
+        "the request was not ended by the policy's failure"
+    );
 }
 
 #[test]
@@ -373,6 +433,14 @@ fn limits_over_the_build_ceiling_fail_the_policy() {
 #[test]
 fn an_invalid_decision_fails_the_policy_and_applies_nothing() {
     let world = World::serving(Toy::idle());
+    // The state the trial judges must hold the request the plan names: a plan
+    // naming a request that never arrived is refused for that, which is a
+    // different decision from the one this case states.
+    world
+        .handle
+        .submit(text_request(1, 8, 4))
+        .expect("the request is submitted");
+    stepped_past(&world, world.step());
     let reason = world
         .refuse(Toy {
             plan: unknown_phase(),
@@ -465,11 +533,18 @@ fn a_starved_request_fails_the_policy() {
     // One millisecond of starvation: the request is admitted by the plan and
     // never given work, and §4.4's watchdog is the mechanism's, not the
     // policy's, so a policy that answers every call correctly still fails.
-    let world = World::with_previous(Toy::idle(), starving(vec![RequestId(1)], Nanos(1_000_000)));
+    // The program that starves must be able to name the request, so the
+    // request is queued before it is offered: its plan admits what the world
+    // already holds, and then gives it nothing.
+    let world = World::serving(Toy::idle());
     let mut events = world
         .handle
         .submit(text_request(1, 8, 4))
         .expect("the request is submitted");
+    stepped_past(&world, world.step());
+    world
+        .install("fcfs", 2, starving(vec![RequestId(1)], Nanos(1_000_000)))
+        .expect("the starving program is instantiated before it serves");
     let report = world.failed();
     assert!(
         report.reason.to_lowercase().contains("starv") && report.reason.contains('1'),

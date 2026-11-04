@@ -1353,10 +1353,20 @@ mod tests {
         };
         // The validators judge a victim against what the policy was told, so a
         // fixture's live state is also what it was told: every identity in it.
+        tell_everything(&mut live);
+        live
+    }
+
+    /// States that the policy was told about every identity the fixture holds.
+    ///
+    /// A case that adds a page or a request to the live state after building it
+    /// calls this once more: an identity the fixture holds and the policy was
+    /// never told of is exactly what the reclaim refuses, which is not what
+    /// such a case is about.
+    fn tell_everything(live: &mut Live<'_>) {
         live.told_pages = std::borrow::Cow::Owned(live.pages.keys().copied().collect());
         live.told_encodings = std::borrow::Cow::Owned(live.encodings.keys().copied().collect());
         live.told_requests = std::borrow::Cow::Owned(live.requests.keys().copied().collect());
-        live
     }
 
     fn room() -> Room {
@@ -1753,6 +1763,7 @@ mod tests {
                 last_used: Nanos(1),
             },
         );
+        tell_everything(&mut live);
 
         let units = Shortage {
             kind: Storage::KvUnits,
