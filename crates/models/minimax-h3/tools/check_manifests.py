@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""Check the DiT's descriptor values against the package manifests that must declare them.
+
+    .venv/bin/python crates/models/minimax-h3/tools/check_manifests.py \
+        [--root /opt/uv/models/MiniMax-H3] [--kernels crates/ops/kernels]
+
+A descriptor outside a package's `dimensions` is a key with no compiled program: `_compile.py`
+accepts exactly the range the manifest declares, and `Generation::kernel` answers
+`MissingKernel` for anything else. So a value the model builds and no manifest lists is a refusal
+at the first call that takes it - and nothing host-side finds it by running the model, because a
+deployment plan sizes buffers and never names a program.
+
+This tool is the check that does. It reads the DiT's own `config.json` for the numbers, and for
+each operator the block launches it asserts the values the crate passes into the descriptor are
+declared by that operator's package. The `reason` column says which code path builds the value, so
+a failure is actionable without reading the tool.
+
+It is a diagnosis, not a gate on the branch: run it before a device run, and read what it prints.
+
+Two things it deliberately does not do:
+  * it does not enumerate tensor names - `Denoiser::keys` is that check, and `load` refuses on it;
+  * it does not know about operators whose key carries no shape (`gemm`, `patch`,
+    `unpatchify_video`, `philox_noise`, `rows`, the `vsa_*` family at one rank), because a
+    manifest cannot be wrong about a value that is not in the key.
+"""
+
+from __future__ import annotations
+
+import argparse
+import itertools
+import json
+import pathlib
+import re
+import sys
+
+# One `dimensions = { field = ["value", ...], ... }` line of a package manifest.
+DIMENSIONS = re.compile(r"^dimensions\s*=\s*\{(.*)\}\s*$")
+
+
+def manifest_values(path: pathlib.Path) -> dict[str, set[str]]:
+    """Every value each descriptor field declares, over all the file's descriptors."""
+    values: dict[str, set[str]] = {}
+    for line in path.read_text().splitlines():
+        match = DIMENSIONS.match(line.strip())
+        if match is None:
+            continue
+        for field in re.finditer(r"(\w+)\s*=\s*\[([^\]]*)\]", match.group(1)):
+            listed = {item.strip().strip('"') for item in field.group(2).split(",")}
+            values.setdefault(field.group(1), set()).update(v for v in listed if v)
+    return values
+
+
+def expectations(config: dict) -> list[tuple[str, str, str, str]]:
+    """(package, field, value, reason) for every value this block passes into a descriptor."""
+    heads = config["num_attention_heads"]
+    head_dim = config["attention_head_dim"]
+    hidden = config["hidden_size"]
+    ffn = config["ffn_dim"]
+    time_hidden = config["time_embed_hidden_dim"]
+    patches = config["in_channels"] * 4
+    # The timestep groups a step reads: the generated pair (§`t2va`), and the two conditioned
+    # levels on top of it (`fl2va`, `ref2va`).
+    groups = [2, 4]
+
+    rows: list[tuple[str, str, str, str]] = []
+    add = rows.append
+
+    # The attention is FP32 SGEMM only for the consumers that hold FP32 activations; the DiT's
+    # dense attention is BF16 and binds `fa4`, whose key carries the rank's head counts.
+    for degree in (1, 2):
+        if heads % degree == 0:
+            for field in ("q_heads", "kv_heads"):
+                add(
+                    (
+                        "dense_attention/fa4",
+                        field,
+                        str(heads // degree),
+                        f"attention.rs: the DiT's {heads} heads over {degree} Ulysses rank(s)",
+                    )
+                )
+                add(
+                    (
+                        "qk_norm_rope/triton",
+                        "q_heads" if field == "q_heads" else "k_heads",
+                        str(heads // degree),
+                        f"attention.rs: the rotation names this rank's {heads // degree} heads",
+                    )
+                )
+
+    add(("qk_norm_rope/triton", "head_dim", str(head_dim), "attention.rs: one head's width"))
+    add(("qk_norm_rope/triton", "rotated", "96", "attention.rs: the rotated channels of a head"))
+    add(("rms_norm/triton", "columns", str(hidden), "conditioning.rs: the refiner's norms"))
+
+    # The AdaLN path cuts its tables by column, so a descriptor names the table's row stride.
+    for field in ("shift_stride", "scale_stride"):
+        add(("modulated_rms_norm/triton", field, str(2 * hidden), "transformer.rs: the output norm"))
+        add(("modulated_rms_norm/triton", field, str(6 * hidden), "transformer.rs: the six vectors"))
+    add(("modulated_rms_norm/triton", "gate_stride", str(6 * hidden), "transformer.rs: the six vectors"))
+    add(("modulated_rms_norm/triton", "width", str(hidden), "transformer.rs: the DiT's hidden width"))
+
+    # The AdaLN gathers: the step→entry table at the group count, then two tables the model owns.
+    for count in groups:
+        add(("logits_gather/triton", "columns", str(count), "modulation.rs: the step→entry table"))
+    for width, why in (
+        (2 * hidden, "modulation.rs: the output table"),
+        (18 * hidden, "modulation.rs: the per-layer table"),
+    ):
+        add(("logits_gather/triton", "columns", str(width), why))
+    add(("logits_gather/triton", "dtype", "i32", "modulation.rs: the step→entry gather is i32"))
+    add(("logits_gather/triton", "columns", "1", "solver.rs: the coefficient table"))
+
+    add(("gated_residual/triton", "width", str(hidden), "transformer.rs: the block's gate"))
+    add(("gated_residual/triton", "gate_stride", str(6 * hidden), "transformer.rs: the block's gate"))
+    add(("act_and_mul/triton", "width", str(ffn), "transformer.rs: the feed-forward's activation"))
+    for field in ("gate_stride", "value_stride"):
+        add(("act_and_mul/triton", field, str(2 * ffn), "transformer.rs: the packed gate and value"))
+    add(("silu/triton", "columns", str(time_hidden), "modulation.rs: the cache's activation"))
+    add(("scaled_add/triton", "columns", str(hidden), "transformer.rs: a widened hidden row"))
+    add(("scaled_add/triton", "columns", str(patches), "transformer.rs: a widened patch row"))
+    add(("scaled_residual/triton", "columns", "1", "solver.rs: a scalar step coefficient"))
+    return rows
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", default="/opt/uv/models/MiniMax-H3")
+    parser.add_argument("--kernels", default="crates/ops/kernels")
+    arguments = parser.parse_args()
+
+    root = pathlib.Path(arguments.root)
+    kernels = pathlib.Path(arguments.kernels)
+    configs = sorted(root.glob("transformer*/config.json"))
+    if not configs:
+        print(f"no DiT config under {root}", file=sys.stderr)
+        return 2
+
+    missing = 0
+    checked = 0
+    for path in configs:
+        config = json.loads(path.read_text())
+        print(f"{path.parent.name}: {config['num_attention_heads']} heads, "
+              f"{config['hidden_size']} wide, head width {config['attention_head_dim']}")
+        for package, field, value, reason in expectations(config):
+            manifest = kernels / package / "package.toml"
+            if not manifest.is_file():
+                print(f"  NO MANIFEST {package}")
+                missing += 1
+                continue
+            checked += 1
+            declared = manifest_values(manifest).get(field, set())
+            if value not in declared:
+                missing += 1
+                print(f"  MISSING {package}: {field} = {value}  [{reason}]")
+    print(f"\n{checked} values checked, {missing} not declared")
+    return 1 if missing else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
