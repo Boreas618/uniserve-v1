@@ -52,8 +52,11 @@
 //!
 //! - `Snapshot::encodings`: `EncoderCacheManager` lists no entries, so no
 //!   encoding is ever a live `EncodingId`.
-//! - host KV pages (`PageView::on_host`): the offload manager lists no pages,
-//!   so no `PageId` is a live host page.
+//! - host KV pages (`PageView::on_host`): host KV pages live in the storage
+//!   servers, and the engine's offload manager holds only per-worker pools and
+//!   fetch tags, so it lists none; no `PageId` is a live host page and a
+//!   `HostPages` shortage has no page victim until the storage side reports its
+//!   pages (an open item with `front`).
 //! - a media request's phase: `VideoGraph` keeps its own cursor.
 //! - `ExpertLoad`: no routed-token counters reach the scheduler, so `experts`
 //!   is skipped rather than asked about a load nobody measured.
@@ -1006,13 +1009,19 @@ pub(crate) fn pages(scheduler: &Scheduler) -> Vec<PageView> {
     views
 }
 
-/// Every encoder cache entry.
+/// Every live encoder cache entry.
 ///
-/// The encoder cache manager exposes no entry list, so an epoch's views name
-/// none; a policy that frees encoder entries by id has nothing to name until
-/// its report gains one.
-pub(crate) fn encodings(_scheduler: &Scheduler) -> Vec<EncodingView> {
-    Vec::new()
+/// Each entry is named by [`encoding_id`] of its key and carries the tick the
+/// cache last used it, which is the order its own eviction follows. A pinned
+/// entry is listed too: it exists, and whether it may be freed is the eviction
+/// call's answer, not the view's.
+pub(crate) fn encodings(scheduler: &Scheduler) -> Vec<EncodingView> {
+    scheduler
+        .storage
+        .encoder_cache
+        .entries()
+        .map(|(key, last_used)| encoding_view(encoding_id(&key), Nanos(last_used)))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1196,6 +1205,21 @@ pub(crate) fn snapshot(scheduler: &Scheduler, step: u64, recorded: &RecordedTabl
         phases: phases_in(&scheduler.info, &world_blocks(scheduler.executor.as_ref())),
         ranks: Vec::new(),
     }
+}
+
+/// The snapshot, with the requests the mechanism no longer holds but still
+/// reports: a policy put in mid-flight sees a finished request whose output
+/// events are retained, as the guest's `Snapshot` asks.
+///
+/// The recorder holds the last view it told the policy of each such request;
+/// this appends the ones the snapshot does not already name.
+pub(crate) fn with_finished(mut snapshot: Snapshot, finished: &[RequestView]) -> Snapshot {
+    for view in finished {
+        if !snapshot.requests.iter().any(|held| held.id == view.id) {
+            snapshot.requests.push(view.clone());
+        }
+    }
+    snapshot
 }
 
 /// The first request the mechanism is still to admit.
