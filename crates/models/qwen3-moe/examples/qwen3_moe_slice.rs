@@ -160,29 +160,21 @@ fn load_declared<R: RetainedWeights>(
     checkpoint: &Checkpoint,
     store: &mut R,
 ) -> Result<(qwen3_moe::Qwen3Moe, Representation)> {
-    // The declaration is the crate's to read: the absence of one is a statement that nothing was
-    // quantized, and a declaration this tree cannot serve is refused there by name.
+    // The dispatch is the crate's: `load_checkpoint` reads the declaration, refuses one that
+    // quantizes a parameter this tree serves dense, and picks the entry point. The copy read here
+    // is the run's log line, and `run_stack` refuses a run whose two reads disagree.
     let declared = Representation::read(root)?;
     let mut loader = WeightLoader::new(checkpoint, store, None, None);
-    let model = match &declared {
-        Representation::Dense => qwen3_moe::load(
-            root,
-            Partition::single(),
-            &mut loader,
-            LoadOptions::default(),
-        )?,
-        // The encoded entry point states the encoding once, so `LoadOptions` follows from the call
-        // rather than from a second statement a caller could get wrong. The scale layout is the one
-        // the compiled NVFP4 programs read - `swizzled_128x4` in their key - and a checkpoint
-        // written in the other layout would dequantize with the wrong block's scale.
-        Representation::Nvfp4 { .. } => qwen3_moe::load::load_encoded(
-            root,
-            Partition::single(),
-            &mut loader,
-            LoadOptions::default(),
-            ScaleLayout::Swizzled128X4,
-        )?,
-    };
+    let model = qwen3_moe::load::load_checkpoint(
+        root,
+        Partition::single(),
+        &mut loader,
+        LoadOptions::default(),
+        // The scale layout is the one the compiled NVFP4 programs read - `swizzled_128x4` in their
+        // key - and a checkpoint written in the other layout would dequantize with the wrong
+        // block's scale.
+        ScaleLayout::Swizzled128X4,
+    )?;
     Ok((model, declared))
 }
 
