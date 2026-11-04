@@ -1896,8 +1896,10 @@ mod tests {
     use futures::{StreamExt as _, stream};
 
     use super::super::protocol::ChatCompletionStreamResponse;
+    use super::ChatCollector;
     use super::ChatResponseContext;
     use super::ChatStreamEmitter;
+    use super::chat_response;
     use super::chat_completion_chunk_stream;
     use crate::output::chat::{AssistantBlockKind, AssistantContentBlock};
     use crate::output::text::{DecodedLogprobs, DecodedPositionLogprobs, DecodedTokenLogprob};
@@ -2069,6 +2071,57 @@ mod tests {
             );
         }
         assert!(handable > 0, "no position in the response can be handed over");
+    }
+
+    /// The collected one-body response continues where a handoff left it: a
+    /// collector handed over mid-response collects exactly the response the
+    /// uninterrupted one does.
+    #[tokio::test]
+    async fn a_handed_over_collector_writes_the_same_response() {
+        let context = ChatResponseContext {
+            request_id: "r".to_string(),
+            response_model: "m".to_string(),
+            include_usage: false,
+            requested_logprobs: true,
+            include_prompt_logprobs: false,
+            include_reasoning: true,
+            return_token_ids: true,
+            return_tokens_as_token_ids: false,
+        };
+        let outputs: Vec<RequestOutput> = thinking_response()
+            .into_iter()
+            .map(|output| output.expect("a served event"))
+            .collect();
+
+        let mut uninterrupted = ChatCollector::new();
+        for output in &outputs {
+            uninterrupted.push(output).expect("a collected output");
+        }
+        let expected = serde_json::to_value(
+            chat_response(uninterrupted.collected().expect("the response"), &context, 7)
+                .expect("a response"),
+        )
+        .expect("the response serializes");
+
+        for split in 1..outputs.len() {
+            let mut first = ChatCollector::new();
+            for output in &outputs[..split] {
+                first.push(output).expect("a collected output");
+            }
+            // The blocks, token ids and images travel; the request's terminal
+            // output arrives after the handoff.
+            let mut second = ChatCollector::new();
+            second.resume(&first.state());
+            for output in &outputs[split..] {
+                second.push(output).expect("a collected output");
+            }
+            let response = serde_json::to_value(
+                chat_response(second.collected().expect("the response"), &context, 7)
+                    .expect("a response"),
+            )
+            .expect("the response serializes");
+            assert_eq!(response, expected, "a handoff after {split} outputs differs");
+        }
     }
 
     /// A stage holding a buffered chunk reports that it cannot be handed over,
