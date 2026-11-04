@@ -22,9 +22,19 @@
 //!
 //! The layer never generates randomness. `draws` is `[rows]` f32 in `[0, 1)`, computed by the
 //! executor from the request's seed and the token position it is sampling (Philox, addressed per
-//! element), so a restored or replayed step draws the same number. A row without a positive
-//! temperature is sampled by the same path with a draw of `0`, which selects its largest candidate —
-//! the greedy token — without a second code path.
+//! element), so a restored or replayed step draws the same number.
+//!
+//! ## Greedy rows
+//!
+//! A row whose temperature is zero is **not** a draw: it is [`Self::argmax`]'s row. The shaper
+//! divides such a row by one rather than by zero (`ops::sampler`'s doc cites the rule), so the row's
+//! shaped logits keep the logits' order and its largest candidate is the temperature-zero token —
+//! which is exactly what a draw of `0` would select *because* the candidates are in descending order,
+//! not because the draw path knows about temperature. The temperature of each row is a request
+//! parameter, so the executor knows which rows are greedy and routes them: `argmax` over the row's
+//! candidates for those, this path's draw for the rest. Sending a greedy row down the draw path would
+//! be right only by that coincidence, and sending it down with a divided-by-zero temperature would be
+//! `nan`.
 //!
 //! ## Rows that cannot be sampled
 //!
