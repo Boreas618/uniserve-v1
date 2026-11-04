@@ -2,6 +2,7 @@
 """Run one of the row-softmax programs and check every row against torch.
 
     python softmax_check.py --op softmax                       # 2048 of a 2048 tile
+    python softmax_check.py --op softmax --columns 20480 --tile 2048   # ten tiles per row
     python softmax_check.py --op log_softmax --interpreter      # the same on the CPU
     python softmax_check.py --op log_softmax --rows 2           # the fixture's vocab row
 
@@ -13,7 +14,9 @@ same file is kept in both packages, byte for byte, and a test in
 `crates/program-server/tests/it/packages.rs` holds them together.
 
 The cases are what a row reduction can get wrong: the shapes the fixture's keys name, a
-width far below the tile where almost every lane is masked, a row of one repeated logit
+width far below the tile where almost every lane is masked, a width far above it - the row is
+walked in as many tiles as it has, and the running maximum must be rescaled when a later tile
+raises it - a row of one repeated logit
 (a uniform distribution, whose probabilities are `1/columns`), and a row with one dominant
 logit a hundred nats above the rest, where the probabilities are `1` and `0` and the
 log-probabilities are `0` and `−100` — the case a relative comparison cannot survive.
@@ -106,6 +109,12 @@ def truncate(values):
     return (bits & ~((1 << 45) - 1)).view(torch.float64)
 
 
+def declared_outside_per_row(difference, relative, expected):
+    """The same count per row, so one wrong row is not read as a wide bound failure."""
+    outside = ~(difference <= relative * expected.abs())
+    return outside.sum(dim=-1).tolist()
+
+
 def compare(name, got, expected, floor, relative, deciding_bound):
     """Count the elements outside each bound and give the line that reports them."""
     difference = (got - expected).abs()
@@ -122,8 +131,9 @@ def compare(name, got, expected, floor, relative, deciding_bound):
     deciding = (
         declared_outside if deciding_bound == "declared" else scaled_outside
     )
+    per_row = declared_outside_per_row(difference, relative, expected)
     line = (
-        f"  {name}: max absolute {difference.nan_to_num(nan=float('inf')).max().item():.3e}, max relative "
+        f"  {name}: per row outside {per_row}, max absolute {difference.nan_to_num(nan=float('inf')).max().item():.3e}, max relative "
         f"{largest:.3e}, declared {declared_outside} of {expected.numel()} outside, "
         f"with the operands' floor {scaled_outside} outside"
     )
@@ -222,6 +232,18 @@ def cases(flags):
         },
         {
             **common,
+            # No dominant row here on purpose: a hundred-nat spread at this width makes every
+            # other probability a subnormal FP32, and the relative bound cannot hold there.
+            "label": "a row far wider than one tile, walked in ten of them",
+            "rows": 2,
+            "columns": 20480,
+            "tile": 2048,
+            "dominant_row": False,
+            "flat_row": False,
+            "seed": 4,
+        },
+        {
+            **common,
             "label": "a row of one repeated logit, a uniform distribution",
             "rows": 2,
             "columns": 512,
@@ -255,10 +277,6 @@ def main() -> int:
         help="run through Triton's interpreter instead of a device",
     )
     arguments = parser.parse_args()
-    if arguments.op == "softmax" and arguments.columns > arguments.tile:
-        parser.error(
-            f"a tile of {arguments.tile} lanes cannot cover a row of {arguments.columns}"
-        )
     if not arguments.interpreter and not torch.cuda.is_available():
         # A host without a device takes the interpreter: a check must run where it lands.
         print(
