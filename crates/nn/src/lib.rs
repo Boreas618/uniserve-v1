@@ -4,7 +4,7 @@
 //! ## Where this crate sits
 //!
 //! The call chain of one forward is `runner → model → layer → operator → kernel` (specs/worker.md
-//! 4). A model in `crates/models/` composes the layers here; a layer calls the operators of
+//! 4). A model in `crates/models/<model>/` composes the layers here; a layer calls the operators of
 //! [`ops`] and nothing below them; the operator's launch code reaches the loaded kernel. `nn` owns
 //! no runtime object: it never allocates device memory, creates a stream, captures a graph or
 //! selects a program. Everything a forward needs arrives borrowed in [`Forward`].
@@ -62,7 +62,7 @@ pub use forward::{Arena, Forward};
 pub use group::Group;
 pub use layers::{
     Activation, AdaptivePool, Attention, AttentionBackend, Candidates, Conv1d, Conv3d,
-    ConvGeometry, ConvTranspose1d, Embedding, FrameMoments, FrameNormPad, FramePad,
+    ConvGeometry, ConvTranspose1d, CrossFade, Embedding, FrameMoments, FrameNormPad, FramePad,
     GatedActivation, GatedResidual, Gelu, LayerNorm, Linear, ModulatedRmsNorm, Moe, Noise,
     NoiseKey, PackedSwiGlu, ParallelLMHead, Patch, PatchMode, RmsNorm, Rotary, Rotate, Rotation,
     Sampler, SamplerState, Samples, ScaledAdd, ScaledResidual, ScaledResidualLayerNorm,
@@ -74,6 +74,6 @@ pub use ops::PhaseKind;
 pub use ops::{DType, DevicePtr, MAX_RANK, Shape, Strides, TensorView};
 pub use tensor::Backing;
 pub use weights::{
-    Quantization, QuantizedStack, QuantizedWeight, RetainedWeights, Weight, WeightKey, WeightLayout,
-    WeightLoader,
+    Quantization, QuantizedStack, QuantizedWeight, RetainedWeights, Weight, WeightKey,
+    WeightLayout, WeightLoader,
 };

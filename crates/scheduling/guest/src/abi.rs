@@ -27,7 +27,7 @@
 use crate::decision::{Plan, Room, Shortage, Victim};
 use crate::event::Event;
 use crate::limits::Limits;
-use crate::policy::Init;
+use crate::policy::Instantiation;
 use crate::view::{CallView, ExpertLoad, ExpertOrder, RankView, ReplicaView, RequestView};
 use crate::wire::{decode, encode, pack};
 
@@ -131,9 +131,11 @@ macro_rules! export_policy {
         extern "C" fn sched_init(ptr: u32, len: u32) -> u64 {
             // SAFETY: the mechanism's message buffer lives for this call.
             let bytes = unsafe { $crate::abi::message(ptr, len) };
-            let init: $crate::Init = $crate::abi::init_message(bytes);
-            let mut policy = <$policy as ::core::default::Default>::default();
-            <$policy as $crate::Policy>::init(&mut policy, &init);
+            let instantiation: $crate::Instantiation = $crate::abi::init_message(bytes);
+            let mut policy = <$policy as ::core::convert::From<$crate::Parameters>>::from(
+                instantiation.parameters,
+            );
+            <$policy as $crate::Policy>::init(&mut policy, &instantiation.state);
             // SAFETY: as in `policy`; `init` is called once.
             unsafe {
                 let slot = &raw mut POLICY;
@@ -221,7 +223,7 @@ macro_rules! export_policy {
 // reply is encoded with the wire's encoding.
 
 /// Decodes the message of `sched_init`.
-pub fn init_message(bytes: &[u8]) -> Init {
+pub fn init_message(bytes: &[u8]) -> Instantiation {
     read(bytes, "init")
 }
 

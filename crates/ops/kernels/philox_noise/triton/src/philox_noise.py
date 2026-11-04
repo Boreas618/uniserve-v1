@@ -20,6 +20,12 @@ The **uniform** draw is the same addressing with one word per element: `out[i] =
 index itself. The kind is part of the compilation because the two draw different values from the same
 counter and their envelopes differ.
 
+A draw is addressed by its key and an element index, and the key may come from either of two
+places, which are two programs: per row of the buffer (one stream per row, the key of
+``keys[row]``) or one key for the whole buffer (one stream over the flattened elements, so an
+element's value depends on the key, the element's own position and the launch's stage and draw,
+and on nothing about how the launch was cut into blocks).
+
 Counter and key words are held in 64-bit registers and masked back to 32 bits after every step, which
 is how the reference keeps the 32×32-bit products and the Weyl key additions from overflowing. The
 uniform is the exactly representable 24-bit value Philox's high word yields; the normal's arithmetic
@@ -87,20 +93,30 @@ def _philox_noise_kernel(
     elements,
     stage,
     draw,
+    key,
     BLOCK: tl.constexpr,
     NORMAL: tl.constexpr,  # noqa: N803
+    ROWS: tl.constexpr,
 ):
-    """Store one block of one row's noise.
+    """Store one block of noise, addressed by rows or by the flattened buffer.
 
-    Grid: ``(rows, ceil(elements / BLOCK))``. Each row's key comes from ``keys``; ``stage`` and
-    ``draw`` are the processor stage and the draw index within the token and stage.
+    ``ROWS`` is the descriptor's key source, and the two forms are two programs:
+
+    * ``ROWS``: grid ``(rows, ceil(elements / BLOCK))``, each program one row's block, the key
+      read from ``keys[row]``, and the element index the column within the row;
+    * ``!ROWS``: grid ``(ceil(elements / BLOCK), 1)``, one program a block of the flattened
+      buffer, the key the launch's ``key`` word, and the element index the flat index itself.
+
+    ``stage`` and ``draw`` are the processor stage and the draw index within the token and
+    stage. Under the scalar form ``keys_ptr`` is null and is not read.
     """
-    row = tl.program_id(0).to(tl.int64)
-    block = tl.program_id(1).to(tl.int64)
+    block = tl.program_id(1).to(tl.int64) if ROWS else tl.program_id(0).to(tl.int64)
+    row = tl.program_id(0).to(tl.int64) if ROWS else tl.zeros((), tl.int64)
     lanes = block * BLOCK + tl.arange(0, BLOCK)
     live = lanes < elements
 
-    key = tl.load(keys_ptr + row)
+    if ROWS:
+        key = tl.load(keys_ptr + row)
     k0 = key.to(tl.uint64) & _MASK32
     k1 = (key >> 32).to(tl.uint64) & _MASK32
 
@@ -125,8 +141,10 @@ def _philox_noise_kernel(
         )
     else:
         value = first
+    # The row form's address is row-major; the scalar form's is the flat index it drew from.
+    offset = row * elements + lanes if ROWS else lanes
     tl.store(
-        out_ptr + row * elements + lanes,
+        out_ptr + offset,
         value.to(out_ptr.dtype.element_ty, fp_downcast_rounding="rtne"),
         mask=live,
     )
