@@ -364,17 +364,25 @@ impl Dense {
                 )
             }
         };
+        // The operator's operands are one axis of tokens, then the heads, then a head's channels
+        // (`ops/src/attention/dense.rs` requires rank 3 of all four), while a projection writes
+        // `[rows, inner]`. The reshaping is by `heads`, which takes the token axis from the view's
+        // own element count - the rows differ between the exchanged and the local path, so a token
+        // count computed once outside would be right on one of them and wrong on the other.
+        let (local_heads, head_dim) = (self.local_heads, self.head_dim);
         self.attention.attend_dense(
             f,
-            query,
-            key,
-            value,
+            query.reshape(heads(query, local_heads, head_dim)),
+            key.reshape(heads(key, local_heads, head_dim)),
+            value.reshape(heads(value, local_heads, head_dim)),
             Some(visible.cu_seq_lens_q),
             Some(visible.cu_seq_lens_k),
             // Every query attends the whole key set in one sequence: the longest key run is the
             // number of used key rows, which `Visible` states.
             visible.key_rows,
-            scratch.attended,
+            scratch
+                .attended
+                .reshape(heads(scratch.attended, local_heads, head_dim)),
         )?;
         let attended = match &self.exchange {
             None => scratch.attended,
@@ -392,18 +400,24 @@ impl Dense {
             f,
             scratch
                 .query
-                .reshape(heads(self.local_heads, self.head_dim)),
-            scratch.key.reshape(heads(self.local_heads, self.head_dim)),
+                .reshape(heads(scratch.query, self.local_heads, self.head_dim)),
+            scratch
+                .key
+                .reshape(heads(scratch.key, self.local_heads, self.head_dim)),
             Some(self.query_gain.view()),
             Some(self.key_gain.view()),
             factors.cosine,
             factors.sine,
-            scratch
-                .rotated_query
-                .reshape(heads(self.local_heads, self.head_dim)),
-            scratch
-                .rotated_key
-                .reshape(heads(self.local_heads, self.head_dim)),
+            scratch.rotated_query.reshape(heads(
+                scratch.rotated_query,
+                self.local_heads,
+                self.head_dim,
+            )),
+            scratch.rotated_key.reshape(heads(
+                scratch.rotated_key,
+                self.local_heads,
+                self.head_dim,
+            )),
         )?)
     }
 }
@@ -473,8 +487,19 @@ impl Scratch {
 }
 
 /// The three-dimensional view of a projected `[rows, heads · head_dim]` block.
-fn heads(count: u32, head_dim: u32) -> Shape {
-    Shape::new(&[0, u64::from(count), u64::from(head_dim)])
+/// A `[tokens, inner]` view as `[tokens, heads, head_dim]`.
+///
+/// The token axis is the view's own element count divided by one row's width: `reshape` takes a
+/// shape literally, so a `0` written there is a zero-row tensor rather than an inferred axis. It was
+/// written that way, and the first launch to reach the rotation read it as `0 tokens` - three gemms
+/// had already written the rows the rope then found empty.
+fn heads(view: TensorView, count: u32, head_dim: u32) -> Shape {
+    let width = u64::from(count) * u64::from(head_dim);
+    Shape::new(&[
+        view.shape.numel() / width.max(1),
+        u64::from(count),
+        u64::from(head_dim),
+    ])
 }
 
 /// The rotary frequencies of `rotated` channels: `theta^(-2i / rotated)`, one per pair.
