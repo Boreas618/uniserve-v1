@@ -233,7 +233,9 @@ def recipe_of(module, experts, top, rows, row_stride, dtype):
     """The harness's recipe for one launch of the module on the fixed input."""
     kind = {"f32": "i32", "bf16": "i32", "f16": "i32"}[dtype]
     return {
-        "module": str(module),
+        # Absolute: the harness resolves a recipe's relative module path against the recipe's own
+        # directory, and a case written from the repo root is read from anywhere.
+        "module": str(pathlib.Path(module).absolute()),
         "entry": "uniserve_topk_softmax",
         "grid": [-(-rows // WARPS_PER_BLOCK), 1, 1],
         "buffers": {
