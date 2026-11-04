@@ -331,6 +331,64 @@ impl Pcm {
     }
 }
 
+/// Every buffer one audio decode takes from `Forward::arena()`, in reservation order.
+///
+/// The decoder's `forward` reserves: the restoring and projecting pair, the input convolution's output,
+/// then per stage the upsampled signal and the running sum plus four buffers per anti-aliased block
+/// (each block's running value, its two convolution outputs and the second's residual), and finally the
+/// post activation's output and the mono signal the PCM step reads. `frames` is the request's latent frame
+/// count, so every length here grows by the rates.
+///
+/// The list matters because the arena never rewinds - its only rewind is the executor's per-forward
+/// `reset` - so every reservation in this walk accumulates and the sum is what a request needs. It is
+/// therefore large: at 207 latent frames the seven stages contribute ~10.6 MB each per buffer, and the
+/// total is about 0.9 GiB against 0.12 GiB of weights. The buffers are, however, uniform in element count
+/// across the stages (the channels halve as the length multiplies), so a scrub-sized set reserved once and
+/// viewed per stage would cut this by the stage and block counts; that is a change to `forward`'s structure
+/// and not something this list can assume.
+pub fn audio_arena(
+    config: &crate::AudioVaeConfig,
+    frames: u32,
+) -> Result<Vec<crate::decoding::Buffer>> {
+    let mut plan = Vec::new();
+    let mut push = |name: String, channels: u64, length: u64| {
+        plan.push(crate::decoding::Buffer {
+            name,
+            element: "f32",
+            elements: u64::from(PCM_CHANNELS) * channels * length,
+        });
+    };
+    let mut length = u64::from(frames);
+    push(
+        "restored".to_owned(),
+        u64::from(config.latent_channels),
+        length,
+    );
+    push("projected".to_owned(), u64::from(config.latent_dim), length);
+    push("input".to_owned(), u64::from(config.decoder_dim), length);
+    let mut channels = u64::from(config.decoder_dim);
+    for (index, rate) in config.decoder_rates.iter().enumerate() {
+        channels /= 2;
+        length = length
+            .checked_mul(u64::from(*rate))
+            .ok_or_else(|| Error::config("an audio length overflows".to_owned()))?;
+        push(format!("stage{index}.upsampled"), channels, length);
+        push(format!("stage{index}.sum"), channels, length);
+        for block in 0..BLOCKS_PER_STAGE {
+            for part in ["running", "activated", "convolved", "residual"] {
+                push(
+                    format!("stage{index}.block{block}.{part}"),
+                    channels,
+                    length,
+                );
+            }
+        }
+    }
+    push("post".to_owned(), channels, length);
+    push("mono".to_owned(), 1, length);
+    Ok(plan)
+}
+
 /// One logical parameter of the audio decoder and the checkpoint tensor that fills it.
 ///
 /// The names are composed from the sidecar's stage table, never transcribed: `parameter` is the
@@ -1359,6 +1417,38 @@ pub(crate) mod tests {
                 (32, 16, 2, 4, 1),
                 (16, 8, 2, 4, 1),
             ]
+        );
+    }
+
+    #[test]
+    fn the_audio_decoders_arena_names_every_buffer_it_reserves() {
+        let config = tests::audio_config();
+        let frames = 207;
+        let plan = audio_arena(&config, frames).expect("the plan");
+        // Three buffers before the stages (restore, project, input), fourteen per stage (the upsampled
+        // signal and the running sum, then four per block), and the post activation and the mono signal.
+        assert_eq!(plan.len(), 3 + 14 * config.decoder_rates.len() + 2);
+        // The lengths follow the rates, so the last stage's buffers cover `frames · Π rates` samples.
+        let longest = config
+            .decoder_rates
+            .iter()
+            .try_fold(u64::from(frames), |length, rate| {
+                length.checked_mul(u64::from(*rate))
+            })
+            .expect("the rates");
+        assert_eq!(longest, u64::from(frames) * 800);
+        let mono = plan.last().expect("the mono signal");
+        assert_eq!(mono.elements, u64::from(PCM_CHANNELS) * longest);
+        // Every buffer is named once, and the total is the sum of what the walk reserves.
+        let mut names: Vec<&str> = plan.iter().map(|buffer| buffer.name.as_str()).collect();
+        let count = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), count);
+        let total: u64 = plan.iter().map(|buffer| buffer.bytes()).sum();
+        assert!(
+            total > 100 * 1024 * 1024,
+            "the walk reserves the stages' buffers: {total} B"
         );
     }
 

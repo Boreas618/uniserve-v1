@@ -450,7 +450,7 @@ pub fn splice_arena(
     };
     let (height, width) = canvas.pixels(config);
     Ok(vec![Buffer {
-        name: "blended",
+        name: "blended".to_owned(),
         element,
         elements: u64::from(Rgb::CHANNELS)
             * u64::from(crate::decoding::CLIP_OUTPUT_FRAMES)
