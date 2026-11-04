@@ -116,6 +116,7 @@ impl fmt::Display for SparseDescriptor {
 }
 
 /// The arguments of one block-sparse attention call.
+#[derive(Clone, Copy)]
 pub struct SparseArgs {
     /// `[query_rows, heads, head_dim]` queries; rows are whole tiles.
     pub query: TensorView,

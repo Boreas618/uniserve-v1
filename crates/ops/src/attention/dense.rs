@@ -103,6 +103,7 @@ impl fmt::Display for DenseDescriptor {
 }
 
 /// The arguments of one dense attention call.
+#[derive(Clone, Copy)]
 pub struct DenseArgs {
     /// `[q_tokens, q_heads, head_dim]` queries, packed by sequence.
     pub query: TensorView,

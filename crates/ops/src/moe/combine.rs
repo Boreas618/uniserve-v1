@@ -61,6 +61,7 @@ impl fmt::Display for Descriptor {
 }
 
 /// The arguments of one combine.
+#[derive(Clone, Copy)]
 pub struct UnpermuteArgs {
     /// `[tokens · top, hidden]` every route's expert product.
     pub routes: TensorView,
