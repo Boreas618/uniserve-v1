@@ -120,8 +120,10 @@ pub fn load(
 /// `Checkpoint` was opened at, and when the union form lands (a checkpoint whose components come
 /// from two roots) this is the only place that changes.
 fn sidecars(checkpoint: &nn::Checkpoint) -> Result<(Layout, Sidecars)> {
-    let root = checkpoint.root();
-    let layout = Layout::detect(root)?;
-    let sidecars = Sidecars::read(root, None, &layout)?;
+    // The pipeline's own `model_index.json` names the components; each component's sidecars are
+    // read from the root that holds it, because a checkpoint may span an export and the base
+    // release it continues.
+    let layout = Layout::detect(checkpoint.root())?;
+    let sidecars = Sidecars::read_components(checkpoint, &layout)?;
     Ok((layout, sidecars))
 }
