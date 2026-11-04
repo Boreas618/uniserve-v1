@@ -3938,7 +3938,7 @@ fn scheduler_takes_limits_in_place_within_its_workers_batch() {
         max_batch: 32,
         ..Default::default()
     };
-    let sched = support::scheduler_with(executor, special_tokens(), base).unwrap();
+    let sched = support::scheduler_with(executor, special_tokens(), base.clone()).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = CommandSender::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -3946,7 +3946,7 @@ fn scheduler_takes_limits_in_place_within_its_workers_batch() {
     let refused = handle
         .configure(SchedulerConfig {
             max_running_requests: 1 << 30,
-            ..base
+            ..base.clone()
         })
         .recv()
         .unwrap()
@@ -3956,7 +3956,7 @@ fn scheduler_takes_limits_in_place_within_its_workers_batch() {
     handle
         .configure(SchedulerConfig {
             max_running_requests: 1,
-            ..base
+            ..base.clone()
         })
         .recv()
         .unwrap()
@@ -3998,7 +3998,7 @@ fn scheduler_takes_limits_in_place_within_its_workers_batch() {
         .configure(SchedulerConfig {
             max_running_requests: 1,
             policy: SchedulingPolicy::Priority,
-            ..base
+            ..base.clone()
         })
         .recv()
         .unwrap()

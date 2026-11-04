@@ -323,6 +323,7 @@ impl Scheduler {
             }
             self.waiting = waiting.into();
         }
+        let graph_tiers = std::mem::take(&mut self.config.graph_tiers);
         self.config = SchedulerConfig {
             policy: limits.policy,
             max_batch: limits.max_batch.max(1),
@@ -335,6 +336,7 @@ impl Scheduler {
             // scheduling choice.
             draft_tokens: self.config.draft_tokens,
             refill: limits.refill,
+            graph_tiers,
         };
         tracing::info!(config = ?self.config, "the scheduler took new limits");
         Ok(())

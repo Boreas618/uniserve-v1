@@ -361,6 +361,10 @@ pub struct EngineConfig {
     pub max_queued_requests: Option<usize>,
     /// When a request whose draft cache is missing has it refilled.
     pub refill: crate::scheduler::RefillPolicy,
+    /// The captured graph sizes the deployment states, in tokens, ascending
+    /// and without duplicates (`Room.graph_tiers`). Empty when the spec states
+    /// none; see `SchedulerConfig::graph_tiers`.
+    pub graph_tiers: Vec<u32>,
     /// Per-request token ceiling for one prefill chunk.
     pub chunked_prefill_size: usize,
     /// Reuse and retain prompt cache prefixes across requests. Disabling this
@@ -466,6 +470,7 @@ impl EngineConfig {
             max_queued_requests: None,
             chunked_prefill_size: DEFAULT_CHUNKED_PREFILL_SIZE,
             refill: crate::scheduler::RefillPolicy::default(),
+            graph_tiers: Vec::new(),
             prefix_cache: true,
             boundary_interval: crate::kv_cache::DEFAULT_BOUNDARY_INTERVAL,
             state_interval: crate::kv_cache::DEFAULT_STATE_INTERVAL,
@@ -927,6 +932,7 @@ impl SchedulerHandle {
                 canvas: config.worker_process.canvas_sampling,
                 draft_tokens: config.worker_process.draft_tokens as usize,
                 refill: config.refill,
+                graph_tiers: config.graph_tiers.clone(),
             },
             config.worker_process.dtype,
             config.generation_limits,
@@ -1207,6 +1213,16 @@ impl SchedulerHandle {
         &self,
     ) -> crossbeam_channel::Receiver<Vec<proto::request::wire::RequestPrefix>> {
         self.commands.describe_requests()
+    }
+
+    /// The policy failure this scheduler recorded since the last call, if it
+    /// recorded one (§7.3); `None` when the scheduler does not answer.
+    pub fn take_policy_report(&self) -> Option<crate::scheduler::PolicyReverted> {
+        self.commands
+            .take_policy_report()
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .ok()
+            .flatten()
     }
 
     /// The state the epoch's policy is instantiated with, as this scheduler

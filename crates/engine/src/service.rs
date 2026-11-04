@@ -37,7 +37,14 @@ use proto::request::{ArtifactMedia, EVENT_WINDOW, Event, MigrationCause, Request
 
 use crate::core::SchedulerHandle;
 use crate::handle::EventRx;
-use crate::scheduler::SchedulerStatsReporter;
+use crate::scheduler::{
+    Arrival, BatchCapacity, Candidate, PolicyProgram, PolicyReverted, PolicySource, RoutePolicy,
+    RouteTrial, SchedulerStatsReporter, TrialState, arrival_view, ceilings_of,
+};
+use scheduling::PolicyError;
+use scheduling::guest::event::{End, Event as PolicyEvent};
+use scheduling::guest::ids::RequestId as PolicyRequestId;
+use scheduling::guest::view::{RankView, RequestClass};
 
 /// How often each scheduler's statistics are reported.
 const STATS_INTERVAL: Duration = Duration::from_secs(1);
@@ -83,8 +90,6 @@ struct Routing {
     slots: Vec<Slot>,
     requests: Mutex<HashMap<RequestId, InFlight>>,
     cache_routes: Mutex<HashMap<proto::request::CacheResume, usize>>,
-    /// The next slot a load scan starts from, so equal loads rotate.
-    next: AtomicUsize,
     /// Each connected daemon's frame queue, by the order it connected; a
     /// closed connection's entry is `None`.
     fronts: Mutex<Vec<Option<crossbeam_channel::Sender<Frame>>>>,
@@ -96,17 +101,215 @@ struct Routing {
     /// engine fails once any scheduler stops, not every one, since the
     /// daemon rolls a failing trial back rather than serving on.
     trial: AtomicBool,
+    /// The control thread's own policy instance, which answers `route`, and
+    /// the successor its precopy prepared (§4.4, §7.3).
+    route: Mutex<RouteState>,
+}
+
+/// The control thread's policy state: its route instance, the candidate a
+/// precopy prepared for the next switchover, and the events it has not been
+/// told yet.
+#[derive(Default)]
+struct RouteState {
+    /// Where a candidate was prepared, for the switchover that installs it
+    /// when the epoch has no route instance yet.
+    engine: Option<scheduling::Engine>,
+    /// The ceilings the instance was instantiated under.
+    ceilings: scheduling::guest::limits::Limits,
+    /// The instance that answers `route`.
+    instance: Option<RoutePolicy>,
+    /// The next program's instance, prepared but not switched in.
+    candidate: Option<Candidate>,
+    /// The events the next `observe` carries.
+    pending: Vec<PolicyEvent>,
+    /// Policy failures to report to the daemons.
+    reports: Vec<PolicyReverted>,
 }
 
 impl Routing {
-    /// The live scheduler with the fewest requests in flight.
-    fn pick(&self) -> Option<usize> {
-        let count = self.slots.len();
-        let start = self.next.fetch_add(1, Ordering::Relaxed) % count;
-        (0..count)
-            .map(|offset| (start + offset) % count)
-            .filter(|&index| !self.slots[index].handle.is_dead())
-            .min_by_key(|&index| self.slots[index].in_flight.load(Ordering::Relaxed))
+    /// The ranks routing orders by: every scheduler, its load and whether it
+    /// lives.
+    fn ranks(&self) -> Vec<RankView> {
+        self.slots
+            .iter()
+            .enumerate()
+            .map(|(index, slot)| RankView {
+                index,
+                in_flight: u32::try_from(slot.in_flight.load(Ordering::Relaxed))
+                    .unwrap_or(u32::MAX),
+                alive: !slot.handle.is_dead(),
+            })
+            .collect()
+    }
+
+    /// The ceilings a policy is instantiated under, from the batch the loaded
+    /// workers were built for (§4.4).
+    fn ceilings(&self) -> scheduling::guest::limits::Limits {
+        ceilings_of(BatchCapacity::of(self.slots[0].handle.info()))
+    }
+
+    /// The state a policy is instantiated with, as the first live scheduler
+    /// holds it and with the ranks the control thread knows (§7.3).
+    fn policy_state(&self, ranks: &[RankView]) -> Option<TrialState> {
+        self.slots
+            .iter()
+            .find(|slot| !slot.handle.is_dead())
+            .and_then(|slot| slot.handle.policy_state(ranks.to_vec()))
+    }
+
+    /// `route`: the rank that serves a request that has just arrived (§4.4).
+    ///
+    /// `None` when the epoch has no route instance — the engine is not
+    /// serving, and the submission is refused as unavailable.
+    fn route(&self, arrival: &Arrival) -> Option<usize> {
+        let mut state = crate::lock(&self.route);
+        let request = arrival_view(arrival);
+        state.pending.push(PolicyEvent::Arrived {
+            request: request.clone(),
+        });
+        let events = std::mem::take(&mut state.pending);
+        let Some(policy) = state.instance.as_mut() else {
+            return None;
+        };
+        let ranks = self.ranks();
+        let outcome = policy
+            .observe(&events)
+            .and_then(|()| policy.route(&request, &ranks));
+        match outcome {
+            Ok(index) => Some(index),
+            Err(error) => {
+                self.policy_failed(&mut state, error);
+                None
+            }
+        }
+    }
+
+    /// `Emitted` and `Finished`, as the daemon's events show them: the route
+    /// instance sees the usage the scheduler threads' instances see (§4.4).
+    fn observe_route(&self, events: Vec<PolicyEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        let mut state = crate::lock(&self.route);
+        if state.instance.is_none() {
+            return;
+        }
+        state.pending.extend(events);
+    }
+
+    /// A failed route instance: the previous policy, instantiated on the state
+    /// the schedulers hold now (§7.3), answers instead.
+    fn policy_failed(&self, state: &mut RouteState, error: PolicyError) {
+        let Some(policy) = state.instance.as_mut() else {
+            return;
+        };
+        let ranks = self.ranks();
+        let report = match self.policy_state(&ranks) {
+            Some(current) => policy.fail(&error, &current),
+            // Without a state to instantiate on, the previous policy cannot
+            // answer either: the epoch fails, as a scheduler's failure does.
+            None => Err(error),
+        };
+        match report {
+            Ok(report) => state.reports.push(report),
+            Err(error) => {
+                let program = policy.program().clone();
+                state.instance = None;
+                state.reports.push(PolicyReverted {
+                    scheduler: None,
+                    program,
+                    reason: error.to_string(),
+                    fatal: true,
+                });
+            }
+        }
+    }
+
+    /// §7.3 step 2 on the control thread: prepares the route instance of
+    /// `program` on the state the schedulers hold, without putting it in.
+    ///
+    /// The first epoch's precopy has no scheduler state to prepare on — no
+    /// scheduler serves before its first switchover — so it prepares on the
+    /// state of an epoch that holds nothing yet.
+    fn precopy_route(
+        &self,
+        engine: &scheduling::Engine,
+        source: &dyn PolicySource,
+        program: PolicyProgram,
+    ) -> Result<(), PolicyError> {
+        let ceilings = self.ceilings();
+        let ranks = self.ranks();
+        let state = self.policy_state(&ranks).unwrap_or_default();
+        let candidate =
+            RoutePolicy::prepare(engine, source, program, &state, &ceilings, &RouteTrial)?;
+        let mut route = crate::lock(&self.route);
+        route.engine = Some(engine.clone());
+        route.ceilings = ceilings;
+        route.candidate = Some(candidate);
+        Ok(())
+    }
+
+    /// §7.3 step 3 on the control thread: the prepared instance answers.
+    fn switchover_route(&self) -> Result<(), PolicyError> {
+        let mut state = crate::lock(&self.route);
+        let Some(candidate) = state.candidate.take() else {
+            return Err(PolicyError::invalid(
+                scheduling::guest::wire::Call::Init,
+                "a route policy switchover arrived without a prepared instance",
+            ));
+        };
+        match state.instance.as_mut() {
+            Some(policy) => {
+                policy.adopt(candidate);
+                policy.switchover();
+            }
+            None => {
+                let engine = state.engine.clone().ok_or_else(|| {
+                    PolicyError::invalid(
+                        scheduling::guest::wire::Call::Init,
+                        "a route policy switchover arrived before its program was loaded",
+                    )
+                })?;
+                state.instance = Some(RoutePolicy::from_candidate(
+                    &engine,
+                    state.ceilings,
+                    candidate,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// §7.3 step 4 on the control thread: the previous policy answers again,
+    /// instantiated on the state the schedulers hold now.
+    fn revert_route(&self) -> Result<(), PolicyError> {
+        let ranks = self.ranks();
+        let Some(current) = self.policy_state(&ranks) else {
+            return Err(PolicyError::invalid(
+                scheduling::guest::wire::Call::Init,
+                "no scheduler holds a state to revert the route policy on",
+            ));
+        };
+        let mut state = crate::lock(&self.route);
+        state.candidate = None;
+        match state.instance.as_mut() {
+            Some(policy) => policy.revert(&current),
+            None => Ok(()),
+        }
+    }
+
+    /// §7.3 step 6 on the control thread: the program the revert could return
+    /// to is forgotten.
+    fn purge_route(&self) {
+        if let Some(policy) = crate::lock(&self.route).instance.as_mut() {
+            policy.purge();
+        }
+    }
+
+    /// The policy failures the daemons must be told of (§7.3), in the order
+    /// they happened.
+    fn take_policy_reports(&self) -> Vec<PolicyReverted> {
+        std::mem::take(&mut crate::lock(&self.route).reports)
     }
 
     /// The scheduler that serves `request`, while it is in flight.
@@ -265,7 +468,6 @@ fn serve(
             .collect(),
         requests: Mutex::default(),
         cache_routes: Mutex::default(),
-        next: AtomicUsize::new(0),
         fronts: Mutex::default(),
         state: AtomicI32::new(if prepared {
             wire::EngineState::Standby
@@ -274,6 +476,7 @@ fn serve(
         } as i32),
         failed: AtomicBool::new(false),
         trial: AtomicBool::new(false),
+        route: Mutex::default(),
     });
     routing.trial.store(
         routing
@@ -637,6 +840,80 @@ fn read_requests(
 }
 
 /// Routes and submits one submission's requests, the daemon `front`'s.
+/// What routing orders a request that has just arrived by (§4.4): the features
+/// the policy sees before any scheduler holds it.
+fn arrival_of(id: RequestId, request: &Request, recovered: Option<usize>) -> Arrival {
+    let prompt_tokens = match request {
+        Request::Generation(request) => request.prompt_token_ids.len(),
+        Request::Diffusion(request) => request.prompt_token_ids.len(),
+    };
+    let (class, generated_tokens, remaining_tokens, migratable) = match request {
+        Request::Generation(request) => (
+            RequestClass::Token,
+            request.generated_token_ids.len(),
+            u32::try_from(request.max_und_tokens).unwrap_or(u32::MAX),
+            !request.generated_token_ids.is_empty(),
+        ),
+        Request::Diffusion(request) => (
+            RequestClass::Media,
+            0,
+            0,
+            request.trajectory.denoised_steps > 0,
+        ),
+    };
+    Arrival {
+        id,
+        priority: request.priority(),
+        class,
+        prompt_tokens: u32::try_from(prompt_tokens).unwrap_or(u32::MAX),
+        generated_tokens: u32::try_from(generated_tokens).unwrap_or(u32::MAX),
+        remaining_tokens,
+        migratable,
+        cache_rank: recovered,
+        arrived_at: scheduling::guest::Nanos(crate::clock::now_monotonic_us() * 1_000),
+    }
+}
+
+/// The policy's view of one event of a request's stream, when it moves that
+/// request's usage or ends it: what the control thread's route instance is
+/// told (§4.4).
+fn policy_event(
+    id: RequestId,
+    event: &Event,
+    now: scheduling::guest::Nanos,
+) -> Option<PolicyEvent> {
+    let request = PolicyRequestId(id.0);
+    match event {
+        Event::TextToken { .. } | Event::ControlToken { .. } => Some(PolicyEvent::Emitted {
+            request,
+            tokens: 1,
+            at: now,
+        }),
+        Event::TextTokens { ids } => Some(PolicyEvent::Emitted {
+            request,
+            tokens: u32::try_from(ids.len()).unwrap_or(u32::MAX),
+            at: now,
+        }),
+        Event::Finished { .. } => Some(PolicyEvent::Finished {
+            request,
+            end: End::Completed,
+        }),
+        Event::Rejected { .. } => Some(PolicyEvent::Finished {
+            request,
+            end: End::Rejected,
+        }),
+        Event::Error { .. } => Some(PolicyEvent::Finished {
+            request,
+            end: End::Failed,
+        }),
+        Event::Migratable { .. } => Some(PolicyEvent::Finished {
+            request,
+            end: End::Migratable,
+        }),
+        _ => None,
+    }
+}
+
 /// Requests routed to one scheduler are submitted to it together, so it
 /// queues all of them before it forms its next batch.
 fn submit_all(
@@ -662,7 +939,8 @@ fn submit_all(
                 .and_then(|resume| crate::lock(&routing.cache_routes).remove(&resume)),
             Request::Diffusion(_) => None,
         };
-        let Some(index) = recovered.or_else(|| routing.pick()) else {
+        let arrival = arrival_of(id, &request, recovered);
+        let Some(index) = recovered.or_else(|| routing.route(&arrival)) else {
             let (event, _) = Event::Error {
                 message: "the engine is unavailable after a worker failure".to_owned(),
             }
@@ -1068,7 +1346,7 @@ fn configure_schedulers(configure: wire::Configure, front: usize, routing: &Arc<
     let answers: Vec<_> = routing
         .slots
         .iter()
-        .map(|slot| slot.handle.configure(limits))
+        .map(|slot| slot.handle.configure(limits.clone()))
         .collect();
     let routing = Arc::clone(routing);
     let spawned = std::thread::Builder::new()
@@ -1596,6 +1874,17 @@ fn forward_events(
                     None => break,
                 },
                 _ = interval.tick() => {
+                    // A policy that failed after the commit reverted and
+                    // serves on; every daemon records the previous policy as
+                    // the epoch's current one (§7.3).
+                    let reports: Vec<PolicyReverted> = routing
+                        .slots
+                        .iter()
+                        .filter_map(|slot| slot.handle.take_policy_report())
+                        .collect();
+                    if !reports.is_empty() {
+                        crate::lock(&routing.route).reports.extend(reports);
+                    }
                     for (index, (slot, reporter)) in routing.slots.iter().zip(&mut reporters).enumerate() {
                         let snapshot = reporter.snapshot(slot.handle.stats());
                         if let Ok(snapshot) = snapshot.encode() {
@@ -1651,6 +1940,13 @@ async fn forward(stream: Stream, routing: &Routing) {
         };
         sent += 1;
         let terminal = event.is_terminal();
+        if let Some(moved) = policy_event(
+            id,
+            &event,
+            scheduling::guest::Nanos(crate::clock::now_monotonic_us() * 1_000),
+        ) {
+            routing.observe_route(vec![moved]);
+        }
         // A failed engine's daemon learns of the failure before the request
         // ends, as migratable for one: it then submits the request to the
         // engine that serves next, never to this one.
@@ -1854,4 +2150,146 @@ fn describe(schedulers: &[SchedulerHandle]) -> anyhow::Result<Vec<wire::CacheSeg
         segments.extend(groups.into_iter().map(wire_cache));
     }
     Ok(segments)
+}
+
+#[cfg(test)]
+mod tests {
+    //! What routing sees of a request before a scheduler holds it, and what
+    //! the control thread's route instance is told as a request runs (§4.4).
+
+    use super::*;
+    use proto::request::{FinishReason, GenerationConstraint, GenerationRequest, ImageParams};
+    use scheduling::guest::view::RequestState;
+
+    fn generation(prompt: Vec<u32>, max_und_tokens: usize) -> GenerationRequest {
+        GenerationRequest {
+            request_id: RequestId(7),
+            prompt_token_ids: prompt,
+            multimodal_inputs: Default::default(),
+            negative_prompt_token_ids: Vec::new(),
+            constraint: GenerationConstraint::UndOnly,
+            sampling: Default::default(),
+            image: ImageParams::default(),
+            max_images: 1,
+            max_und_tokens,
+            include_stop_token: false,
+            stop_strings: Vec::new(),
+            stop_token_ids: Vec::new(),
+            priority: 3,
+            cache: Default::default(),
+            image_generation: Default::default(),
+            readout: Vec::new(),
+            generated_token_ids: Vec::new(),
+            generated_images: Vec::new(),
+            trajectory: Default::default(),
+            adapter: 0,
+        }
+    }
+
+    #[test]
+    fn an_arriving_request_is_queued_with_what_it_was_submitted_with() {
+        let request = Request::Generation(Box::new(generation(vec![1, 2, 3, 4], 64)));
+        let arrival = arrival_of(RequestId(7), &request, Some(2));
+        let view = arrival_view(&arrival);
+        assert_eq!(view.state, RequestState::Queued);
+        assert_eq!(view.class, RequestClass::Token);
+        assert_eq!(view.priority, 3);
+        assert_eq!(view.prompt_tokens, 4);
+        assert_eq!(view.generated_tokens, 0);
+        assert_eq!(view.remaining_tokens, 64);
+        assert_eq!(view.cache_rank, Some(2));
+        assert!(!view.migratable);
+        assert_eq!(view.phase, None);
+        assert_eq!(view.next_tokens, 0);
+    }
+
+    #[test]
+    fn a_migrated_request_arrives_with_the_tokens_it_generated_elsewhere() {
+        let mut request = generation(vec![1, 2, 3, 4], 64);
+        request.generated_token_ids = vec![9, 10];
+        let arrival = arrival_of(RequestId(7), &Request::Generation(Box::new(request)), None);
+        let view = arrival_view(&arrival);
+        assert_eq!(view.generated_tokens, 2);
+        assert!(
+            view.migratable,
+            "a resumed request is ordered as migratable"
+        );
+        assert_eq!(view.cache_rank, None);
+    }
+
+    #[test]
+    fn the_route_instance_hears_emissions_and_ends() {
+        let now = scheduling::guest::Nanos(1_000);
+        let emitted = policy_event(
+            RequestId(7),
+            &Event::TextToken {
+                id: 1,
+                logprob: None,
+            },
+            now,
+        );
+        match emitted {
+            Some(PolicyEvent::Emitted {
+                request,
+                tokens,
+                at,
+            }) => {
+                assert_eq!(request.0, 7);
+                assert_eq!(tokens, 1);
+                assert_eq!(at, now);
+            }
+            other => panic!("a token is an emission, got {other:?}"),
+        }
+        let batch = policy_event(RequestId(7), &Event::TextTokens { ids: vec![1, 2, 3] }, now);
+        assert!(matches!(
+            batch,
+            Some(PolicyEvent::Emitted { tokens: 3, .. })
+        ));
+        let finished = policy_event(
+            RequestId(7),
+            &Event::Finished {
+                reason: FinishReason::Stop,
+                stop_reason: None,
+                prompt_tokens: 4,
+                completion_tokens: 2,
+                images: 0,
+            },
+            now,
+        );
+        assert!(matches!(
+            finished,
+            Some(PolicyEvent::Finished {
+                end: End::Completed,
+                ..
+            })
+        ));
+        let migrated = policy_event(
+            RequestId(7),
+            &Event::Migratable {
+                cause: MigrationCause::Drain,
+                denoised_steps: 0,
+                stored_layout: Vec::new(),
+            },
+            now,
+        );
+        assert!(matches!(
+            migrated,
+            Some(PolicyEvent::Finished {
+                end: End::Migratable,
+                ..
+            })
+        ));
+        assert!(
+            policy_event(
+                RequestId(7),
+                &Event::ImageStep {
+                    image_id: 0,
+                    step: 1
+                },
+                now
+            )
+            .is_none(),
+            "a media step is not a text emission"
+        );
+    }
 }

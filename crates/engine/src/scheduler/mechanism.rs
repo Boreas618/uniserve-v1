@@ -1177,7 +1177,7 @@ mod tests {
         let mut live = live(
             vec![
                 {
-                    let mut r = request(1, RequestState::Queued);
+                    let r = request(1, RequestState::Queued);
                     r
                 },
                 {
