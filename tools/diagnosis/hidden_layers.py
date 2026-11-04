@@ -444,6 +444,17 @@ def main():
             if first is None:
                 first = path.name
             continue
+        if actual.dtype == expected.dtype and np.array_equal(actual, expected) and actual.nbytes:
+            # Bit-identical sides are not a good comparison, they are no comparison: a dump directory
+            # seeded from the reference holds the reference's own file, and a row that reads 0.0 for
+            # every element says "these are the same bytes", which is a provenance question and not a
+            # numerical one.
+            print(
+                f"{path.name:<16} {'-':<12} {'the dump holds the reference bytes':>22}: the two sides are"
+                " bit-identical, so this row measures nothing (was the dump directory seeded from the"
+                " reference?)"
+            )
+            continue
         if actual.shape != expected.shape:
             print(f"{path.name:<16} {str(actual.shape):<12} shape differs from {expected.shape}")
             if first is None:
