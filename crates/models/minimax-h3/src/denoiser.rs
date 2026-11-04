@@ -46,6 +46,7 @@ use nn::{DType, Forward, Shape, TensorView, Weight, WeightLoader};
 use crate::attention::{Factors, Visible};
 use crate::config::{Canvas, DenoiserConfig, MAX_FRAMES};
 use crate::modulation::{AdaLnCache, Groups, Projections};
+use crate::partition::Partition;
 use crate::packing::{self, DensePacking};
 use crate::schedule::{Modality, Schedule};
 use crate::solver::Solver;
@@ -1904,6 +1905,83 @@ pub fn denoise_arena(
 }
 
 impl Denoiser {
+    /// The programs one denoiser launches, from its configuration, its partition and the deployment's
+    /// largest canvas.
+    ///
+    /// The two stacks are their own functions ([`Transformer::programs`],
+    /// [`crate::conditioning::TokenRefiner::programs`]); this adds the orchestration around them — the
+    /// pack and its inverse, the draw, the strided copies, the coefficient gather, and the blends the
+    /// solver and the conditioner issue. `elements` is the element count of the largest trajectory a
+    /// modality steps: the solver's residual is one operator over the whole sample, so its width is a
+    /// deployment statement and not a constant.
+    pub fn programs(
+        config: &crate::config::TransformerConfig,
+        attention: crate::config::AttentionKind,
+        dtype: nn::DType,
+        rows: u32,
+        groups: Groups,
+        partition: &Partition,
+        elements: &[u64],
+    ) -> Result<Vec<(String, String)>> {
+        use crate::programs::Programs;
+        use nn::layers::gather_rows_descriptor;
+        use ops::noise::NoiseKind;
+        use ops::noise::PhiloxNoise as NoiseOp;
+        use ops::patch::Patch as PatchOp;
+        use ops::residual::{ScaledAdd as ScaledAddOp, ScaledResidual as ResidualOp};
+        use ops::unpatchify::Unpatchify;
+
+        let mut programs = Programs::default();
+        programs.extend(Transformer::programs(
+            config, attention, dtype, rows, groups, partition,
+        )?);
+        programs.extend(crate::conditioning::TokenRefiner::programs(config, dtype)?);
+
+        let video = config.video_channels;
+
+        // The pack and its inverse, the draw, and the strided copy the conditioner reads through.
+        programs.launch::<PatchOp>(&nn::layers::Patch::descriptor_of(dtype));
+        programs.launch::<Unpatchify>(&nn::layers::UnpatchifyVideo::new(dtype, u64::from(video), 1, 2)?.descriptor());
+        programs.launch::<NoiseOp>(&nn::layers::Noise::descriptor_of(
+            dtype,
+            NoiseKind::Normal,
+            ops::noise::KeySource::Scalar,
+        ));
+        programs.launch::<ops::copy_block::CopyBlock>(&nn::layers::CopyBlock::descriptor_of(
+            nn::DType::F32,
+        ));
+
+        // The three gathers outside the modulation: the prefix rows of the packed stream, the solver's
+        // step coefficient, and the trace's row copy the diagnosis takes.
+        for columns in [u64::from(config.hidden_size), 1] {
+            programs.launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(dtype, columns)?);
+        }
+
+        // The conditioner's anchor mix over a patch's own columns, and the refine-in-place copy over a
+        // text row's.
+        nn::layers::ScaledAdd.descriptor(nn::DType::F32, nn::DType::F32, 4 * u64::from(video))?;
+        for columns in [4 * u64::from(video), u64::from(config.hidden_size)] {
+            programs.launch::<ScaledAddOp>(&nn::layers::ScaledAdd.descriptor(
+                nn::DType::F32,
+                nn::DType::F32,
+                columns,
+            )?);
+        }
+
+        // The solver's step: one gated residual over the whole trajectory of each modality.
+        programs.launch::<ResidualOp>(&nn::layers::ScaledResidual::descriptor_of(
+            dtype,
+            u64::from(video) * 4,
+            false,
+        )?);
+        for count in elements {
+            programs.launch::<ResidualOp>(&nn::layers::ScaledResidual::descriptor_of(
+                dtype, *count, false,
+            )?);
+        }
+        Ok(programs.finish())
+    }
+
     /// Attach the condition encoders this deployment places.
     ///
     /// `load.rs` builds them from their own checkpoint directories (`vae` and `audio_vae`) and calls
@@ -2913,6 +2991,53 @@ impl Denoiser {
 
 #[cfg(test)]
 mod tests {
+
+    /// The denoiser states the two stacks and the orchestration around them: the pack and its
+    /// inverse, the draw, the strided copy, the gathers outside the modulation, and the blends the
+    /// conditioner and the solver issue. The trajectory's width is a deployment fact and the only one.
+    #[test]
+    fn the_denoiser_states_its_orchestration_beside_its_stacks() {
+        let config = crate::config::tests_support::released_config();
+        let (_, denoiser) = config
+            .denoisers
+            .iter()
+            .next()
+            .expect("a released DiT partition");
+        let programs = Denoiser::programs(
+            &denoiser.transformer,
+            denoiser.attention,
+            nn::DType::BF16,
+            32_000,
+            Groups::of(true),
+            &crate::partition::Partition::single(),
+            &[1_000_000],
+        )
+        .expect("the denoiser's programs");
+        let has = |operator: &str| programs.iter().any(|(name, _)| name == operator);
+
+        for operator in [
+            "patch",
+            "philox_noise",
+            "copy_block",
+            "unpatchify_video",
+            "scaled_add",
+            "scaled_residual",
+            "logits_gather",
+        ] {
+            assert!(has(operator), "{operator} is missing: {programs:?}");
+        }
+        // The solver's residual over the whole trajectory is a second program from the patch-column
+        // one, because the width is in the key.
+        let residuals = programs
+            .iter()
+            .filter(|(name, _)| name == "scaled_residual")
+            .map(|(_, key)| key.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            residuals.iter().any(|key| key.contains("columns_1000000")),
+            "{residuals:?}"
+        );
+    }
     use super::*;
     use crate::config::{AttentionKind, DenoiserConfig, ScheduleSpec, Shifts, TransformerConfig};
 
