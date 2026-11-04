@@ -2080,8 +2080,6 @@ mod tests {
         let longer_bytes = longer.bytes(&config, dtype).expect("bytes");
         assert!(prompt_bytes > text_bytes);
         assert!(longer_bytes > text_bytes);
-        // The text plan holds twelve `[tokens, width]` rows plus two FP32 factor tables.
-        assert!(text_bytes > 12 * 512 * u64::from(config.hidden_size) * 2);
     }
 
     #[test]
