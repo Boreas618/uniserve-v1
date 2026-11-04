@@ -16,6 +16,7 @@
 //! contract the caller holds.
 
 use ops::TensorView;
+use ops::DType;
 use ops::activation::{self, Activation};
 
 use crate::error::{Error, Result};
@@ -250,6 +251,30 @@ pub struct PackedSwiGlu {
 }
 
 impl PackedSwiGlu {
+    /// The descriptor one packed gated activation of `width` channels launches, stated without a
+    /// device or a projection.
+    ///
+    /// `input_stride` is the row stride of the projection's output, which a walk reads from the
+    /// scratch tensor the layer carves; the bias's presence and the absolute-max mode are the
+    /// layer's.
+    pub fn descriptor_of(
+        dtype: DType,
+        width: u64,
+        input_stride: u64,
+        bias: bool,
+        absmax: bool,
+    ) -> Result<activation::ValueFirstSwigluDescriptor> {
+        Ok(activation::ValueFirstSwigluDescriptor {
+            dtype,
+            width: u32::try_from(width)
+                .map_err(|_| Error::shape("PackedSwiGlu", "a row wider than a u32".to_owned()))?,
+            block: BLOCK,
+            input_stride,
+            bias,
+            absmax,
+        })
+    }
+
     /// The gated activation of a projection whose rows hold the value half then the gate half, with
     /// the packed `[value_bias, gate_bias]` bias when the checkpoint has one.
     pub fn new(bias: Option<Weight>) -> Result<Self> {
@@ -303,15 +328,13 @@ impl PackedSwiGlu {
                 ),
             ));
         }
-        let descriptor = activation::ValueFirstSwigluDescriptor {
-            dtype: out.dtype,
-            width: u32::try_from(width)
-                .map_err(|_| Error::shape("PackedSwiGlu", "a row wider than a u32".to_owned()))?,
-            block: BLOCK,
-            input_stride: projection.strides.get(0),
-            bias: self.bias.is_some(),
-            absmax: self.absmax,
-        };
+        let descriptor = Self::descriptor_of(
+            out.dtype,
+            width,
+            projection.strides.get(0),
+            self.bias.is_some(),
+            self.absmax,
+        )?;
         let args = activation::ValueFirstSwigluArgs {
             value_gate: projection,
             bias: self.bias.as_ref().map(Weight::view),
