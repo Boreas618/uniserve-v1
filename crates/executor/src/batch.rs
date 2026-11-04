@@ -20,7 +20,7 @@
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use ipc::PhaseId;
+use ipc::{CallStatus, ErrorCode, PhaseId, TimingCounters};
 
 use crate::completion::Outcome;
 use crate::plan::{Bucket, Shape};
@@ -40,24 +40,65 @@ pub struct BatchId(pub u64);
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct CallId(pub u64);
 
-/// One sampled token, as a serving step produces it (4.4).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SampledToken {
-    /// The call the token was sampled for.
+/// One call's completion, as the device half of 4.4 states it.
+///
+/// A batch advances a set of calls and each of them gets one entry here, whether or not it sampled
+/// a token, because the mechanism's completion path is per call. A call this executor refuses never
+/// reaches this type: [`Batches::submit`](crate::Batches::submit) answers `Error::Invalid`
+/// synchronously for a batch it cannot serve, so an entry here is what execution did, and a
+/// [`CallStatus::Error`] entry is always a device failure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallOutput {
+    /// The call the batch advanced.
     pub call: CallId,
-    /// The token id the bucket's sampler wrote for that call.
-    pub token: u32,
+    /// Whether execution performed the call.
+    pub status: CallStatus,
+    /// Why it failed, when it did: the class the mechanism acts on (`NumericalFault` fails the
+    /// rows that computed non-finite logits, `InputError` rejects the request with this rank's
+    /// message, `ResourceError` fails the call).
+    pub error_code: Option<ErrorCode>,
+    /// What this rank said about a refused input, when it refused one.
+    pub error_message: Option<String>,
+    /// The tokens the sampler accepted for this call, in the order the call's sampling rows took
+    /// them. A call whose rows sampled nothing (a prefill chunk that ends no prompt, a padded row)
+    /// has none, which is not the same as a failure.
+    pub tokens: Vec<u32>,
+    /// The slot's trajectory position the commit table advanced: a denoising trajectory's next
+    /// step, and for a text decode the number of tokens the call's slot has committed.
+    pub step_index: u32,
 }
 
-/// What one serving step produced: the tokens its sampling rows sampled (4.4).
+impl CallOutput {
+    /// A completed call that sampled `tokens` and stands at `step_index`.
+    pub fn completed(call: CallId, tokens: Vec<u32>, step_index: u32) -> Self {
+        Self {
+            call,
+            status: CallStatus::Ok,
+            error_code: None,
+            error_message: None,
+            tokens,
+            step_index,
+        }
+    }
+}
+
+/// What one serving step produced (4.4).
 ///
-/// The mechanism learns them from the batch's [`Submission`], builds the next step's input ids from
-/// them, and counts the tokens it emits. A step that samples nothing (a chunk of a prefill that
-/// samples no token, a warmup, a program-layer command) completes with an empty output.
+/// The mechanism learns it from the batch's [`Submission`], builds the next step's input ids from
+/// the tokens, and folds the timing into the statistics of the calls' domain. A step that samples
+/// nothing (a chunk of a prefill that ends no prompt, a warmup, a program-layer command) completes
+/// with no call and nothing measured.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BatchOutput {
-    /// One entry per sampling row, in the order the batch's calls and rows name them.
-    pub tokens: Vec<SampledToken>,
+    /// One entry per call the batch advanced, in the order the batch named them.
+    pub calls: Vec<CallOutput>,
+    /// What the batch measured, in the segments this executor can observe.
+    ///
+    /// `queued_us` is the wait from the mechanism's submission to this device thread starting the
+    /// batch, `device_us` the replay's launch to the stream's completion, and `host_us` the rest of
+    /// the step on the host. `copy_us` is zero in-process and states a fact rather than a
+    /// measurement: nothing is transferred for the completion, since the mechanism reads it here.
+    pub timing: TimingCounters,
 }
 
 /// One batch: one phase of one step, as the mechanism assembles it.

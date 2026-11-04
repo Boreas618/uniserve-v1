@@ -651,8 +651,8 @@ impl Device {
             let produced = self.runner_mut(runner)?.runner.serve(&job)?;
             self.synchronize()?;
             self.counters.time(started.elapsed());
-            if !produced.tokens.is_empty() {
-                if !output.tokens.is_empty() {
+            if !produced.calls.is_empty() {
+                if !output.calls.is_empty() {
                     return Err(Error::Invariant(
                         "two jobs of one command produced tokens".into(),
                     ));
