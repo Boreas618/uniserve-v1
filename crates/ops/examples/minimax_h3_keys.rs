@@ -308,11 +308,15 @@ fn main() {
             scale: ops::Float::from(1.0_f32),
             pdl: PDL,
             axes: ROPE_AXES,
+            // A section is *rotated elements* per axis, not frequencies: three axes of 32 elements
+            // sum to the 96 the head rotates, and passing the frequency count (16) instead would
+            // describe a different head - the descriptor `attention.rs` builds says 32 each.
             sections: {
+                let per_axis = ROTATED / ROPE_AXES;
                 let mut sections = [0; ops::rope::MAX_AXES];
-                sections[0] = ROPE_FREQ_DIM;
-                sections[1] = ROPE_FREQ_DIM;
-                sections[2] = ROPE_FREQ_DIM;
+                sections[0] = per_axis;
+                sections[1] = per_axis;
+                sections[2] = per_axis;
                 sections
             },
             // H3's text encoder is Qwen3-VL: its M-RoPE cycles the axes over the frequencies.
@@ -339,6 +343,33 @@ fn main() {
         }
         .to_string(),
     );
+
+    // ---- The row gathers: `nn::layers::gather_rows` binds `logits_gather` with the gathered width
+    // in its key, so every place the DiT gathers whole rows is a cell of this operator.
+    //
+    // The video's and the audio's hidden rows (four times per evaluation), the conditioner's prefix
+    // rows once per request, the per-layer modulation table at `18 * hidden`, the final norm's at
+    // `2 * hidden`, and the three narrow i32 gathers: each row's group tag, the coefficient, and the
+    // step-to-entry table.
+    for (dtype, columns) in [
+        (DType::BF16, HIDDEN),
+        (DType::F32, 18 * HIDDEN),
+        (DType::F32, 2 * HIDDEN),
+        (DType::I32, 1),
+        (DType::I32, 2),
+        (DType::I32, 4),
+    ] {
+        push(
+            "logits_gather",
+            ops::logits::GatherDescriptor {
+                dtype,
+                columns,
+                block: 1024,
+                pdl: PDL,
+            }
+            .to_string(),
+        );
+    }
 
     // ---- The transformer's per-row programs, at `hidden_size`.
     push(
