@@ -78,7 +78,13 @@ pub trait Runner: Send {
 
     /// Switches to `generation` at a batch boundary: from the next batch on, `submit` serves with
     /// its kernels and graphs. The runner keeps the previous generation for a revert (7.3).
-    fn switchover(&mut self, generation: u64);
+    ///
+    /// A generation this runner did not prepare is refused by name: the daemon asks for the
+    /// cut-over only after `precopy` built the generation, so a switchover that finds nothing to
+    /// switch to is the two disagreeing about what was prepared - and the alternative, taking the
+    /// generation's number with no kernels and no graphs behind it, would serve an empty
+    /// generation that answers every later batch with "no graph for this bucket".
+    fn switchover(&mut self, generation: u64) -> Result<()>;
 
     /// Reverts a generation (7.3 step 4).
     ///
@@ -102,15 +108,6 @@ pub trait Runner: Send {
     /// This is not `purge`, which drops what is *older* than the serving generation: a precopy that
     /// was abandoned leaves a generation *newer* than it, and only this call reaches that.
     fn discard(&mut self, generation: u64);
-
-    /// What this runner's graph pools hold and what they may hold (4.1, item 5's invariant).
-    ///
-    /// A runner without graph pools answers zeroes. The figures feed
-    /// `FromEngine.metrics` through the executor's counters, so the delivery test can assert
-    /// `mapped <= budget` while both generations' graphs exist.
-    fn pool_metrics(&self) -> crate::arena::PoolMetrics {
-        crate::arena::PoolMetrics::default()
-    }
 
     /// Gives the runner the device's graph pools, before its first capture.
     ///
