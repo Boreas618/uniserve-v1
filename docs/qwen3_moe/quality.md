@@ -100,15 +100,17 @@ The pre-flight prints `1319 gsm8k-00000 gsm8k-01318`. The baseline suite runs it
 
 ## Results
 
-The baselines of two cells are measured on today's implementation; the third baseline and every candidate cell are pending. A baseline is a measurement of one side, not a comparison: no interval and no verdict is claimed until a candidate cell has run on the same checkpoint, sample set and settings.
+The baselines of all three cells are measured on today's implementation; every candidate cell is pending. A baseline is a measurement of one side, not a comparison: no interval and no verdict. A baseline is a measurement of one side, not a comparison: no interval and no verdict is claimed until a candidate cell has run on the same checkpoint, sample set and settings.
 
 | Cell | Commit | Requests | Correct | Accuracy | `decided_by_marker` / `decided_by_boxed` / `unparseable` |
 | --- | --- | --- | --- | --- | --- |
 | `qwen3-moe-gsm8k-bf16` | `0b47282ee` | 1319/1319 | 1248 | 0.946172 | not recorded at this commit; the 1249-row run at `5c6c06a0e` reported 1182 / 136 / 2 |
 | `qwen3-moe-gsm8k-nvfp4` | `becb9e9a5` | 1319/1319 | 1233 | 0.934799 | 1080 / 239 / 4 |
-| `qwen3-moe-gsm8k-bf16-fp8-kv` | pending | — | — | — | — |
+| `qwen3-moe-gsm8k-bf16-fp8-kv` | `f1de185a2` | 1319/1319 | 1250 | 0.947688 | 1171 / 148 / 2 |
 
 The three form counts are what each cell's `summary.json` reports, not a partition of the requests into four buckets: a prediction the extractor cannot parse is still counted under the form that was tried.
+
+The three baselines were measured at three commits of the baseline branch, because each cell was first made to run at the commit that fixed its own path: `0b47282ee` (BF16, 1248), `becb9e9a5` (NVFP4, 1233) and `f1de185a2` (FP8 KV, 1250, together with a second BF16 measurement of 1251). The spread across the three BF16 measurements — 1248, 1249, 1251 — is three rows at n = 1319, where the standard error of a proportion near 0.95 is about 0.0061 (about sixteen rows at 95 %), so they are one implementation measured three times, not three implementations. The accepted baseline for each cell is the bundle the comparison reads (`gsm8k-baseline-2`), whose `summary.json` records its own commit.
 
 The BF16 cell measured 1249 at the extractor commit `5c6c06a0e` and 1248 at `0b47282ee`; the one-row difference is a sampling record, not a protocol change, and the later commit's number is the baseline. The NVFP4 cell's commit carries the calibrated-checkpoint loader only; the later FP8 pooled-scratch commit leaves the dense BF16 and NVFP4 paths untouched, so its number stands there.
 
