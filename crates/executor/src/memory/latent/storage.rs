@@ -79,6 +79,12 @@ impl LatentPlan {
 pub struct LatentStorage {
     num_pages: u32,
     page_units: u32,
+    /// Values per latent unit: the pool's layout, read by
+    /// [`LatentStorage::page_address`] to compute a page's byte offset and by
+    /// [`LatentStorage::width`] for a consumer that validates a request's
+    /// latent shape against the pool. Both readers are the denoiser runner's -
+    /// the computation that binds this pool - which this build does not have
+    /// yet, so nothing calls them today.
     width: u32,
     /// `[2, num_pages, page_units, width]`: two banks that alternate across
     /// denoising steps.
