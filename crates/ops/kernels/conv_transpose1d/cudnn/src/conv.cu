@@ -494,8 +494,10 @@ void add_bias(void* y, const void* bias, int64_t elements, int64_t channels, int
   }
 }
 
-/// The engine tuning data of this module, as the plan cache's key.
-std::string plan_key(const uniserve_conv_call& call) {
+/// The key of one shape's plan: the tensors, the geometry, the element types,
+/// the engine and the device, because a plan belongs to a device's cuDNN
+/// context.
+std::string plan_key(const uniserve_conv_call& call, int32_t device) {
   std::string key;
   auto append = [&key](const char* name, const int64_t* values, int32_t count) {
     key += name;
@@ -526,6 +528,8 @@ std::string plan_key(const uniserve_conv_call& call) {
   key += std::to_string(UNISERVE_CONV_OUTPUT_DTYPE);
   key += '_';
   key += std::to_string(UNISERVE_CONV_ENGINE);
+  key += "_device_";
+  key += std::to_string(device);
   return key;
 }
 
@@ -604,7 +608,7 @@ extern "C" int32_t UNISERVE_CONV_ENTRY(const uniserve_conv_call* call, void* str
     return refuse(error, "cudnnSetStream failed");
   }
 
-  const Plan plan = plan_of(*call, plan_key(*call), error, &status);
+  const Plan plan = plan_of(*call, plan_key(*call, device), error, &status);
   if (plan.plan == nullptr) {
     return status != 0 ? status : refuse(error, "the convolution's plan could not be built");
   }
