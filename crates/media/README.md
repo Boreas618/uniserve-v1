@@ -35,10 +35,11 @@ external `ffmpeg` process by design, and tests validate MP4s with `ffprobe`.
 ## External programs
 
 `MediaConfig::ffmpeg` names the `ffmpeg` executable used to decode reference
-videos; `MediaConfig::from_env` takes it from `UNISERVE_FFMPEG` and otherwise
-uses `ffmpeg` from the loader's search path. Either binary must be able to
-decode H.264 and AAC; the runtime prefix's own `bin/ffmpeg` is the natural
-choice and needs no environment beyond its baked rpath.
+videos. `MediaConfig::from_env` takes it from `UNISERVE_FFMPEG`, else uses the
+linked runtime's own `bin/ffmpeg`, else `ffmpeg` from the loader's search
+path. Either binary must be able to decode H.264 and AAC; the runtime prefix's
+own `ffmpeg` is the natural choice and needs no environment beyond its baked
+rpath.
 
 ## Tests
 
