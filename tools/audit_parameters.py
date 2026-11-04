@@ -23,10 +23,19 @@ Rows whose package cannot be imported here (cutlass, cute and native packages, w
 
 import argparse
 import importlib.util
+import os
 import pathlib
 import re
 import sys
+import tempfile
 import tomllib
+
+# The compiler picks `ptxas` off `PATH`, and the system one may not know this host's architecture;
+# the CUDA toolkit the store is built with does. The Triton cache goes outside the tree.
+os.environ["PATH"] = "/usr/local/cuda/bin:" + os.environ.get("PATH", "")
+os.environ.setdefault(
+    "TRITON_CACHE_DIR", str(pathlib.Path(tempfile.gettempdir()) / "uniserve-audit-cache")
+)
 
 OPS = pathlib.Path("crates/ops/src")
 KERNELS = pathlib.Path("crates/ops/kernels")
@@ -38,14 +47,47 @@ IMPLICIT = 2
 PACKING = re.compile(r"\.(view|pointer|u64|u32|i32|i64|f32|flag|scratch)\(")
 
 
+def masked(text):
+    """The source with the inside of string literals and comments blanked, length preserved.
+
+    A `format!("{}")` in a launch body would otherwise count as code, and its braces would close the
+    block being read.
+    """
+    characters = list(text)
+    index = 0
+    while index < len(text):
+        if text.startswith("//", index):
+            end = text.find("\n", index)
+            end = len(text) if end < 0 else end
+            for at in range(index, end):
+                characters[at] = " "
+            index = end
+        elif text.startswith("/*", index):
+            end = text.find("*/", index + 2)
+            end = len(text) if end < 0 else end + 2
+            for at in range(index, end):
+                characters[at] = " "
+            index = end
+        elif text[index] == '"':
+            index += 1
+            while index < len(text) and text[index] != '"':
+                characters[index] = " "
+                index += 2 if text[index] == "\\" else 1
+            index += 1
+        else:
+            index += 1
+    return "".join(characters)
+
+
 def impl_blocks(text):
-    """Every `impl Op for X { ... }` block, by brace matching."""
-    for match in re.finditer(r"impl Op for (\w+) \{", text):
+    """Every `impl Op for X { ... }` block, by brace matching on the masked source."""
+    masked_text = masked(text)
+    for match in re.finditer(r"impl Op for (\w+) \{", masked_text):
         depth = 0
-        for index in range(match.end() - 1, len(text)):
-            if text[index] == "{":
+        for index in range(match.end() - 1, len(masked_text)):
+            if masked_text[index] == "{":
                 depth += 1
-            elif text[index] == "}":
+            elif masked_text[index] == "}":
                 depth -= 1
                 if depth == 0:
                     yield match.group(1), text[match.start() : index + 1]
@@ -59,7 +101,8 @@ def packed(operator):
         if f'"{operator}"' not in text:
             continue
         for _, body in impl_blocks(text):
-            if f"const NAME: &'static str = \"{operator}\"" not in body:
+            named = re.search(r"const NAME: &'static str = \"([\w]+)\"", body)
+            if not named or named.group(1) != operator:
                 continue
             match = re.search(r"fn launch\(", body)
             if not match:
