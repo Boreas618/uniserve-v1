@@ -13,11 +13,11 @@ use std::time::Duration;
 use platform::nccl::{Communicator, DataType, ReduceOp, UniqueId};
 use platform::{
     Capture, CaptureMode, CaptureStatus, Cluster, CopyBatch, Device, DeviceAllocation,
-    DeviceAttribute, DeviceId, Error, Event, EventFlags, FunctionAttribute, HandleType, Interleave,
-    KernelNodeParams, L2Promotion, LaunchConfig, Library, Nvml, OobFill, PeerMapping, PinnedBuffer,
-    PrimaryContext, Protection, SegmentedMapping, ShareableHandle, SourceOrder, Stream, Strided,
-    StridedCopy, Swizzle, TensorDataType, TensorMap, TensorMapSpec, VirtualPool, memcpy_async,
-    memset_2d_d8, memset_d8, memset_d32, reclaim,
+    DeviceAttribute, DeviceId, Error, Event, EventFlags, FunctionAttribute, GraphNodeKind,
+    HandleType, Interleave, KernelNodeParams, L2Promotion, LaunchConfig, Library, Nvml, OobFill,
+    PeerMapping, PinnedBuffer, PrimaryContext, Protection, SegmentedMapping, ShareableHandle,
+    SourceOrder, Stream, Strided, StridedCopy, Swizzle, TensorDataType, TensorMap, TensorMapSpec,
+    VirtualPool, memcpy_async, memset_2d_d8, memset_d8, memset_d32, reclaim,
 };
 
 pub(crate) const DEVICE: DeviceId = DeviceId(0);
@@ -1353,6 +1353,63 @@ fn rebinding_changes_a_kernel_node_function_and_arguments() {
     unsafe { memcpy_async(host.address(), storage.address(), 32, &stream) }.unwrap();
     stream.synchronize().unwrap();
     assert_eq!(words(&host), vec![7; 8], "the template node is unchanged");
+}
+
+/// The read half of a rebind walk: a template's node gives back the kernel it
+/// captured, its grid, block and the values of its arguments, and setting those
+/// on another executable's node runs the same work.
+#[test]
+fn kernel_node_params_read_back_what_a_capture_recorded() {
+    let _driver = exclusive_driver();
+    let device = Device::new(DEVICE).unwrap();
+    let library = kernels(&device);
+    let write = library.kernel("write").unwrap();
+    let stream = Stream::new(DEVICE).unwrap();
+    let storage = DeviceAllocation::linear(DEVICE, 32).unwrap();
+    let host = PinnedBuffer::new(DEVICE, 32).unwrap();
+    let mut out = storage.address();
+    let mut value = 9u32;
+    let mut parameters: [*mut c_void; 2] = [(&raw mut out).cast(), (&raw mut value).cast()];
+
+    let mut capture = Capture::begin(&stream, CaptureMode::Relaxed).unwrap();
+    write
+        .launch_ex(
+            &stream,
+            &LaunchConfig::new([2, 1, 1], [4, 1, 1]),
+            &mut parameters,
+        )
+        .unwrap();
+    let _ = capture.record().unwrap();
+    let graph = capture.end().unwrap();
+    let node = graph.nodes().unwrap().remove(0);
+
+    assert_eq!(node.kind().unwrap(), GraphNodeKind::Kernel);
+    let read = graph.kernel_node_params(&node).unwrap();
+    assert_eq!(read.grid, [2, 1, 1], "the grid the launch carried");
+    assert_eq!(read.block, [4, 1, 1], "the block the launch carried");
+    assert_eq!(read.shared_memory, 0);
+    assert_eq!(read.parameters.len(), 2, "the kernel takes two parameters");
+    assert_eq!(
+        u64::from_ne_bytes(read.parameters[0][..8].try_into().unwrap()),
+        out,
+        "the address the launch carried"
+    );
+    assert_eq!(
+        u32::from_ne_bytes(read.parameters[1][..4].try_into().unwrap()),
+        value,
+        "the value the launch carried"
+    );
+
+    // Setting what was read on an executable's node runs the captured work.
+    let executable = graph.instantiate().unwrap();
+    executable
+        .set_kernel_node_params_owned(node.clone(), &read)
+        .unwrap();
+    executable.launch(&stream).unwrap();
+    // SAFETY: the copy reads the allocation into the pinned buffer.
+    unsafe { memcpy_async(host.address(), storage.address(), 32, &stream) }.unwrap();
+    stream.synchronize().unwrap();
+    assert_eq!(words(&host), vec![9; 8], "the read-back launch ran");
 }
 
 /// Recapture rebuilds a graph from a new capture, so a program whose node
