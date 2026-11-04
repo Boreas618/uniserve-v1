@@ -267,7 +267,19 @@ const MESSAGE: usize = 512;
 /// nothing enforces it yet: a launch past it gets a tolerance stated for a shorter reduction than
 /// its own, which fails a correct kernel. The repair is a reduction class in the descriptor (the
 /// `max_tiles` pattern), which moves both operators' keys and is therefore not made here.
-pub const FRAME_REDUCTION: u64 = 1 << 16;
+pub const FRAME_REDUCTION_CLASS: u32 = 1 << 16;
+
+/// The reduction class a frame of `channels_per_group` channels and `pixels` pixels falls in.
+///
+/// A class is the reduction padded to a power of two, because that is what a compiled program's
+/// bound is: many frame shapes reduce the same number of values as far as the arithmetic is
+/// concerned, and the tolerance's rounding depends on the length, not on the shape the length came
+/// from. The descriptor carries the class, so one program serves every frame inside it and the
+/// launch refuses a frame that leaves it.
+pub fn frame_reduction_class(channels_per_group: u64, pixels: u64) -> u32 {
+    let reduction = channels_per_group.saturating_mul(pixels).max(1);
+    reduction.next_power_of_two().min(u64::from(u32::MAX)) as u32
+}
 
 /// The call structure of `frame_moments`, mirrored by the package's header.
 #[derive(Clone, Copy)]
@@ -313,10 +325,17 @@ const _: () = assert!(offset_of!(FrameMomentsCall, error) == 88);
 const _: () = assert!(size_of::<FrameMomentsCall>() == 88 + MESSAGE);
 
 /// One compilation of `frame_moments`.
+///
+/// The reduction class is a *declared bound*, not a compilation: the program reads the frame's shape
+/// as scalars, so nothing in it changes with the class. It therefore sits in the descriptor and not
+/// in the key, as every declared bound does, and the launch refuses a frame outside it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct FrameMomentsDescriptor {
     /// Element type of the values and the statistics.
     pub dtype: DType,
+    /// The largest reduction, in values, this compilation's tolerance covers: a power of two at or
+    /// above `channels_per_group · pixels`, which the launch checks.
+    pub reduction: u32,
     /// The epsilon added to the variance before its reciprocal square root.
     pub epsilon: crate::descriptor::Float,
 }
@@ -400,6 +419,18 @@ impl Op for FrameMoments {
         }
 
         let pixels = args.values.shape.dim(3) * args.values.shape.dim(4);
+        let channels_per_group = channels / args.groups;
+        let reduction = channels_per_group.saturating_mul(pixels);
+        if reduction > u64::from(descriptor.reduction) {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "a frame reduces {reduction} values ({channels_per_group} channels by {pixels} \
+                     pixels), past the {} this compilation's tolerance covers",
+                    descriptor.reduction
+                ),
+            ));
+        }
         let mut call = FrameMomentsCall {
             values: args.values.ptr.address(),
             values_batch: args.values.strides.get(0) as i64,
@@ -430,10 +461,9 @@ impl Op for FrameMoments {
 
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
         // The moments reduce `channels_per_group · pixels` values in FP32 and are consumed in FP32:
-        // the bound is the reduction's own rounding, taken at [`FRAME_REDUCTION`] - the class a
-        // caller must stay inside, which the descriptor cannot state and the launch does not check.
-        let _ = descriptor;
-        Tolerance::rounding(FRAME_REDUCTION, DType::F32, DType::F32)
+        // the bound is the reduction's own rounding, taken at the class this compilation declares and
+        // that the launch refuses to exceed.
+        Tolerance::rounding(u64::from(descriptor.reduction), DType::F32, DType::F32)
     }
 }
 
@@ -442,6 +472,9 @@ impl Op for FrameMoments {
 pub struct FrameNormPadDescriptor {
     /// Element type of the values, the parameters and the output.
     pub dtype: DType,
+    /// The largest reduction, in values, this compilation's tolerance covers: a power of two at or
+    /// above `channels_per_group · height · width`, which the launch checks.
+    pub reduction: u32,
     /// The output's storage: channel-first (`false`) or channels-last (`true`).
     pub channels_last: bool,
     /// Normalize with the affine parameters (`false`), or with none (`true`).
@@ -709,6 +742,19 @@ impl Op for FrameNormPad {
         }
 
         // The kernel's branch: one pixel per frame, the centered reduction, or the fused affine one.
+        let channels_per_group = channels / args.groups;
+        let reduction = channels_per_group.saturating_mul(height * width);
+        if reduction > u64::from(descriptor.reduction) {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "a frame reduces {reduction} values ({channels_per_group} channels by {} pixels), \
+                     past the {} this compilation's tolerance covers",
+                    height * width,
+                    descriptor.reduction
+                ),
+            ));
+        }
         let normalization = if descriptor.single_pixel {
             2
         } else if descriptor.centered {
@@ -765,8 +811,45 @@ impl Op for FrameNormPad {
 
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
         // The moments come from the same reduction as `frame_moments`; the normalization, the SiLU
-        // and the padded store round in FP32. The reduction's bound is [`FRAME_REDUCTION`].
-        let _ = descriptor;
-        Tolerance::rounding(FRAME_REDUCTION, DType::F32, DType::F32)
+        // and the padded store round in FP32. The bound is the class the descriptor declares.
+        Tolerance::rounding(u64::from(descriptor.reduction), DType::F32, DType::F32)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_frames_reduction_class_is_the_length_padded_to_a_power_of_two() {
+        // A one-pixel frame of one channel group reduces one value; every class is a power of two,
+        // because that is the length the compiled program's bound is stated at.
+        assert_eq!(frame_reduction_class(1, 1), 1);
+        assert_eq!(frame_reduction_class(4, 1), 4);
+        assert_eq!(frame_reduction_class(3, 3), 16);
+        // The two H3 frames this operator serves: a latent raster inside 65 536 and the encoder's
+        // pixel raster, which is not.
+        assert_eq!(frame_reduction_class(4, 168 * 96), 65_536);
+        assert_eq!(frame_reduction_class(4, 1344 * 768), 4_194_304);
+    }
+
+    #[test]
+    fn the_frame_tolerance_follows_the_class_the_descriptor_declares() {
+        let narrow = FrameMomentsDescriptor {
+            dtype: DType::F32,
+            reduction: 65_536,
+            epsilon: crate::descriptor::Float::from(1e-6_f32),
+        };
+        let wide = FrameMomentsDescriptor {
+            reduction: 4_194_304,
+            ..narrow
+        };
+        // A longer reduction is a longer sum of roundings, so the bound cannot sit still: a kernel
+        // held to the narrow class's bound would fail a frame it computes correctly.
+        assert!(
+            <FrameMoments as Op>::tolerance(&wide).rtol
+                > <FrameMoments as Op>::tolerance(&narrow).rtol,
+            "a four-million-value frame is a longer sum than a sixty-five-thousand-value one"
+        );
     }
 }
