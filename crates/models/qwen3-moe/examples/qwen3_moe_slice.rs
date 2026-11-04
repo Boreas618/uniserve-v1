@@ -13,6 +13,11 @@
 //! --stage decode      the whole model's decode step, against notes/reference/qwen3-reference.json
 //! ```
 //!
+//! `--from NN` on the block stage replaces the embedding with the reference's own `hidden_NN`, so
+//! the layer that runs is measured on the reference's state: its row is that layer's arithmetic and
+//! carries no prefix's error — the one measurement the layer walk cannot make, because the walk runs
+//! the prefix on purpose.
+//!
 //! `--reference <dir>` reads a reference stack's `hidden_NN.npy` files one stage at a time as the
 //! walk reaches them and prints each stage's `rms/scale` against the reference's own scale, the
 //! increment over the stage before it, and at the end the two readings that name a defect: the
@@ -39,7 +44,7 @@ use nn::{
     Shape, TensorView, WeightKey, WeightLoader,
 };
 use ops::{Generation, KernelEntry};
-use qwen3_moe::{Config, LoadOptions, Partition, Substage};
+use qwen3_moe::{Config, LoadOptions, Partition, Run, Substage};
 
 /// The checkpoint the reference was captured from, when `--checkpoint` does not name another.
 const DEFAULT_CHECKPOINT: &str = "/opt/uv/models/Qwen3-30B-A3B";
@@ -115,6 +120,9 @@ struct Args {
     /// A cut inside `--layer`, named by the reference tensor that answers it: `normalized`,
     /// `attended` or `mlp_out`.
     substage: Option<Substage>,
+    /// The reference stage a `--stage block` run starts from: its `hidden_NN` is the run's input
+    /// instead of the embedding, which measures one layer's arithmetic and no prefix's.
+    from: Option<usize>,
 }
 
 /// The four stages of the run.
@@ -138,6 +146,7 @@ impl Args {
         let mut dump = None;
         let mut reference = None;
         let mut substage = None;
+        let mut from = None;
         let mut words = std::env::args().skip(1);
         while let Some(word) = words.next() {
             let mut value = |name: &str| -> Result<String> {
@@ -177,6 +186,12 @@ impl Args {
                 "--tokens" => tokens = value("--tokens")?,
                 "--dump" => dump = Some(PathBuf::from(value("--dump")?)),
                 "--reference" => reference = Some(PathBuf::from(value("--reference")?)),
+                "--from" => {
+                    let number = value("--from")?;
+                    from = Some(number.parse().map_err(|_| {
+                        Failure::message(format!("--from takes a stage number, not `{number}`"))
+                    })?);
+                }
                 "--substage" => {
                     let name = value("--substage")?;
                     substage = Some(Substage::parse(&name).ok_or_else(|| {
@@ -197,7 +212,8 @@ impl Args {
                     return Err(Failure::message(
                         "qwen3_moe_slice --stage weights|embedding|block|decode \
                          [--checkpoint PATH] [--store PATH] [--device N] [--layer N] \
-                         [--tokens ID,ID,...] [--dump DIR] [--reference DIR]",
+                         [--tokens ID,ID,...] [--dump DIR] [--reference DIR] \
+                         [--substage normalized|attended|mlp_out] [--from NN]",
                     ));
                 }
                 other => {
@@ -213,6 +229,16 @@ impl Args {
                 "--substage cuts inside one layer, so it belongs to --stage block",
             ));
         }
+        if from.is_some() && stage != Stage::Block {
+            return Err(Failure::message(
+                "--from starts a run at a reference stage, so it belongs to --stage block",
+            ));
+        }
+        if from.is_some() && reference.is_none() {
+            return Err(Failure::message(
+                "--from reads the reference's own state, so it needs --reference <dir>",
+            ));
+        }
         Ok(Self {
             stage,
             checkpoint,
@@ -224,6 +250,7 @@ impl Args {
             dump,
             reference,
             substage,
+            from,
         })
     }
 }
@@ -657,24 +684,77 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     }];
     let cache = KvView { groups: &groups };
 
-    // The forward: embed, then either stop at one layer or walk the stack and project the last row.
-    let hidden = arena.tensor(DType::BF16, Shape::new(&[count, plan.hidden]))?;
-    model.embed_input_ids(&forward, ids, hidden)?;
-    // The embedding is the one operator in the pass a run can check against the checkpoint alone,
-    // and a stack computed on the wrong prompt is indistinguishable from a model with a defect in
-    // every layer. So it is checked before the first layer launches, and the run stops here rather
-    // than producing a table of thirty numbers that measure the wrong prompt.
-    if args.reference.is_some() || args.dump.is_some() {
-        check_embedded_rows(&stream, &checkpoint, &tokens, hidden, &plan)?;
-    }
+    // The forward: start from the embedding, then either stop at one layer or walk the stack and
+    // project the last row. `--from` replaces the embedding with a reference stage, so what the
+    // layer below computes is measured against the reference's own state and not a prefix's.
+    let hidden = match args.from {
+        Some(from) => {
+            let dir = args.reference.as_deref().ok_or_else(|| {
+                Failure::message(
+                    "--from reads the reference's state, so it needs --reference <dir>",
+                )
+            })?;
+            let rows = reference_rows(
+                &stream,
+                &arena,
+                dir,
+                from,
+                tokens_usize(&batch),
+                usize::try_from(plan.hidden).unwrap_or(0),
+            )?;
+            println!(
+                "input: the run starts at layer {from} with the reference's hidden_{from:02}; the \
+                 embedding is not run, so a row measured here carries one more bf16 rounding than a \
+                 whole-run row (about 4e-03 per value)"
+            );
+            rows
+        }
+        None => {
+            let hidden = arena.tensor(DType::BF16, Shape::new(&[count, plan.hidden]))?;
+            model.embed_input_ids(&forward, ids, hidden)?;
+            // The embedding is the one operator in the pass a run can check against the checkpoint
+            // alone, and a stack computed on the wrong prompt is indistinguishable from a model with
+            // a defect in every layer. So it is checked before the first layer launches, and the run
+            // stops here rather than producing a table of thirty numbers about the wrong prompt.
+            if args.reference.is_some() || args.dump.is_some() {
+                check_embedded_rows(&stream, &checkpoint, &tokens, hidden, &plan)?;
+            }
+            hidden
+        }
+    };
     if let Some(layer) = last {
+        // The measurement this stage makes, on whichever input the run was given: the embedding's
+        // rows, or the reference's own state when `--from` named a stage. A run that starts at
+        // `from` has no prefix in its rows, so what it answers is this layer's arithmetic; a run
+        // that starts at zero answers the prefix's error plus this layer's.
+        let measure = |stage: Option<Substage>| -> Result<TensorView> {
+            match args.from {
+                Some(from) => Ok(model.forward_from(
+                    &forward,
+                    &batch,
+                    &cache,
+                    hidden,
+                    Run {
+                        start: from,
+                        last: layer,
+                        stage,
+                    },
+                )?),
+                None => match stage {
+                    None => Ok(model.forward_through(&forward, &batch, &cache, hidden, layer)?),
+                    Some(cut) => {
+                        Ok(model.forward_substage(&forward, &batch, &cache, hidden, layer, cut)?)
+                    }
+                },
+            }
+        };
         // The layer's rows, twice: a block has no reference capture, so what it can prove is that
         // every key it composes resolves and that two identical runs agree. A digest that moves
         // between them is a race or an uninitialized buffer, which is worth knowing before a
         // numerical comparison blames the arithmetic.
         let mut digests = Vec::new();
         for run in 0..2 {
-            let rows = model.forward_through(&forward, &batch, &cache, hidden, layer)?;
+            let rows = measure(None)?;
             stream.synchronize()?;
             let values = download_bf16(
                 &stream,
@@ -715,7 +795,12 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
             let width = usize::try_from(plan.hidden).unwrap_or(0);
             let mut table = Table::default();
             if let Some(cut) = args.substage {
-                if layer == 0 {
+                if let Some(from) = args.from {
+                    println!(
+                        "prefix: none - the run starts at layer {from} with the reference's own \
+                         state, so this cut is the layer's arithmetic and not a prefix's error"
+                    );
+                } else if layer == 0 {
                     println!("prefix: layer 0 has none - it is handed the embedding itself");
                 } else {
                     let prefix =
@@ -739,7 +824,7 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
                         );
                     }
                 }
-                let out = model.forward_substage(&forward, &batch, &cache, hidden, layer, cut)?;
+                let out = measure(Some(cut))?;
                 stream.synchronize()?;
                 let values = download_bf16(&stream, out, rows, width)?;
                 let file = format!("hidden_{:02}_{}.npy", layer + 1, cut_file(cut));
@@ -779,7 +864,7 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
                 }
                 return Ok(());
             }
-            let out = model.forward_through(&forward, &batch, &cache, hidden, layer)?;
+            let out = measure(None)?;
             stream.synchronize()?;
             let values = download_bf16(&stream, out, rows, width)?;
             let file = format!("hidden_{:02}.npy", layer + 1);
@@ -1838,4 +1923,63 @@ fn check_embedded_rows(
         tokens.len()
     );
     Ok(())
+}
+
+/// Upload `rows × columns` `f32` values as a BF16 tensor, rounding to nearest even.
+fn upload_bf16(
+    stream: &platform::Stream,
+    arena: &Arena,
+    values: &[f32],
+    rows: usize,
+    columns: usize,
+) -> Result<TensorView> {
+    let bits: Vec<u16> = values.iter().copied().map(f32_to_bf16).collect();
+    let bytes: Vec<u8> = bits.iter().flat_map(|bits| bits.to_le_bytes()).collect();
+    let tensor = arena.tensor(DType::BF16, Shape::new(&[rows as u64, columns as u64]))?;
+    // SAFETY: `bytes` outlives the copy, which completes before the wait below.
+    unsafe {
+        platform::memcpy_async(
+            tensor.ptr.address(),
+            bytes.as_ptr() as u64,
+            bytes.len(),
+            stream,
+        )?;
+    }
+    stream.synchronize()?;
+    Ok(tensor)
+}
+
+/// An `f32` as BF16, rounding to nearest even: the same rounding the device's own conversion does,
+/// so a row uploaded from the host is the row a bf16 stack holds.
+fn f32_to_bf16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    // NaN stays NaN and infinities stay themselves; a finite value rounds on the 16 kept bits.
+    let rounding = 0x7fff + ((bits >> 16) & 1);
+    (bits.wrapping_add(rounding) >> 16) as u16
+}
+
+/// The state a run starts from when `--from` names a reference stage: the reference's own
+/// `hidden_NN`, uploaded as this run's input.
+///
+/// A layer run on the reference's state answers about *that layer*: the prefix's error is not in
+/// the rows, so a row that disagrees here is the layer's own arithmetic. The cost is that the input
+/// carries one bf16 rounding of its own, about `2**-8` relative, which is why the caller of this
+/// function prints the floor it measures against.
+fn reference_rows(
+    stream: &platform::Stream,
+    arena: &Arena,
+    dir: &Path,
+    index: usize,
+    rows: usize,
+    width: usize,
+) -> Result<TensorView> {
+    let path = dir.join(format!("hidden_{index:02}.npy"));
+    let (values, their_rows, their_width) = read_npy(&path)?;
+    if their_rows != rows || their_width != width {
+        return Err(Failure::message(format!(
+            "{} is {their_rows} x {their_width}, the run's input is {rows} x {width}",
+            path.display()
+        )));
+    }
+    upload_bf16(stream, arena, &values, rows, width)
 }
