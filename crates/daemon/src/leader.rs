@@ -89,7 +89,6 @@ pub(crate) struct Replicas {
     pub(crate) replacing: tokio::sync::Mutex<()>,
     pub(crate) pending:
         std::sync::Mutex<std::collections::VecDeque<(usize, crate::worlds::ApplyRequest)>>,
-    pub(crate) group: std::sync::Mutex<Option<crate::worlds::group::Trial>>,
     pub(crate) commit: std::sync::Mutex<Option<crate::worlds::Commit>>,
     pub(crate) adapters: Arc<std::sync::Mutex<BTreeMap<String, Adapter>>>,
     pub(crate) schedulers: Arc<std::sync::atomic::AtomicUsize>,
@@ -223,10 +222,6 @@ impl Leader {
     }
 
     pub(crate) fn engine_handoff(&self) -> anyhow::Result<Vec<EngineHandoff>> {
-        anyhow::ensure!(
-            locked(&self.replicas.group).is_none(),
-            "the replica group is on trial: commit it or roll it back before a daemon restart"
-        );
         self.replicas()
             .iter()
             .map(|replica| replica.engine_handoff())
@@ -960,7 +955,6 @@ impl Leader {
             ),
             replacing: tokio::sync::Mutex::new(()),
             pending: std::sync::Mutex::new(std::collections::VecDeque::new()),
-            group: std::sync::Mutex::new(None),
             commit: std::sync::Mutex::new(None),
             adapters: Arc::clone(&adapters),
             schedulers,
@@ -2237,27 +2231,6 @@ pub(crate) async fn watch_engine(replica: Arc<Replica>, mut client: std::sync::W
         let reason = lost(states).await;
         if let Some(registry) = replica.registry.upgrade() {
             let world = locked(&replica.worlds).executing;
-            let group_trial = locked(&registry.group)
-                .as_ref()
-                .is_some_and(|trial| trial.contains(world));
-            if group_trial {
-                let _deployment = registry.replacing.lock().await;
-                if !client
-                    .upgrade()
-                    .is_some_and(|client| replica.hold.serves(&client))
-                {
-                    return;
-                }
-                if locked(&registry.group)
-                    .as_ref()
-                    .is_some_and(|trial| trial.contains(world))
-                {
-                    if let Err(error) = crate::worlds::group::rollback(&registry, reason).await {
-                        tracing::error!(%error, "the group rollback failed");
-                    }
-                    return;
-                }
-            }
             let committing = locked(&registry.commit)
                 .as_ref()
                 .is_some_and(|decision| decision.pending.contains(&world));
