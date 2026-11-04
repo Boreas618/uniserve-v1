@@ -1618,21 +1618,43 @@ impl Leader {
         let filled = crate::epoch::FilledPrograms::of(target);
         let servers = self.program_servers(target);
         let leader_host = self.program_leader_host(target, &servers);
+        // Bounded like the epoch install's: the client's two waits have no
+        // deadline, so an unanswering Program Server would otherwise hold the
+        // update without saying anything at all.
+        let steps = crate::engine::control::PrepareSteps::new();
+        let recorded = steps.clone();
         let prepared = {
             let servers = servers.clone();
             let leader_host = leader_host.clone();
             let filled = filled.clone();
-            tokio::task::spawn_blocking(move || {
-                let steps = crate::engine::control::PrepareSteps::new();
-                crate::engine::control::prepare_epoch(&servers, &leader_host, &filled, &[], &steps)
-            })
-            .await
-            .map_err(|error| {
-                UpdateError::Failed(anyhow::anyhow!("preparing the target's programs: {error}"))
-            })?
-            .map_err(|error| {
-                UpdateError::Refused(format!("preparing the target's programs: {error:#}"))
-            })?
+            let preparing = tokio::task::spawn_blocking(move || {
+                crate::engine::control::prepare_epoch(
+                    &servers,
+                    &leader_host,
+                    &filled,
+                    &[],
+                    &recorded,
+                )
+            });
+            match tokio::time::timeout(PREPARE_TIMEOUT, preparing).await {
+                Ok(joined) => joined
+                    .map_err(|error| {
+                        UpdateError::Failed(anyhow::anyhow!(
+                            "preparing the target's programs: {error}"
+                        ))
+                    })?
+                    .map_err(|error| {
+                        UpdateError::Refused(format!("preparing the target's programs: {error:#}"))
+                    })?,
+                Err(_) => {
+                    return Err(UpdateError::Refused(format!(
+                        "preparing the target's programs: no Program Server answered within \
+                         {} s: the daemon was {}",
+                        PREPARE_TIMEOUT.as_secs(),
+                        steps.describe()
+                    )));
+                }
+            }
         };
         let next = crate::epoch::Deployment {
             config: target.clone(),
