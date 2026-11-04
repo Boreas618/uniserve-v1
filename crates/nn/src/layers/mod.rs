@@ -20,6 +20,7 @@
 
 mod activation;
 mod attention;
+mod bias;
 mod conv;
 mod embedding;
 mod exchange;
@@ -38,10 +39,12 @@ mod rope;
 mod rotate;
 mod rows;
 mod sampler;
+mod segment;
 mod segments;
 
 pub use activation::{GatedActivation, Gelu, PackedSwiGlu, Silu, Snake, SwiGlu};
 pub use attention::{Attention, AttentionBackend, TRTLLM_WORKSPACE_BYTES};
+pub use bias::BiasAdd;
 pub use conv::{Conv1d, Conv3d, ConvGeometry, ConvTranspose1d};
 pub use embedding::Embedding;
 pub use exchange::UlyssesExchange;
@@ -52,6 +55,8 @@ pub use modulation::{GatedResidual, ModulatedRmsNorm};
 pub use moe::Moe;
 pub use noise::{Key as NoiseKey, Noise};
 pub use norm::{LayerNorm, RmsNorm};
+pub use ops::activation::Activation;
+pub use ops::gemm::WeightOrder;
 pub use ops::rope::Rotation;
 pub use patch::{Patch, PatchMode};
 pub use pool::AdaptivePool;
@@ -63,6 +68,7 @@ pub use rope::{Rotary, Sections};
 pub use rotate::Rotate;
 pub use rows::Rows;
 pub use sampler::{Candidates, Sampler, SamplerState, Samples};
+pub use segment::{SegmentAttention, SegmentTables};
 pub use segments::VsaTiles;
 
 /// The constants a layer's operator descriptor carries and the program package owns.
