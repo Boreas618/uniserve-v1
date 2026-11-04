@@ -363,6 +363,14 @@ mod tests {
         assert_eq!(report.calls[1].request_key, calls[1].0);
         assert_eq!(report.calls[1].call_id, calls[1].1);
         assert_eq!(report.calls[1].committed_tokens, vec![7]);
+        // A device names one log-probability per accepted token; the mechanism
+        // records the accepted token as the one candidate, which is the shape
+        // `generation` checks against the tokens it emits.
+        assert_eq!(report.calls[0].token_logprobs.len(), 1);
+        assert_eq!(report.calls[0].token_logprobs[0].len(), 1);
+        assert_eq!(report.calls[0].token_logprobs[0][0].token_id, 5);
+        assert_eq!(report.calls[0].token_logprobs[0][0].logprob, -0.25);
+        assert_eq!(report.calls[0].token_logprobs[0][0].rank, 1);
         assert_eq!(report.timing.device_us, 11);
         assert!(report.command_results.is_empty());
     }
