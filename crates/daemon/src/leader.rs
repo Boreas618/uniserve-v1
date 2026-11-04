@@ -1953,6 +1953,19 @@ impl Replica {
         record.world == served
     }
 
+    /// Ends the parked standby, if one is live: dropping its client closes the
+    /// control connection, which ends its process and releases the read-only
+    /// claim it holds on its world's storage.
+    pub(crate) fn drop_standby(&self) {
+        let dropped = { locked(&self.standby).take() };
+        if let Some(standby) = dropped {
+            info!(
+                generation = standby.generation,
+                "the standby is dropped: its world no longer serves"
+            );
+        }
+    }
+
     /// Replaces the parked standby with one prepared from what the deployment
     /// runs now: a program update moves the serving engine in place, and a
     /// standby started before it holds the programs the update replaced. A
@@ -2458,7 +2471,7 @@ pub(crate) async fn watch_engine(replica: Arc<Replica>, mut client: std::sync::W
         let Some(states) = client.upgrade().map(|client| client.states()) else {
             return;
         };
-        let reason = lost(states).await;
+        let reason = lost(states, &replica).await;
         let _replacing = replica.replacing.lock().await;
         let Some(lost_client) = client.upgrade() else {
             return;
@@ -2518,11 +2531,19 @@ pub(crate) async fn watch_engine(replica: Arc<Replica>, mut client: std::sync::W
 }
 
 /// Waits until the engine whose states `states` observes stops serving,
-/// and returns why. A draining or standing-by engine is no loss.
-async fn lost(mut states: watch::Receiver<EngineState>) -> String {
+/// and returns why. A draining or standing-by engine is no loss — but a world
+/// the deployment stops serving keeps no standby, and a parked engine is the
+/// first moment the watcher learns the switch drained it: the standby's
+/// read-only claim on that world would outlive the purge that frees it.
+async fn lost(mut states: watch::Receiver<EngineState>, replica: &Replica) -> String {
     loop {
         match states.borrow_and_update().clone() {
-            EngineState::Ready | EngineState::Parked | EngineState::Standby => {}
+            EngineState::Parked | EngineState::Standby => {
+                if !replica.serves_serving_epoch() {
+                    replica.drop_standby();
+                }
+            }
+            EngineState::Ready => {}
             EngineState::Failed(error) => return format!("the engine failed: {error}"),
             EngineState::Closed => return "the engine process ended".to_owned(),
         }
