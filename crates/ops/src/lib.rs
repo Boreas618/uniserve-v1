@@ -110,6 +110,7 @@ pub mod prefix_cache;
 pub mod replicate_pad;
 pub mod residual;
 pub mod resize;
+pub mod rgb;
 pub mod rope;
 pub mod rows;
 pub mod sampler;
