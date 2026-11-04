@@ -84,6 +84,8 @@ pub struct Batch {
 /// One call of a batch: which request slot it evaluates and which rows it owns.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct BatchCall {
+    /// The mechanism's name for this call, which the step's output names it by (4.4).
+    pub call: CallId,
     /// The runner's request slot (the design's `request_pool_idx`), which addresses the model's
     /// per-slot state; not the mechanism's request identity.
     pub request: u32,
