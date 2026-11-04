@@ -80,6 +80,9 @@ const MMA_CLUSTER: (u32, u32) = (1, 1);
 /// Permuted rows per tile of the expert sort (`layers/moe.rs`, `Moe::new`'s tile).
 const SORT_TILE: u32 = 128;
 
+/// Lanes one `softmax` program walks at a time: a chunk of the candidate row.
+const SOFTMAX_TILE: u32 = 8192;
+
 /// The candidate width the slice's sampler keeps per row (`Sampler::new`'s `width`).
 ///
 /// It is the **vocabulary**, not a top-k bound: a request may ask for any top-k it likes, so the
@@ -99,9 +102,14 @@ const KV_HEADS: u32 = 4;
 const HEAD_DIM: u32 = 128;
 const EXPERTS: u32 = 128;
 const TOP: u32 = 8;
+/// One expert's intermediate width, as the checkpoint's `moe_intermediate_size` states it: the
+/// descriptor field of both expert products means this number, not the gated product's width. The
+/// first product contracts `hidden` into `2 · intermediate` and fuses the gate, so its *output* is
+/// `intermediate` wide; the launch multiplies by two internally and the key never names the
+/// doubled width. `a7b390915` corrected the fixture row that had it wrong; this is the generator
+/// that would have put it back.
 const INTERMEDIATE: u32 = 768;
 /// FC1's fused output width: the gate and up projections side by side.
-const FUSED: u32 = 2 * INTERMEDIATE;
 const VOCABULARY: u32 = 151936;
 const PAGE: u32 = 64;
 const MAX_KV_LEN: u32 = 40960;
@@ -163,7 +171,7 @@ fn main() {
         "gather_gemm".to_owned(),
         key(&moe::grouped::GatherGemmDescriptor {
             hidden: HIDDEN,
-            intermediate: FUSED,
+            intermediate: INTERMEDIATE,
             experts: EXPERTS,
             top: TOP,
             activation: moe::grouped::Activation::Silu,
@@ -387,10 +395,14 @@ fn main() {
         // The candidates' probabilities: the general selection's step between the top-k program and
         // the filters, over the candidate width rather than the vocabulary.
         "softmax".to_owned(),
+        // The tile is a chunk of the row, not the row: the program walks the width in tiles and
+        // keeps a running maximum and denominator, which is what lets the candidate width be the
+        // vocabulary. Its sibling `log_softmax` takes the row-sized step because its kernel derives
+        // its own tile from the same number.
         key(&ops::norm::SoftmaxDescriptor {
             dtype: DType::F32,
             columns: CANDIDATE_WIDTH,
-            tile: row_tile(CANDIDATE_WIDTH),
+            tile: SOFTMAX_TILE,
             pdl: PDL,
         }),
     ));
