@@ -89,7 +89,6 @@ pub(crate) struct Replicas {
     pub(crate) replacing: tokio::sync::Mutex<()>,
     pub(crate) pending:
         std::sync::Mutex<std::collections::VecDeque<(usize, crate::worlds::ApplyRequest)>>,
-    pub(crate) commit: std::sync::Mutex<Option<crate::worlds::Commit>>,
     pub(crate) adapters: Arc<std::sync::Mutex<BTreeMap<String, Adapter>>>,
     pub(crate) schedulers: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -955,7 +954,6 @@ impl Leader {
             ),
             replacing: tokio::sync::Mutex::new(()),
             pending: std::sync::Mutex::new(std::collections::VecDeque::new()),
-            commit: std::sync::Mutex::new(None),
             adapters: Arc::clone(&adapters),
             schedulers,
         });
@@ -1899,15 +1897,6 @@ impl Replica {
     ///
     /// Fails when no engine this leader started serves.
     pub(crate) fn engine_handoff(&self) -> anyhow::Result<EngineHandoff> {
-        {
-            let worlds = locked(&self.worlds);
-            if let Some(trial) = &worlds.trial {
-                anyhow::bail!(
-                    "world {} is on trial: commit it or roll it back before the daemon restarts",
-                    trial.world
-                );
-            }
-        }
         let client = self
             .hold()
             .client()
@@ -2229,31 +2218,6 @@ pub(crate) async fn watch_engine(replica: Arc<Replica>, mut client: std::sync::W
             return;
         };
         let reason = lost(states).await;
-        if let Some(registry) = replica.registry.upgrade() {
-            let world = locked(&replica.worlds).executing;
-            let committing = locked(&registry.commit)
-                .as_ref()
-                .is_some_and(|decision| decision.pending.contains(&world));
-            if committing {
-                let _deployment = registry.replacing.lock().await;
-                if !client
-                    .upgrade()
-                    .is_some_and(|client| replica.hold.serves(&client))
-                {
-                    return;
-                }
-                if locked(&registry.commit)
-                    .as_ref()
-                    .is_some_and(|decision| decision.pending.contains(&world))
-                {
-                    replica.hold.hold();
-                    if let Err(error) = crate::worlds::complete_commit(&registry).await {
-                        tracing::error!(%error, world, "commit and engine recovery remain pending");
-                    }
-                    return;
-                }
-            }
-        }
         let _replacing = replica.replacing.lock().await;
         let Some(lost_client) = client.upgrade() else {
             return;
@@ -2261,22 +2225,7 @@ pub(crate) async fn watch_engine(replica: Arc<Replica>, mut client: std::sync::W
         if !replica.hold.serves(&lost_client) {
             return;
         }
-        // A world on trial is not relaunched: the deployment rolls back to
-        // the previous world, with the reason naming the world as the
-        // trial's own watch names it, whichever notices the loss first.
-        let world = lost_client.world();
-        let on_trial = locked(&replica.worlds)
-            .trial
-            .as_ref()
-            .is_some_and(|trial| trial.world == world);
         drop(lost_client);
-        if on_trial {
-            let reason = format!("world {world} lost its engine: {reason}");
-            if let Err(error) = crate::worlds::rollback(&replica, reason).await {
-                tracing::error!("the rollback failed: {error:#}");
-            }
-            return;
-        }
         tracing::error!(%reason, "the engine was lost; starting another");
         match replica.recover().await {
             Ok(relaunched) => {

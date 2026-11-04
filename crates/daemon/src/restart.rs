@@ -140,7 +140,6 @@ struct Takeover {
     listener: HandedListener,
     replicas: Vec<ReplicaHandoff>,
     adapters: std::collections::BTreeMap<String, crate::leader::Adapter>,
-    commit: Option<crate::worlds::Commit>,
     pending: std::collections::VecDeque<(usize, crate::worlds::ApplyRequest)>,
     service: HandedService,
     service_descriptors: usize,
@@ -364,7 +363,6 @@ impl Restarter {
                     listener,
                     replicas,
                     adapters: crate::leader::locked(&leader.replicas.adapters).clone(),
-                    commit: crate::leader::locked(&leader.replicas.commit).clone(),
                     pending: crate::leader::locked(&leader.replicas.pending).clone(),
                     service,
                     service_descriptors: service_count,
@@ -664,7 +662,6 @@ async fn prepared_successor(
         listener,
         replicas,
         adapters,
-        commit,
         pending,
         service,
         service_descriptors,
@@ -783,16 +780,7 @@ async fn prepared_successor(
     }
 
     *crate::leader::locked(&leader.replicas.adapters) = adapters;
-    *crate::leader::locked(&leader.replicas.commit) = commit;
     *crate::leader::locked(&leader.replicas.pending) = pending;
-    if crate::leader::locked(&leader.replicas.commit).is_some() {
-        let committing = Arc::clone(&leader);
-        tokio::spawn(async move {
-            if let Err(error) = committing.commit().await {
-                tracing::error!(%error, "the handed-over commit remains pending");
-            }
-        });
-    }
     let retire = Arc::new(AtomicBool::new(false));
     let admin = Admin::resume(shutdown.clone(), Arc::clone(&retire), admin);
     admin.record(
