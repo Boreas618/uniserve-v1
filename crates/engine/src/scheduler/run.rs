@@ -310,24 +310,12 @@ impl Scheduler {
                 canvas.canvas_length, limits.max_num_batched_tokens
             ));
         }
-        if limits.policy != self.config.policy {
-            let mut waiting = Vec::from(std::mem::take(&mut self.waiting));
-            match limits.policy {
-                SchedulingPolicy::Fcfs => {
-                    waiting.sort_by(|a, b| a.queued_at.total_cmp(&b.queued_at))
-                }
-                SchedulingPolicy::Priority => waiting.sort_by(|a, b| {
-                    a.req
-                        .priority
-                        .cmp(&b.req.priority)
-                        .then(a.queued_at.total_cmp(&b.queued_at))
-                }),
-            }
-            self.waiting = waiting.into();
-        }
+        // The queue keeps no order of its own: the waiting requests are a
+        // membership set, and each step's admission order is its plan's
+        // `admit` list (design §4.4). A new `policy` therefore reorders
+        // nothing — the next plan does.
         let graph_tiers = std::mem::take(&mut self.config.graph_tiers);
         self.config = SchedulerConfig {
-            policy: limits.policy,
             max_batch: limits.max_batch.max(1),
             max_num_batched_tokens: limits.max_num_batched_tokens.max(1),
             max_running_requests: limits.max_running_requests.max(1),

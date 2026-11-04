@@ -39,7 +39,7 @@ use anyhow::Context as _;
 use ipc::ComponentDistribution;
 use ipc::WorkerInfo;
 use ipc::{ComponentConfig, ParallelConfig, RequestId};
-use proto::request::{ExpertExchange, SchedulingPolicy};
+use proto::request::ExpertExchange;
 
 /// One cooperative member's physical execution endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -381,7 +381,6 @@ pub struct EngineConfig {
     /// and `host_gib`).
     pub host_cache: crate::kv_cache::HostCacheSize,
     /// Waiting queue policy for admitting/scheduling requests.
-    pub schedule_policy: SchedulingPolicy,
     /// Static computation components and physical rank membership.
     pub worker_groups: Vec<WorkerGroupConfig>,
     /// Per-edge data-plane transfer backend selection (`placement_config.transfer`), e.g.
@@ -475,7 +474,6 @@ impl EngineConfig {
             boundary_interval: crate::kv_cache::DEFAULT_BOUNDARY_INTERVAL,
             state_interval: crate::kv_cache::DEFAULT_STATE_INTERVAL,
             host_cache: crate::kv_cache::HostCacheSize::default(),
-            schedule_policy: SchedulingPolicy::Fcfs,
             worker_groups: vec![WorkerGroupConfig::placed(
                 &["localhost".to_owned()],
                 "cpu",
@@ -928,7 +926,6 @@ impl SchedulerHandle {
                 max_running_requests: config.max_running_requests.max(1),
                 max_queued_requests: config.max_queued_requests,
                 chunked_prefill_size: config.chunked_prefill_size.max(1),
-                policy: config.schedule_policy,
                 canvas: config.worker_process.canvas_sampling,
                 draft_tokens: config.worker_process.draft_tokens as usize,
                 refill: config.refill,
