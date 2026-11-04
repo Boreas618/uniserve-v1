@@ -304,6 +304,28 @@ fn weights(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+/// The largest tile the encoder will read for a raster, which is what its arena must hold.
+///
+/// The encoder reads **one tile per call** (`VideoEncoder::reserve`'s plan), so planning the whole
+/// raster would reserve the ladder fifteen times over at a served canvas. The grid's tiles are
+/// uniform, so the largest is the one the arena needs - and the frames are the condition's own, a
+/// still being one.
+fn largest_tile(config: &minimax_h3::VideoVaeConfig, pixels: Extent) -> Result<Extent, String> {
+    let encoder =
+        minimax_h3::tiled_encode::ClipEncoder::new(pixels.height, pixels.width).map_err(show)?;
+    let plan = encoder.plan();
+    let ratio = config.spatial_compression();
+    plan.tiles
+        .iter()
+        .map(|tile| Extent {
+            frames: pixels.frames,
+            height: tile.rows.1 * ratio,
+            width: tile.columns.1 * ratio,
+        })
+        .max_by_key(|extent| extent.height as u64 * extent.width as u64)
+        .ok_or_else(|| "the tile plan of this raster holds no tile".to_owned())
+}
+
 /// The host stage that sizes the case: every plan the device stage will reserve, and its total.
 ///
 /// A reservation is the number this prints - not a flag - and a harness whose fixed pool is smaller
@@ -358,8 +380,9 @@ fn plan(args: &Args) -> Result<(), String> {
     };
     let conditioning =
         minimax_h3::encoding::conditioning_arena(&config.video_vae, 1, latent).map_err(show)?;
+    let tile = largest_tile(&config.video_vae, pixels)?;
     let tiles =
-        minimax_h3::encoding::video_encoder_tile_arena(&config.video_vae, pixels).map_err(show)?;
+        minimax_h3::encoding::video_encoder_tile_arena(&config.video_vae, tile).map_err(show)?;
     println!(
         "case: {} {}x{} (canvas {}x{}, latent {}x{}), {} frames, {} px image, {} prompt tokens",
         task_name(args.task),
@@ -381,7 +404,11 @@ fn plan(args: &Args) -> Result<(), String> {
         dit.transformer.hidden_size
     );
     let mut total = 0_u64;
-    for (label, buffers) in [("conditioning", &conditioning), ("encoder tiles", &tiles)] {
+    println!(
+        "largest tile: {}x{} px, {} frames",
+        tile.height, tile.width, tile.frames
+    );
+    for (label, buffers) in [("conditioning", &conditioning), ("encoder tile", &tiles)] {
         let bytes: u64 = buffers.iter().map(|buffer| buffer.bytes()).sum();
         total += bytes;
         println!(
@@ -602,8 +629,9 @@ fn encode(args: &Args) -> Result<(), String> {
             .iter()
             .map(|buffer| buffer.bytes())
             .sum();
+    let tile = largest_tile(&config.video_vae, pixels)?;
     let encoder_bytes: u64 =
-        minimax_h3::encoding::video_encoder_tile_arena(&config.video_vae, pixels)
+        minimax_h3::encoding::video_encoder_tile_arena(&config.video_vae, tile)
             .map_err(show)?
             .iter()
             .map(|buffer| buffer.bytes())
