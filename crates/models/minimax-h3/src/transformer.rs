@@ -42,7 +42,6 @@ pub struct Layer {
     gate_up: Linear,
     down: Linear,
     swiglu: PackedSwiGlu,
-    intermediate_size: u32,
     eps: f32,
 }
 
@@ -78,7 +77,6 @@ impl Layer {
             )?,
             down: projection(loader, &format!("{prefix}.ff.net.2.weight"), hidden, ffn)?,
             swiglu: PackedSwiGlu::new(None)?,
-            intermediate_size: config.intermediate_size,
             eps: config.norm_eps,
         })
     }
@@ -98,16 +96,13 @@ impl Layer {
         rows: TensorView,
         factors: Factors,
         visible: &Visible,
-        total_rows: u32,
+        scratch: &Scratch,
     ) -> Result<()> {
         let width = hidden.shape.last();
         let (shift_attention, scale_attention, gate_attention) = chunks(modulation, width, 0)?;
         let (shift_mlp, scale_mlp, gate_mlp) = chunks(modulation, width, 3)?;
-        let arena = f.arena();
-        let dtype = hidden.dtype;
-        let tokens = hidden.shape.dim(0);
-        let normalized = arena.tensor(dtype, Shape::new(&[tokens, width]))?;
-        let update = arena.tensor(dtype, Shape::new(&[tokens, width]))?;
+        let normalized = scratch.normalized;
+        let update = scratch.update;
 
         // Attention: normalize, attend, and fold the gated update into `out` while normalizing the
         // feed-forward's input.
@@ -115,7 +110,7 @@ impl Layer {
             ModulatedRmsNorm::new(self.norm1, shift_attention, scale_attention, None, self.eps)?;
         attention_norm.forward(f, hidden, None, rows, normalized, None, None)?;
         self.attention
-            .forward(f, normalized, factors, visible, total_rows, update)?;
+            .forward(f, normalized, factors, visible, &scratch.attention, update)?;
         let mlp_norm = ModulatedRmsNorm::new(
             self.norm2,
             shift_mlp,
@@ -127,9 +122,8 @@ impl Layer {
 
         // Feed-forward: the packed value and gate halves, the gated activation, the down
         // projection, and the second gated residual into the retained residual.
-        let ffn = u64::from(self.intermediate_size);
-        let packed = arena.tensor(dtype, Shape::new(&[tokens, 2 * ffn]))?;
-        let mlp = arena.tensor(dtype, Shape::new(&[tokens, ffn]))?;
+        let packed = scratch.packed;
+        let mlp = scratch.mlp;
         self.gate_up.forward(f, normalized, packed)?;
         self.swiglu.forward(f, packed, mlp, None)?;
         self.down.forward(f, mlp, update)?;
@@ -375,11 +369,12 @@ impl Transformer {
             Shape::new(&[u64::from(groups.count()) * 3, 6 * width]),
         )?;
         let mut alternate = arena.tensor(hidden.dtype, Shape::new(&[tokens, width]))?;
+        let scratch = Scratch::reserve(self, f, hidden, total_rows)?;
         let mut current = hidden;
         for (index, layer) in self.layers.iter().enumerate() {
             adaln.layer(f, index, entries, modulation)?;
             layer.forward(
-                f, current, alternate, modulation, rows, factors, visible, total_rows,
+                f, current, alternate, modulation, rows, factors, visible, &scratch,
             )?;
             std::mem::swap(&mut current, &mut alternate);
         }
@@ -391,6 +386,45 @@ impl Transformer {
             ));
         }
         Ok(())
+    }
+}
+
+/// Every temporary view the stack reads, reserved once for the whole forward.
+///
+/// The executor's arena is a bump allocator reset once per forward, so scratch that does not depend
+/// on the layer is reserved once: reserving it per layer would multiply the arena by the layer
+/// count, which a 50-layer stack cannot afford at a served canvas.
+pub struct Scratch {
+    normalized: TensorView,
+    update: TensorView,
+    packed: TensorView,
+    mlp: TensorView,
+    attention: attention::Scratch,
+}
+
+impl Scratch {
+    /// Reserve the stack's scratch for `hidden` `[tokens, width]` with a key set of `total_rows`.
+    pub fn reserve(
+        transformer: &Transformer,
+        f: &Forward,
+        hidden: TensorView,
+        total_rows: u32,
+    ) -> Result<Self> {
+        let arena = f.arena();
+        let dtype = hidden.dtype;
+        let tokens = hidden.shape.dim(0);
+        let width = hidden.shape.last();
+        let ffn = u64::from(transformer.config.intermediate_size);
+        let layer = transformer.layers.first().ok_or_else(|| {
+            Error::Unsupported("a stack with no layers has no scratch".to_owned())
+        })?;
+        Ok(Self {
+            normalized: arena.tensor(dtype, Shape::new(&[tokens, width]))?,
+            update: arena.tensor(dtype, Shape::new(&[tokens, width]))?,
+            packed: arena.tensor(dtype, Shape::new(&[tokens, 2 * ffn]))?,
+            mlp: arena.tensor(dtype, Shape::new(&[tokens, ffn]))?,
+            attention: attention::Scratch::reserve(&layer.attention, f, hidden, total_rows)?,
+        })
     }
 }
 
