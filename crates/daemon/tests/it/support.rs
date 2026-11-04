@@ -69,8 +69,10 @@ impl Engine {
                 peer: Some(hello::Peer::Engine(EnginePeer {
                     deployment: "deployment".into(),
                     // The harness client asks and claims; it is not a main process, so it names no
-                    // engine number and no command is addressed to it.
+                    // engine number, no interface and no link of one, and no command is addressed to
+                    // it.
                     engine: 0,
+                    interface: 0,
                 })),
             })
             .unwrap();
