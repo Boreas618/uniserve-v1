@@ -549,6 +549,80 @@ pub struct Submission {
 }
 
 /// Command sent from a frontend handler to the scheduler thread.
+/// Who asked for a stage: a caller that reads the step it applied at, or an
+/// engine command that is answered with whether it applied.
+///
+/// One path applies every stage; the answer shape is the only difference, so a
+/// stage has exactly one place where it changes the slot.
+#[derive(Debug)]
+pub(crate) enum StageAnswer {
+    /// A handle's `stage`, answered with the step it applied at.
+    Step(crossbeam_channel::Sender<Result<StageApplied, String>>),
+    /// An engine or program-layer command, answered with whether it applied.
+    Applied(crossbeam_channel::Sender<Result<(), String>>),
+}
+
+impl StageAnswer {
+    /// Sends `result`, dropping either the step or the detail as the caller's
+    /// shape requires.
+    pub(crate) fn send(self, result: Result<StageApplied, String>) {
+        match self {
+            Self::Step(answer) => {
+                let _ = answer.send(result);
+            }
+            Self::Applied(answer) => {
+                let _ = answer.send(result.map(|_| ()));
+            }
+        }
+    }
+}
+
+/// The step a §7.3 stage was applied at: the boundary where nothing was in
+/// flight, so the policy it replaced had decided its last batch.
+///
+/// Every rank of an expert group applies the stage at the same step: the ranks
+/// take their steps together, on the batches the union runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StageApplied {
+    /// The scheduler's step count when the stage applied.
+    pub step: u64,
+}
+
+/// What one scheduler has done and what its policy has cost (§12).
+///
+/// The step, batch and token counts come from the scheduler's own counters; the
+/// policy's calls and fuel are the serving instance's, carried across a
+/// switchover. `kernel_launches` and `device_ns` are the executor's: this
+/// mechanism sends zero rather than a number it did not measure, and they are
+/// filled when the executor edge reports them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Counters {
+    /// Policy steps taken; a step is one `observe` and one `dispatch`.
+    pub steps: u64,
+    /// Batches submitted to the executor.
+    pub batches: u64,
+    /// Tokens of those batches.
+    pub tokens: u64,
+    /// Fuel the scheduler's policy instances consumed.
+    pub policy_fuel: u64,
+    /// Guest calls into those instances.
+    pub policy_calls: u64,
+    /// Kernel launches the executor issued, zero until its edge reports them.
+    pub kernel_launches: u64,
+    /// Device time in those launches in nanoseconds, zero as above.
+    pub device_ns: u64,
+}
+
+/// The policy programs one scheduler holds (§7.3): the one serving, and the
+/// candidate a precopy prepared for the next switchover.
+#[derive(Debug, Clone, Default)]
+pub struct PolicyPrograms {
+    /// The program the serving policy was instantiated from.
+    pub running: Option<crate::scheduler::PolicyProgram>,
+    /// The program a precopy prepared, waiting for the switchover.
+    pub prepared: Option<crate::scheduler::PolicyProgram>,
+}
+
 pub enum Command {
     /// Admits requests in order and binds their event channels. The
     /// scheduler applies the whole command before it forms another batch, so
@@ -639,20 +713,41 @@ pub enum Command {
         source: std::sync::Arc<dyn crate::scheduler::PolicySource + Send + Sync>,
         answer: crossbeam_channel::Sender<Result<(), String>>,
     },
-    /// §7.3 step 3: the prepared policy answers from the next boundary.
-    SwitchoverPolicy {
+    /// One of §7.3's steps 3 to 6, applied at the next boundary where nothing
+    /// is in flight; the answer names the step it was applied at.
+    StagePolicy {
+        stage: crate::scheduler::Stage,
+        answer: StageAnswer,
+    },
+    /// One command of the program-layer update (§2.3, §7.3), applied as far as
+    /// one scheduler applies it: a stage, at the boundary its command names.
+    ProgramCommand {
+        command: ipc::ProgramCommand,
         answer: crossbeam_channel::Sender<Result<(), String>>,
     },
-    /// §7.3 step 6: forget the policy a revert could return to.
-    CommitPolicy,
-    /// §7.3 step 4: serve the previous policy again, instantiated on the
-    /// scheduler's current state.
-    RevertPolicy {
+    /// One of the epoch's engine commands, applied as far as one scheduler
+    /// applies it (§7.3): the stages yes, the rest answered with the reason.
+    EngineCommand {
+        command: proto::process::Command,
         answer: crossbeam_channel::Sender<Result<(), String>>,
     },
-    /// §7.3 step 6: drop the module a revert could have returned to.
-    PurgePolicy {
+    /// Asks that the following step's batches also run in shadow for the model
+    /// generation `generation` (§7.3 step 2): the executor compares the new
+    /// generation against the resident data and never writes resident memory.
+    /// Answered once one step's batches have been shadowed.
+    Shadow {
+        generation: u64,
         answer: crossbeam_channel::Sender<Result<(), String>>,
+    },
+    /// What this scheduler has done and what its policy has cost (§12): the
+    /// step and batch counters with the policy's calls and fuel.
+    Counters {
+        answer: crossbeam_channel::Sender<Counters>,
+    },
+    /// The program the slot serves and the one a precopy prepared, for the
+    /// handle the control thread holds (§7.3).
+    PolicyPrograms {
+        answer: crossbeam_channel::Sender<PolicyPrograms>,
     },
     /// §7.3 step 2's failure: the precopied generation is dropped and the
     /// serving policy kept.
@@ -1061,33 +1156,139 @@ impl CommandSender {
         done
     }
 
-    /// Puts the prepared policy in from the scheduler's next boundary (§7.3
-    /// step 3).
-    pub fn switchover_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
+    /// One of §7.3's steps 3 to 6, applied at the scheduler's next boundary,
+    /// and answered with the step it was applied at (§7.3: one batch boundary).
+    ///
+    /// A switchover with nothing prepared is refused at once; the others wait
+    /// for a boundary where no batch and no submission is in flight.
+    pub fn stage(
+        &self,
+        stage: crate::scheduler::Stage,
+    ) -> crossbeam_channel::Receiver<Result<StageApplied, String>> {
         let (answer, done) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::SwitchoverPolicy { answer });
+        let _ = self.send(Command::StagePolicy {
+            stage,
+            answer: StageAnswer::Step(answer),
+        });
         done
     }
 
-    /// Forgets the policy this scheduler could revert to (§7.3 step 6).
-    pub fn commit_policy(&self) {
-        let _ = self.send(Command::CommitPolicy);
+    /// A stage answered with whether it applied, for a caller that does not use
+    /// the step it applied at.
+    fn stage_applied(
+        &self,
+        stage: crate::scheduler::Stage,
+    ) -> crossbeam_channel::Receiver<Result<(), String>> {
+        let (answer, done) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::StagePolicy {
+            stage,
+            answer: StageAnswer::Applied(answer),
+        });
+        done
+    }
+
+    /// Puts the prepared policy in from the scheduler's next boundary (§7.3
+    /// step 3).
+    pub fn switchover_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.stage_applied(crate::scheduler::Stage::Switchover)
+    }
+
+    /// Ends the probation: the replaced policy stays until the next precopy
+    /// (§7.3 step 5).
+    pub fn commit_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.stage_applied(crate::scheduler::Stage::Commit)
     }
 
     /// Serves the previous policy again, on the scheduler's current state
     /// (§7.3 step 4).
     pub fn revert_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
-        let (answer, done) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::RevertPolicy { answer });
-        done
+        self.stage_applied(crate::scheduler::Stage::Revert)
     }
 
     /// Drops the module a revert could have returned to, once no batch uses it
     /// (§7.3 step 6).
     pub fn purge_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.stage_applied(crate::scheduler::Stage::Purge)
+    }
+
+    /// One command of the program-layer update, answered when this scheduler
+    /// applied it (§2.3, §7.3).
+    pub fn program_command(
+        &self,
+        command: ipc::ProgramCommand,
+    ) -> crossbeam_channel::Receiver<Result<(), String>> {
         let (answer, done) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::PurgePolicy { answer });
+        let _ = self.send(Command::ProgramCommand { command, answer });
         done
+    }
+
+    /// The epoch's engine command as this scheduler applies it (§7.3): the
+    /// stages are answered when they apply, and every other command is answered
+    /// with why it belongs to the engine process rather than to one scheduler.
+    pub fn engine_command(
+        &self,
+        command: proto::process::Command,
+    ) -> crossbeam_channel::Receiver<Result<(), String>> {
+        let (answer, done) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::EngineCommand { command, answer });
+        done
+    }
+
+    /// Runs the following step's batches in shadow for `generation` too (§7.3
+    /// step 2), answered once one step's batches have been shadowed.
+    pub fn shadow(&self, generation: u64) -> crossbeam_channel::Receiver<Result<(), String>> {
+        let (answer, done) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::Shadow { generation, answer });
+        done
+    }
+
+    /// What this scheduler has done and what its policy has cost (§12).
+    pub fn counters(&self) -> crossbeam_channel::Receiver<Counters> {
+        let (answer, counters) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::Counters { answer });
+        counters
+    }
+
+    /// The serving program and the prepared one (§7.3).
+    pub fn policy_programs(&self) -> crossbeam_channel::Receiver<PolicyPrograms> {
+        let (answer, programs) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::PolicyPrograms { answer });
+        programs
+    }
+
+    /// A request-path command, translated to the scheduler command that
+    /// carries it, and answered when it was enqueued.
+    ///
+    /// `Consumed` and `Takeover` are the connection's bookkeeping rather than a
+    /// scheduler's — the engine's routing holds the request's stream — so they
+    /// are refused here with that reason rather than silently dropped.
+    pub fn request_command(&self, command: proto::request::wire::Command) -> Result<(), String> {
+        use proto::request::wire::command::Kind;
+        let request = ipc::RequestId(command.request);
+        match command.kind {
+            Some(Kind::Cancel(_)) => self.cancel(request),
+            Some(Kind::Stop(_)) => self.stop(request),
+            Some(Kind::Acknowledge(acknowledge)) => {
+                self.acknowledge_at(request, acknowledge.output_tokens as usize);
+            }
+            Some(Kind::Abort(_)) => self.abort(request),
+            Some(Kind::Consumed(_)) => {
+                return Err(
+                    "a consumer's position is the connection's bookkeeping, which the engine's \
+                     routing holds, not a scheduler's"
+                        .to_owned(),
+                );
+            }
+            Some(Kind::Takeover(_)) => {
+                return Err(
+                    "a takeover moves a request's event stream between connections, which the \
+                     engine's routing holds, not a scheduler's"
+                        .to_owned(),
+                );
+            }
+            None => return Err("a request command names no kind".to_owned()),
+        }
+        Ok(())
     }
 
     /// Drops a precopied generation that failed or was abandoned (§7.3 step 2).
@@ -1281,6 +1482,49 @@ impl CommandSender {
             let _ = answer.send(Err("the scheduler stopped".to_owned()));
         }
         receiver
+    }
+}
+
+/// The policy slot of one scheduler thread, as the control thread holds it
+/// (§7.3).
+///
+/// The slot itself lives on the scheduler thread, which alone instantiates,
+/// adopts and reverts a policy; this handle asks that thread rather than reaching
+/// into its fields. A scheduler in the middle of a step answers when that step
+/// ends, so the call waits at most [`POLICY_SLOT_TIMEOUT`] and answers nothing
+/// rather than holding the caller.
+#[derive(Clone)]
+pub struct PolicySlotHandle {
+    commands: CommandSender,
+}
+
+/// How long a policy-slot question waits for the scheduler thread.
+const POLICY_SLOT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+
+impl PolicySlotHandle {
+    /// Wraps the command sender of the scheduler thread whose slot this is.
+    pub(crate) fn new(commands: CommandSender) -> Self {
+        Self { commands }
+    }
+
+    /// The serving program and the prepared one, in one answer.
+    pub fn programs(&self) -> PolicyPrograms {
+        self.commands
+            .policy_programs()
+            .recv_timeout(POLICY_SLOT_TIMEOUT)
+            .unwrap_or_default()
+    }
+
+    /// The program the serving policy was instantiated from, `None` before the
+    /// epoch's first switchover.
+    pub fn running(&self) -> Option<crate::scheduler::PolicyProgram> {
+        self.programs().running
+    }
+
+    /// The program a precopy prepared for the next switchover, `None` when none
+    /// waits.
+    pub fn prepared(&self) -> Option<crate::scheduler::PolicyProgram> {
+        self.programs().prepared
     }
 }
 

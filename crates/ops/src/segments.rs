@@ -953,3 +953,211 @@ fn stride(view: &TensorView, axis: usize) -> Result<i32> {
     i32::try_from(stride)
         .map_err(|_| Error::Shape(format!("the stride {stride} does not fit int32")))
 }
+
+/// One compilation of `vsa_scores`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ScoresDescriptor {
+    /// Element type of the pooled query and key rows; the scores are FP32.
+    pub dtype: DType,
+    /// Heads per row.
+    pub heads: u32,
+    /// Features per head: the contraction.
+    pub width: u32,
+    /// Lanes one program uses for the contraction, rounded up to a power of two.
+    pub block: u32,
+    /// Whether the module was compiled for programmatic dependent launch.
+    pub pdl: bool,
+}
+
+impl ScoresDescriptor {
+    /// The descriptor of a pooled-score product.
+    pub fn new(dtype: DType, heads: u32, width: u32, block: u32, pdl: bool) -> Self {
+        Self {
+            dtype,
+            heads,
+            width,
+            block,
+            pdl,
+        }
+    }
+}
+
+impl fmt::Display for ScoresDescriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Key::new()
+            .field("dtype", self.dtype)
+            .field("heads", self.heads)
+            .field("width", self.width)
+            .field("block", self.block)
+            .field("pdl", self.pdl)
+            .finish(formatter)
+    }
+}
+
+/// The arguments of `vsa_scores`.
+#[derive(Clone, Copy)]
+pub struct ScoresArgs {
+    /// `[heads, query tiles, width]` the pooled query rows, of the descriptor's dtype.
+    pub pooled_query: TensorView,
+    /// `[heads, key tiles, width]` the pooled key rows, of the descriptor's dtype.
+    pub pooled_key: TensorView,
+    /// `[heads, query tiles, key tiles]` FP32: one dot product per (query tile, key tile).
+    pub out: TensorView,
+}
+
+/// The pooled (query tile, key tile) similarities VSA's selection ranks.
+///
+/// This is the step between pooling and selection: `vsa_prepare_tiles` pools each tile's per-head
+/// means, `vsa_scores` contracts them per head, and `vsa_select_tiles` ranks the result. Without it
+/// the sparse path has no scores, and nothing else fills the gap: `gemm` has no batch axis, and the
+/// contraction is per head.
+///
+/// It is exactly a per-head dot product — no scale and no softmax, because the caller applies both
+/// afterwards (the selection only compares, and the attention scales its own products), so the
+/// program writes the raw sum of products and nothing else.
+pub struct VsaScores;
+
+impl Op for VsaScores {
+    const NAME: &'static str = "vsa_scores";
+
+    type Descriptor = ScoresDescriptor;
+    type Args<'a> = ScoresArgs;
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let width = u64::from(descriptor.width);
+        args.pooled_query.require_rank(Self::NAME, 3)?;
+        args.pooled_query
+            .require_row(Self::NAME, descriptor.dtype, width)?;
+        let heads = args.pooled_query.shape.dim(0);
+        if heads != u64::from(descriptor.heads) {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the pooled query has {heads} heads, the descriptor {}",
+                    descriptor.heads
+                ),
+            ));
+        }
+        if args.pooled_query.shape.dim(2) != width {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the pooled query is {} features wide, the descriptor {width}",
+                    args.pooled_query.shape.dim(2)
+                ),
+            ));
+        }
+        let query_tiles = args.pooled_query.shape.dim(1);
+        args.pooled_key.require_rank(Self::NAME, 3)?;
+        args.pooled_key
+            .require_row(Self::NAME, descriptor.dtype, width)?;
+        // Both operands name the same heads and the same contraction: a key pooled over another
+        // width would contract against the wrong features and produce plausible scores.
+        if args.pooled_key.shape.dim(0) != heads || args.pooled_key.shape.dim(2) != width {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the pooled key is [{}, {}, {}], the query's heads and width are [{heads}, _,                      {width}]",
+                    args.pooled_key.shape.dim(0),
+                    args.pooled_key.shape.dim(1),
+                    args.pooled_key.shape.dim(2)
+                ),
+            ));
+        }
+        let key_tiles = args.pooled_key.shape.dim(1);
+        if args.pooled_key.dtype != descriptor.dtype {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "expected {} pooled keys, found {}",
+                    descriptor.dtype, args.pooled_key.dtype
+                ),
+            ));
+        }
+        if args.out.dtype != DType::F32 {
+            return Err(Error::argument(
+                Self::NAME,
+                "the scores are FP32: the selection compares them".to_owned(),
+            ));
+        }
+        args.out
+            .require_shape(Self::NAME, Shape::new(&[heads, query_tiles, key_tiles]))?;
+        // The selection reads the scores as a contiguous `[heads, query tiles, tiles]` matrix, so
+        // this operator writes exactly that layout and no other.
+        if args.out.strides != crate::tensor::Strides::row_major(args.out.shape) {
+            return Err(Error::argument(
+                Self::NAME,
+                "the score matrix is written row-major".to_owned(),
+            ));
+        }
+        if u64::from(descriptor.block) < width.next_power_of_two() {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the descriptor's {} lanes cannot hold the {width}-feature contraction",
+                    descriptor.block
+                ),
+            ));
+        }
+
+        let mut arguments = Arguments::new();
+        arguments
+            .view(args.pooled_query)
+            .view(args.pooled_key)
+            .view(args.out)
+            .i32(query_tiles as i32)
+            .i32(key_tiles as i32)
+            .flag(descriptor.pdl);
+        // One program per (head, query tile): it walks the key tiles and writes one row of scores.
+        kernel.launch(
+            LaunchGrid::new([query_tiles, heads, 1])?,
+            &mut arguments,
+            stream,
+        )
+    }
+
+    fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
+        let _ = stream;
+        ScoresArgs {
+            out: twins.shadow_of(args.out),
+            ..args
+        }
+    }
+
+    fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
+        // The standard bound for the contraction and nothing else: `width` products per score,
+        // accumulated in FP32 and written as FP32, with no activation between them — so the reduction
+        // length is the feature width and the output's rounding is the accumulator's (whose `u` is
+        // already in the bound at FP32).
+        Tolerance::dot(u64::from(descriptor.width), DType::F32, DType::F32)
+    }
+}
+
+#[cfg(test)]
+mod scores_tests {
+    use super::*;
+
+    #[test]
+    fn the_key_names_the_contraction_and_the_lanes() {
+        let descriptor = ScoresDescriptor::new(DType::BF16, 8, 128, 128, false);
+        assert_eq!(
+            descriptor.to_string(),
+            "dtype_bf16_heads_8_width_128_block_128_pdl_false"
+        );
+    }
+
+    #[test]
+    fn the_bound_is_the_contraction_and_the_accumulator() {
+        // Two widths differ only in the reduction length, and the bound follows it: a wider
+        // contraction cannot share a bound with a narrower one, which is why `width` is a key field.
+        let narrow = VsaScores::tolerance(&ScoresDescriptor::new(DType::BF16, 8, 64, 64, false));
+        let wide = VsaScores::tolerance(&ScoresDescriptor::new(DType::BF16, 8, 256, 256, false));
+        assert!(wide.rtol > narrow.rtol);
+        assert_eq!(narrow.rtol, 0.0_f32.max(narrow.rtol));
+    }
+}

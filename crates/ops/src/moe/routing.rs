@@ -324,6 +324,12 @@ impl Op for ExpertGather {
         }
     }
 
+    /// Exact: the gather moves rows of an already-computed activation and rounds nothing.
+    ///
+    /// It reads the routing's `[tokens, top]` ids and writes `top` rows per token — an index
+    /// arithmetic, not a sum, so two implementations agree bit for bit. The rounding this operator
+    /// sits between belongs to `route_gemm` (before it) and `moe_unpermute` (after it), each of which
+    /// states its own reduction length.
     fn tolerance(_descriptor: &Self::Descriptor) -> Tolerance {
         Tolerance::exact()
     }

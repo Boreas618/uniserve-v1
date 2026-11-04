@@ -532,7 +532,7 @@ impl Scheduler {
         };
         let Some((worker, entry)) =
             self.placement
-                .select_worker(self.executor.as_ref(), &self.info, &call, &choice)
+                .select_worker(self.executor.inner(), &self.info, &call, &choice)
         else {
             self.invariant_broken("a planned call retains an executable component");
             return None;

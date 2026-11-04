@@ -77,6 +77,9 @@ pub(crate) enum Command {
     Revert(u64),
     /// Release the graphs that reference a generation older than this (7.3 step 6).
     Purge(u64),
+    /// Release everything that references a generation that was prepared and never served, which
+    /// is a generation *newer* than the serving one and so out of `Purge`'s reach (7.3 step 2).
+    Discard(u64),
     /// A storage owner's recorded issue work.
     Issue(std::sync::Arc<std::sync::Mutex<recorded::Batch>>),
     /// Wait for the events deferred storage release hangs on.
@@ -403,6 +406,7 @@ pub(crate) fn kind_of(command: &Command) -> JobKind {
         Command::Switchover(_) => JobKind::Switchover,
         Command::Revert(_) => JobKind::Revert,
         Command::Purge(_) => JobKind::Purge,
+        Command::Discard(_) => JobKind::Discard,
         Command::Issue(_) => JobKind::Issue,
         Command::After(_) => JobKind::After,
     }

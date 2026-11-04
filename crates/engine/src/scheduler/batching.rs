@@ -167,7 +167,7 @@ impl Scheduler {
             .get(&id)
             .map(|state| RequestKey::new(self.engine_id, id, state.request_epoch))?;
         self.placement.worker_target(
-            self.executor.as_ref(),
+            self.executor.inner(),
             &self.info,
             request_key,
             call.kind,
@@ -623,9 +623,70 @@ impl Scheduler {
             if kind == last {
                 batch.commands.extend(commands.iter().cloned());
             }
-            batches.push(self.finish_generation_batch(batch, submit_at));
+            let mut batch = self.finish_generation_batch(batch, submit_at);
+            self.attach_columns(&mut batch);
+            batches.push(batch);
         }
         batches
+    }
+
+    /// Attaches the batch's columns in the layout the kernels read (design
+    /// §4.3): the batch carries them, so the submission hands an executor one
+    /// value and nothing re-derives the layout from the calls.
+    ///
+    /// `max_kv_len` is the batch's worker group's `max_model_len`: the longest
+    /// sequence the model was built for, not the longest this batch carries,
+    /// because a KV view's shape must not move between steps.
+    ///
+    /// A fact the mechanism cannot state leaves the batch without columns: an
+    /// unusable page geometry, a worker group the mechanism has no info for, or
+    /// a call whose request state is gone. Such a batch is not servable, which
+    /// is what its `None` says; it is never filled with plausible values.
+    fn attach_columns(&self, batch: &mut ExecutionBatch) {
+        let Some(cache) = self.storage.cache() else {
+            return;
+        };
+        let Some(group) = cache.coordinator.groups().first() else {
+            return;
+        };
+        let (Ok(block_size), Ok(units_per_page)) = (
+            u32::try_from(group.block_size),
+            u32::try_from(group.units_per_page),
+        ) else {
+            return;
+        };
+        let page = slots::PageGeometry {
+            block_size,
+            units_per_page,
+        };
+        // The attention descriptor's static bound: the executor states it
+        // from the launch, since a KV view's shape must not move per batch.
+        let max_kv_len = self.executor.info().max_model_len;
+        if max_kv_len == 0 {
+            return;
+        }
+        let mut inputs = Vec::with_capacity(batch.requests.len());
+        let mut sampling = Vec::with_capacity(batch.requests.len());
+        for (call, placed) in &batch.requests {
+            let Some(state) = self.running.get(&call.request_key.request_id) else {
+                return;
+            };
+            // A decode's rows embed the token the request's own state continues
+            // from; every other token call states its tokens itself.
+            let tokens: Vec<i32> = match call.kind {
+                ipc::CallKind::Forward(ipc::ForwardMode::Decode) => (0..placed.forward.query_lens.len())
+                    .map(|_| i32::try_from(state.next_token).unwrap_or(-1))
+                    .collect(),
+                _ => call
+                    .input_token_ids
+                    .iter()
+                    .map(|token| i32::try_from(*token).unwrap_or(-1))
+                    .collect(),
+            };
+            inputs.push(tokens);
+            sampling.push(&state.req.sampling);
+        }
+        batch.columns = columns::columns(&batch.requests, &inputs, &sampling, page, max_kv_len);
     }
 
     /// Determines the next call kind without mutating request or resource state.

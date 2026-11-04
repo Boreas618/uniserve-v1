@@ -86,7 +86,7 @@ pub struct RequestPlacement {
 /// `WorkerExecutor` also uses this type for the part of a logical batch routed
 /// to one worker; that part keeps the logical `id`, so completions from every
 /// worker correlate to the same batch.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct ExecutionBatch {
     /// Logical batch identity used to correlate partial completions.
     pub id: u64,
@@ -103,6 +103,30 @@ pub struct ExecutionBatch {
     pub cache_inputs: Vec<ipc::CacheTransfer>,
     /// Published pages the batch writes to the host KV cache.
     pub page_offloads: Option<PageOffloads>,
+    /// The batch's columns in the layout the kernels read, filled when the
+    /// mechanism assembles the batch (design §4.3, `executor::BatchColumns`).
+    ///
+    /// The batch carries them so that a submission hands the executor one value
+    /// and nothing re-derives the layout from the calls. `None` means the
+    /// mechanism could not state them — a batch no executor may serve, as
+    /// opposed to one served on invented values.
+    pub columns: Option<executor::batch::BatchColumns>,
+}
+
+/// Batches compare by what the mechanism decided: their identity, their
+/// calls and their commands. The columns are that decision's projection into
+/// the executor's layout (equal calls project equally, and a batch with none
+/// is the unservable one), so equality states only whether both carry them.
+impl PartialEq for ExecutionBatch {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.requests == other.requests
+            && self.commands == other.commands
+            && self.input_transfers == other.input_transfers
+            && self.cache_inputs == other.cache_inputs
+            && self.page_offloads == other.page_offloads
+            && self.columns.is_some() == other.columns.is_some()
+    }
 }
 
 /// Published pages one worker group writes to the host KV cache, for
@@ -132,6 +156,7 @@ impl ExecutionBatch {
             input_transfers,
             cache_inputs: Vec::new(),
             page_offloads: None,
+            columns: None,
         }
     }
 
@@ -282,6 +307,9 @@ impl ExecutionBatch {
             input_transfers: input_products,
             cache_inputs,
             page_offloads,
+            // The worker-process wire batch carries no columns: they are the
+            // in-process executor's layout, not the wire protocol's.
+            columns: _,
         } = self;
         let mut block_tables = Vec::new();
         let mut new_cache_units = Vec::new();
