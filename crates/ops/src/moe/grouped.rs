@@ -605,7 +605,9 @@ pub struct GatherGemmNvfp4Descriptor {
     /// Element type of the activations and of the output. The weights are packed, so this is the
     /// unpacked element type rather than the stored one.
     pub dtype: DType,
-    /// Element type of the block scales, as the checkpoint stores them.
+    /// Element type of the block scales, as the checkpoint stores them: `F8_E4M3` for a ModelOpt
+    /// export, `U8` for a shard that already holds the codes. One byte either way, and never
+    /// assumed — the loader passes the shard's own type.
     pub scale: DType,
     /// The block-scale layout the checkpoint uses.
     pub layout: ScaleLayout,
