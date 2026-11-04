@@ -52,9 +52,14 @@ extern "C" int32_t uniserve_moe_unpermute(const uniserve_unpermute_call* call, v
   const auto hidden = static_cast<int32_t>(call->hidden);
   const cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
 
-  // The routes are indexed by `expanded_to_permuted`, so the kernel reads them
-  // as the permuted rows they are; the dependent launch is on, which is how the
-  // sort, the GEMMs and this combine overlap in one captured graph.
+  // `routes` is read as the **permuted** buffer and indexed by `expanded_to_permuted`, which is
+  // what this entry has always done and what the encoded chain's `route_gemm` writes.
+  //
+  // The dense `route_gemm` writes the opposite convention: one row per **expanded** route, at
+  // `expanded_rows`. The two cannot share one module, and the choice is compiled in, so it belongs
+  // in the descriptor as a field rather than in this constant - until it is, a dense deployment's
+  // combine reads permuted indices out of an expanded buffer, which is a read far past its end
+  // whenever the padded permuted bound exceeds the expanded route count.
   constexpr bool kInputIsExpanded = false;
   constexpr bool kEnablePdl = true;
 
