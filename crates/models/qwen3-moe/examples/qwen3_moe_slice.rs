@@ -2125,12 +2125,16 @@ fn post_attention_state(
     batch: &TokenBatch,
     plan: &Plan,
 ) -> Result<TensorView> {
-    let (Some(dir), Some(from)) = (args.reference.as_deref(), args.from) else {
+    let Some(dir) = args.reference.as_deref() else {
         return Err(Failure::message(
             "a routing or score cut runs on the reference's post-attention state, which the run \
-             cannot rebuild: pass --reference <dir> and --from <layer>",
+             cannot rebuild: pass --reference <dir>",
         ));
     };
+    // A run that named no `--from` starts at the embedding, and the state's residual half is the
+    // stage the layer would still be handed: `hidden_layer` is that stage in both cases, so the cut
+    // reads it from the reference either way rather than from the run's rows.
+    let from = args.from.unwrap_or(layer);
     if from != layer {
         return Err(Failure::message(format!(
             "--from {from} runs layer {from}, so it has no state for layer {layer}"
