@@ -52,7 +52,7 @@ A change of the served model name is refused because it names the deployment. A 
 
 ### An epoch and its generations
 
-The daemon keeps one record per epoch it knows: the build config, the programs it filled, the trial's policy, and a status (`Precopy`, `Serving`, `Probation`, `Purged`). The record names the launch generation that serves the epoch once a child reports it; the child numbers its own launch and the daemon never invents one. Every node's main process is a child of that node's daemon at a launch generation of the deployment's group and rank, taken from one counter per group and rank: the serving epoch's parked standby takes the next generation, the target epoch the one after, and a relaunch the next. The daemon writes each child's launch file (`crates/daemon/src/engine/launch.rs`) with that generation in its `engine` field.
+The daemon keeps one record per epoch it knows: the build config, the programs it filled, the trial's policy, and a status (`Precopy`, `Serving`, `Probation`, `Purged`). The record names the generation the epoch's main processes gave the programs they execute, once a child reports it — a model generation, not a process's identity; the child numbers its own programs and the daemon never invents one. A process's identity is its launch generation, below. Every node's main process is a child of that node's daemon at a launch generation of the deployment's group and rank, taken from one counter per group and rank: the serving epoch's parked standby takes the next generation, the target epoch the one after, and a relaunch the next. The daemon writes each child's launch file (`crates/daemon/src/engine/launch.rs`) with that generation in its `engine` field.
 
 ### The switch
 
