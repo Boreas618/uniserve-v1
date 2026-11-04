@@ -1,0 +1,37 @@
+[package]
+name = "executor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The executor half of the main process: the resident-memory owners, the
+# transfer mechanisms, capacity, host groups, and the section 8 keys of the
+# Storage Server's derived state. The runners, graphs and arenas that issue
+# device work live beside these modules in the same crate.
+[dependencies]
+bytemuck.workspace = true
+platform.workspace = true
+indexmap.workspace = true
+ipc.workspace = true
+libc.workspace = true
+libloading.workspace = true
+nvtx.workspace = true
+nn.workspace = true
+ops.workspace = true
+proto.workspace = true
+rustix = { workspace = true, features = ["fs", "pipe", "system"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+storage.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

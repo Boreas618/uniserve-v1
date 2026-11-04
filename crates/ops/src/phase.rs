@@ -14,7 +14,9 @@
 use std::fmt;
 
 /// The phase of a request a call belongs to.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum PhaseKind {
     /// One forward over the whole prompt.

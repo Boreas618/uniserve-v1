@@ -65,6 +65,13 @@ impl Noise {
     /// `stage` and `draw` place the draw within the request's schedule so that two draws never
     /// coincide; under [`Key::Scalar`] they keep the values a pure function of `(seed, element)`
     /// for the request, since they are fixed for the launch.
+    ///
+    /// `offset` is the element of the request's stream this draw starts at. The reference draws
+    /// every condition, the video latent and the audio latent through one Philox stream, so a
+    /// caller that draws part of it — a rank's shard of the latent, or the audio after the video —
+    /// passes the global flat index it begins at, and two draws at adjacent offsets reproduce one
+    /// longer draw. An odd offset is legal and takes the high half of a word first; a caller with a
+    /// whole buffer of its own passes 0.
     pub fn draw(
         &self,
         f: &Forward,
@@ -72,6 +79,7 @@ impl Noise {
         key: Key,
         stage: u32,
         draw: u32,
+        offset: u64,
     ) -> Result<()> {
         let (source, keys, seed) = match key {
             Key::Rows(keys) => {
@@ -101,6 +109,7 @@ impl Noise {
             key: seed,
             stage,
             draw,
+            offset,
         };
 
         f.operate::<NoiseOp>(&descriptor, args)
