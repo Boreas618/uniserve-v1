@@ -228,7 +228,64 @@ def renormalization_note(actual, expected):
             " - one factor on every row, the shape a weight vector has when it was not normalized"
             " over the top k"
         )
-    return note
+    return note + logit_scale_note(actual, expected)
+
+
+def logit_scale_note(actual, expected):
+    """The logit scale and the constant factor, fitted from the weights alone.
+
+    A weight is a normalized exponential of a score, so if our scores were the reference's times `a`,
+    our weights are the reference's raised to `a` and renormalized: `log(ours) = a * log(ref) + c`
+    holds to the rounding, and a least-squares fit over a row's entries recovers both. `a` different
+    from 1 is a score that was scaled on the way in; `a` equal to 1 with `exp(c)` away from 1 is a
+    factor applied after the exponential. Neither needs the logits, which our side does not write.
+    """
+    ours = np.asarray(actual, dtype=np.float64)
+    reference = np.asarray(expected, dtype=np.float64)
+    if ours.shape != reference.shape or ours.ndim != 2:
+        return ""
+    slopes, offsets = [], []
+    for row in range(ours.shape[0]):
+        positive = (ours[row] > 0.0) & (reference[row] > 0.0)
+        if positive.sum() < 3:
+            continue
+        x = np.log(reference[row][positive])
+        y = np.log(ours[row][positive])
+        slope, intercept = np.polyfit(x, y, 1)
+        slopes.append(slope)
+        offsets.append(intercept)
+    if not slopes:
+        return ""
+    slopes = np.asarray(slopes)
+    offsets = np.asarray(offsets)
+    # The widest pair is the most stable estimate, because adjacent weights differ by little and
+    # their ratio carries the rounding: take each row's largest and smallest positive weight.
+    pairs = []
+    for row in range(ours.shape[0]):
+        positive = (ours[row] > 0.0) & (reference[row] > 0.0)
+        if positive.sum() < 2:
+            continue
+        mine = ours[row][positive]
+        theirs = reference[row][positive]
+        high, low = int(np.argmax(theirs)), int(np.argmin(theirs))
+        if theirs[high] / theirs[low] < 10.0:
+            continue
+        pairs.append(np.log(mine[high] / mine[low]) / np.log(theirs[high] / theirs[low]))
+    note = (
+        f"; fitted log(ours) = a*log(ref) + c over every positive entry gives a = "
+        f"{np.median(slopes):.4f} ({slopes.min():.4f} to {slopes.max():.4f}) and exp(c) = "
+        f"{np.exp(np.median(offsets)):.4f}"
+    )
+    if pairs:
+        note += (
+            f"; from the widest pair of each row a = {np.median(pairs):.4f} "
+            f"({min(pairs):.4f} to {max(pairs):.4f})"
+        )
+    return note + (
+        " - a = 1 with exp(c) != 1 is a factor applied after the exponential, a != 1 is a score that"
+        " was scaled on the way in, and a row sum of 1.0 alone does not clear the scores:"
+        " renormalization makes the sum 1 whatever the scale is"
+    )
 
 
 def compare_ids(actual, expected, scores):
