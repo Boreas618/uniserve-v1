@@ -1302,8 +1302,10 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         }
         // A prepared generation that never took over: its graphs go, and with them the kernels
         // they held. The serving generation's graphs, arena plans and sampler regions stay
-        // exactly as they were, so an abandoned update cannot disturb a batch in flight.
-        let dropped = self.graphs.purge(generation);
+        // exactly as they were, so an abandoned update cannot disturb a batch in flight. This is
+        // `discard`, not `purge`: an abandoned generation is one nobody serves from, so its whole
+        // set goes whatever its number is beside the serving one.
+        let dropped = self.graphs.discard(generation);
         let dropped_count = dropped.len();
         if self.next.as_ref().map(|next| next.number()) == Some(generation) {
             self.next = None;
@@ -1403,7 +1405,7 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         // region released under a live executable would be reused by the next generation's
         // capture while the old graph still addressed it. Exactly this generation's graphs go - a
         // released generation may be numbered either side of the serving one.
-        let dropped = self.graphs.purge(generation);
+        let dropped = self.graphs.purge(generation, self.generation.number());
         let dropped_count = dropped.len();
         let mut released = 0u64;
         // Both generations' graphs can address one bucket's plan: the pool records a plan per

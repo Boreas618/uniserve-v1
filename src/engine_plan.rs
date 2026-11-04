@@ -207,7 +207,7 @@ impl EpochPlan {
     /// the shadow pair's region are carved from (7.3). The resident pool is reserved by whoever
     /// carves it - `Memory`, through `Executor::pools()` - so the graph storage asks for none: a
     /// second figure here would be a second claim on the same bytes.
-    pub(crate) fn graph(&self, device: DeviceId) -> Result<GraphStorage> {
+    pub(crate) fn graph(&self, device: DeviceId, resident: u64) -> Result<GraphStorage> {
         let handle = platform::Device::new(device)
             .with_context(|| format!("opening device {}", device.0))?;
         let storage = handle.memory_info()?;
@@ -239,7 +239,7 @@ impl EpochPlan {
         // scratch. The second pool is a reservation until a preparation captures into it, so it is
         // not part of this test - a deployment with room for one pool starts and serves, and an
         // update that needs the second one is refused by name when it maps.
-        let needs = bytes / 2 + scratch;
+        let needs = bytes / 2 + scratch + resident;
         if budget < needs {
             bail!(
                 "device {} has {budget} bytes left of {total} once the model is mapped, at \
@@ -256,7 +256,11 @@ impl EpochPlan {
             // of it, so the graph reservation is not divided among streams.
             streams: 1,
             scratch,
-            resident: 0,
+            // The KV pool: the units the capacity plan fitted, each the size of a cache unit. This
+            // rank keeps its keys and values in the process - that is what a prefix cache is - so
+            // the figure is the plan's and not zero. A pool whose figure is zero is not reserved,
+            // and a KV provider that asks for it is refused by name.
+            resident,
         })
     }
 
@@ -309,7 +313,19 @@ impl EpochPlan {
                     .map(|device| device.0.to_string())
                     .collect(),
             ),
-            hosts: None,
+            // The engine's facts want one host name per rank, and the launch file states the
+            // rank's devices but not which host each rank sits on - it cannot, a launch file is
+            // per node. A world of one therefore has exactly one host and this node is it; the
+            // name is the machine's own rather than an invented string, so a report, a log or a
+            // transfer that names the host names the host.
+            //
+            // A world of more ranks needs the real names for placement and for cross-host weight
+            // transfer, and a guess there would be worse than the refusal: the fact stays absent
+            // and `EngineConfig::of` names what the launch file owes it.
+            hosts: match self.world_size {
+                1 => Some(vec![host_name()?]),
+                _ => None,
+            },
             peers: None,
             max_running_requests: Some(self.build.max_running_requests.get()),
             max_batch: Some(rows as usize),
@@ -429,7 +445,7 @@ impl EpochPlan {
         &self,
         weights: &mut dyn nn::RetainedWeights,
         storage: &mut dyn executor::memory::retained::ExclusiveStorage,
-    ) -> Result<(Arc<qwen3_moe::Qwen3Moe>, Memory)> {
+    ) -> Result<(Arc<qwen3_moe::Qwen3Moe>, Memory, ipc::WorkerInfo)> {
         let placement = &self.placement;
         let class = architectural_class(&self.checkpoint)?;
         match class.as_str() {
@@ -452,8 +468,8 @@ impl EpochPlan {
                     &mut loader,
                     placement.load_options,
                 )?;
-                let memory = self.open_memory(&model, storage)?;
-                Ok((Arc::new(model), memory))
+                let (memory, info) = self.open_memory(&model, storage)?;
+                Ok((Arc::new(model), memory, info))
             }
             other => bail!(
                 "{} declares model class {other}, which this build cannot serve",
@@ -474,7 +490,7 @@ impl EpochPlan {
         &self,
         model: &qwen3_moe::Qwen3Moe,
         storage: &mut dyn executor::memory::retained::ExclusiveStorage,
-    ) -> Result<Memory> {
+    ) -> Result<(Memory, ipc::WorkerInfo)> {
         let device = *self
             .devices
             .first()
@@ -524,11 +540,18 @@ impl EpochPlan {
         let group = executor::parallel::host::HostGroup::single(self.rank as usize);
         let report = rank_report(device, &host)?;
         let planned = executor::capacity::plan_rank(&facts, report, &group)?;
-        let graph = self.graph(device)?;
+        // The keys and values the plan fitted are the process's resident pool: a unit is a cache
+        // unit, and the plan charged them all against the same device allowance the pools are
+        // booked against. A plan that fitted no cache (a rank that serves none) states zero.
+        let resident = match (&planned.plan.cache, planned.plan.info.prefix_cache.as_ref()) {
+            (Some(cache), Some(info)) => u64::from(info.num_units) * cache.unit_bytes,
+            _ => 0,
+        };
+        let graph = self.graph(device, resident)?;
         let pools = executor::device::Executor::open(device, &graph)?;
         let stream = platform::Stream::new(device)
             .with_context(|| format!("creating device {}'s stream", device.0))?;
-        executor::memory::open_memory(
+        let memory = executor::memory::open_memory(
             executor::memory::OpenMemory {
                 plan: &planned.plan,
                 // A causal-language rank keeps no per-slot bank: its per-request state is the KV
@@ -546,11 +569,27 @@ impl EpochPlan {
             },
             storage,
         )
-        .map_err(|error| error).context("opening the rank's resident memory")
+        .map_err(|error| error)
+        .context("opening the rank's resident memory")?;
+        // The plan's own account of this rank is what the scheduler is told about its pool: the
+        // capacities it fitted, the cache it holds and where it is. It is the same `WorkerInfo` the
+        // deployment's other ranks report, so the scheduler plans against one description of a
+        // rank rather than a second one derived here.
+        Ok((memory, planned.plan.info.clone()))
+    }
+
+    /// Requests this rank's scheduler may have in flight (launch: `scheduling.max_running_requests`).
+    pub(crate) fn queue_depth(&self) -> usize {
+        self.queue_depth
+    }
+
+    /// The ranks of this process's group; one process holds one pool, so it is the deployment's.
+    pub(crate) fn world_size(&self) -> usize {
+        self.world_size
     }
 
     /// The keys a row reads at most: the cache's bound, from the epoch's context length.
-    fn max_kv_len(&self, model: &qwen3_moe::Qwen3Moe) -> Result<u32> {
+    pub(crate) fn max_kv_len(&self, model: &qwen3_moe::Qwen3Moe) -> Result<u32> {
         match self.build.max_model_len {
             Some(length) => Ok(length.get()),
             None => u32::try_from(model.config().max_position_embeddings)
