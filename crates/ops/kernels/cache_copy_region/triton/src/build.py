@@ -13,8 +13,10 @@ the field's units per column are launch words.
 import _compile
 import cache_copy_region as kernels
 
-#: Triton's element type for each stored type the operator accepts, and its byte width.
-STORED = {"bf16": ("bf16", 2), "f16": ("fp16", 2)}
+#: Triton's element type for each stored type the operator accepts, and its byte width. An FP8 pool
+#: is addressed as bytes: Triton's signature table has no pointer to a float8, so the kernel bitcasts
+#: the byte to `tl.float8e4nv` itself.
+STORED = {"bf16": ("bf16", 2), "f16": ("fp16", 2), "f8e4m3": ("u8", 1)}
 
 
 def warps_of(row_size):
@@ -25,6 +27,12 @@ def warps_of(row_size):
 def spec(fields, parameters, target):
     """The compilation of one cache_copy_region descriptor."""
     stored, element_bytes = STORED[fields["element"]]
+    scaled = fields["scaled"] == "true"
+    if scaled != (fields["element"] == "f8e4m3"):
+        raise SystemExit(
+            f"{fields['scaled']} with {fields['element']}: an FP8 destination is the scaled one, "
+            "and a dense destination stores the values themselves"
+        )
     heads = int(fields["heads"])
     head_dim = int(fields["head_dim"])
     plane_bytes = int(fields["plane_bytes"])
@@ -46,9 +54,10 @@ def spec(fields, parameters, target):
         "kernel": kernels._cache_copy_region_kernel,
         "signature": {
             "values_ptr": "*" + stored,
-            # A dense pool passes no scale view; the operator's flag slot then carries the
-            # initialized view's address, so this pointer is declared with that view's type.
-            "scale_ptr": "*u8",
+            # The per-unit F32 scale. A dense pool passes no scale view and the operator's flag
+            # slot then carries the initialized view's address; the value is never read as a scale
+            # because `SCALED` is false, and the pointer is only ever dereferenced in that branch.
+            "scale_ptr": "*fp32" if scaled else "*u8",
             "initialized_ptr": "*u8",
             "source_ptr": "*fp32",
             "units_ptr": "*i32",
@@ -60,6 +69,7 @@ def spec(fields, parameters, target):
             "PLANE_ELEMENTS": "constexpr",
             "COLUMNS": "constexpr",
             "BF16": "constexpr",
+            "SCALED": "constexpr",
             "BLOCK": "constexpr",
             "PDL": "constexpr",
         },
@@ -69,6 +79,7 @@ def spec(fields, parameters, target):
             "PLANE_ELEMENTS": plane_elements,
             "COLUMNS": int(fields["columns"]),
             "BF16": 1 if fields["element"] == "bf16" else 0,
+            "SCALED": 1 if scaled else 0,
             "BLOCK": row_pow2,
             "PDL": pdl,
         },
