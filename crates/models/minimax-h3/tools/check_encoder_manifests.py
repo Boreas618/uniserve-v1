@@ -102,6 +102,23 @@ KEY_FIELDS: dict[str, tuple[str, ...]] = {
         "stepwise",
     ),
     "layer_norm/triton": ("dtype", "columns", "tile", "bias", "pdl"),
+    # Four operators whose fields the call sites state outright - no `row_tile` and no width-derived
+    # tile among them - so a key computed here is the call's own key and not a second implementation
+    # of `nn`. Two of the day's three store gaps were rows of these shapes: a `gelu` at the merger's
+    # width and a `scaled_residual` at the text stack's.
+    "embedding/triton": ("dtype", "ids", "hidden", "first", "rows", "block", "pdl"),
+    "gelu/triton": ("dtype", "columns", "block", "approximate", "pdl"),
+    "scaled_residual/triton": ("dtype", "columns", "block", "update_bias"),
+    "rope_apply/triton": (
+        "dtype",
+        "output",
+        "head_dim",
+        "heads",
+        "rotation",
+        "rows",
+        "block",
+        "pdl",
+    ),
 }
 
 # One call: the package, the fields its descriptor carries, and why it carries them.
@@ -233,6 +250,24 @@ def text_calls(text: dict, dtype: str) -> list[Call]:
             "text_encoder.rs: the gated MLP's activation",
         )
     )
+    # The token table the prompt is gathered from: one row per vocabulary id, `hidden` wide, and
+    # eight ids per program. Its key carries the table's shape, not the request's token count, so one
+    # row covers every prompt (`embedding.rs:93`).
+    calls.append(
+        (
+            "embedding/triton",
+            {
+                "dtype": dtype,
+                "ids": "i32",
+                "hidden": str(hidden),
+                "first": "0",
+                "rows": str(text["vocab_size"]),
+                "block": "8",
+                "pdl": "false",
+            },
+            "text_encoder.rs: the token embedding the prompt is gathered from",
+        )
+    )
     # The language stack's residual stream: each retained layer's down projection folded into
     # `[tokens, hidden]` before the next layer's norm. It is the *text* width, and the tower's own
     # residual (below) is 1152 - two rows, neither covering the other.
@@ -292,13 +327,16 @@ def tower_calls(vision: dict, dtype: str) -> list[Call]:
                 "head_dim": str(head_dim),
                 "heads": str(heads),
                 "rotation": "half",
+                "rows": "8",
                 "block": "128",
+                "pdl": "false",
             },
             "vision.rs: the tower's own rotation, host-computed factors",
         ),
         (
             "gelu/triton",
-            {"dtype": dtype, "columns": str(ffn), "approximate": "tanh"},
+            {"dtype": dtype, "columns": str(ffn), "block": "1024", "approximate": "tanh",
+             "pdl": "false"},
             "vision.rs: the MLP's activation",
         ),
         (
@@ -310,7 +348,9 @@ def tower_calls(vision: dict, dtype: str) -> list[Call]:
             {
                 "dtype": dtype,
                 "columns": str(merge * merge * hidden),
+                "block": "1024",
                 "approximate": "exact",
+                "pdl": "false",
             },
             "vision.rs: the patch merger's activation",
         ),
