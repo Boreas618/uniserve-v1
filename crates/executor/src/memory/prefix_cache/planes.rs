@@ -1099,6 +1099,32 @@ impl CachePlanes {
         )
     }
 
+    /// The bytes the pool's planes map on the device: the two value planes, and
+    /// the flag and scale planes of a quantized pool.
+    ///
+    /// This is the `resident` side of the device's storage for the metrics
+    /// report, so it counts mapped storage only: a sleeping rank's released
+    /// segments are not in it.
+    pub fn mapped_bytes(&self) -> u64 {
+        let values = self
+            .values
+            .iter()
+            .map(|storage| storage.bytes() as u64)
+            .sum::<u64>();
+        let initialized = self
+            .initialized
+            .iter()
+            .map(|storage| storage.bytes() as u64)
+            .sum::<u64>();
+        let scales = self.scales.as_ref().map_or(0, |scales| {
+            scales
+                .iter()
+                .map(|storage| storage.bytes() as u64)
+                .sum::<u64>()
+        });
+        values + initialized + scales
+    }
+
     /// Tokens one page of `group` holds, which every per-page view is sized by.
     pub fn page_size(&self, group: usize) -> Result<u32> {
         self.plan
