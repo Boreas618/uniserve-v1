@@ -1070,6 +1070,38 @@ const RELATIVE_BUDGET: f64 = 0.05;
 /// and every row below it would be read as a defect in a layer that is not being measured.
 const EMBEDDING_BUDGET: f64 = 1e-3;
 
+/// Up to how many rows a comparison prints one by one.
+const ROW_DETAIL_LIMIT: usize = 32;
+
+/// One row's magnitude against another's, and the cosine between them.
+///
+/// The magnitude ratio says how much of the row is there; the cosine says whether what is there
+/// points the same way. A defect that scales a row moves the first and leaves the second at 1, and a
+/// defect that replaces part of a row moves both — which is why the pair is printed together.
+fn row_shape(mine: &[f32], other: &[f32]) -> (f64, f64) {
+    let mut dot = 0.0_f64;
+    let mut squares = 0.0_f64;
+    let mut theirs = 0.0_f64;
+    for (one, two) in mine.iter().zip(other.iter()) {
+        let one = f64::from(*one);
+        let two = f64::from(*two);
+        dot += one * two;
+        squares += one * one;
+        theirs += two * two;
+    }
+    let ratio = if theirs > 0.0 {
+        (squares / theirs).sqrt()
+    } else {
+        f64::INFINITY
+    };
+    let cosine = if squares > 0.0 && theirs > 0.0 {
+        dot / (squares.sqrt() * theirs.sqrt())
+    } else {
+        0.0
+    };
+    (ratio, cosine)
+}
+
 /// `hidden_NN`'s stage: the embedding's output at zero, then one layer per file.
 fn stage_name(index: usize) -> String {
     match index {
@@ -1159,6 +1191,22 @@ fn report_stage(
         )));
     }
     let (relative, worst, scale, ours) = distance(values, &theirs);
+    // Per row, because a deficit that is one scalar everywhere and a deficit that is scattered
+    // across rows are different defects and the aggregate cannot tell them apart: a row's ratio is
+    // its magnitude against the reference's, and its cosine is its direction. Fifteen rows is the
+    // harness's regime, so the detail is free.
+    if rows <= ROW_DETAIL_LIMIT {
+        for row in 0..rows {
+            let mine = &values[row * width..(row + 1) * width];
+            let other = &theirs[row * width..(row + 1) * width];
+            let (ratio, cosine) = row_shape(mine, other);
+            println!(
+                "  row {row:2}: norm {:.4e} against {:.4e} — ratio {ratio:.4}, cosine {cosine:+.5}",
+                rms(mine),
+                rms(other)
+            );
+        }
+    }
     let increment = table.push(index, relative);
     let marker = if relative > RELATIVE_BUDGET {
         "  <-- past the tripwire"
