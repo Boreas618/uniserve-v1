@@ -444,10 +444,9 @@ fn claim(
         peers: Vec::new(),
         world: launch.world,
         // The standby role is the epoch layer's (§2.5, §7.4): a standby maps its scope's storage
-        // read-only until it is promoted. Nothing the launch file states tells this process it is
-        // one, and claiming writable storage as a standby would give the scope two writers - so the
-        // role has to be stated before this process ever starts as a standby.
-        standby: false,
+        // read-only until it is promoted, and claiming it writable would give the scope two
+        // writers. The launch file states the role, so the process never has to infer it.
+        standby: launch.standby,
         standby_storage: ipc::StandbyStorage::Auto,
     })
 }
@@ -1095,7 +1094,11 @@ impl MainProcess {
                     self.send_report(proto::process::Report {
                         kind: Some(proto::process::report::Kind::Parked(
                             proto::process::Parked {
-                                generation: current,
+                                // The daemon's epoch layer promotes a child by its
+                                // launch generation: this process's own number, not
+                                // the program generation (which is zero until a
+                                // `Precopy` names one).
+                                generation: self.control.engine(),
                             },
                         )),
                     });
@@ -1106,7 +1109,7 @@ impl MainProcess {
                     self.send_report(proto::process::Report {
                         kind: Some(proto::process::report::Kind::Promoted(
                             proto::process::Promoted {
-                                generation: current,
+                                generation: self.control.engine(),
                             },
                         )),
                     });
