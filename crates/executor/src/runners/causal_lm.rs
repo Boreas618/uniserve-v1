@@ -16,6 +16,7 @@
 //! bucket adds one sequence holding every padding token and then empty sequences, so no padding
 //! token writes the KV cache.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use ipc::PhaseId;
@@ -24,7 +25,9 @@ use ops::Generation;
 use platform::DeviceId;
 
 use crate::arena::{Pools, StreamId};
-use crate::batch::{Batch, BatchColumns, BatchOutput, Job, Jobs, SampledToken};
+use crate::batch::{
+    Batch, BatchCall, BatchColumns, BatchOutput, CallId, Job, Jobs, SampledToken,
+};
 use crate::captured::Captured;
 use crate::graph::Graphs;
 use crate::plan::{Bucket, Buckets, Shape, Variant};
@@ -149,18 +152,16 @@ impl Staging {
     /// The shape staged by the last [`Staging::stage`].
     /// The row indices a token is sampled for, in batch order (4.4's sampling rows).
     pub fn logits_rows(&self, rows: usize) -> Vec<u32> {
-        self.columns
-            .as_ref()
-            .map(|columns| columns.logits_rows.iter().copied().take(rows).collect())
-            .unwrap_or_default()
+        self.logits_rows
+            .iter()
+            .copied()
+            .filter(|row| (*row as usize) < rows.max(self.logits_rows.len()))
+            .collect()
     }
 
     /// The batch's calls, which name the request each row belongs to.
-    pub fn calls(&self) -> &[crate::batch::BatchCall] {
-        self.columns
-            .as_ref()
-            .map(|columns| columns.calls.as_slice())
-            .unwrap_or_default()
+    pub fn calls(&self) -> &[BatchCall] {
+        &self.calls
     }
 
     pub fn staged(&self) -> Option<Shape> {
@@ -238,6 +239,8 @@ pub struct CausalLmRunner<M: CausalLm> {
     stream: platform::Stream,
     /// Where shadow execution's twins live, allocated at bind, before the first capture.
     shadow: Option<crate::shadow::Shadow>,
+    /// The sampler output of every bucket that samples, addressed in its plan (4.4).
+    samplers: HashMap<Bucket, SamplerBuffer>,
 }
 
 impl<M: CausalLm> CausalLmRunner<M> {
@@ -271,6 +274,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             device,
             stream,
             shadow: None,
+            samplers: HashMap::new(),
         })
     }
 
@@ -519,6 +523,12 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 held.push(Arc::clone(kernel));
             }
         }
+        if bucket.variant.samples() {
+            // The sampler output is the plan's first block; the buffer is the runner's host copy.
+            let base = self.pools.base(StreamId(0))?;
+            let sampler = SamplerBuffer::new(self.device, base, bucket.rows)?;
+            self.samplers.insert(bucket, sampler);
+        }
         let captured = Captured::new(template, nodes, held)?;
         self.graphs.insert(bucket, generation, captured);
         Ok(())
@@ -669,7 +679,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         sampler.read_back(&self.stream)?;
         let rows = self.staging.staged().map_or(0, |shape| shape.rows as usize);
         let sampling_rows = self.staging.logits_rows(rows);
-        sampler.output(&sampling_rows, self.staging.calls())
+        sampled_output(sampler.host_tokens(), &sampling_rows, self.staging.calls())
     }
 
     /// Walks one bucket's forward under the active capture with `generation`'s kernels.
@@ -684,21 +694,65 @@ impl<M: CausalLm> CausalLmRunner<M> {
             Some(staged) if staged.variant == bucket.variant => staged,
             _ => self.stage_warm(bucket)?,
         };
-        // The bucket's arena: the base of its plan in the graph pool. A first capture plans it; a
-        // later one replays the plan, so the same allocations land at the same addresses.
+        // The bucket's plan in the graph pool: the sampler output first (a bucket that samples
+        // owns it, so a step allocates nothing), then the arena the forward allocates from.
+        let first = self.pools.begin(StreamId(0), bucket)?;
+        let sampler_bytes = if bucket.variant.samples() {
+            SamplerBuffer::bytes(bucket.rows)
+        } else {
+            0
+        };
         let base = self.pools.base(StreamId(0))?;
-        let plan = self.pools.plan(StreamId(0), bucket).cloned().unwrap_or_default();
-        let arena = nn::Arena::new(base, plan.bytes());
+        let arena_base = platform::DevicePtr::from_address(base.address() + sampler_bytes);
+        let arena = nn::Arena::new(arena_base, self.pools.reserved().saturating_sub(sampler_bytes));
         let forward = nn::Forward {
             stream: &stream,
             kernels: generation,
             arena: &arena,
             group: None,
         };
-        let batch = self.token_batch(&base, &staged)?;
+        let batch = self.token_batch(&arena_base, &staged)?;
         let cache = self.kv_view()?;
-        let hidden = self.hidden(&base, &staged)?;
-        self.model.forward(&forward, &batch, &cache, hidden)
+        let hidden = self.hidden(&arena_base, &staged)?;
+        self.model.forward(&forward, &batch, &cache, hidden.clone())?;
+        if bucket.variant.samples() {
+            // The sampler runs inside this capture too, so a replay samples in the graph: its
+            // nodes are the bucket's, and its region is the plan's first block.
+            self.append_sampler(&stream, bucket, arena_base, &hidden)?;
+        }
+        if first {
+            let offsets = arena
+                .offsets()
+                .iter()
+                .map(|offset| offset + sampler_bytes)
+                .collect();
+            self.pools.record(
+                StreamId(0),
+                bucket,
+                offsets,
+                sampler_bytes + arena.bytes(),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Appends the bucket's sampler chain to the capture in flight (4.4, 9's `采样`).
+    ///
+    /// The chain shapes the row's logits by its parameters, keeps its candidates, and draws or
+    /// picks one token per sampling row, writing the ids to the plan's first block. It is one
+    /// chain per bucket, captured once, so every later replay samples without a host round trip.
+    fn append_sampler(
+        &mut self,
+        _stream: &platform::Stream,
+        bucket: Bucket,
+        _arena_base: platform::DevicePtr,
+        _logits: &ops::TensorView,
+    ) -> Result<()> {
+        Err(Error::State(format!(
+            "the sampler chain of {bucket} needs the batch's sampling parameters and the model's \
+             logits view; exec-work M211 asks for the two crossing columns and \
+             CausalLm::logits (nn)"
+        )))
     }
 
     /// Stages a batch of the bucket's full size with nothing to write: what a warmup capture
@@ -708,6 +762,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let rows = bucket.rows as usize;
         let columns = BatchColumns {
             calls: vec![crate::batch::BatchCall {
+                call: CallId(0),
                 request: 0,
                 kind: if bucket.variant.is_decode() {
                     crate::batch::CallKind::Decode
@@ -783,6 +838,101 @@ impl ops::capture::Sink for Recording<'_> {
     }
 }
 
+/// The sampler output of one bucket: one `u32` token id per sampling row.
+///
+/// The region is the first block of the bucket's plan, so it is allocated at capture and reached at
+/// the same address by every replay without allocating during a step (4.5). It is written by the
+/// bucket's sampler nodes inside the captured graph, and read back into the runner's host pinned
+/// buffer after the replay's stream completed (4.4).
+pub struct SamplerBuffer {
+    /// Where the graph writes the sampled ids.
+    base: platform::DevicePtr,
+    /// How many rows the bucket samples for.
+    rows: usize,
+    /// The host copy one step reads them from; one per runner, never per batch.
+    host: platform::PinnedBuffer,
+}
+
+impl SamplerBuffer {
+    /// The bytes a bucket of `rows` sampling rows needs in its plan.
+    pub fn bytes(rows: u32) -> u64 {
+        u64::from(rows) * std::mem::size_of::<u32>() as u64
+    }
+
+    /// The region at `base` of a bucket whose plan holds it, with `device`'s host staging.
+    pub fn new(device: DeviceId, base: platform::DevicePtr, rows: u32) -> Result<Self> {
+        let bytes = Self::bytes(rows);
+        let host = platform::PinnedBuffer::new(device, bytes as usize)?;
+        Ok(Self {
+            base,
+            rows: rows as usize,
+            host,
+        })
+    }
+
+    /// Where the graph writes the sampled ids.
+    pub fn base(&self) -> platform::DevicePtr {
+        self.base
+    }
+
+    /// The rows the bucket samples for.
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Copies the region to the host buffer; the caller has already waited for `stream`.
+    pub fn read_back(&self, stream: &platform::Stream) -> Result<()> {
+        let bytes = Self::bytes(self.rows as u32);
+        // SAFETY: the region is this bucket's sampler output (one u32 per row, inside the pool's
+        // mapping) and the host buffer is its own pinned memory of the same size.
+        unsafe {
+            platform::memcpy_async(self.host.address(), self.base.address(), bytes as usize, stream)?;
+        }
+        stream.synchronize()
+    }
+
+    /// The sampled ids, in the order the graph wrote them.
+    fn host_tokens(&self) -> &[u32] {
+        // SAFETY: `read_back` filled `rows` u32 values of host-pinned memory; the buffer is aligned
+        // by `PinnedBuffer` for any byte copy, and `rows` is the number it was allocated for.
+        let bytes = Self::bytes(self.rows as u32) as usize;
+        unsafe { std::slice::from_raw_parts(self.host.as_ptr().cast::<u32>(), bytes / 4) }
+    }
+}
+
+/// Names each sampled row's call: the step's output in the mechanism's order (4.4).
+///
+/// `sampling_rows` are the batch rows a token is sampled for, in batch order; `calls` name the row
+/// ranges of the batch. A sampling row outside every call is an invariant violation: the
+/// mechanism's columns and its calls disagree about the batch.
+pub fn sampled_output(
+    ids: &[u32],
+    sampling_rows: &[u32],
+    calls: &[BatchCall],
+) -> Result<BatchOutput> {
+    if ids.len() < sampling_rows.len() {
+        return Err(Error::Invariant(format!(
+            "the bucket sampled {} rows and the batch names {}",
+            ids.len(),
+            sampling_rows.len()
+        )));
+    }
+    let mut tokens = Vec::with_capacity(sampling_rows.len());
+    for (index, row) in sampling_rows.iter().copied().enumerate() {
+        let call = calls
+            .iter()
+            .find(|call| call.rows.contains(&row))
+            .ok_or_else(|| {
+                Error::Invariant(format!("no call of the batch owns sampling row {row}"))
+            })?;
+        tokens.push(SampledToken {
+            call: call.call,
+            token: ids[index],
+        });
+    }
+    Ok(BatchOutput { tokens })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -809,6 +959,7 @@ mod tests {
             num_tokens: 2,
             page_size: 16,
             calls: vec![crate::batch::BatchCall {
+                call: CallId(0),
                 request: 0,
                 kind: crate::batch::CallKind::Decode,
                 cache_group: 0,
@@ -834,6 +985,7 @@ mod tests {
             num_tokens: 3,
             page_size: 16,
             calls: vec![crate::batch::BatchCall {
+                call: CallId(0),
                 request: 0,
                 kind: crate::batch::CallKind::Prefill,
                 cache_group: 0,
@@ -859,5 +1011,58 @@ impl Staging {
     /// The staged write flags, for the upload and the padding test.
     pub fn write_cache(&self) -> &[u8] {
         &self.write_cache
+    }
+}
+
+#[cfg(test)]
+mod sampled_output_tests {
+    use super::*;
+
+    fn call(call: u64, rows: std::ops::Range<u32>) -> BatchCall {
+        BatchCall {
+            call: CallId(call),
+            request: call as u32,
+            kind: crate::batch::CallKind::Decode,
+            cache_group: 0,
+            rows,
+        }
+    }
+
+    /// The step's output names each sampled row's call, in the batch's row order, whatever order
+    /// the mechanism listed the calls in.
+    #[test]
+    fn sampled_rows_are_named_by_their_calls() {
+        let calls = vec![call(7, 0..1), call(9, 1..2)];
+        let output = sampled_output(&[111, 222], &[1, 0], &calls).expect("both rows belong to a call");
+        assert_eq!(
+            output.tokens,
+            vec![
+                SampledToken {
+                    call: CallId(9),
+                    token: 222
+                },
+                SampledToken {
+                    call: CallId(7),
+                    token: 111
+                },
+            ]
+        );
+    }
+
+    /// A batch with no sampling row produces no token: a prefill chunk that samples nothing and a
+    /// bucket whose rows are all padding.
+    #[test]
+    fn a_batch_that_samples_nothing_produces_no_tokens() {
+        let output = sampled_output(&[], &[], &[call(1, 0..4)]).expect("no sampling rows");
+        assert!(output.tokens.is_empty());
+    }
+
+    /// A sampling row outside every call, or fewer sampled ids than sampling rows, is an invariant
+    /// violation: silently dropping either would hand the mechanism the wrong request's token.
+    #[test]
+    fn a_row_no_call_owns_is_refused() {
+        let calls = vec![call(1, 0..1)];
+        sampled_output(&[5], &[3], &calls).expect_err("row 3 belongs to no call");
+        sampled_output(&[], &[0], &calls).expect_err("no id was sampled for row 0");
     }
 }

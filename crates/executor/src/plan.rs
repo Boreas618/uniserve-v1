@@ -49,6 +49,15 @@ impl Variant {
         }
     }
 
+    /// Whether a bucket of this variant samples a token for each of its sampling rows (4.4).
+    ///
+    /// A prefill bucket samples only on the batch that ends a prompt, which the mechanism says by
+    /// putting rows in `logits_rows`; the bucket still owns its sampler region and its nodes, so a
+    /// last chunk samples from the graph like a decode step.
+    pub const fn samples(self) -> bool {
+        true
+    }
+
     /// Whether a forward of this variant draws its inputs from the slot state one token per row.
     pub const fn is_decode(self) -> bool {
         matches!(self, Self::DecodeGreedy | Self::DecodeSampled)
