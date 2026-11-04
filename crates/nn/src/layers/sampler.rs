@@ -58,13 +58,17 @@
 /// Both programs that walk a row of candidates - the distribution and the draw - take it, so a
 /// candidate width may be the whole vocabulary without either holding a row in registers.
 const CANDIDATE_TILE: u32 = 8192;
+/// The lanes one `top_k` pass reads: the only size that operator's key names, since the vocabulary
+/// and the kept count are launch scalars. Smaller than the candidate tile because an ordering pass
+/// holds two planes and a nibble's ranks at once.
+const TOP_TILE: u32 = 2048;
 
 use ops::norm::{Softmax, SoftmaxArgs, SoftmaxDescriptor};
 use ops::sampler::{
     ArgMax, ArgMaxArgs, ArgMaxDescriptor, CandidateOrder, FilterArgs, FilterCandidates,
     FilterDescriptor, InverseCdf, InverseCdfArgs, InverseCdfDescriptor, LogSoftmax, LogSoftmaxArgs,
     LogSoftmaxDescriptor, LogitsShape, LogprobArgs, LogprobDescriptor, LogprobGather, OrderArgs,
-    OrderDescriptor, PARAMETER_COLUMNS, ShapeArgs, ShapeDescriptor, TopK, TopKArgs, TopKDescriptor,
+    OrderDescriptor, ShapeArgs, ShapeDescriptor, TopK, TopKArgs, TopKDescriptor, PARAMETER_COLUMNS,
 };
 use ops::{DType, Op, Shape, TensorView};
 
@@ -116,6 +120,8 @@ pub struct Candidates {
     pub ordered_ids: TensorView,
     /// `[rows]` i32: 1 when the row's candidates form a usable distribution.
     pub valid: TensorView,
+    /// `[rows, 4 · width + 2 · TOP_K_BINS]` i32: the ordering's scratch, which `top_k` fills.
+    pub scratch: TensorView,
 }
 
 impl Candidates {
@@ -129,6 +135,7 @@ impl Candidates {
             ordered_values: arena.tensor(DType::F32, Shape::new(&[rows, width]))?,
             ordered_ids: arena.tensor(DType::I32, Shape::new(&[rows, width]))?,
             valid: arena.tensor(DType::I32, Shape::new(&[rows]))?,
+            scratch: arena.tensor(DType::I32, ops::sampler::top_k_workspace(rows, width))?,
         })
     }
 }
@@ -270,6 +277,7 @@ impl Sampler {
             logits: candidates.shaped,
             values: candidates.values,
             ids: candidates.ids,
+            workspace: candidates.scratch,
         };
 
         f.operate::<TopK>(&top, args)?;
@@ -375,6 +383,7 @@ impl Sampler {
             dtype: DType::F32,
             vocabulary: self.vocabulary,
             width: self.width,
+            tile: TOP_TILE,
             ids: DType::I32,
             pdl: launch::PDL,
         }
