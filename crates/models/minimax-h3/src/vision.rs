@@ -153,7 +153,9 @@ impl Geometry {
         if !sequence.is_multiple_of(merge * merge) {
             return Err(invalid(
                 "VisionTower",
-                format!("a time step of {sequence} patches is not whole {merge}x{merge} merge blocks"),
+                format!(
+                    "a time step of {sequence} patches is not whole {merge}x{merge} merge blocks"
+                ),
             ));
         }
         Ok(Self {
@@ -194,7 +196,9 @@ impl Geometry {
     /// The side of the square learned position table (`position_grid` in the reference).
     pub fn position_grid(config: &VisionConfig) -> Result<u32> {
         let side = u32::try_from(
-            (u64::from(config.num_position_embeddings) as f64).sqrt().round() as u64,
+            (u64::from(config.num_position_embeddings) as f64)
+                .sqrt()
+                .round() as u64,
         )
         .map_err(|_| invalid("VisionTower", "a position grid wider than a u32"))?;
         if u64::from(side) * u64::from(side) != u64::from(config.num_position_embeddings) {
@@ -281,7 +285,12 @@ impl Buffers {
     ///
     /// The reservations happen in one fixed order, so the plan an executor makes for a captured
     /// bucket is the plan every replay follows.
-    pub fn new(arena: &Arena, config: &VisionConfig, patches: u32, dtype: nn::DType) -> Result<Self> {
+    pub fn new(
+        arena: &Arena,
+        config: &VisionConfig,
+        patches: u32,
+        dtype: nn::DType,
+    ) -> Result<Self> {
         let rows = u64::from(patches);
         let hidden = u64::from(config.hidden_size);
         let intermediate = u64::from(config.intermediate_size);
@@ -353,11 +362,7 @@ impl Buffers {
                 ),
             ));
         }
-        Ok(view.reshape(Shape::new(&[
-            rows,
-            u64::from(heads),
-            u64::from(head_dim),
-        ])))
+        Ok(view.reshape(Shape::new(&[rows, u64::from(heads), u64::from(head_dim)])))
     }
 }
 
@@ -382,8 +387,6 @@ pub struct ImageTables {
     pub geometry: Geometry,
     /// The patches the block reads, `[patches, tubelet]`.
     pub pixels: TensorView,
-    /// The block's grid as the request stated it, `[1, 3]` I32: carried for the shape check only.
-    pub grid: TensorView,
 }
 
 impl ImageTables {
@@ -415,7 +418,6 @@ impl ImageTables {
             lengths: *lengths,
             geometry: Geometry::of_counts(config, patches, time)?,
             pixels: image.pixels,
-            grid: image.grid,
         })
     }
 }
@@ -452,8 +454,18 @@ impl Block {
             value: fused_projection(loader, &format!("{block}.attn.qkv"), 2, hidden)?,
             output: projection(loader, &format!("{block}.attn.proj"), hidden, hidden)?,
             output_norm: normalization(loader, &format!("{block}.norm2"), hidden)?,
-            first: projection(loader, &format!("{block}.mlp.linear_fc1"), intermediate, hidden)?,
-            second: projection(loader, &format!("{block}.mlp.linear_fc2"), hidden, intermediate)?,
+            first: projection(
+                loader,
+                &format!("{block}.mlp.linear_fc1"),
+                intermediate,
+                hidden,
+            )?,
+            second: projection(
+                loader,
+                &format!("{block}.mlp.linear_fc2"),
+                hidden,
+                intermediate,
+            )?,
         })
     }
 
@@ -464,6 +476,7 @@ impl Block {
         f: &Forward,
         image: &ImageTables,
         attention: &Attention,
+        geometry: &Geometry,
         buffers: &Buffers,
     ) -> Result<()> {
         let heads = tower.config.num_heads;
@@ -504,6 +517,7 @@ impl Block {
             buffers.as_heads(buffers.value, heads, head_dim)?,
             Some(image.lengths),
             Some(image.lengths),
+            geometry.sequence,
             buffers.as_heads(buffers.attended, heads, head_dim)?,
         )?;
         self.output
@@ -667,7 +681,11 @@ impl VisionTower {
     ///
     /// `dtype` is the activation element type the loading boundary chose: the checkpoint's own
     /// representation unless the deployment asked for another, and every weight is read in it.
-    pub fn load(loader: &mut WeightLoader<'_>, config: &VisionConfig, dtype: nn::DType) -> Result<Self> {
+    pub fn load(
+        loader: &mut WeightLoader<'_>,
+        config: &VisionConfig,
+        dtype: nn::DType,
+    ) -> Result<Self> {
         let hidden = u64::from(config.hidden_size);
         let tubelet = u64::from(Geometry::tubelet(config));
         // The checkpoint's activation, and the merger's exact form, are two different GELUs.
@@ -693,7 +711,12 @@ impl VisionTower {
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             deepstack_layers: deepstack_layers(config)?,
-            patch: projection(loader, &format!("{PREFIX}.patch_embed.proj"), hidden, tubelet)?,
+            patch: projection(
+                loader,
+                &format!("{PREFIX}.patch_embed.proj"),
+                hidden,
+                tubelet,
+            )?,
             position: region(
                 loader,
                 &format!("{PREFIX}.pos_embed.weight"),
@@ -702,7 +725,8 @@ impl VisionTower {
             position_grid,
             heads,
             head_dim,
-            rotate: Rotate::new(head_dim, heads, Rotation::Half).map_err(Error::from)?,
+            rotate: Rotate::new(u64::from(head_dim), u64::from(heads), Rotation::Half)
+                .map_err(Error::from)?,
             layers,
             merger: Merger::load(loader, &format!("{PREFIX}.merger"), config, false)?,
             deepstack,
@@ -788,7 +812,6 @@ impl VisionTower {
             self.dtype,
             u64::from(self.config.hidden_size),
             self.position_grid,
-            geometry.patches,
         )
         .map_err(Error::from)?
         .forward(
@@ -819,13 +842,19 @@ impl VisionTower {
 
         let mut next = 0;
         for (index, block) in self.layers.iter().enumerate() {
-            block.forward(self, f, image, &attention, buffers)?;
+            block.forward(self, f, image, &attention, &geometry, buffers)?;
             if self
                 .deepstack_layers
                 .get(next)
                 .is_some_and(|layer| *layer == index)
             {
-                self.deepstack[next].forward(self, f, buffers.hidden, buffers, out.deepstack[next])?;
+                self.deepstack[next].forward(
+                    self,
+                    f,
+                    buffers.hidden,
+                    buffers,
+                    out.deepstack[next],
+                )?;
                 next += 1;
             }
         }
@@ -850,11 +879,18 @@ impl VisionTower {
         let out_hidden = u64::from(self.config.out_hidden_size);
         let tables = [
             ("pixels", image.pixels, Shape::new(&[patches, tubelet])),
-            ("position_index", image.position_index, Shape::new(&[patches, 4])),
-            ("position_weight", image.position_weight, Shape::new(&[patches, 4])),
+            (
+                "position_index",
+                image.position_index,
+                Shape::new(&[patches, 4]),
+            ),
+            (
+                "position_weight",
+                image.position_weight,
+                Shape::new(&[patches, 4]),
+            ),
             ("cosine", image.cosine, Shape::new(&[patches, columns])),
             ("sine", image.sine, Shape::new(&[patches, columns])),
-            ("grid", image.grid, Shape::new(&[1, 3])),
             ("features", out.features, Shape::new(&[merged, out_hidden])),
         ];
         for (name, view, shape) in tables {
