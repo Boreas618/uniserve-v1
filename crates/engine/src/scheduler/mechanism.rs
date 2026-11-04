@@ -180,7 +180,6 @@ impl Validators for Checked<'_> {
     }
 }
 
-
 /// The mechanism's objects, as the validators read them.
 ///
 /// `scheduler/views.rs` builds this from the scheduler's own state each step
@@ -353,15 +352,12 @@ fn validate_work(plan: &Plan, room: &Room, live: &Live) -> Result<(), PolicyErro
                 format!("{} is given two pieces of work in one step", work.request.0),
             ));
         }
-        let phase = live
-            .phases
-            .get(&work.phase)
-            .ok_or_else(|| {
-                invalid(
-                    Call::Dispatch,
-                    format!("phase {} is not one of this epoch's", work.phase.0),
-                )
-            })?;
+        let phase = live.phases.get(&work.phase).ok_or_else(|| {
+            invalid(
+                Call::Dispatch,
+                format!("phase {} is not one of this epoch's", work.phase.0),
+            )
+        })?;
         let charge = u64::from(work.tokens);
         tokens += charge;
         if phase.kind.writes_prefix_cache() {
@@ -443,8 +439,19 @@ fn validate_work_entry(work: &Work, live: &Live) -> Result<(), PolicyError> {
         ));
     };
     match phase.kind {
+        PhaseKind::Refill => {
+            return Err(invalid(
+                Call::Dispatch,
+                format!(
+                    "{} is given refill work: a refill is named by `plan.refill`, not by `work`",
+                    work.request.0
+                ),
+            ));
+        }
         PhaseKind::Prefill => {
-            let remaining = request.prompt_tokens.saturating_sub(request.prefilled_tokens);
+            let remaining = request
+                .prompt_tokens
+                .saturating_sub(request.prefilled_tokens);
             if work.tokens > remaining {
                 return Err(invalid(
                     Call::Dispatch,
@@ -496,7 +503,10 @@ fn validate_release(plan: &Plan, live: &Live) -> Result<(), PolicyError> {
         if !page.evictable {
             return Err(invalid(
                 Call::Dispatch,
-                format!("page {} is still continued from by a resident request", id.0),
+                format!(
+                    "page {} is still continued from by a resident request",
+                    id.0
+                ),
             ));
         }
         if !pages.insert(*id) {
@@ -581,10 +591,7 @@ pub(crate) fn validate_victims(
     let mut seen: Vec<Victim> = Vec::new();
     for victim in victims {
         if seen.contains(victim) {
-            return Err(invalid(
-                Call::Reclaim,
-                format!("{victim:?} is freed twice"),
-            ));
+            return Err(invalid(Call::Reclaim, format!("{victim:?} is freed twice")));
         }
         seen.push(*victim);
         match (shortage.kind, victim) {
@@ -593,13 +600,19 @@ pub(crate) fn validate_victims(
                 if page.on_host {
                     return Err(invalid(
                         Call::Reclaim,
-                        format!("page {} is on the host, it frees no device units", page.id.0),
+                        format!(
+                            "page {} is on the host, it frees no device units",
+                            page.id.0
+                        ),
                     ));
                 }
                 if !page.evictable {
                     return Err(invalid(
                         Call::Reclaim,
-                        format!("page {} is still continued from and cannot be freed", page.id.0),
+                        format!(
+                            "page {} is still continued from and cannot be freed",
+                            page.id.0
+                        ),
                     ));
                 }
             }
@@ -669,10 +682,7 @@ pub(crate) fn validate_route(
     }
     match ranks.iter().find(|rank| rank.index == chosen) {
         Some(rank) if rank.alive => Ok(()),
-        Some(_) => Err(invalid(
-            Call::Route,
-            format!("rank {chosen} is not alive"),
-        )),
+        Some(_) => Err(invalid(Call::Route, format!("rank {chosen} is not alive"))),
         None => Err(invalid(
             Call::Route,
             format!(
@@ -707,16 +717,16 @@ pub(crate) fn validate_place(
     if !replica.kinds.contains(&call.kind) {
         return Err(invalid(
             Call::Place,
-            format!(
-                "replica {chosen} does not run {:?} calls",
-                call.kind
-            ),
+            format!("replica {chosen} does not run {:?} calls", call.kind),
         ));
     }
     if replica.prefills_only && decodes(call.kind) {
         return Err(invalid(
             Call::Place,
-            format!("replica {chosen} runs prefill only, a {:?} call cannot land on it", call.kind),
+            format!(
+                "replica {chosen} runs prefill only, a {:?} call cannot land on it",
+                call.kind
+            ),
         ));
     }
     Ok(())
@@ -735,7 +745,10 @@ pub(crate) fn validate_warm(room: &Room, pages: &[PageId]) -> Result<(), PolicyE
         if !claimed.contains(page) {
             return Err(invalid(
                 Call::Warm,
-                format!("page {} is not one of the pages this precopy claimed", page.0),
+                format!(
+                    "page {} is not one of the pages this precopy claimed",
+                    page.0
+                ),
             ));
         }
         if !seen.insert(*page) {
@@ -753,10 +766,7 @@ pub(crate) fn validate_warm(room: &Room, pages: &[PageId]) -> Result<(), PolicyE
 ///
 /// The load is the input the order is meant to balance; an order that is legal
 /// but leaves the load unbalanced is a poor decision, not an invalid one.
-pub(crate) fn validate_experts(
-    load: &ExpertLoad,
-    order: &ExpertOrder,
-) -> Result<(), PolicyError> {
+pub(crate) fn validate_experts(load: &ExpertLoad, order: &ExpertOrder) -> Result<(), PolicyError> {
     if load.ranks == 0 || load.experts == 0 {
         return Err(invalid(
             Call::Experts,
@@ -778,7 +788,10 @@ pub(crate) fn validate_experts(
         if *rank >= load.ranks {
             return Err(invalid(
                 Call::Experts,
-                format!("expert {expert} is placed on rank {rank}, there are {} ranks", load.ranks),
+                format!(
+                    "expert {expert} is placed on rank {rank}, there are {} ranks",
+                    load.ranks
+                ),
             ));
         }
         per_rank[*rank] += 1;
@@ -795,6 +808,22 @@ pub(crate) fn validate_experts(
         ));
     }
     Ok(())
+}
+
+/// The tokens a completed call advanced its request by, as a policy counts
+/// them: a prompt chunk by the tokens it wrote, a verification by the drafts it
+/// checked, a token-advancing phase by one, and a denoising step by one latent
+/// unit.
+pub(crate) fn advanced_tokens(call: &ipc::Call) -> u32 {
+    match call.kind {
+        ipc::CallKind::Forward(ipc::ForwardMode::Verify) => {
+            1 + u32::try_from(crate::scheduler::generation::verify_drafts(call).len())
+                .unwrap_or(u32::MAX)
+        }
+        ipc::CallKind::Media(ipc::MediaCall::Denoising) => 1,
+        ipc::CallKind::Forward(ipc::ForwardMode::Prefill) => call.bounds.max_tokens,
+        _ => 1,
+    }
 }
 
 /// The state changes the policy is told about, in the order they happened.
@@ -1044,7 +1073,11 @@ mod tests {
                 .map(|(id, kind)| {
                     (
                         PhaseId(*id),
-                        PhaseView { id: PhaseId(*id), kind: *kind, block: ComponentId(*id) },
+                        PhaseView {
+                            id: PhaseId(*id),
+                            kind: *kind,
+                            block: ComponentId(*id),
+                        },
                     )
                 })
                 .collect(),
@@ -1143,13 +1176,25 @@ mod tests {
     fn a_static_policy_goes_through_the_same_validators_the_live_path_does() {
         let mut live = live(
             vec![
-                { let mut r = request(1, RequestState::Queued); r },
-                { let mut r = request(2, RequestState::Resident); r.phase = Some(PhaseId(1)); r.next_tokens = 1; r },
+                {
+                    let mut r = request(1, RequestState::Queued);
+                    r
+                },
+                {
+                    let mut r = request(2, RequestState::Resident);
+                    r.phase = Some(PhaseId(1));
+                    r.next_tokens = 1;
+                    r
+                },
             ],
             vec![RequestId(1)],
             &[(0, PhaseKind::Prefill), (1, PhaseKind::Decode)],
         );
-        let mut plan = plan(vec![Work { request: RequestId(2), phase: PhaseId(1), tokens: 1 }]);
+        let mut plan = plan(vec![Work {
+            request: RequestId(2),
+            phase: PhaseId(1),
+            tokens: 1,
+        }]);
         plan.admit = vec![RequestId(1)];
         let mut policy = Static {
             limits: Limits::default(),
@@ -1167,11 +1212,23 @@ mod tests {
         let error = validate_plan(&decision, &room(), &live).expect_err("an invalid plan");
         let report = policy.fail(&error, &TrialState::default());
         assert_eq!(policy.failures, 1);
-        assert!(report.is_err(), "a policy with no previous one cannot serve on");
-        assert!(policy.boundary(&TrialState::default()).expect("a boundary").is_none());
+        assert!(
+            report.is_err(),
+            "a policy with no previous one cannot serve on"
+        );
+        assert!(
+            policy
+                .boundary(&TrialState::default())
+                .expect("a boundary")
+                .is_none()
+        );
 
         // The routing and placement answers are checked the same way.
-        let ranks = vec![RankView { index: 0, in_flight: 0, alive: true }];
+        let ranks = vec![RankView {
+            index: 0,
+            in_flight: 0,
+            alive: true,
+        }];
         validate_route(&live.requests[&RequestId(2)], &ranks, 0).expect("a live rank");
         live.queue.clear();
     }
@@ -1268,8 +1325,18 @@ mod tests {
     fn the_step_holds_its_token_call_and_prefill_budgets() {
         let mut live = live(
             vec![
-                { let mut r = request(1, RequestState::Resident); r.phase = Some(PhaseId(0)); r.prompt_tokens = 1000; r },
-                { let mut r = request(2, RequestState::Resident); r.phase = Some(PhaseId(0)); r.prompt_tokens = 1000; r },
+                {
+                    let mut r = request(1, RequestState::Resident);
+                    r.phase = Some(PhaseId(0));
+                    r.prompt_tokens = 1000;
+                    r
+                },
+                {
+                    let mut r = request(2, RequestState::Resident);
+                    r.phase = Some(PhaseId(0));
+                    r.prompt_tokens = 1000;
+                    r
+                },
             ],
             Vec::new(),
             &[(0, PhaseKind::Prefill)],
@@ -1277,8 +1344,16 @@ mod tests {
         let mut r = room();
         r.token_budget = 100;
         let p = plan(vec![
-            Work { request: RequestId(1), phase: PhaseId(0), tokens: 60 },
-            Work { request: RequestId(2), phase: PhaseId(0), tokens: 60 },
+            Work {
+                request: RequestId(1),
+                phase: PhaseId(0),
+                tokens: 60,
+            },
+            Work {
+                request: RequestId(2),
+                phase: PhaseId(0),
+                tokens: 60,
+            },
         ]);
         let error = validate_plan(&p, &r, &live).expect_err("over the step");
         assert!(format!("{error}").contains("120 tokens"));
@@ -1297,8 +1372,16 @@ mod tests {
         // A request gets one piece of work in a step.
         r.call_budget = 8;
         let p = plan(vec![
-            Work { request: RequestId(1), phase: PhaseId(0), tokens: 10 },
-            Work { request: RequestId(1), phase: PhaseId(0), tokens: 10 },
+            Work {
+                request: RequestId(1),
+                phase: PhaseId(0),
+                tokens: 10,
+            },
+            Work {
+                request: RequestId(1),
+                phase: PhaseId(0),
+                tokens: 10,
+            },
         ]);
         let error = validate_plan(&p, &r, &live).expect_err("twice");
         assert!(format!("{error}").contains("two pieces of work"));
@@ -1310,15 +1393,33 @@ mod tests {
         let mut live = live(vec![], Vec::new(), &[]);
         live.pages.insert(
             PageId(1),
-            PageView { id: PageId(1), tokens: 16, last_used: Nanos(1), on_host: false, evictable: false },
+            PageView {
+                id: PageId(1),
+                tokens: 16,
+                last_used: Nanos(1),
+                on_host: false,
+                evictable: false,
+            },
         );
         live.pages.insert(
             PageId(2),
-            PageView { id: PageId(2), tokens: 16, last_used: Nanos(2), on_host: true, evictable: true },
+            PageView {
+                id: PageId(2),
+                tokens: 16,
+                last_used: Nanos(2),
+                on_host: true,
+                evictable: true,
+            },
         );
         live.pages.insert(
             PageId(3),
-            PageView { id: PageId(3), tokens: 16, last_used: Nanos(3), on_host: false, evictable: true },
+            PageView {
+                id: PageId(3),
+                tokens: 16,
+                last_used: Nanos(3),
+                on_host: false,
+                evictable: true,
+            },
         );
 
         let mut p = plan(Vec::new());
@@ -1342,28 +1443,55 @@ mod tests {
     fn a_victim_must_free_the_storage_the_shortage_is_about() {
         let mut live = live(
             vec![
-                { let mut r = request(1, RequestState::Resident); r.migratable = false; r },
-                { let mut r = request(2, RequestState::Resident); r.migratable = true; r },
+                {
+                    let mut r = request(1, RequestState::Resident);
+                    r.migratable = false;
+                    r
+                },
+                {
+                    let mut r = request(2, RequestState::Resident);
+                    r.migratable = true;
+                    r
+                },
             ],
             Vec::new(),
             &[],
         );
         live.pages.insert(
             PageId(1),
-            PageView { id: PageId(1), tokens: 16, last_used: Nanos(1), on_host: false, evictable: true },
+            PageView {
+                id: PageId(1),
+                tokens: 16,
+                last_used: Nanos(1),
+                on_host: false,
+                evictable: true,
+            },
         );
         live.pages.insert(
             PageId(2),
-            PageView { id: PageId(2), tokens: 16, last_used: Nanos(2), on_host: true, evictable: true },
+            PageView {
+                id: PageId(2),
+                tokens: 16,
+                last_used: Nanos(2),
+                on_host: true,
+                evictable: true,
+            },
         );
         live.encodings.insert(
             EncodingId(7),
-            EncodingView { id: EncodingId(7), last_used: Nanos(1) },
+            EncodingView {
+                id: EncodingId(7),
+                last_used: Nanos(1),
+            },
         );
 
-        let units = Shortage { kind: Storage::KvUnits, need: 4 };
+        let units = Shortage {
+            kind: Storage::KvUnits,
+            need: 4,
+        };
         validate_victims(&units, &[Victim::Page(PageId(1))], &live).expect("a free page");
-        validate_victims(&units, &[Victim::Request(RequestId(2))], &live).expect("a migratable request");
+        validate_victims(&units, &[Victim::Request(RequestId(2))], &live)
+            .expect("a migratable request");
 
         let error = validate_victims(&units, &[], &live).expect_err("nothing freed");
         assert!(format!("{error}").contains("nothing was freed"));
@@ -1377,21 +1505,35 @@ mod tests {
             .expect_err("wrong storage");
         assert!(format!("{error}").contains("frees nothing"));
 
-        let pages = Shortage { kind: Storage::HostPages, need: 2 };
+        let pages = Shortage {
+            kind: Storage::HostPages,
+            need: 2,
+        };
         validate_victims(&pages, &[Victim::Page(PageId(2))], &live).expect("a host page");
         let error = validate_victims(&pages, &[Victim::Page(PageId(1))], &live)
             .expect_err("not on the host");
         assert!(format!("{error}").contains("not on the host"));
 
-        let entries = Shortage { kind: Storage::EncoderEntries, need: 1 };
+        let entries = Shortage {
+            kind: Storage::EncoderEntries,
+            need: 1,
+        };
         validate_victims(&entries, &[Victim::Encoding(EncodingId(7))], &live).expect("an entry");
     }
 
     #[test]
     fn a_rank_must_be_offered_and_alive_and_a_replica_must_run_the_call() {
         let ranks = vec![
-            RankView { index: 0, in_flight: 3, alive: true },
-            RankView { index: 1, in_flight: 0, alive: false },
+            RankView {
+                index: 0,
+                in_flight: 3,
+                alive: true,
+            },
+            RankView {
+                index: 1,
+                in_flight: 0,
+                alive: false,
+            },
         ];
         let request = request(9, RequestState::Queued);
         validate_route(&request, &ranks, 0).expect("the live rank");
@@ -1422,11 +1564,19 @@ mod tests {
                 holds_component: false,
             },
         ];
-        let call = CallView { request: RequestId(9), phase: PhaseId(1), kind: PhaseKind::Decode };
+        let call = CallView {
+            request: RequestId(9),
+            phase: PhaseId(1),
+            kind: PhaseKind::Decode,
+        };
         validate_place(&call, &replicas, 1).expect("a full replica still runs the call");
         let error = validate_place(&call, &replicas, 0).expect_err("prefill only");
         assert!(format!("{error}").contains("prefill only"));
-        let call = CallView { request: RequestId(9), phase: PhaseId(1), kind: PhaseKind::Mux };
+        let call = CallView {
+            request: RequestId(9),
+            phase: PhaseId(1),
+            kind: PhaseKind::Mux,
+        };
         let error = validate_place(&call, &replicas, 1).expect_err("cannot run it");
         assert!(format!("{error}").contains("does not run"));
     }
@@ -1434,21 +1584,49 @@ mod tests {
     #[test]
     fn warm_and_experts_must_be_legal() {
         let mut room = room();
-        room.warming = vec![Warming { request: RequestId(1), pages: vec![PageId(1), PageId(2)] }];
+        room.warming = vec![Warming {
+            request: RequestId(1),
+            pages: vec![PageId(1), PageId(2)],
+        }];
         validate_warm(&room, &[PageId(2), PageId(1)]).expect("any order of the claimed pages");
         let error = validate_warm(&room, &[PageId(3)]).expect_err("not claimed");
         assert!(format!("{error}").contains("not one of the pages"));
 
-        let load = ExpertLoad { ranks: 2, experts: 4, tokens: vec![10, 0, 9, 1] };
-        validate_experts(&load, &ExpertOrder { placement: vec![0, 0, 1, 1] }).expect("balanced");
-        let error = validate_experts(&load, &ExpertOrder { placement: vec![0, 0, 0, 0] })
-            .expect_err("unbalanced");
+        let load = ExpertLoad {
+            ranks: 2,
+            experts: 4,
+            tokens: vec![10, 0, 9, 1],
+        };
+        validate_experts(
+            &load,
+            &ExpertOrder {
+                placement: vec![0, 0, 1, 1],
+            },
+        )
+        .expect("balanced");
+        let error = validate_experts(
+            &load,
+            &ExpertOrder {
+                placement: vec![0, 0, 0, 0],
+            },
+        )
+        .expect_err("unbalanced");
         assert!(format!("{error}").contains("experts on one rank"));
-        let error = validate_experts(&load, &ExpertOrder { placement: vec![0, 1, 0] })
-            .expect_err("short");
+        let error = validate_experts(
+            &load,
+            &ExpertOrder {
+                placement: vec![0, 1, 0],
+            },
+        )
+        .expect_err("short");
         assert!(format!("{error}").contains("places 3 experts"));
-        let error = validate_experts(&load, &ExpertOrder { placement: vec![0, 0, 2, 2] })
-            .expect_err("no such rank");
+        let error = validate_experts(
+            &load,
+            &ExpertOrder {
+                placement: vec![0, 0, 2, 2],
+            },
+        )
+        .expect_err("no such rank");
         assert!(format!("{error}").contains("there are 2 ranks"));
     }
 
@@ -1458,7 +1636,9 @@ mod tests {
         let mut arrived = request(1, RequestState::Queued);
         arrived.prompt_tokens = 100;
         arrived.phase = Some(PhaseId(0));
-        recorder.record(Event::Arrived { request: arrived.clone() });
+        recorder.record(Event::Arrived {
+            request: arrived.clone(),
+        });
 
         // A view touched without changing is not an event.
         recorder.update(arrived.clone());
@@ -1478,19 +1658,37 @@ mod tests {
         }
 
         // A finished request is not told about again.
-        recorder.record(Event::Finished { request: RequestId(1), end: scheduling::guest::End::Completed });
+        recorder.record(Event::Finished {
+            request: RequestId(1),
+            end: scheduling::guest::End::Completed,
+        });
         recorder.update(arrived);
         recorder.close();
-        assert!(recorder.take().iter().all(|event| !matches!(event, Event::Updated { .. })));
+        assert!(
+            recorder
+                .take()
+                .iter()
+                .all(|event| !matches!(event, Event::Updated { .. }))
+        );
     }
 
     #[test]
     fn the_watchdog_finds_a_resident_request_that_stopped_advancing_but_not_a_waiting_one() {
         let mut live = live(
             vec![
-                { let mut r = request(1, RequestState::Resident); r },
-                { let mut r = request(2, RequestState::Resident); r.waiting_transfer = true; r },
-                { let mut r = request(3, RequestState::Resident); r },
+                {
+                    let mut r = request(1, RequestState::Resident);
+                    r
+                },
+                {
+                    let mut r = request(2, RequestState::Resident);
+                    r.waiting_transfer = true;
+                    r
+                },
+                {
+                    let mut r = request(3, RequestState::Resident);
+                    r
+                },
             ],
             Vec::new(),
             &[],
@@ -1502,7 +1700,11 @@ mod tests {
         watchdog.advanced(RequestId(3), Nanos(5_000_000_000));
 
         let timeout = Nanos(1_000_000_000);
-        assert_eq!(watchdog.starved(&live, Nanos(500_000_000), timeout), None, "within the timeout");
+        assert_eq!(
+            watchdog.starved(&live, Nanos(500_000_000), timeout),
+            None,
+            "within the timeout"
+        );
         // Request 1 is past it; 2 waits for a transfer; 3 advanced.
         assert_eq!(
             watchdog.starved(&live, Nanos(2_000_000_000), timeout),
@@ -1511,6 +1713,9 @@ mod tests {
         live.requests.get_mut(&RequestId(1)).expect("live").state = RequestState::Finished;
         assert_eq!(watchdog.starved(&live, Nanos(2_000_000_000), timeout), None);
         watchdog.finished(RequestId(3));
-        assert_eq!(watchdog.starved(&live, Nanos(20_000_000_000), timeout), None);
+        assert_eq!(
+            watchdog.starved(&live, Nanos(20_000_000_000), timeout),
+            None
+        );
     }
 }

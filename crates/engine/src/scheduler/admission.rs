@@ -91,6 +91,7 @@ impl Scheduler {
     /// waiting bound is reached. A rejection is sent on `event_tx` and its
     /// send result is ignored.
     pub(super) fn enqueue(&mut self, mut req: GenerationRequest, event_tx: EventTx) {
+        let id = req.request_id;
         let max_cache_tokens = match self.validate_submission(&req) {
             Ok(tokens) => tokens,
             Err(message) => {
@@ -142,17 +143,19 @@ impl Scheduler {
         }
         let st = self.request_state(req, event_tx, max_cache_tokens, continuation);
 
-        // Admission examines only the queue head, so the insertion position
-        // fixes the admission order. Under `Priority` a request goes after
-        // every queued request with a lower priority value, or an equal one
-        // and an earlier or equal arrival, so ties stay FIFO.
-        let position = match self.config.policy {
-            SchedulingPolicy::Fcfs => self.waiting.len(),
-            SchedulingPolicy::Priority => self.waiting.partition_point(|queued| {
-                (queued.req.priority, queued.queued_at) <= (st.req.priority, st.queued_at)
-            }),
-        };
-        self.waiting.insert(position, st);
+        // The queue keeps no order of its own: which queued request runs next
+        // is the policy's `Plan::admit`, and the mechanism admits in the plan's
+        // order (§4.4).
+        self.waiting.push_back(st);
+
+        // The policy sees the request as it arrived: nothing has happened to it
+        // yet, so every feature but the submitted ones is empty.
+        if let Some(view) = views::requests(self, self.recorder.recorded())
+            .into_iter()
+            .find(|view| view.id.0 == id.0)
+        {
+            self.recorder.record(views::arrived(view));
+        }
     }
 
     /// Checks a token-generation request against the loaded workers and
@@ -1593,6 +1596,13 @@ impl Scheduler {
         reservation: AdmissionReservation,
     ) {
         let id = st.req.request_id;
+        // The policy sees every admission as it happens: the request becomes
+        // resident, and the watchdog's deadline starts with it.
+        let admitted_at =
+            scheduling::guest::Nanos(crate::clock::now_monotonic_us().saturating_mul(1_000));
+        let request = scheduling::guest::RequestId(id.0);
+        self.recorder.admitted(request, admitted_at);
+        self.watchdog.admitted(request, admitted_at);
         let request_key = RequestKey::new(self.engine_id, id, st.request_epoch);
         let AdmissionReservation {
             source,

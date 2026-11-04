@@ -39,9 +39,9 @@ mod projection;
 mod results;
 
 use super::*;
+use ipc::{BufferId, MediaCall};
 use scheduling::PolicyError;
 use scheduling::guest::Plan;
-use ipc::{BufferId, MediaCall};
 
 pub(super) use media::Occupancy;
 
@@ -365,10 +365,13 @@ impl Scheduler {
         if !batches.is_empty() {
             return batches;
         }
+        let started = std::time::Instant::now();
         let Some(plan) = self.policy_step() else {
             return Vec::new();
         };
-        self.assemble_plan(&plan)
+        let batches = self.assemble_plan(&plan);
+        self.end_step(started.elapsed());
+        batches
     }
 
     /// One step's plan: observe, dispatch, validate (§4.4).
@@ -385,6 +388,12 @@ impl Scheduler {
         self.step += 1;
         let room = views::room(self, self.step);
         let live = self.live();
+        // A resident request that has not advanced within the policy's timeout
+        // is the policy's failure, not the request's (design §4.4).
+        let now = scheduling::guest::Nanos(crate::clock::now_monotonic_us().saturating_mul(1_000));
+        if let Some(request) = self.watchdog.starved(&live, now, policy.limits().timeout) {
+            return self.policy_failed(policy, PolicyError::Starved { request });
+        }
         // Everything that changed since the previous step, in the order it
         // happened, closed before this step's dispatch.
         self.recorder.close();
@@ -401,6 +410,13 @@ impl Scheduler {
         }
         self.policy = Some(policy);
         Some(plan)
+    }
+
+    /// Ends the step's accounting: the step number, and the policy's per-step
+    /// cost as the fuel it spent (design §12).
+    fn end_step(&mut self, duration: std::time::Duration) {
+        let step = self.step;
+        self.recorder.record(views::stepped(step, duration));
     }
 
     /// A policy failure: serve on under the previous policy (§7.3), or stop the
@@ -483,7 +499,8 @@ impl Scheduler {
     /// ever decided by one policy and executed under another.
     pub(super) fn adopt(&mut self, policy: policy::PolicySlot) {
         debug_assert!(
-            self.inflight.pending_batches.is_empty() && self.inflight.pending_submissions.is_empty(),
+            self.inflight.pending_batches.is_empty()
+                && self.inflight.pending_submissions.is_empty(),
             "a policy is adopted at a batch boundary"
         );
         self.policy = Some(policy);
