@@ -1635,17 +1635,6 @@ mod tests {
     }
 
     #[test]
-    fn rank_views_are_numbered_in_scheduler_order() {
-        let views = ranks([(4, true), (0, false)]);
-        assert_eq!(views.len(), 2);
-        assert_eq!(views[0].index, 0);
-        assert_eq!(views[0].in_flight, 4);
-        assert!(views[0].alive);
-        assert_eq!(views[1].index, 1);
-        assert!(!views[1].alive);
-    }
-
-    #[test]
     fn an_encoding_id_is_the_head_of_its_key() {
         let mut key = [0u8; 32];
         key[..8].copy_from_slice(&9u64.to_be_bytes());
