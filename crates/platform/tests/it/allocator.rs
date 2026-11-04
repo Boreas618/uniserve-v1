@@ -236,3 +236,49 @@ fn a_suspended_allocator_gives_its_budget_back_and_restores_its_blocks() {
     stream.synchronize().unwrap();
     assert_eq!(read(&host), vec![0x11; 16]);
 }
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn a_parked_block_changes_access_in_place_and_keeps_its_address() {
+    let _driver = exclusive_driver();
+    let device = platform::Device::new(DEVICE).unwrap();
+    let budget = RecordingBudget::new(32 << 20);
+    let mut allocator = with_budget(&device, &budget);
+    allocator.reserve(PoolKind::Resident, 8 << 20).unwrap();
+    let stream = device.stream().unwrap();
+
+    let block = allocator.allocate(PoolKind::Resident, 4096).unwrap();
+    let address = block.address();
+    let pattern: Vec<u8> = (0..16).map(|index| index as u8 + 1).collect();
+    let mut host = platform::PinnedBuffer::new(DEVICE, 16).unwrap();
+    // SAFETY: the host buffer is written before the copy and read after the
+    // synchronization.
+    unsafe { host.as_mut_slice() }.copy_from_slice(&pattern);
+    // SAFETY: both ranges hold the bytes and outlive the copy.
+    unsafe { platform::memcpy_async(address, host.address(), 16, &stream) }.unwrap();
+    stream.synchronize().unwrap();
+
+    // Park: the block turns read-only at the same address and keeps what it
+    // holds, which is what keeps a captured graph that reads it valid.
+    allocator
+        .set_protection(&block, platform::Protection::ReadOnly)
+        .unwrap();
+    assert_eq!(block.address(), address);
+    // SAFETY: the block is mapped; the host buffer is as long as the copy.
+    unsafe { platform::memcpy_async(host.address(), address, 16, &stream) }.unwrap();
+    stream.synchronize().unwrap();
+    assert_eq!(read(&host), pattern);
+
+    // Promote: writable again at the same address, and the write lands.
+    allocator
+        .set_protection(&block, platform::Protection::ReadWrite)
+        .unwrap();
+    assert_eq!(block.address(), address);
+    // SAFETY: the block is read-write again and holds the bytes.
+    unsafe { platform::memset_d8(address, 0x77, 16, &stream) }.unwrap();
+    stream.synchronize().unwrap();
+    // SAFETY: as above.
+    unsafe { platform::memcpy_async(host.address(), address, 16, &stream) }.unwrap();
+    stream.synchronize().unwrap();
+    assert_eq!(read(&host), vec![0x77; 16]);
+}

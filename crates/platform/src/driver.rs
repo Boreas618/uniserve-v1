@@ -22,6 +22,9 @@ pub(crate) const LIBCUDA: &str = "libcuda.so.1";
 
 pub(crate) const CUDA_SUCCESS: CuResult = 0;
 pub(crate) const CUDA_ERROR_NOT_READY: CuResult = 600;
+/// `CUDA_ERROR_INVALID_VALUE`, which `cuFuncGetParamInfo` answers past the
+/// last parameter of a kernel's signature.
+pub(crate) const CUDA_ERROR_INVALID_VALUE: CuResult = 1;
 
 /// `CUipcEventHandle`: an opaque 64-byte token passed by value.
 #[repr(C)]
@@ -240,6 +243,7 @@ driver_table! {
         stream_get_priority = "cuStreamGetPriority": fn(Handle, *mut i32);
         stream_get_ctx = "cuStreamGetCtx": fn(Handle, *mut Handle);
         stream_is_capturing = "cuStreamIsCapturing": fn(Handle, *mut i32);
+        stream_query = "cuStreamQuery": fn(Handle);
         stream_synchronize = "cuStreamSynchronize": fn(Handle);
         stream_destroy = "cuStreamDestroy_v2": fn(Handle);
         stream_wait_event = "cuStreamWaitEvent": fn(Handle, Handle, u32);
@@ -312,6 +316,12 @@ driver_table! {
             Handle, *mut Handle, *mut c_void, *mut usize,
         );
         graph_node_get_type = "cuGraphNodeGetType": fn(Handle, *mut i32);
+        graph_kernel_node_get_params = "cuGraphKernelNodeGetParams_v2": fn(
+            Handle, *mut KernelNodeParams,
+        );
+        func_get_param_info = "cuFuncGetParamInfo": fn(
+            Handle, usize, *mut usize, *mut usize,
+        );
         graph_exec_kernel_node_set_params = "cuGraphExecKernelNodeSetParams_v2": fn(
             Handle, Handle, *const KernelNodeParams,
         );

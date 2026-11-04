@@ -23,13 +23,23 @@ use std::sync::Arc;
 
 use crate::driver::{self, Handle, KernelNodeParams as RawKernelNodeParams};
 use crate::launch::Function;
-use crate::{DeviceGuard, DeviceId, Error, PrimaryContext, Result, Stream, reclaim};
+use crate::{Device, DeviceGuard, DeviceId, Error, PrimaryContext, Result, Stream, reclaim};
 
 /// `CU_STREAM_CAPTURE_STATUS_ACTIVE`.
 const CU_STREAM_CAPTURE_STATUS_ACTIVE: i32 = 1;
 
 /// `CU_GRAPH_NODE_TYPE_KERNEL`.
 const CU_GRAPH_NODE_TYPE_KERNEL: i32 = 0;
+/// `CU_GRAPH_NODE_TYPE_MEMCPY`.
+const CU_GRAPH_NODE_TYPE_MEMCPY: i32 = 1;
+/// `CU_GRAPH_NODE_TYPE_MEMSET`.
+const CU_GRAPH_NODE_TYPE_MEMSET: i32 = 2;
+/// `CU_GRAPH_NODE_TYPE_HOST`.
+const CU_GRAPH_NODE_TYPE_HOST: i32 = 3;
+/// `CU_GRAPH_NODE_TYPE_GRAPH`.
+const CU_GRAPH_NODE_TYPE_GRAPH: i32 = 4;
+/// `CU_GRAPH_NODE_TYPE_EMPTY`.
+const CU_GRAPH_NODE_TYPE_EMPTY: i32 = 5;
 
 /// What a template graph, its executable and its nodes share: the `CUgraph`,
 /// the context it belongs to, and the device.
@@ -150,6 +160,94 @@ impl Graph {
         nodes.truncate(count);
         Ok(nodes)
     }
+
+    /// Reads back the parameters of kernel node `node`: the kernel it
+    /// captured, its grid, block, dynamic shared memory and the values of its
+    /// arguments.
+    ///
+    /// This is the read half of a rebind walk (design 4.5): a capture with the
+    /// new kernels on a scratch stream gives a throwaway template, each of its
+    /// changed launches is read with this, and the values are set on the live
+    /// executable. `node` must be a kernel node of this graph, and the graph
+    /// may be destroyed once the returned values have been read.
+    pub fn kernel_node_params(&self, node: &GraphNode) -> Result<OwnedKernelNodeParams> {
+        if !Arc::ptr_eq(&self.core, &node.core) {
+            return Err(Error::invalid("the node belongs to another graph"));
+        }
+        let kind = node.kind()?;
+        if kind != GraphNodeKind::Kernel {
+            return Err(Error::invalid(format!(
+                "the node is {kind:?}, not a kernel node"
+            )));
+        }
+
+        let driver = driver::driver()?;
+        let _context = self.core.context.enter()?;
+        let mut raw = RawKernelNodeParams {
+            func: std::ptr::null_mut(),
+            grid_dim: [0; 3],
+            block_dim: [0; 3],
+            shared_mem_bytes: 0,
+            kernel_params: std::ptr::null_mut(),
+            extra: std::ptr::null_mut(),
+            kern: std::ptr::null_mut(),
+            ctx: std::ptr::null_mut(),
+        };
+        driver.check(
+            // SAFETY: the node is a live kernel node of this graph; the driver
+            // fills `raw` with the node's own parameter storage.
+            unsafe { (driver.graph_kernel_node_get_params)(node.raw, &mut raw) },
+            "cuGraphKernelNodeGetParams",
+        )?;
+
+        // Each parameter's size comes from the kernel's signature: the node's
+        // array carries no count, and the driver answers past the last
+        // parameter with CUDA_ERROR_INVALID_VALUE.
+        let mut sizes = Vec::new();
+        loop {
+            let (mut offset, mut size) = (0usize, 0usize);
+            // SAFETY: the function is the node's, live while its library is.
+            let status = unsafe {
+                (driver.func_get_param_info)(raw.func, sizes.len(), &mut offset, &mut size)
+            };
+            if status == driver::CUDA_ERROR_INVALID_VALUE {
+                break;
+            }
+            driver.check(status, "cuFuncGetParamInfo")?;
+            sizes.push((offset, size));
+        }
+
+        let mut parameters = Vec::with_capacity(sizes.len());
+        for (index, (offset, size)) in sizes.into_iter().enumerate() {
+            // SAFETY: the node's array has one entry per parameter of the
+            // signature, and its packed form lays the values out at the
+            // offsets just read; each value is `size` bytes there.
+            let source: *const c_void = unsafe {
+                if !raw.kernel_params.is_null() {
+                    *raw.kernel_params.add(index)
+                } else {
+                    (raw.extra as *const u8).add(offset).cast()
+                }
+            };
+            let mut value = vec![0u8; size];
+            if size > 0 {
+                // SAFETY: `source` addresses `size` readable bytes, as the
+                // signature says, and `value` holds exactly that many.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(source.cast::<u8>(), value.as_mut_ptr(), size)
+                };
+            }
+            parameters.push(value);
+        }
+
+        Ok(OwnedKernelNodeParams {
+            function: Function::new(raw.func, Device::new(self.core.device)?),
+            grid: raw.grid_dim,
+            block: raw.block_dim,
+            shared_memory: raw.shared_mem_bytes,
+            parameters,
+        })
+    }
 }
 
 /// The template graph's root nodes: those with no dependency.
@@ -190,6 +288,53 @@ unsafe impl Send for GraphNode {}
 // SAFETY: as for Send above.
 unsafe impl Sync for GraphNode {}
 
+impl GraphNode {
+    /// What work the node does (`cuGraphNodeGetType`).
+    ///
+    /// A rebind touches only [`GraphNodeKind::Kernel`] nodes; the capture of
+    /// an operation may add others (a copy of a constant, or the empty node
+    /// that joins dependencies), and setting kernel parameters on one of them
+    /// is the driver's error.
+    pub fn kind(&self) -> Result<GraphNodeKind> {
+        let driver = driver::driver()?;
+        let _context = self.core.context.enter()?;
+        let mut kind = 0;
+        driver.check(
+            // SAFETY: the node belongs to a graph that is live.
+            unsafe { (driver.graph_node_get_type)(self.raw, &mut kind) },
+            "cuGraphNodeGetType",
+        )?;
+        Ok(match kind {
+            CU_GRAPH_NODE_TYPE_KERNEL => GraphNodeKind::Kernel,
+            CU_GRAPH_NODE_TYPE_MEMCPY => GraphNodeKind::Memcpy,
+            CU_GRAPH_NODE_TYPE_MEMSET => GraphNodeKind::Memset,
+            CU_GRAPH_NODE_TYPE_HOST => GraphNodeKind::Host,
+            CU_GRAPH_NODE_TYPE_GRAPH => GraphNodeKind::Graph,
+            CU_GRAPH_NODE_TYPE_EMPTY => GraphNodeKind::Empty,
+            other => GraphNodeKind::Other(other),
+        })
+    }
+}
+
+/// The kind of work a graph node does (`CUgraphNodeType`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GraphNodeKind {
+    /// A kernel launch, the only kind a rebind changes.
+    Kernel,
+    /// A memory copy.
+    Memcpy,
+    /// A memory set.
+    Memset,
+    /// Host code.
+    Host,
+    /// A nested graph.
+    Graph,
+    /// A node that only orders its dependencies.
+    Empty,
+    /// A kind this binding does not name, as the driver's number.
+    Other(i32),
+}
+
 /// The parameters a rebind may change in one kernel node.
 ///
 /// The launch attributes — the cluster, programmatic dependent launch and
@@ -208,6 +353,62 @@ pub struct KernelNodeParams<'a> {
     pub shared_memory: u32,
     /// The address of each kernel parameter's value, in declaration order.
     pub parameters: &'a [*mut c_void],
+}
+
+/// A kernel node's parameters read back from a template graph, owned by the
+/// caller.
+///
+/// [`Graph::kernel_node_params`] fills one from a node of a throwaway capture;
+/// a rebind walk then sets the changed ones on the live executable with
+/// [`GraphExec::set_kernel_node_params_owned`], which replaces the function of
+/// the kernel that answers for the node.
+///
+/// The values are copied out of the node — the driver keeps each parameter's
+/// size in the kernel's signature — so nothing dangles when the template is
+/// destroyed.
+pub struct OwnedKernelNodeParams {
+    /// The kernel the node captured. Valid while the library it was loaded
+    /// from is loaded, the same obligation a captured graph has.
+    pub function: Function,
+    /// Blocks per grid dimension.
+    pub grid: [u32; 3],
+    /// Threads per block dimension.
+    pub block: [u32; 3],
+    /// Dynamic shared memory per block, in bytes.
+    pub shared_memory: u32,
+    /// Each parameter's value, copied, in declaration order.
+    pub parameters: Vec<Vec<u8>>,
+}
+
+impl std::fmt::Debug for OwnedKernelNodeParams {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OwnedKernelNodeParams")
+            .field("function", &(self.function.raw() as usize))
+            .field("grid", &self.grid)
+            .field("block", &self.block)
+            .field("shared_memory", &self.shared_memory)
+            .field("parameters", &self.parameters)
+            .finish()
+    }
+}
+
+impl OwnedKernelNodeParams {
+    /// Pointers to the copied values, as [`KernelNodeParams`] takes them. The
+    /// pointers are valid while this value is alive and not mutated.
+    pub fn pointers(&self) -> Vec<*mut c_void> {
+        self.parameters
+            .iter()
+            .map(|value| value.as_ptr().cast_mut().cast())
+            .collect()
+    }
+
+    /// The same parameters for another kernel: what a rebind sets, which
+    /// changes the function and keeps every argument the node captured.
+    pub fn with_function(mut self, function: Function) -> Self {
+        self.function = function;
+        self
+    }
 }
 
 /// A captured graph instantiated for replay (`CUgraphExec`).
@@ -305,6 +506,26 @@ impl GraphExec {
             // the values it points at.
             unsafe { (driver.graph_exec_kernel_node_set_params)(self.raw, node.raw, &raw) },
             "cuGraphExecKernelNodeSetParams",
+        )
+    }
+    /// Sets parameters read back from a template's node on this executable:
+    /// the values of [`Graph::kernel_node_params`], with the function a rebind
+    /// chooses ([`OwnedKernelNodeParams::with_function`]).
+    pub fn set_kernel_node_params_owned(
+        &self,
+        node: GraphNode,
+        params: &OwnedKernelNodeParams,
+    ) -> Result<()> {
+        let pointers = params.pointers();
+        self.set_kernel_node_params(
+            node,
+            &KernelNodeParams {
+                function: &params.function,
+                grid: params.grid,
+                block: params.block,
+                shared_memory: params.shared_memory,
+                parameters: &pointers,
+            },
         )
     }
 }

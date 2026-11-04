@@ -3,8 +3,9 @@
 use std::marker::PhantomData;
 use std::sync::{Arc, OnceLock};
 
-use crate::driver::{Handle, driver};
-use crate::{DeviceId, Result};
+use crate::driver::{Handle, driver, in_context};
+use crate::stream::CU_STREAM_NON_BLOCKING;
+use crate::{DeviceId, Error, Result};
 
 /// A retained reference to a device's primary context.
 ///
@@ -23,6 +24,10 @@ struct Retained {
     device: DeviceId,
     handle: i32,
     raw: Handle,
+    /// The stream [`PrimaryContext::sticky_error`] probes, created on first use
+    /// and never given work; stored as an address because it is destroyed by
+    /// hand in `Drop`.
+    probe: OnceLock<usize>,
 }
 
 // SAFETY: retaining, pushing and releasing a primary context are thread-safe
@@ -50,6 +55,7 @@ impl PrimaryContext {
                 device,
                 handle,
                 raw,
+                probe: OnceLock::new(),
             }),
         })
     }
@@ -65,6 +71,73 @@ impl PrimaryContext {
     /// The `CUcontext` handle, as the CUPTI profiling APIs take it.
     pub fn handle(&self) -> usize {
         self.retained.raw as usize
+    }
+
+    /// The error that left this context unusable, if any (design 2.4's
+    /// watchdog): the context's sticky state, read without waiting for any
+    /// queued work.
+    ///
+    /// CUDA has no sticky-error query. Once a context has one, every call that
+    /// touches it returns that error, so the probe is a non-blocking
+    /// `cuStreamQuery` on a stream this context owns and never issues work to:
+    /// while the context is healthy the stream is empty and the call succeeds
+    /// at once, and once the context has gone sticky the call returns the error
+    /// that poisoned it.
+    ///
+    /// This is a probe, not a synchronization: a clean answer means only that
+    /// the context has not gone sticky, never that the job's work finished or
+    /// succeeded. A caller waiting for a job synchronizes its stream; this
+    /// answers the watchdog's question while the job still runs.
+    pub fn sticky_error(&self) -> Result<Option<Error>> {
+        let probe = match self.retained.probe.get() {
+            Some(probe) => *probe as Handle,
+            // Creating an object in a context that has gone sticky returns the
+            // sticky error itself; any other failure here is reported the same
+            // way, since a context that cannot create a stream cannot run work.
+            None => match self.probe_stream() {
+                Ok(probe) => probe,
+                Err(error) => return Ok(Some(error)),
+            },
+        };
+        let driver = driver()?;
+        // SAFETY: `probe` is the stream created above for this context, which
+        // outlives it, and the query waits for nothing.
+        let status = unsafe { (driver.stream_query)(probe) };
+        match driver.check(status, "cuStreamQuery") {
+            Ok(()) => Ok(None),
+            Err(error) => Ok(Some(error)),
+        }
+    }
+
+    /// The probe stream, created on first use. Creating an object in a context
+    /// that has gone sticky returns the sticky error, which is the answer.
+    fn probe_stream(&self) -> Result<Handle> {
+        let mut raw = std::ptr::null_mut();
+        let created = in_context(self.raw(), |driver| {
+            driver.check(
+                // SAFETY: the driver writes one stream handle in the context
+                // this call made current.
+                unsafe {
+                    (driver.stream_create_with_priority)(&mut raw, CU_STREAM_NON_BLOCKING, 0)
+                },
+                "cuStreamCreateWithPriority",
+            )
+        });
+        created?;
+        let shared = *self.retained.probe.get_or_init(|| raw as usize);
+        if shared == raw as usize {
+            return Ok(raw);
+        }
+        // Another thread stored its stream first; this one is ours to destroy.
+        let _ = in_context(self.raw(), |driver| {
+            driver.check(
+                // SAFETY: the stream was created above for this context and is
+                // destroyed once here.
+                unsafe { (driver.stream_destroy)(raw) },
+                "cuStreamDestroy_v2",
+            )
+        });
+        Ok(shared as Handle)
     }
 
     /// Makes this context current on the calling thread until the guard drops.
@@ -208,6 +281,18 @@ extern "C" fn reset_at_exit() {
 
 impl Drop for Retained {
     fn drop(&mut self) {
+        if let Some(probe) = self.probe.get() {
+            // The probe stream belongs to this context: destroy it while the
+            // context is still retained.
+            let _ = in_context(self.raw, |driver| {
+                driver.check(
+                    // SAFETY: the stream was created for this context and is
+                    // destroyed once, after its last owner.
+                    unsafe { (driver.stream_destroy)(*probe as Handle) },
+                    "cuStreamDestroy_v2",
+                )
+            });
+        }
         if let Ok(driver) = driver() {
             // SAFETY: releases exactly the reference retained at construction.
             // A failure cannot be reported from drop and leaves one reference.
