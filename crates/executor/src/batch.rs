@@ -302,6 +302,45 @@ pub enum Job {
 }
 
 impl Job {
+    /// What this job is doing, for the report of a failed submission.
+    ///
+    /// The device thread knows the job it was performing and the caller does not, and the failure
+    /// crosses a thread boundary as a bare error, so the description is written where the job is
+    /// performed and carried beside that error.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Replay {
+                bucket,
+                generation,
+                batch,
+                ..
+            } => format!(
+                "replaying batch {} from the bucket of {} tokens and {} rows of generation {generation}",
+                batch.0, bucket.tokens, bucket.rows
+            ),
+            Self::Capture { bucket, generation, .. } => format!(
+                "capturing the bucket of {} tokens and {} rows of generation {generation}",
+                bucket.tokens, bucket.rows
+            ),
+            Self::Rebind { bucket, generation, .. } => format!(
+                "rebinding the bucket of {} tokens and {} rows of generation {generation}",
+                bucket.tokens, bucket.rows
+            ),
+            Self::Shadow {
+                operator,
+                key,
+                bucket,
+                generation,
+                ..
+            } => format!(
+                "shadowing {operator} {key} in the bucket of {} tokens and {} rows of generation {generation}",
+                bucket.tokens, bucket.rows
+            ),
+            Self::Issue { .. } => "issuing deferred storage work".to_owned(),
+            Self::After { .. } => "waiting for deferred storage work".to_owned(),
+        }
+    }
+
     /// What kind of job this is, for the watchdog's report.
     pub fn kind(&self) -> JobKind {
         match self {
@@ -561,6 +600,9 @@ pub struct Submission {
 
 pub(crate) struct SubmissionState {
     outcome: Mutex<Option<Outcome<BatchOutput>>>,
+    /// What the submission was doing when it failed, written where the failure happened: the
+    /// caller cannot know it, and an error alone does not say which bucket or operator broke.
+    failure: Mutex<Option<String>>,
     ready: Condvar,
 }
 
@@ -569,6 +611,7 @@ impl Submission {
     pub fn completed(id: SubmissionId, outcome: Outcome<BatchOutput>) -> Self {
         let state = Arc::new(SubmissionState {
             outcome: Mutex::new(Some(outcome)),
+            failure: Mutex::new(None),
             ready: Condvar::new(),
         });
         Self { id, state }
@@ -578,6 +621,7 @@ impl Submission {
     pub(crate) fn pending(id: SubmissionId) -> (Self, Arc<SubmissionState>) {
         let state = Arc::new(SubmissionState {
             outcome: Mutex::new(None),
+            failure: Mutex::new(None),
             ready: Condvar::new(),
         });
         (
@@ -640,9 +684,25 @@ impl Submission {
     pub fn outcome(&self) -> Option<Outcome<BatchOutput>> {
         lock(&self.state.outcome).clone()
     }
+
+    /// What the submission was doing when it failed, when it did.
+    ///
+    /// The device thread writes it where the failure happens - the job it was performing and the
+    /// bucket, generation or operator that named it - because the caller holds only the bare error.
+    pub fn failure_label(&self) -> Option<String> {
+        lock(&self.state.failure).clone()
+    }
 }
 
 impl SubmissionState {
+    /// Records what this submission was doing when it failed, for the report that reads it.
+    pub(crate) fn note_failure(&self, label: String) {
+        let mut slot = lock(&self.failure);
+        if slot.is_none() {
+            *slot = Some(label);
+        }
+    }
+
     /// Completes the submission with `outcome`; the first completion wins.
     pub(crate) fn finish(self: Arc<Self>, outcome: Outcome<BatchOutput>) {
         let mut slot = lock(&self.outcome);
