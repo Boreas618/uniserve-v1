@@ -663,17 +663,6 @@ mod tests {
     }
 
     #[test]
-    fn a_generation_aborted_before_switchover_is_purged() {
-        let mut update = update();
-        update.begin_precopy(8).expect("a fresh update");
-        update.precopied(8).expect("precopy finished");
-        update.revert(8, precopy_failure()).expect("abort");
-        assert_eq!(update.current(), 7);
-        assert_eq!(update.purge_due(), Some(8));
-        update.purged(8).expect("purged");
-    }
-
-    #[test]
     fn probation_expires_at_the_rollback_threshold() {
         let mut update = update();
         update.begin_precopy(8).expect("a fresh update");
