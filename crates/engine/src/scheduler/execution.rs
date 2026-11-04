@@ -187,6 +187,10 @@ impl Scheduler {
         // The owner loop returns here without parking while progress is being
         // made, so subsequent ready completions are handled on successive turns.
         progressed |= self.poll_one_result();
+        // A stage that arrived while a batch was executing is applied at the
+        // first batch boundary with nothing in flight: no batch is ever decided
+        // by one policy and executed under another (design §7.3).
+        self.apply_policy_stage();
         progressed |= self.poll_kv_offload();
         progressed |= self.poll_trajectories();
         progressed |= self
