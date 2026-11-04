@@ -148,7 +148,8 @@ impl ElementType {
             Self::BF16 => Some(ops::DType::BF16),
             Self::F32 => Some(ops::DType::F32),
             Self::F8E4M3 => Some(ops::DType::F8E4M3),
-            Self::Bool | Self::I8 | Self::I16 | Self::U32 | Self::F64 | Self::F8E5M2 => None,
+            Self::I16 => Some(ops::DType::I16),
+            Self::Bool | Self::I8 | Self::U32 | Self::F64 | Self::F8E5M2 => None,
         }
     }
 
@@ -169,6 +170,7 @@ impl ElementType {
             ops::DType::BF16 => Self::BF16,
             ops::DType::F32 => Self::F32,
             ops::DType::F8E4M3 => Self::F8E4M3,
+            ops::DType::I16 => Self::I16,
             ops::DType::F4E2M1 => return None,
         })
     }

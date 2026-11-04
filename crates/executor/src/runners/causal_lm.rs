@@ -1386,19 +1386,17 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let groups = self.kv.groups();
         let mut layers: Vec<Vec<nn::KvPlanes>> = Vec::with_capacity(groups);
         let mut tables = Vec::with_capacity(groups);
-        let mut scales = Vec::with_capacity(groups);
         for group in 0..groups {
             match scratch_pages {
                 None => {
                     layers.push(self.kv.planes(group)?);
                     tables.push(self.kv.block_table(group, slots, &self.stream)?);
-                    scales.push(self.kv.scales(group));
                 }
                 Some(pages) => {
                     let (table, planes, scale) = self.kv.scratch(group, slots, pages, &self.stream)?;
+                    let _ = scale;
                     layers.push(planes);
                     tables.push(table);
-                    scales.push(scale);
                 }
             }
         }
@@ -1407,8 +1405,9 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 block_tables: tables[group],
                 page_size: self.kv.page_size(),
                 dtype: self.kv.dtype(),
-                key_scales: scales[group].map(|(key, _)| key),
-                value_scales: scales[group].map(|(_, value)| value),
+                // The scales are per layer and travel on each `KvPlanes` (nn's
+                // `KvPlanes::key_scale`/`value_scale`); the provider sets them as it
+                // builds the group's planes.
                 layers: &layers[group],
             })
             .collect();
