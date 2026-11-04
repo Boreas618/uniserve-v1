@@ -700,8 +700,9 @@ impl Scheduler {
             .chain(self.running.keys().map(|id| guest(id.0)))
             .chain(self.running_media.keys().map(|id| guest(id.0)))
             .collect();
-        let told = self.recorder.announced_requests();
-        for id in held.difference(told) {
+        let told: std::collections::BTreeSet<scheduling::guest::RequestId> =
+            self.recorder.known().collect();
+        for id in held.difference(&told) {
             debug_assert!(
                 false,
                 "the policy was never told of request {}: the mechanism holds it, so nothing can                          plan its work",
