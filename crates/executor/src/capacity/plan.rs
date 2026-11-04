@@ -1019,7 +1019,9 @@ mod tests {
             &HostGroup::single(0),
             dense(geometry),
         )
-        .expect("the device has room for this cache")
+        .unwrap_or_else(|error| {
+            panic!("token_plan refused a dense plan of an 8 GiB device: {error}")
+        })
     }
 
     /// The pool the plan fits plus its fixed storage is what the plan books,
