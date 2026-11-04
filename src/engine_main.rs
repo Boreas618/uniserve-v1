@@ -1567,15 +1567,32 @@ impl MainProcess {
                     .collect(),
             });
         }
+        // The schedulers state their own figures; a node that holds none reports the executors'
+        // and a step count of zero, because no step happened here.
+        let (mut steps, mut batches, mut tokens, mut policy_fuel, mut policy_calls) = (0, 0, 0, 0, 0);
+        for scheduler in &self.schedulers {
+            // A scheduler answers its counters on its own thread: a metrics report is not worth
+            // stalling the control thread for, so the pass takes what is there.
+            let Ok(counters) = scheduler.counters().recv_timeout(METRICS_WAIT) else {
+                continue;
+            };
+            steps += counters.steps;
+            batches += counters.batches;
+            tokens += counters.tokens;
+            policy_fuel += counters.policy_fuel;
+            policy_calls += counters.policy_calls;
+            // The launches and the device time are the executors', counted where they are issued:
+            // a scheduler's copy of them would be a second source for one figure.
+        }
         let metrics = proto::request::wire::Metrics {
-            steps: 0,
-            batches: 0,
-            tokens: 0,
+            steps,
+            batches,
+            tokens,
             kernel_launches,
             device_ns,
             queue,
-            policy_fuel: 0,
-            policy_calls: 0,
+            policy_fuel,
+            policy_calls,
             memory,
         };
         if let Err(error) = self
@@ -1912,6 +1929,10 @@ fn answer(
 
 /// How often the engine reports its counters.
 const METRICS_EVERY: Duration = Duration::from_secs(1);
+
+/// How long a metrics pass waits on one scheduler's counters: the report is sent once a second and a
+/// pass that waited longer than this would be reporting what the next pass reports anyway.
+const METRICS_WAIT: Duration = Duration::from_millis(50);
 
 /// How long the daemon's process interface may take to answer the handshake, which it answers at
 /// once: the wait exists to fail a wrong address rather than hang the process.
