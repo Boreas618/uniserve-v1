@@ -430,15 +430,15 @@ impl MainProcess {
             )?;
             // §7.3 step 2 shadows a replaced operator beside the serving one, so the region it runs
             // in is mapped before any batch: the executor books it from the scratch pool the graph
-            // storage sized. Then §4.5's warmup runs every captured bucket once, so the first
-            // request does not pay for a capture. Nothing is serving yet, so the control thread
-            // waits here; `serve` never does (§2.4).
+            // storage sized. Nothing is serving yet, so the control thread waits here; `serve`
+            // never does (§2.4).
+            //
+            // §4.5's warmup is not here: the epoch's first generation holds no kernel until the
+            // daemon's precopy fills it, so there is no bucket to warm. It runs at the first
+            // switchover, which is the boundary the first request is served at.
             let shadow = executor.set_shadow()?;
             device_command(&watchdog, *device, "shadow region", shadow)
                 .with_context(|| format!("mapping the shadow region of device {}", device.0))?;
-            let warmup = executor.warmup()?;
-            device_command(&watchdog, *device, "warmup", warmup)
-                .with_context(|| format!("warming up device {}", device.0))?;
             executors.push(executor);
             generations.push(generation);
         }
@@ -1105,6 +1105,27 @@ impl MainProcess {
                 return Ok(self.revert(generation, failure));
             }
         }
+        // §4.5: the first request served on a generation must not pay for a capture, so every
+        // captured bucket of the generation that just took over runs once, here, between batches.
+        // A switchover later in the epoch warms the buckets the new kernel programs changed; the
+        // first one also warms the buckets no update touched, because until now nothing served
+        // them.
+        for executor in &self.executors {
+            let device = executor.device();
+            let submission = executor
+                .warmup()
+                .with_context(|| format!("warming up device {}", device.0))?;
+            if let Err(error) = device_command(&self.watchdog, device, "warmup", submission) {
+                tracing::error!(%error, "warming the new generation failed; reverting the update");
+                let failure = UpdateFailure::Device {
+                    device: u32::try_from(device.0).unwrap_or_default(),
+                    error: error.to_string(),
+                    batch: None,
+                };
+                return Ok(self.revert(generation, failure));
+            }
+        }
+
         // The state machine records the cut-over only when every device serves the new generation,
         // and the process's record of what serves follows it.
         self.update.switchover(generation, Instant::now())?;
