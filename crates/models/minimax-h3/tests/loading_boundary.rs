@@ -135,3 +135,23 @@ fn no_representation_is_refused() {
     let error = stored_dtype(&checkpoint, "scheduler").expect_err("no float type to keep");
     assert!(error.to_string().contains("no floating-point tensor"));
 }
+
+/// The refiner spans two components, so a deployment whose text encoder and DiT disagree on the
+/// element type is refused at the boundary and not inside a forward.
+#[test]
+fn a_mixed_text_and_dit_pair_is_refused() {
+    use minimax_h3::load::refiner_types;
+
+    refiner_types(DType::F32, DType::F32, "transformer").expect("one type is the answer");
+    refiner_types(DType::BF16, DType::BF16, "transformer_ref").expect("one type is the answer");
+
+    let message = refiner_types(DType::BF16, DType::F32, "transformer")
+        .expect_err("a bf16 encoder over an f32 DiT is one mixed gemm")
+        .to_string();
+    for named in ["BF16", "F32", "transformer", "refiner", "gemm"] {
+        assert!(
+            message.contains(named),
+            "the refusal must name {named}, and it says: {message}"
+        );
+    }
+}

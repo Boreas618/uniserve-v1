@@ -179,6 +179,27 @@ fn require(
     )))
 }
 
+/// Refuse a deployment whose text encoder and DiT are stored in different element types.
+///
+/// The refiner between them reads the encoder's `[rows, text_dim]` features and projects them with
+/// the **DiT's** `token_refiner.input`, so a mixed pair is one gemm whose activation is the encoder's
+/// type and whose weight is the DiT's - a cell no backend can serve (`cuBLASLt refused an argument`),
+/// and one that surfaces deep inside a forward rather than at the boundary that composed it. With
+/// `dtype = "auto"` nothing is converted, so the two must already agree; a deployment that states a
+/// type gets one conversion at load instead, which is what an explicit `dtype` is for.
+pub fn refiner_types(text_encoder: nn::DType, dit: nn::DType, dit_directory: &str) -> Result<()> {
+    if text_encoder == dit {
+        return Ok(());
+    }
+    Err(Error::checkpoint(format!(
+        "the text encoder is stored in {text_encoder} and `{dit_directory}` in {dit}, and the \
+         refiner between them projects the encoder's features with the DiT's own weights: that is one \
+         gemm of a {text_encoder} activation with a {dit} weight, which no compiled cell can run. \
+         With `dtype = \"auto\"` nothing is converted, so this export needs a deployment that states \
+         one element type for both."
+    )))
+}
+
 /// The one floating-point type a component's weights are stored in.
 ///
 /// `dtype = "auto"` converts nothing at load, so this is the element type a block built from that
@@ -250,6 +271,23 @@ pub fn load(
     let (layout, sidecars) = sidecars(checkpoint)?;
     let config = Config::normalize(&layout, &sidecars)?;
     partition.validate(&config)?;
+    // Two components, one number: the refiner spans the text encoder and the DiT, so their stored
+    // types must agree before a single weight is read.
+    if partition.blocks.contains(Component::TextEncoder) {
+        for dit in [Dit::Base, Dit::Reference] {
+            let placed = match dit {
+                Dit::Base => partition.blocks.contains(Component::Transformer),
+                Dit::Reference => partition.blocks.contains(Component::TransformerRef),
+            };
+            if placed {
+                refiner_types(
+                    stored_dtype(checkpoint, Component::TextEncoder.directories()[0])?,
+                    stored_dtype(checkpoint, dit.directory())?,
+                    dit.directory(),
+                )?;
+            }
+        }
+    }
 
     // The two condition encoders are the denoiser block's half, and they are loaded before the
     // loop because a block is boxed as it is built: the partition places `transformer` before
