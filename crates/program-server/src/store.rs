@@ -232,6 +232,12 @@ impl Store {
         if staged.exists() {
             std::fs::remove_dir_all(&staged)?;
         }
+        // A publish that died between its staging and its rename leaves a
+        // directory no reader treats as a module and no later publish reuses, so
+        // the leftovers of a previous run are swept here. Only another process's
+        // are swept: this process's live ones are beside them and must be left
+        // alone.
+        sweep_other_staging(parent)?;
         std::fs::create_dir_all(&staged)?;
         for name in files {
             let source = workspace.join(name);
@@ -386,6 +392,40 @@ fn directories(path: &Path) -> Result<Vec<PathBuf>> {
     }
     directories.sort();
     Ok(directories)
+}
+
+/// Removes staging directories a previous process left beside a publish.
+///
+/// Publishing stages under `.staged-<pid>-<n>` and renames it into place, so a
+/// crash between the two leaves a directory that is invisible to a reader and
+/// never reused. A pid in the name is what says whether that process is still
+/// running: this one's staged directories are live and are left alone.
+fn sweep_other_staging(parent: &Path) -> Result<()> {
+    let mine = format!(".staged-{}-", std::process::id());
+    for entry in std::fs::read_dir(parent)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(".staged-") || name.starts_with(&mine) {
+            continue;
+        }
+        // A second server may be publishing into the same root, and its staging
+        // directory is as live as this one's. The name says which process made
+        // it; only a process that is gone leaves work to sweep.
+        let pid = name
+            .trim_start_matches(".staged-")
+            .split('-')
+            .next()
+            .and_then(|pid| pid.parse::<u32>().ok());
+        let Some(pid) = pid else { continue };
+        if Path::new(&format!("/proc/{pid}")).exists() {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 /// Flushes a directory's entries, so a rename into it survives a crash.
