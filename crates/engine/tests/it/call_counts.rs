@@ -52,6 +52,14 @@ const STEPS: Duration = Duration::from_secs(20);
 /// The token this pool samples for the `index`th call of every batch.
 const SAMPLED: u32 = 1000;
 
+/// Blocks until a command answers, and answers its result.
+fn answer<T>(receiver: crossbeam_channel::Receiver<Result<T, String>>) -> Result<T, String> {
+    match receiver.recv_timeout(ANSWER) {
+        Ok(result) => result,
+        Err(error) => panic!("the scheduler did not answer: {error}"),
+    }
+}
+
 /// One rank of a text pool: prefill and decode, eight request rows, and the
 /// batch bounds the launch stated.
 fn rank(host: &str) -> WorkerInfo {
