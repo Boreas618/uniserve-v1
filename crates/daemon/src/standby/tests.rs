@@ -353,6 +353,31 @@ fn a_standby_whose_preparation_failed_drops_the_domains_standbys() {
 }
 
 #[test]
+fn an_epoch_that_stops_serving_retires_its_standby_and_its_domain_goes_on_short() {
+    let mut roster = roster();
+    start(&mut roster);
+    parked(&mut roster);
+    // The epoch stops serving on `c`: the standby layer owns that child and
+    // stops it, so the epoch layer never needs its generation.
+    assert_eq!(roster.retired("c"), vec![terminate("c", SERVING + 1)]);
+    // A fault of the retired node replaces nothing.
+    assert!(roster.failed("c", &failure("sticky")).is_empty());
+    // The domain's remaining member is promoted alone.
+    assert_eq!(
+        roster.failed("b", &failure("sticky")),
+        vec![promote("b", SERVING + 1)]
+    );
+    assert_eq!(roster.promoted("b", SERVING + 1), vec![stop("b", SERVING)]);
+    // Serving again starts no standby on the retired node.
+    let actions = roster.serve(
+        Status::Serving,
+        options(StandbyStorage::Auto),
+        &roomy(&["a", "b", "c"]),
+    );
+    assert_eq!(actions, vec![spawn("b", SERVING + 2, Storage::Resident)]);
+}
+
+#[test]
 fn a_device_that_needs_a_reset_takes_its_standby_and_migrates_the_node() {
     let mut roster = roster();
     start(&mut roster);
