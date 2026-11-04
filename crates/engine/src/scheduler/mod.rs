@@ -492,6 +492,13 @@ pub struct Scheduler {
     )>,
     /// The events and transitions a policy is told about (§4.4).
     recorder: mechanism::Recorder,
+    /// The device pages that exist, kept from the epoch's snapshot and from the
+    /// `Cached`/`Freed` announcements of each step: the table `Live` checks a
+    /// named page against, without a step walking the prefix cache.
+    pages: std::collections::BTreeMap<scheduling::guest::PageId, scheduling::guest::PageView>,
+    /// Whether `pages` was built yet. It is built on the first step that
+    /// announces a change, from `views::page_index`, which is the one walk.
+    pages_seeded: bool,
     /// The starvation watchdog: a resident request that does not advance
     /// within the policy's `timeout` is the policy's failure (§4.4).
     watchdog: mechanism::Watchdog,

@@ -201,9 +201,10 @@ struct PoolInner {
     free_count: usize,
     /// Published pages keyed by their first unit.
     pages: HashMap<u32, PublishedPage>,
-    /// First units of the pages published since the last drain, in the order
-    /// they were published: the step's `Cached` events.
-    published_log: Vec<u32>,
+    /// The pages published since the last drain, in the order they were
+    /// published, as their first unit and token count: the step's `Cached`
+    /// events.
+    published_log: Vec<(u32, u32)>,
     /// First units of the pages that went since the last drain, in the order
     /// they went: the step's `Freed` events.
     freed_log: Vec<u32>,
@@ -1019,7 +1020,8 @@ impl BlockPool {
             },
         );
         inner.hash_to_pages.entry(hash).or_default().push(head);
-        inner.published_log.push(head);
+        let tokens = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
+        inner.published_log.push((head, tokens));
         if resume.is_none() {
             inner.stats.pages_stored += 1;
         }
@@ -1194,12 +1196,21 @@ impl BlockPool {
     /// and the policy mirrors that from these two lists — one `Cached` and one
     /// `Freed` event each — so no step has to walk the cache to learn what it
     /// holds.
-    pub(crate) fn take_page_changes(&self) -> (Vec<u32>, Vec<u32>) {
+    pub(crate) fn take_page_changes(&self) -> (Vec<(u32, u32)>, Vec<u32>) {
         let mut inner = lock(&self.inner);
         (
             std::mem::take(&mut inner.published_log),
             std::mem::take(&mut inner.freed_log),
         )
+    }
+
+    /// The units of the published page whose first unit is `head`, when it
+    /// still exists.
+    pub(crate) fn page_units(&self, head: u32) -> Option<Vec<u32>> {
+        lock(&self.inner)
+            .pages
+            .get(&head)
+            .map(|page| page.units.iter().map(|unit| unit.0).collect())
     }
 
     /// Whether a published page exists whose first unit is `head`.

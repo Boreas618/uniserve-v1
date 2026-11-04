@@ -539,8 +539,10 @@ impl Scheduler {
         if let Some(request) = self.watchdog.starved(&live, now, policy.limits().timeout) {
             return self.policy_failed(policy, PolicyError::Starved { request });
         }
-        // Everything that changed since the previous step, in the order it
-        // happened, closed before this step's dispatch.
+        // The pages that appeared and went, then everything else that changed
+        // since the previous step, in the order it happened, closed before this
+        // step's dispatch.
+        self.pump_page_changes();
         self.recorder.close();
         let events = self.recorder.take();
         if let Err(error) = policy.observe(&events) {
@@ -620,6 +622,42 @@ impl Scheduler {
     }
 
     /// The objects the validators read, as they stand now.
+    /// Announces the pages that appeared and went since the previous step, and
+    /// keeps the mechanism's table of live pages current (design §4.4).
+    ///
+    /// The pool logs both changes, so a step costs what changed rather than the
+    /// size of the prefix cache: the page table is built once, from the epoch's
+    /// snapshot, and then only by these two events.
+    fn pump_page_changes(&mut self) {
+        let Some(cache) = self.storage.cache() else {
+            return;
+        };
+        let (published, freed) = cache.block_pool.take_page_changes();
+        if published.is_empty() && freed.is_empty() {
+            return;
+        }
+        if !self.pages_seeded {
+            self.pages = views::page_index(self);
+            self.pages_seeded = true;
+        }
+        let announced: Vec<scheduling::guest::PageView> = published
+            .into_iter()
+            .filter_map(|(head, tokens)| {
+                let units = cache.block_pool.page_units(head)?;
+                views::page_of(self, &units, tokens)
+            })
+            .collect();
+        for page in announced {
+            self.pages.insert(page.id, page.clone());
+            self.recorder.cached(page);
+        }
+        for head in freed {
+            let page = views::device_page(head);
+            self.pages.remove(&page);
+            self.recorder.freed(page);
+        }
+    }
+
     fn live(&self) -> mechanism::Live {
         let mut live = mechanism::Live {
             queue: self
@@ -637,8 +675,8 @@ impl Scheduler {
         for request in views::requests(self, self.recorder.recorded()) {
             live.requests.insert(request.id, request);
         }
-        for page in views::pages(self) {
-            live.pages.insert(page.id, page);
+        for page in &self.pages {
+            live.pages.insert(*page.0, page.1.clone());
         }
         for entry in views::encodings(self) {
             live.encodings.insert(entry.id, entry);
@@ -658,6 +696,10 @@ impl Scheduler {
                 && self.inflight.pending_submissions.is_empty(),
             "a policy is adopted at a batch boundary"
         );
+        // The epoch's page table is walked once, here, so every later step costs
+        // what changed: the policy was handed the same table in its snapshot.
+        self.pages = views::page_index(self);
+        self.pages_seeded = true;
         self.policy = Some(policy);
     }
 
