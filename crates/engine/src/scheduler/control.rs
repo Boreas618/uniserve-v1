@@ -12,6 +12,16 @@
 use super::*;
 use crate::handle;
 
+/// The name a stage's refusal uses.
+fn stage_name(stage: Stage) -> &'static str {
+    match stage {
+        Stage::Switchover => "switchover",
+        Stage::Commit => "commit",
+        Stage::Revert => "revert",
+        Stage::Purge => "purge",
+    }
+}
+
 /// What an engine command this scheduler does not apply itself is called, for
 /// the answer that names its owner.
 fn engine_command_name(kind: &proto::process::command::Kind) -> &'static str {
@@ -294,10 +304,13 @@ impl Scheduler {
                 answer,
             } => self.precopy_policy(program, source, answer),
             Command::StagePolicy { stage, answer } => {
-                self.request_stage(stage, Some(StageAnswer::Step(answer)));
+                self.request_stage(stage, Some(StageAnswer::Step(answer)), None);
             }
             Command::EngineCommand { command, answer } => {
                 self.engine_command(command, answer);
+            }
+            Command::ProgramCommand { command, answer } => {
+                self.program_command(command, answer);
             }
             Command::Shadow { generation, answer } => {
                 let _ = answer.send(self.shadow(generation));
@@ -436,6 +449,38 @@ impl Scheduler {
         }
     }
 
+    /// Applies one command of the program-layer update (§2.3, §7.3) to this
+    /// scheduler.
+    ///
+    /// The stages are a scheduler's: it cuts over at the boundary the command
+    /// names, ends probation, reverts, and drops the generation before the
+    /// serving one. A `Precopy` arrives with the operator programs, which are
+    /// the program layer's, and the scheduling policy, whose module comes from
+    /// the Program Server: the process that holds that source resolves it once
+    /// and precopies each scheduler (`SchedulerHandle::precopy_policy`), so the
+    /// command itself is answered with that rather than half applied here.
+    fn program_command(
+        &mut self,
+        command: ipc::ProgramCommand,
+        answer: crossbeam_channel::Sender<Result<(), String>>,
+    ) {
+        let (stage, at) = match command {
+            ipc::ProgramCommand::Switchover { step, .. } => (Stage::Switchover, step),
+            ipc::ProgramCommand::Commit { .. } => (Stage::Commit, None),
+            ipc::ProgramCommand::Revert { .. } => (Stage::Revert, None),
+            ipc::ProgramCommand::Purge { .. } => (Stage::Purge, None),
+            ipc::ProgramCommand::Precopy { .. } => {
+                let _ = answer.send(Err(
+                    "a precopy's policy is resolved through the Program Server by the process \
+                     that holds its client, which then precopies each scheduler's policy"
+                        .to_owned(),
+                ));
+                return;
+            }
+        };
+        self.request_stage(stage, Some(StageAnswer::Applied(answer)), at);
+    }
+
     /// Applies an engine command that concerns this scheduler (§7.3).
     ///
     /// The steps of an update are one scheduler's to apply — a switchover, a
@@ -477,7 +522,7 @@ impl Scheduler {
                 return;
             }
         };
-        self.request_stage(stage, Some(StageAnswer::Applied(answer)));
+        self.request_stage(stage, Some(StageAnswer::Applied(answer)), None);
     }
 
     /// Asks for a stage of §7.3, answered when it is applied.
@@ -486,7 +531,11 @@ impl Scheduler {
     /// no submission is in flight — never in the middle of one (§7.3: "在一个
     /// 批次边界（更新点）上"). A switchover with nothing prepared is refused at
     /// once: the daemon's precopy failed and the update is discarded.
-    fn request_stage(&mut self, stage: Stage, answer: Option<StageAnswer>) {
+    ///
+    /// `at` is the step an expert group agreed to cut over at, when a peer main
+    /// process named it: the stage then waits for that step and refuses to apply
+    /// at any other.
+    fn request_stage(&mut self, stage: Stage, answer: Option<StageAnswer>, at: Option<u64>) {
         if stage == Stage::Switchover {
             self.take_prepared_policy();
             if self.policy_prepared.is_none() {
@@ -498,7 +547,7 @@ impl Scheduler {
                 return;
             }
         }
-        self.policy_stage = Some((stage, answer));
+        self.policy_stage = Some((stage, answer, at));
         self.apply_policy_stage();
     }
 
@@ -511,7 +560,33 @@ impl Scheduler {
         if !ready {
             return;
         }
-        let Some((stage, answer)) = self.policy_stage.take() else {
+        // A command that names the step its expert group agreed applies at that
+        // step alone: before it, the stage waits; after it, the boundary the
+        // other ranks took never comes here, so it is refused rather than
+        // applied at a boundary they did not take.
+        let agreed = match &self.policy_stage {
+            Some((_, _, at)) => *at,
+            None => return,
+        };
+        if let Some(at) = agreed {
+            if self.step < at {
+                return;
+            }
+            if self.step > at {
+                let Some((stage, answer, _)) = self.policy_stage.take() else {
+                    return;
+                };
+                if let Some(answer) = answer {
+                    answer.send(Err(format!(
+                        "the {} was to apply at step {at}, which this scheduler passed at step {}",
+                        stage_name(stage),
+                        self.step
+                    )));
+                }
+                return;
+            }
+        }
+        let Some((stage, answer, _at)) = self.policy_stage.take() else {
             return;
         };
         let state = views::trial_state(self, self.step, self.recorder.recorded());

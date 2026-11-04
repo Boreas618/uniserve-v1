@@ -691,6 +691,12 @@ pub enum Command {
         stage: crate::scheduler::Stage,
         answer: crossbeam_channel::Sender<Result<StageApplied, String>>,
     },
+    /// One command of the program-layer update (§2.3, §7.3), applied as far as
+    /// one scheduler applies it: a stage, at the boundary its command names.
+    ProgramCommand {
+        command: ipc::ProgramCommand,
+        answer: crossbeam_channel::Sender<Result<(), String>>,
+    },
     /// One of the epoch's engine commands, applied as far as one scheduler
     /// applies it (§7.3): the stages yes, the rest answered with the reason.
     EngineCommand {
@@ -1158,6 +1164,17 @@ impl CommandSender {
     /// (§7.3 step 6).
     pub fn purge_policy(&self) -> crossbeam_channel::Receiver<Result<StageApplied, String>> {
         self.stage(crate::scheduler::Stage::Purge)
+    }
+
+    /// One command of the program-layer update, answered when this scheduler
+    /// applied it (§2.3, §7.3).
+    pub fn program_command(
+        &self,
+        command: ipc::ProgramCommand,
+    ) -> crossbeam_channel::Receiver<Result<(), String>> {
+        let (answer, done) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::ProgramCommand { command, answer });
+        done
     }
 
     /// The epoch's engine command as this scheduler applies it (§7.3): the
