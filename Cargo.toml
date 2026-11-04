@@ -7,6 +7,7 @@ members = [
     "crates/executor",
     "crates/ipc",
     "crates/manager",
+    "crates/media",
     "crates/models",
     "crates/nixl",
     "crates/program-server",
@@ -34,6 +35,7 @@ daemon = { path = "crates/daemon" }
 engine = { path = "crates/engine" }
 executor = { path = "crates/executor" }
 ipc = { path = "crates/ipc" }
+media = { path = "crates/media" }
 models = { path = "crates/models" }
 nixl = { path = "crates/nixl" }
 program-server = { path = "crates/program-server" }
