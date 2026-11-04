@@ -1024,6 +1024,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "executor"
+version = "2.0.0"
+dependencies = [
+ "bytemuck",
+ "cuda",
+ "indexmap 2.14.0",
+ "ipc",
+ "libc",
+ "libloading",
+ "proto",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "storage",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "expect-test"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
