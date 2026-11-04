@@ -71,6 +71,28 @@ impl Variant {
         matches!(self, Self::Encode | Self::Denoise | Self::Decode)
     }
 
+    /// The computation a media call is, and `None` for a call no variant states yet.
+    ///
+    /// The three encoders are one computation because they write one thing - the conditioning the
+    /// denoiser reads - and differ only in which tower produced it; the three decoders likewise
+    /// produce one raster for one muxer. A call with no variant is not served, which the mechanism
+    /// reads as a capability the executor does not state rather than as a batch to send anyway.
+    pub const fn of_media(call: ipc::MediaCall) -> Option<Self> {
+        match call {
+            ipc::MediaCall::TextEncoding
+            | ipc::MediaCall::VisionEncoding
+            | ipc::MediaCall::LatentEncoding => Some(Self::Encode),
+            ipc::MediaCall::Denoising => Some(Self::Denoise),
+            ipc::MediaCall::ImageDecoding | ipc::MediaCall::VideoDecoding => Some(Self::Decode),
+            ipc::MediaCall::MediaReading
+            | ipc::MediaCall::LatentPreparation
+            | ipc::MediaCall::AudioDecoding
+            | ipc::MediaCall::VideoEncoding
+            | ipc::MediaCall::AudioEncoding
+            | ipc::MediaCall::Muxing => None,
+        }
+    }
+
     /// Whether a bucket of this variant picks each row's token by taking the largest candidate
     /// rather than by drawing one (4.4's greedy path).
     ///
@@ -124,7 +146,7 @@ impl Shape {
         }
     }
 
-    /// A prefill forward of `rows` rows holding `tokens` tokens.
+    /// A prefill or encode forward of `rows` rows holding `tokens` tokens.
     pub const fn prefill(rows: u32, tokens: u32, variant: Variant) -> Self {
         Self {
             rows,
@@ -155,6 +177,36 @@ impl fmt::Display for Shape {
             "{}/{} rows/{} tokens",
             self.variant, self.rows, self.tokens
         )
+    }
+}
+
+/// One media computation as the mechanism states it, so that a plan can say whether it serves it.
+///
+/// The three fields are what a media graph's capture depends on: which computation it is, how many
+/// requests it holds, and - for a decode or a denoising step - the shape its kernels are captured
+/// for. An encode states rows and tokens like a prefill, so its extent is [`Extent::None`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Computation {
+    /// The media call the mechanism is about to run.
+    pub call: ipc::MediaCall,
+    /// The requests in the batch.
+    pub rows: u32,
+    /// An encode's tokens; zero for a denoising step and a decode, which are sized by their extent.
+    pub tokens: u32,
+    /// The latent layout of a denoising step, the raster of a decode, and [`Extent::None`] for an
+    /// encode.
+    pub extent: Extent,
+}
+
+impl Computation {
+    /// The variant that computes this call, or `None` when no variant states it.
+    pub const fn variant(self) -> Option<Variant> {
+        Variant::of_media(self.call)
+    }
+
+    /// Whether this is a computation the executor serves at all, before any plan is consulted.
+    pub const fn stated(self) -> bool {
+        self.variant().is_some()
     }
 }
 
@@ -277,7 +329,10 @@ impl Bucket {
     /// Whether a forward of `shape` is served by this bucket: the same variant, and room for its
     /// rows and tokens.
     pub const fn holds(self, shape: &Shape) -> bool {
-        self.variant as u8 == shape.variant as u8
+        // A media computation is planned by its extent rather than by a `Shape`, and a graph
+        // captured for one canvas holds no other, so no shape is served by a media bucket.
+        matches!(self.extent, Extent::None)
+            && self.variant as u8 == shape.variant as u8
             && self.rows >= shape.rows
             && self.tokens >= shape.tokens
     }
@@ -481,6 +536,22 @@ impl Buckets {
         })
     }
 
+    /// The smallest captured bucket that serves a media computation, if the set has one.
+    ///
+    /// A media computation is planned by what it is, not by a `Shape`: a denoising step is served
+    /// only by a graph captured for its own latent layout and a decode only by one captured for its
+    /// own clip, so the extent is matched exactly while rows (and an encode's tokens) are room to
+    /// spare. No bucket serving the computation is the executor stating it does not serve it.
+    pub fn select_media(&self, computation: &Computation) -> Option<Bucket> {
+        let variant = computation.variant()?;
+        self.ascending.iter().copied().find(|bucket| {
+            bucket.variant == variant
+                && bucket.extent == computation.extent
+                && bucket.rows >= computation.rows
+                && bucket.tokens >= computation.tokens
+        })
+    }
+
     /// The buckets in capture order: largest first, so smaller captures reuse the graph pool's
     /// blocks of the larger ones.
     pub fn capture_order(&self) -> impl Iterator<Item = &Bucket> {
@@ -512,6 +583,95 @@ impl Buckets {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The executor states which media computations its plan serves, and the mechanism forms a
+    /// batch only where the answer is a bucket: a denoising step is served only by a graph captured
+    /// for its own latent layout, a decode only by one captured for its own clip, and a call no
+    /// variant states - audio decoding, a mux - is served nowhere rather than by the nearest graph.
+    #[test]
+    fn a_media_computation_is_planned_only_into_a_bucket_captured_for_it() {
+        let layout = nn::capability::Layout {
+            video: nn::capability::LatentShape {
+                channels: 16,
+                frames: 13,
+                height: 60,
+                width: 34,
+            },
+            audio: None,
+            text_rows: 256,
+            condition_rows: 0,
+            condition_elements: 0,
+        };
+        let plan = Buckets::new([
+            Bucket::denoise(1, layout),
+            Bucket::clip(48, 768, 1344),
+            Bucket::prefill(1, 512, Variant::Encode),
+        ]);
+
+        let denoise = Computation {
+            call: ipc::MediaCall::Denoising,
+            rows: 1,
+            tokens: 0,
+            extent: Extent::Latents(layout),
+        };
+        assert_eq!(denoise.variant(), Some(Variant::Denoise));
+        assert_eq!(plan.select_media(&denoise), Some(Bucket::denoise(1, layout)));
+
+        // One frame more is another graph, and no capture is made in the serving path.
+        let other = Computation {
+            extent: Extent::Latents(nn::capability::Layout {
+                video: nn::capability::LatentShape {
+                    channels: 16,
+                    frames: 25,
+                    height: 60,
+                    width: 34,
+                },
+                ..layout
+            }),
+            ..denoise
+        };
+        assert_eq!(plan.select_media(&other), None);
+
+        let clip = Computation {
+            call: ipc::MediaCall::VideoDecoding,
+            rows: 1,
+            tokens: 0,
+            extent: Extent::Clip {
+                frames: 48,
+                height: 768,
+                width: 1344,
+            },
+        };
+        assert_eq!(clip.variant(), Some(Variant::Decode));
+        assert_eq!(plan.select_media(&clip), Some(Bucket::clip(48, 768, 1344)));
+
+        // An encode is sized by rows and tokens like a prefill, so it is the one media computation
+        // whose extent says nothing.
+        let encode = Computation {
+            call: ipc::MediaCall::TextEncoding,
+            rows: 1,
+            tokens: 300,
+            extent: Extent::None,
+        };
+        assert_eq!(encode.variant(), Some(Variant::Encode));
+        assert_eq!(
+            plan.select_media(&encode),
+            Some(Bucket::prefill(1, 512, Variant::Encode))
+        );
+
+        // A call no variant states is served nowhere, and the mechanism reads that as the
+        // capability it is.
+        for call in [ipc::MediaCall::AudioDecoding, ipc::MediaCall::Muxing] {
+            let computation = Computation {
+                call,
+                rows: 1,
+                tokens: 0,
+                extent: Extent::None,
+            };
+            assert!(!computation.stated(), "{call:?} states no variant");
+            assert_eq!(plan.select_media(&computation), None);
+        }
+    }
 
     /// The two families are refused by name rather than served from one another's graphs: a media
     /// bucket states an extent a causal-LM forward has no use for, and a media variant is never a
@@ -791,7 +951,7 @@ mod tests {
             assert!(bucket.holds(&Shape {
                 rows: 1,
                 tokens: 1,
-                variant: bucket.variant
+                variant: bucket.variant,
             }));
         }
     }

@@ -32,6 +32,10 @@ pub struct Executor {
     /// The phases this device's runners serve, recorded here because the runners themselves live
     /// on the device thread and a router above the executors has to choose one without asking it.
     phases: Vec<ipc::PhaseId>,
+    /// The media computations this device's runners plan to capture, recorded here for the same
+    /// reason: the mechanism asks whether a media computation is served before it forms the batch,
+    /// and that answer cannot be a round trip to the device thread (2.4).
+    media: crate::plan::Buckets,
     queue: Arc<JobQueue>,
     thread: Option<JoinHandle<()>>,
     /// The device's graph pools, shared by every runner that issues here (4.1).
@@ -161,6 +165,12 @@ impl Executor {
             .iter()
             .flat_map(|named| named.phases.iter().copied())
             .collect();
+        let media = crate::plan::Buckets::new(
+            runners
+                .iter()
+                .flat_map(|named| named.runner.media_plan())
+                .collect::<Vec<_>>(),
+        );
         for named in &mut runners {
             named.runner.attach_pools(Arc::clone(&pools));
             named.runner.attach_counters(Arc::clone(&counters));
@@ -190,6 +200,7 @@ impl Executor {
         Ok(Self {
             device,
             phases,
+            media,
             queue,
             thread: Some(thread),
             pools,
@@ -370,6 +381,16 @@ impl Executor {
     /// The phases this device's runners serve, in the order they were spawned.
     pub fn phases(&self) -> &[ipc::PhaseId] {
         &self.phases
+    }
+
+    /// The bucket this device would serve `computation` in, or `None` when its plan holds no graph
+    /// for it (2.4's stated capability).
+    ///
+    /// The answer comes from the plan the runners stated at spawn, not from the device thread: the
+    /// mechanism forms a media batch only where this answers, so a missing answer is the executor
+    /// saying it does not serve the computation rather than a check nobody makes.
+    pub fn media(&self, computation: &crate::plan::Computation) -> Option<crate::plan::Bucket> {
+        self.media.select_media(computation)
     }
 
     /// The device's one pool set, for an owner that carves its own storage from the same allocator
