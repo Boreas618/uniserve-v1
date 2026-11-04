@@ -1388,11 +1388,15 @@ impl Leader {
         // One update at a time (§7.2, §7.4): an epoch switch and a program
         // update are each the deployment's one update, and the program
         // layer's callers reach this method directly as well as through the
-        // entry, so the check lives here.
-        if let Some(update) = crate::updates::in_flight(
-            self.updates.running(),
-            self.epochs().program_update().is_some(),
-        ) {
+        // entry, so the check lives here. A dry run answers without touching
+        // the processes or the records the update in flight owns, which is
+        // what the entry does for the layers above (§7.2).
+        if !dry_run
+            && let Some(update) = crate::updates::in_flight(
+                self.updates.running(),
+                self.epochs().program_update().is_some(),
+            )
+        {
             return Err(UpdateError::Refused(format!(
                 "another update is in flight: {update}"
             )));
