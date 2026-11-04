@@ -94,6 +94,11 @@ pub struct RequestView {
     /// Tokens of its prompt.
     #[serde(default)]
     pub prompt_tokens: u32,
+    /// The context tokens the request's next prefill must write up to: its
+    /// prompt, extended by what a block commit adds to its context. A request
+    /// with nothing to commit states its prompt length.
+    #[serde(default)]
+    pub prefill_tokens: u32,
     /// Tokens it has generated so far.
     #[serde(default)]
     pub generated_tokens: u32,
