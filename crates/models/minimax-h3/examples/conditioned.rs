@@ -41,7 +41,6 @@ use minimax_h3::checkpoint::Dit;
 use minimax_h3::config::Config;
 use minimax_h3::denoiser::{Denoiser, Layouts};
 use minimax_h3::encoding::Extent;
-use minimax_h3::load::stored_dtype;
 use minimax_h3::partition::{Component, Partition};
 use nn::capability::{Conditioning, Denoiser as _, MediaInput, MediaRole};
 use nn::{
@@ -527,7 +526,11 @@ fn encode(args: &Args) -> Result<(), String> {
     // for the blocks it places - not by a default: a pool that cannot give out one more buffer is a
     // stop the caller reads as a defect in the model (`platform: the pool's reservation cannot give
     // out ... more`), and it is the harness's number that was wrong.
-    let dtype = stored_dtype(&checkpoint, Component::Transformer.directories()[0]).map_err(show)?;
+    // `auto`, as the design states it: the checkpoint's own representation, which is the mixed one -
+    // the timestep pair FP32, the AdaLN projections and the stack BF16 - so every weight is
+    // published as stored and each request's pin decides. Nothing converts at load, so asking the
+    // component for a single type here would refuse the export the model is designed to load.
+    let deployment: Option<DType> = None;
     let mut published = 0_u64;
     for component in partition.blocks.iter() {
         for directory in component.directories() {
@@ -545,23 +548,21 @@ fn encode(args: &Args) -> Result<(), String> {
     );
     let mut weights = DeviceWeights::new(&device, resident)?;
     let model = {
-        // The deployment's type reaches the loader and the boundary together: the loader converts
-        // each weight once, and the boundary refuses a mixed component only when nothing converts.
-        let mut loader = WeightLoader::new(&checkpoint, &mut weights, Some(dtype), None);
-        minimax_h3::load(&checkpoint, partition, Some(dtype), &mut loader).map_err(show)?
+        // The deployment's statement reaches the loader and the boundary **together**, so the two
+        // can never disagree: `None` is `auto`, the checkpoint's own representation with each
+        // request's pin deciding; `Some(stated)` converts every weight once, keyed by the conversion.
+        let mut loader = WeightLoader::new(&checkpoint, &mut weights, deployment, None);
+        minimax_h3::load(&checkpoint, partition, deployment, &mut loader).map_err(show)?
     };
     let denoiser = std::sync::Arc::clone(
         model
             .transformer()
             .ok_or_else(|| "the deployment placed no denoiser block".to_owned())?,
     );
-    if denoiser_dtype(&denoiser) != dtype {
-        return Err(format!(
-            "the deployment loads at {dtype} and the block reports {}: the loader and the boundary \
-             disagreed",
-            denoiser_dtype(&denoiser)
-        ));
-    }
+    // The type this harness's own buffers take is the stack's, which is what the block's first
+    // weight was published at: a prefix source, a condition row and a latent are all written in the
+    // type the block reads them in, and at `auto` that is the checkpoint's, not a component's.
+    let dtype = denoiser_dtype(&denoiser);
     let hidden = u64::from(dit.transformer.hidden_size);
     let source_width = u64::from(config.text_encoder.hidden_size);
     // The prefix source's three regions, from the packing's own indices: the text capacity, then the
@@ -569,9 +570,10 @@ fn encode(args: &Args) -> Result<(), String> {
     // begins, so nothing here re-derives it.
     let rows = u64::from(packing.zero_row()) + 1;
     println!(
-        "loaded: {} is the deployment's element type, hidden {hidden}, text {} rows of capacity, \
+        "loaded: {dtype} is the stack's element type (auto, the checkpoint's own), hidden {hidden}, \
+         text {} rows of capacity, \
          conditions {} rows of capacity, prefix {rows} rows",
-        dtype, layout.text_rows, layout.condition_rows
+        layout.text_rows, layout.condition_rows
     );
 
     // 4. The pieces, from the model: `rows` per piece is the packing's own number, and a harness
