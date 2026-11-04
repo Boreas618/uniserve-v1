@@ -352,6 +352,21 @@ fn the_program_layers_commands_reach_one_scheduler_and_name_what_they_need() {
 }
 
 #[test]
+fn a_scheduler_on_the_worker_processes_refuses_a_shadow_pass_and_names_why() {
+    let world = World::start();
+
+    // §7.3 step 2's paired pass is the in-process arm's: a worker-process
+    // executor shadows a world on its own workers, so the ask is answered with
+    // that rather than left waiting for a step that cannot run it.
+    let refused = answer(world.handle.shadow(7))
+        .expect_err("a scheduler over the worker processes runs no shadow pass");
+    assert!(
+        refused.contains("worker processes"),
+        "the refusal says which arm shadows: {refused}"
+    );
+}
+
+#[test]
 fn a_consumers_position_is_the_connections_and_a_scheduler_refuses_it() {
     let world = World::start();
     let command = proto::request::wire::Command {
