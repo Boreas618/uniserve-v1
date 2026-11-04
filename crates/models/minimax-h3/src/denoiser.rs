@@ -1169,24 +1169,39 @@ fn check_trace_view(view: TensorView, rows: u64, columns: u64, name: &str) -> Re
 ///
 /// The prefix source is one contiguous `[rows, columns]` buffer, so a condition's rows are a view
 /// of it rather than a copy into it.
-/// Where each of a request's condition rows sits, from the prefix source's total.
+/// Where each of a request's condition rows sits in the prefix source.
 ///
-/// `total` is the prefix source's row count - the text capacity, the condition rows and the one zero
-/// row - and `pieces` states what the layout reserved per piece, in request order. The text capacity
-/// is what is left after the rest, so no piece of the arithmetic is stated twice: the packing that
-/// laid the request out counted the condition rows, and this only says where they start. A piece that
-/// declares more rows than the source holds is refused, because the alternative is writing past the
-/// buffer the runner sized.
-fn condition_placements(total: u64, pieces: &[(u32, u32)]) -> Result<(u64, Vec<(u64, u64)>)> {
-    let mut condition_rows = 0u64;
-    for (visual, audio) in pieces {
-        condition_rows += u64::from(*visual) + u64::from(*audio);
+/// `total` is the source's row count and `condition_rows` the **layout's** capacity for them, so the
+/// text capacity is what the layout left: `total - condition_rows - 1`. Subtracting the request's own
+/// piece rows instead would be a second convention for the same split, and it disagrees with the
+/// packing wherever the request does not fill the layout's capacity - the reader (`prefix_index`)
+/// places a condition row at `text_rows + (the rows before it)` from the layout's counts, so a writer
+/// that placed them after a shorter text segment would write rows nothing gathers. That is a silent
+/// drop of the whole conditioning: the page would generate unconditioned media and nothing would
+/// refuse.
+///
+/// A request whose pieces do not fit the layout's capacity is refused here rather than written past
+/// the rows the packing reserved for it.
+fn condition_placements(
+    total: u64,
+    condition_rows: u32,
+    pieces: &[(u32, u32)],
+) -> Result<(u64, Vec<(u64, u64)>)> {
+    let planned = pieces
+        .iter()
+        .map(|(visual, audio)| u64::from(*visual) + u64::from(*audio))
+        .sum::<u64>();
+    let reserved = u64::from(condition_rows);
+    if planned > reserved {
+        return Err(Error::config(format!(
+            "the request's conditions carry {planned} rows and the layout reserves {reserved}"
+        )));
     }
     // The text capacity, the condition rows and the zero row are the whole source.
-    let text_rows = total.checked_sub(condition_rows + 1).ok_or_else(|| {
+    let text_rows = total.checked_sub(reserved + 1).ok_or_else(|| {
         Error::config(format!(
-            "a {total}-row prefix source cannot hold {condition_rows} condition rows and the zero \
-             row the layout reserves"
+            "a {total}-row prefix source cannot hold {reserved} condition rows and the zero row \
+             the layout reserves"
         ))
     })?;
     let mut start = text_rows;
@@ -2036,7 +2051,14 @@ impl Denoiser {
             .iter()
             .map(|piece| (piece.rows, piece.audio_rows))
             .collect();
-        let (_, placements) = condition_placements(text.shape.dim(0), &pieces)?;
+        // The layout's condition capacity, which is the arrangement's: `Layouts::cover` states it on
+        // every layout this deployment serves, so the writer and the packing's `prefix_index` read
+        // one number.
+        let (_, placements) = condition_placements(
+            text.shape.dim(0),
+            self.rules.arrangement().condition_rows,
+            &pieces,
+        )?;
         let audio_channels = u64::from(self.config.transformer.audio_channels);
         for (piece, (start, _)) in media.iter().zip(placements) {
             if piece.audio_rows > 0 {
@@ -3358,17 +3380,16 @@ mod tests {
 
     #[test]
     fn a_conditions_rows_start_after_the_text_the_layout_reserved() {
-        // A `ref2va`-shaped request: a keyframe with a soundtrack, a visual reference, and an
-        // audio-only reference. The source holds the text capacity, every condition's rows and the
-        // zero row, so the capacity is what the layout's own counts leave.
+        // A `ref2va`-shaped request at the released layout: 128 text rows, 192 condition rows and
+        // the zero row. An image takes one 64-row unit, an audio reference 37 rows, and the request
+        // does not fill the capacity - which is the case the subtraction convention got wrong, so
+        // the placement is asserted against the layout's numbers and not against the pieces' sum.
         let text_rows = 128u64;
-        let pieces = [(20_160u32, 414u32), (10_080, 0), (0, 414)];
-        let condition_rows: u64 = pieces
-            .iter()
-            .map(|(visual, audio)| u64::from(*visual) + u64::from(*audio))
-            .sum();
-        let total = text_rows + condition_rows + 1;
-        let (capacity, placements) = super::condition_placements(total, &pieces).unwrap();
+        let condition_rows = 192u32;
+        let pieces = [(64u32, 0u32), (0, 37)];
+        let total = text_rows + u64::from(condition_rows) + 1;
+        let (capacity, placements) =
+            super::condition_placements(total, condition_rows, &pieces).unwrap();
         assert_eq!(capacity, text_rows);
         // Each block starts where the previous one ended, and inside a block the audio rows lead.
         let mut expected = text_rows;
@@ -3377,14 +3398,19 @@ mod tests {
             assert_eq!(*end - *start, u64::from(*visual) + u64::from(*audio));
             expected = *end;
         }
-        assert_eq!(
-            expected + 1,
-            total,
-            "the zero row closes the condition rows"
+        assert!(
+            expected < text_rows + u64::from(condition_rows),
+            "the request leaves {} of the layout's {} condition rows unused, and the zero row is \
+             still the source's last",
+            text_rows + u64::from(condition_rows) - expected,
+            condition_rows
         );
 
-        // A source that cannot hold them is refused rather than written past its end.
-        assert!(super::condition_placements(condition_rows, &pieces).is_err());
+        // A request whose pieces do not fit the layout's capacity is refused rather than written
+        // past the rows the packing reserved.
+        assert!(super::condition_placements(total, condition_rows, &[(128, 128)]).is_err());
+        // And a source that cannot hold the capacity is refused too.
+        assert!(super::condition_placements(text_rows, condition_rows, &pieces).is_err());
     }
 
     #[test]
