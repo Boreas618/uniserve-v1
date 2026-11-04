@@ -82,6 +82,22 @@ pub(crate) enum Command {
     /// Release everything that references a generation that was prepared and never served, which
     /// is a generation *newer* than the serving one and so out of `Purge`'s reach (7.3 step 2).
     Discard(u64),
+    /// Give the resident cache segments back to the Storage Server, for a standby's park (2.5).
+    ///
+    /// It is a command rather than a control-thread call because the device queue's order is the
+    /// only fact that makes "nothing is in flight" true: a batch submitted before this runs to
+    /// completion first, and a batch submitted after it finds the cache unmapped and admission
+    /// closed. Releasing segments under a running capture is the corruption this ordering avoids.
+    Sleep,
+    /// Map the released cache segments again, `limit` of them or all of them (2.5).
+    ///
+    /// It runs on this device's thread because the resets that follow the mapping issue on the
+    /// runners' streams, and that thread is the only one that issues there. A shortfall of
+    /// segments is not an error: the limit is a bound, not a demand.
+    Wake {
+        /// How many segments to map, or `None` for every one the storage holds for this rank.
+        limit: Option<u32>,
+    },
     /// Wait for the events deferred storage release hangs on.
     After(Vec<Arc<platform::Event>>),
 }
@@ -103,6 +119,11 @@ impl Command {
             Self::Revert(generation) => format!("reverting generation {generation}"),
             Self::Purge(generation) => format!("purging generation {generation}"),
             Self::Discard(generation) => format!("discarding generation {generation}"),
+            Self::Sleep => "giving the resident cache segments back".to_owned(),
+            Self::Wake { limit } => match limit {
+                Some(limit) => format!("waking {limit} segments of the resident cache planes"),
+                None => "waking every released segment of the resident cache planes".to_owned(),
+            },
             Self::After(_) => "waiting for deferred storage work".to_owned(),
         }
     }

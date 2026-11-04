@@ -701,6 +701,10 @@ pub enum JobKind {
     Purge,
     /// Releasing a prepared generation that never served (an abandoned precopy, 7.3 step 2).
     Discard,
+    /// Giving the resident cache segments back, for a standby's park (2.5).
+    Sleep,
+    /// Mapping the released cache segments again, with the unit resets that follow (2.5).
+    Wake,
     /// A job that only waits for the events it was given.
     After,
 }
@@ -720,6 +724,8 @@ impl JobKind {
             Self::Revert => "revert",
             Self::Purge => "purge",
             Self::Discard => "discard",
+            Self::Sleep => "sleep",
+            Self::Wake => "wake",
             Self::After => "after",
         }
     }
