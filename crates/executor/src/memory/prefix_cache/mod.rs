@@ -318,6 +318,12 @@ impl PrefixCache {
         &self.storage
     }
 
+    /// The bytes the pool's planes map on the device, for the metrics report's
+    /// resident figure. Block tables and host pages are not in it.
+    pub fn mapped_bytes(&self) -> u64 {
+        self.planes.mapped_bytes()
+    }
+
     pub fn tables(&self) -> &BlockTables {
         &self.tables
     }

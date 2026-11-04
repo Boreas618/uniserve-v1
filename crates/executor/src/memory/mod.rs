@@ -193,6 +193,24 @@ impl Memory {
         Ok(())
     }
 
+    /// The device bytes this rank's owners map, which the metrics report states
+    /// as the `resident` pool.
+    ///
+    /// It is the cache planes, the latent pages, the product store's arenas and
+    /// the request-slot banks, and it counts MAPPED device storage only: host and
+    /// page-locked storage is outside the device's budget, and a sleeping rank's
+    /// released segments are not in it. It reads the owners' books and asks no
+    /// driver, so a figure that could not be computed is left out rather than
+    /// failing the report.
+    pub fn mapped_resident(&self) -> u64 {
+        let planes = self.prefix_cache.mapped_bytes();
+        let latents = self
+            .latents
+            .as_ref()
+            .map_or(0, |latents| latents.mapped_bytes());
+        planes + latents + self.products.mapped_bytes() + self.slots.mapped_bytes()
+    }
+
     /// Release the resident cache segments, which the Storage Server keeps for
     /// the next epoch: what a sleep gives back and a wake maps again.
     ///

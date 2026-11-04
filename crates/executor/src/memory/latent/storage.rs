@@ -9,10 +9,10 @@ use std::sync::Arc;
 
 use platform::{DeviceId, Stream, memset_d8};
 
-use crate::memory::allocation::{Storage, StorageView};
-use crate::memory::retained::{ExclusiveSpec, ExclusiveStorage};
 use crate::memory::allocation::Backing;
 use crate::memory::allocation::ElementType;
+use crate::memory::allocation::{Storage, StorageView};
+use crate::memory::retained::{ExclusiveSpec, ExclusiveStorage};
 use crate::transfer::Spans;
 use crate::{Error, Result};
 
@@ -138,8 +138,9 @@ impl LatentStorage {
             u32::try_from(value).map_err(|_| Error::Invalid(format!("latent {name} overflow")))
         };
         let dtype = plan.dtype;
-        let bytes =
-            |shape: &[i64], dtype: ElementType| shape.iter().product::<i64>() as usize * dtype.bytes();
+        let bytes = |shape: &[i64], dtype: ElementType| {
+            shape.iter().product::<i64>() as usize * dtype.bytes()
+        };
         let bank_shape = plan.bank_shape();
         let page_bytes = bytes(&bank_shape, dtype);
         let (banks, created) = allocate_banks(device, page_bytes, name, storage)?;
@@ -165,6 +166,16 @@ impl LatentStorage {
     }
 
     /// The element type of latent values.
+    /// The device bytes the page banks map, for the metrics report's resident
+    /// figure; a host pool's banks are not in it.
+    pub fn mapped_bytes(&self) -> u64 {
+        let storage = self.pages.storage();
+        match storage.device() {
+            crate::memory::allocation::MemoryKind::Cuda(_) => storage.bytes() as u64,
+            _ => 0,
+        }
+    }
+
     pub(crate) fn dtype(&self) -> ElementType {
         self.pages.dtype()
     }

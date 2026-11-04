@@ -3,9 +3,9 @@
 use platform::DeviceId;
 use std::sync::Arc;
 
-use crate::memory::allocation::{Storage, StorageView};
 use crate::memory::allocation::Backing;
 use crate::memory::allocation::ElementType;
+use crate::memory::allocation::{Storage, StorageView};
 use crate::{Error, Result};
 
 /// One field of per-slot state a model declares: `shape` is one slot's
@@ -57,6 +57,18 @@ impl RequestSlots {
                 (device + bytes, host)
             })
         })
+    }
+
+    /// The device bytes the banks map, over the fields kept on the device.
+    ///
+    /// A field whose bank is host or page-locked storage is not in this figure:
+    /// the device's budget does not cover it.
+    pub(crate) fn mapped_bytes(&self) -> u64 {
+        self.banks
+            .iter()
+            .filter(|bank| bank.view.storage().device().cuda().is_some())
+            .map(|bank| bank.view.storage().bytes() as u64)
+            .sum()
     }
 
     /// Allocate banks for `capacity` slots on `device` (host storage for
@@ -135,6 +147,22 @@ mod tests {
             shapes,
             [("tokens".into(), vec![3, 4]), ("seed".into(), vec![3])]
         );
+        Ok(())
+    }
+
+    /// The resident figure is device storage only: a rank whose banks are host
+    /// storage still allocates them, and maps nothing the device budget covers.
+    #[test]
+    fn host_banks_are_not_device_resident() -> Result<()> {
+        let fields = [SlotField {
+            name: "tokens".into(),
+            dtype: ElementType::I32,
+            shape: vec![4],
+            host: false,
+        }];
+        let slots = RequestSlots::allocate(&fields, 2, None)?;
+        assert_eq!(RequestSlots::bytes(&fields, 2)?.0, 3 * 16);
+        assert_eq!(slots.mapped_bytes(), 0);
         Ok(())
     }
 }

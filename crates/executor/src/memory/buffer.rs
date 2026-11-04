@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use ipc::{BufferAllocation, BufferId};
 
-use crate::memory::allocation::Storage;
 use crate::memory::allocation::MemoryKind;
+use crate::memory::allocation::{Backing, Storage};
 use crate::{Error, Result};
 
 /// One pool-issued physical range. Views retain their allocation; this
@@ -54,6 +54,18 @@ impl BufferPool {
                 })
                 .collect(),
         }
+    }
+
+    /// The device bytes the pool's arenas map, over the devices it backs.
+    ///
+    /// Host and page-locked arenas are not device storage and the device's
+    /// budget does not cover them, so they are not in this figure.
+    pub fn mapped_bytes(&self) -> u64 {
+        self.arenas
+            .iter()
+            .filter(|(device, _)| device.cuda().is_some())
+            .map(|(_, arena)| Backing::bytes(&*arena.backing) as u64)
+            .sum()
     }
 
     /// Reserve a scheduler allocation at its offset and borrow its arena for

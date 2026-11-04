@@ -49,11 +49,11 @@ use read::*;
 use relay::*;
 use write::*;
 
+use crate::memory::allocation::MemoryKind;
 use crate::memory::allocation::StorageView;
 use crate::memory::buffer::BufferPool;
 use crate::stream::EventPool;
 use crate::stream::Issue;
-use crate::memory::allocation::MemoryKind;
 use crate::transfer::exports::{self, Location};
 use crate::{Error, Result, lock};
 use ipc::CallId;
@@ -522,6 +522,13 @@ impl ProductStore {
     }
 
     /// Release the outputs of finished calls.
+    /// The device bytes the store's arenas map, for the metrics report's
+    /// resident figure. Imports are views into other ranks' buffers and add
+    /// nothing here.
+    pub fn mapped_bytes(&self) -> u64 {
+        lock(&self.buffer_pool).mapped_bytes()
+    }
+
     pub fn release_calls(&self, calls: &[(RequestKey, CallId)]) {
         lock(&self.state).release_calls(calls.iter().copied());
     }
