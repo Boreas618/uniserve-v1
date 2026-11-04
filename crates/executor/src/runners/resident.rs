@@ -330,6 +330,65 @@ struct Scratch {
 }
 
 impl KvProvider for ResidentCache {
+    /// Applies what the mechanism allocated for a batch's pages: the units become this cache's, then
+    /// the leased prefix's copies are issued on the batch's stream.
+    ///
+    /// The order is the only order that is correct. A destination is a unit of *this* cache, so it
+    /// is taken first - `recycle` prepares it for a new owner, which is what makes a page whose
+    /// previous request left stale bytes safe to write. The copies come second, and they read the
+    /// sources the mechanism still leases: the copy is issued on the batch's stream, so the forward
+    /// that reads the destinations runs after it by stream order and takes no barrier.
+    ///
+    /// A unit or group this cache does not hold is refused **by name**: the scheduler's allocation
+    /// named a page this pool does not have, and a deployment's reader needs the unit, the group and
+    /// the pool's size, not the fact that a seam existed.
+    fn apply_cache_units(
+        &mut self,
+        units: &[ipc::CacheUnitAllocation],
+        stream: &Stream,
+    ) -> Result<()> {
+        if units.is_empty() {
+            return Ok(());
+        }
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let groups = cache.groups();
+        for allocation in units {
+            let group = allocation.group_id as usize;
+            let pages = cache.pages(group).map_err(|error| {
+                Error::Invalid(format!(
+                    "the mechanism allocated units of cache group {group}, but this pool has \
+                     {groups} group(s): {error}"
+                ))
+            })?;
+            let held = |unit: ipc::UnitId| -> Result<()> {
+                if unit.0 == 0 || unit.0 >= pages {
+                    return Err(Error::Invalid(format!(
+                        "the mechanism named cache unit {} of group {group}, outside the pool's \
+                         {pages} units (unit 0 is the block tables' sentinel)",
+                        unit.0
+                    )));
+                }
+                Ok(())
+            };
+            for &unit in &allocation.unit_ids {
+                held(unit)?;
+            }
+            for &(source, destination) in &allocation.copies {
+                held(source)?;
+                held(destination)?;
+            }
+            // The new units become this cache's pages, then the copies that fill them.
+            let column = cache.bind_units(Some(stream))?;
+            let acquired: Vec<u32> = allocation.unit_ids.iter().map(|unit| unit.0).collect();
+            cache.recycle(&acquired, &column, stream)?;
+            cache.copy_units(&allocation.copies, stream)?;
+        }
+        Ok(())
+    }
+
     fn attach_pools(&mut self, pools: Arc<std::sync::Mutex<Pools>>) -> Result<()> {
         if !self.tables.is_empty() {
             return Ok(());
