@@ -46,7 +46,7 @@ pub use exchange::UlyssesExchange;
 pub use frame::{FrameMoments, FrameNormPad, FramePad};
 pub use head::{ParallelLMHead, gather_rows};
 pub use linear::Linear;
-pub use modulation::ModulatedRmsNorm;
+pub use modulation::{GatedResidual, ModulatedRmsNorm};
 pub use moe::Moe;
 pub use noise::{Key as NoiseKey, Noise};
 pub use norm::{LayerNorm, RmsNorm};
