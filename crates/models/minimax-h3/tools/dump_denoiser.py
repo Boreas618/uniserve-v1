@@ -545,9 +545,17 @@ def run_stack_out(stack: Path, checkpoint: Path, out: Path) -> int:
         )
     step = torch.tensor([step_index], dtype=torch.int64)
     print(f"step    {step_index} of {steps} in the checkpoint's schedule")
+    # The mask is the argument a comparison can disagree on silently: a page whose rows past the
+    # message differ everywhere, with nothing arithmetic behind it, is this number on one side and
+    # another on the other. The harness states the same pair through the deployment's own tables, so
+    # both are on the record and a disagreement is one glance rather than an inference.
+    print(
+        f"mask    every query row sees {plan.used} of {plan.padded_tokens} keys"
+        f" (cu_seq_lens_q = [0, {plan.padded_tokens}], cu_seq_lens_k = [0, {plan.used}])"
+    )
     modulation = model.adaln_cache(step)
     chunks = ((inputs.token_slice, hidden),)
-    print(f"run     {layers} layer(s) at step 0, {rows} rows of {width}")
+    print(f"run     {layers} layer(s) at step {step_index}, {rows} rows of {width}")
     with torch.inference_mode():
         for index, layer in enumerate(model.layers.values()):
             chunks = layer.forward_chunks(
