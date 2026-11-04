@@ -61,7 +61,7 @@ pub use norm::{LayerNorm, RmsNorm};
 pub use ops::activation::Activation;
 pub use ops::gemm::WeightOrder;
 pub use ops::rope::Rotation;
-pub use patch::{Patch, PatchMode};
+pub use patch::Patch;
 pub use pool::AdaptivePool;
 pub use position::PositionInterpolate;
 pub use residual::{
