@@ -855,6 +855,18 @@ impl Switch {
             {
                 self.target_reverted.insert(host);
             }
+            // The returning epoch's own process says it serves: the parked one
+            // served again, or the fresh generation the epoch layer started
+            // where it was gone. It is not the target's generation, which the
+            // return has already settled (`a48631c98`), and its number is read
+            // by `serving` exactly as a host's report is.
+            (Phase::Reverting, Some(Kind::Promoted(promoted)))
+                if self.pending_restore.is_some()
+                    && promoted.generation >= self.previous_generation
+                    && Some(promoted.generation) != self.generation =>
+            {
+                self.serving(roster, &host, promoted.generation);
+            }
             _ => {}
         }
         self.progress(roster);
@@ -1517,6 +1529,70 @@ mod tests {
                 .iter()
                 .all(|(_, generation, _)| *generation == 5),
             "the parked epoch returns at its own launch generation, 5"
+        );
+    }
+
+    /// The return is driven by the reports the adapter forwards: each host's
+    /// returning process says `Promoted`, and the frontend is served the
+    /// previous epoch once every host has. The target's own generation is not
+    /// the return, even while its trial is coming to an end.
+    #[test]
+    fn a_restore_counts_the_returning_processs_promoted_report() {
+        let (_epochs, mut switch) = setup();
+        let mut roster = Fake::default();
+        serve_target(&mut roster, &mut switch);
+        roster.commands.clear();
+        roster.serves.clear();
+
+        roster.scripted = vec![exit_event("n0", 6)];
+        switch.advance(&mut roster);
+        assert_eq!(switch.phase(), Phase::Reverting);
+        assert!(roster.serves.is_empty());
+
+        roster.scripted = vec![report_event(
+            "n1",
+            6,
+            report(process::report::Kind::Promoted(process::Promoted {
+                generation: 6,
+            })),
+        )];
+        switch.advance(&mut roster);
+        assert_eq!(switch.phase(), Phase::Reverting);
+        assert!(
+            roster.serves.is_empty(),
+            "the target's promotion is not the previous epoch's return"
+        );
+
+        // The epoch layer started a fresh generation of the previous epoch
+        // above the target's spawn generation on each host, and promoted it.
+        roster.scripted = vec![
+            report_event(
+                "n0",
+                7,
+                report(process::report::Kind::Promoted(process::Promoted {
+                    generation: 7,
+                })),
+            ),
+            report_event(
+                "n1",
+                7,
+                report(process::report::Kind::Promoted(process::Promoted {
+                    generation: 7,
+                })),
+            ),
+        ];
+        switch.advance(&mut roster);
+
+        assert_eq!(switch.phase(), Phase::Abandoned);
+        assert_eq!(
+            roster.serves,
+            vec![(11, "unix:/run/requests.sock".to_owned())]
+        );
+        assert!(
+            roster
+                .stops
+                .contains(&("n0".to_owned(), "engine:0".to_owned(), Some(6))),
+            "the target generation is stopped once the return serves"
         );
     }
 
