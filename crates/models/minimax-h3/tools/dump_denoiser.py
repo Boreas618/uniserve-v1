@@ -531,7 +531,10 @@ def run_stack_out(stack: Path, checkpoint: Path, out: Path) -> int:
         empty,
         empty,
     )
+    # The case carries no step, and the harness runs the schedule's first; a case that ever names
+    # another would need that field here rather than a second default.
     step = torch.zeros(1, dtype=torch.int64)
+    print("step    0, the first evaluation of the checkpoint's schedule")
     modulation = model.adaln_cache(step)
     chunks = ((inputs.token_slice, hidden),)
     print(f"run     {layers} layer(s) at step 0, {rows} rows of {width}")
