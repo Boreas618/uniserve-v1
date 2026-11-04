@@ -109,15 +109,6 @@ pub trait Runner: Send {
     /// was abandoned leaves a generation *newer* than it, and only this call reaches that.
     fn discard(&mut self, generation: u64);
 
-    /// What this runner's graph pools hold and what they may hold (4.1, item 5's invariant).
-    ///
-    /// A runner without graph pools answers zeroes. The figures feed
-    /// `FromEngine.metrics` through the executor's counters, so the delivery test can assert
-    /// `mapped <= budget` while both generations' graphs exist.
-    fn pool_metrics(&self) -> crate::arena::PoolMetrics {
-        crate::arena::PoolMetrics::default()
-    }
-
     /// Gives the runner the device's graph pools, before its first capture.
     ///
     /// One pool set exists per device and every runner issuing on it books into the same one

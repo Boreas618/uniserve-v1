@@ -25,7 +25,7 @@ use nn::{CausalLm, Forward, KvView, SamplerState, Samples, TokenBatch};
 use ops::{DType, Generation, TensorView};
 use platform::DeviceId;
 
-use crate::arena::{Pools, PoolMetrics, StreamId};
+use crate::arena::{Pools, StreamId};
 use crate::batch::{Batch, BatchColumns, BatchOutput, CallId, CallOutput, Job, Jobs, RowState};
 use crate::captured::Captured;
 use crate::graph::Graphs;
@@ -1043,11 +1043,6 @@ impl<M: CausalLm> CausalLmRunner<M> {
             .ok_or_else(|| Error::State("the runner has no graph pools yet".into()))
     }
 
-    /// What the graph pools hold and what they may hold, for the metrics report (4.1).
-    pub fn pool_metrics(&self) -> PoolMetrics {
-        self.pool().map(|pools| pools.metrics()).unwrap_or_default()
-    }
-
     /// Installs the shadow harness, sized for the largest bucket's shadow set.
     pub fn set_shadow(&mut self, shadow: crate::shadow::Shadow) {
         self.shadow = Some(shadow);
@@ -1312,10 +1307,6 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
             generation,
             "discarded a prepared generation that never served"
         );
-    }
-
-    fn pool_metrics(&self) -> PoolMetrics {
-        self.pool().map(|pools| pools.metrics()).unwrap_or_default()
     }
 
     fn purge(&mut self, generation: u64) {
