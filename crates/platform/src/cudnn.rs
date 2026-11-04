@@ -358,7 +358,12 @@ impl Api {
         values: &mut [T],
         call: &'static str,
     ) -> Result<usize> {
-        let mut written = 0i64;
+        // cuDNN's element count is an in/out parameter: the library is told
+        // how many elements the array holds by `requestedElementCount` and
+        // how many it may write by this value, and it answers a `0` with a
+        // write of nothing — a full list read back as empty. `cuDNN_frontend`
+        // initialises it to `-1` before every read, and so does this.
+        let mut written = -1i64;
         // SAFETY: `values` has room for `values.len()` elements of the
         // attribute's documented C type, and both outlive the call; the
         // descriptor is live.
@@ -378,7 +383,9 @@ impl Api {
 
     /// Reads the element count of an attribute that holds a list.
     fn count(&self, descriptor: &Descriptor, attribute: i32, kind: i32) -> Result<usize> {
-        let mut written = 0i64;
+        // As in `get`: the count is in/out and starts at `-1`, which is what
+        // asks the library for the list's length rather than for nothing.
+        let mut written = -1i64;
         // SAFETY: an element count of zero asks for the list's length and
         // writes no element; the local outlives the call and the descriptor
         // is live.
