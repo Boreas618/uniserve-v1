@@ -15,15 +15,20 @@
 //!    threshold, and reports whether the row's candidates form a usable distribution.
 //! 4. `softmax` over the candidates (the shared operator in [`crate::norm`]).
 //! 5. `inverse_cdf` draws one token per row from one uniform draw, inverting the row's cumulative
-//!    distribution **in the candidate order it was given** — descending logit order, the order
-//!    `top_k` and `filter_candidates` leave behind (see [`InverseCdfArgs::probabilities`]). The order
-//!    is not rearranged by vocabulary id: `uniserve/sampling/categorical.py` inverts the CDF in the
-//!    order it receives, and a rearrangement would make the same draw select a different token than
-//!    the reference for the same probabilities.
+//!    distribution in the candidate order the layer supplies; the operator has no order of its own
+//!    (`uniserve/sampling/categorical.py` inverts in the order it receives). **That order is the
+//!    candidates sorted by token id**, not the descending logit order `top_k` leaves behind: the
+//!    reference reorders by token id before the draw "so inverse-CDF draws are deterministic for a
+//!    fixed random value independent of top-k kernel ordering, and matches the general path, which
+//!    selects in vocabulary order" (`uniserve/sampling/top_k.py:307-314`). The sort is a step of its
+//!    own between the filtering and the draw, because the operator that filters does not reorder
+//!    rows. A consequence worth stating: a draw of zero selects the *lowest token id* of each row's
+//!    candidates, not its largest logit — no draw path produces a greedy token.
 //! 6. `argmax` picks the largest candidate, which is a row's greedy token: with the divide-by-one
-//!    rule the shaped row keeps the logits' order, so its largest candidate is the token a sampling
-//!    path would pick at temperature zero — the reference resolves those rows this way rather than
-//!    through a draw.
+//!    rule the shaped row keeps the logits' order, so its largest candidate is the temperature-zero
+//!    token. The reference computes it separately — `torch.max`, with an `all_gather` across the
+//!    tensor-parallel ranks (`uniserve/sampling/greedy.py`) — because no draw can produce it once the
+//!    candidates are in token order.
 //! 7. `log_softmax` and `logprob_gather` report the log-probability of the tokens the caller asks
 //!    for.
 //!
@@ -418,7 +423,9 @@ impl fmt::Display for InverseCdfDescriptor {
 /// The arguments of `inverse_cdf`.
 #[derive(Clone, Copy)]
 pub struct InverseCdfArgs {
-    /// `[rows, width]` FP32 candidate probabilities, in descending logit order.
+    /// `[rows, width]` FP32 candidate probabilities, in the order the caller supplies them; the layer
+    /// sorts by token id first (`uniserve/sampling/top_k.py:307-314`), so the draw does not depend on
+    /// the order the top-k kernel happened to produce.
     pub probabilities: TensorView,
     /// `[rows, width]` the vocabulary ids of the candidates.
     pub ids: TensorView,
