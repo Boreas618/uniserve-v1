@@ -1677,12 +1677,20 @@ impl Scheduler {
         self.placement
             .affinity
             .insert((request_key, target.1), target.0);
-        st.allocations = Some(RequestAllocations {
-            request_slot,
-            prefix_cache,
-            latent: None,
-            buffers: HashMap::new(),
-        });
+        if st
+            .allocations
+            .replace(RequestAllocations {
+                request_slot,
+                prefix_cache,
+                latent: None,
+                buffers: HashMap::new(),
+            })
+            .is_none()
+        {
+            // The request holds a pool row from now until its execution ends,
+            // which is what `Room::slots` counts without walking the residents.
+            self.rows_held = self.rows_held.saturating_add(1);
+        }
 
         // Queue latency is finalized at the same timestamp exposed through the
         // public scheduling event.

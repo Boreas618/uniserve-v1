@@ -40,6 +40,11 @@ def spec(fields, parameters, target):
     m = int(fields["m"])
     n = int(fields["n"])
     k = int(fields["k"])
+    if fields["scale"] != "f8e4m3":
+        # The block scales are the checkpoint's E4M3 values, one byte per sixteen
+        # elements of the contraction. Any other byte type names a buffer this
+        # module would misread, so it is refused by name.
+        raise SystemExit(f"the {fields['scale']} block scales are not served")
     if fields["layout"] != "swizzled_128x4":
         # The atom both scale fields are read in. A row-major matrix needs a
         # conversion pass the kernel does not have, so it is refused rather than

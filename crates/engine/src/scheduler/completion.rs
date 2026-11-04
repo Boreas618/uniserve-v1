@@ -131,7 +131,11 @@ impl BatchReport {
     pub(crate) fn from_wire(result: BatchResult) -> Self {
         Self {
             batch_id: result.batch_id,
-            calls: result.results.into_iter().map(CallCompletion::from_wire).collect(),
+            calls: result
+                .results
+                .into_iter()
+                .map(CallCompletion::from_wire)
+                .collect(),
             command_results: result.command_results,
             done: result.done,
             worker_exec_us: result.worker_exec_us,

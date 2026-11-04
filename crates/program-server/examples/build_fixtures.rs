@@ -226,7 +226,13 @@ fn run_with(options: Options) -> Result<(), String> {
         for failure in &failures {
             eprintln!("  {failure}");
         }
-        return Err(format!("{} of {} keys did not build", failures.len(), fixtures.len()));
+        // A key can fail in more than one backend, and every failure is printed above; the count
+        // that matters is how many distinct keys the store does not serve.
+        return Err(format!(
+            "{} of {} keys did not build",
+            fixtures.len() - built,
+            fixtures.len()
+        ));
     }
     Ok(())
 }
