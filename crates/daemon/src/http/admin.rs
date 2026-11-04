@@ -104,7 +104,7 @@ pub(crate) struct Admin {
     /// The epochs the deployment executes and the processes this node's
     /// daemon manages, which `GET /admin/config` reports and a configuration
     /// change is routed by (`crate::epoch`).
-    epochs: crate::epoch::Epochs,
+    epochs: std::sync::Arc<crate::epoch::Epochs>,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -121,6 +121,16 @@ impl Admin {
     /// An admin whose shutdown cancels `shutdown` and, when asked to, sets
     /// `retire`.
     pub(crate) fn new(shutdown: CancellationToken, retire: Arc<AtomicBool>) -> Arc<Self> {
+        Self::with_epochs(shutdown, retire, Arc::new(crate::epoch::Epochs::new()))
+    }
+
+    /// As [`Admin::new`], over records the epoch layer already holds: the
+    /// admin reports the same epochs the switch moves.
+    pub(crate) fn with_epochs(
+        shutdown: CancellationToken,
+        retire: Arc<AtomicBool>,
+        epochs: Arc<crate::epoch::Epochs>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             events: Mutex::new(VecDeque::with_capacity(EVENT_CAPACITY)),
             next_event: AtomicU64::new(1),
@@ -131,7 +141,7 @@ impl Admin {
             shutdown,
             retire,
             handed_over: AtomicBool::new(false),
-            epochs: crate::epoch::Epochs::new(),
+            epochs,
         })
     }
 

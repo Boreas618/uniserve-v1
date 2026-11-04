@@ -704,12 +704,21 @@ async fn prepared_successor(
         .processes
         .strip_prefix("unix:")
         .map(std::path::PathBuf::from);
-    let daemon = Daemon::resume(
+    let mut daemon = Daemon::resume(
         config.host_identity.clone(),
         Some((prepare.processes.clone(), socket)),
         service,
         service_fds,
     )?;
+    let epoch_records = Arc::new(crate::epoch::Epochs::new());
+    let (updates, awake) = daemon
+        .updates(
+            Arc::clone(&epoch_records),
+            config.served_model_name().to_owned(),
+        )
+        .context("the leader's daemon serves no epoch layer")?;
+    Daemon::advance_epochs(Arc::clone(&updates), awake)
+        .context("starting the epoch layer's thread")?;
     let control = Arc::new(control);
     let adopting = Arc::clone(&control);
     let daemon_options = config.clone();
@@ -747,6 +756,7 @@ async fn prepared_successor(
         client,
         served,
         observer,
+        updates,
     )?);
     let first = Arc::clone(&leader.replicas()[0]);
     *crate::leader::locked(&first.config) = options;
