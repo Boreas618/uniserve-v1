@@ -63,7 +63,7 @@
 use std::collections::{HashMap, HashSet};
 
 use scheduling::guest::decision::{
-    Inflight as InflightView, Room, Shortage, Storage, Warming as WarmingView,
+    Inflight as InflightView, Plan, Room, Shortage, Storage, Warming as WarmingView,
 };
 use scheduling::guest::event::{End, Event};
 use scheduling::guest::ids::{
@@ -1377,6 +1377,49 @@ pub(crate) fn queued(scheduler: &Scheduler) -> Vec<ViewRequestId> {
 /// the plan belongs to and rebuilt after `reclaim` changes the state.
 pub(crate) fn live(scheduler: &Scheduler, step: u64, recorded: &RecordedTable) -> Live {
     Live::of(&snapshot(scheduler, step, recorded), queued(scheduler))
+}
+
+/// Restates in `live` what the step's admission changed, so the plan is
+/// validated against the state its own admission produced (design §4.4).
+///
+/// Admission moves the names a plan admits from the queue into residency, drops
+/// the names it rejects, and changes no other request, so every other entry of
+/// `live` stands as it was. Rebuilding the whole state after admission would
+/// cost the requests and pages the mechanism holds, once per step; restating
+/// the names the plan decided costs what the plan decided.
+pub(crate) fn admit_live(
+    scheduler: &Scheduler,
+    recorded: &RecordedTable,
+    live: &mut Live,
+    plan: &Plan,
+) {
+    let empty = Recorded::default();
+    for id in plan.admit.iter().chain(plan.reject.iter()) {
+        live.queue.retain(|queued| *queued != *id);
+    }
+    for id in &plan.admit {
+        let facts = recorded.get(&ipc::RequestId(id.0)).copied().unwrap_or(empty);
+        let queued = ipc::RequestId(id.0);
+        if let Some(state) = scheduler.running.get(&queued) {
+            live.requests
+                .insert(*id, request(scheduler, state, Standing::Resident, &facts));
+        } else if let Some(flow) = scheduler.running_media.get(&queued) {
+            // A media request keeps no arrival time of its own once it runs.
+            live.requests.insert(
+                *id,
+                diffusion_request(
+                    &flow.request,
+                    Standing::Resident,
+                    0.0,
+                    media_phase(scheduler, queued),
+                    &facts,
+                ),
+            );
+        }
+    }
+    for id in &plan.reject {
+        live.requests.remove(id);
+    }
 }
 
 /// A queued request and the ranks, for `route`: the first request the
