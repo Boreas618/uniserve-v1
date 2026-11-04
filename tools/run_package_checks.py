@@ -42,7 +42,10 @@ SKIP_MARKERS = (
     "ModuleNotFoundError",
     "No module named",
     "run this with a device",
-    "call structure",
+    "needs the device",
+    "needs a module directory",
+    "module directory is required",
+    "a module directory",
 )
 
 
@@ -88,7 +91,41 @@ def run_one(package, script, timeout):
         return ("passed", tail, "")
     if any(marker in head or marker in tail for marker in SKIP_MARKERS):
         return ("skipped", head or tail, "")
+    if completed.returncode < 0:
+        # A check killed by a signal may be a check that dies when several interpreter runs
+        # import the same libraries at once rather than one that is wrong. It is re-run alone
+        # before it is reported, and it is reported under its own outcome either way: a check
+        # whose verdict depends on how many ran beside it is a finding, not a pass.
+        alone = run_one_alone(script, timeout)
+        if alone.returncode == 0:
+            return (
+                "contended",
+                f"died of signal {-completed.returncode} beside other checks; passes alone: "
+                + (alone.stdout + alone.stderr).strip().splitlines()[-1:][0]
+                if (alone.stdout + alone.stderr).strip()
+                else "",
+                completed.returncode,
+            )
+        return ("failed", tail or head, completed.returncode)
     return ("failed", tail or head, completed.returncode)
+
+
+def run_one_alone(script, timeout):
+    """Run one check again with nothing beside it, to separate contention from a defect."""
+    environment = dict(os.environ)
+    environment.setdefault("TRITON_INTERPRET", "1")
+    environment.pop("PYTHONPATH", None)
+    try:
+        return subprocess.run(
+            [sys.executable, script.name],
+            cwd=str(script.parent),
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess([], 124, "", "no answer")
 
 
 def main():
@@ -105,7 +142,7 @@ def main():
         for package, scripts in found
         for script in scripts
     ]
-    outcomes = {"passed": [], "skipped": [], "failed": [], "timeout": []}
+    outcomes = {"passed": [], "skipped": [], "failed": [], "timeout": [], "contended": []}
     with concurrent.futures.ThreadPoolExecutor(max_workers=options.jobs) as pool:
         futures = {
             pool.submit(run_one, package, script, options.timeout): (package, script)
@@ -121,16 +158,16 @@ def main():
     print(
         f"# {len(found)} packages, {checks} checks: {len(outcomes['passed'])} passed, "
         f"{len(outcomes['skipped'])} skipped, {len(outcomes['failed'])} failed, "
-        f"{len(outcomes['timeout'])} timed out"
+        f"{len(outcomes['timeout'])} timed out, {len(outcomes['contended'])} contended"
     )
-    for outcome in ("failed", "timeout", "skipped"):
+    for outcome in ("failed", "timeout", "contended", "skipped"):
         for name, detail, code in sorted(outcomes[outcome]):
             prefix = f" [{code}]" if code not in (0, "", None) else ""
             print(f"{outcome:8s} {name}{prefix} — {detail}")
     if options.verbose:
         for name, detail, _ in sorted(outcomes["passed"]):
             print(f"passed   {name} — {detail}")
-    return 1 if outcomes["failed"] or outcomes["timeout"] else 0
+    return 1 if outcomes["failed"] or outcomes["timeout"] or outcomes["contended"] else 0
 
 
 if __name__ == "__main__":

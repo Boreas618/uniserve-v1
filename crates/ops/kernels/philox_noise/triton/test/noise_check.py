@@ -153,7 +153,7 @@ def load_kernel(package):
     return module
 
 
-def launch(module, *, rows, elements, keys, stage, draw, key, block, normal, dtype):
+def launch(module, *, rows, elements, keys, stage, draw, key, block, normal, dtype, offset=0):
     """Run the kernel through the interpreter and return the buffer it wrote."""
     torch_dtype = {"f32": torch.float32, "f16": torch.float16, "bf16": torch.bfloat16}[dtype]
     out = torch.zeros((rows, elements) if rows else (elements,), dtype=torch_dtype)
@@ -167,6 +167,8 @@ def launch(module, *, rows, elements, keys, stage, draw, key, block, normal, dty
         grid = (rows, math.ceil(elements / block))
     else:
         grid = (math.ceil(elements / block), 1)
+    # `offset` is the stream's base counter, which the operator's `Args` carries: every case here
+    # starts a stream at its first counter, so it is zero.
     module._philox_noise_kernel[grid](
         out,
         keys_tensor,
@@ -174,6 +176,7 @@ def launch(module, *, rows, elements, keys, stage, draw, key, block, normal, dty
         stage,
         draw,
         key,
+        offset,
         BLOCK=block,
         NORMAL=normal,
         ROWS=rows,
