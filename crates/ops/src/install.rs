@@ -52,6 +52,7 @@ const OPERATORS: &[&str] = &[
     <crate::block_copy::CacheBlockSnapshot as Op>::NAME,
     <crate::block_copy::CacheBlockScatter as Op>::NAME,
     <crate::commit::SlotCommit as Op>::NAME,
+    <crate::transpose::Transpose as Op>::NAME,
     <crate::segments::VsaScores as Op>::NAME,
     <crate::conv::Conv3d as Op>::NAME,
     <crate::conv::Conv1d as Op>::NAME,
