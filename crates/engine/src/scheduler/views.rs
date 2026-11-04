@@ -1095,6 +1095,40 @@ pub(crate) fn replicas(
     request: RequestKey,
     kind: CallKind,
 ) -> Vec<ReplicaView> {
+    replica_facts(scheduler, request, kind)
+        .into_iter()
+        .map(|(view, _, _)| view)
+        .collect()
+}
+
+/// The workers [`replicas`] offers, in the same order and of the same length:
+/// the mechanism's half of a placement decision.
+///
+/// A policy's `place` answers an index into [`replicas`]; the mechanism turns
+/// that index into the worker it binds. Both come from [`replica_facts`], so the
+/// filter that decides which replicas are candidates cannot differ between the
+/// view a policy saw and the worker the mechanism picks. The second element is
+/// the component the worker binds for the call, which a placement records with
+/// the worker.
+pub(crate) fn replica_targets(
+    scheduler: &Scheduler,
+    request: RequestKey,
+    kind: CallKind,
+) -> Vec<(crate::WorkerGroupId, String)> {
+    replica_facts(scheduler, request, kind)
+        .into_iter()
+        .map(|(_, worker, bound)| (worker, bound))
+        .collect()
+}
+
+/// Every candidate replica of `request`'s call of `kind`, with the worker and
+/// component it names. One construction of the filter, which [`replicas`] and
+/// [`replica_targets`] are two views of.
+fn replica_facts(
+    scheduler: &Scheduler,
+    request: RequestKey,
+    kind: CallKind,
+) -> Vec<(ReplicaView, crate::WorkerGroupId, String)> {
     let executor = scheduler.executor.as_ref();
     let info = &scheduler.info;
     let table = world_blocks(executor);
@@ -1109,7 +1143,7 @@ pub(crate) fn replicas(
         .filter(|(id, _, _)| !decode_stage || !scheduler.placement.prefill_groups.contains(*id))
         .enumerate()
         .map(|(index, (worker, bound, worker_info))| {
-            replica_view(ReplicaFacts {
+            let view = replica_view(ReplicaFacts {
                 index,
                 block: block_id(&table, bound).unwrap_or(ComponentId(0)),
                 kinds: worker_phases(worker_info),
@@ -1126,7 +1160,8 @@ pub(crate) fn replicas(
                 ),
                 prefills_only: scheduler.placement.prefill_groups.contains(worker),
                 holds_component: holds_component(&scheduler.placement, request, worker),
-            })
+            });
+            (view, worker.clone(), bound.to_owned())
         })
         .collect()
 }
