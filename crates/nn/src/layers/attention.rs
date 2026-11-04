@@ -602,3 +602,45 @@ impl Attention {
 /// The program's `workspace_size` argument (specs/worker.md 9); the executor carves it from its
 /// scratch pool and zeroes it once (specs/worker.md 5.4, [D4]).
 pub const TRTLLM_WORKSPACE_BYTES: u64 = 512 << 20;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_paged_layer_pins_the_page_geometry() {
+        let attention = Attention::paged(128, 32, 4, 64, 40_960, None, 0.088).unwrap();
+        assert_eq!(attention.backend(), AttentionBackend::Paged);
+        assert_eq!(attention.max_kv_len(), 40_960);
+        // 32 query heads do not group 5 key heads.
+        assert!(Attention::paged(128, 32, 5, 64, 40_960, None, 0.088).is_err());
+        // A bound shorter than one page cannot address a page.
+        assert!(Attention::paged(128, 32, 4, 64, 32, None, 0.088).is_err());
+    }
+
+    #[test]
+    fn a_dense_layer_states_its_mask_and_its_bound() {
+        let encoder = Attention::dense(128, 32, 4, 8_192, true, None, 0.088).unwrap();
+        assert_eq!(encoder.backend(), AttentionBackend::Dense);
+        assert_eq!(encoder.max_kv_len(), 8_192);
+        // The FP32 paths read a whole sequence at once: dense mask, no window.
+        let audio = Attention::fp32(64, 8, 8, 4_096, 0.125).unwrap();
+        assert_eq!(audio.backend(), AttentionBackend::Fp32);
+        // A history window reads the causal mask only.
+        assert!(Attention::dense(128, 32, 4, 8_192, false, Some(1_024), 0.088).is_err());
+        assert!(Attention::dense(0, 32, 4, 8_192, true, None, 0.088).is_err());
+        assert!(Attention::dense(128, 32, 4, 8_192, true, None, 0.0).is_err());
+    }
+
+    #[test]
+    fn a_sparse_layer_names_its_tile_and_its_key_bound() {
+        let vsa = Attention::sparse(64, 128, 12, 65_536, true, 0.088).unwrap();
+        assert_eq!(vsa.backend(), AttentionBackend::Sparse);
+        assert_eq!(vsa.block(), 64);
+        assert_eq!(vsa.max_keys, 65_536);
+        // The descriptor's key bound is whole tiles of the block size.
+        assert!(Attention::sparse(64, 128, 12, 1_000, false, 0.088).is_err());
+        assert!(Attention::sparse(0, 128, 12, 1_024, false, 0.088).is_err());
+        assert!(Attention::sparse(128, 128, 12, 1_024, false, 0.088).is_ok());
+    }
+}

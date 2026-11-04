@@ -749,7 +749,7 @@ impl Moe {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::tensor::Backing;
     use ops::gemm::WeightOrder;
@@ -776,6 +776,28 @@ mod tests {
             None,
             experts,
             top,
+            Activation::Silu,
+            true,
+            None,
+        )
+    }
+
+    /// An expert-parallel block over `local` experts of `experts` at `offset`.
+    pub(super) fn expert_parallel_block(experts: u32, local: u32, offset: u32) -> Result<Moe> {
+        let router = Linear::new(
+            weight(DType::BF16, &[u64::from(experts), 2048]),
+            None,
+            WeightOrder::NxK,
+        )?;
+        Moe::expert_parallel(
+            router,
+            weight(DType::BF16, &[u64::from(local), 1536, 2048]),
+            weight(DType::BF16, &[u64::from(local), 2048, 768]),
+            None,
+            experts,
+            local,
+            offset,
+            8,
             Activation::Silu,
             true,
             None,
@@ -876,5 +898,32 @@ mod tests {
                 output: DType::BF16,
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod parallel_tests {
+    use super::tests::expert_parallel_block;
+
+    #[test]
+    fn an_expert_parallel_block_holds_a_window_of_the_vocabulary() {
+        let block = expert_parallel_block(128, 16, 96).unwrap();
+        assert_eq!(block.experts(), 128);
+        assert_eq!(block.local_experts(), 16);
+        assert_eq!(block.top(), 8);
+    }
+
+    #[test]
+    fn a_window_outside_the_vocabulary_is_refused() {
+        assert!(
+            expert_parallel_block(128, 16, 113).is_err(),
+            "window past the last expert"
+        );
+        assert!(
+            expert_parallel_block(128, 0, 0).is_err(),
+            "no resident expert"
+        );
+        // The stacks hold the window, not the vocabulary.
+        assert!(expert_parallel_block(128, 32, 96).is_err());
     }
 }
