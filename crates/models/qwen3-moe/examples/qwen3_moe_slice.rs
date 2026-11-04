@@ -462,10 +462,13 @@ fn decode_arena_bytes(
         .saturating_mul(pages)
         .saturating_mul(4);
     let rows = tokens.saturating_mul(plan.hidden).saturating_mul(2);
-    // The batch's i32 metadata: positions, slots, sequence lengths, the two offsets, the logits
-    // rows and the page table.
+    // The batch's i32 metadata: positions, slots, sequence lengths, the two offsets and the logits
+    // rows are seven per token; the page table is `[sequences, pages]` and this batch is one
+    // sequence, so its rows are `pages` and not a fixed count — a prompt long enough to need more
+    // pages than the slack reserved would otherwise fault at the first attention launch.
     let metadata = tokens
         .saturating_mul(7)
+        .saturating_add(pages)
         .saturating_add(64)
         .saturating_mul(4);
     let mut total = 0_u64;
