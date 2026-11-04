@@ -22,10 +22,6 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from uniserve.media import image, video
-from uniserve.models import Condition, ConditionRole
-from uniserve.models.minimax_h3 import packing
-
 # The container's dtype codes: 0 f64, 1 f32, 2 i64, 3 i32, 4 bf16, 5 f16
 # (notes/h3/numeric-diagnosis.md). The comparators read a half-precision payload as the dtype its
 # producer computed in: a BF16 activation widened before writing is twice its width on disk and
@@ -41,10 +37,13 @@ CODES = {
 #: The codes whose payload is half precision, and the torch dtype each stands for.
 HALVES = {4: torch.bfloat16, 5: torch.float16}
 
+# The condition roles by the name a case writes, resolved where the reference is imported: this
+# module's container (`dump`, `load`) must be usable without the reference's compiled extensions, so
+# nothing of `uniserve` is imported at module scope.
 ROLES = {
-    "first_frame": ConditionRole.FIRST_FRAME,
-    "last_frame": ConditionRole.LAST_FRAME,
-    "reference": ConditionRole.REFERENCE,
+    "first_frame": "FIRST_FRAME",
+    "last_frame": "LAST_FRAME",
+    "reference": "REFERENCE",
 }
 
 
@@ -114,15 +113,20 @@ def load(path: Path) -> torch.Tensor:
     return values.reshape(shape)
 
 
-def canvas_of(size: dict) -> image.Config:
+def canvas_of(size: dict):
+    from uniserve.media import image
+
     return image.Config(height=size["height"], width=size["width"])
 
 
-def condition_of(case: dict) -> Condition:
+def condition_of(case: dict):
+    from uniserve.media import video
+    from uniserve.models import Condition, ConditionRole
+
     pixels = case.get("canvas")
     frames = case.get("frames", 1)
     return Condition(
-        role=ROLES[case["role"]],
+        role=ConditionRole[ROLES[case["role"]]],
         video=None
         if pixels is None
         else video.Config(frame=canvas_of(pixels), num_frames=frames),
@@ -153,6 +157,8 @@ def main() -> int:
     conditions = tuple(
         condition_of(condition) for condition in case.get("conditions", ())
     )
+    from uniserve.models.minimax_h3 import packing
+
     segments = packing.condition_segments(conditions, canvas)
     spans = tuple(tuple(span) for span in case.get("vision_spans", ()))
     frames = case["num_frames"]
