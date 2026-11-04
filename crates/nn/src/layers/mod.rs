@@ -93,21 +93,21 @@ pub use unpatchify::UnpatchifyVideo;
 /// The constants a layer's operator descriptor carries and the program package owns.
 ///
 /// See the module documentation: one place, one rule, until the program arguments reach loading.
-pub(crate) mod launch {
+pub mod launch {
     /// Whether the descriptors this crate builds are the programmatic-dependent-launch variants.
-    pub(crate) const PDL: bool = false;
+    pub const PDL: bool = false;
 
     /// Tokens one `embedding` program handles.
-    pub(crate) const EMBEDDING_TOKENS: u32 = 8;
+    pub const EMBEDDING_TOKENS: u32 = 8;
 
     /// Elements one `rotary_factors` program handles.
-    pub(crate) const ROTARY_BLOCK: u32 = 256;
+    pub const ROTARY_BLOCK: u32 = 256;
 
     /// Tokens one `qk_norm_rope` program handles.
-    pub(crate) const QK_NORM_TOKENS: u32 = 1;
+    pub const QK_NORM_TOKENS: u32 = 1;
 
     /// The row width a row-wise kernel loads at a time: the width rounded up to a power of two.
-    pub(crate) fn row_tile(columns: u32) -> u32 {
+    pub fn row_tile(columns: u32) -> u32 {
         columns.max(1).next_power_of_two()
     }
 
@@ -115,6 +115,24 @@ pub(crate) mod launch {
     pub(crate) fn kv_tile(head_dim: u32) -> u32 {
         head_dim.clamp(1, 128).next_power_of_two().min(128)
     }
+}
+
+/// The tiling constants a stored program's descriptor key carries.
+///
+/// A key names the block a program was compiled for, so the number has one owner: the layer that
+/// launches it. Re-exported here for a fixture generator that sits above this crate - it must read
+/// what the layers launch rather than restate it, or `generator == fixture` proves only that two
+/// statements agree with each other.
+pub mod tiles {
+    pub use super::activation::BLOCK as ELEMENTWISE_BLOCK;
+    pub use super::bias::BLOCK as BIAS_BLOCK;
+    pub use super::head::BLOCK as LOGITS_BLOCK;
+    pub use super::launch::{EMBEDDING_TOKENS, PDL, QK_NORM_TOKENS, ROTARY_BLOCK, row_tile};
+    pub use super::pool::BLOCK as POOL_BLOCK;
+    pub use super::position::BLOCK as POSITION_BLOCK;
+    pub use super::rotate::{BLOCK as ROTATE_BLOCK, ROWS as ROTATE_ROWS};
+    pub use super::rows::BLOCK as ROWS_BLOCK;
+    pub use super::unpatchify::BLOCK as UNPATCHIFY_BLOCK;
 }
 
 /// The accumulation element type of every floating-point operator here.

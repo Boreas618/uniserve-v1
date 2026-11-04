@@ -24,6 +24,9 @@ pub struct ParallelLMHead {
     padded: u32,
 }
 
+/// Elements one `logits_gather` / `logits_unpad` program handles.
+pub const BLOCK: u32 = 1024;
+
 impl ParallelLMHead {
     /// The head whose rank holds `local` vocabulary rows starting at id `first`, padded to `padded`.
     ///
@@ -208,7 +211,7 @@ impl ParallelLMHead {
             output,
             vocabulary: self.vocabulary,
             padded: gathered_width,
-            block: 1024,
+            block: BLOCK,
             pdl: crate::layers::launch::PDL,
         }
     }
@@ -262,7 +265,7 @@ pub fn gather_rows(
         dtype: hidden.dtype,
         columns: u32::try_from(columns)
             .map_err(|_| Error::shape("gather_rows", "a hidden width above u32::MAX".to_owned()))?,
-        block: 1024,
+        block: BLOCK,
         pdl: crate::layers::launch::PDL,
     };
     let args = logits::GatherArgs { hidden, rows, out };
