@@ -102,6 +102,9 @@ pub(crate) struct Admin {
     /// Set once a hot restart handed the deployment to a successor, which
     /// takes the operations from then on.
     handed_over: AtomicBool,
+    /// The node's epoch records: the same instance the leader keeps, so the
+    /// admin reports and moves the records the epoch layer itself does (§7.2).
+    epochs: Arc<crate::epoch::Epochs>,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -117,12 +120,19 @@ fn now() -> f64 {
 impl Admin {
     /// An admin whose shutdown cancels `shutdown` and, when asked to, sets
     /// `retire`.
+    ///
     pub(crate) fn new(shutdown: CancellationToken, retire: Arc<AtomicBool>) -> Arc<Self> {
-        Self::with_epochs(shutdown, retire, Arc::new(crate::epoch::Epochs::new()))
+        Self::with_epochs(
+            shutdown,
+            retire,
+            Arc::new(crate::epoch::Epochs::new()),
+        )
     }
 
-    /// As [`Admin::new`], over records the epoch layer already holds: the
-    /// admin reports the same epochs the switch moves.
+    /// An admin over `epochs`, the records the node's leader keeps: there is
+    /// one `Epochs` per node and the admin holds the same instance, so
+    /// `GET /admin/config` and the update operations read what the epoch layer
+    /// itself moves (design §7.2).
     pub(crate) fn with_epochs(
         shutdown: CancellationToken,
         retire: Arc<AtomicBool>,
@@ -138,7 +148,14 @@ impl Admin {
             shutdown,
             retire,
             handed_over: AtomicBool::new(false),
+            epochs,
         })
+    }
+
+    /// The node's epoch records, which the admin reports and the program-layer
+    /// operations move.
+    pub(crate) fn epochs(&self) -> &crate::epoch::Epochs {
+        &self.epochs
     }
 
     /// The number of the operation that runs, which is the number an update it
@@ -513,7 +530,7 @@ async fn config(State(state): State<AdminState>) -> Json<serde_json::Value> {
     // configuration and its worlds: `EpochRecord`s are the daemon's record
     // of what it executes, not the engine's (`crate::epoch`).
     if let Some(object) = body.as_object_mut() {
-        let report = state.leader.epochs().report();
+        let report = state.admin.epochs().report();
         object.insert("epochs".to_owned(), report["epochs"].clone());
         object.insert("processes".to_owned(), report["processes"].clone());
     }
@@ -652,7 +669,7 @@ async fn commit(State(state): State<AdminState>) -> Response {
         // flight does the configuration's own commit run.
         // The update the probation belongs to is the one this operation ends,
         // numbered when it was applied — not this operation's own number.
-        let epochs = leader.epochs();
+        let epochs = Arc::clone(&leader.epochs());
         let probation = epochs.program_update();
         if let Some(program) = probation {
             let number = program.update.number;
