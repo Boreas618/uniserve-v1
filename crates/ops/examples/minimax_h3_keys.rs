@@ -758,6 +758,23 @@ fn main() {
         }
         .to_string(),
     );
+    // The video encoder's four levels normalize in FP32 at their own channel counts
+    // (`encoding.rs`: 128, 256, 512 and 1024), each with the tile its width's next power of two is.
+    // These are `ref2va`'s keys - the encoder block is the one path a `t2va` request never touches -
+    // and they are listed because a deployment builds one store for every task it serves.
+    for columns in [128_u32, 256, 512, 1024] {
+        push(
+            "layer_norm",
+            ops::norm::LayerNormDescriptor {
+                dtype: DType::F32,
+                columns,
+                tile: columns.next_power_of_two(),
+                bias: true,
+                pdl: PDL,
+            }
+            .to_string(),
+        );
+    }
     // Its 2-D rotary turns each head's leading half against the trailing half (`Rotation::Half`,
     // `vision.rs`'s `Rotate::new(head_dim, heads, Rotation::Half)`), 8 rows and 128 lanes per program
     // (`nn::layers::rotate`'s own constants); the whole 72-element head rotates, so no narrower
@@ -936,6 +953,56 @@ fn main() {
         );
     }
 
+    // ---- The text stack's attention, at its own geometry.
+    //
+    // The language layers are a 64-head network with 8 key/value heads (GQA) of 128 elements each,
+    // and the fused normalization-plus-rotation runs at those same head counts: `nn`'s `Attention`
+    // builds both descriptors from the heads the partition gives it, so the whole count and the
+    // Ulysses-2 shard are two calls of the same block rather than two code paths. Every key here is
+    // bound by a `t2va` request's first stage, which is why they belong in the list even though no
+    // DiT stage binds them.
+    for heads in [64_u32, 32] {
+        push(
+            "dense_attention",
+            ops::attention::dense::DenseDescriptor {
+                query: DType::BF16,
+                key_value: DType::BF16,
+                output: DType::BF16,
+                head_dim: 128,
+                q_heads: heads,
+                kv_heads: heads / 8,
+                mask: ops::attention::Mask::Dense,
+                windowed: false,
+                // A prompt's token count is a launch value, not part of the key: the bound below is
+                // the text capacity's own, and the reference masks query rows past the prompt.
+                max_kv_len: 4096,
+                cu_seq_lens: true,
+            }
+            .to_string(),
+        );
+        push(
+            "qk_norm_rope",
+            ops::rope::QkNormRopeDescriptor {
+                dtype: DType::BF16,
+                output: DType::BF16,
+                head_dim: 128,
+                q_heads: heads,
+                k_heads: heads / 8,
+                // Qwen3-VL pairs `x[i]` with `x[i + d/2]` over the whole head, and its RMS floor is
+                // the network's own 1e-6 (`config.json`'s `rms_norm_eps`), unlike the DiT's.
+                rotation: ops::rope::Rotation::Half,
+                // The literal is `f32` on purpose: the config's `rms_norm_eps` reaches the
+                // descriptor as a 32-bit float, and a 64-bit literal would name a different key.
+                epsilon: ops::Float::from(1.0e-6_f32),
+                rotated: 128,
+                rows: 1,
+                block: 128,
+                affine: true,
+                pdl: PDL,
+            }
+            .to_string(),
+        );
+    }
     // ---- The text encoder's MLP and its token embedding, and the two packed gated activations.
     //
     // The language layers' MLP is a `GatedActivation` over two *separate* contiguous projections —
