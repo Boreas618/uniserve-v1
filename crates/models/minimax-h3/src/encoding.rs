@@ -2398,6 +2398,39 @@ mod tests {
     }
 
     #[test]
+    fn a_still_is_one_frame_of_tile_and_the_pair_must_agree() {
+        // A still is the case the plan's two frame counts can disagree about, in both directions: its
+        // own frame count is one and so is its latent count, and a still's latent extent paired with a
+        // generated piece's frame count describes a condition that cannot exist.
+        let config = video_config();
+        let still = Extent {
+            frames: 1,
+            height: 84,
+            width: 48,
+        };
+        let plan = conditioning_arena(&config, 1, still).expect("a still's plan");
+        assert_eq!(plan.len(), 6);
+        let stack = Stack::of(&config).expect("the stack");
+        let canvas = crate::video_vae::Canvas::clip(&config, still.height, still.width);
+        let grid = crate::video_vae::Tiles::of(&config, &canvas).expect("the grid");
+        let (tile_height, tile_width) = grid
+            .tiles(&config, &canvas)
+            .iter()
+            .map(|tile| tile.canvas.pixels(&config))
+            .max_by_key(|(height, width)| u64::from(*height) * u64::from(*width))
+            .expect("a largest tile");
+        // One frame of pixels: the tile term scales with the condition's own frame count, and that is
+        // the whole difference between a still's plan and a 25-frame piece's.
+        assert_eq!(
+            plan[0].elements,
+            u64::from(stack.input_channels) * u64::from(tile_height) * u64::from(tile_width)
+        );
+        // A still's latents with a generated piece's frame count is refused rather than sized.
+        let mismatched = Extent { frames: 1, ..still };
+        assert!(conditioning_arena(&config, 25, mismatched).is_err());
+    }
+
+    #[test]
     fn a_condition_that_is_not_whole_patches_is_refused() {
         // The condition's rows are `2 x 2` latent patches, so an odd axis has no row count at all and
         // must be refused here rather than sized by a division that rounds.
