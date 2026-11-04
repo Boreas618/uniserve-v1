@@ -269,13 +269,7 @@ mod tests {
         // next two planes belong to the second field.
         let group = group(2, 1, 2);
         let cells = page_cells(&group, 2, 8, &checkpoint(0, 4), &[5])?;
-        assert_eq!(
-            cells,
-            vec![
-                (0, vec![0 * 8 + 5, 1 * 8 + 5]),
-                (1, vec![0 * 8 + 5, 1 * 8 + 5]),
-            ]
-        );
+        assert_eq!(cells, vec![(0, vec![5, 8 + 5]), (1, vec![5, 8 + 5]),]);
         Ok(())
     }
 
@@ -289,7 +283,7 @@ mod tests {
         // Two units hold the page's first field's four planes.
         assert_eq!(
             page_cells(&group, 2, 8, &checkpoint(0, 4), &[3, 4]).expect("two units"),
-            vec![(0, vec![0 * 8 + 3, 1 * 8 + 3, 0 * 8 + 4, 1 * 8 + 4])]
+            vec![(0, vec![3, 8 + 3, 4, 8 + 4])]
         );
     }
 }
