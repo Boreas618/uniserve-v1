@@ -345,6 +345,18 @@ impl PrefixCache {
         if copies.is_empty() {
             return Ok(());
         }
+        // A page of a pool with a state group holds its layers' checkpoints as planes of their own
+        // storages, and this copy moves the K/V planes, the flags and the scales only. Copying such
+        // a page here would hand the destination a page that looks initialized while its state
+        // planes are stale, so it is refused by name until the block copy
+        // (`snapshot_state` -> `scatter_state`, which is ordered gather-then-write) is its caller.
+        if self.plan().state_fields() > 0 {
+            return Err(Error::Unsupported(
+                "a page copy of a pool with a state group must copy its state planes through the \
+                 block copy, not the K/V copy"
+                    .into(),
+            ));
+        }
         let spans: Vec<_> = copies
             .iter()
             .map(|(_, target)| (target.0, 0, self.plan().unit_tokens()))
@@ -772,7 +784,7 @@ impl PrefixCache {
         let mut row = 0u32;
         for (field, blocks) in &runs {
             let count = blocks.len() as u32;
-            let storage = self.planes.value_storage(*field)?;
+            let storage = self.planes.state_storage(*field)?;
             let field_view = ops::TensorView::new(
                 ops::DevicePtr::new(crate::memory::allocation::Backing::address(
                     storage.as_ref(),

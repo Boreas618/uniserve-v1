@@ -546,8 +546,17 @@ pub(crate) struct MainProcess {
     /// reach the scheduler that serves it, and the command names the request, not the rank.
     streams: Vec<(u64, usize, engine::EventRx)>,
     /// Whether this process admits and executes: a drain parks every scheduler, and only the
-    /// `Serve` that names the epoch again resumes it in place (§2.3, §7.4 step 2).
+    /// `Serve` that names the epoch again resumes it in place (§2.3, §7.4 step 2). A process that
+    /// has not reached its first switchover admits nothing whatever the daemon has said: the epoch's
+    /// first generation holds no kernel and no capture until the daemon's precopy fills it and the
+    /// switchover warms it, and a batch admitted before then would reach a graph that does not
+    /// exist.
     serving: bool,
+    /// Whether the epoch's first switchover has happened: the boundary the first batch is served
+    /// at (§4.5, §7.3 step 3).
+    boundary: bool,
+    /// A `Serve` that arrived before the boundary: the epoch may admit, but not yet.
+    pending_serve: bool,
     /// What each scheduler parked with, in `schedulers` order: kept from the drain to the resume,
     /// which adopts it, so a resumed epoch reuses the pages it still holds instead of reading them
     /// again.
@@ -623,7 +632,7 @@ impl MainProcess {
         // one `Arc` and not a second load. The load and the capacity plan are one call because the
         // order between them is the plan's: the weights are mapped first, so what the plan measures
         // is what is left of the device rather than what was there before the model.
-        let (model, mut memory) = plan
+        let (model, mut memory, inventory) = plan
             .load_and_open(&mut weights, &mut &*client)
             .context("loading the epoch's model")?;
 
@@ -656,7 +665,10 @@ impl MainProcess {
             .devices()
             .first()
             .context("this rank serves no device")?;
-        let scratch = plan.graph(device)?.scratch;
+        // Only the scratch figure is read here: the device thread starts before any batch and the
+        // shadow region is the one pool it is sized with. The resident pool is the capacity plan's
+        // and `open_memory` opens it, so this call states none.
+        let scratch = plan.graph(device, 0)?.scratch;
         for device in plan.devices() {
             let generation = Arc::new(Generation::new(epoch.generation, std::iter::empty()));
             let runners = plan.runners(*device, Arc::clone(&model), &mut memory, &generation)?;
@@ -682,7 +694,7 @@ impl MainProcess {
         // above through `executor::Batches` (§2.4, §4.4). A node that holds none keeps an empty list
         // and serves only what its peers' schedulers ask of it; a node that is the scheduler node
         // and holds none would accept requests and dispatch nothing, which is refused by name.
-        let schedulers = schedulers(&plan, launch, &memory, &model, &executors)?;
+        let schedulers = schedulers(&plan, launch, &memory, &model, &executors, &inventory)?;
 
         let mut process = Self {
             control,
@@ -704,10 +716,13 @@ impl MainProcess {
             process,
             stopping: false,
             streams: Vec::new(),
-            // The epoch serves from the end of `start` until the daemon drains it, unless the
-            // launcher started it as a standby: that one parks itself here, before it can admit
-            // anything, and the `Promote` that follows resumes it (2.5, 7.4).
-            serving: !launch.standby,
+            // Nothing is admitted until the epoch's first switchover, which is the boundary the
+            // first batch is served at: before it the generation holds no kernel and no capture, so
+            // a batch would find no graph. A standby parks itself here as well, and the `Promote`
+            // that follows does not lift the boundary either (2.5, 7.4).
+            serving: false,
+            boundary: false,
+            pending_serve: false,
             parked: None,
             paused: false,
             rollback: launch.rollback_s.map(Duration::from_secs),
@@ -1002,6 +1017,9 @@ impl MainProcess {
                             proto::request::RejectionKind::Overloaded,
                             if self.paused {
                                 "the frontend's admissions are held".to_owned()
+                            } else if !self.boundary {
+                                "the epoch is starting and has reached no batch boundary yet"
+                                    .to_owned()
                             } else {
                                 "the epoch is drained and serves nothing".to_owned()
                             },
@@ -1103,6 +1121,12 @@ impl MainProcess {
                 Some(proto::process::command::Kind::Promote(_)) => {
                     self.resume_schedulers()
                         .context("promoting this process in place")?;
+                    if !self.boundary {
+                        // A promoted standby serves only once the switchover that fills its
+                        // generation has happened, the same rule a fresh process follows.
+                        self.serving = false;
+                        self.pending_serve = true;
+                    }
                     self.send_report(proto::process::Report {
                         kind: Some(proto::process::report::Kind::Promoted(
                             proto::process::Promoted {
@@ -1852,6 +1876,14 @@ impl MainProcess {
             }
         }
 
+        // The boundary the first batch is served at (§4.5): every device serves this generation
+        // and its buckets are warming behind the batches that follow. A `Serve` that arrived while
+        // the generation was still being filled is honoured now.
+        self.boundary = true;
+        if self.pending_serve {
+            self.pending_serve = false;
+            self.serving = true;
+        }
         Ok(ProgramStatus::Switched { generation })
     }
 
@@ -1937,6 +1969,13 @@ impl MainProcess {
     /// command is the one this process bound at launch: the daemon names it so that the frontend
     /// submits to the right place, not so that a process moves its socket.
     fn resume(&mut self, serve: proto::process::Serve) -> Result<()> {
+        if !self.boundary {
+            // The daemon has said the epoch serves; the process cannot admit until its first
+            // generation is filled and warmed. The request waits in the frontend, which retries the
+            // submission it was refused.
+            self.pending_serve = true;
+            return Ok(());
+        }
         if self.parked.is_some() {
             self.resume_schedulers()
                 .with_context(|| format!("resuming epoch {}", serve.epoch))?;
@@ -3267,6 +3306,7 @@ fn schedulers(
     memory: &Memory,
     model: &qwen3_moe::Qwen3Moe,
     executors: &[Arc<Executor>],
+    rank: &ipc::WorkerInfo,
 ) -> Result<Vec<engine::SchedulerHandle>> {
     if !launch.scheduler_node {
         return Ok(Vec::new());
@@ -3281,9 +3321,28 @@ fn schedulers(
     let config = engine::EngineConfig::of(&facts)?;
     // The scheduler submits through the same devices this process drives, so a batch and a
     // switchover reach one executor thread per device and never two.
-    let batches: Arc<dyn executor::batch::Batches> = Arc::new(executor::batch::Executors::shared(
-        executors.iter().map(Arc::clone).collect(),
-    )?);
+    // The scheduler plans against a description of the pool, and this process is the one pool it
+    // holds: its single rank is this one, its capacities are the launch's (the rank reports what it
+    // holds, not what it was launched for), and its longest sequence is the model's bound. The
+    // inventory is the executor's to hold and the boot's to state, because neither number can be
+    // derived from a batch (4.4).
+    let inventory = executor::batch::Inventory {
+        group: launch.group.clone(),
+        ranks: vec![rank.clone()],
+        placement: executor::batch::Placement {
+            queue_depth: plan.queue_depth(),
+            ranks: plan.world_size(),
+            components: engine::WorkerGroupConfig::single_component(
+                ipc::DEFAULT_COMPONENT,
+                plan.world_size(),
+            ),
+        },
+        max_model_len: plan.max_kv_len(model)?,
+    };
+    let batches: Arc<dyn executor::batch::Batches> = Arc::new(
+        executor::batch::Executors::shared(executors.iter().map(Arc::clone).collect())?
+            .stating(vec![inventory]),
+    );
     let handle = engine::SchedulerHandle::over_batches(config, batches)?;
     Ok(vec![handle])
 }
