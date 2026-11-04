@@ -60,6 +60,15 @@ class Call(ctypes.Structure):
     ]
 
 
+#: `crates/ops/src/moe/grouped.rs` — `ROUTE_CALL_LAYOUT`'s size, which `entry.h` also pins. Measured,
+#: not remembered: a field added to the operator's struct shifts every field after it.
+ROUTE_CALL_SIZE = 616
+assert ctypes.sizeof(Call) == ROUTE_CALL_SIZE, (
+    f"the check's RouteCall mirror is {ctypes.sizeof(Call)} bytes, the operator's layout says "
+    f"{ROUTE_CALL_SIZE}"
+)
+
+
 def gamma(reduction, unit):
     """`Tolerance::gamma`, the operator's own expression."""
     terms = reduction * unit
@@ -124,9 +133,15 @@ def main() -> int:
     tokens, top = options.tokens, options.top
     experts, hidden_size, intermediate = options.experts, options.hidden, options.intermediate
 
+    # As in `gather_gemm`'s check: one expert is emptied by hand (a dropped route would not empty
+    # one at this size) and one route dies, so a tile is only partly filled.
     routes = torch.stack([torch.randperm(experts)[:top] for _ in range(tokens)])
-    routes[0, 0] = -1  # one dead route: an expert with no rows, a tile that is not full
+    emptied = 11 % experts
+    routes[routes == emptied] = (emptied + 1) % experts
+    routes[0, 0] = -1
     per_expert = tiles_of(routes, experts, top)
+    if not any(not members for members in per_expert):
+        raise SystemExit("the case was built with an empty expert in mind and has none")
     tile_expert, tile_limit, map_rows, live_tiles = sort_metadata(per_expert, top)
 
     permuted_rows = len(map_rows)
@@ -138,6 +153,7 @@ def main() -> int:
     ).to(torch.bfloat16)
     expanded = tokens * top
     out = torch.full((expanded, hidden_size), float("nan"), dtype=torch.bfloat16, device=device)
+    rows_before, weights_before = rows.clone(), weights.clone()
 
     tile_to_expert = torch.tensor(tile_expert, dtype=torch.int32, device=device)
     tile_to_limit = torch.tensor(tile_limit, dtype=torch.int32, device=device)
@@ -164,6 +180,9 @@ def main() -> int:
     if status != 0:
         message = call.error.decode("utf-8", "replace").rstrip("\x00")
         raise SystemExit(f"the module refused the call with status {status}: {message}")
+
+    if not torch.equal(rows, rows_before) or not torch.equal(weights, weights_before):
+        raise SystemExit("the module wrote into its inputs; FC2 scatters only into `out`")
 
     # The reference, tile by tile: each live tile's rows contracted with its expert's weights.
     expected = torch.full(
@@ -198,15 +217,17 @@ def main() -> int:
     relative = bound(intermediate)
     allowed = relative * expected.abs()
     error = (got - expected).abs()
-    violations = int((error > allowed).sum())
+    # `~(error <= allowed)`: a NaN difference (a route no tile wrote) is not `> allowed` either,
+    # so the plain comparison would pass it.
+    violations = int((~(error <= allowed)).sum())
     print(
         f"tokens {tokens} top {top} experts {experts} hidden {hidden_size} intermediate "
         f"{intermediate}: {permuted_rows} permuted rows in {live_tiles} tiles, "
-        f"max |out - reference| = {float(error.max()):.6g}, bound rtol {relative:.3e}, "
+        f"max |out - reference| = {float(torch.nan_to_num(error).max()):.6g}, bound rtol {relative:.3e}, "
         f"experts with no routes {sum(1 for m in per_expert if not m)}"
     )
     if violations:
-        position = int((error > allowed).reshape(-1).nonzero()[0])
+        position = int((~(error <= allowed)).reshape(-1).nonzero()[0])
         print(
             f"{violations} of {error.numel()} products are outside the bound; first at {position}: "
             f"{float(got.reshape(-1)[position])} vs {float(expected.reshape(-1)[position])}",

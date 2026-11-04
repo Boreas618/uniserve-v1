@@ -63,6 +63,16 @@ class Call(ctypes.Structure):
     ]
 
 
+#: `crates/ops/src/moe/grouped.rs:192` — `GATHER_CALL_LAYOUT`'s size. The mirror above is written by
+#: hand, so it is measured rather than remembered: a field added to the operator's struct shifts
+#: everything after it, and the call below would pass garbage flags instead of failing.
+GATHER_CALL_SIZE = 624
+assert ctypes.sizeof(Call) == GATHER_CALL_SIZE, (
+    f"the check's GatherCall mirror is {ctypes.sizeof(Call)} bytes, the operator's layout says "
+    f"{GATHER_CALL_SIZE} (crates/ops/src/moe/grouped.rs:192)"
+)
+
+
 def gamma(reduction, unit):
     """`Tolerance::gamma`, the operator's own expression."""
     terms = reduction * unit
@@ -150,11 +160,18 @@ def main() -> int:
     tokens, top = options.tokens, options.top
     experts, hidden_size, intermediate = options.experts, options.hidden, options.intermediate
 
-    # Every token takes `top` distinct experts; one route beside the first token is dropped, so at
-    # least one expert has no routes and at least one tile is only partly filled.
+    # Every token takes `top` distinct experts, and **one expert is emptied by hand**: with 512
+    # tokens × 8 routes over 128 experts every expert expects about 32 routes, so a dropped route
+    # would leave no expert empty and the case would be vacuous. The dead expert's routes are moved
+    # to a neighbour, which keeps every token's route count and leaves exactly one expert with none.
     routes = torch.stack([torch.randperm(experts)[:top] for _ in range(tokens)])
+    emptied = 7 % experts
+    routes[routes == emptied] = (emptied + 1) % experts
+    # And one route dies, so one tile is only partly filled.
     routes[0, 0] = -1
     per_expert = tiles_of(routes, experts, top)
+    if not any(not members for members in per_expert):
+        raise SystemExit("the case was built with an empty expert in mind and has none")
 
     hidden = (torch.randn(tokens, hidden_size, dtype=torch.float32, device=device) * 0.5).to(
         torch.bfloat16
@@ -198,26 +215,47 @@ def main() -> int:
         message = call.error.decode("utf-8", "replace").rstrip("\x00")
         raise SystemExit(f"the module refused the call with status {status}: {message}")
 
-    # The rows the metadata names, tile by tile, are the ones the operator writes.
-    live_rows = sum(tile_limit)
+    # The rows the metadata names are a tile's **first `limit` rows**; the rest of each tile is the
+    # sort's padding, and a kernel that walks a tile's rows without respecting `tile_to_limit` writes
+    # into it. The NaN fill is only evidence if something looks at it, and the live rows are not a
+    # prefix of the table: every tile pads at its own end.
+    live_mask = torch.zeros(permuted_rows, dtype=torch.bool, device=device)
+    for tile, limit in enumerate(tile_limit):
+        live_mask[tile * TILE_ROWS:tile * TILE_ROWS + limit] = True
+    if not bool(live_mask.any()):
+        raise SystemExit("the metadata names no rows, so the case measures nothing")
+    if not any(0 < limit < TILE_ROWS for limit in tile_limit):
+        raise SystemExit(
+            "no tile is partly filled, so the case does not exercise a tile's `tile_to_limit`"
+        )
+    if not bool(torch.isnan(out[~live_mask]).all()):
+        written = int((~torch.isnan(out[~live_mask])).sum())
+        raise SystemExit(
+            f"a padding row was written: {written} of {out[~live_mask].numel()} values inside the "
+            f"tiles past their `tile_to_limit`"
+        )
+
     expected = reference(
         hidden, weights, tile_expert, tile_limit, map_rows, intermediate, top
     )
-    want = expected[:live_rows]
-    got = out[:live_rows].to(torch.float32)
+    got = out[live_mask].to(torch.float32)
+    want = expected[live_mask]
 
     relative, absolute = bound(hidden_size)
     allowed = absolute + relative * want.abs()
     error = (got - want).abs()
-    violations = int((error > allowed).sum())
+    # `~(error <= allowed)`, not `error > allowed`: `out` starts as NaN precisely so that an
+    # unwritten row shows up, and `NaN > allowed` is False — the sentinel would be invisible.
+    violations = int((~(error <= allowed)).sum())
     print(
         f"tokens {tokens} top {top} experts {experts} hidden {hidden_size} intermediate "
         f"{intermediate}: {live_rows} live rows of {permuted_rows} in {live_tiles} tiles, "
-        f"max |out - reference| = {float(error.max()):.6g}, bound rtol {relative:.3e} "
-        f"atol {absolute:.3e}, experts with no routes {sum(1 for m in per_expert if not m)}"
+        f"max |out - reference| = {float(torch.nan_to_num(error).max()):.6g}, bound rtol {relative:.3e} "
+        f"atol {absolute:.3e}, experts with no routes {sum(1 for m in per_expert if not m)}, "
+        f"partly filled tiles {sum(1 for limit in tile_limit if 0 < limit < TILE_ROWS)}"
     )
     if violations:
-        position = int((error > allowed).reshape(-1).nonzero()[0])
+        position = int((~(error <= allowed)).reshape(-1).nonzero()[0])
         print(
             f"{violations} of {error.numel()} gated products are outside the bound; first at "
             f"{position}: {float(got.reshape(-1)[position])} vs "
