@@ -1351,6 +1351,8 @@ impl Denoiser {
             Modality::Video,
             modulation,
             video_groups,
+            step.index,
+            step_index,
             velocity_rows,
         )?;
         let velocity = arena.tensor(dtype, video.shape)?;
@@ -1382,6 +1384,8 @@ impl Denoiser {
                 Modality::Audio,
                 modulation,
                 audio_groups,
+                step.index,
+                step_index,
                 velocity,
             )?;
             let flat = TensorView::with_strides(
@@ -1414,6 +1418,7 @@ impl Denoiser {
         rows: u32,
         partition: &crate::Partition,
         loader: &mut WeightLoader<'_>,
+        heads: Option<crate::transformer::StudentHeads>,
     ) -> Result<Self> {
         let schedule = Schedule::new(&config.schedule)?;
         let evaluations = schedule.num_steps()?;
@@ -1479,6 +1484,7 @@ impl Denoiser {
             rows,
             partition,
             loader,
+            heads,
         )?;
         let solver = Solver::load(&schedule, loader)?;
         let rules = Layouts::new(config.clone(), arrangement)?;

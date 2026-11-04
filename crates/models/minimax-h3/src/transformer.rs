@@ -23,7 +23,7 @@ use crate::attention_sparse::Segments;
 use crate::config::{AttentionKind, TransformerConfig};
 use crate::modulation::AdaLnCache;
 use crate::partition::Partition;
-use crate::schedule::Modality;
+use crate::schedule::{Modality, Schedule};
 use crate::{Error, Result};
 
 use nn::layers::{GatedResidual, Linear, ModulatedRmsNorm, PackedSwiGlu, RmsNorm};
@@ -193,6 +193,279 @@ impl Trace<'_> {
     }
 }
 
+/// A parallel-decoding student's output heads, fused per evaluation block at load.
+///
+/// A DMD/PDD student stacks one head per fine interval (`pdd_steps`, e.g. 32) and predicts one
+/// block's velocity from the weighted sum of its intervals' heads
+/// (`uniserve/diffusion/schedule.py:297-326`: weights and accumulation in FP32, rounded to the
+/// parameter's dtype). The fusion is arithmetic over the checkpoint's own numbers, so it is done
+/// once, on the host, at the loading boundary; what a forward does is pick one row.
+///
+/// The table is laid out `[blocks, out * hidden]` so that one evaluation's head is **one table
+/// row**: `gather_rows` indexed by the executor's `step` view (`[1]` int32) gives `[1, out *
+/// hidden]`, and a projection over that view's element type is the ordinary output projection. The
+/// gathered buffers sit at fixed arena addresses with contents that change per evaluation, so the
+/// graph does not change: one capture serves every step of a layout.
+pub struct StudentHeads {
+    video: FusedHeads,
+    audio: Option<FusedHeads>,
+}
+
+/// One modality's fused heads: the weight and bias rows of every evaluation block.
+struct FusedHeads {
+    /// `[blocks, out * hidden]` in the checkpoint's own type: block `b`'s fused weight.
+    weight: Weight,
+    /// `[blocks, out]`: block `b`'s fused bias.
+    bias: Weight,
+    /// The velocity's width for this modality.
+    out: u32,
+    /// The partition's hidden width.
+    hidden: u32,
+    /// The blocks the schedule fused into the table.
+    blocks: u32,
+}
+
+/// One evaluation's head, as the two weights a projection reads.
+struct Selected {
+    weight: Weight,
+    bias: Weight,
+}
+
+impl FusedHeads {
+    /// Pick `block`'s row of each table on the device and answer the two weights over it.
+    fn select(
+        &self,
+        f: &Forward,
+        block: u32,
+        step: TensorView,
+        arena: &nn::Arena,
+    ) -> Result<Selected> {
+        if block >= self.blocks {
+            return Err(Error::checkpoint(format!(
+                "H3 evaluation {block} is outside the {} fused student heads",
+                self.blocks
+            )));
+        }
+        let dtype = self.weight.dtype();
+        let wide = arena.tensor(
+            dtype,
+            Shape::new(&[1, u64::from(self.out) * u64::from(self.hidden)]),
+        )?;
+        nn::layers::gather_rows(f, self.weight.view(), step, wide)?;
+        let narrow = arena.tensor(dtype, Shape::new(&[1, u64::from(self.out)]))?;
+        nn::layers::gather_rows(f, self.bias.view(), step, narrow)?;
+        Ok(Selected {
+            weight: staged(
+                wide.reshape(Shape::new(&[u64::from(self.out), u64::from(self.hidden)])),
+            )?,
+            bias: staged(narrow.reshape(Shape::new(&[u64::from(self.out)])))?,
+        })
+    }
+}
+
+/// A weight over a device buffer the caller of this module owns for the launch's lifetime.
+///
+/// The circled views a step gathers into are arena buffers: they live as long as the forward that
+/// wrote them, which is exactly as long as the projection that reads them, so a weight can address
+/// one without a loader having published it.
+fn staged(view: TensorView) -> Result<Weight> {
+    let element = view.dtype.bytes().ok_or_else(|| {
+        Error::checkpoint(format!(
+            "a staged weight of {} has no whole-byte element size",
+            view.dtype
+        ))
+    })?;
+    Ok(Weight {
+        backing: nn::Backing::new(view.ptr, view.shape.numel() * element),
+        view,
+    })
+}
+
+impl StudentHeads {
+    /// Fuse a checkpoint's stacked interval heads into one head per evaluation block.
+    ///
+    /// The checkpoint stacks `output_heads` heads along the first axis of `proj_out` and
+    /// `audio_proj_out` (`[output_heads * out, hidden]`, `[output_heads * out]`). Block `b`'s fused
+    /// weight is `sum_n w[n] * head[start + n]` with `w` the block's normalized integration weights,
+    /// the products and the sum in FP32, and the result rounded to the checkpoint's own type -
+    /// exactly `fuse_heads` (`uniserve/diffusion/schedule.py:297-326`). One derivation per block
+    /// per modality, once per load, published as a constant of the loader's store.
+    pub fn fuse(
+        source: &nn::Checkpoint,
+        schedule: &Schedule,
+        config: &TransformerConfig,
+        loader: &mut WeightLoader<'_>,
+    ) -> Result<Self> {
+        let hidden = u64::from(config.hidden_size);
+        let video_out = u64::from(config.video_channels) * 4;
+        let audio_out = u64::from(config.audio_channels);
+        let video = FusedHeads::fuse(
+            source,
+            schedule,
+            Modality::Video,
+            "proj_out",
+            video_out,
+            hidden,
+            config.output_heads,
+            loader,
+        )?;
+        let audio = FusedHeads::fuse(
+            source,
+            schedule,
+            Modality::Audio,
+            "audio_proj_out",
+            audio_out,
+            hidden,
+            config.output_heads,
+            loader,
+        )?;
+        Ok(Self {
+            video,
+            audio: Some(audio),
+        })
+    }
+}
+
+impl FusedHeads {
+    #[allow(clippy::too_many_arguments)]
+    fn fuse(
+        source: &nn::Checkpoint,
+        schedule: &Schedule,
+        modality: Modality,
+        name: &str,
+        out: u64,
+        hidden: u64,
+        heads: u32,
+        loader: &mut WeightLoader<'_>,
+    ) -> Result<Self> {
+        let heads = u64::from(heads);
+        let block_count = schedule.num_steps()?;
+        let weight = source.read(&format!("{name}.weight"))?;
+        let bias = source.read(&format!("{name}.bias"))?;
+        let rows = heads * out;
+        if weight.shape.dims() != [rows, hidden] {
+            return Err(Error::checkpoint(format!(
+                "{name}.weight is {:?}, [{rows}, {hidden}] expected for {heads} stacked heads",
+                weight.shape.dims()
+            )));
+        }
+        if bias.shape.dims() != [rows] {
+            return Err(Error::checkpoint(format!(
+                "{name}.bias is {:?}, [{rows}] expected for {heads} stacked heads",
+                bias.shape.dims()
+            )));
+        }
+        let dtype = weight.dtype;
+        if bias.dtype != dtype {
+            return Err(Error::checkpoint(format!(
+                "{name}'s weight is {dtype} and its bias {}",
+                bias.dtype
+            )));
+        }
+        let values = host_f32(dtype, &weight.bytes, &format!("{name}.weight"))?;
+        let biases = host_f32(dtype, &bias.bytes, &format!("{name}.bias"))?;
+        let blocks = u64::from(block_count);
+        let per_head = out * hidden;
+        let mut fused = vec![0_f32; (blocks * per_head) as usize];
+        let mut fused_bias = vec![0_f32; (blocks * out) as usize];
+        for block in 0..block_count {
+            let (start, weights) = schedule.block_span(modality, block)?;
+            let start = u64::from(start);
+            let weights = weights
+                .iter()
+                .map(|weight| *weight as f32)
+                .collect::<Vec<_>>();
+            let target = (u64::from(block) * per_head) as usize;
+            for entry in 0..per_head {
+                let mut sum = 0.0_f32;
+                for (index, weight) in weights.iter().enumerate() {
+                    let head = start + index as u64;
+                    sum += weight * values[(head * per_head + entry) as usize];
+                }
+                fused[target + entry as usize] = sum;
+            }
+            let target = (u64::from(block) * out) as usize;
+            for channel in 0..out {
+                let mut sum = 0.0_f32;
+                for (index, weight) in weights.iter().enumerate() {
+                    let head = start + index as u64;
+                    sum += weight * biases[(head * out + channel) as usize];
+                }
+                fused_bias[target + channel as usize] = sum;
+            }
+        }
+        let modality_name = modality.as_str();
+        Ok(Self {
+            weight: loader.constant(
+                &format!("denoiser.{modality_name}.student_heads.weight"),
+                dtype,
+                Shape::new(&[blocks, per_head]),
+                &host_bytes(dtype, &fused)?,
+            )?,
+            bias: loader.constant(
+                &format!("denoiser.{modality_name}.student_heads.bias"),
+                dtype,
+                Shape::new(&[blocks, out]),
+                &host_bytes(dtype, &fused_bias)?,
+            )?,
+            out: u32::try_from(out)
+                .map_err(|_| Error::checkpoint(format!("{name}'s width exceeds u32")))?,
+            hidden: u32::try_from(hidden)
+                .map_err(|_| Error::checkpoint(format!("{name}'s hidden width exceeds u32")))?,
+            blocks: block_count,
+        })
+    }
+}
+
+/// A checkpoint tensor's values as FP32, for a derivation that must be exact on the host.
+fn host_f32(dtype: nn::DType, bytes: &[u8], name: &str) -> Result<Vec<f32>> {
+    match dtype {
+        nn::DType::BF16 => Ok(bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| f32::from_bits(u32::from(u16::from_le_bytes(*pair)) << 16))
+            .collect()),
+        nn::DType::F32 => Ok(bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| f32::from_le_bytes(*word))
+            .collect()),
+        other => Err(Error::Unsupported(format!(
+            "{name} is {other}; a parallel-decoding student's heads are fused on the host in FP32, \
+             which this build does for BF16 and F32 only"
+        ))),
+    }
+}
+
+/// FP32 values as the little-endian bytes of `dtype`, rounded the way the checkpoint's own type
+/// rounds (BF16: round to nearest even).
+fn host_bytes(dtype: nn::DType, values: &[f32]) -> Result<Vec<u8>> {
+    match dtype {
+        nn::DType::BF16 => {
+            let mut bytes = Vec::with_capacity(values.len() * 2);
+            for value in values {
+                let bits = value.to_bits();
+                // Round to nearest even on the eight dropped bits before truncating.
+                let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
+                bytes.extend_from_slice(&((rounded >> 16) as u16).to_le_bytes());
+            }
+            Ok(bytes)
+        }
+        nn::DType::F32 => {
+            let mut bytes = Vec::with_capacity(values.len() * 4);
+            for value in values {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            Ok(bytes)
+        }
+        other => Err(Error::Unsupported(format!(
+            "a fused head cannot be stored as {other}"
+        ))),
+    }
+}
+
 impl Transformer {
     /// Project one modality's patchified audio rows into the hidden width.
     pub fn project_audio(&self, f: &Forward, rows: TensorView, out: TensorView) -> Result<()> {
@@ -222,6 +495,7 @@ impl Transformer {
     ///
     /// The final normalization is modulated like every other one: `[groups, 2 * hidden]` of shift
     /// and scale, gathered at the AdaLN entry the step reads. `rows` selects each row's group.
+    #[allow(clippy::too_many_arguments)]
     pub fn velocity(
         &self,
         f: &Forward,
@@ -229,6 +503,8 @@ impl Transformer {
         modality: Modality,
         modulation: TensorView,
         rows: TensorView,
+        block: u32,
+        step: TensorView,
         out: TensorView,
     ) -> Result<()> {
         let width = hidden.shape.last();
@@ -244,15 +520,7 @@ impl Transformer {
         let dtype = hidden.dtype;
         let normalized = arena.tensor(dtype, hidden.shape)?;
         norm.forward(f, hidden, None, rows, normalized, None, None)?;
-        match modality {
-            Modality::Video => Ok(self.video_out.forward(f, normalized, out)?),
-            Modality::Audio => {
-                let audio = self.audio_out.as_ref().ok_or_else(|| {
-                    Error::Unsupported("this H3 partition predicts no audio velocity".to_owned())
-                })?;
-                Ok(audio.forward(f, normalized, out)?)
-            }
-        }
+        self.project_head(f, normalized, modality, block, step, out)
     }
 }
 
@@ -327,8 +595,11 @@ pub struct Transformer {
     audio_proj_in: Option<Linear>,
     layers: Vec<Layer>,
     norm_out: RmsNorm,
-    video_out: Linear,
+    /// The base form's one output head per modality. A student fuses its heads instead.
+    video_out: Option<Linear>,
     audio_out: Option<Linear>,
+    /// A parallel-decoding student's fused heads, when the checkpoint stacks more than one.
+    heads: Option<StudentHeads>,
     config: TransformerConfig,
 }
 
@@ -343,14 +614,30 @@ impl Transformer {
         rows: u32,
         partition: &Partition,
         loader: &mut WeightLoader<'_>,
+        heads: Option<StudentHeads>,
     ) -> Result<Self> {
-        if config.output_heads != 1 {
-            return Err(Error::Unsupported(format!(
-                "the H3 partition predicts {} output heads per evaluation (a parallel-decoding \
-                 student); its fused per-step heads need a step-indexed gather of a [steps, out, \
-                 in] weight, which crates/nn does not express yet",
-                config.output_heads
-            )));
+        match (config.output_heads, heads.is_some()) {
+            (1, false) | (2.., true) => {}
+            (0, _) => {
+                return Err(Error::checkpoint(
+                    "the H3 partition predicts no output heads".to_owned(),
+                ));
+            }
+            (1, true) => {
+                return Err(Error::checkpoint(
+                    "the H3 partition predicts one output head per evaluation, and fused student \
+                     heads were handed in"
+                        .to_owned(),
+                ));
+            }
+            (count, false) => {
+                return Err(Error::Unsupported(format!(
+                    "the H3 partition predicts {count} output heads per evaluation (a \
+                     parallel-decoding student), and the loading boundary fused none: a student is \
+                     served from its fused per-block heads, never from a plain projection over a \
+                     [count * out, hidden] table"
+                )));
+            }
         }
         let hidden = u64::from(config.hidden_size);
         let video_in = u64::from(config.video_channels) * 4;
@@ -371,13 +658,22 @@ impl Transformer {
                 gain(loader, "norm_out.norm.weight", hidden)?,
                 config.norm_eps,
             )?,
-            video_out: projection_with_bias(loader, "proj_out", video_in, hidden)?,
-            audio_out: Some(projection_with_bias(
-                loader,
-                "audio_proj_out",
-                audio_in,
-                hidden,
-            )?),
+            // A student's checkpoint holds the stacked interval heads, so the plain projection is
+            // read only when the partition has one head.
+            video_out: match heads {
+                Some(_) => None,
+                None => Some(projection_with_bias(loader, "proj_out", video_in, hidden)?),
+            },
+            audio_out: match heads {
+                Some(_) => None,
+                None => Some(projection_with_bias(
+                    loader,
+                    "audio_proj_out",
+                    audio_in,
+                    hidden,
+                )?),
+            },
+            heads,
             config: *config,
         })
     }
@@ -392,9 +688,60 @@ impl Transformer {
         Ok(self.proj_in.forward(f, rows, out)?)
     }
 
-    /// Project one modality's hidden rows back to its velocity.
-    pub fn predict(&self, f: &Forward, hidden: TensorView, out: TensorView) -> Result<()> {
-        Ok(self.video_out.forward(f, hidden, out)?)
+    /// Project one modality's hidden rows back to its velocity at one evaluation.
+    ///
+    /// `step` is the executor's `[1]` int32 step view: a student's head is chosen by it on the
+    /// device, so the same graph serves every evaluation.
+    pub fn predict(
+        &self,
+        f: &Forward,
+        hidden: TensorView,
+        modality: Modality,
+        block: u32,
+        step: TensorView,
+        out: TensorView,
+    ) -> Result<()> {
+        self.project_head(f, hidden, modality, block, step, out)
+    }
+
+    /// The output projection of `hidden` at one evaluation, for either form of the heads.
+    fn project_head(
+        &self,
+        f: &Forward,
+        hidden: TensorView,
+        modality: Modality,
+        block: u32,
+        step: TensorView,
+        out: TensorView,
+    ) -> Result<()> {
+        if let Some(heads) = &self.heads {
+            let arena = f.arena();
+            let fused = match modality {
+                Modality::Video => &heads.video,
+                Modality::Audio => heads.audio.as_ref().ok_or_else(|| {
+                    Error::Unsupported("this H3 partition predicts no audio velocity".to_owned())
+                })?,
+            };
+            let selected = fused.select(f, block, step, arena)?;
+            return Ok(
+                Linear::new(selected.weight, Some(selected.bias), WeightOrder::NxK)?
+                    .forward(f, hidden, out)?,
+            );
+        }
+        match modality {
+            Modality::Video => {
+                let head = self.video_out.as_ref().ok_or_else(|| {
+                    Error::Unsupported("this H3 partition predicts no video velocity".to_owned())
+                })?;
+                Ok(head.forward(f, hidden, out)?)
+            }
+            Modality::Audio => {
+                let head = self.audio_out.as_ref().ok_or_else(|| {
+                    Error::Unsupported("this H3 partition predicts no audio velocity".to_owned())
+                })?;
+                Ok(head.forward(f, hidden, out)?)
+            }
+        }
     }
 
     /// The stack over `hidden` `[tokens, hidden_size]`, in place, at one step.
@@ -542,6 +889,28 @@ mod tests {
 
     fn index(tokens: u64) -> TensorView {
         TensorView::new(nn::DevicePtr::new(0), DType::I32, Shape::new(&[tokens]))
+    }
+
+    #[test]
+    fn a_bf16_head_round_trips_through_the_host_path() {
+        // Every BF16 value is an FP32 value, so a tensor that is already BF16 must come back bit
+        // for bit: the fusion reads and writes the checkpoint's own type.
+        let values = [0.0_f32, 1.0, -2.5, 0.125, 1.0 / 3.0];
+        let bytes = host_bytes(nn::DType::BF16, &values).expect("a BF16 encoding");
+        let back = host_f32(nn::DType::BF16, &bytes, "test").expect("a BF16 decoding");
+        let again = host_bytes(nn::DType::BF16, &back).expect("a second encoding");
+        assert_eq!(bytes, again);
+        assert_eq!(back[0], 0.0);
+        assert_eq!(back[1], 1.0);
+        assert_eq!(back[2], -2.5);
+        assert_eq!(back[3], 0.125);
+        assert!((back[4] - 1.0 / 3.0).abs() < 0.004, "{} ", back[4]);
+    }
+
+    #[test]
+    fn a_head_type_the_host_fusion_cannot_read_is_refused() {
+        assert!(host_f32(nn::DType::I32, &[0, 0, 0, 0], "test").is_err());
+        assert!(host_bytes(nn::DType::I32, &[0.0]).is_err());
     }
 
     #[test]

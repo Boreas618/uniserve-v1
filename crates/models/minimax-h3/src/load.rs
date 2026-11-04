@@ -27,7 +27,9 @@ use nn::{Block, BlockName};
 use crate::checkpoint::{Dit, Layout, Sidecars};
 use crate::config::Config;
 use crate::denoiser::{Denoiser, Layouts};
+use crate::schedule::Schedule;
 use crate::text_encoder::TextEncoder;
+use crate::transformer::StudentHeads;
 use crate::{Error, Partition, Result};
 
 /// The block type is the partition's; re-exported here because a block and its loading are read
@@ -92,8 +94,28 @@ pub fn load(
                 let rows = Layouts::new(denoiser.clone(), arrangement)?.rows_bound()?;
                 let source = checkpoint.component(dit.directory())?;
                 let mut shards = loader.reborrow(source)?;
-                let denoiser =
-                    Denoiser::load(denoiser.clone(), arrangement, rows, &partition, &mut shards)?;
+                // A parallel-decoding student stacks one head per fine interval; the boundary that
+                // owns the checkpoint fuses them into one head per evaluation block and publishes
+                // them through the same loader, so the model reads fused tables and nothing else.
+                let schedule = Schedule::new(&denoiser.schedule)?;
+                let heads = if denoiser.transformer.output_heads > 1 {
+                    Some(StudentHeads::fuse(
+                        source,
+                        &schedule,
+                        &denoiser.transformer,
+                        &mut shards,
+                    )?)
+                } else {
+                    None
+                };
+                let denoiser = Denoiser::load(
+                    denoiser.clone(),
+                    arrangement,
+                    rows,
+                    &partition,
+                    &mut shards,
+                    heads,
+                )?;
                 Block::Denoiser(Box::new(denoiser))
             }
             Component::VideoDecoder | Component::AudioDecoder | Component::LatentEncoder => {
