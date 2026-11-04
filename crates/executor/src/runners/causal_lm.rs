@@ -1152,11 +1152,11 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         // refused at submit - the same place, and with the same kind of error, as any other batch
         // this device cannot serve.
         self.kv.apply_cache_units(&batch.cache_units, &self.stream)?;
-        // The upload and the device views are staged by the executor's stream work, then the
-        // bucket's graph is replayed (design §9, `每批的规划`). Until `nn::TokenBatch`/`KvView`
-        // and platform's allocator are published, the staging is as far as this path can go; the
-        // replay job is what the executor performs once they are.
-        let _ = &self.model;
+        // The columns are staged here, on the submitting thread; everything that touches the
+        // device is the replay job, which this executor's device thread performs in `serve`: the
+        // staged columns are uploaded, the bucket's graph is launched - the smallest captured
+        // bucket holding this shape - and the sampled tokens are read back, all before `submit`
+        // returns its output (4.5, 2.4: one thread issues to the streams).
         Ok(Jobs::new([Job::Replay {
             runner: self.id,
             bucket,
