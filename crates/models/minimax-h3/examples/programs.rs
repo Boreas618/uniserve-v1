@@ -234,6 +234,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?);
     }
 
+    // Deduplicate first: a count of the launches before deduplication is a count of something else
+    // (163 against 134 here), and the header's number must be the number of rows below it.
+    rows.sort();
+    rows.dedup();
+
+    // The header states its own size, printed from the vector that produced the rows rather than
+    // counted afterwards: a reader comparing two fixtures sees the count, the command and the reasons
+    // below without running anything, and no two readings of the file can disagree about it.
+    let operators = {
+        let mut names: Vec<&str> = rows.iter().map(|(name, _)| name.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        names.len()
+    };
+    println!("# {} data rows, {operators} operators", rows.len());
     println!(
         "# MiniMax-H3 programs for these clip lengths: {samples:?}, raster sizes: {rasters:?}, prompt lengths: {tokens:?}, packed rows: {packed:?}, trajectory elements: {elements:?}, audio tracks: {track:?}, tensor-parallel degree {degree}"
     );
@@ -246,8 +261,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         elements.iter().map(u64::to_string).collect::<Vec<_>>().join(","),
         track.iter().map(u32::to_string).collect::<Vec<_>>().join(","),
     );
-    rows.sort();
-    rows.dedup();
     for (operator, key) in &rows {
         println!("{operator}\t{key}");
     }
