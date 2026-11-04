@@ -99,7 +99,7 @@ fn run_with(options: Options) -> Result<(), String> {
 
     // Install every package of every operator the fixtures name: the store is
     // filled from packages the tree holds, exactly as `install` fills it.
-    let mut backends: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut backends: BTreeMap<String, Vec<(String, Manifest)>> = BTreeMap::new();
     let mut ops: Vec<String> = fixtures.iter().map(|one| one.op.clone()).collect();
     ops.sort();
     ops.dedup();
@@ -107,6 +107,10 @@ fn run_with(options: Options) -> Result<(), String> {
         let directory = packages.join(op);
         let entries = match std::fs::read_dir(&directory) {
             Ok(entries) => entries,
+            // An operator with no package at all is a finding, not a failure of
+            // the run: its keys are reported uncovered below and the rest of
+            // the fixtures still build.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(format!("reading {}: {error}", directory.display())),
         };
         for entry in entries {
@@ -114,13 +118,15 @@ fn run_with(options: Options) -> Result<(), String> {
             if !entry.path().is_dir() || !entry.path().join("package.toml").is_file() {
                 continue;
             }
+            let manifest = Manifest::load(&entry.path())
+                .map_err(|error| format!("{}: {error}", entry.path().display()))?;
             let installed = server
                 .install(&entry.path())
                 .map_err(|error| format!("{}: {error}", entry.path().display()))?;
             backends
                 .entry(installed.package.op.clone())
                 .or_default()
-                .push(installed.package.backend.clone());
+                .push((installed.package.backend.clone(), manifest));
         }
     }
 
@@ -135,7 +141,19 @@ fn run_with(options: Options) -> Result<(), String> {
             .map(|one| one.key.clone())
             .collect();
         let mut resolved: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
-        for backend in backends.get(op).map(Vec::as_slice).unwrap_or_default() {
+        for (backend, manifest) in backends.get(op).map(Vec::as_slice).unwrap_or_default() {
+            // A backend is asked only for the keys its own manifest covers: an
+            // operator with several backends serves a cell through whichever
+            // one declares it, and a backend that never claimed a key is not a
+            // failure when it cannot build it.
+            let covered: Vec<String> = keys
+                .iter()
+                .filter(|key| manifest.covers(key))
+                .cloned()
+                .collect();
+            if covered.is_empty() {
+                continue;
+            }
             let request = PrepareRequest {
                 targets: vec![options.target.clone()],
                 programs: vec![ProgramRequest {
@@ -147,7 +165,7 @@ fn run_with(options: Options) -> Result<(), String> {
                 }],
                 descriptors: vec![Descriptors {
                     op: op.clone(),
-                    keys: keys.clone(),
+                    keys: covered.clone(),
                 }],
             };
             let prepared = match server.prepare(&request, &mut |_| {}) {
@@ -158,7 +176,7 @@ fn run_with(options: Options) -> Result<(), String> {
                 }
             };
             let program = prepared.programs[0].program.clone();
-            for key in &keys {
+            for key in &covered {
                 match server.resolve(op, &program, &options.target, key, &mut |_| {}) {
                     Ok(module) => {
                         resolved
@@ -183,7 +201,12 @@ fn run_with(options: Options) -> Result<(), String> {
                     println!("ok\t{op}\t{key}\t{}", named.join(", "));
                 }
                 None => {
-                    failures.push(format!("{op} {key}: no backend resolved it"));
+                    let why = if backends.contains_key(op) {
+                        "no backend resolved it".to_owned()
+                    } else {
+                        "no package of the tree fills it".to_owned()
+                    };
+                    failures.push(format!("{op} {key}: {why}"));
                     println!("FAILED\t{op}\t{key}");
                 }
             }
