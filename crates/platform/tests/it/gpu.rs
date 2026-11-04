@@ -1822,6 +1822,33 @@ fn forward_reference(
     y
 }
 
+/// The host reference is the definition the device is compared against, so it
+/// is checked against values computed by hand: a reference that is wrong in
+/// the same way for every input would let a wrong device result pass, and one
+/// that is merely wrong turns a correct device result into a failure (which is
+/// how the tap position, divided by the stride, was found).
+#[test]
+fn the_one_dimensional_reference_is_the_definition() {
+    // x[1, 2, 5] as two channels of five, w[3, 2, 3] as KCRS, stride 2,
+    // padding 1, dilation 1: the taps of output 0 sit at input -1 (the
+    // padding), 0 and 1.
+    let x = [-1.0f32, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5];
+    let w = [
+        -0.5f32, 0.25, -0.25, 0.5, 0.0, -0.5, // filter 0
+        0.25, -0.25, 0.5, 0.0, -0.5, 0.25, // filter 1
+        -0.25, 0.5, 0.0, -0.5, 0.25, -0.25, // filter 2
+    ];
+    let y = forward_reference(&x, [1, 2, 5], &w, [3, 2, 3], [1, 3, 3], 2, 1, 1);
+    // Output 0 of filter 0: x[0][0]·w[0][0][1] + x[0][1]·w[0][0][2] +
+    // x[1][0]·w[0][1][1] + x[1][1]·w[0][1][2]
+    // = -1·0.25 + -0.5·-0.25 + 1.5·0.0 + 2.0·-0.5 = -0.25 + 0.125 - 1.0.
+    assert_eq!(y[0], -1.125);
+    // Output 1 reads inputs 1, 2 and 3: channel 0 gives
+    // -0.5·-0.5 + 0·0.25 + 0.5·-0.25 = 0.125, channel 1 gives
+    // 2·0.5 + 2.5·0.0 + 3·-0.5 = -0.5, and the sum is -0.375.
+    assert_eq!(y[1], -0.375);
+}
+
 /// The definition of a one-dimensional transposed convolution, computed on
 /// the host: every input element is scattered through the filter,
 /// `y[n][k][i · stride - padding + j · dilation] += x[n][c][i] · w[c][k][j]`.
