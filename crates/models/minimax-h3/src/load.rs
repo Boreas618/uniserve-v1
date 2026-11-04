@@ -255,6 +255,21 @@ pub fn stored_dtype(checkpoint: &nn::Checkpoint, component: &str) -> Result<nn::
     }
 }
 
+/// The element type of one tensor of a component.
+///
+/// A component may store several types (a release that keeps a loading derivation's operand in
+/// FP32, say), so a question about one weight must be asked of that weight. The name must be in the
+/// component's index; a name it lacks is refused here rather than defaulted.
+pub fn tensor_dtype(checkpoint: &nn::Checkpoint, component: &str, name: &str) -> Result<nn::DType> {
+    let source = checkpoint.component(component)?;
+    let location = source.tensor(name).ok_or_else(|| {
+        Error::checkpoint(format!(
+            "the checkpoint's `{component}` component has no tensor `{name}`, so its element type              cannot be read"
+        ))
+    })?;
+    Ok(location.dtype)
+}
+
 /// Load the deployment this rank places.
 ///
 /// The place and the blocks are the `partition`'s: it names the degrees and the rank's position in
@@ -288,31 +303,12 @@ pub fn load(
             None => stored_dtype(checkpoint, component.directories()[0]),
         }
     };
-    // With no stated type every component this rank places must have **one** floating-point type,
-    // because nothing converts and a component of two makes a forward mix them: the timestep
-    // embedding's second projection over the first is the cell that stopped a run, and it was a
-    // bf16 weight beside f32 activations. A deployment that states a type converts each weight once,
-    // and its retained key names the conversion, so the mixed export is legal only that way.
-    if dtype.is_none() {
-        // The weight-bearing blocks. The postprocessor is weightless, and the two condition
-        // encoders are the denoiser's half whose directories this loop does not own: they are
-        // checked by their own `require` and built by `ConditionEncoders::load`, which reads each
-        // half from its own component.
-        let weighted = [
-            Component::TextEncoder,
-            Component::Transformer,
-            Component::TransformerRef,
-            Component::VideoDecoder,
-            Component::AudioDecoder,
-        ];
-        for component in weighted {
-            if partition.blocks.contains(component) {
-                for directory in component.directories() {
-                    stored_dtype(checkpoint, directory)?;
-                }
-            }
-        }
-    }
+    // A component that stores more than one floating-point type is legal under `auto`: the
+    // reference pins a type per tensor (`weights.py`'s loading derivations, `precision.py`'s
+    // table), and a pin is the *request*'s, so each weight is loaded at the type its own tensor is
+    // pinned to and nothing is silently mixed. What must never happen is a launch whose activation
+    // and weight differ, and that is refused where it happens - by the request that states no pin,
+    // and by the operator's own launch check, which names the cell.
     // Two components, one number: the refiner spans the text encoder and the DiT, so their stored
     // types must agree before a single weight is read.
     if partition.blocks.contains(Component::TextEncoder) {
@@ -324,7 +320,7 @@ pub fn load(
             if placed {
                 refiner_types(
                     deployment(Component::TextEncoder)?,
-                    deployment(Component::Transformer)?,
+                    tensor_dtype(checkpoint, dit.directory(), "token_refiner.input.weight")?,
                     dit.directory(),
                 )?;
             }
