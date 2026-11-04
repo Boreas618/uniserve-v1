@@ -260,7 +260,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for line in &missing {
             eprintln!("missing key: {line}");
         }
-        return Err(format!("{} key groups the blocks ask for are absent", missing.len()).into());
+        return Err(format!("{} keys a block asks for are absent", missing.len()).into());
     }
     Ok(())
 }
