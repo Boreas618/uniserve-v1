@@ -314,7 +314,9 @@ impl ProcessRoster {
         {
             let epochs = Arc::clone(&self.epochs);
             let failure = crate::epoch::Failure {
-                kind: "exited".to_owned(),
+                // The vocabulary `Failure` names: a main process that ended
+                // during probation (§7.3 step 4).
+                kind: "process_exit".to_owned(),
                 reason: format!("a main process of the update exited ({})", exit.status),
                 device: None,
             };
