@@ -619,17 +619,20 @@ impl Scheduler {
             Ok(plan) => plan,
             Err(error) => return self.policy_failed(policy, error),
         };
-        // The plan's admission is the mechanism's own act, bounded by the hard
-        // limits as it goes, and it runs before the plan is checked: a request
-        // the plan admits is resident for the work the same plan gives it, which
-        // is what lets one plan both admit and run a request (§4.4).
-        self.admit_plan(&plan);
-        // Admission is the only thing between the policy's dispatch and the
-        // plan's check, so the state the plan is checked against is read once,
-        // here, after it: the pages are the scheduler's own table borrowed for
-        // the check (design §4.4).
+        // The admission the plan states is checked against the queue the policy
+        // was given, and applied before the rest of the plan is checked: a
+        // request the plan admits is resident for the work the same plan gives
+        // it, which is what lets one plan both admit and run a request (§4.4).
+        // Applying it first would make its own names unqueued.
         let live = self.live();
-        if let Err(error) = mechanism::validate_plan(&plan, &room, &live) {
+        if let Err(error) = mechanism::validate_admission(&plan, &live) {
+            return self.policy_failed(policy, error);
+        }
+        self.admit_plan(&plan);
+        // The rest is read against the state admission has left: the pages are
+        // the scheduler's own table borrowed for the check (design §4.4).
+        let live = self.live();
+        if let Err(error) = mechanism::validate_after_admission(&plan, &room, &live) {
             return self.policy_failed(policy, error);
         }
         self.policy = Some(policy);
