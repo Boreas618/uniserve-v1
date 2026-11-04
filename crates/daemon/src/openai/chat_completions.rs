@@ -476,7 +476,7 @@ pub(crate) fn chat_response(
 
 /// Everything `collect_chat_events` accumulates from one request's stream.
 #[derive(Debug, Clone, PartialEq)]
-struct CollectedChatOutput {
+pub(crate) struct CollectedChatOutput {
     message: AssistantMessage,
     prompt_token_ids: Vec<u32>,
     prompt_logprobs: Option<crate::output::text::DecodedPromptLogprobs>,
