@@ -186,13 +186,16 @@ mod tests {
         let two = UlyssesExchange::new(2).unwrap();
         let wide = view(&[16, 8, 128]);
         let narrow = view(&[32, 64]);
-        assert!(two.check_views(wide, narrow).is_ok());
+        two.check_views(wide, narrow)
+            .expect("two ranks exchange [16, 8, 128] against [32, 64]");
         // Four ranks from the same geometry: twice the rows, a quarter of the width.
         let four = UlyssesExchange::new(4).unwrap();
-        assert!(four.check_views(wide, view(&[64, 32])).is_ok());
+        four.check_views(wide, view(&[64, 32]))
+            .expect("four ranks exchange [16, 8, 128] against [64, 32]");
         // The same views are still one exchange's two sides, so `gather` is the same check with the
         // arguments read the other way round.
-        assert!(two.check_views(wide, narrow).is_ok());
+        two.check_views(wide, narrow)
+            .expect("the gather reads the same two views the other way round");
     }
 
     /// Each way the geometry can be wrong is refused by name, because a mismatched collective is a
@@ -228,14 +231,20 @@ mod tests {
 
         // A head of 96 features over 3 ranks divides, but 3 ranks are not a group.
         assert!(UlyssesExchange::new(3).is_err());
-        // Over four ranks an odd head width does not divide.
+        // Over four ranks a head divides into whole features or not at all: 100 gives 25 a rank,
+        // 102 gives 25 and a half and is refused.
         let four = UlyssesExchange::new(4).unwrap();
-        let odd = four.check_views(view(&[16, 8, 100]), view(&[64, 25]));
-        assert!(format!("{}", odd.unwrap_err()).contains("does not divide"));
+        four.check_views(view(&[16, 8, 100]), view(&[64, 25]))
+            .expect("a head of 100 over 4 ranks is 25 features a rank");
+        let odd = four
+            .check_views(view(&[16, 8, 102]), view(&[64, 25]))
+            .expect_err("102 over 4");
+        assert!(format!("{odd}").contains("does not divide"));
 
+        // One element type on both sides: a collective cannot narrow a half into a float on the way.
         let dtype = two.check_views(
             wide,
-            TensorView::new(DevicePtr::new(0x2000), DType::F32, Shape::new(&[32, 64])),
+            TensorView::new(DevicePtr::new(0x2000), DType::F16, Shape::new(&[32, 64])),
         );
         assert!(
             format!("{}", dtype.unwrap_err()).contains("moves"),

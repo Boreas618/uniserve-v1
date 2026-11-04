@@ -122,7 +122,17 @@ impl VsaTiles {
         cosine: Option<TensorView>,
         sine: Option<TensorView>,
     ) -> Result<()> {
-        if self.norm != (query_weight && key_weight) {
+        if query_weight != key_weight {
+            return Err(Error::shape(
+                "VsaTiles",
+                format!(
+                    "the Q and K normalization weights are a pair: {} without {}",
+                    if query_weight { "Q" } else { "K" },
+                    if query_weight { "K" } else { "Q" }
+                ),
+            ));
+        }
+        if self.norm != query_weight {
             return Err(Error::shape(
                 "VsaTiles",
                 "the Q/K normalization weights are present exactly when the layer normalizes"
@@ -392,11 +402,13 @@ mod tests {
         assert!(VsaTiles::new(0, 8, 256, 1e-6).is_err());
         assert!(VsaTiles::new(64, 0, 256, 1e-6).is_err());
         assert!(VsaTiles::new(64, 8, 0, 1e-6).is_err());
-        let text = match VsaTiles::new(96, 8, 256, 1e-6) {
-            Ok(_) => panic!("96 is not a whole number of programme rows"),
+        // 96 is six whole 16-row programmes, so it serves; 100 is not.
+        VsaTiles::new(96, 8, 256, 1e-6).expect("96 is six whole 16-row programmes");
+        let text = match VsaTiles::new(100, 8, 256, 1e-6) {
+            Ok(_) => panic!("100 rows is not a whole number of programme rows"),
             Err(error) => format!("{error}"),
         };
-        assert!(text.contains("96"), "{text}");
+        assert!(text.contains("100"), "{text}");
     }
 
     /// A rotation reads the first features of a head in pairs, and implies the normalization the
@@ -436,12 +448,16 @@ mod tests {
     #[test]
     fn a_preparation_names_its_weights_and_tables_exactly() {
         let plain = VsaTiles::new(64, 8, 256, 1e-6).unwrap();
-        assert!(plain.check_prepare(false, false, None, None).is_ok());
+        plain
+            .check_prepare(false, false, None, None)
+            .expect("a layer that does not normalize reads no weights");
         assert!(plain.check_prepare(true, true, None, None).is_err());
         assert!(plain.check_prepare(true, false, None, None).is_err());
 
         let normed = VsaTiles::new(64, 8, 256, 1e-6).unwrap().with_norm();
-        assert!(normed.check_prepare(true, true, None, None).is_ok());
+        normed
+            .check_prepare(true, true, None, None)
+            .expect("a normalizing layer reads both weights");
         assert!(normed.check_prepare(false, false, None, None).is_err());
         assert!(
             normed.check_prepare(true, false, None, None).is_err(),
@@ -453,11 +469,9 @@ mod tests {
             .with_rotation(96)
             .unwrap();
         let (cosine, sine) = (view(&[4096, 96]), view(&[4096, 96]));
-        assert!(
-            rotated
-                .check_prepare(true, true, Some(cosine), Some(sine))
-                .is_ok()
-        );
+        rotated
+            .check_prepare(true, true, Some(cosine), Some(sine))
+            .expect("a rotated layer reads both tables");
         let missing = rotated.check_prepare(true, true, Some(cosine), None);
         assert!(
             format!("{}", missing.unwrap_err()).contains("factor tables"),
@@ -470,8 +484,8 @@ mod tests {
     #[test]
     fn a_composition_names_one_member_per_rank_and_no_more_than_the_table() {
         let tiles = VsaTiles::new(64, 8, 256, 1e-6).unwrap();
-        assert!(tiles.check_members(1).is_ok());
-        assert!(tiles.check_members(MAX_MEMBERS).is_ok());
+        tiles.check_members(1).expect("one member");
+        tiles.check_members(MAX_MEMBERS).expect("the table's size");
         let none = tiles.check_members(0);
         assert!(
             format!("{}", none.unwrap_err()).contains("one to"),
