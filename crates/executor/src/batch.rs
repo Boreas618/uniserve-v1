@@ -566,6 +566,10 @@ pub struct Placement {
 /// plain route on purpose: the phase list is fixed at spawn, so no lock, no schedule, no retry.
 pub struct Executors {
     executors: Vec<Arc<crate::device::Executor>>,
+    /// The pools this rank serves, as the deployment launched them (4.2): the scheduler builds its
+    /// executor facts from this and refuses to start on an empty answer, so a rank states its pools
+    /// before it is handed over rather than after the first batch finds none.
+    inventory: Vec<Inventory>,
 }
 
 impl Executors {
@@ -596,7 +600,22 @@ impl Executors {
                 served.push(*phase);
             }
         }
-        Ok(Self { executors })
+        Ok(Self {
+            executors,
+            inventory: Vec::new(),
+        })
+    }
+
+    /// States the pools this rank serves, which the scheduler's executor facts are built from.
+    ///
+    /// The facts are the deployment's: its pool's name, its ranks as they reported at handshake,
+    /// what the launch placed there and the model's maximum length. A rank that serves batches must
+    /// state them - `Submissions::over_batches` refuses an executor that states no pool - so this is
+    /// called where the launch facts are known, before the scheduler is built.
+    #[must_use]
+    pub fn stating(mut self, inventory: Vec<Inventory>) -> Self {
+        self.inventory = inventory;
+        self
     }
 
     /// The device that serves `phase`.
@@ -628,6 +647,10 @@ impl Executors {
 }
 
 impl Batches for Executors {
+    fn inventory(&self) -> &[Inventory] {
+        &self.inventory
+    }
+
     fn submit(&self, batch: Batch) -> Result<Submission> {
         self.route(batch.phase)?.submit(batch)
     }
