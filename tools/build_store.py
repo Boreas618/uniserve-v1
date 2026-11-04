@@ -17,6 +17,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import tomllib
 from pathlib import Path
 
@@ -91,7 +92,9 @@ def build(package, key, target, out_dir):
         "UNISERVE_OUT": str(out_dir.resolve()),
     })
     if source["kind"] == "triton":
-        environment.setdefault("TRITON_CACHE_DIR", str((out_dir.parent / ".triton").resolve()))
+        # Triton's cache is build scratch, not part of the module: keep it out of the store so a store
+        # can be copied or published without a compilation cache inside it.
+        environment.setdefault("TRITON_CACHE_DIR", str(Path(tempfile.gettempdir()) / "uniserve-triton-cache"))
     # A package that fetches a vendored artifact asks for the Program Server's own interpreter by
     # importing `uniserve_program_server`; making that package importable lets the script keep this
     # interpreter, which is the one that carries the toolchain (Triton, CuTe DSL, nvcc).
