@@ -386,7 +386,7 @@ def main() -> int:
 
     key = (
         f"dtype_{arguments.dtype}_columns_{arguments.columns}_tile_{arguments.tile}"
-        f"_update_bias_{arguments.update_bias}_absmax_{arguments.absmax}_pdl_false"
+        f"_update_bias_{arguments.update_bias}_absmax_{arguments.absmax}"
     )
     print(f"descriptor: {key} ({arguments.op})")
     if arguments.expect_key is not None and arguments.expect_key != key:
