@@ -24,8 +24,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use nn::{Arena, Backing, CausalLm, Checkpoint, DType, DevicePtr, Forward, RetainedWeights, Shape,
-    WeightKey, WeightLoader};
+use nn::{
+    Arena, Backing, CausalLm, Checkpoint, DType, DevicePtr, Forward, RetainedWeights, Shape,
+    WeightKey, WeightLoader,
+};
 use ops::{Generation, KernelEntry};
 use qwen3_moe::{Config, LoadOptions, Partition};
 
@@ -82,7 +84,6 @@ impl Failure {
     fn message(problem: impl Into<String>) -> Self {
         Self::Message(problem.into())
     }
-
 }
 
 type Result<T> = std::result::Result<T, Failure>;
@@ -244,7 +245,9 @@ impl RetainedWeights for HostWeights {
             key: key.to_string(),
             _bytes: kept,
         });
-        Backing::new(address, expected).view(dtype, shape).map(|_| ())?;
+        Backing::new(address, expected)
+            .view(dtype, shape)
+            .map(|_| ())?;
         let last = self
             .published
             .last()
@@ -311,7 +314,8 @@ fn stage_embedding(args: &Args) -> Result<()> {
 
     // 1. The device and the stream every launch is issued on, before any weight is allocated: a
     //    driver that cannot give a device should fail here and not inside a load.
-    let device = platform::Device::new(platform::DeviceId(i32::try_from(args.device).unwrap_or(0)))?;
+    let device =
+        platform::Device::new(platform::DeviceId(i32::try_from(args.device).unwrap_or(0)))?;
     let _guard = device.enter()?;
     let stream = device.stream()?;
 
@@ -337,7 +341,10 @@ fn stage_embedding(args: &Args) -> Result<()> {
     let hidden = plan.hidden;
     let bytes = arena_bytes(&plan);
     let allocator = weights.allocator();
-    allocator.reserve(platform::PoolKind::Graph, usize::try_from(bytes).unwrap_or(usize::MAX))?;
+    allocator.reserve(
+        platform::PoolKind::Graph,
+        usize::try_from(bytes).unwrap_or(usize::MAX),
+    )?;
     let region = allocator.allocate(
         platform::PoolKind::Graph,
         usize::try_from(bytes).unwrap_or(usize::MAX),
@@ -355,7 +362,12 @@ fn stage_embedding(args: &Args) -> Result<()> {
     // 6. Read back and compare with the checkpoint's rows, which is the check that needs no
     //    reference capture: the table is the same tensor the checkpoint holds.
     let table = checkpoint.read("model.embed_tokens.weight")?;
-    let rows = download_bf16(&stream, out, tokens.len(), usize::try_from(hidden).unwrap_or(0))?;
+    let rows = download_bf16(
+        &stream,
+        out,
+        tokens.len(),
+        usize::try_from(hidden).unwrap_or(0),
+    )?;
     let width = usize::try_from(hidden).unwrap_or(0);
     let mut worst = (0_usize, 0.0_f32);
     for (row, token) in tokens.iter().enumerate() {
@@ -396,8 +408,8 @@ fn arena_bytes(plan: &qwen3_moe::Plan) -> u64 {
 
 /// The (operator, key) pairs the fixture names for the slice, which is what the store must hold.
 fn needed_keys(store_root: &Path) -> Result<Vec<(String, String)>> {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../notes/programs/qwen3-moe-keys.txt");
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../notes/programs/qwen3-moe-keys.txt");
     let text = std::fs::read_to_string(&fixture).map_err(|error| {
         Failure::message(format!(
             "reading the fixture {}: {error} (the store root given was {})",
@@ -431,7 +443,9 @@ fn load_generation(
     let mut missing = Vec::new();
     for (operator, descriptor) in needed {
         match find_module(root, operator, descriptor) {
-            Some(directory) => entries.push(install(device, root, operator, descriptor, &directory)?),
+            Some(directory) => {
+                entries.push(install(device, root, operator, descriptor, &directory)?)
+            }
             None => missing.push(format!("{operator}\t{descriptor}")),
         }
     }
@@ -458,12 +472,11 @@ fn find_module(root: &Path, operator: &str, descriptor: &str) -> Option<PathBuf>
     for backend in backends.flatten() {
         let revisions = std::fs::read_dir(backend.path()).ok().into_iter().flatten();
         for revision in revisions.flatten() {
-            let number: u32 = revision
-                .file_name()
-                .to_string_lossy()
-                .parse()
-                .unwrap_or(0);
-            let targets = std::fs::read_dir(revision.path()).ok().into_iter().flatten();
+            let number: u32 = revision.file_name().to_string_lossy().parse().unwrap_or(0);
+            let targets = std::fs::read_dir(revision.path())
+                .ok()
+                .into_iter()
+                .flatten();
             for target in targets.flatten() {
                 let directory = target.path().join(descriptor);
                 if directory.join(".committed").is_file()
@@ -494,9 +507,8 @@ fn install(
     })?;
     let cubin = directory.join("module.cubin");
     if cubin.is_file() {
-        let image = std::fs::read(&cubin).map_err(|error| {
-            Failure::message(format!("reading {}: {error}", cubin.display()))
-        })?;
+        let image = std::fs::read(&cubin)
+            .map_err(|error| Failure::message(format!("reading {}: {error}", cubin.display())))?;
         let metadata_path = directory.join("metadata.json");
         let metadata = std::fs::read(&metadata_path).ok();
         let kernel = ops::install::install(
@@ -614,9 +626,7 @@ impl RetainedWeights for DeviceWeights {
         // The publish is synchronous with respect to the host: the copy is issued on the device's
         // default stream and waited on before the backing is handed out, because the loader keeps
         // no stream and a later launch may use another one.
-        let stream = platform::Stream::new(
-            buffer.device(),
-        )?;
+        let stream = platform::Stream::new(buffer.device())?;
         // SAFETY: `bytes` outlives the copy, which completes before the wait below.
         unsafe {
             platform::memcpy_async(
@@ -637,11 +647,7 @@ impl RetainedWeights for DeviceWeights {
 }
 
 /// Upload `values` as an `i32` arena tensor.
-fn upload_i32(
-    stream: &platform::Stream,
-    arena: &Arena,
-    values: &[i32],
-) -> Result<ops::TensorView> {
+fn upload_i32(stream: &platform::Stream, arena: &Arena, values: &[i32]) -> Result<ops::TensorView> {
     let tensor = arena.tensor(DType::I32, Shape::new(&[values.len() as u64]))?;
     // SAFETY: `values` outlives the copy, which completes before the wait below.
     unsafe {
