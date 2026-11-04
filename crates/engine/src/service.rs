@@ -2582,6 +2582,7 @@ fn policy_usage(
         .fold(route, |sum, usage| PolicyUsage {
             calls: sum.calls + usage.calls,
             fuel: sum.fuel + usage.fuel,
+            decisions: sum.decisions + usage.decisions,
         })
 }
 
@@ -3679,7 +3680,11 @@ mod tests {
 
     #[test]
     fn the_epochs_policy_cost_is_the_route_instance_and_every_scheduler() {
-        let usage = |calls, fuel| PolicyUsage { calls, fuel };
+        let usage = |calls, fuel| PolicyUsage {
+            calls,
+            fuel,
+            decisions: scheduling::PolicyCost::default(),
+        };
         // A scheduler that has no policy yet states nothing and adds nothing,
         // and the control thread's route instance is part of the epoch's cost
         // whether or not any scheduler serves.
