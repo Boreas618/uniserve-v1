@@ -1097,6 +1097,20 @@ fn place_grid_frames(
     }
 }
 
+/// The keep rates a segment layout's selection reads.
+///
+/// The two rates travel together because they are not interchangeable: the generated video's
+/// `sparsity` decides its own kept tiles, and `reference_keep` decides how much of a reference
+/// segment survives. Both are `f64`, so a caller that swaps them still compiles - which is why they
+/// are named here rather than passed positionally.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Sparsity {
+    /// The fraction of a generated video segment's tiles the selection drops.
+    pub sparsity: f64,
+    /// The fraction of a reference segment's tiles the selection keeps.
+    pub reference_keep: Option<f64>,
+}
+
 /// Build one request's tables in its segment layout.
 ///
 /// `reference_keep` is the fraction of tiles a generated video keeps of a reference segment; it is
@@ -1108,8 +1122,7 @@ pub fn segment_tables(
     num_text_tokens: u32,
     segments: &[Segment],
     vision_spans: VisionSpans<'_>,
-    sparsity: f64,
-    reference_keep: Option<f64>,
+    sparsity: Sparsity,
 ) -> Result<SegmentTables> {
     let extent = &packing.extent;
     let tile = extent.tile;
@@ -1306,9 +1319,10 @@ pub fn segment_tables(
     let mut below = tile_segments.iter().filter(|index| **index < 0).count() as i32;
     for (index, count) in tile_counts.iter().enumerate() {
         let keep = if index + 1 == tile_counts.len() {
-            sparsity
+            sparsity.sparsity
         } else {
-            let reference_keep = reference_keep
+            let reference_keep = sparsity
+                .reference_keep
                 .ok_or_else(|| Error::config("reference videos need a keep rate".to_owned()))?;
             1.0 - reference_keep
         };
@@ -1736,8 +1750,7 @@ mod tests {
     fn a_prompt_or_a_condition_that_does_not_fit_its_capacity_is_refused() {
         let plan = dense_packing(124, &canvas(), 1935, 0, 64).expect("a dense plan");
         let error = dense_tables(&plan, 124, &canvas(), 1936, &[], &[])
-            .err()
-            .expect("the prompt exceeds the text capacity");
+            .expect_err("the prompt exceeds the text capacity");
         assert!(
             matches!(error, Error::Config(ref problem) if problem.contains("prefix segment")),
             "{error}"
@@ -1754,8 +1767,7 @@ mod tests {
             audio_frames: 0,
         };
         let error = dense_tables(&plan, 124, &canvas(), 1935, &[keyframe], &[])
-            .err()
-            .expect("no condition row fits");
+            .expect_err("no condition row fits");
         assert!(
             matches!(error, Error::Config(ref problem) if problem.contains("prefix segment")),
             "{error}"
@@ -1763,8 +1775,7 @@ mod tests {
 
         let capacity = dense_packing(124, &canvas(), 1935, 2048, 64).expect("a plan");
         let error = dense_tables(&capacity, 124, &canvas(), 1935, &[], &[(10, 5)])
-            .err()
-            .expect("a vision span must be a range of the prompt");
+            .expect_err("a vision span must be a range of the prompt");
         assert!(
             matches!(error, Error::Config(ref problem) if problem.contains("vision spans")),
             "{error}"
@@ -1871,8 +1882,19 @@ mod tests {
     #[test]
     fn a_text_only_sparse_request_fills_its_text_audio_and_video_tiles() {
         let packing = segment_packing(124, &canvas(), 7040, 512, 128, 128).expect("a layout");
-        let tables = segment_tables(&packing, 124, &canvas(), 1935, &[], &[(5, 10)], 0.9, None)
-            .expect("a sparse request");
+        let tables = segment_tables(
+            &packing,
+            124,
+            &canvas(),
+            1935,
+            &[],
+            &[(5, 10)],
+            Sparsity {
+                sparsity: 0.9,
+                reference_keep: None,
+            },
+        )
+        .expect("a sparse request");
         assert_eq!(tables.variable_block_sizes.len(), 423);
 
         // The prompt fills 15 whole tiles and 15 rows of the sixteenth.
@@ -1946,8 +1968,10 @@ mod tests {
             6913,
             std::slice::from_ref(&reference),
             &[],
-            0.9,
-            Some(0.1),
+            Sparsity {
+                sparsity: 0.9,
+                reference_keep: Some(0.1),
+            },
         )
         .expect("a reference request");
 
@@ -2005,11 +2029,12 @@ mod tests {
             6913,
             std::slice::from_ref(&reference),
             &[],
-            0.9,
-            None,
+            Sparsity {
+                sparsity: 0.9,
+                reference_keep: None,
+            },
         )
-        .err()
-        .expect("a reference video without a keep rate");
+        .expect_err("a reference video without a keep rate");
         assert!(
             matches!(error, Error::Config(ref problem) if problem.contains("keep rate")),
             "{error}"
@@ -2023,11 +2048,12 @@ mod tests {
             6913,
             &[reference; 2],
             &[],
-            0.9,
-            Some(0.1),
+            Sparsity {
+                sparsity: 0.9,
+                reference_keep: Some(0.1),
+            },
         )
-        .err()
-        .expect("160 tiles do not fit 80");
+        .expect_err("160 tiles do not fit 80");
         assert!(
             matches!(error, Error::Config(ref problem) if problem.contains("capacities")),
             "{error}"

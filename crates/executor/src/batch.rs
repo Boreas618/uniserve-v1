@@ -20,10 +20,7 @@
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use ipc::{
-    CacheTransfer, CallStatus, ComponentConfig, ErrorCode, MediaOutput, PhaseId, RankLatentLayout,
-    TimingCounters, TokenLogprob, WorkerInfo,
-};
+use ipc::{CallStatus, ErrorCode, PhaseId, TimingCounters};
 
 use crate::completion::Outcome;
 use crate::plan::{Bucket, Shape};
@@ -43,89 +40,116 @@ pub struct BatchId(pub u64);
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct CallId(pub u64);
 
-/// One sampled token, as a serving step produces it (4.4).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SampledToken {
-    /// The call the token was sampled for.
-    pub call: CallId,
-    /// The token id the bucket's sampler wrote for that call.
-    pub token: u32,
-}
-
-/// What one call of a batch produced, as the device produced it (4.4).
+/// One call's completion, as the device half of 4.4 states it.
 ///
-/// The mechanism's completion path reads exactly these values: what execution did. What the
-/// mechanism keeps is not here - the stop conditions it evaluates from the sampled token, the call's
-/// token budget, its cache window and its sampling rows are the plan's - so a device-side copy of a
-/// mechanism rule has nowhere to appear. The value leaves are `ipc`'s for the same reason a client's
-/// answer is: they are data a device produced and a caller consumes, not an envelope this crate
-/// defines.
+/// A batch advances a set of calls and each of them gets one entry here, whether or not it sampled
+/// a token, because the mechanism's completion path is per call. A call this executor refuses never
+/// reaches this type: [`Batches::submit`](crate::Batches::submit) answers `Error::Invalid`
+/// synchronously for a batch it cannot serve, so an entry here is what execution did, and a
+/// [`CallStatus::Error`] entry is always a device failure.
 #[derive(Clone, Debug, PartialEq)]
-pub struct CallCompletion {
-    /// The call this completion belongs to.
+pub struct CallOutput {
+    /// The call the batch advanced.
     pub call: CallId,
-    /// Whether execution produced the call's products or failed it.
+    /// Whether execution performed the call.
     pub status: CallStatus,
-    /// The failure's kind, when `status` is an error and the device can name one.
+    /// Why it failed, when it did: the class the mechanism acts on (`NumericalFault` fails the
+    /// rows that computed non-finite logits, `InputError` rejects the request with this rank's
+    /// message, `ResourceError` fails the call).
     pub error_code: Option<ErrorCode>,
-    /// The device's own account of the failure, when it has one.
+    /// What this rank said about a refused input, when it refused one.
     pub error_message: Option<String>,
-    /// The tokens the sampler accepted, in the order it accepted them.
-    pub committed_tokens: Vec<u32>,
-    /// Each committed token's log-probabilities, in `committed_tokens` order.
-    pub token_logprobs: Vec<Vec<TokenLogprob>>,
-    /// Ranked candidates for each scored prompt position, in input order.
-    pub prompt_logprobs: Vec<Vec<TokenLogprob>>,
-    /// A token-denoising readout's candidate probabilities.
-    pub candidate_logprobs: Vec<f32>,
-    /// The cache extent execution initialized, rejected speculative positions included.
-    pub cache_computed_len: u32,
-    /// The accepted cache prefix a successor may read.
-    pub cache_visible_len: u32,
-    /// A denoising trajectory's next step.
+    /// The tokens the sampler accepted for this call, in the order the call's sampling rows took
+    /// them. A call whose rows sampled nothing (a prefill chunk that ends no prompt, a padded row)
+    /// has none, which is not the same as a failure.
+    pub tokens: Vec<u32>,
+    /// The slot's committed count for a text call; a latent trajectory reports its own step here
+    /// once `ops::commit` gains a per-slot step column, and until then this field is the commit
+    /// count for every call kind.
+    ///
+    /// It is read from the commit table's sampling position, which a text slot advances once per
+    /// committed token and a latent slot advances once per denoising step.
     pub step_index: u32,
-    /// The finished media artifact, when the call produced one.
-    pub media_output: Option<MediaOutput>,
+    /// The cache extent execution initialized, rejected speculative positions included: the slot's
+    /// logical position after the commit.
+    pub cache_computed_len: u32,
+    /// The accepted prefix a successor may read: the slot's sampling position after the commit.
+    pub cache_visible_len: u32,
+    /// The log-probability of each accepted token, aligned with [`CallOutput::tokens`].
+    ///
+    /// Empty unless the deployment planned logprob buckets (4.5): producing them costs a
+    /// full-vocabulary softmax on every sampling step and its `[rows, vocabulary]` buffer, so a
+    /// deployment that serves without clients asking for them plans the plain buckets and every
+    /// call reports this empty. **Empty means "not planned", never "zero".**
+    pub token_logprobs: Vec<f32>,
+    /// Ranked log-probabilities for each scored prompt position, in input order.
+    pub prompt_logprobs: Vec<Vec<ipc::TokenLogprob>>,
+    /// A token-denoising readout's candidate log-probabilities, in its own candidate order.
+    pub candidate_logprobs: Vec<f32>,
+    /// The finished artifact and its storage lifetime, when the call produced one.
+    pub media_output: Option<ipc::MediaOutput>,
     /// The physical cache export, when the call publishes one.
-    pub cache_output: Option<CacheTransfer>,
+    pub cache_output: Option<ipc::CacheTransfer>,
     /// The drafter's proposals after the last committed token.
     pub draft_token_ids: Vec<u32>,
     /// A video latent preparation's per-rank page layout.
-    pub latent_layouts: Vec<RankLatentLayout>,
-    /// The call's own measurements.
-    pub timing_counters: TimingCounters,
+    pub latent_layouts: Vec<ipc::RankLatentLayout>,
+}
+
+impl CallOutput {
+    /// A completed call that sampled `tokens` and stands at `step_index`, from the slot state
+    /// `state` the commit table left.
+    pub fn completed(call: CallId, tokens: Vec<u32>, state: RowState) -> Self {
+        Self {
+            call,
+            status: CallStatus::Ok,
+            error_code: None,
+            error_message: None,
+            tokens,
+            step_index: state.step_index,
+            cache_computed_len: state.cache_computed_len,
+            cache_visible_len: state.cache_visible_len,
+            token_logprobs: Vec::new(),
+            prompt_logprobs: Vec::new(),
+            candidate_logprobs: Vec::new(),
+            // A text call produces no artifact, publishes no export, drafts no token and lays out
+            // no latent page: the mechanism reads these as empty, which is what happened.
+            media_output: None,
+            cache_output: None,
+            draft_token_ids: Vec::new(),
+            latent_layouts: Vec::new(),
+        }
+    }
+}
+
+/// Where the commit table left one call's slot, as the completion reads it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RowState {
+    /// The slot's trajectory position: the denoising trajectory's next step.
+    pub step_index: u32,
+    /// The cache extent execution initialized, rejected speculative positions included.
+    pub cache_computed_len: u32,
+    /// The accepted prefix a successor may read.
+    pub cache_visible_len: u32,
 }
 
 /// What one serving step produced (4.4).
 ///
-/// The mechanism learns it from the batch's [`Submission`]: the sampled tokens build the next
-/// step's input ids and are the tokens it emits, and each call's [`CallCompletion`] is the record
-/// its requests advance on. A step that samples nothing (a chunk of a prefill that samples no
-/// token, a warmup, a program-layer command) completes with empty `tokens`.
-///
-/// `calls` is empty only for a batch no call of which reported anything, which is a lifecycle job,
-/// not a serving step: a runner that serves rows and leaves `calls` empty has not been wired to
-/// report them yet, and the mechanism's filler refuses such a report rather than advancing a slot's
-/// state on tokens nobody accounted for.
-#[derive(Clone, Debug, PartialEq)]
+/// The mechanism learns it from the batch's [`Submission`], builds the next step's input ids from
+/// the tokens, and folds the timing into the statistics of the calls' domain. A step that samples
+/// nothing (a chunk of a prefill that ends no prompt, a warmup, a program-layer command) completes
+/// with no call and nothing measured.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct BatchOutput {
-    /// One entry per sampling row, in the order the batch's calls and rows name them.
-    pub tokens: Vec<SampledToken>,
-    /// What each call of the batch reported, in the order the calls completed.
-    pub calls: Vec<CallCompletion>,
-    /// Whether this output ends the batch.
-    pub done: bool,
-}
-
-impl Default for BatchOutput {
-    /// An output that reports nothing: a lifecycle job's, or a shadow pass's.
-    fn default() -> Self {
-        Self {
-            tokens: Vec::new(),
-            calls: Vec::new(),
-            done: false,
-        }
-    }
+    /// One entry per call the batch advanced, in the order the batch named them.
+    pub calls: Vec<CallOutput>,
+    /// What the batch measured, in the segments this executor can observe.
+    ///
+    /// `queued_us` is the wait from the mechanism's submission to this device thread starting the
+    /// batch, `device_us` the replay's launch to the stream's completion, and `host_us` the rest of
+    /// the step on the host. `copy_us` is zero in-process and states a fact rather than a
+    /// measurement: nothing is transferred for the completion, since the mechanism reads it here.
+    pub timing: TimingCounters,
 }
 
 /// One batch: one phase of one step, as the mechanism assembles it.
@@ -185,16 +209,15 @@ pub struct BatchColumns {
 impl BatchColumns {
     /// The number of rows (sequences) the columns describe.
     ///
-    /// A row is one sequence's query, and a call owns a half-open range of them: a verification's
-    /// candidate tokens are several rows of one call, so this is the rows' count and not the calls'.
+    /// A row is one sequence's query, which is not the same as a call: a verify batch carries
+    /// several rows for one call, and the per-row columns (`slots`, `parameters`) are as long as
+    /// the rows. `rows.calls` counts the calls instead, which sized the sampler's views to one row
+    /// when a call held three.
     pub fn rows(&self) -> usize {
         self.rows.rows()
     }
 
-    /// The number of calls the columns describe.
-    ///
-    /// The sampler's slots and parameters are per row; the commit table's rows are per call, since
-    /// a call states how the step advances its slot's state once, however many rows it evaluated.
+    /// The calls the columns describe.
     pub fn calls(&self) -> usize {
         self.rows.calls.len()
     }
@@ -208,8 +231,7 @@ impl BatchColumns {
     /// batch fails before a launch rather than after one.
     pub fn check(&self, shape: &Shape) -> Result<()> {
         let tokens = self.rows.tokens();
-        let rows = self.rows.rows();
-        let calls = self.rows.calls.len();
+        let rows = self.rows.calls.len();
         for (name, actual, expected) in [
             ("input_ids", self.input_ids.len(), tokens),
             ("slots", self.slots.len(), rows),
@@ -225,9 +247,9 @@ impl BatchColumns {
                 )));
             }
         }
-        if self.commit.len() % calls.max(1) != 0 {
+        if self.commit.len() % rows.max(1) != 0 {
             return Err(Error::Invalid(format!(
-                "commit has {} entries, not a whole number of columns over {calls} calls",
+                "commit has {} entries, not a whole number of columns over {rows} rows",
                 self.commit.len()
             )));
         }
@@ -341,6 +363,45 @@ pub enum Job {
 }
 
 impl Job {
+    /// What this job is doing, for the report of a failed submission.
+    ///
+    /// The device thread knows the job it was performing and the caller does not, and the failure
+    /// crosses a thread boundary as a bare error, so the description is written where the job is
+    /// performed and carried beside that error.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Replay {
+                bucket,
+                generation,
+                batch,
+                ..
+            } => format!(
+                "replaying batch {} from the bucket of {} tokens and {} rows of generation {generation}",
+                batch.0, bucket.tokens, bucket.rows
+            ),
+            Self::Capture { bucket, generation, .. } => format!(
+                "capturing the bucket of {} tokens and {} rows of generation {generation}",
+                bucket.tokens, bucket.rows
+            ),
+            Self::Rebind { bucket, generation, .. } => format!(
+                "rebinding the bucket of {} tokens and {} rows of generation {generation}",
+                bucket.tokens, bucket.rows
+            ),
+            Self::Shadow {
+                operator,
+                key,
+                bucket,
+                generation,
+                ..
+            } => format!(
+                "shadowing {operator} {key} in the bucket of {} tokens and {} rows of generation {generation}",
+                bucket.tokens, bucket.rows
+            ),
+            Self::Issue { .. } => "issuing deferred storage work".to_owned(),
+            Self::After { .. } => "waiting for deferred storage work".to_owned(),
+        }
+    }
+
     /// What kind of job this is, for the watchdog's report.
     pub fn kind(&self) -> JobKind {
         match self {
@@ -457,45 +518,6 @@ pub trait Batches: Send + Sync {
     /// A shadow batch never writes resident memory and never serves a request; its failure is the
     /// update's, which the main process reports as `PrecopyFailed`.
     fn shadow(&self, batch: Batch) -> Result<Submission>;
-
-    /// The pools this executor serves (4.2, 7.3): what the mechanism schedules against.
-    ///
-    /// The mechanism builds its `ExecutorInfo` from this and nothing else: a pool whose ranks, media
-    /// units, cache geometry or model length are absent here is a pool it refuses to serve rather
-    /// than one it assumes, because a scheduler that guesses a rank's cache makes the host KV path
-    /// disappear at runtime.
-    ///
-    /// Empty means an executor that has not stated its pools; the mechanism refuses to construct a
-    /// scheduler over it, so the omission is a visible failure at construction and never a silent
-    /// default. An executor that serves batches states them.
-    fn inventory(&self) -> &[Inventory] {
-        &[]
-    }
-}
-
-/// One pool of the deployment an executor serves (4.2, 7.3).
-#[derive(Clone, Debug, Default)]
-pub struct Inventory {
-    /// The deployment's name for the pool, the identity the mechanism's `WorkerGroupId` carries.
-    pub group: String,
-    /// The pool's ranks in launch order, each with what it reported at handshake.
-    pub ranks: Vec<WorkerInfo>,
-    /// What the deployment launched the pool with; the ranks' reports do not carry it back.
-    pub placement: Placement,
-    /// The longest sequence the pool's model was built for: the attention descriptor's static bound
-    /// on the keys one row reads.
-    pub max_model_len: u32,
-}
-
-/// What a deployment launched one pool with (4.2).
-#[derive(Clone, Debug, Default)]
-pub struct Placement {
-    /// Unresolved physical batches the pool admits at once, counted as at least one.
-    pub queue_depth: usize,
-    /// Ranks the pool was launched with, counted as at least one.
-    pub ranks: usize,
-    /// The pool's components by name, each with its member ranks, parallel degrees and distribution.
-    pub components: std::collections::BTreeMap<String, ComponentConfig>,
 }
 
 /// The mechanism's `Batches` over a rank's devices (2.4, 4.4): a batch goes to the device whose
@@ -639,6 +661,9 @@ pub struct Submission {
 
 pub(crate) struct SubmissionState {
     outcome: Mutex<Option<Outcome<BatchOutput>>>,
+    /// What the submission was doing when it failed, written where the failure happened: the
+    /// caller cannot know it, and an error alone does not say which bucket or operator broke.
+    failure: Mutex<Option<String>>,
     ready: Condvar,
 }
 
@@ -647,6 +672,7 @@ impl Submission {
     pub fn completed(id: SubmissionId, outcome: Outcome<BatchOutput>) -> Self {
         let state = Arc::new(SubmissionState {
             outcome: Mutex::new(Some(outcome)),
+            failure: Mutex::new(None),
             ready: Condvar::new(),
         });
         Self { id, state }
@@ -656,6 +682,7 @@ impl Submission {
     pub(crate) fn pending(id: SubmissionId) -> (Self, Arc<SubmissionState>) {
         let state = Arc::new(SubmissionState {
             outcome: Mutex::new(None),
+            failure: Mutex::new(None),
             ready: Condvar::new(),
         });
         (
@@ -718,9 +745,25 @@ impl Submission {
     pub fn outcome(&self) -> Option<Outcome<BatchOutput>> {
         lock(&self.state.outcome).clone()
     }
+
+    /// What the submission was doing when it failed, when it did.
+    ///
+    /// The device thread writes it where the failure happens - the job it was performing and the
+    /// bucket, generation or operator that named it - because the caller holds only the bare error.
+    pub fn failure_label(&self) -> Option<String> {
+        lock(&self.state.failure).clone()
+    }
 }
 
 impl SubmissionState {
+    /// Records what this submission was doing when it failed, for the report that reads it.
+    pub(crate) fn note_failure(&self, label: String) {
+        let mut slot = lock(&self.failure);
+        if slot.is_none() {
+            *slot = Some(label);
+        }
+    }
+
     /// Completes the submission with `outcome`; the first completion wins.
     pub(crate) fn finish(self: Arc<Self>, outcome: Outcome<BatchOutput>) {
         let mut slot = lock(&self.outcome);

@@ -1817,16 +1817,23 @@ impl Cudnn {
         steps
     }
 
-    /// The six readings of what a fill of `CUDNN_ATTR_ENGINEHEUR_RESULTS`
-    /// wants of the array it is handed, against one finalized `heuristic`
-    /// descriptor and one that no count query has touched, so the only
-    /// difference between them is the request.
+    /// The readings of what a fill of `CUDNN_ATTR_ENGINEHEUR_RESULTS` wants of
+    /// the array it is handed, against one finalized `heuristic` descriptor and
+    /// one that no count query has touched, so the only difference between them
+    /// is the request.
     ///
-    /// A diagnostic: it decides nothing and changes nothing. Each line says
-    /// the status, the element count the library answered, and how many slots
-    /// hold a handle afterwards, because those three separate the readings —
-    /// a list that is written but not counted looks like a list that was left
-    /// empty from the caller's side.
+    /// A diagnostic: it decides nothing and changes nothing. Each line says the
+    /// status, the element count the library answered, and how many slots hold
+    /// a handle afterwards, because those three separate the readings — a list
+    /// that is written but not counted looks like a list that was left empty
+    /// from the caller's side.
+    ///
+    /// These stay because the failure they separate is invisible otherwise: a
+    /// search on a graph that names no device counts configurations and fills
+    /// none, answering success, so the plan reports "listed N, returned none"
+    /// and reads exactly like a shape cuDNN has no engine for. The readings
+    /// tell the two apart in one output, and a device is the only place they
+    /// can be taken, so they cannot live in the ordinary test run.
     fn fill_variants(
         &self,
         graph: &Descriptor,
