@@ -1,0 +1,58 @@
+# The dense_attention operator's f32 backend: design 5.2's program package, and
+# design 9's "FP32 attention: cuBLASLt SGEMM and a softmax kernel program" — the
+# audio encoder's and the VSA compression branch's path.
+#
+# One native module per descriptor, and one work item per 64 query rows per head:
+# cuBLASLt computes the tile's scores, a kernel masks them and writes the
+# row-normalized weights, cuBLASLt computes the tile's product with the values, and
+# a kernel copies the tile's real rows into the caller's output. The module owns
+# its host work, so `Op::launch` computes no grid.
+#
+# The descriptor's `mask` is compiled in (a causal module refuses a dense call and
+# the other way round); its `window` is not, because the window is a bound the call
+# carries and one module serves both. Only FP32 activations are declared, which is
+# what this backend is for — the bf16 projection paths are the `fa4` backend's.
+#
+# The length caps are the lengths this backend declares it serves; a call is
+# refused if it packs more keys than its descriptor's cap, so a longer sequence is
+# a new descriptor and a new module, not a slower launch.
+
+op = "dense_attention"
+backend = "f32"
+
+[toolchain]
+kind = "nvcc"
+version = "13.0.48"
+packages = []
+
+[module]
+form = "native"
+
+[module.entries]
+launch = "uniserve_dense_attention"
+
+[source]
+kind = "cuda"
+files = [
+    "include/uniserve_dense_attention.h",
+    "src/dense.cu",
+    "src/build.py",
+]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_100f"]
+
+# `dtype_f32_kv_f32_out_f32_head_dim_64_q_heads_8_kv_heads_8_mask_dense_window_false_len_4096`,
+# the audio encoder's shape in the operator's own test, is one of these cells.
+[kernel.descriptors]
+dimensions = { dtype = ["f32"], kv = ["f32"], out = ["f32"], head_dim = ["64", "128"], q_heads = ["32", "24", "16", "8"], kv_heads = ["8", "4", "2", "1"], mask = ["causal", "dense"], window = ["false", "true"], len = ["8192", "16384", "32768", "40960"] }
+
+[parameters]
+# The problem this backend is built for: one 64-row query tile over the packed key
+# extent of the descriptor's longest call. The script compiles the mask only, so
+# these name the shape the module is expected to serve rather than a configuration
+# chosen for it.
+tile = 64
+keys = 8192
