@@ -115,16 +115,13 @@ const HEAD_DIM: u32 = 128;
 /// Rows of one VSA tile (`vsa_tile_size` in `fastvideo_inference.json`: 64 for the FastH3 students,
 /// 128 for OmniRef). `uniserve/models/minimax_h3/packing.py` binds a 64-row tile to a `4×4×4`
 /// spatiotemporal block and refuses any size it does not pack, so this is the checkpoint's number,
-/// not a scheduling choice.
+/// not a scheduling choice. The `vsa_sparsity: 0.8` beside it gives the selection's keep count, which
+/// is a launch value: it follows the clip's tile count, so it is in no key.
 const VSA_TILE_ROWS: u32 = 64;
 
 /// Rows one VSA program handles (`_BLOCK_ROWS` in `uniserve_kernels/attention/vsa_segments.py`): the
 /// kernel's own tiling inside a tile, compiled in.
 const VSA_BLOCK_ROWS: u32 = 16;
-
-/// The keep policy `vsa_sparsity: 0.8` states — a launch value, not a key, because the count follows
-/// the clip's tile count.
-const _VSA_KEEP_RATE: f64 = 0.2;
 
 /// The transformer's feed-forward width (`ffn_dim`).
 const FFN: u32 = 14336;
