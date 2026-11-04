@@ -62,7 +62,7 @@ impl Placement {
     /// protocol's default component for an undivided model.
     pub(super) fn worker_candidates<'a>(
         &'a self,
-        executor: &'a dyn Executor,
+        world: &'a dyn super::submission::World,
         info: &'a WorkerInfo,
         kind: CallKind,
     ) -> impl Iterator<Item = (&'a crate::WorkerGroupId, &'a str, &'a WorkerInfo)> {
@@ -73,7 +73,7 @@ impl Placement {
                 .map_or(DEFAULT_COMPONENT, String::as_str),
             _ => DEFAULT_COMPONENT,
         };
-        self.component_candidates(executor, kind, component)
+        self.component_candidates(world, kind, component)
     }
 
     /// Enumerates workers that support `kind` and can serve `component`, with
@@ -85,36 +85,32 @@ impl Placement {
     /// Other workers are excluded.
     pub(super) fn component_candidates<'a>(
         &'a self,
-        executor: &'a dyn Executor,
+        world: &'a dyn super::submission::World,
         kind: CallKind,
         component: &'a str,
     ) -> impl Iterator<Item = (&'a crate::WorkerGroupId, &'a str, &'a WorkerInfo)> {
-        executor
-            .info()
-            .workers
-            .iter()
-            .filter_map(move |(id, info)| {
-                if !info.supported_calls.contains(&kind) {
-                    return None;
-                }
-                let bound_component = if info
+        world.info().workers.iter().filter_map(move |(id, info)| {
+            if !info.supported_calls.contains(&kind) {
+                return None;
+            }
+            let bound_component = if info
+                .components
+                .iter()
+                .any(|binding| binding.name == component)
+            {
+                component
+            } else if info.components.is_empty()
+                || info
                     .components
                     .iter()
-                    .any(|binding| binding.name == component)
-                {
-                    component
-                } else if info.components.is_empty()
-                    || info
-                        .components
-                        .iter()
-                        .any(|binding| binding.name == DEFAULT_COMPONENT)
-                {
-                    DEFAULT_COMPONENT
-                } else {
-                    return None;
-                };
-                Some((id, bound_component, info))
-            })
+                    .any(|binding| binding.name == DEFAULT_COMPONENT)
+            {
+                DEFAULT_COMPONENT
+            } else {
+                return None;
+            };
+            Some((id, bound_component, info))
+        })
     }
 
     /// Whether a request already runs somewhere: a replica holds its mutable
@@ -134,7 +130,7 @@ impl Placement {
     /// choice.
     pub(super) fn component_target<'a>(
         &'a self,
-        executor: &'a dyn Executor,
+        world: &'a dyn super::submission::World,
         request: RequestKey,
         kind: CallKind,
         component: &'a str,
@@ -144,7 +140,7 @@ impl Placement {
         // install, which a prefill replica could serve, hands the request to
         // a decode replica.
         let candidates = self
-            .component_candidates(executor, kind, component)
+            .component_candidates(world, kind, component)
             .filter(|(id, _, _)| !decodes(kind) || !self.prefill_groups.contains(*id))
             .collect::<Vec<_>>();
         let bound = candidates.first()?.1;
@@ -159,7 +155,7 @@ impl Placement {
         };
         if let Some(owner) = pinned.get(&(request, bound.to_owned())) {
             let (id, component, _) = candidates.into_iter().find(|(id, _, _)| *id == owner)?;
-            return executor.has_capacity(id).then_some((id, component));
+            return world.has_capacity(id).then_some((id, component));
         }
 
         // A request that has not run here yet runs where the policy says
@@ -168,7 +164,7 @@ impl Placement {
         // substitutes a replica the policy did not choose.
         if let Choice::Target(named) = choice {
             let (id, component, _) = candidates.into_iter().find(|(id, _, _)| *id == named)?;
-            return executor.has_capacity(id).then_some((id, component));
+            return world.has_capacity(id).then_some((id, component));
         }
 
         // Prefer a worker already selected for another component of this
@@ -184,7 +180,7 @@ impl Placement {
             .copied()
             .find(|(id, _, _)| resident.contains(id))
         {
-            return executor.has_capacity(id).then_some((id, component));
+            return world.has_capacity(id).then_some((id, component));
         }
 
         // Among replicas with queue capacity, a new request goes to the one
@@ -194,7 +190,7 @@ impl Placement {
         // `ExecutorInfo::workers`.
         candidates
             .into_iter()
-            .filter(|(id, _, _)| executor.has_capacity(id))
+            .filter(|(id, _, _)| world.has_capacity(id))
             .min_by_key(|(id, _, _)| {
                 self.affinity
                     .iter()
@@ -209,7 +205,7 @@ impl Placement {
     /// `info`, as `worker_candidates` does, while preserving residency.
     pub(super) fn worker_target<'a>(
         &'a self,
-        executor: &'a dyn Executor,
+        world: &'a dyn super::submission::World,
         info: &'a WorkerInfo,
         request: RequestKey,
         kind: CallKind,
@@ -222,7 +218,7 @@ impl Placement {
                 .map_or("model", String::as_str),
             _ => "model",
         };
-        self.component_target(executor, request, kind, component, choice)
+        self.component_target(world, request, kind, component, choice)
     }
 
     /// Places `request`'s calls of `kind` on the replica that will execute
@@ -233,13 +229,13 @@ impl Placement {
     /// submission capacity.
     pub(super) fn place(
         &mut self,
-        executor: &dyn Executor,
+        world: &dyn super::submission::World,
         info: &WorkerInfo,
         request: RequestKey,
         kind: CallKind,
     ) -> Option<crate::WorkerGroupId> {
         let (id, bound_component) =
-            self.worker_target(executor, info, request, kind, &Choice::Existing)?;
+            self.worker_target(world, info, request, kind, &Choice::Existing)?;
         let target = (id.clone(), bound_component.to_owned());
         let pinned = if decodes(kind) {
             &mut self.decode_affinity
@@ -256,21 +252,15 @@ impl Placement {
     /// eligible replica with submission capacity.
     pub(super) fn select_worker(
         &mut self,
-        executor: &dyn Executor,
+        world: &dyn super::submission::World,
         info: &WorkerInfo,
         call: &Call,
         choice: &Choice,
     ) -> Option<(crate::WorkerGroupId, String)> {
         let (id, bound_component) = if call.component == DEFAULT_COMPONENT {
-            self.worker_target(executor, info, call.request_key, call.kind, choice)
+            self.worker_target(world, info, call.request_key, call.kind, choice)
         } else {
-            self.component_target(
-                executor,
-                call.request_key,
-                call.kind,
-                &call.component,
-                choice,
-            )
+            self.component_target(world, call.request_key, call.kind, &call.component, choice)
         }?;
         let target = (id.clone(), bound_component.to_owned());
         let pinned = if decodes(call.kind) {

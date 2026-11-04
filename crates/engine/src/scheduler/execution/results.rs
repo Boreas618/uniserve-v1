@@ -3,8 +3,8 @@
 //! completions, and applies them in request-local dependency order; a diffusion
 //! request's results advance its media flow until it finishes.
 
-use crate::scheduler::completion::{BatchReport, CallCompletion};
 use super::*;
+use crate::scheduler::completion::{BatchReport, CallCompletion};
 use ipc::{ForwardMode, MediaCall, TransferMode};
 
 /// Describes a rejected worker result for the request's terminal error and
@@ -638,10 +638,9 @@ impl Scheduler {
             return;
         };
         let pending = owned.get_mut();
-        pending.worker_exec_us = report
+        pending.worker_exec_us = pending
             .worker_exec_us
-            .into_iter()
-            .fold(pending.worker_exec_us, u64::saturating_add);
+            .saturating_add(report.timing.device_us);
         let batch_roundtrip_us = pending.started.elapsed().as_micros() as u64;
         // A partial result leaves the batch owned. The final one releases it
         // and settles its command receipts: the recorded commands exclude

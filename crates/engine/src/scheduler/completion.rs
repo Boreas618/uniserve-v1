@@ -19,9 +19,10 @@
 //! - [`CallCompletion::from_wire`] / [`BatchReport::from_wire`] for the
 //!   worker-process executor, which speaks `ipc`. They are temporary: they are
 //!   deleted with that executor (§2.4).
-//! - the in-process filler, from `executor::BatchOutput`, written when the
-//!   device executor reports what the completion path reads. Until it does, the
-//!   in-process path has no completion to report — it does not stand one in.
+//! - [`BatchReport::from_output`] / [`CallCompletion::from_output`] for the
+//!   in-process executor, which reports `executor::batch::BatchOutput`: the
+//!   device's own account of each call (2.4). This is the filler the
+//!   worker-process one is deleted with.
 
 use std::sync::Arc;
 
@@ -108,6 +109,42 @@ impl CallCompletion {
     }
 }
 
+impl CallCompletion {
+    /// The in-process edge: what a device's runner reported, in the mechanism's
+    /// type (2.4).
+    ///
+    /// The mechanism names the call: the executor numbers a batch's calls by
+    /// their index, so the pair comes from the batch that was submitted. A
+    /// process publishes no immutable storage of its own to claim, so `media`
+    /// is empty — an in-process media call is refused before it is submitted.
+    pub(crate) fn from_output(
+        output: executor::batch::CallCompletion,
+        request_key: RequestKey,
+        call_id: CallId,
+    ) -> Self {
+        Self {
+            request_key,
+            call_id,
+            status: output.status,
+            error_code: output.error_code,
+            error_message: output.error_message,
+            timing_counters: output.timing_counters,
+            cache_visible_len: output.cache_visible_len,
+            cache_computed_len: output.cache_computed_len,
+            step_index: output.step_index,
+            committed_tokens: output.committed_tokens,
+            token_logprobs: output.token_logprobs,
+            prompt_logprobs: output.prompt_logprobs,
+            candidate_logprobs: output.candidate_logprobs,
+            media_output: output.media_output,
+            cache_output: output.cache_output,
+            draft_token_ids: output.draft_token_ids,
+            latent_layouts: output.latent_layouts,
+            media: Ok(None),
+        }
+    }
+}
+
 /// One batch's completion, as the mechanism reads it.
 #[derive(Clone, Debug)]
 pub(crate) struct BatchReport {
@@ -119,8 +156,9 @@ pub(crate) struct BatchReport {
     pub command_results: Vec<crate::executor::CommandResult>,
     /// Whether this report ends the batch.
     pub done: bool,
-    /// Per-worker execution durations, in microseconds.
-    pub worker_exec_us: Vec<u64>,
+    /// The batch's own measurements: the execution time the report is measured
+    /// by.
+    pub timing: TimingCounters,
     /// Per-worker model-forward statistics.
     pub forward_stats: Vec<ForwardStats>,
 }
@@ -138,8 +176,110 @@ impl BatchReport {
                 .collect(),
             command_results: result.command_results,
             done: result.done,
-            worker_exec_us: result.worker_exec_us,
+            // The wire states a duration per worker; the mechanism measures a
+            // step by the device work it waited for, which is their sum.
+            timing: TimingCounters {
+                device_us: result
+                    .worker_exec_us
+                    .into_iter()
+                    .fold(0u64, u64::saturating_add),
+                ..TimingCounters::default()
+            },
             forward_stats: result.forward_stats,
         }
+    }
+
+    /// The in-process edge: what this process's devices reported, in the
+    /// mechanism's type.
+    ///
+    /// `calls` names the batch's calls as the mechanism named them: the
+    /// executor numbers a batch's calls by their index in `Batch.calls`, so a
+    /// report's call is resolved against the batch that was submitted, and a
+    /// report naming a call the batch does not have is refused rather than
+    /// filed against a neighbour.
+    ///
+    /// A completed batch acknowledges its lifecycle commands by reporting none
+    /// of them failed: the mechanism knots a failed receipt to a command it
+    /// keeps for a later attempt, so silence is the receipt of a command that
+    /// was applied. A serving batch whose report carries no call is refused —
+    /// a runner that serves rows and reports nothing has not been wired to
+    /// report them, and advancing a call's state on tokens nobody accounted for
+    /// is worse than stopping.
+    pub(crate) fn from_output(
+        batch: u64,
+        outcome: executor::completion::Outcome<executor::batch::BatchOutput>,
+        calls: &[(RequestKey, CallId)],
+    ) -> Result<Self, crate::executor::ExecutorError> {
+        let output = match outcome {
+            executor::completion::Outcome::Success(output) => output,
+            executor::completion::Outcome::Failed(error) => {
+                return Err(anyhow::anyhow!("batch {batch} failed: {error}"));
+            }
+            executor::completion::Outcome::Cancelled => {
+                return Err(anyhow::anyhow!(
+                    "batch {batch} was cancelled by the executor"
+                ));
+            }
+        };
+        let mut reported: Vec<Option<executor::batch::CallCompletion>> = vec![None; calls.len()];
+        for completion in output.calls {
+            let index = completion.call.0 as usize;
+            let (request_key, call_id) = calls.get(index).copied().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "batch {batch} reported call {} of {} the batch submitted",
+                    completion.call.0,
+                    calls.len()
+                )
+            })?;
+            anyhow::ensure!(
+                reported[index].is_none(),
+                "batch {batch} reported call {} twice",
+                completion.call.0
+            );
+            reported[index] = Some(completion);
+        }
+        let mut timing = TimingCounters::default();
+        let mut finished = Vec::with_capacity(calls.len());
+        for (index, completion) in reported.into_iter().enumerate() {
+            let Some(completion) = completion else {
+                continue;
+            };
+            let (request_key, call_id) = calls[index];
+            timing.queued_us = timing
+                .queued_us
+                .saturating_add(completion.timing_counters.queued_us);
+            timing.device_us = timing
+                .device_us
+                .saturating_add(completion.timing_counters.device_us);
+            timing.copy_us = timing
+                .copy_us
+                .saturating_add(completion.timing_counters.copy_us);
+            timing.host_us = timing
+                .host_us
+                .saturating_add(completion.timing_counters.host_us);
+            finished.push(CallCompletion::from_output(
+                completion,
+                request_key,
+                call_id,
+            ));
+        }
+        anyhow::ensure!(
+            !finished.is_empty() || calls.is_empty(),
+            "batch {batch} completed with no call reported for its {} calls",
+            calls.len()
+        );
+        Ok(Self {
+            batch_id: batch,
+            calls: finished,
+            // No lifecycle command of an in-process batch failed: the batch is
+            // its commands' own delivery, and a command that failed failed the
+            // batch.
+            command_results: Vec::new(),
+            done: output.done,
+            timing,
+            // Device-side forward statistics are a worker's readout, not a
+            // rank's own (`crate::worker`); a process reports none here.
+            forward_stats: Vec::new(),
+        })
     }
 }

@@ -499,8 +499,7 @@ impl Scheduler {
         let floor = self
             .policy
             .as_ref()
-            .map_or(0, |policy| policy.limits().prefetch_min_tokens)
-            as usize;
+            .map_or(0, |policy| policy.limits().prefetch_min_tokens) as usize;
         let Some(state) = self.running.get(&id) else {
             return;
         };
@@ -548,6 +547,11 @@ impl Scheduler {
             return None;
         };
         self.step += 1;
+        // The kernels this step's batches serve on, read once: a switchover
+        // that completes mid-step must not split one step across two worlds
+        // (4.2, 7.3).
+        let generation = self.serving_generation();
+        self.executor.set_generation(generation);
         // The pages that appeared and went since the previous step, then
         // everything else that changed, in the order it happened, closed before
         // this step's dispatch. The room, the live state, and the plan's checks
@@ -574,12 +578,10 @@ impl Scheduler {
         // setup that applies it (§7.6). No load means nothing to decide, not a
         // zero one: the executor has published no routed tokens yet.
         let experts_due = self.expert_load_new
-            || self
-                .expert_asked
-                .is_none_or(|asked| self.step.saturating_sub(asked) >= Self::EXPERT_REBALANCE_STEPS);
-        if experts_due
-            && let Some(load) = views::expert_load_of(self)
-        {
+            || self.expert_asked.is_none_or(|asked| {
+                self.step.saturating_sub(asked) >= Self::EXPERT_REBALANCE_STEPS
+            });
+        if experts_due && let Some(load) = views::expert_load_of(self) {
             let order = match policy.experts(&load) {
                 Ok(order) => order,
                 Err(error) => return self.policy_failed(policy, error),
