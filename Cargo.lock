@@ -4725,6 +4725,7 @@ dependencies = [
  "proto",
  "qwen3-moe",
  "rustix",
+ "serde_json",
  "storage",
  "storage-server",
  "tempfile",
