@@ -1112,11 +1112,17 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
                 }
             }
             Some(from_engine::Kind::Metrics(metrics)) => {
-                // The main process's counters for the frontend's `/metrics`
-                // (design §2.3): nothing serves them from the daemon while the
-                // application is still here; delivery item 2/4 wires them into
-                // the metrics registry.
-                let _ = metrics;
+                // The main process's allocator, which the deployment exports: each device's budget
+                // and, per pool, the bytes it has mapped now (`uniserve:memory_budget`,
+                // `uniserve:memory_mapped`; design §4.1 and §8). The message arrives once a second
+                // while the process serves, so the series follow the allocator rather than a snapshot
+                // taken at launch.
+                //
+                // The message's counters - `steps`, `batches`, `tokens`, `kernel_launches`,
+                // `device_ns`, `policy_fuel`, `policy_calls`, and each rank's `queue` depth - have no
+                // family here: the engine's scheduler and request families are recorded from
+                // `SchedulerStats` and `RequestStats`, which arrive beside this message.
+                crate::metrics::METRICS.memory.record(&metrics.memory);
             }
             Some(from_engine::Kind::Stats(report)) => {
                 match SchedulerStats::decode(&report.snapshot) {
