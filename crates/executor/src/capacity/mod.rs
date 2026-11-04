@@ -376,6 +376,28 @@ pub fn graph_storage_budget_bytes(total_device_bytes: i64) -> u64 {
     (total_device_bytes.max(0) as f64 * 0.10) as u64
 }
 
+/// The graph storage a device must budget for the generations the deployment
+/// keeps resident: one pool per generation a preparation can hold.
+///
+/// `online-operations.md` states the cost of a preparation as a SECOND graph
+/// pool of 10% of the device, with `eager_prepare` as the way to free it:
+/// making the serving world run eagerly gives its graph storage to the
+/// successor's captures. So a rank that prepares a generation beside a serving
+/// one budgets two pools, and a rank that does not - or that prepares with the
+/// serving side eager - budgets one.
+///
+/// The pools are distinct: two live generations do not share activations, so a
+/// per-bucket recapture beside a serving generation needs room of its own, and
+/// a revert needs the serving generation's graphs to still be there.
+pub fn graph_storage_bytes(total_device_bytes: i64, prepares: bool, eager_prepare: bool) -> u64 {
+    let pool = graph_storage_budget_bytes(total_device_bytes);
+    if prepares && !eager_prepare {
+        pool * 2
+    } else {
+        pool
+    }
+}
+
 /// A deployment's quota of a device of `total` bytes for `fraction` of it:
 /// `⌊total × fraction⌋`.
 pub fn quota(total: u64, fraction: f64) -> u64 {
@@ -462,6 +484,17 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    /// A preparation beside a serving generation needs a second graph pool; with the serving side
+    /// eager it does not, because that is what `eager_prepare` gives up.
+    #[test]
+    fn a_prepared_generation_budgets_a_second_graph_pool() {
+        let total = 1000;
+        assert_eq!(graph_storage_bytes(total, false, false), 100);
+        assert_eq!(graph_storage_bytes(total, true, false), 200);
+        assert_eq!(graph_storage_bytes(total, true, true), 100);
+        assert_eq!(graph_storage_bytes(-1, true, false), 0);
     }
 
     #[test]
