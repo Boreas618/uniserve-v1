@@ -80,6 +80,28 @@ pub(crate) struct IssuedPages {
 }
 
 /// The rank's prefix cache owners.
+/// One layer's share of the cache planes, as the model reads it.
+///
+/// The scales and flags are views of the pool's per-cell planes, borrowed for
+/// as long as the layer's pages are referenced; the page geometry is stated
+/// once per group and repeated here so a caller needs no second lookup.
+pub struct LayerPlanes {
+    /// Tokens one page holds of every layer in the group.
+    pub block_size: u32,
+    /// Pages the pool holds for the layer's group.
+    pub pages: u32,
+    /// The element type the group's value planes hold, as a kernel operand.
+    pub dtype: ops::DType,
+    /// The layer's key scales, `[pages,1,1,1]`; `None` on a dense pool.
+    pub key_scale: Option<StorageView>,
+    /// The layer's value scales, as `key_scale`.
+    pub value_scale: Option<StorageView>,
+    /// The layer's key "initialized" flags, `[pages,1,1,1]`.
+    pub key_initialized: StorageView,
+    /// The layer's value "initialized" flags.
+    pub value_initialized: StorageView,
+}
+
 pub struct PrefixCache {
     planes: Arc<CachePlanes>,
     storage: BlockTableStorage,
@@ -322,6 +344,25 @@ impl PrefixCache {
     /// resident figure. Block tables and host pages are not in it.
     pub fn mapped_bytes(&self) -> u64 {
         self.planes.mapped_bytes()
+    }
+
+    /// One layer's pages as the model's cache reads them: the page geometry
+    /// and the layer's own cell of each page.
+    ///
+    /// A layer occupies one cell of a page - column `layer % columns`, unit
+    /// `layer / columns` - so its scale and flag views are `[pages,1,1,1]`,
+    /// borrowed from the per-cell planes and never copied. A dense pool answers
+    /// `None` for its scales because it holds none.
+    pub fn layer_planes(&self, group: usize, layer: usize) -> Result<LayerPlanes> {
+        Ok(LayerPlanes {
+            block_size: self.planes.page_size(group)?,
+            pages: self.planes.pages(group)?,
+            dtype: self.planes.dtype(group)?,
+            key_scale: self.planes.key_scale(group, layer)?,
+            value_scale: self.planes.value_scale(group, layer)?,
+            key_initialized: self.planes.key_initialized(group, layer)?,
+            value_initialized: self.planes.value_initialized(group, layer)?,
+        })
     }
 
     pub fn tables(&self) -> &BlockTables {
