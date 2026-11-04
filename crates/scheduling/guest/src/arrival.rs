@@ -36,10 +36,10 @@ use crate::ids::{EncodingId, PageId, RequestId};
 use crate::limits::{Limits, Parameters};
 use crate::lru::Lru;
 use crate::phases::Phases;
-use crate::policy::{Init, Policy};
+use crate::policy::Policy;
 use crate::view::{
     CallView, ExpertLoad, ExpertOrder, PhaseClass, PhaseKind, RankView, ReplicaView, RequestClass,
-    RequestState, RequestView,
+    RequestState, RequestView, Snapshot,
 };
 use crate::waiting::{Order, Waiting};
 
@@ -96,6 +96,18 @@ pub struct Arrival<K: Order> {
     /// Whether the next step puts the media path's work first, which alternates
     /// the two paths as today's `prefer_media` does.
     media_first: bool,
+}
+
+impl<K: Order> From<Parameters> for Arrival<K> {
+    /// The program's arguments construct the policy (design §5.1: the arguments
+    /// are part of the program); the state arrives in `init`.
+    fn from(parameters: Parameters) -> Self {
+        Self {
+            limits: Limits::from_parameters(&parameters),
+            parameters,
+            ..Self::default()
+        }
+    }
 }
 
 impl<K: Order> Default for Arrival<K> {
@@ -330,17 +342,14 @@ enum Pass {
 }
 
 impl<K: Order> Policy for Arrival<K> {
-    fn init(&mut self, init: &Init) {
-        self.parameters = init.parameters.clone();
-        self.limits = Limits::from_parameters(&self.parameters);
-        self.phases = Phases::new(&init.state.phases);
-        for view in &init.state.requests {
+    fn init(&mut self, state: &Snapshot) {
+        self.phases = Phases::new(&state.phases);
+        for view in &state.requests {
             self.views.insert(view.id, view.clone());
         }
         // Residents start in admission order, which the snapshot states as the
         // time each was admitted.
-        let mut residents: Vec<&RequestView> = init
-            .state
+        let mut residents: Vec<&RequestView> = state
             .requests
             .iter()
             .filter(|view| view.state == RequestState::Resident)
@@ -352,14 +361,13 @@ impl<K: Order> Policy for Arrival<K> {
             )
         });
         self.admission = residents.into_iter().map(|view| view.id).collect();
-        for view in &init.state.requests {
+        for view in &state.requests {
             if view.state == RequestState::Queued {
                 self.waiting.push(view);
             }
         }
         // The cache orders the snapshot states, least recently used first.
-        let mut pages: Vec<(u64, PageId, bool, bool)> = init
-            .state
+        let mut pages: Vec<(u64, PageId, bool, bool)> = state
             .pages
             .iter()
             .map(|page| (page.last_used.0, page.id, page.on_host, page.evictable))
@@ -370,8 +378,7 @@ impl<K: Order> Policy for Arrival<K> {
             self.on_host.insert(page, on_host);
             self.evictable.insert(page, evictable);
         }
-        let mut encodings: Vec<(u64, EncodingId)> = init
-            .state
+        let mut encodings: Vec<(u64, EncodingId)> = state
             .encodings
             .iter()
             .map(|entry| (entry.last_used.0, entry.id))
@@ -696,12 +703,26 @@ mod tests {
     use crate::decision::Warming;
     use crate::ids::{ComponentId, PhaseId};
     use crate::time::{Duration, Nanos};
+    use crate::policy::Instantiation;
     use crate::view::{EncodingView, PageView, PhaseView, RankView, ReplicaView, Snapshot};
+
+    /// Drives an `Arrival` the way the mechanism does: construct it from the
+    /// program's arguments, then initialize it with the snapshot.
+    trait FromInstantiation {
+        fn instantiate(&mut self, init: &Instantiation);
+    }
+
+    impl<K: Order> FromInstantiation for Arrival<K> {
+        fn instantiate(&mut self, init: &Instantiation) {
+            *self = Arrival::from(init.parameters.clone());
+            Policy::init(self, &init.state);
+        }
+    }
 
     /// A policy with two phases: 0 prefill, 1 decode.
     fn policy() -> Arrival<crate::ArrivalOrder> {
         let mut fcfs = Arrival::default();
-        fcfs.init(&Init {
+        fcfs.instantiate(&Instantiation {
             parameters: Parameters::default(),
             state: Snapshot {
                 phases: vec![
@@ -1065,7 +1086,7 @@ mod tests {
     #[test]
     fn priority_admits_and_assembles_by_priority_then_arrival() {
         let mut priority = Arrival::<crate::PriorityOrder>::default();
-        priority.init(&Init {
+        priority.instantiate(&Instantiation {
             parameters: Parameters::default(),
             state: Snapshot {
                 phases: vec![
@@ -1115,7 +1136,7 @@ mod tests {
     #[test]
     fn a_refill_is_prefill_work() {
         let mut fcfs = Arrival::<crate::ArrivalOrder>::default();
-        fcfs.init(&Init {
+        fcfs.instantiate(&Instantiation {
             parameters: Parameters::default(),
             state: Snapshot {
                 phases: vec![
@@ -1176,7 +1197,7 @@ mod tests {
         media.class = RequestClass::Media;
         media.admitted_at = Some(Nanos(3));
         media.prefetch_tokens = 300;
-        fcfs.init(&Init {
+        fcfs.instantiate(&Instantiation {
             parameters: Parameters::default(),
             state: Snapshot {
                 requests: vec![fits.clone(), enormous, prefill, decode, media],

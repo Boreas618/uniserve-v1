@@ -15,7 +15,8 @@
 
 use scheduling::guest::wire::{self, Call};
 use scheduling::guest::{
-    CallView, ExpertLoad, ExpertOrder, Init, Limits, Nanos, PageId, PhaseId, Plan, RequestId,
+    CallView, ExpertLoad, ExpertOrder, Limits, Nanos, PageId, Parameters, PhaseId, Plan, RequestId,
+    Snapshot,
     RequestView, Room, Shortage, Storage, Victim, Work,
 };
 use scheduling::{Engine, PolicyError, PolicyInstance, PolicyModule};
@@ -234,7 +235,7 @@ fn call() -> CallView {
 fn policy(engine: &Engine, toy: Toy) -> PolicyInstance {
     let module = PolicyModule::load(engine, toy.wat().as_bytes()).unwrap();
     module
-        .instantiate(&Init::default(), &Limits::default())
+        .instantiate(&Snapshot::default(), &Parameters::default(), &Limits::default())
         .unwrap()
 }
 
@@ -429,7 +430,7 @@ fn a_module_that_cannot_reserve_the_message_fails_the_call() {
     let module = PolicyModule::load(&engine, toy.wat().as_bytes()).unwrap();
     // `limits()` is read at instantiation and needs a buffer too, so the
     // module refuses to instantiate before any decision is made.
-    match module.instantiate(&Init::default(), &Limits::default()) {
+    match module.instantiate(&Snapshot::default(), &Parameters::default(), &Limits::default()) {
         Err(PolicyError::Malformed { call, .. }) => assert_eq!(call, Call::Init),
         Err(other) => panic!("expected a malformed call, got {other:?}"),
         Ok(_) => panic!("expected a malformed call, got an instance"),
@@ -459,7 +460,7 @@ fn a_module_without_a_decision_does_not_instantiate() {
     let toy = Toy::new().omit(Call::Warm.export());
     let module = PolicyModule::load(&engine, toy.wat().as_bytes()).unwrap();
 
-    match module.instantiate(&Init::default(), &Limits::default()) {
+    match module.instantiate(&Snapshot::default(), &Parameters::default(), &Limits::default()) {
         Err(PolicyError::Instantiate { message }) => {
             assert!(message.contains("sched_warm"), "{message}");
         }
@@ -478,7 +479,7 @@ fn limits_outside_the_build_config_are_refused() {
     let toy = Toy::new().reply(Call::Limits.export(), &wider);
     let module = PolicyModule::load(&engine, toy.wat().as_bytes()).unwrap();
 
-    match module.instantiate(&Init::default(), &Limits::default()) {
+    match module.instantiate(&Snapshot::default(), &Parameters::default(), &Limits::default()) {
         Err(PolicyError::BadLimits { message }) => {
             assert!(message.contains("max_batch"), "{message}");
         }
@@ -503,7 +504,7 @@ fn a_starvation_timeout_above_thirty_seconds_is_refused() {
     };
     let module = PolicyModule::load(&engine, toy.wat().as_bytes()).unwrap();
 
-    match module.instantiate(&Init::default(), &ceilings) {
+    match module.instantiate(&Snapshot::default(), &Parameters::default(), &ceilings) {
         Err(PolicyError::BadLimits { message }) => {
             assert!(message.contains("timeout"), "{message}");
         }
@@ -525,7 +526,7 @@ fn a_prefetch_floor_below_the_build_config_s_floor_is_refused() {
     let toy = Toy::new().reply(Call::Limits.export(), &sparing);
     let module = PolicyModule::load(&engine, toy.wat().as_bytes()).unwrap();
 
-    match module.instantiate(&Init::default(), &Limits::default()) {
+    match module.instantiate(&Snapshot::default(), &Parameters::default(), &Limits::default()) {
         Err(PolicyError::BadLimits { message }) => {
             assert!(message.contains("prefetch_min_tokens"), "{message}");
         }
@@ -579,7 +580,7 @@ fn a_precompiled_module_round_trips() {
     let artifact = engine.precompile(text.as_bytes()).unwrap();
     let module = engine.module(&artifact).unwrap();
     let mut policy = module
-        .instantiate(&Init::default(), &Limits::default())
+        .instantiate(&Snapshot::default(), &Parameters::default(), &Limits::default())
         .unwrap();
 
     assert_eq!(
@@ -596,6 +597,41 @@ fn bytes_that_are_not_a_module_are_rejected() {
         Err(other) => panic!("expected a load failure, got {other:?}"),
         Ok(_) => panic!("expected a load failure, got a module"),
     }
+}
+
+#[test]
+fn two_instances_of_one_module_are_independent() {
+    let engine = engine();
+    // The serving instance, the control thread's route instance and a trial
+    // instance during precopy are all made from one module (§4.4, §7.3): a
+    // failure of one must leave the others serving.
+    let plan = Plan {
+        admit: vec![RequestId(1)],
+        ..Plan::default()
+    };
+    let toy = Toy::new()
+        .body(Call::Observe.export(), "unreachable")
+        .reply(Call::Dispatch.export(), &plan);
+    let module = PolicyModule::load(&engine, toy.wat().as_bytes()).unwrap();
+    let mut failing = module
+        .instantiate(&Snapshot::default(), &Parameters::default(), &Limits::default())
+        .unwrap();
+    let mut serving = module
+        .instantiate(&Snapshot::default(), &Parameters::default(), &Limits::default())
+        .unwrap();
+
+    assert!(matches!(
+        failing.observe(&[]),
+        Err(PolicyError::Trap {
+            call: Call::Observe,
+            ..
+        })
+    ));
+    assert_eq!(
+        serving.dispatch(&Room::default()).unwrap().admit,
+        vec![RequestId(1)]
+    );
+    assert!(serving.failure().is_none());
 }
 
 #[test]

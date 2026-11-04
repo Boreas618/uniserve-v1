@@ -15,16 +15,16 @@
 use scheduling_guest::decision::{Plan, Room, Shortage, Victim};
 use scheduling_guest::event::Event;
 use scheduling_guest::ids::PageId;
-use scheduling_guest::limits::Limits;
-use scheduling_guest::policy::Init;
+use scheduling_guest::limits::{Limits, Parameters};
+use scheduling_guest::policy::Instantiation;
 use scheduling_guest::view::{
-    CallView, ExpertLoad, ExpertOrder, RankView, ReplicaView, RequestView,
+    CallView, ExpertLoad, ExpertOrder, RankView, ReplicaView, RequestView, Snapshot,
 };
 use scheduling_guest::wire::{self, Call};
 use wasmtime::{Instance, Memory, Store, Trap, TypedFunc};
 
-use crate::Engine;
 use crate::error::PolicyError;
+use crate::Engine;
 
 /// Fuel one call may consume unless the mechanism gives another budget.
 ///
@@ -131,17 +131,20 @@ where
 }
 
 impl PolicyInstance {
-    /// Instantiates `module`, drives `init` with `init`, reads the policy's
-    /// limits once and checks them against the build config's `ceilings`.
+    /// Instantiates `module`, constructs the policy from the program's
+    /// `parameters`, drives `init` with `state`, and reads the policy's limits
+    /// once and checks them against the build config's `ceilings`.
     ///
-    /// A policy put in place of another starts here: `init` carries the program
-    /// arguments and the whole state, so it knows every request, cache page,
-    /// encoding and replica that already exists (§4.4). Its own soft state
-    /// starts empty, which is what makes a mid-flight swap well defined.
+    /// A policy put in place of another starts here: the program arguments
+    /// construct it and the whole state is its `init`, so it knows every
+    /// request, cache page, encoding and replica that already exists (§4.4).
+    /// Its own soft state starts empty, which is what makes a mid-flight swap
+    /// well defined.
     pub(crate) fn new(
         engine: &Engine,
         module: &wasmtime::Module,
-        init: &Init,
+        state: &Snapshot,
+        parameters: &Parameters,
         ceilings: &Limits,
     ) -> Result<Self, PolicyError> {
         let mut store = Store::new(engine.inner(), ());
@@ -165,7 +168,11 @@ impl PolicyInstance {
             fuel_consumed: 0,
             failed: None,
         };
-        policy.initialize(init)?;
+        let instantiation = Instantiation {
+            parameters: parameters.clone(),
+            state: state.clone(),
+        };
+        policy.initialize(&instantiation)?;
         policy.limits = policy.read_limits()?;
         crate::limits::check(&policy.limits, ceilings)?;
         Ok(policy)
@@ -206,7 +213,7 @@ impl PolicyInstance {
     // -- the decisions of §4.4, in the order a policy's life makes them ------
 
     /// `init`, called once at instantiation. Answers nothing.
-    fn initialize(&mut self, init: &Init) -> Result<(), PolicyError> {
+    fn initialize(&mut self, init: &Instantiation) -> Result<(), PolicyError> {
         self.run(Call::Init, |policy| {
             let message = encode(Call::Init, init)?;
             let _ = policy.send(Call::Init, &message)?;
