@@ -176,6 +176,14 @@ impl Store {
     /// `.committed` mark is written last, so a reader never finds a module
     /// that is partly written.
     pub fn publish(&self, path: &ModulePath, workspace: &Path, files: &[String]) -> Result<()> {
+        for name in files {
+            if !is_relative_name(name) {
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{name:?} is not a path inside a module directory"),
+                )));
+            }
+        }
         let destination = self.roots[0].path.join(path.relative());
         let parent = destination.parent().ok_or_else(|| {
             Error::Io(io::Error::new(
@@ -279,6 +287,14 @@ pub struct StoreFile {
     /// or `tuning/tactics.json`.
     pub name: String,
     pub path: PathBuf,
+}
+
+/// Whether a build's file name is a path inside the module directory:
+/// relative, and every component a name.
+fn is_relative_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('/')
+        && name.split('/').all(|component| is_name(component))
 }
 
 /// Whether a store name is one path component: non-empty, no separator, and
