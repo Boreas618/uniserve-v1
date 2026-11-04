@@ -22,6 +22,7 @@ which is the one thing about its addressing that could silently be wrong.
 
 import argparse
 import importlib.util
+import pathlib
 import struct
 
 import torch
@@ -39,7 +40,8 @@ GROUND_TRUTH = ["befeb3c5", "c706d084", "4018f211", "3fb8095e"]
 
 def load_kernel(package):
     """The package's kernel, imported from its source directory."""
-    path = f"{package}/src/posterior.py"
+    del package  # the check's own location is the package's, wherever it is run from
+    path = pathlib.Path(__file__).resolve().parents[1] / "src" / "posterior.py"
     spec = importlib.util.spec_from_file_location("posterior_kernel", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
