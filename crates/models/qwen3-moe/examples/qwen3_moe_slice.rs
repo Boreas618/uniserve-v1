@@ -146,6 +146,9 @@ struct Args {
     /// Where a generated token id comes from: `nn::Sampler::greedy`, or a host argmax over the same
     /// row when the store has no program for the sampler's launches.
     greedy: Greedy,
+    /// The reference's greedy continuation, as JSON with an `ids` list: the run compares as it goes
+    /// and stops at the first step that differs, which is the step the defect is in.
+    expect: Option<PathBuf>,
 }
 
 /// Where a generated token id comes from.
@@ -185,6 +188,7 @@ impl Args {
         let mut scores = false;
         let mut generate = None;
         let mut greedy = Greedy::Sampler;
+        let mut expect = None;
         let mut words = std::env::args().skip(1);
         while let Some(word) = words.next() {
             let mut value = |name: &str| -> Result<String> {
@@ -238,6 +242,7 @@ impl Args {
                         Failure::message(format!("--generate takes a token count, not `{number}`"))
                     })?);
                 }
+                "--expect" => expect = Some(PathBuf::from(value("--expect")?)),
                 "--greedy" => {
                     let name = value("--greedy")?;
                     greedy = match name.as_str() {
@@ -271,14 +276,14 @@ impl Args {
                         "qwen3_moe_slice --stage weights|embedding|block|decode \
                          [--checkpoint PATH] [--store PATH] [--device N] [--layer N] \
                          [--tokens ID,ID,...] [--dump DIR] [--reference DIR] \
-                         [--substage normalized|attended|mlp_out] [--from NN] [--routing] [--generate N] [--greedy sampler|host]",
+                         [--substage normalized|attended|mlp_out] [--from NN] [--routing] [--generate N] [--greedy sampler|host] [--expect FILE]",
                     ));
                 }
                 other => {
                     return Err(Failure::message(format!(
                         "unknown argument `{other}`; expected --stage, --checkpoint, --store, \
                          --device, --layer, --tokens, --from, --substage, --routing, --scores, \
-                         --generate, --greedy, --dump or --reference"
+                         --generate, --greedy, --expect, --dump or --reference"
                     )));
                 }
             }
@@ -323,6 +328,11 @@ impl Args {
                  prompt's activations and no continuation, so the two would be different questions",
             ));
         }
+        if expect.is_some() && generate.is_none() {
+            return Err(Failure::message(
+                "--expect compares a generation step by step, so it needs --generate N",
+            ));
+        }
         if generate == Some(0) {
             return Err(Failure::message("--generate takes at least one token"));
         }
@@ -342,6 +352,7 @@ impl Args {
             scores,
             generate,
             greedy,
+            expect,
         })
     }
 }
@@ -1295,8 +1306,26 @@ fn generate(
         .transpose()?;
     let samples = Samples::reserve(arena, DType::I32, 1, false)?;
     let hidden_width = model.plan(1)?.hidden;
-    let mut row = prompt;
+    let expected = match args.expect.as_deref() {
+        Some(path) => Some(read_expectation(path, &args.tokens)?),
+        None => None,
+    };
     let start = u64::from(batch.num_tokens);
+    // The loop's arithmetic, stated once: step k appends the token at position `start + k`, writes
+    // the slot of that same position and carries a sequence length one past it. A position or a
+    // slot that drifts by one is invisible in an id list that happens to be right, and this is the
+    // line that makes the drift visible.
+    let last = start.saturating_add(u64::try_from(steps.saturating_sub(1)).unwrap_or(0));
+    println!(
+        "generate: step k (k = 0..{}) appends position {start}+k, writes slot {start}+k, \
+         seq_len {}+k; positions {start}..{last}, slots {start}..{last}, page capacity {capacity}",
+        steps.saturating_sub(1),
+        start.saturating_add(1),
+    );
+    let mut row = prompt;
+    let mut chosen_ids: Vec<i32> = Vec::with_capacity(steps);
+    let mut agreed = 0_usize;
+    let mut differed = false;
     for step in 0..steps {
         // The prompt's row answers the token at position `start`; a decode step's row answers the
         // one after it, so the position of this step's token is `start + step`.
@@ -1332,14 +1361,14 @@ fn generate(
                     chosen = theirs;
                 }
                 Err(error) => {
-                    // The store may have no program for the sampler's launches. The token is still
-                    // this run's answer, computed without a launch, and the missing key is named by
-                    // the store's own error rather than guessed here.
-                    println!(
-                        "generate: step {}: the sampler path did not run ({error}); the host argmax \
-                         stands",
+                    // A decode answers through `greedy` or it does not answer: a host argmax here
+                    // would produce an id list that cannot say which path chose it, and a decode
+                    // run is the only evidence the decode path has.
+                    return Err(Failure::message(format!(
+                        "generate: step {}: the sampler path did not run ({error}); pass \
+                         `--greedy host` to ask for the host argmax deliberately",
                         step + 1
-                    );
+                    )));
                 }
             }
         }
@@ -1353,6 +1382,7 @@ fn generate(
         for (token, logprob) in &best {
             println!("  {token}\t{logprob:.6}");
         }
+        chosen_ids.push(chosen);
         if let Some(dir) = args.dump.as_deref() {
             let file = dir.join(format!("logits_step_{:02}.npy", step + 1));
             write_npy(&file, &row, 1, vocabulary)?;
@@ -1361,6 +1391,29 @@ fn generate(
                 file.display(),
                 step + 1
             );
+        }
+        // The comparison is the measurement: a list that differs says nothing about where, and the
+        // first differing step names the launch the defect is in - step 0 is the prefill's own
+        // answer, step 1 is the decode's first launch, and a later step is the slot or the page.
+        if let Some(expected) = expected.as_deref() {
+            match expected.get(step) {
+                Some(want) if *want == chosen => agreed += 1,
+                Some(want) => {
+                    differed = true;
+                    println!(
+                        "generate: FIRST DIFFERENCE at step {step} (position {position}): chose \
+                         {chosen}, the reference chose {want}; {} of {steps} steps agree before it",
+                        step
+                    );
+                    println!("generate: step {step}'s top-5, on our row:");
+                    for (token, logprob) in &best {
+                        println!("  {token}\t{logprob:.6}");
+                    }
+                    arena.release(mark);
+                    break;
+                }
+                None => {}
+            }
         }
         if step + 1 == steps {
             arena.release(mark);
@@ -1398,7 +1451,84 @@ fn generate(
         row = download_f32(stream, logits, vocabulary)?;
         arena.release(mark);
     }
+    // One line, so a reader or a `diff` sees the whole continuation at once.
+    let ids = chosen_ids
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    println!("generate: ids {ids}");
+    match expected.as_deref() {
+        Some(expected) => {
+            let total = expected.len().min(steps);
+            if differed {
+                println!(
+                    "generate: {agreed} of {total} steps agree with the reference before the first \
+                     difference; the steps after it were not run"
+                );
+            } else {
+                println!("generate: all {total} steps agree with the reference");
+            }
+        }
+        None => println!(
+            "generate: {} tokens, no reference to compare against (pass --expect <file>)",
+            chosen_ids.len()
+        ),
+    }
     Ok(())
+}
+
+/// Read a reference continuation: JSON with an `ids` list, and the prompt it continues.
+///
+/// The prompt is the reason this file can be compared at all: a continuation of another prompt is a
+/// different question, and an id list that differs then says nothing about the model.
+fn read_expectation(path: &std::path::Path, tokens: &str) -> Result<Vec<i32>> {
+    let text = std::fs::read_to_string(path).map_err(|error| {
+        Failure::message(format!(
+            "reading the expectation {}: {error}",
+            path.display()
+        ))
+    })?;
+    let list = |key: &str| -> Option<Vec<i32>> {
+        let at = text.find(&format!("\"{key}\""))?;
+        let open = text[at..].find('[').map(|offset| offset + at)?;
+        let close = text[open..].find(']').map(|offset| offset + open)?;
+        Some(
+            text[open + 1..close]
+                .split(',')
+                .filter_map(|part| part.trim().parse().ok())
+                .collect(),
+        )
+    };
+    if let (Some(theirs), prompt) = (list("prompt_ids"), tokens) {
+        let ours: Vec<i32> = prompt
+            .split(',')
+            .filter_map(|part| part.trim().parse().ok())
+            .collect();
+        if !theirs.is_empty() && !ours.is_empty() && theirs != ours {
+            return Err(Failure::message(format!(
+                "{} continues a {} token prompt and this run's --tokens names {}: a continuation of \
+                 another prompt would disagree from the first step and say nothing about the \
+                 decode",
+                path.display(),
+                theirs.len(),
+                ours.len()
+            )));
+        }
+    }
+    let ids = list("ids").ok_or_else(|| {
+        Failure::message(format!(
+            "{} holds no `\"ids\": [...]` list to compare against",
+            path.display()
+        ))
+    })?;
+    if ids.is_empty() {
+        return Err(Failure::message(format!(
+            "{} holds an empty `ids` list",
+            path.display()
+        )));
+    }
+    Ok(ids)
 }
 
 /// The two numbers a continuation's batch must satisfy, checked before it is built.
