@@ -104,8 +104,16 @@ def main() -> int:
         f"_order_{arguments.order}_epilogue_{arguments.epilogue}_k_{arguments.k}"
     )
     print(f"descriptor: {key}")
-    if arguments.expect_key is not None and arguments.expect_key != key:
-        parser.error(f"the flags name {key}, not {arguments.expect_key}")
+    # The directory `resolve` hands a runner is named by the descriptor the module was
+    # built for, so the flags are held against it: a check that tested its own defaults
+    # against a module built for other flags would report a kernel defect that is not one.
+    named = arguments.expect_key or (
+        arguments.module.name if "_order_" in arguments.module.name else None
+    )
+    if named is not None and named != key:
+        parser.error(
+            f"the flags name {key}, and the module was built for {named}"
+        )
 
     library = ctypes.CDLL(str(arguments.module / "module.so"))
     entry = library.uniserve_gemm
@@ -142,7 +150,12 @@ def main() -> int:
     )
 
     with torch.no_grad():
-        expected = x.double() @ weight.double()
+        # `kxn` stores the weight `[k, n]` and contracts its rows; `nxk` stores it
+        # `[n, k]`, so the reference takes the transposed product.
+        stored = (
+            weight.double() if arguments.order == "kxn" else weight.double().T
+        )
+        expected = x.double() @ stored
         expected *= arguments.alpha
         if bias is not None:
             expected += bias.double()

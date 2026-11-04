@@ -19,7 +19,9 @@ it installs:
 - ``CACHE``: set only the cache length (a prefill without a sample).
 
 Only rows that sampled write the next input token, the predicate and the
-positions; every row writes the cache length. Penalty counts accumulate through
+positions; every row that has a slot writes the cache length. A row whose slot is
+``-1`` is padding: it touches no slot state, not even its lengths, because ``-1``
+addresses the element before each tensor. Penalty counts accumulate through
 an atomic add, weighted by whether the selection is valid and active, so
 speculation counts only its final emitted token. A row's token relay carries the
 continuation in bit 31 and the token in the low 31 bits.
@@ -99,11 +101,17 @@ def _slot_commit_kernel(
     selected_active = tl.load(active + selected, mask=sampled, other=0) != 0
     weight = (selected_valid & selected_active).to(tl.int32)
 
+    # A row without a destination — `slot = -1`, the padding sentinel — touches no
+    # slot state at all, and that includes its three lengths: the reads are masked as
+    # well as the stores, because `slot = -1` addresses the element *before* each
+    # tensor. `dedicated` is the whole reason a warm batch can be recorded, so it is
+    # one condition used by every load and store of the slot's state.
+    dedicated = mask & (slot >= 0)
     decode = mode == DECODE
     verify = mode == VERIFY
-    cache = tl.load(verified + slot, mask=mask, other=0)
-    position = tl.load(logical + slot, mask=mask, other=0)
-    sampling_position = tl.load(sampling + slot, mask=mask, other=0)
+    cache = tl.load(verified + slot, mask=dedicated, other=0)
+    position = tl.load(logical + slot, mask=dedicated, other=0)
+    sampling_position = tl.load(sampling + slot, mask=dedicated, other=0)
     cache = tl.where(
         decode,
         cache + 1,
@@ -118,16 +126,16 @@ def _slot_commit_kernel(
         tl.where(verify, host_sampling + accepted, host_sampling),
     )
 
-    tl.store(verified + slot, cache.to(VERIFIED), mask=mask)
-    tl.store(future + slot * FUTURE_STRIDE, token, mask=sampled)
-    tl.store(predicates + slot, carries, mask=sampled)
-    tl.store(logical + slot, position, mask=sampled)
-    tl.store(sampling + slot, sampling_position, mask=sampled)
+    tl.store(verified + slot, cache.to(VERIFIED), mask=dedicated)
+    tl.store(future + slot * FUTURE_STRIDE, token, mask=sampled & dedicated)
+    tl.store(predicates + slot, carries, mask=sampled & dedicated)
+    tl.store(logical + slot, position, mask=sampled & dedicated)
+    tl.store(sampling + slot, sampling_position, mask=sampled & dedicated)
     # The penalty counts are the one field two rows could share: the add is
     # atomic so a step that installs two tokens of one slot to the same word
     # still sums both weights.
     tl.atomic_add(
         penalties + slot.to(tl.int64) * VOCAB + token,
         weight,
-        mask=sampled & (counts_penalty != 0),
+        mask=sampled & dedicated & (counts_penalty != 0),
     )
