@@ -250,7 +250,7 @@ fn a_parked_block_changes_access_in_place_and_keeps_its_address() {
     let block = allocator.allocate(PoolKind::Resident, 4096).unwrap();
     let address = block.address();
     let pattern: Vec<u8> = (0..16).map(|index| index as u8 + 1).collect();
-    let host = platform::PinnedBuffer::new(DEVICE, 16).unwrap();
+    let mut host = platform::PinnedBuffer::new(DEVICE, 16).unwrap();
     // SAFETY: the host buffer is written before the copy and read after the
     // synchronization.
     unsafe { host.as_mut_slice() }.copy_from_slice(&pattern);
