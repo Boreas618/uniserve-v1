@@ -152,19 +152,33 @@ def wait_health(
     )
 
 
+def _serves_a_deployment(args: list[str]) -> bool:
+    """Whether `args` starts a deployment: the `serve` subcommand of the one
+    executable.
+
+    The subcommand is the second word. `uniserve program-server serve` and
+    `uniserve storage serve` are other commands: `serve` is theirs too, and they
+    take no deployment options.
+    """  # noqa: D205
+    return len(args) > 1 and args[1] == "serve"
+
+
 def start_server(
     args: list[str], log_path: Path, env: dict[str, str] | None = None
 ) -> subprocess.Popen[str]:
     """Start `args` in a session of its own, its output to `log_path`.
 
-    A `serve` command that sizes no host KV cache
-    (``kv_cache_config.host_*``) holds `HOST_CACHE_GIB` of it, and every
-    `serve` command adds `E2E_SET`.
+    A deployment that sizes no host KV cache (``kv_cache_config.host_*``) holds
+    `HOST_CACHE_GIB` of it, and every deployment adds `E2E_SET`.
     """
-    sized = any("kv_cache_config.host_" in arg for arg in args)
-    if "serve" in args and not sized:
-        args = [*args, "--set", f"kv_cache_config.host_gib={HOST_CACHE_GIB}"]
-    if "serve" in args:
+    if _serves_a_deployment(args):
+        sized = any("kv_cache_config.host_" in arg for arg in args)
+        if not sized:
+            args = [
+                *args,
+                "--set",
+                f"kv_cache_config.host_gib={HOST_CACHE_GIB}",
+            ]
         for assignment in E2E_SET:
             args = [*args, "--set", assignment]
     log_path.parent.mkdir(parents=True, exist_ok=True)
