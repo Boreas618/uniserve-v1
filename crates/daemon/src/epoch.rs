@@ -27,6 +27,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use proto::request::ModelDtype;
+use program_server::{PhaseKind, Program, ProgramSlot};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -34,49 +35,89 @@ use crate::options::{
     CudaGraphOptions, KvCacheOptions, LoadOptions, ServeConfig, VideoOptions, WorkerOptions,
 };
 
-/// A program the epoch fills an operator or the scheduling interface with:
-/// the backend's name, the revision of its package the upstream Program
-/// Server numbered, and its parameters (§5.1).
+/// The operator names the epoch record keys its kernel programs by (§5.1,
+/// §5.2), of the operators whose backend a configuration selects. They are
+/// `crates/ops`'s `Op::NAME` of the same operator, so the daemon, the
+/// Program Server and the main process cannot disagree about a slot's name.
 ///
-/// The Rust type is `crates/program-server`'s `Program`; the programs swarm
-/// owns it, and the daemon uses its wire form until that crate lands. The
-/// wire form is the same three values, so nothing but the type name changes
-/// then.
-pub type Program = proto::process::Program;
+/// The complete slot set is `crates/ops`'s operator names. The rest are
+/// filled by the epoch's programs like any other slot and need no entry
+/// here: their backend is not a configuration field, so this module names
+/// only the operators the configuration selects a backend for. The
+/// scheduling interface is not an operator at all: its program is the epoch
+/// record's `policy` field.
+pub mod operators {
+    use ops::Op as _;
 
-/// The phase of an operator's calls a kernel program fills. An operator is
-/// filled once for all its phases unless the configuration fills it per
-/// phase, which attention allows (§5.2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum PhaseKind {
-    /// Prompt processing.
-    Prefill,
-    /// One token of a request in progress.
-    Decode,
+    /// Paged attention, the operator `attention_backend` and the per-phase
+    /// attention fields select a backend for (§4.2, §9).
+    pub const PAGED_ATTENTION: &str = ops::attention::PagedAttention::NAME;
+    /// The grouped expert GEMM's gather and compute, the operator
+    /// `moe_runner_backend` selects a backend for (§5.1, §9). The grouped
+    /// experts are two operators, and one program backend fills both.
+    pub const GATHER_GEMM: &str = ops::moe::GatherGemm::NAME;
+    /// The grouped expert GEMM's route and combine, filled by the same
+    /// program backend as [`GATHER_GEMM`].
+    pub const ROUTE_GEMM: &str = ops::moe::RouteGemm::NAME;
+    /// The expert exchange around the grouped expert GEMM, the operator
+    /// `moe_config.exchange` selects a backend for (§9).
+    pub const EXPERT_EXCHANGE: &str = ops::moe::ExpertExchange::NAME;
 }
 
-impl PhaseKind {
-    /// The wire form of this phase.
-    pub fn to_wire(self) -> proto::process::PhaseKind {
-        match self {
-            Self::Prefill => proto::process::PhaseKind::Prefill,
-            Self::Decode => proto::process::PhaseKind::Decode,
-        }
-    }
 
-    /// The phase `wire` names; `None` for the unspecified value, which a
-    /// `KernelProgram` leaves absent for an operator filled for every face.
-    pub fn from_wire(wire: proto::process::PhaseKind) -> Option<Self> {
-        match wire {
-            proto::process::PhaseKind::Prefill => Some(Self::Prefill),
-            proto::process::PhaseKind::Decode => Some(Self::Decode),
-            proto::process::PhaseKind::Unspecified => None,
-        }
+/// The key an epoch's programs are stored under: the operator, and the
+/// phase when the configuration fills it per phase (§5.2). Programs and
+/// slots are `crates/program-server`'s types, which the daemon, the main
+/// process and the Program Server all name programs with (§5.1).
+pub type KernelKey = ProgramSlot;
+
+/// One program as the process interface's wire form: its parameters as the
+/// TOML text of each value, so a main process of another build reads each
+/// back as the value it was (§5.1).
+pub fn program_to_wire(program: &Program) -> proto::process::Program {
+    proto::process::Program {
+        backend: program.backend.clone(),
+        revision: program.revision,
+        arguments: program
+            .arguments
+            .iter()
+            .map(|(key, value)| (key.clone(), value.to_string()))
+            .collect(),
     }
 }
 
-/// What one operator is filled with, or which phases of it.
-pub type KernelKey = (String, Option<PhaseKind>);
+/// The program `wire` states, its parameters read back as TOML values.
+pub fn program_from_wire(wire: proto::process::Program) -> Program {
+    Program {
+        backend: wire.backend,
+        revision: wire.revision,
+        arguments: wire
+            .arguments
+            .into_iter()
+            .map(|(key, value)| {
+                let value = value.parse::<toml::Value>().unwrap_or(toml::Value::String(value));
+                (key, value)
+            })
+            .collect(),
+    }
+}
+
+/// One operator's program as the `Precopy` command states it (§7.3 step 2).
+pub fn kernel_to_wire(slot: &KernelKey, program: &Program) -> proto::process::KernelProgram {
+    proto::process::KernelProgram {
+        op: slot.op.clone(),
+        phase: slot.phase.map(|phase| {
+            let phase = match phase {
+                PhaseKind::Prefill => proto::process::PhaseKind::Prefill,
+                PhaseKind::Decode => proto::process::PhaseKind::Decode,
+                PhaseKind::Encode => proto::process::PhaseKind::Encode,
+                PhaseKind::Denoise => proto::process::PhaseKind::Denoise,
+            };
+            phase as i32
+        }),
+        program: Some(program_to_wire(program)),
+    }
+}
 
 /// The values that build a main process: every one of them is a value a new
 /// epoch must be built for, and no other change is (§7.1, §7.7).
@@ -433,8 +474,8 @@ impl Epochs {
     }
 
     /// The epochs and the process table as `GET /admin/config` reports
-    /// them: the records of §5.1, with the programs in the wire form the
-    /// daemon records, and one entry per process the daemon manages.
+    /// them: the records of §5.1, with the programs in the form the daemon
+    /// records, and one entry per process the daemon manages.
     pub fn report(&self) -> Value {
         let epochs = locked(&self.records)
             .iter()
@@ -448,19 +489,16 @@ impl Epochs {
     }
 }
 
-/// One epoch record as JSON: the programs by operator and phase, the
-/// previous generation, and the status, as the design names them.
+/// One epoch record as JSON: the build config, the programs by operator and
+/// phase, the previous generation, and the status, as the design names them.
 fn record_report(record: &EpochRecord) -> Value {
     let kernels = record
         .kernels
         .iter()
-        .map(|((op, phase), program)| {
+        .map(|(slot, program)| {
             serde_json::json!({
-                "op": op,
-                "phase": phase.map(|phase| match phase {
-                    PhaseKind::Prefill => "prefill",
-                    PhaseKind::Decode => "decode",
-                }),
+                "op": slot.op,
+                "phase": slot.phase.map(PhaseKind::as_str),
                 "program": program_report(program),
             })
         })
@@ -468,13 +506,10 @@ fn record_report(record: &EpochRecord) -> Value {
     let previous = record
         .previous_kernels
         .iter()
-        .map(|((op, phase), program)| {
+        .map(|(slot, program)| {
             serde_json::json!({
-                "op": op,
-                "phase": phase.map(|phase| match phase {
-                    PhaseKind::Prefill => "prefill",
-                    PhaseKind::Decode => "decode",
-                }),
+                "op": slot.op,
+                "phase": slot.phase.map(PhaseKind::as_str),
                 "program": program_report(program),
             })
         })
@@ -539,22 +574,6 @@ fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// only the operators the configuration selects a backend for. The
 /// scheduling interface is not an operator at all: its program is the epoch
 /// record's `policy` field.
-pub mod operators {
-    /// Paged attention, the operator `attention_backend` and the per-phase
-    /// attention fields select a backend for (§4.2, §9).
-    pub const PAGED_ATTENTION: &str = "paged_attention";
-    /// The grouped expert GEMM's gather and compute, the operator
-    /// `moe_runner_backend` selects a backend for (§5.1, §9). The grouped
-    /// experts are two operators, and one program backend fills both.
-    pub const GATHER_GEMM: &str = "gather_gemm";
-    /// The grouped expert GEMM's route and combine, filled by the same
-    /// program backend as [`GATHER_GEMM`].
-    pub const ROUTE_GEMM: &str = "route_gemm";
-    /// The expert exchange around the grouped expert GEMM, the operator
-    /// `moe_config.exchange` selects a backend for (§9).
-    pub const EXPERT_EXCHANGE: &str = "expert_exchange";
-}
-
 /// The programs a configuration fills, by operator and phase, and the
 /// scheduling interface's (§5.1, §5.2).
 ///
@@ -579,11 +598,11 @@ impl FilledPrograms {
         let attention = attention_programs(config);
         kernels.extend(attention);
         kernels.insert(
-            (operators::EXPERT_EXCHANGE.to_owned(), None),
+            KernelKey::all(operators::EXPERT_EXCHANGE),
             Program {
                 backend: word(&config.moe_config.exchange),
                 revision: 0,
-                arguments: HashMap::new(),
+                arguments: toml::Table::new(),
             },
         );
         if let Some(backend) = &config.moe_runner_backend {
@@ -591,11 +610,11 @@ impl FilledPrograms {
             // and one program backend fills both (§9).
             for operator in [operators::GATHER_GEMM, operators::ROUTE_GEMM] {
                 kernels.insert(
-                    (operator.to_owned(), None),
+                    KernelKey::all(operator),
                     Program {
                         backend: backend.clone(),
                         revision: 0,
-                        arguments: HashMap::new(),
+                        arguments: toml::Table::new(),
                     },
                 );
             }
@@ -626,7 +645,7 @@ fn attention_programs(config: &ServeConfig) -> Vec<(KernelKey, Program)> {
     let arguments = || toml_arguments(&config.flashinfer_config);
     if prefill == decode {
         return vec![(
-            (operators::PAGED_ATTENTION.to_owned(), None),
+            KernelKey::all(operators::PAGED_ATTENTION),
             Program {
                 backend: prefill,
                 revision: 0,
@@ -636,7 +655,7 @@ fn attention_programs(config: &ServeConfig) -> Vec<(KernelKey, Program)> {
     }
     vec![
         (
-            (operators::PAGED_ATTENTION.to_owned(), Some(PhaseKind::Prefill)),
+            KernelKey::phase(operators::PAGED_ATTENTION, PhaseKind::Prefill),
             Program {
                 backend: prefill,
                 revision: 0,
@@ -644,7 +663,7 @@ fn attention_programs(config: &ServeConfig) -> Vec<(KernelKey, Program)> {
             },
         ),
         (
-            (operators::PAGED_ATTENTION.to_owned(), Some(PhaseKind::Decode)),
+            KernelKey::phase(operators::PAGED_ATTENTION, PhaseKind::Decode),
             Program {
                 backend: decode,
                 revision: 0,
@@ -657,7 +676,7 @@ fn attention_programs(config: &ServeConfig) -> Vec<(KernelKey, Program)> {
 /// The scheduling program's parameters: the values §7.7 assigns to the
 /// scheduling policy, which decides with them inside the build config's
 /// bounds (§4.4).
-fn policy_arguments(config: &ServeConfig) -> HashMap<String, String> {
+fn policy_arguments(config: &ServeConfig) -> toml::Table {
     #[derive(Serialize)]
     struct Arguments {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -690,17 +709,13 @@ fn policy_arguments(config: &ServeConfig) -> HashMap<String, String> {
     toml_arguments(&arguments)
 }
 
-/// `value`'s fields as the TOML key/value strings a program's arguments
-/// carry (the wire form of `Program.arguments`, §5.1): a main process of
-/// another build reads each value back as the TOML value it was. Values the
-/// field's serialization leaves out, such as an unset option, are absent.
-fn toml_arguments<T: Serialize>(value: &T) -> HashMap<String, String> {
+/// `value`'s fields as the TOML table a program's arguments carry (§5.1).
+/// Values the field's serialization leaves out, such as an unset option, are
+/// absent.
+fn toml_arguments<T: Serialize>(value: &T) -> toml::Table {
     match toml::Value::try_from(value) {
-        Ok(toml::Value::Table(table)) => table
-            .into_iter()
-            .map(|(key, value)| (key, value.to_string()))
-            .collect(),
-        _ => HashMap::new(),
+        Ok(toml::Value::Table(table)) => table,
+        _ => toml::Table::new(),
     }
 }
 
@@ -802,7 +817,7 @@ mod tests {
         Program {
             backend: backend.to_owned(),
             revision: 1,
-            arguments: std::collections::HashMap::new(),
+            arguments: toml::Table::new(),
         }
     }
 
@@ -811,7 +826,7 @@ mod tests {
         let config = ServeConfig::default();
         EpochRecord {
             build_config: BuildConfig::of(&config),
-            kernels: BTreeMap::from([(("rms_norm".to_owned(), None), program("triton"))]),
+            kernels: BTreeMap::from([(KernelKey::all("rms_norm"), program("triton"))]),
             policy: program("fcfs"),
             previous_kernels: BTreeMap::new(),
             previous_policy: None,
@@ -978,16 +993,16 @@ mod tests {
         // One attention program for every phase, the expert exchange's
         // backend, and no grouped expert GEMM until the configuration names
         // one: prepare resolves it (§5.1).
-        let attention = &programs.kernels[&(operators::PAGED_ATTENTION.to_owned(), None)];
+        let attention = &programs.kernels[&KernelKey::all(operators::PAGED_ATTENTION)];
         assert_eq!(attention.backend, "auto");
         assert_eq!(attention.revision, 0, "no revision before prepare");
         assert_eq!(
-            programs.kernels[&(operators::EXPERT_EXCHANGE.to_owned(), None)].backend,
+            programs.kernels[&KernelKey::all(operators::EXPERT_EXCHANGE)].backend,
             "alltoall"
         );
         for operator in [operators::GATHER_GEMM, operators::ROUTE_GEMM] {
             assert!(
-                !programs.kernels.contains_key(&(operator.to_owned(), None)),
+                !programs.kernels.contains_key(&KernelKey::all(operator)),
                 "an operator the configuration does not fill is absent"
             );
         }
@@ -997,7 +1012,7 @@ mod tests {
         assert_eq!(programs.policy.backend, "fcfs");
         assert_eq!(
             programs.policy.arguments["max_batch"],
-            NonZeroUsize::new(128).unwrap().get().to_string()
+            toml::Value::Integer(128)
         );
         let scheduler = SchedulerOptions {
             max_queued_requests: NonZeroUsize::new(16),
@@ -1009,10 +1024,22 @@ mod tests {
         stated.max_num_batched_tokens = NonZeroUsize::new(4096);
         stated.speculative_config.expected_speedup = Some(2.5);
         let programs = FilledPrograms::of(&stated);
-        assert_eq!(programs.policy.arguments["chunked_prefill_size"], "2048");
-        assert_eq!(programs.policy.arguments["max_queued_requests"], "16");
-        assert_eq!(programs.policy.arguments["max_num_batched_tokens"], "4096");
-        assert_eq!(programs.policy.arguments["expected_speedup"], "2.5");
+        assert_eq!(
+            programs.policy.arguments["chunked_prefill_size"],
+            toml::Value::Integer(2048)
+        );
+        assert_eq!(
+            programs.policy.arguments["max_queued_requests"],
+            toml::Value::Integer(16)
+        );
+        assert_eq!(
+            programs.policy.arguments["max_num_batched_tokens"],
+            toml::Value::Integer(4096)
+        );
+        assert_eq!(
+            programs.policy.arguments["expected_speedup"],
+            toml::Value::Float(2.5)
+        );
 
         // Per-phase attention: two entries, each naming its phase, once the
         // fields state different backends.
@@ -1021,14 +1048,14 @@ mod tests {
         split.decode_attention_backend = Some("trtllm".to_owned());
         let programs = FilledPrograms::of(&split);
         let prefill =
-            &programs.kernels[&(operators::PAGED_ATTENTION.to_owned(), Some(PhaseKind::Prefill))];
+            &programs.kernels[&KernelKey::phase(operators::PAGED_ATTENTION, PhaseKind::Prefill)];
         let decode =
-            &programs.kernels[&(operators::PAGED_ATTENTION.to_owned(), Some(PhaseKind::Decode))];
+            &programs.kernels[&KernelKey::phase(operators::PAGED_ATTENTION, PhaseKind::Decode)];
         assert_eq!((prefill.backend.as_str(), decode.backend.as_str()), ("fa4", "trtllm"));
         assert!(
             !programs
                 .kernels
-                .contains_key(&(operators::PAGED_ATTENTION.to_owned(), None)),
+                .contains_key(&KernelKey::all(operators::PAGED_ATTENTION)),
             "a per-phase fill covers no whole operator"
         );
 
@@ -1037,7 +1064,7 @@ mod tests {
         one.prefill_attention_backend = Some("fa4".to_owned());
         let programs = FilledPrograms::of(&one);
         assert_eq!(
-            programs.kernels[&(operators::PAGED_ATTENTION.to_owned(), None)].backend,
+            programs.kernels[&KernelKey::all(operators::PAGED_ATTENTION)].backend,
             "fa4"
         );
 
@@ -1047,7 +1074,7 @@ mod tests {
         let programs = FilledPrograms::of(&moe);
         for operator in [operators::GATHER_GEMM, operators::ROUTE_GEMM] {
             assert_eq!(
-                programs.kernels[&(operator.to_owned(), None)].backend,
+                programs.kernels[&KernelKey::all(operator)].backend,
                 "cutlass"
             );
         }
@@ -1155,7 +1182,7 @@ mod tests {
         let mut second = record();
         second.status = Status::Precopy;
         second.kernels.insert(
-            ("paged_attention".to_owned(), Some(PhaseKind::Decode)),
+            KernelKey::phase(operators::PAGED_ATTENTION, PhaseKind::Decode),
             program("trtllm"),
         );
         epochs.record(2, second);
