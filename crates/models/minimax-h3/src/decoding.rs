@@ -371,6 +371,12 @@ pub struct ClipDecoder {
 }
 
 impl ClipDecoder {
+    /// The blends this stitch compiles: one module per seam width the grid can produce, on both
+    /// axes. A walk states each one's program without a device.
+    pub fn blends(&self) -> &[(u32, u32, CrossFade)] {
+        &self.blends
+    }
+
     /// The output path of `canvas`, whose tiles the caller decodes in [`Tile`] order.
     pub fn new(config: &VideoVaeConfig, dtype: DType) -> Result<Self> {
         let spatial = config.spatial_compression();

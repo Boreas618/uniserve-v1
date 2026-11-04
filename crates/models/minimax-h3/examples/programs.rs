@@ -22,6 +22,7 @@ use std::path::PathBuf;
 use minimax_h3::audio_vae::AudioDecoder;
 use minimax_h3::config::{AudioVaeConfig, VideoVaeConfig};
 use minimax_h3::output::VideoPostprocessor;
+use minimax_h3::video_vae::VideoDecoder;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args().skip(1);
@@ -91,7 +92,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // element type, which the video VAE's config states.
     let vae = root.join("vae/config.json");
     if vae.exists() {
-        let _config = VideoVaeConfig::parse(&read(&vae)?)?;
+        let config = VideoVaeConfig::parse(&read(&vae)?)?;
+        rows.extend(VideoDecoder::programs(&config, dtype)?);
         rows.extend(VideoPostprocessor::programs(dtype, &rasters));
     } else {
         eprintln!("not walked: {} has no video VAE config", root.display());

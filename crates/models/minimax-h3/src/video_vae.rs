@@ -708,6 +708,122 @@ pub fn folded_input(
 }
 
 impl VideoDecoder {
+    /// The programs one clip's decode of `config` launches.
+    ///
+    /// Stated from the configuration alone, because a deployment compiles its store before it opens
+    /// the checkpoint: the geometry is the config's and the element type is the checkpoint's (the
+    /// design's `dtype = "auto"` converts nothing). **No extent enters a key**: a clip's token count is
+    /// a launch value the dense attention and the normalizations read position by position, so one
+    /// program serves every raster — which is why this takes no bucket set while the post-processor,
+    /// whose blend is keyed by its pixel count, does. Every projection carries a bias and every
+    /// residual its projection's, as the checkpoint's mapping states.
+    pub fn programs(config: &VideoVaeConfig, dtype: DType) -> Result<Vec<(String, String)>> {
+        use crate::programs::Programs;
+        use ops::activation::ValueFirstSwiglu as SwigluOp;
+        use ops::attention::dense::DenseAttention;
+        use ops::cross_fade::CrossFade as CrossFadeOp;
+        use ops::gemm::Gemm;
+        use ops::norm::LayerNorm as LayerNormOp;
+        use ops::norm::RmsNorm as RmsNormOp;
+        use ops::residual::ScaledResidual as ResidualOp;
+        use ops::rope::{QkNormRope, RotaryFactors};
+        use ops::rows::{self, Rows as RowsOp};
+        use nn::layers::UnpatchifyVideo;
+        use ops::unpatchify::Unpatchify;
+
+        let (head, heads) = (
+            config.decoder_attention_head_dim,
+            config.decoder_num_attention_heads,
+        );
+        let width = heads * head;
+        let ffn = width * config.decoder_ffn_mult;
+        let spatial = config.spatial_compression().max(1);
+        let patch = config.out_channels * config.temporal_compression() * spatial * spatial;
+        let (rotated, sections) = rotary(config)?;
+        let sections = nn::layers::Sections::new(&sections)?;
+        let bias = true;
+
+        let mut programs = Programs::default();
+
+        // The clip's latents in, the clip's pixels out.
+        for k in [config.latent_channels, width, ffn, width, patch] {
+            programs.launch::<Gemm>(&Linear::descriptor_of(
+                k,
+                dtype,
+                WeightOrder::NxK,
+                bias,
+                dtype,
+                dtype,
+            ));
+        }
+
+        // The three placements into the token stream: every row-major gather is one program.
+        programs.launch::<RowsOp>(&Rows::descriptor_of(dtype, rows::Mode::Replace, width));
+
+        // The rotation's table once, then its application in every layer.
+        programs.launch::<RotaryFactors>(&Rotary::factors_descriptor_of(
+            rotated,
+            1.0,
+            Some(sections),
+            DType::F32,
+        ));
+        programs.launch::<QkNormRope>(&Rotary::apply_descriptor_of(
+            head,
+            heads,
+            heads,
+            Rotation::Half,
+            config.decoder_norm_eps,
+            rotated,
+            dtype,
+            dtype,
+            // The checkpoint stores no per-head normalization weight, which is what its absence means.
+            false,
+        ));
+
+        // The layer's two halves: their normalization, the residual each projection folds into, and
+        // the gated feed-forward's packed activation.
+        programs.launch::<RmsNormOp>(&RmsNorm::descriptor_of(width, dtype));
+        programs.launch::<ResidualOp>(&ScaledResidual::descriptor_of(dtype, u64::from(width), bias)?);
+        programs.launch::<SwigluOp>(&PackedSwiGlu::descriptor_of(
+            dtype,
+            u64::from(ffn),
+            2 * u64::from(ffn),
+            bias,
+            false,
+        )?);
+
+        // The output path: the final normalization, the projection to pixels, and the stitch's
+        // unpatchify and its blends.
+        programs.launch::<LayerNormOp>(&LayerNorm::descriptor_of(dtype, width, bias));
+        programs.launch::<Unpatchify>(&UnpatchifyVideo::new(
+            dtype,
+            u64::from(config.out_channels),
+            config.temporal_compression(),
+            spatial,
+        )?
+        .descriptor());
+        for (_, _, blend) in crate::decoding::ClipDecoder::new(config, dtype)?.blends() {
+            programs.launch::<CrossFadeOp>(&blend.descriptor());
+        }
+
+        // One dense attention for the whole decoder: the clip's row count is a launch value, not a
+        // key field, so the largest sequence the decoder was accepted for states the program too.
+        let attention = Attention::dense(
+            head,
+            heads,
+            heads,
+            width,
+            false,
+            None,
+            (head as f32).sqrt().recip(),
+        )?;
+        programs.launch::<DenseAttention>(&attention.dense_descriptor(
+            dtype, dtype, dtype, width, false,
+        ));
+
+        Ok(programs.finish())
+    }
+
     /// Read the 36 layers and the head of the checkpoint's decoder.
     pub fn load(
         config: &VideoVaeConfig,
@@ -1788,4 +1904,44 @@ pub(crate) mod tests {
         });
         VideoVaeConfig::parse(&sidecar).expect("the checkpoint's video VAE sidecar")
     }
+
+    /// The decoder's programs follow from its configuration and the rasters the deployment serves:
+    /// one key per operator whose key does not vary with the launch, a blend per seam width the stitch
+    /// compiles, and one dense attention per distinct token count.
+    #[test]
+    fn the_decoder_states_its_programs_from_its_own_config() {
+        let config = video_config();
+        let programs = VideoDecoder::programs(&config, DType::BF16).expect("the decoder's programs");
+        let count = |operator: &str| {
+            programs
+                .iter()
+                .filter(|(name, _)| name == operator)
+                .count()
+        };
+
+        // Every projection this decoder has, whatever its contraction: the key carries the element
+        // types and the order, and the contraction length is a descriptor field of one program.
+        assert_eq!(count("gemm"), 1);
+        assert_eq!(count("rows"), 1, "three placements, one program");
+        assert_eq!(count("rotary_factors"), 1);
+        assert_eq!(count("qk_norm_rope"), 1);
+        assert_eq!(count("rms_norm"), 1);
+        assert_eq!(count("layer_norm"), 1);
+        assert_eq!(count("scaled_residual"), 1);
+        assert_eq!(count("value_first_swiglu"), 1);
+        assert_eq!(count("unpatchify_video"), 1);
+
+        // The stitch compiles one blend per seam width on each of the two axes.
+        let blends = crate::decoding::ClipDecoder::new(&config, DType::BF16)
+            .expect("the stitch")
+            .blends()
+            .len();
+        assert!(blends > 0);
+        assert_eq!(count("cross_fade"), blends);
+
+        // One dense attention whatever the clip: the row count is a launch value, so the decoder's
+        // programs do not depend on the raster a request asks for.
+        assert_eq!(count("dense_attention"), 1, "{programs:?}");
+    }
+
 }
