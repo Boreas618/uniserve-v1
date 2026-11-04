@@ -8,8 +8,9 @@
 //! logits [rows, vocabulary]        → logits_shape   → shaped [rows, vocabulary] f32
 //! shaped                           → log_softmax   → logprobs [rows, vocabulary] f32  (when asked)
 //! shaped                           → top_k          → values [rows, width] f32, ids [rows, width] i32
-//! values                           → filter_candidates → values (dropped = -inf), valid [rows]
-//! values                           → softmax        → probabilities [rows, width] f32
+//! values + ids                     → filter_candidates → values (dropped = -inf), valid [rows]
+//! values + ids                     → candidate_order → the same rows in ascending token id
+//! ordered values                   → softmax        → probabilities [rows, width] f32
 //! probabilities + draws            → inverse_cdf    → tokens [rows]
 //! logprobs + tokens                → logprob_gather → logp [rows] f32                    (when asked)
 //! ```
@@ -90,8 +91,12 @@ pub struct Candidates {
     pub values: TensorView,
     /// `[rows, width]` i32 the vocabulary ids of the candidates.
     pub ids: TensorView,
-    /// `[rows, width]` f32 the candidates' probabilities after filtering.
+    /// `[rows, width]` f32 the candidates' probabilities, in the reference's token order.
     pub probabilities: TensorView,
+    /// `[rows, width]` f32 the filtered candidates in ascending token id order.
+    pub ordered_values: TensorView,
+    /// `[rows, width]` i32 the ids of `ordered_values`, in the same order.
+    pub ordered_ids: TensorView,
     /// `[rows]` i32: 1 when the row's candidates form a usable distribution.
     pub valid: TensorView,
 }
@@ -104,6 +109,8 @@ impl Candidates {
             values: arena.tensor(DType::F32, Shape::new(&[rows, width]))?,
             ids: arena.tensor(DType::I32, Shape::new(&[rows, width]))?,
             probabilities: arena.tensor(DType::F32, Shape::new(&[rows, width]))?,
+            ordered_values: arena.tensor(DType::F32, Shape::new(&[rows, width]))?,
+            ordered_ids: arena.tensor(DType::I32, Shape::new(&[rows, width]))?,
             valid: arena.tensor(DType::I32, Shape::new(&[rows]))?,
         })
     }
@@ -198,12 +205,11 @@ impl Sampler {
     /// `[0, 1)` from the executor. The step's working set comes from the forward's arena, so the
     /// call is inside a captured bucket's plan.
     ///
-    /// The candidates reach [`InverseCdf`] in descending logit order, which is the order
-    /// [`TopK`] writes and [`FilterCandidates`] preserves. The reference reorders them by token id
-    /// first (`uniserve/sampling/top_k.py:307-314`), so a fixed draw selects the same token there and
-    /// may select another one here until that reordering is an operator of its own; the distribution
-    /// over draws is the same either way. Greedy rows do not go through this method at all — see
-    /// [`Self::greedy`].
+    /// The candidates reach [`InverseCdf`] in ascending token id order: [`TopK`] writes them by
+    /// descending logit, [`FilterCandidates`] preserves that, and [`CandidateOrder`] permutes both
+    /// the values and the ids into token order, which is what makes a fixed draw select the same
+    /// token as the reference's (`uniserve/sampling/top_k.py:307-314`). Greedy rows do not go through
+    /// this method at all — see [`Self::greedy`].
     pub fn forward(
         &self,
         f: &Forward,
@@ -278,7 +284,25 @@ impl Sampler {
 
         f.operate::<FilterCandidates>(&filter, args)?;
 
-        // 3. The candidates' distribution, then one draw per row.
+        // 3. Token order, because the draw must not depend on the order the top-k program kept the
+        // candidates in: the reference reorders them by token id before its inverse CDF
+        // (`uniserve/sampling/top_k.py:307-314`), and a fixed draw selects the same token only when
+        // the columns mean the same thing on both sides.
+        let order = OrderDescriptor {
+            values: DType::F32,
+            ids: DType::I32,
+            pdl: launch::PDL,
+        };
+        let args = OrderArgs {
+            values: candidates.values,
+            ids: candidates.ids,
+            ordered_values: candidates.ordered_values,
+            ordered_ids: candidates.ordered_ids,
+        };
+
+        f.operate::<CandidateOrder>(&order, args)?;
+
+        // 4. The candidates' distribution, then one draw per row.
         let softmax = SoftmaxDescriptor {
             dtype: DType::F32,
             columns: self.width,
@@ -286,7 +310,7 @@ impl Sampler {
             pdl: launch::PDL,
         };
         let args = SoftmaxArgs {
-            x: candidates.values,
+            x: candidates.ordered_values,
             out: candidates.probabilities,
         };
 
@@ -300,14 +324,14 @@ impl Sampler {
         };
         let args = InverseCdfArgs {
             probabilities: candidates.probabilities,
-            ids: candidates.ids,
+            ids: candidates.ordered_ids,
             draws,
             tokens: samples.tokens,
         };
 
         f.operate::<InverseCdf>(&draw, args)?;
 
-        // 4. The reported log-probabilities, over the shaped distribution of the whole vocabulary.
+        // 5. The reported log-probabilities, over the shaped distribution of the whole vocabulary.
         if let Some(logprobabilities) = samples.logprobabilities {
             let softmax = LogSoftmaxDescriptor {
                 dtype: DType::F32,
@@ -623,6 +647,8 @@ mod tests {
             candidates.values,
             candidates.ids,
             candidates.probabilities,
+            candidates.ordered_values,
+            candidates.ordered_ids,
             candidates.valid,
             samples.tokens,
             samples.logprobabilities.unwrap(),
@@ -637,6 +663,8 @@ mod tests {
         assert_eq!(candidates.shaped.shape.dims(), &[rows, 1_024]);
         assert_eq!(candidates.values.shape.dims(), &[rows, 32]);
         assert_eq!(candidates.ids.dtype, DType::I32);
+        assert_eq!(candidates.ordered_values.shape.dims(), &[rows, 32]);
+        assert_eq!(candidates.ordered_ids.dtype, DType::I32);
         assert_eq!(candidates.valid.shape.dims(), &[rows]);
         assert_eq!(samples.tokens.shape.dims(), &[rows]);
         // Without log-probabilities the step reserves neither the row of log-probabilities nor the
