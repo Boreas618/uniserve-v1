@@ -2800,18 +2800,14 @@ impl Denoiser {
         // the zero.
         let tile_bound = match config.attention {
             crate::config::AttentionKind::Sparse { .. } => {
-                // The bound is a **cap** in the program, not this deployment's count: it is a
-                // descriptor field (`CompressPooledDescriptor::max_tiles`, "the reduction length
-                // its tolerance is written against") and a key must not move when a request asks
-                // for more frames. The smallest power of two that covers the layouts is passed
-                // instead, so a deployment whose longest layout is a canvas-and-frame combination
-                // somewhere between two declared caps still has one, and a longer request lands on
-                // the next. Rounding up is safe in both directions: the scratch is sized from the
-                // layout's own tile count, and the compiled tolerance is a bound on a reduction
-                // that only gets shorter.
-                Layouts::new(config.clone(), arrangement)?
-                    .tiles_bound()?
-                    .next_power_of_two()
+                // The value is this deployment's own bound - the longest layout it can be asked
+                // for, a cap over canvases and frame counts rather than any one request's count -
+                // and the key names its *class*: `CompressPooledDescriptor`'s key is
+                // `max_tiles.next_power_of_two()`, because the package compiles the reduction to
+                // the bound's next power of two and two bounds inside one class are one module.
+                // The descriptor keeps the live bound, since the tolerance is written against the
+                // reduction length itself.
+                Layouts::new(config.clone(), arrangement)?.tiles_bound()?
             }
             crate::config::AttentionKind::Dense => 0,
         };
