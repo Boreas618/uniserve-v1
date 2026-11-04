@@ -1249,16 +1249,26 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         let next = self.generation_named(batch.generation)?;
         let mut jobs = Vec::new();
         for (operator, key, kernel) in self.generation.iter() {
-            let Ok(candidate) = next.kernel(operator, key) else {
-                // The new generation has no program under this key: its program for the operator
-                // is a different descriptor, whose kernel output cannot be paired with this one.
-                // The precopy's walk recaptures such a bucket; there is nothing to compare here.
-                tracing::debug!(
-                    operator,
-                    key,
-                    "the prepared generation has no program under this key; no paired forward"
-                );
-                continue;
+            let candidate = match next.kernel(operator, key) {
+                Ok(candidate) => candidate,
+                // A recapture replaces the operator's program by another compilation, whose
+                // descriptor text may differ. The comparison pairs by operator (7.3 step 2), and
+                // the previous program is resolved by the key it served with, so the update is
+                // still compared rather than silently committed. The walk has already recaptured
+                // this bucket for the new descriptor; the comparison is what measures the program.
+                Err(_) => {
+                    let Some(other) = next.keys(operator).next() else {
+                        // The operator left the deployment: no program of the prepared generation
+                        // launches it, so there is nothing for a comparison to pair.
+                        tracing::debug!(
+                            operator,
+                            key,
+                            "the prepared generation holds no program for this operator; no paired forward"
+                        );
+                        continue;
+                    };
+                    next.kernel(operator, other)?
+                }
             };
             if Arc::ptr_eq(candidate, kernel) {
                 continue;
@@ -1848,6 +1858,12 @@ impl<M: CausalLm> CausalLmRunner<M> {
 
     /// Walks one bucket's forward with two kernels of `operator`: `previous`'s on the real outputs
     /// and `next`'s on the twins (7.3).
+    ///
+    /// The pair is the operator's, not the descriptor's: `key` is the key the serving generation
+    /// stored the previous program under, and every launch of the operator in this bucket is
+    /// compared against it (or against the serving program under the launch's own key, when that
+    /// generation still holds one - an operator served under several descriptors is compared
+    /// program for program).
     ///
     /// The paired forward runs over a scratch KV: every page it writes is a scratch page, so the
     /// new kernel cannot touch a page a serving request reads. The model's `Forward::operate` does
