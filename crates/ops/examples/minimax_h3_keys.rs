@@ -91,6 +91,20 @@ const ACTIVATION_KERNEL: u32 = 12;
 /// The transformer's hidden width (`hidden_size`).
 const HIDDEN: u32 = 5376;
 
+/// The attention projections' inner width, `num_attention_heads · attention_head_dim = 7168`: the
+/// contraction length of the output projection (`attention.py`'s `RowParallelLinear(inner, hidden)`).
+const HEADS_TIMES_HEAD_DIM: u32 = 7168;
+
+/// The transformer's feed-forward width (`ffn_dim`).
+const FFN: u32 = 14336;
+
+/// The audio encoder's attention: 8 heads over the 2048-wide latent, so 256 features per head.
+const AUDIO_ATTENTION_HEADS: u32 = 8;
+const AUDIO_LATENT_DIM: u32 = 2048;
+
+/// The audio VAE's latent channels (`latent_channels`): the encoder's narrow width.
+const AUDIO_LATENT_CHANNELS: u32 = 32;
+
 /// The transformer's normalizer epsilon (`norm_eps`, `qk_norm_eps`).
 const NORM_EPSILON: f32 = 1e-5;
 
@@ -193,6 +207,55 @@ fn main() {
         }
         .to_string(),
     );
+
+    // ---- The DiT's projections: one key per distinct contraction length.
+    //
+    // The transformer stores its weights as Hugging Face checkpoints do (`[n, k]`, `nxk`), contracts
+    // in FP32 and adds no bias: `MergedColumnParallelLinear(..., bias=False)` for the fused q/k/v and
+    // `RowParallelLinear` for the output, `ffn_dim` for the feed-forward (`attention.py`,
+    // `transformer.py`). The three lengths are the attention projections' `hidden_size`,
+    // the output projection's `heads · head_dim = 7168`, and the feed-forward's `ffn_dim = 14336`.
+    for k in [HIDDEN, HEADS_TIMES_HEAD_DIM, FFN] {
+        push(
+            "gemm",
+            ops::gemm::Descriptor {
+                input: DType::BF16,
+                weight: DType::BF16,
+                accumulate: DType::F32,
+                output: DType::BF16,
+                order: ops::gemm::WeightOrder::NxK,
+                epilogue: ops::gemm::Epilogue::None,
+                k,
+            }
+            .to_string(),
+        );
+    }
+
+    // The audio encoder is FP32 throughout (`Model.forward` casts, and the whole autoencoder runs in
+    // FP32): its pre-block contracts at the latent width for the fused q/k/v and the shortcut, at
+    // the head width for the attended rows, and at the latent channels for the GeGLU's two halves
+    // and its output (`audio_vae.py:403-440`: `Linear(width, 3·width)`, `Linear(width, channels)`,
+    // `Linear(channels, channels)`, `GeGLU(channels, 2·channels)`).
+    for k in [
+        AUDIO_LATENT_DIM,
+        AUDIO_LATENT_DIM / AUDIO_ATTENTION_HEADS,
+        AUDIO_LATENT_CHANNELS,
+        2 * AUDIO_LATENT_CHANNELS,
+    ] {
+        push(
+            "gemm",
+            ops::gemm::Descriptor {
+                input: DType::F32,
+                weight: DType::F32,
+                accumulate: DType::F32,
+                output: DType::F32,
+                order: ops::gemm::WeightOrder::NxK,
+                epilogue: ops::gemm::Epilogue::None,
+                k,
+            }
+            .to_string(),
+        );
+    }
 
     // ---- The transformer's per-row programs, at `hidden_size`.
     push(
