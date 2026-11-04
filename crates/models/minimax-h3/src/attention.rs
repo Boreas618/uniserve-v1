@@ -177,14 +177,13 @@ impl Dense {
         normalized: TensorView,
         factors: Factors,
         visible: &Visible,
-        total_rows: u32,
+        scratch: &Scratch,
         out: TensorView,
     ) -> Result<()> {
-        let scratch = Scratch::reserve(self, f, normalized, total_rows)?;
         self.query.forward(f, normalized, scratch.query)?;
         self.key.forward(f, normalized, scratch.key)?;
         self.value.forward(f, normalized, scratch.value)?;
-        self.rotate(f, factors, &scratch)?;
+        self.rotate(f, factors, scratch)?;
 
         let (query, key, value) = match &self.exchange {
             None => (scratch.rotated_query, scratch.rotated_key, scratch.value),
@@ -244,21 +243,26 @@ impl Dense {
 }
 
 /// One layer's projection scratch, reserved from the forward's arena.
-struct Scratch {
-    query: TensorView,
-    key: TensorView,
-    value: TensorView,
-    rotated_query: TensorView,
-    rotated_key: TensorView,
-    exchanged_query: TensorView,
-    exchanged_key: TensorView,
-    exchanged_value: TensorView,
-    attended: TensorView,
-    gathered: TensorView,
+pub struct Scratch {
+    pub query: TensorView,
+    pub key: TensorView,
+    pub value: TensorView,
+    pub rotated_query: TensorView,
+    pub rotated_key: TensorView,
+    pub exchanged_query: TensorView,
+    pub exchanged_key: TensorView,
+    pub exchanged_value: TensorView,
+    pub attended: TensorView,
+    pub gathered: TensorView,
 }
 
 impl Scratch {
-    fn reserve(
+    /// Reserve one layer's scratch for `normalized` and a key set of `total_rows` rows.
+    ///
+    /// The shapes do not depend on the layer, and the executor's arena is a bump allocator reset
+    /// once per forward, so the stack reserves this once rather than once per layer: 50 layers of
+    /// ten change-shaped buffers is what a served canvas cannot hold.
+    pub fn reserve(
         layer: &Dense,
         f: &Forward,
         normalized: TensorView,
