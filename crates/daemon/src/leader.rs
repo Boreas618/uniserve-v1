@@ -648,6 +648,33 @@ impl Leader {
         // reports and a later update is routed against (§7.2, §7.4).
         // The first epoch of a daemon is epoch 0 (§7.4).
         let epoch = self.epochs().install(0, &deployment, world, &generations);
+        // The process table names every main process this daemon manages, and
+        // the serving one is the first (§7.4): a switch addresses the process it
+        // replaces by this generation, `GET /admin/config` lists it, and without
+        // the row a deployment started here looks like one with no main process
+        // at all — which is what an epoch switch refuses for.
+        if let Some(engine) = self
+            .replicas
+            .serving
+            .borrow()
+            .first()
+            .and_then(|replica| replica.hold().client())
+            .and_then(|client| client.engine())
+        {
+            let mut processes = self.epochs().processes();
+            processes.retain(|process| process.generation != engine);
+            processes.push(crate::epoch::ManagedProcess {
+                role: crate::epoch::Role::MainProcess,
+                group: crate::engine::control::ENGINE_GROUP.to_owned(),
+                rank: 0,
+                pid: None,
+                epoch: Some(world),
+                build: deployment.build_config.executable.clone(),
+                generation: engine,
+                state: crate::epoch::ProcessState::Serving,
+            });
+            self.epochs().set_processes(processes);
+        }
         tracing::info!(
             epoch,
             world,
