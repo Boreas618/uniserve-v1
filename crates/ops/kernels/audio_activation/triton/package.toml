@@ -1,0 +1,34 @@
+# The audio_activation operator's Triton backend: design 5.2's program package.
+#
+# One cubin per descriptor: the BigVGAN decoder's activation block as one program — the
+# replicate pad, the transposed convolution that upsamples, the crop, SnakeBeta and the
+# low-pass, fused so that the `ratio`-times-larger intermediate never exists in memory.
+#
+# The tap count, the ratio and the block width are the compilation, because the kernel
+# unrolls both convolutions from them; the channel count and both lengths are launch words,
+# since an audio length follows the request's duration.
+
+op = "audio_activation"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+
+[source]
+kind = "triton"
+files = ["src/audio_activation.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+[kernel.descriptors]
+dimensions = { dtype = ["f32", "bf16", "f16"], channels = ["8", "16", "32", "64", "128", "256", "512", "1024"], kernel = ["12"], ratio = ["2"], block = ["1024"], pdl = ["false", "true"] }
+
+[parameters]
