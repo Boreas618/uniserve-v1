@@ -703,10 +703,10 @@ pub enum Command {
         command: proto::process::Command,
         answer: crossbeam_channel::Sender<Result<(), String>>,
     },
-    /// Asks that the following step's batches also run in shadow for
-    /// `generation` (§7.3 step 2): the executor compares the new generation
-    /// against the resident data and never writes resident memory. Answered
-    /// once one step's batches have been shadowed.
+    /// Asks that the following step's batches also run in shadow for the model
+    /// generation `generation` (§7.3 step 2): the executor compares the new
+    /// generation against the resident data and never writes resident memory.
+    /// Answered once one step's batches have been shadowed.
     Shadow {
         generation: u64,
         answer: crossbeam_channel::Sender<Result<(), String>>,

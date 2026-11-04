@@ -1136,8 +1136,10 @@ impl SchedulerHandle {
         self.commands.stage(stage)
     }
 
-    /// §7.3 step 2's shadow pass for `generation`: the following step's batches
-    /// also run in shadow, against the resident data and without writing it.
+    /// §7.3 step 2's shadow pass for the model generation `generation` (front's
+    /// two axes: the model's generation, not a launch's): the following step's
+    /// batches also run in shadow, against the resident data and without
+    /// writing it.
     ///
     /// Answered once one step's batches have been shadowed, or with the reason
     /// the pass could not run.
