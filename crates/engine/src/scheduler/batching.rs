@@ -719,10 +719,14 @@ impl Scheduler {
             max_kv_len,
         );
         if batch.columns.is_none() {
+            let tokens = batch
+                .requests
+                .iter()
+                .map(|(call, _)| call.input_token_ids.len())
+                .sum::<usize>();
             tracing::debug!(
-                "a batch is dropped: the fill refuses {} calls over {} tokens at page {} ({max_kv_len} tokens of model)",
+                "a batch is dropped: the fill refuses {} calls over {tokens} tokens at page {} ({max_kv_len} tokens of model)",
                 batch.requests.len(),
-                batch.requests.iter().map(|(call, _)| call.input_token_ids.len()).sum::<usize>(),
                 block_size,
             );
         }
