@@ -557,6 +557,12 @@ pub(crate) struct MainProcess {
     boundary: bool,
     /// A `Serve` that arrived before the boundary: the epoch may admit, but not yet.
     pending_serve: bool,
+    /// Whether this process was launched as the epoch's standby (§2.5): it admits nothing until
+    /// the daemon promotes it *and* the epoch reaches its boundary.
+    standby: bool,
+    /// Whether a promoted standby has been promoted: a standby that has not been stays silent
+    /// through the boundary, and one that has follows the rule of any other process.
+    promoted: bool,
     /// What each scheduler parked with, in `schedulers` order: kept from the drain to the resume,
     /// which adopts it, so a resumed epoch reuses the pages it still holds instead of reading them
     /// again.
@@ -723,6 +729,8 @@ impl MainProcess {
             serving: false,
             boundary: false,
             pending_serve: false,
+            standby: launch.standby,
+            promoted: false,
             parked: None,
             paused: false,
             rollback: launch.rollback_s.map(Duration::from_secs),
@@ -1119,6 +1127,7 @@ impl MainProcess {
                     });
                 }
                 Some(proto::process::command::Kind::Promote(_)) => {
+                    self.promoted = true;
                     self.resume_schedulers()
                         .context("promoting this process in place")?;
                     if !self.boundary {
@@ -1880,9 +1889,18 @@ impl MainProcess {
         // and its buckets are warming behind the batches that follow. A `Serve` that arrived while
         // the generation was still being filled is honoured now.
         self.boundary = true;
-        if self.pending_serve {
+        // An epoch admits once this boundary is behind it and nothing has parked it since: a
+        // non-standby process was launched to serve, a standby only after the daemon promoted it,
+        // and a drained one waits for the `Serve` that names the epoch again. The start of an epoch
+        // carries no `Serve` - the daemon tells the frontend where requests go and the process was
+        // launched serving - so the boundary itself is what opens admission.
+        let admitted = self.pending_serve || self.parked.is_none();
+        if admitted && (self.promoted || !self.standby) {
             self.pending_serve = false;
-            self.serving = true;
+            // Resuming is what honours the daemon's early `Serve` when a drain parked the
+            // schedulers first; a process that never parked resumes nothing and simply admits.
+            self.resume_schedulers()
+                .context("resuming for the epoch's first switchover")?;
         }
         Ok(ProgramStatus::Switched { generation })
     }
