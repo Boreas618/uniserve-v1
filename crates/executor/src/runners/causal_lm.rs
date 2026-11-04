@@ -1453,11 +1453,26 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 // uploads it, so a replay that skipped the upload would serve the pose the bucket
                 // was captured with.
                 self.upload(*bucket)?;
-                let captured = self.graphs.captured(*bucket, *generation).ok_or_else(|| {
-                    Error::Invariant(format!(
-                        "no graph of bucket {bucket} in generation {generation}"
-                    ))
-                })?;
+                // A bucket this generation did not prepare launches only operators that did not
+                // change, so the newest generation that did prepare it is the same program: it
+                // serves the batch, and the switchover of an update that changed no kernel of this
+                // bucket's does not need a fresh executable per bucket.
+                let (served, captured) = self.graphs.captured_for(*bucket, *generation).ok_or_else(
+                    || {
+                        Error::Invariant(format!(
+                            "no graph of bucket {bucket} in generation {generation} or in a \
+                             generation it replaces"
+                        ))
+                    },
+                )?;
+                if served != *generation {
+                    tracing::debug!(
+                        bucket = %bucket,
+                        generation,
+                        served,
+                        "the bucket was prepared for an earlier generation; its programs did not change"
+                    );
+                }
                 let launched = Instant::now();
                 captured.launch(&stream)?;
                 if let Some(counters) = &self.counters {
@@ -1578,23 +1593,20 @@ impl<M: CausalLm> CausalLmRunner<M> {
                  prepares"
             )));
         }
-        if self.graphs.captured(bucket, current).is_none() {
-            return Err(Error::Invariant(format!(
-                "no graph of bucket {bucket} in generation {current}"
-            )));
-        }
         let walked = self.walk_capture(bucket, &kernels)?;
         let served = self.graphs.captured(bucket, current).ok_or_else(|| {
-            Error::Invariant(format!("no graph of bucket {bucket} in generation {current}"))
+            Error::Invariant(format!(
+                "no graph of bucket {bucket} in generation {current} to prepare the next one from"
+            ))
         })?;
         // A walk with no node table means the operator launches were not annotated, so there is no
-        // node to set the new kernel's parameters on and a rebind would be the silent no-op the
-        // record exists to prevent. Recapturing is the design's other path (7.3 step 2) and is
-        // correct here: the template already carries the new kernels and their arguments.
+        // node to set the prepared generation's parameters on and the bucket must be recaptured
+        // rather than prepared from a structure nobody can address.
         let unannotated = walked.nodes.is_empty();
         if unannotated || !served.same_structure(&walked.nodes)? {
             // The launch structure changed: the bucket is recaptured from the walk's template,
-            // which already carries the new kernels and their arguments.
+            // which already carries the new kernels and their arguments. The generation being
+            // replaced keeps its own graph and executable, which a revert serves from.
             let held = hold_kernels(&kernels, &walked.nodes)?;
             let recaptured = Captured::new(walked.template, walked.nodes, held)?;
             self.graphs.insert(bucket, generation, recaptured);
@@ -1609,30 +1621,41 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 tracing::info!(
                     bucket = %bucket,
                     generation,
-                    "the launch structure changed; recaptured the bucket instead of rebinding it"
+                    "the launch structure changed; recaptured the bucket"
                 );
             }
             return Ok(());
         }
-        // The walk's launches are the same ones, in the same order, as the live graph's: pair
-        // them, read each node's parameters from the template, and set them on the executable.
-        let mut launch_of: std::collections::HashMap<&'static str, usize> =
+        // 4.5's rebind, on the serving graph's own template: the prepared generation gets an
+        // executable instantiated from the structure this bucket already has, and the walk's
+        // parameters are then set on it. Nothing is captured a second time, and the generation
+        // being replaced keeps the executable it serves from - probation and a revert need it
+        // (7.3 step 4), so a rebind that rewrote the live executable in place would leave a
+        // revert with no graph to serve.
+        let template = served.shared_template();
+        let mut launches: Vec<(&'static str, usize, Vec<platform::OwnedKernelNodeParams>)> =
+            Vec::with_capacity(walked.nodes.len());
+        let mut ordinal_of: std::collections::HashMap<&'static str, usize> =
             std::collections::HashMap::new();
-        let mut applied = 0usize;
-        for (operator, _, walk_nodes) in &walked.nodes {
-            let ordinal = launch_of.entry(*operator).or_insert(0);
-            // A capture adds both kernel nodes and (for example) the empty nodes that carry a
-            // dependency; only kernel nodes have launch parameters to carry over.
-            let mut params = Vec::with_capacity(walk_nodes.len());
-            for node in walk_nodes {
+        for (operator, _, launch) in &walked.nodes {
+            let ordinal = ordinal_of.entry(*operator).or_insert(0);
+            let mut params = Vec::with_capacity(launch.len());
+            for node in launch {
                 if node.kind()? != platform::GraphNodeKind::Kernel {
                     continue;
                 }
                 params.push(walked.template.kernel_node_params(node)?);
             }
-            applied += served.rebind_launch(operator, *ordinal, &params)?;
+            launches.push((*operator, *ordinal, params));
             *ordinal += 1;
         }
+        let held = hold_kernels(&kernels, &walked.nodes)?;
+        let prepared = Captured::from_template(template, walked.nodes, held)?;
+        let mut applied = 0usize;
+        for (operator, ordinal, params) in launches {
+            applied += prepared.rebind_launch(operator, ordinal, &params)?;
+        }
+        self.graphs.insert(bucket, generation, prepared);
         tracing::debug!(bucket = %bucket, applied, "rebound a bucket for a new generation");
         Ok(())
     }
@@ -2261,19 +2284,37 @@ fn hold_kernels(
     Ok(held)
 }
 
-struct Recording {
+/// Public because a device test of the rebind mechanism must record with the sink the runner
+/// captures with: a copy of it in a test would measure the copy.
+pub struct Recording {
     capture: Arc<std::sync::Mutex<platform::Capture>>,
     nodes: crate::captured::Nodes,
     failure: Option<platform::Error>,
 }
 
 impl Recording {
-    fn new(capture: Arc<std::sync::Mutex<platform::Capture>>) -> Self {
+    /// Records into `capture`, which the caller installs as the sink and takes back afterwards.
+    pub fn new(capture: Arc<std::sync::Mutex<platform::Capture>>) -> Self {
         Self {
             capture,
             nodes: Vec::new(),
             failure: None,
         }
+    }
+
+    /// The per-launch node table, in capture order: `Captured.index_nodes`'s own input.
+    pub fn nodes(&self) -> &crate::captured::Nodes {
+        &self.nodes
+    }
+
+    /// The first failure a record reported, if any: a capture that failed part-way through.
+    pub fn failure(&self) -> Option<&platform::Error> {
+        self.failure.as_ref()
+    }
+
+    /// The node table, the recorder consumed.
+    pub fn into_nodes(self) -> crate::captured::Nodes {
+        self.nodes
     }
 }
 
