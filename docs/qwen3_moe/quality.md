@@ -100,7 +100,7 @@ The pre-flight prints `1319 gsm8k-00000 gsm8k-01318`. The baseline suite runs it
 
 ## Results
 
-The baselines of all three cells are measured on today's implementation; every candidate cell is pending. A baseline is a measurement of one side, not a comparison: no interval and no verdict. A baseline is a measurement of one side, not a comparison: no interval and no verdict is claimed until a candidate cell has run on the same checkpoint, sample set and settings.
+The baselines of all three cells are measured on today's implementation; every candidate cell is pending. A baseline is a measurement of one side, not a comparison: no interval and no verdict is claimed until a candidate cell has run on the same checkpoint, sample set and settings.
 
 | Cell | Commit | Requests | Correct | Accuracy | `decided_by_marker` / `decided_by_boxed` / `unparseable` |
 | --- | --- | --- | --- | --- | --- |
