@@ -29,7 +29,13 @@ use ipc::{
 };
 
 /// How long a command answer may take.
-const ANSWER: Duration = Duration::from_secs(10);
+///
+/// Generous because the first one is the whole installation of a policy: the
+/// tree's `fcfs` module is built for `wasm32-unknown-unknown` on first use and
+/// then loaded and instantiated, on a machine that runs this suite's tests in
+/// parallel. The bound is the harness's, not the mechanism's; a mechanism that
+/// stopped answering would still fail here, only later.
+const ANSWER: Duration = Duration::from_secs(60);
 
 /// How long a request may take to emit its first token.
 const FIRST_TOKEN: Duration = Duration::from_secs(20);
