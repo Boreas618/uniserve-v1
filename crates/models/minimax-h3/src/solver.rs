@@ -232,18 +232,20 @@ impl Track {
             Shape::new(&[coefficients.len() as u64, 1]),
         )?;
 
-        // The start coefficient is `sigma_0 - 1`; at unit noise the draw needs no launch.
-        let sigma = schedule.start_sigma(modality)?;
-        let start = if sigma == 1.0 {
-            None
-        } else {
-            let table = publish(
-                loader,
-                &format!("denoiser.{}.start_coefficient", modality.as_str()),
-                &[sigma - 1.0],
-                Shape::new(&[1]),
-            )?;
-            Some(ScaledResidual::new(table, None).map_err(Error::from)?)
+        // The start coefficient is `sigma_0 - 1`, and only the grid that scales its draw has one
+        // (`Schedule::start_sigma`): a released or distilled grid starts from unit noise and needs
+        // no launch at all.
+        let start = match schedule.start_sigma(modality)? {
+            None => None,
+            Some(sigma) => {
+                let table = publish(
+                    loader,
+                    &format!("denoiser.{}.start_coefficient", modality.as_str()),
+                    &[sigma - 1.0],
+                    Shape::new(&[1]),
+                )?;
+                Some(ScaledResidual::new(table, None).map_err(Error::from)?)
+            }
         };
         Ok(Self {
             coefficients: table,
@@ -284,6 +286,21 @@ mod tests {
         )
         .expect("the base checkpoint's schedule");
         Schedule::new(&spec).expect("an aligned base schedule")
+    }
+
+    fn dmd() -> Schedule {
+        // A distilled ladder: its first sigma is below one too, which is why the *kind* decides
+        // whether a draw is scaled and the number does not.
+        let spec = ScheduleSpec::dmd(
+            vec![999, 874, 749, 624, 500, 375, 250, 125],
+            1000.0,
+            Shifts {
+                video: 10.0,
+                audio: 3.0,
+            },
+        )
+        .expect("a DMD ladder");
+        Schedule::new(&spec).expect("an aligned DMD schedule")
     }
 
     fn blocks() -> Schedule {
@@ -347,12 +364,21 @@ mod tests {
         let schedule = blocks();
         let sigma = schedule
             .start_sigma(Modality::Video)
-            .expect("a start level");
+            .expect("a start level")
+            .expect("a parallel-decoding grid scales its draw");
         assert!((sigma - 0.999).abs() < 1e-6);
         // Its draw is scaled by `sigma`, which the start coefficient expresses as `sigma - 1`.
         assert!((sigma - 1.0 - -0.001).abs() < 1e-6);
         // The released grid starts at unit noise and needs no launch.
-        assert_eq!(base().start_sigma(Modality::Video).expect("a level"), 1.0);
+        assert_eq!(base().start_sigma(Modality::Video).expect("a level"), None);
+        // And a distilled grid's first sigma is also below one, so the kind decides and not the
+        // number: the reference scales a `PddGrid`'s draw alone (`denoiser.py:1103-1112`).
+        let distilled = dmd();
+        assert!(distilled.sigmas(Modality::Video)[0] < 1.0);
+        assert_eq!(
+            distilled.start_sigma(Modality::Video).expect("a level"),
+            None
+        );
     }
 
     #[test]

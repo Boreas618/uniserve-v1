@@ -405,6 +405,27 @@ pub struct Source {
     pub tensor: Tensor,
 }
 
+/// Every checkpoint tensor a source list reads, in the order the load binds them.
+///
+/// One parameter can read more than one tensor: a weight-normalized convolution reads its direction
+/// and its magnitude, and a fused request reads every part. This is the other column of a component's
+/// source table rather than a second spelling of it, so a `keys` list built here cannot drift from the
+/// load that table drives.
+pub fn tensor_keys(sources: &[Source]) -> Vec<String> {
+    let mut keys = Vec::new();
+    for source in sources {
+        match &source.tensor {
+            Tensor::Region(tensor) => keys.push(tensor.clone()),
+            Tensor::Parts(parts) => keys.extend(parts.iter().cloned()),
+            Tensor::Normalized { value, gain } => {
+                keys.push(value.clone());
+                keys.push(gain.clone());
+            }
+        }
+    }
+    keys
+}
+
 /// How the checkpoint stores one tensor.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Tensor {
@@ -842,6 +863,19 @@ pub fn parameters(config: &AudioVaeConfig) -> Result<Vec<String>> {
 }
 
 impl AudioDecoder {
+    /// Every checkpoint tensor the audio decoder reads, by name.
+    ///
+    /// The decoder is a component whose names were already data ([`sources`] maps each parameter to
+    /// the key that fills it), so this list is that mapping's other column: a weight-normalized pair
+    /// names both tensors and a fused request names every part. A checkpoint that lacks one is refused
+    /// by block and name before a byte is read. `audio_vae/` ships no weights in the export this tree
+    /// was checked against, so the list's honest verdict against that checkpoint is "all absent" -
+    /// which is the right refusal for a task that needs the audio path and not a load failure from
+    /// inside a layer.
+    pub fn keys(config: &AudioVaeConfig) -> Result<Vec<String>> {
+        Ok(tensor_keys(&sources(config)?))
+    }
+
     /// Bind every parameter the checkpoint's audio decoder has, through [`sources`].
     ///
     /// The table is consumed exactly: a tensor it names but the load never reads is an error, so a
@@ -1254,10 +1288,11 @@ fn check_table(table: &[Source], bound: &[String]) -> Result<()> {
 }
 
 impl Decoder for AudioDecoder {
-    fn layout_tables(&self, _layout: &nn::capability::Layout) -> Vec<StateTable> {
+    fn layout_tables(&self, _layout: &nn::capability::Layout) -> nn::Result<Vec<StateTable>> {
         // Every table this decoder reads is a weight, bound at load: nothing follows from the
-        // layout, so the runner uploads nothing for it.
-        Vec::new()
+        // layout, so the runner uploads nothing for it. `Ok` of nothing for every layout is the
+        // correct answer, and different from a failure to answer.
+        Ok(Vec::new())
     }
 
     fn prepare_layout(
@@ -1497,6 +1532,31 @@ impl<'a, 'b> Binder<'a, 'b> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+
+    #[test]
+    fn the_audio_decoders_keys_name_both_tensors_of_every_normalized_pair() {
+        let config = audio_config();
+        let keys = AudioDecoder::keys(&config).expect("the decoder's keys");
+        let mut unique = keys.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), keys.len(), "no tensor is named twice");
+        // A weight-normalized convolution reads a direction and a magnitude, and the load needs both:
+        // a list that named only the direction would refuse a checkpoint that is complete.
+        assert!(keys.iter().any(|key| key == "dec_in_proj.weight_v"));
+        assert!(keys.iter().any(|key| key == "dec_in_proj.weight_g"));
+        let magnitudes = keys.iter().filter(|key| key.ends_with(".weight_g")).count();
+        let directions = keys.iter().filter(|key| key.ends_with(".weight_v")).count();
+        assert_eq!(magnitudes, directions, "every magnitude has its direction");
+        assert_eq!(
+            magnitudes, 136,
+            "the decoder's weight-normalized convolutions"
+        );
+        // The encoder reads a different half of a different directory; a shared name would be one
+        // block binding the other's tensor.
+        let encoder = crate::encoding::AudioEncoder::keys(&config).expect("the encoder's keys");
+        assert!(encoder.iter().all(|key| !keys.contains(key)));
+    }
 
     #[test]
     fn the_load_binds_every_parameter_the_table_names() {

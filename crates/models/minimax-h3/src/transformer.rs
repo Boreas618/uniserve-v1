@@ -58,8 +58,16 @@ pub(crate) fn projection_halves(projection: TensorView) -> (TensorView, TensorVi
     (value, gate)
 }
 
-/// The rotary width of one head's three axes: 16 frequencies per axis, 32 channels each.
-pub const ROTATED_AXES: [u32; 3] = [32, 32, 32];
+/// The rotary width of one head's three axes: `2 * rope_frequency_dim` channels each.
+///
+/// The width is the checkpoint's `rope_freq_dim`, not a constant of this module: the reference
+/// builds its rotary embedding as `RotaryEmbedding(2 * rope_frequency_dim)`
+/// (`uniserve/models/minimax_h3/denoiser.py:231`) and applies that one spectrum to each of the
+/// three coordinates (`attention.py:94-105`). Three is the model's own count: `position_ids` is
+/// `[3, rows]`, one coordinate for time, height and width.
+pub fn rotated_axes(config: &TransformerConfig) -> [u32; 3] {
+    [2 * config.rope_frequency_dim; 3]
+}
 
 /// One dilated layer of the stack.
 pub struct Layer {
@@ -113,19 +121,16 @@ impl Layer {
                 index,
                 config,
                 rows,
-                &ROTATED_AXES,
+                &rotated_axes(config),
                 tile_bound,
                 partition,
                 loader,
             )?,
             // The checkpoint fuses the feed-forward's value half first and its gate half second.
-            gate_up: projection(
-                loader,
-                &format!("{prefix}.ff.net.0.proj.weight"),
-                2 * ffn,
-                hidden,
-            )?,
-            down: projection(loader, &format!("{prefix}.ff.net.2.weight"), hidden, ffn)?,
+            // `projection` appends the `.weight` itself: a name that already ends in it asks the
+            // checkpoint for `…weight.weight`, which is the name the index does not hold.
+            gate_up: projection(loader, &format!("{prefix}.ff.net.0.proj"), 2 * ffn, hidden)?,
+            down: projection(loader, &format!("{prefix}.ff.net.2"), hidden, ffn)?,
             gated: GatedActivation::new(ops::activation::Activation::Silu).with_stepwise(),
             eps: config.norm_eps,
         })
@@ -169,13 +174,19 @@ impl Layer {
             &scratch.attention,
             update,
         )?;
+        // The MLP norm folds the attention's gated update into the residual and copies the result
+        // out: the block's second residual reads it after the down projection has overwritten
+        // `update`, and `retain` is what lets one launch produce both the normalized feed-forward
+        // input and that residual base (`crates/ops/kernels/modulated_rms_norm`: with `update` the
+        // kernel stores the gated sum, and with `retain` it copies the same value out).
         let mlp_norm = ModulatedRmsNorm::new(
             self.norm2,
             shift_mlp,
             scale_mlp,
             Some(gate_attention),
             self.eps,
-        )?;
+        )?
+        .with_retain();
         mlp_norm.forward(f, hidden, Some(update), rows, normalized, None, Some(out))?;
 
         // Feed-forward: the packed value and gate halves, the gated activation, the down
@@ -269,8 +280,8 @@ struct FusedHeads {
     ///
     /// FP32 because the reference builds a student's head FP32 (`transformer.py:307-311`): the fused
     /// row is a sum of the checkpoint's BF16 rows and rounding it back would round a number the
-    /// reference keeps exact. The projection that reads it takes the stack's BF16 rows, so the only
-    /// rounding is the store into the velocity.
+    /// reference keeps exact. The projection reads the widened FP32 rows (`Transformer::wide`), so
+    /// its two operands are one type and the only rounding is the store into the velocity.
     weight: Weight,
     /// `[blocks, out]`: block `b`'s fused bias.
     bias: Weight,
@@ -568,11 +579,13 @@ impl Transformer {
         let audio = self.audio_proj_in.as_ref().ok_or_else(|| {
             Error::Unsupported("this H3 partition has no audio input projection".to_owned())
         })?;
-        // The audio input projection is FP32 in the reference like the video's, and the widening that
-        // would feed it is refused here until `scaled_add` enumerates `columns = 32`: the store holds
-        // a module for 96 and 5376 columns and none for the audio width, and a launch with no module
-        // is a hard failure at bind, which is worse than the rounding this leaves in place. The one
-        // line to restore is `let rows = self.wide(f, rows)?;` above this call.
+        // The audio input projection reads an FP32 activation in the reference like the video's, so
+        // the rows widen first when they are not FP32 already: the audio latent's own width (32) is
+        // a declared `scaled_add` column count, which is what makes the widening launchable. The
+        // weight is the checkpoint's own - it is never widened at load - so the product is an FP32
+        // activation against a BF16 weight with an FP32 output, and the caller's `out` decides the
+        // one rounding that follows it.
+        let rows = self.wide(f, rows)?;
         Ok(audio.forward(f, rows, out)?)
     }
 
@@ -713,8 +726,17 @@ impl Transformer {
     ///
     /// One type for the whole stack: the precision rule keeps the checkpoint's own representation,
     /// and every layer's operands are of it.
+    ///
+    /// The witness is a **block's** norm gain and not an end projection. Those four are pinned FP32
+    /// at every preset (`precision.py:106-117`), so `proj_in` reports the pin rather than the
+    /// stack: at `auto` a BF16 deployment would claim FP32, a harness would allocate FP32
+    /// activations against BF16 blocks, and the sampler's first layer gemm would be the mixed pair
+    /// this branch has already spent rounds removing (`input_f32_weight_bf16`). A block's gain is
+    /// never pinned, so it is the deployment's type by construction.
     pub fn dtype(&self) -> nn::DType {
-        self.proj_in.weight().dtype
+        self.layers
+            .first()
+            .map_or_else(|| self.proj_in.weight().dtype, |layer| layer.norm1.dtype())
     }
 
     /// Read one DiT partition of the checkpoint.
@@ -760,12 +782,24 @@ impl Transformer {
             .map(|index| Layer::load(kind, index, config, rows, tile_bound, partition, loader))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            proj_in: projection_with_bias(loader, "proj_in", hidden, video_in)?,
+            // **The four end projections are FP32 parameters at every preset**, because they are what
+            // touches the trajectory: `precision.py:106-117` pins `video_input`, `audio_input`,
+            // `video_output` and `audio_output` at FP32 whatever the attention, MLP and VAE tiers
+            // are. So the widening `wide` performs meets an FP32 weight and the product is FP32 on
+            // both sides, which is what makes the released BF16 stack run a FP32 sample at all.
+            proj_in: projection_with_bias(
+                loader,
+                "proj_in",
+                hidden,
+                video_in,
+                Some(nn::DType::F32),
+            )?,
             audio_proj_in: Some(projection_with_bias(
                 loader,
                 "audio_proj_in",
                 hidden,
                 audio_in,
+                Some(nn::DType::F32),
             )?),
             layers,
             norm_out: RmsNorm::new(
@@ -776,7 +810,13 @@ impl Transformer {
             // read only when the partition has one head.
             video_out: match heads {
                 Some(_) => None,
-                None => Some(projection_with_bias(loader, "proj_out", video_in, hidden)?),
+                None => Some(projection_with_bias(
+                    loader,
+                    "proj_out",
+                    video_in,
+                    hidden,
+                    Some(nn::DType::F32),
+                )?),
             },
             audio_out: match heads {
                 Some(_) => None,
@@ -785,6 +825,7 @@ impl Transformer {
                     "audio_proj_out",
                     audio_in,
                     hidden,
+                    Some(nn::DType::F32),
                 )?),
             },
             heads,
@@ -888,10 +929,18 @@ impl Transformer {
         let arena = f.arena();
         let entries = arena.tensor(nn::DType::I32, Shape::new(&[1, u64::from(groups.count())]))?;
         adaln.entries_of(f, step, entries)?;
+        // **The gather's own arrangement: one row per entry, the whole 18-vector table across the
+        // columns** (`gather_rows` derives its output from the table's columns and the index count,
+        // so a buffer of the same bytes in another shape is refused by name:
+        // `out is [12, 32256], [4, 96768] expected`). The block cuts three intervals per group out
+        // of it, and that is a view of the same flat order - group `g`'s row holds its three
+        // intervals' six vectors each, in order - so the block reads `[3 · groups, 6 · width]` over
+        // these bytes and nothing is copied.
         let modulation = arena.tensor(
             hidden.dtype,
-            Shape::new(&[u64::from(groups.count()) * 3, 6 * width]),
+            Shape::new(&[u64::from(groups.count()), adaln.layer_width()]),
         )?;
+        let per_layer = modulation.reshape(Shape::new(&[u64::from(groups.count()) * 3, 6 * width]));
         if let Some(trace) = trace {
             trace.check(self.layers.len(), tokens, width, hidden.dtype)?;
         }
@@ -901,7 +950,7 @@ impl Transformer {
         for (index, layer) in self.layers.iter().enumerate() {
             adaln.layer(f, index, entries, modulation)?;
             layer.forward(
-                f, current, alternate, modulation, rows, factors, visible, segments, &scratch,
+                f, current, alternate, per_layer, rows, factors, visible, segments, &scratch,
             )?;
             std::mem::swap(&mut current, &mut alternate);
             // A diagnosis reads the layer's packed output as it stands: the same rows the next
@@ -983,13 +1032,19 @@ fn projection_with_bias(
     name: &str,
     rows: u64,
     columns: u64,
+    dtype: Option<nn::DType>,
 ) -> Result<Linear> {
-    let weight = loader.load(&WeightRequest::region(
-        format!("{name}.weight"),
-        0,
-        Shape::new(&[rows, columns]),
-    ))?;
-    let bias = gain(loader, &format!("{name}.bias"), rows)?;
+    let mut request =
+        WeightRequest::region(format!("{name}.weight"), 0, Shape::new(&[rows, columns]));
+    if let Some(dtype) = dtype {
+        request = request.pinned(dtype);
+    }
+    let weight = loader.load(&request)?;
+    let mut request = WeightRequest::region(format!("{name}.bias"), 0, Shape::new(&[rows]));
+    if let Some(dtype) = dtype {
+        request = request.pinned(dtype);
+    }
+    let bias = loader.load(&request)?;
     Ok(Linear::new(weight, Some(bias), WeightOrder::NxK)?)
 }
 

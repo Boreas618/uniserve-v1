@@ -253,7 +253,8 @@ impl<'a> Forward<'a> {
             .filter(|shadow| shadow.operator == O::NAME);
         let Some(shadow) = shadow else {
             let kernel = self.kernels.op::<O>(descriptor)?;
-            O::launch(kernel, descriptor, args, self.stream).map_err(Error::from)?;
+            O::launch(kernel, descriptor, args, self.stream)
+                .map_err(|error| Error::launch(O::NAME, ops::descriptor::key(descriptor), error))?;
             Self::record::<O>(descriptor);
             return Ok(());
         };
@@ -274,10 +275,12 @@ impl<'a> Forward<'a> {
         // Redirect the call's outputs into the twins and let the new program write them; the
         // previous program then writes the real outputs, which the forward continues on.
         let redirected = O::shadow(args, &mut twins, self.stream);
-        O::launch(current, descriptor, redirected, self.stream).map_err(Error::from)?;
+        O::launch(current, descriptor, redirected, self.stream)
+            .map_err(|error| Error::launch(O::NAME, ops::descriptor::key(descriptor), error))?;
         Self::record::<O>(descriptor);
         drop(twins);
-        O::launch(previous, descriptor, args, self.stream).map_err(Error::from)?;
+        O::launch(previous, descriptor, args, self.stream)
+            .map_err(|error| Error::launch(O::NAME, ops::descriptor::key(descriptor), error))?;
         Self::record::<O>(descriptor);
         Ok(())
     }

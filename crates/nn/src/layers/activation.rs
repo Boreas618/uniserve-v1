@@ -27,7 +27,7 @@ use crate::weights::Weight;
 ///
 /// The programs vary the tile with the row width, so the descriptor states the element count one
 /// statement handles; a power of two keeps every vector load aligned.
-const BLOCK: u32 = 1024;
+pub const BLOCK: u32 = 1024;
 
 /// `out = act(gate) · value` over two views.
 pub struct GatedActivation {
