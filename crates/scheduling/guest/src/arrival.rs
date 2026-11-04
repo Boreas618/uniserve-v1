@@ -231,9 +231,10 @@ impl<K: Order> Arrival<K> {
     /// and token cost `k`, a refill of `t` tokens of a request that may still
     /// generate `remaining` tokens is worth it when
     /// `remaining * (1 - 1/g) > t * k`, and with neither stated nor measured
-    /// the refill runs. The remaining token budget is the one feature the
-    /// views do not carry, so a deployment that states both parameters gets
-    /// the cost-only answer (a gap is refilled) until it does.
+    /// the refill runs. The measured values today's scheduler weighs
+    /// (`SpeculationMeter`) are the mechanism's measurement, which the views
+    /// do not carry; the policy's parameters replace them, as design §7.7
+    /// says they may.
     fn refill_due(&self, view: &RequestView) -> bool {
         let Some(tokens) = view.refill_tokens else {
             return false;
@@ -241,17 +242,24 @@ impl<K: Order> Arrival<K> {
         if tokens == 0 {
             return false;
         }
-        match (
+        // A request already refilling its draft cache has the refill as its
+        // next call; asking again would start a second one.
+        if view
+            .phase
+            .is_some_and(|phase| self.phases.kind(phase) == PhaseKind::Refill)
+        {
+            return false;
+        }
+        let (Some(speedup), Some(cost)) = (
             self.parameters.expected_speedup,
             self.parameters.refill_token_cost,
-        ) {
+        ) else {
             // Nothing stated: today's `worth` has no value to weigh and
             // refills.
-            (None, _) | (_, None) => true,
-            // Stated, but without the request's remaining token budget the
-            // weigh has nothing to compare the cost with; the gap is refilled.
-            (Some(_), Some(_)) => true,
-        }
+            return true;
+        };
+        let saved = f64::from(view.remaining_tokens) * (1.0 - 1.0 / speedup.max(1.0));
+        saved > f64::from(tokens) * cost.max(0.0)
     }
 
     /// Whether a request's host prefix hit deepens by enough to prefetch: the
@@ -445,23 +453,29 @@ impl<K: Order> Policy for Arrival<K> {
     }
 
     fn dispatch(&mut self, room: &Room) -> Plan {
+        // A request whose worst-case reservation is larger than the whole
+        // device cache can never run: it is rejected rather than left to block
+        // the queue (today's `admission.rs`, "request exceeds total KV
+        // capacity").
+        let reject: Vec<RequestId> = self
+            .waiting
+            .iter()
+            .filter(|id| {
+                self.views
+                    .get(id)
+                    .is_some_and(|view| view.reservation_units > room.capacity_units)
+            })
+            .collect();
         let mut plan = Plan {
-            // Every queued request, in order. The mechanism admits them until
-            // the first it cannot place, which is the admission decision.
-            admit: self.waiting.iter().collect(),
-            // A request whose worst-case reservation is larger than the whole
-            // device cache can never run: it is rejected rather than left to
-            // block the queue (today's `admission.rs`, "request exceeds total
-            // KV capacity").
-            reject: self
+            // Every other queued request, in order. The mechanism admits them
+            // until the first it cannot place, which is the admission
+            // decision.
+            admit: self
                 .waiting
                 .iter()
-                .filter(|id| {
-                    self.views
-                        .get(id)
-                        .is_some_and(|view| view.reservation_units > room.capacity_units)
-                })
+                .filter(|id| !reject.contains(id))
                 .collect(),
+            reject,
             // The device pages no resident request continues from go to the
             // host KV cache, least recently used first, which is today's rule
             // for writing a prefix out.
@@ -679,6 +693,7 @@ impl<K: Order> Policy for Arrival<K> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decision::Warming;
     use crate::ids::{ComponentId, PhaseId};
     use crate::time::{Duration, Nanos};
     use crate::view::{EncodingView, PageView, PhaseView, RankView, ReplicaView, Snapshot};
@@ -1134,6 +1149,117 @@ mod tests {
             plan.work.first().map(|work| (work.request, work.tokens)),
             Some((RequestId(1), 4))
         );
+    }
+
+    #[test]
+    fn a_full_step_decides_every_entry_of_its_plan() {
+        let mut fcfs = Arrival::<crate::ArrivalOrder>::default();
+        // Two queued: the first fits the cache, the second never can.
+        let mut fits = view(10, 0, 1);
+        fits.reservation_units = 10;
+        let mut enormous = view(11, 0, 2);
+        enormous.reservation_units = 1_000;
+        // A resident prefill, a resident decode with a draft gap, and a
+        // resident media request whose host hit deepens.
+        let mut prefill = view(20, 0, 3);
+        prefill.state = RequestState::Resident;
+        prefill.phase = Some(PhaseId(0));
+        prefill.admitted_at = Some(Nanos(1));
+        let mut decode = view(21, 0, 4);
+        decode.state = RequestState::Resident;
+        decode.phase = Some(PhaseId(1));
+        decode.admitted_at = Some(Nanos(2));
+        decode.refill_tokens = Some(8);
+        let mut media = view(22, 0, 5);
+        media.state = RequestState::Resident;
+        media.phase = Some(PhaseId(2));
+        media.class = RequestClass::Media;
+        media.admitted_at = Some(Nanos(3));
+        media.prefetch_tokens = 300;
+        fcfs.init(&Init {
+            parameters: Parameters::default(),
+            state: Snapshot {
+                requests: vec![fits.clone(), enormous, prefill, decode, media],
+                phases: vec![
+                    PhaseView {
+                        id: PhaseId(0),
+                        kind: PhaseKind::Prefill,
+                        block: ComponentId(0),
+                    },
+                    PhaseView {
+                        id: PhaseId(1),
+                        kind: PhaseKind::Decode,
+                        block: ComponentId(0),
+                    },
+                    PhaseView {
+                        id: PhaseId(2),
+                        kind: PhaseKind::Denoise,
+                        block: ComponentId(1),
+                    },
+                ],
+                pages: vec![
+                    PageView {
+                        id: PageId(1),
+                        tokens: 16,
+                        last_used: Nanos(1),
+                        on_host: false,
+                        evictable: true,
+                    },
+                    PageView {
+                        id: PageId(2),
+                        tokens: 16,
+                        last_used: Nanos(2),
+                        on_host: false,
+                        evictable: true,
+                    },
+                    PageView {
+                        id: PageId(3),
+                        tokens: 16,
+                        last_used: Nanos(3),
+                        on_host: true,
+                        evictable: true,
+                    },
+                ],
+                ..Snapshot::default()
+            },
+        });
+        let room = Room {
+            token_budget: 1024,
+            call_budget: 8,
+            page_tokens: 16,
+            prefill_tokens: Some(64),
+            capacity_units: 100,
+            warming: vec![Warming {
+                request: RequestId(20),
+                pages: vec![PageId(7), PageId(8)],
+            }],
+            ..Room::default()
+        };
+        // With the prefill window open, the step carries context work only:
+        // today a prefill pass schedules no token progress either.
+        let plan = fcfs.dispatch(&room);
+        let order: Vec<u64> = plan.work.iter().map(|work| work.request.0).collect();
+        assert_eq!(order, vec![20]);
+        assert_eq!(plan.work[0].tokens, 100);
+        // The over-capacity request is rejected and not also admitted.
+        assert_eq!(plan.reject, vec![RequestId(11)]);
+        assert_eq!(plan.admit, vec![RequestId(10)]);
+        // The device pages no request continues from go to the host, in
+        // least-recently-used order; the host page stays.
+        assert_eq!(plan.offload, vec![PageId(1), PageId(2)]);
+        assert_eq!(plan.prefetch, vec![RequestId(22)]);
+        assert_eq!(plan.refill, vec![RequestId(21)]);
+        assert_eq!(fcfs.warm(&room), vec![PageId(7), PageId(8)]);
+
+        // Two prefill batches in flight close the window: the step carries
+        // token progress and media work, in class order within the generation
+        // path, and the media path second.
+        let mut closed = room.clone();
+        closed.inflight.prefill_batches = PREFILL_WINDOW_CREDITS;
+        let plan = fcfs.dispatch(&closed);
+        let order: Vec<u64> = plan.work.iter().map(|work| work.request.0).collect();
+        assert_eq!(order, vec![21, 22]);
+        assert!(plan.work.iter().all(|work| work.tokens == 1));
     }
 
     #[test]
