@@ -545,6 +545,9 @@ pub(crate) struct MainProcess {
     /// The frontend's admission gate, the `/admin/pause_generation` of §2.3: submissions are
     /// refused while it is held, and no request in flight is ended by it.
     paused: bool,
+    /// The generations this process has released: a purge is a release of what it holds, so a
+    /// second request for one of them is answered rather than run again.
+    released: std::collections::BTreeSet<u64>,
     /// The probation an update must survive before it is committed, when the launch file states
     /// one (§7.3 step 4). The daemon decides the commit; this is the process's own guard against
     /// an update that is left on probation with nobody watching: it reverts at the threshold
@@ -701,6 +704,7 @@ impl MainProcess {
             parked: None,
             paused: false,
             rollback: launch.rollback_s.map(Duration::from_secs),
+            released: std::collections::BTreeSet::new(),
         };
         if launch.standby {
             process.park_standby()?;
@@ -1886,6 +1890,25 @@ impl MainProcess {
             })?;
             device_command(&self.watchdog, device, "revert", submission)?;
         }
+        // No purge follows a revert: the daemon purges the generation a *commit* released, and its
+        // reverted path sends nothing (§7.3 step 5 and 6). The generation that served and went back
+        // would otherwise keep its graphs, its kernels and its arena until the process exits - a
+        // whole generation of device memory - so it is released here, now that every device has
+        // finished going back and no batch of it can be in flight.
+        if matches!(phase, executor::hot_update::Phase::Probation { .. }) {
+            match self.purge(generation) {
+                Ok(ProgramStatus::Purged { .. }) => {}
+                Ok(other) => tracing::warn!(
+                    ?other,
+                    "the generation the revert went back from was not released"
+                ),
+                Err(error) => {
+                    // The revert stands: serving is correct and what a failed release costs is the
+                    // reverted generation's storage, which the process keeps until it exits.
+                    tracing::error!(%error, "releasing the generation a revert went back from failed");
+                }
+            }
+        }
         Ok(ProgramStatus::Reverted {
             generation,
             reason: failure.reason(),
@@ -1897,6 +1920,12 @@ impl MainProcess {
     /// it already holds, and `Captured` keeps each kernel alive until the graph
     /// that uses it is rebound or destroyed.
     fn purge(&mut self, generation: u64) -> Result<ProgramStatus> {
+        // A purge releases what this process holds of a generation, so a number it has already
+        // released is answered rather than refused: the revert below releases a reverted generation
+        // itself, and a daemon that later purges the same number asks for a release that happened.
+        if self.released.contains(&generation) {
+            return Ok(ProgramStatus::Purged { generation });
+        }
         if let Err(error) = self.update.request_purge(generation) {
             bail!("purging generation {generation}: {error}");
         }
@@ -1920,6 +1949,7 @@ impl MainProcess {
             }
         }
         self.update.purged(generation)?;
+        self.released.insert(generation);
         Ok(ProgramStatus::Purged { generation })
     }
 
