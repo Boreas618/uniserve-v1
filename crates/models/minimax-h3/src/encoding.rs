@@ -1915,9 +1915,19 @@ impl AudioEncoder {
 /// patches, so `latent_channels · 4` columns, and a 84 x 48 latent gives 42 x 24 of them a frame.
 pub fn conditioning_arena(
     config: &crate::VideoVaeConfig,
+    frames: u32,
     latent: Extent,
 ) -> Result<Vec<crate::decoding::Buffer>> {
     let stack = Stack::of(config)?;
+    // The tile buffer is in **pixels**, so its frame axis is the condition's own, while every other
+    // buffer is in latents. Two frame counts in one plan is exactly the confusion this check removes.
+    let expected = stack.clip.latent_frames(frames)?;
+    if expected != latent.frames {
+        return Err(Error::config(format!(
+            "{frames} frames of condition are {expected} latent frames, and the plan was given {}",
+            latent.frames
+        )));
+    }
     let canvas = crate::video_vae::Canvas::clip(config, latent.height, latent.width);
     let tiles = crate::video_vae::Tiles::of(config, &canvas)?;
     let tile = tiles
@@ -1932,10 +1942,10 @@ pub fn conditioning_arena(
             latent.height, latent.width
         )));
     }
-    let frames = u64::from(latent.frames);
+    let latent_frames = u64::from(latent.frames);
     let rows = u64::from(latent.height);
     let columns = u64::from(latent.width);
-    let voxels = frames * rows * columns;
+    let voxels = latent_frames * rows * columns;
     let channels = u64::from(config.latent_channels);
     let patch_rows = voxels / 4;
     let buffer = |name: &str, elements: u64| crate::decoding::Buffer {
@@ -1946,7 +1956,10 @@ pub fn conditioning_arena(
     Ok(vec![
         buffer(
             "tile",
-            u64::from(stack.input_channels) * frames * u64::from(tile.0) * u64::from(tile.1),
+            u64::from(stack.input_channels)
+                * u64::from(frames)
+                * u64::from(tile.0)
+                * u64::from(tile.1),
         ),
         buffer("stitch", 2 * channels * voxels),
         buffer("moments", 2 * channels * voxels),
@@ -2324,18 +2337,27 @@ mod tests {
         // six buffers are the same six of the same size. A per-tile buffer would fail this on the
         // larger canvas and nowhere else.
         let config = video_config();
+        let stack = Stack::of(&config).expect("the stack");
+        // The condition's latent frame count is the encoder's own rule, so the test derives it rather
+        // than naming it: the two frame counts in this plan - the tile's, in pixels, and every other
+        // buffer's, in latents - are what `conditioning_arena` checks against each other.
+        let frames = 25;
+        let latent_frames = stack
+            .clip
+            .latent_frames(frames)
+            .expect("the condition's latent frames");
         let vertical = Extent {
-            frames: 5,
+            frames: latent_frames,
             height: 84,
             width: 48,
         };
         let wide = Extent {
-            frames: 5,
+            frames: latent_frames,
             height: 48,
             width: 84,
         };
-        let first = conditioning_arena(&config, vertical).expect("the vertical condition");
-        let second = conditioning_arena(&config, wide).expect("the wide condition");
+        let first = conditioning_arena(&config, frames, vertical).expect("the vertical condition");
+        let second = conditioning_arena(&config, frames, wide).expect("the wide condition");
         let names: Vec<&str> = first.iter().map(|buffer| buffer.name.as_str()).collect();
         assert_eq!(
             names,
@@ -2365,11 +2387,10 @@ mod tests {
             .map(|tile| tile.canvas.pixels(&config))
             .max_by_key(|(height, width)| u64::from(*height) * u64::from(*width))
             .expect("a largest tile");
-        let stack = Stack::of(&config).expect("the stack");
         assert_eq!(
             tile.elements,
             u64::from(stack.input_channels)
-                * u64::from(vertical.frames)
+                * u64::from(frames)
                 * u64::from(tile_height)
                 * u64::from(tile_width),
             "the tile buffer is one tile's pixels, refilled per tile"
@@ -2386,7 +2407,7 @@ mod tests {
             height: 83,
             width: 48,
         };
-        assert!(conditioning_arena(&config, odd).is_err());
+        assert!(conditioning_arena(&config, 1, odd).is_err());
     }
 
     #[test]
