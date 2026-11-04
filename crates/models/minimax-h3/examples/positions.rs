@@ -132,6 +132,24 @@ impl Arguments {
             I32,
             &payload,
         )?;
+        // The case the dumper uses, so a dump directory and ours pair without an argument: the
+        // comparator reads both and refuses a pair that describes different requests.
+        let case = format!(
+            "{{\"clip\": {},\"canvas\": {{\"height\": {}, \"width\": {}}},\
+             \"num_frames\": {}, \"num_text_tokens\": {}, \"text_capacity\": {}, \
+             \"condition_capacity\": {}, \"token_multiple\": {}, \
+             \"attention\": {{\"kind\": \"dense\"}}}}\n",
+            minimax_h3::CLIP_LATENTS,
+            self.height,
+            self.width,
+            self.frames,
+            self.text_tokens,
+            self.text_rows,
+            self.condition_rows,
+            self.shard
+        );
+        std::fs::write(self.out.join("case.json"), case)
+            .map_err(|error| Error::Config(format!("case.json: {error}")))?;
         println!(
             "case: {}x{}, {} frames, prompt {} of {} rows, conditions {} of {} rows, shard {}",
             self.width,
