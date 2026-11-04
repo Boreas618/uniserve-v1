@@ -2261,19 +2261,37 @@ fn hold_kernels(
     Ok(held)
 }
 
-struct Recording {
+/// Public because a device test of the rebind mechanism must record with the sink the runner
+/// captures with: a copy of it in a test would measure the copy.
+pub struct Recording {
     capture: Arc<std::sync::Mutex<platform::Capture>>,
     nodes: crate::captured::Nodes,
     failure: Option<platform::Error>,
 }
 
 impl Recording {
-    fn new(capture: Arc<std::sync::Mutex<platform::Capture>>) -> Self {
+    /// Records into `capture`, which the caller installs as the sink and takes back afterwards.
+    pub fn new(capture: Arc<std::sync::Mutex<platform::Capture>>) -> Self {
         Self {
             capture,
             nodes: Vec::new(),
             failure: None,
         }
+    }
+
+    /// The per-launch node table, in capture order: `Captured.index_nodes`'s own input.
+    pub fn nodes(&self) -> &crate::captured::Nodes {
+        &self.nodes
+    }
+
+    /// The first failure a record reported, if any: a capture that failed part-way through.
+    pub fn failure(&self) -> Option<&platform::Error> {
+        self.failure.as_ref()
+    }
+
+    /// The node table, the recorder consumed.
+    pub fn into_nodes(self) -> crate::captured::Nodes {
+        self.nodes
     }
 }
 
