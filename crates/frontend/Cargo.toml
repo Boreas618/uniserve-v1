@@ -1,0 +1,42 @@
+[package]
+name = "frontend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The deployment's application process (`uniserve frontend`): the HTTP and
+# OpenAI API, requests' input and output processing, the facts of the requests
+# in flight and their migration between epochs, and the metrics of the serving
+# address. It links no numerical code (`specs/worker.md` §2.1, §3).
+[dependencies]
+anyhow.workspace = true
+# The tokenizer's decoder chain, which the served tokenizer loads.
+fastokens.workspace = true
+# The checkpoint's own files and the Hub's cache layout.
+hf-hub.workspace = true
+models.workspace = true
+proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_with.workspace = true
+thiserror.workspace = true
+thiserror-ext.workspace = true
+tracing.workspace = true
+# Builds the deterministic serving tokenizer of the test fixtures.
+tokenizers = { workspace = true, optional = true }
+
+[features]
+# Test fixtures (`src/test_support.rs`) for the crates whose tests serve
+# requests through the frontend.
+testing = ["dep:tokenizers"]
+
+[dev-dependencies]
+# Enables the crate's own test fixtures, which build the serving tokenizer.
+frontend = { path = ".", features = ["testing"] }
+axum.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true
