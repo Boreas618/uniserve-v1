@@ -881,6 +881,34 @@ fn audio_steps(rows: u32) -> Result<u32> {
         })
 }
 
+/// The stream offsets one rank's video and audio draws start at.
+///
+/// A request's noise is **one stream addressed by element** (`denoiser.py:452-500`): the visual
+/// conditions' draws first, then the video's rows, then the audio's. Every rank draws its own rows
+/// of that same stream, so each offset advances by the rank's **global** first row. A shard's own
+/// row count, or a row width that is not multiplied in, puts rank 1's draw on rank 0's elements:
+/// at one rank the picture is right, at two it is wrong per rank and the aggregate looks plausible.
+fn draw_offsets(layout: Layout, audio_width: u64, rank: u32, shard: u32) -> Result<(u64, u64)> {
+    let shard = u64::from(shard.max(1));
+    let rank = u64::from(rank);
+    if rank >= shard {
+        return Err(Error::config(format!(
+            "rank {rank} is outside a shard of {shard}"
+        )));
+    }
+    let first_row = |rows: u64| rank * rows / shard;
+    // One packed row is a 2x2 patch of one latent frame, so it covers four voxels' channels.
+    let row_elements = u64::from(layout.video.channels) * 4;
+    let video_rows = u64::from(layout.video.frames)
+        * u64::from(layout.video.height / 2)
+        * u64::from(layout.video.width / 2);
+    let condition = u64::from(layout.condition_elements);
+    let video = condition + first_row(video_rows) * row_elements;
+    let audio_rows = audio_elements(layout)? / audio_width;
+    let audio = condition + video_rows * row_elements + first_row(audio_rows) * audio_width;
+    Ok((video, audio))
+}
+
 /// Elements of the audio latent a layout holds: `AUDIO_CHANNELS * audio_channels * steps`, the
 /// stereo pair of channel planes packed channel-major.
 ///
@@ -1211,24 +1239,17 @@ impl nn::capability::Denoiser for Denoiser {
     ) -> nn::Result<()> {
         // One stream per request, addressed by element: the conditions' own draws first, then the
         // video latents, then the audio latents. A shard's first row is not element zero, so each
-        // modality's offset carries the rank's global first row.
-        let channels = u64::from(layout.video.channels);
-        // One packed row is a 2x2 patch of one latent frame, so it covers four voxels' channels.
-        let row_elements = channels * 4;
-        let video_rows = u64::from(layout.video.frames)
-            * u64::from(layout.video.height / 2)
-            * u64::from(layout.video.width / 2);
-        let condition = u64::from(layout.condition_elements);
-        let video_offset =
-            condition + self.first_row(video_rows).map_err(flattened)? * row_elements;
+        // modality's offset carries the rank's global first row (`draw_offsets`).
+        let (video_offset, audio_offset) = draw_offsets(
+            layout,
+            u64::from(self.config.transformer.audio_channels),
+            self.rank,
+            self.shard,
+        )
+        .map_err(flattened)?;
         // A rank splits the audio latent by rows, as it splits the video's, and a row is
         // `audio_channels` elements: an offset that forgot the width would put every rank after the
         // first at the wrong place of the stream, and at one rank nothing would show.
-        let audio_width = u64::from(self.config.transformer.audio_channels);
-        let audio_rows = audio_elements(layout).map_err(flattened)? / audio_width;
-        let audio_offset = condition
-            + video_rows * row_elements
-            + self.first_row(audio_rows).map_err(flattened)? * audio_width;
         // A layout with an audio stream and no audio latents would draw the video's noise and leave
         // the audio's undrawn, which is a silent disagreement rather than an absent stream.
         match (layout.audio, out.audio) {
@@ -2006,20 +2027,6 @@ impl Denoiser {
         self.evaluations
     }
 
-    /// The first row of this rank's shard, in the layout's global row order.
-    ///
-    /// A shard is a contiguous block of rows, so a rank's elements begin at its first row's.
-    fn first_row(&self, rows: u64) -> Result<u64> {
-        let shard = u64::from(self.shard.max(1));
-        let rank = u64::from(self.rank);
-        if rank >= shard {
-            return Err(Error::config(format!(
-                "rank {rank} is outside a shard of {shard}"
-            )));
-        }
-        Ok(rank * rows / shard)
-    }
-
     /// The tables the runner fills after loading.
     ///
     /// Empty by construction: the AdaLN cache is model memory (see [`Denoiser`]).
@@ -2381,6 +2388,41 @@ mod tests {
                 * u64::from(steps),
             "the stereo pair of channel planes is the latent's element count"
         );
+    }
+
+    #[test]
+    fn a_shard_draws_disjoint_rows_of_one_stream() {
+        // One stream per request, addressed by element: the conditions first, then the video's rows,
+        // then the audio's. Two ranks of one shard must split it without overlapping and without a
+        // gap - the property that a per-shard row count, or a row width that is not multiplied in,
+        // breaks while a single rank still looks right.
+        let rule = layouts();
+        let (layout, _) = rule.layout(&request(121, 1344, 768)).unwrap();
+        let width = u64::from(rule.config.transformer.audio_channels);
+        let row_elements = u64::from(layout.video.channels) * 4;
+        let video_rows = u64::from(layout.video.frames)
+            * u64::from(layout.video.height / 2)
+            * u64::from(layout.video.width / 2);
+        let audio = layout
+            .audio
+            .expect("a request that produces audio carries its latent");
+        let audio_rows = u64::from(audio.channels) * u64::from(audio.frames) / width;
+        let condition = u64::from(layout.condition_elements);
+
+        let (video0, audio0) = draw_offsets(layout, width, 0, 2).unwrap();
+        let (video1, audio1) = draw_offsets(layout, width, 1, 2).unwrap();
+        // Rank 0 starts where the conditions end; rank 1 where rank 0's video rows end.
+        assert_eq!(video0, condition);
+        // Rank 0 holds the first `floor(rows / 2)` rows, so that is the gap to rank 1 - the same
+        // split `first_row` gives, derived here from the row count rather than from the function.
+        assert_eq!(video1 - video0, (video_rows / 2) * row_elements);
+        // The audio follows the whole video stream on both ranks, and splits by its own rows.
+        assert_eq!(audio0, condition + video_rows * row_elements);
+        assert_eq!(audio1 - audio0, (audio_rows / 2) * width);
+        // One rank is the whole stream, and its audio starts where the video ends.
+        let (video, audio) = draw_offsets(layout, width, 0, 1).unwrap();
+        assert_eq!(video, condition);
+        assert_eq!(audio, condition + video_rows * row_elements);
     }
 
     #[test]
