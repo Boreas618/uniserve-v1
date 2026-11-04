@@ -59,7 +59,6 @@ import tempfile
 import threading
 import time
 import tomllib
-import warnings
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -304,13 +303,10 @@ def _build_store(store: Path, target: str, python: Path | None) -> None:
     serves the store as it stands, which is why ``--store-root`` below is this
     directory and no kernel package is installed a second time.
 
-    A key this deployment does not launch may fail to build — the key file
-    states a shape's whole walk, and a package the operator has but this host
-    cannot build is not the deployment's problem. So a partial store is served
-    as it stands and its gaps are printed: a precopy that needs one names the
-    descriptor it lacks precisely (the module lane's refusal), which is a
-    better report than a fixture refusing to start. Only a store with no
-    module at all — which no deployment can serve — fails here.
+    Every row it is given is one this deployment launches, so a row that does
+    not build is this deployment's failure and the file stops here: a short
+    store would only move the same news to the precopy a minute later, and the
+    build's own output names the key and the reason.
     """
     command = [
         "cargo",
@@ -336,27 +332,17 @@ def _build_store(store: Path, target: str, python: Path | None) -> None:
         text=True,
         timeout=3600,
     )
-    lines = built.stdout.splitlines()
-    prepared = [line for line in lines if line.startswith("ok\t")]
-    missing = [line for line in lines if line.startswith("FAILED\t")]
-    if prepared and built.returncode == 0:
-        return
-    if not prepared:
+    if built.returncode != 0:
+        missing = [
+            line.removeprefix("FAILED\t").replace("\t", " ")
+            for line in built.stdout.splitlines()
+            if line.startswith("FAILED\t")
+        ]
         raise AssertionError(
-            "the deployment's store has no module at all, so nothing can "
-            "serve: "
-            f"{built.stdout[-4000:]}\n{built.stderr[-4000:]}"
+            "the deployment's own kernels did not build, so nothing can serve"
+            + (f": {', '.join(missing)}" if missing else "")
+            + f"\n{built.stdout[-4000:]}\n{built.stderr[-4000:]}"
         )
-    # A short store is served, not refused: the keys that could not be built
-    # are named, and a precopy that needs one names its descriptor. A warning
-    # rather than a failure, because the key file states a shape's whole walk
-    # and a key this deployment never launches may be one no package builds.
-    warnings.warn(
-        f"the store holds {len(prepared)} built key(s) and not {len(missing)}: "
-        + "; ".join(line.replace("\t", " ") for line in missing),
-        stacklevel=2,
-    )
-    print(built.stderr[-2000:])
 
 
 @pytest.fixture(scope="module", autouse=True)
