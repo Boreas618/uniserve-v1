@@ -69,7 +69,6 @@ pub(crate) use crate::updates::change::{Applied, ApplyRequest, InFlight, resolve
 pub(crate) use crate::updates::epoch::Unavailable;
 
 mod change;
-pub(crate) mod group;
 mod redistribution;
 mod warming;
 use change::{Numerics, Observed, Step, Treatment, WorldChange};
@@ -1089,9 +1088,6 @@ impl Leader {
         if locked(&self.replicas.commit).is_some() {
             return Err(UpdateError::InProgress);
         }
-        if let Some(trial) = locked(&self.replicas.group).as_ref() {
-            return Err(UpdateError::OnTrial(trial.world()));
-        }
         if let Some(world) = replicas.iter().find_map(|replica| {
             locked(&replica.worlds)
                 .trial
@@ -1126,19 +1122,6 @@ impl Leader {
                 "epoch": epoch,
                 "update": update.number,
             })));
-        }
-        let count = if target.moe_config.expert_parallel {
-            1
-        } else {
-            target.data_parallel_size.get()
-        };
-        if count != replicas.len() {
-            if request.replica.is_some() {
-                return Err(UpdateError::Refused(
-                    "a change across replica boundaries applies to the whole deployment".into(),
-                ));
-            }
-            return group::apply(self, &request, target, stated, update).await;
         }
         let indices: Vec<_> = match request.replica {
             Some(index) => vec![index],
@@ -1312,11 +1295,7 @@ impl Leader {
             }
         }
         if locked(&self.replicas.commit).is_none() {
-            if locked(&self.replicas.group).is_some() {
-                group::decide_commit(&self.replicas).await?;
-            } else {
-                self.trial()?.decide_commit(&self.replicas).await?;
-            }
+            self.trial()?.decide_commit(&self.replicas).await?;
         }
         complete_commit(&self.replicas).await
     }
@@ -1336,9 +1315,6 @@ impl Leader {
             return Err(UpdateError::Refused(
                 "commit is decided; finish the pending commit".into(),
             ));
-        }
-        if locked(&self.replicas.group).is_some() {
-            return group::rollback(&self.replicas, reason).await;
         }
         let replica = self.trial()?;
         locked(&self.replicas.pending).clear();
@@ -1395,9 +1371,6 @@ impl Leader {
             deployment_gpus(nodes).into()
         });
         status["ledgers"] = ledgers;
-        if let Some(trial) = locked(&self.replicas.group).as_ref() {
-            status["trial"] = trial.status();
-        }
         status["commit"] = serde_json::json!(&*locked(&self.replicas.commit));
         status["pending_replicas"] = locked(&self.replicas.pending)
             .iter()
