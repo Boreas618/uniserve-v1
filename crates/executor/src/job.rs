@@ -441,6 +441,7 @@ mod tests {
             shape: Shape::decode(1, Variant::DecodeGreedy),
             columns: BatchColumns::default(),
             generation: 1,
+            cache_units: Vec::new(),
         }
     }
 
