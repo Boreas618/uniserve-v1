@@ -455,12 +455,12 @@ pub fn sources(config: &VideoVaeConfig) -> crate::Result<Vec<crate::audio_vae::S
 // The video decoder's transformer.
 // ---------------------------------------------------------------------------------------------
 
-use nn::Forward;
 use nn::layers::Rotation;
 use nn::layers::{
     Attention, LayerNorm, Linear, PackedSwiGlu, RmsNorm, Rotary, Rows, ScaledResidual, Sections,
 };
 use nn::weights::{Weight, WeightLoader, WeightRequest};
+use nn::Forward;
 use nn::{DType, DecodedMedia, Decoder, Shape, StateTable, TensorView};
 use ops::gemm::WeightOrder;
 
@@ -491,10 +491,6 @@ struct Layer {
 /// which is what `Rotary::apply`'s absent gains express.
 pub struct VideoDecoder {
     canvas: Canvas,
-    /// How the denoiser that produced this clip's latents attends. The clip's rows are packed in that
-    /// attention's order, so the table that gathers them is keyed by it - a property of the deployment,
-    /// stated once at load, not of a request.
-    packing: AttentionKind,
     /// The tile stitch: the unpatchify and one compiled blend per seam width, built at load so that no
     /// layer is built on a request's path.
     stitch: crate::decoding::ClipDecoder,
@@ -526,15 +522,20 @@ pub struct VideoDecoder {
 
 /// The packed row of every latent voxel one clip's decode reads, in clip-then-raster order.
 ///
+/// One clip's voxel rows: for every voxel of the clip's latent raster, the packed row it belongs to.
+///
 /// The decoder has one token per **latent voxel** - the VAE's patch is `1 x 2 x 2` latent cells and the
 /// transformer reads one token per cell - so this table is four times longer than the denoiser's row
-/// table: each voxel names the packed row of the `2 x 2` patch it lies in, which is what the gather into
-/// the clip's latent rows reads. The extents are a layout's latent ones, so the table is keyed by the
-/// layout and not by the request.
+/// table: each voxel names the packed row of the `2 x 2` patch it lies in. It describes **one clip**,
+/// because that is what the checkpoint's `video_vae.voxel_rows` holds and all a decode ever reads; how
+/// many clips a request has is the runner's question and the splice's, not this table's.
+///
+/// Nothing calls it at runtime: the checkpoint publishes the table, and this is the arithmetic that says
+/// what the published table must contain, checked by [`the_decoder_tables_name_one_voxel_and_one_position_per_row`].
+#[cfg(test)]
 fn voxel_rows(
     config: &VideoVaeConfig,
     attention: AttentionKind,
-    latent_frames: u32,
     latent_height: u32,
     latent_width: u32,
 ) -> Result<Vec<u32>> {
@@ -542,26 +543,23 @@ fn voxel_rows(
         height: latent_height,
         width: latent_width,
     };
-    let order = crate::packing::video_order_of(attention, latent_frames, raster)?;
+    // A clip's own window of latent frames, which is the timeline of exactly one clip.
+    let clip = Canvas::clip(config, latent_height, latent_width);
+    let order = crate::packing::video_order_of(attention, clip.frames, raster)?;
     let mut packed_of_raster = vec![0_u32; order.len()];
     for (packed, raster_row) in order.iter().enumerate() {
         packed_of_raster[*raster_row as usize] = u32::try_from(packed)
             .map_err(|_| Error::config("a packed row wider than a table entry".to_owned()))?;
     }
     let tokens = u64::from(raster.patch_rows());
-    let clip = Canvas::clip(config, latent_height, latent_width);
-    let clips = u64::from(latent_frames - crate::CLIP_LATENTS) / u64::from(crate::CLIP_FRAMES);
     let side = u64::from(crate::packing::PATCH_SIDE);
     let columns = u64::from(latent_width) / side;
-    let mut rows = Vec::with_capacity((clips * clip.voxels()) as usize);
-    for clip_index in 0..clips {
-        let start = clip_index * u64::from(crate::CLIP_LATENTS) * tokens;
-        for frame in 0..u64::from(clip.frames) {
-            for height in 0..u64::from(latent_height) {
-                for column in 0..u64::from(latent_width) {
-                    let patch = start + frame * tokens + (height / side) * columns + column / side;
-                    rows.push(packed_of_raster[patch as usize]);
-                }
+    let mut rows = Vec::with_capacity(clip.voxels() as usize);
+    for frame in 0..u64::from(clip.frames) {
+        for height in 0..u64::from(latent_height) {
+            for column in 0..u64::from(latent_width) {
+                let patch = frame * tokens + (height / side) * columns + column / side;
+                rows.push(packed_of_raster[patch as usize]);
             }
         }
     }
@@ -582,58 +580,34 @@ fn largest_tile(config: &VideoVaeConfig, latent_height: u32, latent_width: u32) 
         .ok_or_else(|| Error::config("a canvas with no tile has no position table".to_owned()))
 }
 
-/// The tables one layout's decode reads, keyed by its latent extents.
+/// The one table a layout's decode reads, keyed by its latent extents.
 ///
-/// These are the model's arithmetic and they are keyed by the **layout**: the rotary positions of the
-/// largest tile of the latent raster (every other tile's are a slice of them, because the tiles are
-/// uniform), and the rows one clip gathers its voxels by. `attention` is the packed order of the
-/// denoiser whose latents this decoder reconstructs, which is a property of the deployment and not of a
-/// request.
+/// The model's arithmetic, keyed by the **layout**: the rotary positions of the largest tile of the latent
+/// raster, which every other tile's positions are a slice of because the tiles are uniform. There is one
+/// table and not two: the clip's voxel rows are the checkpoint's own `video_vae.voxel_rows`, a constant
+/// read once at load ([`voxel_rows`] states what it must contain), so a per-layout copy of them would be
+/// a second source of truth for a value that never varies with the layout.
 pub(crate) fn table_specs(
     config: &VideoVaeConfig,
-    attention: AttentionKind,
-    latent_frames: u32,
     latent_height: u32,
     latent_width: u32,
 ) -> Result<Vec<StateTable>> {
     let positions = u64::from(positions_table(config, latent_height, latent_width)?);
-    let rows = voxel_rows(
-        config,
-        attention,
-        latent_frames,
-        latent_height,
-        latent_width,
-    )?;
-    Ok(vec![
-        StateTable {
-            name: "video_positions",
-            dtype: DType::F32,
-            shape: Shape::new(&[3, positions]),
-        },
-        StateTable {
-            name: "video_clip_rows",
-            dtype: DType::I32,
-            shape: Shape::new(&[rows.len() as u64]),
-        },
-    ])
+    Ok(vec![StateTable {
+        name: "video_positions",
+        dtype: DType::F32,
+        shape: Shape::new(&[3, positions]),
+    }])
 }
 
 /// Write the host bytes of [`table_specs`], in its order, checking every buffer's length.
 pub(crate) fn table_bytes_into(
     config: &VideoVaeConfig,
-    attention: AttentionKind,
-    latent_frames: u32,
     latent_height: u32,
     latent_width: u32,
     out: &mut [Vec<u8>],
 ) -> Result<()> {
-    let tables = table_specs(
-        config,
-        attention,
-        latent_frames,
-        latent_height,
-        latent_width,
-    )?;
+    let tables = table_specs(config, latent_height, latent_width)?;
     if out.len() != tables.len() {
         return Err(Error::config(format!(
             "{} tables are read and {} buffers given",
@@ -647,21 +621,6 @@ pub(crate) fn table_bytes_into(
         bytes.extend_from_slice(&value.to_le_bytes());
     }
     out[0] = bytes;
-    let rows = voxel_rows(
-        config,
-        attention,
-        latent_frames,
-        latent_height,
-        latent_width,
-    )?;
-    let mut bytes = Vec::with_capacity(rows.len() * 4);
-    for row in rows {
-        let row = i32::try_from(row).map_err(|_| {
-            Error::config(format!("the packed row {row} does not fit a table entry"))
-        })?;
-        bytes.extend_from_slice(&row.to_le_bytes());
-    }
-    out[1] = bytes;
     for (buffer, table) in out.iter().zip(&tables) {
         let expected = table.shape.numel() as usize * (table.dtype.bits() as usize / 8);
         if buffer.len() != expected {
@@ -758,6 +717,17 @@ impl VideoDecoder {
         input: Linear,
         loader: &mut WeightLoader,
     ) -> Result<Self> {
+        // The clip's rows are gathered by the checkpoint's own `video_vae.voxel_rows`, which names the
+        // dense packed order; a denoiser that packed sparsely would hand rows in another order and the
+        // gather would read a neighbouring voxel's channel. Sparse serving is refused before this block
+        // is reached, and it is refused here too rather than read through the wrong table.
+        if attention != AttentionKind::Dense {
+            return Err(Error::config(
+                "the video decoder's voxel rows are the checkpoint's dense packed order, so a \
+                 sparsely packed denoiser cannot hand it latents"
+                    .to_owned(),
+            ));
+        }
         let width = config.decoder_num_attention_heads * config.decoder_attention_head_dim;
         let head = config.decoder_attention_head_dim;
         let heads = config.decoder_num_attention_heads;
@@ -898,7 +868,6 @@ impl VideoDecoder {
         .sectioned(Sections::new(&sections)?)?;
         Ok(Self {
             canvas,
-            packing: attention,
             dtype,
             stitch,
             width,
@@ -996,39 +965,18 @@ fn frequencies(loader: &mut WeightLoader, config: &VideoVaeConfig) -> Result<Wei
 
 impl VideoDecoder {
     /// The tables one layout's decode reads, in [`table_bytes_into`]' order.
-    pub fn tables(
-        &self,
-        attention: AttentionKind,
-        latent_frames: u32,
-        latent_height: u32,
-        latent_width: u32,
-    ) -> Result<Vec<StateTable>> {
-        table_specs(
-            &self.config,
-            attention,
-            latent_frames,
-            latent_height,
-            latent_width,
-        )
+    pub fn tables(&self, latent_height: u32, latent_width: u32) -> Result<Vec<StateTable>> {
+        table_specs(&self.config, latent_height, latent_width)
     }
 
     /// Write the host bytes of each table of [`Self::tables`], in the same order.
     pub fn table_bytes(
         &self,
-        attention: AttentionKind,
-        latent_frames: u32,
         latent_height: u32,
         latent_width: u32,
         out: &mut [Vec<u8>],
     ) -> Result<()> {
-        table_bytes_into(
-            &self.config,
-            attention,
-            latent_frames,
-            latent_height,
-            latent_width,
-            out,
-        )
+        table_bytes_into(&self.config, latent_height, latent_width, out)
     }
 
     /// The layout's tables, keyed by the extents the layout states.
@@ -1036,7 +984,7 @@ impl VideoDecoder {
     /// This is the shape the capability protocol asks for; a request's own state is none of it.
     pub fn layout_tables(&self, layout: &nn::capability::Layout) -> Result<Vec<StateTable>> {
         let video = layout.video;
-        self.tables(self.packing, video.frames, video.height, video.width)
+        self.tables(video.height, video.width)
     }
 
     /// Write the layout's table bytes, in [`Self::layout_tables`]' order.
@@ -1046,7 +994,7 @@ impl VideoDecoder {
         out: &mut [Vec<u8>],
     ) -> Result<()> {
         let video = layout.video;
-        self.table_bytes(self.packing, video.frames, video.height, video.width, out)
+        self.table_bytes(video.height, video.width, out)
     }
 
     /// Decode one clip's latent rows into the pixel block of every token.
@@ -1170,7 +1118,7 @@ impl Decoder for VideoDecoder {
     /// Decode one clip: every tile of its canvas, stitched into `out.video`.
     ///
     /// `latents` is the clip's `[voxels, latent_channels]` rows in tile order — the runner gathers them
-    /// with the layout's `video_clip_rows` — `state` holds this block's one table, `video_positions`
+    /// through the checkpoint's own `video_vae.voxel_rows` — `state` holds this block's one table, `video_positions`
     /// `[3, rows]` axis-major in radians, and `out.video` is the clip's raster. The raster is
     /// `[channels, frames, rows, columns]` in the decoder's own element type: the layers on this path —
     /// the unpatchify, the seam blends and the byte step — all read a planar channels-first raster, and
@@ -1372,30 +1320,16 @@ pub(crate) mod tests {
             width: 1344,
             height: 768,
         };
-        // The layout's own extents: the canvas over the spatial compression, and the latent frame count
-        // the request's frames encode to.
+        // The layout's own extents: the canvas over the spatial compression.
         let raster = crate::packing::latent_raster(&canvas).expect("raster");
-        // One generated clip: 22 frames is the shortest count of the form 17n + 5, and it encodes to
-        // five latent frames plus the two that the next clip repeats.
-        let latent_frames = crate::packing::video_latent_frames(22).expect("frames");
-        // One entry per latent voxel of one clip, and the values are the packed rows of the patches
-        // those voxels lie in - not the voxel indices, which is the factor of the patch area apart.
-        let rows = voxel_rows(
-            &config,
-            AttentionKind::Dense,
-            latent_frames,
-            raster.height,
-            raster.width,
-        )
-        .expect("rows");
+        // One entry per latent voxel of **one clip** - the checkpoint's own `video_vae.voxel_rows` - and
+        // the values are the packed rows of the patches those voxels lie in, not the voxel indices,
+        // which is the factor of the patch area apart. How many clips a request has is the runner's
+        // question, so no clip count appears here.
+        let rows =
+            voxel_rows(&config, AttentionKind::Dense, raster.height, raster.width).expect("rows");
         let clip = Canvas::clip(&config, raster.height, raster.width);
-        // The clip count of the timeline, through the inverse rather than from the latent count's
-        // arithmetic: `17n + 5` frames are `n` clips, and its latent timeline is `5n + 2` frames.
-        let generated =
-            crate::packing::video_output_frames(latent_frames).expect("the frames back");
-        let clips = (generated - crate::CLIP_LATENTS) / crate::CLIP_FRAMES;
-        assert_eq!(clips, 1);
-        assert_eq!(rows.len() as u64, u64::from(clips) * clip.voxels());
+        assert_eq!(rows.len() as u64, clip.voxels());
         let side = u64::from(crate::packing::PATCH_SIDE);
         let columns = u64::from(raster.width) / side;
         let per_frame = u64::from(raster.patch_rows());
@@ -1416,7 +1350,7 @@ pub(crate) mod tests {
             );
         }
         // Every value is a row of the packed sequence the denoiser writes.
-        let packed = crate::packing::video_order_of(AttentionKind::Dense, latent_frames, raster)
+        let packed = crate::packing::video_order_of(AttentionKind::Dense, clip.frames, raster)
             .expect("order")
             .len() as u64;
         assert!(rows.iter().all(|row| u64::from(*row) < packed));
@@ -1431,12 +1365,12 @@ pub(crate) mod tests {
                 assert_eq!(table[(channel * tile.rows() + row) as usize], 0.0);
             }
         }
-        // The two tables a layout declares are the two this decoder reads, and their descriptors are
-        // the extents the layout states - the adapter adds no arithmetic of its own.
+        // The one table a layout declares is the one this decoder reads, and its descriptor is the
+        // extent the layout states - the adapter adds no arithmetic of its own.
         let layout = nn::capability::Layout {
             video: nn::capability::LatentShape {
                 channels: config.latent_channels,
-                frames: latent_frames,
+                frames: clip.frames,
                 height: raster.height,
                 width: raster.width,
             },
@@ -1445,18 +1379,12 @@ pub(crate) mod tests {
             condition_rows: 0,
             condition_elements: 0,
         };
-        let declared = table_specs(
-            &config,
-            AttentionKind::Dense,
-            layout.video.frames,
-            layout.video.height,
-            layout.video.width,
-        )
-        .expect("specs");
-        assert_eq!(declared.len(), 2);
+        let declared =
+            table_specs(&config, layout.video.height, layout.video.width).expect("specs");
+        assert_eq!(declared.len(), 1);
         assert_eq!(declared[0].name, "video_positions");
-        assert_eq!(declared[1].name, "video_clip_rows");
-        assert_eq!(declared[1].shape.numel(), rows.len() as u64);
+        assert_eq!(declared[0].shape.dim(1), 3 * tile.rows());
+        assert_eq!(declared[0].dtype, DType::F32);
     }
 
     #[test]
