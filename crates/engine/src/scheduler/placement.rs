@@ -41,6 +41,17 @@ fn decodes(kind: CallKind) -> bool {
     )
 }
 
+/// Who chooses the replica a call runs on.
+pub(super) enum Choice {
+    /// The mechanism's own rule: the replica holding the request's state, the
+    /// one already serving another of its components, or the one with the
+    /// fewest resident requests.
+    Existing,
+    /// The policy's answer for a request that has not run there yet: the worker
+    /// it named among the candidates `views::replicas` showed it.
+    Target(crate::WorkerGroupId),
+}
+
 impl Placement {
     /// Enumerates loaded components that can execute the requested call.
     ///
@@ -106,6 +117,13 @@ impl Placement {
             })
     }
 
+    /// Whether a request already runs somewhere: a replica holds its mutable
+    /// state, so its next call goes there and the policy is not asked.
+    pub(super) fn resident(&self, request: RequestKey) -> bool {
+        self.affinity.keys().any(|(key, _)| *key == request)
+            || self.decode_affinity.keys().any(|(key, _)| *key == request)
+    }
+
     /// Selects one replica while preserving request residency.
     ///
     /// Returns `None` when no worker can serve the component, when the replica
@@ -120,6 +138,7 @@ impl Placement {
         request: RequestKey,
         kind: CallKind,
         component: &'a str,
+        choice: &Choice,
     ) -> Option<(&'a crate::WorkerGroupId, &'a str)> {
         // A decode-stage call runs on a replica that decodes: a cache
         // install, which a prefill replica could serve, hands the request to
@@ -140,6 +159,15 @@ impl Placement {
         };
         if let Some(owner) = pinned.get(&(request, bound.to_owned())) {
             let (id, component, _) = candidates.into_iter().find(|(id, _, _)| *id == owner)?;
+            return executor.has_capacity(id).then_some((id, component));
+        }
+
+        // A request that has not run here yet runs where the policy says
+        // (design §4.4). A named worker that is not a candidate, or whose queue
+        // has no room, leaves the call to a later step: the mechanism never
+        // substitutes a replica the policy did not choose.
+        if let Choice::Target(named) = choice {
+            let (id, component, _) = candidates.into_iter().find(|(id, _, _)| *id == named)?;
             return executor.has_capacity(id).then_some((id, component));
         }
 
@@ -185,6 +213,7 @@ impl Placement {
         info: &'a WorkerInfo,
         request: RequestKey,
         kind: CallKind,
+        choice: &Choice,
     ) -> Option<(&'a crate::WorkerGroupId, &'a str)> {
         let component = match kind {
             CallKind::Media(media_call) => info
@@ -193,7 +222,7 @@ impl Placement {
                 .map_or("model", String::as_str),
             _ => "model",
         };
-        self.component_target(executor, request, kind, component)
+        self.component_target(executor, request, kind, component, choice)
     }
 
     /// Places `request`'s calls of `kind` on the replica that will execute
@@ -209,7 +238,8 @@ impl Placement {
         request: RequestKey,
         kind: CallKind,
     ) -> Option<crate::WorkerGroupId> {
-        let (id, bound_component) = self.worker_target(executor, info, request, kind)?;
+        let (id, bound_component) =
+            self.worker_target(executor, info, request, kind, &Choice::Existing)?;
         let target = (id.clone(), bound_component.to_owned());
         let pinned = if decodes(kind) {
             &mut self.decode_affinity
@@ -229,11 +259,12 @@ impl Placement {
         executor: &dyn Executor,
         info: &WorkerInfo,
         call: &Call,
+        choice: &Choice,
     ) -> Option<(crate::WorkerGroupId, String)> {
         let (id, bound_component) = if call.component == DEFAULT_COMPONENT {
-            self.worker_target(executor, info, call.request_key, call.kind)
+            self.worker_target(executor, info, call.request_key, call.kind, choice)
         } else {
-            self.component_target(executor, call.request_key, call.kind, &call.component)
+            self.component_target(executor, call.request_key, call.kind, &call.component, choice)
         }?;
         let target = (id.clone(), bound_component.to_owned());
         let pinned = if decodes(call.kind) {

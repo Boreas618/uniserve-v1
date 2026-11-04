@@ -76,6 +76,43 @@ impl Scheduler {
         self.assemble_batch(&work)
     }
 
+    /// The replica a planned call runs on: the mechanism's own residency when
+    /// the request already ran, the policy's answer when it has not (design
+    /// §4.4).
+    ///
+    /// The policy sees the candidates exactly as `views::replicas` shows them
+    /// and answers one of their indices; `views::replica_targets` names the same
+    /// workers in the same order, both built from one filter in `views.rs`, so
+    /// an index becomes a worker without two candidate lists that could
+    /// disagree. A policy that fails here fails as any decision does: the call
+    /// waits this step and the previous policy decides the next one.
+    fn place_call(&mut self, call: &Call) -> Option<placement::Choice> {
+        if self.placement.resident(call.request_key) {
+            return Some(placement::Choice::Existing);
+        }
+        let replicas = views::replicas(self, call.request_key, call.kind);
+        if replicas.is_empty() {
+            return Some(placement::Choice::Existing);
+        }
+        let targets = views::replica_targets(self, call.request_key, call.kind);
+        let view = views::call_view(call.request_key, call.kind);
+        let Some(mut policy) = self.policy.take() else {
+            return None;
+        };
+        let answer = policy
+            .place(&view, &replicas)
+            .and_then(|index| mechanism::validate_place(&view, &replicas, index).map(|()| index));
+        let target = match answer {
+            Ok(index) => targets.get(index).map(|(worker, _)| worker.clone()),
+            Err(error) => {
+                let _ = self.policy_failed(policy, error);
+                return None;
+            }
+        };
+        self.policy = Some(policy);
+        target.map(placement::Choice::Target)
+    }
+
     /// Charges actual token work, including each CFG branch of a denoising step.
     ///
     /// A denoising call costs its latent units times its guidance branches;
@@ -126,7 +163,13 @@ impl Scheduler {
             .get(&id)
             .map(|state| RequestKey::new(self.engine_id, id, state.request_epoch))?;
         self.placement
-            .worker_target(self.executor.as_ref(), &self.info, request_key, call.kind)?;
+            .worker_target(
+                self.executor.as_ref(),
+                &self.info,
+                request_key,
+                call.kind,
+                &placement::Choice::Existing,
+            )?;
 
         let mut buffer_allocations = Vec::new();
         for bytes in call.buffer_outputs().map(TensorRef::max_bytes) {

@@ -574,7 +574,7 @@ impl Scheduler {
     /// The state the previous policy is instantiated on is the mechanism's at
     /// this moment, built here and handed over owned: the slot lives inside the
     /// scheduler, so the mechanism cannot lend it a borrow of the scheduler.
-    fn policy_failed(
+    pub(super) fn policy_failed(
         &mut self,
         mut policy: policy::PolicySlot,
         error: PolicyError,
