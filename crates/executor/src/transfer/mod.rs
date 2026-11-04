@@ -8,7 +8,7 @@
 
 pub(crate) mod backing;
 pub(crate) mod cache_export;
-pub use cache_export::CacheExport;
+pub use cache_export::{CacheExport, StateIdentity};
 mod cache_import;
 mod capacity;
 mod channel;
@@ -31,14 +31,14 @@ pub(crate) mod warming;
 pub(crate) use cache_import::{
     CacheImport, CacheImporter, ImportCopy, ImportEntry, ImportWorkspace, Retired,
 };
+pub(crate) use posix_shm::SharedBuffer;
 pub use posix_shm::SharedRead;
-pub(crate) use posix_shm::{SharedBuffer, SharedMapping};
 pub use read::Read;
 pub(crate) use read::ReadRef;
 pub use spans::Spans;
 pub(crate) use spans::{copy_on_host, copy_planner, submit_copy};
 pub use transport::{Transport, TransportKind, TransportOptions, Transports};
-pub(crate) use vmm::{DescriptorGrants, PeerStorage};
+pub(crate) use vmm::DescriptorGrants;
 
 pub(crate) use capacity::ByteReservation;
 pub use capacity::{ReadReservation, TransferCapacity};
@@ -47,8 +47,8 @@ pub(crate) use ticket::TransferTicket;
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::Result;
 use crate::completion::Completion;
-use crate::{Error, Result};
 
 /// A completion or readiness observer. Observers only notify (wake a
 /// submission or the service loop); they never block or call back into the

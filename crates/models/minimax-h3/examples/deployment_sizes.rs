@@ -25,32 +25,32 @@ struct Stage {
 #[rustfmt::skip]
 const STAGES: &[Stage] = &[
     Stage { deployment: "t2va dense", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
-    Stage { deployment: "t2va dense", stage: "denoiser (base DiT + refiner)", weights: 41953, constants: 1946, arena: 9341, tables: 12 },
+    Stage { deployment: "t2va dense", stage: "denoiser (base DiT + refiner)", weights: 41953, constants: 1946, arena: 10129, tables: 12 },
     Stage { deployment: "t2va dense", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
     Stage { deployment: "t2va dense", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "t2va dense", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
     Stage { deployment: "fl2va dense", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
-    Stage { deployment: "fl2va dense", stage: "denoiser (base DiT + refiner + encoders)", weights: 42453, constants: 1946, arena: 16216, tables: 12 },
+    Stage { deployment: "fl2va dense", stage: "denoiser (base DiT + refiner + encoders)", weights: 42453, constants: 1946, arena: 17041, tables: 12 },
     Stage { deployment: "fl2va dense", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
     Stage { deployment: "fl2va dense", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "fl2va dense", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
-    Stage { deployment: "ref2va dense (tile 128)", stage: "denoiser (OmniRef DiT + refiner + encoders)", weights: 42453, constants: 1946, arena: 16216, tables: 14 },
+    Stage { deployment: "ref2va dense (tile 128)", stage: "denoiser (OmniRef DiT + refiner + encoders)", weights: 42453, constants: 1946, arena: 17041, tables: 14 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
     Stage { deployment: "t2va + DMD student", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
-    Stage { deployment: "t2va + DMD student", stage: "denoiser (student + refiner)", weights: 41953, constants: 343, arena: 9341, tables: 12 },
+    Stage { deployment: "t2va + DMD student", stage: "denoiser (student + refiner)", weights: 41953, constants: 343, arena: 10129, tables: 12 },
     Stage { deployment: "t2va + DMD student", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
     Stage { deployment: "t2va + DMD student", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "t2va + DMD student", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
     Stage { deployment: "t2va dense, Ulysses 2", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
-    Stage { deployment: "t2va dense, Ulysses 2", stage: "denoiser (base DiT + refiner)", weights: 21299, constants: 1946, arena: 10383, tables: 12 },
+    Stage { deployment: "t2va dense, Ulysses 2", stage: "denoiser (base DiT + refiner)", weights: 21299, constants: 1946, arena: 11169, tables: 12 },
     Stage { deployment: "t2va dense, Ulysses 2", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
     Stage { deployment: "t2va dense, Ulysses 2", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "t2va dense, Ulysses 2", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
     Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "text_encoder", weights: 25129, constants: 0, arena: 1, tables: 7 },
-    Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "denoiser (base DiT + refiner)", weights: 21299, constants: 1946, arena: 10383, tables: 12 },
+    Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "denoiser (base DiT + refiner)", weights: 21299, constants: 1946, arena: 11169, tables: 12 },
     Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
     Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "t2va dense, Ulysses 2 x tensor 2", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
@@ -179,13 +179,138 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             mib(rows * width * 2 / (1 << 20))
         );
         if let minimax_h3::config::AttentionKind::Sparse { tile, .. } = denoiser.attention {
+            // The tile bound is the deployment's own maximum over every layout it serves, and it
+            // is the model's (`Layouts::tiles_bound`) - a scratch figure derived here from one
+            // request's rows would be a second statement of it and could size the sparse stack's
+            // buffer short.
+            let arrangement = minimax_h3::partition::Partition::single().arrangement(denoiser)?;
+            let bound =
+                minimax_h3::denoiser::Layouts::new(denoiser.clone(), arrangement)?.tiles_bound()?;
             let heads = u64::from(denoiser.transformer.num_attention_heads);
-            let tiles = rows.div_ceil(u64::from(tile));
+            let bound = u64::from(bound);
             println!(
-                "  sparse scratch {} (tiles^2 x heads x 2 B, {tiles} tiles)",
-                mib(tiles * tiles * heads * 2 / (1 << 20))
+                "  sparse scratch {} at the deployment's bound (tiles^2 x heads x 2 B, {bound} tiles)",
+                mib(bound * bound * heads * 2 / (1 << 20))
+            );
+            // This request's own tile count, for comparison: the buffer is sized by the bound, so a
+            // request under it must not be read as the size.
+            println!(
+                "    this request's rows span {} tiles of {} rows",
+                rows.div_ceil(u64::from(tile)),
+                tile
+            );
+        } else {
+            println!("  sparse scratch: this DiT attends densely, so no tile bound applies");
+        }
+    }
+
+    // The stage table's weight column, from the checkpoint's own index rather than by hand.
+    //
+    // A component's `total_size` is the index's sum over every tensor it names, so a row cannot
+    // drift from the checkpoint it describes - which is how the three hand-carried rows of the
+    // previous round drifted. The index is read as a small file: the shards themselves are not
+    // needed to know how many bytes they hold. Two components hold a block's encoder and its
+    // decoder in one directory, and the table's split of those into two stages is the loaders' key
+    // sets, so they are printed whole with the table's two rows beside them.
+    let mut component_bytes = std::collections::BTreeMap::new();
+    println!();
+    for component in minimax_h3::partition::Component::ALL {
+        let Some(directory) = component.directories().first().copied() else {
+            continue;
+        };
+        // The two VAEs are each named by two components (a decoder's directory and the condition
+        // encoder that reads its other half), and the byte figure belongs to the directory.
+        if component_bytes.contains_key(directory) {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(root.join(directory)) else {
+            println!("weights {directory}: no such directory, so the table's figure stands alone");
+            continue;
+        };
+        let mut named = None;
+        let mut single = None;
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(".index.json") {
+                named = Some(entry.path());
+            } else if name.ends_with(".safetensors") {
+                single = Some(entry.path());
+            }
+        }
+        // A sharded export states its own total in the index's metadata; an export of one file
+        // states nothing, and its data section is the file less its eight-byte length and header.
+        if let Some(path) = named {
+            let text = std::fs::read_to_string(path)?;
+            let index: serde_json::Value = serde_json::from_str(&text)?;
+            let total = index["metadata"]["total_size"]
+                .as_u64()
+                .or_else(|| index["total_size"].as_u64())
+                .unwrap_or(0);
+            let count = index["weight_map"].as_object().map_or(0, |map| map.len());
+            component_bytes.insert(directory.to_owned(), total);
+            println!(
+                "weights {directory}: {count} tensors in the index, {} MiB",
+                total / (1 << 20)
+            );
+        } else if let Some(path) = single {
+            let bytes = std::fs::metadata(&path)?.len();
+            let mut header = [0_u8; 8];
+            let mut file = std::fs::File::open(&path)?;
+            std::io::Read::read_exact(&mut file, &mut header)?;
+            let header_len = u64::from_le_bytes(header);
+            let data = bytes.saturating_sub(8 + header_len);
+            component_bytes.insert(directory.to_owned(), data);
+            println!(
+                "weights {directory}: one file, {data} bytes of data = {} MiB (its header states no \
+                 count)",
+                data / (1 << 20)
+            );
+        } else {
+            println!(
+                "weights {directory}: no index and no shard beside it here, so the table's figure \
+                 stands alone"
             );
         }
+    }
+
+    // The table's weight column is the **kept** tensors of each block, and a component's total is
+    // not that: the text encoder retains 50 of its 64 layers, the denoiser folds `adaln_proj` away,
+    // and the two VAEs are told apart by their key prefixes. Which tensors a block keeps is the
+    // loaders' selection, and restating it here would be a second statement of one rule - so the
+    // index is a bound the table must sit under, not a figure that replaces it. A row that
+    // overstates a block is what the bound catches; one that understates it is caught by
+    // `inspect_checkpoint`, which proves the key groups exist.
+    for deployment in DEPLOYMENTS {
+        // A rank places one DiT partition, so the other one's directory is not part of the bound.
+        let placed = if deployment.contains("ref2va") {
+            Dit::Reference
+        } else {
+            Dit::Base
+        };
+        let unplaced = match placed {
+            Dit::Base => "transformer_ref",
+            Dit::Reference => "transformer",
+        };
+        let all: u64 = component_bytes
+            .iter()
+            .filter(|(directory, _)| directory.as_str() != unplaced)
+            .map(|(_, bytes)| bytes / (1 << 20))
+            .sum();
+        let table: u64 = STAGES
+            .iter()
+            .filter(|stage| stage.deployment == deployment)
+            .map(|stage| stage.weights)
+            .sum();
+        if table > all {
+            return Err(format!(
+                "{deployment} states {table} MiB of weights and the components it places hold \
+                 {all} MiB"
+            )
+            .into());
+        }
+        println!(
+            "weights {deployment}: table {table} MiB, under the {all} MiB its own components hold"
+        );
     }
 
     // The DiT's plans, from the crate's own function, one line per deployment shape: the base DiT on
@@ -260,9 +385,11 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             )?;
             let bytes: u64 = plan.iter().map(minimax_h3::decoding::Buffer::bytes).sum();
             println!(
-                "DiT plan {name}, {frames} frames: {} entries, {}",
+                "DiT plan {name}, {frames} frames: {} entries, {} = {} MiB ({} bytes)",
                 plan.len(),
-                mib(bytes / (1 << 20))
+                mib(bytes / (1 << 20)),
+                bytes / (1 << 20),
+                bytes
             );
         }
     }
@@ -279,6 +406,38 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             mib(bytes / (1 << 20))
         );
     }
+    // The conditioning pass's own arena, which a conditioned deployment reserves once per condition
+    // beside the encoder's set. Two anchors, because the tile buffer is in pixels and the rest are in
+    // latents: a still and a 25-frame reference at the same raster.
+    // The latent raster the packing names: 84 columns by 48 rows, the reference's own.
+    let latent = minimax_h3::encoding::Extent {
+        frames: 1,
+        height: 48,
+        width: 84,
+    };
+    for (frames, extent) in [
+        (1_u32, latent),
+        (
+            // 25 frames of a reference are 7 latent frames by the encoder's own rule, and the plan
+            // refuses a caller that hands it the wrong one of the two counts.
+            25,
+            minimax_h3::encoding::Extent {
+                frames: 7,
+                ..latent
+            },
+        ),
+    ] {
+        let plan = minimax_h3::encoding::conditioning_arena(&config.video_vae, frames, extent)?;
+        let bytes: u64 = plan.iter().map(minimax_h3::decoding::Buffer::bytes).sum();
+        println!(
+            "conditioning plan {frames} frames ({} latent): {} buffers, {} bytes = {} KiB",
+            extent.frames,
+            plan.len(),
+            bytes,
+            bytes / (1 << 10)
+        );
+    }
+
     // The splice's plan: one buffer, one clip's raster at the canvas's pixel extents. It does not
     // grow with the grid or the clip count, because a splice blends one clip at a time.
     for canvas in NAMED_CANVASES {

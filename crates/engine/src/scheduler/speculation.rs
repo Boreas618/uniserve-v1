@@ -29,9 +29,9 @@
 //! the tokens a verification carrying drafts commits, the worker's time of
 //! a decoding step with and without drafts, and its time per prompt token.
 
-use crate::scheduler::completion::CallCompletion;
 use super::*;
 use crate::kv_cache::Checkpoint;
+use crate::scheduler::completion::CallCompletion;
 use ipc::ForwardMode;
 
 /// The weight of each new observation in the meter's averages: an average

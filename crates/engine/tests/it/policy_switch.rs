@@ -296,8 +296,8 @@ fn the_program_layers_commands_reach_one_scheduler_and_name_what_they_need() {
             arguments: Default::default(),
         },
     };
-    let refused = answer(world.handle.program_command(precopy))
-        .expect_err("a precopy needs its source");
+    let refused =
+        answer(world.handle.program_command(precopy)).expect_err("a precopy needs its source");
     assert!(
         refused.contains("Program Server"),
         "the refusal names the owner of the program: {refused}"
@@ -308,10 +308,14 @@ fn the_program_layers_commands_reach_one_scheduler_and_name_what_they_need() {
     // stage that applied there.
     world.precopy("fcfs", 2, toy()).expect("the first precopy");
     let ahead = world.step() + 2;
-    answer(world.handle.program_command(ipc::ProgramCommand::Switchover {
-        generation: 1,
-        step: Some(ahead),
-    }))
+    answer(
+        world
+            .handle
+            .program_command(ipc::ProgramCommand::Switchover {
+                generation: 1,
+                step: Some(ahead),
+            }),
+    )
     .expect("a switchover at a step ahead applies there");
     assert!(
         world.step() >= ahead,
@@ -326,10 +330,14 @@ fn the_program_layers_commands_reach_one_scheduler_and_name_what_they_need() {
     world
         .precopy("fcfs", 3, toy())
         .expect("a candidate the boundary check can leave prepared");
-    let refused_step = answer(world.handle.program_command(ipc::ProgramCommand::Switchover {
-        generation: 1,
-        step: Some(ahead - 1),
-    }))
+    let refused_step = answer(
+        world
+            .handle
+            .program_command(ipc::ProgramCommand::Switchover {
+                generation: 1,
+                step: Some(ahead - 1),
+            }),
+    )
     .expect_err("a step the scheduler passed cannot be applied at");
     assert!(
         refused_step.contains("passed"),
@@ -337,11 +345,15 @@ fn the_program_layers_commands_reach_one_scheduler_and_name_what_they_need() {
     );
 
     // One that names a step far ahead waits for it instead of applying early.
-    world.precopy("priority", 4, toy()).expect("the second precopy");
-    let waiting = world.handle.program_command(ipc::ProgramCommand::Switchover {
-        generation: 2,
-        step: Some(world.step() + 1000),
-    });
+    world
+        .precopy("priority", 4, toy())
+        .expect("the second precopy");
+    let waiting = world
+        .handle
+        .program_command(ipc::ProgramCommand::Switchover {
+            generation: 2,
+            step: Some(world.step() + 1000),
+        });
     assert!(
         waiting.recv_timeout(Duration::from_millis(200)).is_err(),
         "a switchover for a later step does not apply at this one"

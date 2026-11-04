@@ -207,6 +207,48 @@ impl Layouts {
         Ok(bound)
     }
 
+    /// The largest number of video tiles any layout of this deployment reaches.
+    ///
+    /// The compression's score matrix is `[heads, query tiles, tiles]`, so its tile axis must cover
+    /// every video tile of every layout the deployment can be asked for. It counts **all** video
+    /// tiles and not the kept ones: a tile the sparsity drops keeps its column and says so through
+    /// its size being zero, which is what masks it out of the softmax, so a bound of the kept tiles
+    /// would under-size the matrix by `1 / (1 - sparsity)` - a fifth of it at `.8`.
+    ///
+    /// Only a sparse deployment has tiles. A dense one refuses by name rather than answering zero,
+    /// because a zero bound would size nothing and the refusal would then arrive at a launch.
+    pub fn tiles_bound(&self) -> Result<u32> {
+        let crate::config::AttentionKind::Sparse { .. } = self.config.attention else {
+            return Err(Error::config(
+                "a dense deployment has no tiles to bound".to_owned(),
+            ));
+        };
+        let tile = self.config.attention.capacity_rows();
+        let mut bound = 0;
+        for canvas in self.config.offered_canvases() {
+            let mut frames = crate::CLIP_FRAMES + crate::CLIP_LATENTS;
+            while frames <= MAX_FRAMES {
+                if let Ok(segment) = packing::segment_packing(
+                    frames,
+                    canvas,
+                    self.arrangement.text_rows,
+                    self.arrangement.condition_rows,
+                    tile,
+                    tile,
+                ) {
+                    bound = bound.max(segment.extent.video_tiles);
+                }
+                frames += crate::CLIP_FRAMES;
+            }
+        }
+        if bound == 0 {
+            return Err(Error::config(
+                "a deployment offers no canvas a layout can be built for".to_owned(),
+            ));
+        }
+        Ok(bound)
+    }
+
     pub fn segment_of(&self, layout: &Layout) -> Result<packing::SegmentPacking> {
         let tile = match self.config.attention {
             crate::config::AttentionKind::Sparse { tile, .. } => tile,
@@ -1265,6 +1307,13 @@ pub struct Denoiser {
     /// rather than in one of their own because `nn` has no condition-encoder capability -
     /// `EncoderInputs` takes a token batch, and these take pixels and samples.
     encoders: Option<ConditionEncoders>,
+    /// The packed row bound this deployment was loaded for.
+    ///
+    /// The stack's dense attention is compiled with it as its key bound (`nn`'s `DenseDescriptor`
+    /// carries `max_kv_len`), so a request wider than this has no module to launch: the bound is
+    /// consumed here, at load, and a layout or a request beyond it is refused by name rather than
+    /// discovered at the first layer.
+    rows: u32,
     /// This rank's position in the sequence shard and the shard's degree.
     rank: u32,
     shard: u32,
@@ -1692,6 +1741,10 @@ pub fn denoise_arena(
         out: u64,
     ) {
         push(plan, &format!("{name}.normed"), element, rows * hidden);
+        // The floor of the head is FP32 (`transformer.py:404-421`), so the normalised rows are
+        // widened before the projection reads them. A stack whose own element type is already FP32
+        // reads them in place and leaves this buffer untouched; the plan sizes for the widening.
+        push(plan, &format!("{name}.wide"), "f32", rows * hidden);
         if student {
             push(plan, &format!("{name}.head"), element, out * hidden);
             push(plan, &format!("{name}.head_bias"), element, out);
@@ -1705,6 +1758,11 @@ pub fn denoise_arena(
     push(&mut plan, "packed", element, tokens * hidden);
     push(&mut plan, "patched", element, video_rows * patches);
     push(&mut plan, "video.projected", element, video_rows * hidden);
+    // The input projections are FP32 too (`transformer.py:366-372`), so the video's reads a widened
+    // copy of its own rows - 96 columns - which `Transformer::project` reserves after the buffer it
+    // writes. The audio input projection still reads the stack's own rows: `scaled_add` holds no
+    // module for its 32 columns.
+    push(&mut plan, "patched.wide", "f32", video_rows * patches);
     if let Some((audio_rows, _)) = audio {
         push(&mut plan, "audio.projected", element, audio_rows * hidden);
     }
@@ -1891,6 +1949,8 @@ impl Denoiser {
     /// this deployment's own numbers - the checkpoint's element type and the schedule's group count -
     /// so the plan and the forward read one configuration.
     pub fn denoise_arena(&self, layout: &Layout) -> Result<Vec<crate::decoding::Buffer>> {
+        let rows = self.bound(layout)?;
+        let _ = rows;
         denoise_arena(
             &self.config,
             &self.rules.arrangement,
@@ -1898,6 +1958,24 @@ impl Denoiser {
             self.transformer.dtype(),
             layout,
         )
+    }
+
+    /// Refuse a layout whose packed rows exceed the bound this deployment was loaded for.
+    ///
+    /// The stack's dense attention is compiled with that bound as `nn`'s `DenseDescriptor.max_kv_len`
+    /// and refuses a longer key run at its own launch, so a wider layout has no module at all: the
+    /// refusal belongs where a layout first meets the deployment, not at the first layer of a
+    /// capture that then has to be thrown away.
+    fn bound(&self, layout: &Layout) -> Result<u32> {
+        let tokens = packed_rows(&self.config, &self.rules.arrangement, layout)?;
+        if tokens > self.rows {
+            return Err(Error::config(format!(
+                "this denoiser was loaded for {} packed rows and {} is a layout beyond it; the \
+                 attention is compiled for the bound, so no module would launch",
+                self.rows, tokens
+            )));
+        }
+        Ok(tokens)
     }
 
     /// Refine one request's conditioning: the text encoder's features into the DiT's width.
@@ -1962,14 +2040,215 @@ impl Denoiser {
                     .project_audio(f, encoded, row_range(text, start, rows)?)?;
             }
             if piece.rows > 0 {
-                return Err(Error::config(format!(
-                    "condition {:?} is visual, and the video encoder's posterior epilogue does not \
-                     exist: `VideoEncoder::encode` writes the 48-channel moments, and a condition's \
-                     rows are the 24 normalised channels (`notes/h3/encoder-audit.md` H1)",
-                    piece.role
-                )));
+                let visual = u32::try_from(start).map_err(|_| {
+                    Error::config("a condition row start above u32::MAX".to_owned())
+                })? + piece.audio_rows;
+                self.encode_visual(f, piece, encoders, text, visual)?;
             }
         }
+        Ok(())
+    }
+
+    /// Encode one visual condition and write its patch rows into the prefix source.
+    ///
+    /// The chain is the reference's, and each step is its own program:
+    ///
+    /// 1. the tiled video encoder over the piece's pixels ([`crate::tiled_encode::ClipEncoder`]),
+    ///    stitching its tiles into the run's raster;
+    /// 2. `quant_conv` once, on the stitched moments ([`crate::encoding::VideoEncoder::project`]);
+    /// 3. the posterior epilogue, which samples the condition's latent from the moments and the
+    ///    piece's draw and applies the per-channel affine
+    ///    ([`crate::encoding::VideoEncoder::posterior`]);
+    /// 4. the patchify into `video_channels * 4`-wide rows;
+    /// 5. the anchoring, `t · clean + (1 - t) · draw`, in FP32, and the projection into the source.
+    ///
+    /// The draw is patchified like the latent: the reference's condition noise is drawn at latent
+    /// resolution, so the two operands of the anchor are rows only after the same mapping.
+    fn encode_visual(
+        &self,
+        f: &Forward,
+        piece: &nn::capability::MediaInput,
+        encoders: &ConditionEncoders,
+        text: TensorView,
+        start: u32,
+    ) -> Result<()> {
+        let pixels = piece.pixels.ok_or_else(|| {
+            Error::config(format!(
+                "condition {:?} declares {} visual rows and no pixels were offered",
+                piece.role, piece.rows
+            ))
+        })?;
+        let draw = piece.noise.ok_or_else(|| {
+            Error::config(format!(
+                "condition {:?} is visual and the runner offered no draw for it",
+                piece.role
+            ))
+        })?;
+        let compression = u64::from(crate::encoding::SPATIAL_RATIO);
+        if pixels.shape.rank() != 5 || pixels.shape.dim(0) != 1 {
+            return Err(Error::config(format!(
+                "condition {:?} reads [1, channels, frames, height, width] pixels, not {:?}",
+                piece.role,
+                pixels.shape.dims()
+            )));
+        }
+        if pixels.dtype != DType::F32 || draw.dtype != DType::F32 {
+            return Err(Error::config(format!(
+                "condition {:?} is encoded in FP32: pixels are {} and the draw {}",
+                piece.role, pixels.dtype, draw.dtype
+            )));
+        }
+        let (in_channels, frames, height, width) = (
+            pixels.shape.dim(1),
+            pixels.shape.dim(2),
+            pixels.shape.dim(3),
+            pixels.shape.dim(4),
+        );
+        let (taller, wider) = (
+            u32::try_from(height).unwrap_or(0),
+            u32::try_from(width).unwrap_or(0),
+        );
+        let clip = crate::tiled_encode::ClipEncoder::new(taller, wider)?;
+        let plan = clip.plan();
+        // One packed copy per tile, taken from the piece's own raster. `FramePad` - which pads a
+        // tile's edges - reads each frame's rows in place, so it wants the *tile's* row stride and a
+        // tile cut from a wider raster has the raster's: the kernel refuses it by name ("a frame's
+        // pixels of one channel are not contiguous"). `CopyBlock` is the strided-to-packed copy, and
+        // the tile's own pixels are a few megabytes against the encoder's set.
+        let raster = {
+            let strides = pixels.strides.as_slice();
+            TensorView::with_strides(
+                pixels.offset_elements(0),
+                pixels.dtype,
+                Shape::new(&[in_channels, frames, height, width]),
+                nn::Strides::new(&strides[1..]),
+            )
+        };
+        // A run's tiles are uniform (the seam split keeps every tile at the tile size), so one
+        // buffer holds any tile of this run and its extents are the plan's largest.
+        // The run's raster is the whole encoding's: the plan is the identity crop, so the raster's
+        // own latent extent is what the tiles stitch into. It carries the **moments'** channels and
+        // not the latent's - the encoder's last level writes `2 * latent_channels`, and `quant_conv`
+        // projects those to the two fields the posterior samples from, so the stitch, the projection
+        // and the posterior's first operand share one width
+        // (`crate::encoding::VideoEncoder::moments`).
+        let video_channels = u64::from(self.config.transformer.video_channels);
+        let (origin, end) = plan.extent();
+        let run_rows = u64::from(end - origin);
+        let run_columns = u64::from(wider / crate::encoding::SPATIAL_RATIO);
+        let frame_count = u32::try_from(frames)
+            .map_err(|_| Error::config("a condition of more frames than u32 holds".to_owned()))?;
+        let latent_frames = u64::from(encoders.video.latent_frames(frame_count)?);
+        let (tile_height, tile_width) = plan.tiles.iter().fold((0_u64, 0_u64), |held, tile| {
+            (
+                held.0.max(u64::from(tile.rows.1) * compression),
+                held.1.max(u64::from(tile.columns.1) * compression),
+            )
+        });
+        let buffer = f.arena().tensor(
+            DType::F32,
+            Shape::new(&[in_channels, frames, tile_height, tile_width]),
+        )?;
+        let copy = nn::layers::CopyBlock::new(DType::F32)?;
+        let mut tiles = Vec::with_capacity(plan.tiles.len());
+        for tile in &plan.tiles {
+            let (tile_height, tile_width) = (
+                u64::from(tile.rows.1) * compression,
+                u64::from(tile.columns.1) * compression,
+            );
+            let source = TensorView::with_strides(
+                raster.offset_elements(
+                    u64::from(tile.rows.0) * compression * width
+                        + u64::from(tile.columns.0) * compression,
+                ),
+                raster.dtype,
+                Shape::new(&[in_channels, frames, tile_height, tile_width]),
+                raster.strides,
+            );
+            let packed = [
+                frames * tile_height * tile_width,
+                tile_height * tile_width,
+                tile_width,
+                1,
+            ];
+            let mut destination_strides = [0_i64; ops::copy_block::RANK];
+            for (axis, stride) in packed.iter().enumerate() {
+                destination_strides[axis] = i64::try_from(*stride).map_err(|_| {
+                    Error::config("a condition tile is larger than i64 strides address".to_owned())
+                })?;
+            }
+            let destination = TensorView::with_strides(
+                buffer.offset_elements(0),
+                DType::F32,
+                Shape::new(&[in_channels, frames, tile_height, tile_width]),
+                nn::Strides::new(&packed),
+            );
+            copy.forward(f, source, destination, &destination_strides)?;
+            // The encoder's tile view is the packed copy at the shape it pads from, with the batch
+            // axis the scene's contract asks for.
+            tiles.push(TensorView::with_strides(
+                buffer.offset_elements(0),
+                DType::F32,
+                Shape::new(&[1, in_channels, frames, tile_height, tile_width]),
+                nn::Strides::new(&[
+                    in_channels * frames * tile_height * tile_width,
+                    frames * tile_height * tile_width,
+                    tile_height * tile_width,
+                    tile_width,
+                    1,
+                ]),
+            ));
+        }
+
+        let moment_channels = 2 * video_channels;
+        let run = f.arena().tensor(
+            DType::F32,
+            Shape::new(&[moment_channels, latent_frames, run_rows, run_columns]),
+        )?;
+        clip.encode(
+            f,
+            &encoders.video,
+            &plan,
+            crate::tiled_encode::Scene {
+                pixels: &tiles,
+                blended: run,
+            },
+        )?;
+
+        // `quant_conv` once over the stitched raster, then the posterior's sample: the moments in,
+        // the normalised latent out at half their width.
+        let moments = f.arena().tensor(DType::F32, run.shape)?;
+        encoders.video.project(f, run, moments)?;
+        let latent = f.arena().tensor(
+            DType::F32,
+            Shape::new(&[video_channels, latent_frames, run_rows, run_columns]),
+        )?;
+        encoders.video.posterior(f, moments, draw, latent)?;
+
+        // The latent becomes rows, the draw becomes rows - the draw is drawn at latent resolution,
+        // so it takes the same mapping - and the anchor mixes them in place over the latent's rows.
+        // `ScaledAdd` is `target ← β · target + α · source`, so the reference's `t · clean + (1 - t) ·
+        // draw` is β = t on the latent's rows and α = 1 - t on the draw's.
+        let patch = nn::layers::Patch::new(video_channels, run_rows, run_columns)?;
+        let rows = u64::from(piece.rows);
+        let columns = video_channels * 4;
+        let clean = f.arena().tensor(DType::F32, Shape::new(&[rows, columns]))?;
+        patch.forward(f, latent, clean, latent_frames)?;
+        let anchored = f.arena().tensor(DType::F32, Shape::new(&[rows, columns]))?;
+        patch.forward(f, draw, anchored, latent_frames)?;
+        // `target ← β · target + α · source` with the target the latent's rows and the source the
+        // draw's: α weights the draw, β the latent, so the result is `t · clean + (1 - t) · draw`.
+        nn::layers::ScaledAdd
+            .forward(
+                f,
+                clean,
+                anchored,
+                1.0 - VISUAL_CONDITION_TIME,
+                VISUAL_CONDITION_TIME,
+            )
+            .map_err(Error::from)?;
+        self.transformer
+            .project(f, clean, row_range(text, start, rows)?)?;
         Ok(())
     }
 
@@ -2252,6 +2531,15 @@ impl Denoiser {
         let height = video.shape.dim(2);
         let width = video.shape.dim(3);
         let tokens = u64::from(tables.get("groups")?.shape.dim(0) as u32);
+        // The same bound `denoise_arena` checks, at the one other place a request reaches this block:
+        // a request wider than the deployment was loaded for has no attention module to run.
+        if tokens > u64::from(self.rows) {
+            return Err(Error::config(format!(
+                "this denoiser was loaded for {} packed rows and the request has {tokens}; the \
+                 attention is compiled for the bound",
+                self.rows
+            )));
+        }
         let hidden_size = u64::from(self.config.transformer.hidden_size);
         let dtype = cond.text.dtype;
         let arena = f.arena();
@@ -2506,10 +2794,21 @@ impl Denoiser {
             groups,
             config.transformer.hidden_size,
         )?;
+        // A sparse deployment states the compression's tile bound once, from its own layouts: the
+        // score matrix is `[heads, query tiles, tiles]` and must cover every video tile any layout
+        // it serves can hold. A dense one has no tiles, and the stack's attention kind never reads
+        // the zero.
+        let tile_bound = match config.attention {
+            crate::config::AttentionKind::Sparse { .. } => {
+                Layouts::new(config.clone(), arrangement)?.tiles_bound()?
+            }
+            crate::config::AttentionKind::Dense => 0,
+        };
         let transformer = Transformer::load(
             &config.transformer,
             config.attention,
             rows,
+            tile_bound,
             partition,
             loader,
             heads,
@@ -2544,11 +2843,26 @@ impl Denoiser {
                 .blocks
                 .contains(crate::partition::Component::LatentEncoder),
             encoders: None,
+            rows,
             // The denoiser's own rank, not the text encoder's: the two shards are independent, and
             // with one tensor shard every rank's `tensor_rank` is 0 (`partition.rs`).
             rank: partition.sequence_rank as u32,
             shard: partition.ulysses_degree as u32,
         })
+    }
+
+    /// Every checkpoint tensor this block's partition reads, as complete names.
+    ///
+    /// The refiner's, the stack's and the AdaLN cache's, in the order `load` reads them. The
+    /// condition encoders are **not** here: they are the `latent_encoder` component's, loaded from
+    /// their own checkpoint directories (`vae`, `audio_vae`) and answered by their own `keys`, even
+    /// though this block holds them once a deployment places them.
+    pub fn keys(config: &DenoiserConfig) -> Vec<String> {
+        let transformer = &config.transformer;
+        let mut keys = crate::conditioning::TokenRefiner::keys(transformer);
+        keys.extend(Transformer::keys(transformer, config.attention));
+        keys.extend(crate::modulation::AdaLnCache::keys(transformer));
+        keys
     }
 
     /// The checkpoint this denoiser evaluates.
@@ -2864,6 +3178,56 @@ mod tests {
         let mut broken = layout;
         broken.video.frames = 24;
         assert!(sparse_layouts().segment_of(&broken).is_err());
+    }
+
+    #[test]
+    fn the_tile_bound_covers_every_layout_the_deployment_serves() {
+        // The compression's score matrix has one column per video tile, so the bound has to cover
+        // every layout the deployment can be asked for - not only the longest frame count, because a
+        // canvas with a taller grid can hold more tiles at a shorter one.
+        let rules = sparse_layouts();
+        let bound = rules
+            .tiles_bound()
+            .expect("a sparse deployment bounds its tiles");
+        let tile = rules.config.attention.capacity_rows();
+        let mut largest = 0;
+        for canvas in rules.config.offered_canvases() {
+            let mut frames = crate::CLIP_FRAMES + crate::CLIP_LATENTS;
+            while frames <= MAX_FRAMES {
+                if let Ok(segment) = packing::segment_packing(
+                    frames,
+                    canvas,
+                    rules.arrangement.text_rows,
+                    rules.arrangement.condition_rows,
+                    tile,
+                    tile,
+                ) {
+                    let tiles = segment.extent.video_tiles;
+                    assert!(
+                        tiles <= bound,
+                        "{tiles} tiles at {}x{} and {frames} frames exceed the bound {bound}",
+                        canvas.width,
+                        canvas.height
+                    );
+                    largest = largest.max(tiles);
+                }
+                frames += crate::CLIP_FRAMES;
+            }
+        }
+        // And the bound is reached rather than merely safe: a number larger than any layout's spends
+        // memory on nothing, and one smaller refuses on the device instead of counting.
+        assert_eq!(largest, bound);
+    }
+
+    #[test]
+    fn a_dense_deployment_has_no_tile_bound_to_ask_for() {
+        let error = layouts()
+            .tiles_bound()
+            .expect_err("a dense deployment has no tiles");
+        assert!(
+            matches!(error, Error::Config(ref problem) if problem.contains("dense")),
+            "{error:?}"
+        );
     }
 
     #[test]

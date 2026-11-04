@@ -321,12 +321,15 @@ impl Scheduler {
             // worker admission are that flow's. Its batch is made first, since
             // the call's id names it, and the component is known before
             // planning because a media call's kind fixes it.
-            if let CallKind::Media(media_call) = kind {
-                // The call waits for the media calls it reads and for the
-                // component and host task pools it occupies to find room.
-                let Some(state) = self.media_state(id) else {
-                    continue;
-                };
+            // A media request's call is planned by the media flow. A token
+            // request's own encoder call — an input image's block, a generated
+            // image's feedback encode — is planned by the generation flow
+            // below, which knows the context segment it serves: routing it
+            // here found no media state and planned nothing, so the request
+            // held the encode phase and never advanced.
+            if let CallKind::Media(media_call) = kind
+                && let Some(state) = self.media_state(id)
+            {
                 // A request offers nothing further while the call carrying its
                 // worker admission is in flight.
                 if state.admission_state == WorkerRegistration::InFlight
@@ -405,6 +408,21 @@ impl Scheduler {
                     // The request's state moved past the phase the plan named:
                     // the plan is executed as far as the state allows.
                     continue;
+                }
+                // A generation request's own encoder call — an input image's
+                // block, a generated image's feedback encode — prepares its
+                // inline bytes on its rank's host task pool and holds those
+                // tasks until the result returns. The pass charges it at the
+                // first such call, as the media flow charges a media request's
+                // calls.
+                if let CallKind::Media(media_call) = call.kind {
+                    let demand = self.image_demand(call.request_key, media_call);
+                    let occupancy = media_occupancy.get_or_insert_with(|| self.media_occupancy());
+                    if !occupancy.admits(&demand, id, self) {
+                        self.record_domain_backpressure(kind);
+                        continue;
+                    }
+                    occupancy.occupy(&demand, id);
                 }
                 // A context prefill plans within the pass's context rows;
                 // otherwise it waits for a later pass, as a call without

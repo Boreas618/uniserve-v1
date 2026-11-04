@@ -60,7 +60,7 @@ pub struct Memory {
     /// The products of cross-call tensors.
     pub products: ProductStore,
     /// The banks of the layers a request keeps per slot.
-    pub slots: RequestSlots,
+    pub(crate) slots: RequestSlots,
     /// The page-locked host blocks copies go through.
     pub pinned: Arc<PinnedPool>,
     /// The device this rank's memory lives on, as the plan states it.
@@ -154,7 +154,7 @@ pub fn open_memory(request: OpenMemory<'_>, storage: &mut dyn ExclusiveStorage) 
             width: request.width,
             request_pool_size: info.request_slots,
             devices: request.devices,
-            max_feature_bytes: u64::from(info.encoder_entry_bytes),
+            max_feature_bytes: info.encoder_entry_bytes,
             relay_depth: plan.arena.relay_depth,
             import_capacity: info.max_unresolved_calls as usize,
             conversion: request.conversion,
@@ -163,6 +163,52 @@ pub fn open_memory(request: OpenMemory<'_>, storage: &mut dyn ExclusiveStorage) 
         },
         storage,
     )
+}
+
+/// Release the resident cache segments of `cache`, which the Storage Server
+/// keeps for the next epoch: what a sleep gives back and a wake maps again.
+///
+/// The device storage the segments held is booked as released before it is
+/// given back (`ExclusiveStorage::release_segments`), so the ledger of the GPU
+/// never counts storage no process maps. A pool that is not segmented has no
+/// segment to give back, which is not an error.
+///
+/// One body for both callers: [`Memory::sleep`] on the control thread and the
+/// device thread's own command handler, which holds the cache handle and no
+/// `Memory`. A second copy of this body is the failure to avoid - it is where a
+/// divergence would surface as a rank that wakes with unwritten pages.
+pub fn sleep(cache: &Arc<Mutex<PrefixCache>>, storage: &mut dyn ExclusiveStorage) -> Result<()> {
+    let planes = {
+        let cache = lock(cache);
+        Arc::clone(cache.planes())
+    };
+    if planes.segments().is_none() {
+        return Ok(());
+    }
+    planes.release_segments(0, storage)
+}
+
+/// Map the released cache segments of `cache` again, `limit` of them or all,
+/// booking their storage first: a booking the GPU's quota refuses leaves the
+/// rank asleep rather than half woken.
+///
+/// Resets the units of the segments it created, on `stream`, which is
+/// synchronized before returning. A wake for a pool that never slept is a
+/// no-op, not an error: there is nothing to map again.
+pub fn wake(
+    cache: &Arc<Mutex<PrefixCache>>,
+    storage: &mut dyn ExclusiveStorage,
+    stream: &Stream,
+    limit: Option<u32>,
+) -> Result<()> {
+    let planes = {
+        let cache = lock(cache);
+        Arc::clone(cache.planes())
+    };
+    if planes.segments().is_none() {
+        return Ok(());
+    }
+    planes.restore_segments(storage, stream, limit)
 }
 
 impl Memory {
@@ -256,7 +302,7 @@ impl Memory {
         let Memory {
             prefix_cache,
             latents,
-            mut products,
+            products,
             slots,
             pinned,
             device,
@@ -265,8 +311,7 @@ impl Memory {
         drop((device, pools));
         // The products go first: their reads retain views into the cache, and the cache's
         // segments are the last thing an epoch gives back.
-        let drained = products.close();
-        drop(drained);
+        products.close();
         lock(&prefix_cache).close()?;
         drop(latents);
         drop(slots);
@@ -295,36 +340,27 @@ impl Memory {
         planes + latents + self.products.mapped_bytes() + self.slots.mapped_bytes()
     }
 
-    /// Release the resident cache segments, which the Storage Server keeps for
-    /// the next epoch: what a sleep gives back and a wake maps again.
+    /// Release the resident cache segments: what a sleep gives back and a wake
+    /// maps again.
     ///
-    /// The device storage the segments held is booked as released before it is
-    /// given back (`ExclusiveStorage::release_segments`), so the ledger of the
-    /// GPU never counts storage no process maps.
-    pub fn sleep(&mut self, storage: &mut dyn ExclusiveStorage) -> Result<()> {
-        if lock(&self.prefix_cache).planes().segments().is_none() {
-            return Ok(());
-        }
-        lock(&self.prefix_cache)
-            .planes()
-            .release_segments(0, storage)
+    /// Takes `&self`: the one thing it touches is the shared cache, which the
+    /// caller reaches through an `Arc<Mutex<_>>`, so the device thread and the
+    /// control thread call the same body - [`sleep`].
+    pub fn sleep(&self, storage: &mut dyn ExclusiveStorage) -> Result<()> {
+        sleep(&self.prefix_cache, storage)
     }
 
-    /// Map the released cache segments again, `limit` of them or all, booking
-    /// their storage first: a booking the GPU's quota refuses leaves the rank
-    /// asleep rather than half woken.
+    /// Map the released cache segments again, `limit` of them or all.
     ///
-    /// Resets the units of the segments it created, on `stream`, which is
-    /// synchronized before returning.
+    /// Takes `&self` for the same reason as [`Memory::sleep`]; the body is
+    /// [`wake`], which the device thread calls with the cache handle it holds.
     pub fn wake(
-        &mut self,
+        &self,
         storage: &mut dyn ExclusiveStorage,
         stream: &Stream,
         limit: Option<u32>,
     ) -> Result<()> {
-        lock(&self.prefix_cache)
-            .planes()
-            .restore_segments(storage, stream, limit)
+        wake(&self.prefix_cache, storage, stream, limit)
     }
 
     /// The device this rank's memory lives on.

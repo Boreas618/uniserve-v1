@@ -59,13 +59,30 @@ pub enum Layer {
 }
 
 impl Layer {
+    /// Every checkpoint tensor layer `index`'s attention reads, as complete names.
+    ///
+    /// The list is what [`Layer::load`] requests, in the order it requests it, and the caller
+    /// intersects it with the checkpoint's index: a name here the index lacks is a weight the layer
+    /// cannot load, and a weight no block names is one nothing reads. A name that is built from the
+    /// layer's prefix is returned whole, because the lookup that consumes it is whole.
+    pub fn keys(index: u32, kind: crate::config::AttentionKind) -> Vec<String> {
+        match kind {
+            crate::config::AttentionKind::Dense => Dense::keys(index),
+            crate::config::AttentionKind::Sparse { .. } => {
+                crate::attention_sparse::Sparse::keys(index)
+            }
+        }
+    }
+
     /// Read layer `index`'s attention of a DiT partition, of the kind the deployment composes.
+    #[allow(clippy::too_many_arguments)]
     pub fn load(
         kind: crate::config::AttentionKind,
         index: u32,
         config: &TransformerConfig,
         rows: u32,
         rotated_axes: &[u32],
+        tile_bound: u32,
         partition: &Partition,
         loader: &mut WeightLoader<'_>,
     ) -> Result<Self> {
@@ -85,6 +102,7 @@ impl Layer {
                     rows,
                     rotated_axes,
                     tile,
+                    tile_bound,
                     partition,
                     loader,
                 )?,
@@ -221,6 +239,22 @@ pub struct Dense {
 }
 
 impl Dense {
+    /// Every checkpoint tensor one layer's dense attention reads, as complete names.
+    pub fn keys(index: u32) -> Vec<String> {
+        let prefix = format!("transformer_blocks.{index}.attn");
+        [
+            "norm_q.weight",
+            "norm_k.weight",
+            "to_q.weight",
+            "to_k.weight",
+            "to_v.weight",
+            "to_out.0.weight",
+        ]
+        .iter()
+        .map(|suffix| format!("{prefix}.{suffix}"))
+        .collect()
+    }
+
     /// Read layer `index`'s dense attention of a DiT partition.
     ///
     /// `rows` is the layout's packed row capacity, which bounds the keys of one call; `rotated` is
@@ -248,11 +282,15 @@ impl Dense {
         let query_gain = gain(loader, &format!("{prefix}.norm_q.weight"), head)?;
         let key_gain = gain(loader, &format!("{prefix}.norm_k.weight"), head)?;
         let frequencies = frequencies(loader, config, rotated)?;
+        // The rotation reads *this rank's* heads: under Ulysses the sequence is split across ranks
+        // and each holds `heads / degree` of them (`Partition::denoiser_heads`), so a descriptor that
+        // named the global count would refuse its own query view at any degree above one.
+        let local_heads = partition.denoiser_heads(config.num_attention_heads);
         let rotary = Rotary::new(
             frequencies,
             config.head_dim,
-            config.num_attention_heads,
-            config.num_attention_heads,
+            local_heads,
+            local_heads,
             config.qk_norm_eps,
             Rotation::Half,
             1.0,
@@ -260,7 +298,6 @@ impl Dense {
         .partial(rotated)?
         .sectioned(Sections::new(rotated_axes)?.interleaved())?;
 
-        let local_heads = partition.denoiser_heads(config.num_attention_heads);
         Ok(Self {
             query: projection(loader, &format!("{prefix}.to_q.weight"), inner, hidden)?,
             key: projection(loader, &format!("{prefix}.to_k.weight"), inner, hidden)?,

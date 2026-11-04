@@ -217,12 +217,31 @@ impl Scheduler {
                 let token = self.running.get(&id)?.next_token;
                 let capacity_target = decode_capacity_target(cache_visible_len as usize, 0);
                 if !self.ensure_decode_capacity(id, cache_visible_len as usize, capacity_target) {
+                    // The request stays in `CloseCache` for this step: the
+                    // cache does not yet cover the position the write lands on.
+                    // Named here because the silent return is a stall the rest
+                    // of the world cannot see (the pass stays non-token and the
+                    // decoders wait behind it).
+                    tracing::debug!(
+                        request = id.0,
+                        visible = cache_visible_len,
+                        target = capacity_target,
+                        "a close write waits: the cache does not cover the position it lands on"
+                    );
                     return None;
                 }
 
-                self.plan_call(id, |_scheduler, request| {
+                let planned = self.plan_call(id, |_scheduler, request| {
                     generation::plan_close_cache(request, token, false)
-                })
+                });
+                if planned.is_none() {
+                    tracing::debug!(
+                        request = id.0,
+                        token,
+                        "a close write was not planned for this step"
+                    );
+                }
+                planned
             }
             Phase::PublishCache => self.plan_call(id, |scheduler, request| {
                 generation::plan_cache_export(
@@ -645,7 +664,8 @@ impl Scheduler {
             let mut rows = 0usize;
             let mut blocks = Vec::new();
             let mut block_tokens = 0u32;
-            let mut block = self.scheduled_context(id)?.blocks;
+            let sc = self.scheduled_context(id);
+            let mut block = sc?.blocks;
             // In-flight context prefills hold the leading features.
             let in_flight = state.blocks_between(state.block_cursor(), block);
             loop {

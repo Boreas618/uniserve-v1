@@ -94,7 +94,10 @@ impl Warm {
     /// A request id of this scheduler's, so warm-up requests are numbered with
     /// a client's.
     fn next_request_id(&self) -> ipc::RequestId {
-        ipc::RequestId(self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+        ipc::RequestId(
+            self.next_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     /// Whether the scheduler stopped fatally, which ends a warm-up.
@@ -381,11 +384,7 @@ fn warmup_request(
 /// The requests reach the scheduler in one command, so it queues all of them
 /// before it forms its next batch, as it would concurrent clients that all
 /// arrived before that batch.
-fn run(
-    core: &Warm,
-    group: &str,
-    requests: Vec<GenerationRequest>,
-) -> anyhow::Result<()> {
+fn run(core: &Warm, group: &str, requests: Vec<GenerationRequest>) -> anyhow::Result<()> {
     let mut streams = core
         .submit_all(requests.into_iter().map(Request::from).collect())
         .map_err(|error| anyhow::anyhow!("{group} warmup was not accepted: {error}"))?;
@@ -512,7 +511,10 @@ mod tests {
 
         // The token runtime's group comes first; the shapes follow, one group
         // each, because the denoiser runs one request at a time.
-        let images: Vec<&Group> = groups.iter().filter(|group| group.what != "token").collect();
+        let images: Vec<&Group> = groups
+            .iter()
+            .filter(|group| group.what != "token")
+            .collect();
         assert_eq!(images.len(), 3, "one group per shape");
         for group in &images {
             let [request] = &group.requests[..] else {
@@ -556,7 +558,10 @@ mod tests {
     #[test]
     fn a_shape_the_limits_refuse_is_not_warmed() {
         let groups = groups_of(
-            image_rank(vec![shape(64, 64, 1, Vec::new()), shape(64, 64, 3, vec![11])]),
+            image_rank(vec![
+                shape(64, 64, 1, Vec::new()),
+                shape(64, 64, 3, vec![11]),
+            ]),
             // At most two guidance branches: no client can submit the
             // three-branch shape either.
             |config| config.generation_limits.max_cfg_branches = 2,

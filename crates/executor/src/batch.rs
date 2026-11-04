@@ -170,6 +170,25 @@ pub struct Batch {
     pub columns: BatchColumns,
     /// The generation whose kernels serve this batch (4.2, 7.3).
     pub generation: u64,
+    /// What the mechanism allocated for this batch's cache pages: per group, the units it acquired
+    /// and the `(source, destination)` copies a leased prefix needs before a call reads it.
+    ///
+    /// The mechanism computes these and owns the source lease, which runs to completion; the
+    /// executor applies them on the batch's stream before the forward, so a destination holds the
+    /// source's bytes by stream order and the graph needs no extra barrier. A batch that reads a
+    /// fresh prefix carries no allocation, and one that reuses a cached prefix cannot be served
+    /// correctly without it (`ipc::batch::CacheUnitAllocation`).
+    pub cache_units: Vec<ipc::CacheUnitAllocation>,
+    /// The batch's slot rows: one `ipc::BlockTable` per request slot and cache group, as the
+    /// mechanism's own allocation of pages states them.
+    ///
+    /// The executor installs these into the cache's pooled table before the replay, because the
+    /// gather that builds the attention kernels' block-table column reads **row `slot` of that
+    /// table**. The row is the only place a request's pages live for the gather: a batch whose rows
+    /// are not installed gathers whatever the slot held before - zeros, or another request's pages -
+    /// and the graph then runs clean against the wrong memory. That failure looks like a model
+    /// defect rather than a cache one, so it is refused at submit rather than left to the graph.
+    pub block_tables: Vec<ipc::BlockTable>,
 }
 
 /// The commit table's own definition, so a producer outside this crate writes its rows against
@@ -245,13 +264,6 @@ impl BatchColumns {
 
     /// Whether every column has the length its field promises for `shape`, so that a mis-sized
     /// batch fails before a launch rather than after one.
-    ///
-    /// Three counts, not one: `input_ids` is as long as the batch's tokens, `slots` and
-    /// `parameters` as long as its rows — the sequences, which is `[rows]` in every per-row column
-    /// and what [`BatchColumns::rows`] answers — and `commit` is one row per *call*, since a call
-    /// states once how the step advances its slot however many rows it evaluated. A verify batch
-    /// of three candidates is one call and three rows, and comparing the per-row columns with the
-    /// call count refuses it.
     pub fn check(&self, shape: &Shape) -> Result<()> {
         let tokens = self.rows.tokens();
         // Two counts, and a column belongs to one of them: `slots`, `parameters`, `seq_lens` and
@@ -566,6 +578,10 @@ pub struct Placement {
 /// plain route on purpose: the phase list is fixed at spawn, so no lock, no schedule, no retry.
 pub struct Executors {
     executors: Vec<Arc<crate::device::Executor>>,
+    /// The pools this rank serves, as the deployment launched them (4.2): the scheduler builds its
+    /// executor facts from this and refuses to start on an empty answer, so a rank states its pools
+    /// before it is handed over rather than after the first batch finds none.
+    inventory: Vec<Inventory>,
 }
 
 impl Executors {
@@ -596,7 +612,22 @@ impl Executors {
                 served.push(*phase);
             }
         }
-        Ok(Self { executors })
+        Ok(Self {
+            executors,
+            inventory: Vec::new(),
+        })
+    }
+
+    /// States the pools this rank serves, which the scheduler's executor facts are built from.
+    ///
+    /// The facts are the deployment's: its pool's name, its ranks as they reported at handshake,
+    /// what the launch placed there and the model's maximum length. A rank that serves batches must
+    /// state them - `Submissions::over_batches` refuses an executor that states no pool - so this is
+    /// called where the launch facts are known, before the scheduler is built.
+    #[must_use]
+    pub fn stating(mut self, inventory: Vec<Inventory>) -> Self {
+        self.inventory = inventory;
+        self
     }
 
     /// The device that serves `phase`.
@@ -628,6 +659,10 @@ impl Executors {
 }
 
 impl Batches for Executors {
+    fn inventory(&self) -> &[Inventory] {
+        &self.inventory
+    }
+
     fn submit(&self, batch: Batch) -> Result<Submission> {
         self.route(batch.phase)?.submit(batch)
     }

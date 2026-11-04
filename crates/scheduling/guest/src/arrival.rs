@@ -234,11 +234,19 @@ impl<K: Order> Arrival<K> {
         let share = shares.tokens().min(shares.prefill());
         let chunk = prefill_chunk(
             start,
-            view.prompt_tokens,
+            view.prefill_tokens.max(view.prompt_tokens),
             self.limits.chunked_prefill_size,
             share,
             room.page_tokens,
         );
+        if chunk == 0 {
+            // Nothing left to ingest: this phase's write is structural (a close
+            // cache, a feedback state, a block's commit), so its charge is the
+            // one the mechanism states rather than a chunk to size. Without
+            // this the request is never named, the pass stays non-token, and
+            // the decoders behind it wait for ever.
+            return (view.next_tokens, true);
+        }
         (chunk, true)
     }
 
@@ -780,6 +788,8 @@ mod tests {
             arrived_at: Nanos(arrived),
             admitted_at: None,
             prompt_tokens: 100,
+            // Nothing to commit: a request with no block commit states its prompt length.
+            prefill_tokens: 100,
             generated_tokens: 0,
             cached_prefix_tokens: 0,
             prefilled_tokens: 0,
