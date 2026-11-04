@@ -179,7 +179,12 @@ fn a_paired_forward_accepts_agreement_and_refuses_a_wrong_kernel() {
         Allocator::new(&device, Arc::new(Allowance::default())).expect("an allocator");
     allocator
         .reserve(PoolKind::Graph, 1 << 20)
-        .expect("reserve a pool");
+        .expect("reserve the graph pool");
+    // The twin region is carved from the scratch pool, and an allocator refuses a pool it was never
+    // given: the paired forward's own region is the probe's second reservation (4.1, 7.3).
+    allocator
+        .reserve(PoolKind::Scratch, 1 << 20)
+        .expect("reserve the scratch pool the twins are carved from");
     let buffer: Buffer = allocator
         .allocate(PoolKind::Graph, BYTES)
         .expect("the activation buffer");
