@@ -6,11 +6,11 @@
 # the caller's stream, workspace from the stream's pool so a captured graph
 # records it.
 #
-# The descriptor carries the element types and the geometry, so a descriptor is
-# one compilation: the script passes the types, the geometry is validated at
-# launch. The key is the operator crate's: `input_f32_weight_f32_output_f32_`
-# `geometry_kernel_3x3x3_stride_1x1x1_padding_1x1x1_dilation_1x1x1_groups_1_`
-# `bias_true_tf32_true_rank_3_transposed_false`.
+# The descriptor carries the element types only: the geometry, the strides, the padding, the
+# dilation, the groups, the bias, the TF32 permission and the direction travel in the call
+# structure the entry reads, so one compilation serves every shape a request brings — a
+# descriptor that named them would compile one module per clip length and per filter shape.
+# The key is the operator crate's: `input_f32_weight_f32_output_f32`.
 #
 # `tf32` is a permission, not a setting: it says whether the engine *may* use TF32
 # tensor cores for an FP32 convolution, which is what design 9 asks the video VAE
