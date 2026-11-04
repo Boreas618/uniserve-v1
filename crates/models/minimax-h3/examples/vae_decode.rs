@@ -559,6 +559,20 @@ fn stage_decode(args: &Args) -> Result<()> {
         );
     }
     let (latent_bytes, generated) = match &args.latents {
+        Some(path) if !path.exists() && is_index(&path) => {
+            // A bare number is an *evaluation index*, not a path, and three runs have now stopped on
+            // one: the flag is the only place in this stage a caller names an input, so it is where
+            // the confusion lands. Say the file the index would name, so the corrected command is
+            // visible rather than inferable.
+            return Err(Failure::message(format!(
+                "`--latents {}`: that is an evaluation index, not a path. The trajectory file stage 3 \
+                 writes for evaluation {} is `<stage3-out>/latents_video_e{}.h3t` - pass that path, \
+                 or leave `--latents` out and this stage draws and writes its own latent",
+                path.display(),
+                path.display(),
+                path.display(),
+            )));
+        }
         Some(path) if !path.exists() => {
             // An input the caller named is read, never substituted - but the operating system's own
             // message says only `No such file`, and a flag given a word that is not a path (`5`, or a
@@ -1202,6 +1216,13 @@ fn write_h3t(path: &Path, shape: &[u64], dtype: u8, payload: &[u8]) -> Result<()
     std::fs::write(path, bytes)
         .map_err(|error| Failure::message(format!("{}: {error}", path.display())))?;
     Ok(())
+}
+
+/// Whether a `--latents` value is a bare non-negative integer - an evaluation index a caller meant as
+/// a file name.
+fn is_index(path: &Path) -> bool {
+    path.to_str()
+        .is_some_and(|word| !word.is_empty() && word.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 /// Read a `.h3t` container, refusing a shape or an element type this run cannot use.
