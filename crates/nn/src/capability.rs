@@ -228,17 +228,40 @@ pub struct EncoderInputs<'a> {
     pub batch: TokenBatch,
     /// The images of a multimodal tower, empty for a text-only encoder.
     pub images: &'a [ImageInput],
-    /// The tables [`Denoiser::state_tables`] named for this layout, in that order.
+    /// The per-request tables [`Denoiser::state_tables`] named for this layout, in that order.
     pub state: &'a [TensorView],
+    /// The per-layout constants [`Denoiser::layout_tables`] named for this layout, in that order:
+    /// values that depend on the layout and nothing of the request.
+    pub tables: &'a [TensorView],
+    /// The rows an encoder reports back for its caller's inspection, in the model's order.
+    ///
+    /// Diagnostics are outputs of the encode and never an input of the model's mathematics: a
+    /// model that reports nothing passes an empty slice.
+    pub diagnostics: &'a [TensorView],
 }
 
-/// One image a multimodal tower reads: its pixels and the grid they form.
+/// One image a multimodal tower reads: its pixels, its patch grid and its own rotary clock.
+///
+/// Everything here is the image's, not a request's: two images of one request carry their own
+/// grids, tables and row counts. The tables are the model's, prepared per image on the host because
+/// a tower's positions are a patch grid — cheap to evaluate once, and the same for every request
+/// that brings an image of that size.
 #[derive(Clone, Copy)]
 pub struct ImageInput {
     /// `[tokens, pixels]` packed patches, or `[channels, height, width]` rasters.
     pub pixels: TensorView,
-    /// `[1, axes]` i32 patch grid.
-    pub grid: TensorView,
+    /// The patch grid's three extents: time, rows, columns.
+    pub grid_shape: [u32; 3],
+    /// `[merged_rows, 4]` i32: the four taps each merged row reads of a tower's table.
+    pub position_index: TensorView,
+    /// `[merged_rows, 4]` f32: those taps' weights, normalized by the caller.
+    pub position_weight: TensorView,
+    /// `[time + 1]` i32: the first merged row of each frame's run, plus the total.
+    pub lengths: TensorView,
+    /// `[patches, head_dim / 2]` f32: the cosine of each patch's rotation phase.
+    pub cosine: TensorView,
+    /// `[patches, head_dim / 2]` f32: the sine of each patch's rotation phase.
+    pub sine: TensorView,
 }
 
 /// What an encoder writes.
@@ -248,8 +271,12 @@ pub struct EncoderOutputs {
 }
 
 /// A video request's numerical layout input: what the denoiser must lay out (specs/worker.md 4.3).
+///
+/// Every field is a request fact the executor already holds — it decoded the media, encoded the
+/// prompt and knows the canvas — and none is derivable from the others: the packed layout needs the
+/// canvas, the roles' counts, the prompt's token count and each condition's raster.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct VideoRequest {
+pub struct VideoRequest<'a> {
     /// The task the request asks for.
     pub task: VideoTask,
     /// Canvas width in pixels.
@@ -270,6 +297,44 @@ pub struct VideoRequest {
     /// one encoded frame at a fixed position, a reference is an encoded clip — and the reference
     /// implementation enforces it (`uniserve/models/denoiser.py`, `ConditionRole`).
     pub references: u32,
+    /// Prompt tokens the request presents, vision tokens included.
+    ///
+    /// The packed sequence's rotary clock starts at the prompt's length, so a layout cannot place a
+    /// row without it.
+    pub text_tokens: u32,
+    /// The encoded condition media, in request order: anchors, then references.
+    pub conditions: &'a [ConditionShape],
+    /// Per-image prompt spans, in request order: the prompt rows a reference's own rows replace.
+    ///
+    /// Those rows take the image's rotary coordinates rather than the text clock's, so a layout
+    /// that placed them on the prompt's clock would be silently wrong rather than refusing.
+    pub vision_spans: &'a [(u32, u32)],
+}
+
+/// One condition's raster, as a layout needs it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ConditionShape {
+    /// How the condition relates to the generated video.
+    pub role: ConditionRole,
+    /// Encoded frames; an image is one frame, and audio alone has none.
+    pub frames: u32,
+    /// Raster rows; zero without pixels.
+    pub height: u32,
+    /// Raster columns; zero without pixels.
+    pub width: u32,
+    /// Samples of the encoded track: a reference's soundtrack, zero without one.
+    pub audio_samples: u32,
+}
+
+/// How a conditioning input relates to the generated video.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConditionRole {
+    /// Anchors the first generated frame.
+    FirstFrame,
+    /// Anchors the last generated frame.
+    LastFrame,
+    /// Conditions the generation as a whole.
+    Reference,
 }
 
 /// The tasks a video model serves.
@@ -311,7 +376,7 @@ pub struct LatentShape {
 
 /// A table a model needs on the device but does not own.
 ///
-/// The executor allocates; the model says what it is and fills it. Three kinds exist, they differ
+/// The executor allocates; the model says what it is and fills it. Four kinds exist, they differ
 /// in **who writes them, when, and how many times**, and that is the whole of the protocol:
 ///
 /// - **constants** ([`Denoiser::constant_tables`]) are device memory written by
@@ -319,11 +384,16 @@ pub struct LatentShape {
 ///   hold values that never change for a model — an AdaLN cache folded once from the weights — so
 ///   they are filled once per load and read by every capture. The forward is capture-safe: it reads
 ///   nothing back and synchronizes nothing.
-/// - **state** ([`Denoiser::state_tables`]) is per *layout*: the same model denoises different
-///   latent shapes, and a table derived from a request's layout (its positional encodings, its
-///   mask) is one table per shape. [`Denoiser::prepare_state`] writes **host bytes only**; the
-///   executor allocates each table and uploads those bytes. The list is deterministic for a layout,
-///   and the executor keys its storage by `(layout, name)`.
+/// - **layout** ([`Denoiser::layout_tables`]) is per *layout* and needs no request: the video VAE's
+///   rotary positions of its raster, the packed row of each clip's latent voxel. These are the
+///   model's mathematical layout, which the executor cannot compute, and they are the same for
+///   every request of one shape — so they are filled once per layout
+///   ([`Denoiser::prepare_layout`], host bytes only) and shared.
+/// - **state** ([`Denoiser::state_tables`]) is per *request* of a layout: a table derived from the
+///   request itself (its prompt clock, its spans, its mask) is one table per request.
+///   [`Denoiser::prepare_state`] writes **host bytes only**; the executor allocates each table and
+///   uploads those bytes. The list is deterministic for a layout, and the executor keys its storage
+///   by `(layout, name)` beside the layout constants'.
 /// - **evaluation** ([`Denoiser::prepare_evaluation`]) is per *evaluation index*: one solver
 ///   coefficient set, again host bytes the executor uploads, so a request's schedule is chosen
 ///   without capturing a graph per step.
@@ -408,7 +478,7 @@ pub trait Encoder {
 /// A diffusion model that denoises latents step by step.
 pub trait Denoiser {
     /// The latent layout this request needs.
-    fn prepare_layout(&self, request: &VideoRequest) -> Layout;
+    fn layout(&self, request: &VideoRequest<'_>) -> Layout;
 
     /// Draw the initial noise of `out` from `seed`.
     fn draw_noise(&self, f: &Forward, seed: Seed, out: Latents) -> Result<()>;
@@ -440,6 +510,20 @@ pub trait Denoiser {
     /// synchronization, no allocation.
     fn prepare_constants(&self, f: &Forward, out: &[TensorView]) -> Result<()>;
 
+    /// The constants a layout needs, in the order [`Self::prepare_layout`] fills them.
+    ///
+    /// These are the layout's alone: the video VAE's per-voxel rotary positions, the packed row of
+    /// each clip's voxel. They are filled once per layout, not once per request, so the executor
+    /// keys its storage by `(layout, name)` beside the request's state and shares one set between
+    /// every request of that shape.
+    fn layout_tables(&self, layout: &Layout) -> Vec<StateTable>;
+
+    /// Write the host bytes of each layout constant of `layout`, in [`Self::layout_tables`]' order.
+    ///
+    /// Same rule as [`Self::prepare_state`]: host bytes only, already the right length, uploaded by
+    /// the executor, and deterministic for a layout so two requests of one shape agree.
+    fn prepare_layout(&self, layout: &Layout, out: &mut [Vec<u8>]) -> Result<()>;
+
     /// The tables a request of `layout` needs, in the order [`Self::prepare_state`] fills them.
     ///
     /// Deterministic for a layout: the executor keys its storage by `(layout, name)`, so two
@@ -452,7 +536,7 @@ pub trait Denoiser {
     /// the right length; the executor uploads it.
     fn prepare_state(
         &self,
-        request: &VideoRequest,
+        request: &VideoRequest<'_>,
         layout: &Layout,
         out: &mut [Vec<u8>],
     ) -> Result<()>;
