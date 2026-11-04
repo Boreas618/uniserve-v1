@@ -76,12 +76,41 @@ fn main() -> ExitCode {
         fixture_rows.intersection(&walk_rows).count()
     );
 
-    report("only in the fixture", &only_fixture, "the fixture states a program the walk does not");
+    // The dangerous class, named separately: a fixture row whose operator the walk *does* launch but
+    // whose key it does not state. A row like that is not merely absent — a store built from it holds
+    // a program that launches and returns a number for a geometry the model does not serve, and no
+    // package check can see it, because the package exists and the key builds.
+    let walk_operators: BTreeSet<&str> = walk_rows
+        .iter()
+        .filter_map(|row| row.split_once('\t').map(|(operator, _)| operator))
+        .collect();
+    let (dangerous, unbound): (Vec<&String>, Vec<&String>) = only_fixture
+        .iter()
+        .partition(|row| {
+            row.split_once('\t')
+                .is_some_and(|(operator, _)| walk_operators.contains(operator))
+        });
+
+    report(
+        "only in the fixture, operator the walk also launches",
+        &dangerous,
+        "a program that would launch for a geometry the walk does not state",
+    );
+    report(
+        "only in the fixture, operator the walk never launches",
+        &unbound,
+        "a replaced design, or a component the walk has not bound",
+    );
     report("only in the walk", &only_walk, "the walk states a program the fixture lacks");
 
     if only_fixture.is_empty() && only_walk.is_empty() {
+        println!("# verdict: the fixture is the walk's rows");
         ExitCode::SUCCESS
     } else {
+        println!(
+            "# verdict: {} difference(s) — a store must not be built from this fixture",
+            only_fixture.len() + only_walk.len()
+        );
         ExitCode::FAILURE
     }
 }
