@@ -23,7 +23,7 @@ use ipc::{ImageParams, RequestId, SamplingParams};
 fn main() -> anyhow::Result<()> {
     let executor = Box::new(SimExecutor::new(SimEngine::new()));
     let sched = Scheduler::new(
-        executor,
+        engine::Submissions::new(executor),
         SimEngine::special_tokens(),
         SchedulerConfig {
             max_batch: 32,
