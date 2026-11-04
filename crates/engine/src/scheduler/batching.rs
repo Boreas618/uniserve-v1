@@ -250,8 +250,12 @@ impl Scheduler {
         // component a call binds to follows from its kind, so the two
         // together name one group. Kinds keep the order in which their
         // first call was selected.
-        let mut kind_order: Vec<CallKind> = Vec::new();
-        let mut kind_batches: HashMap<CallKind, ExecutionBatch> = HashMap::new();
+        // One batch per (phase, component): a batch is one numerical call of one
+        // phase on one component, so a rank receives a homogeneous group and
+        // the executor's phase column names it exactly. The plan's order is the
+        // order the first call of each pair was selected in.
+        let mut kind_order: Vec<(PhaseId, String)> = Vec::new();
+        let mut kind_batches: HashMap<(PhaseId, String), ExecutionBatch> = HashMap::new();
         let submit_at = Instant::now();
         // The per-step token budget is the binding limit; individual prefill
         // chunks are clipped to its remaining capacity.
@@ -420,9 +424,9 @@ impl Scheduler {
 
                 // Identify the call by its batch and row, and stamp the
                 // coordinates projected through the request's in-flight calls.
-                let kind = call.kind;
-                let batch = kind_batches.entry(kind).or_insert_with(|| {
-                    kind_order.push(kind);
+                let key = (phase, call.component.clone());
+                let batch = kind_batches.entry(key.clone()).or_insert_with(|| {
+                    kind_order.push(key);
                     ExecutionBatch::new(
                         self.inflight.next_batch_id(),
                         Vec::new(),
@@ -523,7 +527,7 @@ impl Scheduler {
                 .get(kind)
                 .is_some_and(|batch| !batch.requests.is_empty())
         });
-        let Some(&last) = kind_order.last() else {
+        let Some(last) = kind_order.last().cloned() else {
             return Vec::new();
         };
 
@@ -535,9 +539,11 @@ impl Scheduler {
         // submissions, not round trips, so a command-only batch costs the
         // round a queue slot and halves how many rounds a depth-two rank can
         // hold in flight.
-        let prompt_only = kind_order
-            .iter()
-            .all(|kind| batch_kind(*kind) == BatchKind::Prefill);
+        let prompt_only = kind_order.iter().all(|(phase, _)| {
+            views::phase_kind(*phase)
+                .and_then(views::phase_call)
+                .is_some_and(|kind| batch_kind(kind) == BatchKind::Prefill)
+        });
         let commands = if prompt_only {
             let requests = kind_order
                 .iter()
@@ -554,7 +560,7 @@ impl Scheduler {
         let mut batches = Vec::with_capacity(kind_order.len());
         for kind in kind_order {
             let Some(mut batch) = kind_batches.remove(&kind) else {
-                self.invariant_broken("every selected call kind has its batch");
+                self.invariant_broken("every selected phase and component has its batch");
                 return Vec::new();
             };
             if kind == last {
