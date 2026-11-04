@@ -911,6 +911,15 @@ impl Switch {
                     self.failed(roster, failure);
                 }
             }
+            // The same while it is promoted: `Promote` resumes the target's
+            // schedulers, and a device fault as they start is such a report.
+            // The frontend is not served the target until every `Promoted`
+            // arrives, so a half-promoted epoch serves nobody and is dropped.
+            (Phase::Promoting, _) if self.is_target(generation) => {
+                if let Some(failure) = Failure::of_report(&report) {
+                    self.failed(roster, failure);
+                }
+            }
             (Phase::Serving, _) if self.is_target(generation) => {
                 if let Some(failure) = Failure::of_report(&report) {
                     self.restore(roster, failure);
@@ -1509,6 +1518,58 @@ mod tests {
             promotes,
             vec![("n0", 6), ("n1", 7)],
             "each node's own generation, not the highest reported"
+        );
+    }
+
+    /// A target that faults while it is promoted never serves: one node
+    /// answers `Promoted` and the other faults as its schedulers start. The
+    /// frontend is not served the target until every node answered, so
+    /// dropping it leaves the previous epoch serving and the trial unstarted.
+    #[test]
+    fn a_fault_while_promoting_drops_the_target() {
+        let (epochs, mut switch) = setup();
+        let mut roster = Fake::default();
+        switch.start(&mut roster);
+        roster.scripted = vec![hello("n0", 6, "2.0.0+new"), hello("n1", 6, "2.0.0+new")];
+        switch.advance(&mut roster);
+        switch.parked(&mut roster, "n0", 6);
+        switch.parked(&mut roster, "n1", 6);
+        assert_eq!(switch.phase(), Phase::Promoting);
+
+        switch.promoted(&mut roster, "n0", 6);
+        assert_eq!(
+            switch.phase(),
+            Phase::Promoting,
+            "one node's promotion does not serve the epoch"
+        );
+        roster.scripted = vec![report_event(
+            "n1",
+            6,
+            report(process::report::Kind::Fault(process::Fault {
+                kind: "illegal_address".to_owned(),
+                reason: "the resumed schedulers faulted".to_owned(),
+                device: 1,
+            })),
+        )];
+        switch.advance(&mut roster);
+
+        assert_eq!(switch.phase(), Phase::Abandoned);
+        assert_eq!(
+            switch.failure().map(|failure| failure.kind.as_str()),
+            Some("illegal_address")
+        );
+        assert_eq!(
+            epochs.get(12).map(|record| record.status),
+            Some(Status::Purged)
+        );
+        assert!(
+            roster.serves.is_empty(),
+            "the frontend never switched to the dropped epoch"
+        );
+        assert!(
+            roster
+                .stops
+                .contains(&("n1".to_owned(), "engine:0".to_owned(), Some(6)))
         );
     }
 
