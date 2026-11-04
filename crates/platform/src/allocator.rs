@@ -254,10 +254,16 @@ impl Buffer {
     /// descriptor (`cuMemExportToShareableHandle`). Closing the descriptor does
     /// not affect the mapping.
     ///
-    /// This is the first half of design 8's NVML rule: the owner imports the
-    /// descriptor and maps it, then drops the handle that created the storage,
-    /// so NVML attributes the storage to the importer and not to the process
-    /// that created it. The Storage Server takes resident storage that way.
+    /// The block stays mapped in this process and the pool keeps the handle it
+    /// created the storage with, so **exporting does not move this process's
+    /// NVML attribution**: design 8's rule is for storage whose attribution
+    /// belongs elsewhere, and it is met by creating and exporting such storage
+    /// through [`crate::vmm::SegmentedMapping::create`], which maps its own
+    /// import of the exported descriptor and drops the creating handle. Storage
+    /// retained by the Storage Server is created that way
+    /// (`crates/worker/src/storage/allocation.rs`, `retainable`); a pool block
+    /// handed over with this descriptor is memory mapped in two processes and
+    /// NVML counts it in both.
     pub fn export(&self) -> Result<OwnedFd> {
         self.block.export()
     }
