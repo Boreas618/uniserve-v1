@@ -3044,7 +3044,10 @@ mod tests {
         fn done(&self, name: &str) -> Result<(), String> {
             crate::lock(&self.calls).push(name.to_owned());
             match self.fails {
-                Some(at) if at == name => Err(format!("{name} failed")),
+                // A stage names the generation it applied at, so the failure a
+                // test asks for is matched by the call's name, not the whole
+                // record.
+                Some(at) if name.starts_with(at) => Err(format!("{at} failed")),
                 _ => Ok(()),
             }
         }
@@ -3453,19 +3456,21 @@ mod tests {
     fn a_failed_switchover_or_revert_is_a_fault() {
         use proto::process::report::Kind;
 
-        let switchover_policy = Recording::failing("switchover");
+        let policy = Recording::failing("switchover");
         let generations = Mutex::new(Generations::default());
         let store = store();
-        let report = apply_process_command(
-            &switchover_policy,
-            &generations,
-            Some(&store),
-            switchover(4),
-        );
-        match answered(report) {
+        let mut run = |command| apply_process_command(&policy, &generations, Some(&store), command);
+
+        // A switchover names the generation a precopy answered, so the failure
+        // here is the stage's own, not a number the engine never prepared.
+        let prepared = match answered(run(precopy(Vec::new()))) {
+            Kind::Precopied(precopied) => precopied.generation,
+            other => panic!("a precopy is answered by Precopied, not {other:?}"),
+        };
+        match answered(run(switchover(prepared))) {
             Kind::Fault(fault) => {
                 assert_eq!(fault.kind, "policy_switchover");
-                assert!(fault.reason.contains("switchover failed"));
+                assert!(fault.reason.contains("switchover failed"), "{}", fault.reason);
             }
             other => panic!("a failed switchover is answered by Fault, not {other:?}"),
         }
