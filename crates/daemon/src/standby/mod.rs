@@ -169,6 +169,9 @@ struct Node {
     standby: Option<Standby>,
     /// It cannot run again after a device fault; no action names it.
     gone: bool,
+    /// Its epoch stopped serving there (drained, purged or switched away):
+    /// its standby is gone and none starts until `serve` is called again.
+    retired: bool,
 }
 
 /// The epoch's main processes and the standby rules over them.
@@ -213,6 +216,7 @@ impl Roster {
                     process,
                     standby: None,
                     gone: false,
+                    retired: false,
                 })
                 .collect(),
             domains,
@@ -261,7 +265,7 @@ impl Roster {
         self.domains[domain]
             .iter()
             .copied()
-            .filter(|&node| !self.nodes[node].gone)
+            .filter(|&node| !self.nodes[node].gone && !self.nodes[node].retired)
             .collect()
     }
 
@@ -399,6 +403,14 @@ impl Roster {
         let Some(domain) = self.domain_of(host) else {
             return Vec::new();
         };
+        if self
+            .nodes
+            .iter()
+            .find(|node| node.process.host == host)
+            .is_some_and(|node| node.gone || node.retired)
+        {
+            return Vec::new();
+        }
         if matches!(
             self.phases[domain],
             Phase::Promoting { .. } | Phase::Relaunching { .. }
@@ -605,6 +617,44 @@ impl Roster {
         actions.push(Action::Migrate {
             host: host.to_owned(),
         });
+        actions
+    }
+    /// The node's epoch stopped serving there: its main process was drained,
+    /// purged or switched away, so its standby is terminated and none starts
+    /// until [`Roster::serve`] is called again.
+    ///
+    /// The standby layer owns the standby child, so it stops it: the epoch
+    /// layer does not need to know its generation. A replacement round in
+    /// flight owns the domain's children until it ends, so a retirement is
+    /// refused then; the round's own actions stop them.
+    pub fn retired(&mut self, host: &str) -> Vec<Action> {
+        let Some(domain) = self.domain_of(host) else {
+            return Vec::new();
+        };
+        if matches!(
+            self.phases[domain],
+            Phase::Promoting { .. } | Phase::Relaunching { .. }
+        ) {
+            return Vec::new();
+        }
+        let Some(node) = self.nodes.iter().position(|node| node.process.host == host) else {
+            return Vec::new();
+        };
+        self.nodes[node].retired = true;
+        let mut actions = Vec::new();
+        if let Some(standby) = self.nodes[node].standby.take() {
+            actions.push(Action::Terminate {
+                host: host.to_owned(),
+                generation: standby.generation,
+            });
+        }
+        if self.live(domain).is_empty() {
+            self.phases[domain] = Phase::Absent;
+        } else if self.phases[domain] == Phase::Starting
+            && self.live(domain).iter().all(|&node| self.is_parked(node))
+        {
+            self.phases[domain] = Phase::Parked;
+        }
         actions
     }
 }
