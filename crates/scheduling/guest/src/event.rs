@@ -51,6 +51,13 @@ pub enum Event {
     /// next phase changed, its prompt progress or cached prefix moved, its
     /// page count changed. Emitted before the `dispatch` of the step the
     /// change belongs to, and always after the event that caused it.
+    ///
+    /// This kind is an addition to §4.4's list, which allows a mechanism to
+    /// append events it needs: `next_tokens`, `remaining_tokens`,
+    /// `cached_pages`, `cache_rank` and `waiting_transfer` move without any
+    /// other event carrying them, and a policy cannot derive them. It is
+    /// emitted only when the view actually moved, so the event count stays
+    /// proportional to the step's state changes.
     Updated { request: RequestView },
     /// A call of the request advanced: its phase ran and produced `tokens`
     /// tokens (or latent units, for a media phase). One event per completed

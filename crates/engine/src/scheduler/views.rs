@@ -34,10 +34,10 @@
 //!
 //! # What a scheduler cannot tell a view
 //!
-//! - `Room::graph_tiers` and `Room::warming` are the mechanism's: it holds the
-//!   build config's captured tiers and the precopy's claimed order. It builds
-//!   the facts with [`room_facts`], fills those two, and turns them into the
-//!   `Room` with [`room_view`]; [`room`] leaves both empty.
+//! - `Room::graph_tiers` is the mechanism's: it holds the build config's
+//!   captured tiers. It builds the facts with [`room_facts`], fills the tiers,
+//!   and turns them into the `Room` with [`room_view`]; [`room`] leaves them
+//!   empty. (`Room::warming` is read here, from the claimed precopy pages.)
 //! - `Snapshot::ranks` and a trial's `arrival` need the ranks' load, which the
 //!   routing table on the control thread holds and a scheduler does not: a
 //!   scheduler knows one rank's load, its own. [`trial_state`] therefore trips
@@ -52,9 +52,11 @@
 //!
 //! - `Snapshot::encodings`: `EncoderCacheManager` lists no entries, so no
 //!   encoding is ever a live `EncodingId`.
-//! - host KV pages (`PageView::on_host`): the offload manager lists no pages,
-//!   so no `PageId` is a live host page.
-//! - a media request's phase: `VideoGraph` keeps its own cursor.
+//! - host KV pages (`PageView::on_host`): host KV pages live in the storage
+//!   servers, and the engine's offload manager holds only per-worker pools and
+//!   fetch tags, so it lists none; no `PageId` is a live host page and a
+//!   `HostPages` shortage has no page victim until the storage side reports its
+//!   pages (an open item with `front`).
 //! - `ExpertLoad`: no routed-token counters reach the scheduler, so `experts`
 //!   is skipped rather than asked about a load nobody measured.
 
@@ -238,10 +240,21 @@ pub(crate) fn block_id(blocks: &[String], name: &str) -> Option<ComponentId> {
         .map(|index| ComponentId(u32::try_from(index).unwrap_or(u32::MAX)))
 }
 
+/// The blocks of every worker of the world: the table `ComponentId`s number, so
+/// a phase's block and a replica's block name the same component.
+pub(crate) fn world_blocks(executor: &dyn Executor) -> Vec<String> {
+    let mut names = Vec::new();
+    for (_, info) in &executor.info().workers {
+        names.extend(blocks(info));
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// The block that runs `kind` on this worker group: the component the worker
 /// reports for its media call, or the protocol's default component.
-fn block_of(info: &WorkerInfo, kind: PhaseKind) -> ComponentId {
-    let blocks = blocks(info);
+fn block_of(table: &[String], info: &WorkerInfo, kind: PhaseKind) -> ComponentId {
     let name = match phase_call(kind) {
         Some(CallKind::Media(call)) => info
             .media_components
@@ -249,7 +262,7 @@ fn block_of(info: &WorkerInfo, kind: PhaseKind) -> ComponentId {
             .map_or(DEFAULT_COMPONENT, String::as_str),
         _ => DEFAULT_COMPONENT,
     };
-    block_id(&blocks, name).unwrap_or(ComponentId(0))
+    block_id(table, name).unwrap_or(ComponentId(0))
 }
 
 /// Every phase this worker group can run, in id order.
@@ -257,6 +270,11 @@ fn block_of(info: &WorkerInfo, kind: PhaseKind) -> ComponentId {
 /// `Snapshot::phases`, built once per epoch: a policy reads a request's
 /// `PhaseId` here to learn its kind and its block.
 pub(crate) fn phases(info: &WorkerInfo) -> Vec<PhaseView> {
+    phases_in(info, &blocks(info))
+}
+
+/// Every phase this worker group can run, numbered in the world's block table.
+pub(crate) fn phases_in(info: &WorkerInfo, table: &[String]) -> Vec<PhaseView> {
     PHASES
         .iter()
         .copied()
@@ -270,7 +288,7 @@ pub(crate) fn phases(info: &WorkerInfo) -> Vec<PhaseView> {
         .map(|kind| PhaseView {
             id: phase_id(kind),
             kind,
-            block: block_of(info, kind),
+            block: block_of(table, info, kind),
         })
         .collect()
 }
@@ -326,12 +344,6 @@ pub(crate) fn encoding_id(key: &[u8; 32]) -> EncodingId {
     let mut head = [0u8; 8];
     head.copy_from_slice(&key[..8]);
     EncodingId(u64::from_be_bytes(head))
-}
-
-/// The page a request holds its cached prefix in, per cache group: the pages
-/// whose hashes the request reused or published.
-fn prefix_pages(state: &RequestState) -> usize {
-    state.prefix_published.iter().copied().min().unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -491,33 +503,6 @@ pub(crate) fn call_view(request: RequestKey, kind: CallKind) -> CallView {
     }
 }
 
-/// The view of one DP rank, for `route`.
-pub(crate) fn rank_view(index: usize, in_flight: u32, alive: bool) -> RankView {
-    RankView {
-        index,
-        in_flight,
-        alive,
-    }
-}
-
-/// The views of the ranks, in scheduler-index order.
-pub(crate) fn ranks(loads: impl IntoIterator<Item = (u32, bool)>) -> Vec<RankView> {
-    loads
-        .into_iter()
-        .enumerate()
-        .map(|(index, (in_flight, alive))| rank_view(index, in_flight, alive))
-        .collect()
-}
-
-/// The load an `experts` decision balances.
-pub(crate) fn expert_load(ranks: usize, experts: usize, tokens: Vec<u64>) -> ExpertLoad {
-    ExpertLoad {
-        ranks,
-        experts,
-        tokens,
-    }
-}
-
 /// A shortage of one storage class.
 pub(crate) const fn shortage(kind: Storage, need: u64) -> Shortage {
     Shortage { kind, need }
@@ -628,9 +613,33 @@ pub(crate) fn room_facts(scheduler: &Scheduler, step: u64) -> RoomFacts {
         )
         .unwrap_or(u32::MAX),
         capacity_units: scheduler.storage.capacity_units() as u64,
-        // `warming::Warming::reserved` is private to its module.
-        warming: Vec::new(),
+        warming: warming(scheduler),
     }
+}
+
+/// The requests an epoch's precopy warms, in the order the mechanism claimed
+/// them, each with its pages in prefix order.
+///
+/// The claim order is the reservation list's own: each reserved page names the
+/// cache resume it serves, and a request's pages keep the order they were
+/// claimed in.
+fn warming(scheduler: &Scheduler) -> Vec<WarmingView> {
+    let mut views: Vec<WarmingView> = Vec::new();
+    for reserved in &scheduler.warming.reserved {
+        let Some(unit) = reserved.reference.units().first().copied() else {
+            continue;
+        };
+        let request = ViewRequestId(reserved.resume.request_id);
+        let page = device_page(unit.0);
+        match views.iter_mut().find(|view| view.request == request) {
+            Some(view) => view.pages.push(page),
+            None => views.push(WarmingView {
+                request,
+                pages: vec![page],
+            }),
+        }
+    }
+    views
 }
 
 /// The storage the mechanism finds short right now, for `reclaim`.
@@ -638,7 +647,34 @@ pub(crate) fn room_facts(scheduler: &Scheduler, step: u64) -> RoomFacts {
 /// The mechanism knows the shortfall when executing a plan hits it; a step that
 /// hit none has nothing to reclaim.
 pub(crate) fn shortage_now(scheduler: &Scheduler) -> Option<Shortage> {
-    (!scheduler.starved.is_empty()).then_some(shortage(Storage::KvUnits, 1))
+    if scheduler.starved.is_empty() {
+        return None;
+    }
+    let Some(cache) = scheduler.storage.cache() else {
+        return Some(shortage(Storage::KvUnits, 1));
+    };
+    // What the starved requests' next calls need beyond what the pool holds: a
+    // policy sizing its victims by `need` frees enough for them to go on. Each
+    // contributes at least one unit, because a request the mechanism could not
+    // give units to needs some however small its next call is (a prefill chunk
+    // is sized by the policy, so its token count is not known here).
+    let wanted = scheduler
+        .starved
+        .iter()
+        .filter_map(|id| {
+            let state = scheduler.running.get(id)?;
+            Some((*id, state))
+        })
+        .map(|(id, state)| {
+            let tokens = usize::try_from(next_tokens(scheduler, state, id)).unwrap_or(usize::MAX);
+            u64::try_from(cache.coordinator.units_for_tokens(tokens).max(1)).unwrap_or(u64::MAX)
+        })
+        .fold(0u64, u64::saturating_add);
+    let free = u64::try_from(cache.block_pool.free_units()).unwrap_or(0);
+    Some(shortage(
+        Storage::KvUnits,
+        wanted.saturating_sub(free).max(1),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -818,20 +854,30 @@ pub(crate) fn request(
     })
 }
 
+/// The phase of a resident media request's next ready call, when its graph has
+/// one ready.
+fn media_phase(scheduler: &Scheduler, id: RequestId) -> Option<PhaseId> {
+    scheduler
+        .media_ready_calls(id)
+        .first()
+        .map(|kind| call_phase_id(*kind))
+}
+
 /// The view of a media (diffusion) request the scheduler holds.
 ///
-/// A media request's progress is its call graph's, which keeps its own cursor:
-/// an epoch's views carry no phase for it yet.
+/// A media request's progress is its call graph's: `phase` is the phase of the
+/// graph's first ready call, which is what the mechanism would run next.
 pub(crate) fn diffusion_request(
     request: &DiffusionRequest,
     standing: Standing,
     queued_at: f64,
+    phase: Option<PhaseId>,
     recorded: &Recorded,
 ) -> RequestView {
     request_view(RequestFacts {
         id: ViewRequestId(request.request_id.0),
         standing,
-        phase: None,
+        phase,
         priority: request.priority,
         arrived_at: nanos_at(queued_at),
         admitted_at: recorded.admitted_at,
@@ -876,26 +922,43 @@ pub(crate) fn requests(scheduler: &Scheduler, recorded: &RecordedTable) -> Vec<R
             &pending.request,
             Standing::Queued,
             pending.queued_at,
+            None,
             &facts,
         ));
     }
+    let mut seen = HashSet::new();
     for id in &scheduler.running_order {
-        let Some(state) = scheduler.running.get(id) else {
+        if !seen.insert(*id) {
             continue;
-        };
+        }
         let facts = recorded.get(id).copied().unwrap_or(empty);
-        views.push(request(scheduler, state, Standing::Resident, &facts));
+        if let Some(state) = scheduler.running.get(id) {
+            views.push(request(scheduler, state, Standing::Resident, &facts));
+        } else if let Some(flow) = scheduler.running_media.get(id) {
+            // A media request keeps no arrival time of its own once it runs.
+            views.push(diffusion_request(
+                &flow.request,
+                Standing::Resident,
+                0.0,
+                media_phase(scheduler, *id),
+                &facts,
+            ));
+        }
     }
+    // A media request the admission order does not name still exists.
     for id in scheduler.running_media.keys() {
         let Some(flow) = scheduler.running_media.get(id) else {
             continue;
         };
+        if !seen.insert(*id) {
+            continue;
+        }
         let facts = recorded.get(id).copied().unwrap_or(empty);
-        // A media request keeps no arrival time of its own once it runs.
         views.push(diffusion_request(
             &flow.request,
             Standing::Resident,
             0.0,
+            media_phase(scheduler, *id),
             &facts,
         ));
     }
@@ -952,13 +1015,56 @@ pub(crate) fn pages(scheduler: &Scheduler) -> Vec<PageView> {
     views
 }
 
-/// Every encoder cache entry.
+/// The view of one pool page, from the mechanism's own record of it.
 ///
-/// The encoder cache manager exposes no entry list, so an epoch's views name
-/// none; a policy that frees encoder entries by id has nothing to name until
-/// its report gains one.
-pub(crate) fn encodings(_scheduler: &Scheduler) -> Vec<EncodingView> {
-    Vec::new()
+/// `units` are all the page's units and `tokens` the tokens it holds: what a
+/// cached page carries, and what a change log keeps of a page it freed. The
+/// evictability rule is [`pages`]'s — no resident request continues from any of
+/// the page's units — so a policy is never told a page is evictable that the
+/// mechanism would refuse to evict, and this reads one page rather than the
+/// cache.
+pub(crate) fn page_of(scheduler: &Scheduler, units: &[u32], tokens: u32) -> Option<PageView> {
+    let first = *units.first()?;
+    let held = held_units(scheduler);
+    Some(page_view(PageFacts {
+        id: device_page(first),
+        tokens,
+        last_used: Nanos(0),
+        on_host: false,
+        // A page is evictable once no resident request continues from any of
+        // its units, not just from the one its id names.
+        evictable: !units.iter().any(|unit| held.contains(unit)),
+    }))
+}
+
+/// Every page of the device KV cache, keyed by id: the table `Live` checks a
+/// named page against.
+///
+/// Named so the cost is visible: it walks the whole prefix cache, so it belongs
+/// where a snapshot is built (once per epoch), not in a step. The pages that
+/// appear and go reach a policy as `Cached` and `Freed`, which is the per-step
+/// source, and the mechanism asks the pool itself whether a named page still
+/// exists.
+pub(crate) fn page_index(scheduler: &Scheduler) -> std::collections::BTreeMap<PageId, PageView> {
+    pages(scheduler)
+        .into_iter()
+        .map(|page| (page.id, page))
+        .collect()
+}
+
+/// Every live encoder cache entry.
+///
+/// Each entry is named by [`encoding_id`] of its key and carries the tick the
+/// cache last used it, which is the order its own eviction follows. A pinned
+/// entry is listed too: it exists, and whether it may be freed is the eviction
+/// call's answer, not the view's.
+pub(crate) fn encodings(scheduler: &Scheduler) -> Vec<EncodingView> {
+    scheduler
+        .storage
+        .encoder_cache
+        .entries()
+        .map(|(key, last_used)| encoding_view(encoding_id(&key), Nanos(last_used)))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1038,22 +1144,77 @@ pub(crate) fn replicas(
     request: RequestKey,
     kind: CallKind,
 ) -> Vec<ReplicaView> {
+    replica_facts(scheduler, request, kind)
+        .into_iter()
+        .map(|(view, _, _)| view)
+        .collect()
+}
+
+/// The workers [`replicas`] offers, in the same order and of the same length:
+/// the mechanism's half of a placement decision.
+///
+/// A policy's `place` answers an index into [`replicas`]; the mechanism turns
+/// that index into the worker it binds. Both come from [`replica_facts`], so the
+/// filter that decides which replicas are candidates cannot differ between the
+/// view a policy saw and the worker the mechanism picks. The second element is
+/// the component the worker binds for the call, which a placement records with
+/// the worker.
+pub(crate) fn replica_targets(
+    scheduler: &Scheduler,
+    request: RequestKey,
+    kind: CallKind,
+) -> Vec<(crate::WorkerGroupId, String)> {
+    replica_facts(scheduler, request, kind)
+        .into_iter()
+        .map(|(_, worker, bound)| (worker, bound))
+        .collect()
+}
+
+/// Every candidate replica of `request`'s call of `kind`, with the worker and
+/// component it names. One construction of the filter, which [`replicas`] and
+/// [`replica_targets`] are two views of.
+fn replica_facts(
+    scheduler: &Scheduler,
+    request: RequestKey,
+    kind: CallKind,
+) -> Vec<(ReplicaView, crate::WorkerGroupId, String)> {
     let executor = scheduler.executor.as_ref();
-    let info = &scheduler.info;
+    candidate_facts(
+        scheduler,
+        request,
+        kind,
+        scheduler
+            .placement
+            .worker_candidates(executor, &scheduler.info, kind),
+    )
+}
+
+/// One replica view per candidate of `request`'s call, with the worker and
+/// component it names.
+///
+/// The candidates are the caller's list — a call kind's, or a named component's
+/// — so a policy's index and the mechanism's worker resolve against the same
+/// list, and the decode-stage filter is applied once, here, for every list.
+fn candidate_facts<'a>(
+    scheduler: &'a Scheduler,
+    request: RequestKey,
+    kind: CallKind,
+    candidates: impl Iterator<Item = (&'a crate::WorkerGroupId, &'a str, &'a WorkerInfo)>,
+) -> Vec<(ReplicaView, crate::WorkerGroupId, String)> {
+    let executor = scheduler.executor.as_ref();
+    let table = world_blocks(executor);
     let decode_stage = matches!(
         kind,
         CallKind::Forward(ForwardMode::Decode | ForwardMode::Verify)
             | CallKind::Transfer(TransferMode::CacheInstall)
     );
-    scheduler
-        .placement
-        .worker_candidates(executor, info, kind)
+    candidates
         .filter(|(id, _, _)| !decode_stage || !scheduler.placement.prefill_groups.contains(*id))
         .enumerate()
         .map(|(index, (worker, bound, worker_info))| {
-            replica_view(ReplicaFacts {
+            let view = replica_view(ReplicaFacts {
                 index,
-                block: block_id(&blocks(info), bound).unwrap_or(ComponentId(0)),
+                block: block_id(&table, bound).unwrap_or(ComponentId(0)),
                 kinds: worker_phases(worker_info),
                 resident_requests: resident_requests(&scheduler.placement, worker),
                 // The executor reports whether a worker's queue has room, not
@@ -1068,7 +1229,8 @@ pub(crate) fn replicas(
                 ),
                 prefills_only: scheduler.placement.prefill_groups.contains(worker),
                 holds_component: holds_component(&scheduler.placement, request, worker),
-            })
+            });
+            (view, worker.clone(), bound.to_owned())
         })
         .collect()
 }
@@ -1084,11 +1246,18 @@ pub(crate) fn call(
     (!candidates.is_empty()).then(|| (call_view(request, kind), candidates))
 }
 
+/// One entry per worker the world reports, in the order `WorkerGroup::spawn_all`
+/// returned them — the same length and order as the control thread's
+/// `routing.slots`, so an index into this list and an index into that one name
+/// the same rank. The two are built on different threads and carry different
+/// fields (a rank's in-flight count and liveness exist only on the control
+/// thread), so this contract is stated here rather than enforced by a type.
+
 /// Every replica a `place` decision may choose, for `Snapshot::replicas`: one
 /// per worker of the world, in the executor's order.
 pub(crate) fn replica_catalog(scheduler: &Scheduler) -> Vec<ReplicaView> {
     let executor = scheduler.executor.as_ref();
-    let table = blocks(&scheduler.info);
+    let table = world_blocks(executor);
     executor
         .info()
         .workers
@@ -1117,8 +1286,10 @@ pub(crate) fn replica_catalog(scheduler: &Scheduler) -> Vec<ReplicaView> {
 ///
 /// No worker reports the tokens it routed to each expert, so an epoch's views
 /// carry none and the mechanism makes no expert decision.
-pub(crate) fn expert_load_of(_scheduler: &Scheduler) -> Option<ExpertLoad> {
-    None
+pub(crate) fn expert_load_of(scheduler: &Scheduler) -> Option<ExpertLoad> {
+    // The routed tokens per expert are the executor's to measure; the
+    // mechanism states them only once it has been told.
+    scheduler.expert_load.clone()
 }
 
 // ---------------------------------------------------------------------------
@@ -1138,7 +1309,7 @@ pub(crate) fn snapshot(scheduler: &Scheduler, step: u64, recorded: &RecordedTabl
         pages: pages(scheduler),
         encodings: encodings(scheduler),
         replicas: replica_catalog(scheduler),
-        phases: phases(&scheduler.info),
+        phases: phases_in(&scheduler.info, &world_blocks(scheduler.executor.as_ref())),
         ranks: Vec::new(),
     }
 }
@@ -1178,6 +1349,7 @@ fn request_of(scheduler: &Scheduler, id: RequestId, standing: Standing) -> Optio
                 &pending.request,
                 standing,
                 pending.queued_at,
+                None,
                 &Recorded::default(),
             )
         })
@@ -1289,16 +1461,6 @@ pub(crate) fn arrived(request: RequestView) -> Event {
     Event::Arrived { request }
 }
 
-/// The mechanism admitted a queued request.
-pub(crate) const fn admitted(request: ViewRequestId) -> Event {
-    Event::Admitted { request }
-}
-
-/// A resident request's view changed in a way the policy must see.
-pub(crate) fn updated(request: RequestView) -> Event {
-    Event::Updated { request }
-}
-
 /// A call of the request advanced by `tokens` tokens of `phase`.
 pub(crate) const fn advanced(request: ViewRequestId, phase: PhaseId, tokens: u32) -> Event {
     Event::Advanced {
@@ -1337,19 +1499,9 @@ pub(crate) fn cached(page: PageView) -> Event {
     Event::Cached { page }
 }
 
-/// A resident (device) page was used again.
-pub(crate) const fn hit(page: PageId) -> Event {
-    Event::Hit { page }
-}
-
 /// A page was freed.
 pub(crate) const fn freed(page: PageId) -> Event {
     Event::Freed { page }
-}
-
-/// An encoder product entered the encoder cache.
-pub(crate) fn encoded(entry: EncodingView) -> Event {
-    Event::Encoded { entry }
 }
 
 #[cfg(test)]
@@ -1573,17 +1725,6 @@ mod tests {
         );
         assert!(replicas[1].holds_request);
         assert!(replicas[2].holds_component);
-    }
-
-    #[test]
-    fn rank_views_are_numbered_in_scheduler_order() {
-        let views = ranks([(4, true), (0, false)]);
-        assert_eq!(views.len(), 2);
-        assert_eq!(views[0].index, 0);
-        assert_eq!(views[0].in_flight, 4);
-        assert!(views[0].alive);
-        assert_eq!(views[1].index, 1);
-        assert!(!views[1].alive);
     }
 
     #[test]

@@ -20,10 +20,23 @@ def spec(fields, parameters, target):
     if fields["kv"] != fields["dtype"] or fields["out"] != fields["dtype"]:
         raise SystemExit("FA4's paged pass serves one element type for query, cache and output")
     compiler = fa4.PrefillCompiler(fields, parameters, target)
+    # The module states the geometry it was compiled for, so a call of another
+    # geometry is refused instead of run against the wrong tiles.
+    codes = {"bf16": "UNISERVE_DTYPE_BF16", "f16": "UNISERVE_DTYPE_F16"}
+    defines = [
+        f"UNISERVE_FA4_DTYPE={codes[fields['dtype']]}",
+        f"UNISERVE_FA4_HEAD_DIM={int(fields['head_dim'])}",
+        f"UNISERVE_FA4_PAGE={int(fields['page'])}",
+        f"UNISERVE_FA4_Q_HEADS={int(fields['q_heads'])}",
+        f"UNISERVE_FA4_KV_HEADS={int(fields['kv_heads'])}",
+        f"UNISERVE_FA4_CAUSAL={1 if fields['mask'] == 'causal' else 0}",
+        f"UNISERVE_FA4_MAX_KV_LEN={int(fields['len'])}",
+    ]
     return {
         "name": fa4.NAME,
         "entry": "uniserve_paged_attention",
         "compile": compiler,
+        "defines": defines,
     }
 
 

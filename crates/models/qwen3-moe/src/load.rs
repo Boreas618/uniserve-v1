@@ -24,8 +24,9 @@ use std::f64::consts::PI;
 use std::path::Path;
 
 use nn::layers::{Attention, Embedding, Linear, Moe, ParallelLMHead, RmsNorm, Rotary, SwiGlu};
-use nn::weights::{Weight, WeightLayout, WeightLoader, WeightRequest};
+use nn::weights::{QuantizedStack, Weight, WeightLayout, WeightLoader, WeightRequest};
 use nn::{DType, Shape};
+use ops::fp4::ScaleLayout;
 use ops::gemm::WeightOrder;
 use ops::moe::grouped::Activation as MoeActivation;
 use ops::rope::Rotation;
@@ -42,6 +43,47 @@ pub fn load(
     partition: Partition,
     loader: &mut WeightLoader<'_>,
     options: LoadOptions,
+) -> Result<Qwen3Moe> {
+    load_with(root, partition, loader, options, Quantization::Bf16)
+}
+
+/// Load a model whose expert stacks are stored encoded (NVFP4).
+///
+/// Everything but the expert block is identical to [`load`]; the expert block's weights are the
+/// checkpoint's packed E2M1 field, its swizzled block scales and its per-expert tensor scales, in the
+/// layout the caller names. A checkpoint that stores them any other way is refused rather than
+/// reinterpreted, and the BF16 path above is untouched byte for byte.
+pub fn load_encoded(
+    root: &Path,
+    partition: Partition,
+    loader: &mut WeightLoader<'_>,
+    options: LoadOptions,
+    layout: ScaleLayout,
+) -> Result<Qwen3Moe> {
+    load_with(
+        root,
+        partition,
+        loader,
+        options,
+        Quantization::Nvfp4(layout),
+    )
+}
+
+/// How a checkpoint stores its expert stacks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Quantization {
+    /// Dense tensors, one per expert, concatenated into a stack.
+    Bf16,
+    /// Packed E2M1 with block scales in `ScaleLayout`.
+    Nvfp4(ScaleLayout),
+}
+
+fn load_with(
+    root: &Path,
+    partition: Partition,
+    loader: &mut WeightLoader<'_>,
+    options: LoadOptions,
+    quantization: Quantization,
 ) -> Result<Qwen3Moe> {
     let config = Config::read(root)?;
     partition.validate(&config)?;
@@ -236,6 +278,7 @@ pub fn load(
                 &config,
                 &parameter,
                 hidden,
+                quantization,
             )?)
         } else {
             Mlp::Dense(Box::new(dense_block(
@@ -372,6 +415,11 @@ fn output_projection(
 }
 
 /// One sparse layer's expert block: the replicated router and the rank's experts.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the block is named by its parts: the loader, the checkpoint's sources, the expert \
+              source, the partition, the config, the parameter and the quantization"
+)]
 fn expert_block(
     loader: &mut WeightLoader<'_>,
     sources: &HashMap<String, String>,
@@ -380,6 +428,7 @@ fn expert_block(
     config: &Config,
     parameter: &str,
     hidden: u64,
+    quantization: Quantization,
 ) -> Result<Moe> {
     let experts = as_u64(config.num_experts, "num_experts")?;
     let range = partition.expert_range(config);
@@ -405,7 +454,55 @@ fn expert_block(
     )
     .map_err(Error::from)?;
 
-    // Fused per expert, in the reading order the layout names: up before gate.
+    // The encoded checkpoint names the same three tensors per projection and carries three fields
+    // each; the dense path names one tensor per projection. Both are fused expert-major, in the
+    // reading order the layouts name: up before gate.
+    if let Quantization::Nvfp4(layout) = quantization {
+        // The encoded block is colocated by construction: its stacks hold every expert the router
+        // names, so a rank holding only a window cannot be served from them.
+        if partition.expert_parallel != 1 {
+            return Err(Error::Unsupported(format!(
+                "{parameter} is encoded, and an encoded expert block is colocated: this rank holds \
+                 {} of {} experts",
+                range.len(),
+                config.num_experts
+            )));
+        }
+        let vocabulary = as_u32(config.num_experts, "num_experts")?;
+        let up_gate: QuantizedStack = loader
+            .nvfp4_stack(
+                &format!("{parameter}.mlp.experts.up_gate"),
+                &expert_source.checkpoint_prefix,
+                &["up", "gate"],
+                vocabulary,
+                layout,
+            )
+            .map_err(Error::from)?;
+        let down: QuantizedStack = loader
+            .nvfp4_stack(
+                &format!("{parameter}.mlp.experts.down"),
+                &expert_source.checkpoint_prefix,
+                &["down"],
+                vocabulary,
+                layout,
+            )
+            .map_err(Error::from)?;
+        let activation = activation(config.hidden_act)?;
+        let top = as_u32(config.num_experts_per_tok, "num_experts_per_tok")?;
+        return Moe::quantized(
+            router,
+            up_gate,
+            down,
+            None,
+            vocabulary,
+            top,
+            activation,
+            config.norm_topk_prob,
+            None,
+        )
+        .map_err(Error::from);
+    }
+
     let mut up_gate_parts = Vec::with_capacity(range.len() * 2);
     let mut down_parts = Vec::with_capacity(range.len());
     for expert in range.clone() {

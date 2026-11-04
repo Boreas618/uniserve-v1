@@ -3,7 +3,7 @@
 ``processing`` calls the request rules of the ``models`` crate through the rank
 runtime library. Its canvas rule and the frame count of a duration match the
 vectors in ``minimax_h3_plan.json``, generated from the diffusers MiniMax-H3
-pipeline; the rules' own tests (``crates/models/src/video``) check every
+pipeline; the rules' own tests (``crates/models/rules/src/video``) check every
 planned request and presentation against the same vectors.
 """
 

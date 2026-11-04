@@ -7,8 +7,9 @@ dimensions give, and the compilation options. The Program Server's Triton source
 
 The draw's kind is baked in: a normal draw takes one counter per element pair and stores two values,
 a uniform draw takes one counter per element, so the two read different words from the same counter
-and are separate programs. The row count, the element count, the stage and the draw index are launch
-words.
+and are separate programs. So is where the key comes from: per row of the buffer, or one launch word
+for the whole flattened buffer, which addresses the same draw differently and is a second program.
+The row count, the element count, the stage, the draw index and the scalar key are launch words.
 """
 
 import _compile
@@ -35,12 +36,17 @@ def spec(fields, parameters, target):
             "elements": "i64",
             "stage": "i32",
             "draw": "i32",
+            "key": "i64",
             "BLOCK": "constexpr",
             "NORMAL": "constexpr",
+            "ROWS": "constexpr",
         },
         "constexprs": {
             "BLOCK": block,
             "NORMAL": fields["kind"] == "normal",
+            # The descriptor names the scalar form; the per-row form is the default and prints
+            # nothing, which is what the key's other program always looked like.
+            "ROWS": fields.get("source", "rows") == "rows",
         },
         "options": {"num_warps": warps_of(block)},
     }

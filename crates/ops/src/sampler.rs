@@ -565,6 +565,8 @@ impl Op for ArgMax {
         }
     }
 
+    // The largest value of a row and its index: a comparison, not an arithmetic result, so an
+    // implementation that differs has seen a different logits tensor rather than rounded one.
     fn tolerance(_descriptor: &Self::Descriptor) -> Tolerance {
         Tolerance::exact()
     }
@@ -743,6 +745,8 @@ impl Op for LogprobGather {
         }
     }
 
+    // A copy of one already-computed log-probability per row; the arithmetic happened in
+    // `log_softmax`, and this moves its result.
     fn tolerance(_descriptor: &Self::Descriptor) -> Tolerance {
         Tolerance::exact()
     }

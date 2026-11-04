@@ -371,7 +371,6 @@ impl ProgramServer {
             package: directory.to_path_buf(),
             source: Box::new(source),
         })?;
-        let source = manifest.source(directory)?;
         let mut packages = self
             .packages
             .write()
@@ -394,11 +393,24 @@ impl ProgramServer {
             revision,
         );
         install_package(directory, &root)?;
+        // The source compiles the installed copy, not the tree the install
+        // named: a downstream server's package root is a read-only mount of the
+        // upstream's, and the publisher's directory need not exist there.
+        let source = manifest.source(&root)?;
         let package = Arc::new(Package {
             manifest,
             root,
             source,
         });
+        // Design 6.2: a package is built when it is installed. Every other kind
+        // builds per descriptor at `prepare`; a wasm policy is one module with
+        // no descriptor and no target, and its build is the publisher's own
+        // crate inside the publisher's workspace, so it is built here, once,
+        // while that directory is still reachable. What the revision keeps is
+        // the precompiled artifact.
+        if package.source.toolchain() == crate::manifest::ToolchainKind::Wasm {
+            self.build_policy(&package, directory)?;
+        }
         let (op, backend) = (
             package.manifest.op.clone(),
             package.manifest.backend.clone(),
@@ -411,6 +423,59 @@ impl ProgramServer {
                 revision,
             },
         })
+    }
+
+    /// Builds one installed wasm policy into its revision's directory.
+    ///
+    /// The build runs with the publisher's directory as the package root,
+    /// because a policy crate inherits its workspace from its ancestors; what
+    /// the revision keeps is the artifact alone, so nothing later needs that
+    /// directory — not a scan of the package root, and not a `prepare` after a
+    /// restart (design section 6.2).
+    fn build_policy(&self, package: &Package, publisher: &Path) -> Result<()> {
+        let kind = package.source.toolchain();
+        let toolchain = self.toolchains.get(kind)?;
+        if !package.manifest.toolchain.version.is_empty()
+            && toolchain.version() != package.manifest.toolchain.version
+        {
+            return Err(Error::Toolchain {
+                kind,
+                message: format!(
+                    "the package {} {} is written for {kind} {} and this host has {}",
+                    package.manifest.op,
+                    package.manifest.backend,
+                    package.manifest.toolchain.version,
+                    toolchain.version()
+                ),
+            });
+        }
+        let source = package.manifest.source(publisher)?;
+        let workspace = crate::source::Workspace::new()?;
+        let target = Target::new(crate::manifest::WASM_TARGET);
+        // A policy has no descriptor: the key is empty, as the store's wasm path
+        // ignores it.
+        let built = source.build(&package.manifest.op, "", &target, toolchain, &workspace)?;
+        let artifact = workspace.path().join(crate::source::MODULE_WASM);
+        if !built
+            .files
+            .iter()
+            .any(|file| file == crate::source::MODULE_WASM)
+            || !artifact.is_file()
+        {
+            return Err(Error::Build {
+                op: package.manifest.op.clone(),
+                backend: package.manifest.backend.clone(),
+                revision: 0,
+                target: target.to_string(),
+                descriptor: String::new(),
+                message: format!(
+                    "the policy's build wrote no {}",
+                    crate::source::MODULE_WASM
+                ),
+            });
+        }
+        std::fs::copy(&artifact, package.root.join(crate::source::MODULE_WASM))?;
+        Ok(())
     }
 
     /// Selects the programs of an epoch's operators and commits every module
@@ -1035,33 +1100,48 @@ impl Queue {
     fn compile(&self, job: &BuildJob) -> Result<()> {
         let package = &job.package;
         let kind = package.toolchain();
-        let toolchain = self.toolchains.get(kind)?;
-        // A package that compiles nothing has no compiler version to match;
-        // its `[toolchain] version` is empty and is not compared.
-        if kind != crate::manifest::ToolchainKind::None
-            && toolchain.version() != package.manifest.toolchain.version
-        {
-            return Err(Error::Toolchain {
-                kind,
-                message: format!(
-                    "the package {} {} revision {} is written for {kind} {} and this host has {}",
-                    package.manifest.op,
-                    package.manifest.backend,
-                    job.path.revision,
-                    package.manifest.toolchain.version,
-                    toolchain.version()
-                ),
-            });
-        }
         let workspace = crate::source::Workspace::new()?;
         let target = Target::new(job.path.target.clone());
-        let built = package.source.build(
-            &job.path.op,
-            &job.path.descriptor,
-            &target,
-            toolchain,
-            &workspace,
-        )?;
+        // What the installed revision already holds is published as it is: a
+        // package built when it was installed carries its module, and neither it
+        // nor the host needs a compiler to serve it (design section 6.2).
+        let built = match package
+            .source
+            .stored(&job.path.descriptor, &target, &workspace)?
+        {
+            Some(built) => built,
+            None => {
+                let toolchain = self.toolchains.get(kind)?;
+                // A package that compiles nothing has no compiler version to
+                // match, and a package that declares no version is built by
+                // whatever this host has: both leave `[toolchain] version`
+                // empty, and neither is compared.
+                if kind != crate::manifest::ToolchainKind::None
+                    && !package.manifest.toolchain.version.is_empty()
+                    && toolchain.version() != package.manifest.toolchain.version
+                {
+                    return Err(Error::Toolchain {
+                        kind,
+                        message: format!(
+                            "the package {} {} revision {} is written for {kind} {} and this host \
+                             has {}",
+                            package.manifest.op,
+                            package.manifest.backend,
+                            job.path.revision,
+                            package.manifest.toolchain.version,
+                            toolchain.version()
+                        ),
+                    });
+                }
+                package.source.build(
+                    &job.path.op,
+                    &job.path.descriptor,
+                    &target,
+                    toolchain,
+                    &workspace,
+                )?
+            }
+        };
         if built.files.is_empty() {
             return Err(Error::Build {
                 op: job.path.op.clone(),
