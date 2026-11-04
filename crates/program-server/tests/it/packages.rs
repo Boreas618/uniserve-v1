@@ -487,10 +487,11 @@ fn every_package_names_an_operator_the_ops_crate_declares() {
 #[test]
 fn the_convolutions_are_one_source_in_three_packages() {
     const CONVOLUTIONS: [&str; 3] = ["conv1d", "conv3d", "conv_transpose1d"];
-    const SHARED: [&str; 3] = [
+    const SHARED: [&str; 4] = [
         "src/conv.cu",
         "include/uniserve_conv.h",
         "test/conv_check.py",
+        "test/refusal_check.py",
     ];
     for shared in SHARED {
         let sources = CONVOLUTIONS.map(|op| {
