@@ -624,6 +624,11 @@ impl Epochs {
         };
         record.previous_kernels = std::mem::replace(&mut record.kernels, programs.kernels);
         record.previous_policy = Some(std::mem::replace(&mut record.policy, programs.policy));
+        // The new programs serve while the previous generation is kept as
+        // the last resort (§7.3 step 4).
+        if record.status == Status::Serving {
+            record.status = Status::Probation;
+        }
     }
 
     /// Records that epoch `epoch`'s new programs are what serves and the
@@ -805,8 +810,9 @@ impl Epochs {
         if let Err(failure) = switch.commit().and_then(|()| switch.purge()) {
             anyhow::bail!("committing the program update: {}", failure.reason);
         }
+        // The epoch keeps serving: what the commit purges is the previous
+        // *generation* of programs in every main process, not the epoch.
         self.committed(program.epoch);
-        self.purged(program.epoch);
         *locked(&self.update) = Some(switch.update().clone());
         *locked(&self.program) = None;
         Ok(true)
@@ -1235,6 +1241,7 @@ mod tests {
     use std::num::NonZeroU32;
 
     use super::*;
+    use crate::engine::stand_in::Seen;
     use crate::options::{SchedulerOptions, SpeculativeOptions};
 
     /// A program of backend `backend` at revision 1 with no parameters.
@@ -1259,6 +1266,171 @@ mod tests {
             generation: None,
             world: 3,
         }
+    }
+
+
+    /// A program-layer update in flight is the epoch's probation: the record
+    /// names the programs the main processes took, the previous generation is
+    /// kept, and a commit ends the probation without the epoch stopping
+    /// (§7.3 steps 4-6).
+    #[test]
+    fn a_program_update_serves_from_the_generation_it_switched_to_until_it_is_committed() {
+        use crate::engine::stand_in::{main_processes, process, Answer, Seen};
+
+        let (commands, seen) = main_processes(vec![(7, Answer::Serves(11)), (8, Answer::Serves(12))]);
+        let epochs = Epochs::new();
+        let config = ServeConfig::default();
+        let serving = Deployment {
+            config: config.clone(),
+            build_config: BuildConfig::of(&config),
+            programs: FilledPrograms::of(&config),
+        };
+        epochs.install(0, &serving, 3, &[10]);
+        epochs.supervise(commands);
+
+        // A change that moves only the programs: one operator's backend.
+        let mut target = serving.clone();
+        let mut programs = FilledPrograms::of(&config);
+        programs
+            .policy
+            .arguments
+            .insert("max_batch".to_owned(), toml::Value::Integer(8));
+        target.programs = programs.clone();
+        let update = Update::new(1, target);
+        epochs
+            .apply_programs(update, vec![process("rank-0", 7), process("rank-1", 8)])
+            .expect("both main processes took the programs");
+
+        // The epoch is on probation from the generation the update switched
+        // to, and the record names what executes.
+        let program = epochs.program_update().expect("the update is in flight");
+        assert_eq!(program.update.number, 1);
+        assert_eq!(program.update.state, UpdateState::Probation);
+        assert_eq!(program.epoch, 0);
+        let prepared: Vec<u64> = program.prepared.iter().map(|p| p.generation).collect();
+        assert_eq!(prepared, vec![11, 12]);
+        let serving_epoch = epochs.get(0).expect("the epoch is recorded");
+        assert_eq!(serving_epoch.status, Status::Probation);
+        assert_eq!(serving_epoch.policy, programs.policy);
+        assert!(serving_epoch.previous_policy.is_some());
+
+        assert!(
+            epochs.commit_programs().expect("both main processes committed"),
+            "a program-layer update is committed here"
+        );
+        let serving_epoch = epochs.get(0).expect("the epoch is recorded");
+        assert_eq!(serving_epoch.status, Status::Serving);
+        assert!(serving_epoch.previous_policy.is_none());
+        assert!(
+            serving_epoch.previous_kernels.is_empty(),
+            "a commit keeps no previous generation"
+        );
+        assert!(epochs.program_update().is_none());
+
+        // Each process was commanded in the protocol's order, and the
+        // generation each switched to is the one it numbered itself.
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![
+                (7, Seen::Precopy),
+                (8, Seen::Precopy),
+                (7, Seen::Switchover(11)),
+                (8, Seen::Switchover(12)),
+                (7, Seen::Commit),
+                (8, Seen::Commit),
+                (7, Seen::Purge(11)),
+                (8, Seen::Purge(12)),
+            ]
+        );
+    }
+
+    /// A revert puts the previous generation back in every main process and
+    /// in the epoch's record, and the update stays unavailable with its first
+    /// failure until it is applied with `force` (§7.2, §7.3 step 5).
+    #[test]
+    fn a_reverted_program_update_leaves_the_previous_programs_serving() {
+        use crate::engine::stand_in::{main_processes, process, Answer};
+
+        let (commands, seen) = main_processes(vec![(7, Answer::Serves(11))]);
+        let epochs = Epochs::new();
+        let config = ServeConfig::default();
+        let serving = Deployment {
+            config: config.clone(),
+            build_config: BuildConfig::of(&config),
+            programs: FilledPrograms::of(&config),
+        };
+        epochs.install(0, &serving, 3, &[10]);
+        epochs.supervise(commands);
+
+        let mut target = serving.clone();
+        let mut programs = FilledPrograms::of(&config);
+        programs
+            .policy
+            .arguments
+            .insert("max_batch".to_owned(), toml::Value::Integer(8));
+        target.programs = programs;
+        epochs
+            .apply_programs(Update::new(2, target), vec![process("rank-0", 7)])
+            .expect("the main process took the programs");
+        assert!(
+            epochs.revert_programs("a trial refused it").expect("the revert was answered")
+        );
+
+        let serving_epoch = epochs.get(0).expect("the epoch is recorded");
+        assert_eq!(serving_epoch.status, Status::Serving);
+        assert_eq!(
+            serving_epoch.policy, serving.programs.policy,
+            "the previous programs serve again"
+        );
+        let reverted = seen.lock().unwrap().clone();
+        assert!(
+            reverted
+                .iter()
+                .any(|(engine, what)| *engine == 7 && *what == Seen::Revert("a trial refused it".to_owned())),
+            "{reverted:?}"
+        );
+        let update = epochs.update().expect("the update is recorded");
+        assert_eq!(update.state, UpdateState::Reverted);
+    }
+
+    /// A refused precopy changes nothing that serves, and an update in flight
+    /// is what a commit finds: with none, a commit answers that it is not a
+    /// program-layer update, so a caller falls through to the world path.
+    #[test]
+    fn a_refused_precopy_records_no_probation_and_a_commit_falls_through() {
+        use crate::engine::stand_in::{main_processes, process, Answer};
+
+        let (commands, _) = main_processes(vec![(
+            7,
+            Answer::Refuses("the policy module did not build".to_owned()),
+        )]);
+        let epochs = Epochs::new();
+        let config = ServeConfig::default();
+        let serving = Deployment {
+            config: config.clone(),
+            build_config: BuildConfig::of(&config),
+            programs: FilledPrograms::of(&config),
+        };
+        epochs.install(0, &serving, 3, &[10]);
+        epochs.supervise(commands);
+        assert!(!epochs.commit_programs().expect("nothing to commit"));
+
+        let mut target = serving.clone();
+        let mut programs = FilledPrograms::of(&config);
+        programs
+            .policy
+            .arguments
+            .insert("max_batch".to_owned(), toml::Value::Integer(8));
+        target.programs = programs;
+        let failure = epochs
+            .apply_programs(Update::new(3, target), vec![process("rank-0", 7)])
+            .expect_err("a refused precopy fails the update");
+        assert_eq!(failure.kind, "precopy_failed");
+        assert!(epochs.program_update().is_none());
+        let serving_epoch = epochs.get(0).expect("the epoch is recorded");
+        assert_eq!(serving_epoch.status, Status::Serving);
+        assert_eq!(serving_epoch.policy, serving.programs.policy);
     }
 
     /// Which layer a change moves on is decided by what it moves, never by
