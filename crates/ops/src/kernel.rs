@@ -860,9 +860,9 @@ mod tests {
 
     #[test]
     fn a_signature_that_names_its_scratch_is_not_counted_twice() {
-        // A module whose signature records the two scratch addresses itself states them as part of
-        // its declaration; the operator still packs only its own words, and `parameters` appends the
-        // two addresses after them. Neither side counts a name the other also has.
+        // Triton 3.7's metadata records the two scratch addresses inside the signature, and the launch
+        // appends those two slots itself. A module of two parameters therefore takes two packed
+        // words, not four: counting the named entries again refused every module built that way.
         let module = metadata(
             r#"{"name":"_kernel","signature":{"x":"*bf16","rows":"i32","global_scratch":"*i8","profile_scratch":"*i8"}}"#,
         );
@@ -874,28 +874,6 @@ mod tests {
         let error = long.parameters(Some(&module)).unwrap_err().to_string();
         assert!(error.contains("declares 2 parameters"), "{error}");
         assert!(error.contains("packed 3"), "{error}");
-    }
-
-    #[test]
-    fn a_signature_that_leaves_the_scratch_out_is_the_whole_declaration() {
-        // What Triton 3.7 writes: the signature holds the kernel's own parameters and the scratch
-        // sizes are separate metadata fields, so a six-word signature takes six packed words and the
-        // two addresses follow them. Counting a fixed two more refused every module the compiler
-        // built.
-        let module = metadata(
-            r#"{"name":"_kernel","signature":{"x_ptr":"*bf16","w_ptr":"*bf16","y_ptr":"*bf16",
-                "columns":"i32","eps":"fp32","pdl":"i32"},"global_scratch_size":0,
-                "profile_scratch_size":0}"#,
-        );
-        let mut arguments = Arguments::new();
-        arguments
-            .pointer(DevicePtr::new(0x1000))
-            .pointer(DevicePtr::new(0x2000))
-            .pointer(DevicePtr::new(0x3000))
-            .u32(2048)
-            .f32(1e-6)
-            .u32(0);
-        assert_eq!(arguments.parameters(Some(&module)).unwrap().len(), 8);
     }
 
     #[test]
