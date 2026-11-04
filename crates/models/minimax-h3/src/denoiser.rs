@@ -279,6 +279,65 @@ impl Layouts {
     }
 }
 
+/// Where each modality's initial noise begins in the request's one Philox stream.
+///
+/// The reference draws one stream per request, in the order conditions, video, audio, and offsets
+/// the draws by element rather than by tensor: a condition's noise is its video rows times the
+/// video channels plus its audio rows times the audio channels, so the count cannot be read off a
+/// row capacity alone. Every value here is a property of the layout, which is why a captured graph
+/// can replay for another request of the same layout.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NoiseOffsets {
+    /// Elements the conditions' noise occupies, which is where the video's begins.
+    pub condition: u64,
+    /// Where the video latent's noise begins.
+    pub video: u64,
+    /// Where the audio latent's noise begins.
+    pub audio: u64,
+}
+
+impl Layouts {
+    /// The noise stream's offsets for a layout and the conditions it holds.
+    ///
+    /// The conditions are the request's, in request order; a layout's `condition_rows` is their
+    /// packed row capacity and cannot replace them, because rows and elements differ by modality
+    /// (`video_channels` against `audio_channels`).
+    pub fn noise_offsets(
+        &self,
+        layout: &Layout,
+        conditions: &[packing::Condition],
+    ) -> Result<NoiseOffsets> {
+        let canvas = canvas_of_latents(layout)?;
+        let segments = packing::condition_segments(conditions, &canvas)?;
+        let video_channels = u64::from(self.config.transformer.video_channels);
+        // The noise is drawn at latent resolution and patchified afterwards, so a condition's
+        // elements are its latent volume times the channels - not its packed rows, which is one row
+        // per 2x2 patch. Audio is not patched: its rows are already its elements, channel-major.
+        let mut condition = 0_u64;
+        for segment in &segments {
+            if let Some(visual) = segment.visual {
+                condition += u64::from(visual.frames)
+                    * u64::from(visual.raster.height)
+                    * u64::from(visual.raster.width)
+                    * video_channels;
+            }
+            // Audio rows are already channel-major elements: two stereo channels per latent step.
+            condition += u64::from(segment.audio_rows());
+        }
+        let video = condition;
+        let audio = video
+            + u64::from(layout.video.frames)
+                * u64::from(layout.video.height)
+                * u64::from(layout.video.width)
+                * video_channels;
+        Ok(NoiseOffsets {
+            condition,
+            video,
+            audio,
+        })
+    }
+}
+
 /// The frame count a request is snapped to.
 pub fn frames_of(request: &VideoRequest) -> u32 {
     packing::align_num_frames(request.frames)
@@ -402,10 +461,8 @@ mod tests {
     fn layouts() -> Layouts {
         let config = DenoiserConfig {
             transformer: transformer(),
-            schedule: ScheduleSpec::Uniform {
-                points: 50,
-                shifts: Shifts { video: 12.0, audio: 3.0 },
-            },
+            schedule: ScheduleSpec::uniform(50, Shifts { video: 12.0, audio: 3.0 })
+                .expect("the base checkpoint's schedule"),
             attention: AttentionKind::DENSE,
             tasks: vec![nn::capability::VideoTask::TextToVideoAudio],
             canvases: None,
@@ -500,6 +557,42 @@ mod tests {
         // The modulation index of the first text row is `3 * video_group + text`.
         let indices = decode_i32(&out[1]);
         assert_eq!(indices[0], 1);
+    }
+
+    #[test]
+    fn the_noise_stream_counts_elements_not_rows() {
+        let rule = layouts();
+        let request = request(121, 1344, 768);
+        let (layout, _) = rule.layout(&request).unwrap();
+        let bare = rule.noise_offsets(&layout, &[]).unwrap();
+        assert_eq!(bare.condition, 0);
+        assert_eq!(bare.video, 0);
+        // 121 frames snap to 124, which is 37 latent frames of 48x84 at 24 channels.
+        assert_eq!(layout.video.frames, 37);
+        assert_eq!(bare.audio, 37 * 48 * 84 * 24);
+        // One condition of two latent frames at a 48x84 raster carries two stereo channels per
+        // latent step: its rows are patched, and its element count weights each modality by its own
+        // channel count.
+        let conditions = [packing::Condition {
+            role: packing::Role::Reference,
+            frame: Some(packing::Frame {
+                canvas: Canvas {
+                    short_edge: 768,
+                    aspect: (7, 4),
+                    width: 1344,
+                    height: 768,
+                },
+                num_frames: 2,
+            }),
+            audio_samples: 0,
+        }];
+        let one = rule.noise_offsets(&layout, &conditions).unwrap();
+        // A condition's noise is its latent volume times the channels, not its packed rows: two
+        // latent frames of 48x84 at 24 channels, and no audio.
+        let expected = 2 * 48 * 84 * 24;
+        assert_eq!(one.condition, expected);
+        assert_eq!(one.video, one.condition);
+        assert_eq!(one.audio, one.video + bare.audio);
     }
 
     #[test]
