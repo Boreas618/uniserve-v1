@@ -25,40 +25,40 @@ use crate::memory::allocation::{Storage, StorageView};
 use crate::tensor::DType;
 
 /// One source span to convert, and the destination units to write it into.
-pub struct ConversionRequest<'a> {
+pub(crate) struct ConversionRequest<'a> {
     /// The workspace's scratch, `[20 E + 8 S)` bytes: the raw keys at
     /// `[0, 8 E)`, the raw values at `[8 E, 16 E)`, the FP32 conversion
     /// values at `[16 E, 20 E)` and the FP32 source scales at `[20 E, 20 E + 8 S)`,
     /// where `E` is `elements` and `S` is `scales`.
-    pub scratch: StorageView,
+    pub(crate) scratch: StorageView,
     /// `E` above: elements of the largest group page.
-    pub elements: u64,
+    pub(crate) elements: u64,
     /// `S` above: scale entries of the largest group page.
-    pub scales: u64,
+    pub(crate) scales: u64,
     /// The destination group's index in the pool's plan.
-    pub group: usize,
+    pub(crate) group: usize,
     /// The source's stored element type.
-    pub source_dtype: DType,
+    pub(crate) source_dtype: DType,
     /// The source's logical element type, through which decoded values round
     /// before the destination encoding.
-    pub compute_dtype: DType,
+    pub(crate) compute_dtype: DType,
     /// Tokens of the span: `[layers, heads, head_dim]` each.
-    pub count: u64,
+    pub(crate) count: u64,
     /// First destination token within the page.
-    pub offset: u64,
+    pub(crate) offset: u64,
     /// Token offset of the span's first token within its first source page.
-    pub source_offset: u64,
+    pub(crate) source_offset: u64,
     /// Tokens per page of the source, which select its scale rows.
-    pub source_block_size: u32,
+    pub(crate) source_block_size: u32,
     /// Heads of one source scale group; 0 for a dense (unscaled) source.
-    pub scale_heads: u32,
+    pub(crate) scale_heads: u32,
     /// Source pages the span covers.
-    pub pages: u64,
+    pub(crate) pages: u64,
     /// The destination page's units, one per row of `units_per_page`.
-    pub units: &'a [u32],
+    pub(crate) units: &'a [u32],
     /// The pool's unit fields, keyed as the library reads them
     /// (`prefix_cache.key.values`, `prefix_cache.key.scale`, ...).
-    pub fields: &'a [(String, StorageView)],
+    pub(crate) fields: &'a [(String, StorageView)],
 }
 
 /// A bound import conversion program.
@@ -67,7 +67,7 @@ pub struct ConversionRequest<'a> {
 /// workspace's scratch, its stream and the pool's fields, and launched per
 /// span afterwards. A launch enqueues its kernels on the stream it is given;
 /// the caller has already ordered the span's reads before it.
-pub trait PageConversion: Send + Sync {
+pub(crate) trait PageConversion: Send + Sync {
     /// Decode `request`'s span and encode it into the destination units.
     fn convert(&self, stream: Option<&Stream>, request: &ConversionRequest<'_>) -> Result<()>;
 }

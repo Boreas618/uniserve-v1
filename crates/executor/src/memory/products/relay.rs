@@ -1,8 +1,8 @@
 //! Relay entries: scalar products stored per request slot and depth index.
 
 use super::*;
-use crate::tensor::{DType, MemoryKind};
 use crate::memory::allocation::{Storage, StorageView};
+use crate::tensor::{DType, MemoryKind};
 use crate::{Error, Result};
 use ipc::CallId;
 use ipc::{RequestKey, TensorRef};

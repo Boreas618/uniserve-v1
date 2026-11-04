@@ -1,9 +1,9 @@
 //! Products imported from other ranks and workers.
 
 use super::*;
-use crate::tensor::{DType, MemoryKind};
 use crate::memory::allocation::StorageView;
 use crate::stream::Issue;
+use crate::tensor::{DType, MemoryKind};
 use crate::transfer::{ReadRef, Spans, Transports, fetch};
 use crate::{Error, Result};
 use ipc::{TensorRef, TensorTransfer, subtract_region};
