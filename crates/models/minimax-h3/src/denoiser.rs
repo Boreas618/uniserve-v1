@@ -603,7 +603,7 @@ impl Layouts {
             )));
         }
         let conditions = conditions_of(request);
-        let segments = packing::condition_segments(&conditions, &canvas)?;
+        let segments = packing::condition_segments(&conditions, &canvas, self.config.clip)?;
         let tables = packing::segment_tables(
             &packing,
             frames,
@@ -723,7 +723,7 @@ impl Layouts {
         let frames = frame_count(layout.video.frames)?;
         let canvas = canvas_of_latents(layout)?;
         let conditions = conditions_of(request);
-        let segments = packing::condition_segments(&conditions, &canvas)?;
+        let segments = packing::condition_segments(&conditions, &canvas, self.config.clip)?;
         let tables = packing::dense_tables(
             &packing,
             frames,
@@ -837,7 +837,7 @@ impl Layouts {
         conditions: &[packing::Condition],
     ) -> Result<NoiseOffsets> {
         let canvas = canvas_of_latents(layout)?;
-        let segments = packing::condition_segments(conditions, &canvas)?;
+        let segments = packing::condition_segments(conditions, &canvas, self.config.clip)?;
         let video_channels = u64::from(self.config.transformer.video_channels);
         // The noise is drawn at latent resolution and patchified afterwards, so a condition's
         // elements are its latent volume times the channels - not its packed rows, which is one row
@@ -1862,7 +1862,7 @@ impl Denoiser {
     ) -> Result<()> {
         let canvas = canvas_of_latents(&layout)?;
         let declared = conditions_of(request);
-        let segments = packing::condition_segments(&declared, &canvas)?;
+        let segments = packing::condition_segments(&declared, &canvas, self.config.clip)?;
         // The source is sized by the layout the runner laid the request out under, so a buffer of
         // another size is refused here rather than read past its rows below.
         let packing = self.rules.packing_of(&layout)?;
@@ -2943,7 +2943,8 @@ mod tests {
         };
         let conditions = conditions_of(&request);
         let canvas = canvas_of_raster(832, 480).unwrap();
-        let segments = packing::condition_segments(&conditions, &canvas).unwrap();
+        let segments =
+            packing::condition_segments(&conditions, &canvas, layouts().config.clip).unwrap();
         let audio: Vec<_> = segments
             .iter()
             .filter(|segment| segment.audio_rows() > 0)
@@ -3164,7 +3165,7 @@ mod tests {
         let conditions = conditions_of(&request);
         let declared = rule.condition_elements(&conditions, &canvas);
         assert_eq!(layout.condition_elements, declared);
-        let segments = packing::condition_segments(&conditions, &canvas).unwrap();
+        let segments = packing::condition_segments(&conditions, &canvas, rule.config.clip).unwrap();
         assert_eq!(segments.len(), conditions.len());
         assert!(packing.padded_tokens > packing.video_rows + packing.audio_rows);
         // With no conditions the video's stream starts at zero.
