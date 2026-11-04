@@ -40,6 +40,8 @@ import argparse
 import pathlib
 import sys
 
+import math
+
 import numpy as np
 
 #: The three cuts a layer is walked through, in the order the layer runs them. A reference that sets
@@ -185,13 +187,23 @@ def main():
         # The prefix is the enclosing boundary's error, printed beside a cut so an error a cut
         # inherited is not read as an error the cut made.
         prefix = cut_prefix(path, measured)
-        increment = float("nan") if previous is None else rel - previous
-        measured[path.stem] = rel
-        previous = rel
+        # The increment is measured on the rms ratio and not on the peak: a single element's worst
+        # case jumps by a factor of two between stages on rounding alone, while the rms ratio moves
+        # continuously and is the quantity a multiplicative fault scales. The peak stays in the table
+        # as the diagnostic that finds one bad channel, and it gates as well.
+        increment = float("nan") if previous is None else rms - previous
+        growth = 0.0 if math.isnan(increment) else increment
+        measured[path.stem] = rms
+        previous = rms
         flag = ""
         if first is None and (rel > arguments.floor or rms > arguments.floor):
             first = path.name
-            flag = "  <- first outside the floor"
+            which = (
+                "both"
+                if rel > arguments.floor and rms > arguments.floor
+                else ("peak" if rel > arguments.floor else "rms")
+            )
+            flag = f"  <- first outside the floor ({which})"
         # The embedding is the one stage whose answer the harness can prove without the model: the
         # gather of the prompt's ids. Anything above the floor there is the comparison's own
         # misalignment - two sides that are not the same tensor, or not the same rows - and every
@@ -209,8 +221,8 @@ def main():
             )
             return 2
         uncorrelated.append(rms)
-        if increment > largest[1]:
-            largest = (path.name, increment)
+        if growth > largest[1]:
+            largest = (path.name, growth)
         prefix_text = "" if prefix is None else f"  (prefix {prefix:.3e})"
         lines.append(
             f"{path.name:<16} {str(expected.shape):<12} {rel:10.3e} {rms:10.3e}"
@@ -229,11 +241,17 @@ def main():
     # median near or above 1 is not "the model is uniformly bad" - it is two sides that are not the
     # same quantity. Saying so in words is what stops the table being read as thirty defects.
     median = float(np.median(uncorrelated)) if uncorrelated else 0.0
-    if median > 0.5:
+    if 1.2 <= median <= 1.7:
         print(
             f"every stage is uncorrelated (median rms(diff)/rms(reference) {median:.2f}, and two "
-            "unrelated vectors of one magnitude sit near 1.41): check that the two sides hold the "
-            "same quantity before reading any row as a model defect"
+            "unrelated vectors of one magnitude sit at sqrt(2) = 1.41): check that the two sides "
+            "hold the same quantity before reading any row as a model defect"
+        )
+    elif median > 1.7:
+        print(
+            f"every stage differs by more than decorrelation can explain (median "
+            f"rms(diff)/rms(reference) {median:.2f}): the two sides carry different magnitudes - a "
+            "scale, or a tensor read from the wrong place - not a defect repeated thirty times"
         )
 
     print()
