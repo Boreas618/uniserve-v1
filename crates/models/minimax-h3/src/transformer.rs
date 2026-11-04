@@ -565,11 +565,11 @@ impl Transformer {
         let audio = self.audio_proj_in.as_ref().ok_or_else(|| {
             Error::Unsupported("this H3 partition has no audio input projection".to_owned())
         })?;
-        // The audio input projection is FP32 in the reference like the video's, and the widening that
-        // would feed it is refused here until `scaled_add` enumerates `columns = 32`: the store holds
-        // a module for 96 and 5376 columns and none for the audio width, and a launch with no module
-        // is a hard failure at bind, which is worse than the rounding this leaves in place. The one
-        // line to restore is `let rows = self.wide(f, rows)?;` above this call.
+        // The audio input projection is FP32 in the reference like the video's, so the rows widen
+        // first: the audio latent's own width (32) is a declared `scaled_add` column count, which is
+        // what makes the widening launchable. The alternative - a BF16 matmul with the projection's
+        // FP32 weights - would round the rows once more than the reference does.
+        let rows = self.wide(f, rows)?;
         Ok(audio.forward(f, rows, out)?)
     }
 

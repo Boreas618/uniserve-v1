@@ -623,9 +623,10 @@ fn main() {
     // **The widening**: `Transformer::wide` turns the stack's own BF16 rows into the FP32 the head's
     // floor computes in - `target <- 1 * source + 0 * target`, so the target is never read and an
     // uninitialised buffer is the right operand (`transformer.rs`, `denoise_arena`'s `*.wide`).
-    // Two widths, because it widens the patchified rows before the input projection (96 columns) and
-    // the hidden rows before the output projection (5376).
-    for columns in [96, HIDDEN] {
+    // Three widths: the patchified rows before the video input projection (96 columns), the hidden
+    // rows before the output projection (5376), and the audio latent's own rows before the audio
+    // input projection (32) - the one projection whose input is narrower than a patch.
+    for columns in [32, 96, HIDDEN] {
         push(
             "scaled_add",
             ops::residual::ScaledAddDescriptor {
