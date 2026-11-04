@@ -27,6 +27,7 @@ use proto::request::wire;
 use tracing::info;
 
 use crate::engine::client::EngineState;
+use crate::engine::hold::HoldState;
 use crate::leader::{Leader, Replica, UpdateError, locked};
 use crate::options::ServeConfig;
 use crate::updates::change::{Applied, ApplyRequest, resolve};
@@ -707,7 +708,13 @@ impl Replica {
                     EngineState::Closed => unavailable(world, "its engine process ended"),
                 }
             }
-            None => unavailable(worlds.executing, "requests wait for its engine"),
+            // A hold that closed names why it closed, and it names it to the
+            // requests it fails: the status states the same reason rather
+            // than that requests merely wait for an engine that will not come.
+            None => match hold.state() {
+                HoldState::Closed(reason) => unavailable(worlds.executing, &reason),
+                _ => unavailable(worlds.executing, "requests wait for its engine"),
+            },
         };
         serde_json::json!({
             "config": printed,
