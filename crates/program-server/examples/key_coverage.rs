@@ -52,7 +52,9 @@ fn main() -> ExitCode {
         match flag.as_str() {
             "--fixture" => fixture = value(),
             "--target" => target = value().unwrap_or(target),
-            "--kernels" => kernels = PathBuf::from(value().unwrap_or(kernels.display().to_string())),
+            "--kernels" => {
+                kernels = PathBuf::from(value().unwrap_or(kernels.display().to_string()))
+            }
             other => {
                 eprintln!("unknown argument {other}");
                 return ExitCode::from(2);
@@ -115,7 +117,10 @@ fn main() -> ExitCode {
 
     let orphaned: Vec<&str> = filled.difference(&declared).copied().collect();
     if !orphaned.is_empty() {
-        println!("\n# packages whose operator is not declared: {}", orphaned.join(" "));
+        println!(
+            "\n# packages whose operator is not declared: {}",
+            orphaned.join(" ")
+        );
     }
     let unfilled: Vec<&str> = declared.difference(&filled).copied().collect();
     if !unfilled.is_empty() {
@@ -130,7 +135,10 @@ fn main() -> ExitCode {
         println!("\n# every key is covered for {target}");
         ExitCode::SUCCESS
     } else {
-        println!("\n# {uncovered} of {} keys are not covered for {target}", rows.len());
+        println!(
+            "\n# {uncovered} of {} keys are not covered for {target}",
+            rows.len()
+        );
         ExitCode::FAILURE
     }
 }
@@ -148,13 +156,14 @@ fn load_packages(kernels: &Path) -> Result<BTreeMap<String, Vec<PackageSource>>,
         let backends = std::fs::read_dir(op.path())
             .map_err(|error| format!("reading {}: {error}", op.path().display()))?;
         for backend in backends {
-            let backend = backend.map_err(|error| format!("reading {}: {error}", op.path().display()))?;
+            let backend =
+                backend.map_err(|error| format!("reading {}: {error}", op.path().display()))?;
             let root = backend.path();
             if !root.join("package.toml").is_file() {
                 continue;
             }
-            let manifest = Manifest::load(&root)
-                .map_err(|error| format!("{}: {error}", root.display()))?;
+            let manifest =
+                Manifest::load(&root).map_err(|error| format!("{}: {error}", root.display()))?;
             packages
                 .entry(manifest.op.clone())
                 .or_default()
@@ -221,7 +230,11 @@ fn cover(
         let architectures: BTreeSet<&str> = covering
             .iter()
             .flat_map(|candidate| match &candidate.manifest.kernel {
-                Some(kernel) => kernel.architectures.iter().map(String::as_str).collect::<Vec<_>>(),
+                Some(kernel) => kernel
+                    .architectures
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
                 None => vec!["wasm32"],
             })
             .collect();
