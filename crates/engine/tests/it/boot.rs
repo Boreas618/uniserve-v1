@@ -16,7 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use engine::{
-    BatchCapacity, Event, GenerationConstraint, GenerationRequest, RankFacts, SchedulerHandle, Stage,
+    BatchCapacity, Event, GenerationConstraint, GenerationRequest, RankFacts, SchedulerHandle,
+    Stage,
 };
 use executor::batch::{
     Batch, BatchOutput, Batches, CallOutput, Inventory, Placement, RowState, Submission,
