@@ -139,13 +139,19 @@ struct Routing {
 /// A command the daemon repeats is answered without acting twice: a switchover
 /// names the generation it means, and one this engine already serves changes
 /// nothing.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Generations {
     /// The program content each generation names, while some number still names
-    /// it (§7.3). The daemon numbers generations and states the number in every
-    /// command; a number this engine has not recorded is one it cannot switch
-    /// to or purge.
+    /// it (§7.3). The main process numbers the generations and states the number
+    /// in `Precopied`, on to `Switchover` and `Purge`; a number this engine has
+    /// not recorded is one it cannot switch to or purge.
     named: std::collections::BTreeMap<u64, ProgramKey>,
+    /// The number the next new program content is prepared under.
+    ///
+    /// It only ever grows: a number a purge forgot is never handed out again, so
+    /// a `Switchover` of an old number can never install a program it did not
+    /// prepare.
+    next: u64,
     /// The content a precopy prepared and no switchover has taken yet.
     candidate: Option<ProgramKey>,
     /// The generation the epoch serves, and the content it is serving: what
@@ -156,12 +162,41 @@ struct Generations {
     previous: Option<(u64, ProgramKey)>,
 }
 
+impl Default for Generations {
+    fn default() -> Self {
+        Self {
+            named: Default::default(),
+            next: 1,
+            candidate: None,
+            serving: None,
+            previous: None,
+        }
+    }
+}
+
 impl Generations {
     /// Whether any generation still names `key`, which is what decides whether
-    /// a purge may drop the modules: an aliased content lives while one of its
-    /// numbers remains (§7.3).
+    /// a purge may drop the modules: a content lives while one of its numbers
+    /// remains (§7.3).
     fn still_named(&self, key: &ProgramKey) -> bool {
         self.named.values().any(|named| named == key)
+    }
+
+    /// The number `key` is prepared under: the one an earlier precopy gave this
+    /// same content, or the next unused number for a content not prepared yet.
+    ///
+    /// A repeated precopy of the same program is the same generation - the
+    /// daemon repeats a precopy it did not see answered - so it neither prepares
+    /// the program twice nor takes a second number for it.
+    fn number_of(&mut self, key: &ProgramKey) -> u64 {
+        match self.named.iter().find(|(_, named)| *named == key) {
+            Some((number, _)) => *number,
+            None => {
+                let number = self.next;
+                self.next = number + 1;
+                number
+            }
+        }
     }
 }
 
@@ -2734,37 +2769,22 @@ fn apply_process_command(
                 Ok(program) => program,
                 Err(error) => return Some(precopy_failed(error.to_string())),
             };
-            // The generation is the daemon's number (§7.3): the program is
-            // recorded under it, and `Precopied` echoes it so the daemon can
-            // name it back in `Switchover`.
-            let generation = precopy.generation;
+            // The main process numbers its generations (§7.3): `Precopy` names
+            // none, this number goes back in `Precopied`, and the daemon names it
+            // in `Switchover` and `Purge`.
             let key: ProgramKey = (
                 program.backend.clone(),
                 program.revision,
                 program.stated.clone(),
             );
-            // A number this engine already holds either names this content
-            // (nothing to do) or another one (the daemon's numbers must not be
-            // reused for another program: that would make an old switchover
-            // name a policy it never prepared).
-            if let Some(named) = crate::lock(generations).named.get(&generation) {
-                if *named == key {
-                    return Some(precopied(generation));
-                }
-                return Some(precopy_failed(format!(
-                    "generation {generation} already names the {} policy revision {} and cannot \
-                     name the {} revision {}",
-                    named.0, named.1, key.0, key.1
-                )));
-            }
-            // The same content under another number is an alias: its modules are
-            // loaded once, and it goes when no number names it any more.
-            if crate::lock(generations)
-                .named
-                .values()
-                .any(|named| *named == key)
-            {
-                crate::lock(generations).named.insert(generation, key);
+            let (generation, prepared) = {
+                let mut generations = crate::lock(generations);
+                let known = generations.named.values().any(|named| *named == key);
+                (generations.number_of(&key), known)
+            };
+            // A program this engine already prepared is answered with its number
+            // and not prepared again.
+            if prepared {
                 return Some(precopied(generation));
             }
             let Some(policies) = policies else {
@@ -3074,7 +3094,7 @@ mod tests {
         }
     }
 
-    fn precopy(generation: u64, kernels: Vec<proto::process::KernelProgram>) -> proto::process::Command {
+    fn precopy(kernels: Vec<proto::process::KernelProgram>) -> proto::process::Command {
         proto::process::Command {
             kind: Some(proto::process::command::Kind::Precopy(
                 proto::process::Precopy {
@@ -3147,7 +3167,7 @@ mod tests {
         let store = store();
         let mut run = |command| apply_process_command(&policy, &generations, Some(&store), command);
 
-        match answered(run(precopy(1, Vec::new()))) {
+        match answered(run(precopy(Vec::new()))) {
             Kind::Precopied(precopied) => assert_eq!(precopied.generation, 1),
             other => panic!("a precopy is answered by Precopied, not {other:?}"),
         }
@@ -3218,7 +3238,7 @@ mod tests {
             &policy,
             &generations,
             Some(&store),
-            precopy(1, Vec::new()),
+            precopy(Vec::new()),
         ));
         let report = apply_process_command(&policy, &generations, Some(&store), switchover(9));
         match answered(report) {
@@ -3241,7 +3261,7 @@ mod tests {
         let generations = Mutex::new(Generations::default());
         let store = store();
         let mut run = |command| apply_process_command(&policy, &generations, Some(&store), command);
-        assert!(matches!(answered(run(precopy(3, Vec::new()))), Kind::Precopied(_)));
+        assert!(matches!(answered(run(precopy(Vec::new()))), Kind::Precopied(_)));
         assert!(matches!(answered(run(switchover(3))), Kind::Switched(_)));
         match answered(run(purge(3))) {
             Kind::Fault(fault) => {
@@ -3266,8 +3286,8 @@ mod tests {
         let store = store();
         let mut run = |command| apply_process_command(&policy, &generations, Some(&store), command);
         // The same content under two numbers: an alias.
-        assert!(matches!(answered(run(precopy(1, Vec::new()))), Kind::Precopied(_)));
-        assert!(matches!(answered(run(precopy(2, Vec::new()))), Kind::Precopied(_)));
+        assert!(matches!(answered(run(precopy(Vec::new()))), Kind::Precopied(_)));
+        assert!(matches!(answered(run(precopy(Vec::new()))), Kind::Precopied(_)));
         let calls = policy.calls().len();
         // Purging one number leaves the other naming the module: nothing drops.
         assert!(matches!(answered(run(purge(2))), Kind::Purged(_)));
@@ -3287,14 +3307,14 @@ mod tests {
             &policy,
             &generations,
             Some(&store),
-            precopy(7, Vec::new()),
+            precopy(Vec::new()),
         ));
         let before = policy.calls().len();
         let _ = answered(apply_process_command(
             &policy,
             &generations,
             Some(&store),
-            precopy(7, Vec::new()),
+            precopy(Vec::new()),
         ));
         assert_eq!(policy.calls().len(), before, "nothing was prepared twice");
     }
@@ -3308,11 +3328,10 @@ mod tests {
         let store = store();
         let mut run = |command| apply_process_command(&policy, &generations, Some(&store), command);
 
-        fn precopy_with(generation: u64, max_batch: &str) -> proto::process::Command {
+        fn precopy_with(max_batch: &str) -> proto::process::Command {
             proto::process::Command {
                 kind: Some(proto::process::command::Kind::Precopy(
                     proto::process::Precopy {
-                        generation,
                         kernels: Vec::new(),
                         policy: Some(proto::process::Program {
                             backend: "fcfs".to_owned(),
@@ -3327,18 +3346,18 @@ mod tests {
             }
         }
 
-        match answered(run(precopy_with(1, "16"))) {
+        match answered(run(precopy_with("16"))) {
             Kind::Precopied(precopied) => assert_eq!(precopied.generation, 1),
             other => panic!("a precopy is answered by Precopied, not {other:?}"),
         }
         // The same backend and revision, the same arguments: prepared once.
-        match answered(run(precopy_with(1, "16"))) {
+        match answered(run(precopy_with("16"))) {
             Kind::Precopied(precopied) => assert_eq!(precopied.generation, 1),
             other => panic!("a repeated precopy is answered by Precopied, not {other:?}"),
         }
         // The program's arguments are its parameters (§7.7), so another
         // argument is another program.
-        match answered(run(precopy_with(2, "32"))) {
+        match answered(run(precopy_with("32"))) {
             Kind::Precopied(precopied) => assert_eq!(precopied.generation, 2),
             other => panic!("a changed program is answered by Precopied, not {other:?}"),
         }
@@ -3354,7 +3373,7 @@ mod tests {
             &policy,
             &generations,
             Some(&store),
-            precopy(DEFAULT_GENERATION, vec![kernel_program()]),
+            precopy(vec![kernel_program()]),
         );
         match answered(report) {
             proto::process::report::Kind::PrecopyFailed(failed) => {
@@ -3372,7 +3391,7 @@ mod tests {
         let generations = Mutex::new(Generations::default());
         let store = store();
         let report =
-            apply_process_command(&policy, &generations, Some(&store), precopy(DEFAULT_GENERATION, Vec::new()));
+            apply_process_command(&policy, &generations, Some(&store), precopy(Vec::new()));
         match answered(report) {
             proto::process::report::Kind::PrecopyFailed(failed) => {
                 assert!(
@@ -3427,7 +3446,7 @@ mod tests {
     fn a_precopy_without_a_program_store_is_refused_and_nothing_is_prepared() {
         let policy = Recording::default();
         let generations = Mutex::new(Generations::default());
-        let report = apply_process_command(&policy, &generations, None, precopy(DEFAULT_GENERATION, Vec::new()));
+        let report = apply_process_command(&policy, &generations, None, precopy(Vec::new()));
         match answered(report) {
             proto::process::report::Kind::PrecopyFailed(failed) => {
                 assert!(failed.reason.contains("program store"), "{}", failed.reason);

@@ -269,6 +269,12 @@ impl ModelConfig {
 }
 
 impl InputProcessor {
+    /// The model's tokenizer, which a process continuing a response builds
+    /// its incremental decoder from (design `specs/worker.md` §7.5.1).
+    pub fn tokenizer(&self) -> DynTokenizer {
+        Arc::clone(&self.tokenizer)
+    }
+
     /// Binds model resources to the generation limits the started workers
     /// report in their handshake, without rebuilding model data.
     ///
