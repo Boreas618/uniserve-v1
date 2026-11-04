@@ -638,7 +638,7 @@ impl VideoDecoder {
             1.0,
         )?
         .partial(rotated)?
-        .sectioned(Sections::new(&sections)?.interleaved())?;
+        .sectioned(Sections::new(&sections)?)?;
         Ok(Self {
             canvas,
             width,
@@ -708,16 +708,30 @@ fn indices(loader: &mut WeightLoader, name: &str, start: u32, count: u32) -> Res
 
 /// The rotary frequency table of the decoder: `theta^(-2i/rotated)` over the rotated width.
 fn frequencies(loader: &mut WeightLoader, config: &VideoVaeConfig) -> Result<Weight> {
-    let (rotated, _) = rotary(config)?;
-    let half = (rotated / 2) as usize;
-    let mut bytes = Vec::with_capacity(half * 4);
-    for index in 0..half {
-        let exponent = 2.0 * index as f64 / f64::from(rotated);
-        let value = f64::from(config.decoder_rope_theta).powf(-exponent) as f32;
+    let (rotated, sections) = rotary(config)?;
+    // One block per axis, each over that axis's own width: the reference builds its embedding with
+    // `head_dim · ratio / 3` and reuses those frequencies on all three axes, so axis `a` takes
+    // `theta^(-2k / sections[a])` rather than a slice of one wider spectrum.
+    let mut table = Vec::new();
+    for width in &sections {
+        for pair in 0..width / 2 {
+            let exponent = 2.0 * f64::from(pair) / f64::from(*width);
+            table.push(f64::from(config.decoder_rope_theta).powf(-exponent) as f32);
+        }
+    }
+    if table.len() as u32 != rotated / 2 {
+        return Err(Error::config(format!(
+            "the rotary table of {rotated} channels holds {} frequencies, {} expected",
+            table.len(),
+            rotated / 2
+        )));
+    }
+    let mut bytes = Vec::with_capacity(table.len() * 4);
+    for value in &table {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
     let name = format!("video_vae.rotary.{rotated}.{}", config.decoder_rope_theta);
-    Ok(loader.constant(&name, DType::F32, Shape::new(&[half as u64]), &bytes)?)
+    Ok(loader.constant(&name, DType::F32, Shape::new(&[table.len() as u64]), &bytes)?)
 }
 
 impl VideoDecoder {
