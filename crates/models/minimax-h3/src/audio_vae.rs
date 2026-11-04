@@ -590,6 +590,64 @@ pub fn workspace(config: &AudioVaeConfig, latent_frames: u32) -> Result<Vec<Work
     Ok(buffers)
 }
 
+/// The latent statistics the decoder inverts before its first convolution.
+///
+/// A generated audio latent is normalized per channel; the decoder restores it with
+/// `value * std + mean` (`LatentDecoder` in the reference) before the input projection. The two vectors
+/// are load-time constants of the checkpoint, one entry per latent channel.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Statistics {
+    /// The per-channel mean.
+    pub mean: Vec<f32>,
+    /// The per-channel standard deviation.
+    pub std: Vec<f32>,
+}
+
+impl Statistics {
+    /// The statistics the config states, one entry per latent channel.
+    pub fn of(config: &AudioVaeConfig) -> Result<Self> {
+        let channels = config.latent_channels as usize;
+        if config.latents_mean.len() != channels || config.latents_std.len() != channels {
+            return Err(Error::config(format!(
+                "the audio latent statistics hold {} means and {} deviations for {channels} channels",
+                config.latents_mean.len(),
+                config.latents_std.len()
+            )));
+        }
+        for (index, (mean, std)) in config
+            .latents_mean
+            .iter()
+            .zip(config.latents_std.iter())
+            .enumerate()
+        {
+            if !mean.is_finite() || !std.is_finite() || *std == 0.0 {
+                return Err(Error::config(format!(
+                    "the audio latent channel {index} has mean {mean} and deviation {std}"
+                )));
+            }
+        }
+        Ok(Self {
+            mean: config.latents_mean.clone(),
+            std: config.latents_std.clone(),
+        })
+    }
+
+    /// Restore one channel's value: `value * std + mean`.
+    ///
+    /// The reference of the affine the decoder's input stage applies; a kernel that folds it into the
+    /// input projection's epilogue must agree with it.
+    pub fn denormalize(&self, channel: usize, value: f32) -> Result<f32> {
+        let mean = *self.mean.get(channel).ok_or_else(|| {
+            Error::config(format!(
+                "channel {channel} of {} audio latent channels",
+                self.mean.len()
+            ))
+        })?;
+        let std = self.std[channel];
+        Ok(value * std + mean)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -680,6 +738,32 @@ pub(crate) mod tests {
     fn the_receptive_field_is_the_references_thirty_latent_frames() {
         // Computed from the reference `receptive_field`: spread 58.31 output samples, one side 30.
         assert_eq!(receptive_field(&audio_config()).expect("field"), 30);
+    }
+
+    #[test]
+    fn the_latent_statistics_restore_a_channel() {
+        let config = audio_config();
+        let statistics = Statistics::of(&config).expect("the statistics");
+        assert_eq!(statistics.mean.len(), 32);
+        assert_eq!(statistics.std.len(), 32);
+        // A zero latent restores the channel's mean; a unit latent the mean plus its deviation.
+        assert_eq!(
+            statistics.denormalize(0, 0.0).expect("a value"),
+            statistics.mean[0]
+        );
+        assert_eq!(
+            statistics.denormalize(0, 1.0).expect("a value"),
+            statistics.mean[0] + statistics.std[0]
+        );
+        // A channel the statistics do not hold is refused rather than read past the end.
+        assert!(statistics.denormalize(32, 0.0).is_err());
+        // A sidecar with the wrong counts, or a zero deviation, is refused at the boundary.
+        let mut broken = config.clone();
+        broken.latents_mean.pop();
+        assert!(Statistics::of(&broken).is_err());
+        let mut broken = config.clone();
+        broken.latents_std[3] = 0.0;
+        assert!(Statistics::of(&broken).is_err());
     }
 
     #[test]
