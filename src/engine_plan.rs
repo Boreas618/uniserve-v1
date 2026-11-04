@@ -309,7 +309,19 @@ impl EpochPlan {
                     .map(|device| device.0.to_string())
                     .collect(),
             ),
-            hosts: None,
+            // The engine's facts want one host name per rank, and the launch file states the
+            // rank's devices but not which host each rank sits on - it cannot, a launch file is
+            // per node. A world of one therefore has exactly one host and this node is it; the
+            // name is the machine's own rather than an invented string, so a report, a log or a
+            // transfer that names the host names the host.
+            //
+            // A world of more ranks needs the real names for placement and for cross-host weight
+            // transfer, and a guess there would be worse than the refusal: the fact stays absent
+            // and `EngineConfig::of` names what the launch file owes it.
+            hosts: match self.world_size {
+                1 => Some(vec![host_name()?]),
+                _ => None,
+            },
             peers: None,
             max_running_requests: Some(self.build.max_running_requests.get()),
             max_batch: Some(rows as usize),
