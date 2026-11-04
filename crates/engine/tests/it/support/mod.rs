@@ -17,7 +17,7 @@ pub(crate) fn image_digest(id: u64) -> [u8; 32] {
     digest
 }
 
-use engine::{Executor, Scheduler, SchedulerConfig, SimEngine, SpecialTokenIds};
+use engine::{Executor, PolicyProgram, Scheduler, SchedulerConfig, SimEngine, SpecialTokenIds};
 use engine::{GenerationFeatures, GenerationLimits, ModelDtype};
 use ipc::{CallKind, ForwardMode, MediaCall};
 
@@ -65,13 +65,54 @@ pub(crate) fn scheduler_with(
             ..Default::default()
         }
     };
-    Scheduler::new(
+    let mut scheduler = Scheduler::new(
         executor,
         special_tokens,
         config,
         ModelDtype::BFloat16,
         limits,
-    )
+    )?;
+    install_policy(&mut scheduler);
+    Ok(scheduler)
+}
+
+/// The policy module every integration test's world serves with.
+///
+/// A deployed epoch takes its policy from the Program Server; a test world has
+/// none, and a scheduler with no policy decides nothing — no plan, no
+/// admission, no batch — so a world that submits a request must be given one.
+/// `SCHED_POLICY_WASM` names the module: the `fcfs` program this tree builds
+/// for `wasm32-unknown-unknown`, the one that reproduces the rules the tests
+/// were written against. Unset, every test fails here with what to build, rather
+/// than skipping or serving a policy nobody named.
+pub(crate) fn policy_module() -> Vec<u8> {
+    let path = std::env::var("SCHED_POLICY_WASM").unwrap_or_else(|_| {
+        panic!(
+            "SCHED_POLICY_WASM names the scheduling policy module these worlds serve with, and it \
+             is unset. Build it with `cargo build -p scheduling-policy-fcfs --target \
+             wasm32-unknown-unknown --release` and set SCHED_POLICY_WASM to the file it wrote, \
+             e.g. target/wasm32-unknown-unknown/release/scheduling_policy_fcfs.wasm"
+        )
+    });
+    std::fs::read(&path).unwrap_or_else(|error| {
+        panic!("SCHED_POLICY_WASM names `{path}`, which cannot be read: {error}")
+    })
+}
+
+/// Installs the policy a test world serves with: the `fcfs` package, revision
+/// one, with the policy's own defaults for every argument it lets a deployment
+/// state.
+pub(crate) fn install_policy(scheduler: &mut Scheduler) {
+    let program = PolicyProgram {
+        backend: "fcfs".to_owned(),
+        revision: 1,
+        arguments: Default::default(),
+        stated: Default::default(),
+    };
+    let source = engine::PolicyBytes::new(policy_module());
+    scheduler
+        .install_policy(program, &source)
+        .unwrap_or_else(|error| panic!("the fcfs policy is installed: {error}"));
 }
 
 /// Builds a scheduler that batches at most `max_batch` calls per pass.
