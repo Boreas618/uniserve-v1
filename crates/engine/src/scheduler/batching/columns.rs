@@ -236,10 +236,11 @@ pub(crate) fn columns(
         // sampled token it installs, the host length and positions an explicit
         // or a verification row writes, and whether its token counts penalties.
         let query = *forward.query_lens.last()?;
-        // A call samples when it has a consumer for its logits; a decode and a
-        // verification always do, and a prompt chunk's last row does not until
-        // it is the chunk that finishes the prompt.
-        let sampled = !call.consumer_slots.is_empty();
+        // A call samples when it declares a sampled-token output: a decode and
+        // a verification always do, and a prompt chunk does only when it is the
+        // chunk that ends the prompt. `consumer_slots` is the worker's, filled
+        // after this runs, so the mechanism's own answer is `token_output`.
+        let sampled = call.token_output.is_some();
         if matches!(kind, RowKind::Decode | RowKind::Verify) && !sampled {
             return None;
         }
@@ -251,10 +252,20 @@ pub(crate) fn columns(
         };
         let explicit = mode == commit::mode::EXPLICIT;
         let verify = mode == commit::mode::VERIFY;
-        // The tokens this call commits to the cache: a decode commits its one
-        // token, every other call its last row's query. A call that would write
-        // past its block table is a planning fault, not a clamp.
-        let committed = if matches!(kind, RowKind::Decode) { 1 } else { query };
+        // The tokens this call commits to the cache: a decode its one token,
+        // a prefill the query of every row that writes, and a verification
+        // none, its accepted span being the device's to install. A call that
+        // would write past its block table is a planning fault, not a clamp.
+        let committed = match kind {
+            RowKind::Decode => 1,
+            RowKind::Verify => 0,
+            RowKind::Prefill => forward
+                .query_lens
+                .iter()
+                .zip(&forward.write_cache)
+                .filter(|(_, writes)| **writes)
+                .try_fold(0u32, |total, (length, _)| total.checked_add(*length))?,
+        };
         let visible = call.coordinates.cache_visible_len;
         let length = visible.checked_add(committed)?;
         if committed > query || (!verify && length > table.allocated_tokens) {
@@ -314,7 +325,7 @@ pub(crate) fn columns(
     rows.logits_rows = slots::logits_rows_of(
         requests
             .iter()
-            .map(|(call, _)| (call.kind, !call.consumer_slots.is_empty())),
+            .map(|(call, _)| (call.kind, call.token_output.is_some())),
         &spans,
     )?;
 
@@ -367,7 +378,17 @@ mod tests {
             ipc::CallId::new(1, 0),
             kind,
         );
-        call.consumer_slots = vec![0];
+        // A call that samples declares the output it samples into, which is
+        // what the planner sets (`plan_decode`, `plan_verify`, a sampling
+        // `plan_prefill`); `consumer_slots` is the worker's, filled later.
+        call.token_output = Some(ipc::TensorRef {
+            request_key: ipc::RequestKey::new(1, ipc::RequestId(1), 1),
+            producer_call_id: ipc::CallId::new(1, 0),
+            output_index: 0,
+            generation: 1,
+            dtype: ipc::DType::I64,
+            shape_bound: Default::default(),
+        });
         call.coordinates.logical_position = position;
         call.input_token_ids = (0..query_lens.iter().sum()).map(|_| 1u32).collect();
         call
@@ -509,7 +530,7 @@ mod tests {
     #[test]
     fn a_prefill_that_samples_nothing_still_states_its_cache_extent() {
         let mut chunk = call(prefill(), 8, &[2], true);
-        chunk.consumer_slots.clear();
+        chunk.token_output = None;
         chunk.coordinates.cache_visible_len = 8;
         let mut neutral = sampling();
         neutral.repetition_penalty = 1.0;
@@ -590,13 +611,11 @@ mod tests {
         // A prompt chunk, then a decode, then a sampling prefill: the chunk
         // installs no token and so consumes no task.
         let mut chunk = call(prefill(), 8, &[2], true);
-        chunk.consumer_slots.clear();
+        chunk.token_output = None;
         chunk.coordinates.cache_visible_len = 8;
         let mut decode_call = call(decode(), 10, &[1], true);
-        decode_call.consumer_slots = vec![2];
         decode_call.coordinates.cache_visible_len = 10;
         let mut prefill_call = call(prefill(), 11, &[2], true);
-        prefill_call.consumer_slots = vec![3];
         prefill_call.coordinates.cache_visible_len = 11;
         let requests = vec![
             (chunk, placement(1, &[2], &[true])),
@@ -632,7 +651,7 @@ mod tests {
     fn a_call_the_commit_cannot_state_is_no_batch_rather_than_a_guess() {
         // A decode always samples: one with no consumer has no task to name.
         let mut unsampled_decode = call(decode(), 12, &[1], true);
-        unsampled_decode.consumer_slots.clear();
+        unsampled_decode.token_output = None;
         unsampled_decode.coordinates.cache_visible_len = 12;
         assert!(columns(
             &[(unsampled_decode, placement(1, &[1], &[true]))],
