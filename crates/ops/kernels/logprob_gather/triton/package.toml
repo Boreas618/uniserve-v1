@@ -1,0 +1,34 @@
+# The logprob_gather operator's Triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py`.
+#
+# One program reads one row's selected log-probability, so the row count is a
+# launch value and the module serves every batch.
+
+op = "logprob_gather"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/logprob_gather.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+# `columns_151936_ids_i64_pdl_true`.
+[kernel.descriptors]
+dimensions = { columns = ["151936", "152064", "248320", "2048", "128"], ids = ["i64", "i32"], pdl = ["true", "false"] }
+
+[parameters]
