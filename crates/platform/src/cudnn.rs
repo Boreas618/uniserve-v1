@@ -77,6 +77,7 @@ const DESCRIPTOR_ENGINE_CONFIG: i32 = 3;
 const DESCRIPTOR_ENGINE_HEURISTIC: i32 = 4;
 const DESCRIPTOR_EXECUTION_PLAN: i32 = 5;
 const DESCRIPTOR_OPERATION_CONVOLUTION_FORWARD: i32 = 10;
+const DESCRIPTOR_OPERATION_CONVOLUTION_BACKWARD_DATA: i32 = 12;
 const DESCRIPTOR_OPERATION_GRAPH: i32 = 15;
 const DESCRIPTOR_VARIANT_PACK: i32 = 16;
 const DESCRIPTOR_TENSOR: i32 = 17;
@@ -101,6 +102,12 @@ const ATTR_OPERATION_CONVOLUTION_FORWARD_CONV_DESC: i32 = 702;
 const ATTR_OPERATION_CONVOLUTION_FORWARD_W: i32 = 703;
 const ATTR_OPERATION_CONVOLUTION_FORWARD_X: i32 = 704;
 const ATTR_OPERATION_CONVOLUTION_FORWARD_Y: i32 = 705;
+const ATTR_OPERATION_CONVOLUTION_BWD_DATA_ALPHA: i32 = 706;
+const ATTR_OPERATION_CONVOLUTION_BWD_DATA_BETA: i32 = 707;
+const ATTR_OPERATION_CONVOLUTION_BWD_DATA_CONV_DESC: i32 = 708;
+const ATTR_OPERATION_CONVOLUTION_BWD_DATA_W: i32 = 709;
+const ATTR_OPERATION_CONVOLUTION_BWD_DATA_DX: i32 = 710;
+const ATTR_OPERATION_CONVOLUTION_BWD_DATA_DY: i32 = 711;
 const ATTR_OPERATIONGRAPH_OPS: i32 = 801;
 const ATTR_TENSOR_DATA_TYPE: i32 = 901;
 const ATTR_TENSOR_DIMENSIONS: i32 = 902;
@@ -404,15 +411,33 @@ impl Tensor {
     }
 }
 
-/// A convolution's description: the input (`NCDHW`), filter (`KCDHW`) and
-/// output (`NKDHW`) tensors, the padding, filter strides and dilations of its
+/// Which cuDNN operation runs a convolution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConvolutionKind {
+    /// The forward cross-correlation of a `Conv1d` or `Conv3d` layer.
+    Forward,
+    /// A `ConvTranspose1d` upsampling layer, which cuDNN computes as the
+    /// backward data pass of the convolution it is the transpose of.
+    Transposed,
+}
+
+/// A convolution's description: the input (`NCDHW`), filter and output
+/// (`NKDHW`) tensors, the padding, filter strides and dilations of its
 /// spatial dimensions, and the compute type.
 ///
 /// The spatial rank is the tensors' own: a rank-three input describes a
 /// `conv1d` (the audio decoder), a rank-five input a `conv3d` (the video
 /// VAE), and everything in between.
+///
+/// The tensors carry the layer's own layout: for [`ConvolutionKind::Forward`]
+/// the filter is cuDNN's `KCDHW`, output channels first; for
+/// [`ConvolutionKind::Transposed`] it is PyTorch's `ConvTranspose1d` weight,
+/// `CKDHW`, input channels first, which is cuDNN's `KCDHW` of the
+/// convolution the layer transposes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Convolution {
+    /// Which operation runs it.
+    pub kind: ConvolutionKind,
     pub x: Tensor,
     pub w: Tensor,
     pub y: Tensor,
@@ -422,6 +447,9 @@ pub struct Convolution {
     pub stride: Vec<i64>,
     /// Filter dilation in each spatial dimension.
     pub dilation: Vec<i64>,
+    /// Extra output positions per spatial dimension of a transposed
+    /// convolution, PyTorch's `output_padding`; empty for a forward one.
+    pub output_padding: Vec<i64>,
     /// The accumulation type; FP32 keeps the video VAE's precision while
     /// allowing TF32.
     pub compute: DataType,
@@ -440,13 +468,74 @@ impl Convolution {
         dilation: Vec<i64>,
     ) -> Self {
         Self {
+            kind: ConvolutionKind::Forward,
             x,
             w,
             y,
             padding,
             stride,
             dilation,
+            output_padding: Vec::new(),
             compute: DataType::F32,
+        }
+    }
+
+    /// A transposed convolution of `x` with `w` into `y` — what PyTorch's
+    /// `ConvTranspose1d` computes — with one padding, stride, dilation and
+    /// output padding per spatial dimension.
+    ///
+    /// `w` is the layer's own weight, `(in_channels, out_channels, kernel)`;
+    /// `y` is the upsampled output, whose spatial sizes follow
+    /// `(input - 1) · stride - 2 · padding + dilation · (kernel - 1) +
+    /// output_padding + 1`.
+    ///
+    /// cuDNN runs it as the backward data pass of the forward convolution
+    /// this layer transposes, and the two descriptions differ in two places:
+    /// the backward pass's filter is the same weight read with the input
+    /// channels first (cuDNN's `K`), and its lower padding is the layer's
+    /// padding while its upper padding is the layer's padding less the output
+    /// padding; the layer's stride and dilation are unchanged. The crate does
+    /// not compute the convolution itself. An `output_padding` larger than
+    /// the `padding` has no such description and is refused.
+    pub fn transpose(
+        x: Tensor,
+        w: Tensor,
+        y: Tensor,
+        padding: Vec<i64>,
+        stride: Vec<i64>,
+        dilation: Vec<i64>,
+        output_padding: Vec<i64>,
+    ) -> Self {
+        Self {
+            kind: ConvolutionKind::Transposed,
+            x,
+            w,
+            y,
+            padding,
+            stride,
+            dilation,
+            output_padding,
+            compute: DataType::F32,
+        }
+    }
+
+    /// The lower padding the convolution descriptor takes: the layer's own.
+    fn lower_padding(&self) -> &[i64] {
+        &self.padding
+    }
+
+    /// The upper padding the convolution descriptor takes: the layer's own
+    /// for a forward convolution, and less the output padding for a
+    /// transposed one, which is what makes its output the layer's size.
+    fn upper_padding(&self) -> Vec<i64> {
+        match self.kind {
+            ConvolutionKind::Forward => self.padding.clone(),
+            ConvolutionKind::Transposed => self
+                .padding
+                .iter()
+                .zip(&self.output_padding)
+                .map(|(padding, output)| padding - output)
+                .collect(),
         }
     }
 
@@ -486,11 +575,15 @@ impl Convolution {
                 self.y.rank()
             )));
         }
-        for (name, values) in [
+        let mut named = vec![
             ("padding", &self.padding),
             ("stride", &self.stride),
             ("dilation", &self.dilation),
-        ] {
+        ];
+        if self.kind == ConvolutionKind::Transposed {
+            named.push(("output_padding", &self.output_padding));
+        }
+        for (name, values) in named {
             if values.len() != rank {
                 return Err(Error::invalid(format!(
                     "a {rank}-dimensional convolution needs {rank} {name} values, not {}",
@@ -516,30 +609,84 @@ impl Convolution {
                 self.padding
             )));
         }
-        if self.w.dims[1] != self.x.dims[1] {
-            return Err(Error::invalid(format!(
-                "the filter spans {} input channels, the input has {}",
-                self.w.dims[1], self.x.dims[1]
-            )));
-        }
-        if self.y.dims[0] != self.x.dims[0] || self.y.dims[1] != self.w.dims[0] {
-            return Err(Error::invalid(format!(
-                "the output is {} by {}, the batch is {} and the filter produces {} channels",
-                self.y.dims[0], self.y.dims[1], self.x.dims[0], self.w.dims[0]
-            )));
-        }
-        for index in 0..rank {
-            let dim = 2 + index;
-            let expected = (self.x.dims[dim] + 2 * self.padding[index]
-                - self.dilation[index] * (self.w.dims[dim] - 1)
-                - 1)
-                / self.stride[index]
-                + 1;
-            if self.y.dims[dim] != expected {
-                return Err(Error::invalid(format!(
-                    "spatial dimension {index} of the output is {} where the input, filter, padding, stride and dilation give {expected}",
-                    self.y.dims[dim]
-                )));
+        match self.kind {
+            ConvolutionKind::Forward => {
+                if self.w.dims[1] != self.x.dims[1] {
+                    return Err(Error::invalid(format!(
+                        "the filter spans {} input channels, the input has {}",
+                        self.w.dims[1], self.x.dims[1]
+                    )));
+                }
+                if self.y.dims[0] != self.x.dims[0] || self.y.dims[1] != self.w.dims[0] {
+                    return Err(Error::invalid(format!(
+                        "the output is {} by {}, the batch is {} and the filter produces {} channels",
+                        self.y.dims[0], self.y.dims[1], self.x.dims[0], self.w.dims[0]
+                    )));
+                }
+                if !self.output_padding.is_empty() {
+                    return Err(Error::invalid(
+                        "a forward convolution has no output padding",
+                    ));
+                }
+                for index in 0..rank {
+                    let dim = 2 + index;
+                    let expected = (self.x.dims[dim] + 2 * self.padding[index]
+                        - self.dilation[index] * (self.w.dims[dim] - 1)
+                        - 1)
+                        / self.stride[index]
+                        + 1;
+                    if self.y.dims[dim] != expected {
+                        return Err(Error::invalid(format!(
+                            "spatial dimension {index} of the output is {} where the input, filter, padding, stride and dilation give {expected}",
+                            self.y.dims[dim]
+                        )));
+                    }
+                }
+            }
+            ConvolutionKind::Transposed => {
+                // The layer's weight puts its input channels first, and the
+                // forward convolution it transposes therefore spans
+                // `x.dims[1]` output channels.
+                if self.w.dims[0] != self.x.dims[1] {
+                    return Err(Error::invalid(format!(
+                        "the filter spans {} input channels, the input has {}",
+                        self.w.dims[0], self.x.dims[1]
+                    )));
+                }
+                if self.y.dims[0] != self.x.dims[0] || self.y.dims[1] != self.w.dims[1] {
+                    return Err(Error::invalid(format!(
+                        "the output is {} by {}, the batch is {} and the filter produces {} channels",
+                        self.y.dims[0], self.y.dims[1], self.x.dims[0], self.w.dims[1]
+                    )));
+                }
+                for index in 0..rank {
+                    if self.output_padding[index] < 0
+                        || self.output_padding[index] >= self.stride[index]
+                    {
+                        return Err(Error::invalid(format!(
+                            "output padding {} in dimension {index} lies outside 0..{}",
+                            self.output_padding[index], self.stride[index]
+                        )));
+                    }
+                    if self.output_padding[index] > self.padding[index] {
+                        return Err(Error::invalid(format!(
+                            "output padding {} in dimension {index} exceeds the padding {}:                              cuDNN's backward data pass has one lower padding",
+                            self.output_padding[index], self.padding[index]
+                        )));
+                    }
+                    let dim = 2 + index;
+                    let expected = (self.x.dims[dim] - 1) * self.stride[index]
+                        - 2 * self.padding[index]
+                        + self.dilation[index] * (self.w.dims[dim] - 1)
+                        + self.output_padding[index]
+                        + 1;
+                    if self.y.dims[dim] != expected {
+                        return Err(Error::invalid(format!(
+                            "spatial dimension {index} of the output is {} where the input, filter, padding, stride, dilation and output padding give {expected}",
+                            self.y.dims[dim]
+                        )));
+                    }
+                }
             }
         }
         if self.compute != DataType::F32 {
@@ -631,6 +778,12 @@ impl Operation {
         let mode = CROSS_CORRELATION;
         let spatial = convolution.rank() as i64;
         let call = "cudnnBackendSetAttribute";
+        // A forward convolution pads both sides of each spatial dimension
+        // with the layer's padding; a transposed one pads the upper side with
+        // the padding less the output padding, which is what makes the
+        // backward data pass produce the layer's output size.
+        let lower = convolution.lower_padding().to_vec();
+        let upper = convolution.upper_padding();
         api.set_one(
             &descriptor,
             ATTR_CONVOLUTION_COMP_TYPE,
@@ -659,14 +812,14 @@ impl Operation {
             &descriptor,
             ATTR_CONVOLUTION_PRE_PADDINGS,
             TYPE_INT64,
-            &convolution.padding,
+            &lower,
             call,
         )?;
         api.set(
             &descriptor,
             ATTR_CONVOLUTION_POST_PADDINGS,
             TYPE_INT64,
-            &convolution.padding,
+            &upper,
             call,
         )?;
         api.set(
@@ -685,30 +838,46 @@ impl Operation {
         )?;
         api.finalize(&descriptor, "cudnnBackendFinalize")?;
 
-        let forward = Descriptor::create(api, DESCRIPTOR_OPERATION_CONVOLUTION_FORWARD)?;
-        // `y = alpha · conv(x, w) + beta · y`: FP32 scalars, the scale type of
+        // `y = alpha · op(x, w) + beta · y`: FP32 scalars, the scale type of
         // an FP32 convolution.
         let (alpha, beta) = (1.0f32, 0.0f32);
-        api.set_one(
-            &forward,
-            ATTR_OPERATION_CONVOLUTION_FORWARD_ALPHA,
-            TYPE_FLOAT,
-            &alpha,
-            call,
-        )?;
-        api.set_one(
-            &forward,
-            ATTR_OPERATION_CONVOLUTION_FORWARD_BETA,
-            TYPE_FLOAT,
-            &beta,
-            call,
-        )?;
-        for (attribute, tensor) in [
-            (ATTR_OPERATION_CONVOLUTION_FORWARD_CONV_DESC, &descriptor),
-            (ATTR_OPERATION_CONVOLUTION_FORWARD_X, &x),
-            (ATTR_OPERATION_CONVOLUTION_FORWARD_W, &w),
-            (ATTR_OPERATION_CONVOLUTION_FORWARD_Y, &y),
-        ] {
+        let (op, attributes) = match convolution.kind {
+            ConvolutionKind::Forward => (
+                DESCRIPTOR_OPERATION_CONVOLUTION_FORWARD,
+                [
+                    (ATTR_OPERATION_CONVOLUTION_FORWARD_CONV_DESC, &descriptor),
+                    (ATTR_OPERATION_CONVOLUTION_FORWARD_X, &x),
+                    (ATTR_OPERATION_CONVOLUTION_FORWARD_W, &w),
+                    (ATTR_OPERATION_CONVOLUTION_FORWARD_Y, &y),
+                ],
+            ),
+            // Backward data: `dx` is the layer's output, `dy` its input, and
+            // the filter is the forward convolution's, the layer's weight
+            // read with its input channels first.
+            ConvolutionKind::Transposed => (
+                DESCRIPTOR_OPERATION_CONVOLUTION_BACKWARD_DATA,
+                [
+                    (ATTR_OPERATION_CONVOLUTION_BWD_DATA_CONV_DESC, &descriptor),
+                    (ATTR_OPERATION_CONVOLUTION_BWD_DATA_DX, &y),
+                    (ATTR_OPERATION_CONVOLUTION_BWD_DATA_W, &w),
+                    (ATTR_OPERATION_CONVOLUTION_BWD_DATA_DY, &x),
+                ],
+            ),
+        };
+        let forward = Descriptor::create(api, op)?;
+        let (alpha_attribute, beta_attribute) = match convolution.kind {
+            ConvolutionKind::Forward => (
+                ATTR_OPERATION_CONVOLUTION_FORWARD_ALPHA,
+                ATTR_OPERATION_CONVOLUTION_FORWARD_BETA,
+            ),
+            ConvolutionKind::Transposed => (
+                ATTR_OPERATION_CONVOLUTION_BWD_DATA_ALPHA,
+                ATTR_OPERATION_CONVOLUTION_BWD_DATA_BETA,
+            ),
+        };
+        api.set_one(&forward, alpha_attribute, TYPE_FLOAT, &alpha, call)?;
+        api.set_one(&forward, beta_attribute, TYPE_FLOAT, &beta, call)?;
+        for (attribute, tensor) in attributes {
             api.set_one(
                 &forward,
                 attribute,
@@ -1239,6 +1408,115 @@ mod tests {
 
         let error = tensor.check().expect_err("two strides for three dims");
         assert!(error.to_string().contains("has 2 strides"), "{error}");
+    }
+
+    #[test]
+    fn a_transposed_convolution_upsamples_to_its_output_shape() {
+        // The audio decoder's upsampling: a stride-two layer with a kernel of
+        // twice the stride and half its padding doubles the length exactly.
+        let one_dimensional = Convolution::transpose(
+            Tensor::contiguous(vec![1, 6, 8], DataType::F32),
+            Tensor::contiguous(vec![6, 3, 4], DataType::F32),
+            Tensor::contiguous(vec![1, 3, 16], DataType::F32),
+            vec![1],
+            vec![2],
+            vec![1],
+            vec![0],
+        );
+        assert!(one_dimensional.check().is_ok(), "{one_dimensional:?}");
+        assert_eq!(one_dimensional.rank(), 1);
+
+        // The same identity at rank three: unit stride and padding keep the
+        // spatial shape.
+        let three_dimensional = Convolution::transpose(
+            Tensor::contiguous(vec![1, 4, 8, 8, 8], DataType::F32),
+            Tensor::contiguous(vec![4, 2, 3, 3, 3], DataType::F32),
+            Tensor::contiguous(vec![1, 2, 8, 8, 8], DataType::F32),
+            vec![1, 1, 1],
+            vec![1, 1, 1],
+            vec![1, 1, 1],
+            vec![0, 0, 0],
+        );
+        assert!(three_dimensional.check().is_ok(), "{three_dimensional:?}");
+
+        // A two-dimensional transposed convolution with output padding.
+        let two_dimensional = Convolution::transpose(
+            Tensor::contiguous(vec![2, 3, 4, 4], DataType::F32),
+            Tensor::contiguous(vec![3, 5, 3, 3], DataType::F32),
+            Tensor::contiguous(vec![2, 5, 7, 7], DataType::F32),
+            vec![1, 1],
+            vec![2, 2],
+            vec![1, 1],
+            vec![0, 0],
+        );
+        assert!(two_dimensional.check().is_ok(), "{two_dimensional:?}");
+    }
+
+    #[test]
+    fn a_transposed_convolution_rejects_an_impossible_output_padding() {
+        let mut convolution = Convolution::transpose(
+            Tensor::contiguous(vec![1, 6, 8], DataType::F32),
+            Tensor::contiguous(vec![6, 3, 4], DataType::F32),
+            Tensor::contiguous(vec![1, 3, 17], DataType::F32),
+            vec![1],
+            vec![2],
+            vec![1],
+            vec![1],
+        );
+        // With output padding one the layer's output is one longer, and the
+        // upper padding is the padding less the output padding.
+        assert!(convolution.check().is_ok(), "{convolution:?}");
+        assert_eq!(convolution.upper_padding(), vec![0]);
+
+        // Output padding must stay below the stride.
+        convolution.y.dims[2] = 18;
+        convolution.output_padding = vec![2];
+        let error = convolution
+            .check()
+            .expect_err("output padding is smaller than the stride");
+        assert!(error.to_string().contains("lies outside 0..2"), "{error}");
+
+        // A layer whose padding is smaller than its output padding has no
+        // backward data description: the upper padding would be negative.
+        convolution.output_padding = vec![1];
+        convolution.padding = vec![0];
+        convolution.y.dims[2] = 17;
+        let error = convolution
+            .check()
+            .expect_err("no padding to take the output padding from");
+        assert!(error.to_string().contains("exceeds the padding"), "{error}");
+    }
+
+    #[test]
+    fn a_transposed_convolution_checks_its_channels_and_output_shape() {
+        let mut convolution = Convolution::transpose(
+            Tensor::contiguous(vec![1, 6, 8], DataType::F32),
+            Tensor::contiguous(vec![5, 3, 4], DataType::F32),
+            Tensor::contiguous(vec![1, 3, 16], DataType::F32),
+            vec![1],
+            vec![2],
+            vec![1],
+            vec![0],
+        );
+        let error = convolution
+            .check()
+            .expect_err("the filter and the input disagree on channels");
+        assert!(error.to_string().contains("filter spans 5"), "{error}");
+
+        convolution.w.dims[0] = 6;
+        convolution.y.dims[2] = 15;
+        let error = convolution
+            .check()
+            .expect_err("the upsampled length is wrong");
+        assert!(error.to_string().contains("give 16"), "{error}");
+
+        // A forward convolution has no output padding to take.
+        let mut forward = conv1d(vec![1, 6, 8], vec![3, 6, 4], vec![1, 3, 7]);
+        forward.output_padding = vec![1];
+        let error = forward
+            .check()
+            .expect_err("a forward convolution has no output padding");
+        assert!(error.to_string().contains("no output padding"), "{error}");
     }
 
     #[test]

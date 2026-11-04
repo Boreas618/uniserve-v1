@@ -12,13 +12,14 @@ use std::time::Duration;
 
 use platform::nccl::{Communicator, ReduceOp, UniqueId};
 use platform::{
-    Capture, CaptureMode, CaptureStatus, Cluster, ComputeType, Convolution, ConvolutionArgs, CopyBatch,
-    Cudnn, DataType, Device, DeviceAllocation, Matmul, MatmulArgs, MatmulDescriptor, Tensor,
-    DeviceAttribute, DeviceId, Error, Event, EventFlags, FunctionAttribute, GraphNodeKind,
-    HandleType, Interleave, KernelNodeParams, L2Promotion, LaunchConfig, Library, Nvml, OobFill,
-    PeerMapping, PinnedBuffer, PrimaryContext, Protection, SegmentedMapping, ShareableHandle,
-    SourceOrder, Stream, Strided, StridedCopy, Swizzle, TensorDataType, TensorMap, TensorMapSpec,
-    VirtualPool, memcpy_async, memset_2d_d8, memset_d8, memset_d32, reclaim,
+    Algorithm, Capture, CaptureMode, CaptureStatus, Cluster, ComputeType, Convolution,
+    ConvolutionArgs, CopyBatch, Cudnn, DataType, Device, DeviceAllocation, DeviceAttribute,
+    DeviceId, DevicePtr, Engine, Error, Event, EventFlags, FunctionAttribute, GraphNodeKind,
+    HandleType, Interleave, KernelNodeParams, L2Promotion, LaunchConfig, Library, Matmul,
+    MatmulArgs, MatmulDescriptor, Nvml, OobFill, PeerMapping, PinnedBuffer, PrimaryContext,
+    Protection, SegmentedMapping, ShareableHandle, SourceOrder, Stream, Strided, StridedCopy,
+    Swizzle, Tensor, TensorDataType, TensorMap, TensorMapSpec, VirtualPool, memcpy_async,
+    memset_2d_d8, memset_d8, memset_d32, reclaim,
 };
 
 pub(crate) const DEVICE: DeviceId = DeviceId(0);
@@ -832,30 +833,41 @@ fn single_rank_communicators_run_collectives() {
     assert_eq!((communicator.rank(), communicator.size()), (0, 1));
 
     // SAFETY: the buffers outlive the synchronization below.
-    unsafe {
-        memset_d32(data.address(), 41, 4, &stream).unwrap();
-        communicator
-            .all_reduce(
-                data.address(),
-                data.address(),
-                4,
-                platform::DataType::I32,
-                ReduceOp::Min,
-                &stream,
-            )
-            .unwrap();
-        communicator
-            .broadcast(
-                data.address(),
-                data.address(),
-                4,
-                platform::DataType::I32,
-                0,
-                &stream,
-            )
-            .unwrap();
-        memcpy_async(host.address(), data.address(), 16, &stream).unwrap();
-    }
+    unsafe { memset_d32(data.address(), 41, 4, &stream).unwrap() };
+    let words = DevicePtr::from_address(data.address());
+    let all = data.len();
+    communicator
+        .all_reduce(
+            &stream,
+            words,
+            all,
+            words,
+            all,
+            4,
+            DataType::I32,
+            ReduceOp::Min,
+        )
+        .unwrap();
+    communicator
+        .broadcast(&stream, words, all, words, all, 4, DataType::I32, 0)
+        .unwrap();
+    // A collective whose stated ranges cannot hold the elements it asks for
+    // fails before any NCCL call is made.
+    let short = communicator
+        .all_reduce(
+            &stream,
+            words,
+            8,
+            words,
+            all,
+            4,
+            DataType::I32,
+            ReduceOp::Min,
+        )
+        .unwrap_err();
+    assert!(matches!(short, Error::InvalidArgument { .. }), "{short:?}");
+    // SAFETY: the buffer outlives the synchronization below.
+    unsafe { memcpy_async(host.address(), data.address(), 16, &stream).unwrap() };
     stream.synchronize().unwrap();
     let words: Vec<u32> = read(&host)
         .as_chunks::<4>()
@@ -1407,7 +1419,6 @@ fn rebinding_changes_a_kernel_node_function_and_arguments() {
     assert_eq!(words(&host), vec![7; 8], "the template node is unchanged");
 }
 
-
 /// A row-major matrix product runs on an algorithm cuBLASLt's heuristic
 /// offers, and its result is the arithmetic the descriptor names.
 #[test]
@@ -1440,14 +1451,13 @@ fn a_matrix_product_runs_on_an_algorithm_the_heuristic_offers() {
     unsafe {
         memcpy_async(a_device.address(), a.as_ptr() as u64, a.len() * 4, &stream).unwrap();
         memcpy_async(b_device.address(), b.as_ptr() as u64, b.len() * 4, &stream).unwrap();
-        memset_d32(c_device.address(), 0, expected.len() as u32, &stream).unwrap();
-        memset_d32(d_device.address(), 0, expected.len() as u32, &stream).unwrap();
+        memset_d32(c_device.address(), 0, expected.len(), &stream).unwrap();
+        memset_d32(d_device.address(), 0, expected.len(), &stream).unwrap();
     }
     stream.synchronize().unwrap();
 
     let matmul = Matmul::new(&device).unwrap();
-    let descriptor =
-        MatmulDescriptor::row_major(m, n, k, DataType::F32, ComputeType::F32);
+    let descriptor = MatmulDescriptor::row_major(m, n, k, DataType::F32, ComputeType::F32);
     let algorithms = matmul.candidates(&descriptor, 0, 4).unwrap();
     assert!(
         !algorithms.is_empty(),
@@ -1478,8 +1488,15 @@ fn a_matrix_product_runs_on_an_algorithm_the_heuristic_offers() {
     let host = PinnedBuffer::new(DEVICE, expected.len() * 4).unwrap();
     // SAFETY: the copy reads the result allocation into a pinned buffer of its
     // size, and the stream is synchronized afterwards.
-    unsafe { memcpy_async(host.address(), d_device.address(), expected.len() * 4, &stream) }
-        .unwrap();
+    unsafe {
+        memcpy_async(
+            host.address(),
+            d_device.address(),
+            expected.len() * 4,
+            &stream,
+        )
+    }
+    .unwrap();
     stream.synchronize().unwrap();
     let result: Vec<f32> = read(&host)
         .as_chunks::<4>()
@@ -1487,7 +1504,10 @@ fn a_matrix_product_runs_on_an_algorithm_the_heuristic_offers() {
         .iter()
         .map(|word| f32::from_le_bytes(*word))
         .collect();
-    assert_eq!(result, expected, "D = A·B with A 4x3 row-major, B 3x6 row-major");
+    assert_eq!(
+        result, expected,
+        "D = A·B with A 4x3 row-major, B 3x6 row-major"
+    );
 
     // The algorithm is what the program's tuning data carries: the record
     // reproduces the same algorithm's bytes.
@@ -1533,7 +1553,7 @@ fn a_convolution_matches_the_arithmetic() {
     unsafe {
         memcpy_async(x_device.address(), x.as_ptr() as u64, x.len() * 4, &stream).unwrap();
         memcpy_async(w_device.address(), w.as_ptr() as u64, w.len() * 4, &stream).unwrap();
-        memset_d32(y_device.address(), 0, expected.len() as u32, &stream).unwrap();
+        memset_d32(y_device.address(), 0, expected.len(), &stream).unwrap();
     }
     stream.synchronize().unwrap();
 
@@ -1551,8 +1571,15 @@ fn a_convolution_matches_the_arithmetic() {
     let host = PinnedBuffer::new(DEVICE, expected.len() * 4).unwrap();
     // SAFETY: the copy reads the output allocation into a pinned buffer of its
     // size, and the stream is synchronized afterwards.
-    unsafe { memcpy_async(host.address(), y_device.address(), expected.len() * 4, &stream) }
-        .unwrap();
+    unsafe {
+        memcpy_async(
+            host.address(),
+            y_device.address(),
+            expected.len() * 4,
+            &stream,
+        )
+    }
+    .unwrap();
     stream.synchronize().unwrap();
     let result: Vec<f32> = read(&host)
         .as_chunks::<4>()
@@ -1752,24 +1779,282 @@ fn tensor_maps_encode_tiled_descriptors() {
 
 #[test]
 #[ignore = "requires a CUDA device"]
-fn a_healthy_context_reports_no_sticky_error() {
+fn a_communicator_splits_into_a_subgroup_and_a_rank_left_out_gets_none() {
     let _driver = exclusive_driver();
-    let context = PrimaryContext::retain(DEVICE).unwrap();
-    assert!(context.sticky_error().unwrap().is_none());
-    // A second probe answers from the stream the context already owns.
-    assert!(context.sticky_error().unwrap().is_none());
+    let id = UniqueId::new().unwrap();
+    let world = Communicator::init(DEVICE, 1, 0, &id).unwrap();
+    let mut tp = world
+        .split(&[0], 0)
+        .unwrap()
+        .expect("the only rank is in the subgroup");
+    assert_eq!((tp.rank(), tp.size()), (0, 1));
+
+    let stream = Stream::new(DEVICE).unwrap();
+    let data = DeviceAllocation::linear(DEVICE, 16).unwrap();
+    let host = PinnedBuffer::new(DEVICE, 16).unwrap();
+    // SAFETY: the buffers outlive the synchronization below.
+    unsafe { memset_d32(data.address(), 41, 4, &stream).unwrap() };
+    let words = DevicePtr::from_address(data.address());
+    let all = data.len();
+    tp.all_reduce(
+        &stream,
+        words,
+        all,
+        words,
+        all,
+        4,
+        DataType::I32,
+        ReduceOp::Min,
+    )
+    .unwrap();
+    // SAFETY: the buffer outlives the synchronization below.
+    unsafe { memcpy_async(host.address(), data.address(), 16, &stream).unwrap() };
+    stream.synchronize().unwrap();
+    let reduced: Vec<u32> = read(&host)
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| u32::from_ne_bytes(*word))
+        .collect();
+    assert_eq!(reduced, [41; 4]);
+
+    tp.destroy().unwrap();
+    // A rank outside the subgroup still takes part in the split, and NCCL
+    // hands it no communicator.
+    assert!(world.split(&[], 0).unwrap().is_none());
+    world.destroy().unwrap();
 }
 
+/// One tensor of floats as bytes, for a copy in or out.
+fn float_bytes(values: &[f32]) -> &[u8] {
+    // SAFETY: a float slice is readable as its own bytes.
+    unsafe {
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+    }
+}
+
+/// The bytes of a copy read back as floats.
+fn floats(bytes: Vec<u8>) -> Vec<f32> {
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| f32::from_le_bytes(*word))
+        .collect()
+}
+
+/// The definition of a one-dimensional cross-correlation, computed on the
+/// host: `y[n][k][o] = sum over c, j of x[n][c][i] * w[k][c][j]` with
+/// `o = i · stride - padding + j · dilation`.
+///
+/// This is the reference the convolution's own numbers are compared with; it
+/// is written from the definition, not from the device's result.
+fn forward_reference(
+    x: &[f32],
+    x_dims: [usize; 3],
+    w: &[f32],
+    w_dims: [usize; 3],
+    y_dims: [usize; 3],
+    stride: i64,
+    padding: i64,
+    dilation: i64,
+) -> Vec<f32> {
+    let [batch, channels, length] = x_dims;
+    let [filters, _, kernel] = w_dims;
+    let [_, _, out_length] = y_dims;
+    let mut y = vec![0.0f32; batch * filters * out_length];
+    for n in 0..batch {
+        for k in 0..filters {
+            for o in 0..out_length {
+                let mut total = 0.0f64;
+                for c in 0..channels {
+                    for j in 0..kernel {
+                        let i = (o as i64 + padding - j as i64 * dilation) / stride;
+                        let aligned = i >= 0
+                            && (i < length as i64)
+                            && o as i64 == i * stride - padding + j as i64 * dilation;
+                        if aligned {
+                            let value = x[(n * channels + c) * length + i as usize];
+                            let weight = w[(k * channels + c) * kernel + j];
+                            total += f64::from(value) * f64::from(weight);
+                        }
+                    }
+                }
+                y[(n * filters + k) * out_length + o] = total as f32;
+            }
+        }
+    }
+    y
+}
+
+/// The definition of a one-dimensional transposed convolution, computed on
+/// the host: every input element is scattered through the filter,
+/// `y[n][k][i · stride - padding + j · dilation] += x[n][c][i] · w[c][k][j]`.
+fn transposed_reference(
+    x: &[f32],
+    x_dims: [usize; 3],
+    w: &[f32],
+    w_dims: [usize; 3],
+    y_dims: [usize; 3],
+    stride: i64,
+    padding: i64,
+    dilation: i64,
+) -> Vec<f32> {
+    let [batch, channels, length] = x_dims;
+    let [_, filters, kernel] = w_dims;
+    let [_, _, out_length] = y_dims;
+    let mut y = vec![0.0f32; batch * filters * out_length];
+    for n in 0..batch {
+        for c in 0..channels {
+            for i in 0..length {
+                for k in 0..filters {
+                    for j in 0..kernel {
+                        let o = i as i64 * stride - padding + j as i64 * dilation;
+                        if o >= 0 && o < out_length as i64 {
+                            let value = x[(n * channels + c) * length + i];
+                            let weight = w[(c * filters + k) * kernel + j];
+                            y[(n * filters + k) * out_length + o as usize] += value * weight;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    y
+}
+
+/// Runs `convolution` through cuDNN on device storage, with the given host
+/// tensors, and answers what the device computed.
+fn convolve(
+    cudnn: &Cudnn,
+    stream: &Stream,
+    convolution: &Convolution,
+    x: &[f32],
+    w: &[f32],
+    y_len: usize,
+    engine: Option<platform::Engine>,
+) -> Vec<f32> {
+    let plan = cudnn.plan(convolution, engine).unwrap();
+    let input = DeviceAllocation::linear(DEVICE, x.len() * 4).unwrap();
+    let filter = DeviceAllocation::linear(DEVICE, w.len() * 4).unwrap();
+    let output = DeviceAllocation::linear(DEVICE, y_len * 4).unwrap();
+    let workspace = DeviceAllocation::linear(DEVICE, plan.workspace_bytes().max(4)).unwrap();
+    let mut host_input = PinnedBuffer::new(DEVICE, x.len() * 4).unwrap();
+    let mut host_filter = PinnedBuffer::new(DEVICE, w.len() * 4).unwrap();
+    let host_output = PinnedBuffer::new(DEVICE, y_len * 4).unwrap();
+
+    // SAFETY: each host slice is filled whole, and every copy below lies
+    // inside the buffers it names.
+    unsafe {
+        host_input.as_mut_slice().copy_from_slice(float_bytes(x));
+        host_filter.as_mut_slice().copy_from_slice(float_bytes(w));
+        memcpy_async(input.address(), host_input.address(), x.len() * 4, stream).unwrap();
+        memcpy_async(filter.address(), host_filter.address(), w.len() * 4, stream).unwrap();
+        let args = ConvolutionArgs {
+            x: input.address(),
+            w: filter.address(),
+            y: output.address(),
+            workspace: workspace.address(),
+        };
+        cudnn.run(&plan, args, stream).unwrap();
+        memcpy_async(host_output.address(), output.address(), y_len * 4, stream).unwrap();
+    }
+    stream.synchronize().unwrap();
+    floats(read(&host_output))
+}
+
+/// Compares a computed convolution with the definition's numbers.
+fn assert_close(observed: &[f32], expected: &[f32]) {
+    assert_eq!(observed.len(), expected.len());
+    for (index, (observed, expected)) in observed.iter().zip(expected).enumerate() {
+        let tolerance = 1e-4 * expected.abs().max(1.0);
+        assert!(
+            (observed - expected).abs() <= tolerance,
+            "element {index}: {observed} where the definition gives {expected}"
+        );
+    }
+}
+
+/// cuDNN's forward convolution computes the definition of a `Conv1d`: the
+/// engine the heuristic picks, the plan built from it, and the variant pack
+/// the call passes all agree with a host reference of the same numbers.
 #[test]
 #[ignore = "requires a CUDA device"]
-fn the_sticky_error_probe_does_not_wait_for_queued_work() {
+fn a_convolution_matches_the_definition_of_a_conv1d() {
     let _driver = exclusive_driver();
-    let context = PrimaryContext::retain(DEVICE).unwrap();
+    let device = Device::new(DEVICE).unwrap();
+    let cudnn = Cudnn::new(&device).unwrap();
+    assert!(cudnn.version() >= 9_000, "cuDNN 9 is bound");
     let stream = Stream::new(DEVICE).unwrap();
-    // The stream is held inside a host function, so any call that waited for
-    // its queued work would not return; the probe answers at once.
-    let release = block(&stream);
-    assert!(context.sticky_error().unwrap().is_none());
-    release.send(()).unwrap();
-    stream.synchronize().unwrap();
+
+    let (x_dims, w_dims) = ([1usize, 2, 5], [3usize, 2, 3]);
+    let (stride, padding, dilation) = (2i64, 1i64, 1i64);
+    let out_length = ((x_dims[2] as i64 + 2 * padding - dilation * (w_dims[2] as i64 - 1) - 1)
+        / stride
+        + 1) as usize;
+    let y_dims = [x_dims[0], w_dims[0], out_length];
+
+    let x: Vec<f32> = (0..x_dims.iter().product())
+        .map(|i| i as f32 * 0.5 - 1.0)
+        .collect();
+    let w: Vec<f32> = (0..w_dims.iter().product())
+        .map(|i| ((i * 3) % 5) as f32 * 0.25 - 0.5)
+        .collect();
+    let expected = forward_reference(&x, x_dims, &w, w_dims, y_dims, stride, padding, dilation);
+
+    let convolution = Convolution::new(
+        Tensor::contiguous(vec![1, 2, 5], DataType::F32),
+        Tensor::contiguous(vec![3, 2, 3], DataType::F32),
+        Tensor::contiguous(vec![1, 3, out_length as i64], DataType::F32),
+        vec![padding],
+        vec![stride],
+        vec![dilation],
+    );
+    let observed = convolve(&cudnn, &stream, &convolution, &x, &w, expected.len(), None);
+
+    assert_close(&observed, &expected);
+}
+
+/// cuDNN's backward data pass computes the definition of a `ConvTranspose1d`,
+/// with the layer's own weight and the padding and output padding the
+/// description carries, and the engine the tuning data recorded is the one
+/// the plan runs.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn a_transposed_convolution_matches_the_definition_of_a_conv_transpose1d() {
+    let _driver = exclusive_driver();
+    let device = Device::new(DEVICE).unwrap();
+    let cudnn = Cudnn::new(&device).unwrap();
+    let stream = Stream::new(DEVICE).unwrap();
+
+    // The audio decoder's upsampling: a stride-two layer, a kernel of twice
+    // the stride, half its padding, and the same length doubling.
+    let (x_dims, w_dims) = ([1usize, 2, 4], [2usize, 3, 4]);
+    let (stride, padding, dilation, output_padding) = (2i64, 1i64, 1i64, 0i64);
+    let out_length = ((x_dims[2] as i64 - 1) * stride - 2 * padding
+        + dilation * (w_dims[2] as i64 - 1)
+        + output_padding
+        + 1) as usize;
+    let y_dims = [x_dims[0], w_dims[1], out_length];
+
+    let x: Vec<f32> = (0..x_dims.iter().product())
+        .map(|i| (i % 5) as f32 * 0.25 - 0.5)
+        .collect();
+    let w: Vec<f32> = (0..w_dims.iter().product())
+        .map(|i| ((i * 7) % 5) as f32 * 0.25 - 0.5)
+        .collect();
+    let expected = transposed_reference(&x, x_dims, &w, w_dims, y_dims, stride, padding, dilation);
+
+    let convolution = Convolution::transpose(
+        Tensor::contiguous(vec![1, 2, 4], DataType::F32),
+        Tensor::contiguous(vec![2, 3, 4], DataType::F32),
+        Tensor::contiguous(vec![1, 3, out_length as i64], DataType::F32),
+        vec![padding],
+        vec![stride],
+        vec![dilation],
+        vec![output_padding],
+    );
+    let observed = convolve(&cudnn, &stream, &convolution, &x, &w, expected.len(), None);
+
+    assert_close(&observed, &expected);
 }
