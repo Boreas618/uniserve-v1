@@ -1007,7 +1007,12 @@ impl VideoEncoder {
 
         // The moment convolution writes `2 · latent_channels`; the one-by-one projection narrows it to
         // the latent's own channels, which is the posterior the caller reads.
-        let moments = f.arena().tensor(DType::F32, out.shape)?;
+        // The moment convolution writes `2 * latent_channels`; the one-by-one projection after it
+        // narrows that to the latent's own channels. The scratch is the moment extent, which is twice
+        // the output's channel count - sizing it from `out` would half it.
+        let mut moment_extent = out.shape.dims().to_vec();
+        moment_extent[1] = 2 * u64::from(self.stack.latent_channels);
+        let moments = f.arena().tensor(DType::F32, Shape::new(&moment_extent))?;
         self.output.run(f, hidden, moments)?;
         Ok(self.moments.forward(f, moments, out)?)
     }
@@ -1245,19 +1250,28 @@ impl AudioEncoder {
         })
     }
 
-    /// Encode one mono track: `samples [1, 1, length]` to `out [latent_channels, frames]`.
+    /// Encode a `[batch, 1, length]` track into `out [batch · frames, latent_channels]` F32 rows.
+    ///
+    /// The reference's encoder is mono per batch row (`audio_vae.py:448-452`, "encode mono
+    /// `[batch, 1, samples]` waveforms") and its latent is a **two-row batch**: a stereo reference
+    /// arrives as `[2, 1, samples]` and its latent is `[2, latent_channels, frames]`, the same two-row
+    /// shape the audio decoder reads. The rows are written channel-major, `[batch · frames,
+    /// latent_channels]` with batch outermost, because that is the form the DiT's audio conditioning
+    /// reads (`denoiser.py:518`, `[2 · frames, audio_channels]`) - so no caller transposes.
     ///
     /// The length must be a whole number of hops and no longer than the deployment's bound. The
     /// activation of every stage runs at the stage's inner width, which is half of the width the
-    /// widening convolution writes.
+    /// widening convolution writes. The projection attends over frame 2, so it runs once per batch row
+    /// and never mixes them.
     pub fn encode(&self, f: &Forward, samples: TensorView, out: TensorView) -> Result<()> {
         let shape = samples.shape;
-        if shape.rank() != 3 || shape.dim(0) != 1 || shape.dim(1) != 1 {
+        if shape.rank() != 3 || shape.dim(0) == 0 || shape.dim(1) != 1 {
             return Err(Error::config(format!(
-                "the audio encoder reads one [1, 1, samples] track, not {:?}",
+                "the audio encoder reads a [batch, 1, samples] track, not {:?}",
                 shape.dims()
             )));
         }
+        let batch = shape.dim(0);
         let length = shape.dim(2);
         let frames = self.frames(length)?;
         if frames > u64::from(self.frames) {
@@ -1267,9 +1281,12 @@ impl AudioEncoder {
             )));
         }
         let channels = u64::from(self.config.latent_channels);
-        if out.shape.rank() != 2 || out.shape.dims() != [channels, frames] {
+        let rows = batch
+            .checked_mul(frames)
+            .ok_or_else(|| Error::config("the audio latent's row count overflows".to_owned()))?;
+        if out.shape.rank() != 2 || out.shape.dims() != [rows, channels] {
             return Err(Error::config(format!(
-                "the audio encoder writes [{channels}, {frames}], not {:?}",
+                "the audio encoder writes [{rows}, {channels}] channel-major rows, not {:?}",
                 out.shape.dims()
             )));
         }
@@ -1277,7 +1294,7 @@ impl AudioEncoder {
         let width = u64::from(self.config.encoder_dim);
         let mut hidden = f
             .arena()
-            .tensor(DType::F32, Shape::new(&[1, width, length]))?;
+            .tensor(DType::F32, Shape::new(&[batch, width, length]))?;
         self.input.forward(f, samples, hidden)?;
 
         // A stage runs its three units at the stage's inner width, which is the width it receives, then
@@ -1286,7 +1303,7 @@ impl AudioEncoder {
         let mut extent = length;
         for stage in &self.stages {
             let inner = u64::from(stage.inner);
-            let inner_shape = Shape::new(&[1, inner, extent]);
+            let inner_shape = Shape::new(&[batch, inner, extent]);
             for unit in &stage.units {
                 let first = f.arena().tensor(DType::F32, inner_shape)?;
                 let second = f.arena().tensor(DType::F32, inner_shape)?;
@@ -1300,7 +1317,7 @@ impl AudioEncoder {
             let widened = extent / u64::from(stage.rate);
             let next = f.arena().tensor(
                 DType::F32,
-                Shape::new(&[1, u64::from(self.width_of(stage)), widened]),
+                Shape::new(&[batch, u64::from(self.width_of(stage)), widened]),
             )?;
             let scratch = f.arena().tensor(DType::F32, inner_shape)?;
             stage
@@ -1313,29 +1330,49 @@ impl AudioEncoder {
 
         // The tail Snake and the convolution to the latent width.
         let wide = u64::from(self.config.latent_dim);
-        let tail_shape = Shape::new(&[1, wide, extent]);
+        let tail_shape = Shape::new(&[batch, wide, extent]);
         let tail_scratch = f.arena().tensor(DType::F32, tail_shape)?;
         self.tail
             .forward(f, hidden, self.tail_alpha.view(), tail_scratch)?;
         let features = f.arena().tensor(DType::F32, tail_shape)?;
         self.output.forward(f, tail_scratch, features)?;
 
-        // The projection attends over frames, so the frame axis comes first; the mean head then turns
-        // the frame-major latents back into `[channels, frames]` with a one-wide convolution.
-        let matrix = TensorView::new(features.ptr, DType::F32, Shape::new(&[wide, extent]));
-        let frames_view = f.arena().tensor(DType::F32, Shape::new(&[extent, wide]))?;
-        self.transpose.forward(f, matrix, frames_view)?;
-        let pooled = self.projection.forward(f, frames_view, extent)?;
-        let pooled_matrix = f
-            .arena()
-            .tensor(DType::F32, Shape::new(&[channels, extent]))?;
-        self.transpose.forward(f, pooled, pooled_matrix)?;
-        let batched = TensorView::new(
-            pooled_matrix.ptr,
-            DType::F32,
-            Shape::new(&[1, channels, extent]),
-        );
-        self.mean.forward(f, batched, out)?;
+        // The projection attends over the frame axis, so it runs once per batch row and never mixes
+        // rows: a row's features are a `[wide, extent]` matrix, transposed to frame-major for the
+        // attention, and the mean head's `[channels, extent]` is transposed again into the row-major
+        // channel-major block the conditioning reads.
+        let per_row = wide * extent;
+        for row in 0..batch {
+            let features = TensorView::new(
+                features.ptr.offset(row * per_row * 4),
+                DType::F32,
+                Shape::new(&[wide, extent]),
+            );
+            let frames_view = f.arena().tensor(DType::F32, Shape::new(&[extent, wide]))?;
+            self.transpose.forward(f, features, frames_view)?;
+            let pooled = self.projection.forward(f, frames_view, extent)?;
+            let pooled_matrix = f
+                .arena()
+                .tensor(DType::F32, Shape::new(&[channels, extent]))?;
+            self.transpose.forward(f, pooled, pooled_matrix)?;
+            let batched = TensorView::new(
+                pooled_matrix.ptr,
+                DType::F32,
+                Shape::new(&[1, channels, extent]),
+            );
+            let narrowed = f
+                .arena()
+                .tensor(DType::F32, Shape::new(&[1, channels, extent]))?;
+            self.mean.forward(f, batched, narrowed)?;
+            // One row's latent, channel-major rows: `[extent, channels]` at the row's place in `out`.
+            let plane = TensorView::new(narrowed.ptr, DType::F32, Shape::new(&[channels, extent]));
+            let written = TensorView::new(
+                out.ptr.offset(row * extent * channels * 4),
+                DType::F32,
+                Shape::new(&[extent, channels]),
+            );
+            self.transpose.forward(f, plane, written)?;
+        }
         Ok(())
     }
 
@@ -1345,18 +1382,23 @@ impl AudioEncoder {
     }
 }
 
-/// A three-dimensional view's matrix: the batch axis of one dropped.
+/// A `[batch, rows, columns]` view as `[batch · rows, columns]`: the row axis the operators that work
+/// a row at a time read.
+///
+/// Valid for a contiguous view, which every arena tensor and every slice of one is: the batch axis is
+/// the outermost, so folding it into the row axis keeps every row where it is.
 fn matrix(view: TensorView) -> Result<TensorView> {
-    if view.shape.rank() != 3 || view.shape.dim(0) != 1 {
+    if view.shape.rank() != 3 || view.shape.dim(0) == 0 {
         return Err(Error::config(format!(
-            "{:?} is not one batched matrix",
+            "{:?} is not a batched matrix",
             view.shape.dims()
         )));
     }
+    let rows = view.shape.dim(0) * view.shape.dim(1);
     Ok(TensorView::new(
         view.ptr,
         view.dtype,
-        Shape::new(&[view.shape.dim(1), view.shape.dim(2)]),
+        Shape::new(&[rows, view.shape.dim(2)]),
     ))
 }
 
