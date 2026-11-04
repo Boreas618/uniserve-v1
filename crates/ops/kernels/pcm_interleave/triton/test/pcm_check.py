@@ -71,9 +71,10 @@ def main() -> int:
     import pcm_interleave as kernels
 
     device = torch.device("cuda")
+    # `GPUTarget.arch` is the compute capability as one number (100 for Blackwell),
+    # not a name like "sm100": an int here, and `--pdl` is a Blackwell capability.
     architecture = triton.runtime.driver.active.get_current_target().arch
-    # PDL is a Blackwell capability; a host below it runs the plain module.
-    pdl = arguments.pdl and architecture.endswith("100")
+    pdl = arguments.pdl and int(architecture) == 100
     left = samples(arguments.samples, seed=0)
     right = samples(arguments.samples, seed=1)
     expected = np.stack([quantize(left), quantize(right)], axis=1)
