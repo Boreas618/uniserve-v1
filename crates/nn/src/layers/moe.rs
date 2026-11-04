@@ -1055,15 +1055,21 @@ impl Moe {
 
         // 4. The activation's encoding: the same pass computes the block scales and the row factor
         //    the product multiplies by, and its global scale is the stack's neutral.
-        let layout = ScaleLayout::Linear;
+        //
+        // The layout here is the **activation plane's**, and it is plain: the encoder writes one
+        // scale per sixteen codes in row-major order. The weights' plane is the checkpoint's own —
+        // swizzled, F8_E4M3 — and reaches the products through *their* descriptors, below. The two
+        // are different fields of different descriptors and must not be swapped: a product told the
+        // activation's layout would dequantize the checkpoint's swizzled table as if it were linear.
+        let activation_layout = ScaleLayout::Linear;
         let values = arena.tensor(DType::U8, Shape::new(&[tokens, hidden_width / 2]))?;
-        let scales = arena.tensor(DType::U8, layout.shape(tokens, hidden_width))?;
+        let scales = arena.tensor(DType::U8, activation_layout.shape(tokens, hidden_width))?;
         let token_scale = arena.tensor(DType::F32, Shape::new(&[tokens]))?;
         let first = self.quantize_descriptor(
             hidden.dtype,
             u32::try_from(hidden_width)
                 .map_err(|_| Error::shape("Moe", format!("{hidden_width} hidden elements")))?,
-            layout,
+            activation_layout,
         );
         let args = QuantizeArgs {
             input: hidden,
@@ -1078,7 +1084,10 @@ impl Moe {
         let gated = arena.tensor(hidden.dtype, Shape::new(&[rows, intermediate]))?;
         let workspace =
             arena.tensor(DType::U8, Shape::new(&[self.workspace_bytes(rows).max(1)]))?;
-        let descriptor = self.gather_nvfp4_descriptor(hidden.dtype, DType::U8, layout);
+        // The scale's element type and the plane layout are the **checkpoint's**, read off the stack
+        // they belong to; the loader published them from the shard's own tensors.
+        let descriptor =
+            self.gather_nvfp4_descriptor(hidden.dtype, up_gate.scales.dtype(), up_gate.layout);
         let args = GatherGemmNvfp4Args {
             hidden: values,
             hidden_scale: scales,
@@ -1098,14 +1107,14 @@ impl Moe {
         // 6. The gated rows' own encoding: FC1's epilogue is a BF16 row, so this is a program of its
         //    own rather than a wider operand of the second product.
         let gated_values = arena.tensor(DType::U8, Shape::new(&[rows, intermediate / 2]))?;
-        let gated_scales = arena.tensor(DType::U8, layout.shape(rows, intermediate))?;
+        let gated_scales = arena.tensor(DType::U8, activation_layout.shape(rows, intermediate))?;
         let gated_token_scale = arena.tensor(DType::F32, Shape::new(&[rows]))?;
         let second = self.quantize_descriptor(
             hidden.dtype,
             u32::try_from(intermediate).map_err(|_| {
                 Error::shape("Moe", format!("{intermediate} intermediate elements"))
             })?,
-            layout,
+            activation_layout,
         );
         let args = QuantizeArgs {
             input: gated,
@@ -1118,7 +1127,8 @@ impl Moe {
 
         // 7. FC2: one row per permuted route, the `top` repeats still separate.
         let products = arena.tensor(hidden.dtype, Shape::new(&[rows, hidden_width]))?;
-        let descriptor = self.route_nvfp4_descriptor(hidden.dtype, DType::U8, layout);
+        let descriptor =
+            self.route_nvfp4_descriptor(hidden.dtype, down.scales.dtype(), down.layout);
         let args = RouteGemmNvfp4Args {
             hidden: gated_values,
             hidden_scale: gated_scales,
