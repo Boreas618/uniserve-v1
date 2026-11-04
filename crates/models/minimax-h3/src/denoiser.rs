@@ -1781,7 +1781,16 @@ pub fn denoise_arena(
     push(&mut plan, "patched.wide", "f32", video_rows * patches);
     if let Some((audio_rows, audio_features)) = audio {
         push(&mut plan, "audio.projected", element, audio_rows * hidden);
-        push(&mut plan, "audio.wide", "f32", audio_rows * audio_features);
+        // The audio patch, widened for its own input projection - `audio.patched.wide` so that it is
+        // the video's `patched.wide` at another modality and not a second `audio.wide`, which is
+        // the name the head's widening already takes (`head`, `{name}.wide`). Two entries with one
+        // name alias one region, since the executor keys the arena's storage by name.
+        push(
+            &mut plan,
+            "audio.patched.wide",
+            "f32",
+            audio_rows * audio_features,
+        );
     }
     push(&mut plan, "cosine", "f32", tokens * rotated);
     push(&mut plan, "sine", "f32", tokens * rotated);
