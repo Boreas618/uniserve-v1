@@ -1837,14 +1837,141 @@ impl MainProcess {
         &mut self,
         command: proto::request::wire::EngineCommand,
     ) -> Result<Option<UpdateFailure>> {
-        // The request connection carries the epoch's own lifecycle commands. `Shutdown` ends the
-        // epoch: every request finishes as aborted, the workers close and the process exits, which
-        // is what `close` does in the order the owners need (§2.3). The rest are the routing's and
-        // the daemon's successor machinery's - they apply to connections this node does not hold -
-        // while the epoch layer's Park, Promote, Serve, Drain and Pause arrive on the process
-        // connection, where the schedulers take them.
-        if let Some(proto::request::wire::engine_command::Kind::Shutdown(_)) = command.kind {
-            self.stopping = true;
+        // §2.3: the epoch's lifecycle - Park, Promote, Serve, Drain, Pause, the program layer's
+        // stages - arrives on the process connection and is applied by the driver. On this
+        // connection the epoch owns exactly one command, `Shutdown`: every request finishes as
+        // aborted and the owners close in the order they need (`close`).
+        //
+        // The rest are the engine surface of the worker era, and the daemon's migration, expert
+        // and admin paths still send them here. Each is answered with what it needs instead of
+        // being dropped: a command a process does not serve is otherwise a caller waiting for a
+        // reply that never comes, which is a hang with no name in it.
+        let refused = match command.kind {
+            Some(proto::request::wire::engine_command::Kind::Shutdown(_)) => {
+                self.stopping = true;
+                return Ok(None);
+            }
+            Some(proto::request::wire::engine_command::Kind::Hook(hook)) => Some(
+                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
+                    id: hook.id,
+                    results: Vec::new(),
+                    error: WORKER_ERA.to_owned(),
+                }),
+            ),
+            Some(proto::request::wire::engine_command::Kind::ResizeCache(resize)) => {
+                Some(proto::request::wire::from_engine::Kind::Hooked(
+                    proto::request::wire::Hooked {
+                        id: resize.id,
+                        results: Vec::new(),
+                        error: WORKER_ERA.to_owned(),
+                    },
+                ))
+            }
+            Some(proto::request::wire::engine_command::Kind::UpdateWeights(update)) => Some(
+                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
+                    id: update.id,
+                    results: Vec::new(),
+                    error: WORKER_ERA.to_owned(),
+                }),
+            ),
+            Some(proto::request::wire::engine_command::Kind::CommitExperts(commit)) => Some(
+                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
+                    id: commit.id,
+                    results: Vec::new(),
+                    error: WORKER_ERA.to_owned(),
+                }),
+            ),
+            Some(proto::request::wire::engine_command::Kind::CacheWarm(warm)) => Some(
+                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
+                    id: warm.id,
+                    results: Vec::new(),
+                    error: WORKER_ERA.to_owned(),
+                }),
+            ),
+            // The worker era's park, resume and trial commit move a worker world between
+            // processes. The epoch parks, resumes and commits through the process connection, in
+            // front of the frontend rather than behind it (§2.5, §7.4).
+            Some(proto::request::wire::engine_command::Kind::Park(park)) => Some(
+                proto::request::wire::from_engine::Kind::Parked(proto::request::wire::Parked {
+                    id: park.id,
+                    error: EPOCH_LIFECYCLE.to_owned(),
+                    index: Vec::new(),
+                }),
+            ),
+            Some(proto::request::wire::engine_command::Kind::Resume(resume)) => Some(
+                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
+                    id: resume.id,
+                    results: Vec::new(),
+                    error: EPOCH_LIFECYCLE.to_owned(),
+                }),
+            ),
+            Some(proto::request::wire::engine_command::Kind::Commit(commit)) => Some(
+                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
+                    id: commit.id,
+                    results: Vec::new(),
+                    error: EPOCH_LIFECYCLE.to_owned(),
+                }),
+            ),
+            // The scheduling limits are the schedulers', applied at their next step through the
+            // policy slot the process connection names (§4.4).
+            Some(proto::request::wire::engine_command::Kind::Configure(configure)) => Some(
+                proto::request::wire::from_engine::Kind::Configured(
+                    proto::request::wire::Configured {
+                        id: configure.id,
+                        error: EPOCH_LIFECYCLE.to_owned(),
+                    },
+                ),
+            ),
+            // The storage ledgers and the transfer budgets are each node's daemon's, read over
+            // its claim (§8); an epoch's main process holds no claim of the deployment's.
+            Some(proto::request::wire::engine_command::Kind::DescribeStorage(describe)) => Some(
+                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
+                    id: describe.id,
+                    results: Vec::new(),
+                    error: LEDGERS.to_owned(),
+                }),
+            ),
+            Some(proto::request::wire::engine_command::Kind::ThrottleTransfers(throttle)) => Some(
+                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
+                    id: throttle.id,
+                    results: Vec::new(),
+                    error: LEDGERS.to_owned(),
+                }),
+            ),
+            // What the prefix cache holds is the schedulers' answer, and they are asked through
+            // the process connection.
+            Some(proto::request::wire::engine_command::Kind::DescribeCache(describe)) => Some(
+                proto::request::wire::from_engine::Kind::CacheDescribed(
+                    proto::request::wire::CacheDescribed {
+                        id: describe.id,
+                        error: EPOCH_LIFECYCLE.to_owned(),
+                        segments: Vec::new(),
+                    },
+                ),
+            ),
+            Some(proto::request::wire::engine_command::Kind::DescribeRequests(describe)) => Some(
+                proto::request::wire::from_engine::Kind::RequestsDescribed(
+                    proto::request::wire::RequestsDescribed {
+                        id: describe.id,
+                        error: EPOCH_LIFECYCLE.to_owned(),
+                        requests: Vec::new(),
+                    },
+                ),
+            ),
+            // Promote, FlushCache and Attach state no id and are answered with a state this
+            // process does not own: there is nothing to answer on, and a log line is what is
+            // left.
+            Some(other) => {
+                tracing::warn!(
+                    "the daemon sent an engine command this epoch does not serve: {}",
+                    engine_command_name(&other)
+                );
+                None
+            }
+            None => None,
+        };
+        if let Some(kind) = refused {
+            self.send_event(kind);
         }
         Ok(None)
     }
@@ -2254,6 +2381,48 @@ fn answer(
         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
             bail!("{what} lost its scheduler")
         }
+    }
+}
+
+/// What the engine answers a command of the worker era's surface: the operation named a worker
+/// world of its own, and this epoch executes batches itself (§2.4).
+const WORKER_ERA: &str =
+    "this epoch has no worker of that kind: the command names a worker-era engine, and the epoch's \
+     executors are the process's own";
+
+/// What the engine answers a command whose owner is the epoch layer: the same operation exists,
+/// and it is asked for through the process connection, where the driver applies it (§2.5, §7.4).
+const EPOCH_LIFECYCLE: &str =
+    "this command is the epoch layer's, applied through the process connection rather than the \
+     request connection";
+
+/// What the engine answers a command over the deployment's storage ledgers or transfer budgets:
+/// each node's daemon reads them over the claim it holds, not through an epoch's main process (§8).
+const LEDGERS: &str =
+    "the storage ledgers and transfer budgets are read by each node's daemon over its claim, not \
+     by an epoch's main process";
+
+/// The name of an engine command, for a log line about one this epoch does not serve.
+fn engine_command_name(kind: &proto::request::wire::engine_command::Kind) -> &'static str {
+    use proto::request::wire::engine_command::Kind;
+    match kind {
+        Kind::Shutdown(_) => "shutdown",
+        Kind::Promote(_) => "promote",
+        Kind::FlushCache(_) => "flush_cache",
+        Kind::Hook(_) => "hook",
+        Kind::Configure(_) => "configure",
+        Kind::Attach(_) => "attach",
+        Kind::ResizeCache(_) => "resize_cache",
+        Kind::UpdateWeights(_) => "update_weights",
+        Kind::Park(_) => "park",
+        Kind::Resume(_) => "resume",
+        Kind::Commit(_) => "commit",
+        Kind::DescribeCache(_) => "describe_cache",
+        Kind::DescribeStorage(_) => "describe_storage",
+        Kind::ThrottleTransfers(_) => "throttle_transfers",
+        Kind::DescribeRequests(_) => "describe_requests",
+        Kind::CacheWarm(_) => "cache_warm",
+        Kind::CommitExperts(_) => "commit_experts",
     }
 }
 
