@@ -475,6 +475,19 @@ pub struct Scheduler {
     /// The report of a policy failure the mechanism did not take from `fail`'s
     /// answer, for the control thread.
     policy_report: Option<policy::PolicyReverted>,
+    /// The routed tokens per expert the executor last published (§4.4's
+    /// `experts`): the one fact the mechanism cannot measure. `None` until the
+    /// executor publishes it, so the periodic call asks nothing it cannot state.
+    expert_load: Option<scheduling::guest::ExpertLoad>,
+    /// The expert placement the policy last answered, validated and waiting for
+    /// the executor's world setup, which applies it (§7.6).
+    expert_order: Option<scheduling::guest::ExpertOrder>,
+    /// The step the policy last answered an expert placement on, so the
+    /// mechanism's interval is measured from the decision, not from step zero.
+    expert_asked: Option<u64>,
+    /// A load the executor published since the last decision: a new load is
+    /// worth asking about at once, rather than after a full interval.
+    expert_load_new: bool,
     /// The candidate a precopy is preparing on a blocking thread, while it runs
     /// (§7.3 step 2): loading and instantiating a policy must not hold the
     /// serving thread.

@@ -666,6 +666,14 @@ pub enum Command {
     /// Hands the control thread a policy failure this scheduler recorded: it
     /// reverted to the previous policy and serves on (§7.3).
     TakePolicyReport(crossbeam_channel::Sender<Option<crate::scheduler::PolicyReverted>>),
+    /// The routed tokens per expert, from the executor's edge: what §4.4's
+    /// periodic `experts` decision is asked about. `None` withdraws them.
+    PublishExpertLoad {
+        load: Option<scheduling::guest::view::ExpertLoad>,
+    },
+    /// Takes the expert placement the policy last answered: the handoff to the
+    /// executor's world setup, which applies it (§7.6).
+    TakeExpertOrder(crossbeam_channel::Sender<Option<scheduling::guest::view::ExpertOrder>>),
     /// Reports the state a policy is instantiated with, as seen from this
     /// scheduler with every rank's load the control thread named (§7.3).
     DescribePolicyState {
@@ -1093,6 +1101,23 @@ impl CommandSender {
         let (answer, progress) = crossbeam_channel::bounded(1);
         let _ = self.send(Command::Progress { answer });
         progress
+    }
+
+    /// Publishes the executor's routed-token counts per expert, or withdraws
+    /// them with `None`.
+    pub fn publish_expert_load(&self, load: Option<scheduling::guest::view::ExpertLoad>) {
+        let _ = self.send(Command::PublishExpertLoad { load });
+    }
+
+    /// Takes the expert placement the policy last answered, for the executor's
+    /// world setup that applies it (§7.6). `None` when no placement is waiting.
+    pub fn take_expert_order(&self) -> Option<scheduling::guest::view::ExpertOrder> {
+        let (answer, taken) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::TakeExpertOrder(answer));
+        taken
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .ok()
+            .flatten()
     }
 
     /// Takes the policy failure this scheduler recorded since the last call,

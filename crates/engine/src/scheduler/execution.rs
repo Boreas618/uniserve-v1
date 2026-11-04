@@ -525,6 +525,18 @@ impl Scheduler {
     /// nothing. The slot is taken out of the scheduler for the calls and put
     /// back whatever they answer, so a failure can hand the mechanism's state
     /// to the switch without borrowing the scheduler the slot lives in.
+    /// How often the mechanism asks for an expert placement, in steps.
+    ///
+    /// §4.4 calls the decision periodic and leaves the period to the mechanism:
+    /// a fixed number of steps, not a clock, so the decision is a function of
+    /// the step count and a program never reads time. Rebalancing experts costs
+    /// a collective on every rank, so the period is long compared with a step.
+    ///
+    /// A load the executor publishes in between is asked about at the next
+    /// step: waiting a full interval to look at new numbers would leave a rank
+    /// hot for no reason.
+    const EXPERT_REBALANCE_STEPS: u64 = 64;
+
     fn policy_step(&mut self) -> Option<Plan> {
         let Some(mut policy) = self.policy.take() else {
             return None;
@@ -548,6 +560,28 @@ impl Scheduler {
         let events = self.recorder.take();
         if let Err(error) = policy.observe(&events) {
             return self.policy_failed(policy, error);
+        }
+        // §4.4's periodic row: the mechanism owns the interval, the executor
+        // publishes the load, and the order is checked and handed to the world
+        // setup that applies it (§7.6). No load means nothing to decide, not a
+        // zero one: the executor has published no routed tokens yet.
+        let experts_due = self.expert_load_new
+            || self
+                .expert_asked
+                .is_none_or(|asked| self.step.saturating_sub(asked) >= Self::EXPERT_REBALANCE_STEPS);
+        if experts_due
+            && let Some(load) = views::expert_load_of(self)
+        {
+            let order = match policy.experts(&load) {
+                Ok(order) => order,
+                Err(error) => return self.policy_failed(policy, error),
+            };
+            if let Err(error) = mechanism::validate_experts(&load, &order) {
+                return self.policy_failed(policy, error);
+            }
+            self.expert_order = Some(order);
+            self.expert_asked = Some(self.step);
+            self.expert_load_new = false;
         }
         let plan = match policy.dispatch(&room) {
             Ok(plan) => plan,
@@ -714,6 +748,21 @@ impl Scheduler {
         let snapshot = policy.instantiated_on().clone();
         self.recorder = mechanism::Recorder::from_snapshot(&snapshot);
         self.policy = Some(policy);
+    }
+
+    /// The executor's routed-token counts per expert, which the mechanism asks
+    /// about on its own interval. The executor's edge publishes them; `None`
+    /// withdraws them.
+    pub(super) fn set_expert_load(&mut self, load: Option<scheduling::guest::ExpertLoad>) {
+        self.expert_load_new = load.is_some();
+        self.expert_load = load;
+    }
+
+    /// The expert placement the policy last answered, taken by the point that
+    /// applies it: the executor's world setup (§7.6). Taking it once is the
+    /// handoff, so a placement is applied once.
+    pub(super) fn take_expert_order(&mut self) -> Option<scheduling::guest::ExpertOrder> {
+        self.expert_order.take()
     }
 
     /// The report of a policy failure, for the control thread to hand up.

@@ -1286,8 +1286,10 @@ pub(crate) fn replica_catalog(scheduler: &Scheduler) -> Vec<ReplicaView> {
 ///
 /// No worker reports the tokens it routed to each expert, so an epoch's views
 /// carry none and the mechanism makes no expert decision.
-pub(crate) fn expert_load_of(_scheduler: &Scheduler) -> Option<ExpertLoad> {
-    None
+pub(crate) fn expert_load_of(scheduler: &Scheduler) -> Option<ExpertLoad> {
+    // The routed tokens per expert are the executor's to measure; the
+    // mechanism states them only once it has been told.
+    scheduler.expert_load.clone()
 }
 
 // ---------------------------------------------------------------------------
