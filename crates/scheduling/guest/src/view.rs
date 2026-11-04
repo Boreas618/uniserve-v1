@@ -168,7 +168,7 @@ pub struct PhaseView {
 ///
 /// This is the vocabulary today's `CallKind` and generation phases have, named
 /// once so a policy orders and charges work by it. Appended, never renumbered.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PhaseKind {
     // Context ingestion: reads the request's inputs and writes the prefix cache.
@@ -199,14 +199,9 @@ pub enum PhaseKind {
     /// (design §4.4, `Plan::refill`).
     Refill,
     /// A phase kind this policy does not know.
+    #[default]
     #[serde(other)]
     Other,
-}
-
-impl Default for PhaseKind {
-    fn default() -> Self {
-        Self::Other
-    }
 }
 
 /// The four classes work is assembled in (design §4.4, `fcfs`).
@@ -230,7 +225,8 @@ impl PhaseKind {
             PhaseKind::TextEncoding
             | PhaseKind::VisionEncoding
             | PhaseKind::LatentEncoding
-            | PhaseKind::Prefill => PhaseClass::Context,
+            | PhaseKind::Prefill
+            | PhaseKind::Refill => PhaseClass::Context,
             PhaseKind::Decode
             | PhaseKind::Verify
             | PhaseKind::TokenDenoise
@@ -247,7 +243,6 @@ impl PhaseKind {
             PhaseKind::LatentPrepare
             | PhaseKind::TensorTransfer
             | PhaseKind::CacheExport
-            | PhaseKind::Refill
             | PhaseKind::Other => PhaseClass::Background,
         }
     }
