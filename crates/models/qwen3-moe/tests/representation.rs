@@ -145,3 +145,27 @@ fn an_unserved_algorithm_is_refused_before_the_architecture_is_even_read() {
     let refused = Representation::read(&dir).expect_err("an unserved algorithm");
     assert!(format!("{refused}").contains("MXFP4"), "{refused}");
 }
+
+/// The declaration's one-line form names what it is and how many modules it keeps out, and does not
+/// carry the modules themselves: a run's first line is not the place for forty-eight paths.
+#[test]
+fn the_declaration_states_itself_in_one_line() {
+    let excluded: Vec<String> = (0..48)
+        .map(|layer| format!("model.layers.{layer}.mlp.gate"))
+        .collect();
+    let declaration = Representation::Nvfp4 {
+        excluded: excluded.clone(),
+        also_excluded: Vec::new(),
+    };
+    let line = declaration.summary();
+    assert_eq!(line, "nvfp4, 48 module(s) excluded");
+    assert!(!line.contains("model.layers"), "{line}");
+    assert!(line.len() < 64, "{line}");
+
+    let side = Representation::Nvfp4 {
+        excluded,
+        also_excluded: vec!["lm_head".to_owned()],
+    };
+    assert_eq!(side.summary(), "nvfp4, 48 module(s) excluded and 1 on the side file");
+    assert_eq!(Representation::Dense.summary(), "dense");
+}
