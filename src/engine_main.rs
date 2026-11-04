@@ -788,8 +788,55 @@ impl MainProcess {
                 self.revert(generation, failure);
                 Ok(None)
             }
-            Action::Epoch => Ok(Some(failure)),
+            Action::Epoch => {
+                // The three failures that end the epoch's service are said before it ends: the
+                // daemon replaces a stalled rank on the report, and a report that never arrives
+                // leaves it reading a process that exited for no stated reason (§2.4, §2.5).
+                self.report_ending(&failure);
+                Ok(Some(failure))
+            }
         }
+    }
+
+    /// States the failure that ends this epoch's service to the daemon (§2.4, §2.5, §7.3 step 4).
+    ///
+    /// A failure with no report of its own is left unsaid rather than given a shape it does not
+    /// have; the process's exit still reaches the daemon.
+    fn report_ending(&mut self, failure: &UpdateFailure) {
+        use proto::process::report::Kind;
+
+        let kind = match failure {
+            UpdateFailure::Stalled { stall } => Kind::Stalled(proto::process::Stalled {
+                generation: self.update.current(),
+                batch: stall
+                    .batch_id
+                    .map_or_else(String::new, |batch| batch.to_string()),
+                // The job's own name, as the executor classifies it: what stalled, not which
+                // operator it was in.
+                job: stall
+                    .route
+                    .clone()
+                    .or_else(|| stall.method.clone())
+                    .unwrap_or_default(),
+                elapsed_ms: stall.running_ms,
+            }),
+            UpdateFailure::Device {
+                device,
+                error,
+                batch: _,
+            } => Kind::Fault(proto::process::Fault {
+                kind: "sticky".to_owned(),
+                reason: error.clone(),
+                device: *device,
+            }),
+            UpdateFailure::NonFiniteLogits { request } => {
+                Kind::NonFiniteLogits(proto::process::NonFiniteLogits {
+                    request: format!("{request:?}"),
+                })
+            }
+            _ => return,
+        };
+        self.send_report(proto::process::Report { kind: Some(kind) });
     }
 
     /// Serves the daemon's buffered messages: request submissions and commands
