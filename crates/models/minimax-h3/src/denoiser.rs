@@ -478,7 +478,7 @@ mod tests {
         .unwrap()
     }
 
-    fn request(frames: u32, width: u32, height: u32) -> VideoRequest {
+    fn request(frames: u32, width: u32, height: u32) -> VideoRequest<'static> {
         VideoRequest {
             task: nn::capability::VideoTask::TextToVideoAudio,
             width,
@@ -488,6 +488,9 @@ mod tests {
             first_frames: 0,
             last_frames: 0,
             references: 0,
+            text_tokens: 0,
+            conditions: &[],
+            vision_spans: &[],
         }
     }
 
