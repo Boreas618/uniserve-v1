@@ -306,11 +306,26 @@ fn a_restore_a_shrunk_budget_refuses_parks_every_pool_again() {
     allocator.suspend().unwrap();
     assert_eq!(allocator.mapped_bytes(PoolKind::Resident), 0);
 
-    // The allowance shrinks below what the three pools mapped. Pools come back
-    // in the allocator's order, so graph (1 MiB) and scratch (2 MiB) map and
-    // the resident pool's 3 MiB is refused — and then nothing may stay
-    // promoted, which is the state a standby's accounting must never see.
-    budget.set_limit((2 << 20) + (1 << 19));
+    // The allowance shrinks below what the three pools map, but not below what
+    // the graph and scratch pools map: both are derived from the blocks the
+    // driver actually gave out, because a block is rounded up to the device's
+    // allocation granularity and a hard-coded limit would refuse whichever pool
+    // first crossed it. Pools come back in the allocator's order, so the
+    // refusal lands on the resident pool — and then nothing may stay promoted,
+    // which is the state a standby's accounting must never see.
+    let limit = (graph.len() + scratch.len() + resident.len() / 2) as u64;
+    assert!(
+        limit >= (graph.len() + scratch.len()) as u64,
+        "the allowance {limit} must cover the graph and scratch blocks ({} + {} bytes)",
+        graph.len(),
+        scratch.len()
+    );
+    assert!(
+        limit < (graph.len() + scratch.len() + resident.len()) as u64,
+        "the allowance {limit} must not cover all three blocks ({} bytes)",
+        graph.len() + scratch.len() + resident.len()
+    );
+    budget.set_limit(limit);
     let refused = allocator.restore().unwrap_err();
     let message = refused.to_string();
     assert!(message.contains("resident"), "{message}");
