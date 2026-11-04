@@ -364,10 +364,11 @@ impl Arguments {
         let Some(metadata) = metadata.filter(|metadata| !metadata.signature.is_empty()) else {
             return Ok(());
         };
-        // A Triton module's signature is what the operator states and only that: the global and the
-        // profile scratch address follow it whatever the scratch sizes are, and `parameters` appends
-        // both after the packed words. Triton 3.7 records them in `global_scratch_size` and
-        // `profile_scratch_size`, not in the signature, so a plain signature holds no scratch entry.
+        // `parameters` appends the global and the profile scratch address after the packed words, so
+        // the launch passes two more words than the operator packed whatever the scratch sizes are.
+        // Triton's metadata may already name those two entries inside the signature (`_embedding_kernel`
+        // does) and may not; filtering them out leaves the signature's own parameters on both sides,
+        // which is the count the operator can be held to.
         let declared: Vec<&Parameter> = metadata
             .signature
             .iter()
