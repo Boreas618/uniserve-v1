@@ -109,10 +109,12 @@ impl VsaTiles {
         self.width
     }
 
-    /// What a preparation needs of its at-rest arguments, checked before any launch.
+    /// What a preparation needs of its at-rest arguments: [`Self::prepare`] calls this before it
+    /// composes a descriptor.
     ///
-    /// Split from [`Self::prepare`] because it needs no device: a layer's argument contract is
-    /// assertable on the host, and a caller that gets it wrong is told before a kernel is resolved.
+    /// It is public because a host test cannot build a [`Forward`] and this is the only part of a
+    /// preparation a test can exercise; a second copy of the rule inside `prepare` would be the
+    /// untested path.
     pub fn check_prepare(
         &self,
         query_weight: bool,
@@ -227,10 +229,12 @@ impl VsaTiles {
         f.operate::<segments::VsaAddGatedTiles>(&descriptor, args)
     }
 
-    /// How many members a composition may name, checked before any launch.
+    /// How many members a composition may name: [`Self::compose`] calls this before it composes a
+    /// descriptor.
     ///
     /// A tensor-parallel group's membership is the caller's, so the count is the caller's argument
-    /// and its refusal belongs where a host can see it.
+    /// and its refusal belongs where a host can see it — public for the same reason as
+    /// [`Self::check_prepare`].
     pub fn check_members(&self, members: usize) -> Result<()> {
         if members == 0 || members > MAX_MEMBERS {
             return Err(Error::shape(

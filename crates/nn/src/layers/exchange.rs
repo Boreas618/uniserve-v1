@@ -2,7 +2,12 @@
 //! back (specs/worker.md 4.3, `UlyssesExchange`).
 //!
 //! The exchange is a collective, not a kernel program: every rank sends the same number of bytes, so
-//! there is nothing to compile per geometry and the epoch record fills no program for it. The layer
+//! there is nothing to compile per geometry and the epoch record fills no program for it.
+//!
+//! No model in this tree composes the layer yet: a sequence-parallel deployment is its consumer
+//! (specs/worker.md 4.3 names it), and it is kept — and tested — for that deployment rather than
+//! because a caller exercises it today. It is not dead code to be deleted; it is the partitioned
+//! path the design states. The layer
 //! holds the group's rank count, which is the model's mathematical partition (specs/worker.md 3,
 //! `Partition`), and calls the operator on the forward's communicator: `[tokens, heads, head_dim]`
 //! becomes `[tokens × ranks, head_dim / ranks]` per rank after [`UlyssesExchange::scatter`] and back
