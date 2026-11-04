@@ -500,6 +500,9 @@ impl Qwen3Moe {
     ///
     /// `last` past the last layer is refused rather than clamped: a stage asking for layer 60 of a
     /// 48-layer model is a caller error, and clamping it would answer a different question.
+    ///
+    /// The answer is the **state** after layer `last` — the reference's `hidden_{last + 1}` — and
+    /// not the block's update, which is one fold short of it (see [`Self::fold`]).
     pub fn forward_through(
         &self,
         f: &Forward,
@@ -526,16 +529,47 @@ impl Qwen3Moe {
                 plan.hidden
             )));
         }
-        self.walk(f, batch, cache, hidden, last, None)
-            .map(|(out, _)| out)
+        let (update, residual) = self.walk(f, batch, cache, hidden, last, None)?;
+        self.fold(f, update, residual)
+    }
+
+    /// The state after a layer: its block's update folded into the residual stream.
+    ///
+    /// This is the tensor the reference calls `hidden_{layer+1}` — the whole state a layer hands
+    /// the next one — and not the block's update, which is an order of magnitude smaller and on its
+    /// own is not a state at all. Comparing one against the other would read as a collapse at every
+    /// layer.
+    ///
+    /// The fold is the layer boundary's own operator, `add_rms_norm`, whose residual output is the
+    /// sum: a boundary has no separate add, and the run accumulates the stream with exactly this
+    /// launch at the next layer's input norm, so the state answered here is bit-identical to the
+    /// one the run produces. The normalization the operator fuses is computed and discarded; its
+    /// weights do not touch the sum.
+    fn fold(&self, f: &Forward, update: TensorView, residual: TensorView) -> Result<TensorView> {
+        let shape = update.shape;
+        let sum = f.arena.tensor(update.dtype, shape)?;
+        let discarded = f.arena.tensor(update.dtype, shape)?;
+        self.layers[0]
+            .input_norm
+            .forward_with_residual(f, update, residual, sum, discarded)
+            .map_err(Error::from)?;
+        Ok(sum)
     }
 
     /// Run layers `0..=layer` and stop inside `layer` after `stage`, answering what it wrote there.
     ///
     /// The prefix is run in full, so the layer's residual stream and every operand are the ones the
     /// whole run hands it: an in-layer walk whose prefix differed from the model's would answer a
-    /// question about a model nobody runs. `stage = Mlp` is [`Self::forward_through`] for the same
-    /// layer, which is what makes this a refinement of the layer walk and not a second path.
+    /// question about a model nobody runs. The cuts sit *inside* the layer, so `MlpOut` is the
+    /// block's update and [`Self::forward_through`] is that update folded into the stream: the two
+    /// differ by the boundary's residual add. The three cuts are one operator each, which is what
+    /// lets a reference post-hook on `input_layernorm`, on `self_attn` and on `mlp` be their
+    /// counterparts.
+    ///
+    /// The prefix's error is the cut's error floor: what the cut shows is a divergence *on top of*
+    /// the state layers `0..layer` already produced, which is the walk's `hidden_{layer}` row. A cut
+    /// that looks clean at layer 30 therefore means "layer 30 adds nothing to a prefix that is
+    /// already off by the walk's error at 29", and never "layers 0..29 are right".
     pub fn forward_substage(
         &self,
         f: &Forward,
@@ -852,15 +886,21 @@ fn headed(projection: TensorView, norm: &Weight) -> Result<Shape> {
 /// - [`Substage::Normalized`] is `input_layernorm`'s output, residual add included for every layer
 ///   after the first (the first's input residual is the embedding itself);
 /// - [`Substage::Attended`] is `self_attn`'s output, projected out and **before** the residual add;
-/// - [`Substage::Mlp`] is the routed (or dense) block's output, which is the layer's output.
+/// - [`Substage::MlpOut`] is the routed (or dense) block's output, **before** its residual add —
+///   transformers' `mlp` post-hook — and one fold short of the layer's output state, which is what
+///   `forward_through` answers and which no cut names because the layer walk already shows it.
+///
+/// Each cut is named after the reference tensor that answers it, and a cut exists only where such a
+/// tensor exists: a name ambiguous about the residual would produce a number that looks like
+/// evidence and is off by a vector the size of the stream (rms ~7.3 in this model).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Substage {
     /// The residual add and the input normalization.
     Normalized,
     /// The attention block's projection out, before the residual add.
     Attended,
-    /// The routed (or dense) block, whose output is the layer's output.
-    Mlp,
+    /// The routed (or dense) block's output, before its residual add (`mlp`).
+    MlpOut,
 }
 
 impl Substage {
@@ -868,14 +908,14 @@ impl Substage {
     ///
     /// The spellings are the contract with a command line that names a stage: the model refuses
     /// anything else, so a mistyped stage cannot silently run a different cut.
-    pub const NAMES: [&'static str; 3] = ["normalized", "attended", "mlp"];
+    pub const NAMES: [&'static str; 3] = ["normalized", "attended", "mlp_out"];
 
     /// The stage `name` asks for, or `None` when it names no cut.
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "normalized" => Some(Self::Normalized),
             "attended" => Some(Self::Attended),
-            "mlp" => Some(Self::Mlp),
+            "mlp_out" => Some(Self::MlpOut),
             _ => None,
         }
     }
@@ -885,7 +925,7 @@ impl Substage {
         match self {
             Self::Normalized => "normalized",
             Self::Attended => "attended",
-            Self::Mlp => "mlp",
+            Self::MlpOut => "mlp_out",
         }
     }
 }
@@ -1019,8 +1059,17 @@ mod tests {
         }
         assert_eq!(Substage::parse("normalized"), Some(Substage::Normalized));
         assert_eq!(Substage::parse("attended"), Some(Substage::Attended));
-        assert_eq!(Substage::parse("mlp"), Some(Substage::Mlp));
-        for refused in ["", "norm", "Normalized", "attention", "attn", "moe", "mlp "] {
+        assert_eq!(Substage::parse("mlp_out"), Some(Substage::MlpOut));
+        for refused in [
+            "",
+            "norm",
+            "Normalized",
+            "attention",
+            "attn",
+            "moe",
+            "mlp",
+            "mlpout",
+        ] {
             assert_eq!(Substage::parse(refused), None, "{refused:?} named no cut");
         }
     }
