@@ -866,6 +866,65 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
         }
         .to_string(),
     );
+    // The audio encoder's projection block, the refiner's own operators: a **causal** dense attention
+    // and a **tanh-GELU** gated unit, and neither shape existed anywhere in this list.
+    //
+    // The geometry is the export's (`audio_vae/config.json`): `latent_dim 2048` over
+    // `num_attention_heads 8` heads of 256, with as many key heads as query heads; `Projection::load`
+    // passes `causal = true` and one sequence with no offsets, so the key carries the `mask_causal`
+    // and `cu_seq_lens_false` forms. The gated unit is `GatedActivation::new(GeluTanh)` over the
+    // latent channels, whose gate and value are **two separate** `[frames, 2 · 32]` buffers rather
+    // than one packed one - so the row stride is the width, and this row is the `gelu_tanh`
+    // activation the DiT's `silu` rows cannot stand in for.
+    push(
+        "dense_attention",
+        ops::attention::DenseDescriptor {
+            query: DType::F32,
+            key_value: DType::F32,
+            output: DType::F32,
+            head_dim: AUDIO_LATENT_DIM / AUDIO_ATTENTION_HEADS,
+            q_heads: AUDIO_ATTENTION_HEADS,
+            kv_heads: AUDIO_ATTENTION_HEADS,
+            mask: ops::attention::Mask::Causal,
+            windowed: false,
+            // A launch bound outside the key: the refiner attends one clip's frames as one sequence.
+            max_kv_len: 4096,
+            cu_seq_lens: false,
+        }
+        .to_string(),
+    );
+    let audio_hidden = 2 * AUDIO_LATENT_CHANNELS;
+    push(
+        "act_and_mul",
+        ops::activation::ActAndMulDescriptor {
+            dtype: DType::F32,
+            width: audio_hidden,
+            block: ELEMENTWISE_BLOCK,
+            activation: ops::activation::Activation::GeluTanh,
+            gate_stride: u64::from(audio_hidden),
+            value_stride: u64::from(audio_hidden),
+            wide: false,
+            pdl: PDL,
+            // `GatedActivation::new` is the default (non-stepwise) form; the DiT's MLP declares the
+            // stepwise one because the reference rounds each row's output as it goes.
+            stepwise: false,
+        }
+        .to_string(),
+    );
+    // The projection's MLP normalizes over the latent channels (`projection.mlp.norm`,
+    // `LayerNorm` at 32 with its bias), a width no other row of this list has.
+    push(
+        "layer_norm",
+        ops::norm::LayerNormDescriptor {
+            dtype: DType::F32,
+            columns: AUDIO_LATENT_CHANNELS,
+            tile: row_tile(AUDIO_LATENT_CHANNELS),
+            bias: true,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
+
     // The video path's last step: the VAE's raster is `float16`
     // (`uniserve/models/minimax_h3/output.py`'s own state buffer), three channels, packed bytes.
     for vae in VAES {
