@@ -162,10 +162,11 @@ impl<'a> Issue for Recording<'a> {
 
     unsafe fn fill(&self, fill: Fill) -> Result<()> {
         self.batch.push(Box::new(move |stream| match stream {
+            Some(stream) =>
             // SAFETY: forwarded from the caller.
-            Some(stream) => unsafe { stream.fill(fill) },
-            // SAFETY: forwarded from the caller.
+            unsafe { stream.fill(fill) },
             None => {
+                // SAFETY: forwarded from the caller.
                 unsafe { fill_host(fill) };
                 Ok(())
             }
@@ -175,10 +176,11 @@ impl<'a> Issue for Recording<'a> {
 
     unsafe fn memset_2d(&self, fill: RowFill) -> Result<()> {
         self.batch.push(Box::new(move |stream| match stream {
+            Some(stream) =>
             // SAFETY: forwarded from the caller.
-            Some(stream) => unsafe { stream.memset_2d(fill) },
-            // SAFETY: forwarded from the caller.
+            unsafe { stream.memset_2d(fill) },
             None => {
+                // SAFETY: forwarded from the caller.
                 unsafe { fill_host_rows(fill) };
                 Ok(())
             }

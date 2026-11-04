@@ -63,6 +63,8 @@ pub struct Memory {
     pub slots: RequestSlots,
     /// The page-locked host blocks copies go through.
     pub pinned: Arc<PinnedPool>,
+    /// The device this rank's memory lives on, as the plan states it.
+    pub device: crate::config::Device,
     /// The device's pools, which the scratch page set a paired forward writes
     /// is taken from: its bytes are booked against the same allowance as every
     /// other pool, so the shadow never writes memory the report cannot see.
@@ -237,6 +239,9 @@ impl Memory {
             products,
             slots,
             pinned,
+            device: request
+                .device
+                .map_or(crate::config::Device::Cpu, crate::config::Device::Cuda),
             pools: request.pools,
         })
     }
@@ -254,9 +259,10 @@ impl Memory {
             mut products,
             slots,
             pinned,
+            device,
             pools,
         } = self;
-        drop(pools);
+        drop((device, pools));
         // The products go first: their reads retain views into the cache, and the cache's
         // segments are the last thing an epoch gives back.
         let drained = products.close();
@@ -319,6 +325,11 @@ impl Memory {
         lock(&self.prefix_cache)
             .planes()
             .restore_segments(storage, stream, limit)
+    }
+
+    /// The device this rank's memory lives on.
+    pub fn device(&self) -> crate::config::Device {
+        self.device
     }
 
     /// The device's pools, so a paired forward can take its scratch page set
