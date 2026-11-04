@@ -29,6 +29,12 @@ pub struct EncodingId(pub u64);
 #[serde(transparent)]
 pub struct PhaseId(pub u32);
 
+impl Default for PhaseId {
+    fn default() -> Self {
+        Self(0)
+    }
+}
+
 /// A block of the model: an encoder, denoiser, decoder or causal language
 /// model (design §0, §4.3). A block names the computation, not the replica
 /// that runs it.
