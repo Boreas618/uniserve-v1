@@ -30,7 +30,9 @@ struct uniserve_conv_call {
   int32_t groups;
   // 0 for a convolution, 1 for a transposed one.
   int32_t transposed;
-  // 1 when the library may use TF32 for an FP32 convolution.
+  // 1 when the library may use TF32 for an FP32 convolution. With 0 the module uses
+  // only an engine that does not narrow its inputs; a convolution whose inputs are
+  // not FP32 may not set it, and is refused if it does.
   int32_t tf32;
   char error[512];
 };
