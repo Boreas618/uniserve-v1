@@ -280,12 +280,17 @@ impl EpochPlan {
     /// largest bucket is refused before a kernel runs, so the catalog is the admission bound), and,
     /// for the page size and the cache dtype, what was opened rather than what was asked for.
     ///
-    /// The facts no source states stay `None`, and that is the answer rather than a gap to fill
-    /// with a guess: `hosts` is the deployment's hosts in rank order, which the launch file does not
-    /// carry (`Launch::peers` is this node's peer addresses), and `bos`, `eos`, `end_of_image` and
-    /// `generation_limits` are the checkpoint's tokenizer and generation facts, which neither the
-    /// launch file nor the model's configuration states. `engine::EngineConfig::of` refuses each of
-    /// them by name, so a deployment that needs one fails with the fact it is missing.
+    /// Two facts are answered only as far as a launch file can answer them. `hosts` is one host
+    /// name per rank in rank order: a world of one states this node's own, because one node is one
+    /// host and the name is read from the machine rather than invented, while a world of more ranks
+    /// leaves the fact absent - the real names are the deployment's, and a launch file, which is per
+    /// node, does not carry them (`Launch::peers` is this node's peer addresses).
+    ///
+    /// The rest stay `None`, and that is the answer rather than a gap to fill with a guess: `bos`,
+    /// `eos`, `end_of_image` and `generation_limits` are the checkpoint's tokenizer and generation
+    /// facts, which neither the launch file nor the model's configuration states.
+    /// `engine::EngineConfig::of` refuses each absent fact by name, so a deployment that needs one
+    /// fails with the fact it is missing rather than planning against a made-up value.
     pub(crate) fn rank_facts(
         &self,
         memory: &Memory,
@@ -627,8 +632,11 @@ pub(crate) fn rank_report(
             ipc::CallKind::Forward(ipc::ForwardMode::Decode),
         ],
         media_components: std::collections::BTreeMap::new(),
+        // The component this rank holds, named as the placement names it (`schedulers` places one
+        // component over every rank). The scheduler routes a call by component name, so a rank that
+        // advertised a name of its own would hold nothing any pool asks for.
         components: vec![ipc::ComponentInfo {
-            name: "backbone".to_owned(),
+            name: ipc::DEFAULT_COMPONENT.to_owned(),
             outputs: Vec::new(),
         }],
     })

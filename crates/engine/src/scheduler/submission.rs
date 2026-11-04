@@ -523,6 +523,10 @@ impl InProcess {
             shape,
             columns,
             generation,
+            // The mechanism fills this from the batch's `CacheUnitAllocation` once the scheduler
+            // states it; the seam names it so a batch that reuses a cached prefix cannot be served
+            // without it.
+            cache_units: Vec::new(),
         };
         Ok((device, calls))
     }
