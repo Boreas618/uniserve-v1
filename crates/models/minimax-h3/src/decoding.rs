@@ -168,11 +168,16 @@ impl Buffer {
 ///
 /// `tiles` are in grid order ([`Tiles::tiles`]), and each tile contributes
 /// `frames · (rows_end − rows_start) · (columns_end − columns_start)` entries: the row index
-/// `((frame · h + row) · w + column)` of each of its voxels. **The counts are returned with the rows
-/// because they are not all equal**: the seams spread their slack, so the last tile of an axis can be
-/// narrower than the tile size, and a consumer that pads the table to one uniform tile stride needs the
-/// per-tile lengths to know where each block ends. Taken together the entries are a permutation of
-/// `0..frames · h · w`, because the tiles partition the raster.
+/// `((frame · h + row) · w + column)` of each of its voxels.
+///
+/// The counts are returned with the rows rather than left implicit, because they are not derivable from
+/// the tile size alone: a canvas side shorter than one tile gives a single tile of that side
+/// (`Seams::split`'s one-tile branch), so a block can be smaller than the tile. Where the side is at
+/// least a tile, every tile is exactly the tile's extent — `Seams::split` builds `lengths = [tile; n]`
+/// and distributes the slack over the seams — so the grid is uniform and the counts are all equal.
+///
+/// **The tiles overlap at their seams**, so the entries are not a permutation of the clip's voxels: a
+/// seam's positions are decoded by both neighbours, which is what the blend is for.
 pub fn tile_rows(canvas: &Canvas, tiles: &[Tile]) -> (Vec<i32>, Vec<u32>) {
     let height = u64::from(canvas.height);
     let width = u64::from(canvas.width);
