@@ -424,11 +424,17 @@ impl Op for QkNormRope {
             ));
         }
         let pairs = u64::from(descriptor.rotated) / 2;
-        let tokens = args.query.rows();
-        if args.key.rows() != tokens {
+        // The token count is the FIRST extent: these views are `[tokens, heads, head_dim]`, and
+        // `rows()` is the product of every extent but the last, which would count tokens times
+        // heads. A head count of one hides that; any real head count refuses its own query view.
+        let tokens = args.query.shape.dim(0);
+        if args.key.shape.dim(0) != tokens {
             return Err(Error::argument(
                 Self::NAME,
-                format!("{} query tokens but {} key tokens", tokens, args.key.rows()),
+                format!(
+                    "{tokens} query tokens but {} key tokens",
+                    args.key.shape.dim(0)
+                ),
             ));
         }
         args.query.require_shape(

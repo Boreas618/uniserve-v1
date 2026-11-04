@@ -257,6 +257,23 @@ pub(crate) fn total_bytes(device: DeviceId) -> Result<u64> {
     Ok(device.memory_info()?.total)
 }
 
+/// Storage of a CUDA device a rank may still plan into, in bytes: what is
+/// FREE when the plan runs.
+///
+/// A rank that loads its model first measures a device the weights are already
+/// mapped on, so what a plan may spend is what is left, not what was there
+/// before the load - retained weights are device memory (they are published as
+/// device blocks and imported by handle, 4.1), and a plan over the total would
+/// budget pools on bytes the weights already hold. A parked standby's storage
+/// counts as spent, because it is real and 7.4 keeps it mapped to serve again.
+///
+/// The figure is a plan input, read once before any pool maps; every mapping
+/// after it is booked against the same allowance, and the ledger is the
+/// enforcement.
+pub(crate) fn available_bytes(device: DeviceId) -> Result<u64> {
+    Ok(device.memory_info()?.free)
+}
+
 /// A deployment's quota of a device of `total` bytes for `fraction` of it:
 /// `⌊total × fraction⌋`.
 pub(crate) fn quota(total: u64, fraction: f64) -> u64 {

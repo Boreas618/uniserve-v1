@@ -26,12 +26,17 @@ pub struct PcmInterleave {
 }
 
 impl PcmInterleave {
-    /// The interleave of `dtype` float channels, which is the decoder's own output type.
+    /// The interleave of `dtype` channels, which is the decoder's own output type.
+    ///
+    /// FP32 only, because that is the type `pcm_interleave` is compiled for: the reference's
+    /// quantization is one multiply, one rounding and one cast, and a kernel that read halves would
+    /// have to round in FP32 anyway. A decoder that emits another float type is refused here rather
+    /// than at its launch, and widening this is a program for `ops::pcm` to state first.
     pub fn new(dtype: DType) -> Result<Self> {
-        if !dtype.is_float() {
+        if dtype != DType::F32 {
             return Err(Error::shape(
                 "PcmInterleave",
-                format!("a PCM conversion reads a float signal, not {dtype}"),
+                format!("the PCM interleave reads f32 channels, not {dtype}"),
             ));
         }
         Ok(Self { dtype })

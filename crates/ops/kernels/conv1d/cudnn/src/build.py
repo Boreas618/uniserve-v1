@@ -1,9 +1,11 @@
 """The convolution packages' compile script: one descriptor -> one module.
 
 The module is the convolution itself: cuDNN 9's backend API, asked once for an
-engine and then executed on the caller's stream. A descriptor is the element
-types and the geometry, both known when the module is compiled, so the script
-passes them to the compiler as defines, and the entry is the package's operator.
+engine and then executed on the caller's stream. A descriptor is the three element
+types and nothing else: the geometry, the bias and the TF32 choice arrive in the
+call structure, which the entry reads, so one module serves every window, filter,
+group count and rank of its types. The script passes the types and the operator's
+entry name to the compiler as defines.
 
 `tuning/engines.json`, when the package carries one, maps a descriptor key to
 the cuDNN engine's global index a tuning pass chose for it (design section 5.4);

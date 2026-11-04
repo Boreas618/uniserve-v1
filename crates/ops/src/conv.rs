@@ -92,15 +92,14 @@ pub struct Descriptor {
 
 impl fmt::Display for Descriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Only what selects a compiled module is in the key. The geometry, the bias, the TF32 choice
+        // and the rank travel in the call structure (`Call`), which the entry reads: a convolution of a
+        // different window, or with a bias, or in the transposed direction, launches the same module.
+        // A key that named them would compile one module per clip length and per filter shape.
         Key::new()
             .field("input", self.input)
             .field("weight", self.weight)
             .field("output", self.output)
-            .field("geometry", self.geometry)
-            .field("bias", self.bias)
-            .field("tf32", self.tf32)
-            .field("rank", self.rank)
-            .field("transposed", self.transposed)
             .finish(formatter)
     }
 }

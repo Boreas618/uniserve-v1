@@ -615,10 +615,17 @@ impl Storage {
         Ok(lock(&self.segments()?.mapping).allocation(index))
     }
 
-    /// Map an allocation the host's Storage Server retains, `bytes` long,
+    /// Map a **device** allocation the Storage Server retains, `bytes` long,
     /// through its `descriptor`, with `protection` for `device` and every
     /// device in `access`. The mapping is registered as resident exportable
     /// storage, which this process exports in place by its descriptor.
+    ///
+    /// The descriptor must be one `cuMemExportToShareableHandle` produced from
+    /// a `cuMemCreate` allocation, which is what a device placement's is: this
+    /// is the VMM import, and it cannot take a host record. A `Placement::Host`
+    /// record's storage is a memfd, and it is mapped and registered instead by
+    /// [`Storage::import_host`] (read-only) or [`Storage::map_host`]
+    /// (read-write). The record's placement is the rule, not this function.
     pub(crate) fn import(
         descriptor: OwnedFd,
         bytes: usize,
