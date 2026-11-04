@@ -397,10 +397,6 @@ impl Column {
 
 /// The batch columns of every bucket of one runner, sized for the largest bucket it serves.
 struct Columns {
-    /// The tokens the largest bucket holds.
-    tokens: usize,
-    /// The rows the largest bucket holds.
-    rows: usize,
     positions: Column,
     /// `[tokens]` i32 the input ids, which the model embeds into the forward's hidden states.
     input_ids: Column,
@@ -433,8 +429,6 @@ impl Columns {
         let rows = largest.rows as u64;
         let parameters = rows * u64::from(ops::sampler::PARAMETER_COLUMNS);
         Ok(Self {
-            tokens: tokens as usize,
-            rows: rows as usize,
             positions: Column::new(device, DType::I32, tokens)?,
             input_ids: Column::new(device, DType::I32, tokens)?,
             slot_mapping: Column::new(device, DType::I32, tokens)?,
