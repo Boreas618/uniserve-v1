@@ -862,10 +862,20 @@ impl PrefixCache {
         retained: &crate::memory::retained::Retained,
         entry: &ipc::StateTransfer,
         page: &StatePage,
-        snapshot: &mut Snapshot,
+        snapshot: Option<&mut Snapshot>,
         generation: &ops::Generation,
         stream: &Stream,
     ) -> Result<()> {
+        // A runner binds one snapshot per state group before its first capture, because a step
+        // allocates nothing (4.5). A transfer that carries state reaching a runner with none is a
+        // model change, and it is refused rather than scattered into nothing.
+        let snapshot = snapshot.ok_or_else(|| {
+            Error::Invariant(
+                "this runner holds no state snapshot: a model with a state group binds one before \
+                 its first capture"
+                    .into(),
+            )
+        })?;
         let device = self
             .planes
             .device_of()
