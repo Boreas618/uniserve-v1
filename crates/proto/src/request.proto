@@ -55,7 +55,35 @@ message FromEngine {
     RequestsDescribed requests_described = 9;
     // TCP artifact bytes, sent contiguously before their Artifact event.
     ArtifactPart artifact_part = 10;
+    // The main process's counters for the frontend's `/metrics` (minor 4).
+    Metrics metrics = 11;
   }
+}
+
+// The main process's counters for the deployment's `/metrics`, which the
+// frontend serves: sent once a second while the main process serves, and
+// once more when it drains. They are per epoch and additive — an epoch
+// starts at zero and the frontend sums the epochs it serves. `device_ns` is
+// CUPTI kernel time summed over batches, in nanoseconds, when profiling is
+// on and zero otherwise; `queue` is the waiting depth of each DP rank.
+message Metrics {
+  uint64 steps = 1;
+  uint64 batches = 2;
+  uint64 tokens = 3;
+  uint64 kernel_launches = 4;
+  uint64 device_ns = 5;
+  repeated QueueDepth queue = 6;
+  // Fuel the scheduling policy's calls consumed, summed over the scheduler
+  // threads since the main process started: the deterministic proxy for the
+  // per-step cost design §12 measures.
+  uint64 policy_fuel = 7;
+  // The number of those policy calls.
+  uint64 policy_calls = 8;
+}
+
+message QueueDepth {
+  uint32 rank = 1;
+  uint32 depth = 2;
 }
 
 // What travels to the engine process after the welcome.
@@ -221,7 +249,6 @@ message Abort {}
 message Consumed {
   uint64 events = 1;
 }
-
 // A command for the whole engine.
 message EngineCommand {
   reserved 2;
