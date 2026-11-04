@@ -52,6 +52,7 @@ impl fmt::Display for NoiseDescriptor {
 }
 
 /// The arguments of `philox_noise`.
+#[derive(Clone, Copy)]
 pub struct NoiseArgs {
     /// `[rows, elements]`, contiguous: receives one standard normal sample per row.
     pub out: TensorView,

@@ -63,6 +63,7 @@ impl fmt::Display for ZeroPaddingDescriptor {
 }
 
 /// The arguments of `vsa_zero_padding`.
+#[derive(Clone, Copy)]
 pub struct ZeroPaddingArgs {
     /// `[tiles · tile_rows, heads, width]`, unit column stride; rows past a tile's valid size become
     /// zeros.
@@ -163,6 +164,7 @@ impl fmt::Display for AddGatedTilesDescriptor {
 }
 
 /// The arguments of `vsa_add_gated_tiles`.
+#[derive(Clone, Copy)]
 pub struct AddGatedTilesArgs {
     /// `[tiles · tile_rows, heads, width]`, unit column stride; receives the gated compression.
     pub output: TensorView,
@@ -299,6 +301,7 @@ impl fmt::Display for ComposeGatedRowsDescriptor {
 }
 
 /// The arguments of `vsa_compose_gated_rows`.
+#[derive(Clone, Copy)]
 pub struct ComposeGatedRowsArgs {
     /// `[members, count, heads, width]`, contiguous: receives the members' gated rows.
     pub output: TensorView,
@@ -486,6 +489,7 @@ impl fmt::Display for SelectTilesDescriptor {
 }
 
 /// The arguments of `vsa_select_tiles`.
+#[derive(Clone, Copy)]
 pub struct SelectTilesArgs {
     /// `[heads, query tiles, tiles]` FP32, contiguous: the pooled (query tile, key tile) scores.
     pub scores: TensorView,
@@ -675,6 +679,7 @@ impl fmt::Display for PrepareTilesDescriptor {
 }
 
 /// The arguments of `vsa_prepare_tiles`.
+#[derive(Clone, Copy)]
 pub struct PrepareTilesArgs {
     /// `[tiles · tile_rows, heads, width]`, unit column stride: the query rows, normalized and
     /// rotated in place.

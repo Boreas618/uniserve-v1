@@ -90,6 +90,7 @@ impl fmt::Display for ModulatedRmsNormDescriptor {
 /// The three modulation vectors are `[parameters, width]` with `width` unit-strided and their leading
 /// stride equal to the descriptor's, because the kernel addresses a parameter row from the leading
 /// axis alone. `update` and `retain` are present exactly when the descriptor says so.
+#[derive(Clone, Copy)]
 pub struct Args {
     /// `[rows, width]`, contiguous: the activation row the mean square reduces.
     pub value: TensorView,
@@ -369,6 +370,7 @@ impl fmt::Display for GatedResidualDescriptor {
 }
 
 /// The arguments of `gated_residual`.
+#[derive(Clone, Copy)]
 pub struct GatedResidualArgs {
     /// `[rows, width]`, contiguous: the residual stream.
     pub hidden: TensorView,

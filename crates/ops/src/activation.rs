@@ -97,6 +97,7 @@ impl fmt::Display for ActAndMulDescriptor {
 }
 
 /// The arguments of `act_and_mul`.
+#[derive(Clone, Copy)]
 pub struct ActAndMulArgs {
     /// The gate half, its rows `gate_stride` elements apart and its last axis unit-strided.
     pub gate: TensorView,
@@ -288,6 +289,7 @@ impl fmt::Display for ValueFirstSwigluDescriptor {
 }
 
 /// The arguments of `value_first_swiglu`.
+#[derive(Clone, Copy)]
 pub struct ValueFirstSwigluArgs {
     /// `[..., 2 · width]`, contiguous, value half first: the packed projection.
     pub value_gate: TensorView,
@@ -469,6 +471,7 @@ impl fmt::Display for ActAndMulE4M3Descriptor {
 }
 
 /// The arguments of `act_and_mul_fp8`.
+#[derive(Clone, Copy)]
 pub struct ActAndMulE4M3Args {
     /// The gate half, its rows `gate_stride` elements apart.
     pub gate: TensorView,
@@ -609,6 +612,7 @@ impl fmt::Display for ValueFirstSwigluE4M3Descriptor {
 }
 
 /// The arguments of `value_first_swiglu_fp8`.
+#[derive(Clone, Copy)]
 pub struct ValueFirstSwigluE4M3Args {
     /// `[rows, 2 · width]`, contiguous, value half first.
     pub value_gate: TensorView,
@@ -753,6 +757,7 @@ impl fmt::Display for SwigluDescriptor {
 }
 
 /// The arguments of `swiglu`.
+#[derive(Clone, Copy)]
 pub struct SwigluArgs {
     /// The value half, its rows `value_stride` elements apart.
     pub value: TensorView,

@@ -84,6 +84,7 @@ impl FramePadDescriptor {
 }
 
 /// The arguments of `frame_pad`.
+#[derive(Clone, Copy)]
 pub struct FramePadArgs {
     /// `[batch, channels, frames, height, width]`, any strides, its columns unit-strided.
     pub values: TensorView,
@@ -319,6 +320,7 @@ impl fmt::Display for FrameMomentsDescriptor {
 }
 
 /// The arguments of `frame_moments`.
+#[derive(Clone, Copy)]
 pub struct FrameMomentsArgs {
     /// `[batch, channels, frames, height, width]` FP32, each frame's pixels contiguous.
     pub values: TensorView,
@@ -527,6 +529,7 @@ const _: () = assert!(offset_of!(FrameNormPadCall, error) == 216);
 const _: () = assert!(size_of::<FrameNormPadCall>() == 216 + MESSAGE);
 
 /// The arguments of `frame_norm_pad`.
+#[derive(Clone, Copy)]
 pub struct FrameNormPadArgs {
     /// `[batch, channels, frames, height, width]` FP32, each frame's pixels contiguous.
     pub values: TensorView,
@@ -712,10 +715,7 @@ impl Op for FrameNormPad {
                 .weight
                 .map(|view| view.ptr.address())
                 .unwrap_or_default(),
-            bias: args
-                .bias
-                .map(|view| view.ptr.address())
-                .unwrap_or_default(),
+            bias: args.bias.map(|view| view.ptr.address()).unwrap_or_default(),
             out: args.out.ptr.address(),
             out_batch: args.out.strides.get(0) as i64,
             out_channel: args.out.strides.get(1) as i64,

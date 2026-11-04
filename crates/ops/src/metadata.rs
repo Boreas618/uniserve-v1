@@ -104,6 +104,7 @@ impl fmt::Display for GatherRowsDescriptor {
 }
 
 /// The arguments of `attention_gather_rows`.
+#[derive(Clone, Copy)]
 pub struct GatherRowsArgs {
     /// `[row_columns_size]` int64: the device copy of the call's host columns.
     pub columns: TensorView,
@@ -456,6 +457,7 @@ impl fmt::Display for GatherDecodeInputsDescriptor {
 }
 
 /// The arguments of `attention_gather_decode_inputs`.
+#[derive(Clone, Copy)]
 pub struct GatherDecodeInputsArgs {
     /// `[rows]`: each decode row's scheduler-owned request slot; slot 0 pads the row.
     pub request_pool_indices: TensorView,

@@ -152,6 +152,7 @@ const _: () = assert!(
 );
 
 /// The arguments of a convolution.
+#[derive(Clone, Copy)]
 pub struct Args {
     /// `[n, c, …]`.
     pub input: TensorView,

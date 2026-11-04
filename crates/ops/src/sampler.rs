@@ -82,6 +82,7 @@ impl fmt::Display for ShapeDescriptor {
 }
 
 /// The arguments of `logits_shape`.
+#[derive(Clone, Copy)]
 pub struct ShapeArgs {
     /// `[rows, vocabulary]` raw logits.
     pub logits: TensorView,
@@ -208,6 +209,7 @@ impl fmt::Display for TopKDescriptor {
 }
 
 /// The arguments of `top_k`.
+#[derive(Clone, Copy)]
 pub struct TopKArgs {
     /// `[rows, vocabulary]` shaped logits.
     pub logits: TensorView,
@@ -302,6 +304,7 @@ impl fmt::Display for FilterDescriptor {
 }
 
 /// The arguments of `filter_candidates`.
+#[derive(Clone, Copy)]
 pub struct FilterArgs {
     /// `[rows, width]` FP32 candidates, descending; a dropped candidate is written as `-inf`.
     pub values: TensorView,
@@ -402,6 +405,7 @@ impl fmt::Display for InverseCdfDescriptor {
 }
 
 /// The arguments of `inverse_cdf`.
+#[derive(Clone, Copy)]
 pub struct InverseCdfArgs {
     /// `[rows, width]` FP32 candidate probabilities, in descending logit order.
     pub probabilities: TensorView,
@@ -509,6 +513,7 @@ impl fmt::Display for ArgMaxDescriptor {
 }
 
 /// The arguments of `argmax`.
+#[derive(Clone, Copy)]
 pub struct ArgMaxArgs {
     /// `[rows, width]` logits or candidates.
     pub values: TensorView,
@@ -590,6 +595,7 @@ impl fmt::Display for LogSoftmaxDescriptor {
 }
 
 /// The arguments of `log_softmax`.
+#[derive(Clone, Copy)]
 pub struct LogSoftmaxArgs {
     /// `[rows, columns]`.
     pub x: TensorView,
@@ -672,6 +678,7 @@ impl fmt::Display for LogprobDescriptor {
 }
 
 /// The arguments of `logprob_gather`.
+#[derive(Clone, Copy)]
 pub struct LogprobArgs {
     /// `[rows, columns]` FP32 log-probabilities.
     pub logprobabilities: TensorView,
