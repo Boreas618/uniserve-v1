@@ -599,7 +599,57 @@ fn main() {
         }
         .to_string(),
     );
-    // The vision tower's MLP activation, over its own `intermediate_size 4304`.
+    // Its norms are `[patches, 1152]`, so the tile is the layer's `next_power_of_two`.
+    push(
+        "layer_norm",
+        ops::norm::LayerNormDescriptor {
+            dtype: DType::BF16,
+            columns: 1152,
+            tile: 1152_u32.next_power_of_two(),
+            bias: true,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
+    // Its 2-D rotary turns each head's leading half against the trailing half (`Rotation::Half`,
+    // `vision.rs`'s `Rotate::new(head_dim, heads, Rotation::Half)`), 8 rows and 128 lanes per program
+    // (`nn::layers::rotate`'s own constants); the whole 72-element head rotates, so no narrower
+    // `rotated` is appended.
+    push(
+        "rope_apply",
+        ops::rope::RopeApplyDescriptor {
+            dtype: DType::BF16,
+            output: DType::BF16,
+            head_dim: 72,
+            heads: 16,
+            rotation: ops::rope::Rotation::Half,
+            rows: 8,
+            block: 128,
+            pdl: PDL,
+            rotated: 72,
+        }
+        .to_string(),
+    );
+    // Its learned position table, bilinearly resampled from the 48 × 48 it was trained on to the
+    // patch grid a request's frame count produces. `channels` and `in_side` are compiled in; the
+    // output's grid is the args' extent.
+    push(
+        "position_interpolate",
+        ops::position::Descriptor {
+            dtype: DType::BF16,
+            channels: 1152,
+            in_side: 48,
+            block: 1024,
+            pdl: PDL,
+        }
+        .to_string(),
+    );
+
+    // The vision tower is `Qwen3VLVisionModel` (`text_encoder/config.json`'s `vision_config`):
+    // `hidden_size 1152`, `num_heads 16` — so `head_dim 72` — 27 blocks, `num_position_embeddings
+    // 2304` (a 48 × 48 learned table), `patch_size 16`, `temporal_patch_size 2`, and both weight and
+    // bias on every LayerNorm (the checkpoint's `model.visual.*.norm{1,2}.bias` entries). Its MLP
+    // activation is `gelu_pytorch_tanh` over `intermediate_size 4304`.
     push(
         "gelu",
         ops::gelu::Descriptor {
@@ -722,14 +772,10 @@ fn main() {
     // itself (the tile reduction and its stride) is `vsa_prepare_tiles`' launch values.
     push(
         "vsa_scores",
-        ops::segments::ScoresDescriptor::new(
-            DType::BF16,
-            HEADS,
-            HEAD_DIM,
-            HEAD_DIM.next_power_of_two(),
-            PDL,
-        )
-        .to_string(),
+        // FP32: `vsa_prepare_tiles` writes each tile's per-head means in FP32, so the product has no
+        // element-type field at all.
+        ops::segments::ScoresDescriptor::new(HEADS, HEAD_DIM, HEAD_DIM.next_power_of_two(), PDL)
+            .to_string(),
     );
 
     // ---- The audio encoder's frame/channel swap, in the audio VAEs' own FP32.
