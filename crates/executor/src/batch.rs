@@ -245,38 +245,36 @@ impl BatchColumns {
 
     /// Whether every column has the length its field promises for `shape`, so that a mis-sized
     /// batch fails before a launch rather than after one.
-    ///
-    /// Three counts, not one: `input_ids` is as long as the batch's tokens, `slots` and
-    /// `parameters` as long as its rows — the sequences, which is `[rows]` in every per-row column
-    /// and what [`BatchColumns::rows`] answers — and `commit` is one row per *call*, since a call
-    /// states once how the step advances its slot however many rows it evaluated. A verify batch
-    /// of three candidates is one call and three rows, and comparing the per-row columns with the
-    /// call count refuses it.
     pub fn check(&self, shape: &Shape) -> Result<()> {
         let tokens = self.rows.tokens();
+        // Two counts, and a column belongs to one of them: `slots`, `parameters`, `seq_lens` and
+        // `logits_rows` are per **row** (a verify or branch call carries several rows for one call),
+        // while the commit table states one row per **call** (`crates/engine`'s `columns.rs`).
+        // Sizing one against the other refuses a valid multi-row call and lets a wrong commit table
+        // through.
         let rows = self.rows();
         let calls = self.calls();
+        let parameters = ops::sampler::PARAMETER_COLUMNS as usize;
         for (name, actual, expected) in [
+            ("positions", self.rows.positions.len(), tokens),
+            ("slot_mapping", self.rows.slot_mapping.len(), tokens),
             ("input_ids", self.input_ids.len(), tokens),
+            ("seq_lens", self.rows.seq_lens.len(), rows),
+            ("logits_rows", self.rows.logits_rows.len(), rows),
             ("slots", self.slots.len(), rows),
+            ("parameters", self.parameters.len(), rows * parameters),
             (
-                "parameters",
-                self.parameters.len(),
-                rows * ops::sampler::PARAMETER_COLUMNS as usize,
+                "commit",
+                self.commit.len(),
+                ops::commit::COMMIT_FIELDS * calls,
             ),
         ] {
             if actual != expected {
                 return Err(Error::Invalid(format!(
-                    "{name} has {actual} entries, the batch has {rows} rows and {tokens} tokens \
-                     in {calls} calls"
+                    "{name} has {actual} entries, the batch has {rows} rows, {calls} calls and \
+                     {tokens} tokens"
                 )));
             }
-        }
-        if self.commit.len() % calls.max(1) != 0 {
-            return Err(Error::Invalid(format!(
-                "commit has {} entries, not a whole number of columns over {calls} calls",
-                self.commit.len()
-            )));
         }
         if tokens > shape.tokens as usize || rows > shape.rows as usize {
             return Err(Error::Invalid(format!(

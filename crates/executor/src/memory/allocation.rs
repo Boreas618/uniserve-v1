@@ -663,10 +663,24 @@ impl Storage {
         Ok((storage, descriptor))
     }
 
-    /// New host storage for the Storage Server to retain, of `bytes`, mapped
-    /// writable and registered in `device`'s context, and the descriptor
-    /// that publishes it. Contents are zero.
+    /// New host storage for the Storage Server to retain, at least `bytes`
+    /// long, mapped writable and registered in `device`'s context, and the
+    /// descriptor that publishes it. Contents are zero.
+    ///
+    /// The driver imports a retained allocation in whole granules, so the
+    /// allocation is rounded up to the granularity of the handle the import
+    /// uses: a weight's length is its shape's and is rarely a granule, and the
+    /// server refuses the import rather than padding it. What the tail holds is
+    /// the caller's record's business, so [`Storage::bytes`] answers the
+    /// rounded length while the record states the bytes that mean something.
     pub(crate) fn host_retainable(device: DeviceId, bytes: usize) -> Result<(Arc<Self>, OwnedFd)> {
+        let granularity = platform::HandleType::probe(device)?.granularity(device)?;
+        let bytes = bytes
+            .div_ceil(granularity)
+            .checked_mul(granularity)
+            .ok_or_else(|| {
+                Error::Invalid(format!("a retained allocation of {bytes} bytes overflows"))
+            })?;
         let descriptor =
             rustix::fs::memfd_create("uniserve-retained", rustix::fs::MemfdFlags::CLOEXEC)
                 .map_err(|error| {
