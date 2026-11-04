@@ -336,8 +336,7 @@ pub(crate) const EPOCH_ENGINE: u64 = 0;
 /// once it stopped.
 /// The daemon's process table: the processes this node supervises, which
 /// `GET /admin/config` reports and which a successor daemon keeps (§2.3).
-pub(crate) type ProcessTable =
-    std::sync::Arc<std::sync::Mutex<Vec<crate::epoch::ManagedProcess>>>;
+pub(crate) type ProcessTable = std::sync::Arc<std::sync::Mutex<Vec<crate::epoch::ManagedProcess>>>;
 
 /// Publishes the node's live processes into `table`, keeping what the epoch
 /// layer recorded of each of them — its epoch, its build and the state it
@@ -400,6 +399,7 @@ pub(crate) fn serve_leader(
     reports: Sender<(u64, process::Report)>,
     requests: Receiver<(Request, Sender<Reply>)>,
     greetings: Sender<(u64, Greeting)>,
+    frontend_greetings: Option<Sender<u64>>,
     exits: Sender<Exit>,
     wake: Sender<()>,
     processes: ProcessTable,
@@ -430,6 +430,7 @@ pub(crate) fn serve_leader(
             reports,
             requests,
             greetings,
+            frontend_greetings,
             exits,
             pending: HashMap::new(),
             wake,
@@ -469,6 +470,10 @@ pub(crate) struct LeaderService {
     /// epoch layer binds a peer to the launch it started once the peer's
     /// report names it.
     greetings: Sender<(u64, Greeting)>,
+    /// The peers that greeted as the frontend, for the daemon that starts the
+    /// frontend itself: its commands are addressed to that peer, and the
+    /// greeting stream above is the epoch layer's to take (§2.1, §2.3).
+    frontend_greetings: Option<Sender<u64>>,
     /// Every supervised process that exited, for the epoch layer's switch.
     exits: Sender<Exit>,
     /// The epoch layer's requests a node has not answered yet, by request id.
@@ -500,6 +505,7 @@ pub(crate) fn run_leader(
         reports,
         requests,
         greetings,
+        frontend_greetings,
         exits,
         mut pending,
         wake,
@@ -526,6 +532,7 @@ pub(crate) fn run_leader(
                 reports,
                 requests,
                 greetings,
+                frontend_greetings,
                 exits,
                 pending,
                 wake,
@@ -625,6 +632,11 @@ pub(crate) fn run_leader(
                             }
                             let frontend = matches!(hello.peer, Some(hello::Peer::Frontend(_)));
                             tracing::info!(engine, build = %hello.build, frontend, "a process connected");
+                            if frontend
+                                && let Some(frontend_greetings) = &frontend_greetings
+                            {
+                                let _ = frontend_greetings.send(engine);
+                            }
                             // The epoch layer binds this connection to the
                             // launch it started when the peer's first report
                             // names the launch generation (§2.5).
@@ -1050,6 +1062,7 @@ impl LeaderService {
             reports: _,
             requests: _,
             greetings: _,
+            frontend_greetings: _,
             exits: _,
             pending: _,
             wake: _,
@@ -1114,6 +1127,7 @@ pub(crate) fn resume(
     reports: Sender<(u64, process::Report)>,
     requests: Receiver<(Request, Sender<Reply>)>,
     greetings: Sender<(u64, Greeting)>,
+    frontend_greetings: Option<Sender<u64>>,
     exits: Sender<Exit>,
     wake: Sender<()>,
     processes: ProcessTable,
@@ -1199,6 +1213,7 @@ pub(crate) fn resume(
                     reports,
                     requests,
                     greetings,
+                    frontend_greetings,
                     exits,
                     pending: HashMap::new(),
                     wake,

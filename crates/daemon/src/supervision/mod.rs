@@ -165,6 +165,10 @@ pub struct Daemon {
             std::sync::mpsc::Sender<proto::process::Reply>,
         )>,
     >,
+    /// The peers that greeted as the frontend, taken once: the part of the
+    /// daemon that starts the frontend addresses its commands to that peer, and
+    /// the greeting stream itself belongs to the epoch layer (§2.1, §2.3).
+    frontend_greeted: std::sync::Mutex<Option<std::sync::mpsc::Receiver<u64>>>,
     /// The processes this node supervises, which the service keeps current
     /// (§2.3): the epoch layer and `GET /admin/config` read them.
     table: Option<service::ProcessTable>,
@@ -215,7 +219,8 @@ impl Daemon {
             wake: wake_reader,
         };
 
-        let (served, thread, commands, link, requests, awake, table) = if options.node_rank == 0 {
+        let (served, thread, commands, link, requests, frontend_greeted, awake, table) =
+            if options.node_rank == 0 {
             let (joins, members) = join_members(&options)?;
             let leader_address = leader_address(&options, &members);
             // Engines may run on any joined node. A deployment with a
@@ -245,6 +250,7 @@ impl Daemon {
             let (reports, reports_rx) = std::sync::mpsc::channel();
             let (requests, requests_rx) = std::sync::mpsc::channel();
             let (greetings, greetings_rx) = std::sync::mpsc::channel();
+            let (frontend_greetings, frontend_greeted) = std::sync::mpsc::channel();
             let (exits, exits_rx) = std::sync::mpsc::channel();
             let (activity, awake) = std::sync::mpsc::channel();
             // The processes this node supervises, which the service keeps
@@ -264,6 +270,7 @@ impl Daemon {
                         reports,
                         requests_rx,
                         greetings,
+                        Some(frontend_greetings),
                         exits,
                         activity,
                         published,
@@ -287,6 +294,7 @@ impl Daemon {
                 Some(commands),
                 link,
                 Some(requests),
+                Some(frontend_greeted),
                 Some(awake),
                 Some(table),
             )
@@ -298,13 +306,14 @@ impl Daemon {
                 .name("daemon".into())
                 .spawn(move || service::serve_member(local, leader, &stop))
                 .context("starting the daemon's service")?;
-            (None, thread, None, None, None, None, None)
+            (None, thread, None, None, None, None, None, None)
         };
         let (address, socket) = served.unzip();
         Ok(Self {
             commands,
             table,
             requests,
+            frontend_greeted: std::sync::Mutex::new(frontend_greeted),
             link: std::sync::Mutex::new(link),
             awake: std::sync::Mutex::new(awake),
             address,
@@ -342,6 +351,7 @@ impl Daemon {
         let (reports, reports_rx) = std::sync::mpsc::channel();
         let (requests, requests_rx) = std::sync::mpsc::channel();
         let (greetings, greetings_rx) = std::sync::mpsc::channel();
+        let (frontend_greetings, frontend_greeted) = std::sync::mpsc::channel();
         let (exits, exits_rx) = std::sync::mpsc::channel();
         let (activity, awake) = std::sync::mpsc::channel();
         let table: service::ProcessTable = Default::default();
@@ -359,6 +369,7 @@ impl Daemon {
                     reports,
                     requests_rx,
                     greetings,
+                    Some(frontend_greetings),
                     exits,
                     activity,
                     published,
@@ -383,6 +394,7 @@ impl Daemon {
         Ok(Self {
             table: leader.then_some(table),
             requests: leader.then_some(requests),
+            frontend_greeted: std::sync::Mutex::new(leader.then_some(frontend_greeted)),
             link: std::sync::Mutex::new(link),
             awake: std::sync::Mutex::new(leader.then_some(awake)),
             commands,
@@ -424,6 +436,17 @@ impl Daemon {
     /// supervises; `None` on a member, which supervises none here.
     pub fn commands(&self) -> Option<ProcessCommands> {
         self.commands.clone()
+    }
+
+    /// The peers that greet as the frontend on this node, taken once: the
+    /// daemon that starts the frontend needs the peer its commands go to, and
+    /// the epoch layer's greeting stream is the epoch layer's. `None` on a
+    /// member daemon, and `None` again once taken.
+    pub(crate) fn frontend_greeted(&self) -> Option<std::sync::mpsc::Receiver<u64>> {
+        self.frontend_greeted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
     /// The requests channel down to this node's service, for the processes the
