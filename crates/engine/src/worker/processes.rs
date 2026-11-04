@@ -19,7 +19,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
@@ -49,6 +49,53 @@ pub(crate) struct Retirement {
 
 /// The deployment's connection to its daemons, shared by its worker groups.
 pub(crate) type Processes = Arc<Mutex<ProcessClient>>;
+
+/// The daemon's commands for this main process, filed as they arrive.
+///
+/// One connection serves the whole deployment, so every group shares it and the
+/// commands cannot be kept by a group: the serving path takes them once
+/// ([`take_commands`]) and runs them at the epoch's control thread.
+struct CommandChannel {
+    sender: crossbeam_channel::Sender<proto::process::Command>,
+    receiver: Mutex<Option<crossbeam_channel::Receiver<proto::process::Command>>>,
+}
+
+/// The commands of this main process's process interface.
+fn command_channel() -> &'static CommandChannel {
+    static COMMANDS: OnceLock<CommandChannel> = OnceLock::new();
+    COMMANDS.get_or_init(|| {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        CommandChannel {
+            sender,
+            receiver: Mutex::new(Some(receiver)),
+        }
+    })
+}
+
+/// The daemon's commands for this main process, taken once by the serving path
+/// (§7.3). `None` when this process takes them a second time.
+pub(crate) fn take_commands() -> Option<crossbeam_channel::Receiver<proto::process::Command>> {
+    command_channel().receiver.lock().ok()?.take()
+}
+
+/// This process's connection to its daemons, once it has one.
+///
+/// The connection is the deployment's, shared by the worker groups; a report
+/// needs no answer, so it does not need to be the thread that made a request.
+static CONNECTION: OnceLock<Processes> = OnceLock::new();
+
+/// Reports `report` to the deployment's daemons over the process interface
+/// (§7.3), answering nothing.
+///
+/// # Errors
+///
+/// Fails when this process has no connection, or the connection failed.
+pub(crate) fn report(report: proto::process::Report) -> anyhow::Result<()> {
+    let processes = CONNECTION
+        .get()
+        .context("this process has no connection to the deployment's daemons")?;
+    lock(processes)?.report(report)
+}
 
 /// Locks the deployment's connection for one operation.
 pub(crate) fn lock(
@@ -173,13 +220,31 @@ impl ProcessClient {
             welcome.refusal
         );
         tracing::info!(daemon = %address, nodes = welcome.nodes.len(), build = %welcome.build, "connected to the deployment's daemons");
-        Ok(Arc::new(Mutex::new(Self {
+        let processes = Arc::new(Mutex::new(Self {
             connection,
             nodes: welcome.nodes,
             minor: welcome.minor,
             next_request: 1,
             exits: ExitReports::default(),
-        })))
+        }));
+        // The first connection of a process is the one its reports use: a
+        // planning run in the daemon connects too, and never reports.
+        let _ = CONNECTION.set(Arc::clone(&processes));
+        Ok(processes)
+    }
+
+    /// Sends one report of this main process's state, which the daemon needs no
+    /// answer to (§7.3).
+    ///
+    /// # Errors
+    ///
+    /// Fails when the connection failed.
+    pub(crate) fn report(&mut self, report: proto::process::Report) -> anyhow::Result<()> {
+        self.connection
+            .send(&Upstream {
+                kind: Some(upstream::Kind::Report(report)),
+            })
+            .context("reporting to the daemon")
     }
 
     /// The hosts of the deployment's nodes as the leader knows them now,

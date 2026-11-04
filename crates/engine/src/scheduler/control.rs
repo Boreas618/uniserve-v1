@@ -234,6 +234,14 @@ impl Scheduler {
             }
             Command::CommitPolicy => self.request_stage(Stage::Commit, None),
             Command::RevertPolicy { answer } => self.request_stage(Stage::Revert, Some(answer)),
+            Command::PurgePolicy { answer } => self.request_stage(Stage::Purge, Some(answer)),
+            Command::DiscardPolicy => {
+                self.policy_prepared = None;
+                self.policy_stage = None;
+                if let Some(policy) = self.policy.as_mut() {
+                    policy.discard();
+                }
+            }
             Command::Shutdown => return true,
         }
         // A precopy that finished on its blocking thread is taken here, and a

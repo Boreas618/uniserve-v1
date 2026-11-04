@@ -42,6 +42,9 @@ pub(crate) fn run(args: &EngineArgs, lifeline: Option<i32>, log: &LogLevels) -> 
         log.log_level.as_deref(),
         log.log_level_http.as_deref(),
     );
-    engine::run_engine(&args.requests, &args.processes, args.engine)?;
+    // The epoch names no program store yet, so a `Precopy` of a scheduling
+    // policy fails its precopy and reports why; the store's path is the
+    // epoch's to state (`EngineSpec`).
+    engine::run_engine(&args.requests, &args.processes, args.engine, None)?;
     Ok(ExitCode::SUCCESS)
 }

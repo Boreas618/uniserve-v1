@@ -121,6 +121,29 @@ struct Routing {
     /// The control thread's own policy instance, which answers `route`, and
     /// the successor its precopy prepared (§4.4, §7.3).
     route: Mutex<RouteState>,
+    /// The generations the epoch has prepared, switched to and purged.
+    generations: Mutex<Generations>,
+    /// The answer each scheduler owes for the policy-failure report it has not
+    /// given yet: one ask is in flight per scheduler, polled on the stats tick
+    /// rather than waited for.
+    policy_reports: Mutex<Vec<Option<crossbeam_channel::Receiver<Option<PolicyReverted>>>>>,
+}
+
+/// The program-layer generations this engine has prepared, switched to and
+/// purged (§7.3).
+///
+/// A command the daemon repeats is answered without acting twice: a switchover
+/// names the generation it means, and one this engine already serves changes
+/// nothing.
+#[derive(Debug, Default)]
+struct Generations {
+    /// The generations successfully precopied, which is also the number the
+    /// next one gets.
+    prepared: u64,
+    /// The generation the epoch serves.
+    switched: u64,
+    /// The generation no batch uses anything older than.
+    purged: u64,
 }
 
 /// The control thread's policy state: its route instance, the candidate a
@@ -310,6 +333,12 @@ impl Routing {
         }
     }
 
+    /// §7.3 step 2's failure on the control thread: the precopied generation is
+    /// dropped and the serving instance kept.
+    fn discard_route(&self) {
+        crate::lock(&self.route).candidate = None;
+    }
+
     /// §7.3 step 6 on the control thread: the program the revert could return
     /// to is forgotten.
     fn purge_route(&self) {
@@ -465,6 +494,7 @@ pub fn serve_requests(stream: UnixStream, schedulers: Vec<SchedulerHandle>) -> a
         Connection::from_unix(writer)?,
         schedulers,
         None,
+        None,
     )
 }
 
@@ -479,8 +509,10 @@ fn serve(
     writer: Connection,
     schedulers: Vec<SchedulerHandle>,
     attachment: Option<Attachment>,
+    policies: Option<Arc<dyn PolicySource + Send + Sync>>,
 ) -> anyhow::Result<()> {
     let prepared = schedulers.iter().any(SchedulerHandle::starts_on_trial);
+    let count = schedulers.len();
     let routing = Arc::new(Routing {
         slots: schedulers
             .into_iter()
@@ -500,6 +532,8 @@ fn serve(
         failed: AtomicBool::new(false),
         trial: AtomicBool::new(false),
         route: Mutex::default(),
+        policy_reports: Mutex::new(vec![None; count]),
+        generations: Mutex::default(),
     });
     routing.trial.store(
         routing
@@ -510,6 +544,19 @@ fn serve(
     );
     anyhow::ensure!(!routing.slots.is_empty(), "the engine runs no scheduler");
 
+    let stop = Arc::new(AtomicBool::new(false));
+    // The daemon's commands for the epoch's policy run beside the requests: a
+    // precopy loads a module and trials every decision, which no reader waits
+    // for (§7.3).
+    let commands_thread = {
+        let routing = Arc::clone(&routing);
+        let stop = Arc::clone(&stop);
+        std::thread::Builder::new()
+            .name("process-commands".into())
+            .spawn(move || handle_process_commands(routing, policies, &stop))
+            .context("starting the epoch's command thread")?
+    };
+
     let (streams, incoming) = tokio::sync::mpsc::unbounded_channel::<Stream>();
     let events_thread = {
         let routing = Arc::clone(&routing);
@@ -519,7 +566,6 @@ fn serve(
             .context("starting the event forwarder")?
     };
     let (control, controls) = crossbeam_channel::unbounded::<Control>();
-    let stop = Arc::new(AtomicBool::new(false));
     let mut threads = Vec::new();
     let opened = open_front(
         reader,
@@ -584,6 +630,7 @@ fn serve(
     SchedulerHandle::shutdown_all(routing.slots.iter().map(|slot| &slot.handle));
     drop(streams);
     let _ = events_thread.join();
+    let _ = commands_thread.join();
     crate::lock(&routing.fronts).clear();
     let mut outcome = opened;
     for (writer, reader) in threads {
@@ -1012,11 +1059,8 @@ fn submit_all(
         let handle = &routing.slots[index].handle;
         match handle.submit_all(requests) {
             Ok(events) => {
-                for (((id, events), credit), takeover) in ids
-                    .into_iter()
-                    .zip(events)
-                    .zip(credits)
-                    .zip(takeovers)
+                for (((id, events), credit), takeover) in
+                    ids.into_iter().zip(events).zip(credits).zip(takeovers)
                 {
                     routing.send(
                         front,
@@ -1921,23 +1965,63 @@ fn forward_events(
                     // the epoch's current one (§7.3). A scheduler's report is
                     // named here, since a scheduler does not know its index.
                     //
-                    // The reports wait for the frame that carries them: the
-                    // daemon's decode side of that message is front's, and the
-                    // engine's case is added with it.
-                    let reports: Vec<PolicyReverted> = routing
-                        .slots
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, slot)| {
-                            slot.handle.take_policy_report().map(|mut report| {
+                    // The report is an engine-level event, not a request's: it
+                    // waits for the process interface's report frame, and until
+                    // that frame carries it this log is where a revert is seen.
+                    let mut reverted: Vec<PolicyReverted> = Vec::new();
+                    {
+                        let mut asked = crate::lock(&routing.policy_reports);
+                        for (index, slot) in routing.slots.iter().enumerate() {
+                            let report = match &asked[index] {
+                                Some(answer) => match answer.try_recv() {
+                                    Ok(report) => {
+                                        asked[index] = None;
+                                        report
+                                    }
+                                    Err(crossbeam_channel::TryRecvError::Empty) => continue,
+                                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                                        asked[index] = None;
+                                        None
+                                    }
+                                },
+                                None => {
+                                    asked[index] = Some(slot.handle.take_policy_report());
+                                    continue;
+                                }
+                            };
+                            if let Some(mut report) = report {
                                 report.scheduler = Some(index);
-                                report
-                            })
-                        })
-                        .chain(routing.take_policy_reports())
-                        .collect();
-                    if !reports.is_empty() {
-                        crate::lock(&routing.route).reports.extend(reports);
+                                reverted.push(report);
+                            }
+                        }
+                    }
+                    reverted.extend(routing.take_policy_reports());
+                    for report in reverted {
+                        if report.fatal {
+                            tracing::error!(
+                                scheduler = ?report.scheduler,
+                                backend = %report.program.backend,
+                                revision = report.program.revision,
+                                reason = %report.reason,
+                                "a policy failed and no previous policy could take over"
+                            );
+                        } else {
+                            tracing::warn!(
+                                scheduler = ?report.scheduler,
+                                backend = %report.program.backend,
+                                revision = report.program.revision,
+                                reason = %report.reason,
+                                "a policy failed; serving on under the previous one"
+                            );
+                        }
+                        // §7.3: the daemon that committed the policy is told,
+                        // once, from here — the step loop never waits on a
+                        // report.
+                        report_policy(proto::process::Report {
+                            kind: Some(proto::process::report::Kind::PolicyReverted(
+                                report.to_process(),
+                            )),
+                        });
                     }
                     for (index, (slot, reporter)) in routing.slots.iter().zip(&mut reporters).enumerate() {
                         let snapshot = reporter.snapshot(slot.handle.stats());
@@ -2138,12 +2222,23 @@ const WELCOME_TIMEOUT: Duration = Duration::from_secs(60);
 /// A start that fails is reported to the daemon as the engine's failure
 /// before this returns it.
 ///
+/// `policies` reads the module of a scheduling policy program the daemon names
+/// in a `Precopy` (§7.3 step 2): this node's Program Server store. Without one
+/// every precopy fails, which the daemon records as a failed update; the
+/// module bytes are not part of the program's name on the wire, so an engine
+/// that is to switch policies must be given its store.
+///
 /// # Errors
 ///
 /// Fails when the daemon cannot be reached or refuses the engine, the spec
 /// does not resolve, the workers or schedulers do not start, or the
 /// connection fails.
-pub fn run_engine(requests: &str, processes: &str, engine: u64) -> anyhow::Result<()> {
+pub fn run_engine(
+    requests: &str,
+    processes: &str,
+    engine: u64,
+    policies: Option<Arc<dyn PolicySource + Send + Sync>>,
+) -> anyhow::Result<()> {
     let mut reader = Connection::connect(requests)
         .with_context(|| format!("connecting to the daemon's request socket {requests}"))?;
     let mut writer = reader.writer()?;
@@ -2256,7 +2351,327 @@ pub fn run_engine(requests: &str, processes: &str, engine: u64) -> anyhow::Resul
         writer,
         schedulers,
         Some(Attachment { engine, info }),
+        policies,
     )
+}
+
+/// The longest a command of the process interface waits for a scheduler: a
+/// precopy loads and instantiates a policy module on a blocking thread, and a
+/// switchover applies at the batch boundary that follows.
+const POLICY_STAGE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Runs the daemon's commands for the epoch's policy (§7.3), on a thread of
+/// their own.
+///
+/// The process interface's connection is shared by the worker groups, so
+/// `worker/processes.rs` files the commands and this thread runs them: a
+/// precopy takes seconds, and nothing that serves may wait for it.
+///
+/// `policies` reads the module of a program the daemon names — the node's
+/// Program Server store. Without one a precopy fails, which is §7.3's own
+/// answer ("preparation or precopy failed: the new generation is dropped and
+/// service goes on"), not a degraded path.
+fn handle_process_commands(
+    routing: Arc<Routing>,
+    policies: Option<Arc<dyn PolicySource + Send + Sync>>,
+    stop: &AtomicBool,
+) {
+    let Some(commands) = crate::worker::processes::take_commands() else {
+        // Another thread of this process runs them.
+        return;
+    };
+    while !stop.load(Ordering::Acquire) {
+        match commands.recv_timeout(Duration::from_millis(100)) {
+            Ok(command) => {
+                let report = apply_process_command(
+                    routing.as_ref(),
+                    &routing.generations,
+                    policies.as_ref(),
+                    command,
+                );
+                if let Some(report) = report {
+                    report_policy(report);
+                }
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+/// Reports one answer or report of the epoch's policy to the daemons (§7.3).
+fn report_policy(report: proto::process::Report) {
+    if let Err(error) = crate::worker::processes::report(report) {
+        tracing::error!(%error, "a report of the epoch's policy did not reach the daemons");
+    }
+}
+
+/// §7.3's precondition, or the failure that answers a command with none.
+fn precopy_failed(reason: impl Into<String>) -> proto::process::Report {
+    use proto::process::report;
+    proto::process::Report {
+        kind: Some(report::Kind::PrecopyFailed(proto::process::PrecopyFailed {
+            reason: reason.into(),
+        })),
+    }
+}
+
+/// The epoch's policy, as the process interface's commands change it (§7.3):
+/// the control thread's route instance and every scheduler's.
+///
+/// A trait so the commands can be run against a double in a test, where no
+/// scheduler exists; the engine's implementation is [`Routing`].
+trait EpochPolicy {
+    /// §7.3 step 2: prepare `program`'s policy on the current state, on every
+    /// scheduler and on the control thread, executing nothing.
+    fn precopy(
+        &self,
+        policies: &Arc<dyn PolicySource + Send + Sync>,
+        program: &PolicyProgram,
+    ) -> Result<(), String>;
+
+    /// §7.3 step 2's failure: the prepared generation is dropped.
+    fn discard(&self);
+
+    /// §7.3 step 3: the prepared policy answers from the next batch boundary.
+    fn switchover(&self) -> Result<(), String>;
+
+    /// §7.3 step 5: probation ends; the replaced policy stays.
+    fn commit(&self);
+
+    /// §7.3 step 4: the previous policy answers on the state of the moment.
+    fn revert(&self) -> Result<(), String>;
+
+    /// §7.3 step 6: the module a revert could return to is dropped.
+    fn purge(&self) -> Result<(), String>;
+}
+
+impl EpochPolicy for Routing {
+    fn precopy(
+        &self,
+        policies: &Arc<dyn PolicySource + Send + Sync>,
+        program: &PolicyProgram,
+    ) -> Result<(), String> {
+        for slot in &self.slots {
+            match slot
+                .handle
+                .precopy_policy(program.clone(), Arc::clone(policies))
+                .recv_timeout(POLICY_STAGE_TIMEOUT)
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(reason)) => return Err(reason),
+                Err(error) => return Err(format!("a scheduler did not answer: {error}")),
+            }
+        }
+        self.precopy_route(policies.as_ref(), program.clone())
+    }
+
+    fn discard(&self) {
+        for slot in &self.slots {
+            slot.handle.discard_policy();
+        }
+        self.discard_route();
+    }
+
+    fn switchover(&self) -> Result<(), String> {
+        for slot in &self.slots {
+            match slot
+                .handle
+                .switchover_policy()
+                .recv_timeout(POLICY_STAGE_TIMEOUT)
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(reason)) => return Err(reason),
+                Err(error) => return Err(format!("a scheduler did not answer: {error}")),
+            }
+        }
+        self.switchover_route()
+    }
+
+    fn commit(&self) {
+        for slot in &self.slots {
+            slot.handle.commit_policy();
+        }
+    }
+
+    fn revert(&self) -> Result<(), String> {
+        for slot in &self.slots {
+            match slot
+                .handle
+                .revert_policy()
+                .recv_timeout(POLICY_STAGE_TIMEOUT)
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(reason)) => return Err(reason),
+                Err(error) => return Err(format!("a scheduler did not answer: {error}")),
+            }
+        }
+        self.revert_route()
+    }
+
+    fn purge(&self) -> Result<(), String> {
+        let mut failure = None;
+        for slot in &self.slots {
+            match slot
+                .handle
+                .purge_policy()
+                .recv_timeout(POLICY_STAGE_TIMEOUT)
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(reason)) => {
+                    failure = Some(reason);
+                    break;
+                }
+                Err(error) => {
+                    failure = Some(format!("a scheduler did not answer: {error}"));
+                    break;
+                }
+            }
+        }
+        // The control thread's instance drops its previous program whether or
+        // not a scheduler could: no batch of it is in flight, since this thread
+        // owns it.
+        self.purge_route();
+        match failure {
+            Some(reason) => Err(reason),
+            None => Ok(()),
+        }
+    }
+}
+
+/// One command of the process interface that changes the epoch's policy
+/// (§7.3), and the report that answers it.
+///
+/// The commands that move the epoch's kernels and graphs (`Precopy`'s kernel
+/// programs, the graph half of the switchover) are the executor's; a precopy
+/// that names kernels cannot be prepared here and is answered as the failure it
+/// is. A repeated command is answered without acting twice: a switchover or a
+/// purge names the generation it means, and one this engine has already reached
+/// changes nothing.
+fn apply_process_command(
+    policy: &dyn EpochPolicy,
+    generations: &Mutex<Generations>,
+    policies: Option<&Arc<dyn PolicySource + Send + Sync>>,
+    command: proto::process::Command,
+) -> Option<proto::process::Report> {
+    use proto::process::command::Kind;
+    use proto::process::report;
+
+    let kind = command.kind?;
+    match kind {
+        Kind::Precopy(precopy) => {
+            if !precopy.kernels.is_empty() {
+                return Some(precopy_failed(
+                    "this main process prepares no kernel generation: the executor's precopy is \
+                     not part of this build",
+                ));
+            }
+            let Some(stated) = &precopy.policy else {
+                return Some(precopy_failed(
+                    "a precopy that names no scheduling policy program",
+                ));
+            };
+            let program = match PolicyProgram::from_program(stated) {
+                Ok(program) => program,
+                Err(error) => return Some(precopy_failed(error.to_string())),
+            };
+            let Some(policies) = policies else {
+                return Some(precopy_failed(format!(
+                    "this main process reads no program store, so it cannot load the {} policy \
+                     revision {}",
+                    program.backend, program.revision
+                )));
+            };
+            match policy.precopy(policies, &program) {
+                Ok(()) => {
+                    let mut generations = crate::lock(generations);
+                    generations.prepared += 1;
+                    Some(proto::process::Report {
+                        kind: Some(report::Kind::Precopied(proto::process::Precopied {
+                            generation: generations.prepared,
+                        })),
+                    })
+                }
+                Err(reason) => {
+                    // The generation is dropped and the serving policy stays.
+                    policy.discard();
+                    Some(precopy_failed(reason))
+                }
+            }
+        }
+        Kind::Switchover(switchover) => {
+            let generation = switchover.generation;
+            if generation <= crate::lock(generations).switched {
+                return Some(proto::process::Report {
+                    kind: Some(report::Kind::Switched(proto::process::Switched {
+                        generation,
+                    })),
+                });
+            }
+            match policy.switchover() {
+                Ok(()) => {
+                    crate::lock(generations).switched = generation;
+                    Some(proto::process::Report {
+                        kind: Some(report::Kind::Switched(proto::process::Switched {
+                            generation,
+                        })),
+                    })
+                }
+                Err(reason) => Some(proto::process::Report {
+                    kind: Some(report::Kind::Fault(proto::process::Fault {
+                        kind: "policy_switchover".to_owned(),
+                        reason,
+                        device: 0,
+                    })),
+                }),
+            }
+        }
+        Kind::Commit(_) => {
+            policy.commit();
+            Some(proto::process::Report {
+                kind: Some(report::Kind::Committed(proto::process::Committed {})),
+            })
+        }
+        Kind::Revert(revert) => match policy.revert() {
+            Ok(()) => Some(proto::process::Report {
+                kind: Some(report::Kind::Reverted(proto::process::Reverted {
+                    reason: revert.reason,
+                })),
+            }),
+            Err(reason) => Some(proto::process::Report {
+                kind: Some(report::Kind::Fault(proto::process::Fault {
+                    kind: "policy_revert".to_owned(),
+                    reason,
+                    device: 0,
+                })),
+            }),
+        },
+        Kind::Purge(purge) => {
+            let generation = purge.generation;
+            if generation <= crate::lock(generations).purged {
+                return Some(proto::process::Report {
+                    kind: Some(report::Kind::Purged(proto::process::Purged { generation })),
+                });
+            }
+            match policy.purge() {
+                Ok(()) => {
+                    crate::lock(generations).purged = generation;
+                    Some(proto::process::Report {
+                        kind: Some(report::Kind::Purged(proto::process::Purged { generation })),
+                    })
+                }
+                Err(reason) => Some(proto::process::Report {
+                    kind: Some(report::Kind::Fault(proto::process::Fault {
+                        kind: "policy_purge".to_owned(),
+                        reason,
+                        device: 0,
+                    })),
+                }),
+            }
+        }
+        // The epoch's and the world's commands are not the policy's.
+        Kind::Park(_) | Kind::Promote(_) | Kind::Drain(_) | Kind::Serve(_) | Kind::Pause(_) => None,
+    }
 }
 
 /// Every worker group's KV cache as the engine starts with it.
@@ -2305,6 +2720,272 @@ mod tests {
             trajectory: Default::default(),
             adapter: 0,
         }
+    }
+
+    /// The epoch's policy as a double: every call recorded, and one of them
+    /// made to fail, so a command's report can be read without a scheduler.
+    #[derive(Default)]
+    struct Recording {
+        calls: Mutex<Vec<&'static str>>,
+        fails: Option<&'static str>,
+    }
+
+    impl Recording {
+        fn failing(at: &'static str) -> Self {
+            Self {
+                calls: Mutex::default(),
+                fails: Some(at),
+            }
+        }
+
+        fn done(&self, name: &'static str) -> Result<(), String> {
+            crate::lock(&self.calls).push(name);
+            match self.fails {
+                Some(at) if at == name => Err(format!("{name} failed")),
+                _ => Ok(()),
+            }
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            crate::lock(&self.calls).clone()
+        }
+    }
+
+    impl EpochPolicy for Recording {
+        fn precopy(
+            &self,
+            _policies: &Arc<dyn PolicySource + Send + Sync>,
+            _program: &PolicyProgram,
+        ) -> Result<(), String> {
+            self.done("precopy")
+        }
+
+        fn discard(&self) {
+            let _ = self.done("discard");
+        }
+
+        fn switchover(&self) -> Result<(), String> {
+            self.done("switchover")
+        }
+
+        fn commit(&self) {
+            let _ = self.done("commit");
+        }
+
+        fn revert(&self) -> Result<(), String> {
+            self.done("revert")
+        }
+
+        fn purge(&self) -> Result<(), String> {
+            self.done("purge")
+        }
+    }
+
+    /// A program as the epoch names it on the wire.
+    fn program() -> proto::process::Program {
+        proto::process::Program {
+            backend: "fcfs".to_owned(),
+            revision: 3,
+            arguments: Default::default(),
+        }
+    }
+
+    fn precopy(kernels: Vec<proto::process::KernelProgram>) -> proto::process::Command {
+        proto::process::Command {
+            kind: Some(proto::process::command::Kind::Precopy(
+                proto::process::Precopy {
+                    kernels,
+                    policy: Some(program()),
+                },
+            )),
+        }
+    }
+
+    fn kernel_program() -> proto::process::KernelProgram {
+        proto::process::KernelProgram {
+            op: "rms_norm".to_owned(),
+            phase: None,
+            program: Some(proto::process::Program {
+                backend: "cuda".to_owned(),
+                revision: 9,
+                arguments: Default::default(),
+            }),
+        }
+    }
+
+    fn switchover(generation: u64) -> proto::process::Command {
+        proto::process::Command {
+            kind: Some(proto::process::command::Kind::Switchover(
+                proto::process::Switchover { generation },
+            )),
+        }
+    }
+
+    fn purge(generation: u64) -> proto::process::Command {
+        proto::process::Command {
+            kind: Some(proto::process::command::Kind::Purge(
+                proto::process::Purge { generation },
+            )),
+        }
+    }
+
+    fn revert(reason: &str) -> proto::process::Command {
+        proto::process::Command {
+            kind: Some(proto::process::command::Kind::Revert(
+                proto::process::Revert {
+                    reason: reason.to_owned(),
+                },
+            )),
+        }
+    }
+
+    fn answered(report: Option<proto::process::Report>) -> proto::process::report::Kind {
+        report
+            .expect("the command is answered")
+            .kind
+            .expect("the report states what happened")
+    }
+
+    /// The store the strand is loaded from: the bytes are never read, since the
+    /// double prepares nothing.
+    fn store() -> Arc<dyn PolicySource + Send + Sync> {
+        Arc::new(crate::scheduler::PolicyBytes::new(Vec::new()))
+    }
+
+    #[test]
+    fn the_epochs_policy_commands_are_answered_by_the_reports_they_mean() {
+        use proto::process::report::Kind;
+
+        let policy = Recording::default();
+        let generations = Mutex::new(Generations::default());
+        let store = store();
+        let mut run = |command| apply_process_command(&policy, &generations, Some(&store), command);
+
+        match answered(run(precopy(Vec::new()))) {
+            Kind::Precopied(precopied) => assert_eq!(precopied.generation, 1),
+            other => panic!("a precopy is answered by Precopied, not {other:?}"),
+        }
+        match answered(run(switchover(1))) {
+            Kind::Switched(switched) => assert_eq!(switched.generation, 1),
+            other => panic!("a switchover is answered by Switched, not {other:?}"),
+        }
+        // A command the daemon repeats changes nothing and is answered again.
+        assert!(matches!(answered(run(switchover(1))), Kind::Switched(_)));
+        assert!(matches!(
+            answered(run(proto::process::Command {
+                kind: Some(proto::process::command::Kind::Commit(
+                    proto::process::Commit {}
+                )),
+            })),
+            Kind::Committed(_)
+        ));
+        match answered(run(revert("the trial failed"))) {
+            Kind::Reverted(reverted) => assert_eq!(reverted.reason, "the trial failed"),
+            other => panic!("a revert is answered by Reverted, not {other:?}"),
+        }
+        match answered(run(purge(1))) {
+            Kind::Purged(purged) => assert_eq!(purged.generation, 1),
+            other => panic!("a purge is answered by Purged, not {other:?}"),
+        }
+        assert!(matches!(answered(run(purge(1))), Kind::Purged(_)));
+        assert_eq!(
+            policy.calls(),
+            vec!["precopy", "switchover", "commit", "revert", "purge"]
+        );
+    }
+
+    #[test]
+    fn a_precopy_that_names_kernels_is_refused_before_anything_is_prepared() {
+        let policy = Recording::default();
+        let generations = Mutex::new(Generations::default());
+        let store = store();
+        let report = apply_process_command(
+            &policy,
+            &generations,
+            Some(&store),
+            precopy(vec![kernel_program()]),
+        );
+        match answered(report) {
+            proto::process::report::Kind::PrecopyFailed(failed) => {
+                assert!(failed.reason.contains("kernel"), "{}", failed.reason);
+            }
+            other => panic!("a precopy of kernels is answered by PrecopyFailed, not {other:?}"),
+        }
+        assert_eq!(policy.calls(), Vec::<&'static str>::new());
+        assert_eq!(crate::lock(&generations).prepared, 0);
+    }
+
+    #[test]
+    fn a_failed_precopy_drops_the_generation_and_keeps_the_serving_policy() {
+        let policy = Recording::failing("precopy");
+        let generations = Mutex::new(Generations::default());
+        let store = store();
+        let report =
+            apply_process_command(&policy, &generations, Some(&store), precopy(Vec::new()));
+        match answered(report) {
+            proto::process::report::Kind::PrecopyFailed(failed) => {
+                assert!(
+                    failed.reason.contains("precopy failed"),
+                    "{}",
+                    failed.reason
+                );
+            }
+            other => panic!("a failed precopy is answered by PrecopyFailed, not {other:?}"),
+        }
+        assert_eq!(policy.calls(), vec!["precopy", "discard"]);
+        assert_eq!(crate::lock(&generations).prepared, 0);
+    }
+
+    #[test]
+    fn a_failed_switchover_or_revert_is_a_fault() {
+        use proto::process::report::Kind;
+
+        let switchover_policy = Recording::failing("switchover");
+        let generations = Mutex::new(Generations::default());
+        let store = store();
+        let report = apply_process_command(
+            &switchover_policy,
+            &generations,
+            Some(&store),
+            switchover(4),
+        );
+        match answered(report) {
+            Kind::Fault(fault) => {
+                assert_eq!(fault.kind, "policy_switchover");
+                assert!(fault.reason.contains("switchover failed"));
+            }
+            other => panic!("a failed switchover is answered by Fault, not {other:?}"),
+        }
+        // The generation is not the one this engine serves.
+        assert_eq!(crate::lock(&generations).switched, 0);
+
+        let revert_policy = Recording::failing("revert");
+        let report = apply_process_command(
+            &revert_policy,
+            &generations,
+            Some(&store),
+            revert("no previous policy"),
+        );
+        match answered(report) {
+            Kind::Fault(fault) => assert_eq!(fault.kind, "policy_revert"),
+            other => panic!("a failed revert is answered by Fault, not {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_precopy_without_a_program_store_is_refused_and_nothing_is_prepared() {
+        let policy = Recording::default();
+        let generations = Mutex::new(Generations::default());
+        let report = apply_process_command(&policy, &generations, None, precopy(Vec::new()));
+        match answered(report) {
+            proto::process::report::Kind::PrecopyFailed(failed) => {
+                assert!(failed.reason.contains("program store"), "{}", failed.reason);
+            }
+            other => {
+                panic!("a precopy without a store is answered by PrecopyFailed, not {other:?}")
+            }
+        }
+        assert_eq!(policy.calls(), Vec::<&'static str>::new());
     }
 
     #[test]

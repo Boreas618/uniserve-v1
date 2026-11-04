@@ -360,7 +360,6 @@ pub struct EngineConfig {
     /// queues without bound.
     pub max_queued_requests: Option<usize>,
     /// When a request whose draft cache is missing has it refilled.
-    pub refill: crate::scheduler::RefillPolicy,
     /// The captured graph sizes the deployment states, in tokens, ascending
     /// and without duplicates (`Room.graph_tiers`). Empty when the spec states
     /// none; see `SchedulerConfig::graph_tiers`.
@@ -468,7 +467,6 @@ impl EngineConfig {
             max_running_requests: DEFAULT_MAX_RUNNING_REQUESTS,
             max_queued_requests: None,
             chunked_prefill_size: DEFAULT_CHUNKED_PREFILL_SIZE,
-            refill: crate::scheduler::RefillPolicy::default(),
             graph_tiers: Vec::new(),
             prefix_cache: true,
             boundary_interval: crate::kv_cache::DEFAULT_BOUNDARY_INTERVAL,
@@ -928,7 +926,6 @@ impl SchedulerHandle {
                 chunked_prefill_size: config.chunked_prefill_size.max(1),
                 canvas: config.worker_process.canvas_sampling,
                 draft_tokens: config.worker_process.draft_tokens as usize,
-                refill: config.refill,
                 graph_tiers: config.graph_tiers.clone(),
             },
             config.worker_process.dtype,
@@ -1212,14 +1209,55 @@ impl SchedulerHandle {
         self.commands.describe_requests()
     }
 
-    /// The policy failure this scheduler recorded since the last call, if it
-    /// recorded one (§7.3); `None` when the scheduler does not answer.
-    pub fn take_policy_report(&self) -> Option<crate::scheduler::PolicyReverted> {
-        self.commands
-            .take_policy_report()
-            .recv_timeout(std::time::Duration::from_millis(200))
-            .ok()
-            .flatten()
+    /// §7.3 step 2: prepares `program`'s policy on this scheduler's state,
+    /// without putting it in; the answer arrives when the blocking thread that
+    /// loaded it is done.
+    pub fn precopy_policy(
+        &self,
+        program: crate::scheduler::PolicyProgram,
+        source: std::sync::Arc<dyn crate::scheduler::PolicySource + Send + Sync>,
+    ) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.commands.precopy_policy(program, source)
+    }
+
+    /// §7.3 step 3: the prepared policy answers from this scheduler's next
+    /// batch boundary.
+    pub fn switchover_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.commands.switchover_policy()
+    }
+
+    /// §7.3 step 5: probation ended; the replaced policy stays until the next
+    /// precopy.
+    pub fn commit_policy(&self) {
+        self.commands.commit_policy();
+    }
+
+    /// §7.3 step 4: the previous policy answers again, on the state this
+    /// scheduler holds when the stage applies.
+    pub fn revert_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.commands.revert_policy()
+    }
+
+    /// §7.3 step 6: the module a revert could return to is dropped.
+    pub fn purge_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.commands.purge_policy()
+    }
+
+    /// §7.3 step 2's failure: a precopied generation is dropped.
+    pub fn discard_policy(&self) {
+        self.commands.discard_policy();
+    }
+
+    /// Asks this scheduler for the policy failure it recorded since the last
+    /// call, if it recorded one (§7.3).
+    ///
+    /// The answer is polled, not waited for: the caller of the stats tick is
+    /// the engine's control thread, and a scheduler that does not answer must
+    /// not hold it.
+    pub fn take_policy_report(
+        &self,
+    ) -> crossbeam_channel::Receiver<Option<crate::scheduler::PolicyReverted>> {
+        self.commands.take_policy_report()
     }
 
     /// The state the epoch's policy is instantiated with, as this scheduler
