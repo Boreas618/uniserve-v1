@@ -36,8 +36,28 @@
 //! packages the fixture `notes/programs/qwen3-moe-keys.txt` names. Nothing here hard-codes a store
 //! root or a checkpoint, because the host that runs it is not the host that wrote it.
 //!
-//! What is deliberately *not* here: capture, buckets, the prefix cache's paging, request slots and
-//! the sampler. This is a numerics harness. Its results are for comparing against a reference, and
+//! `--generate N` on the decode stage continues the prompt: the prefill's own last row answers the
+//! token at position `count`, and every later token is a **one-row decode batch** appended to the
+//! cache the prefill filled, at the token's own position, walked by the same `CausalLm::forward` the
+//! prefill walks. The id is `nn::Sampler::greedy`'s - the path a request's zero-temperature row
+//! takes - and a sampler that cannot run is a refusal, not a host argmax standing in for it, because
+//! an id list cannot say which path chose it. `--greedy host` asks for the host argmax deliberately.
+//!
+//! `--expect <file>` compares the continuation against a reference's `ids` as it goes, with the
+//! reference's own `margins` beside ours when the file records them. `--divergence stop` ends the
+//! run at the first id that differs, which is what a cache-precision change on an id-exact chain
+//! owes; `--divergence report` keeps going and prints every difference with the margin it moved
+//! across, because a lossy weight representation moves ids where the choice was a tie and the gap
+//! is the number that separates one from a defect.
+//!
+//! A run measures a **pair**, and its first line states both halves: the representation the
+//! checkpoint declares, read from the checkpoint, and the deployment's cache page type, stated by
+//! `--kv-pages bf16|fp8`. Neither is a per-run switch for the other. The second line counts what the
+//! loader published by the element type each weight arrived in, beside what the checkpoint's index
+//! declares, and refuses a checkpoint whose packed tensors arrived as none.
+//!
+//! What is deliberately *not* here: capture, buckets, request slots, multi-request batching and the
+//! serve path. This is a numerics harness. Its results are for comparing against a reference, and
 //! its failures are for naming the operator and the key that produced them.
 
 use std::collections::BTreeMap;
