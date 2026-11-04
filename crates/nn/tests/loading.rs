@@ -258,3 +258,75 @@ fn a_computed_constant_is_published_once_and_needs_its_own_name() {
     );
     assert_eq!(store.published.len(), 2);
 }
+/// The `f32` values of BF16 bytes.
+fn from_bf16(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_bits(u32::from(u16::from_le_bytes(*chunk)) << 16))
+        .collect()
+}
+
+#[test]
+fn a_weight_normalized_convolution_is_computed_once_at_load() {
+    let dir = tempfile::tempdir().unwrap();
+    shard(
+        dir.path(),
+        "model.safetensors",
+        &[
+            // Two output channels of two elements: v = [[3, 4], [0, 1]].
+            ("conv.weight_v", vec![2, 2], bf16(&[3.0, 4.0, 0.0, 1.0])),
+            // PyTorch keeps the gain as [channels, 1, 1].
+            ("conv.weight_g", vec![2, 1, 1], bf16(&[5.0, 10.0])),
+        ],
+    );
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let mut store = Recording::default();
+    let weight = {
+        let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+        loader
+            .weight_norm("conv.weight", "conv.weight_v", "conv.weight_g")
+            .unwrap()
+    };
+
+    // v · g / ‖v‖ per channel: [3, 4] · 5/5 and [0, 1] · 10/1.
+    let (_, bytes, dtype, shape, _) = &store.published[0];
+    assert_eq!(*dtype, DType::BF16);
+    assert_eq!(shape.dims(), &[2, 2]);
+    assert_eq!(from_bf16(bytes), vec![3.0, 4.0, 0.0, 10.0]);
+    assert_eq!(weight.shape().dims(), &[2, 2]);
+    assert_eq!(store.published.len(), 1);
+
+    // A second load reuses the retained region.
+    let again = {
+        let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+        loader
+            .weight_norm("conv.weight", "conv.weight_v", "conv.weight_g")
+            .unwrap()
+    };
+    assert_eq!(again.view().ptr, weight.view().ptr);
+    assert_eq!(store.published.len(), 1);
+}
+
+#[test]
+fn a_weight_normalized_gain_must_match_the_output_channels() {
+    let dir = tempfile::tempdir().unwrap();
+    shard(
+        dir.path(),
+        "model.safetensors",
+        &[
+            ("conv.weight_v", vec![2, 2], bf16(&[3.0, 4.0, 0.0, 1.0])),
+            ("conv.weight_g", vec![3, 1, 1], bf16(&[5.0, 10.0, 1.0])),
+        ],
+    );
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let mut store = Recording::default();
+    let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+    assert!(
+        loader
+            .weight_norm("conv.weight", "conv.weight_v", "conv.weight_g")
+            .is_err()
+    );
+    assert!(store.published.is_empty());
+}

@@ -387,6 +387,85 @@ impl<'a> WeightLoader<'a> {
         })
     }
 
+    /// Publish the weight-normalized form of `v` and `g` as one weight.
+    ///
+    /// A checkpoint stores a weight-normalized convolution as two tensors: `v` with the weight's
+    /// extents and `g` with one magnitude per output channel (PyTorch keeps it as `[channels, 1,
+    /// 1]`). The weight the convolution reads is `v · g / ‖v‖`, where the norm reduces every axis
+    /// but the first per channel; spec 9 computes it once at loading, so a loaded model never
+    /// carries the pair. The computation is FP32 and the result keeps the checkpoint's element type
+    /// unless the loader was given another.
+    ///
+    /// `name` is the logical tensor the key records; the key also names both sources, so it cannot
+    /// be confused with a plain region of either.
+    pub fn weight_norm(&mut self, name: &str, v: &str, g: &str) -> Result<Weight> {
+        let value = self.checkpoint.read(v)?;
+        let gain = self.checkpoint.read(g)?;
+        if value.shape.rank() == 0 {
+            return Err(Error::weight(
+                name,
+                "a weight-normalized tensor has an axis".to_owned(),
+            ));
+        }
+        let channels = value.shape.dim(0);
+        if gain.shape.numel() != channels {
+            return Err(Error::weight(
+                name,
+                format!(
+                    "a gain of {} elements for {channels} output channels",
+                    gain.shape.numel()
+                ),
+            ));
+        }
+        let dtype = self.dtype.unwrap_or(value.dtype);
+        if !dtype.is_float() || !value.dtype.is_float() {
+            return Err(Error::weight(
+                name,
+                format!(
+                    "weight normalization of {} is not floating point",
+                    value.dtype
+                ),
+            ));
+        }
+        let names = vec![v.to_owned(), g.to_owned()];
+        let key = WeightKey {
+            files: self.identities(&names)?,
+            dtype,
+            layout: WeightLayout::ROW_MAJOR,
+            region: WeightRegion {
+                // The logical name first: the double underscore marks a computed weight, so the key
+                // is a region neither source names on its own.
+                tensors: vec![format!("{name}__weight_norm"), v.to_owned(), g.to_owned()],
+                start: 0,
+                shape: value.shape,
+            },
+        };
+        if let Some(backing) = self.store.retained(&key)? {
+            return Ok(Weight {
+                view: backing.view(dtype, value.shape)?,
+                backing,
+            });
+        }
+
+        let values = to_f32(value.dtype, &value.bytes, v)?;
+        let gains = to_f32(gain.dtype, &gain.bytes, g)?;
+        let per_channel = usize::try_from(value.shape.numel() / channels.max(1))
+            .map_err(|_| Error::weight(name, "more elements than a usize".to_owned()))?;
+        let mut normalized = Vec::with_capacity(values.len());
+        for (channel, gain) in gains.iter().enumerate() {
+            let rows = &values[channel * per_channel..][..per_channel];
+            let sum = rows.iter().map(|value| value * value).sum::<f32>();
+            let scale = gain / sum.sqrt();
+            normalized.extend(rows.iter().map(|value| value * scale));
+        }
+        let bytes = from_f32(dtype, &normalized, name)?;
+        let backing = self.store.publish(&key, dtype, value.shape, &bytes)?;
+        Ok(Weight {
+            view: backing.view(dtype, value.shape)?,
+            backing,
+        })
+    }
+
     /// Publish host-computed bytes as a weight, without a checkpoint tensor behind them.
     ///
     /// The rotary frequency table is the first such weight: `inv_freq` is computed once at loading
@@ -649,6 +728,26 @@ fn convert(from: DType, to: DType, bytes: &[u8], tensor: &str) -> Result<Vec<u8>
         }
     }
     Ok(converted)
+}
+
+/// The `f32` values of `bytes`, which hold `dtype` elements.
+fn to_f32(dtype: DType, bytes: &[u8], tensor: &str) -> Result<Vec<f32>> {
+    let converted = convert(dtype, DType::F32, bytes, tensor)?;
+    Ok(converted
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
+        .collect())
+}
+
+/// `values` as `dtype` elements.
+fn from_f32(dtype: DType, values: &[f32], tensor: &str) -> Result<Vec<u8>> {
+    let bytes: Vec<u8> = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    convert(DType::F32, dtype, &bytes, tensor)
 }
 
 /// The `f32` value of an IEEE half-precision bit pattern.
