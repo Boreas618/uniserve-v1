@@ -352,8 +352,8 @@ impl nn::capability::Decoder for VideoPostprocessor {
     /// needs - which frames it keeps, how many fade, where on the timeline it writes - arrives as the
     /// [`nn::capability::Splice`] the runner passes. So an empty list is the *correct* answer for this
     /// block, not a refusal, and a runner that asks must get it.
-    fn layout_tables(&self, _layout: &nn::capability::Layout) -> Vec<StateTable> {
-        Vec::new()
+    fn layout_tables(&self, _layout: &nn::capability::Layout) -> nn::Result<Vec<StateTable>> {
+        Ok(Vec::new())
     }
 
     /// Nothing to prepare, for the reason above: `layout_tables` answers no tables, so there are no

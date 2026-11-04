@@ -1155,11 +1155,15 @@ pub struct TileScratch {
 }
 
 impl Decoder for VideoDecoder {
-    fn layout_tables(&self, layout: &nn::capability::Layout) -> Vec<StateTable> {
-        // A layout whose extents contradict the checkpoint has no tables; `prepare_layout` refuses
-        // it rather than this method answering a table of the wrong shape.
+    fn layout_tables(&self, layout: &nn::capability::Layout) -> nn::Result<Vec<StateTable>> {
+        // A layout whose extents contradict the checkpoint is a named error and not an empty list: a
+        // runner that made a mistake hears which one, where an empty answer would have reached the
+        // decode as a block with no tables and read nothing.
         self.tables(layout.video.height, layout.video.width)
-            .unwrap_or_default()
+            .map_err(|error| nn::Error::Shape {
+                owner: "VideoDecoder",
+                problem: error.to_string(),
+            })
     }
 
     fn prepare_layout(
