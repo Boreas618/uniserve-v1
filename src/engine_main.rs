@@ -1214,6 +1214,17 @@ impl MainProcess {
         });
         Ok(())
     }
+    /// The Program Server's store as it stands: every installed package, its revision and the
+    /// descriptors its modules cover for each target.
+    fn listing(&self) -> std::result::Result<program_server::Listing, String> {
+        let mut client = self
+            .programs
+            .lock()
+            .map_err(|_| "the Program Server client was poisoned".to_owned())?;
+        client
+            .list()
+            .map_err(|error| format!("reading the Program Server's store: {error}"))
+    }
 
     /// The module-load tasks one generation needs, one per device (§7.3 step 2).
     ///
@@ -1230,6 +1241,10 @@ impl MainProcess {
         learned: &BTreeMap<String, Vec<String>>,
     ) -> std::result::Result<Vec<Arc<HostTask<Install>>>, UpdateFailure> {
         let invalid = |reason: String| UpdateFailure::Precopy { reason };
+        // The Program Server's listing, read at most once and only when a program's keys cannot be
+        // taken from a generation that already launched it: the epoch's first generation has
+        // nothing to copy from, and the walk would otherwise discover one descriptor per capture.
+        let mut listing: Option<program_server::Listing> = None;
         let mut descriptors = Vec::with_capacity(programs.len());
         let mut requests = Vec::with_capacity(programs.len());
         for (slot, program) in programs {
@@ -1240,10 +1255,28 @@ impl MainProcess {
                 )));
             };
             let serving = descriptor_keys(&self.generations[0], operator);
-            let keys = if serving.is_empty() {
-                learned.get(operator).cloned().unwrap_or_default()
-            } else {
+            let keys = if !serving.is_empty() {
                 serving
+            } else if let Some(keys) = learned.get(operator) {
+                keys.clone()
+            } else {
+                if listing.is_none() {
+                    listing = Some(self.listing().map_err(invalid)?);
+                }
+                let declared = declared_keys(
+                    listing.as_ref().expect("the listing was read above"),
+                    &slot.op,
+                    program,
+                    &self.targets,
+                );
+                if declared.is_empty() {
+                    return Err(invalid(format!(
+                        "the package the daemon names for {} ({} revision {}) declares no \
+                         descriptor for this node's target {:?}",
+                        slot.op, program.backend, program.revision, self.targets
+                    )));
+                }
+                declared
             };
             descriptors.push(Descriptors {
                 op: slot.op.clone(),
@@ -2777,6 +2810,36 @@ fn unfinished(submissions: &[Submission], what: &str) -> Option<StageFailure> {
 
 /// The descriptor keys `generation` holds for `operator`: what a precopy must
 /// cover, and exactly what it never adds to (§7.3 step 2, §5.3).
+/// The descriptor keys a named package declares for this node's targets.
+///
+/// The epoch's first generation has no serving generation to copy keys from, and the walk would
+/// otherwise learn one descriptor per capture: a package states every descriptor it was built for,
+/// so the keys come from it once. A module built for another target does not cover this node and is
+/// not claimed.
+fn declared_keys(
+    listing: &program_server::Listing,
+    op: &str,
+    program: &Program,
+    targets: &[program_server::Target],
+) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    for package in &listing.packages {
+        if package.op != op
+            || package.backend != program.backend
+            || package.revision != program.revision
+        {
+            continue;
+        }
+        for module in &package.modules {
+            if !targets.contains(&module.target) || keys.contains(&module.descriptor) {
+                continue;
+            }
+            keys.push(module.descriptor.clone());
+        }
+    }
+    keys
+}
+
 fn descriptor_keys(generation: &Generation, operator: &'static str) -> Vec<String> {
     generation
         .iter()
