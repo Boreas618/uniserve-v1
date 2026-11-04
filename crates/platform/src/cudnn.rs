@@ -1664,7 +1664,7 @@ impl Cudnn {
             self.api
                 .count(&mode_b, ATTR_ENGINEHEUR_RESULTS, TYPE_BACKEND_DESCRIPTOR)
         );
-        steps.extend(self.fill_variants(&mode_b, listed_b));
+        steps.extend(self.fill_variants(&graph, &mode_b, listed_b));
         let exhaustive = stage!(
             "engine heuristic: mode B, read up to eight configurations and their numerical notes",
             self.configs(&graph, 8, HEURISTIC_MODE_B, false)
@@ -1750,10 +1750,10 @@ impl Cudnn {
         steps
     }
 
-    /// The four readings of what a fill of `CUDNN_ATTR_ENGINEHEUR_RESULTS`
-    /// wants of the array it is handed, all four against the same finalized
-    /// `heuristic` descriptor, so the only difference between them is the
-    /// request.
+    /// The six readings of what a fill of `CUDNN_ATTR_ENGINEHEUR_RESULTS`
+    /// wants of the array it is handed, against one finalized `heuristic`
+    /// descriptor and one that no count query has touched, so the only
+    /// difference between them is the request.
     ///
     /// A diagnostic: it decides nothing and changes nothing. Each line says
     /// the status, the element count the library answered, and how many slots
@@ -1762,73 +1762,115 @@ impl Cudnn {
     /// empty from the caller's side.
     fn fill_variants(
         &self,
+        graph: &Descriptor,
         heuristic: &Descriptor,
         listed: usize,
     ) -> Vec<(String, Option<String>)> {
         let mut steps = Vec::new();
-        // (name, requestedElementCount, descriptors created, initial count)
-        let variants: [(&str, i64, usize, i64); 4] = [
+        // (name, requestedElementCount, slots, initial count, slots are null)
+        let variants: [(&str, i64, usize, i64, bool); 5] = [
             (
-                "1 as the code reads it now: requested = the list's length, count starts at 0",
+                "1 the code as it was: requested = the list's length, count starts at 0",
                 listed as i64,
                 listed.max(1),
                 0,
+                false,
             ),
             (
                 "2 the same request with the count initialised to the list's length",
                 listed as i64,
                 listed.max(1),
                 listed as i64,
+                false,
             ),
             (
-                "3 no count query first: created MAX_ENGINE_CONFIGS descriptors, requested that many",
+                "3 the counted descriptor, MAX_ENGINE_CONFIGS created slots requested",
                 MAX_ENGINE_CONFIGS as i64,
                 MAX_ENGINE_CONFIGS,
                 0,
+                false,
             ),
             (
                 "4 requested larger than the list: list + MAX_ENGINE_CONFIGS",
                 (listed + MAX_ENGINE_CONFIGS) as i64,
                 listed + MAX_ENGINE_CONFIGS,
                 0,
+                false,
+            ),
+            (
+                "5 null slots: the library creates the descriptors and writes their handles",
+                listed as i64,
+                listed.max(1),
+                -1,
+                true,
             ),
         ];
-        for (name, requested, created, initial) in variants {
+        for (name, requested, slots, initial, nulls) in variants {
             // A variant the library refuses is one reading of the contract that
             // does not hold, which is exactly what the probe asks about: it is
             // reported in its line, not counted as a refusal of the probe.
-            let line = match self.fill_once(heuristic, requested, created, initial) {
+            let line = match self.fill_once(heuristic, requested, slots, initial, nulls) {
                 Ok(line) => line,
                 Err(error) => format!("refused: {error}"),
             };
             steps.push((format!("engine heuristic fill {name}: {line}"), None));
         }
+        // 6: a heuristic descriptor no count query has touched. It separates
+        // "the count query consumed the list", which variant 3 cannot, because
+        // 3 asks the descriptor that was counted.
+        let line = match Self::heuristic(self.api, graph, HEURISTIC_MODE_B).and_then(|fresh| {
+            self.fill_once(
+                &fresh,
+                MAX_ENGINE_CONFIGS as i64,
+                MAX_ENGINE_CONFIGS,
+                -1,
+                false,
+            )
+        }) {
+            Ok(line) => line,
+            Err(error) => format!("refused: {error}"),
+        };
+        steps.push((
+            format!("engine heuristic fill 6 a fresh descriptor, never counted, MAX_ENGINE_CONFIGS slots requested: {line}"),
+            None,
+        ));
         steps
     }
 
-    /// One fill of the heuristic's results with the array and the initial
+    /// One fill of the heuristic's results with the slots and the initial
     /// element count a variant names.
     ///
+    /// `nulls` hands the library an array of empty slots, which is the reading
+    /// that it creates the descriptors itself; otherwise the slots are
+    /// descriptors created here, which is the reading that it fills them.
+    ///
     /// Answers with the status and what the array holds afterwards; handles the
-    /// library writes that are not the ones created here are destroyed, so a
-    /// library that replaces the array does not leak through the probe.
+    /// library wrote that this call did not create are destroyed, so a library
+    /// that creates or replaces descriptors does not leak through the probe.
     fn fill_once(
         &self,
         heuristic: &Descriptor,
         requested: i64,
-        created: usize,
+        slots: usize,
         initial: i64,
+        nulls: bool,
     ) -> Result<String> {
-        let mut ours = Vec::with_capacity(created);
-        for _ in 0..created {
-            ours.push(Descriptor::create(self.api, DESCRIPTOR_ENGINE_CONFIG)?);
+        let mut ours = Vec::with_capacity(if nulls { 0 } else { slots });
+        if !nulls {
+            for _ in 0..slots {
+                ours.push(Descriptor::create(self.api, DESCRIPTOR_ENGINE_CONFIG)?);
+            }
         }
         let mine: Vec<Handle> = ours.iter().map(|descriptor| descriptor.raw).collect();
-        let mut handles: Vec<Handle> = mine.clone();
+        let mut handles: Vec<Handle> = if nulls {
+            vec![std::ptr::null_mut(); slots]
+        } else {
+            mine.clone()
+        };
         let mut written = initial;
-        // SAFETY: every slot holds a descriptor this module created with
-        // `cudnnBackendCreateDescriptor`, which is what the call fills, and
-        // both the array and the slots outlive it.
+        // SAFETY: every slot is either a descriptor this module created with
+        // `cudnnBackendCreateDescriptor` or a null the library may fill, which
+        // is what the call takes, and both the array and the slots outlive it.
         let status = unsafe {
             (self.api.backend_get_attribute)(
                 heuristic.raw,
@@ -1845,12 +1887,12 @@ impl Cudnn {
                 continue;
             }
             replaced += 1;
-            // SAFETY: a handle the library wrote into a slot of ours is a
-            // descriptor it created and handed over; destroyed once here.
+            // SAFETY: a handle the library wrote into a slot this call handed
+            // it is a descriptor it created and handed over; destroyed once.
             unsafe { (self.api.backend_destroy_descriptor)(*handle) };
         }
         let held = handles.iter().filter(|handle| !handle.is_null()).count();
-        let line = format!(
+        Ok(format!(
             "status {status}{}, wrote {written}, {held} of {} slots hold a handle, {replaced} of them new",
             if status == STATUS_SUCCESS {
                 String::new()
@@ -1858,8 +1900,7 @@ impl Cudnn {
                 format!(" ({})", self.api.last_error())
             },
             handles.len()
-        );
-        Ok(line)
+        ))
     }
 
     /// The engine heuristic descriptor of `graph` in `mode`, finalized.
