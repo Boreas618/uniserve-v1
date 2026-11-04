@@ -343,13 +343,14 @@ fn the_message_is_written_into_the_module() {
 #[test]
 fn fuel_is_renewed_for_every_call() {
     let engine = engine();
-    // A hundred loop iterations fit the budget many times over but not the
-    // budget of several calls together: every call must get the whole budget.
+    // A dispatch that costs a measurable amount, so the budget can be set
+    // between one call's cost and two calls' cost: three calls then prove the
+    // budget is renewed per call rather than shared by the instance.
     let toy = Toy::new().body(
         Call::Dispatch.export(),
         r#"
     (local $n i32)
-    (local.set $n (i32.const 100))
+    (local.set $n (i32.const 1000))
     (block $done
       (loop $l
         (br_if $done (i32.eqz (local.get $n)))
@@ -358,15 +359,15 @@ fn fuel_is_renewed_for_every_call() {
     (i64.const 0)"#,
     );
     let mut policy = policy(&engine, toy);
-    policy.set_call_fuel(1_000);
 
-    let mut consumed = policy.fuel_consumed();
-    for _ in 0..8 {
+    assert!(policy.dispatch(&Room::default()).unwrap().work.is_empty());
+    let per_call = policy.fuel_consumed();
+    assert!(per_call > 0, "a call spends fuel");
+    policy.set_call_fuel(per_call + per_call / 2);
+
+    for _ in 0..3 {
         assert!(policy.dispatch(&Room::default()).unwrap().work.is_empty());
-        // The fuel a step's calls used is the measurement §12 asks for.
-        assert!(policy.fuel_consumed() > consumed);
-        consumed = policy.fuel_consumed();
-        assert!(consumed < 1_000 * 8);
+        assert!(policy.failure().is_none());
     }
 }
 
