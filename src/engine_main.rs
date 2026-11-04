@@ -1430,12 +1430,19 @@ impl MainProcess {
                                 // The walk named a key this generation already installed, so no
                                 // further attempt can succeed: the loop stops with both names
                                 // rather than retrying a key it holds.
+                                let cause = if precopy.programs.is_empty() {
+                                    " - and the daemon named no kernel program for this \
+                                     generation, so there is nothing to install it from (the \
+                                     startup switch states the scheduling policy alone)"
+                                } else {
+                                    ""
+                                };
                                 return self.abandon_precopy(
                                     generation,
                                     UpdateFailure::Precopy {
                                         reason: format!(
                                             "{operator} still has no kernel under {key} after it \
-                                             was installed: the walk and the install disagree"
+                                             was installed: the walk and the install disagree{cause}"
                                         ),
                                     },
                                     precopy.reply,
