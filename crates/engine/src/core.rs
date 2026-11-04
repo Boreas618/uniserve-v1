@@ -1182,21 +1182,8 @@ impl SchedulerHandle {
         workers: Vec<(WorkerGroupId, WorkerGroup)>,
     ) -> anyhow::Result<Self> {
         let executor = WorkerExecutor::try_new(workers, config.transfer.clone())?;
-
-        // A token runtime serves `max_running_requests` running requests only while
-        // its workers hold that many request rows beyond the reserve; the
-        // scheduler would otherwise lower the limit. Workers without a prefix
-        // cache fit their request pools to device storage, and the
-        // scheduler bounds their requests by the rows they report.
         let info = executor.info().runtime_info()?;
-        let request_rows = info.request_slots as usize;
-        let needed_rows = max_running_requests + guidance_prefix_rows(&info);
-        anyhow::ensure!(
-            !info.uses_cache() || request_rows >= needed_rows,
-            "the workers hold {request_rows} request rows, but {max_running_requests} running \
-             requests need {needed_rows}"
-        );
-
+        Self::check_rows(&info, max_running_requests)?;
         let waker = executor.command_waker();
         let scheduler = Self::assemble(config.clone(), Box::new(executor), waker)?;
         // The serving path's warm-up is the serving path's: a scheduler with no
@@ -1220,28 +1207,65 @@ impl SchedulerHandle {
         Self::assemble(config, executor, CommandWaker::noop())
     }
 
+    /// Refuses a token runtime whose workers hold fewer request rows than
+    /// `max_running_requests` running requests need.
+    ///
+    /// A token runtime serves those requests only while its workers hold that
+    /// many rows beyond the guidance prefix's; the scheduler would otherwise
+    /// lower the limit. Workers without a prefix cache fit their request pools
+    /// to device storage, and the scheduler bounds their requests by the rows
+    /// they report.
+    fn check_rows(info: &WorkerInfo, max_running_requests: usize) -> anyhow::Result<()> {
+        let request_rows = info.request_slots as usize;
+        let needed_rows = max_running_requests + guidance_prefix_rows(info);
+        anyhow::ensure!(
+            !info.uses_cache() || request_rows >= needed_rows,
+            "the workers hold {request_rows} request rows, but {max_running_requests} running \
+             requests need {needed_rows}"
+        );
+        Ok(())
+    }
+
+    /// The scheduler configuration `config` states: its budgets, its capture
+    /// catalog and its generation sizes.
+    fn scheduler_config(config: &EngineConfig) -> SchedulerConfig {
+        SchedulerConfig {
+            max_batch: config.max_batch,
+            max_num_batched_tokens: config.max_num_batched_tokens.max(1),
+            max_running_requests: config.max_running_requests.max(1),
+            max_queued_requests: config.max_queued_requests,
+            chunked_prefill_size: config.chunked_prefill_size.max(1),
+            canvas: config.worker_process.canvas_sampling,
+            draft_tokens: config.worker_process.draft_tokens as usize,
+            graph_tiers: config.graph_tiers.clone(),
+        }
+    }
+
     /// Builds the scheduler `config` states over `executor` and runs it.
     fn assemble(
         config: EngineConfig,
         executor: Box<dyn Executor>,
         waker: CommandWaker,
     ) -> anyhow::Result<Self> {
-        let mut scheduler = Scheduler::new(
+        let tokens = config.control_tokens();
+        let scheduler = Scheduler::new(
             executor,
-            config.control_tokens(),
-            SchedulerConfig {
-                max_batch: config.max_batch,
-                max_num_batched_tokens: config.max_num_batched_tokens.max(1),
-                max_running_requests: config.max_running_requests.max(1),
-                max_queued_requests: config.max_queued_requests,
-                chunked_prefill_size: config.chunked_prefill_size.max(1),
-                canvas: config.worker_process.canvas_sampling,
-                draft_tokens: config.worker_process.draft_tokens as usize,
-                graph_tiers: config.graph_tiers.clone(),
-            },
+            tokens,
+            Self::scheduler_config(&config),
             config.worker_process.dtype,
-            config.generation_limits,
+            config.generation_limits.clone(),
         )?;
+        let scheduler = Self::configured(scheduler, &config)?;
+        Self::spawn(scheduler, config.worker_process.model.clone(), waker)
+    }
+
+    /// Applies `config`'s per-world settings to a freshly built scheduler: its
+    /// world identity, its prefix reuse and state interval, its prefill groups,
+    /// and the host storages its ranks map.
+    fn configured(
+        mut scheduler: Scheduler,
+        config: &EngineConfig,
+    ) -> anyhow::Result<Scheduler> {
         scheduler.set_world(config.world);
         scheduler.set_prefix_reuse(config.prefix_cache);
         scheduler.set_state_interval(config.state_interval);
@@ -1282,7 +1306,7 @@ impl SchedulerHandle {
             config.world,
             &config.worker_process.host,
         );
-        Self::spawn(scheduler, config.worker_process.model, waker)
+        Ok(scheduler)
     }
 
     /// Runs `scheduler`, which serves `model`, on a thread of its own.
