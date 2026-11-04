@@ -2039,6 +2039,17 @@ impl Replica {
     /// Fails when the blocking shutdown task does not complete, which happens
     /// only if it panics or its runtime is shutting down.
     pub(crate) async fn shutdown(&self) -> anyhow::Result<()> {
+        // A parked standby is a process of its own: the daemon ends it first,
+        // so nothing of this replica's stays on the device after the daemon is
+        // gone. Dropping its client closes the control connection, which its
+        // engine treats as the end of the process.
+        let standby = { locked(&self.standby).take() };
+        if let Some(standby) = standby {
+            if let Err(error) = tokio::task::spawn_blocking(move || standby.client.shutdown()).await
+            {
+                warn!("the standby's shutdown did not complete: {error}");
+            }
+        }
         let hold = self.hold();
         let client = hold.client();
         hold.close("the daemon is shutting down");
