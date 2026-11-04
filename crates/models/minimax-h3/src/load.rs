@@ -215,14 +215,20 @@ pub fn refiner_types(text_encoder: nn::DType, dit: nn::DType, dit_directory: &st
 /// sidecar that omits `torch_dtype` states nothing, and a preset in this crate would be a second
 /// statement of a number the files already hold.
 ///
-/// A component holding two floating-point types has no single representation, and this answers with
-/// a refusal that names both and an example of each rather than picking one: a block has one weight
-/// type, so an export that mixes them must say which it means, and the report is what decides the
-/// question instead of a guess. Integer tensors - a table, an index - are not weights and do not
-/// count.
-pub fn stored_dtype(checkpoint: &nn::Checkpoint, component: &str) -> Result<nn::DType> {
+/// This is the **one** type a consumer takes for a whole component - a module whose tables are
+/// published in a single dtype, or a container that must agree with its export. It is **not** the
+/// answer to "what does `auto` load": `auto` loads each weight in its own stored type, and a
+/// component may store several ([`stored_types`] lists them), because the reference pins a type per
+/// tensor. A component of two is therefore refused here by name - because *this caller* needs one
+/// type - and never as a statement that the checkpoint is wrong. Integer tensors - a table, an index
+/// - are not weights and do not count.
+pub fn stored_types(
+    checkpoint: &nn::Checkpoint,
+    component: &str,
+) -> Result<Vec<(nn::DType, String)>> {
     let source = checkpoint.component(component)?;
-    // The element types present, with one tensor that carries each, so a refusal is answerable.
+    // The element types present, with one tensor that carries each, so a question about them is
+    // answerable by name.
     let mut found: Vec<(nn::DType, String)> = Vec::new();
     for name in source.names() {
         let Some(location) = source.tensor(name) else {
@@ -235,6 +241,12 @@ pub fn stored_dtype(checkpoint: &nn::Checkpoint, component: &str) -> Result<nn::
             found.push((location.dtype, name.to_owned()));
         }
     }
+    Ok(found)
+}
+
+/// The element type a consumer takes for a whole component, refusing one of two by name.
+pub fn stored_dtype(checkpoint: &nn::Checkpoint, component: &str) -> Result<nn::DType> {
+    let found = stored_types(checkpoint, component)?;
     match found.len() {
         1 => Ok(found[0].0),
         0 => Err(Error::checkpoint(format!(
@@ -242,9 +254,10 @@ pub fn stored_dtype(checkpoint: &nn::Checkpoint, component: &str) -> Result<nn::
              no representation to load its weights in"
         ))),
         _ => Err(Error::checkpoint(format!(
-            "the checkpoint's `{component}` component stores {} floating-point types ({}), so \
-             `dtype = \"auto\"` has no single representation to keep; the export must state which \
-             one a deployment loads",
+            "the checkpoint's `{component}` component stores {} floating-point types ({}); the \
+             consumer that asked takes one element type for a whole component, and a component of \
+             several is legal under `dtype = \"auto\"` - each weight loads in its own stored type - \
+             so this is a limit of that consumer, not of the export",
             found.len(),
             found
                 .iter()

@@ -95,7 +95,9 @@ fn integer_tensors_do_not_count_as_a_representation() {
     );
 }
 
-/// Two floating-point types in one component have no single representation, and the refusal names
+/// A consumer that takes one type for a whole component is refused by name when the component holds
+/// two - while the component itself is legal under `auto`, which loads each weight as stored, and
+/// `stored_types` is what lists them.
 /// both, each with a tensor that carries it.
 #[test]
 fn two_representations_are_refused_by_name() {
@@ -194,4 +196,31 @@ fn a_tensors_own_type_is_answered_by_that_tensor() {
             "the refusal must name {named}, and it says: {message}"
         );
     }
+}
+
+/// The listing is what a mixed component answers with, and it names one tensor of each type so a
+/// reader of the report can go and look at them.
+#[test]
+fn a_mixed_component_lists_each_type_with_a_tensor_that_carries_it() {
+    use minimax_h3::load::stored_types;
+
+    let root = tempfile::tempdir().unwrap();
+    component(
+        root.path(),
+        "transformer",
+        &[
+            ("audio_proj_in.bias", DType::F32, 3),
+            ("context_embedder.bias", DType::BF16, 3),
+            ("proj_in.weight", DType::BF16, 3),
+            ("positions", DType::I32, 3),
+        ],
+    );
+    let checkpoint = Checkpoint::open(root.path()).unwrap();
+    let types = stored_types(&checkpoint, "transformer").unwrap();
+    assert_eq!(
+        types.iter().map(|(dtype, _)| *dtype).collect::<Vec<_>>(),
+        vec![DType::F32, DType::BF16],
+        "two floating-point types, and the integer table is not one of them"
+    );
+    assert_eq!(types[0].1, "audio_proj_in.bias");
 }

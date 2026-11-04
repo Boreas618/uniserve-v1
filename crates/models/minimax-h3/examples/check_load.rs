@@ -33,7 +33,7 @@ use minimax_h3::checkpoint::{Layout, Sidecars};
 use minimax_h3::config::Config;
 use minimax_h3::denoiser::ConditionEncoders;
 use minimax_h3::load;
-use minimax_h3::load::stored_dtype;
+use minimax_h3::load::stored_types;
 use minimax_h3::partition::{Component, Components, Partition};
 
 /// The task a deployment serves, by the name its deployment file gives it.
@@ -188,9 +188,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // `dtype = "auto"` converts nothing, so the element type the deployment loads this
             // component in is the one its tensors are stored in. Printing it next to the count is
             // what makes a store list's dtype auditable against the export it will run on.
-            match stored_dtype(&checkpoint, directory) {
-                Ok(dtype) => println!("  {directory}: {dtype}, which is what `auto` loads"),
-                Err(error) => println!("  {directory}: no single representation ({error})"),
+            match stored_types(&checkpoint, directory) {
+                Ok(types) => {
+                    // `auto` converts nothing, so what it loads is exactly what the file holds -
+                    // one type or several. A component of several is not a defect; the pins are the
+                    // model's requests, and a mixed cell is refused at its launch, by name.
+                    let listed: Vec<String> = types
+                        .iter()
+                        .map(|(dtype, example)| format!("{dtype} (such as `{example}`)"))
+                        .collect();
+                    let what = if types.len() == 1 {
+                        "which is what `auto` loads"
+                    } else {
+                        "which `auto` loads as stored, weight by weight"
+                    };
+                    println!("  {directory}: {}, {what}", listed.join(", "));
+                }
+                Err(error) => println!("  {directory}: not answerable here ({error})"),
             }
         }
         println!("  at most {} MiB of host memory", budget / (1 << 20));
