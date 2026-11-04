@@ -1093,7 +1093,36 @@ impl<'a> WeightLoader<'a> {
             let bytes = self.checkpoint.read(&scales.tensor)?;
             let dtype = block_scale_dtype(&scales.tensor, bytes.dtype)?;
             let blocks = file.columns(columns);
-            let arranged = swizzled_scales(&bytes.bytes, rows, blocks);
+            // The request may name a column block of a row-parallel matrix, so the rows are gathered
+            // at its stride before the permutation: permuting the file's first `rows · blocks`
+            // elements instead would publish another rank's scales under this rank's key.
+            let (start, stride) = match &scales.source {
+                WeightSource::Region { start, .. } => (*start, blocks),
+                WeightSource::Strided {
+                    start, row_stride, ..
+                } => (*start, *row_stride),
+                WeightSource::Parts { .. } => {
+                    return Err(Error::weight(
+                        &scales.tensor,
+                        "block scales gathered from fused parts have no single row stride".to_owned(),
+                    ));
+                }
+            };
+            let mut linear = Vec::with_capacity((rows * blocks) as usize);
+            for row in 0..rows {
+                let first = start + row * stride;
+                let end = first + blocks;
+                let end = usize::try_from(end).unwrap_or(usize::MAX);
+                let first = usize::try_from(first).unwrap_or(usize::MAX);
+                let row_bytes = bytes.bytes.get(first..end).ok_or_else(|| {
+                    Error::weight(
+                        &scales.tensor,
+                        format!("elements {first}..{end} of a row are past the tensor's {blocks}-block rows"),
+                    )
+                })?;
+                linear.extend_from_slice(row_bytes);
+            }
+            let arranged = swizzled_scales(&linear, rows, blocks);
             let shape = product.shape(rows, columns);
             let files = self.identities(std::slice::from_ref(&scales.tensor))?;
             self.publish_computed(
@@ -2104,6 +2133,8 @@ mod tests {
         let linear: Vec<u8> = (1..=rows * blocks).map(|value| value as u8).collect();
         let swizzled = swizzled_scales(&linear, rows, blocks);
         let index = 594_usize;
+        // The data starts at one so that a genuine zero cannot be mistaken for the table's padding;
+        // the pinned value is therefore `row * blocks + column + 1`, not the position itself.
         assert_eq!(swizzled[index], (5 * blocks + 6 + 1) as u8);
     }
 
