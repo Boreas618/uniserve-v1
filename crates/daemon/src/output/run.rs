@@ -19,6 +19,7 @@
 //! again, so no token is computed twice.
 
 use std::future::Future;
+use std::sync::Arc;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -804,4 +805,72 @@ impl From<&ChatResponseContext> for handoff::ChatResponseOptions {
 pub(crate) fn started_instant(started_unix_us: u64) -> Instant {
     let elapsed = unix_us().saturating_sub(started_unix_us);
     Instant::now() - Duration::from_micros(elapsed)
+}
+
+/// A video job's retained artifact streamed as a response body, one chunk of
+/// bytes per step so that a hot restart can stop it between two chunks.
+pub(crate) struct VideoContentRun<M: AsRef<[u8]> + Send + Sync + 'static> {
+    /// The job whose retained media the body streams.
+    job_id: String,
+    /// The artifact's content type.
+    content_type: String,
+    /// The retained media, which keeps its retained-byte share until the
+    /// body ends.
+    media: Arc<M>,
+    /// Bytes of the body written so far.
+    offset: usize,
+    /// Whether the body ended.
+    ended: bool,
+}
+
+impl<M: AsRef<[u8]> + Send + Sync + 'static> VideoContentRun<M> {
+    /// The body streaming `media` for the job `job_id`, from its first byte.
+    pub(crate) fn new(job_id: String, content_type: String, media: Arc<M>) -> Self {
+        Self {
+            job_id,
+            content_type,
+            media,
+            offset: 0,
+            ended: false,
+        }
+    }
+
+    /// How many bytes the body writes in one frame.
+    const CHUNK: usize = 64 * 1024;
+}
+
+impl<M: AsRef<[u8]> + Send + Sync + 'static> Session for VideoContentRun<M> {
+    fn poll_step(&mut self, _cx: &mut Context<'_>) -> Poll<Step> {
+        if self.ended {
+            return Poll::Ready(Step::Ended);
+        }
+        let media = Arc::clone(&self.media);
+        let bytes = media.as_ref().as_ref();
+        if self.offset >= bytes.len() {
+            self.ended = true;
+            return Poll::Ready(Step::Ended);
+        }
+        let count = (bytes.len() - self.offset).min(Self::CHUNK);
+        let frame = Bytes::copy_from_slice(&bytes[self.offset..self.offset + count]);
+        self.offset += count;
+        Poll::Ready(Step::Frames(vec![frame]))
+    }
+
+    fn migrate(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
+
+    fn freeze(&mut self) -> Option<Application> {
+        Some(Application::VideoContent(handoff::VideoContent {
+            job_id: self.job_id.clone(),
+            content_type: self.content_type.clone(),
+            offset: self.offset as u64,
+        }))
+    }
+
+    /// The client is gone: nothing of the artifact was computed for it.
+    fn abort(&mut self) {}
+
+    /// A successor owns the body from `offset` on.
+    fn detach(&mut self) {}
 }
