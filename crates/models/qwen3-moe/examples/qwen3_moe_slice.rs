@@ -153,6 +153,20 @@ struct Args {
     /// The deployment's cache precision. It is a deployment fact and not a per-run switch: the
     /// weights' precision comes from the checkpoint and cannot be overridden here.
     kv_pages: KvPages,
+    /// What a difference from the reference means for this run.
+    divergence: Divergence,
+}
+
+/// What a run does at the first id that differs from the reference.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Divergence {
+    /// Stop there. A cache-precision change on an id-exact chain is a defect with a step index, and
+    /// the steps after the first difference measure nothing.
+    Stop,
+    /// Keep going and report every difference with its margin. A lossy weight representation moves
+    /// ids where the choice was a tie, so the run's question is how wide the margin was, not whether
+    /// an id changed.
+    Report,
 }
 
 fn load_declared<R: RetainedWeights>(
@@ -235,6 +249,7 @@ impl Args {
         let mut greedy = Greedy::Sampler;
         let mut expect = None;
         let mut kv_pages = KvPages::Bf16;
+        let mut divergence = Divergence::Stop;
         let mut words = std::env::args().skip(1);
         while let Some(word) = words.next() {
             let mut value = |name: &str| -> Result<String> {
@@ -289,6 +304,19 @@ impl Args {
                     })?);
                 }
                 "--expect" => expect = Some(PathBuf::from(value("--expect")?)),
+                "--divergence" => {
+                    let name = value("--divergence")?;
+                    divergence = match name.as_str() {
+                        "stop" => Divergence::Stop,
+                        "report" => Divergence::Report,
+                        other => {
+                            return Err(Failure::message(format!(
+                                "--divergence {other:?} names no behaviour; the behaviours are \
+                                 stop and report"
+                            )));
+                        }
+                    };
+                }
                 "--kv-pages" => {
                     let name = value("--kv-pages")?;
                     kv_pages = match name.as_str() {
@@ -335,14 +363,15 @@ impl Args {
                         "qwen3_moe_slice --stage weights|embedding|block|decode \
                          [--checkpoint PATH] [--store PATH] [--device N] [--layer N] \
                          [--tokens ID,ID,...] [--dump DIR] [--reference DIR] \
-                         [--substage normalized|attended|mlp_out] [--from NN] [--routing] [--generate N] [--greedy sampler|host] [--expect FILE] [--kv-pages bf16|fp8]",
+                         [--substage normalized|attended|mlp_out] [--from NN] [--routing] [--generate N] [--greedy sampler|host] [--expect FILE] [--divergence stop|report] [--kv-pages bf16|fp8]",
                     ));
                 }
                 other => {
                     return Err(Failure::message(format!(
                         "unknown argument `{other}`; expected --stage, --checkpoint, --store, \
                          --device, --layer, --tokens, --from, --substage, --routing, --scores, \
-                         --generate, --greedy, --expect, --kv-pages, --dump or --reference"
+                         --generate, --greedy, --expect, --divergence, --kv-pages, --dump or \
+                         --reference"
                     )));
                 }
             }
@@ -413,6 +442,7 @@ impl Args {
             greedy,
             expect,
             kv_pages,
+            divergence,
         })
     }
 }
@@ -770,8 +800,13 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     // and a number that does not say which pair it measured cannot enter a table. The pair is the
     // run's first line, read from the checkpoint and stated by the deployment, never overridden.
     let declared = Representation::read(&args.checkpoint)?;
+    // A calibrated checkpoint keeps some tensors in the source dtype and packs the rest, so naming
+    // the representation is not the same as measuring it: the counts below come from the checkpoint's
+    // own index, where a packed projection appears as a `weight_scale_2` and a kept one does not.
+    let (packed, kept) = representation_counts(&args.checkpoint);
     println!(
-        "combination: checkpoint {} declares {declared:?}; kv pages {}",
+        "combination: checkpoint {} declares {declared:?}; tensors packed {packed}, in their own \
+         dtype {kept}; kv pages {}",
         args.checkpoint.display(),
         args.kv_pages,
     );
@@ -1420,6 +1455,14 @@ fn generate(
         Some(path) => Some(read_expectation(path, &args.tokens)?),
         None => None,
     };
+    // The reference's margin at a step, when the file records one: an id that moved says nothing
+    // about a defect unless the gap it moved across is known, and the file is where that gap lives.
+    let expected_margins = args
+        .expect
+        .as_deref()
+        .map(reference_margins)
+        .unwrap_or_default();
+    let mut differences: Vec<(usize, i32, i32, f64)> = Vec::new();
     let start = u64::from(batch.num_tokens);
     // The loop's arithmetic, stated once: step k appends the token at position `start + k`, writes
     // the slot of that same position and carries a sequence length one past it. A position or a
@@ -1518,17 +1561,36 @@ fn generate(
                 Some(want) if *want == chosen => agreed += 1,
                 Some(want) => {
                     differed = true;
-                    println!(
-                        "generate: FIRST DIFFERENCE at reference index {step} (position \
-                         {position}): chose {chosen}, the reference chose {want}; {step} of {steps} \
-                         ids agree before it"
-                    );
-                    println!("generate: step {step}'s top-5, on our row:");
-                    for (token, logprob) in &best {
-                        println!("  {token}\t{logprob:.6}");
+                    let ours = margin(&row);
+                    let theirs = expected_margins.get(step).copied();
+                    let shown = match theirs {
+                        Some(margin) => format!("{margin:.4}"),
+                        None => "not in the file".to_owned(),
+                    };
+                    match args.divergence {
+                        Divergence::Stop => {
+                            println!(
+                                "generate: FIRST DIFFERENCE at reference index {step} (position \
+                                 {position}): chose {chosen} with margin {ours:.4}, the reference \
+                                 chose {want} with margin {shown}; {step} of {steps} ids agree \
+                                 before it"
+                            );
+                            println!("generate: step {step}'s top-5, on our row:");
+                            for (token, logprob) in &best {
+                                println!("  {token}\t{logprob:.6}");
+                            }
+                            arena.release(mark);
+                            break;
+                        }
+                        Divergence::Report => {
+                            differences.push((step, chosen, *want, ours));
+                            println!(
+                                "generate: difference at reference index {step} (position \
+                                 {position}): chose {chosen} with margin {ours:.4}, the reference \
+                                 chose {want} with margin {shown}; continuing"
+                            );
+                        }
                     }
-                    arena.release(mark);
-                    break;
                 }
                 None => {}
             }
@@ -1596,13 +1658,38 @@ fn generate(
     match expected.as_deref() {
         Some(expected) => {
             let total = expected.len().min(steps);
-            if differed {
-                println!(
+            match args.divergence {
+                Divergence::Stop if differed => println!(
                     "generate: {agreed} of {total} ids agree with the reference before the first \
                      difference; the ids after it were not run"
-                );
-            } else {
-                println!("generate: all {total} ids agree with the reference");
+                ),
+                Divergence::Stop => println!("generate: all {total} ids agree with the reference"),
+                Divergence::Report => {
+                    println!(
+                        "generate: {} of {total} ids differ from the reference; each with the \
+                         margin it moved across:",
+                        differences.len()
+                    );
+                    for (step, ours, theirs, our_margin) in &differences {
+                        let their_margin = match expected_margins.get(*step) {
+                            Some(margin) => format!("{margin:.4}"),
+                            None => "not in the file".to_owned(),
+                        };
+                        println!(
+                            "  index {step}: ours {ours} (margin {our_margin:.4}), the reference \
+                             {theirs} (margin {their_margin})"
+                        );
+                    }
+                    let widest = differences
+                        .iter()
+                        .map(|(_, _, _, margin)| *margin)
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    println!(
+                        "generate: the widest margin at a difference is {widest:.4} - a difference \
+                         inside a margin is a tie and one outside it is a defect, and the reference's \
+                         own margins are what settle which"
+                    );
+                }
             }
         }
         None => println!(
@@ -1843,6 +1930,65 @@ fn slot_for(position: u64, page_size: u64, block_table: &[i32]) -> Result<u64> {
     Ok(page
         .saturating_mul(page_size)
         .saturating_add(position % page_size))
+}
+
+/// How many of a checkpoint's tensors are packed and how many kept in their own dtype.
+///
+/// A packed projection lists `weight_scale_2` beside its packed `weight`; a kept one lists only its
+/// tensor. The index is the checkpoint's own statement of what it holds, so the count is a
+/// measurement of the file rather than a restatement of its name.
+fn representation_counts(root: &Path) -> (usize, usize) {
+    let index =
+        std::fs::read_to_string(root.join("model.safetensors.index.json")).unwrap_or_default();
+    let mut names = 0_usize;
+    let mut packed = 0_usize;
+    let mut weights = 0_usize;
+    for name in index.split('"') {
+        if !name.ends_with(".weight") && !name.ends_with(".weight_scale_2") {
+            continue;
+        }
+        names += 1;
+        if name.ends_with(".weight_scale_2") {
+            packed += 1;
+        } else {
+            weights += 1;
+        }
+    }
+    // A tensor counted as packed still has its own `weight` entry, so what the representation kept
+    // is every plain weight without a packed sibling.
+    let _ = names;
+    (packed, weights.saturating_sub(packed))
+}
+
+/// The reference's margins, when its file records them under `margins`.
+fn reference_margins(path: &Path) -> Vec<f64> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let Some(at) = text.find("\"margins\"") else {
+        return Vec::new();
+    };
+    let Some(open) = text[at..].find('[').map(|offset| offset + at) else {
+        return Vec::new();
+    };
+    let Some(close) = text[open..].find(']').map(|offset| offset + open) else {
+        return Vec::new();
+    };
+    text[open + 1..close]
+        .split(',')
+        .filter_map(|part| part.trim().parse().ok())
+        .collect()
+}
+
+/// The gap between a row's best and its runner-up, in logit units.
+///
+/// A log-softmax subtracts one constant from a whole row, so the difference of two log-probabilities
+/// is the difference of the two logits: a margin of a thousandth says the choice was a tie and a
+/// margin of two says it was not.
+fn margin(row: &[f32]) -> f64 {
+    let best = top_logprobs(row, 2);
+    match best.as_slice() {
+        [first, second, ..] => first.1 - second.1,
+        _ => f64::NAN,
+    }
 }
 
 /// The largest value's first index, on the host.
