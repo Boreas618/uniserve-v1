@@ -612,7 +612,8 @@ fn stage_weights(args: &Args) -> Result<()> {
             .sum::<usize>();
         check_representation(packed, kept, published.0, published.1, dense)?;
         println!(
-            "loaded: {declared:?}, {} layers, hidden {}, {} experts of {} at top {}, {} parameters",
+            "loaded: {}, {} layers, hidden {}, {} experts of {} at top {}, {} parameters",
+            declared.summary(),
             config.num_hidden_layers,
             config.hidden_size,
             config.num_experts,
@@ -930,8 +931,10 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     )?;
     if loaded != declared {
         return Err(Failure::message(format!(
-            "the checkpoint declared {declared:?} before the load and {loaded:?} during it: a \
-             declaration that changes between two reads is one this run cannot attribute"
+            "the checkpoint declared {} before the load and {} during it: a declaration that \
+             changes between two reads is one this run cannot attribute",
+            declared.summary(),
+            loaded.summary()
         )));
     }
 
