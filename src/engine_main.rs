@@ -557,6 +557,12 @@ pub(crate) struct MainProcess {
     boundary: bool,
     /// A `Serve` that arrived before the boundary: the epoch may admit, but not yet.
     pending_serve: bool,
+    /// Whether admission is owed to the warmup: the switchover that opens the epoch queues one
+    /// capture per device and does not wait for them, so a batch admitted the moment the boundary
+    /// opened could be planned into a bucket whose capture has not run - a replay finds no graph of
+    /// it and answers an invariant error that names a capture bug. The epoch opens serving when the
+    /// last submission finishes (`advance_warmup`), and a `Drain` drops what was owed (§4.5).
+    admission_owed: bool,
     /// Whether this process was launched as the epoch's standby (§2.5): it admits nothing until
     /// the daemon promotes it *and* the epoch reaches its boundary.
     standby: bool,
@@ -729,6 +735,7 @@ impl MainProcess {
             serving: false,
             boundary: false,
             pending_serve: false,
+            admission_owed: false,
             standby: launch.standby,
             promoted: false,
             parked: None,
@@ -1128,7 +1135,9 @@ impl MainProcess {
                 }
                 Some(proto::process::command::Kind::Promote(_)) => {
                     self.promoted = true;
-                    self.resume_schedulers()
+                    // A promoted standby admits on the same rule as any other process: once the
+                    // generation it will serve has been warmed (§4.5).
+                    self.open_admission()
                         .context("promoting this process in place")?;
                     if !self.boundary {
                         // A promoted standby serves only once the switchover that fills its
@@ -1516,6 +1525,12 @@ impl MainProcess {
             }
         }
         self.warming = pending;
+        if self.warming.is_empty() && self.admission_owed {
+            // The last capture of the epoch's warmup has run, so every bucket a batch can be planned
+            // into exists. A warmup that failed returns above and its revert clears what was owed.
+            self.open_admission()
+                .context("opening admission after the warmup")?;
+        }
         Ok(None)
     }
 
@@ -1896,10 +1911,13 @@ impl MainProcess {
         // launched serving - so the boundary itself is what opens admission.
         let admitted = self.pending_serve || self.parked.is_none();
         if admitted && (self.promoted || !self.standby) {
-            self.pending_serve = false;
-            // Resuming is what honours the daemon's early `Serve` when a drain parked the
-            // schedulers first; a process that never parked resumes nothing and simply admits.
-            self.resume_schedulers()
+            // Admission is the end of the warmup, not the boundary: the buckets the epoch serves
+            // are the ones the warmup captures, and a batch admitted before the last of them has
+            // run and been captured would be planned into a bucket with no graph. So the answer to
+            // the daemon leaves `Switched` inside its window and the opening happens in
+            // `advance_warmup`, which is what honours an early `Serve` when a drain parked the
+            // schedulers first - a process that never parked resumes nothing and simply admits.
+            self.open_admission()
                 .context("resuming for the epoch's first switchover")?;
         }
         Ok(ProgramStatus::Switched { generation })
@@ -1994,12 +2012,31 @@ impl MainProcess {
             self.pending_serve = true;
             return Ok(());
         }
-        if self.parked.is_some() {
-            self.resume_schedulers()
-                .with_context(|| format!("resuming epoch {}", serve.epoch))?;
+        // A `Serve` that arrives while the warmup still has to capture this generation's buckets is
+        // owed rather than refused: admission opens when the last submission finishes, the same way
+        // it does at a switchover (§4.5).
+        self.open_admission()
+            .with_context(|| format!("resuming epoch {}", serve.epoch))
+    }
+
+    /// Opens admission, or owes it to the warmup (§4.5).
+    ///
+    /// A bucket is served only after its capture has run: a replay reads the captures of the
+    /// generation serving, and a bucket captured by no one is an invariant error at the first batch
+    /// rather than a capture that is slow. `warmup` queues one capture of every bucket per device
+    /// and returns at once - it runs one bucket per queue turn behind serving, which for a model
+    /// with many buckets is minutes - so the switchover answers the daemon and leaves the opening
+    /// here. A `Drain` clears what was owed, because the epoch it was owed to is no longer serving.
+    fn open_admission(&mut self) -> Result<()> {
+        if !self.warming.is_empty() {
+            self.admission_owed = true;
+            return Ok(());
         }
-        self.serving = true;
-        Ok(())
+        self.admission_owed = false;
+        // An early `Serve` is honoured here rather than at its arrival: this is the pass that
+        // admits, so the request waiting in the frontend is exactly what it was waiting for.
+        self.pending_serve = false;
+        self.resume_schedulers()
     }
 
     /// §7.3 step 4: an update left on probation past the window the launch file states is
@@ -2072,6 +2109,9 @@ impl MainProcess {
         }
         self.parked = Some(parked);
         self.serving = false;
+        // A drain ends the epoch this process was serving, so admission owed to a warmup of it is
+        // owed to nothing: the `Serve` that names the epoch again opens the next one.
+        self.admission_owed = false;
         Ok(())
     }
 
@@ -2113,7 +2153,8 @@ impl MainProcess {
         self.revert_policy(generation);
         // The generation that served before the update serves again, and the one built for the
         // update keeps nothing: its kernels are released and its captures are never taken over.
-        if !self.retired.is_empty() {
+        let kept = !self.retired.is_empty();
+        if kept {
             self.generations = std::mem::take(&mut self.retired);
         }
         self.prepared.clear();
@@ -2122,6 +2163,15 @@ impl MainProcess {
         // stopped describing serving, and a failure read from a stale entry would revert an update
         // that is over.
         self.warming.clear();
+        // What the update's warmup still owed is owed no longer. An epoch that kept the generation
+        // which served before it goes on serving, and that generation's buckets are captured - a
+        // cancelled warmup of the update's is nothing to wait for. A revert of the epoch's first
+        // switchover keeps nothing, and its end is the report rather than an admission.
+        let owed = std::mem::take(&mut self.admission_owed);
+        if owed && kept && self.boundary && (self.promoted || !self.standby) {
+            self.resume_schedulers()
+                .context("resuming the generation a revert went back to")?;
+        }
         let current = self.update.current();
         for executor in &self.executors {
             let device = executor.device();
