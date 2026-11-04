@@ -230,17 +230,24 @@ impl Staging {
             )));
         }
 
-        // The commit table's padded rows keep their token state: a slot below zero. As with the
-        // rows, the table is copied into the staging's buffer rather than cloned per step.
+        // The commit table states one row per call. Its padded rows are inert rows by the
+        // operator's own sentinels - a slot and a task of -1 name no destination and sample
+        // nothing - so a padding row commits nothing and the graph may run over the whole bucket.
+        // As with the rows, the table is copied into the staging's buffer rather than cloned per
+        // step, so a step writes fixed addresses (4.5).
         self.commit.clear();
-        self.commit.extend_from_slice(&columns.commit);
         if !columns.commit.is_empty() {
-            let columns = columns.commit.len() / rows.max(1);
-            self.commit.resize(columns * bucket_rows, 0);
-            for column in 0..columns {
-                for row in rows..bucket_rows {
-                    self.commit[column * bucket_rows + row] = -1;
-                }
+            let fields = ops::commit::COMMIT_FIELDS;
+            if columns.commit.len() != fields * rows {
+                return Err(Error::Invariant(format!(
+                    "the commit table holds {} values, {fields} fields of {rows} rows",
+                    columns.commit.len()
+                )));
+            }
+            self.commit.extend_from_slice(&inert_commit(bucket_rows));
+            for field in 0..fields {
+                self.commit[field * bucket_rows..field * bucket_rows + rows]
+                    .copy_from_slice(&columns.commit[field * rows..(field + 1) * rows]);
             }
         }
         self.page_size = columns.page_size;
@@ -2275,6 +2282,15 @@ pub fn calls_output(
 mod tests {
     use super::*;
 
+    /// A mechanism commit table of one row per call, column-major `[COMMIT_FIELDS][rows]`: the one
+    /// column a fixture states is the row's destination slot, and the rest keep zero.
+    fn committed(slots: &[i64]) -> Vec<i64> {
+        let rows = slots.len();
+        let mut table = vec![0_i64; ops::commit::COMMIT_FIELDS * rows];
+        table[..rows].copy_from_slice(slots);
+        table
+    }
+
     fn decode_columns() -> BatchColumns {
         BatchColumns {
             rows: nn::BatchRows {
@@ -2283,17 +2299,25 @@ mod tests {
                 seq_lens: vec![4, 9],
                 query_offsets: vec![0, 1, 2],
                 logits_rows: vec![0, 1],
-                calls: vec![nn::BatchRow {
-                    request: 0,
-                    kind: nn::RowKind::Decode,
-                    cache_group: 0,
-                    rows: 0..2,
-                }],
+                calls: vec![
+                    nn::BatchRow {
+                        request: 0,
+                        kind: nn::RowKind::Decode,
+                        cache_group: 0,
+                        rows: 0..1,
+                    },
+                    nn::BatchRow {
+                        request: 1,
+                        kind: nn::RowKind::Decode,
+                        cache_group: 0,
+                        rows: 1..2,
+                    },
+                ],
             },
             input_ids: vec![7, 8],
             slots: vec![0, 1],
             parameters: vec![0.0; 2 * ops::sampler::PARAMETER_COLUMNS as usize],
-            commit: vec![0, 1],
+            commit: committed(&[0, 1]),
             page_size: 16,
             max_kv_len: 4096,
         }
@@ -2317,7 +2341,7 @@ mod tests {
             input_ids: vec![1, 2, 3],
             slots: vec![0],
             parameters: vec![0.0; ops::sampler::PARAMETER_COLUMNS as usize],
-            commit: vec![0],
+            commit: committed(&[0]),
             page_size: 16,
             max_kv_len: 4096,
         }
