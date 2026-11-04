@@ -1978,17 +1978,6 @@ impl Denoiser {
         Ok(tokens)
     }
 
-    /// Refine one request's conditioning: the text encoder's features into the DiT's width.
-    ///
-    /// `source` is the encoder's `[rows, text_dim]` output and `text` the request's `[rows, hidden]`
-    /// conditioning buffer; both are the executor's, and neither is retained. The refiner's
-    /// document boundaries are the `refiner_cu_seq_lens_*` tables of `state`, so its queries are
-    /// every padded row and its keys stop at the prompt's last row.
-    ///
-    /// It runs once per request, before the first evaluation
-    /// (`uniserve/models/minimax_h3/generation.py:145-171`): the conditioning never changes across
-    /// a trajectory, so refining inside the step loop would pay twice per layer per evaluation for
-    /// a value that is already right.
     /// Encode the request's raw media and write its condition rows into the prefix source.
     ///
     /// The rows are the layout's - `MediaInput::rows` and `audio_rows` carry the counts the packing
@@ -1996,10 +1985,11 @@ impl Denoiser {
     /// the encoders against it. Within a piece the audio rows come first, which is the reference's
     /// order (`uniserve/models/minimax_h3/denoiser.py:585-620`).
     ///
-    /// **The visual half is refused by name until the video encoder's posterior exists.**
-    /// `VideoEncoder::encode` stops at the 48-channel moments a sampler consumes, and a condition's
-    /// rows are built from the 24 normalised channels the posterior produces (`encoder-audit.md`
-    /// H1); conditioning on the moments instead would be a different image, quietly.
+    /// The visual half reads the encoder's 48-channel moments, not the rows a sampler consumes: a
+    /// condition's rows are the 24 normalised channels the posterior produces (`encoder-audit.md`
+    /// H1), so this projects the stitched raster once, takes the posterior's sample, patches it to
+    /// rows and anchors it against a draw at [`VISUAL_CONDITION_TIME`]. Conditioning on the moments
+    /// instead would be a different image, quietly.
     fn encode_media(
         &self,
         f: &Forward,
@@ -2252,6 +2242,17 @@ impl Denoiser {
         Ok(())
     }
 
+    /// Refine one request's conditioning: the text encoder's features into the DiT's width.
+    ///
+    /// `source` is the encoder's `[rows, text_dim]` output and `text` the request's `[rows, hidden]`
+    /// conditioning buffer; both are the executor's, and neither is retained. The refiner's
+    /// document boundaries are the `refiner_cu_seq_lens_*` tables of `state`, so its queries are
+    /// every padded row and its keys stop at the prompt's last row.
+    ///
+    /// It runs once per request, before the first evaluation
+    /// (`uniserve/models/minimax_h3/generation.py:145-171`): the conditioning never changes across a
+    /// trajectory, so refining inside the step loop would pay twice per layer per evaluation for a
+    /// value that is already right.
     pub fn refine_conditioning(
         &self,
         f: &Forward,
