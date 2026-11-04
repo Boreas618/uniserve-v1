@@ -1,0 +1,32 @@
+# The paged_kv_write operator's triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the
+# compile driver the Program Server runs for one descriptor and target).
+
+op = "paged_kv_write"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/paged_kv_write.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+[kernel.descriptors]
+dimensions = { dtype = ["bf16", "fp16", "fp32"], heads = ["4", "8"], head_dim = ["128"], block_size = ["16", "64", "128"], pages = ["1024", "4096", "16384", "65536"], flags = ["blocks", "none"], layout = ["contiguous"] }
+
+[parameters]
+tile = 256

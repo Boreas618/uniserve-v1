@@ -18,7 +18,7 @@ use crate::driver::{
     CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION, ClusterDim, Handle, LaunchAttribute,
     LaunchAttributeValue,
 };
-use crate::{Error, PrimaryContext, Result, Stream};
+use crate::{Device, Error, Result, Stream};
 
 /// A kernel of a loaded [`crate::Library`], resolved in its device's primary
 /// context.
@@ -30,7 +30,7 @@ use crate::{Error, PrimaryContext, Result, Stream};
 #[derive(Clone)]
 pub struct Function {
     raw: Handle,
-    context: PrimaryContext,
+    device: Device,
 }
 
 // SAFETY: a function handle is a driver object valid in every thread; the
@@ -41,16 +41,16 @@ unsafe impl Send for Function {}
 unsafe impl Sync for Function {}
 
 impl Function {
-    pub(crate) fn new(raw: Handle, context: PrimaryContext) -> Self {
-        Self { raw, context }
+    pub(crate) fn new(raw: Handle, device: Device) -> Self {
+        Self { raw, device }
     }
 
     pub(crate) fn raw(&self) -> Handle {
         self.raw
     }
 
-    pub(crate) fn context(&self) -> &PrimaryContext {
-        &self.context
+    pub(crate) fn device(&self) -> &Device {
+        &self.device
     }
 
     /// Launches the kernel on `stream` with `config` and `parameters`, which
@@ -71,6 +71,13 @@ impl Function {
         parameters: &mut [*mut c_void],
     ) -> Result<()> {
         config.check()?;
+        if stream.device() != self.device.id() {
+            return Err(Error::invalid(format!(
+                "the function belongs to {} but the stream to {}",
+                self.device.id(),
+                stream.device()
+            )));
+        }
 
         let driver = driver::driver()?;
         let _context = stream.enter()?;
@@ -148,7 +155,7 @@ impl Function {
     /// shared-memory size it may be launched with.
     pub fn set_attribute(&self, attribute: FunctionAttribute, value: i32) -> Result<()> {
         let driver = driver::driver()?;
-        let _context = self.context.enter()?;
+        let _context = self.device.enter()?;
         driver.check(
             // SAFETY: the function is live while its library is; the value is
             // passed by value.
@@ -198,13 +205,13 @@ impl LaunchConfig {
                 self.grid, self.block
             )));
         }
-        if let Some(cluster) = self.cluster {
-            if cluster.dims.contains(&0) {
-                return Err(Error::invalid(format!(
-                    "a cluster needs non-zero dimensions, got {:?}",
-                    cluster.dims
-                )));
-            }
+        if let Some(cluster) = self.cluster
+            && cluster.dims.contains(&0)
+        {
+            return Err(Error::invalid(format!(
+                "a cluster needs non-zero dimensions, got {:?}",
+                cluster.dims
+            )));
         }
         Ok(())
     }
@@ -268,5 +275,40 @@ fn empty_attribute() -> LaunchAttribute {
         id: 0,
         pad: [0; 4],
         value: LaunchAttributeValue { pad: [0; 64] },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_launch_rejects_empty_grid_block_and_cluster_dimensions() {
+        // A zero dimension is the caller's mistake, named before the driver
+        // sees the launch.
+        for config in [
+            LaunchConfig {
+                grid: [0, 1, 1],
+                ..LaunchConfig::new([1, 1, 1], [1, 1, 1])
+            },
+            LaunchConfig {
+                block: [1, 1, 0],
+                ..LaunchConfig::new([1, 1, 1], [1, 1, 1])
+            },
+            LaunchConfig {
+                cluster: Some(Cluster::new([1, 0, 1])),
+                ..LaunchConfig::new([1, 1, 1], [1, 1, 1])
+            },
+        ] {
+            assert!(matches!(config.check(), Err(Error::InvalidArgument(_))));
+        }
+
+        let well_formed = LaunchConfig {
+            cluster: Some(Cluster::new([2, 1, 1])),
+            pdl: true,
+            cooperative: false,
+            ..LaunchConfig::new([2, 4, 1], [128, 1, 1])
+        };
+        assert!(well_formed.check().is_ok());
     }
 }
