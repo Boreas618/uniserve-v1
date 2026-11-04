@@ -794,14 +794,24 @@ impl Switch {
     /// One report of one main process.
     fn report(&mut self, roster: &mut impl Roster, host: String, generation: u64, report: Report) {
         use process::report::Kind;
+        // Whichever report it is, it comes from a process of that generation:
+        // the highest one seen is the epoch's current generation, which the
+        // commit's and the revert's acks therefore keep up to date.
+        if self.is_target(generation) {
+            self.accept(generation);
+        }
         // The kind drives the phase; the whole report still states a failure.
         let kind = report.kind.clone();
         match (self.phase, kind) {
-            // `Report::Parked` and `Report::Promoted` are not in this
-            // branch's `process.proto` yet (front's `026466b20`,
-            // `2d477b9b5`); when they land, the daemon's mapping calls
-            // `parked` and `promoted` here. Until then those two inputs are
-            // the phase's only sources.
+            // The two reports that say a child prepared and serves in
+            // place: `Park` took effect, and `Promote` did. The child's
+            // generation is the one it was spawned at.
+            (Phase::Preparing, Some(Kind::Parked(parked))) if self.is_target(generation) => {
+                self.parked(roster, &host, parked.generation);
+            }
+            (Phase::Promoting, Some(Kind::Promoted(promoted))) if self.is_target(generation) => {
+                self.promoted(roster, &host, promoted.generation);
+            }
             (Phase::Serving, Some(Kind::Drained(drained)))
                 if generation == self.previous_generation =>
             {
@@ -1061,6 +1071,12 @@ mod tests {
     }
 
     fn setup() -> (Arc<Epochs>, Switch) {
+        switch_with(start())
+    }
+
+    /// A switch started with `start`, for a test that needs another command
+    /// than the usual one.
+    fn switch_with(start: Start) -> (Arc<Epochs>, Switch) {
         let epochs = Arc::new(Epochs::new());
         let switch = Switch::new(
             Arc::clone(&epochs),
@@ -1072,7 +1088,7 @@ mod tests {
             6,
             "engine:0".to_owned(),
             nodes(),
-            start(),
+            start,
             "unix:/run/requests.sock".to_owned(),
             Vec::new(),
         );
@@ -1321,7 +1337,12 @@ mod tests {
     /// build is stopped.
     #[test]
     fn an_unknown_build_is_fixed_by_the_first_child() {
-        let (epochs, mut switch) = setup();
+        // Another executable's build is unknown to the daemon: the child's
+        // first `Hello` is what fixes it.
+        let (epochs, mut switch) = switch_with(Start {
+            build: None,
+            ..start()
+        });
         let mut roster = Fake::default();
         switch.start(&mut roster);
         roster.scripted = vec![hello("n0", 6, "3.0.0+theirs")];
@@ -1491,7 +1512,8 @@ mod tests {
             roster
                 .resumes
                 .iter()
-                .all(|(_, generation, _)| *generation == 7)
+                .all(|(_, generation, _)| *generation == 5),
+            "the parked epoch returns at its own launch generation, 5"
         );
     }
 
@@ -1603,6 +1625,9 @@ mod tests {
         serve_target(&mut roster, &mut switch);
         roster.commands.clear();
         roster.serves.clear();
+        // The precopy claimed the target's world on each node; only the
+        // revert's claims are asserted below.
+        roster.claims.clear();
 
         roster.scripted = vec![report_event(
             "n1",
