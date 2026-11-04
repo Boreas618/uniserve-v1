@@ -1309,6 +1309,18 @@ impl MainProcess {
             if package.modules.is_empty() {
                 continue;
             }
+            // The store may hold operators this binary does not implement - another model's, or one
+            // whose row an older build lacked. Installing one would refuse the whole precopy in
+            // `admit_installs`, which is the wrong answer for a program this process cannot launch
+            // anyway: it is left out, and named at debug level so a missing operator is traceable.
+            if ops::operator_name(&package.op).is_none() {
+                tracing::debug!(
+                    op = %package.op,
+                    backend = %package.backend,
+                    "the store holds an operator this build does not implement"
+                );
+                continue;
+            }
             built += 1;
             let candidate = (package.backend.clone(), package.revision);
             match chosen.get(&package.op) {
