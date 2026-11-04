@@ -448,6 +448,10 @@ impl Update {
     /// Ends the probation by returning to the previous deployment (§7.3
     /// step 5): the update stays unavailable with its first failure, and
     /// applying it again takes `force`.
+    ///
+    /// A deliberate rollback is not a failure: it states none, so the update
+    /// it ends stays available and applying it again needs no `force`.
+    /// Only a revert after a failure is marked with one.
     pub fn revert(&mut self) {
         self.state = UpdateState::Reverted;
     }
