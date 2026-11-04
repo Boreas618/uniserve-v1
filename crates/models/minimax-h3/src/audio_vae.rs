@@ -678,6 +678,9 @@ impl Statistics {
 /// nothing in the network mixes the rows, so both output channels carry the same signal.
 pub struct AudioDecoder {
     config: AudioVaeConfig,
+    /// The latent statistics as one one-by-one convolution: a diagonal of the deviations and the means
+    /// as its bias, which is `value · std + mean` per latent channel.
+    denormalize: Conv1d,
     input: Conv1d,
     pre: Conv1d,
     stages: Vec<DecoderStage>,
@@ -776,6 +779,25 @@ impl AudioDecoder {
         let table = sources(config)?;
         let bound = parameters(config)?;
         check_table(&table, &bound)?;
+        let statistics = Statistics::of(config)?;
+        let (scale, shift) = denormalize_tables(&statistics)?;
+        let channels = u64::from(config.latent_channels);
+        let denormalize = Conv1d::new(
+            constants(
+                loader,
+                "audio_vae.denormalize.weight",
+                Shape::new(&[channels, channels, 1]),
+                &scale,
+            )?,
+            Some(constants(
+                loader,
+                "audio_vae.denormalize.bias",
+                Shape::new(&[channels]),
+                &shift,
+            )?),
+            geometry(1, 1, 0)?,
+            false,
+        )?;
         let mut binder = Binder::new(loader, table);
         let input = Conv1d::new(
             binder.normalized("input.weight")?,
@@ -856,6 +878,7 @@ impl AudioDecoder {
         binder.finish()?;
         Ok(Self {
             config: config.clone(),
+            denormalize,
             input,
             pre,
             stages: built,
@@ -884,8 +907,14 @@ impl AudioDecoder {
             )));
         }
         let mut length = shape.dim(2);
+        // The reference restores each latent channel (`value · std + mean`) before the decoder's first
+        // convolution, and this decoder's first convolution is weight-normalized, so its values exist
+        // only after the fold: the statistics are one one-by-one convolution of constants instead of a
+        // fold into that projection.
+        let restored = self.buffer(f, self.config.latent_channels, length)?;
+        self.denormalize.forward(f, latents, restored)?;
         let projected = self.buffer(f, self.config.latent_dim, length)?;
-        self.input.forward(f, latents, projected)?;
+        self.input.forward(f, restored, projected)?;
         let mut current = self.buffer(f, self.config.decoder_dim, length)?;
         self.pre.forward(f, projected, current)?;
         for stage in &self.stages {
@@ -977,6 +1006,42 @@ impl AudioDecoder {
             Shape::new(&[u64::from(PCM_CHANNELS), u64::from(channels), length]),
         )?)
     }
+}
+
+/// The statistics as the diagonal and the shift of the decoder's restoring convolution.
+///
+/// `value · std + mean` per latent channel is a one-by-one convolution whose weight is the diagonal of
+/// the deviations and whose bias is the means, so the restore is one operator of the same shape as the
+/// projection that follows it. The diagonal is `[channels, channels, 1]` in the convolution's
+/// `[out, in, kernel]` order.
+pub fn denormalize_tables(statistics: &Statistics) -> Result<(Vec<f32>, Vec<f32>)> {
+    let channels = statistics.mean.len();
+    if channels == 0 || statistics.std.len() != channels {
+        return Err(Error::config(format!(
+            "the latent statistics hold {} means and {} deviations",
+            statistics.mean.len(),
+            statistics.std.len()
+        )));
+    }
+    let mut scale = vec![0.0_f32; channels * channels];
+    for channel in 0..channels {
+        scale[channel * channels + channel] = statistics.std[channel];
+    }
+    Ok((scale, statistics.mean.clone()))
+}
+
+/// A constant weight of `values` in FP32, published once at load.
+fn constants(
+    loader: &mut nn::WeightLoader<'_>,
+    name: &str,
+    shape: Shape,
+    values: &[f32],
+) -> Result<Weight> {
+    let bytes: Vec<u8> = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    Ok(loader.constant(name, DType::F32, shape, &bytes)?)
 }
 
 /// The table and the load's own list must name the same parameters.
@@ -1346,6 +1411,28 @@ pub(crate) mod tests {
     fn the_receptive_field_is_the_references_thirty_latent_frames() {
         // Computed from the reference `receptive_field`: spread 58.31 output samples, one side 30.
         assert_eq!(receptive_field(&audio_config()).expect("field"), 30);
+    }
+
+    #[test]
+    fn the_restoring_convolution_is_the_diagonal_of_the_deviations() {
+        let config = crate::audio_vae::tests::audio_config();
+        let statistics = Statistics::of(&config).expect("the statistics");
+        let channels = statistics.mean.len();
+        let (scale, shift) = denormalize_tables(&statistics).expect("the tables");
+        // A one-by-one convolution's weight is `[out, in, 1]`: the deviations on the diagonal and zero
+        // everywhere else, so each channel is scaled by its own deviation and by nothing else.
+        assert_eq!(scale.len(), channels * channels);
+        for out in 0..channels {
+            for input in 0..channels {
+                let want = if out == input {
+                    statistics.std[input]
+                } else {
+                    0.0
+                };
+                assert_eq!(scale[out * channels + input], want);
+            }
+        }
+        assert_eq!(shift, statistics.mean);
     }
 
     #[test]
