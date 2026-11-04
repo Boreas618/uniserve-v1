@@ -30,6 +30,7 @@ pub mod scratch;
 mod transfers;
 
 pub(crate) use access::UnitAccesses;
+pub(crate) use conversion::Unimported;
 use imports::Imports;
 pub use imports::PendingImport;
 pub(crate) use transfers::TransferBases;
