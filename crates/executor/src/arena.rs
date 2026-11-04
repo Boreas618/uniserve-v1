@@ -19,9 +19,8 @@
 //! plan reuses the mapped blocks of a larger one instead of growing the pool.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
 
-use platform::{Allocator, Buffer, DevicePtr};
+use platform::{Allocator, Buffer, DevicePtr, PoolKind};
 
 use crate::plan::Bucket;
 use crate::{Error, Result};
@@ -60,12 +59,20 @@ struct Pool {
     plans: HashMap<Bucket, Plan>,
 }
 
-/// Every graph pool of one runner, by stream.
+/// The device's graph pools, by stream.
+///
+/// One `Pools` per device, shared by every runner that issues on it: two runners each reserving
+/// their own range would double-book the device's graph storage and break 4.1's budget by
+/// construction. Each stream gets one buffer of its share; the ledger books each bucket's extent
+/// inside it.
 pub struct Pools {
-    allocator: Arc<Allocator>,
-    /// The pool's reservation per stream and every mapping's booking.
+    /// The device's graph allocator, the one this pool reserved.
+    allocator: Allocator,
+    /// The pool's reservation per stream and every plan's booking.
     ledger: Ledger,
     pools: HashMap<StreamId, Pool>,
+    /// How many streams share the reservation.
+    streams: usize,
 }
 
 /// What a runner's graph pools hold, for the metrics report and item 5's invariant.
@@ -123,7 +130,7 @@ impl Ledger {
             .reservation
             .saturating_mul(self.streams.len() as u64 + 1);
         if reserved > self.budget {
-            return Err(Error::Resource(format!(
+            return Err(Error::Invalid(format!(
                 "a graph pool of {} bytes on stream {stream:?} would reserve {reserved} bytes of a {}-byte budget",
                 self.reservation, self.budget
             )));
@@ -186,19 +193,25 @@ impl Ledger {
 }
 
 impl Pools {
-    /// Reserves `bytes` of virtual address space per stream, on demand.
+    /// Reserves the device's graph pool and divides it among `streams` ranges.
     ///
-    /// The range is reserved, not mapped: physical blocks are mapped as a bucket's plan needs them
-    /// and booked against the device budget then. `bytes` is each stream's reservation and `budget`
-    /// the device bytes every mapping is booked against (`capacity::graph_storage_budget_bytes`);
-    /// the two are kept apart because a metric that reported the reservation as the budget would
-    /// pass every invariant by construction.
-    pub fn new(allocator: Arc<Allocator>, bytes: u64, budget: u64) -> Self {
-        Self {
+    /// `bytes` is the device's whole graph storage (`capacity::graph_storage_budget_bytes`) and
+    /// each stream gets `bytes / streams` of it: a captured graph addresses fixed buffers, so a
+    /// stream's range must not move while its graphs live, and two streams' work runs at once.
+    /// `budget` is the device budget the pool is booked against, kept apart from the reservation so
+    /// a report of one cannot pass the other's invariant by construction.
+    pub fn new(allocator: Allocator, bytes: u64, budget: u64, streams: usize) -> Result<Self> {
+        let streams = streams.max(1);
+        let mut allocator = allocator;
+        let size = usize::try_from(bytes)
+            .map_err(|_| Error::Resource("the graph storage is larger than memory".into()))?;
+        allocator.reserve(PoolKind::Graph, size)?;
+        Ok(Self {
             allocator,
-            ledger: Ledger::new(bytes, budget),
+            ledger: Ledger::new(bytes / streams as u64, budget),
             pools: HashMap::new(),
-        }
+            streams,
+        })
     }
 
     /// The bytes each stream's range reserves.
@@ -206,20 +219,25 @@ impl Pools {
         self.ledger.reservation
     }
 
-    /// The bytes mapped over every pool.
+    /// The bytes the device's graph pool has mapped, as the allocator books them (4.1).
     pub fn mapped(&self) -> u64 {
-        self.ledger.mapped()
+        self.allocator.mapped_bytes(PoolKind::Graph) as u64
     }
 
-    /// What this runner's graph pools hold and what they may hold (4.1, item 5's mapped-bytes
-    /// invariant): the bytes reserved per stream, the bytes mapped over them, and the device
-    /// budget they are booked against.
-    ///
-    /// `mapped <= budget` holds by construction: a reservation past the budget is refused in
-    /// [`Ledger::open`] and a plan past the reservation in [`Ledger::note`], so two generations'
-    /// graphs coexisting cannot overrun the device.
+    /// How many streams share the range.
+    pub fn streams(&self) -> usize {
+        self.streams
+    }
+
+    /// What the device's graph pools hold and what they may hold (4.1, item 5's invariant).
     pub fn metrics(&self) -> PoolMetrics {
-        self.ledger.metrics()
+        let booked = self.ledger.metrics();
+        PoolMetrics {
+            streams: self.pools.len(),
+            reserved: booked.reserved,
+            mapped: self.mapped(),
+            budget: booked.budget,
+        }
     }
 
     /// The plan of `bucket` on `stream`, if it was captured.
@@ -227,10 +245,10 @@ impl Pools {
         self.pools.get(&stream)?.plans.get(&bucket)
     }
 
-    /// The pool's base address on `stream`, reserving the range on first use.
+    /// The base address of `stream`'s range, allocating the range on first use.
     pub fn base(&mut self, stream: StreamId) -> Result<DevicePtr> {
         let pool = self.pool(stream)?;
-        Ok(pool.buffer.ptr())
+        Ok(DevicePtr::from_address(pool.buffer.address()))
     }
 
     /// Begins planning (first capture) or replaying `bucket` on `stream`, and answers whether the
@@ -240,53 +258,41 @@ impl Pools {
         Ok(!pool.plans.contains_key(&bucket))
     }
 
-    /// Records the plan of a bucket's first capture, from the allocations the model made.
+    /// Records the plan of a bucket's first capture: how far its arena reached in the range.
     ///
-    /// `offsets` are the pool offsets `nn::Arena` handed out in allocation order, relative to the
-    /// pool's base, and `bytes` the extent they reached. An empty plan is a bucket without
-    /// activations, which is legal.
-    pub fn record(
-        &mut self,
-        stream: StreamId,
-        bucket: Bucket,
-        offsets: Vec<u64>,
-        bytes: u64,
-    ) -> Result<()> {
-        let map = self.ledger.note(stream, bucket, bytes)?;
+    /// `nn::Arena` hands out addresses in the order the forward reserves them, and every capture
+    /// and replay of a bucket walks the same sequence, so the extent is all the pool has to
+    /// remember: the addresses repeat. A zero extent is a bucket without activations.
+    pub fn record(&mut self, stream: StreamId, bucket: Bucket, bytes: u64) -> Result<()> {
+        self.ledger.note(stream, bucket, bytes)?;
         let pool = self.pool(stream)?;
-        if map > 0 {
-            // The plan's extent is what must be mapped, so map up to it; the allocator books it
-            // against the device budget before the mapping exists.
-            pool.buffer.map(map)?;
-        }
-        pool.plans.insert(bucket, Plan { offsets, bytes });
+        pool.plans.insert(bucket, Plan { bytes });
         Ok(())
     }
 
-    /// Gives back the region of `bucket` on `stream` once its graph is gone (7.3's purge).
+    /// Stops planning `bucket` on `stream` once its graph is gone (7.3's purge).
     ///
-    /// The plan goes first, then the pool shrinks its mapping to the largest remaining plan, so a
-    /// purged generation returns its bytes to the budget rather than holding them until the
-    /// executor closes. Answers the bytes unmapped.
+    /// The booking goes; the pool's mapping stays, because 4.1 returns physical storage to the
+    /// device only when the pool is destroyed or shrunk. Answers the bytes the bucket no longer
+    /// books.
     pub fn release_bucket(&mut self, stream: StreamId, bucket: Bucket) -> Result<u64> {
-        let unmap = self.ledger.release(stream, bucket);
-        let Some(pool) = self.pools.get_mut(&stream) else {
-            return Ok(0);
-        };
-        pool.plans.remove(&bucket);
-        if unmap > 0 {
-            pool.buffer.unmap(unmap)?;
+        let bytes = self
+            .pools
+            .get(&stream)
+            .and_then(|pool| pool.plans.get(&bucket).map(Plan::bytes))
+            .unwrap_or(0);
+        self.ledger.release(stream, bucket);
+        if let Some(pool) = self.pools.get_mut(&stream) {
+            pool.plans.remove(&bucket);
         }
-        Ok(unmap)
+        Ok(bytes)
     }
 
-    /// Releases every plan and the pool's mappings of one stream (an executor close).
+    /// Gives `stream`'s range back: its plans go and the pool takes the buffer's block back.
     pub fn release(&mut self, stream: StreamId) -> Result<()> {
-        let unmap = self.ledger.close(stream);
-        if let Some(mut pool) = self.pools.remove(&stream) {
-            if unmap > 0 {
-                pool.buffer.unmap(unmap)?;
-            }
+        self.ledger.close(stream);
+        if let Some(pool) = self.pools.remove(&stream) {
+            self.allocator.free(pool.buffer);
         }
         Ok(())
     }
@@ -303,7 +309,10 @@ impl Pools {
     fn pool(&mut self, stream: StreamId) -> Result<&mut Pool> {
         if !self.pools.contains_key(&stream) {
             self.ledger.open(stream)?;
-            let buffer = self.allocator.reserve(self.ledger.reservation)?;
+            let bytes = usize::try_from(self.ledger.reservation).map_err(|_| {
+                Error::Resource("a stream's graph range is larger than memory".into())
+            })?;
+            let buffer = self.allocator.allocate(PoolKind::Graph, bytes)?;
             self.pools.insert(
                 stream,
                 Pool {

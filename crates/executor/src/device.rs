@@ -15,13 +15,14 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use nn::Generation;
+use ops::Generation;
 use platform::DeviceId;
 
 use crate::batch::{Batch, BatchOutput, Job, JobKind, Submission, SubmissionId};
 use crate::completion::Outcome;
 use crate::job::{Command, JobQueue, jobs_of, kind_of, phase_of};
 use crate::runner::{NamedRunner, RunnerId};
+use crate::arena::Pools;
 use crate::stream::Streams;
 use crate::stream::events::{DRAIN_LIMIT, EventPool, JobId, drain_event};
 use crate::{Error, Result};
@@ -31,6 +32,19 @@ pub struct Executor {
     device: DeviceId,
     queue: Arc<JobQueue>,
     thread: Option<JoinHandle<()>>,
+    /// The device's graph pools, shared by every runner that issues here (4.1).
+    pools: Arc<std::sync::Mutex<Pools>>,
+}
+
+/// The device's graph storage, as the engine sizes it before the executor starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GraphStorage {
+    /// Bytes the device may map for captured graphs (4.1's budget).
+    pub bytes: u64,
+    /// The device budget those mappings are booked against.
+    pub budget: u64,
+    /// How many streams the executor issues on; the range is divided among them.
+    pub streams: usize,
 }
 
 impl Executor {
@@ -41,10 +55,22 @@ impl Executor {
     /// owners' recorded jobs.
     pub fn spawn(
         device: DeviceId,
-        runners: Vec<NamedRunner>,
+        mut runners: Vec<NamedRunner>,
         streams: Streams,
         events: Arc<EventPool>,
+        graph: GraphStorage,
     ) -> Result<Self> {
+        let handle = platform::Device::new(device)?;
+        let allocator = platform::Allocator::new(&handle, Arc::new(GraphBudget { bytes: graph.budget }))?;
+        let pools = Arc::new(std::sync::Mutex::new(Pools::new(
+            allocator,
+            graph.bytes,
+            graph.budget,
+            graph.streams,
+        )?));
+        for named in &mut runners {
+            named.runner.attach_pools(Arc::clone(&pools));
+        }
         let queue = JobQueue::new(device, Arc::clone(&events));
         let state = Device {
             device,
@@ -58,7 +84,7 @@ impl Executor {
             .name(format!("executor-{}", device.0))
             .spawn(move || state.run(&thread_queue))
             .map_err(|error| {
-                Error::State(format!(
+                Error::Invalid(format!(
                     "the executor thread of {device} did not start: {error}"
                 ))
             })?;
@@ -66,6 +92,7 @@ impl Executor {
             device,
             queue,
             thread: Some(thread),
+            pools,
         })
     }
 
@@ -141,6 +168,19 @@ impl Executor {
             None,
         )?;
         Ok(submission)
+    }
+
+    /// The device's graph pools' books: reserved and mapped bytes against the budget (4.1).
+    pub fn pools_metrics(&self) -> crate::arena::PoolMetrics {
+        self.pools
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .metrics()
+    }
+
+    /// The device's memory report: the budget and the mapped bytes of every pool kind.
+    pub fn memory(&self) -> crate::arena::PoolMetrics {
+        self.pools_metrics()
     }
 
     /// What the control thread's watchdog reads: the command in flight and how long it took (2.4).
@@ -226,6 +266,24 @@ enum Step {
     Requeued,
 }
 
+/// The device's graph-storage budget, as the allocator books against it (4.1).
+struct GraphBudget {
+    /// Bytes the device may map for captured graphs.
+    bytes: u64,
+}
+
+impl platform::Budget for GraphBudget {
+    fn book(&self, _device: DeviceId, _pool: platform::PoolKind, bytes: u64) -> platform::Result<()> {
+        if bytes > self.bytes {
+            return Err(platform::Error::InvalidArgument(format!(
+                "a graph pool of {bytes} bytes exceeds the device's {} bytes",
+                self.bytes
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// What a sticky-error probe found (2.4).
 #[derive(Debug)]
 pub enum Probe {
@@ -300,7 +358,7 @@ impl Device {
     /// Reads this device's context for a sticky error, the check the stall rule ends in (2.4).
     fn probe_sticky(&self) -> Result<Option<platform::Error>> {
         let context = platform::PrimaryContext::retain(self.device)?;
-        context.sticky_error()
+        context.sticky_error().map_err(Into::into)
     }
 
     /// Performs one command and waits for its device work before returning (2.4: the executor
@@ -314,7 +372,7 @@ impl Device {
         match &entry.command {
             Command::Batch(batch) => {
                 let runner = self.runner_of(phase_of(batch))?;
-                let jobs = self.runner_mut(runner)?.submit(batch.clone())?;
+                let jobs = self.runner_mut(runner)?.runner.submit(batch.clone())?;
                 // A batch's jobs are its replay and nothing else: serving it is one turn, because
                 // the mechanism waits on this submission to build the next step.
                 self.perform(jobs_of(runner, jobs)).map(Step::Done)
@@ -340,26 +398,28 @@ impl Device {
                 for named in &mut self.runners {
                     named.runner.switchover(*generation);
                 }
-                self.streams.synchronize()?;
+                self.synchronize()?;
                 Ok(Step::Done(BatchOutput::default()))
             }
             Command::Revert(generation) => {
                 for named in &mut self.runners {
                     named.runner.revert(*generation);
                 }
-                self.streams.synchronize()?;
+                self.synchronize()?;
                 Ok(Step::Done(BatchOutput::default()))
             }
             Command::Purge(generation) => {
                 for named in &mut self.runners {
                     named.runner.purge(*generation);
                 }
-                self.streams.synchronize()?;
+                self.synchronize()?;
                 Ok(Step::Done(BatchOutput::default()))
             }
             Command::Issue(work) => {
-                work.perform()?;
-                self.streams.synchronize()?;
+                work.lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .perform()?;
+                self.synchronize()?;
                 Ok(Step::Done(BatchOutput::default()))
             }
             Command::After(events) => {
@@ -404,8 +464,8 @@ impl Device {
             let runner = job
                 .runner()
                 .ok_or_else(|| Error::Invariant("a serving job names no runner".into()))?;
-            let produced = self.runner_mut(runner)?.serve(&job)?;
-            self.streams.synchronize()?;
+            let produced = self.runner_mut(runner)?.runner.serve(&job)?;
+            self.synchronize()?;
             if !produced.tokens.is_empty() {
                 if !output.tokens.is_empty() {
                     return Err(Error::Invariant(
@@ -416,6 +476,14 @@ impl Device {
             }
         }
         Ok(output)
+    }
+
+    /// Waits for this device's primary stream, which is where the runner's work was issued.
+    fn synchronize(&self) -> Result<()> {
+        match self.streams.stream_for(self.device) {
+            Some(stream) => stream.synchronize(),
+            None => Ok(()),
+        }
     }
 
     /// The runner that serves `phase`.

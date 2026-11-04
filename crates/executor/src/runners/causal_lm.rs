@@ -20,11 +20,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use ipc::PhaseId;
-use nn::CausalLm;
-use ops::Generation;
+use nn::{CausalLm, Forward, KvView, SamplerState, Samples, TokenBatch};
+use ops::{DType, Generation, TensorView};
 use platform::DeviceId;
 
-use crate::arena::{Pools, StreamId};
+use crate::arena::{Pools, PoolMetrics, StreamId};
 use crate::batch::{Batch, BatchColumns, BatchOutput, CallId, Job, Jobs, SampledToken};
 use crate::captured::Captured;
 use crate::graph::Graphs;
@@ -86,7 +86,7 @@ impl Staging {
     pub fn stage(
         &mut self,
         columns: &BatchColumns,
-        calls: &[CallId],
+        call_ids: &[CallId],
         shape: &Shape,
         bucket: Bucket,
     ) -> Result<Shape> {
@@ -144,6 +144,7 @@ impl Staging {
         // after it, each evaluating the padding token that follows.
         let mut cursor = tokens;
         let calls = self.rows.calls.len();
+        let _ = calls;
         if let Some(last) = self.rows.calls.last_mut() {
             if tokens < bucket_tokens {
                 last.rows.end = bucket_tokens as u32;
@@ -189,7 +190,7 @@ impl Staging {
         self.page_size = columns.page_size;
         self.max_kv_len = columns.max_kv_len;
         self.calls.clear();
-        self.calls.extend_from_slice(calls);
+        self.calls.extend_from_slice(call_ids);
         self.calls.resize(bucket_rows, CallId(u64::MAX));
 
         self.staged = Some(bucket.shape());
@@ -248,6 +249,257 @@ impl Staging {
     }
 }
 
+/// The model's geometry: what the runner sizes a bucket's plan and the sampler from.
+#[derive(Clone, Copy, Debug)]
+pub struct Geometry {
+    /// The width of a hidden-state row.
+    pub hidden: u32,
+    /// The element type the model's forward reads and writes hidden states in.
+    pub hidden_dtype: DType,
+    /// The element type the head writes logits in.
+    pub logits_dtype: DType,
+    /// The vocabulary width of a logit row.
+    pub vocabulary: u32,
+    /// How many request slots the deployment serves: the sampler's penalty-count table's height.
+    pub slots: u32,
+    /// The largest top-k width a request may ask for: the sampler's candidate width.
+    pub width: u32,
+    /// Tokens per KV page.
+    pub page_size: u32,
+    /// The bound on the keys a row reads: the attention descriptor's reduction length.
+    pub max_kv_len: u32,
+}
+
+/// One host column of a batch, uploaded into a device buffer whose address never moves.
+///
+/// A captured graph addresses these buffers directly, so they are allocated once when the runner
+/// binds, sized for the largest bucket, and every step rewrites their contents instead of
+/// allocating: what 4.5 forbids is an allocation inside a step, not a copy into a fixed buffer.
+struct Column {
+    device: TensorView,
+    host: platform::PinnedBuffer,
+}
+
+impl Column {
+    /// A column of `numel` elements of `dtype` on `device`.
+    fn new(device: DeviceId, dtype: DType, numel: u64) -> Result<Self> {
+        let bytes = dtype
+            .bytes()
+            .ok_or_else(|| Error::Invalid(format!("{dtype} has no whole-byte size")))?
+            .checked_mul(numel)
+            .ok_or_else(|| Error::Invalid("a batch column's extent overflows".into()))?;
+        let host = platform::PinnedBuffer::new(device, bytes as usize)?;
+        let device = TensorView::new(
+            ops::DevicePtr::new(host.address()),
+            dtype,
+            ops::Shape::new(&[numel]),
+        );
+        Ok(Self { device, host })
+    }
+
+    /// Writes `bytes` into the host side; the device copy follows in [`Column::upload`].
+    fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        if bytes.len() > self.host.len() {
+            return Err(Error::Invariant(format!(
+                "a column of {} bytes cannot hold {}",
+                self.host.len(),
+                bytes.len()
+            )));
+        }
+        // SAFETY: the caller wrote `bytes.len()` bytes of one element type into a host buffer of at
+        // least that size, allocated for exactly this purpose; the buffer is not read concurrently.
+        unsafe {
+            self.host.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
+        }
+        Ok(())
+    }
+
+    /// Copies the host side into the device column; the caller's graph reads it afterwards.
+    fn upload(&self, stream: &platform::Stream) -> Result<()> {
+        // SAFETY: source and destination are this column's own host and device buffers, of the
+        // same length, and the copy is stream-ordered before the graph that reads the device one.
+        unsafe {
+            platform::memcpy_async(
+                self.device.ptr.address(),
+                self.host.address(),
+                self.host.len(),
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The first `elements` of the column, as a view the batch reads.
+    fn extent(&self, elements: std::ops::Range<u64>) -> TensorView {
+        TensorView::new(
+            self.device.ptr,
+            self.device.dtype,
+            ops::Shape::new(&[elements.end - elements.start]),
+        )
+    }
+}
+
+/// The batch columns of every bucket of one runner, sized for the largest bucket it serves.
+struct Columns {
+    /// The tokens the largest bucket holds.
+    tokens: usize,
+    /// The rows the largest bucket holds.
+    rows: usize,
+    positions: Column,
+    slot_mapping: Column,
+    seq_lens: Column,
+    query_offsets: Column,
+    logits_rows: Column,
+    /// `[rows]` the token row each row's logits are gathered from, `0` for a row that samples
+    /// nothing (its id is discarded, so the gather may read any in-range row).
+    indices: Column,
+    parameters: Column,
+    slots: Column,
+    draws: Column,
+    /// `[rows]` the sampled ids, read back after a replay.
+    readback: platform::PinnedBuffer,
+}
+
+impl Columns {
+    /// Allocates the columns for the largest bucket `buckets` holds.
+    fn new(device: DeviceId, buckets: &Buckets) -> Result<Self> {
+        let largest = buckets
+            .iter()
+            .max_by_key(|bucket| (bucket.rows, bucket.tokens))
+            .copied()
+            .ok_or_else(|| Error::Invalid("the runner has no bucket to serve".into()))?;
+        let tokens = largest.tokens as u64;
+        let rows = largest.rows as u64;
+        let parameters = rows * u64::from(ops::sampler::PARAMETER_COLUMNS);
+        Ok(Self {
+            tokens: tokens as usize,
+            rows: rows as usize,
+            positions: Column::new(device, DType::I32, tokens)?,
+            slot_mapping: Column::new(device, DType::I32, tokens)?,
+            seq_lens: Column::new(device, DType::I32, rows)?,
+            query_offsets: Column::new(device, DType::I32, rows + 1)?,
+            logits_rows: Column::new(device, DType::I32, rows)?,
+            indices: Column::new(device, DType::I32, rows)?,
+            parameters: Column::new(device, DType::F32, parameters)?,
+            slots: Column::new(device, DType::I32, rows)?,
+            draws: Column::new(device, DType::F32, rows)?,
+            readback: platform::PinnedBuffer::new(device, (rows * 4) as usize)?,
+        })
+    }
+}
+
+/// Where one bucket's sampler wrote its ids: the first `rows` i32 of the plan's sampler block.
+#[derive(Clone, Copy)]
+struct Sampled {
+    /// `[rows]` i32 sampled token ids, in the bucket's row order.
+    tokens: TensorView,
+}
+
+/// The sampling step's own device state: the slot histories its penalties read.
+struct Sampling {
+    sampler: nn::Sampler,
+    /// `[slots, vocabulary]` i32 counts of the tokens each slot has already seen, which the
+    /// penalties subtract; zeroed once when the runner binds and advanced by `ops::commit`.
+    counts: TensorView,
+    _counts: platform::DeviceAllocation,
+}
+
+impl Sampling {
+    /// The sampler and its zeroed count table for `geometry`.
+    fn new(device: DeviceId, stream: &platform::Stream, geometry: Geometry) -> Result<Self> {
+        let sampler = nn::Sampler::new(
+            geometry.vocabulary,
+            geometry.slots,
+            geometry.width.min(geometry.vocabulary),
+            0,
+        )?;
+        let bytes = u64::from(geometry.slots) * u64::from(geometry.vocabulary) * 4;
+        let allocation = platform::DeviceAllocation::linear(
+            device,
+            usize::try_from(bytes)
+                .map_err(|_| Error::Invalid("the sampler's count table is larger than memory".into()))?,
+        )?;
+        // The table starts at zero: a slot has seen no token before its first call. Zeroing is a
+        // bind-time copy, not a step's, so a chunked upload from pinned memory is enough.
+        let chunk = 1 << 22;
+        let staging = platform::PinnedBuffer::new(device, chunk)?;
+        // SAFETY: the staging buffer is this allocation's own pinned memory, wholly writable.
+        let zeros = unsafe { staging.as_slice() };
+        let mut written = 0u64;
+        while written < bytes {
+            let step = (bytes - written).min(chunk as u64);
+            // SAFETY: source and destination are the pinned chunk and the count table's range, of
+            // the same length, and the copy is stream-ordered before the first sample.
+            unsafe {
+                platform::memcpy_async(
+                    allocation.address() + written,
+                    staging.address(),
+                    step as usize,
+                    stream,
+                )?;
+            }
+            written += step;
+            let _ = zeros;
+        }
+        stream.synchronize()?;
+        let counts = TensorView::new(
+            ops::DevicePtr::new(allocation.address()),
+            DType::I32,
+            ops::Shape::new(&[
+                u64::from(geometry.slots),
+                u64::from(geometry.vocabulary),
+            ]),
+        );
+        Ok(Self {
+            sampler,
+            counts,
+            _counts: allocation,
+        })
+    }
+}
+
+/// What the runner needs from the block's resident KV cache to build a batch's `nn::KvView`.
+///
+/// The cache is the memory owner's (8's resident pages and its block tables); the runner only
+/// reads it. `scratch` answers a page set of the paired forward's own, whose pages are never a
+/// serving request's (7.3).
+pub trait KvProvider: Send + Sync {
+    /// How many attention groups the model's layers index.
+    fn groups(&self) -> usize;
+
+    /// Tokens per cache page.
+    fn page_size(&self) -> u32;
+
+    /// Element type of the KV planes.
+    fn dtype(&self) -> DType;
+
+    /// The block table of `group` for the batch rows whose slots are `slots`, `[rows, max_pages]`.
+    ///
+    /// The batch's rows are the calls' request slots, so this gathers one table row per batch row
+    /// on `stream` and returns a view the captured graph addresses.
+    fn block_table(
+        &self,
+        group: usize,
+        slots: &[u32],
+        stream: &platform::Stream,
+    ) -> Result<TensorView>;
+
+    /// The plane views of `group`'s layers, in model order.
+    fn planes(&self, group: usize) -> Result<Vec<nn::KvPlanes>>;
+
+    /// The per-page scales of `group`'s planes, for a quantized cache.
+    fn scales(&self, group: usize) -> Option<(TensorView, TensorView)>;
+
+    /// A scratch page set of `pages` pages for `group`, its table over `slots`, and its planes.
+    fn scratch(
+        &self,
+        group: usize,
+        slots: &[u32],
+        pages: u32,
+        stream: &platform::Stream,
+    ) -> Result<(TensorView, Vec<nn::KvPlanes>, Option<(TensorView, TensorView)>)>;
+}
+
 /// A causal language model's runner: one block's decode and prefill phases.
 pub struct CausalLmRunner<M: CausalLm> {
     /// The executor's name for this runner.
@@ -266,8 +518,10 @@ pub struct CausalLmRunner<M: CausalLm> {
     buckets: Buckets,
     /// The captured graphs of every generation the runner holds.
     graphs: Graphs,
-    /// The graph pools and each bucket's static activation plan.
-    pools: Pools,
+    /// The device's graph pools and each bucket's static activation plan, shared with every other
+    /// runner of this device (one pool per device, never per runner); the executor attaches them
+    /// before the first capture.
+    pools: Option<Arc<std::sync::Mutex<Pools>>>,
     /// The host columns of the batch being staged.
     staging: Staging,
     /// The device the runner computes on.
@@ -278,8 +532,20 @@ pub struct CausalLmRunner<M: CausalLm> {
     stream: platform::Stream,
     /// Where shadow execution's twins live, allocated at bind, before the first capture.
     shadow: Option<crate::shadow::Shadow>,
-    /// The sampler output of every bucket that samples, addressed in its plan (4.4).
-    samplers: HashMap<Bucket, SamplerBuffer>,
+    /// The model's geometry: hidden width, logits width, page size and the sampler's bounds.
+    geometry: Geometry,
+    /// Every bucket's per-step columns, whom the captured graphs address directly.
+    columns: Columns,
+    /// The sampling step's own state, when any bucket samples.
+    sampling: Option<Sampling>,
+    /// The sampling row's output views, per bucket's plan, written by `sample` and read by the
+    /// replay's readback. Interior mutability because the walk's KV closure borrows the runner
+    /// while it runs.
+    bucket_samples: std::cell::RefCell<HashMap<Bucket, Sampled>>,
+    /// Where the batch's KV views come from: the resident cache, and a paired forward's scratch.
+    kv: Arc<dyn KvProvider>,
+    /// The sampling step's uniform generator, seeded by the engine so a run reproduces.
+    seed: std::cell::Cell<u64>,
 }
 
 impl<M: CausalLm> CausalLmRunner<M> {
@@ -293,12 +559,20 @@ impl<M: CausalLm> CausalLmRunner<M> {
         model: M,
         generation: Arc<Generation>,
         buckets: Buckets,
-        pools: Pools,
         device: DeviceId,
         stream: platform::Stream,
+        geometry: Geometry,
+        kv: Arc<dyn KvProvider>,
+        seed: u64,
     ) -> Result<Self> {
         let mut staging = Staging::new();
         staging.reserve(&buckets)?;
+        let columns = Columns::new(device, &buckets)?;
+        let sampling = if buckets.iter().any(|bucket| bucket.variant.samples()) {
+            Some(Sampling::new(device, &stream, geometry)?)
+        } else {
+            None
+        };
         Ok(Self {
             id,
             phases,
@@ -308,12 +582,17 @@ impl<M: CausalLm> CausalLmRunner<M> {
             next: None,
             buckets,
             graphs: Graphs::new(),
-            pools,
+            pools: None,
             staging,
             device,
             stream,
             shadow: None,
-            samplers: HashMap::new(),
+            geometry,
+            columns,
+            sampling,
+            bucket_samples: std::cell::RefCell::new(HashMap::new()),
+            kv,
+            seed: std::cell::Cell::new(seed | 1),
         })
     }
 
@@ -337,9 +616,26 @@ impl<M: CausalLm> CausalLmRunner<M> {
         &self.graphs
     }
 
-    /// The graph pools.
-    pub fn pools(&self) -> &Pools {
-        &self.pools
+    /// The graph pools this runner books its buckets in, once the executor attached them.
+    pub fn pools(&self) -> Option<&Arc<std::sync::Mutex<Pools>>> {
+        self.pools.as_ref()
+    }
+
+    /// The pools' books, for the caller that reports mapped bytes against the budget.
+    fn pool(&self) -> Result<std::sync::MutexGuard<'_, Pools>> {
+        self.pools
+            .as_ref()
+            .map(|pools| {
+                pools
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            })
+            .ok_or_else(|| Error::State("the runner has no graph pools yet".into()))
+    }
+
+    /// What the graph pools hold and what they may hold, for the metrics report (4.1).
+    pub fn pool_metrics(&self) -> PoolMetrics {
+        self.pool().map(|pools| pools.metrics()).unwrap_or_default()
     }
 
     /// Installs the shadow harness, sized for the largest bucket's shadow set.
@@ -465,11 +761,12 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         // held. The old generation's graphs, its arena plans and its sampler regions stay exactly
         // as they were, so a reverted update cannot disturb a batch in flight.
         let dropped = self.graphs.purge(generation);
+        let dropped_count = dropped.len();
         if self.next.as_ref().map(|next| next.number()) == Some(generation) {
             self.next = None;
         }
         tracing::info!(
-            dropped,
+            dropped = dropped_count,
             generation,
             "reverted the prepared generation; the serving generation is unchanged"
         );
@@ -492,14 +789,26 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         self.previous = Some(std::mem::replace(&mut self.generation, prepared));
     }
 
+    fn attach_pools(&mut self, pools: Arc<std::sync::Mutex<Pools>>) {
+        self.pools = Some(pools);
+    }
+
+    fn pool_metrics(&self) -> PoolMetrics {
+        self.pool().map(|pools| pools.metrics()).unwrap_or_default()
+    }
+
     fn purge(&mut self, generation: u64) {
         // The graphs go first, then their arena regions: `Captured` guarantees that order, and a
         // region released under a live executable would be reused by the next generation's
         // capture while the old graph still addressed it.
         let dropped = self.graphs.purge(generation);
+        let dropped_count = dropped.len();
         let mut released = 0u64;
         for bucket in &dropped {
-            match self.pools.release_bucket(StreamId(0), *bucket) {
+            let released_bucket = self
+                .pool()
+                .and_then(|mut pools| pools.release_bucket(StreamId(0), *bucket));
+            match released_bucket {
                 Ok(bytes) => released += bytes,
                 // A pool that cannot shrink keeps the bytes mapped until the executor closes;
                 // the purge itself still holds, so this is not a reason to fail the command.
@@ -509,7 +818,7 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
             }
         }
         tracing::debug!(
-            dropped = dropped.len(),
+            dropped = dropped_count,
             released,
             generation,
             "purged graphs of a replaced generation"
@@ -528,28 +837,48 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
     fn serve(&mut self, job: &Job) -> Result<BatchOutput> {
         match job {
             Job::Replay {
-                bucket, generation, ..
+                bucket,
+                generation,
+                batch,
+                ..
             } => {
+                let _ = batch;
+                let stream = self.stream.clone();
                 let captured = self.graphs.captured(*bucket, *generation).ok_or_else(|| {
                     Error::Invariant(format!(
                         "no graph of bucket {bucket} in generation {generation}"
                     ))
                 })?;
-                self.replay(captured)
+                captured.launch(&stream)?;
+                // The sampled tokens are read back now, before the submission completes: the
+                // mechanism builds the next step's input ids from them (4.4).
+                self.read_sampled(*bucket)
             }
-            Job::Capture { bucket, generation } => self.capture(*bucket, *generation),
+            Job::Capture {
+                bucket, generation, ..
+            } => self
+                .capture(*bucket, *generation)
+                .map(|()| BatchOutput::default()),
             Job::Shadow {
                 operator,
                 key,
                 bucket,
                 generation,
-            } => self.shadow(*operator, key, *bucket, *generation),
-            Job::Rebind { bucket, generation } => self.rebind(*bucket, *generation),
+                ..
+            } => self
+                .shadow(*operator, key, *bucket, *generation)
+                .map(|()| BatchOutput::default()),
+            Job::Rebind {
+                bucket, generation, ..
+            } => self
+                .rebind(*bucket, *generation)
+                .map(|()| BatchOutput::default()),
             Job::Issue { .. } | Job::After { .. } => Err(Error::Invariant(
                 "the device queue performs its own jobs".into(),
             )),
         }
     }
+
 }
 
 impl<M: CausalLm> CausalLmRunner<M> {
@@ -569,18 +898,22 @@ impl<M: CausalLm> CausalLmRunner<M> {
     fn capture(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
         let kernels = self.generation_named(generation)?;
         let stream = self.stream.clone();
-        let mut capture = platform::Capture::begin(&stream)?;
-        let nodes = {
-            let mut recording = Recording::new(&mut capture);
-            // The model's forward runs with the generation being captured and the bucket's
-            // arena, so every operator launch becomes a node of the template and is reported to
-            // `recording` by the operator layer.
-            ops::capture::set_sink(Some(&mut recording));
-            let walked = self.walk(bucket, &kernels);
-            ops::capture::set_sink(None);
-            walked?;
-            recording.nodes
-        };
+        let capture = Arc::new(std::sync::Mutex::new(platform::Capture::begin(&stream, platform::CaptureMode::Relaxed)?));
+        let mut recording = Recording::new(Arc::clone(&capture));
+        // The model's forward runs with the generation being captured and the bucket's arena, so
+        // every operator launch becomes a node of the template and is reported to `recording`.
+        ops::capture::set_sink(Some(&mut recording));
+        let walked = self.walk(bucket, &kernels);
+        ops::capture::set_sink(None);
+        let nodes = recording.nodes;
+        if let Some(failure) = recording.failure {
+            return Err(failure.into());
+        }
+        walked?;
+        let capture = Arc::try_unwrap(capture)
+            .map_err(|_| Error::Invariant("the capture is still shared by its recorder".into()))?
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let template = capture.end()?;
 
         // The graph holds the kernels it launches, so none unloads while it can replay; purge
@@ -591,12 +924,6 @@ impl<M: CausalLm> CausalLmRunner<M> {
             if !held.iter().any(|existing| Arc::ptr_eq(existing, kernel)) {
                 held.push(Arc::clone(kernel));
             }
-        }
-        if bucket.variant.samples() {
-            // The sampler output is the plan's first block; the buffer is the runner's host copy.
-            let base = self.pools.base(StreamId(0))?;
-            let sampler = SamplerBuffer::new(self.device, base, bucket.rows)?;
-            self.samplers.insert(bucket, sampler);
         }
         let captured = Captured::new(template, nodes, held)?;
         self.graphs.insert(bucket, generation, captured);
@@ -609,21 +936,31 @@ impl<M: CausalLm> CausalLmRunner<M> {
     fn rebind(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
         let kernels = self.generation_named(generation)?;
         let current = self.generation.number();
+        if self.graphs.captured(bucket, current).is_none() {
+            return Err(Error::Invariant(format!(
+                "no graph of bucket {bucket} in generation {current}"
+            )));
+        }
+        let stream = self.stream.clone();
+        let capture = Arc::new(std::sync::Mutex::new(platform::Capture::begin(&stream, platform::CaptureMode::Relaxed)?));
+        let mut recording = Recording::new(Arc::clone(&capture));
+        ops::capture::set_sink(Some(&mut recording));
+        let walked = self.walk(bucket, &kernels);
+        ops::capture::set_sink(None);
+        let nodes = recording.nodes;
+        if let Some(failure) = recording.failure {
+            return Err(failure.into());
+        }
+        walked?;
+        let capture = Arc::try_unwrap(capture)
+            .map_err(|_| Error::Invariant("the capture is still shared by its recorder".into()))?
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let template = capture.end()?;
+
         let served = self.graphs.captured(bucket, current).ok_or_else(|| {
             Error::Invariant(format!("no graph of bucket {bucket} in generation {current}"))
         })?;
-        let stream = self.stream.clone();
-        let mut capture = platform::Capture::begin(&stream)?;
-        let nodes = {
-            let mut recording = Recording::new(&mut capture);
-            ops::capture::set_sink(Some(&mut recording));
-            let walked = self.walk(bucket, &kernels);
-            ops::capture::set_sink(None);
-            walked?;
-            recording.nodes
-        };
-        let template = capture.end()?;
-
         // The walk's launches are the same ones, in the same order, as the live graph's: pair
         // them, read each node's parameters from the template, and set them on the executable.
         let mut launch_of: std::collections::HashMap<&'static str, usize> =
@@ -700,23 +1037,55 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// Walks one bucket's forward with two kernels of `operator`: `previous`'s on the real outputs
     /// and `next`'s on the twins (7.3).
     ///
-    /// The model's `Forward::operate` does the branch, for every layer alike: with the shadow
-    /// field set it calls `O::shadow`, launches the new kernel into the twins and the old one into
-    /// the real outputs; every other operator launches from `next` only.
+    /// The paired forward runs over the batch's own columns but a scratch KV: every page it writes
+    /// is a scratch page, so the new kernel cannot touch a page a serving request reads. The
+    /// model's `Forward::operate` does the branch, once, for every layer alike.
     fn walk_paired(
         &mut self,
-        _bucket: Bucket,
-        _next: &Arc<Generation>,
-        _previous: &Arc<Generation>,
-        _operator: &'static str,
-        _key: &str,
-        _twins: &mut ops::Twins,
+        bucket: Bucket,
+        next: &Arc<Generation>,
+        previous: &Arc<Generation>,
+        operator: &'static str,
+        key: &str,
+        twins: &mut ops::Twins,
     ) -> Result<()> {
-        Err(Error::State(
-            "the paired forward needs nn::Forward::operate (exec-work M169/M159): the model's \
-             layers call it, and the runner only sets the forward's shadow field"
-                .into(),
-        ))
+        let stream = self.stream.clone();
+        match self.staging.staged() {
+            Some(staged) if staged.variant == bucket.variant => {}
+            _ => {
+                self.stage_warm(bucket)?;
+            }
+        }
+        self.upload(bucket)?;
+        let base = self.pool()?.base(StreamId(0))?;
+        let arena = nn::Arena::new(
+            ops::DevicePtr::new(base.address()),
+            self.pool()?.reserved(),
+        );
+        let batch = self.token_batch(bucket)?;
+        let shadow = nn::forward::Shadow::new(operator, key, previous, twins);
+        let forward = Forward::new(&stream, next, &arena).with_shadow(shadow);
+        let hidden = arena.tensor(
+            self.geometry.hidden_dtype,
+            ops::Shape::new(&[u64::from(bucket.tokens), u64::from(self.geometry.hidden)]),
+        )?;
+        // Every row writes its own scratch page: the paired forward must not write a resident one.
+        let pages = bucket
+            .tokens
+            .div_ceil(self.geometry.page_size.max(1))
+            .max(1);
+        let slots: Vec<u32> = self
+            .staging
+            .batch_rows()
+            .calls
+            .iter()
+            .map(|call| call.request)
+            .collect();
+        self.with_kv(&slots, Some(pages), |cache| {
+            self.model
+                .forward(&forward, &batch, cache, hidden)
+                .map_err(|error| Error::Interface(error.to_string()))
+        })
     }
 
     /// The generation with `number`: the serving one, the prepared one, or the old one probation
@@ -737,94 +1106,281 @@ impl<M: CausalLm> CausalLmRunner<M> {
 
     /// Reads the bucket's sampled token ids back and names the call each belongs to (4.4).
     ///
-    /// The bucket's sampler writes one `u32` per sampling row; the staged columns name those rows
-    /// (`logits_rows`) and the call each row belongs to, so the output preserves the mechanism's
-    /// request order. A bucket that samples nothing has no sampler buffer and answers empty.
+    /// The sampling step wrote one `i32` per sampling row into the bucket's plan; the readback
+    /// copies them into the runner's pinned buffer after the replay's stream completed, and the
+    /// batch's columns say which call each row belongs to. A bucket that samples nothing, or a
+    /// batch whose rows all end no prompt, answers with no token.
     fn read_sampled(&mut self, bucket: Bucket) -> Result<BatchOutput> {
-        let Some(sampler) = self.samplers.get(&bucket) else {
+        let Some(samples) = self.bucket_samples.borrow().get(&bucket).copied() else {
             return Ok(BatchOutput::default());
         };
         self.stream.synchronize()?;
-        sampler.read_back(&self.stream)?;
+        let rows = bucket.rows as usize;
+        let bytes = rows * std::mem::size_of::<i32>();
+        if bytes > self.columns.readback.len() {
+            return Err(Error::Invariant(
+                "the sampler's readback buffer is smaller than the bucket".into(),
+            ));
+        }
+        // SAFETY: the sampled ids are `rows` i32 in the bucket's plan and the readback buffer is
+        // this runner's pinned memory of at least that size; the stream has completed.
+        unsafe {
+            platform::memcpy_async(
+                self.columns.readback.address(),
+                samples.tokens.ptr.address(),
+                bytes,
+                &self.stream,
+            )?;
+        }
+        self.stream.synchronize()?;
+        // SAFETY: the copy above filled `rows` i32 of pinned host memory with the sampled ids.
+        let ids: &[i32] = unsafe {
+            std::slice::from_raw_parts(self.columns.readback.as_ptr().cast::<i32>(), rows)
+        };
         sampled_output(
-            sampler.host_tokens(),
+            ids,
             self.staging.logits_rows(),
             self.staging.batch_rows(),
             self.staging.calls(),
         )
     }
 
-    /// Walks one bucket's forward under the active capture with `generation`'s kernels.
+    /// Uploads the staged batch into the device columns the captured graphs address.
     ///
-    /// It is the same forward a replay runs, with the same staged columns, so the nodes it records
-    /// are the ones the live graph has. It launches nothing: the stream is capturing.
-    fn walk(&mut self, bucket: Bucket, generation: &Arc<Generation>) -> Result<()> {
-        let stream = self.stream.clone();
-        // A capture during warmup has no batch: the bucket's own full size is staged, with every
-        // padding token writing nothing. A capture of a served batch reuses its staged columns.
-        let staged = match self.staging.staged() {
-            Some(staged) if staged.variant == bucket.variant => staged,
-            _ => self.stage_warm(bucket)?,
-        };
-        // The bucket's plan in the graph pool: the sampler output first (a bucket that samples
-        // owns it, so a step allocates nothing), then the arena the forward allocates from.
-        let first = self.pools.begin(StreamId(0), bucket)?;
-        let sampler_bytes = if bucket.variant.samples() {
-            SamplerBuffer::bytes(bucket.rows)
-        } else {
-            0
-        };
-        let base = self.pools.base(StreamId(0))?;
-        let arena_base = platform::DevicePtr::from_address(base.address() + sampler_bytes);
-        let arena = nn::Arena::new(arena_base, self.pools.reserved().saturating_sub(sampler_bytes));
-        let forward = nn::Forward {
-            stream: &stream,
-            kernels: generation,
-            arena: &arena,
-            group: None,
-        };
-        let batch = self.token_batch(&arena_base, &staged)?;
-        let cache = self.kv_view()?;
-        let hidden = self.hidden(&arena_base, &staged)?;
-        self.model.forward(&forward, &batch, &cache, hidden.clone())?;
-        if bucket.variant.samples() {
-            // The sampler runs inside this capture too, so a replay samples in the graph: its
-            // nodes are the bucket's, and its region is the plan's first block.
-            self.append_sampler(&stream, bucket, arena_base, &hidden)?;
+    /// Every column is copied into a buffer allocated when the runner bound, sized for the largest
+    /// bucket, so a step writes fixed addresses and allocates nothing (4.5).
+    fn upload(&mut self, bucket: Bucket) -> Result<()> {
+        let rows = bucket.rows as usize;
+        let tokens = bucket.tokens as usize;
+        if self.staging.staged().is_none() {
+            return Err(Error::State("a step needs a staged batch".into()));
         }
-        if first {
-            let offsets = arena
-                .offsets()
+        let encoded = |values: &[i32]| -> Vec<u8> {
+            values.iter().flat_map(|value| value.to_ne_bytes()).collect()
+        };
+        let batch = self.staging.batch_rows();
+        self.columns.positions.write(&encoded(&batch.positions[..tokens]))?;
+        self.columns
+            .slot_mapping
+            .write(&encoded(&batch.slot_mapping[..tokens]))?;
+        self.columns.seq_lens.write(&encoded(&batch.seq_lens[..rows]))?;
+        self.columns
+            .query_offsets
+            .write(&encoded(&batch.query_offsets[..rows + 1]))?;
+        self.columns
+            .logits_rows
+            .write(&encoded(&batch.logits_rows[..rows]))?;
+        // A row that samples nothing still gathers some in-range token; its id is discarded.
+        let indices: Vec<i32> = batch.logits_rows[..rows]
+            .iter()
+            .map(|row| if *row < 0 { 0 } else { *row })
+            .collect();
+        self.columns.indices.write(&encoded(&indices))?;
+        self.columns.parameters.write(
+            &self
+                .staging
+                .parameters(rows)
                 .iter()
-                .map(|offset| offset + sampler_bytes)
-                .collect();
-            self.pools.record(
-                StreamId(0),
-                bucket,
-                offsets,
-                sampler_bytes + arena.bytes(),
-            )?;
+                .flat_map(|value| value.to_ne_bytes())
+                .collect::<Vec<u8>>(),
+        )?;
+        self.columns.slots.write(&encoded(self.staging.slots(rows)))?;
+        self.columns.draws.write(
+            &self
+                .draw_uniforms(rows)
+                .iter()
+                .flat_map(|value| value.to_ne_bytes())
+                .collect::<Vec<u8>>(),
+        )?;
+        for column in [
+            &self.columns.positions,
+            &self.columns.slot_mapping,
+            &self.columns.seq_lens,
+            &self.columns.query_offsets,
+            &self.columns.logits_rows,
+            &self.columns.indices,
+            &self.columns.parameters,
+            &self.columns.slots,
+            &self.columns.draws,
+        ] {
+            column.upload(&self.stream)?;
         }
         Ok(())
     }
 
-    /// Appends the bucket's sampler chain to the capture in flight (4.4, 9's `采样`).
+    /// `rows` uniform draws in `[0, 1)` for the sampling step, from the runner's generator.
     ///
-    /// The chain shapes the row's logits by its parameters, keeps its candidates, and draws or
-    /// picks one token per sampling row, writing the ids to the plan's first block. It is one
-    /// chain per bucket, captured once, so every later replay samples without a host round trip.
-    fn append_sampler(
-        &mut self,
-        _stream: &platform::Stream,
+    /// The generator is the runner's own: sampling state is the executor's (4.5), and a seeded
+    /// generator is what makes a replay reproduce its tokens.
+    fn draw_uniforms(&self, rows: usize) -> Vec<f32> {
+        let mut state = self.seed.get();
+        let mut draws = Vec::with_capacity(rows);
+        while draws.len() < rows {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            // The top 24 bits are a value in [0, 1) that cannot round up to one in f32.
+            draws.push(((state >> 40) as f32) / ((1u64 << 24) as f32));
+        }
+        self.seed.set(state);
+        draws
+    }
+
+    /// The device-side `TokenBatch` of `bucket`: the bucket's extent of each column.
+    fn token_batch(&self, bucket: Bucket) -> Result<TokenBatch> {
+        Ok(TokenBatch {
+            positions: self.columns.positions.extent(0..bucket.tokens as u64),
+            slot_mapping: self.columns.slot_mapping.extent(0..bucket.tokens as u64),
+            seq_lens: self.columns.seq_lens.extent(0..bucket.rows as u64),
+            query_offsets: self.columns.query_offsets.extent(0..bucket.rows as u64 + 1),
+            logits_rows: self.columns.logits_rows.extent(0..bucket.rows as u64),
+            phase: match bucket.variant.is_decode() {
+                true => ops::PhaseKind::Decode,
+                false => ops::PhaseKind::Prefill,
+            },
+            page_size: self.geometry.page_size,
+            num_tokens: bucket.tokens,
+            max_kv_len: self.geometry.max_kv_len,
+            draft_lens: None,
+        })
+    }
+
+    /// Runs `operation` with the batch's `KvView` over `slots`, resident or scratch.
+    ///
+    /// The view lives as long as the closure: `KvGroup` borrows its layer planes, so the planes,
+    /// tables and groups are locals of one scope and the model reads them borrowed.
+    fn with_kv<R>(
+        &self,
+        slots: &[u32],
+        scratch_pages: Option<u32>,
+        operation: impl FnOnce(&KvView<'_>) -> Result<R>,
+    ) -> Result<R> {
+        let groups = self.kv.groups();
+        let mut layers: Vec<Vec<nn::KvPlanes>> = Vec::with_capacity(groups);
+        let mut tables = Vec::with_capacity(groups);
+        let mut scales = Vec::with_capacity(groups);
+        for group in 0..groups {
+            match scratch_pages {
+                None => {
+                    layers.push(self.kv.planes(group)?);
+                    tables.push(self.kv.block_table(group, slots, &self.stream)?);
+                    scales.push(self.kv.scales(group));
+                }
+                Some(pages) => {
+                    let (table, planes, scale) = self.kv.scratch(group, slots, pages, &self.stream)?;
+                    layers.push(planes);
+                    tables.push(table);
+                    scales.push(scale);
+                }
+            }
+        }
+        let view: Vec<nn::KvGroup<'_>> = (0..groups)
+            .map(|group| nn::KvGroup {
+                block_tables: tables[group],
+                page_size: self.kv.page_size(),
+                dtype: self.kv.dtype(),
+                key_scales: scales[group].map(|(key, _)| key),
+                value_scales: scales[group].map(|(_, value)| value),
+                layers: &layers[group],
+            })
+            .collect();
+        operation(&KvView { groups: &view })
+    }
+
+    /// Walks one bucket's forward under the active capture with `generation`'s kernels.
+    ///
+    /// It is the same forward a replay runs, over the same columns and in the same arena order, so
+    /// the nodes it records are the ones the live graph has and the addresses are the same each
+    /// time. It launches nothing: the stream is capturing.
+    fn walk(&mut self, bucket: Bucket, generation: &Arc<Generation>) -> Result<()> {
+        let stream = self.stream.clone();
+        match self.staging.staged() {
+            Some(staged) if staged.variant == bucket.variant => {}
+            _ => {
+                self.stage_warm(bucket)?;
+            }
+        }
+        let first = self.pool()?.begin(StreamId(0), bucket)?;
+        self.upload(bucket)?;
+        let base = self.pool()?.base(StreamId(0))?;
+        let arena = nn::Arena::new(
+            ops::DevicePtr::new(base.address()),
+            self.pool()?.reserved(),
+        );
+        let batch = self.token_batch(bucket)?;
+        let forward = Forward::new(&stream, generation, &arena);
+        let hidden = arena.tensor(
+            self.geometry.hidden_dtype,
+            ops::Shape::new(&[u64::from(bucket.tokens), u64::from(self.geometry.hidden)]),
+        )?;
+        let slots: Vec<u32> = self
+            .staging
+            .batch_rows()
+            .calls
+            .iter()
+            .map(|call| call.request)
+            .collect();
+        self.with_kv(&slots, None, |cache| {
+            self.model
+                .forward(&forward, &batch, cache, hidden)
+                .map_err(|error| Error::Interface(error.to_string()))?;
+            if bucket.variant.samples() {
+                self.sample(&forward, bucket, &arena, hidden)?;
+            }
+            Ok(())
+        })?;
+        if first {
+            self.pool()?.record(StreamId(0), bucket, arena.used())?;
+        }
+        Ok(())
+    }
+
+    /// Appends the bucket's sampling step to the capture in flight (4.4, 9's `采样`).
+    ///
+    /// The step gathers the rows whose logits are wanted, projects them, and samples one token per
+    /// row through the model's sampler; its working set comes from the bucket's arena, so a replay
+    /// samples without a host round trip.
+    fn sample(
+        &self,
+        forward: &Forward<'_>,
         bucket: Bucket,
-        _arena_base: platform::DevicePtr,
-        _logits: &ops::TensorView,
+        arena: &nn::Arena,
+        hidden: TensorView,
     ) -> Result<()> {
-        Err(Error::State(format!(
-            "the sampler chain of {bucket} needs the batch's sampling parameters and the model's \
-             logits view; exec-work M211 asks for the two crossing columns and \
-             CausalLm::logits (nn)"
-        )))
+        let Some(sampling) = &self.sampling else {
+            return Err(Error::State(
+                "the runner has no sampler but the bucket samples".into(),
+            ));
+        };
+        let rows = u64::from(bucket.rows);
+        let gathered = arena.tensor(
+            self.geometry.hidden_dtype,
+            ops::Shape::new(&[rows, u64::from(self.geometry.hidden)]),
+        )?;
+        nn::gather_rows(forward, hidden, self.columns.indices.device, gathered)
+            .map_err(|error| Error::Interface(error.to_string()))?;
+        let logits = arena.tensor(
+            self.geometry.logits_dtype,
+            ops::Shape::new(&[rows, u64::from(self.geometry.vocabulary)]),
+        )?;
+        self.model
+            .logits(forward, gathered, logits)
+            .map_err(|error| Error::Interface(error.to_string()))?;
+        let state = SamplerState {
+            counts: sampling.counts,
+            parameters: self.columns.parameters.device,
+            slots: self.columns.slots.device,
+            extras: None,
+        };
+        let samples = Samples::reserve(arena, DType::I32, rows, false)?;
+        sampling
+            .sampler
+            .forward(forward, logits, &state, self.columns.draws.device, &samples)
+            .map_err(|error| Error::Interface(error.to_string()))?;
+        self.bucket_samples
+            .borrow_mut()
+            .insert(bucket, Sampled { tokens: samples.tokens });
+        Ok(())
     }
 
     /// Stages a batch of the bucket's full size with nothing to write: what a warmup capture
@@ -861,118 +1417,48 @@ impl<M: CausalLm> CausalLmRunner<M> {
             .stage(&columns, &[CallId(0)], &bucket.shape(), bucket)
     }
 
-    /// The device-side `TokenBatch` over the bucket's staged columns (9's `每批的规划`).
-    fn token_batch(&self, _arena: &platform::DevicePtr, _staged: &Shape) -> Result<nn::TokenBatch> {
-        Err(Error::State(
-            "the token batch is built once nn::TokenBatch and the pinned upload are published"
-                .into(),
-        ))
-    }
-
-    /// The KV view of the batch: the request slots' block tables and the cache geometry.
-    fn kv_view(&self) -> Result<nn::KvView> {
-        Err(Error::State(
-            "the KV view is built once nn::KvView and the slot tables are published".into(),
-        ))
-    }
-
-    /// Where the forward's hidden states go for this bucket.
-    fn hidden(&self, _base: &platform::DevicePtr, _staged: &Shape) -> Result<ops::TensorView> {
-        Err(Error::State(
-            "the hidden-state buffer comes from the bucket's static plan".into(),
-        ))
-    }
-
 }
 
 /// Records the nodes each operator launch adds during a capture (4.5's `Captured.nodes`).
 ///
-/// `ops` reports every launch to the installed sink because the executor never sees an individual
-/// `Op::launch` (see `ops::capture`); the sink turns the report into the per-launch node table.
-struct Recording<'a> {
-    capture: &'a mut platform::Capture,
+/// `ops` reports every launch to the installed sink, because the executor never sees an
+/// individual `Op::launch`; the sink asks the capture which nodes the launch added and keeps the
+/// per-launch table. The sink must own its data (`ops::capture` keeps a thread-local pointer), so
+/// it holds the capture behind an `Arc`: the capture outlives every report, and it is taken back
+/// after the sink is removed.
+struct Recording {
+    capture: Arc<std::sync::Mutex<platform::Capture>>,
     nodes: crate::captured::Nodes,
+    failure: Option<platform::Error>,
 }
 
-impl<'a> Recording<'a> {
-    fn new(capture: &'a mut platform::Capture) -> Self {
+impl Recording {
+    fn new(capture: Arc<std::sync::Mutex<platform::Capture>>) -> Self {
         Self {
             capture,
             nodes: Vec::new(),
+            failure: None,
         }
     }
 }
 
-impl ops::capture::Sink for Recording<'_> {
-    fn launched(&mut self, operator: &'static str, descriptor: &str) -> ops::Result<()> {
-        let nodes = self
-            .capture
-            .record()
-            .map_err(ops::Error::Platform)?;
-        self.nodes.push((operator, descriptor.to_owned(), nodes));
-        Ok(())
-    }
-}
-
-/// The sampler output of one bucket: one `u32` token id per sampling row.
-///
-/// The region is the first block of the bucket's plan, so it is allocated at capture and reached at
-/// the same address by every replay without allocating during a step (4.5). It is written by the
-/// bucket's sampler nodes inside the captured graph, and read back into the runner's host pinned
-/// buffer after the replay's stream completed (4.4).
-pub struct SamplerBuffer {
-    /// Where the graph writes the sampled ids.
-    base: platform::DevicePtr,
-    /// How many rows the bucket samples for.
-    rows: usize,
-    /// The host copy one step reads them from; one per runner, never per batch.
-    host: platform::PinnedBuffer,
-}
-
-impl SamplerBuffer {
-    /// The bytes a bucket of `rows` sampling rows needs in its plan.
-    pub fn bytes(rows: u32) -> u64 {
-        u64::from(rows) * std::mem::size_of::<u32>() as u64
-    }
-
-    /// The region at `base` of a bucket whose plan holds it, with `device`'s host staging.
-    pub fn new(device: DeviceId, base: platform::DevicePtr, rows: u32) -> Result<Self> {
-        let bytes = Self::bytes(rows);
-        let host = platform::PinnedBuffer::new(device, bytes as usize)?;
-        Ok(Self {
-            base,
-            rows: rows as usize,
-            host,
-        })
-    }
-
-    /// Where the graph writes the sampled ids.
-    pub fn base(&self) -> platform::DevicePtr {
-        self.base
-    }
-
-    /// The rows the bucket samples for.
-    pub fn rows(&self) -> usize {
-        self.rows
-    }
-
-    /// Copies the region to the host buffer; the caller has already waited for `stream`.
-    pub fn read_back(&self, stream: &platform::Stream) -> Result<()> {
-        let bytes = Self::bytes(self.rows as u32);
-        // SAFETY: the region is this bucket's sampler output (one u32 per row, inside the pool's
-        // mapping) and the host buffer is its own pinned memory of the same size.
-        unsafe {
-            platform::memcpy_async(self.host.address(), self.base.address(), bytes as usize, stream)?;
+impl ops::capture::Sink for Recording {
+    fn launched(&mut self, operator: &'static str, key: &str) {
+        let recorded = {
+            let mut capture = self
+                .capture
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            capture.record()
+        };
+        match recorded {
+            Ok(nodes) => self.nodes.push((operator, key.to_owned(), nodes)),
+            Err(error) => {
+                if self.failure.is_none() {
+                    self.failure = Some(error);
+                }
+            }
         }
-        stream.synchronize()
-    }
-
-    /// The sampled ids, in the order the graph wrote them.
-    fn host_tokens(&self) -> &[u32] {
-        // SAFETY: `read_back` filled `rows` u32 values of host-pinned memory; the buffer is aligned
-        // by `PinnedBuffer` for any byte copy, and `rows` is the number it was allocated for.
-        let bytes = Self::bytes(self.rows as u32) as usize;
-        unsafe { std::slice::from_raw_parts(self.host.as_ptr().cast::<u32>(), bytes / 4) }
     }
 }
 
@@ -982,7 +1468,7 @@ impl SamplerBuffer {
 /// ranges of the batch. A sampling row outside every call is an invariant violation: the
 /// mechanism's columns and its calls disagree about the batch.
 pub fn sampled_output(
-    ids: &[u32],
+    ids: &[i32],
     sampling_rows: &[i32],
     rows: &nn::BatchRows,
     calls: &[CallId],
@@ -1017,7 +1503,7 @@ pub fn sampled_output(
         })?;
         tokens.push(SampledToken {
             call,
-            token: ids[index],
+            token: ids[index] as u32,
         });
     }
     Ok(BatchOutput { tokens })

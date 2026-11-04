@@ -27,7 +27,10 @@ use crate::{Error, Result};
 
 /// One operation a recording holds. It runs when the batch is performed,
 /// with the batch's stream (`None` for host storage).
-type Step = Box<dyn FnOnce(Option<&Stream>) -> Result<()>>;
+// The work is recorded by a storage owner's thread and performed by the device executor's, so a
+// step must be able to cross threads; what each closure borrows is the recorder's business and
+// lives at least as long as the batch.
+type Step = Box<dyn FnOnce(Option<&Stream>) -> Result<()> + Send>;
 
 /// A batch's recorded work.
 struct Recorded {

@@ -153,7 +153,7 @@ impl Captured {
             )));
         }
         for (node, owned) in nodes.iter().zip(params) {
-            self.exec.set_kernel_node_params_owned(node, owned)?;
+            self.exec.set_kernel_node_params_owned(node.clone(), owned)?;
         }
         Ok(nodes.len())
     }
