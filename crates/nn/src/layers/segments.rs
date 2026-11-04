@@ -261,10 +261,11 @@ impl VsaTiles {
 
     /// Contract the pooled query and key tiles into the scores `select` ranks.
     ///
-    /// `pooled_query` is `[heads, query tiles, width]` and `pooled_key` `[heads, tiles, width]`, both
-    /// of the layer's dtype; `scores` is `[heads, query tiles, tiles]` FP32, contiguous, written here
-    /// and read by [`Self::select`]. One dot product per (query tile, key tile) and head — no scale
-    /// and no softmax, because the selection only compares and the attention scales its own products.
+    /// `pooled_query` is `[query tiles, heads, width]` and `pooled_key` `[tiles, heads, width]`, both
+    /// FP32 — the layout and the type [`Self::prepare`] writes; `scores` is
+    /// `[heads, query tiles, tiles]` FP32, contiguous, written here and read by [`Self::select`]. One
+    /// dot product per (query tile, key tile) and head — no scale and no softmax, because the
+    /// selection only compares and the attention scales its own products.
     pub fn scores(
         &self,
         f: &Forward,
@@ -276,7 +277,7 @@ impl VsaTiles {
             return Err(Error::shape(
                 "VsaTiles",
                 format!(
-                    "the pooled query is [heads, query tiles, width], not {:?}",
+                    "the pooled query is [query tiles, heads, width], not {:?}",
                     pooled_query.shape.dims()
                 ),
             ));
@@ -287,13 +288,8 @@ impl VsaTiles {
                 format!("{} features per head", pooled_query.shape.dim(2)),
             )
         })?;
-        let descriptor = segments::ScoresDescriptor::new(
-            pooled_query.dtype,
-            self.heads,
-            width,
-            width.next_power_of_two(),
-            false,
-        );
+        let descriptor =
+            segments::ScoresDescriptor::new(self.heads, width, width.next_power_of_two(), false);
         let args = segments::ScoresArgs {
             pooled_query,
             pooled_key,
