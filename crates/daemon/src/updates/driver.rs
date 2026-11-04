@@ -166,18 +166,37 @@ impl Driver {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use proto::process::report::Kind;
+    use proto::process::{Committed, Drained, Parked, Promoted, Report, Spawn};
 
     use super::*;
     use crate::epoch::{BuildConfig, EpochRecord, Program, Status, Update};
     use crate::options::ServeConfig;
     use crate::updates::switch::{Event, Node, Start};
-    use proto::process::Spawn;
 
-    /// A roster that records what it was asked and replays scripted events.
+    /// The reports the test feeds as if the adapter had delivered them.
+    type Feed = Arc<Mutex<Vec<Event>>>;
+
+    /// A roster that records what it was asked and replays the fed events.
     #[derive(Default)]
     struct Fake {
         spawns: Vec<Spawn>,
-        scripted: Vec<Event>,
+        feed: Feed,
+    }
+
+    impl Fake {
+        fn with_feed() -> (Self, Feed) {
+            let feed = Feed::default();
+            (
+                Self {
+                    spawns: Vec::new(),
+                    feed: Arc::clone(&feed),
+                },
+                feed,
+            )
+        }
     }
 
     impl Roster for Fake {
@@ -205,7 +224,7 @@ mod tests {
         fn resume(&mut self, _host: &str, _generation: u64, _reason: &str) {}
 
         fn events(&mut self) -> Vec<Event> {
-            std::mem::take(&mut self.scripted)
+            std::mem::take(&mut *self.feed.lock().expect("the feed lock"))
         }
     }
 
@@ -243,38 +262,78 @@ mod tests {
         }
     }
 
-    /// The driver runs the epoch layer, reports it, and frees the slot when
-    /// the switch ends: a second change can start and no stale switch is left.
+    fn reported(host: &str, generation: u64, kind: Kind) -> Event {
+        Event::Report {
+            host: host.to_owned(),
+            generation,
+            report: Report { kind: Some(kind) },
+        }
+    }
+
+    fn deliver(feed: &Feed, events: Vec<Event>) {
+        feed.lock().expect("the feed lock").extend(events);
+    }
+
+    /// The driver runs one epoch switch from the wire reports to the end: a
+    /// change to another executable prepares, promotes, serves, drains the
+    /// previous epoch, goes on probation, and a commit frees the slot. Nothing
+    /// but `advance` moves it — the adapter's only call.
     #[test]
-    fn the_epoch_layer_runs_and_frees_its_slot() {
+    fn the_epoch_layer_runs_from_reports_and_frees_its_slot() {
         let epochs = Arc::new(Epochs::new());
         epochs.record(11, record(11));
-        let driver = Driver::new(Arc::clone(&epochs), Box::<Fake>::default());
+        let (roster, feed) = Fake::with_feed();
+        let driver = Driver::new(Arc::clone(&epochs), Box::new(roster));
         let previous = Deployment::of(ServeConfig::default());
         let mut target_config = ServeConfig::default();
         target_config.worker_config.executable = "/opt/uniserve-b".into();
         let target = Deployment::of(target_config);
 
+        // The switch's nodes are the target configuration's: one node here.
+        let host = target.config.host_identity.clone();
         let applied = driver
             .apply(&previous, &target, change(12), false)
             .expect("the epoch arm runs");
         assert!(matches!(applied, Some(Applied::World(_))));
-        assert!(driver.running());
         assert_eq!(driver.phase(), Some(Phase::Preparing));
 
-        // The targets report parked and promoted; the driver advances them.
-        let nodes = vec![
-            Node {
-                host: "n0".to_owned(),
-                rank: 0,
-            },
-            Node {
-                host: "n1".to_owned(),
-                rank: 1,
-            },
-        ];
-        let _ = nodes;
-        assert!(driver.report().is_some());
+        deliver(
+            &feed,
+            vec![reported(&host, 7, Kind::Parked(Parked { generation: 7 }))],
+        );
+        driver.advance();
+        assert_eq!(driver.phase(), Some(Phase::Promoting));
+
+        deliver(
+            &feed,
+            vec![reported(
+                &host,
+                7,
+                Kind::Promoted(Promoted { generation: 7 }),
+            )],
+        );
+        driver.advance();
+        assert_eq!(driver.phase(), Some(Phase::Serving));
+
+        deliver(
+            &feed,
+            vec![reported(&host, 5, Kind::Drained(Drained { epoch: 11 }))],
+        );
+        driver.advance();
+        assert_eq!(driver.phase(), Some(Phase::Probation));
+
+        assert!(driver.commit());
+        assert_eq!(driver.phase(), Some(Phase::Committing));
+        deliver(
+            &feed,
+            vec![reported(&host, 7, Kind::Committed(Committed {}))],
+        );
+        driver.advance();
+        assert!(!driver.running());
+        assert_eq!(
+            epochs.get(12).map(|record| record.status),
+            Some(Status::Serving)
+        );
     }
 
     /// A commit or a rollback with no switch running does nothing and says so,
@@ -282,7 +341,8 @@ mod tests {
     #[test]
     fn no_switch_means_no_decision() {
         let epochs = Arc::new(Epochs::new());
-        let driver = Driver::new(epochs, Box::<Fake>::default());
+        let (roster, _feed) = Fake::with_feed();
+        let driver = Driver::new(epochs, Box::new(roster));
         assert!(!driver.commit());
         assert!(!driver.rollback("nothing runs"));
         assert!(driver.report().is_none());
