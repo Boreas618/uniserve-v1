@@ -658,6 +658,14 @@ pub struct Transformer {
 }
 
 impl Transformer {
+    /// The element type the checkpoint's weights and the activations they produce are in.
+    ///
+    /// One type for the whole stack: the precision rule keeps the checkpoint's own representation,
+    /// and every layer's operands are of it.
+    pub fn dtype(&self) -> nn::DType {
+        self.proj_in.weight().dtype
+    }
+
     /// Read one DiT partition of the checkpoint.
     ///
     /// `rows` bounds one call's keys: the largest packed row count the deployment's layouts hold,
