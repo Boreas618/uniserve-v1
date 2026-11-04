@@ -112,21 +112,56 @@ pub struct Stack {
     pub blocks: u32,
     /// Latent channels.
     pub latent_channels: u32,
-    /// Frames one clip of the encoder's raster is: the frame count the network reads at once.
-    pub clip_frames: u32,
+    /// The clip the network reads: its frames and what one clip yields.
+    pub clip: Clip,
+}
+
+/// The clip a causal encoder cuts a raster into, and what its frames are worth.
+///
+/// Three numbers of one geometry, stated together because every use needs all three: the frames the
+/// network reads at once, the latent frames one complete clip yields, and the latent frames a
+/// condition drops from its last clip because a later clip of a generated video would overlap them.
+/// A condition's own latent count follows from them ([`Clip::latent_frames`]), and packing takes this
+/// value rather than three loose numbers so that the count has one statement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Clip {
+    /// Frames one clip of the encoder's raster is.
+    pub frames: u32,
     /// Latent frames one complete clip yields.
-    pub clip_latents: u32,
-    /// Latent frames the last clip of a condition drops: the clip's trailing frames a later clip
-    /// overlaps, which a condition's timeline does not keep.
+    pub latents: u32,
+    /// Latent frames a condition drops from its last clip.
     pub token_drop: u32,
 }
 
-impl Stack {
+impl Clip {
+    /// The clip a checkpoint's video VAE config states.
+    pub fn of(config: &VideoVaeConfig) -> Result<Self> {
+        let clip = Self {
+            frames: config.clip_length,
+            latents: config.clip_latents(),
+            token_drop: config.token_drop,
+        };
+        if clip.frames == 0 || clip.latents <= clip.token_drop {
+            return Err(Error::config(format!(
+                "a clip of {} frames yields {} latent frames and drops {}; the drop must leave some",
+                clip.frames, clip.latents, clip.token_drop
+            )));
+        }
+        Ok(clip)
+    }
+
     /// The latent frames a **condition** of `frames` frames encodes to.
     ///
-    /// Clips of [`Self::clip_frames`] frames, each [`Self::clip_latents`] latent frames, less the last
-    /// clip's trailing [`Self::token_drop`]; a single frame is a still of one latent frame.
-    pub fn condition_latent_frames(&self, frames: u32) -> Result<u32> {
+    /// A condition is cut into clips of [`Self::frames`] frames, each yielding [`Self::latents`] latent
+    /// frames, and the last clip's trailing [`Self::token_drop`] latent frames are dropped - so 17
+    /// frames are 2 and 22 are 7. A single frame is a still and yields one: the network's causal front
+    /// padding makes one frame one latent frame (`video_vae.py:1105-1113`), and the reference encodes
+    /// an image or a keyframe through the same network alone (`encoding.py:41-51`).
+    ///
+    /// This is a **different statement** from a generated timeline's (`packing::video_latent_frames`:
+    /// `17n + 5` frames to `5n + 2` latents). The two agree on the counts a generation uses, and only
+    /// this one accepts the counts a condition may be - a condition is cut and padded, not generated.
+    pub fn latent_frames(&self, frames: u32) -> Result<u32> {
         if frames == 0 {
             return Err(Error::config(
                 "a video condition of no frame encodes nothing".to_owned(),
@@ -135,10 +170,11 @@ impl Stack {
         if frames == 1 {
             return Ok(1);
         }
-        let clips = frames.div_ceil(self.clip_frames);
-        Ok(clips * self.clip_latents - self.token_drop)
+        Ok(frames.div_ceil(self.frames) * self.latents - self.token_drop)
     }
+}
 
+impl Stack {
     /// The stack the config states.
     pub fn of(config: &VideoVaeConfig) -> Result<Self> {
         let stages = config.block_out_channels.len();
@@ -189,9 +225,7 @@ impl Stack {
             spatial_strides: config.spatial_downsample_factors.clone(),
             blocks: config.layers_per_block,
             latent_channels: config.latent_channels,
-            clip_frames: config.clip_length,
-            clip_latents: config.clip_latents(),
-            token_drop: config.token_drop,
+            clip: Clip::of(config)?,
         })
     }
 
@@ -1163,10 +1197,10 @@ impl VideoEncoder {
                 self.stack.input_channels
             )));
         }
-        if frames != 1 && frames != u64::from(self.stack.clip_frames) {
+        if frames != 1 && frames != u64::from(self.stack.clip.frames) {
             return Err(Error::config(format!(
                 "a video encoder reads one still (one frame) or one {}-frame clip, not {frames}",
-                self.stack.clip_frames
+                self.stack.clip.frames
             )));
         }
         let raster = Extent {
@@ -1227,7 +1261,7 @@ impl VideoEncoder {
     /// one alone accepts the counts a condition may be - 17, 30, any length - because a condition is
     /// cut and padded, not generated.
     pub fn latent_frames(&self, frames: u32) -> Result<u32> {
-        self.stack.condition_latent_frames(frames)
+        self.stack.clip.latent_frames(frames)
     }
 
     /// Project the stitched moments to the posterior's two fields: one call, after the stitch.
@@ -2017,36 +2051,29 @@ mod tests {
         // The reference counts a condition in clips: every clip of `clip_length` frames yields
         // `clip_latents` latent frames and the last clip's trailing `token_drop` are dropped, so the
         // canonical 22 frames (`clip_length + 5`) are two clips less three.
-        let stack = encoder_stack();
-        assert_eq!(stack.condition_latent_frames(1).expect("a still"), 1);
+        let clip = encoder_stack().clip;
+        assert_eq!(clip.latent_frames(1).expect("a still"), 1);
         assert_eq!(
-            stack
-                .condition_latent_frames(stack.clip_frames)
-                .expect("one clip"),
-            stack.clip_latents - stack.token_drop
+            clip.latent_frames(clip.frames).expect("one clip"),
+            clip.latents - clip.token_drop
         );
-        let tail = stack.clip_frames + crate::config::CLIP_LATENTS;
+        let tail = clip.frames + crate::config::CLIP_LATENTS;
         assert_eq!(
-            stack
-                .condition_latent_frames(tail)
-                .expect("a clip and a tail"),
-            2 * stack.clip_latents - stack.token_drop
+            clip.latent_frames(tail).expect("a clip and a tail"),
+            2 * clip.latents - clip.token_drop
         );
         // A length no generation produces is a condition all the same: two clips and a short tail.
         assert_eq!(
-            stack
-                .condition_latent_frames(2 * stack.clip_frames - 4)
+            clip.latent_frames(2 * clip.frames - 4)
                 .expect("a short last clip"),
-            2 * stack.clip_latents - stack.token_drop
+            2 * clip.latents - clip.token_drop
         );
-        assert!(stack.condition_latent_frames(0).is_err());
+        assert!(clip.latent_frames(0).is_err());
 
         // The generated timeline's rule agrees on the canonical count, which is why the two must be
         // stated separately rather than one standing in for the other.
         assert_eq!(
-            stack
-                .condition_latent_frames(tail)
-                .expect("a clip and a tail"),
+            clip.latent_frames(tail).expect("a clip and a tail"),
             crate::packing::video_latent_frames(tail).expect("the generated rule")
         );
     }
