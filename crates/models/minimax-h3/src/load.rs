@@ -6,6 +6,14 @@
 //! loader per component over the same store and precision policy (specs/worker.md 8). The blocks a
 //! rank holds are the [`Partition`]'s, so this module only names the components and builds them.
 //!
+//! ## Testing
+//!
+//! A load publishes every tensor through `nn::weights::RetainedWeights`, which only the executor
+//! implements, so this module has no unit test of its own: the block constructors are tested where
+//! they live, and the composition is exercised by the caller's load of a real checkpoint. What can
+//! be checked here without a device is checked - `Partition`'s rules, the packing's tables, and the
+//! component names and directories.
+//!
 //! ## Precision
 //!
 //! With the design's `dtype = "auto"` nothing is converted at load: each weight keeps the
