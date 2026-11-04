@@ -236,6 +236,8 @@ impl Scheduler {
             policy_prepared: None,
             policy_stage: None,
             recorder: mechanism::Recorder::default(),
+            pages: std::collections::BTreeMap::new(),
+            pages_seeded: false,
             watchdog: mechanism::Watchdog::default(),
             step: 0,
             config,

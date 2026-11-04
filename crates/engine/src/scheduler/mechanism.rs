@@ -869,6 +869,18 @@ impl Recorder {
     }
 
     /// Records one state change.
+    /// A page was published: a policy that mirrors the cache keeps it from now
+    /// on, and no step has to walk the pool to learn it.
+    pub(crate) fn cached(&mut self, page: PageView) {
+        self.record(Event::Cached { page });
+    }
+
+    /// A page went: the policy drops it, and the mechanism's own table of live
+    /// pages stops answering for it.
+    pub(crate) fn freed(&mut self, page: PageId) {
+        self.record(Event::Freed { page });
+    }
+
     pub(crate) fn record(&mut self, event: Event) {
         match &event {
             Event::Arrived { request } => {
