@@ -33,9 +33,20 @@ impl FramePad {
     /// are stated from the views rather than from an element type alone.
     pub fn pad_descriptor(&self, values: TensorView, out: TensorView) -> frame::FramePadDescriptor {
         let (block_pixels, block_channels) = frame::FramePadDescriptor::tiles(&values, &out);
+        Self::descriptor_of(values.dtype, self.reflect, block_pixels, block_channels)
+    }
+
+    /// The descriptor one pad launch takes from the numbers alone: a walk has the extents, not the
+    /// views, and the block split turns on two of their facts (`FramePadDescriptor::tiles_of`).
+    pub fn descriptor_of(
+        dtype: ops::DType,
+        reflect: bool,
+        block_pixels: u32,
+        block_channels: u32,
+    ) -> frame::FramePadDescriptor {
         frame::FramePadDescriptor {
-            dtype: values.dtype,
-            reflect: self.reflect,
+            dtype,
+            reflect,
             block_pixels,
             block_channels,
         }
@@ -86,12 +97,28 @@ impl FrameMoments {
     /// narrower than the reduction it asks for: `channels_per_group · pixels`, padded to a power of
     /// two because that is what the compiled program's bound is.
     pub fn moments_descriptor(&self, values: TensorView) -> frame::FrameMomentsDescriptor {
-        let channels = values.shape.dim(1);
-        let pixels = values.shape.dim(3) * values.shape.dim(4);
+        Self::descriptor_of(
+            values.dtype,
+            values.shape.dim(1),
+            values.shape.dim(3) * values.shape.dim(4),
+            self.groups,
+            self.eps,
+        )
+    }
+
+    /// The descriptor one moments launch takes from the frame's own numbers: the channels, the pixels
+    /// per frame, and the groups the reduction is classed by.
+    pub fn descriptor_of(
+        dtype: ops::DType,
+        channels: u64,
+        pixels: u64,
+        groups: u64,
+        eps: f32,
+    ) -> frame::FrameMomentsDescriptor {
         frame::FrameMomentsDescriptor {
-            dtype: values.dtype,
-            reduction: frame::frame_reduction_class(channels / self.groups.max(1), pixels),
-            epsilon: Float::from(self.eps),
+            dtype,
+            reduction: frame::frame_reduction_class(channels / groups.max(1), pixels),
+            epsilon: Float::from(eps),
         }
     }
 
