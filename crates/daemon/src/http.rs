@@ -426,6 +426,7 @@ pub(crate) fn router(
                     Arc::clone(&engine),
                     Arc::clone(&jobs),
                     video_body_limit,
+                    Arc::clone(&handoff),
                 ));
             }
             Task::Readout => {
