@@ -12,6 +12,7 @@
 //! accepted progress (cursors, encoder indices, denoising steps, phase) by the
 //! time `resolve` runs.
 
+use crate::scheduler::completion::CallCompletion;
 use super::*;
 use ipc::{ForwardMode, MediaCall, TransferMode};
 
@@ -65,7 +66,7 @@ fn terminal_event(
 /// `index`: the token's own value and its entries (the token's own, then its
 /// top candidates), or nothing when the request did not ask for them.
 fn take_token_logprobs(
-    record: &mut ipc::CallOutput,
+    record: &mut CallCompletion,
     index: usize,
 ) -> (Option<f32>, Option<Vec<TokenLogprob>>) {
     let entries = record
@@ -274,7 +275,7 @@ impl Scheduler {
     /// finishes the request, opens an image branch, or is a round-close token.
     /// The sampled log probability and top candidates belong to the last
     /// committed token only.
-    pub(super) fn resolve_decode_text(&mut self, id: RequestId, mut record: ipc::CallOutput) {
+    pub(super) fn resolve_decode_text(&mut self, id: RequestId, mut record: CallCompletion) {
         self.activate_request_tables(id);
 
         // A round-close token committed alone by the previous decode became
@@ -396,7 +397,7 @@ impl Scheduler {
         &mut self,
         id: RequestId,
         call: Call,
-        mut record: ipc::CallOutput,
+        mut record: CallCompletion,
         media: Option<&SharedMedia>,
     ) {
         let call_variant = call.kind;

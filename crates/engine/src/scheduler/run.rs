@@ -232,6 +232,7 @@ impl Scheduler {
             output: output::OutputSender::default(),
             policy: None,
             policy_report: None,
+            serving: tokio::sync::watch::Sender::new(false),
             expert_load: None,
             expert_order: None,
             expert_asked: None,
@@ -261,6 +262,18 @@ impl Scheduler {
             failure: Arc::default(),
             stats,
         })
+    }
+
+    /// A receiver for [`Self::note_policy_serves`], for whoever waits until a
+    /// policy actually serves this scheduler (§7.3).
+    pub fn serving_receiver(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.serving.subscribe()
+    }
+
+    /// Reports that a policy instance serves from here on. Idempotent: a later
+    /// switchover reports it too, and a waiter only waits for the first.
+    pub(super) fn note_policy_serves(&self) {
+        self.serving.send_replace(true);
     }
 
     /// Returns the effective scheduler configuration.

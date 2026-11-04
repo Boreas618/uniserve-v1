@@ -33,6 +33,7 @@
 //! - `config`, `stats`, and `stats_report`: limits and statistics.
 //! - `image_artifact`: metadata of worker-produced PNG artifacts.
 
+mod completion;
 mod config;
 mod stats;
 pub(crate) mod stats_report;
@@ -403,7 +404,7 @@ struct HostTrajectory {
     offloading: bool,
     /// How each denoising rank's pages hold the trajectory's samples, by
     /// rank, as its latent preparation reported them
-    /// (`CallOutput::latent_layouts`): a stored trajectory's pages are
+    /// (`CallCompletion::latent_layouts`): a stored trajectory's pages are
     /// keyed and recorded by them.
     layouts: BTreeMap<u32, String>,
 }
@@ -497,6 +498,14 @@ pub struct Scheduler {
     /// The candidate a precopy prepared at this boundary, until the switchover
     /// puts it in.
     policy_prepared: Option<policy::Candidate>,
+    /// Set once a policy instance actually serves this scheduler (§7.3).
+    ///
+    /// Before the epoch's first switchover the mechanism decides nothing — a
+    /// scheduler with no policy forms no batch — so the serving path's warm-up
+    /// (and anything else that must run once serving is real) waits on this
+    /// rather than on startup. It is a `watch` because the waiters outlive the
+    /// stage that sets it and never need the value to change back.
+    serving: tokio::sync::watch::Sender<bool>,
     /// The stage §7.3 asked for and the answer to give once it is applied: a
     /// stage changes the serving policy, so it waits for a boundary where no
     /// batch and no submission is in flight.

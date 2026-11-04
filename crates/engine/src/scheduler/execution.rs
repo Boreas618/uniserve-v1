@@ -220,6 +220,11 @@ impl Scheduler {
             return false;
         };
         let answered = kv_offload.poll();
+        // Nothing pinned means nothing to sweep, so a step gathers no live set
+        // to find that out (design §4.4).
+        if !kv_offload.holds() {
+            return answered;
+        }
         let waiting: HashSet<RequestId> = self
             .waiting
             .iter()
@@ -241,19 +246,20 @@ impl Scheduler {
         // A retiring request keeps its entries because
         // `Placement::batch_workers` finds the destinations of its `Finish`
         // and `Free` commands through them.
-        let live: HashSet<RequestId> = self
-            .running
-            .keys()
-            .chain(self.running_media.keys())
-            .chain(self.retiring_requests.keys())
-            .copied()
-            .collect();
+        let running = &self.running;
+        let running_media = &self.running_media;
+        let retiring = &self.retiring_requests;
+        let live = |request: &ipc::RequestId| {
+            running.contains_key(request)
+                || running_media.contains_key(request)
+                || retiring.contains_key(request)
+        };
         self.placement
             .affinity
-            .retain(|(request, _), _| live.contains(&request.request_id));
+            .retain(|(request, _), _| live(&request.request_id));
         self.placement
             .decode_affinity
-            .retain(|(request, _), _| live.contains(&request.request_id));
+            .retain(|(request, _), _| live(&request.request_id));
 
         let mut blocked_workers = HashSet::new();
         progressed |= self.dispatch_submissions(&mut blocked_workers);
@@ -550,7 +556,7 @@ impl Scheduler {
         self.pump_page_changes();
         self.recorder.close();
         let room = self.room();
-        let live = self.live();
+        let mut live = self.live();
         // A resident request that has not advanced within the policy's timeout
         // is the policy's failure, not the request's (design §4.4).
         let now = scheduling::guest::Nanos(crate::clock::now_monotonic_us().saturating_mul(1_000));
@@ -592,7 +598,12 @@ impl Scheduler {
         // the plan admits is resident for the work the same plan gives it, which
         // is what lets one plan both admit and run a request (§4.4).
         self.admit_plan(&plan);
-        let live = self.live();
+        // Admission is the only thing between the policy's dispatch and the
+        // plan's check, and it moves just the names the plan decided: restating
+        // those in the live state keeps a step's cost the size of its decision
+        // rather than the size of the world it holds (design §4.4).
+        let recorded = self.recorder.recorded();
+        views::admit_live(self, recorded, &mut live, &plan);
         if let Err(error) = mechanism::validate_plan(&plan, &room, &live) {
             return self.policy_failed(policy, error);
         }
@@ -775,8 +786,10 @@ impl Scheduler {
     }
 
     /// The expert placement the policy last answered, taken by the point that
-    /// applies it: the executor's world setup (§7.6). Taking it once is the
-    /// handoff, so a placement is applied once.
+    /// applies it: the executor's world setup (§7.6), which commits it with
+    /// `Executor::commit_experts` — the executor's own method for retaining an
+    /// expert order. Taking it once is the handoff, so a placement is applied
+    /// once; the mechanism keeps no second copy.
     pub(super) fn take_expert_order(&mut self) -> Option<scheduling::guest::ExpertOrder> {
         self.expert_order.take()
     }
