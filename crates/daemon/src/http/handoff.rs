@@ -28,6 +28,9 @@ use tokio::sync::{oneshot, watch};
 
 use proto::handoff;
 
+/// The HTTP framing of a frozen response, as the handoff state carries it.
+pub(crate) use proto::handoff::Http;
+
 /// The current time on `CLOCK_MONOTONIC`, in nanoseconds.
 ///
 /// The predecessor records when it stopped a response's socket and the

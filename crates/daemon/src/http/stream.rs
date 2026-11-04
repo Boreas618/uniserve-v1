@@ -356,19 +356,25 @@ async fn drive(
                     session.abort();
                     return;
                 }
-                match control.recv().await {
-                    Some(Control::Resume) => continue,
-                    // Adopted: the successor consumes the request's events
-                    // from here on, and the request keeps generating.
-                    Some(Control::Adopted) => {
-                        session.detach();
-                        return;
-                    }
-                    // The connection went away without a decision: the client
-                    // is gone, so the request ends with it.
-                    None => {
-                        session.abort();
-                        return;
+                loop {
+                    match control.recv().await {
+                        Some(Control::Resume) => break,
+                        // Adopted: the successor consumes the request's events
+                        // from here on, and the request keeps generating.
+                        Some(Control::Adopted) => {
+                            session.detach();
+                            return;
+                        }
+                        // A second pause request finds the response already
+                        // frozen; dropping its answer tells the caller that it
+                        // cannot be frozen again.
+                        Some(Control::Pause(_)) => continue,
+                        // The connection went away without a decision: the
+                        // client is gone, so the request ends with it.
+                        None => {
+                            session.abort();
+                            return;
+                        }
                     }
                 }
             }
