@@ -73,6 +73,7 @@
 
 pub mod activation;
 pub mod attention;
+pub mod block_copy;
 pub mod conv;
 pub mod descriptor;
 pub mod embedding;
