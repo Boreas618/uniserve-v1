@@ -11,10 +11,17 @@
 //! group holds `block_size` tokens and occupies `units_per_page` units
 //! (`ipc::CacheGroup`, reported by the worker at handshake and kept in
 //! `WorkerInfo`). The KV-write kernels address one row of the cache planes per
-//! token and store it themselves as `unit * block_size + position % block_size`
-//! (`ops/kernels/gather_decode_inputs`, `gather_request_rows`), so the mechanism
-//! states the same number in the batch's slot column. Nothing else derives it:
-//! the executor submits the column, it does not build it.
+//! token and store it themselves as `unit * block_size + position % block_size`,
+//! the number this module states in the batch's slot column. Nothing else
+//! derives it: the executor submits the column, it does not build it.
+//!
+//! A captured decode's metadata - rows, block tables, positions - reaches the
+//! device as the batch's columns each step, gathered on the host here. A
+//! device-side gather (`ops/kernels/attention_gather_rows` and
+//! `attention_gather_decode_inputs`, which exist once the runners replay a
+//! capture whose rows moved) would read the same tables on the device instead;
+//! which shape the executor captures is its decision, and either reads the slot
+//! numbers this module computes.
 //!
 //! The mapping is a pure function of a table, the group's page geometry and the
 //! positions of the tokens a call evaluates, which is why it lives here rather

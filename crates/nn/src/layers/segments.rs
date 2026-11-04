@@ -109,6 +109,45 @@ impl VsaTiles {
         self.width
     }
 
+    /// What a preparation needs of its at-rest arguments: [`Self::prepare`] calls this before it
+    /// composes a descriptor.
+    ///
+    /// It is public because a host test cannot build a [`Forward`] and this is the only part of a
+    /// preparation a test can exercise; a second copy of the rule inside `prepare` would be the
+    /// untested path.
+    pub fn check_prepare(
+        &self,
+        query_weight: bool,
+        key_weight: bool,
+        cosine: Option<TensorView>,
+        sine: Option<TensorView>,
+    ) -> Result<()> {
+        if query_weight != key_weight {
+            return Err(Error::shape(
+                "VsaTiles",
+                format!(
+                    "the Q and K normalization weights are a pair: {} without {}",
+                    if query_weight { "Q" } else { "K" },
+                    if query_weight { "K" } else { "Q" }
+                ),
+            ));
+        }
+        if self.norm != query_weight {
+            return Err(Error::shape(
+                "VsaTiles",
+                "the Q/K normalization weights are present exactly when the layer normalizes"
+                    .to_owned(),
+            ));
+        }
+        if self.rotated != 0 && (cosine.is_none() || sine.is_none()) {
+            return Err(Error::shape(
+                "VsaTiles",
+                "a rotated preparation needs both factor tables".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Normalize, rotate, zero and pool whole tiles of projected Q/K/V rows.
     ///
     /// `query`, `key` and `value` are `[tiles · tile_rows, heads, width]` and are modified in place;
@@ -131,20 +170,7 @@ impl VsaTiles {
         pooled_key: TensorView,
         pooled_value: TensorView,
     ) -> Result<()> {
-        let weights = [query_weight, key_weight];
-        if self.norm != weights.iter().all(Option::is_some) {
-            return Err(Error::shape(
-                "VsaTiles",
-                "the Q/K normalization weights are present exactly when the layer normalizes"
-                    .to_owned(),
-            ));
-        }
-        if self.rotated != 0 && (cosine.is_none() || sine.is_none()) {
-            return Err(Error::shape(
-                "VsaTiles",
-                "a rotated preparation needs both factor tables".to_owned(),
-            ));
-        }
+        self.check_prepare(query_weight.is_some(), key_weight.is_some(), cosine, sine)?;
         let descriptor = segments::PrepareTilesDescriptor {
             dtype: query.dtype,
             heads: self.heads,
@@ -213,6 +239,22 @@ impl VsaTiles {
         f.operate::<segments::VsaAddGatedTiles>(&descriptor, args)
     }
 
+    /// How many members a composition may name: [`Self::compose`] calls this before it composes a
+    /// descriptor.
+    ///
+    /// A tensor-parallel group's membership is the caller's, so the count is the caller's argument
+    /// and its refusal belongs where a host can see it — public for the same reason as
+    /// [`Self::check_prepare`].
+    pub fn check_members(&self, members: usize) -> Result<()> {
+        if members == 0 || members > MAX_MEMBERS {
+            return Err(Error::shape(
+                "VsaTiles",
+                format!("{members} members, one to {MAX_MEMBERS}"),
+            ));
+        }
+        Ok(())
+    }
+
     /// Write one row interval of every member's gated rows, member-major.
     ///
     /// `slots` names the payload slot of each member, in member order; a tensor-parallel group has
@@ -230,12 +272,7 @@ impl VsaTiles {
         count: u64,
         slots: &[u32],
     ) -> Result<()> {
-        if slots.is_empty() || slots.len() > MAX_MEMBERS {
-            return Err(Error::shape(
-                "VsaTiles",
-                format!("{} members, at most {MAX_MEMBERS}", slots.len()),
-            ));
-        }
+        self.check_members(slots.len())?;
         let mut table = [0_u32; MAX_MEMBERS];
         table[..slots.len()].copy_from_slice(slots);
         let descriptor = segments::ComposeGatedRowsDescriptor {
@@ -261,10 +298,11 @@ impl VsaTiles {
 
     /// Contract the pooled query and key tiles into the scores `select` ranks.
     ///
-    /// `pooled_query` is `[heads, query tiles, width]` and `pooled_key` `[heads, tiles, width]`, both
-    /// of the layer's dtype; `scores` is `[heads, query tiles, tiles]` FP32, contiguous, written here
-    /// and read by [`Self::select`]. One dot product per (query tile, key tile) and head — no scale
-    /// and no softmax, because the selection only compares and the attention scales its own products.
+    /// `pooled_query` is `[query tiles, heads, width]` and `pooled_key` `[tiles, heads, width]`, both
+    /// FP32 — the layout and the type [`Self::prepare`] writes; `scores` is
+    /// `[heads, query tiles, tiles]` FP32, contiguous, written here and read by [`Self::select`]. One
+    /// dot product per (query tile, key tile) and head — no scale and no softmax, because the
+    /// selection only compares and the attention scales its own products.
     pub fn scores(
         &self,
         f: &Forward,
@@ -276,7 +314,7 @@ impl VsaTiles {
             return Err(Error::shape(
                 "VsaTiles",
                 format!(
-                    "the pooled query is [heads, query tiles, width], not {:?}",
+                    "the pooled query is [query tiles, heads, width], not {:?}",
                     pooled_query.shape.dims()
                 ),
             ));
@@ -287,13 +325,8 @@ impl VsaTiles {
                 format!("{} features per head", pooled_query.shape.dim(2)),
             )
         })?;
-        let descriptor = segments::ScoresDescriptor::new(
-            pooled_query.dtype,
-            self.heads,
-            width,
-            width.next_power_of_two(),
-            false,
-        );
+        let descriptor =
+            segments::ScoresDescriptor::new(self.heads, width, width.next_power_of_two(), false);
         let args = segments::ScoresArgs {
             pooled_query,
             pooled_key,
@@ -345,5 +378,123 @@ impl VsaTiles {
             query_offset,
         };
         f.operate::<segments::VsaSelectTiles>(&descriptor, args)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ops::{DType, DevicePtr, Shape};
+
+    /// A view of `shape` at a host address: these tests never launch, so the address is a marker.
+    fn view(shape: &[u64]) -> TensorView {
+        TensorView::new(DevicePtr::new(0x1000), DType::F32, Shape::new(shape))
+    }
+
+    #[test]
+    fn a_tile_is_whole_programme_rows_and_positive_everywhere() {
+        let default = VsaTiles::with_default_tile(8, 256, 1e-6).unwrap();
+        assert_eq!(default.tile_rows(), DEFAULT_TILE);
+        assert_eq!(default.heads(), 8);
+        assert_eq!(default.width(), 256);
+        // A tile of 64 rows and a 128-row checkpoint both serve: tile rows are the checkpoint's.
+        assert!(VsaTiles::new(128, 8, 256, 1e-6).is_ok());
+        assert!(VsaTiles::new(0, 8, 256, 1e-6).is_err());
+        assert!(VsaTiles::new(64, 0, 256, 1e-6).is_err());
+        assert!(VsaTiles::new(64, 8, 0, 1e-6).is_err());
+        // 96 is six whole 16-row programmes, so it serves; 100 is not.
+        VsaTiles::new(96, 8, 256, 1e-6).expect("96 is six whole 16-row programmes");
+        let text = match VsaTiles::new(100, 8, 256, 1e-6) {
+            Ok(_) => panic!("100 rows is not a whole number of programme rows"),
+            Err(error) => format!("{error}"),
+        };
+        assert!(text.contains("100"), "{text}");
+    }
+
+    /// A rotation reads the first features of a head in pairs, and implies the normalization the
+    /// reference applies with it: a layer that rotates without normalizing is not a case.
+    #[test]
+    fn a_rotation_is_even_bounded_by_the_width_and_implies_the_norm() {
+        let rotated = VsaTiles::new(64, 8, 256, 1e-6)
+            .unwrap()
+            .with_rotation(96)
+            .unwrap();
+        assert_eq!(rotated.rotated, 96);
+        assert!(rotated.norm, "a rotation implies the norm");
+        assert!(
+            VsaTiles::new(64, 8, 256, 1e-6)
+                .unwrap()
+                .with_rotation(0)
+                .is_err()
+        );
+        assert!(
+            VsaTiles::new(64, 8, 256, 1e-6)
+                .unwrap()
+                .with_rotation(97)
+                .is_err(),
+            "a rotation reads pairs of features"
+        );
+        assert!(
+            VsaTiles::new(64, 8, 256, 1e-6)
+                .unwrap()
+                .with_rotation(512)
+                .is_err(),
+            "a rotation of more features than a head has"
+        );
+    }
+
+    /// The weights are present exactly when the layer normalizes, and a rotation needs both factor
+    /// tables: a preparation missing either would read a null view, so both are refused by name.
+    #[test]
+    fn a_preparation_names_its_weights_and_tables_exactly() {
+        let plain = VsaTiles::new(64, 8, 256, 1e-6).unwrap();
+        plain
+            .check_prepare(false, false, None, None)
+            .expect("a layer that does not normalize reads no weights");
+        assert!(plain.check_prepare(true, true, None, None).is_err());
+        assert!(plain.check_prepare(true, false, None, None).is_err());
+
+        let normed = VsaTiles::new(64, 8, 256, 1e-6).unwrap().with_norm();
+        normed
+            .check_prepare(true, true, None, None)
+            .expect("a normalizing layer reads both weights");
+        assert!(normed.check_prepare(false, false, None, None).is_err());
+        assert!(
+            normed.check_prepare(true, false, None, None).is_err(),
+            "one weight is not both halves of the normalization"
+        );
+
+        let rotated = VsaTiles::new(64, 8, 256, 1e-6)
+            .unwrap()
+            .with_rotation(96)
+            .unwrap();
+        let (cosine, sine) = (view(&[4096, 96]), view(&[4096, 96]));
+        rotated
+            .check_prepare(true, true, Some(cosine), Some(sine))
+            .expect("a rotated layer reads both tables");
+        let missing = rotated.check_prepare(true, true, Some(cosine), None);
+        assert!(
+            format!("{}", missing.unwrap_err()).contains("factor tables"),
+            "both tables are the rotation's"
+        );
+    }
+
+    /// A composition names one member per rank of a tensor-parallel group: at least one, at most the
+    /// operator's table.
+    #[test]
+    fn a_composition_names_one_member_per_rank_and_no_more_than_the_table() {
+        let tiles = VsaTiles::new(64, 8, 256, 1e-6).unwrap();
+        tiles.check_members(1).expect("one member");
+        tiles.check_members(MAX_MEMBERS).expect("the table's size");
+        let none = tiles.check_members(0);
+        assert!(
+            format!("{}", none.unwrap_err()).contains("one to"),
+            "no member is not a composition"
+        );
+        let too_many = tiles.check_members(MAX_MEMBERS + 1);
+        assert!(
+            format!("{}", too_many.unwrap_err()).contains(&MAX_MEMBERS.to_string()),
+            "the table's size is named"
+        );
     }
 }

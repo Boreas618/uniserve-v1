@@ -29,7 +29,11 @@ script = "src/build.py"
 target = "arch"
 architectures = ["sm_100a", "sm_100f"]
 
-# `packed_u8_scale_u8_accumulate_f32_output_bf16_layout_swizzled_128x4_epilogue_none_m_128_n_256_k_2048_pdl_true`.
+# `packed_u8_scale_f8e4m3_accumulate_f32_output_bf16_layout_swizzled_128x4_epilogue_none_m_128_n_256_k_2048_pdl_true`.
+#
+# The scale fields are the checkpoint's own dtype, E4M3, one byte per sixteen
+# elements: the kernel decodes each byte as an E4M3 value, so a `u8` cell would
+# describe a buffer nothing here interprets.
 #
 # The layout is the one both operands' scale fields carry: Blackwell's block
 # scaled tensor-core instructions read the 128x4 interleaved atom, so CUTLASS's
@@ -37,6 +41,6 @@ architectures = ["sm_100a", "sm_100f"]
 # a `tile_to_shape` of that atom, not a row-major view. A row-major matrix would
 # need a conversion pass before the MMA; nothing here declares one.
 [kernel.descriptors]
-dimensions = { packed = ["u8"], scale = ["u8"], accumulate = ["f32"], output = ["bf16", "f16"], layout = ["swizzled_128x4"], epilogue = ["none"], m = ["128", "256", "1024", "4096"], n = ["256", "2048", "8192"], k = ["2048", "4096", "7168", "16384"], pdl = ["true", "false"] }
+dimensions = { packed = ["u8"], scale = ["f8e4m3"], accumulate = ["f32"], output = ["bf16", "f16"], layout = ["swizzled_128x4"], epilogue = ["none"], m = ["128", "256", "1024", "4096"], n = ["256", "2048", "8192"], k = ["2048", "4096", "7168", "16384"], pdl = ["true", "false"] }
 
 [parameters]

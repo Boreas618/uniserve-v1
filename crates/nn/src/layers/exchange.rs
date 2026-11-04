@@ -2,7 +2,12 @@
 //! back (specs/worker.md 4.3, `UlyssesExchange`).
 //!
 //! The exchange is a collective, not a kernel program: every rank sends the same number of bytes, so
-//! there is nothing to compile per geometry and the epoch record fills no program for it. The layer
+//! there is nothing to compile per geometry and the epoch record fills no program for it.
+//!
+//! No model in this tree composes the layer yet: a sequence-parallel deployment is its consumer
+//! (specs/worker.md 4.3 names it), and it is kept — and tested — for that deployment rather than
+//! because a caller exercises it today. It is not dead code to be deleted; it is the partitioned
+//! path the design states. The layer
 //! holds the group's rank count, which is the model's mathematical partition (specs/worker.md 3,
 //! `Partition`), and calls the operator on the forward's communicator: `[tokens, heads, head_dim]`
 //! becomes `[tokens × ranks, head_dim / ranks]` per rank after [`UlyssesExchange::scatter`] and back
@@ -43,6 +48,7 @@ impl UlyssesExchange {
 
     /// Split the heads of `input` across the ranks into `out`.
     pub fn scatter(&self, f: &Forward, input: TensorView, out: TensorView) -> Result<()> {
+        self.check_views(input, out)?;
         let group = self.group(f)?;
         group.with(|communicator| {
             exchange::scatter(communicator, input, out, self.ranks, f.stream).map_err(Error::from)
@@ -51,10 +57,78 @@ impl UlyssesExchange {
 
     /// Put every rank's heads back together into `out`.
     pub fn gather(&self, f: &Forward, input: TensorView, out: TensorView) -> Result<()> {
+        self.check_views(out, input)?;
         let group = self.group(f)?;
         group.with(|communicator| {
             exchange::gather(communicator, input, out, self.ranks, f.stream).map_err(Error::from)
         })
+    }
+
+    /// The geometry one exchange direction needs, checked before the collective is issued.
+    ///
+    /// `input` and `out` are the two sides of the exchange: `[tokens, heads, head_dim]` on one side
+    /// and `[tokens · ranks, head_dim / ranks]` on the other, in whichever order the direction
+    /// reads them. Split from [`Self::scatter`] and [`Self::gather`] because it needs no device: a
+    /// caller's geometry is assertable on the host, and a wrong one is refused before a collective
+    /// is issued rather than after a mismatched send.
+    pub fn check_views(&self, wide: TensorView, narrow: TensorView) -> Result<()> {
+        if wide.shape.rank() != 3 {
+            return Err(Error::shape(
+                "UlyssesExchange",
+                format!(
+                    "the wide side is [tokens, heads, head_dim], not {:?}",
+                    wide.shape.dims()
+                ),
+            ));
+        }
+        let head_dim = wide.shape.last();
+        if !head_dim.is_multiple_of(self.ranks) {
+            return Err(Error::shape(
+                "UlyssesExchange",
+                format!(
+                    "a head of {head_dim} features does not divide across {} ranks",
+                    self.ranks
+                ),
+            ));
+        }
+        if narrow.shape.rank() != 2 {
+            return Err(Error::shape(
+                "UlyssesExchange",
+                format!(
+                    "the exchanged side is [tokens · ranks, head_dim / ranks], not {:?}",
+                    narrow.shape.dims()
+                ),
+            ));
+        }
+        let tokens = wide.shape.dim(0);
+        if narrow.shape.dim(0) != tokens * self.ranks {
+            return Err(Error::shape(
+                "UlyssesExchange",
+                format!(
+                    "the exchanged side has {} rows, {} expected for {tokens} tokens over {} ranks",
+                    narrow.shape.dim(0),
+                    tokens * self.ranks,
+                    self.ranks
+                ),
+            ));
+        }
+        if narrow.shape.dim(1) * self.ranks != head_dim {
+            return Err(Error::shape(
+                "UlyssesExchange",
+                format!(
+                    "the exchanged side is {} wide, a head of {head_dim} over {} ranks",
+                    narrow.shape.dim(1),
+                    self.ranks
+                ),
+            ));
+        }
+        if narrow.dtype != wide.dtype {
+            return Err(Error::shape(
+                "UlyssesExchange",
+                format!("the exchange moves {} against {}", wide.dtype, narrow.dtype),
+            ));
+        }
+        Ok(())
     }
 
     fn group<'a>(&self, f: &Forward<'a>) -> Result<&'a crate::Group> {
@@ -75,5 +149,106 @@ impl UlyssesExchange {
             ));
         }
         Ok(group)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ops::{DType, DevicePtr, Shape};
+
+    /// A view of `shape` at a host address: these tests never issue a collective.
+    fn view(shape: &[u64]) -> TensorView {
+        TensorView::new(DevicePtr::new(0x2000), DType::BF16, Shape::new(shape))
+    }
+
+    /// A group is a power of two ranks: a mistyped degree is caught before it reaches a collective.
+    #[test]
+    fn a_group_is_a_positive_power_of_two() {
+        for ranks in [1, 2, 4, 8] {
+            assert_eq!(UlyssesExchange::new(ranks).unwrap().ranks(), ranks);
+        }
+        assert!(UlyssesExchange::new(0).is_err());
+        assert!(UlyssesExchange::new(3).is_err());
+        assert!(UlyssesExchange::new(6).is_err());
+        let text = match UlyssesExchange::new(12) {
+            Ok(_) => panic!("twelve is not a power of two"),
+            Err(error) => format!("{error}"),
+        };
+        assert!(text.contains("12"), "{text}");
+    }
+
+    /// `[tokens, heads, head_dim]` over `ranks` becomes `[tokens · ranks, head_dim / ranks]`: each
+    /// rank keeps its slice of every head at every token of the whole sequence, so the row count
+    /// grows by the rank count while a row narrows by it.
+    #[test]
+    fn an_exchange_trades_head_width_for_rows_and_back() {
+        let two = UlyssesExchange::new(2).unwrap();
+        let wide = view(&[16, 8, 128]);
+        let narrow = view(&[32, 64]);
+        two.check_views(wide, narrow)
+            .expect("two ranks exchange [16, 8, 128] against [32, 64]");
+        // Four ranks from the same geometry: twice the rows, a quarter of the width.
+        let four = UlyssesExchange::new(4).unwrap();
+        four.check_views(wide, view(&[64, 32]))
+            .expect("four ranks exchange [16, 8, 128] against [64, 32]");
+        // The same views are still one exchange's two sides, so `gather` is the same check with the
+        // arguments read the other way round.
+        two.check_views(wide, narrow)
+            .expect("the gather reads the same two views the other way round");
+    }
+
+    /// Each way the geometry can be wrong is refused by name, because a mismatched collective is a
+    /// deadlock or a wrong answer rather than an error.
+    #[test]
+    fn a_geometry_that_cannot_exchange_is_refused() {
+        let two = UlyssesExchange::new(2).unwrap();
+        let wide = view(&[16, 8, 128]);
+
+        let rows = two.check_views(wide, view(&[16, 64]));
+        assert!(
+            format!("{}", rows.unwrap_err()).contains("32 expected"),
+            "rows are tokens · ranks"
+        );
+
+        let width = two.check_views(wide, view(&[32, 128]));
+        assert!(
+            format!("{}", width.unwrap_err()).contains("a head of 128"),
+            "width is head_dim / ranks"
+        );
+
+        let rank = two.check_views(wide, view(&[32]));
+        assert!(
+            format!("{}", rank.unwrap_err()).contains("exchanged side"),
+            "a rank-1 side"
+        );
+
+        let heads = two.check_views(view(&[16]), view(&[32, 64]));
+        assert!(
+            format!("{}", heads.unwrap_err()).contains("wide side"),
+            "a rank-1 wide side"
+        );
+
+        // A head of 96 features over 3 ranks divides, but 3 ranks are not a group.
+        assert!(UlyssesExchange::new(3).is_err());
+        // Over four ranks a head divides into whole features or not at all: 100 gives 25 a rank,
+        // 102 gives 25 and a half and is refused.
+        let four = UlyssesExchange::new(4).unwrap();
+        four.check_views(view(&[16, 8, 100]), view(&[64, 25]))
+            .expect("a head of 100 over 4 ranks is 25 features a rank");
+        let odd = four
+            .check_views(view(&[16, 8, 102]), view(&[64, 25]))
+            .expect_err("102 over 4");
+        assert!(format!("{odd}").contains("does not divide"));
+
+        // One element type on both sides: a collective cannot narrow a half into a float on the way.
+        let dtype = two.check_views(
+            wide,
+            TensorView::new(DevicePtr::new(0x2000), DType::F16, Shape::new(&[32, 64])),
+        );
+        assert!(
+            format!("{}", dtype.unwrap_err()).contains("moves"),
+            "both sides are one type"
+        );
     }
 }
