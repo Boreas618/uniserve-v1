@@ -1758,3 +1758,83 @@ fn download_bf16(
 fn half_to_f32(bits: u16) -> f32 {
     f32::from_bits(u32::from(bits) << 16)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The reading the table exists for: the stage whose error grew by much more than its
+    /// predecessor's, which is not the stage that crossed the tripwire first.
+    #[test]
+    fn the_largest_increment_and_the_first_crossing_are_different_stages() {
+        let mut table = Table::default();
+        // Accumulation: each stage adds a little, and the last one is what crosses 5 %.
+        for (index, error) in [0.0, 0.02, 0.04, 0.06].into_iter().enumerate() {
+            table.push(index, error);
+        }
+        assert_eq!(
+            table.first_above,
+            Some(3),
+            "the crossing is the stage past the budget"
+        );
+        // `0 -> 0.02` is the largest step, which is where the divergence enters.
+        assert_eq!(table.largest, Some((1, 0.02)));
+    }
+
+    /// A jump in the middle of a flat table names that stage, and the stages after it inherit the
+    /// error without growing it.
+    #[test]
+    fn a_jump_names_its_own_stage_and_inheritance_names_none() {
+        let mut table = Table::default();
+        for (index, error) in [0.001, 0.0012, 0.031, 0.0312, 0.0315]
+            .into_iter()
+            .enumerate()
+        {
+            table.push(index, error);
+        }
+        let (index, step) = table.largest.expect("a stage grew");
+        assert_eq!(index, 2, "the jump is at the third stage");
+        assert!((step - 0.0298).abs() < 1e-12, "the step is the difference");
+        assert_eq!(table.first_above, Some(2));
+    }
+
+    /// One stage has no increment: the table must not report a growth it cannot measure.
+    #[test]
+    fn a_single_stage_has_no_increment() {
+        let mut table = Table::default();
+        assert_eq!(table.push(0, 0.5), None);
+        assert_eq!(table.largest, None);
+        assert_eq!(table.first_above, Some(0));
+        assert_eq!(table.stages, 1);
+    }
+
+    /// `rms/scale` is zero for equal rows and one for a row that is entirely different at the
+    /// reference's own scale, which is the denominator the metric has to use.
+    #[test]
+    fn the_distance_is_measured_against_the_references_scale() {
+        let theirs = [1.0_f32, -2.0, 3.0, -4.0];
+        let (relative, worst, scale, ours) = distance(&theirs, &theirs);
+        assert_eq!(relative, 0.0);
+        assert_eq!(worst, 0.0);
+        assert!((scale - ours).abs() < 1e-12, "equal rows have one rms");
+
+        let doubled: Vec<f32> = theirs.iter().map(|value| value * 2.0).collect();
+        let (relative, ..) = distance(&doubled, &theirs);
+        assert!((relative - 1.0).abs() < 1e-6, "twice the row is 100 % off");
+
+        let zeros = [0.0_f32; 4];
+        assert_eq!(rms(&zeros), 0.0);
+        assert!((rms(&[3.0, 4.0]) - 12.5_f64.sqrt()).abs() < 1e-12);
+    }
+
+    /// A cut's file is named after the module whose hook produces it, which is what a reference
+    /// directory holds; the cut's own name states whether the residual has been added.
+    #[test]
+    fn a_cut_reads_the_hooks_file_and_writes_the_hooks_name() {
+        assert_eq!(cut_file(Substage::MlpOut), "mlp");
+        assert_eq!(Substage::MlpOut.name(), "mlp_out");
+        assert_eq!(cut_hook(Substage::MlpOut), "`mlp`");
+        assert_eq!(cut_file(Substage::Normalized), "normalized");
+        assert_eq!(cut_file(Substage::Attended), "attended");
+    }
+}
