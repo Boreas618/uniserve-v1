@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use platform::nccl::{Communicator, ReduceOp, UniqueId};
 use platform::{
-    Capture, CaptureMode, CaptureStatus, Cluster, CopyBatch, Device, DeviceAllocation,
+    Capture, CaptureMode, CaptureStatus, Cluster, ComputeType, Convolution, ConvolutionArgs, CopyBatch,
+    Cudnn, DataType, Device, DeviceAllocation, Matmul, MatmulArgs, MatmulDescriptor, Tensor,
     DeviceAttribute, DeviceId, Error, Event, EventFlags, FunctionAttribute, GraphNodeKind,
     HandleType, Interleave, KernelNodeParams, L2Promotion, LaunchConfig, Library, Nvml, OobFill,
     PeerMapping, PinnedBuffer, PrimaryContext, Protection, SegmentedMapping, ShareableHandle,
@@ -1056,6 +1057,42 @@ const KERNELS: &str = "\
     @%p st.global.u32 [%rd3], %r7;\n\
     ret;\n\
 }\n\
+.visible .entry report_cluster(.param .u64 out)\n\
+{\n\
+    .reg .u64 %rd<3>;\n\
+    .reg .u32 %r<11>;\n\
+    .reg .pred %p;\n\
+    ld.param.u64 %rd1, [out];\n\
+    mov.u32 %r1, %ctaid.x;\n\
+    mov.u32 %r2, %ctaid.y;\n\
+    mov.u32 %r3, %cluster_ctaid.x;\n\
+    mov.u32 %r4, %cluster_ctaid.y;\n\
+    mov.u32 %r5, %cluster_ctarank;\n\
+    mov.u32 %r6, %cluster_nctaid.x;\n\
+    mov.u32 %r7, %cluster_nctaid.y;\n\
+    mov.u32 %r8, %nctaid.x;\n\
+    mov.u32 %r9, %tid.x;\n\
+    mad.lo.u32 %r10, %r8, %r2, %r1;\n\
+    mul.wide.u32 %rd2, %r10, 32;\n\
+    add.u64 %rd2, %rd1, %rd2;\n\
+    setp.eq.u32 %p, %r9, 0;\n\
+    @%p st.global.u32 [%rd2], %r1;\n\
+    add.u64 %rd2, %rd2, 4;\n\
+    @%p st.global.u32 [%rd2], %r2;\n\
+    add.u64 %rd2, %rd2, 4;\n\
+    @%p st.global.u32 [%rd2], %r3;\n\
+    add.u64 %rd2, %rd2, 4;\n\
+    @%p st.global.u32 [%rd2], %r4;\n\
+    add.u64 %rd2, %rd2, 4;\n\
+    @%p st.global.u32 [%rd2], %r5;\n\
+    add.u64 %rd2, %rd2, 4;\n\
+    @%p st.global.u32 [%rd2], %r6;\n\
+    add.u64 %rd2, %rd2, 4;\n\
+    @%p st.global.u32 [%rd2], %r7;\n\
+    add.u64 %rd2, %rd2, 4;\n\
+    @%p st.global.u32 [%rd2], %r9;\n\
+    ret;\n\
+}\n\
 .visible .entry write(.param .u64 out, .param .u32 value)\n\
 {\n\
     .reg .u64 %rd<3>;\n\
@@ -1209,26 +1246,41 @@ fn launch_ex_carries_the_grid_shared_memory_and_launch_attributes() {
 
     // A cluster is one launch attribute more; it needs a compute capability
     // that has clusters (sm_90 and later), which is every device this branch
-    // targets.
+    // targets. The kernel reads the cluster's own registers, so a launch that
+    // dropped the attribute cannot pass: without it every block is a cluster
+    // of one.
     if device.architecture().0 >= 9 {
+        let cluster = library.kernel("report_cluster").unwrap();
         let config = LaunchConfig {
             grid: [2, 2, 1],
             block: [1, 1, 1],
             cluster: Some(Cluster::new([2, 1, 1])),
             ..LaunchConfig::default()
         };
-        // SAFETY: four records of seven words lie in the allocation.
-        unsafe { memset_d8(storage.address(), 0xff, 4 * 28, &stream) }.unwrap();
-        report.launch_ex(&stream, &config, &mut parameters).unwrap();
+        // The launch writes one record of eight words per block of its grid,
+        // and only that many: the pinned buffer still holds the earlier
+        // section's records beyond them.
+        let records = 4 * 8 * 4;
+        // SAFETY: four records of eight words lie in the allocation.
+        unsafe { memset_d8(storage.address(), 0xff, records, &stream) }.unwrap();
+        cluster
+            .launch_ex(&stream, &config, &mut parameters)
+            .unwrap();
         // SAFETY: as above.
-        unsafe { memcpy_async(host.address(), storage.address(), 4 * 28, &stream) }.unwrap();
+        unsafe { memcpy_async(host.address(), storage.address(), records, &stream) }.unwrap();
         stream.synchronize().unwrap();
         let observed = words(&host);
-        for (block, record) in observed.as_chunks::<7>().0.iter().enumerate() {
+        let written = &observed[..records / 4];
+        for (block, record) in written.as_chunks::<8>().0.iter().enumerate() {
             let block = block as u32;
+            let (x, y) = (block % 2, block / 2);
+            // The grid's block, the block's place inside its cluster (two
+            // blocks wide, so the cluster-local x is the grid x modulo two),
+            // its rank inside the cluster, the cluster's own dimensions, and
+            // the thread's x index.
             assert_eq!(
                 *record,
-                [block % 2, block / 2, 0, 0, 0, 0, 0],
+                [x, y, x, 0, x, 2, 1, 0],
                 "block {block} of a clustered launch"
             );
         }
@@ -1353,6 +1405,170 @@ fn rebinding_changes_a_kernel_node_function_and_arguments() {
     unsafe { memcpy_async(host.address(), storage.address(), 32, &stream) }.unwrap();
     stream.synchronize().unwrap();
     assert_eq!(words(&host), vec![7; 8], "the template node is unchanged");
+}
+
+
+/// A row-major matrix product runs on an algorithm cuBLASLt's heuristic
+/// offers, and its result is the arithmetic the descriptor names.
+#[test]
+fn a_matrix_product_runs_on_an_algorithm_the_heuristic_offers() {
+    let _driver = exclusive_driver();
+    let device = Device::new(DEVICE).unwrap();
+    let stream = Stream::new(DEVICE).unwrap();
+    let (m, n, k) = (4u64, 6, 3);
+    // Small integers, so an FP32 product is exact and a tolerance would only
+    // hide a wrong layout.
+    let a: Vec<f32> = (0..m * k).map(|index| (index % 7) as f32 - 3.0).collect();
+    let b: Vec<f32> = (0..k * n).map(|index| (index % 5) as f32 + 1.0).collect();
+    let mut expected = vec![0f32; (m * n) as usize];
+    for row in 0..m as usize {
+        for col in 0..n as usize {
+            let mut sum = 0f64;
+            for inner in 0..k as usize {
+                sum += a[row * k as usize + inner] as f64 * b[inner * n as usize + col] as f64;
+            }
+            expected[row * n as usize + col] = sum as f32;
+        }
+    }
+
+    let a_device = DeviceAllocation::linear(DEVICE, a.len() * 4).unwrap();
+    let b_device = DeviceAllocation::linear(DEVICE, b.len() * 4).unwrap();
+    let c_device = DeviceAllocation::linear(DEVICE, expected.len() * 4).unwrap();
+    let d_device = DeviceAllocation::linear(DEVICE, expected.len() * 4).unwrap();
+    // SAFETY: each copy fills a device allocation of exactly the bytes it
+    // reads from a live slice, and the stream is synchronized afterwards.
+    unsafe {
+        memcpy_async(a_device.address(), a.as_ptr() as u64, a.len() * 4, &stream).unwrap();
+        memcpy_async(b_device.address(), b.as_ptr() as u64, b.len() * 4, &stream).unwrap();
+        memset_d32(c_device.address(), 0, expected.len() as u32, &stream).unwrap();
+        memset_d32(d_device.address(), 0, expected.len() as u32, &stream).unwrap();
+    }
+    stream.synchronize().unwrap();
+
+    let matmul = Matmul::new(&device).unwrap();
+    let descriptor =
+        MatmulDescriptor::row_major(m, n, k, DataType::F32, ComputeType::F32);
+    let algorithms = matmul.candidates(&descriptor, 0, 4).unwrap();
+    assert!(
+        !algorithms.is_empty(),
+        "cuBLASLt's heuristic proposes an algorithm for a 4x6x3 product"
+    );
+    let algorithm = algorithms[0];
+    let workspace = if algorithm.workspace_bytes() > 0 {
+        DeviceAllocation::linear(DEVICE, algorithm.workspace_bytes()).unwrap()
+    } else {
+        DeviceAllocation::linear(DEVICE, 4).unwrap()
+    };
+    let args = MatmulArgs {
+        a: a_device.address(),
+        b: b_device.address(),
+        c: c_device.address(),
+        d: d_device.address(),
+        alpha: 1.0,
+        beta: 0.0,
+        bias: 0,
+        workspace: workspace.address(),
+        workspace_bytes: workspace.len() as usize,
+    };
+    // SAFETY: every operand is a device allocation of the descriptor's bytes and
+    // outlives the launch, and the workspace is the algorithm's own need.
+    unsafe { matmul.run(&descriptor, &algorithm, &args, &stream) }.unwrap();
+    stream.synchronize().unwrap();
+
+    let host = PinnedBuffer::new(DEVICE, expected.len() * 4).unwrap();
+    // SAFETY: the copy reads the result allocation into a pinned buffer of its
+    // size, and the stream is synchronized afterwards.
+    unsafe { memcpy_async(host.address(), d_device.address(), expected.len() * 4, &stream) }
+        .unwrap();
+    stream.synchronize().unwrap();
+    let result: Vec<f32> = read(&host)
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| f32::from_le_bytes(*word))
+        .collect();
+    assert_eq!(result, expected, "D = A·B with A 4x3 row-major, B 3x6 row-major");
+
+    // The algorithm is what the program's tuning data carries: the record
+    // reproduces the same algorithm's bytes.
+    let record = algorithm.to_bytes();
+    let restored = Algorithm::from_bytes(&record, algorithm.workspace_bytes());
+    assert_eq!(restored.to_bytes(), record, "the tuning record round-trips");
+}
+
+/// A 1-D convolution through cuDNN computes the cross-correlation the tensors
+/// describe, and the plan's engine is the record a program carries.
+#[test]
+fn a_convolution_matches_the_arithmetic() {
+    let _driver = exclusive_driver();
+    let device = Device::new(DEVICE).unwrap();
+    let stream = Stream::new(DEVICE).unwrap();
+    // N=1, C=1, D=8 with filter [1, 0, -1]: y[i] = x[i] - x[i + 2] = -2.
+    let x: Vec<f32> = (0..8).map(|index| index as f32 + 1.0).collect();
+    let w: Vec<f32> = vec![1.0, 0.0, -1.0];
+    let expected = vec![-2f32; 6];
+
+    let convolution = Convolution::new(
+        Tensor::contiguous(vec![1, 1, 8], DataType::F32),
+        Tensor::contiguous(vec![1, 1, 3], DataType::F32),
+        Tensor::contiguous(vec![1, 1, 6], DataType::F32),
+        vec![0],
+        vec![1],
+        vec![1],
+    );
+    let bytes = convolution.bytes();
+    let cudnn = Cudnn::new(&device).unwrap();
+    let plan = cudnn.plan(&convolution, None).unwrap();
+
+    let x_device = DeviceAllocation::linear(DEVICE, bytes.x as usize).unwrap();
+    let w_device = DeviceAllocation::linear(DEVICE, bytes.w as usize).unwrap();
+    let y_device = DeviceAllocation::linear(DEVICE, bytes.y as usize).unwrap();
+    let workspace = if plan.workspace_bytes() > 0 {
+        DeviceAllocation::linear(DEVICE, plan.workspace_bytes()).unwrap()
+    } else {
+        DeviceAllocation::linear(DEVICE, 4).unwrap()
+    };
+    // SAFETY: the copies fill allocations of the tensors' sizes from live
+    // slices, and the stream is synchronized afterwards.
+    unsafe {
+        memcpy_async(x_device.address(), x.as_ptr() as u64, x.len() * 4, &stream).unwrap();
+        memcpy_async(w_device.address(), w.as_ptr() as u64, w.len() * 4, &stream).unwrap();
+        memset_d32(y_device.address(), 0, expected.len() as u32, &stream).unwrap();
+    }
+    stream.synchronize().unwrap();
+
+    let args = ConvolutionArgs {
+        x: x_device.address(),
+        w: w_device.address(),
+        y: y_device.address(),
+        workspace: workspace.address(),
+    };
+    // SAFETY: each argument is a device allocation of the convolution's size and
+    // the workspace is the plan's own need.
+    unsafe { cudnn.run(&plan, args, &stream) }.unwrap();
+    stream.synchronize().unwrap();
+
+    let host = PinnedBuffer::new(DEVICE, expected.len() * 4).unwrap();
+    // SAFETY: the copy reads the output allocation into a pinned buffer of its
+    // size, and the stream is synchronized afterwards.
+    unsafe { memcpy_async(host.address(), y_device.address(), expected.len() * 4, &stream) }
+        .unwrap();
+    stream.synchronize().unwrap();
+    let result: Vec<f32> = read(&host)
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| f32::from_le_bytes(*word))
+        .collect();
+    assert_eq!(result, expected, "y = conv(x, [1, 0, -1])");
+
+    // The engine is the program's tuning record: 8 bytes that round-trip.
+    let record = plan.engine().to_bytes();
+    assert_eq!(
+        Engine::from_bytes(&record).unwrap(),
+        plan.engine(),
+        "the engine record round-trips"
+    );
 }
 
 /// The read half of a rebind walk: a template's node gives back the kernel it
@@ -1480,7 +1696,7 @@ fn recapture_builds_an_executable_of_the_new_capture() {
 fn tensor_maps_encode_tiled_descriptors() {
     let _driver = exclusive_driver();
     // The device's retained context is what the allocation belongs to.
-    let _device = Device::new(DEVICE).unwrap();
+    let device = Device::new(DEVICE).unwrap();
     let storage = DeviceAllocation::linear(DEVICE, 4096).unwrap();
 
     let rank_one = TensorMapSpec {
@@ -1495,7 +1711,7 @@ fn tensor_maps_encode_tiled_descriptors() {
         l2_promotion: L2Promotion::None,
         oob_fill: OobFill::None,
     };
-    let encoded = TensorMap::encode_tiled(&rank_one).unwrap();
+    let encoded = TensorMap::encode_tiled(&device, &rank_one).unwrap();
     assert!(
         encoded.as_bytes().iter().any(|byte| *byte != 0),
         "the driver encoded the descriptor"
@@ -1514,14 +1730,14 @@ fn tensor_maps_encode_tiled_descriptors() {
         l2_promotion: L2Promotion::B128,
         oob_fill: OobFill::NanRequestZeroFma,
     };
-    TensorMap::encode_tiled(&rank_two).unwrap();
+    TensorMap::encode_tiled(&device, &rank_two).unwrap();
 
     let missing_stride = TensorMapSpec {
         global_strides: &[16, 32],
         ..rank_two
     };
     assert!(matches!(
-        TensorMap::encode_tiled(&missing_stride),
+        TensorMap::encode_tiled(&device, &missing_stride),
         Err(Error::InvalidArgument(_))
     ));
     let rank_zero = TensorMapSpec {
@@ -1529,7 +1745,7 @@ fn tensor_maps_encode_tiled_descriptors() {
         ..rank_one
     };
     assert!(matches!(
-        TensorMap::encode_tiled(&rank_zero),
+        TensorMap::encode_tiled(&device, &rank_zero),
         Err(Error::InvalidArgument(_))
     ));
 }
