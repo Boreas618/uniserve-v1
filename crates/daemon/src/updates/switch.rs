@@ -1468,6 +1468,50 @@ mod tests {
         );
     }
 
+    /// Every node allocates its own launch generation, and a command reaches
+    /// the process of the generation that node started: addressing the highest
+    /// number any node reported would reach no process on the other node and
+    /// the phase would wait for an answer that cannot come.
+    #[test]
+    fn each_node_is_commanded_at_the_generation_it_allocated() {
+        let (_epochs, mut switch) = setup();
+        let mut roster = Fake {
+            allocate_from: Some(6),
+            ..Fake::default()
+        };
+        switch.start(&mut roster);
+        assert_eq!(
+            roster.spawns.len(),
+            2,
+            "two nodes, each allocated its own generation"
+        );
+
+        roster.scripted = vec![hello("n0", 6, "2.0.0+new"), hello("n1", 7, "2.0.0+new")];
+        switch.advance(&mut roster);
+        let parks: Vec<_> = roster
+            .commands
+            .iter()
+            .filter(|(_, _, kind)| matches!(kind, process::command::Kind::Park(_)))
+            .map(|(host, generation, _)| (host.as_str(), *generation))
+            .collect();
+        assert_eq!(parks, vec![("n0", 6), ("n1", 7)]);
+
+        switch.parked(&mut roster, "n0", 6);
+        switch.parked(&mut roster, "n1", 7);
+        assert_eq!(switch.phase(), Phase::Promoting);
+        let promotes: Vec<_> = roster
+            .commands
+            .iter()
+            .filter(|(_, _, kind)| matches!(kind, process::command::Kind::Promote(_)))
+            .map(|(host, generation, _)| (host.as_str(), *generation))
+            .collect();
+        assert_eq!(
+            promotes,
+            vec![("n0", 6), ("n1", 7)],
+            "each node's own generation, not the highest reported"
+        );
+    }
+
     /// A world an earlier switch dropped is retired by the next switch's
     /// claim on every node: a claim retires storage on the node it is made
     /// on, so passing it to one node would leave the others holding it.
