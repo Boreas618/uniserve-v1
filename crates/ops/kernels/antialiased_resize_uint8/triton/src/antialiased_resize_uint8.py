@@ -113,10 +113,15 @@ def _antialiased_resize_uint8_kernel(
     count_h = tl.minimum(count_h, MAX_TAPS)
     sum_h = tl.zeros((BLOCK,), dtype=tl.float32)
     for tap in tl.static_range(MAX_TAPS):
-        inside = tap < count_h
+        # A tap outside the row contributes nothing and is **left out of the sum**: the taps that
+        # fall off the edge are dropped and the rest renormalised, which is what torch's resize does.
+        # Clamping the index instead would repeat the edge pixel with the dropped taps' weight and
+        # move an output row by up to nine code values.
+        source_h = start_h + tap
+        inside = (tap < count_h) & (source_h >= 0) & (source_h < height_of)
         weight = tl.where(
             inside,
-            _kernel_of(((start_h + tap).to(tl.float32) - center_h) / scale_h, BICUBIC),
+            _kernel_of((source_h.to(tl.float32) - center_h) / scale_h, BICUBIC),
             0.0,
         )
         sum_h += weight
@@ -133,10 +138,11 @@ def _antialiased_resize_uint8_kernel(
         total = tl.zeros((BLOCK,), dtype=tl.float32)
         sum_w = tl.zeros((BLOCK,), dtype=tl.float32)
         for horizontal in tl.static_range(MAX_TAPS):
+            source_w = start_w + horizontal
             width_weight = tl.where(
-                horizontal < count_w,
+                (horizontal < count_w) & (source_w >= 0) & (source_w < width_of),
                 _kernel_of(
-                    ((start_w + horizontal).to(tl.float32) - center_w) / scale_w,
+                    (source_w.to(tl.float32) - center_w) / scale_w,
                     BICUBIC,
                 ),
                 0.0,
@@ -146,17 +152,16 @@ def _antialiased_resize_uint8_kernel(
                 tl.maximum(start_w + horizontal, 0), width_of - 1
             )
             for vertical in tl.static_range(MAX_TAPS):
+                source_h = start_h + vertical
                 height_weight = tl.where(
-                    vertical < count_h,
+                    (vertical < count_h) & (source_h >= 0) & (source_h < height_of),
                     _kernel_of(
-                        ((start_h + vertical).to(tl.float32) - center_h) / scale_h,
+                        (source_h.to(tl.float32) - center_h) / scale_h,
                         BICUBIC,
                     ),
                     0.0,
                 )
-                source_row = tl.minimum(
-                    tl.maximum(start_h + vertical, 0), height_of - 1
-                )
+                source_row = tl.minimum(tl.maximum(source_h, 0), height_of - 1)
                 code = tl.load(
                     x_ptr + source_base + source_row * width_of + column,
                     mask=live,
