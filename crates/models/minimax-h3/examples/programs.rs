@@ -20,7 +20,7 @@
 use std::path::PathBuf;
 
 use minimax_h3::audio_vae::AudioDecoder;
-use minimax_h3::encoding::AudioEncoder;
+use minimax_h3::encoding::{AudioEncoder, VideoEncoder};
 use minimax_h3::config::{
     AttentionKind, AudioVaeConfig, TextEncoderConfig, TransformerConfig, VideoVaeConfig,
 };
@@ -176,6 +176,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let config = VideoVaeConfig::parse(&read(&vae)?)?;
         rows.extend(VideoDecoder::programs(&config, dtype)?);
         rows.extend(VideoPostprocessor::programs(dtype, &rasters));
+        // The encoder runs FP32 by the design's own row, and its frame operators key on classes the
+        // raster derives — the one component of this model where the raster is load-bearing.
+        rows.extend(VideoEncoder::programs(&config, &rasters)?);
     } else {
         eprintln!("not walked: {} has no video VAE config", root.display());
     }
