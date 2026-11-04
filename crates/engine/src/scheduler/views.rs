@@ -63,7 +63,7 @@
 use std::collections::{HashMap, HashSet};
 
 use scheduling::guest::decision::{
-    Inflight as InflightView, Plan, Room, Shortage, Storage, Warming as WarmingView,
+    Inflight as InflightView, Room, Shortage, Storage, Warming as WarmingView,
 };
 use scheduling::guest::event::{End, Event};
 use scheduling::guest::ids::{
@@ -1379,52 +1379,43 @@ pub(crate) fn queued(scheduler: &Scheduler) -> Vec<ViewRequestId> {
 ///
 /// The validators read a `Plan`'s names against it, so it is built at the step
 /// the plan belongs to and rebuilt after `reclaim` changes the state.
-pub(crate) fn live(scheduler: &Scheduler, step: u64, recorded: &RecordedTable) -> Live {
+pub(crate) fn live(scheduler: &Scheduler, step: u64, recorded: &RecordedTable) -> Live<'static> {
     Live::of(&snapshot(scheduler, step, recorded), queued(scheduler))
 }
 
-/// Restates in `live` what the step's admission changed, so the plan is
-/// validated against the state its own admission produced (design §4.4).
+/// The live state a step's starvation rule reads: the views of the requests the
+/// watchdog tracks, and nothing else.
 ///
-/// Admission moves the names a plan admits from the queue into residency, drops
-/// the names it rejects, and changes no other request, so every other entry of
-/// `live` stands as it was. Rebuilding the whole state after admission would
-/// cost the requests and pages the mechanism holds, once per step; restating
-/// the names the plan decided costs what the plan decided.
-pub(crate) fn admit_live(
-    scheduler: &Scheduler,
-    recorded: &RecordedTable,
-    live: &mut Live,
-    plan: &Plan,
-) {
+/// The rule names only a request it has seen advancing, so a step that asks
+/// whether one has waited too long states those requests' views rather than a
+/// view of every resident (design §4.4).
+pub(crate) fn watching(scheduler: &Scheduler, recorded: &RecordedTable) -> Live<'static> {
+    let mut live = Live::default();
     let empty = Recorded::default();
-    for id in plan.admit.iter().chain(plan.reject.iter()) {
-        live.queue.retain(|queued| *queued != *id);
+    for id in scheduler.watchdog.tracked() {
+        let key = ipc::RequestId(id.0);
+        let facts = recorded.get(&key).copied().unwrap_or(empty);
+        let view = match scheduler.running.get(&key) {
+            Some(state) => request(scheduler, state, Standing::Resident, &facts),
+            None => match scheduler.running_media.get(&key) {
+                Some(flow) => {
+                    // A media request keeps no arrival time of its own once it runs.
+                    diffusion_request(
+                        &flow.request,
+                        Standing::Resident,
+                        0.0,
+                        media_phase(scheduler, key),
+                        &facts,
+                    )
+                }
+                None => continue,
+            },
+        };
+        live.requests.insert(*id, view);
     }
-    for id in &plan.admit {
-        let facts = recorded.get(&ipc::RequestId(id.0)).copied().unwrap_or(empty);
-        let queued = ipc::RequestId(id.0);
-        if let Some(state) = scheduler.running.get(&queued) {
-            live.requests
-                .insert(*id, request(scheduler, state, Standing::Resident, &facts));
-        } else if let Some(flow) = scheduler.running_media.get(&queued) {
-            // A media request keeps no arrival time of its own once it runs.
-            live.requests.insert(
-                *id,
-                diffusion_request(
-                    &flow.request,
-                    Standing::Resident,
-                    0.0,
-                    media_phase(scheduler, queued),
-                    &facts,
-                ),
-            );
-        }
-    }
-    for id in &plan.reject {
-        live.requests.remove(id);
-    }
+    live
 }
+
 
 /// A queued request and the ranks, for `route`: the first request the
 /// mechanism is still to admit, and the ranks it may be routed to.
