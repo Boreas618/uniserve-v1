@@ -350,6 +350,23 @@ impl PrefixCache {
         self.planes.mapped_bytes()
     }
 
+    /// How many attention groups the plan holds, which the model's layers index.
+    pub fn groups(&self) -> usize {
+        self.planes.groups()
+    }
+
+    /// How many layers read `group`, in model order: the bound of the
+    /// `layer_planes` loop and of every per-layer view.
+    pub fn layers(&self, group: usize) -> usize {
+        self.planes.layers(group)
+    }
+
+    /// The pages `group`'s pool holds; `LayerPlanes::pages` repeats this per
+    /// layer, so a caller that needs it once asks here.
+    pub fn pages(&self, group: usize) -> Result<u32> {
+        self.planes.pages(group)
+    }
+
     /// One layer's pages as the model's cache reads them: the page geometry
     /// and the layer's own cell of each page.
     ///
