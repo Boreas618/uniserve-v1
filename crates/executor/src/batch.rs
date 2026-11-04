@@ -24,7 +24,6 @@ use ipc::{CallStatus, ComponentConfig, ErrorCode, PhaseId, TimingCounters, Worke
 
 use crate::completion::Outcome;
 use crate::plan::{Bucket, Shape};
-use crate::stream::recorded;
 use crate::{Error, Result, lock};
 
 /// The scheduling mechanism's name for one submission: monotonic in the order the mechanism made
@@ -185,6 +184,23 @@ pub use ops::commit;
 /// the mechanism. The runner pads to the bucket it serves and never reorders what the mechanism
 /// wrote; a padded row carries `slot_mapping = -1` and a commit slot below zero, so it writes no
 /// cache page and keeps no token state.
+///
+/// # The three counts
+///
+/// Every column here follows exactly one of three counts, and a column compared with the wrong one
+/// is a mis-sized batch:
+///
+/// - **tokens** ([`BatchColumns::tokens`]): `input_ids` and the `[tokens]` columns of `rows` —
+///   positions, slot mapping;
+/// - **rows** ([`BatchColumns::rows`]): the sequences. `slots`, `parameters` and the `[rows]`
+///   columns of `rows` — lengths, query offsets, the sampling rows — are one entry per row, and a
+///   call may own several: a verification of three candidates is one call with three rows, and a
+///   call's `BatchRow::rows` span names them;
+/// - **calls** ([`BatchColumns::calls`]): the commit table, one row per call, because a call states
+///   once how its step advances the slot's device state however many rows it evaluated.
+///
+/// A mechanism that fills these columns and an executor that stages them both read this, so the
+/// rule is stated once; [`BatchColumns::check`] enforces it before a launch.
 #[derive(Clone, Default, Debug)]
 pub struct BatchColumns {
     /// The rows and their calls, as the model reads them: positions, slot mapping, lengths, query
@@ -229,9 +245,17 @@ impl BatchColumns {
 
     /// Whether every column has the length its field promises for `shape`, so that a mis-sized
     /// batch fails before a launch rather than after one.
+    ///
+    /// Three counts, not one: `input_ids` is as long as the batch's tokens, `slots` and
+    /// `parameters` as long as its rows — the sequences, which is `[rows]` in every per-row column
+    /// and what [`BatchColumns::rows`] answers — and `commit` is one row per *call*, since a call
+    /// states once how the step advances its slot however many rows it evaluated. A verify batch
+    /// of three candidates is one call and three rows, and comparing the per-row columns with the
+    /// call count refuses it.
     pub fn check(&self, shape: &Shape) -> Result<()> {
         let tokens = self.rows.tokens();
-        let rows = self.rows.calls.len();
+        let rows = self.rows();
+        let calls = self.calls();
         for (name, actual, expected) in [
             ("input_ids", self.input_ids.len(), tokens),
             ("slots", self.slots.len(), rows),
@@ -243,13 +267,14 @@ impl BatchColumns {
         ] {
             if actual != expected {
                 return Err(Error::Invalid(format!(
-                    "{name} has {actual} entries, the batch has {rows} rows and {tokens} tokens"
+                    "{name} has {actual} entries, the batch has {rows} rows and {tokens} tokens \
+                     in {calls} calls"
                 )));
             }
         }
-        if self.commit.len() % rows.max(1) != 0 {
+        if self.commit.len() % calls.max(1) != 0 {
             return Err(Error::Invalid(format!(
-                "commit has {} entries, not a whole number of columns over {rows} rows",
+                "commit has {} entries, not a whole number of columns over {calls} calls",
                 self.commit.len()
             )));
         }
@@ -350,16 +375,6 @@ pub enum Job {
         /// The generation the rebind is for.
         generation: u64,
     },
-    /// A storage owner's recorded issue work, performed on its stream in submission order.
-    Issue {
-        /// The recorded copies, fills, fences and waits.
-        work: std::sync::Arc<std::sync::Mutex<recorded::Batch>>,
-    },
-    /// A job whose only work is the wait for the events the event pool deferred work on.
-    After {
-        /// The events whose completion the job establishes.
-        events: Vec<Arc<platform::Event>>,
-    },
 }
 
 impl Job {
@@ -397,8 +412,6 @@ impl Job {
                 "shadowing {operator} {key} in the bucket of {} tokens and {} rows of generation {generation}",
                 bucket.tokens, bucket.rows
             ),
-            Self::Issue { .. } => "issuing deferred storage work".to_owned(),
-            Self::After { .. } => "waiting for deferred storage work".to_owned(),
         }
     }
 
@@ -409,8 +422,6 @@ impl Job {
             Self::Capture { .. } => JobKind::Capture,
             Self::Rebind { .. } => JobKind::Rebind,
             Self::Shadow { .. } => JobKind::Shadow,
-            Self::Issue { .. } => JobKind::Issue,
-            Self::After { .. } => JobKind::After,
         }
     }
 
@@ -429,7 +440,6 @@ impl Job {
             | Self::Capture { runner, .. }
             | Self::Rebind { runner, .. }
             | Self::Shadow { runner, .. } => Some(*runner),
-            Self::Issue { .. } | Self::After { .. } => None,
         }
     }
 }
@@ -482,20 +492,6 @@ impl std::fmt::Debug for Job {
                 .field("runner", runner)
                 .field("bucket", bucket)
                 .field("generation", generation)
-                .finish(),
-            Self::Issue { work } => formatter
-                .debug_struct("Issue")
-                .field(
-                    "work",
-                    &work
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .is_empty(),
-                )
-                .finish(),
-            Self::After { events } => formatter
-                .debug_struct("After")
-                .field("events", &events.len())
                 .finish(),
         }
     }
@@ -564,7 +560,7 @@ pub struct Placement {
 /// translation happens, so a scheduler never needs to know how many devices a rank holds. It is a
 /// plain route on purpose: the phase list is fixed at spawn, so no lock, no schedule, no retry.
 pub struct Executors {
-    executors: Vec<crate::device::Executor>,
+    executors: Vec<Arc<crate::device::Executor>>,
 }
 
 impl Executors {
@@ -574,6 +570,16 @@ impl Executors {
     /// devices serving one phase is refused, because a batch could go to either and the two would
     /// disagree about the model's state.
     pub fn new(executors: Vec<crate::device::Executor>) -> Result<Self> {
+        Self::shared(executors.into_iter().map(Arc::new).collect())
+    }
+
+    /// The rank's devices, as the handles the rest of the process already holds.
+    ///
+    /// A main process holds one handle per device from the moment it spawns them: the control
+    /// thread reads their running jobs for the stall rule and their counters for the metrics,
+    /// and a scheduler submits through the same handles. Sharing them rather than moving them in
+    /// keeps one device one owner, and the phase check is the same one [`Executors::new`] makes.
+    pub fn shared(executors: Vec<Arc<crate::device::Executor>>) -> Result<Self> {
         let mut served: Vec<PhaseId> = Vec::new();
         for executor in &executors {
             for phase in executor.phases() {
@@ -589,7 +595,7 @@ impl Executors {
     }
 
     /// The device that serves `phase`.
-    fn route(&self, phase: PhaseId) -> Result<&crate::device::Executor> {
+    fn route(&self, phase: PhaseId) -> Result<&Arc<crate::device::Executor>> {
         self.executors
             .iter()
             .find(|executor| executor.serves(phase))
@@ -655,8 +661,6 @@ pub enum JobKind {
     Purge,
     /// Releasing a prepared generation that never served (an abandoned precopy, 7.3 step 2).
     Discard,
-    /// A storage job: the copies, fills and fences a storage owner recorded.
-    Issue,
     /// A job that only waits for the events it was given.
     After,
 }
@@ -676,7 +680,6 @@ impl JobKind {
             Self::Revert => "revert",
             Self::Purge => "purge",
             Self::Discard => "discard",
-            Self::Issue => "issue",
             Self::After => "after",
         }
     }
@@ -738,11 +741,6 @@ impl Submission {
     /// The state the queue completes, and the submission's number.
     pub(crate) fn parts(&self) -> (Arc<SubmissionState>, SubmissionId) {
         (Arc::clone(&self.state), self.id)
-    }
-
-    /// Completes this submission with `outcome`, if something else did not already.
-    pub(crate) fn complete(&self, outcome: Outcome<BatchOutput>) {
-        Arc::clone(&self.state).finish(outcome);
     }
 
     /// Waits until the submission completed and answers its outcome.
