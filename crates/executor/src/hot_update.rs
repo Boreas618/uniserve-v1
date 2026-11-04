@@ -296,10 +296,18 @@ impl HotUpdate {
     /// Only the generation a switchover or a revert replaced is purged: any
     /// other number names a generation this process never held, and releasing
     /// it would report a purge of nothing. A second purge while one is pending
-    /// is refused too, and so is any purge while an update is in flight.
+    /// is refused too.
+    ///
+    /// An update in flight does not stop a purge: what an update prepares is its
+    /// own generation, and the generation being released here is the one the last
+    /// switchover replaced. What is refused is a purge of the generation the
+    /// update is preparing - that one is neither serving nor replaced, and its
+    /// graphs are the ones being built.
     pub fn request_purge(&mut self, generation: u64) -> Result<()> {
-        if self.phase.updating() {
-            return Err(Error::State("cannot purge while an update is in flight"));
+        if self.phase.generation() == Some(generation) {
+            return Err(Error::Invalid(format!(
+                "generation {generation} is the one this process is preparing and cannot be purged"
+            )));
         }
         if generation == self.current {
             return Err(Error::Invalid(format!(
@@ -511,6 +519,28 @@ mod tests {
         update.purged(7).expect("purged");
         assert_eq!(update.phase(), Phase::Serving);
         assert_eq!(update.previous(), None);
+    }
+
+    /// A purge of the generation the last switchover replaced still runs while a newer update is in
+    /// flight - the two generations are unrelated - and a purge of the generation being prepared is
+    /// refused, because its graphs are the ones the update is building.
+    #[test]
+    fn a_purge_runs_during_a_later_update_and_refuses_the_generation_being_prepared() {
+        let mut update = update();
+        update.begin_precopy(8).expect("a fresh update");
+        update.precopied(8).expect("precopy finished");
+        update.switchover(8, Instant::now()).expect("switchover");
+        update.commit(8).expect("commit");
+
+        update.begin_precopy(9).expect("a second update");
+        update
+            .request_purge(7)
+            .expect("the switchover's generation is released while 9 is prepared");
+        assert_eq!(update.purge_due(), Some(7));
+        let error = update
+            .request_purge(9)
+            .expect_err("the generation being prepared is not released");
+        assert!(matches!(error, Error::Invalid(_)), "{error:?}");
     }
 
     #[test]
