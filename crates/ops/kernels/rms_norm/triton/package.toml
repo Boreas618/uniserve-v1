@@ -31,7 +31,7 @@ architectures = ["sm_100a", "sm_90a"]
 
 # `dtype_bf16_columns_2048_tile_2048_pdl_true`.
 [kernel.descriptors]
-dimensions = { dtype = ["bf16", "fp16", "f32"], columns = ["768", "2048", "4096", "6144", "7168"], tile = ["1024", "2048", "4096", "8192"], pdl = ["true", "false"] }
+dimensions = { dtype = ["bf16", "fp16", "f32"], columns = ["768", "2048", "4096", "6144", "7168", "128"], tile = ["1024", "2048", "4096", "8192", "128"], pdl = ["true", "false"] }
 
 [parameters]
 eps = 1e-06
