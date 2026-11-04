@@ -542,12 +542,22 @@ impl Qwen3Moe {
             // expects. The layer-independent buffers above were reserved before this mark.
             let mark = f.arena.mark();
             layer.forward(
-                f, batch, cache, index, &buffers, residual, cosine, sine, input,
+                f,
+                    batch,
+                    cache,
+                    index,
+                    &buffers,
+                    residual,
+                    buffers.residual,
+                    cosine,
+                    sine,
+                    input,
             )?;
             f.arena.release(mark);
-            if index == 0 {
-                residual = buffers.residual;
-            }
+            // The first layer read the embedding in `hidden` and wrote the first sum into the
+            // plan's residual region; from here on the stream lives there and every layer
+            // accumulates it in place.
+            residual = buffers.residual;
             input = buffers.update;
         }
         Ok(input)
@@ -584,7 +594,11 @@ impl Qwen3Moe {
 
 impl DecoderLayer {
     /// Run the layer: normalize (or add and normalize for later layers), attend, then route,
-    /// writing the layer's output into `update` and the new residual into `residual`.
+    /// writing the layer's output into `update` and the new residual into `residual_out`.
+    ///
+    /// `residual` and `residual_out` differ for the first layer only: its input residual is the
+    /// caller's `hidden` — the embedding — while its output must land in the plan's residual
+    /// region, where every later layer accumulates in place.
     #[allow(
         clippy::too_many_arguments,
         reason = "the layer runs the reference's tuple through the plan's buffers"
@@ -597,6 +611,7 @@ impl DecoderLayer {
         index: usize,
         buffers: &Buffers,
         residual: TensorView,
+        residual_out: TensorView,
         cosine: TensorView,
         sine: TensorView,
         hidden: TensorView,
@@ -619,7 +634,7 @@ impl DecoderLayer {
         )?;
 
         self.post_attention_norm
-            .forward_with_residual(f, update, residual, residual, normalized)
+            .forward_with_residual(f, update, residual, residual_out, normalized)
             .map_err(Error::from)?;
 
         match &self.mlp {
@@ -809,13 +824,23 @@ impl CausalLm for Qwen3Moe {
             let mark = f.arena.mark();
             layer
                 .forward(
-                    f, batch, cache, index, &buffers, residual, cosine, sine, input,
+                    f,
+                    batch,
+                    cache,
+                    index,
+                    &buffers,
+                    residual,
+                    buffers.residual,
+                    cosine,
+                    sine,
+                    input,
                 )
                 .map_err(capability)?;
             f.arena.release(mark);
-            if index == 0 {
-                residual = buffers.residual;
-            }
+            // The first layer read the embedding in `hidden` and wrote the first sum into the
+            // plan's residual region; from here on the stream lives there and every layer
+            // accumulates it in place.
+            residual = buffers.residual;
             input = buffers.update;
         }
 
