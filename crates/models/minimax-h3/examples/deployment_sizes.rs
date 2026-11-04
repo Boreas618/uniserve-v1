@@ -235,6 +235,18 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // The audio encoder's plan, which a ref2va's conditioning pass reserves beside the video
+    // encoder's set: `samples` is the reference's sample count at the request's frame count.
+    for frames in [124_u32, 362] {
+        let samples = u64::from(minimax_h3::packing::audio_latent_frames(frames)) * 800;
+        let plan = minimax_h3::encoding::audio_encoder_arena(&config.audio_vae, 2, samples)?;
+        let bytes: u64 = plan.iter().map(minimax_h3::decoding::Buffer::bytes).sum();
+        println!(
+            "audio encoder plan {frames} frames ({samples} samples): {} buffers, {}",
+            plan.len(),
+            mib(bytes / (1 << 20))
+        );
+    }
     // The splice's plan: one buffer, one clip's raster at the canvas's pixel extents. It does not
     // grow with the grid or the clip count, because a splice blends one clip at a time.
     for canvas in NAMED_CANVASES {
