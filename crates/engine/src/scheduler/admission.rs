@@ -954,6 +954,18 @@ impl Scheduler {
             }) {
                 state.terminal_intent.finish(FinishReason::Cancelled);
             }
+            // A media request the mechanism admits is announced exactly as a
+            // token one is (`admit_running`): the policy's queue is its own, so
+            // an admission it is not told of is a name it offers in `admit`
+            // again, and one the mechanism then refuses as "not queued". The
+            // watchdog's deadline starts here for the same reason it does
+            // there - a resident request that never advances is a policy
+            // failure, media included.
+            let admitted_at =
+                scheduling::guest::Nanos(crate::clock::now_monotonic_us().saturating_mul(1_000));
+            let request = scheduling::guest::RequestId(id.0);
+            self.recorder.admitted(request, admitted_at);
+            self.watchdog.admitted(request, admitted_at);
             self.running_media.insert(id, state);
             self.running_order.push(id);
             // A resumed request's stored trajectory is pinned while its
