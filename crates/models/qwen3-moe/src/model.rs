@@ -919,8 +919,11 @@ impl DecoderLayer {
 
         // `first` is the first layer *of this run*, which is layer 0 for the whole model and layer
         // `start` for a run that begins part way up: its input residual is the caller's rows, so it
-        // normalizes alone and the addition starts at the next layer. `layer` is the cache plane and
-        // the rotary table's layer, which is always the model's own index.
+        // normalizes alone and the addition starts at the next layer. `layer` is the cache plane this
+        // layer writes and reads, and it is always the model's own index: the one index a layer takes
+        // from anything but itself would be a plane, a page or a buffer named for another layer. The
+        // rotary tables are not one of those: `walk` reserves one pair per call and every layer of the
+        // run reads it, so no layer selects a table.
         if first {
             self.input_norm
                 .forward(f, hidden, normalized)
