@@ -25,7 +25,7 @@ use nn::{CausalLm, Forward, KvView, SamplerState, Samples, TokenBatch};
 use ops::{DType, Generation, TensorView};
 use platform::DeviceId;
 
-use crate::arena::{Pools, PoolMetrics, StreamId};
+use crate::arena::{Pools, StreamId};
 use crate::batch::{Batch, BatchColumns, BatchOutput, CallId, CallOutput, Job, Jobs, RowState};
 use crate::captured::Captured;
 use crate::graph::Graphs;
@@ -397,10 +397,6 @@ impl Column {
 
 /// The batch columns of every bucket of one runner, sized for the largest bucket it serves.
 struct Columns {
-    /// The tokens the largest bucket holds.
-    tokens: usize,
-    /// The rows the largest bucket holds.
-    rows: usize,
     positions: Column,
     /// `[tokens]` i32 the input ids, which the model embeds into the forward's hidden states.
     input_ids: Column,
@@ -433,8 +429,6 @@ impl Columns {
         let rows = largest.rows as u64;
         let parameters = rows * u64::from(ops::sampler::PARAMETER_COLUMNS);
         Ok(Self {
-            tokens: tokens as usize,
-            rows: rows as usize,
             positions: Column::new(device, DType::I32, tokens)?,
             input_ids: Column::new(device, DType::I32, tokens)?,
             slot_mapping: Column::new(device, DType::I32, tokens)?,
@@ -1049,11 +1043,6 @@ impl<M: CausalLm> CausalLmRunner<M> {
             .ok_or_else(|| Error::State("the runner has no graph pools yet".into()))
     }
 
-    /// What the graph pools hold and what they may hold, for the metrics report (4.1).
-    pub fn pool_metrics(&self) -> PoolMetrics {
-        self.pool().map(|pools| pools.metrics()).unwrap_or_default()
-    }
-
     /// Installs the shadow harness, sized for the largest bucket's shadow set.
     pub fn set_shadow(&mut self, shadow: crate::shadow::Shadow) {
         self.shadow = Some(shadow);
@@ -1145,6 +1134,20 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
     }
 
     fn precopy(&mut self, next: &Arc<Generation>) -> Result<Jobs> {
+        // One update at a time: a second generation prepared while the first is still waiting for
+        // its switchover would leave the first one's graphs unreachable and unaccounted for. The
+        // daemon discards an update before starting the next, so this is a disagreement, not a
+        // sequence to support.
+        if let Some(prepared) = &self.next {
+            if prepared.number() != next.number() {
+                return Err(Error::Invariant(format!(
+                    "precopy of generation {} while generation {} is prepared and has not been \
+                     switched over or discarded",
+                    next.number(),
+                    prepared.number()
+                )));
+            }
+        }
         // Which (operator, key) pairs changed between the serving generation and `next` (7.3
         // step 1). A kernel is unchanged when it is the same `Arc`, so an untouched program keeps
         // its bucket as it is.
@@ -1239,25 +1242,23 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         );
     }
 
-    fn switchover(&mut self, generation: u64) {
+    fn switchover(&mut self, generation: u64) -> Result<()> {
         // From the next batch on, the prepared generation serves; the old one stays for a revert
-        // (7.3 step 4). A generation that was not prepared here is a generation of kernels only,
-        // and is taken as the serving one unchanged.
+        // (7.3 step 4).
         let prepared = self.next.take().filter(|next| next.number() == generation);
-        let prepared = prepared.unwrap_or_else(|| {
-            // A generation this runner never prepared: the daemon and the executor disagree on
-            // what was precopied. The switchover still happens - the generation's kernels are the
-            // ones the caller named - but the report says the buckets must be captured again.
-            tracing::warn!(
-                generation,
-                "switched to a generation this runner did not prepare; its buckets have no graphs"
-            );
-            Arc::new(
-                self.generation
-                    .replace(generation, std::iter::empty::<ops::KernelEntry>()),
-            )
-        });
+        let Some(prepared) = prepared else {
+            // The daemon asks for the cut-over only after `precopy` built the generation. Taking
+            // the number anyway would serve a generation with no kernels and no graphs, which
+            // answers every later batch with "no graph for this bucket" - a disagreement between
+            // the daemon and this process stated as a defect rather than hidden as a switch.
+            return Err(Error::Invariant(format!(
+                "switchover to generation {generation} found no preparation: this runner serves \
+                 generation {} and prepared none other",
+                self.generation.number()
+            )));
+        };
         self.previous = Some(std::mem::replace(&mut self.generation, prepared));
+        Ok(())
     }
 
     fn attach_pools(&mut self, pools: Arc<std::sync::Mutex<Pools>>) {
@@ -1306,10 +1307,6 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
             generation,
             "discarded a prepared generation that never served"
         );
-    }
-
-    fn pool_metrics(&self) -> PoolMetrics {
-        self.pool().map(|pools| pools.metrics()).unwrap_or_default()
     }
 
     fn purge(&mut self, generation: u64) {
@@ -1368,8 +1365,9 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 let _ = batch;
                 let stream = self.stream.clone();
                 // The batch's columns are uploaded here, on the device thread, before the graph
-                // reads them: `submit` stages on the scheduler's thread and issues nothing, and a
-                // replay that skipped this would serve the pose the bucket was captured with.
+                // reads them: the scheduler hands over a `Batch` and the device thread stages and
+                // uploads it, so a replay that skipped the upload would serve the pose the bucket
+                // was captured with.
                 self.upload(*bucket)?;
                 let captured = self.graphs.captured(*bucket, *generation).ok_or_else(|| {
                     Error::Invariant(format!(
@@ -1406,9 +1404,6 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
             } => self
                 .rebind(*bucket, *generation)
                 .map(|()| BatchOutput::default()),
-            Job::Issue { .. } | Job::After { .. } => Err(Error::Invariant(
-                "the device queue performs its own jobs".into(),
-            )),
         }
     }
 
@@ -1641,10 +1636,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
         self.with_kv(&slots, Some(pages), |cache| {
             self.model
                 .embed_input_ids(&forward, ids, hidden)
-                .map_err(|error| Error::Interface(error.to_string()))?;
+                .map_err(Error::from)?;
             self.model
                 .forward(&forward, &batch, cache, hidden)
-                .map_err(|error| Error::Interface(error.to_string()))
+                .map_err(Error::from)
         })
     }
 
@@ -1968,10 +1963,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
         self.with_kv(&slots, None, |cache| {
             self.model
                 .embed_input_ids(&forward, ids, hidden)
-                .map_err(|error| Error::Interface(error.to_string()))?;
+                .map_err(Error::from)?;
             self.model
                 .forward(&forward, &batch, cache, hidden)
-                .map_err(|error| Error::Interface(error.to_string()))?;
+                .map_err(Error::from)?;
             if bucket.variant.samples() {
                 self.sample(&forward, bucket, &arena, hidden)?;
             }
@@ -2006,14 +2001,14 @@ impl<M: CausalLm> CausalLmRunner<M> {
             ops::Shape::new(&[rows, u64::from(self.geometry.hidden)]),
         )?;
         nn::gather_rows(forward, hidden, self.columns.indices.device, gathered)
-            .map_err(|error| Error::Interface(error.to_string()))?;
+            .map_err(Error::from)?;
         let logits = arena.tensor(
             self.geometry.logits_dtype,
             ops::Shape::new(&[rows, u64::from(self.geometry.vocabulary)]),
         )?;
         self.model
             .logits(forward, gathered, logits)
-            .map_err(|error| Error::Interface(error.to_string()))?;
+            .map_err(Error::from)?;
         let state = SamplerState {
             counts: sampling.counts,
             parameters: self.columns.parameters.device,
@@ -2024,7 +2019,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         sampling
             .sampler
             .forward(forward, logits, &state, self.columns.draws.device, &samples)
-            .map_err(|error| Error::Interface(error.to_string()))?;
+            .map_err(Error::from)?;
         self.bucket_samples
             .borrow_mut()
             .insert(bucket, Sampled { tokens: samples.tokens });
@@ -2081,7 +2076,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         };
         forward
             .operate::<ops::commit::SlotCommit>(&descriptor, args)
-            .map_err(|error| Error::Interface(error.to_string()))
+            .map_err(Error::from)
     }
 
     /// Stages a batch of the bucket's full size with nothing to write: what a warmup capture
@@ -2445,7 +2440,6 @@ mod tests {
         ]);
         let mut staging = Staging::new();
         staging.reserve(&buckets)?;
-        let commit_rows = largest_rows(&buckets)?;
 
         staging.stage(
             &prefill_columns(),
