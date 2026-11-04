@@ -123,7 +123,9 @@ impl State {
                 ),
             },
             command::Kind::Pause(pause) => self.paused = pause.paused,
-            other => anyhow::bail!("the daemon sent the frontend a command it does not take: {other:?}"),
+            other => {
+                anyhow::bail!("the daemon sent the frontend a command it does not take: {other:?}")
+            }
         }
         Ok(())
     }
@@ -402,9 +404,7 @@ mod tests {
                 connection
                     .send(&process::Downstream {
                         kind: Some(downstream::Kind::Event(process::Event {
-                            kind: Some(event::Kind::Command(process::Command {
-                                kind: Some(kind),
-                            })),
+                            kind: Some(event::Kind::Command(process::Command { kind: Some(kind) })),
                         })),
                     })
                     .expect("a command");
@@ -426,7 +426,10 @@ mod tests {
                 assert!(!state.paused(), "the daemon released admissions again");
                 break;
             }
-            assert!(Instant::now() < deadline, "the commands did not arrive: {state:?}");
+            assert!(
+                Instant::now() < deadline,
+                "the commands did not arrive: {state:?}"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
         // The link ends when the daemon's side does, and says so.
