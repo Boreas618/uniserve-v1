@@ -14,6 +14,17 @@
 //! otherwise). Two requests of one layout share one set of tables, and the executor keys its
 //! storage by `(layout, name)`.
 //!
+//! ## The prefix source is one buffer
+//!
+//! The packed rows are assembled by gathering the prompt's prefix: every text row reads its own
+//! row of the source, every condition row reads its row in packed order, and every generated or
+//! padding row reads the source's **zero row**. That source is one buffer of `text_rows +
+//! condition_rows + 1` rows - the prompt's rows, then one row per packed condition row, then the
+//! zero row last - and [`Layouts::table_specs`]'s `prefix_index` addresses it directly
+//! ([`crate::packing::DensePacking::zero_row`]). The runner builds it, because the encoders produce
+//! the pieces and the packing decides the order; the DiT reads no other conditioning view, so a
+//! condition the source does not carry cannot reach the model.
+//!
 //! ## Host bytes
 //!
 //! Everything a request changes arrives as device tables the executor allocates: the rotary
@@ -1268,6 +1279,26 @@ mod tests {
         let (mut layout, _) = rule.layout(&request(121, 1344, 768)).unwrap();
         layout.text_rows = 100;
         assert!(rule.packing_of(&layout).is_err());
+    }
+
+    #[test]
+    fn the_layout_s_condition_count_and_the_stream_offsets_agree() {
+        // Two paths compute the same number: the layout's declared `condition_elements`, which the
+        // draw addresses from, and `noise_offsets`, which counts the conditions' own draws. They
+        // must never drift, because a drift is a stream that starts the video too early or too late
+        // with nothing to raise.
+        let rule = layouts();
+        let request = request(121, 1344, 768);
+        let (layout, packing) = rule.layout(&request).unwrap();
+        let canvas = canvas_of(&request).unwrap();
+        let conditions = conditions_of(&request);
+        let declared = rule.condition_elements(&conditions, &canvas);
+        assert_eq!(layout.condition_elements, declared);
+        let segments = packing::condition_segments(&conditions, &canvas).unwrap();
+        assert_eq!(segments.len(), conditions.len());
+        assert!(packing.padded_tokens > packing.video_rows + packing.audio_rows);
+        // With no conditions the video's stream starts at zero.
+        assert_eq!(declared, 0);
     }
 
     #[test]
