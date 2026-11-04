@@ -25,7 +25,7 @@ use ops::PhaseKind;
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
-use crate::tensor::{DType, TensorView};
+use crate::tensor::{DType, Shape, TensorView};
 
 /// One host-side call of a batch: which request, which phase, which rows it occupies.
 ///
@@ -228,6 +228,8 @@ pub struct EncoderInputs<'a> {
     pub batch: TokenBatch,
     /// The images of a multimodal tower, empty for a text-only encoder.
     pub images: &'a [ImageInput],
+    /// The tables [`Denoiser::state_tables`] named for this layout, in that order.
+    pub state: &'a [TensorView],
 }
 
 /// One image a multimodal tower reads: its pixels and the grid they form.
@@ -307,6 +309,37 @@ pub struct LatentShape {
     pub width: u32,
 }
 
+/// A table a model needs on the device but does not own.
+///
+/// The executor allocates; the model says what it is and fills it. Three kinds exist, they differ
+/// in **who writes them, when, and how many times**, and that is the whole of the protocol:
+///
+/// - **constants** ([`Denoiser::constant_tables`]) are device memory written by
+///   [`Denoiser::prepare_constants`], one forward *after* loading and *before* any capture. They
+///   hold values that never change for a model — an AdaLN cache folded once from the weights — so
+///   they are filled once per load and read by every capture. The forward is capture-safe: it reads
+///   nothing back and synchronizes nothing.
+/// - **state** ([`Denoiser::state_tables`]) is per *layout*: the same model denoises different
+///   latent shapes, and a table derived from a request's layout (its positional encodings, its
+///   mask) is one table per shape. [`Denoiser::prepare_state`] writes **host bytes only**; the
+///   executor allocates each table and uploads those bytes. The list is deterministic for a layout,
+///   and the executor keys its storage by `(layout, name)`.
+/// - **evaluation** ([`Denoiser::prepare_evaluation`]) is per *evaluation index*: one solver
+///   coefficient set, again host bytes the executor uploads, so a request's schedule is chosen
+///   without capturing a graph per step.
+///
+/// No `prepare_*` allocates, takes an allocator, synchronizes or reads anything back; allocation is
+/// the executor's and uploads are the executor's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct StateTable {
+    /// The table's name: unique within its kind and layout, and what the executor keys storage by.
+    pub name: &'static str,
+    /// The element type the model writes and the forward reads.
+    pub dtype: DType,
+    /// The extents.
+    pub shape: Shape,
+}
+
 /// The seed a noise draw is addressed by.
 ///
 /// A draw is a function of this seed and the element's index, never of a batch position, so
@@ -330,13 +363,18 @@ pub struct Latents {
 /// anchors, references). A model that needs the roles reads them from the request it laid out, not
 /// from this value, so nothing request-shaped crosses the boundary.
 #[derive(Clone, Copy)]
-pub struct Conditioning {
+pub struct Conditioning<'a> {
     /// `[rows, width]` encoded text.
     pub text: TensorView,
     /// `[rows, …]` encoded reference media, when the task has references.
     pub images: Option<TensorView>,
     /// `[rows, …]` encoded reference audio, when the task has audio references.
     pub audio: Option<TensorView>,
+    /// The tables [`Denoiser::state_tables`] named for this layout, in that order.
+    pub state: &'a [TensorView],
+    /// `[1]` i64: the step the schedule evaluates, when the model selects coefficients on the
+    /// device. Absent when the model's coefficients arrive as launch scalars.
+    pub step: Option<TensorView>,
 }
 
 /// One denoising step's schedule values.
@@ -376,16 +414,69 @@ pub trait Denoiser {
     fn draw_noise(&self, f: &Forward, seed: Seed, out: Latents) -> Result<()>;
 
     /// Fold `cond` into the latents the schedule starts from.
-    fn prepare_latents(&self, f: &Forward, cond: Conditioning, out: Latents) -> Result<()>;
+    fn prepare_latents<'a>(
+        &self,
+        f: &Forward,
+        cond: Conditioning<'a>,
+        out: Latents,
+    ) -> Result<()>;
 
     /// One denoising step: update `latents` in place with the model's velocity.
-    fn denoise(&self, f: &Forward, step: Step, latents: Latents, cond: Conditioning) -> Result<()>;
+    fn denoise<'a>(
+        &self,
+        f: &Forward,
+        step: Step,
+        latents: Latents,
+        cond: Conditioning<'a>,
+    ) -> Result<()>;
+
+    /// How many solver evaluations one request makes: the coefficient sets
+    /// [`Self::prepare_evaluation`] can be asked for.
+    fn evaluations(&self) -> u32;
+
+    /// The tables that never change for this model, in the order [`Self::prepare_constants`] fills
+    /// them.
+    fn constant_tables(&self) -> Vec<StateTable>;
+
+    /// Fill `out` with the constants, in [`Self::constant_tables`]' order.
+    ///
+    /// The executor calls this once after loading and before it captures anything: the launches are
+    /// captured with everything else, so the forward must be capture-safe — no host read, no
+    /// synchronization, no allocation.
+    fn prepare_constants(&self, f: &Forward, out: &[TensorView]) -> Result<()>;
+
+    /// The tables a request of `layout` needs, in the order [`Self::prepare_state`] fills them.
+    ///
+    /// Deterministic for a layout: the executor keys its storage by `(layout, name)`, so two
+    /// requests of the same shape share one set.
+    fn state_tables(&self, layout: &Layout) -> Vec<StateTable>;
+
+    /// Write the host bytes of each table of `layout`, in [`Self::state_tables`]' order.
+    ///
+    /// `out[i]` is `state_tables(layout)[i]`'s bytes, row-major in its element type, and is already
+    /// the right length; the executor uploads it.
+    fn prepare_state(
+        &self,
+        request: &VideoRequest,
+        layout: &Layout,
+        out: &mut [Vec<u8>],
+    ) -> Result<()>;
+
+    /// Write the host bytes of evaluation `index`'s coefficient tables, in
+    /// [`Self::constant_tables`]' layout order.
+    fn prepare_evaluation(&self, index: u32, out: &mut [Vec<u8>]) -> Result<()>;
 }
 
 /// A decoder that turns latents back into media.
 pub trait Decoder {
-    /// Decode `latents` into `out`.
-    fn decode(&self, f: &Forward, latents: TensorView, out: DecodedMedia) -> Result<()>;
+    /// Decode `latents` into `out`, reading the layout's tables in order.
+    fn decode(
+        &self,
+        f: &Forward,
+        latents: TensorView,
+        state: &[TensorView],
+        out: DecodedMedia,
+    ) -> Result<()>;
 }
 
 /// An autoregressive token model.
