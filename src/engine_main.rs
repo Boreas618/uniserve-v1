@@ -267,7 +267,7 @@ pub(crate) struct MainProcess {
     control: Control,
     schedulers: Vec<engine::Scheduler>,
     executors: Vec<Executor>,
-    memory: Memory,
+    memory: Option<Memory>,
     blocking: ThreadPool,
     /// The blocking lane module loads run on (§2.4, §7.3 step 2).
     modules: Lane<Install>,
@@ -326,12 +326,17 @@ impl MainProcess {
         for device in build.devices() {
             let generation = Arc::new(Generation::new(epoch.generation, std::iter::empty()));
             let runners = build.runners(device, &model, &mut memory, &generation)?;
-            executors.push(Executor::spawn(
-                device,
-                runners,
-                build.events(),
-                build.graph(device)?,
-            )?);
+            let executor = Executor::spawn(device, runners, build.events(), build.graph(device)?)?;
+            // §7.3 step 2 shadows a replaced operator beside the serving one, so the region it runs
+            // in is mapped before any batch: the executor books it from the scratch pool the graph
+            // storage sized. Then §4.5's warmup runs every captured bucket once, so the first
+            // request does not pay for a capture. Nothing is serving yet, so the control thread
+            // waits here; `serve` never does (§2.4).
+            completed(executor.set_shadow()?.wait())
+                .with_context(|| format!("mapping the shadow region of device {}", device.0))?;
+            completed(executor.warmup()?.wait())
+                .with_context(|| format!("warming up device {}", device.0))?;
+            executors.push(executor);
             generations.push(generation);
         }
         // The executors own the device streams from here on; the blocks and
@@ -353,7 +358,7 @@ impl MainProcess {
             control,
             schedulers,
             executors,
-            memory,
+            memory: Some(memory),
             blocking,
             modules,
             update,
@@ -443,6 +448,10 @@ impl MainProcess {
 
         if self.watchdog.probe_due(now, oldest(running)) {
             self.watchdog.probed(now);
+            // The probe leaves an answered error latched in the device rather than failing, so a
+            // device that errored and one that is healthy are read in one pass, and only then is
+            // the update's decision table applied to what was found.
+            let mut sticky = Vec::new();
             for (rank, executor) in self.executors.iter().enumerate() {
                 let Probe::Sticky(error) = executor.probe()? else {
                     continue;
@@ -451,11 +460,13 @@ impl MainProcess {
                     .iter()
                     .find(|job| job.rank == rank)
                     .and_then(|job| job.batch);
-                let failure = UpdateFailure::Device {
+                sticky.push(UpdateFailure::Device {
                     device: u32::try_from(executor.device().0).unwrap_or_default(),
                     error: error.to_string(),
                     batch,
-                };
+                });
+            }
+            for failure in sticky {
                 if let Some(ending) = self.failure(failure)? {
                     return Ok(Some(ending));
                 }
@@ -535,6 +546,32 @@ impl MainProcess {
         }
     }
 
+    /// Serves one command of the daemon's process interface (§2.3).
+    ///
+    /// `ipc::ProgramCommand` is the one form the driver reads, whether the command came from the
+    /// daemon's Protobuf or from a peer of this epoch, so the conversion happens here and nowhere
+    /// else. The daemon's `Commit` and `Revert` carry no generation of their own; the one they
+    /// name is the generation this process is serving.
+    fn process_command(
+        &mut self,
+        command: proto::process::Command,
+    ) -> Result<Option<UpdateFailure>> {
+        let current = self.update.current();
+        let Some(command) = ProgramCommand::from_command(command, current)? else {
+            // Park, Promote, Drain, Pause and Serve are the epoch layer's, not the program
+            // layer's; the daemon's own path runs them.
+            return Ok(None);
+        };
+        match self.program(command, None)? {
+            // A precopy answers when its installs finish, from `advance_precopy`.
+            None => Ok(None),
+            Some(status) => {
+                self.report(status);
+                Ok(None)
+            }
+        }
+    }
+
     /// Serves one peer's program-layer messages: the scheduler node's fan-out
     /// of §7.3 step 2 and the commands of steps 3-6.
     fn peer_messages(&mut self, rank: u32) -> Result<Option<UpdateFailure>> {
@@ -567,8 +604,9 @@ impl MainProcess {
             ProgramCommand::Precopy {
                 generation,
                 programs,
+                policy,
             } => {
-                self.start_precopy(generation, &programs, reply)?;
+                self.start_precopy(generation, &programs, &policy, reply)?;
                 return Ok(None);
             }
             ProgramCommand::Switchover { generation, step } => self.switchover(generation, step)?,
@@ -604,6 +642,7 @@ impl MainProcess {
         &mut self,
         generation: u64,
         programs: &Programs,
+        policy: &Program,
         reply: Option<u32>,
     ) -> Result<()> {
         if let Err(error) = self.update.begin_precopy(generation) {
@@ -619,18 +658,6 @@ impl MainProcess {
             );
             return Ok(());
         }
-
-        // The scheduling policy is one program among the others, in the epoch's
-        // `scheduling` slot (§4.4, §5.1).
-        let Some(policy) = programs.get(&ProgramSlot::all(SCHEDULING)).cloned() else {
-            return self.abandon_precopy(
-                generation,
-                UpdateFailure::Precopy {
-                    reason: format!("the update names no {SCHEDULING} program"),
-                },
-                reply,
-            );
-        };
 
         // The descriptors each operator must cover are exactly the keys the
         // serving generation holds: an update changes implementations and never
@@ -721,7 +748,7 @@ impl MainProcess {
         self.precopy = Some(Precopy {
             generation,
             reply,
-            policy,
+            policy: policy.clone(),
             next: Vec::new(),
             stage: PrecopyStage::Modules(tasks),
         });
@@ -904,7 +931,7 @@ impl MainProcess {
 
     /// §7.3 step 3: cut over at the batch boundary whose step the scheduler put
     /// the command at; an expert group's ranks switch at the same step.
-    fn switchover(&mut self, generation: u64, step: u64) -> Result<ProgramStatus> {
+    fn switchover(&mut self, generation: u64, step: Option<u64>) -> Result<ProgramStatus> {
         switchover_policy(&mut self.schedulers, generation, step)?;
         for executor in &self.executors {
             if let Err(error) = completed(executor.switchover(generation)?.wait()) {
@@ -1110,55 +1137,65 @@ impl MainProcess {
         for error in self.blocking.close() {
             tracing::warn!(%error, "closing a blocking lane failed");
         }
-        self.memory.close();
+        if let Some(memory) = self.memory.take() {
+            if let Err(error) = memory.close() {
+                tracing::warn!(%error, "closing the resident owners failed");
+            }
+        }
         self.control.close();
     }
 }
 
-/// §7.3 step 2's policy half: sched's `PolicySlot` instantiates the candidate
-/// scheduling policy on the current snapshot and dry-runs every decision it
-/// would make against the mechanism's hard constraints (§4.4).
+/// §7.3 step 2's policy half: the update's policy program is prepared on the
+/// scheduler's own snapshot and adopted as a candidate, which the switchover puts
+/// in the serving instance's place.
+///
+/// The state a candidate is admitted on is the scheduler's - the live objects, the
+/// step's room and the shortage the mechanism faces - so the scheduler takes the
+/// program and prepares it, and this side never holds a slot.
 fn precopy_policy(schedulers: &mut [Scheduler], policy: &Program) -> Result<()> {
     for scheduler in schedulers {
-        scheduler.policy_mut().precopy(policy)?;
+        scheduler.precopy_policy(policy)?;
     }
     Ok(())
 }
 
-/// §7.3 step 3's policy half: the switchover is requested on the slot, and the
-/// mechanism executes it at the rank's batch boundary whose step is `step`.
-fn switchover_policy(schedulers: &mut [Scheduler], generation: u64, step: u64) -> Result<()> {
+/// §7.3 step 3's policy half: the switchover is asked for on the slot, and the
+/// mechanism applies it at this rank's next batch boundary.
+///
+/// `step` is the boundary the epoch's schedulers agreed on, which only the
+/// scheduler node can name; `None` means the command came from the daemon, which
+/// does not choose a boundary, so each scheduler switches at its own next one.
+fn switchover_policy(schedulers: &mut [Scheduler], _generation: u64, _step: Option<u64>) -> Result<()> {
     for scheduler in schedulers {
-        let slot: &mut PolicySlot = scheduler.policy_mut();
-        slot.request(Stage::Switchover, generation)?;
-        slot.boundary(step)?;
+        scheduler.policy_mut().request(Stage::Switchover);
     }
     Ok(())
 }
 
-/// §7.3 step 5's policy half: probation ended in a commit.
-fn commit_policy(schedulers: &mut [Scheduler], generation: u64) -> Result<()> {
+/// §7.3 step 5's policy half: probation ended in a commit, so the candidate is
+/// the serving instance and the previous one is gone.
+fn commit_policy(schedulers: &mut [Scheduler], _generation: u64) -> Result<()> {
     for scheduler in schedulers {
-        scheduler.policy_mut().request(Stage::Commit, generation)?;
+        scheduler.policy_mut().request(Stage::Commit);
     }
     Ok(())
 }
 
-/// §7.3 step 4's policy half: the update is reverted and the previous policy
-/// module serves again from the next batch boundary.
-fn revert_policy(schedulers: &mut [Scheduler], generation: u64) -> Result<()> {
+/// §7.3 step 4's policy half: the previous policy module serves again from the
+/// next batch boundary, and the candidate is dropped at it.
+fn revert_policy(schedulers: &mut [Scheduler], _generation: u64) -> Result<()> {
     for scheduler in schedulers {
-        scheduler.policy_mut().request(Stage::Revert, generation)?;
+        scheduler.policy_mut().request(Stage::Revert);
     }
     Ok(())
 }
 
-/// A discarded generation's policy slot: the candidate never serves.
+/// A discarded generation's policy slot: the candidate never serves (§7.3 step 2,
+/// a precopy that failed).
 fn discard_policy(schedulers: &mut [Scheduler]) {
     for scheduler in schedulers {
-        if let Err(error) = scheduler.policy_mut().discard() {
-            tracing::warn!(%error, "discarding a precopied scheduling policy failed");
-        }
+        scheduler.policy_mut().discard();
     }
 }
 
@@ -1182,6 +1219,108 @@ struct Install {
     request: PrepareRequest,
 }
 
+/// One module the Program Server resolved, held open while its kernel loads (`specs/worker.md`
+/// §4.2, §6.3).
+///
+/// The server sends the module's files as open handles rather than as paths, so the image is read
+/// through the handle: a cubin's bytes are small and read once, and a native library is loaded
+/// through the handle's `/proc/self/fd` path, which names the same inode the server sent. Every
+/// handle stays open until the kernel has loaded, so neither read reaches a file that has gone.
+struct Resolved {
+    image: Option<Vec<u8>>,
+    metadata: Option<Vec<u8>>,
+    native: Option<(std::fs::File, String)>,
+    entry: String,
+}
+
+impl Resolved {
+    /// The module as `ops::install` takes it.
+    fn as_ops(&self) -> executor::Result<ops::Module<'_>> {
+        match (&self.image, &self.native) {
+            (Some(image), _) => Ok(ops::Module::Cubin {
+                image,
+                metadata: self.metadata.as_deref(),
+                entry: &self.entry,
+            }),
+            (None, Some((_, path))) => Ok(ops::Module::Native {
+                path: std::path::Path::new(path),
+                entry: &self.entry,
+            }),
+            (None, None) => Err(executor::Error::Invalid(
+                "a resolved module carries neither a cubin image nor a native library".to_owned(),
+            )),
+        }
+    }
+}
+
+/// Reads a resolved module into the form `ops::install` takes, or refuses a form this build cannot
+/// install (§4.2): a scheduling policy's wasm program and a program the main process runs as its
+/// own process are not kernels.
+fn resolved(module: program_server::Module) -> executor::Result<Resolved> {
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd as _;
+
+    let invalid = |reason: String| executor::Error::Invalid(reason);
+    let mut files = module.files.into_iter();
+    match module.form {
+        program_server::manifest::ModuleForm::Cubin => {
+            let mut image = None;
+            let mut metadata = None;
+            for file in &mut files {
+                let mut bytes = Vec::with_capacity(file.size as usize);
+                let mut handle = &file.file;
+                handle
+                    .read_to_end(&mut bytes)
+                    .map_err(|error| invalid(format!("reading {}: {error}", file.name)))?;
+                if module.metadata.as_deref() == Some(file.name.as_str()) {
+                    metadata = Some(bytes);
+                } else {
+                    image = Some(bytes);
+                }
+            }
+            let Some(image) = image else {
+                return Err(invalid("a cubin module carries no image".to_owned()));
+            };
+            // The image's kernel symbol is its metadata's name; without metadata the package names
+            // the entry itself, and `ops` falls back to the module's single entry.
+            let entry = match &metadata {
+                Some(metadata) => ops::CubinMetadata::parse(metadata)
+                    .map_err(|error| invalid(format!("the cubin's metadata: {error}")))?
+                    .name,
+                None => String::new(),
+            };
+            Ok(Resolved {
+                image: Some(image),
+                metadata,
+                native: None,
+                entry,
+            })
+        }
+        program_server::manifest::ModuleForm::Native => {
+            let Some(entry) = module.entries.get(program_server::manifest::LAUNCH_ENTRY) else {
+                return Err(invalid(
+                    "a native module states no launch entry".to_owned(),
+                ));
+            };
+            let Some(file) = files.next() else {
+                return Err(invalid("a native module carries no library".to_owned()));
+            };
+            // `dlopen` opens a path, and the handle the server sent has none of its own: the fd is
+            // the same inode, and the handle stays ours for as long as the library is loaded.
+            let path = format!("/proc/self/fd/{}", file.file.as_raw_fd());
+            Ok(Resolved {
+                image: None,
+                metadata: None,
+                native: Some((file.file, path)),
+                entry: entry.clone(),
+            })
+        }
+        other => Err(invalid(format!(
+            "a {other:?} module is not a kernel this process installs"
+        ))),
+    }
+}
+
 impl HostAction for Install {
     type Output = Vec<KernelEntry>;
 
@@ -1199,7 +1338,7 @@ impl HostAction for Install {
                 );
             })
             .map_err(|error| {
-                executor::Error::State(format!("building the new generation: {error}"))
+                executor::Error::Invalid(format!("building the new generation: {error}"))
             })?;
 
         let mut entries = Vec::new();
@@ -1233,12 +1372,17 @@ impl HostAction for Install {
                         },
                     )
                     .map_err(|error| {
-                        executor::Error::State(format!(
+                        executor::Error::Invalid(format!(
                             "resolving {} for {key}: {error}",
                             chosen.slot.op
                         ))
                     })?;
-                if let Some(entry) = ops::install(&self.device, operator, &key, &module)? {
+                let module = resolved(module)?;
+                let entry = ops::install(&self.device, operator, &key, module.as_ops()?)
+                    .map_err(|error| {
+                        executor::Error::Invalid(format!("installing {operator} for {key}: {error}"))
+                    })?;
+                if let Some(entry) = entry {
                     entries.push(entry);
                 }
             }
@@ -1378,7 +1522,6 @@ fn completed<T>(outcome: Outcome<T>) -> Result<()> {
 fn handshake(control: &mut Control, args: &EngineArgs, build: &BuildConfig) -> Result<Epoch> {
     control.daemon_mut().send(&proto::request::wire::Hello {
         engine: args.engine,
-        node_rank: args.node_rank,
         build: proto::BUILD.to_owned(),
         major: proto::PROTOCOL_MAJOR,
         minor: proto::PROTOCOL_MINOR,
