@@ -66,7 +66,7 @@ fn a_manifest_says_what_the_package_is_and_how_it_is_built() {
     assert_eq!(manifest.module.form, ModuleForm::Cubin);
     assert_eq!(manifest.source.kind, SourceKind::Triton);
     assert_eq!(manifest.source.kernel.as_deref(), Some("rms_norm"));
-    assert_eq!(manifest.kernel.architectures, ["sm_100a"]);
+    assert_eq!(manifest.kernel.as_ref().unwrap().architectures, ["sm_100a"]);
     assert_eq!(manifest.tuning, ["tuning/tactics.json"]);
     assert_eq!(
         manifest.parameters.get("tile"),
@@ -81,7 +81,7 @@ fn a_package_covers_a_descriptor_by_dimension_values_or_by_name() {
         &["src/rms.py", "src/compile.py", "tuning/tactics.json"],
     );
     let manifest = Manifest::load(root.path()).unwrap();
-    let descriptors = &manifest.kernel.descriptors;
+    let descriptors = &manifest.kernel.as_ref().unwrap().descriptors;
 
     assert!(descriptors.covers("dtype_bf16_hidden_2048"));
     assert!(descriptors.covers("dtype_fp32_hidden_2048"));
@@ -117,13 +117,8 @@ descriptors = { dimensions = { dtype = ["bf16"] }, keys = ["head_dim_128_page_64
 "#;
     let root = package(text, &["cubin/attention.cubin"]);
     let manifest = Manifest::load(root.path()).unwrap();
-    assert!(
-        manifest
-            .kernel
-            .descriptors
-            .covers("head_dim_128_page_64_mask")
-    );
-    assert!(manifest.kernel.descriptors.covers("dtype_bf16"));
+    assert!(manifest.covers("head_dim_128_page_64_mask"));
+    assert!(manifest.covers("dtype_bf16"));
 }
 
 #[test]
@@ -247,17 +242,13 @@ form = "wasm"
 [source]
 kind = "wasm"
 files = ["src/lib.rs"]
-
-[kernel]
-architectures = ["wasm32"]
-descriptors = { keys = ["default"] }
 "#;
     let root = package(text, &["src/lib.rs"]);
     let manifest = Manifest::load(root.path()).unwrap();
     assert_eq!(manifest.module.form, ModuleForm::Wasm);
     assert!(manifest.module.metadata.is_none());
     assert!(manifest.module.entry.is_none());
-    assert!(manifest.kernel.descriptors.covers("default"));
+    assert!(manifest.covers("default"));
 }
 
 #[test]
@@ -277,10 +268,6 @@ entry = "uniserve_fcfs"
 [source]
 kind = "wasm"
 files = ["src/lib.rs"]
-
-[kernel]
-architectures = ["wasm32"]
-descriptors = { keys = ["default"] }
 "#;
     let root = package(text, &["src/lib.rs"]);
     assert!(Manifest::load(root.path()).is_err());
