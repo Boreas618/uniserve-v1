@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use super::device::{DeviceBudget, total_bytes};
-use super::graph_storage_budget_bytes;
+use crate::capacity::graph_storage_budget_bytes;
 use crate::config::Device;
 use crate::{Error, Result};
 
