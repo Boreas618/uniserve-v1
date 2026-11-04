@@ -1000,14 +1000,17 @@ fn canvas_of_raster(width: u32, height: u32) -> Option<Canvas> {
     })
 }
 
-/// The condition latents a request's conditions encode to, and their noise draws.
+/// The rows a request's conditions encode to, and their noise draws.
 ///
-/// Both are the runner's: the VAE encoders produce the latents and the request's Philox stream
-/// produces the draws, so the model reads views it allocated nothing for and writes only the prefix
-/// source it was given. A condition with pixels contributes one latent view and, if it carries a
-/// soundtrack, one audio view after it; an audio-only reference contributes its audio view alone.
+/// Both are the runner's: the encoders produce the rows and the request's Philox stream produces the
+/// draws, so the model reads views it allocated nothing for and writes only the prefix source it was
+/// given. A condition with pixels contributes one **normalized patch-row** view - `[rows, channels *
+/// 4]`, what the video encoder emits, not `[rows, channels]` - and, if it carries a soundtrack, one
+/// channel-major audio view after it (`[2 * frames, audio_channels]`); an audio-only reference
+/// contributes its audio view alone. The reference's tuple has the same shape and the same order
+/// (`uniserve/models/minimax_h3/denoiser.py:512-516, 553-561`).
 pub struct ConditionLatents<'a> {
-    /// Each condition's latents, in request order and in the order above.
+    /// Each condition's encoded rows, in request order and in the order above.
     pub latents: &'a [TensorView],
     /// One draw per visual condition, in packed order: `[channels, frames, height, width]` in the
     /// prefix source's dtype, which is the dtype the anchoring and the projection work in.
@@ -1055,14 +1058,14 @@ pub const VISUAL_CONDITION_TIME: f32 = 0.999;
 /// row after the reference.
 pub const AUDIO_CONDITION_TIME: f32 = 1.0;
 
-/// A request's condition latents, each condition's visual view and its audio view.
+/// A request's condition rows, each condition's visual view and its audio view.
 struct ConditionViews {
     pairs: Vec<(Option<TensorView>, Option<TensorView>)>,
 }
 
 impl ConditionViews {
     /// Pair the request's flat view list with its conditions: each condition contributes its
-    /// visual latents when it has pixels and its audio latents when it has samples, in that order,
+    /// visual patch rows when it has pixels and its audio rows when it has samples, in that order,
     /// which is the order the reference's `latents` tuple holds them
     /// (`uniserve/models/minimax_h3/denoiser.py:553-561`).
     fn new(conditions: &[packing::Condition], views: &[TensorView]) -> Result<Self> {
@@ -1903,7 +1906,7 @@ impl Denoiser {
                 let count = u64::from(segment.audio_rows());
                 if audio.shape.dims() != [count, audio_channels] {
                     return Err(Error::config(format!(
-                        "condition {}'s audio latents are [{count}, {audio_channels}], got {:?}",
+                        "condition {}'s audio rows are [{count}, {audio_channels}], got {:?}",
                         segment.condition,
                         audio.shape.dims()
                     )));
@@ -1925,7 +1928,7 @@ impl Denoiser {
             let count = u64::from(visual.rows());
             if clean.shape.dims() != [count, width] {
                 return Err(Error::config(format!(
-                    "condition {}'s visual latents are [{count}, {width}], got {:?}",
+                    "condition {}'s visual patch rows are [{count}, {width}], got {:?}",
                     segment.condition,
                     clean.shape.dims()
                 )));
