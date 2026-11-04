@@ -9,8 +9,45 @@
 
 use std::fmt;
 
-use crate::platform::{self, DevicePtr};
-use crate::{Error, Result};
+use crate::{Error, Result, platform};
+
+/// A device address: an opaque `u64` the driver uses (`CUdeviceptr`).
+///
+/// `ops` carries addresses in its own type rather than as bare integers, so that a view's address
+/// cannot be confused with a scalar parameter and a byte offset cannot be added to an element
+/// count by accident. Arithmetic on it is in bytes ([`DevicePtr::offset`]); the element offset of a
+/// view goes through [`TensorView::offset_elements`].
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DevicePtr(u64);
+
+impl DevicePtr {
+    /// The address of `address`.
+    pub const fn new(address: u64) -> Self {
+        Self(address)
+    }
+
+    /// The address as the driver sees it.
+    pub const fn address(self) -> u64 {
+        self.0
+    }
+
+    /// The address `bytes` bytes further.
+    pub const fn offset(self, bytes: u64) -> Self {
+        Self(self.0 + bytes)
+    }
+}
+
+impl std::fmt::Debug for DevicePtr {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "0x{:x}", self.0)
+    }
+}
+
+impl std::fmt::Display for DevicePtr {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "0x{:x}", self.0)
+    }
+}
 
 /// The most axes a [`Shape`] or [`Strides`] holds.
 ///
@@ -398,7 +435,7 @@ impl TensorView {
         self.offset_elements(element)
     }
 
-    /// A view moved `elements` elements further.
+    /// The address `elements` elements further, when the element type has a whole-byte size.
     pub fn offset_elements(&self, elements: u64) -> DevicePtr {
         match self.dtype.bytes() {
             Some(bytes) => platform::offset(self.ptr, elements * bytes),
@@ -467,7 +504,7 @@ impl fmt::Debug for TensorView {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("TensorView")
-            .field("ptr", &format_args!("0x{:x}", platform::address(self.ptr)))
+            .field("ptr", &self.ptr)
             .field("dtype", &self.dtype)
             .field("shape", &self.shape)
             .field("strides", &self.strides)

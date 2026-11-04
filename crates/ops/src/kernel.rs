@@ -30,7 +30,8 @@
 
 use std::ffi::c_void;
 
-use crate::platform::{self, DevicePtr, Function, Library, NativeLibrary, Stream, Symbol};
+use crate::platform::{self, Function, Library, NativeLibrary, Stream};
+use crate::tensor::DevicePtr;
 use crate::{Error, Result};
 
 /// The signature every native entry has.
@@ -265,35 +266,27 @@ impl Arguments {
     }
 }
 
-/// A symbol of a loaded native library, with the name the package declares for it.
+/// A C entry of a loaded native library, with the name the package declares for it.
 pub struct NativeEntry {
     name: &'static str,
-    symbol: Symbol,
+    function: Entry,
 }
 
 impl NativeEntry {
-    /// Resolve `name` in `library`.
+    /// Resolve `name` in `library` as an [`Entry`].
+    ///
+    /// The entry's signature is the package's contract with `ops`: `int32_t entry(const void* call,
+    /// void* stream)`, the call structure being the operator's own `#[repr(C)]` type.
     pub fn resolve(library: &NativeLibrary, name: &'static str) -> Result<Self> {
-        let symbol = library.symbol(name)?;
-        Ok(Self { name, symbol })
+        // SAFETY: the convention every package follows is exactly `Entry`; a package that declares
+        // another signature for its entry name breaks this contract, which its header states.
+        let function = unsafe { platform::native_entry::<Entry>(library, name)? };
+        Ok(Self { name, function })
     }
 
     /// The name the package declares.
     pub const fn name(&self) -> &'static str {
         self.name
-    }
-
-    /// The entry as the C function the operator's call structure declares.
-    ///
-    /// # Safety
-    ///
-    /// The symbol must be the C entry with the signature [`Entry`] states, and the call structure
-    /// the operator passes must have the layout the package's header declares for it. A wrong
-    /// signature or layout is undefined behaviour in the library.
-    unsafe fn entry(&self) -> Entry {
-        // SAFETY: a function pointer and a symbol pointer have the same representation on every
-        // platform this runs on, and the caller states that this symbol is that function.
-        unsafe { std::mem::transmute_copy::<Symbol, Entry>(&self.symbol) }
     }
 }
 
@@ -318,6 +311,38 @@ pub enum Kernel {
 }
 
 impl Kernel {
+    /// Load a cubin, fatbin or PTX image on `device` and resolve the kernel its metadata names.
+    ///
+    /// A module whose metadata declares a dynamic shared-memory size beyond the driver's default
+    /// has its function's limit raised here, once, before any launch: the launch path never sets an
+    /// attribute, so nothing an operator does can surprise a capture.
+    pub fn load_cubin(
+        device: &platform::Device,
+        image: &[u8],
+        metadata: CubinMetadata,
+    ) -> Result<Self> {
+        let library = platform::load_library(device, image)?;
+        let function = platform::library_kernel(&library, &metadata.name)?;
+        if metadata.shared > platform::DEFAULT_SHARED_LIMIT {
+            platform::raise_shared_limit(&function, metadata.shared)?;
+        }
+        Ok(Self::Cubin {
+            library,
+            function,
+            metadata,
+        })
+    }
+
+    /// Open nothing and wrap a native library with the entry the package declares.
+    ///
+    /// The library is opened by whoever resolved the module ([`NativeLibrary::open`]); this
+    /// resolves the package's C entry and keeps the two together, so the library stays loaded while
+    /// any generation or captured graph can call it.
+    pub fn load_native(library: NativeLibrary, entry: &'static str) -> Result<Self> {
+        let entry = NativeEntry::resolve(&library, entry)?;
+        Ok(Self::Native { library, entry })
+    }
+
     /// What this kernel is called, for diagnostics and for a capture's node table.
     pub fn name(&self) -> &str {
         match self {
@@ -371,9 +396,8 @@ impl Kernel {
                 cluster: metadata.num_ctas,
                 pdl: metadata.launch_pdl,
                 cooperative: metadata.launch_cooperative_grid,
-                scratch: metadata.global_scratch_size,
-                parameters,
             },
+            parameters,
         )
         .map_err(Error::Platform)
     }
@@ -395,11 +419,10 @@ impl Kernel {
         };
         // SAFETY: the caller states that this symbol is the package's entry with the `Entry`
         // signature.
-        let function = unsafe { entry.entry() };
-        // SAFETY: forwarded from the caller: the symbol is the entry with this signature and the
-        // call structure has the layout the package declares for it.
+        // SAFETY: forwarded from the caller: the entry is this package's `Entry`, and the call
+        // structure has the layout the package's header declares for it.
         let status = unsafe {
-            function(
+            (entry.function)(
                 call as *mut C as *const c_void,
                 platform::stream_handle(stream),
             )

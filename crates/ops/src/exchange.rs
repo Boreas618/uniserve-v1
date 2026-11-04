@@ -19,8 +19,8 @@
 //! both directions only move bytes, and two implementations agree bit for bit, so the layer's
 //! shadow comparison is an equality.
 
-use crate::platform::{self, Communicator, DevicePtr, Stream};
-use crate::tensor::{DType, Shape, TensorView};
+use crate::platform::{self, Communicator, Stream};
+use crate::tensor::TensorView;
 use crate::{Error, Result};
 
 /// The operator name the runtime records for this exchange.
@@ -35,53 +35,41 @@ pub const NAME: &str = "ulysses_exchange";
 /// `[tokens, heads, head_dim]` and the output `[tokens · ranks', head_dim / ranks]` where `ranks'`
 /// is the rank count, i.e. one row per (token, head-block) pair.
 pub fn scatter(
-    communicator: &Communicator,
+    communicator: &mut Communicator,
     input: TensorView,
     output: TensorView,
     ranks: u64,
     stream: &Stream,
 ) -> Result<()> {
-    let counts = checked(input, output, ranks)?;
-    // SAFETY: both views address the counts checked above of `input.dtype`, and both stay alive
-    // until the collective completes (the caller owns them).
-    unsafe {
-        platform::all_to_all(
-            communicator,
-            input.ptr,
-            output.ptr,
-            &counts,
-            input.dtype.as_i64() as u32,
-            stream,
-        )
-    }
-    .map_err(Error::Platform)
+    let count = checked(input, output, ranks)?;
+    let dtype = count.1;
+    // SAFETY: both views address `count.0` elements of `dtype` for each of `ranks` ranks, and both
+    // stay alive until the collective completes (the caller owns them).
+    unsafe { platform::all_to_all(communicator, input.ptr, output.ptr, count.0, dtype, stream) }
+        .map_err(Error::Platform)
 }
 
 /// Put the heads of every rank back together.
 pub fn gather(
-    communicator: &Communicator,
+    communicator: &mut Communicator,
     input: TensorView,
     output: TensorView,
     ranks: u64,
     stream: &Stream,
 ) -> Result<()> {
-    let counts = checked(output, input, ranks)?;
+    let count = checked(output, input, ranks)?;
+    let dtype = count.1;
     // SAFETY: as in `scatter`, with the roles of the two views exchanged.
-    unsafe {
-        platform::all_to_all(
-            communicator,
-            input.ptr,
-            output.ptr,
-            &counts,
-            input.dtype.as_i64() as u32,
-            stream,
-        )
-    }
-    .map_err(Error::Platform)
+    unsafe { platform::all_to_all(communicator, input.ptr, output.ptr, count.0, dtype, stream) }
+        .map_err(Error::Platform)
 }
 
-/// Check one direction's shapes and give the per-rank element counts.
-fn checked(large: TensorView, small: TensorView, ranks: u64) -> Result<Vec<u64>> {
+/// Check one direction's shapes and give the elements each rank sends and the collective's type.
+fn checked(
+    large: TensorView,
+    small: TensorView,
+    ranks: u64,
+) -> Result<(usize, platform::CollectiveType)> {
     if ranks == 0 {
         return Err(Error::argument(NAME, "an exchange has no ranks"));
     }
@@ -119,11 +107,13 @@ fn checked(large: TensorView, small: TensorView, ranks: u64) -> Result<Vec<u64>>
             format!("the exchange moves {} against {}", large.dtype, small.dtype),
         ));
     }
-    let per_rank = small.numel();
-    Ok(vec![per_rank; ranks as usize])
-}
-
-/// A view of `shape` elements of `dtype` at `pointer`, for the layer's buffers.
-pub fn view(pointer: DevicePtr, dtype: DType, shape: Shape) -> TensorView {
-    TensorView::new(pointer, dtype, shape)
+    let dtype = platform::collective_type(small.dtype).ok_or_else(|| {
+        Error::unsupported(
+            NAME,
+            format!("a {} exchange has no collective element type", small.dtype),
+        )
+    })?;
+    let per_rank = usize::try_from(small.numel())
+        .map_err(|_| Error::argument(NAME, "a per-rank count above usize::MAX"))?;
+    Ok((per_rank, dtype))
 }
