@@ -43,8 +43,11 @@ def _adaptive_pool_kernel(
     """Store one block of pooled output elements.
 
     Grid: ``ceil(rows · output / BLOCK)`` programs. ``WINDOW`` is the longest window
-    the descriptor's width and output give (`ceil(width / output)`), the bound the
-    unrolled loop below covers; a shorter window is masked out term by term.
+    the descriptor's width and output can give — ``ceil(width / output) + 1``, not
+    ``ceil(width / output)``: a window is ``ceil((i+1)·width/output) -
+    floor(i·width/output)``, and for a width the output does not divide those two
+    roundings can add a position that the quotient alone does not allow (24 pooled to
+    7 gives windows of four and of five). A shorter window is masked out term by term.
     """
     program = tl.program_id(0)
     index = (program * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)

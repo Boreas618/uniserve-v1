@@ -1,26 +1,27 @@
 #!/usr/bin/env python3
 """Run one rgb_bytes module on a GPU and check the bytes it writes.
 
-    python rgb_check.py
-    python rgb_check.py --dtype bf16 --pdl
+    python rgb_check.py python rgb_check.py --dtype bf16 --pdl
 
-The package's Triton source is launched through Triton's own launcher, which is the
-code the store's module is compiled from. Everything geometric is a launch value —
-the raster, the block, the dependent launch — so one run covers a geometry the
-descriptor does not name.
+The package's Triton source is launched through Triton's own launcher, which is
+the code the store's module is compiled from. Everything geometric is a launch
+value — the raster, the block, the dependent launch — so one run covers a
+geometry the descriptor does not name.
 
 **The comparison is in bytes, and exact except at the ties.** The operator's
-arithmetic (`(x · std + mean) · 255`, clamp, round half to even) is a real value
-rounded once, so two implementations can differ by one byte only where the real value
-sits within floating-point error of a half-byte boundary. The samples contain many
-such values on purpose and the check separates them: an element farther than a part
-in ten thousand from a half-integer must match **exactly**, and one inside that band
-may differ by **one byte**, the operator's own `Tolerance::new(1.0, 0.0)`. The band
-and its count are printed, so a failure says which side it came from.
+arithmetic (`(x · std + mean) · 255`, clamp, round half to even) is a real
+value rounded once, so two implementations can differ by one byte only where
+the real value sits within floating-point error of a half-byte boundary. The
+samples contain many such values on purpose and the check separates them: an
+element farther than a part in ten thousand from a half-integer must match
+**exactly**, and one inside that band may differ by **one byte**, the
+operator's own `Tolerance::new(1.0, 0.0)`. The band and its count are printed,
+so a failure says which side it came from.
 
-Two layouts are checked, because the operator's contract allows both: the packed
-raster, and a tile written into a sub-region of a larger, strided canvas with a
-strided read side, which is what the decoder does with each decoded tile.
+Two layouts are checked, because the operator's contract allows both: the
+packed raster, and a tile written into a sub-region of a larger, strided canvas
+with a strided read side, which is what the decoder does with each decoded
+tile.
 """
 
 import argparse
@@ -49,8 +50,9 @@ def samples(shape, seed):
     generator = np.random.default_rng(seed)
     raster = generator.normal(0.0, 0.3, shape).astype(np.float32)
     channels, frames, rows, columns = shape
-    # Ties: ask for a scaled value of `k + 0.5` and invert the de-normalization. The
-    # inverse is inexact, which is why a band exists rather than an equality.
+    # Ties: ask for a scaled value of `k + 0.5` and invert the
+    # de-normalization. The inverse is inexact, which is why a band exists
+    # rather than an equality.
     for channel in range(channels):
         values = (np.arange(0.5, 12.5, 1.0) / 255.0 - MEAN[channel]) / STD[
             channel
@@ -62,8 +64,9 @@ def samples(shape, seed):
                 (index * 3) % rows,
                 (index * 7) % columns,
             ] = value
-    # Both ends and past them: the clamp, not a wrapping cast. A saturated zero and a
-    # saturated 255 are the two bytes a de-normalization must reach exactly.
+    # Both ends and past them: the clamp, not a wrapping cast. A saturated zero
+    # and a saturated 255 are the two bytes a de-normalization must reach
+    # exactly.
     raster[0, 0, 0, 0] = 10.0
     raster[0, 0, 0, 1] = -10.0
     raster[0, 0, 0, 2] = (1.0 - MEAN[0]) / STD[0]
@@ -74,8 +77,8 @@ def samples(shape, seed):
 def reference(raster, mean, std):
     """The bytes the operator's arithmetic gives, and which of them are tie candidates.
 
-    The arithmetic is FP64 from the input's own (already rounded) values, which is
-    what "the real value" means for a comparison whose output is an integer.
+    The arithmetic is FP64 from the input's own (already rounded) values, which
+    is what "the real value" means for a comparison whose output is an integer.
     """
     scaled = (
         raster.astype(np.float64) * std.astype(np.float64)[:, None, None, None]
@@ -97,15 +100,16 @@ def launch(dtype, block, pdl, raster, canvas):
     operand = torch.from_numpy(raster).to(
         device=device, dtype=TORCH_TYPES[dtype]
     )
-    # What the program actually reads: the operand after its own type's rounding,
-    # which is what the reference has to be compared against.
+    # What the program actually reads: the operand after its own type's
+    # rounding, which is what the reference has to be compared against.
     rounded = operand.to(torch.float32).cpu().numpy()
     mean = torch.from_numpy(MEAN).to(device)
     std = torch.from_numpy(STD).to(device)
 
     if canvas:
-        # The write goes into a sub-region of a larger canvas and the read side is a
-        # slice of a wider raster, so three of the six strides are not the packed ones.
+        # The write goes into a sub-region of a larger canvas and the read side
+        # is a slice of a wider raster, so three of the six strides are not the
+        # packed ones.
         buffer = torch.zeros(
             (frames + 1, rows, columns + 2, channels),
             dtype=torch.uint8,

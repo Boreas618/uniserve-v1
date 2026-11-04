@@ -7,8 +7,10 @@
 # This is the video path's last step: an ImageNet-normalized, channel-major float
 # raster to packed 8-bit RGB, `round_half_to_even(clamp((x · std + mean) · 255, 0,
 # 255))` in FP32 whatever the input's element type. The rounding is visible in the
-# artifact and the operator's tolerance is one byte, so this module rounds with one
-# `rint` and the check script compares bytes exactly, its samples including ties.
+# artifact: a tie goes to the even neighbour, written as an addition and subtraction
+# of 2^23 (where an FP32's ulp is one) rather than as a library call, so the arithmetic
+# also runs under Triton's interpreter and can be checked without a GPU. The check
+# scripts compare bytes, their samples including ties.
 #
 # The key names the input's element type, the channel count, the block and whether
 # the module was compiled for programmatic dependent launch. The raster's frame

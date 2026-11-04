@@ -12,9 +12,16 @@ The arithmetic is the operator's, in this order and in FP32 whatever the input's
 element type: de-normalize (multiply by the channel's standard deviation, add its
 mean), scale by 255, clamp into ``[0, 255]``, then round **half to even**. The
 rounding is the visible part of the artifact — a tie must go to the even neighbour,
-which is what ``numpy.rint``, Rust's ``round_ties_even`` and this module's
-``libdevice.rint`` all do — so the check script compares bytes exactly and the ties
-are in its samples.
+which is what ``numpy.rint`` and Rust's ``round_ties_even`` do — so the check script
+compares bytes and the ties are in its samples.
+
+The rounding is written as an addition and a subtraction of 2^23 rather than as a
+library call, and that is the rounding, not an approximation of it: at 2^23 an FP32
+value's unit in the last place is exactly one, so the addition *is* a round to the
+nearest integer with ties to even, and the subtraction is exact for the range the
+clamp leaves (0 to 255, far below 2^23). Writing it this way keeps the kernel running
+under Triton's interpreter, which has no libdevice, so the arithmetic here can be
+checked on a host with no GPU.
 
 Reading ``mean`` and ``std`` with the vector index ``k`` makes them one load per
 element rather than three host scalars per launch: they are the checkpoint's
@@ -26,7 +33,12 @@ the geometry is compiled in, so one module serves every raster.
 
 import triton
 import triton.language as tl
-from triton.language.extra import libdevice
+
+
+#: 2^23: the magnitude at which an FP32's ulp is one, and therefore the constant that
+#: turns an addition into a round-half-to-even at one byte. It is a `tl.constexpr`
+#: because a kernel may only read globals declared as one.
+MAGNITUDE = tl.constexpr(8388608.0)
 
 
 @triton.jit
@@ -82,9 +94,10 @@ def _rgb_bytes_kernel(
 
     scaled = (value * deviation + average) * 255.0
     clamped = tl.minimum(tl.maximum(scaled, 0.0), 255.0)
-    # `rint` rounds to nearest with ties to even, in one instruction, which is what
-    # the output's bytes are compared against exactly.
-    byte = libdevice.rint(clamped).to(tl.uint8)
+    # Round half to even: at 2^23 an FP32's ulp is one, so this addition rounds to the
+    # nearest integer with ties to the even neighbour, which is the reference's rule,
+    # and the subtraction is exact over the clamp's range.
+    byte = ((clamped + MAGNITUDE) - MAGNITUDE).to(tl.uint8)
 
     target = frame * out0 + row * out1 + column * out2 + channel
     tl.store(out + target, byte, mask=live)
