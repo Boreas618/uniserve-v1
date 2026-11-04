@@ -148,10 +148,9 @@ impl<S: WeightStorage> WeightStore<S> {
     /// rounded length is what the store allocates and publishes; the tensor keeps `bytes`, and a
     /// reader maps the allocation and reads only the weight.
     fn allocation_length(&self, bytes: usize) -> Result<usize> {
-        let granularity = self
-            .storage
-            .granularity(self.device)
-            .map_err(|error| Error::State(format!("the granularity of {}: {error}", self.device).leak()))?;
+        let granularity = self.storage.granularity(self.device).map_err(|error| {
+            Error::State(format!("the granularity of {}: {error}", self.device).leak())
+        })?;
         if granularity == 0 {
             return Err(Error::Invariant(
                 "the storage states a zero allocation granularity".into(),
@@ -210,7 +209,7 @@ impl<S: WeightStorage> RetainedWeights for WeightStore<S> {
         }
         let expected = shape
             .numel()
-            .checked_mul(u64::from(dtype.bytes().unwrap_or_default()))
+            .checked_mul(dtype.bytes().unwrap_or_default())
             .and_then(|bytes| usize::try_from(bytes).ok())
             .ok_or_else(|| {
                 nn::Error::Unsupported(format!(
@@ -232,9 +231,9 @@ impl<S: WeightStorage> RetainedWeights for WeightStore<S> {
         if let Some(backing) = self.mapped.get(&storage_key) {
             return Ok(*backing);
         }
-        let allocation = self.allocation_length(bytes.len()).map_err(|error| {
-            nn::Error::Unsupported(format!("sizing weight {key}: {error}"))
-        })?;
+        let allocation = self
+            .allocation_length(bytes.len())
+            .map_err(|error| nn::Error::Unsupported(format!("sizing weight {key}: {error}")))?;
         let backing = self
             .storage
             .store(self.device, &storage_key, bytes, allocation)
@@ -319,7 +318,7 @@ mod tests {
         ) -> Result<Backing> {
             self.stores.fetch_add(1, Ordering::Relaxed);
             *self.handed.lock().unwrap() = Some((bytes.len(), allocation));
-            if allocation < bytes.len() || allocation % self.granularity != 0 {
+            if allocation < bytes.len() || !allocation.is_multiple_of(self.granularity) {
                 return Err(Error::Invalid(format!(
                     "a retained allocation of {allocation} bytes is not a positive multiple of \
                      the {}-byte granularity",
@@ -508,7 +507,10 @@ mod tests {
     fn a_weight_whose_length_is_not_a_granule_is_retained_in_a_rounded_allocation() {
         const GRANULE: usize = 1 << 21;
         let storage = std::sync::Arc::new(FakeStorage::with_granularity(GRANULE));
-        let mut store = WeightStore::new(Shared(std::sync::Arc::clone(&storage)), platform::DeviceId(0));
+        let mut store = WeightStore::new(
+            Shared(std::sync::Arc::clone(&storage)),
+            platform::DeviceId(0),
+        );
         // The embedding that ended the epoch's model load is 622329856 bytes against a 2097152-byte
         // granule, which is 296 granule and 190210304 bytes over; this is the same shape, small.
         let bytes = vec![3_u8; 30];

@@ -909,6 +909,7 @@ fn unchanged_cache_export_round_trips_without_physical_tensors() {
                 base_extent: 16,
                 exported_extent: 16,
                 compute_dtype: "bfloat16".into(),
+                state: Vec::new(),
             }),
             ..completion_record()
         }],
@@ -1030,6 +1031,7 @@ fn raw_cache_export_round_trips_page_representation_and_exact_request() {
                     base_extent: 3,
                     exported_extent: 8,
                     compute_dtype: "bfloat16".into(),
+                    state: Vec::new(),
                 }),
                 ..completion_record()
             }],

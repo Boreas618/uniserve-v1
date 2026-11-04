@@ -27,7 +27,7 @@ use super::{
     ArenaCapacity, CacheCapacity, CacheDemand, RequestBounds, TokenBounds, call_window,
     request_tensor_window,
 };
-use crate::capacity::{graph_storage_budget_bytes, graph_storage_bytes};
+use crate::capacity::graph_storage_bytes;
 use crate::config::Device;
 use crate::memory::prefix_cache::planes::{PlaneLayout, UnitColumn};
 use crate::memory::{CachePlan, LatentPlan};
@@ -255,8 +255,9 @@ pub struct TokenFacts {
 pub struct Plan {
     /// The capacity the rank reports to the engine.
     pub info: WorkerInfo,
-    /// The host and device arenas of its calls.
-    pub arena: ArenaCapacity,
+    /// The host and device arenas of its calls: read where a rank's arenas are
+    /// built, which is inside this crate.
+    pub(crate) arena: ArenaCapacity,
     /// Fixed bytes by device, beside the cache pool.
     pub fixed_device_bytes: BTreeMap<Device, u64>,
     /// The latent pool of a rank that stores one.
@@ -391,7 +392,9 @@ impl TokenPlan {
 ///
 /// `width` is the widest block table a request of the model's length needs,
 /// which the caller derives from its own `max_model_len`; `total_bytes` is the
-/// device's total storage (zero on CPU) and `granularity` its allocation
+/// storage the rank may plan into - what the device has left at plan time, not
+/// the size it has, because the weights are mapped outside every pool - zero on
+/// CPU, which states no grant; `granularity` is the device's allocation
 /// granularity, in whose granules a device pool splits its planes.
 #[expect(
     clippy::too_many_arguments,
@@ -629,9 +632,15 @@ impl TokenLayout {
     /// at open, so no unit is fitted into storage the graphs will take - and
     /// `unit_overhead` is device
     /// storage other owners keep per unit (unit index columns), charged with
-    /// each unit. `granularity` is the device's allocation granularity, in
+    /// each unit; `total_bytes` is the storage the rank may plan into, the
+    /// grant when the request states none. `granularity` is the device's
+    /// allocation granularity, in
     /// whose granules a device pool splits its planes into segments; `None`
     /// on CPU.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the plan, the request, the device's figures and the agreement"
+    )]
     pub(crate) fn fit_cache(
         &mut self,
         cache: &CachePlan,
@@ -659,7 +668,15 @@ impl TokenLayout {
 
         let cuda = request.device.is_cuda();
         let tokens = request.max_total_tokens.map(|tokens| tokens as u64);
-        let available = request.pool_storage_bytes.map(|bytes| bytes as u64);
+        // The grant the pool is fitted into: the host storage a deployment states for it, or -
+        // when it states none - the storage the device has left, which is `total_bytes` here
+        // because the weights are mapped by handle outside every pool and so never count against
+        // a budget that would otherwise size the cache into bytes the weights already hold. A
+        // device that states neither cannot be sized automatically, below.
+        let available = request
+            .pool_storage_bytes
+            .map(|bytes| bytes as u64)
+            .or(Some(total_bytes).filter(|bytes| *bytes > 0));
         if cuda && tokens.is_none() && available.is_none() {
             return Err(Error::Invalid(
                 "automatic CUDA KV sizing requires a host storage grant".into(),

@@ -1068,7 +1068,7 @@ impl crate::memory::weights::WeightStorage for Retained {
         // The store rounds a weight's true length up to the granule the import needs; a length that
         // is not such a multiple would be refused by the driver, so it is refused here by name.
         let granularity = self.granularity(device)?;
-        if allocation < bytes.len() || allocation % granularity != 0 {
+        if allocation < bytes.len() || !allocation.is_multiple_of(granularity) {
             return Err(Error::Invariant(format!(
                 "a weight of {} bytes cannot be retained in an allocation of {allocation} bytes, \
                  which is not a multiple of the {granularity}-byte granularity",

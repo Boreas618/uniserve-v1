@@ -291,8 +291,15 @@ impl Buckets {
         Self::causal_lm(&decode, &prefill, sampled)
     }
 
-    /// The largest decode row count and prefill token count the set captures, which is the batch
-    /// bound its captures imply.
+    /// The largest decode row count and prefill token count the set captures: **the batch bound the
+    /// mechanism may admit**, not an estimate of one.
+    ///
+    /// A rank that serves captured graphs only is never handed a batch larger than its largest
+    /// bucket, so the catalogue is the rank's admission bound and the two must not drift: whatever
+    /// states a batch capacity for this rank (the epoch plan's rank facts) states these figures, not
+    /// the build config's, which may be larger. [`Self::require`] is the other half - a shape that
+    /// exceeds the bound is refused naming the bound and the shape, so a mechanism bug is a named
+    /// refusal rather than a batch no graph can serve.
     pub fn bounds(&self) -> (u32, u32) {
         let mut rows = 0;
         let mut tokens = 0;
@@ -332,8 +339,11 @@ impl Buckets {
     /// bucket that does not hold it, or grown into one that was never captured.
     pub fn require(&self, shape: &Shape) -> Result<Bucket> {
         self.select(shape).ok_or_else(|| {
+            let (rows, tokens) = self.bounds();
             Error::Invalid(format!(
-                "no captured bucket holds {shape}: the bucket plan and the batch disagree"
+                "no captured bucket holds {shape}: this rank's warmed set tops at {rows} rows and \
+                 {tokens} tokens, and a batch above that bound must be admitted as smaller ones - \
+                 no capture is made in the serving path"
             ))
         })
     }
@@ -459,6 +469,62 @@ mod tests {
         let sampled = Shape::decode(1, Variant::DecodeSampled);
         assert!(buckets.select(&sampled).is_none());
         assert!(buckets.require(&sampled).is_err());
+        // The refusal names the bound as well as the shape, so the shape a mechanism admitted and
+        // the bound it exceeded are both in the one line a deployment's reader has.
+        let (rows, tokens) = buckets.bounds();
+        assert!(
+            message.contains(&format!("{rows} rows")) && message.contains(&format!("{tokens} tokens")),
+            "the refusal does not state this rank's bound: {message}"
+        );
+    }
+
+    /// The bound the epoch plan states as a rank's batch capacity is this set's `bounds()`, so no
+    /// batch the mechanism admits is larger than the largest warmed bucket - and a build config
+    /// asking for more is clamped by the catalogue rather than honoured.
+    ///
+    /// This is the invariant that keeps a serving batch from reaching a bucket nobody captured:
+    /// `require` would refuse it, and a refusal in the serving path ends the epoch, so the bound
+    /// must never be stated above what is warmed.
+    #[test]
+    fn the_admission_bound_is_the_largest_warmed_bucket_and_never_the_build_configs() {
+        // A deployment that asks for far more than the default catalogue holds.
+        let buckets =
+            Buckets::for_batch(None, None, 256, 1_000_000, true).expect("the default catalogue");
+        let (rows, tokens) = buckets.bounds();
+        assert!((rows, tokens) == (128, 16384), "the catalogue tops at {rows} rows, {tokens} tokens");
+
+        // Every shape inside the bound is planned, at both edges and along each axis: the bound is
+        // only useful if it is covered, and a catalogue with a hole inside its own bound would be
+        // exactly the drift this test exists to catch.
+        for variant in [
+            Variant::DecodeGreedy,
+            Variant::DecodeSampled,
+            Variant::PrefillWrite,
+            Variant::PrefillOutput,
+        ] {
+            if variant.is_decode() {
+                for count in 1..=rows {
+                    let shape = Shape::decode(count, variant);
+                    assert!(buckets.select(&shape).is_some(), "{shape} is inside the bound");
+                }
+            } else {
+                for count in 1..=tokens {
+                    let shape = Shape::prefill(1, count, variant);
+                    assert!(buckets.select(&shape).is_some(), "{shape} is inside the bound");
+                }
+                // The widest prefill the bound admits: every row count with the largest chunk.
+                for row in 1..=rows {
+                    let shape = Shape::prefill(row, tokens, variant);
+                    assert!(buckets.select(&shape).is_some(), "{shape} is inside the bound");
+                }
+            }
+            // One past the bound is refused by name, never clamped into the largest bucket.
+            let over = match variant.is_decode() {
+                true => Shape::decode(rows + 1, variant),
+                false => Shape::prefill(1, tokens + 1, variant),
+            };
+            assert!(buckets.require(&over).is_err(), "{over} is past the bound");
+        }
     }
 
     /// A forward is served by the smallest bucket that holds it, and never by a bucket of another
