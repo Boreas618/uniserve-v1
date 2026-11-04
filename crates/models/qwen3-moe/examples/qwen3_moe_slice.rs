@@ -291,12 +291,42 @@ impl Args {
 
 fn run() -> Result<()> {
     let args = Args::parse()?;
+    check_dump_dir(&args)?;
     match args.stage {
         Stage::Weights => stage_weights(&args),
         Stage::Embedding => stage_embedding(&args),
         Stage::Decode => run_stack(&args, None),
         Stage::Block => run_stack(&args, Some(args.layer)),
     }
+}
+
+/// Refuse a `--dump` directory that holds the reference's stages.
+///
+/// The two sides of every comparison are the reference's hooks' answer and the run's own tensors; a
+/// dump into the reference's directory overwrites the answer with the thing it is meant to judge, and
+/// the comparison that follows reads one file twice — a ratio of exactly 1 with no residual, which is
+/// indistinguishable from a correct run. `hidden_00.npy` is the embedding's stage, which a dump never
+/// writes (a dump starts at layer 1), and `_normalized`/`_attended` name cuts only the hooks produce.
+fn check_dump_dir(args: &Args) -> Result<()> {
+    let Some(dir) = args.dump.as_deref() else {
+        return Ok(());
+    };
+    let marks = [
+        "hidden_00.npy",
+        "hidden_01_normalized.npy",
+        "hidden_01_attended.npy",
+    ];
+    let hit = marks.iter().find(|name| dir.join(name).exists());
+    let Some(name) = hit else {
+        return Ok(());
+    };
+    Err(Failure::message(format!(
+        "--dump {} holds the reference's stages ({name}), so a dump there would overwrite the tensors \
+         every comparison is measured against: write the run's tensors to a directory of their own and \
+         read the reference with --reference {}",
+        dir.display(),
+        dir.display()
+    )))
 }
 
 // -------------------------------------------------------------------------------------------
