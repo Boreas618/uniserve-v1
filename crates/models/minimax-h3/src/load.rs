@@ -294,9 +294,22 @@ pub fn load(
     // bf16 weight beside f32 activations. A deployment that states a type converts each weight once,
     // and its retained key names the conversion, so the mixed export is legal only that way.
     if dtype.is_none() {
-        for component in partition.blocks.iter() {
-            for directory in component.directories() {
-                stored_dtype(checkpoint, directory)?;
+        // The weight-bearing blocks. The postprocessor is weightless, and the two condition
+        // encoders are the denoiser's half whose directories this loop does not own: they are
+        // checked by their own `require` and built by `ConditionEncoders::load`, which reads each
+        // half from its own component.
+        let weighted = [
+            Component::TextEncoder,
+            Component::Transformer,
+            Component::TransformerRef,
+            Component::VideoDecoder,
+            Component::AudioDecoder,
+        ];
+        for component in weighted {
+            if partition.blocks.contains(component) {
+                for directory in component.directories() {
+                    stored_dtype(checkpoint, directory)?;
+                }
             }
         }
     }
