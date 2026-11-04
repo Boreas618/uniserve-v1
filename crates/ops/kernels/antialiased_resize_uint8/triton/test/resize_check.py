@@ -1,35 +1,36 @@
 #!/usr/bin/env python3
-"""Run `antialiased_resize_uint8`'s kernel and check it against torch's antialiased resize.
+"""Run `antialiased_resize_uint8`'s kernel and check it against the rule its contract names.
 
-    crates/program-server/python/.venv/bin/python resize_check.py [--self-test]
+    crates/program-server/python/.venv/bin/python resize_check.py [--self-test] [--package DIR]
 
 This is `interpolate(scale, mode="bilinear"|"bicubic", antialias=True, align_corners=False)` on a
 `[rows, channels, height, width]` uint8 frame. The filter is separable: for an output index `i` along
-an axis, `center = (i + 0.5)·scale − 0.5`, `support = (bicubic ? 2 : 1)·max(1, scale)`, the taps are
-`ceil(center - support)` through `floor(center + support)` narrowed to those **inside** the input, and a tap weighs the kernel at
-its distance over the scale, divided by the sum of the kept taps so a constant image stays constant.
+an axis, `center = (i + 0.5)·scale − 0.5` and `support = (bicubic ? 2 : 1)·max(1, scale)`; the taps
+that contribute are the integers in `[center − support, center + support]`, each weighing the kernel at
+its distance divided by the scale, and the weights are divided by the sum of the ones that stay, so a
+constant image stays constant.
 
-**Two things about the reference that a check must not guess.**
+**The contract this program implements names torchvision's antialiased resize; H3's live image and
+video paths use Pillow's LANCZOS (`uniserve/media/reader.py`) and swscale's lanczos
+(`uniserve/video/media.py`) respectively, so a caller comparing against either must expect them to
+differ.** The check is pointed at the authority the contract names, not at whichever resampler is
+easier to call: that is the mistake the −0.5/−0.75 finding below is about. H3's aspect fit is also
+followed by a **crop**, so a resize that is right can still land in the wrong pixels if its edge
+convention differs from the cropper's; nothing here can see that.
+
+**Three things about the reference a check must not guess.**
 
 *The taps past an edge are dropped, not clamped.* Measured: a bilinear halving whose tap indices are
-clamped to the frame differs from `F.interpolate` by **7.4 code values** at the border row, and the
-same model with the taps dropped matches it **exactly**. The operator's kernel clamped the index; it
-now drops the tap and renormalises, which is the fix this check was written around.
+clamped to the frame differs from the rule by **7.4 code values** at the border row, and the same model
+with the taps dropped matches it **exactly**.
 
-*`F.interpolate`'s bicubic constant is −0.5, not torchvision's −0.75.* Measured the same way: the
-transcription below reproduces `F.interpolate`'s bicubic to **0.000000** with α = −0.5, and differs by
-7.1 code values with α = −0.75, which is the constant `torchvision.transforms.functional.resize` and
-this operator use. So bilinear cases are compared against `F.interpolate` itself and bicubic cases
-against the transcription at α = −0.75, with `--self-test` proving both halves: that the transcription
-is exact for the constant ATen uses, and that the two constants really differ.
+*The window's ends are the interval's.* The contributing taps are those in
+`[center − support, center + support]`, so the window runs from its **ceiling** to its **floor**.
+Rounding both ends — `floor(center ± support + 0.5)`, the natural-looking form — drops the last
+contributing tap whenever `center + support` is not near a half-integer, and at an integer scale it
+usually is. Measured on a random frame against `F.interpolate`, worst pixel of the frame:
 
-**Which taps are in the window is where a fractional scale goes wrong, and the interval settles it.**
-The contributing taps are those in `[center − support, center + support]`, so the window runs from its
-ceiling to its floor. Rounding both ends instead — `floor(center ± support + 0.5)`, which is what this
-kernel did — drops the last contributing tap whenever `center + support` is not near a half-integer,
-and at an integer scale it usually is. Measured on a random frame against `F.interpolate`:
-
-| scale | rounded window | the interval |
+| scale | rounded ends | the interval |
 | --- | --- | --- |
 | 16 → 11 | 23.19 code values | 0.0000 |
 | 13 → 9 | 20.17 | 0.0000 |
@@ -37,24 +38,31 @@ and at an integer scale it usually is. Measured on a random frame against `F.int
 | 14 → 5 | 4.31 | 0.0000 |
 | 16 → 8, 32 → 8 | 0.0000 | 0.0000 |
 
-So the transcription below reproduces torch's rule at **every** downscale, fractional ones included, and
-the downscaling bilinear cases are compared against `F.interpolate` itself.
+against a bound of one code value. The kernel and this transcription both had the rounded window, which
+is why they agreed with each other and were both wrong.
 
-**An upscale is the one case not compared against torch**, and it is stated rather than hidden:
+*`F.interpolate`'s bicubic constant is −0.5, not torchvision's −0.75.* Measured the same way: the
+transcription matches `F.interpolate` to **0.000000** with α = −0.5 and differs by 7.1 code values with
+α = −0.75, which is the constant `torchvision.transforms.functional.resize` and this operator use (the
+kernel hard-codes it). So bilinear cases are compared against `F.interpolate` itself, bicubic cases
+against the transcription at −0.75, and `--self-test` proves both halves.
+
+**The cases are the two scale pairs the pipeline runs** — `1280x720 → 1344x768` (1.05, an *upscale* in
+both axes) and `1920x1080 → 1344x768` (0.70) — not a toy geometry, so whatever authority is named later,
+the shapes under test are the shapes the canvas is. An **upscale is compared against the transcription
+and not against torch**, and that is measured rather than assumed:
 `F.interpolate(mode="bilinear", antialias=True)` on a 5×9 → 8×17 frame differs from the same separable
-rule by **109** code values, so torch's own upscale path is something this check does not reproduce. The
-case stays, compared against the transcription, because the window, the drop, the renormalisation and
-the quantiser are all exercised by it; nothing in this pipeline resizes up.
+rule by **109** code values, so torch's own upscale path is a question this check does not answer. The
+small pairs remain, in `--self-test`, as the lattice on which the transcription is proved against torch.
 
 The operator's bound is **one code value** — the quantiser's rounding tie — `Tolerance::exact()
-.with_atol(1.0)`. And every case's scale stays inside the kernel's eight-tap envelope (a halving with
-the cubic, a quartering with the triangle), where the tap count never reaches `MAX_TAPS`: a case
-beyond it measures the cap, not the arithmetic.
+.with_atol(1.0)`. Every scale stays inside the kernel's eight-tap envelope, where the tap count never
+reaches `MAX_TAPS`: a case beyond it measures the cap, not the arithmetic.
 
-**The kernel cannot run on Triton's interpreter**: it walks a row with `tl.range(0, out_width)`, and
-the interpreter hands that loop body Python integers, so `out_column.to(tl.float32)` raises `'int'
-object has no attribute 'to'` before any pixel is summed. So the device path is unproven until a
-device runs it, and `--self-test` is what proves the instrument here.
+**The kernel cannot run on Triton's interpreter**: it walks a row with `tl.range(0, out_width)`, and the
+interpreter hands that loop body Python integers, so `out_column.to(tl.float32)` raises `'int' object
+has no attribute 'to'` before any pixel is summed. Without a device the script says so and exits 0; the
+device path is written and unproven until a device runs it.
 """
 
 import argparse
@@ -66,8 +74,6 @@ import sys
 
 import torch
 import torch.nn.functional as F
-
-MODES = ("bilinear", "bicubic")
 
 #: The taps one axis may use, as the kernel's `MAX_TAPS` states it.
 MAX_TAPS = 8
@@ -105,38 +111,34 @@ def kernel_of(distance, mode, alpha):
     return max(0.0, 1.0 - absolute)
 
 
-def taps(extent, out_extent, mode, alpha):
-    """The kept taps and weights along one axis: `(index, weight)` per output index."""
+def weights(extent, out_extent, mode, alpha=CUBIC_ALPHA):
+    """The separable weights along one axis: one row of `out_extent` values per output index."""
     scale = extent / out_extent
     support = (2.0 if mode == "bicubic" else 1.0) * max(1.0, scale)
-    per_index = []
+    matrix = torch.zeros(out_extent, extent, dtype=torch.float64)
     for index in range(out_extent):
         center = (index + 0.5) * scale - 0.5
-        # The window of contributing taps is `[center - support, center + support]`: the first
-        # integer is its ceiling and the last its floor.
+        # The window is the interval the filter covers: from its ceiling to its floor.
         start = math.floor(center - support) + 1
         count = min(math.floor(center + support) - start + 1, MAX_TAPS)
         kept = [(start + tap, kernel_of((start + tap - center) / scale, mode, alpha))
                 for tap in range(count) if 0 <= start + tap < extent]
         total = sum(weight for _, weight in kept)
-        per_index.append([(position, weight / total) for position, weight in kept])
-    return per_index
+        for position, weight in kept:
+            matrix[index, position] = weight / total
+    return matrix
 
 
 def model(frames, out_height, out_width, mode, alpha=CUBIC_ALPHA):
-    """The operator's formula transcribed, in FP64, quantised the way the operator quantises."""
+    """The operator's formula, in FP64, quantised the way the operator quantises.
+
+    Written as the separable product it is: a `[out, in]` weight matrix per axis, applied to the frame.
+    A per-pixel loop is the same arithmetic and too slow to run at 1080p.
+    """
     values = frames.to(torch.float64)
-    rows, channels, height, width = values.shape
-    vertical = taps(height, out_height, mode, alpha)
-    horizontal = taps(width, out_width, mode, alpha)
-    out = torch.zeros(rows, channels, out_height, out_width, dtype=torch.float64)
-    for out_row, weights_h in enumerate(vertical):
-        for out_column, weights_w in enumerate(horizontal):
-            total = 0.0
-            for source_row, weight_h in weights_h:
-                for source_column, weight_w in weights_w:
-                    total = total + weight_h * weight_w * values[:, :, source_row, source_column]
-            out[:, :, out_row, out_column] = total
+    vertical = weights(frames.shape[2], out_height, mode, alpha)
+    horizontal = weights(frames.shape[3], out_width, mode, alpha)
+    out = torch.einsum("ih,rchw,jw->rcij", vertical, values, horizontal)
     return torch.clamp(torch.floor(out + 0.5), 0.0, 255.0).to(torch.int16)
 
 
@@ -147,113 +149,119 @@ def torch_resize(frames, out_height, out_width, mode):
     return torch.clamp(torch.floor(resized + 0.5), 0.0, 255.0).to(torch.int16)
 
 
+#: The two scale pairs the pipeline runs. `reference` says which authority the case is compared against:
+#: `torch` where `F.interpolate` reproduces the contract's rule, `operator` where it does not.
 CASES = [
-    # The fixture's cell: bicubic, three channels, a halving, where the cubic filter uses all eight
-    # taps and every border row is where the tap rule shows.
-    dict(what="the fixture's cell", mode="bicubic", channels=3, block=1024, rows=1, height=16,
-         width=16, out_height=8, out_width=8, pattern="random", reference="operator"),
-    # A checkerboard at a halving: the antialiasing itself.
-    dict(what="a checkerboard halved", mode="bicubic", channels=1, block=256, rows=1, height=16,
-         width=16, out_height=8, out_width=8, pattern="checker", reference="operator"),
-    # A bilinear quartering, which torch's own rule reproduces exactly, so it is compared to torch.
-    dict(what="a checkerboard quartered", mode="bilinear", channels=2, block=512, rows=1,
-         height=32, width=32, out_height=8, out_width=8, pattern="checker", reference="torch"),
-    dict(what="a bilinear halving", mode="bilinear", channels=3, block=256, rows=2, height=16,
-         width=16, out_height=8, out_width=8, pattern="random", reference="torch"),
-    # The kept taps' sum divides out, whatever the mode and scale.
-    dict(what="a constant image, bicubic", mode="bicubic", channels=3, block=256, rows=1,
-         height=13, width=13, out_height=7, out_width=9, pattern="constant",
-         reference="operator"),
-    dict(what="a constant image, bilinear", mode="bilinear", channels=4, block=256, rows=1,
-         height=9, width=9, out_height=5, out_width=5, pattern="constant", reference="torch"),
-    # Fractional scales, which is every real request: the taps' centres are fractional, so the window
-    # and the drop-and-renormalise rule both decide the answer.
-    dict(what="a non-square bicubic at 16 -> 11", mode="bicubic", channels=4, block=256, rows=2,
-         height=16, width=16, out_height=11, out_width=11, pattern="random",
-         reference="operator"),
-    dict(what="an uneven bilinear at 14 -> 5", mode="bilinear", channels=3, block=256, rows=2,
-         height=14, width=14, out_height=5, out_width=5, pattern="random", reference="torch"),
-    # An upscale: `max(1, scale)` is 1, so no widening.
-    dict(what="an upscale", mode="bicubic", channels=3, block=128, rows=1, height=7, width=7,
-         out_height=15, out_width=15, pattern="random", reference="operator"),
-    # An upscale is compared against the transcription and not against torch: measured,
-    # `F.interpolate(mode="bilinear", antialias=True)` on a 5x9 -> 8x17 frame differs by **109** code
-    # values from the same separable rule, so torch's own upscale path is a question this check does
-    # not answer. The arithmetic (window, drop, renormalise, quantiser) is still exercised here.
-    dict(what="an uneven upscale", mode="bilinear", channels=2, block=128, rows=1, height=5,
-         width=9, out_height=8, out_width=17, pattern="random", reference="operator"),
+    # 1920x1080 -> 1344x768: 0.70 both axes, the canvas H3 fits down to.
+    dict(what="1920x1080 -> 1344x768, bicubic", mode="bicubic", channels=3, block=1024, rows=1,
+         height=1080, width=1920, out_height=768, out_width=1344, pattern="random",
+         reference="operator", seed=21),
+    dict(what="1920x1080 -> 1344x768, bilinear", mode="bilinear", channels=3, block=1024, rows=1,
+         height=1080, width=1920, out_height=768, out_width=1344, pattern="random",
+         reference="torch", seed=22),
+    # 1280x720 -> 1344x768: 1.05 and 1.067 both axes, an upscale in each — compared against the
+    # transcription, because torch's own upscale path is not this rule (see the module docstring).
+    dict(what="1280x720 -> 1344x768, bicubic", mode="bicubic", channels=3, block=1024, rows=1,
+         height=720, width=1280, out_height=768, out_width=1344, pattern="random",
+         reference="operator", seed=23),
+    dict(what="1280x720 -> 1344x768, bilinear", mode="bilinear", channels=3, block=1024, rows=1,
+         height=720, width=1280, out_height=768, out_width=1344, pattern="random",
+         reference="operator", seed=24),
+    # The kept taps' sum divides out, whatever the mode and scale: a constant frame stays constant.
+    dict(what="a constant 1280x720 frame, bicubic", mode="bicubic", channels=3, block=1024, rows=1,
+         height=720, width=1280, out_height=768, out_width=1344, pattern="constant",
+         reference="operator", seed=25),
 ]
 
+#: The lattice on which `--self-test` proves the transcription against torch, per mode, kept inside the
+#: kernel's eight-tap envelope: a bilinear window holds `2·scale + 1` taps and a cubic `4·scale + 1`, so a
+#: cubic case is at most a halving. A pair beyond it would measure `MAX_TAPS` and not the arithmetic.
+PROOF_PAIRS = {
+    "bilinear": [(16, 11), (13, 9), (9, 5), (14, 5), (16, 8), (32, 8), (33, 17)],
+    "bicubic": [(16, 11), (13, 9), (16, 9), (9, 8), (16, 8), (33, 17)],
+}
 
-def frames_of(case, seed=37):
+
+def frames_of(case):
     """The case's frame batch, distinct in every pixel so a wrong tap cannot pass."""
-    torch.manual_seed(seed)
+    generator = torch.Generator().manual_seed(case["seed"])
     rows, channels = case["rows"], case["channels"]
     height, width = case["height"], case["width"]
-    if case["pattern"] == "checker":
-        picture = (torch.arange(height)[:, None] + torch.arange(width)[None, :]) % 2
-        picture = (picture.to(torch.float32) * 255.0).to(torch.uint8)
-        return picture.expand(rows, channels, height, width).contiguous()
     if case["pattern"] == "constant":
         return torch.full((rows, channels, height, width), 128, dtype=torch.uint8)
-    return torch.randint(0, 256, (rows, channels, height, width), dtype=torch.uint8)
+    return torch.randint(0, 256, (rows, channels, height, width), generator=generator,
+                         dtype=torch.uint8)
 
 
 def expected_of(case, frames):
-    """The reference for one case: torch where torch's rule is reproducible, else the operator's."""
+    """The reference for one case: torch where torch's rule is the contract's, else the operator's."""
     if case["reference"] == "torch":
         return torch_resize(frames, case["out_height"], case["out_width"], case["mode"])
     return model(frames, case["out_height"], case["out_width"], case["mode"], CUBIC_ALPHA)
 
 
 def self_test():
-    """Prove the instrument: the transcription, the two constants, and the case list's sharpness."""
+    """Prove the instrument: the rule at many scales, the two constants, and the case list's weight."""
     bilinear_exact = bicubic_exact = separated = 0
-    for case in CASES:
-        frames = frames_of(case)
-        torch_side = torch_resize(frames, case["out_height"], case["out_width"], case["mode"])
-        if case["reference"] == "torch":
-            got = model(frames, case["out_height"], case["out_width"], case["mode"])
-            difference = int((got - torch_side).abs().max())
-            # The FP64 transcription and torch's FP32 path may break a rounding tie differently, so
-            # the agreement is stated at the operator's own one-code bound; a systematic difference
-            # in the taps or the renormalisation is much larger than a code.
-            if difference > BOUND:
+    for mode, pairs in PROOF_PAIRS.items():
+        for extent, out in pairs:
+            generator = torch.Generator().manual_seed(extent * 100 + out)
+            picture = torch.randint(0, 256, (1, 1, extent, extent), generator=generator,
+                                    dtype=torch.uint8)
+            torch_side = torch_resize(picture, out, out, mode)
+            if mode == "bilinear":
+                difference = int((model(picture, out, out, mode) - torch_side).abs().max())
+                if difference > BOUND:
+                    raise SystemExit(
+                        f"bilinear {extent} -> {out}: the transcription is {difference} codes from "
+                        f"torch's own resize, so the model is not the rule torch applies")
+                bilinear_exact += 1
+                continue
+            aten = model(picture, out, out, mode, ATEN_ALPHA)
+            if int((aten - torch_side).abs().max()) > BOUND:
                 raise SystemExit(
-                    f"{case['what']}: the transcription is {difference} codes from torch's own "
-                    f"resize, so the model is not the rule torch applies"
-                )
-            bilinear_exact += 1
-        if case["mode"] == "bicubic":
-            # ATen's own constant, on the cases where torch's rule itself is reproduced.
-            aten = model(frames, case["out_height"], case["out_width"], "bicubic", ATEN_ALPHA)
-            if int((aten - torch_side).abs().max()) <= BOUND:
-                bicubic_exact += 1
-            ours = model(frames, case["out_height"], case["out_width"], "bicubic", CUBIC_ALPHA)
+                    f"bicubic {extent} -> {out}: the transcription at ATen's own constant is not "
+                    f"torch's answer, so the cubic form is wrong and not only its constant")
+            bicubic_exact += 1
+            ours = model(picture, out, out, mode, CUBIC_ALPHA)
             if int((ours - torch_side).abs().max()) > BOUND:
                 separated += 1
     if not bilinear_exact:
         raise SystemExit(
-            "no case compares the transcription against torch's own rule, so the taps, the dropped "
+            "no case compares the transcription against torch's own rule, so the window, the dropped "
             "edge taps and the renormalisation are unproven")
     if not bicubic_exact:
         raise SystemExit(
-            "no bicubic case reproduces torch's own rule at ATen's constant, so the cubic form is "
-            "unproven and only its constant is")
+            "no case reproduces torch's rule at ATen's constant, so the cubic form is unproven and "
+            "only its constant is")
     if not separated:
         raise SystemExit(
-            "no case tells torchvision's cubic constant from ATen's, so a check that compares "
+            "no case tells torchvision's cubic constant from ATen's, so a check that compared "
             "bicubic output to F.interpolate would pass a kernel with the wrong one")
-    print(f"ok: the transcription reproduces torch's own rule on {bilinear_exact} integer-scale case"
-          f"(s) and on {bicubic_exact} bicubic case(s) at ATen's constant; {separated} case(s) tell "
-          f"torchvision's cubic constant from ATen's by more than a code value")
+    # And the reference holds at the sizes the pipeline runs, which is what the cases are.
+    for case in CASES:
+        if case["reference"] != "torch":
+            continue
+        frames = frames_of(case)
+        difference = int((model(frames, case["out_height"], case["out_width"], case["mode"])
+                          - torch_resize(frames, case["out_height"], case["out_width"],
+                                         case["mode"])).abs().max())
+        if difference > BOUND:
+            raise SystemExit(
+                f"{case['what']}: the transcription is {difference} codes from torch at the size the "
+                f"pipeline runs")
+    print(f"ok: the transcription is torch's own rule on {bilinear_exact} bilinear pairs and on "
+          f"{bicubic_exact} bicubic pairs at ATen's constant, {separated} pairs tell torchvision's "
+          f"cubic constant from ATen's by more than a code value, and it holds at the two scale pairs "
+          f"the pipeline runs")
+    return 0
 
 
 def check(module, case):
     """One resize, compared to the reference at the operator's one-code bound."""
     frames = frames_of(case)
-    out = torch.full((case["rows"], case["channels"], case["out_height"], case["out_width"]), 0,
-                     dtype=torch.uint8)
+    out = torch.zeros((case["rows"], case["channels"], case["out_height"], case["out_width"]),
+                      dtype=torch.uint8)
     scale_h = float(case["height"]) / float(case["out_height"])
     scale_w = float(case["width"]) / float(case["out_width"])
     units = case["rows"] * case["channels"] * case["out_height"]
@@ -265,8 +273,9 @@ def check(module, case):
     )
 
     expected = expected_of(case, frames)
-    where = (f"{case['what']}: {case['mode']} {case['rows']}x{case['channels']} of "
-             f"{case['height']}x{case['width']} -> {case['out_height']}x{case['out_width']}")
+    where = (f"{case['what']}: {case['rows']}x{case['channels']} of {case['height']}x"
+             f"{case['width']} -> {case['out_height']}x{case['out_width']}, against "
+             f"{'torch' if case['reference'] == 'torch' else 'the transcription'}")
     difference = (out.to(torch.int16) - expected).abs()
     violations = int((difference > BOUND).sum())
     if violations:
@@ -274,13 +283,11 @@ def check(module, case):
         raise SystemExit(
             f"{where}: {violations} of {out.numel()} codes are more than {BOUND} away from the "
             f"reference; first at {position}: {int(out.reshape(-1)[position])} vs "
-            f"{int(expected.reshape(-1)[position])}"
-        )
+            f"{int(expected.reshape(-1)[position])}")
     if case["pattern"] == "constant" and int(difference.max()) != 0:
         raise SystemExit(
-            f"{where}: a constant image resized to {int(out.max())}/{int(out.min())}, not 128 — the "
-            f"taps' sum does not divide out"
-        )
+            f"{where}: a constant frame resized to {int(out.max())}/{int(out.min())}, not 128 — the "
+            f"taps' sum does not divide out")
     return out.numel(), int((difference == 1).sum())
 
 
@@ -296,11 +303,10 @@ def main():
                         help="prove the reference without the kernel")
     options = parser.parse_args()
     if options.self_test:
-        return self_test() or 0
+        return self_test()
     if not torch.cuda.is_available():
         os.environ.setdefault("TRITON_INTERPRET", "1")
         module = load_kernel(options.package)
-        case = CASES[0]
         frames = torch.zeros(1, 1, 4, 4, dtype=torch.uint8)
         try:
             module._antialiased_resize_uint8_kernel[(1, 1, 1)](
@@ -319,6 +325,7 @@ def main():
         count, tie = check(module, case)
         checked += count
         ties += tie
+        print(f"  {case['what']}: {count} codes")
     print(f"ok: {checked} resized codes over {len(CASES)} cases, none more than one code value from "
           f"the reference, {ties} of them on a rounding tie")
     return 0
