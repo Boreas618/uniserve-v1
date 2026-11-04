@@ -26,8 +26,10 @@ Two measures, because they answer different questions:
   leaves `rel` near it.
 
 The dump holds **bf16** values widened to float32, so a perfectly correct run still differs from a
-float32 reference by that rounding: `--floor` defaults to `3e-3` per value and the table prints the
-first layer that leaves it. Rows are reported too: the last row is the one that becomes the logits,
+float32 reference by that rounding - about `2e-3` per value, and it does not grow with depth, because
+each hidden state is rounded on its own rather than accumulated. The verdict uses the same 5% the
+slice uses (`--floor`), so the two agree on which stage is the first to diverge; a number below the
+floor is rounding and a number above it is structure. Rows are reported too: the last row is the one that becomes the logits,
 and a divergence that starts at row 0 while the later rows agree is a causal-mask fault, not a
 numerical one.
 """
@@ -77,8 +79,8 @@ def main():
     parser.add_argument(
         "--floor",
         type=float,
-        default=3e-3,
-        help="the relative error a correct run may still show (bf16 rounding), default 3e-3",
+        default=0.05,
+        help="the relative error that counts as divergence, matching the slice's 5%, default 0.05",
     )
     arguments = parser.parse_args()
 
