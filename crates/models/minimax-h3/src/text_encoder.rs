@@ -1245,6 +1245,44 @@ fn write_state(
     write_i32(&mut out[6], &lengths, "vision_lengths")
 }
 
+/// The bytes of every host table one prompt of `ids` and `layout` needs, with its declaration.
+///
+/// This is the whole of [`Encoder::prepare_state`] without an encoder: the arithmetic depends on the
+/// configuration and the prompt, not on the weights, so the block-by-block diagnosis can compare the
+/// tables against the reference without loading a checkpoint (specs/worker.md 10). Serving does not
+/// call it: the executor owns the buffers there, and `prepare_state` writes into them in place.
+pub fn table_bytes(
+    config: &TextEncoderConfig,
+    ids: &[u32],
+    layout: &EncoderLayout,
+) -> Result<Vec<(StateTable, Vec<u8>)>> {
+    let grids = layout
+        .images
+        .iter()
+        .map(|image| image.grid)
+        .collect::<Vec<_>>();
+    let plan = Plan::new(config, &Partition::single(), layout.tokens, &grids)?;
+    if plan.rows != layout.rows {
+        return Err(Error::config(format!(
+            "the layout reserves {} output rows for a {} token prompt",
+            layout.rows, plan.rows
+        )));
+    }
+    let tables = table_specs(config, layout.rows, &plan.images, &plan.time, plan.merged);
+    let bytes = tables
+        .iter()
+        .map(|table| {
+            let width = table.dtype.bits().div_ceil(8) as u64;
+            usize::try_from(table.shape.numel() * width)
+                .map(|bytes| vec![0_u8; bytes])
+                .map_err(|_| Error::config("a table larger than a host allocation".to_owned()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut buffers = bytes;
+    write_state(config, ids, layout, &mut buffers)?;
+    Ok(tables.into_iter().zip(buffers).collect())
+}
+
 /// The grids [`positions::rope_index`] reads: one list per placeholder kind, in prompt order.
 type GridRuns = (Vec<[u32; 3]>, Vec<[u32; 3]>);
 
