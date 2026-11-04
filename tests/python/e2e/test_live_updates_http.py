@@ -82,9 +82,9 @@ pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
 OPTIONS = (
     "dtype=bfloat16",
     # The attention program the deployment's paged attention executes, as a
-    # package name (``KERNEL_PACKAGES``). ``auto`` names no package, so the
-    # deployment names the backend design 9's default choice picks for this
-    # shape: trtllm-gen.
+    # package name (one of the store's packages, ``KEYS``). ``auto`` names no
+    # package, so the deployment names the backend design 9's default choice
+    # picks for this shape: trtllm-gen.
     "attention_backend=trtllm",
     "kv_cache_config.max_tokens=32768",
     "chat_config.reasoning_parser=none",
@@ -139,7 +139,20 @@ PLUGIN_ENTRY_POINTS = (
 # it is the one design 9's default choice resolves to for this shape — BF16, no
 # window, head_dim 128, 64-token pages, one rank: trtllm-gen.
 POLICY_PACKAGE = "crates/ops/program-fixtures/policy"
-KERNEL_PACKAGES = ("crates/ops/kernels/paged_attention/trtllm",)
+
+#: The descriptor keys the deployment launches: the model's own ``keys()`` plus
+#: the executor's sampler launches, as ``crates/ops`` generators state them
+#: (``notes/programs/qwen3-moe-keys.txt``). The store the fixture serves holds a
+#: module for every one of them.
+#:
+#: This file used to install one kernel package, the attention one the daemon
+#: names. That is enough for the epoch to *resolve* — the daemon names one
+#: operator and the Program Server fills that slot — but not to serve: a main
+#: process installs the kernels the model actually launches, and it resolves
+#: them from this host's store (``listed_programs`` in ``src/engine_main.rs``).
+#: With two packages there, the listing described nothing to overlay and the
+#: precopy stood in ``this node's devices`` until its 300 s budget ended it.
+KEYS = "notes/programs/qwen3-moe-keys.txt"
 
 #: The socket of the module's Program Server, which every deployment of this
 #: file reaches through ``--program-server``. Set by :func:`program_server`.
@@ -190,15 +203,104 @@ def _precompiler() -> Path:
     return root / "target" / "debug" / "scheduling-precompile"
 
 
+def _program_target() -> str:
+    """The target this host's modules are built for.
+
+    The engine derives it from the device it serves — ``sm_{major}{minor}a``
+    (``src/engine_plan.rs``) — and a store built for another target describes
+    nothing to overlay: the precopy then fails at the module lane rather than
+    the build. So the default is the served device's own compute capability,
+    read the way this file already reads that device; the environment's
+    ``UNISERVE_PROGRAM_TARGET`` names a target instead, for a host whose store
+    is provisioned elsewhere.
+    """
+    named = os.environ.get("UNISERVE_PROGRAM_TARGET")
+    if named:
+        return named
+    device = os.environ.get("UNISERVE_LIVE_DEVICE", "0")
+    reported = subprocess.run(
+        [
+            "nvidia-smi",
+            f"--id={device}",
+            "--query-gpu=compute_cap",
+            "--format=csv,noheader",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    major, _, minor = reported.partition(".")
+    if not major.isdigit() or not minor.isdigit():
+        raise AssertionError(
+            f"nvidia-smi reported no compute capability for GPU {device}: "
+            f"{reported!r}"
+        )
+    return f"sm_{major}{minor}a"
+
+
+def _build_store(store: Path, target: str, python: Path | None) -> None:
+    """Builds a module for every kernel key the deployment launches.
+
+    `store` is ``build_fixtures``'s store, which it fills in its own shape: the
+    installed package sources under ``<store>/packages`` and the prepared
+    modules under ``<store>/modules``. The directory a Program Server serves is
+    the second of those — a store root holds the modules, not the store's
+    parent.
+
+    ``build_fixtures`` (``crates/program-server/examples``) is the store's own
+    producer: for each ``operator<TAB>key`` line it installs the operator's
+    package, prepares that key for `target`, and resolves it to the module it
+    names. The builds are real — Triton, nvcc and CuTe DSL all run — so this
+    takes minutes rather than seconds, once per module. The Program Server then
+    serves the store as it stands, which is why ``--store-root`` below is this
+    directory and no kernel package is installed a second time.
+    """
+    command = [
+        "cargo",
+        "run",
+        "--package",
+        "program-server",
+        "--example",
+        "build_fixtures",
+        "--",
+        "--keys",
+        str(_repository() / KEYS),
+        "--target",
+        target,
+        "--store",
+        str(store),
+    ]
+    if python is not None:
+        command += ["--python", str(python)]
+    built = subprocess.run(
+        command,
+        cwd=_repository(),
+        capture_output=True,
+        text=True,
+        timeout=3600,
+    )
+    if built.returncode != 0:
+        raise AssertionError(
+            "building the deployment's kernels failed: "
+            f"{built.stdout[-4000:]}\n{built.stderr[-4000:]}"
+        )
+
+
 @pytest.fixture(scope="module", autouse=True)
 def program_server(tmp_path_factory: pytest.TempPathFactory):
     """The host's Program Server, with the deployment's programs installed.
 
     Autouse and module-scoped because every deployment of this file needs it:
     the daemon's leader resolves each epoch's programs at this server, and a
-    program's module exists nowhere else. Every package the deployment selects
-    is installed once, here — the policy and ``KERNEL_PACKAGES`` — because the
-    epoch is refused by the first slot no installed program fills.
+    program's module exists nowhere else. Two sets of programs are here, built
+    once for the module:
+
+    * the kernels — a module for every descriptor key the deployment launches,
+      built into the store by ``build_fixtures`` (``KEYS``). The epoch is
+      refused by the first slot no installed program fills, and a main process
+      serves nothing until it can install the kernels the model launches;
+    * the policy — ``POLICY_PACKAGE``, installed below, because a policy is a
+      wasm package this host precompiles rather than a kernel key.
 
     The package root and the store live as long as the module, and every test
     of the module deploys against this one server, so a module is built once and
@@ -212,11 +314,15 @@ def program_server(tmp_path_factory: pytest.TempPathFactory):
     binary = require_uniserve_binary()
     work = tmp_path_factory.mktemp("program-server")
     socket = work / "program-server.sock"
-    packages = work / "packages"
-    packages.mkdir()
-    store = work / "store"
-    store.mkdir()
     log = work / "program-server.log"
+    target = _program_target()
+    interpreter = _repository() / ".venv" / "bin" / "python"
+    built = work / "programs"
+    _build_store(built, target, interpreter if interpreter.exists() else None)
+    # The builder's two directories are the two the server is given: installed
+    # sources for a rebuild, prepared modules for what it serves.
+    packages = built / "packages"
+    store = built / "modules"
     command = [
         str(binary),
         "program-server",
@@ -228,11 +334,10 @@ def program_server(tmp_path_factory: pytest.TempPathFactory):
         "--store-root",
         str(store),
         "--target",
-        os.environ.get("UNISERVE_PROGRAM_TARGET", "sm_100a"),
+        target,
         "--wasm",
         str(_precompiler()),
     ]
-    interpreter = _repository() / ".venv" / "bin" / "python"
     if interpreter.exists():
         command += ["--python", str(interpreter)]
     process = start_server(command, log)
@@ -246,7 +351,7 @@ def program_server(tmp_path_factory: pytest.TempPathFactory):
     else:
         raise TimeoutError(f"the Program Server left no socket at {socket}")
 
-    for package in (POLICY_PACKAGE, *KERNEL_PACKAGES):
+    for package in (POLICY_PACKAGE,):
         installed = subprocess.run(
             [
                 str(binary),
