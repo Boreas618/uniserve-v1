@@ -234,16 +234,33 @@ fn packaged_program(capacity: BatchCapacity) -> PolicyProgram {
 /// The module `SCHED_POLICY_WASM` names: the `fcfs` program this tree builds
 /// for `wasm32-unknown-unknown`.
 fn packaged_module() -> Vec<u8> {
-    let path = std::env::var("SCHED_POLICY_WASM").unwrap_or_else(|_| {
-        panic!(
-            "SCHED_POLICY_WASM names the scheduling policy module this source serves with, and it              is unset. Build it with `cargo build -p scheduling-policy-fcfs --target \
-             wasm32-unknown-unknown --release` and set SCHED_POLICY_WASM to the file it wrote, \
-             e.g. target/wasm32-unknown-unknown/release/scheduling_policy_fcfs.wasm"
-        )
-    });
+    let path = std::env::var("SCHED_POLICY_WASM").unwrap_or_else(|_| built_module());
     std::fs::read(&path).unwrap_or_else(|error| {
-        panic!("SCHED_POLICY_WASM names `{path}`, which cannot be read: {error}")
+        panic!("the scheduling policy module `{path}` cannot be read: {error}")
     })
+}
+
+/// The module `cargo build -p scheduling-policy-fcfs --target
+/// wasm32-unknown-unknown --release` writes in this tree, for a caller that
+/// named none.
+///
+/// It is this tree's own build of the `fcfs` policy — the same bytes a caller
+/// would name — read from where `cargo build` puts them, so a test run needs
+/// no variable to serve a policy. A workspace that builds elsewhere
+/// (`CARGO_TARGET_DIR`) should still state `SCHED_POLICY_WASM`; absent both,
+/// this fails with the command that writes the module rather than serving none.
+fn built_module() -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/wasm32-unknown-unknown/release/scheduling_policy_fcfs.wasm");
+    if !path.is_file() {
+        panic!(
+            "SCHED_POLICY_WASM is unset and {} does not exist. Build it with `cargo build -p \
+             scheduling-policy-fcfs --target wasm32-unknown-unknown --release`, or set \
+             SCHED_POLICY_WASM to the file that build writes.",
+            path.display()
+        );
+    }
+    path.display().to_string()
 }
 
 #[cfg(test)]
