@@ -24,6 +24,7 @@
 
 use nn::{Block, BlockName};
 
+use crate::audio_vae::AudioDecoder;
 use crate::checkpoint::{Dit, Layout, Sidecars};
 use crate::config::Config;
 use crate::denoiser::{Denoiser, Layouts};
@@ -118,10 +119,18 @@ pub fn load(
                 )?;
                 Block::Denoiser(Box::new(denoiser))
             }
-            Component::VideoDecoder | Component::AudioDecoder | Component::LatentEncoder => {
-                // The decoders and the condition encoders become capability blocks as their
-                // layers land; until then a deployment that places one is refused here rather
-                // than served by a half-built block.
+            Component::AudioDecoder => {
+                // The audio decoder has no layout tables - every table it reads is a weight bound
+                // at load - so it constructs from its own component and its sidecar alone.
+                let source = checkpoint.component("audio_vae")?;
+                let mut shards = loader.reborrow(source)?;
+                let decoder = AudioDecoder::load(&config.audio_vae, &mut shards)?;
+                Block::Decoder(Box::new(decoder))
+            }
+            Component::VideoDecoder | Component::LatentEncoder => {
+                // The video decoder is sized by the canvas a request serves and the condition
+                // encoders become capability blocks as their layers land; until then a deployment
+                // that places one is refused here rather than served by a half-built block.
                 return Err(Error::Unsupported(format!(
                     "the {} block has no construction yet, so it cannot be placed",
                     component.name()
