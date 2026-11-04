@@ -1647,13 +1647,26 @@ impl MainProcess {
     /// The Program Server's store as it stands: every installed package, its revision and the
     /// descriptors its modules cover for each target.
     fn listing(&self) -> std::result::Result<program_server::Listing, String> {
+        // The one call that leaves this process before a generation is prepared, and the one with no
+        // deadline of its own: the client's connect and reply read are unbounded, so a store that
+        // never answers holds whoever asked. Both sides say so - a line before the call and one with
+        // the count after it - so a run attributes the wait from its log rather than by inference.
+        // Every caller of this function runs on the control thread today, which is why that thread
+        // must not be the one to ask; a staging call that blocks it stops commands, events, metrics
+        // and the watchdog together.
+        tracing::info!("asking the Program Server for its installed programs");
         let mut client = self
             .programs
             .lock()
             .map_err(|_| "the Program Server client was poisoned".to_owned())?;
-        client
+        let listing = client
             .list()
-            .map_err(|error| format!("reading the Program Server's store: {error}"))
+            .map_err(|error| format!("reading the Program Server's store: {error}"))?;
+        tracing::info!(
+            packages = listing.packages.len(),
+            "the Program Server's listing answered"
+        );
+        Ok(listing)
     }
 
     /// The programs this host has built, one per operator, for a precopy that names none.
