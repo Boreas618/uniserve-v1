@@ -499,6 +499,9 @@ impl Layouts {
                 shape: Shape::new(&[rows]),
             },
             StateTable {
+                // Over-allocated to the tile count and filled by segment index, exactly as the
+                // reference builds it (`packing.py:1228-1239`); `select` reads only its first
+                // `segments` entries, which is the prefix view the layer hands it.
                 name: "segment_keep",
                 dtype: DType::I32,
                 shape: Shape::new(&[tiles]),
