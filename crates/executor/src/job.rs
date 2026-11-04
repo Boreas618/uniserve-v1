@@ -30,7 +30,6 @@ use crate::batch::{
 };
 use crate::completion::Outcome;
 use crate::stream::events::{EventPool, JobId};
-use crate::stream::recorded;
 use crate::{Error, Result, lock};
 
 /// One command waiting for the device thread, or being performed by it.
@@ -83,8 +82,6 @@ pub(crate) enum Command {
     /// Release everything that references a generation that was prepared and never served, which
     /// is a generation *newer* than the serving one and so out of `Purge`'s reach (7.3 step 2).
     Discard(u64),
-    /// A storage owner's recorded issue work.
-    Issue(std::sync::Arc<std::sync::Mutex<recorded::Batch>>),
     /// Wait for the events deferred storage release hangs on.
     After(Vec<Arc<platform::Event>>),
 }
@@ -106,7 +103,6 @@ impl Command {
             Self::Revert(generation) => format!("reverting generation {generation}"),
             Self::Purge(generation) => format!("purging generation {generation}"),
             Self::Discard(generation) => format!("discarding generation {generation}"),
-            Self::Issue(_) => "issuing deferred storage work".to_owned(),
             Self::After(_) => "waiting for deferred storage work".to_owned(),
         }
     }
@@ -259,16 +255,6 @@ impl JobQueue {
         drop(state);
         self.ready.notify_one();
         id
-    }
-
-    /// The recorded issue work of one storage submission, named for the queue.
-    pub(crate) fn issue(&self, work: recorded::Batch) -> Result<JobId> {
-        self.push(
-            Command::Issue(std::sync::Arc::new(std::sync::Mutex::new(work))),
-            None,
-            JobKind::Issue,
-            None,
-        )
     }
 
     /// The next command, once one is pending or `timeout` passed; `None` when the queue closed.
@@ -427,28 +413,8 @@ pub(crate) fn jobs_of(runner: crate::runner::RunnerId, jobs: crate::batch::Jobs)
                 bucket: *bucket,
                 generation: *generation,
             },
-            Job::Issue { .. } | Job::After { .. } => {
-                unreachable!("a runner returned a job the device queue owns")
-            }
         })
         .collect()
-}
-
-/// The kind of a command, for the watchdog.
-pub(crate) fn kind_of(command: &Command) -> JobKind {
-    match command {
-        Command::Batch(_) => JobKind::Batch,
-        Command::Warmup => JobKind::Warmup,
-        Command::Precopy(_) => JobKind::Precopy,
-        Command::Shadow(_) | Command::SetShadow => JobKind::Shadow,
-        Command::Steps { .. } => JobKind::Precopy,
-        Command::Switchover(_) => JobKind::Switchover,
-        Command::Revert(_) => JobKind::Revert,
-        Command::Purge(_) => JobKind::Purge,
-        Command::Discard(_) => JobKind::Discard,
-        Command::Issue(_) => JobKind::Issue,
-        Command::After(_) => JobKind::After,
-    }
 }
 
 /// The phase a batch names, for the runner lookup.

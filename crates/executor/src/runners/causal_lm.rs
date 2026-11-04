@@ -1413,9 +1413,6 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
             } => self
                 .rebind(*bucket, *generation)
                 .map(|()| BatchOutput::default()),
-            Job::Issue { .. } | Job::After { .. } => Err(Error::Invariant(
-                "the device queue performs its own jobs".into(),
-            )),
         }
     }
 
