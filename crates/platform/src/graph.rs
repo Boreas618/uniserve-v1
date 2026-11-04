@@ -110,7 +110,7 @@ impl Graph {
             "cuGraphInstantiateWithFlags",
         )?;
         Ok(GraphExec {
-            core: self.core.clone(),
+            core: Arc::clone(&self.core),
             raw,
         })
     }
@@ -127,7 +127,7 @@ impl Graph {
         Ok(handles
             .into_iter()
             .map(|raw| GraphNode {
-                core: self.core.clone(),
+                core: Arc::clone(&self.core),
                 raw,
             })
             .collect())
@@ -155,31 +155,29 @@ impl Graph {
         nodes.truncate(count);
         Ok(nodes)
     }
+}
 
-    /// The graph's root nodes: those with no dependency.
-    fn root_handles(&self) -> Result<Vec<Handle>> {
-        let driver = driver::driver()?;
-        let _context = self.core.context.enter()?;
-        let mut count = 0usize;
-        driver.check(
-            // SAFETY: a null array asks only for the count.
-            unsafe {
-                (driver.graph_get_root_nodes)(self.core.raw, std::ptr::null_mut(), &mut count)
-            },
-            "cuGraphGetRootNodes",
-        )?;
-        if count == 0 {
-            return Ok(Vec::new());
-        }
-        let mut nodes = vec![std::ptr::null_mut(); count];
-        driver.check(
-            // SAFETY: the array holds `count` handles, which the driver fills.
-            unsafe { (driver.graph_get_root_nodes)(self.core.raw, nodes.as_mut_ptr(), &mut count) },
-            "cuGraphGetRootNodes",
-        )?;
-        nodes.truncate(count);
-        Ok(nodes)
+/// The template graph's root nodes: those with no dependency.
+fn root_handles(core: &Core) -> Result<Vec<Handle>> {
+    let driver = driver::driver()?;
+    let _context = core.context.enter()?;
+    let mut count = 0usize;
+    driver.check(
+        // SAFETY: a null array asks only for the count.
+        unsafe { (driver.graph_get_root_nodes)(core.raw, std::ptr::null_mut(), &mut count) },
+        "cuGraphGetRootNodes",
+    )?;
+    if count == 0 {
+        return Ok(Vec::new());
     }
+    let mut nodes = vec![std::ptr::null_mut(); count];
+    driver.check(
+        // SAFETY: the array holds `count` handles, which the driver fills.
+        unsafe { (driver.graph_get_root_nodes)(core.raw, nodes.as_mut_ptr(), &mut count) },
+        "cuGraphGetRootNodes",
+    )?;
+    nodes.truncate(count);
+    Ok(nodes)
 }
 
 /// One node of a template graph (`CUgraphNode`).
@@ -276,9 +274,9 @@ impl GraphExec {
                 "the node does not belong to the graph this executable was instantiated from",
             ));
         }
-        if params.function.context().raw() != self.core.context.raw() {
+        if params.function.device().id() != self.core.device {
             return Err(Error::invalid(
-                "the node's function belongs to another device's context",
+                "the node's function belongs to another device",
             ));
         }
 
@@ -318,7 +316,7 @@ impl GraphExec {
 
 impl Drop for GraphExec {
     fn drop(&mut self) {
-        let (core, raw) = (self.core.clone(), self.raw as usize);
+        let (core, raw) = (Arc::clone(&self.core), self.raw as usize);
         // Queued before the template's own release, which the `core` clone
         // keeps from happening first.
         reclaim::defer(move || {
@@ -345,7 +343,7 @@ impl Drop for GraphExec {
 /// is what the owner records to rebind a graph later.
 pub struct Capture {
     stream: Stream,
-    graph: Option<Graph>,
+    core: Arc<Core>,
     /// The dependency set of the next node: the nodes added by the previous
     /// operation end here, and the next operation's nodes are reachable from
     /// them.
@@ -381,16 +379,13 @@ impl Capture {
                 "the stream's capture is in status {status} right after it began"
             )));
         }
-        let graph = Graph {
+        Ok(Self {
+            stream: stream.clone(),
             core: Arc::new(Core {
                 raw: graph,
                 context,
                 device: stream.device(),
             }),
-        };
-        Ok(Self {
-            stream: stream.clone(),
-            graph: Some(graph),
             frontier,
             seen: HashSet::new(),
             ended: false,
@@ -405,10 +400,6 @@ impl Capture {
     /// the nodes are that operation's, and the owner records which operation
     /// they belong to for a later rebind.
     pub fn record(&mut self) -> Result<Vec<GraphNode>> {
-        let graph = self
-            .graph
-            .as_ref()
-            .expect("a capture has its graph until it ends");
         let (status, _, frontier) = capture_info(&self.stream)?;
         if status != CU_STREAM_CAPTURE_STATUS_ACTIVE {
             return Err(Error::invalid(format!(
@@ -421,7 +412,7 @@ impl Capture {
         // The next node depends on the frontier. When the dependency set is
         // empty (the first operation, or an operation that clears it), the
         // new nodes are the graph's root nodes instead.
-        for root in graph.root_handles()? {
+        for root in root_handles(&self.core)? {
             if self.seen.insert(root as usize) {
                 found.push(root);
                 queue.push_back(root);
@@ -440,7 +431,7 @@ impl Capture {
         Ok(found
             .into_iter()
             .map(|raw| GraphNode {
-                core: graph.core.clone(),
+                core: Arc::clone(&self.core),
                 raw,
             })
             .collect())
@@ -457,15 +448,12 @@ impl Capture {
             "cuStreamEndCapture",
         )?;
         self.ended = true;
-
-        let graph = self
-            .graph
-            .take()
-            .expect("a capture has its graph until it ends");
         // The driver promises the same graph at the end of the capture; a
         // different handle would leave the node handles of `record` dangling.
-        debug_assert_eq!(raw, graph.core.raw);
-        Ok(graph)
+        debug_assert_eq!(raw, self.core.raw);
+        Ok(Graph {
+            core: Arc::clone(&self.core),
+        })
     }
 }
 
