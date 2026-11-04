@@ -19,29 +19,29 @@
 //! again, so no token is computed twice.
 
 use std::future::Future;
-use std::sync::Arc;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use anyhow::Context as _;
 use bytes::Bytes;
 use futures::FutureExt as _;
 use proto::handoff;
-use anyhow::Context as _;
 use thiserror_ext::AsReport as _;
 use tracing::{error, trace};
 
 use crate::http::stream::{Application, Session, Step};
 use crate::metrics::stats::RequestOutcome;
 use crate::migration::{RequestEvents, Step as EventStep};
+use crate::openai::chat_completions::ChatResponseContext;
 use crate::openai::chat_completions::ChatStreamEmitter;
 use crate::openai::error::ApiError;
-use crate::openai::chat_completions::ChatResponseContext;
 use crate::output::assembly::StreamClock;
-use crate::output::chat::structured::StructuredEventState;
 use crate::output::chat::ChatOutputProcessor;
-use crate::output::text::{DecodeStream, DecodedTextEvent, ImageEvent};
+use crate::output::chat::structured::StructuredEventState;
 use crate::output::text::TextDecodeOptions;
+use crate::output::text::{DecodeStream, DecodedTextEvent, ImageEvent};
 use crate::output::{OutputError, RequestOutput, RequestUsage};
 use crate::tokenizer::DynTokenizer;
 
@@ -526,8 +526,9 @@ impl<S: ResponseSink> GenerationRun<S> {
                 tokenizer.clone(),
                 parser.parse_reasoning,
             )?,
-            handoff::parser::Kind::ParserKindSenseNova
-            | handoff::parser::Kind::ParserKindNone => ChatOutputProcessor::new(None, None),
+            handoff::parser::Kind::ParserKindSenseNova | handoff::parser::Kind::ParserKindNone => {
+                ChatOutputProcessor::new(None, None)
+            }
         };
         if let Some(parsers) = state.processor {
             processor.resume(parsers);
@@ -595,23 +596,25 @@ impl<S: ResponseSink> GenerationRun<S> {
         };
         let body = self.sink.body_state()?;
         Some(match body {
-            BodyState::Stream(chunks) => handoff::stream::Application::ChatStream(handoff::ChatStream {
-                request: self.events.submitted().unwrap_or_default(),
-                lowering: Some(lowering),
-                decode: Some(self.decode.state()),
-                processor: Some(processor),
-                assembly: Some(assembly),
-                chunks: Some(chunks),
-                consumed_events,
-                consumed_tokens,
-                usage_owed: self.context.include_usage && !self.sink.done(),
-                engine_request_id: self
-                    .events
-                    .engine_request_id()
-                    .map(|id| id.0.to_string())
-                    .unwrap_or_default(),
-                engine_replica: self.replica,
-            }),
+            BodyState::Stream(chunks) => {
+                handoff::stream::Application::ChatStream(handoff::ChatStream {
+                    request: self.events.submitted().unwrap_or_default(),
+                    lowering: Some(lowering),
+                    decode: Some(self.decode.state()),
+                    processor: Some(processor),
+                    assembly: Some(assembly),
+                    chunks: Some(chunks),
+                    consumed_events,
+                    consumed_tokens,
+                    usage_owed: self.context.include_usage && !self.sink.done(),
+                    engine_request_id: self
+                        .events
+                        .engine_request_id()
+                        .map(|id| id.0.to_string())
+                        .unwrap_or_default(),
+                    engine_replica: self.replica,
+                })
+            }
             BodyState::Collection(collection) => {
                 handoff::stream::Application::ChatResponse(handoff::ChatResponse {
                     request: self.events.submitted().unwrap_or_default(),

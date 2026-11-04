@@ -93,15 +93,21 @@ impl Gemma4ToolParser {
     /// The parser's state, as `Gemma4ToolCall`'s fields hold it.
     fn state(&self) -> proto::handoff::Gemma4ToolCall {
         let (phase, in_string, offset) = match &self.mode {
-            Mode::Text => (proto::handoff::gemma4_tool_call::Phase::Gemma4ToolPhaseText, false, 0),
+            Mode::Text => (
+                proto::handoff::gemma4_tool_call::Phase::Gemma4ToolPhaseText,
+                false,
+                0,
+            ),
             Mode::Call(scan) => {
                 let (phase, in_string) = match scan.phase {
-                    CallPhase::Prefix => {
-                        (proto::handoff::gemma4_tool_call::Phase::Gemma4ToolPhasePrefix, false)
-                    }
-                    CallPhase::Name => {
-                        (proto::handoff::gemma4_tool_call::Phase::Gemma4ToolPhaseName, false)
-                    }
+                    CallPhase::Prefix => (
+                        proto::handoff::gemma4_tool_call::Phase::Gemma4ToolPhasePrefix,
+                        false,
+                    ),
+                    CallPhase::Name => (
+                        proto::handoff::gemma4_tool_call::Phase::Gemma4ToolPhaseName,
+                        false,
+                    ),
                     CallPhase::Arguments { in_string } => (
                         proto::handoff::gemma4_tool_call::Phase::Gemma4ToolPhaseArguments,
                         in_string,
@@ -133,12 +139,10 @@ impl Gemma4ToolParser {
                     offset: state.offset as usize,
                 })
             }
-            proto::handoff::gemma4_tool_call::Phase::Gemma4ToolPhaseName => {
-                Mode::Call(CallScan {
-                    phase: CallPhase::Name,
-                    offset: state.offset as usize,
-                })
-            }
+            proto::handoff::gemma4_tool_call::Phase::Gemma4ToolPhaseName => Mode::Call(CallScan {
+                phase: CallPhase::Name,
+                offset: state.offset as usize,
+            }),
             proto::handoff::gemma4_tool_call::Phase::Gemma4ToolPhaseArguments => {
                 Mode::Call(CallScan {
                     phase: CallPhase::Arguments {
