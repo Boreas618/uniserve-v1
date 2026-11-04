@@ -4154,6 +4154,7 @@ impl HostAction for Install {
             })?;
 
         let mut entries = Vec::new();
+        let mut asked: Vec<(String, usize)> = Vec::with_capacity(prepared.programs.len());
         for chosen in &prepared.programs {
             let operator = ops::operator_name(&chosen.slot.op).ok_or_else(|| {
                 executor::Error::Invalid(format!(
@@ -4168,6 +4169,7 @@ impl HostAction for Install {
                 .filter(|descriptor| descriptor.op == chosen.slot.op)
                 .flat_map(|descriptor| descriptor.keys.iter().cloned())
                 .collect();
+            asked.push((format!("{}/{}", chosen.slot.op, chosen.program.backend), keys.len()));
             for key in keys {
                 let module = client
                     .resolve(
@@ -4202,6 +4204,27 @@ impl HostAction for Install {
                     entries.push(entry);
                 }
             }
+        }
+        // A prepare that answered and produced nothing is a failure of the store's build, not a
+        // generation with fewer kernels: the walk would then find every operator missing and the
+        // update would stand in its device stage until a bound ended it. The key counts are what
+        // separates the two causes - a program given no descriptor key at all was never asked for
+        // a module, and one given keys whose build answered nothing is the store's own refusal.
+        if entries.is_empty() && !prepared.programs.is_empty() {
+            let asked = asked
+                .iter()
+                .map(|(program, keys)| format!("{program} with {keys} key(s)"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            tracing::warn!(
+                target = %self.target,
+                "the Program Server prepared this generation's programs and this device installed                  no module of any of them"
+            );
+            return Err(executor::Error::Invalid(format!(
+                "the Program Server prepared {} program(s) for target {} and this device installed                  no module of any of them ({asked}): a program given no key was never asked for a                  module, and one given keys built nothing",
+                prepared.programs.len(),
+                self.target
+            )));
         }
         tracing::info!(
             modules = entries.len(),
