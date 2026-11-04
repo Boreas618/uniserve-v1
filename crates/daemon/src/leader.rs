@@ -467,6 +467,7 @@ impl Leader {
         config: &ServeConfig,
         stated: &Stated,
         daemon: String,
+        commands: Option<&crate::supervision::ProcessCommands>,
     ) -> anyhow::Result<Self> {
         let prepared = Self::prepare(config, stated).await?;
         info!(placement = ?prepared.spec.placement, "starting the engine process");
@@ -495,6 +496,12 @@ impl Leader {
             .map(|started| started.context("the engine startup task did not complete")?)
             .collect::<anyhow::Result<Vec<_>>>()
             .context("failed to start the UniServe engine")?;
+        // The main processes this node started, by the engine number their
+        // reports carry, for the epoch's first program switch.
+        let engines: Vec<u64> = clients
+            .iter()
+            .filter_map(|(client, _, _)| client.engine())
+            .collect();
         let mut clients = clients.into_iter();
         let (client, served, observer) = clients
             .next()
@@ -524,7 +531,87 @@ impl Leader {
                 .serving
                 .send_modify(|replicas| replicas.push(replica));
         }
+        if let Some(commands) = commands {
+            leader
+                .install_programs(commands, config, engines)
+                .await
+                .context("installing the epoch's programs in its main processes")?;
+        }
         Ok(leader)
+    }
+
+    /// Prepares the epoch's programs and switches this node's main processes
+    /// to them (§7.3 steps 2-3, §3): a main process reports ready without
+    /// waiting for warmup and serves only once the switchover has installed
+    /// the epoch's programs, the scheduling policy among them, so the daemon
+    /// switches every main process once before it accepts a request.
+    ///
+    /// The generation is each main process's own, as its `Precopied` names
+    /// it, and the first epoch is committed at once: it has no previous
+    /// generation to keep as a last resort, so there is nothing to purge.
+    ///
+    /// # Errors
+    ///
+    /// Refuses when a Program Server cannot select the epoch's programs, and
+    /// fails with the first main process that refuses or does not answer.
+    async fn install_programs(
+        &self,
+        commands: &crate::supervision::ProcessCommands,
+        config: &ServeConfig,
+        engines: Vec<u64>,
+    ) -> anyhow::Result<()> {
+        let filled = crate::epoch::FilledPrograms::of(config);
+        let servers = self.program_servers(config);
+        let leader_host = self.program_leader_host(config, &servers);
+        let prepared = {
+            let servers = servers.clone();
+            let leader_host = leader_host.clone();
+            let filled = filled.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::engine::control::prepare_epoch(&servers, &leader_host, &filled, &[])
+            })
+            .await
+            .context("preparing the epoch's programs")?
+            .context("preparing the epoch's programs")?
+        };
+        let deployment = crate::epoch::Deployment {
+            config: config.clone(),
+            build_config: crate::epoch::BuildConfig::of(config),
+            programs: prepared.clone(),
+        };
+        let processes: Vec<crate::engine::control::EpochProcess> = engines
+            .into_iter()
+            .map(|engine| crate::engine::control::EpochProcess {
+                host: config.host_identity.clone(),
+                engine,
+            })
+            .collect();
+        let commands = commands.clone();
+        let generations = tokio::task::spawn_blocking(move || {
+            let mut switch = crate::engine::control::ProgramSwitch::new(
+                &commands,
+                processes,
+                crate::epoch::Update::new(0, deployment),
+            );
+            switch.precopy(&prepared.kernels, &prepared.policy)?;
+            switch.switchover()?;
+            switch.commit()?;
+            Ok::<_, crate::epoch::Failure>(switch.generations().to_vec())
+        })
+        .await
+        .context("switching the main processes to the epoch's programs")?
+        .map_err(|failure| {
+            anyhow::anyhow!(
+                "the main processes did not take the epoch's programs ({}): {}",
+                failure.kind,
+                failure.reason
+            )
+        })?;
+        tracing::info!(
+            generations = ?generations,
+            "the main processes serve the epoch's programs"
+        );
+        Ok(())
     }
 
     /// What a leader prepares before it has an engine: the model's files

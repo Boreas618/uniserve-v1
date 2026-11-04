@@ -118,8 +118,17 @@ pub async fn serve(config: ServeConfig, stated: Stated, shutdown: CancellationTo
         }
         return stop_daemon(daemon).await;
     };
+    // The daemon's channel down to the main processes, which the epoch's
+    // first program switch commands through.
+    let commands = daemon
+        .lock()
+        .map_err(|_| anyhow::anyhow!("the daemon's lock is poisoned"))?
+        .as_ref()
+        .and_then(Daemon::commands);
     let engine = tokio::select! {
-        engine = Leader::start(&config, &stated, address) => engine.map(Arc::new),
+        engine = Leader::start(&config, &stated, address, commands.as_ref()) => {
+            engine.map(Arc::new)
+        }
         () = shutdown.cancelled() => return stop_daemon(daemon).await,
     };
     let engine = match engine {
