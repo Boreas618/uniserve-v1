@@ -655,6 +655,7 @@ def trajectory_case(case: dict) -> dict:
         "frames",
         "text_tokens",
         "text_rows",
+        "condition_rows",
         "layers",
         "hidden",
         "seed",
@@ -780,7 +781,26 @@ def run_trajectory(
     size = model.make_size(
         int(case["frames"]), int(case["text_tokens"]), canvas=canvas
     )
-    layout = model.layout_size(size)
+    # The layout is the **case's**, not the smallest one that holds the request: the device runs the
+    # layout its runner reserves, and the row count changes what every attention reads even though
+    # the latent files it writes do not depend on it - so a reference at `layout_size(size)` would
+    # produce a page of the same shape as the device's and a different trajectory, which reads as an
+    # arithmetic difference whose cause is an arrangement.
+    denoiser_module = reference("uniserve.models.minimax_h3.denoiser")
+    layout = denoiser_module.DenoiserSize(
+        int(case["frames"]),
+        canvas,
+        int(case["text_rows"]),
+        int(case["condition_rows"]),
+    )
+    if not model.holds(layout, size):
+        raise SystemExit(
+            f"the case's layout {layout.num_text_tokens} text +"
+            f" {layout.condition_rows} condition rows does not hold a request of"
+            f" {size.num_text_tokens} text and {size.condition_rows} condition rows at"
+            f" {layout.num_frames} frames and {layout.canvas}; the layout must be whole tiles"
+            f" and at least the request's own counts"
+        )
     steps = int(model.num_steps)
     evaluations = int(case["evaluations"])
     # The schedule is the checkpoint's and the case may only shorten it: a longer one would be a
@@ -801,10 +821,29 @@ def run_trajectory(
             f"the case's schedule is {case['schedule']!r} and the checkpoint's is {kind!r};"
             f" a page cannot show that one was read as the other"
         )
+    packed = model._dense_packing(layout)
+    rows_stated = {
+        "frames": int(layout.num_frames),
+        "canvas": [int(layout.canvas.height), int(layout.canvas.width)],
+        "text_rows": int(layout.num_text_tokens),
+        "condition_rows": int(layout.condition_rows),
+        "video_rows": int(packed.video_rows),
+        "audio_rows": int(packed.audio_rows),
+        "packed_rows": int(packed.padded_tokens),
+    }
     print(
-        f"layout  {layout.num_frames} frames, {layout.num_text_tokens} text rows,"
-        f" {layout.condition_rows} condition rows, {evaluations} of {steps} evaluations"
+        f"layout  {rows_stated['packed_rows']} packed rows ="
+        f" {rows_stated['video_rows']} video + {rows_stated['audio_rows']} audio +"
+        f" {rows_stated['text_rows']} text + {rows_stated['condition_rows']} condition"
+        f" ({layout.num_frames} frames, {evaluations} of {steps} evaluations)"
     )
+    # Written beside the trajectory so the two sides can be paired by their row counts: the latent
+    # files do not depend on the packed row count, so a page from two different layouts has the same
+    # shape and would read as an arithmetic difference with an arrangement for a cause.
+    stated_layout = out / "denoiser" / "layout.json"
+    stated_layout.parent.mkdir(parents=True, exist_ok=True)
+    stated_layout.write_text(json.dumps(rows_stated, indent=2) + "\n")
+    print(f"stated  {stated_layout}: {json.dumps(rows_stated)}")
     width = int(config.transformer.hidden_size)
     if int(case["hidden"]) != width:
         raise SystemExit(
