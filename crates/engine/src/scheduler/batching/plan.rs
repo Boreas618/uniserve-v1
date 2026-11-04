@@ -604,6 +604,9 @@ impl Scheduler {
                 });
             };
             let product = self.storage.encoder_cache.acquire(cache_key)?;
+            // Planning a call that reads a cached feature re-uses the entry, so
+            // the policy's LRU sees the use.
+            self.record_encoded(cache_key);
             if product != cached_product {
                 return None;
             }

@@ -316,7 +316,9 @@ mod tests {
     #[test]
     fn an_aligned_start_leaves_a_chunk_of_whole_pages() {
         assert_eq!(prefill_chunk(32, 2000, 100, 1000, 16), 96);
-        assert_eq!(prefill_chunk(64, 5000, 4096, 4096, 64), 4032);
+        // 64 + 4096 = 4160 is itself a page boundary (65 × 64), so the whole
+        // share fits and nothing is clipped.
+        assert_eq!(prefill_chunk(64, 5000, 4096, 4096, 64), 4096);
     }
 
     #[test]

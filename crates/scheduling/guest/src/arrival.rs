@@ -36,10 +36,10 @@ use crate::ids::{EncodingId, PageId, RequestId};
 use crate::limits::{Limits, Parameters};
 use crate::lru::Lru;
 use crate::phases::Phases;
-use crate::policy::{Init, Policy};
+use crate::policy::Policy;
 use crate::view::{
     CallView, ExpertLoad, ExpertOrder, PhaseClass, PhaseKind, RankView, ReplicaView, RequestClass,
-    RequestState, RequestView,
+    RequestState, RequestView, Snapshot,
 };
 use crate::waiting::{Order, Waiting};
 
@@ -96,6 +96,18 @@ pub struct Arrival<K: Order> {
     /// Whether the next step puts the media path's work first, which alternates
     /// the two paths as today's `prefer_media` does.
     media_first: bool,
+}
+
+impl<K: Order> From<Parameters> for Arrival<K> {
+    /// The program's arguments construct the policy (design §5.1: the arguments
+    /// are part of the program); the state arrives in `init`.
+    fn from(parameters: Parameters) -> Self {
+        Self {
+            limits: Limits::from_parameters(&parameters),
+            parameters,
+            ..Self::default()
+        }
+    }
 }
 
 impl<K: Order> Default for Arrival<K> {
@@ -161,7 +173,13 @@ impl<K: Order> Arrival<K> {
         if self.has_readout() {
             return Pass::Token;
         }
-        let prefill_ready = self.has_work_of_class(PhaseClass::Context);
+        // A refill is a prefill-class chunk: a step whose only prefill work is
+        // a refill's is a prefill step, as today's `select_batch_kind` has it.
+        let prefill_ready = self.has_work_of_class(PhaseClass::Context)
+            || self
+                .views
+                .values()
+                .any(|view| view.state == RequestState::Resident && self.refill_due(view));
         let window_open = room.inflight.prefill_batches < PREFILL_WINDOW_CREDITS;
         if prefill_ready && window_open {
             return Pass::Prefill;
@@ -236,18 +254,18 @@ impl<K: Order> Arrival<K> {
     /// do not carry; the policy's parameters replace them, as design §7.7
     /// says they may.
     fn refill_due(&self, view: &RequestView) -> bool {
+        // A request with a call in flight is not a candidate (today's
+        // `can_schedule_next`). A refill is prefill work of the step that
+        // names it, and `plan.refill` is the one decision that names it; the
+        // request's phase stays the one it will serve next, so no phase kind
+        // is asked for here.
+        if view.phase.is_none() {
+            return false;
+        }
         let Some(tokens) = view.refill_tokens else {
             return false;
         };
         if tokens == 0 {
-            return false;
-        }
-        // A request already refilling its draft cache has the refill as its
-        // next call; asking again would start a second one.
-        if view
-            .phase
-            .is_some_and(|phase| self.phases.kind(phase) == PhaseKind::Refill)
-        {
             return false;
         }
         let (Some(speedup), Some(cost)) = (
@@ -330,17 +348,14 @@ enum Pass {
 }
 
 impl<K: Order> Policy for Arrival<K> {
-    fn init(&mut self, init: &Init) {
-        self.parameters = init.parameters.clone();
-        self.limits = Limits::from_parameters(&self.parameters);
-        self.phases = Phases::new(&init.state.phases);
-        for view in &init.state.requests {
+    fn init(&mut self, state: &Snapshot) {
+        self.phases = Phases::new(&state.phases);
+        for view in &state.requests {
             self.views.insert(view.id, view.clone());
         }
         // Residents start in admission order, which the snapshot states as the
         // time each was admitted.
-        let mut residents: Vec<&RequestView> = init
-            .state
+        let mut residents: Vec<&RequestView> = state
             .requests
             .iter()
             .filter(|view| view.state == RequestState::Resident)
@@ -352,14 +367,13 @@ impl<K: Order> Policy for Arrival<K> {
             )
         });
         self.admission = residents.into_iter().map(|view| view.id).collect();
-        for view in &init.state.requests {
+        for view in &state.requests {
             if view.state == RequestState::Queued {
                 self.waiting.push(view);
             }
         }
         // The cache orders the snapshot states, least recently used first.
-        let mut pages: Vec<(u64, PageId, bool, bool)> = init
-            .state
+        let mut pages: Vec<(u64, PageId, bool, bool)> = state
             .pages
             .iter()
             .map(|page| (page.last_used.0, page.id, page.on_host, page.evictable))
@@ -370,8 +384,7 @@ impl<K: Order> Policy for Arrival<K> {
             self.on_host.insert(page, on_host);
             self.evictable.insert(page, evictable);
         }
-        let mut encodings: Vec<(u64, EncodingId)> = init
-            .state
+        let mut encodings: Vec<(u64, EncodingId)> = state
             .encodings
             .iter()
             .map(|entry| (entry.last_used.0, entry.id))
@@ -466,6 +479,10 @@ impl<K: Order> Policy for Arrival<K> {
                     .is_some_and(|view| view.reservation_units > room.capacity_units)
             })
             .collect();
+        // The step's kind, decided before the plan is built: a refill is named
+        // as the step's prefill work only when the step is not a token step
+        // (today's `pass_kind != Some(BatchKind::Decode)`).
+        let pass = self.pass(room);
         let mut plan = Plan {
             // Every other queued request, in order. The mechanism admits them
             // until the first it cannot place, which is the admission
@@ -494,15 +511,17 @@ impl<K: Order> Policy for Arrival<K> {
                 .collect(),
             ..Plan::default()
         };
-        // A draft cache with a gap is refilled, which is prefill work of the
-        // request's next step (`PhaseKind::Refill`).
-        plan.refill = self
-            .admission
-            .iter()
-            .filter(|id| self.views.get(id).is_some_and(|view| self.refill_due(view)))
-            .copied()
-            .collect();
-        let pass = self.pass(room);
+        // A draft cache with a gap is refilled as the step's prefill work. In a
+        // token step the request is planned as its decode instead, which is
+        // what today's `plan_refill` replaces only outside a decode pass.
+        if pass != Pass::Token {
+            plan.refill = self
+                .admission
+                .iter()
+                .filter(|id| self.views.get(id).is_some_and(|view| self.refill_due(view)))
+                .copied()
+                .collect();
+        }
         let shares = Shares::of(room);
         let mut step = Step::new(shares);
         let mut media_path = false;
@@ -510,6 +529,11 @@ impl<K: Order> Policy for Arrival<K> {
         for id in self.assembly_order() {
             if step.shares().full() {
                 break;
+            }
+            // The step's refill is the request's call: planning its decode too
+            // would plan two calls, the second before the one it depends on.
+            if plan.refill.contains(&id) {
+                continue;
             }
             let Some(view) = self.views.get(&id).cloned() else {
                 continue;
@@ -696,12 +720,26 @@ mod tests {
     use crate::decision::Warming;
     use crate::ids::{ComponentId, PhaseId};
     use crate::time::{Duration, Nanos};
+    use crate::policy::Instantiation;
     use crate::view::{EncodingView, PageView, PhaseView, RankView, ReplicaView, Snapshot};
+
+    /// Drives an `Arrival` the way the mechanism does: construct it from the
+    /// program's arguments, then initialize it with the snapshot.
+    trait FromInstantiation {
+        fn instantiate(&mut self, init: &Instantiation);
+    }
+
+    impl<K: Order> FromInstantiation for Arrival<K> {
+        fn instantiate(&mut self, init: &Instantiation) {
+            *self = Arrival::from(init.parameters.clone());
+            Policy::init(self, &init.state);
+        }
+    }
 
     /// A policy with two phases: 0 prefill, 1 decode.
     fn policy() -> Arrival<crate::ArrivalOrder> {
         let mut fcfs = Arrival::default();
-        fcfs.init(&Init {
+        fcfs.instantiate(&Instantiation {
             parameters: Parameters::default(),
             state: Snapshot {
                 phases: vec![
@@ -815,7 +853,14 @@ mod tests {
             },
         }]);
         let plan = fcfs.dispatch(&room(1024, 8));
-        assert_eq!(plan.work[0].tokens, 64);
+        // 32 prefilled of 100 leaves 68, which *is* the prompt end: a chunk
+        // that reaches the end may end there, so the page clip does not bite.
+        // Clipping needs room smaller than the tokens left.
+        assert_eq!(plan.work[0].tokens, 68);
+        let plan = fcfs.dispatch(&room(40, 8));
+        // Under 68 left and a 40-token share: 32 + 40 = 72, clipped down to
+        // the last 16-token page boundary at or before it, so 32.
+        assert_eq!(plan.work[0].tokens, 32);
     }
 
     #[test]
@@ -825,9 +870,10 @@ mod tests {
         first.phase = Some(PhaseId(0));
         let _ = admit(&mut fcfs, first);
         let mut decode = view(2, 0, 1);
-        decode.phase = Some(PhaseId(1));
         decode.prompt_tokens = 10;
-        let _ = admit(&mut fcfs, decode);
+        // On its decode phase: `admit` would put it back on the prefill phase
+        // and this step would be two prefills.
+        let _ = admit_with_phase(&mut fcfs, decode, PhaseId(1));
         // One batch with prefill work is in flight and another is allowed, so
         // this step still prefills.
         let plan = fcfs.dispatch(&room(1024, 8));
@@ -981,7 +1027,9 @@ mod tests {
             },
         ];
         assert_eq!(fcfs.route(&view(1, 0, 0), &ranks), 1);
-        // The cursor moved past rank 1, so the next equal load behind it wins.
+        // Today's `Routing::pick` advances one raw counter per pick, not one
+        // past the rank it chose: the second pick starts at 1, so with two
+        // ranks the rotation is [1, 0] and equal load keeps rank 1.
         let ranks = [
             RankView {
                 index: 0,
@@ -994,7 +1042,7 @@ mod tests {
                 alive: true,
             },
         ];
-        assert_eq!(fcfs.route(&view(2, 0, 0), &ranks), 0);
+        assert_eq!(fcfs.route(&view(2, 0, 0), &ranks), 1);
     }
 
     #[test]
@@ -1065,7 +1113,7 @@ mod tests {
     #[test]
     fn priority_admits_and_assembles_by_priority_then_arrival() {
         let mut priority = Arrival::<crate::PriorityOrder>::default();
-        priority.init(&Init {
+        priority.instantiate(&Instantiation {
             parameters: Parameters::default(),
             state: Snapshot {
                 phases: vec![
@@ -1113,42 +1161,38 @@ mod tests {
     }
 
     #[test]
-    fn a_refill_is_prefill_work() {
-        let mut fcfs = Arrival::<crate::ArrivalOrder>::default();
-        fcfs.init(&Init {
-            parameters: Parameters::default(),
-            state: Snapshot {
-                phases: vec![
-                    PhaseView {
-                        id: PhaseId(0),
-                        kind: PhaseKind::Refill,
-                        block: ComponentId(0),
-                    },
-                    PhaseView {
-                        id: PhaseId(1),
-                        kind: PhaseKind::Decode,
-                        block: ComponentId(0),
-                    },
-                ],
-                ..Snapshot::default()
-            },
-        });
-        let mut refilling = view(1, 0, 0);
-        refilling.phase = Some(PhaseId(0));
-        refilling.prefilled_tokens = 16;
-        refilling.refill_tokens = Some(4);
-        let _ = admit_with_phase(&mut fcfs, refilling, PhaseId(0));
-        let mut decoding = view(2, 0, 1);
-        decoding.phase = Some(PhaseId(1));
+    fn a_refill_is_the_steps_prefill_work() {
+        let mut fcfs = policy();
+        // A decoding request whose draft cache is 4 tokens short, and a plain
+        // decode. No view sits in a refill phase: the refill is a call the
+        // mechanism builds for a request the plan names.
+        let mut short = view(1, 0, 0);
+        short.phase = Some(PhaseId(1));
+        short.prefilled_tokens = 16;
+        short.refill_tokens = Some(4);
+        let _ = admit_with_phase(&mut fcfs, short, PhaseId(1));
+        let decoding = view(2, 0, 1);
         let _ = admit_with_phase(&mut fcfs, decoding, PhaseId(1));
-        // The refill is prefill work, so it is planned in a prefill step and
-        // its call draws on the prefill budget.
+
+        // A refill-due resident is prefill work, so with the window open the
+        // step is a prefill step: it names the refill and plans no work entry
+        // for that request — the refill is its call.
         let plan = fcfs.dispatch(&room(1024, 8));
         assert_eq!(plan.refill, vec![RequestId(1)]);
-        assert_eq!(
-            plan.work.first().map(|work| (work.request, work.tokens)),
-            Some((RequestId(1), 4))
-        );
+        assert!(plan.work.is_empty(), "{:?}", plan.work);
+
+        // Two prefill batches in flight close the window: the step is a token
+        // step, so the refill is not named and both requests decode.
+        let mut closed = room(1024, 8);
+        closed.inflight.prefill_batches = PREFILL_WINDOW_CREDITS;
+        let plan = fcfs.dispatch(&closed);
+        assert!(plan.refill.is_empty());
+        let work: Vec<(u64, u32)> = plan
+            .work
+            .iter()
+            .map(|work| (work.request.0, work.tokens))
+            .collect();
+        assert_eq!(work, vec![(1, 1), (2, 1)]);
     }
 
     #[test]
@@ -1176,7 +1220,7 @@ mod tests {
         media.class = RequestClass::Media;
         media.admitted_at = Some(Nanos(3));
         media.prefetch_tokens = 300;
-        fcfs.init(&Init {
+        fcfs.instantiate(&Instantiation {
             parameters: Parameters::default(),
             state: Snapshot {
                 requests: vec![fits.clone(), enormous, prefill, decode, media],
@@ -1240,7 +1284,10 @@ mod tests {
         let plan = fcfs.dispatch(&room);
         let order: Vec<u64> = plan.work.iter().map(|work| work.request.0).collect();
         assert_eq!(order, vec![20]);
-        assert_eq!(plan.work[0].tokens, 100);
+        // `Room::prefill_tokens` is the warming reservation today's
+        // `assemble_batch` charges every prefix-writing call against, so a
+        // 100-token chunk is capped at 64.
+        assert_eq!(plan.work[0].tokens, 64);
         // The over-capacity request is rejected and not also admitted.
         assert_eq!(plan.reject, vec![RequestId(11)]);
         assert_eq!(plan.admit, vec![RequestId(10)]);
@@ -1257,6 +1304,9 @@ mod tests {
         let mut closed = room.clone();
         closed.inflight.prefill_batches = PREFILL_WINDOW_CREDITS;
         let plan = fcfs.dispatch(&closed);
+        // A token step plans a refill-due request as its decode, so it names
+        // no refill.
+        assert!(plan.refill.is_empty());
         let order: Vec<u64> = plan.work.iter().map(|work| work.request.0).collect();
         assert_eq!(order, vec![21, 22]);
         assert!(plan.work.iter().all(|work| work.tokens == 1));

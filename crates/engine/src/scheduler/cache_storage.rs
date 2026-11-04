@@ -779,11 +779,39 @@ impl Scheduler {
     /// evicted without a copy: a later prompt computes them again. Returns
     /// how many pages wait for their copies.
     fn offload_idle_from(&mut self, unit: u32) -> usize {
-        let (Some(cache), Some(kv_offload)) = (self.storage.cache(), self.kv_offload.as_mut())
-        else {
+        let Some(cache) = self.storage.cache() else {
             return 0;
         };
         let idle = cache.block_pool.acquire_idle_from(unit);
+        self.offload_pages(idle)
+    }
+
+    /// Offloads exactly the pages a policy named, by their device units.
+    ///
+    /// A plan's `offload` list names units, not a range: asking the pool for
+    /// everything idle from the first unit on would move pages the policy
+    /// judged worth keeping.
+    pub(super) fn offload_units(&mut self, units: &[u32]) -> usize {
+        let Some(cache) = self.storage.cache() else {
+            return 0;
+        };
+        let idle = cache.block_pool.acquire_idle_units(units);
+        self.offload_pages(idle)
+    }
+
+    /// Hands idle pages to the host KV cache, grouped by the worker group and
+    /// group index they belong to. Returns how many pages went.
+    ///
+    /// A page whose worker group does not serve it, or whose group is not
+    /// full-attention, is dropped uncopied: the withdrawal that owns it evicts
+    /// it then.
+    fn offload_pages(&mut self, idle: Vec<crate::kv_cache::IdlePage>) -> usize {
+        if idle.is_empty() {
+            return 0;
+        }
+        let Some(kv_offload) = self.kv_offload.as_mut() else {
+            return 0;
+        };
         let workers: Vec<(WorkerGroupId, ipc::WorkerEndpoint)> = self
             .executor
             .info()

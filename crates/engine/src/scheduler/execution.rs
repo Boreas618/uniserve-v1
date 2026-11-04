@@ -4,7 +4,7 @@
 //!
 //! - Refill and dispatch: `refill_executor` admits requests, asks the
 //!   generation assembler (`assemble`) and the video media planner
-//!   (`prepare_media_batches`) for batches while a rank queue has room, and
+//!   for batches while a rank queue has room, and
 //!   `dispatch_submissions` hands them to the executor in order per worker,
 //!   each after the batches producing its inputs.
 //! - Video media scheduling: a video request runs the calls of its graph
@@ -39,9 +39,9 @@ mod projection;
 mod results;
 
 use super::*;
-use scheduling::PolicyError;
-use scheduling::guest::Plan;
 use ipc::{BufferId, MediaCall};
+use scheduling::PolicyError;
+use scheduling::guest::{Plan, Room};
 
 pub(super) use media::Occupancy;
 
@@ -187,6 +187,10 @@ impl Scheduler {
         // The owner loop returns here without parking while progress is being
         // made, so subsequent ready completions are handled on successive turns.
         progressed |= self.poll_one_result();
+        // A stage that arrived while a batch was executing is applied at the
+        // first batch boundary with nothing in flight: no batch is ever decided
+        // by one policy and executed under another (design §7.3).
+        self.apply_policy_stage();
         progressed |= self.poll_kv_offload();
         progressed |= self.poll_trajectories();
         progressed |= self
@@ -260,16 +264,9 @@ impl Scheduler {
         // Reap cancellations before assembling.
         self.reap_cancellations();
 
-        // Admit request and resource residency even while every execution slot
-        // is occupied. This lets the next batch see the complete resident
-        // cohort instead of admitting only when a slot happens to open.
-        self.admit();
-        self.admit_media();
-
-        // Submit as many batches as the rank queues admit.
+        // Submit as many batches as the rank queues admit. Admission is not
+        // done here: it is the plan's `admit`, executed once per step.
         loop {
-            self.admit();
-            self.admit_media();
             if !self.a_rank_queue_admits() {
                 break;
             }
@@ -357,18 +354,168 @@ impl Scheduler {
         if self.closing || self.asleep {
             return Vec::new();
         }
-        // Video media work runs the ready calls of its graph through the media
-        // planner; the plan's media work entries replace that path when the
-        // media planner is cut, so a video request is decided by one policy
-        // like every other request.
-        let batches = self.prepare_media_batches();
-        if !batches.is_empty() {
-            return batches;
-        }
+        let started = std::time::Instant::now();
         let Some(plan) = self.policy_step() else {
             return Vec::new();
         };
-        self.assemble_plan(&plan)
+        // What the policy gives up comes first: the plan was decided on the
+        // state it saw, and freeing a victim makes room for the step's calls.
+        // The plan's own page decisions then run, so a prefetch's pins are in
+        // flight by the time the calls are built.
+        self.reclaim_shortage();
+        self.execute_plan_pages(&plan);
+        let batches = self.assemble_plan(&plan);
+        self.end_step(started.elapsed());
+        batches
+    }
+
+    /// Asks the policy for the victims of the shortage the mechanism reports,
+    /// validates them, and frees exactly those (design §4.4).
+    ///
+    /// The mechanism decides that there is a shortage and owns every cache; the
+    /// policy decides what to give up. A victim list that does not validate is
+    /// a policy failure, like any other invalid decision.
+    fn reclaim_shortage(&mut self) {
+        let Some(shortage) = views::shortage_now(self) else {
+            return;
+        };
+        let Some(mut policy) = self.policy.take() else {
+            return;
+        };
+        let victims = match policy.reclaim(&shortage) {
+            Ok(victims) => victims,
+            Err(error) => {
+                let _ = self.policy_failed(policy, error);
+                return;
+            }
+        };
+        let live = self.live();
+        if let Err(error) = mechanism::validate_victims(&shortage, &victims, &live) {
+            let _ = self.policy_failed(policy, error);
+            return;
+        }
+        self.policy = Some(policy);
+        for victim in &victims {
+            self.free_victim(victim);
+        }
+        if !victims.is_empty() {
+            tracing::debug!(
+                kind = ?shortage.kind,
+                need = shortage.need,
+                victims = victims.len(),
+                "the policy freed what it named"
+            );
+        }
+    }
+
+    /// Frees the one thing a victim names.
+    ///
+    /// An encoder entry leaves the encoder cache and its worker buffer goes with
+    /// it; a device page goes to the host KV cache, exactly as a withdrawal's
+    /// pages do, and the units it held return when the copy completes (or at
+    /// once when the host cache has nowhere to put it).
+    fn free_victim(&mut self, victim: &scheduling::guest::Victim) {
+        match victim {
+            scheduling::guest::Victim::Encoding(id) => {
+                let key = self
+                    .storage
+                    .encoder_cache
+                    .entries()
+                    .map(|(key, _)| key)
+                    .find(|key| views::encoding_id(key) == *id);
+                let freed = key.and_then(|key| self.storage.encoder_cache.evict(&key));
+                if let Some(product) = freed {
+                    self.free_buffers([product.buffer_id()]);
+                }
+            }
+            scheduling::guest::Victim::Page(page) => {
+                if let Some(unit) = views::unit_of(*page) {
+                    self.offload_units(&[unit]);
+                }
+            }
+            // Today's capacity preemption, which the design keeps: a request
+            // that must give its units away is marked migratable with `Drain`,
+            // as `recompute_starved` does when it withdraws the units its
+            // requests hold. `Drain` asks the engine to hold the world the
+            // stream is in, and there is no world change here, so the daemon
+            // resubmits the request as a continuation carrying the state it
+            // reached. Only a migratable request is marked: one the daemon
+            // could not resubmit would be lost. The request retires at its next
+            // call boundary, and what it holds returns then.
+            scheduling::guest::Victim::Request(request) => {
+                self.migrate_running(MigrationCause::Drain, |id| id.0 == request.0);
+            }
+        }
+    }
+
+    /// Executes the page half of a validated plan (§4.4).
+    ///
+    /// The policy names pages to hand to the host KV cache and requests whose
+    /// host hit should deepen; the mechanism owns the caches and moves exactly
+    /// what it named, after validating that every name is a live, unreferenced
+    /// device page. A move that the host cache cannot take leaves the pages
+    /// where they are: the plan asked, the limit refused, and no request is at
+    /// fault.
+    fn execute_plan_pages(&mut self, plan: &Plan) {
+        let units: Vec<u32> = plan
+            .offload
+            .iter()
+            .filter_map(|page| views::unit_of(*page))
+            .collect();
+        if !units.is_empty() {
+            let moved = self.offload_units(&units);
+            if moved < units.len() {
+                tracing::debug!(
+                    asked = units.len(),
+                    moved,
+                    "the host KV cache took fewer pages than the plan offered"
+                );
+            }
+        }
+        for request in &plan.prefetch {
+            self.prefetch_host(ipc::RequestId(request.0));
+        }
+    }
+
+    /// Deepens one request's host KV cache hit as far as the host holds it.
+    ///
+    /// The device hit cannot grow, so the deepening is the host boundary
+    /// beyond it: asking again after host pages arrive raises the boundary,
+    /// and the answer is recorded so the next dispatch sees what the request
+    /// can reuse. A request the mechanism cannot place, or whose host lookup
+    /// is still in flight, keeps what it had: the plan asked, the cache is not
+    /// ready, and no request is at fault.
+    fn prefetch_host(&mut self, id: ipc::RequestId) {
+        // §4.4: the mechanism deepens a prefix hit only by at least the floor
+        // the policy declared, so a smaller deepening is not a prefetch at all.
+        // The floor is the policy's, not a constant here, because a policy that
+        // asks for less eager deepenings must get them.
+        let floor = self
+            .policy
+            .as_ref()
+            .map_or(0, |policy| policy.limits().prefetch_min_tokens)
+            as usize;
+        let Some(state) = self.running.get(&id) else {
+            return;
+        };
+        let Some((target, hit)) = self.prefill_target(state) else {
+            return;
+        };
+        let device_hit = hit.cached_tokens.min(state.req.prompt_token_ids.len());
+        if let admission::HostHit::Serving(boundary) = admission::host_prefix(
+            &mut self.kv_offload,
+            state,
+            &target,
+            device_hit,
+            usize::MAX,
+            floor,
+        ) {
+            self.recorder.prefix_hit(
+                scheduling::guest::RequestId(id.0),
+                u32::try_from(device_hit).unwrap_or(u32::MAX),
+                u32::try_from(boundary.saturating_sub(device_hit)).unwrap_or(u32::MAX),
+            );
+        }
     }
 
     /// One step's plan: observe, dispatch, validate (§4.4).
@@ -378,29 +525,86 @@ impl Scheduler {
     /// nothing. The slot is taken out of the scheduler for the calls and put
     /// back whatever they answer, so a failure can hand the mechanism's state
     /// to the switch without borrowing the scheduler the slot lives in.
+    /// How often the mechanism asks for an expert placement, in steps.
+    ///
+    /// §4.4 calls the decision periodic and leaves the period to the mechanism:
+    /// a fixed number of steps, not a clock, so the decision is a function of
+    /// the step count and a program never reads time. Rebalancing experts costs
+    /// a collective on every rank, so the period is long compared with a step.
+    ///
+    /// A load the executor publishes in between is asked about at the next
+    /// step: waiting a full interval to look at new numbers would leave a rank
+    /// hot for no reason.
+    const EXPERT_REBALANCE_STEPS: u64 = 64;
+
     fn policy_step(&mut self) -> Option<Plan> {
         let Some(mut policy) = self.policy.take() else {
             return None;
         };
         self.step += 1;
-        let room = views::room(self, self.step);
-        let live = self.live();
-        // Everything that changed since the previous step, in the order it
-        // happened, closed before this step's dispatch.
+        // The pages that appeared and went since the previous step, then
+        // everything else that changed, in the order it happened, closed before
+        // this step's dispatch. The room, the live state, and the plan's checks
+        // are all read after it: a page announced now is a page this step's
+        // plan may name, so the validators must already see it.
+        self.pump_page_changes();
         self.recorder.close();
+        let room = self.room();
+        let live = self.live();
+        // A resident request that has not advanced within the policy's timeout
+        // is the policy's failure, not the request's (design §4.4).
+        let now = scheduling::guest::Nanos(crate::clock::now_monotonic_us().saturating_mul(1_000));
+        if let Some(request) = self.watchdog.starved(&live, now, policy.limits().timeout) {
+            return self.policy_failed(policy, PolicyError::Starved { request });
+        }
         let events = self.recorder.take();
         if let Err(error) = policy.observe(&events) {
             return self.policy_failed(policy, error);
+        }
+        // §4.4's periodic row: the mechanism owns the interval, the executor
+        // publishes the load, and the order is checked and handed to the world
+        // setup that applies it (§7.6). No load means nothing to decide, not a
+        // zero one: the executor has published no routed tokens yet.
+        let experts_due = self.expert_load_new
+            || self
+                .expert_asked
+                .is_none_or(|asked| self.step.saturating_sub(asked) >= Self::EXPERT_REBALANCE_STEPS);
+        if experts_due
+            && let Some(load) = views::expert_load_of(self)
+        {
+            let order = match policy.experts(&load) {
+                Ok(order) => order,
+                Err(error) => return self.policy_failed(policy, error),
+            };
+            if let Err(error) = mechanism::validate_experts(&load, &order) {
+                return self.policy_failed(policy, error);
+            }
+            self.expert_order = Some(order);
+            self.expert_asked = Some(self.step);
+            self.expert_load_new = false;
         }
         let plan = match policy.dispatch(&room) {
             Ok(plan) => plan,
             Err(error) => return self.policy_failed(policy, error),
         };
+        // The plan's admission is the mechanism's own act, bounded by the hard
+        // limits as it goes, and it runs before the plan is checked: a request
+        // the plan admits is resident for the work the same plan gives it, which
+        // is what lets one plan both admit and run a request (§4.4).
+        self.admit_plan(&plan);
+        let live = self.live();
         if let Err(error) = mechanism::validate_plan(&plan, &room, &live) {
             return self.policy_failed(policy, error);
         }
         self.policy = Some(policy);
         Some(plan)
+    }
+
+    /// Ends the step's accounting: the step number, and the policy's per-step
+    /// cost as the fuel it spent (design §12).
+    fn end_step(&mut self, duration: std::time::Duration) {
+        let step = self.step;
+        self.recorder.record(views::stepped(step, duration));
     }
 
     /// A policy failure: serve on under the previous policy (§7.3), or stop the
@@ -409,7 +613,7 @@ impl Scheduler {
     /// The state the previous policy is instantiated on is the mechanism's at
     /// this moment, built here and handed over owned: the slot lives inside the
     /// scheduler, so the mechanism cannot lend it a borrow of the scheduler.
-    fn policy_failed(
+    pub(super) fn policy_failed(
         &mut self,
         mut policy: policy::PolicySlot,
         error: PolicyError,
@@ -436,19 +640,65 @@ impl Scheduler {
         None
     }
 
+    /// This step's room.
+    ///
+    /// `views.rs` builds every fact but one: the captured graph tiers, which
+    /// the build config states (the spec's `cuda_graphs`).
+    fn room(&self) -> Room {
+        let mut facts = views::room_facts(self, self.step);
+        facts.graph_tiers = self.config.graph_tiers.clone();
+        views::room_view(facts)
+    }
+
     /// The mechanism's state at a batch boundary, owned, for the switch.
     fn trial_state(&self) -> policy::TrialState {
         policy::TrialState {
             snapshot: views::snapshot(self, self.step, self.recorder.recorded()),
-            room: views::room(self, self.step),
+            room: self.room(),
             shortage: views::shortage_now(self),
             arrival: None,
-            call: None,
+            call: views::placement(self),
             expert_load: views::expert_load_of(self),
         }
     }
 
     /// The objects the validators read, as they stand now.
+    /// Announces the pages that appeared and went since the previous step, and
+    /// keeps the mechanism's table of live pages current (design §4.4).
+    ///
+    /// The pool logs both changes, so a step costs what changed rather than the
+    /// size of the prefix cache: the page table is built once, from the epoch's
+    /// snapshot, and then only by these two events.
+    fn pump_page_changes(&mut self) {
+        let Some(cache) = self.storage.cache() else {
+            return;
+        };
+        let (published, freed) = cache.block_pool.take_page_changes();
+        if published.is_empty() && freed.is_empty() {
+            return;
+        }
+        if !self.pages_seeded {
+            self.pages = views::page_index(self);
+            self.pages_seeded = true;
+        }
+        let announced: Vec<scheduling::guest::PageView> = published
+            .into_iter()
+            .filter_map(|(head, tokens)| {
+                let units = cache.block_pool.page_units(head)?;
+                views::page_of(self, &units, tokens)
+            })
+            .collect();
+        for page in announced {
+            self.pages.insert(page.id, page.clone());
+            self.recorder.cached(page);
+        }
+        for head in freed {
+            let page = views::device_page(head);
+            self.pages.remove(&page);
+            self.recorder.freed(page);
+        }
+    }
+
     fn live(&self) -> mechanism::Live {
         let mut live = mechanism::Live {
             queue: self
@@ -466,8 +716,8 @@ impl Scheduler {
         for request in views::requests(self, self.recorder.recorded()) {
             live.requests.insert(request.id, request);
         }
-        for page in views::pages(self) {
-            live.pages.insert(page.id, page);
+        for page in &self.pages {
+            live.pages.insert(*page.0, page.1.clone());
         }
         for entry in views::encodings(self) {
             live.encodings.insert(entry.id, entry);
@@ -483,10 +733,52 @@ impl Scheduler {
     /// ever decided by one policy and executed under another.
     pub(super) fn adopt(&mut self, policy: policy::PolicySlot) {
         debug_assert!(
-            self.inflight.pending_batches.is_empty() && self.inflight.pending_submissions.is_empty(),
+            self.inflight.pending_batches.is_empty()
+                && self.inflight.pending_submissions.is_empty(),
             "a policy is adopted at a batch boundary"
         );
+        // The epoch's page table is walked once, here, so every later step costs
+        // what changed: the policy was handed the same table in its snapshot.
+        self.pages = views::page_index(self);
+        self.pages_seeded = true;
+        // The instance was instantiated on a snapshot and has never been
+        // observed. Seeding the recorder from that same snapshot is what keeps
+        // the next step's events proportional to what changed after it, rather
+        // than one `Updated` per live request to a policy that already knows.
+        let snapshot = policy.instantiated_on().clone();
+        self.recorder = mechanism::Recorder::from_snapshot(&snapshot);
         self.policy = Some(policy);
+    }
+
+    /// Tells the policy that the encoder entry `key` is live, with the last use
+    /// the cache now records for it (§4.4's `Encoded`).
+    ///
+    /// Called where the cache creates, re-activates, or re-uses an entry: a
+    /// re-use raises its last use, which is the order a policy's LRU reads.
+    pub(super) fn record_encoded(&mut self, key: [u8; 32]) {
+        let Some(last_used) = self.storage.encoder_cache.last_used(&key) else {
+            return;
+        };
+        let entry = views::encoding_view(
+            views::encoding_id(&key),
+            scheduling::guest::Nanos(last_used),
+        );
+        self.recorder.encoded(entry);
+    }
+
+    /// The executor's routed-token counts per expert, which the mechanism asks
+    /// about on its own interval. The executor's edge publishes them; `None`
+    /// withdraws them.
+    pub(super) fn set_expert_load(&mut self, load: Option<scheduling::guest::ExpertLoad>) {
+        self.expert_load_new = load.is_some();
+        self.expert_load = load;
+    }
+
+    /// The expert placement the policy last answered, taken by the point that
+    /// applies it: the executor's world setup (§7.6). Taking it once is the
+    /// handoff, so a placement is applied once.
+    pub(super) fn take_expert_order(&mut self) -> Option<scheduling::guest::ExpertOrder> {
+        self.expert_order.take()
     }
 
     /// The report of a policy failure, for the control thread to hand up.

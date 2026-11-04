@@ -39,14 +39,15 @@ pub(crate) mod stats_report;
 
 pub use config::{
     DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
-    DEFAULT_MAX_RUNNING_REQUESTS, RefillPolicy, SchedulerConfig,
+    DEFAULT_MAX_RUNNING_REQUESTS, SchedulerConfig,
 };
 pub(crate) use execution::generation_consuming_calls;
 use ipc::{ForwardMode, MediaCall, TransferMode};
+pub(crate) use policy::process_engine;
 pub use policy::{
-    BatchCapacity, Candidate, PREFETCH_FLOOR_TOKENS, PolicyBytes, PolicyPorts, PolicyProgram,
-    PolicyReverted, PolicySlot, PolicySource, PolicyStore, RouteFeed, RoutePolicy, Stage,
-    TrialState, Validators, backend_name, ceilings_of, parameters_of, program_of,
+    Arrival, BatchCapacity, Candidate, PREFETCH_FLOOR_TOKENS, PolicyBytes, PolicyProgram,
+    PolicyReverted, PolicySlot, PolicySource, PolicyUsage, ProgramSource, Progress, RoutePolicy,
+    RouteTrial, Stage, TrialState, Validators, arrival_view, ceilings_of,
 };
 pub(crate) use run::{MAX_GUIDANCE_PREFIX_ROWS, guidance_prefix_rows};
 pub use stats::{
@@ -115,7 +116,7 @@ use ipc::{
     ShapeBound, TensorRef, TimingCounters, WorkerInfo,
 };
 use ipc::{SharedMedia, TokenLogprob};
-use proto::request::{MigrationCause, SchedulingPolicy};
+use proto::request::MigrationCause;
 
 use crate::executor::{RankBuffer, WorkerFailure};
 use crate::scheduler::image_artifact::png_artifact_info;
@@ -474,8 +475,46 @@ pub struct Scheduler {
     /// The report of a policy failure the mechanism did not take from `fail`'s
     /// answer, for the control thread.
     policy_report: Option<policy::PolicyReverted>,
+    /// The routed tokens per expert the executor last published (§4.4's
+    /// `experts`): the one fact the mechanism cannot measure. `None` until the
+    /// executor publishes it, so the periodic call asks nothing it cannot state.
+    expert_load: Option<scheduling::guest::ExpertLoad>,
+    /// The expert placement the policy last answered, validated and waiting for
+    /// the executor's world setup, which applies it (§7.6).
+    expert_order: Option<scheduling::guest::ExpertOrder>,
+    /// The step the policy last answered an expert placement on, so the
+    /// mechanism's interval is measured from the decision, not from step zero.
+    expert_asked: Option<u64>,
+    /// A load the executor published since the last decision: a new load is
+    /// worth asking about at once, rather than after a full interval.
+    expert_load_new: bool,
+    /// The candidate a precopy is preparing on a blocking thread, while it runs
+    /// (§7.3 step 2): loading and instantiating a policy must not hold the
+    /// serving thread.
+    policy_precopy:
+        Option<crossbeam_channel::Receiver<Result<policy::Candidate, scheduling::PolicyError>>>,
+    /// The candidate a precopy prepared at this boundary, until the switchover
+    /// puts it in.
+    policy_prepared: Option<policy::Candidate>,
+    /// The stage §7.3 asked for and the answer to give once it is applied: a
+    /// stage changes the serving policy, so it waits for a boundary where no
+    /// batch and no submission is in flight.
+    policy_stage: Option<(
+        policy::Stage,
+        Option<crossbeam_channel::Sender<Result<(), String>>>,
+    )>,
     /// The events and transitions a policy is told about (§4.4).
     recorder: mechanism::Recorder,
+    /// The device pages that exist, kept from the epoch's snapshot and from the
+    /// `Cached`/`Freed` announcements of each step: the table `Live` checks a
+    /// named page against, without a step walking the prefix cache.
+    pages: std::collections::BTreeMap<scheduling::guest::PageId, scheduling::guest::PageView>,
+    /// Whether `pages` was built yet. It is built on the first step that
+    /// announces a change, from `views::page_index`, which is the one walk.
+    pages_seeded: bool,
+    /// The starvation watchdog: a resident request that does not advance
+    /// within the policy's `timeout` is the policy's failure (§4.4).
+    watchdog: mechanism::Watchdog,
     /// The step number this scheduler is at.
     step: u64,
     /// Maximum number of transfer calls holding a reservation at once

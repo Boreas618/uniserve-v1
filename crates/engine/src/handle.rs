@@ -272,17 +272,6 @@ pub enum StreamCancelCause {
     StopStringMatched,
 }
 
-/// What a scheduler reports about the engine itself, rather than about one
-/// request.
-#[derive(Clone, Debug)]
-pub enum EngineEvent {
-    /// The scheduler's policy failed after the update committed, and the
-    /// scheduler serves on under the previous policy (§7.3). The control thread
-    /// forwards this to every daemon, which records the previous policy as the
-    /// epoch's current one.
-    PolicyReverted(crate::scheduler::PolicyReverted),
-}
-
 /// Request-submission failures visible to engine clients.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SubmitError {
@@ -642,6 +631,55 @@ pub enum Command {
     DescribeCache(crossbeam_channel::Sender<Result<Vec<crate::scheduler::GroupCache>, String>>),
     /// Accepted prefixes of running requests that can move to another world.
     DescribeRequests(crossbeam_channel::Sender<Vec<proto::request::wire::RequestPrefix>>),
+    /// §7.3 step 2: prepares `program`'s policy on this scheduler's state,
+    /// without putting it in. The load and the instantiation run on a blocking
+    /// thread; the answer says whether a candidate was prepared.
+    PrecopyPolicy {
+        program: crate::scheduler::PolicyProgram,
+        source: std::sync::Arc<dyn crate::scheduler::PolicySource + Send + Sync>,
+        answer: crossbeam_channel::Sender<Result<(), String>>,
+    },
+    /// §7.3 step 3: the prepared policy answers from the next boundary.
+    SwitchoverPolicy {
+        answer: crossbeam_channel::Sender<Result<(), String>>,
+    },
+    /// §7.3 step 6: forget the policy a revert could return to.
+    CommitPolicy,
+    /// §7.3 step 4: serve the previous policy again, instantiated on the
+    /// scheduler's current state.
+    RevertPolicy {
+        answer: crossbeam_channel::Sender<Result<(), String>>,
+    },
+    /// §7.3 step 6: drop the module a revert could have returned to.
+    PurgePolicy {
+        answer: crossbeam_channel::Sender<Result<(), String>>,
+    },
+    /// §7.3 step 2's failure: the precopied generation is dropped and the
+    /// serving policy kept.
+    DiscardPolicy,
+    /// The step this scheduler reached and §12's cost counters: the calls its
+    /// policy has made and the fuel they consumed, absent before its first
+    /// switchover.
+    Progress {
+        answer: crossbeam_channel::Sender<crate::scheduler::Progress>,
+    },
+    /// Hands the control thread a policy failure this scheduler recorded: it
+    /// reverted to the previous policy and serves on (§7.3).
+    TakePolicyReport(crossbeam_channel::Sender<Option<crate::scheduler::PolicyReverted>>),
+    /// The routed tokens per expert, from the executor's edge: what §4.4's
+    /// periodic `experts` decision is asked about. `None` withdraws them.
+    PublishExpertLoad {
+        load: Option<scheduling::guest::view::ExpertLoad>,
+    },
+    /// Takes the expert placement the policy last answered: the handoff to the
+    /// executor's world setup, which applies it (§7.6).
+    TakeExpertOrder(crossbeam_channel::Sender<Option<scheduling::guest::view::ExpertOrder>>),
+    /// Reports the state a policy is instantiated with, as seen from this
+    /// scheduler with every rank's load the control thread named (§7.3).
+    DescribePolicyState {
+        ranks: Vec<scheduling::guest::view::RankView>,
+        answer: crossbeam_channel::Sender<Option<crate::scheduler::TrialState>>,
+    },
     CacheWarm {
         operation: storage::manifest::cache::Operation,
         together: Arc<HookBarrier>,
@@ -1005,6 +1043,107 @@ impl CommandSender {
         let (answer, described) = crossbeam_channel::bounded(1);
         let _ = self.send(Command::DescribeCache(answer));
         described
+    }
+
+    /// Prepares `program`'s policy on this scheduler's state without putting it
+    /// in (§7.3 step 2); the answer arrives when the blocking thread is done.
+    pub fn precopy_policy(
+        &self,
+        program: crate::scheduler::PolicyProgram,
+        source: std::sync::Arc<dyn crate::scheduler::PolicySource + Send + Sync>,
+    ) -> crossbeam_channel::Receiver<Result<(), String>> {
+        let (answer, done) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::PrecopyPolicy {
+            program,
+            source,
+            answer,
+        });
+        done
+    }
+
+    /// Puts the prepared policy in from the scheduler's next boundary (§7.3
+    /// step 3).
+    pub fn switchover_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
+        let (answer, done) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::SwitchoverPolicy { answer });
+        done
+    }
+
+    /// Forgets the policy this scheduler could revert to (§7.3 step 6).
+    pub fn commit_policy(&self) {
+        let _ = self.send(Command::CommitPolicy);
+    }
+
+    /// Serves the previous policy again, on the scheduler's current state
+    /// (§7.3 step 4).
+    pub fn revert_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
+        let (answer, done) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::RevertPolicy { answer });
+        done
+    }
+
+    /// Drops the module a revert could have returned to, once no batch uses it
+    /// (§7.3 step 6).
+    pub fn purge_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
+        let (answer, done) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::PurgePolicy { answer });
+        done
+    }
+
+    /// Drops a precopied generation that failed or was abandoned (§7.3 step 2).
+    pub fn discard_policy(&self) {
+        let _ = self.send(Command::DiscardPolicy);
+    }
+
+    /// The step and cost counters, polled rather than waited for: the caller is
+    /// the engine's control thread, which no scheduler may hold.
+    pub fn progress(&self) -> crossbeam_channel::Receiver<crate::scheduler::Progress> {
+        let (answer, progress) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::Progress { answer });
+        progress
+    }
+
+    /// Publishes the executor's routed-token counts per expert, or withdraws
+    /// them with `None`.
+    pub fn publish_expert_load(&self, load: Option<scheduling::guest::view::ExpertLoad>) {
+        let _ = self.send(Command::PublishExpertLoad { load });
+    }
+
+    /// Takes the expert placement the policy last answered, for the executor's
+    /// world setup that applies it (§7.6). `None` when no placement is waiting.
+    pub fn take_expert_order(&self) -> Option<scheduling::guest::view::ExpertOrder> {
+        let (answer, taken) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::TakeExpertOrder(answer));
+        taken
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .ok()
+            .flatten()
+    }
+
+    /// Takes the policy failure this scheduler recorded since the last call,
+    /// if it recorded one: the control thread forwards it to the daemons.
+    pub fn take_policy_report(
+        &self,
+    ) -> crossbeam_channel::Receiver<Option<crate::scheduler::PolicyReverted>> {
+        let (answer, report) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::TakePolicyReport(answer));
+        report
+    }
+
+    /// Reports the state a policy is instantiated with at the scheduler's next
+    /// boundary, with `ranks` as the control thread knows them; `None` when the
+    /// scheduler does not answer in time. The state is the mechanism's, so an
+    /// epoch's first precopy has it before any policy serves.
+    ///
+    /// The control thread's route instance is instantiated and, after a
+    /// `route` failure, reverted on this state (§7.3).
+    pub fn policy_state(
+        &self,
+        ranks: Vec<scheduling::guest::view::RankView>,
+    ) -> crossbeam_channel::Receiver<Option<crate::scheduler::TrialState>> {
+        let (answer, state) = crossbeam_channel::bounded(1);
+        let _ = self.send(Command::DescribePolicyState { ranks, answer });
+        state
     }
 
     /// Read accepted cache lengths of requests that can move to a successor.

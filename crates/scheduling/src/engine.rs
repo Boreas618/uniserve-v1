@@ -26,14 +26,38 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// The target a policy module is precompiled for: the host architecture's
+    /// baseline Linux triple.
+    ///
+    /// Naming the architecture and nothing finer is what makes the Program
+    /// Server's artifact portable within it (§5.3): the module store keeps one
+    /// artifact per architecture, and any host of that architecture loads it
+    /// whatever its CPU model. A host whose architecture has no policy target
+    /// fails here rather than compiling a module no other host can load.
+    pub fn target() -> Option<&'static str> {
+        match std::env::consts::ARCH {
+            "x86_64" => Some("x86_64-unknown-linux-gnu"),
+            "aarch64" => Some("aarch64-unknown-linux-gnu"),
+            _ => None,
+        }
+    }
+
     /// Builds the process's engine.
     ///
     /// Fuel metering is enabled for the whole engine (§4.4: every call into a
     /// policy has a budget), backtraces are off because a failure is reported
     /// as its trap code alone, and the compiler runs at `Speed` because a
     /// policy compiled for a different optimisation level is not the artifact
-    /// the Program Server stored.
+    /// the Program Server stored. The target is [`Self::target`], so an
+    /// artifact the Program Server precompiled for this architecture loads
+    /// here even though the two engines are different objects.
     pub fn new() -> Result<Self, PolicyError> {
+        let target = Self::target().ok_or_else(|| PolicyError::Load {
+            message: format!(
+                "the host architecture {} has no policy target",
+                std::env::consts::ARCH
+            ),
+        })?;
         let mut config = Config::new();
         config.consume_fuel(true);
         config.cranelift_opt_level(OptLevel::Speed);
@@ -41,6 +65,9 @@ impl Engine {
         // collected (`None`): the mechanism reverts the policy rather than
         // debugging it in the scheduler thread.
         config.wasm_backtrace_max_frames(None);
+        config.target(target).map_err(|error| PolicyError::Load {
+            message: format!("{target} is not a policy target: {error}"),
+        })?;
         let inner = wasmtime::Engine::new(&config).map_err(|error| PolicyError::Load {
             message: format!("this host has no engine for wasm32 policy modules: {error}"),
         })?;

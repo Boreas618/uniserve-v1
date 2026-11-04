@@ -39,7 +39,7 @@ use anyhow::Context as _;
 use ipc::ComponentDistribution;
 use ipc::WorkerInfo;
 use ipc::{ComponentConfig, ParallelConfig, RequestId};
-use proto::request::{ExpertExchange, SchedulingPolicy};
+use proto::request::ExpertExchange;
 
 /// One cooperative member's physical execution endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -360,7 +360,10 @@ pub struct EngineConfig {
     /// queues without bound.
     pub max_queued_requests: Option<usize>,
     /// When a request whose draft cache is missing has it refilled.
-    pub refill: crate::scheduler::RefillPolicy,
+    /// The captured graph sizes the deployment states, in tokens, ascending
+    /// and without duplicates (`Room.graph_tiers`). Empty when the spec states
+    /// none; see `SchedulerConfig::graph_tiers`.
+    pub graph_tiers: Vec<u32>,
     /// Per-request token ceiling for one prefill chunk.
     pub chunked_prefill_size: usize,
     /// Reuse and retain prompt cache prefixes across requests. Disabling this
@@ -377,7 +380,6 @@ pub struct EngineConfig {
     /// and `host_gib`).
     pub host_cache: crate::kv_cache::HostCacheSize,
     /// Waiting queue policy for admitting/scheduling requests.
-    pub schedule_policy: SchedulingPolicy,
     /// Static computation components and physical rank membership.
     pub worker_groups: Vec<WorkerGroupConfig>,
     /// Per-edge data-plane transfer backend selection (`placement_config.transfer`), e.g.
@@ -465,12 +467,11 @@ impl EngineConfig {
             max_running_requests: DEFAULT_MAX_RUNNING_REQUESTS,
             max_queued_requests: None,
             chunked_prefill_size: DEFAULT_CHUNKED_PREFILL_SIZE,
-            refill: crate::scheduler::RefillPolicy::default(),
+            graph_tiers: Vec::new(),
             prefix_cache: true,
             boundary_interval: crate::kv_cache::DEFAULT_BOUNDARY_INTERVAL,
             state_interval: crate::kv_cache::DEFAULT_STATE_INTERVAL,
             host_cache: crate::kv_cache::HostCacheSize::default(),
-            schedule_policy: SchedulingPolicy::Fcfs,
             worker_groups: vec![WorkerGroupConfig::placed(
                 &["localhost".to_owned()],
                 "cpu",
@@ -923,10 +924,9 @@ impl SchedulerHandle {
                 max_running_requests: config.max_running_requests.max(1),
                 max_queued_requests: config.max_queued_requests,
                 chunked_prefill_size: config.chunked_prefill_size.max(1),
-                policy: config.schedule_policy,
                 canvas: config.worker_process.canvas_sampling,
                 draft_tokens: config.worker_process.draft_tokens as usize,
-                refill: config.refill,
+                graph_tiers: config.graph_tiers.clone(),
             },
             config.worker_process.dtype,
             config.generation_limits,
@@ -1207,6 +1207,84 @@ impl SchedulerHandle {
         &self,
     ) -> crossbeam_channel::Receiver<Vec<proto::request::wire::RequestPrefix>> {
         self.commands.describe_requests()
+    }
+
+    /// §7.3 step 2: prepares `program`'s policy on this scheduler's state,
+    /// without putting it in; the answer arrives when the blocking thread that
+    /// loaded it is done.
+    pub fn precopy_policy(
+        &self,
+        program: crate::scheduler::PolicyProgram,
+        source: std::sync::Arc<dyn crate::scheduler::PolicySource + Send + Sync>,
+    ) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.commands.precopy_policy(program, source)
+    }
+
+    /// §7.3 step 3: the prepared policy answers from this scheduler's next
+    /// batch boundary.
+    pub fn switchover_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.commands.switchover_policy()
+    }
+
+    /// §7.3 step 5: probation ended; the replaced policy stays until the next
+    /// precopy.
+    pub fn commit_policy(&self) {
+        self.commands.commit_policy();
+    }
+
+    /// §7.3 step 4: the previous policy answers again, on the state this
+    /// scheduler holds when the stage applies.
+    pub fn revert_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.commands.revert_policy()
+    }
+
+    /// §7.3 step 6: the module a revert could return to is dropped.
+    pub fn purge_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.commands.purge_policy()
+    }
+
+    /// §7.3 step 2's failure: a precopied generation is dropped.
+    pub fn discard_policy(&self) {
+        self.commands.discard_policy();
+    }
+
+    /// The step this scheduler reached and §12's cost counters for its policy,
+    /// or a timeout when the scheduler does not answer.
+    pub fn progress(&self) -> crossbeam_channel::Receiver<crate::scheduler::Progress> {
+        self.commands.progress()
+    }
+
+    /// Asks this scheduler for the policy failure it recorded since the last
+    /// call, if it recorded one (§7.3).
+    ///
+    /// The answer is polled, not waited for: the caller of the stats tick is
+    /// the engine's control thread, and a scheduler that does not answer must
+    /// not hold it.
+    pub fn take_policy_report(
+        &self,
+    ) -> crossbeam_channel::Receiver<Option<crate::scheduler::PolicyReverted>> {
+        self.commands.take_policy_report()
+    }
+
+    /// The state the epoch's policy is instantiated with, as this scheduler
+    /// holds it and with `ranks` as the control thread knows them (§7.3);
+    /// `None` when the scheduler does not answer in time.
+    ///
+    /// The state is the mechanism's, not a serving policy's, so an epoch's
+    /// first precopy instantiates its policy on it before any policy serves.
+    ///
+    /// The control thread instantiates its route instance on it and reverts
+    /// there after a `route` failure, so a failure costs one boundary, not the
+    /// epoch.
+    pub fn policy_state(
+        &self,
+        ranks: Vec<scheduling::guest::view::RankView>,
+    ) -> Option<crate::scheduler::TrialState> {
+        self.commands
+            .policy_state(ranks)
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .ok()
+            .flatten()
     }
 
     /// Publishes the committed world's immutable pages on every claimed node.

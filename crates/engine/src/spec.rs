@@ -20,7 +20,7 @@ use crate::core::{EngineConfig, WorkerGroupConfig};
 use crate::deployment::Deployment;
 use crate::executor::TransferConfig;
 use crate::scheduler::{
-    DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_NUM_BATCHED_TOKENS, RefillPolicy, SchedulerConfig,
+    DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_NUM_BATCHED_TOKENS, SchedulerConfig,
 };
 use crate::worker::WorkerProcessArgs;
 
@@ -39,7 +39,6 @@ fn named<T: DeserializeOwned>(value: &str, option: &str) -> anyhow::Result<T> {
 /// Fails on a policy the engine does not know.
 pub(crate) fn scheduler_limits(scheduling: &Scheduling) -> anyhow::Result<SchedulerConfig> {
     Ok(SchedulerConfig {
-        policy: named(&scheduling.policy, "scheduler_config.policy")?,
         max_batch: scheduling.max_batch.max(1) as usize,
         max_num_batched_tokens: scheduling
             .max_num_batched_tokens
@@ -53,17 +52,10 @@ pub(crate) fn scheduler_limits(scheduling: &Scheduling) -> anyhow::Result<Schedu
             .map(|requests| requests as usize),
         canvas: None,
         draft_tokens: 0,
-        refill: refill_policy(scheduling),
+        // A `Configure` command states the scheduling limits, not the
+        // deployment's graph catalog.
+        graph_tiers: Vec::new(),
     })
-}
-
-/// The draft cache refill policy `scheduling` states: the values it states
-/// in place of the ones the world measures.
-pub(crate) fn refill_policy(scheduling: &Scheduling) -> RefillPolicy {
-    RefillPolicy {
-        expected_speedup: scheduling.expected_speedup,
-        token_cost: scheduling.refill_token_cost,
-    }
 }
 
 /// A list the spec states, `None` when absent.
@@ -304,7 +296,16 @@ impl EngineConfig {
             chunked_prefill_size: scheduling
                 .chunked_prefill_size
                 .map_or(DEFAULT_CHUNKED_PREFILL_SIZE, |size| size as usize),
-            refill: refill_policy(scheduling),
+            graph_tiers: {
+                // The deployment's captured graph catalog, ascending and
+                // without duplicates: the largest of them bounds a batch's
+                // tokens (`Room.graph_tiers`).
+                let mut tiers: Vec<u32> = sizes(&graphs.decode_batch_sizes).unwrap_or_default();
+                tiers.extend(sizes(&graphs.prefill_token_sizes).unwrap_or_default());
+                tiers.sort_unstable();
+                tiers.dedup();
+                tiers
+            },
             prefix_cache: kv_cache.prefix_caching,
             boundary_interval: kv_cache
                 .boundary_interval
@@ -322,7 +323,6 @@ impl EngineConfig {
                 kv_cache.host_ratio,
                 kv_cache.host_bytes,
             )?,
-            schedule_policy: named(&scheduling.policy, "scheduler_config.policy")?,
             worker_groups,
             transfer,
             data_parallel_size: placement.data_parallel_size.max(1) as usize,

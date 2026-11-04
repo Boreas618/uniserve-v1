@@ -15,8 +15,8 @@
 
 use scheduling::guest::wire::{self, Call};
 use scheduling::guest::{
-    CallView, ExpertLoad, ExpertOrder, Init, Limits, Nanos, PageId, PhaseId, Plan, RequestId,
-    RequestView, Room, Shortage, Storage, Victim, Work,
+    CallView, ExpertLoad, ExpertOrder, Limits, Nanos, PageId, Parameters, PhaseId, Plan, RankView,
+    RequestId, RequestView, Room, Shortage, Snapshot, Storage, Victim, Work,
 };
 use scheduling::{Engine, PolicyError, PolicyInstance, PolicyModule};
 
@@ -41,7 +41,7 @@ struct Toy {
     refuses_allocation: bool,
     replies: Vec<(&'static str, Vec<u8>)>,
     indexes: Vec<(&'static str, u32)>,
-    bodies: Vec<(&'static str, &'static str)>,
+    bodies: Vec<(&'static str, String)>,
 }
 
 impl Toy {
@@ -69,8 +69,8 @@ impl Toy {
 
     /// Answers `export` with a body written in `wat`, whose value is the
     /// export's result.
-    fn body(mut self, export: &'static str, body: &'static str) -> Self {
-        self.bodies.push((export, body));
+    fn body(mut self, export: &'static str, body: impl Into<String>) -> Self {
+        self.bodies.push((export, body.into()));
         self
     }
 
@@ -155,7 +155,7 @@ impl Toy {
             let is_index = call.replies_with_index();
             let body = if let Some((_, body)) = self.bodies.iter().find(|(name, _)| *name == export)
             {
-                (*body).to_owned()
+                body.clone()
             } else if let Some(index) = self.replies.iter().position(|(name, _)| *name == export) {
                 let (offset, bytes) = (reply_offsets[index], &self.replies[index].1);
                 packed(offset, bytes.len())
@@ -234,7 +234,11 @@ fn call() -> CallView {
 fn policy(engine: &Engine, toy: Toy) -> PolicyInstance {
     let module = PolicyModule::load(engine, toy.wat().as_bytes()).unwrap();
     module
-        .instantiate(&Init::default(), &Limits::default())
+        .instantiate(
+            &Snapshot::default(),
+            &Parameters::default(),
+            &Limits::default(),
+        )
         .unwrap()
 }
 
@@ -293,15 +297,13 @@ fn reclaim_and_warm_may_answer_nothing() {
     // nothing; that is a decision, not a failure.
     let mut policy = policy(&engine, Toy::new());
 
-    assert!(
-        policy
-            .reclaim(&Shortage {
-                kind: Storage::HostPages,
-                need: 1,
-            })
-            .unwrap()
-            .is_empty()
-    );
+    assert!(policy
+        .reclaim(&Shortage {
+            kind: Storage::HostPages,
+            need: 1,
+        })
+        .unwrap()
+        .is_empty());
     assert!(policy.warm(&Room::default()).unwrap().is_empty());
 }
 
@@ -331,13 +333,50 @@ fn an_answer_with_a_field_the_host_does_not_know_still_decodes() {
 #[test]
 fn the_message_is_written_into_the_module() {
     let engine = engine();
-    // The first byte of the message of a JSON object is `{`; the toy answers
-    // with it, so the host must have written the message at the pointer the
-    // module returned.
+    // The toy answers with the first byte of the message it was handed, so the
+    // host must have written that message at the pointer the module returned.
+    // The route message is the interface's `(RequestView, &[RankView])` tuple
+    // (the guest decodes a tuple too), and a tuple encodes as a JSON sequence:
+    // its first byte is `[`, not the `{` of one object.
     let toy = Toy::new().body(Call::Route.export(), "(i32.load8_u (local.get 0))");
     let mut policy = policy(&engine, toy);
+    let ranks: Vec<RankView> = Vec::new();
+    let message = wire::encode(&(request(), &ranks)).unwrap();
 
-    assert_eq!(policy.route(&request(), &[]).unwrap(), usize::from(b'{'));
+    assert_eq!(
+        policy.route(&request(), &[]).unwrap(),
+        usize::from(message[0])
+    );
+    assert_eq!(message[0], b'[');
+}
+
+/// An artifact outlives the engine that made it: the Program Server
+/// precompiles a policy with one engine, a scheduler thread loads it with
+/// another built by `Engine::new()`, and the target `new` pins is what makes
+/// the two agree (a module from a differently targeted engine does not load).
+#[test]
+fn a_precompiled_module_loads_and_runs_in_another_engine() {
+    let artifact = engine().precompile(Toy::new().wat().as_bytes()).unwrap();
+    // A second engine of the same process: the store's artifact is not tied to
+    // the compiling engine, only to the target both are built for.
+    let second = engine();
+    let module = PolicyModule::load(&second, &artifact).unwrap();
+    let policy = module
+        .instantiate(
+            &Snapshot::default(),
+            &Parameters::default(),
+            &Limits::default(),
+        )
+        .unwrap();
+
+    assert!(policy.failure().is_none());
+    // The module answers the limits it was initialized with, so the call runs.
+    let limits = policy.limits();
+    assert_eq!(limits.max_batch, Limits::default().max_batch);
+    assert_eq!(
+        limits.max_num_batched_tokens,
+        Limits::default().max_num_batched_tokens
+    );
 }
 
 #[test]
@@ -346,9 +385,16 @@ fn fuel_is_renewed_for_every_call() {
     // A dispatch that costs a measurable amount, so the budget can be set
     // between one call's cost and two calls' cost: three calls then prove the
     // budget is renewed per call rather than shared by the instance.
-    let toy = Toy::new().body(
-        Call::Dispatch.export(),
-        r#"
+    // Dispatch is one of the calls whose answer must carry something, so the
+    // body runs the loop and then answers with an empty plan: every call of the
+    // loop below is a complete dispatch, not one the host rejects for silence.
+    let reply = wire::encode(&Plan::default()).unwrap();
+    let toy = Toy::new()
+        .reply(Call::Dispatch.export(), &Plan::default())
+        .body(
+            Call::Dispatch.export(),
+            format!(
+                r#"
     (local $n i32)
     (local.set $n (i32.const 1000))
     (block $done
@@ -356,8 +402,10 @@ fn fuel_is_renewed_for_every_call() {
         (br_if $done (i32.eqz (local.get $n)))
         (local.set $n (i32.sub (local.get $n) (i32.const 1)))
         (br $l)))
-    (i64.const 0)"#,
-    );
+    {}"#,
+                packed(REPLY_BASE, reply.len()),
+            ),
+        );
     let mut policy = policy(&engine, toy);
 
     assert!(policy.dispatch(&Room::default()).unwrap().work.is_empty());
@@ -429,7 +477,11 @@ fn a_module_that_cannot_reserve_the_message_fails_the_call() {
     let module = PolicyModule::load(&engine, toy.wat().as_bytes()).unwrap();
     // `limits()` is read at instantiation and needs a buffer too, so the
     // module refuses to instantiate before any decision is made.
-    match module.instantiate(&Init::default(), &Limits::default()) {
+    match module.instantiate(
+        &Snapshot::default(),
+        &Parameters::default(),
+        &Limits::default(),
+    ) {
         Err(PolicyError::Malformed { call, .. }) => assert_eq!(call, Call::Init),
         Err(other) => panic!("expected a malformed call, got {other:?}"),
         Ok(_) => panic!("expected a malformed call, got an instance"),
@@ -459,7 +511,11 @@ fn a_module_without_a_decision_does_not_instantiate() {
     let toy = Toy::new().omit(Call::Warm.export());
     let module = PolicyModule::load(&engine, toy.wat().as_bytes()).unwrap();
 
-    match module.instantiate(&Init::default(), &Limits::default()) {
+    match module.instantiate(
+        &Snapshot::default(),
+        &Parameters::default(),
+        &Limits::default(),
+    ) {
         Err(PolicyError::Instantiate { message }) => {
             assert!(message.contains("sched_warm"), "{message}");
         }
@@ -478,7 +534,11 @@ fn limits_outside_the_build_config_are_refused() {
     let toy = Toy::new().reply(Call::Limits.export(), &wider);
     let module = PolicyModule::load(&engine, toy.wat().as_bytes()).unwrap();
 
-    match module.instantiate(&Init::default(), &Limits::default()) {
+    match module.instantiate(
+        &Snapshot::default(),
+        &Parameters::default(),
+        &Limits::default(),
+    ) {
         Err(PolicyError::BadLimits { message }) => {
             assert!(message.contains("max_batch"), "{message}");
         }
@@ -503,7 +563,7 @@ fn a_starvation_timeout_above_thirty_seconds_is_refused() {
     };
     let module = PolicyModule::load(&engine, toy.wat().as_bytes()).unwrap();
 
-    match module.instantiate(&Init::default(), &ceilings) {
+    match module.instantiate(&Snapshot::default(), &Parameters::default(), &ceilings) {
         Err(PolicyError::BadLimits { message }) => {
             assert!(message.contains("timeout"), "{message}");
         }
@@ -525,7 +585,11 @@ fn a_prefetch_floor_below_the_build_config_s_floor_is_refused() {
     let toy = Toy::new().reply(Call::Limits.export(), &sparing);
     let module = PolicyModule::load(&engine, toy.wat().as_bytes()).unwrap();
 
-    match module.instantiate(&Init::default(), &Limits::default()) {
+    match module.instantiate(
+        &Snapshot::default(),
+        &Parameters::default(),
+        &Limits::default(),
+    ) {
         Err(PolicyError::BadLimits { message }) => {
             assert!(message.contains("prefetch_min_tokens"), "{message}");
         }
@@ -579,7 +643,11 @@ fn a_precompiled_module_round_trips() {
     let artifact = engine.precompile(text.as_bytes()).unwrap();
     let module = engine.module(&artifact).unwrap();
     let mut policy = module
-        .instantiate(&Init::default(), &Limits::default())
+        .instantiate(
+            &Snapshot::default(),
+            &Parameters::default(),
+            &Limits::default(),
+        )
         .unwrap();
 
     assert_eq!(
@@ -596,6 +664,49 @@ fn bytes_that_are_not_a_module_are_rejected() {
         Err(other) => panic!("expected a load failure, got {other:?}"),
         Ok(_) => panic!("expected a load failure, got a module"),
     }
+}
+
+#[test]
+fn two_instances_of_one_module_are_independent() {
+    let engine = engine();
+    // The serving instance, the control thread's route instance and a trial
+    // instance during precopy are all made from one module (§4.4, §7.3): a
+    // failure of one must leave the others serving.
+    let plan = Plan {
+        admit: vec![RequestId(1)],
+        ..Plan::default()
+    };
+    let toy = Toy::new()
+        .body(Call::Observe.export(), "unreachable")
+        .reply(Call::Dispatch.export(), &plan);
+    let module = PolicyModule::load(&engine, toy.wat().as_bytes()).unwrap();
+    let mut failing = module
+        .instantiate(
+            &Snapshot::default(),
+            &Parameters::default(),
+            &Limits::default(),
+        )
+        .unwrap();
+    let mut serving = module
+        .instantiate(
+            &Snapshot::default(),
+            &Parameters::default(),
+            &Limits::default(),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        failing.observe(&[]),
+        Err(PolicyError::Trap {
+            call: Call::Observe,
+            ..
+        })
+    ));
+    assert_eq!(
+        serving.dispatch(&Room::default()).unwrap().admit,
+        vec![RequestId(1)]
+    );
+    assert!(serving.failure().is_none());
 }
 
 #[test]

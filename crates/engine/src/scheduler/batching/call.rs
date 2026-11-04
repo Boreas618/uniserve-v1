@@ -523,10 +523,16 @@ impl Scheduler {
             ));
         }
 
-        // Worker selection records the request's residency on that worker.
+        // Worker selection records the request's residency on that worker. A
+        // request that has not run this component yet is placed where the
+        // policy says (§4.4); one that has goes back to the replica holding its
+        // state, whatever the policy would answer.
+        let Some(choice) = self.place_call(&call) else {
+            return None;
+        };
         let Some((worker, entry)) =
             self.placement
-                .select_worker(self.executor.as_ref(), &self.info, &call)
+                .select_worker(self.executor.as_ref(), &self.info, &call, &choice)
         else {
             self.invariant_broken("a planned call retains an executable component");
             return None;

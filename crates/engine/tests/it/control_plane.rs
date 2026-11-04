@@ -46,7 +46,6 @@ use engine::{
     RejectionKind,
 };
 use ipc::{ImageParams, RequestId, SamplingParams};
-use proto::request::SchedulingPolicy;
 
 /// Default special tokens, whose first EOS id equals the simulator's synthetic
 /// EOS, so the simulator's end of text finishes requests with `Eos`.
@@ -502,13 +501,12 @@ struct Collected {
 /// events but no terminal event has `finished == false`.
 fn batch_requests(
     depth: u32,
-    policy: SchedulingPolicy,
     cases: &[(GenerationConstraint, usize)],
 ) -> HashMap<RequestId, Collected> {
     let mut sim = SimEngine::new();
     sim.set_queue_depth(depth);
     let executor = Box::new(SimExecutor::new(sim));
-    let sched = support::scheduler_with_policy(executor, special_tokens(), 32, policy).unwrap();
+    let sched = support::scheduler_with_depth(executor, special_tokens(), 32).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = CommandSender::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -570,7 +568,6 @@ fn batch_requests(
 fn text_and_image_requests_complete() {
     let out = batch_requests(
         2,
-        SchedulingPolicy::Fcfs,
         &[
             (GenerationConstraint::UndOnly, 3),
             (GenerationConstraint::GenOnly, 2),
@@ -1002,16 +999,8 @@ fn forward_batches_hold_at_most_the_workers_batch_calls() {
 /// the same prompts produce the same per-request token counts at depth 1 and 2.
 #[test]
 fn queue_depth_is_token_identical() {
-    let d1 = batch_requests(
-        1,
-        SchedulingPolicy::Fcfs,
-        &[(GenerationConstraint::UndOnly, 4)],
-    );
-    let d2 = batch_requests(
-        2,
-        SchedulingPolicy::Fcfs,
-        &[(GenerationConstraint::UndOnly, 4)],
-    );
+    let d1 = batch_requests(1, &[(GenerationConstraint::UndOnly, 4)]);
+    let d2 = batch_requests(2, &[(GenerationConstraint::UndOnly, 4)]);
     for id in d1.keys() {
         assert_eq!(
             d1[id].text, d2[id].text,
@@ -3318,11 +3307,7 @@ fn commit_eos_finishes_without_spending_remaining_budget() {
 
 #[test]
 fn fcfs_policy_completes_text() {
-    let out = batch_requests(
-        2,
-        SchedulingPolicy::Fcfs,
-        &[(GenerationConstraint::UndOnly, 3)],
-    );
+    let out = batch_requests(2, &[(GenerationConstraint::UndOnly, 3)]);
     assert_eq!(out.len(), 3);
     for c in out.values() {
         assert!(c.finished);
@@ -3656,9 +3641,7 @@ fn cache_resources_return_after_completion() {
     let handle = engine::CommandSender::new(command_tx);
 
     let executor = Box::new(SimExecutor::new(SimEngine::new()));
-    let mut sched =
-        support::scheduler_with_policy(executor, special_tokens(), 32, SchedulingPolicy::Fcfs)
-            .unwrap();
+    let mut sched = support::scheduler_with_depth(executor, special_tokens(), 32).unwrap();
 
     // Keep receivers alive — a dropped receiver is treated as a cancellation.
     let mut keep_alive = Vec::new();
@@ -3755,9 +3738,7 @@ fn slow_client_releases_execution_slots_before_output_capacity_returns() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
     let executor = Box::new(SimExecutor::new(sim));
-    let mut scheduler =
-        support::scheduler_with_policy(executor, special_tokens(), 32, SchedulingPolicy::Fcfs)
-            .unwrap();
+    let mut scheduler = support::scheduler_with_depth(executor, special_tokens(), 32).unwrap();
     let slow_events = handle
         .submit(generation_request(
             RequestId(1),
@@ -3871,9 +3852,7 @@ fn engine_death_delivers_the_terminal_behind_a_full_event_channel() {
         inner: SimExecutor::new(sim),
         lost: Arc::clone(&lost),
     });
-    let mut scheduler =
-        support::scheduler_with_policy(executor, special_tokens(), 32, SchedulingPolicy::Fcfs)
-            .unwrap();
+    let mut scheduler = support::scheduler_with_depth(executor, special_tokens(), 32).unwrap();
     let mut events = handle
         .submit(generation_request(
             RequestId(1),
@@ -3938,7 +3917,7 @@ fn scheduler_takes_limits_in_place_within_its_workers_batch() {
         max_batch: 32,
         ..Default::default()
     };
-    let sched = support::scheduler_with(executor, special_tokens(), base).unwrap();
+    let sched = support::scheduler_with(executor, special_tokens(), base.clone()).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = CommandSender::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
@@ -3946,7 +3925,7 @@ fn scheduler_takes_limits_in_place_within_its_workers_batch() {
     let refused = handle
         .configure(SchedulerConfig {
             max_running_requests: 1 << 30,
-            ..base
+            ..base.clone()
         })
         .recv()
         .unwrap()
@@ -3956,7 +3935,7 @@ fn scheduler_takes_limits_in_place_within_its_workers_batch() {
     handle
         .configure(SchedulerConfig {
             max_running_requests: 1,
-            ..base
+            ..base.clone()
         })
         .recv()
         .unwrap()
@@ -3997,8 +3976,7 @@ fn scheduler_takes_limits_in_place_within_its_workers_batch() {
     handle
         .configure(SchedulerConfig {
             max_running_requests: 1,
-            policy: SchedulingPolicy::Priority,
-            ..base
+            ..base.clone()
         })
         .recv()
         .unwrap()

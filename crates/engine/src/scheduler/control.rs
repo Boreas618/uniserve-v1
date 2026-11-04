@@ -165,6 +165,31 @@ impl Scheduler {
             Command::DescribeRequests(answer) => {
                 let _ = answer.send(self.migrating_cache().1);
             }
+            Command::TakePolicyReport(answer) => {
+                let _ = answer.send(self.take_policy_report());
+            }
+            Command::Progress { answer } => {
+                let progress = policy::Progress {
+                    step: self.step,
+                    usage: self.policy.as_ref().map(policy::PolicySlot::usage),
+                };
+                let _ = answer.send(progress);
+            }
+            Command::PublishExpertLoad { load } => {
+                self.set_expert_load(load);
+            }
+            Command::TakeExpertOrder(answer) => {
+                let _ = answer.send(self.take_expert_order());
+            }
+            Command::DescribePolicyState { ranks, answer } => {
+                // The state is the mechanism's, not the serving policy's: an
+                // epoch's first precopy instantiates the epoch's policy on the
+                // state the mechanism holds before any policy serves (§7.3
+                // step 2).
+                let state =
+                    views::trial_state_with_ranks(self, self.step, self.recorder.recorded(), ranks);
+                let _ = answer.send(Some(state));
+            }
             Command::CacheWarm {
                 operation,
                 together,
@@ -213,9 +238,191 @@ impl Scheduler {
                 }
                 let _ = answer.send(committed);
             }
+            Command::PrecopyPolicy {
+                program,
+                source,
+                answer,
+            } => self.precopy_policy(program, source, answer),
+            Command::SwitchoverPolicy { answer } => {
+                self.request_stage(Stage::Switchover, Some(answer));
+            }
+            Command::CommitPolicy => self.request_stage(Stage::Commit, None),
+            Command::RevertPolicy { answer } => self.request_stage(Stage::Revert, Some(answer)),
+            Command::PurgePolicy { answer } => self.request_stage(Stage::Purge, Some(answer)),
+            Command::DiscardPolicy => {
+                self.policy_prepared = None;
+                self.policy_stage = None;
+                if let Some(policy) = self.policy.as_mut() {
+                    policy.discard();
+                }
+            }
             Command::Shutdown => return true,
         }
+        // A precopy that finished on its blocking thread is taken here, and a
+        // stage that waited for a boundary is applied when there is one.
+        self.take_prepared_policy();
+        self.apply_policy_stage();
         false
+    }
+
+    /// §7.3 step 2: prepares the next policy on this boundary's state.
+    ///
+    /// The state is read here, at a boundary, and the load, the instantiation
+    /// and the trial of each decision run on a blocking thread, so the serving
+    /// thread is never held by them. The answer arrives when that thread is
+    /// done; [`Self::take_prepared_policy`] takes the candidate.
+    fn precopy_policy(
+        &mut self,
+        program: PolicyProgram,
+        source: Arc<dyn PolicySource + Send + Sync>,
+        answer: crossbeam_channel::Sender<Result<(), String>>,
+    ) {
+        let answer_moved = answer.clone();
+        let step = self.step;
+        let state = views::trial_state(self, step, self.recorder.recorded());
+        let live = views::live(self, step, self.recorder.recorded());
+        let ceilings = ceilings_of(BatchCapacity::of(&self.info));
+        let engine = policy::process_engine().cloned();
+        let (prepared, candidate) = crossbeam_channel::bounded(1);
+        let spawned = std::thread::Builder::new()
+            .name("policy-precopy".to_owned())
+            .spawn(move || {
+                let room = state.room.clone();
+                let built = engine.and_then(|engine| {
+                    let checked = mechanism::Checked::new(&live, &room);
+                    PolicySlot::prepare(
+                        &engine,
+                        source.as_ref(),
+                        program,
+                        state,
+                        &ceilings,
+                        &checked,
+                    )
+                });
+                let failed = built.as_ref().err().map(|error| error.to_string());
+                let _ = prepared.send(built);
+                let _ = match failed {
+                    Some(error) => answer_moved.send(Err(error)),
+                    None => answer_moved.send(Ok(())),
+                };
+            });
+        match spawned {
+            Ok(_) => self.policy_precopy = Some(candidate),
+            Err(error) => {
+                let _ = self.policy_precopy.take();
+                let _ = answer.send(Err(format!("the precopy thread did not start: {error}")));
+            }
+        }
+    }
+
+    /// Takes the candidate a precopy prepared, once its blocking thread is done.
+    ///
+    /// The scheduler that is about to switch reads it; a candidate that failed
+    /// is dropped, and its failure is the answer the precopy already gave.
+    pub(super) fn take_prepared_policy(&mut self) {
+        let Some(precopy) = self.policy_precopy.as_ref() else {
+            return;
+        };
+        let Ok(built) = precopy.try_recv() else {
+            return;
+        };
+        self.policy_precopy = None;
+        match built {
+            Ok(candidate) => self.policy_prepared = Some(candidate),
+            Err(error) => tracing::warn!(%error, "a policy precopy failed"),
+        }
+    }
+
+    /// Asks for a stage of §7.3, answered when it is applied.
+    ///
+    /// A stage changes the serving policy, so it is applied where no batch and
+    /// no submission is in flight — never in the middle of one (§7.3: "在一个
+    /// 批次边界（更新点）上"). A switchover with nothing prepared is refused at
+    /// once: the daemon's precopy failed and the update is discarded.
+    fn request_stage(
+        &mut self,
+        stage: Stage,
+        answer: Option<crossbeam_channel::Sender<Result<(), String>>>,
+    ) {
+        if stage == Stage::Switchover {
+            self.take_prepared_policy();
+            if self.policy_prepared.is_none() {
+                if let Some(answer) = answer {
+                    let _ = answer.send(Err(
+                        "a switchover arrived without a policy prepared by a precopy".to_owned(),
+                    ));
+                }
+                return;
+            }
+        }
+        self.policy_stage = Some((stage, answer));
+        self.apply_policy_stage();
+    }
+
+    /// Applies the stage asked for, when the scheduler is at a boundary: no
+    /// batch and no submission is in flight, so the policy that decided them is
+    /// no longer needed by anything (§7.3 steps 3 to 6).
+    pub(super) fn apply_policy_stage(&mut self) {
+        let ready = self.inflight.pending_batches.is_empty()
+            && self.inflight.pending_submissions.is_empty();
+        if !ready {
+            return;
+        }
+        let Some((stage, answer)) = self.policy_stage.take() else {
+            return;
+        };
+        let state = views::trial_state(self, self.step, self.recorder.recorded());
+        let applied = match self.stage_policy(stage, &state) {
+            Ok(report) => {
+                if let Some(report) = report {
+                    self.policy_report = Some(report);
+                }
+                Ok(())
+            }
+            Err(reason) => {
+                let program = self.policy.as_ref().map(|policy| policy.program().clone());
+                if let Some(program) = program {
+                    self.policy_report = Some(policy::PolicyReverted {
+                        scheduler: None,
+                        program,
+                        reason: reason.clone(),
+                        fatal: true,
+                    });
+                }
+                Err(reason)
+            }
+        };
+        if let Some(answer) = answer {
+            let _ = answer.send(applied);
+        }
+    }
+
+    /// Applies `stage` to the serving slot, installing an epoch's first policy
+    /// from the candidate its precopy prepared.
+    fn stage_policy(
+        &mut self,
+        stage: Stage,
+        state: &TrialState,
+    ) -> Result<Option<policy::PolicyReverted>, String> {
+        let Some(policy) = self.policy.as_mut() else {
+            // An epoch's first switchover: no policy served before, so the
+            // candidate's precopy prepared the only instance this policy has.
+            let Some(candidate) = self.policy_prepared.take() else {
+                return Ok(None);
+            };
+            let engine = policy::process_engine().map_err(|error| error.to_string())?;
+            let ceilings = ceilings_of(BatchCapacity::of(&self.info));
+            self.adopt(PolicySlot::from_candidate(engine, ceilings, candidate));
+            return Ok(None);
+        };
+        if stage == Stage::Switchover {
+            let Some(candidate) = self.policy_prepared.take() else {
+                return Err("a switchover arrived without a prepared policy".to_owned());
+            };
+            policy.adopt(candidate);
+        }
+        policy.request(stage);
+        policy.boundary(state).map_err(|error| error.to_string())
     }
 
     /// Selects commands with available destinations without bypassing an older

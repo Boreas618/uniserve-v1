@@ -172,6 +172,35 @@ impl EncoderCacheManager {
         Some(entry.product)
     }
 
+    /// Every entry the cache holds, with the tick it was last used at.
+    ///
+    /// This is the encoder cache as a policy sees it: `Snapshot.encodings`
+    /// describes each entry by `views::encoding_id(key)` and its last use, and
+    /// `Victim::Encoding` names one. A pinned entry is listed too — it is live,
+    /// and whether it may be freed is [`Self::evict`]'s answer.
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (EncoderKey, u64)> + '_ {
+        self.entries.iter().map(|(key, entry)| (*key, entry.lru))
+    }
+
+    /// Frees the entry `key` names when nothing pins it, returning the product
+    /// whose worker buffer the caller must free.
+    ///
+    /// Returns `None` when the entry is absent or pinned, so a policy's
+    /// `Victim::Encoding` frees exactly what it named and nothing else. This is
+    /// the named-entry form of [`Self::evict_one`], which evicts the least
+    /// recently used unpinned entry.
+    pub(crate) fn evict(&mut self, key: &EncoderKey) -> Option<TensorRef> {
+        let entry = self.entries.get(key)?;
+        if entry.ref_cnt != 0 {
+            return None;
+        }
+        let tick = entry.lru;
+        self.evictable.remove(&tick);
+        let entry = self.entries.remove(key)?;
+        self.stats.evictions += 1;
+        Some(entry.product)
+    }
+
     /// Inserts a freshly-computed encoder product, evicting the LRU unreferenced
     /// entry if at budget. Returns any product the caller must free.
     ///
@@ -258,6 +287,14 @@ impl EncoderCacheManager {
         // Freshly inserted entries are unreferenced, hence evictable.
         self.evictable.insert(tick, hash);
         freed
+    }
+
+    /// When the entry `hash` now names was last used, if it is live.
+    ///
+    /// An entry's last use is its own clock: a re-use raises it, which is what
+    /// a policy's LRU reads to decide what to evict next.
+    pub(crate) fn last_used(&self, hash: &EncoderKey) -> Option<u64> {
+        self.entries.get(hash).map(|entry| entry.lru)
     }
 
     /// Acquires a cached entry, pinning it against eviction while the request uses it.

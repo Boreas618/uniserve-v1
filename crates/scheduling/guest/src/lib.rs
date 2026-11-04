@@ -54,7 +54,7 @@ pub use ids::{ComponentId, EncodingId, PageId, PhaseId, RequestId};
 pub use limits::{Limits, Parameters};
 pub use lru::Lru;
 pub use phases::Phases;
-pub use policy::{Init, Policy};
+pub use policy::{Instantiation, Policy};
 pub use time::{Duration, Nanos};
 pub use view::{
     CallView, EncodingView, ExpertLoad, ExpertOrder, PageView, PhaseClass, PhaseKind, PhaseView,
