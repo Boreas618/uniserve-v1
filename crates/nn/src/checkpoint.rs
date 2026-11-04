@@ -1,8 +1,15 @@
 //! A checkpoint: its safetensors shards, the tensors they hold, and the identity of every file.
 //!
 //! The loader never converts a checkpoint's weights in place and never holds a whole shard in host
-//! memory: each shard is mapped read-only with `memmap2`, the safetensors crate reads its header,
-//! and one tensor's bytes are copied when a weight is converted. A shard is mapped for the life of
+//! memory: each shard is mapped read-only with `memmap2`, [`read_header`] reads its header — eight
+//! bytes of length, the JSON body, and each tensor's `{dtype, shape, data_offsets}` — and one
+//! tensor's bytes are copied when a weight is converted.
+//!
+//! The header reader is ours and not a crate's because the dtype set is the **format's**, while a
+//! crate's `Dtype` enum is a subset of it: a calibrated NVFP4 export stores its block scales as
+//! `F8_E4M3`, and a reader that cannot name that cannot open the model. Every dtype name our
+//! operators speak is mapped onto an operator ABI [`DType`], and any other name is refused at open,
+//! with the name and the tensor in the message, rather than reach a launch that would misread it. A shard is mapped for the life of
 //! the [`Checkpoint`], which is the model's life; the mapping costs virtual address space, not
 //! resident memory.
 //!

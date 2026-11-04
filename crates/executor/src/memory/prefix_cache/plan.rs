@@ -161,6 +161,65 @@ pub struct CacheDescription {
     pub checkpoints: Vec<Checkpoint>,
 }
 
+impl CacheDescription {
+    /// The pool one group of `layers` dense layers describes: one column holding
+    /// `layers` rows of `kv_heads x head_dim` of `dtype`, no scales, no state
+    /// fields and no checkpoints.
+    ///
+    /// A caller that has no model geometry yet - the mount's capacity path - gets
+    /// the smallest honest pool from it instead of inventing fields.
+    pub fn dense(
+        block_size: u32,
+        layers: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        dtype: PrefixCacheDtype,
+    ) -> Self {
+        let element = match dtype {
+            PrefixCacheDtype::Float16 | PrefixCacheDtype::BFloat16 => 2,
+            PrefixCacheDtype::Float32 => 4,
+            PrefixCacheDtype::Float8E4m3Fn => 1,
+        };
+        let row_bytes = u64::from(kv_heads) * u64::from(head_dim) * element;
+        let plane_bytes = row_bytes * u64::from(block_size);
+        Self {
+            // One column per layer: every layer writes its own column's unit,
+            // so a page holds one unit whatever the layer count.
+            columns: layers.max(1),
+            plane_bytes,
+            quantized: false,
+            unit_bytes: 2 * plane_bytes + 2,
+            dtype,
+            groups: vec![CacheGroupPlan {
+                window: None,
+                state: false,
+                draft: false,
+                block_size,
+                units_per_page: 1,
+                layers: (0..layers).map(|layer| format!("layers.{layer}")).collect(),
+                layer_ids: (0..layers).collect(),
+                axis: GroupAxis {
+                    offset: 0,
+                    total: layers,
+                },
+                num_kv_heads: kv_heads,
+                total_kv_heads: kv_heads,
+                kv_head_offset: 0,
+                head_dim,
+                dtype: match dtype {
+                    PrefixCacheDtype::Float16 => ElementType::F16,
+                    PrefixCacheDtype::Float32 => ElementType::F32,
+                    PrefixCacheDtype::Float8E4m3Fn => ElementType::F8E4M3,
+                    PrefixCacheDtype::BFloat16 => ElementType::BF16,
+                },
+                compute_dtype: ElementType::BF16,
+            }],
+            states: Vec::new(),
+            checkpoints: Vec::new(),
+        }
+    }
+}
+
 impl CachePlan {
     /// Plan the unit pool a model describes.
     ///
