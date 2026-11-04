@@ -94,9 +94,11 @@ fn run() -> Result<(), String> {
     let args = Args::parse()?;
     match args.stage.as_str() {
         "weights" => weights(&args),
+        "plan" => plan(&args),
         "encode" => encode(&args),
         other => Err(format!(
-            "`{other}` is not a stage of this harness; it has `weights` (host) and `encode` (device)"
+            "`{other}` is not a stage of this harness; it has `weights` (host), `plan` (host) and \
+             `encode` (device)"
         )),
     }
 }
@@ -298,6 +300,127 @@ fn weights(args: &Args) -> Result<(), String> {
          the placement the packing gathers them from - so they need the loaded block and are printed \
          by `--stage encode`. The case is {}x{} with a {} px image and {} prompt tokens.",
         args.width, args.height, args.image, args.text_tokens
+    );
+    Ok(())
+}
+
+/// The host stage that sizes the case: every plan the device stage will reserve, and its total.
+///
+/// A reservation is the number this prints - not a flag - and a harness whose fixed pool is smaller
+/// than its plan is a stop the caller reads as a defect in the model. So the plan is printed before
+/// anything runs, and the device stage reserves exactly this.
+fn plan(args: &Args) -> Result<(), String> {
+    let layout = minimax_h3::checkpoint::Layout::detect(&args.root).map_err(show)?;
+    let sidecars =
+        minimax_h3::checkpoint::Sidecars::read(&args.root, None, &layout).map_err(show)?;
+    let config = Config::normalize(&layout, &sidecars).map_err(show)?;
+    let partition = Partition::serving(&config, args.task, 1, 1, 0, 0).map_err(show)?;
+    let dit = config
+        .denoisers
+        .get(&Dit::Base)
+        .ok_or_else(|| "the checkpoint states no base DiT".to_owned())?
+        .clone();
+    let arrangement = partition.arrangement(&dit).map_err(show)?;
+    let layouts = Layouts::new(dit.clone(), arrangement).map_err(show)?;
+
+    let condition = ConditionShape {
+        role: ConditionRole::FirstFrame,
+        frames: 1,
+        height: args.image,
+        width: args.image,
+        audio_samples: 0,
+    };
+    let request = VideoRequest {
+        task: args.task,
+        width: args.width,
+        height: args.height,
+        frames: args.frames,
+        fps: 24,
+        first_frames: 1,
+        last_frames: 0,
+        references: 0,
+        text_tokens: args.text_tokens,
+        conditions: std::slice::from_ref(&condition),
+        vision_spans: &[],
+    };
+    let (one, packing) = layouts.layout(&request).map_err(show)?;
+    let canvas = layouts.canvas(&request).map_err(show)?;
+    let raster = minimax_h3::packing::latent_raster(&canvas).map_err(show)?;
+    let latent = Extent {
+        frames: 1,
+        height: raster.height,
+        width: raster.width,
+    };
+    let pixels = Extent {
+        frames: 1,
+        height: canvas.height,
+        width: canvas.width,
+    };
+    let conditioning =
+        minimax_h3::encoding::conditioning_arena(&config.video_vae, 1, latent).map_err(show)?;
+    let tiles =
+        minimax_h3::encoding::video_encoder_tile_arena(&config.video_vae, pixels).map_err(show)?;
+    println!(
+        "case: {} {}x{} (canvas {}x{}, latent {}x{}), {} frames, {} px image, {} prompt tokens",
+        task_name(args.task),
+        args.width,
+        args.height,
+        canvas.width,
+        canvas.height,
+        raster.width,
+        raster.height,
+        args.frames,
+        args.image,
+        args.text_tokens
+    );
+    println!(
+        "rows: text capacity {}, condition capacity {}, prefix {} rows of {}",
+        one.text_rows,
+        one.condition_rows,
+        packing.zero_row() + 1,
+        dit.transformer.hidden_size
+    );
+    let mut total = 0_u64;
+    for (label, buffers) in [("conditioning", &conditioning), ("encoder tiles", &tiles)] {
+        let bytes: u64 = buffers.iter().map(|buffer| buffer.bytes()).sum();
+        total += bytes;
+        println!(
+            "plan {label}: {} buffers, {bytes} B = {} MiB",
+            buffers.len(),
+            bytes >> 20
+        );
+        for buffer in buffers.iter() {
+            println!("  {:<24} {:>12} elements", buffer.name, buffer.elements);
+        }
+    }
+    // The draws are FP32 and the text buffers the deployment's type, which the device stage reads
+    // from the checkpoint; on this host the case's own type is the export's, so both are four bytes
+    // unless a caller says otherwise.
+    let prefix_mib =
+        ((packing.zero_row() as u64 + 1) * u64::from(dit.transformer.hidden_size) * 4) >> 20;
+    let text_mib = (u64::from(one.text_rows)
+        * (u64::from(dit.transformer.hidden_size) + u64::from(config.text_encoder.hidden_size))
+        * 4)
+        >> 20;
+    let pixel_mib = (u64::from(pixels.frames)
+        * u64::from(pixels.height)
+        * u64::from(pixels.width)
+        * u64::from(config.video_vae.in_channels)
+        * 4)
+        >> 20;
+    let draw_mib = (u64::from(latent.frames)
+        * u64::from(latent.height)
+        * u64::from(latent.width)
+        * u64::from(dit.transformer.video_channels)
+        * 4)
+        >> 20;
+    println!(
+        "plan buffers: prefix {prefix_mib} MiB, text+source {text_mib} MiB, pixels {pixel_mib} MiB, \
+         draw {draw_mib} MiB"
+    );
+    println!(
+        "plan arena total (the two plans alone): {} MiB",
+        total >> 20
     );
     Ok(())
 }
