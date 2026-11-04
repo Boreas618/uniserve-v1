@@ -52,7 +52,7 @@ const STAGES: &[Stage] = &[
         stage: "video_decoder",
         weights: 4_618,
         constants: 0,
-        arena: 5_619,
+        arena: 7_757,
         tables: 3,
     },
     Stage {
@@ -85,7 +85,7 @@ const STAGES: &[Stage] = &[
         stage: "video_decoder",
         weights: 4_618,
         constants: 0,
-        arena: 5_619,
+        arena: 7_757,
         tables: 3,
     },
     Stage {
@@ -127,7 +127,7 @@ const STAGES: &[Stage] = &[
         stage: "video_decoder",
         weights: 4_618,
         constants: 0,
-        arena: 5_619,
+        arena: 7_757,
         tables: 3,
     },
     Stage {
@@ -168,7 +168,7 @@ const STAGES: &[Stage] = &[
         stage: "video_decoder",
         weights: 4_618,
         constants: 0,
-        arena: 5_619,
+        arena: 7_757,
         tables: 3,
     },
     Stage {
@@ -201,7 +201,7 @@ const STAGES: &[Stage] = &[
         stage: "video_decoder",
         weights: 4_618,
         constants: 0,
-        arena: 5_619,
+        arena: 7_757,
         tables: 3,
     },
     Stage {
@@ -333,6 +333,12 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .map(|buffer| buffer.elements * if buffer.element == "f16" { 2 } else { 4 })
             .sum();
+        if std::env::var("H3_ARENA_BUFFERS").is_ok() && canvas.width == 1536 {
+            for buffer in minimax_h3::decoding::video_arena(&config.video_vae, &latent)? {
+                let bytes = buffer.elements * if buffer.element == "f16" { 2 } else { 4 };
+                println!("    {} {} {} B", buffer.name, buffer.element, bytes);
+            }
+        }
         println!(
             "decode plan {}x{}: {} bytes = {} MiB",
             canvas.width,
