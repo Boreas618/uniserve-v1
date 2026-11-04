@@ -105,9 +105,10 @@ pub struct RequestView {
     /// Tokens of its prompt the prefix cache already holds.
     #[serde(default)]
     pub cached_prefix_tokens: u32,
-    /// Prompt tokens the runtime has computed so far (the next prefill chunk
-    /// starts here). Together with `cached_prefix_tokens` it gives the chunk
-    /// start and so the distance to the next KV page boundary.
+    /// Where the next prefill chunk starts: the prompt tokens the runtime has
+    /// computed, or the prefix the cache already held for it at admission,
+    /// whichever is further on. `cached_prefix_tokens` says how many of those
+    /// the cache holds; it is part of this count, not a value to add to it.
     #[serde(default)]
     pub prefilled_tokens: u32,
     /// KV pages it currently holds.

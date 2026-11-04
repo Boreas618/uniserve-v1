@@ -1597,8 +1597,10 @@ fn prefix_cache_configuration_controls_reuse() {
             prefix_cache: enabled,
             ..EngineConfig::sim("sim-model")
         };
-        let engine =
-            SchedulerHandle::with_executor(config, Box::new(SimExecutor::new(sim))).unwrap();
+        let executor = SimExecutor::new(sim);
+        let rank = executor.info().runtime_info().expect("the sim states its rank");
+        let engine = SchedulerHandle::with_executor(config, Box::new(executor)).unwrap();
+        support::install_policy_on(&engine, engine::BatchCapacity::of(&rank));
         let stats = engine.stats();
         let mut replies = Vec::new();
 
@@ -1931,7 +1933,10 @@ fn a_state_group_reuses_prefixes_up_to_a_checkpoint() {
         prefix_cache: true,
         ..EngineConfig::sim("sim-model")
     };
-    let engine = SchedulerHandle::with_executor(config, Box::new(SimExecutor::new(sim))).unwrap();
+    let executor = SimExecutor::new(sim);
+    let rank = executor.info().runtime_info().expect("the sim states its rank");
+    let engine = SchedulerHandle::with_executor(config, Box::new(executor)).unwrap();
+    support::install_policy_on(&engine, engine::BatchCapacity::of(&rank));
     let stats = engine.stats();
     for rid in 1..=2 {
         let mut events = engine
