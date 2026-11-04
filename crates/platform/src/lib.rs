@@ -16,9 +16,11 @@
 //! | Graph executable | [`GraphExec`] (borrowed) | by its owner |
 //! | Library loaded from a cubin or PTX image | [`Library`], [`Function`] | `cuLibraryUnload` on the last owner's drop |
 //! | Native kernel library | [`NativeLibrary`] | `dlclose` on the last owner's drop |
-//! | Device storage | [`DeviceAllocation`], [`PeerMapping`] | deferred to the reclaimer |
+//! | Device storage, mapped from a pool | [`Allocator`], [`Buffer`] | `cuMemUnmap` and `cuMemRelease` only when the pool is destroyed or shrunk; a freed block stays mapped for reuse |
+//! | Device storage, standalone | [`DeviceAllocation`], [`PeerMapping`] | deferred to the reclaimer |
 //! | Host storage | [`PinnedBuffer`] (deferred), [`HostRegistration`] (synchronous) | on drop |
-//! | NCCL | [`nccl::Communicator`] | explicit `destroy` |
+//! | NCCL | [`Communicator`] | explicit `destroy`, and only after every graph that captured one of its collectives is gone |
+//! | cuDNN | [`Cudnn`] | `cudnnDestroy` on drop |
 //! | NVML | [`Nvml`] | `nvmlShutdown` on drop |
 //!
 //! Device addresses are plain `u64` values (`CUdeviceptr`, unified with host
@@ -27,9 +29,11 @@
 //! Releasing storage never synchronizes on the dropping thread; see
 //! [`reclaim`].
 
+mod allocator;
 mod context;
 mod copy;
 mod cublas;
+mod cudnn;
 pub mod cupti;
 mod device;
 mod driver;
@@ -50,6 +54,7 @@ mod stream;
 mod tensormap;
 mod vmm;
 
+pub use allocator::{Allocator, Budget, Buffer, DevicePtr, DeviceRange, PoolKind};
 pub use context::{DeviceGuard, PrimaryContext};
 pub use copy::{
     CopyBatch, Pitched, PitchedBatch, SourceOrder, Strided, StridedCopy, memcpy_async,
@@ -59,17 +64,25 @@ pub use cublas::{
     Algorithm, ComputeType, Epilogue, Matmul, MatmulArgs, MatmulBytes, MatmulDescriptor,
     MatrixLayout,
 };
+pub use cudnn::{
+    Convolution, ConvolutionArgs, ConvolutionBytes, ConvolutionKind, ConvolutionPlan, Cudnn,
+    Engine, Tensor,
+};
 pub use device::{
     Device, DeviceAttribute, DeviceId, DeviceUuid, MemoryInfo, profiler_start, profiler_stop,
 };
 pub use dtype::DataType;
 pub use error::{Error, Result};
 pub use event::{Event, EventFlags, IpcEventHandle};
-pub use graph::{Capture, Graph, GraphExec, GraphNode, KernelNodeParams};
+pub use graph::{
+    Capture, CaptureMode, Graph, GraphExec, GraphNode, GraphNodeKind, KernelNodeParams,
+    OwnedKernelNodeParams,
+};
 pub use launch::{Cluster, ClusterScheduling, Function, FunctionAttribute, LaunchConfig};
 pub use library::Library;
 pub use memory::{DeviceAllocation, HostRegistration, PinnedBuffer};
 pub use native::NativeLibrary;
+pub use nccl::{Communicator, UniqueId};
 pub use nvml::{Nvml, NvmlMemory};
 pub use pool::VirtualPool;
 pub use stream::{CaptureStatus, Stream};

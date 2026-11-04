@@ -23,18 +23,23 @@ use std::sync::Arc;
 
 use crate::driver::{self, Handle, KernelNodeParams as RawKernelNodeParams};
 use crate::launch::Function;
-use crate::{DeviceGuard, DeviceId, Error, PrimaryContext, Result, Stream, reclaim};
-
-/// `CU_STREAM_CAPTURE_MODE_RELAXED`: other threads of the process may keep
-/// issuing CUDA work (the other devices' executors do) without invalidating
-/// the capture, and their work is not captured.
-const CU_STREAM_CAPTURE_MODE_RELAXED: i32 = 2;
+use crate::{Device, DeviceGuard, DeviceId, Error, PrimaryContext, Result, Stream, reclaim};
 
 /// `CU_STREAM_CAPTURE_STATUS_ACTIVE`.
 const CU_STREAM_CAPTURE_STATUS_ACTIVE: i32 = 1;
 
 /// `CU_GRAPH_NODE_TYPE_KERNEL`.
 const CU_GRAPH_NODE_TYPE_KERNEL: i32 = 0;
+/// `CU_GRAPH_NODE_TYPE_MEMCPY`.
+const CU_GRAPH_NODE_TYPE_MEMCPY: i32 = 1;
+/// `CU_GRAPH_NODE_TYPE_MEMSET`.
+const CU_GRAPH_NODE_TYPE_MEMSET: i32 = 2;
+/// `CU_GRAPH_NODE_TYPE_HOST`.
+const CU_GRAPH_NODE_TYPE_HOST: i32 = 3;
+/// `CU_GRAPH_NODE_TYPE_GRAPH`.
+const CU_GRAPH_NODE_TYPE_GRAPH: i32 = 4;
+/// `CU_GRAPH_NODE_TYPE_EMPTY`.
+const CU_GRAPH_NODE_TYPE_EMPTY: i32 = 5;
 
 /// What a template graph, its executable and its nodes share: the `CUgraph`,
 /// the context it belongs to, and the device.
@@ -110,7 +115,7 @@ impl Graph {
             "cuGraphInstantiateWithFlags",
         )?;
         Ok(GraphExec {
-            core: self.core.clone(),
+            core: Arc::clone(&self.core),
             raw,
         })
     }
@@ -127,7 +132,7 @@ impl Graph {
         Ok(handles
             .into_iter()
             .map(|raw| GraphNode {
-                core: self.core.clone(),
+                core: Arc::clone(&self.core),
                 raw,
             })
             .collect())
@@ -156,30 +161,116 @@ impl Graph {
         Ok(nodes)
     }
 
-    /// The graph's root nodes: those with no dependency.
-    fn root_handles(&self) -> Result<Vec<Handle>> {
+    /// Reads back the parameters of kernel node `node`: the kernel it
+    /// captured, its grid, block, dynamic shared memory and the values of its
+    /// arguments.
+    ///
+    /// This is the read half of a rebind walk (design 4.5): a capture with the
+    /// new kernels on a scratch stream gives a throwaway template, each of its
+    /// changed launches is read with this, and the values are set on the live
+    /// executable. `node` must be a kernel node of this graph, and the graph
+    /// may be destroyed once the returned values have been read.
+    pub fn kernel_node_params(&self, node: &GraphNode) -> Result<OwnedKernelNodeParams> {
+        if !Arc::ptr_eq(&self.core, &node.core) {
+            return Err(Error::invalid("the node belongs to another graph"));
+        }
+        let kind = node.kind()?;
+        if kind != GraphNodeKind::Kernel {
+            return Err(Error::invalid(format!(
+                "the node is {kind:?}, not a kernel node"
+            )));
+        }
+
         let driver = driver::driver()?;
         let _context = self.core.context.enter()?;
-        let mut count = 0usize;
+        let mut raw = RawKernelNodeParams {
+            func: std::ptr::null_mut(),
+            grid_dim: [0; 3],
+            block_dim: [0; 3],
+            shared_mem_bytes: 0,
+            kernel_params: std::ptr::null_mut(),
+            extra: std::ptr::null_mut(),
+            kern: std::ptr::null_mut(),
+            ctx: std::ptr::null_mut(),
+        };
         driver.check(
-            // SAFETY: a null array asks only for the count.
-            unsafe {
-                (driver.graph_get_root_nodes)(self.core.raw, std::ptr::null_mut(), &mut count)
-            },
-            "cuGraphGetRootNodes",
+            // SAFETY: the node is a live kernel node of this graph; the driver
+            // fills `raw` with the node's own parameter storage.
+            unsafe { (driver.graph_kernel_node_get_params)(node.raw, &mut raw) },
+            "cuGraphKernelNodeGetParams",
         )?;
-        if count == 0 {
-            return Ok(Vec::new());
+
+        // Each parameter's size comes from the kernel's signature: the node's
+        // array carries no count, and the driver answers past the last
+        // parameter with CUDA_ERROR_INVALID_VALUE.
+        let mut sizes = Vec::new();
+        loop {
+            let (mut offset, mut size) = (0usize, 0usize);
+            // SAFETY: the function is the node's, live while its library is.
+            let status = unsafe {
+                (driver.func_get_param_info)(raw.func, sizes.len(), &mut offset, &mut size)
+            };
+            if status == driver::CUDA_ERROR_INVALID_VALUE {
+                break;
+            }
+            driver.check(status, "cuFuncGetParamInfo")?;
+            sizes.push((offset, size));
         }
-        let mut nodes = vec![std::ptr::null_mut(); count];
-        driver.check(
-            // SAFETY: the array holds `count` handles, which the driver fills.
-            unsafe { (driver.graph_get_root_nodes)(self.core.raw, nodes.as_mut_ptr(), &mut count) },
-            "cuGraphGetRootNodes",
-        )?;
-        nodes.truncate(count);
-        Ok(nodes)
+
+        let mut parameters = Vec::with_capacity(sizes.len());
+        for (index, (offset, size)) in sizes.into_iter().enumerate() {
+            // SAFETY: the node's array has one entry per parameter of the
+            // signature, and its packed form lays the values out at the
+            // offsets just read; each value is `size` bytes there.
+            let source: *const c_void = unsafe {
+                if !raw.kernel_params.is_null() {
+                    *raw.kernel_params.add(index)
+                } else {
+                    (raw.extra as *const u8).add(offset).cast()
+                }
+            };
+            let mut value = vec![0u8; size];
+            if size > 0 {
+                // SAFETY: `source` addresses `size` readable bytes, as the
+                // signature says, and `value` holds exactly that many.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(source.cast::<u8>(), value.as_mut_ptr(), size)
+                };
+            }
+            parameters.push(value);
+        }
+
+        Ok(OwnedKernelNodeParams {
+            function: Function::new(raw.func, Device::new(self.core.device)?),
+            grid: raw.grid_dim,
+            block: raw.block_dim,
+            shared_memory: raw.shared_mem_bytes,
+            parameters,
+        })
     }
+}
+
+/// The template graph's root nodes: those with no dependency.
+fn root_handles(core: &Core) -> Result<Vec<Handle>> {
+    let driver = driver::driver()?;
+    let _context = core.context.enter()?;
+    let mut count = 0usize;
+    driver.check(
+        // SAFETY: a null array asks only for the count.
+        unsafe { (driver.graph_get_root_nodes)(core.raw, std::ptr::null_mut(), &mut count) },
+        "cuGraphGetRootNodes",
+    )?;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let mut nodes = vec![std::ptr::null_mut(); count];
+    driver.check(
+        // SAFETY: the array holds `count` handles, which the driver fills.
+        unsafe { (driver.graph_get_root_nodes)(core.raw, nodes.as_mut_ptr(), &mut count) },
+        "cuGraphGetRootNodes",
+    )?;
+    nodes.truncate(count);
+    Ok(nodes)
 }
 
 /// One node of a template graph (`CUgraphNode`).
@@ -196,6 +287,53 @@ pub struct GraphNode {
 unsafe impl Send for GraphNode {}
 // SAFETY: as for Send above.
 unsafe impl Sync for GraphNode {}
+
+impl GraphNode {
+    /// What work the node does (`cuGraphNodeGetType`).
+    ///
+    /// A rebind touches only [`GraphNodeKind::Kernel`] nodes; the capture of
+    /// an operation may add others (a copy of a constant, or the empty node
+    /// that joins dependencies), and setting kernel parameters on one of them
+    /// is the driver's error.
+    pub fn kind(&self) -> Result<GraphNodeKind> {
+        let driver = driver::driver()?;
+        let _context = self.core.context.enter()?;
+        let mut kind = 0;
+        driver.check(
+            // SAFETY: the node belongs to a graph that is live.
+            unsafe { (driver.graph_node_get_type)(self.raw, &mut kind) },
+            "cuGraphNodeGetType",
+        )?;
+        Ok(match kind {
+            CU_GRAPH_NODE_TYPE_KERNEL => GraphNodeKind::Kernel,
+            CU_GRAPH_NODE_TYPE_MEMCPY => GraphNodeKind::Memcpy,
+            CU_GRAPH_NODE_TYPE_MEMSET => GraphNodeKind::Memset,
+            CU_GRAPH_NODE_TYPE_HOST => GraphNodeKind::Host,
+            CU_GRAPH_NODE_TYPE_GRAPH => GraphNodeKind::Graph,
+            CU_GRAPH_NODE_TYPE_EMPTY => GraphNodeKind::Empty,
+            other => GraphNodeKind::Other(other),
+        })
+    }
+}
+
+/// The kind of work a graph node does (`CUgraphNodeType`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GraphNodeKind {
+    /// A kernel launch, the only kind a rebind changes.
+    Kernel,
+    /// A memory copy.
+    Memcpy,
+    /// A memory set.
+    Memset,
+    /// Host code.
+    Host,
+    /// A nested graph.
+    Graph,
+    /// A node that only orders its dependencies.
+    Empty,
+    /// A kind this binding does not name, as the driver's number.
+    Other(i32),
+}
 
 /// The parameters a rebind may change in one kernel node.
 ///
@@ -215,6 +353,62 @@ pub struct KernelNodeParams<'a> {
     pub shared_memory: u32,
     /// The address of each kernel parameter's value, in declaration order.
     pub parameters: &'a [*mut c_void],
+}
+
+/// A kernel node's parameters read back from a template graph, owned by the
+/// caller.
+///
+/// [`Graph::kernel_node_params`] fills one from a node of a throwaway capture;
+/// a rebind walk then sets the changed ones on the live executable with
+/// [`GraphExec::set_kernel_node_params_owned`], which replaces the function of
+/// the kernel that answers for the node.
+///
+/// The values are copied out of the node — the driver keeps each parameter's
+/// size in the kernel's signature — so nothing dangles when the template is
+/// destroyed.
+pub struct OwnedKernelNodeParams {
+    /// The kernel the node captured. Valid while the library it was loaded
+    /// from is loaded, the same obligation a captured graph has.
+    pub function: Function,
+    /// Blocks per grid dimension.
+    pub grid: [u32; 3],
+    /// Threads per block dimension.
+    pub block: [u32; 3],
+    /// Dynamic shared memory per block, in bytes.
+    pub shared_memory: u32,
+    /// Each parameter's value, copied, in declaration order.
+    pub parameters: Vec<Vec<u8>>,
+}
+
+impl std::fmt::Debug for OwnedKernelNodeParams {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OwnedKernelNodeParams")
+            .field("function", &(self.function.raw() as usize))
+            .field("grid", &self.grid)
+            .field("block", &self.block)
+            .field("shared_memory", &self.shared_memory)
+            .field("parameters", &self.parameters)
+            .finish()
+    }
+}
+
+impl OwnedKernelNodeParams {
+    /// Pointers to the copied values, as [`KernelNodeParams`] takes them. The
+    /// pointers are valid while this value is alive and not mutated.
+    pub fn pointers(&self) -> Vec<*mut c_void> {
+        self.parameters
+            .iter()
+            .map(|value| value.as_ptr().cast_mut().cast())
+            .collect()
+    }
+
+    /// The same parameters for another kernel: what a rebind sets, which
+    /// changes the function and keeps every argument the node captured.
+    pub fn with_function(mut self, function: Function) -> Self {
+        self.function = function;
+        self
+    }
 }
 
 /// A captured graph instantiated for replay (`CUgraphExec`).
@@ -276,9 +470,9 @@ impl GraphExec {
                 "the node does not belong to the graph this executable was instantiated from",
             ));
         }
-        if params.function.context().raw() != self.core.context.raw() {
+        if params.function.device().id() != self.core.device {
             return Err(Error::invalid(
-                "the node's function belongs to another device's context",
+                "the node's function belongs to another device",
             ));
         }
 
@@ -314,11 +508,31 @@ impl GraphExec {
             "cuGraphExecKernelNodeSetParams",
         )
     }
+    /// Sets parameters read back from a template's node on this executable:
+    /// the values of [`Graph::kernel_node_params`], with the function a rebind
+    /// chooses ([`OwnedKernelNodeParams::with_function`]).
+    pub fn set_kernel_node_params_owned(
+        &self,
+        node: GraphNode,
+        params: &OwnedKernelNodeParams,
+    ) -> Result<()> {
+        let pointers = params.pointers();
+        self.set_kernel_node_params(
+            node,
+            &KernelNodeParams {
+                function: &params.function,
+                grid: params.grid,
+                block: params.block,
+                shared_memory: params.shared_memory,
+                parameters: &pointers,
+            },
+        )
+    }
 }
 
 impl Drop for GraphExec {
     fn drop(&mut self) {
-        let (core, raw) = (self.core.clone(), self.raw as usize);
+        let (core, raw) = (Arc::clone(&self.core), self.raw as usize);
         // Queued before the template's own release, which the `core` clone
         // keeps from happening first.
         reclaim::defer(move || {
@@ -345,7 +559,7 @@ impl Drop for GraphExec {
 /// is what the owner records to rebind a graph later.
 pub struct Capture {
     stream: Stream,
-    graph: Option<Graph>,
+    core: Arc<Core>,
     /// The dependency set of the next node: the nodes added by the previous
     /// operation end here, and the next operation's nodes are reachable from
     /// them.
@@ -359,19 +573,44 @@ pub struct Capture {
     _context: DeviceGuard,
 }
 
+/// `CUstreamCaptureMode`: how a capture interacts with CUDA calls from other
+/// threads of the process, such as the other devices' executors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureMode {
+    /// `CU_STREAM_CAPTURE_MODE_GLOBAL`: an unsafe call from any thread
+    /// invalidates the capture. The strictest mode, which catches a thread
+    /// that issues CUDA work while this one captures.
+    Global,
+    /// `CU_STREAM_CAPTURE_MODE_THREAD_LOCAL`: only the capturing thread's
+    /// unsafe calls invalidate the capture.
+    ThreadLocal,
+    /// `CU_STREAM_CAPTURE_MODE_RELAXED`: other threads' calls are neither
+    /// captured nor invalidating. The executor captures in this mode: its
+    /// device's stream is its own, and the process's other executors keep
+    /// working meanwhile.
+    Relaxed,
+}
+
+impl CaptureMode {
+    fn raw(self) -> i32 {
+        match self {
+            Self::Global => 0,
+            Self::ThreadLocal => 1,
+            Self::Relaxed => 2,
+        }
+    }
+}
+
 impl Capture {
-    /// Begins capturing `stream` in relaxed mode: work other threads issue
-    /// meanwhile is neither captured nor breaks the capture.
-    pub fn begin(stream: &Stream) -> Result<Self> {
+    /// Begins capturing `stream` in `mode`.
+    pub fn begin(stream: &Stream, mode: CaptureMode) -> Result<Self> {
         let context = PrimaryContext::retain(stream.device())?;
         let guard = context.enter()?;
         let driver = driver::driver()?;
         driver.check(
             // SAFETY: the stream is live and not capturing, by this type's
             // contract.
-            unsafe {
-                (driver.stream_begin_capture)(stream.handle(), CU_STREAM_CAPTURE_MODE_RELAXED)
-            },
+            unsafe { (driver.stream_begin_capture)(stream.handle(), mode.raw()) },
             "cuStreamBeginCapture",
         )?;
 
@@ -381,16 +620,13 @@ impl Capture {
                 "the stream's capture is in status {status} right after it began"
             )));
         }
-        let graph = Graph {
+        Ok(Self {
+            stream: stream.clone(),
             core: Arc::new(Core {
                 raw: graph,
                 context,
                 device: stream.device(),
             }),
-        };
-        Ok(Self {
-            stream: stream.clone(),
-            graph: Some(graph),
             frontier,
             seen: HashSet::new(),
             ended: false,
@@ -405,10 +641,6 @@ impl Capture {
     /// the nodes are that operation's, and the owner records which operation
     /// they belong to for a later rebind.
     pub fn record(&mut self) -> Result<Vec<GraphNode>> {
-        let graph = self
-            .graph
-            .as_ref()
-            .expect("a capture has its graph until it ends");
         let (status, _, frontier) = capture_info(&self.stream)?;
         if status != CU_STREAM_CAPTURE_STATUS_ACTIVE {
             return Err(Error::invalid(format!(
@@ -421,7 +653,7 @@ impl Capture {
         // The next node depends on the frontier. When the dependency set is
         // empty (the first operation, or an operation that clears it), the
         // new nodes are the graph's root nodes instead.
-        for root in graph.root_handles()? {
+        for root in root_handles(&self.core)? {
             if self.seen.insert(root as usize) {
                 found.push(root);
                 queue.push_back(root);
@@ -440,7 +672,7 @@ impl Capture {
         Ok(found
             .into_iter()
             .map(|raw| GraphNode {
-                core: graph.core.clone(),
+                core: Arc::clone(&self.core),
                 raw,
             })
             .collect())
@@ -457,15 +689,12 @@ impl Capture {
             "cuStreamEndCapture",
         )?;
         self.ended = true;
-
-        let graph = self
-            .graph
-            .take()
-            .expect("a capture has its graph until it ends");
         // The driver promises the same graph at the end of the capture; a
         // different handle would leave the node handles of `record` dangling.
-        debug_assert_eq!(raw, graph.core.raw);
-        Ok(graph)
+        debug_assert_eq!(raw, self.core.raw);
+        Ok(Graph {
+            core: Arc::clone(&self.core),
+        })
     }
 }
 

@@ -121,7 +121,7 @@ pub enum Protection {
 }
 
 impl Protection {
-    fn flags(self) -> i32 {
+    pub(crate) fn flags(self) -> i32 {
         match self {
             Self::ReadOnly => CU_MEM_ACCESS_FLAGS_PROT_READ,
             Self::ReadWrite => CU_MEM_ACCESS_FLAGS_PROT_READWRITE,

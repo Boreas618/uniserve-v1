@@ -1,0 +1,30 @@
+[package]
+name = "program-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The Program Server: the object model, module store, compile queue, package
+# manifest and protobuf protocol of design section 6, its client (the daemon
+# prepares programs with it, the main process resolves them), and the
+# `uniserve program-server` command. Sources and toolchains compile a program
+# package with the Program Server's own Python environment under `python/`.
+[dependencies]
+clap.workspace = true
+libc.workspace = true
+prost.workspace = true
+rustix = { workspace = true, features = ["net"] }
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+tracing.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true
+protox.workspace = true
+
+[lints]
+workspace = true

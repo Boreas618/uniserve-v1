@@ -1,0 +1,32 @@
+# The qk_norm_rope operator's triton backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the
+# compile driver the Program Server runs for one descriptor and target).
+
+op = "qk_norm_rope"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/qk_norm_rope.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+[kernel.descriptors]
+dimensions = { dtype = ["bf16", "fp16"], head_dim = ["128"], q_heads = ["32"], k_heads = ["4"], factors = ["fp32"], rounding = ["once", "stepwise"], layout = ["tokens_heads"] }
+
+[parameters]
+eps = 1e-06

@@ -1,0 +1,5 @@
+upscale 3 5 7 11 13
+downscale 3 16 9 5 3
+aspect 3 9 7 12 4
+wide 3 24 17 6 4
+single 1 5 7 11 13

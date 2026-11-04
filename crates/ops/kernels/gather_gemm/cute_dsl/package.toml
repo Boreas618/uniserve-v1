@@ -1,0 +1,36 @@
+# The gather_gemm operator's cute_dsl backend: design 5.2's program package.
+#
+# One module covers one descriptor of `[kernel.descriptors]` for one
+# architecture of `[kernel.architectures]`, built by `src/build.py` (the
+# compile driver the Program Server runs for one descriptor and target).
+
+op = "gather_gemm"
+backend = "cute_dsl"
+
+[toolchain]
+kind = "cute_dsl"
+version = "4.6.2"
+packages = [{ name = "cutlass-dsl", version = "4.6.2" }, { name = "flashinfer-python", version = "0.6.18" }]
+
+[module]
+form = "native"
+
+[module.entries]
+launch = "uniserve_gather_gemm"
+
+[source]
+kind = "cute_dsl"
+files = ["src/gather_gemm.py", "src/build.py", "src/_compile.py", "src/entry.cpp", "src/entry.h"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a"]
+
+[kernel.descriptors]
+dimensions = { tactic = ["m128n128", "m256n128", "m128n256", "m256n256"], topk = ["8"], activation = ["silu", "gelu_tanh"], k = ["2048"], n = ["1536"], experts = ["128"] }
+
+[parameters]
+tokens = 4096
+rows = 32768
+max_active_clusters = 1

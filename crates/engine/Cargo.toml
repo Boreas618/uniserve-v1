@@ -13,6 +13,7 @@ crossbeam-channel.workspace = true
 fnv.workspace = true
 ipc.workspace = true
 proto.workspace = true
+scheduling.workspace = true
 png = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
@@ -42,6 +43,9 @@ engine = { path = ".", features = ["testing"] }
 models.workspace = true
 png.workspace = true
 tracing-subscriber.workspace = true
+# A toy policy module written as WebAssembly text, so the switch's tests need no
+# compiled policy package.
+wat = "1"
 
 [lints]
 workspace = true

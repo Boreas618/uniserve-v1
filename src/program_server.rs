@@ -1,63 +1,30 @@
-//! `uniserve program-server`: a host's Program Server and the operator's
-//! commands against it.
+//! The `uniserve program-server` command (design sections 6.1 and 6.3).
 //!
-//! The Program Server compiles program packages, keeps them, and serves their
-//! modules to the main processes (`specs/worker.md` §6). One runs on every
-//! host, beside its Storage Server. Only the upstream Program Server — the
-//! one whose package root is writable — accepts `install`, and it numbers the
-//! revisions; the others mount that root read-only.
+//! One Program Server runs per host, beside the Storage Server. It compiles
+//! program packages into the modules of their descriptors, keeps them in the
+//! module store, and answers `install`, `prepare`, `resolve` and `list` on its
+//! Unix socket. It launches no kernel and allocates no device memory, and it is
+//! not on the serving path: a main process asks it for modules when it starts
+//! and when a program changes, so a restart of the Program Server delays only
+//! those two moments.
 //!
-//! The process itself is `crates/program-server`, which the programs swarm
-//! builds. Until it lands this command says so instead of pretending to
-//! serve.
+//! The command's implementation is the `program_server` crate's
+//! [`command`](program_server::command) module; this module mounts it into the
+//! `uniserve` executable:
+//!
+//! ```ignore
+//! let matches = uniserve::program_server::command()
+//!     .get_matches_from(std::env::args_os().skip(1));
+//! uniserve::program_server::run(uniserve::program_server::options(&matches)?)?;
+//! ```
+//!
+//! The executable also gives the server the devices this host builds for
+//! (design section 5.3): only the executable queries the platform crate
+//! (design section 4.1), so `serve --target` names them, and a caller that
+//! already holds the device list fills
+//! [`ServeOptions::devices`](program_server::command::ServeOptions::devices)
+//! instead.
 
-use std::path::PathBuf;
-use std::process::ExitCode;
-
-use anyhow::Result;
-use clap::{Parser, Subcommand};
-
-use crate::cli::LogLevels;
-use crate::logging;
-
-/// The `program-server` command's arguments.
-#[derive(Debug, Parser)]
-#[command(
-    name = "program-server",
-    about = "The Program Server of one host: compile, keep and serve programs"
-)]
-pub(crate) struct ProgramServerArgs {
-    #[command(subcommand)]
-    pub(crate) command: Option<ProgramServerCommand>,
-    /// The socket to listen on; this host's default when unset.
-    #[arg(long, value_name = "PATH")]
-    pub(crate) socket: Option<PathBuf>,
-    /// The package root this server writes: the upstream's, which alone
-    /// accepts `install`; another server mounts it read-only.
-    #[arg(long, value_name = "DIRECTORY")]
-    pub(crate) packages: Option<PathBuf>,
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum ProgramServerCommand {
-    /// Install a program package into the upstream's package root, which
-    /// gives it a new revision; a later update picks it up.
-    Install {
-        /// The package directory holding its `package.toml`.
-        #[arg(value_name = "DIRECTORY")]
-        package: PathBuf,
-    },
-}
-
-/// Runs the `program-server` command with its `args`, logging under `log`.
-pub(crate) fn run(_args: ProgramServerArgs, log: &LogLevels) -> Result<ExitCode> {
-    logging::init_tracing(
-        "ProgramServer",
-        log.log_level.as_deref(),
-        log.log_level_http.as_deref(),
-    );
-    anyhow::bail!(
-        "crates/program-server is not built in this tree yet; `uniserve program-server` \
-         serves programs once it is (specs/worker.md §6)"
-    )
-}
+pub use program_server::command::{
+    Action, Options, ServeOptions, command, default_socket, options, run,
+};
