@@ -1033,6 +1033,16 @@ impl VideoEncoder {
     }
 }
 
+/// The longest track the model supports, in latent frames.
+///
+/// A request is at most [`crate::config::MAX_FRAMES`] frames of video at [`crate::config::FPS`], and its
+/// audio lasts as long, so the longest track is that duration at [`crate::config::AUDIO_LATENTS_PER_SECOND`]
+/// latents, rounded up to the next latent. The encoder's attention is built for this bound and a longer
+/// track is refused rather than read past it.
+pub const LONGEST_TRACK: u32 = (crate::config::MAX_FRAMES
+    * crate::config::AUDIO_LATENTS_PER_SECOND)
+    .div_ceil(crate::config::FPS);
+
 /// The DAC-style audio encoder `ref2va` conditions on: a waveform's posterior mean as latent frames.
 ///
 /// `[1, 1, samples]` mono audio in, `[latent_channels, frames]` latents out, with `frames =
@@ -1115,7 +1125,14 @@ impl AudioEncoder {
                 "{samples} samples is not a whole number of {hop}-sample latent frames"
             )));
         }
-        Ok(samples / hop)
+        let frames = samples / hop;
+        if frames > u64::from(LONGEST_TRACK) {
+            return Err(Error::config(format!(
+                "{frames} latent frames exceed the {LONGEST_TRACK}-frame track the encoder's \
+                 attention is built for"
+            )));
+        }
+        Ok(frames)
     }
 
     /// The samples one latent frame covers: the product of the encoder's rates.
@@ -1128,19 +1145,11 @@ impl AudioEncoder {
 
     /// Bind the encoder every checkpoint field it has, through [`audio_sources`].
     ///
-    /// `frames` is the deployment's longest track in latent frames: the attention is built for it, and a
-    /// longer track is refused rather than read past the bound. The table is consumed exactly, the same
-    /// discipline the audio decoder's load keeps.
-    pub fn load(
-        config: &crate::AudioVaeConfig,
-        loader: &mut WeightLoader,
-        frames: u32,
-    ) -> Result<Self> {
-        if frames == 0 {
-            return Err(Error::config(
-                "an audio encoder needs a bound of at least one latent frame".to_owned(),
-            ));
-        }
+    /// The attention is built for [`LONGEST_TRACK`], the longest track the model supports; a longer
+    /// track is refused by [`Self::frames`] rather than read past the bound. The table is consumed
+    /// exactly, the same discipline the audio decoder's load keeps.
+    pub fn load(config: &crate::AudioVaeConfig, loader: &mut WeightLoader) -> Result<Self> {
+        let frames = LONGEST_TRACK;
         let table = audio_sources(config)?;
         let mut binder = Binder::new(loader, table);
         let mut width = config.encoder_dim;
