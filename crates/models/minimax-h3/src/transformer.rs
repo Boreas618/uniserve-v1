@@ -112,7 +112,7 @@ impl Layer {
         // Attention: normalize, attend, and fold the gated update into `out` while normalizing the
         // feed-forward's input.
         let attention_norm = ModulatedRmsNorm::new(
-            self.norm1.clone(),
+            self.norm1,
             shift_attention,
             scale_attention,
             None,
@@ -122,7 +122,7 @@ impl Layer {
         self.attention
             .forward(f, normalized, factors, visible, total_rows, update)?;
         let mlp_norm = ModulatedRmsNorm::new(
-            self.norm2.clone(),
+            self.norm2,
             shift_mlp,
             scale_mlp,
             Some(gate_attention),
@@ -164,7 +164,7 @@ impl Transformer {
         let layer = self.layers.first().ok_or_else(|| {
             Error::Unsupported("an H3 partition with no layers has no rotary".to_owned())
         })?;
-        Ok(layer.attention.factors(f, positions, cosine, sine)?)
+        layer.attention.factors(f, positions, cosine, sine)
     }
 
     /// The final normalization and one modality's output projection: `hidden` in, velocity out.
@@ -253,7 +253,7 @@ fn chunks(table: TensorView, width: u64, first: u64) -> Result<(Weight, Weight, 
             Shape::new(&[rows, width]),
             nn::Strides::new(&[stride, 1]),
         );
-        Ok(borrowed(view)?)
+        borrowed(view)
     };
     Ok((chunk(0)?, chunk(1)?, chunk(2)?))
 }
@@ -334,7 +334,7 @@ impl Transformer {
                 audio_in,
                 hidden,
             )?),
-            config: config.clone(),
+            config: *config,
         })
     }
 
@@ -407,7 +407,7 @@ fn projection(
     columns: u64,
 ) -> Result<Linear> {
     let weight = loader.load(&WeightRequest::region(
-        &format!("{name}.weight"),
+        format!("{name}.weight"),
         0,
         Shape::new(&[rows, columns]),
     ))?;
@@ -422,7 +422,7 @@ fn projection_with_bias(
     columns: u64,
 ) -> Result<Linear> {
     let weight = loader.load(&WeightRequest::region(
-        &format!("{name}.weight"),
+        format!("{name}.weight"),
         0,
         Shape::new(&[rows, columns]),
     ))?;

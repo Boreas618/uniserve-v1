@@ -392,8 +392,8 @@ impl Projections {
         )?;
         let linear = |weights: &(Weight, Weight)| {
             nn::layers::Linear::new(
-                weights.0.clone(),
-                Some(weights.1.clone()),
+                weights.0,
+                Some(weights.1),
                 nn::layers::WeightOrder::NxK,
             )
         };
