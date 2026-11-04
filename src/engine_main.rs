@@ -1595,14 +1595,28 @@ impl MainProcess {
                 Err(failure) if programs.is_empty() => {
                     return self.abandon_precopy(generation, failure, reply);
                 }
+                // A first generation that could not take the store's set holds only what the
+                // deployment named - one operator pinned while the model's buckets launch every
+                // other one. Nothing can bind that generation, so it is refused here, where the
+                // figures are, rather than submitted to the devices: a device stage handed such a
+                // generation recaptures the catalogue bucket by bucket and answers nothing for
+                // minutes, which is a hang to every reader of the log.
                 Err(failure) => {
-                    tracing::warn!(
-                        ?failure,
-                        named = programs.len(),
-                        "this host's store describes no program to overlay: installing what the \
-                         deployment named"
+                    return self.abandon_precopy(
+                        generation,
+                        UpdateFailure::Precopy {
+                            reason: format!(
+                                "the epoch's first generation would hold {} of the operators its \
+                                 buckets launch: {}",
+                                programs.len(),
+                                match failure {
+                                    UpdateFailure::Precopy { reason } => reason,
+                                    other => format!("{other:?}"),
+                                }
+                            ),
+                        },
+                        reply,
                     );
-                    programs
                 }
             }
         } else {
@@ -1647,13 +1661,26 @@ impl MainProcess {
     /// The Program Server's store as it stands: every installed package, its revision and the
     /// descriptors its modules cover for each target.
     fn listing(&self) -> std::result::Result<program_server::Listing, String> {
+        // The one call that leaves this process before a generation is prepared, and the one with no
+        // deadline of its own: the client's connect and reply read are unbounded, so a store that
+        // never answers holds whoever asked. Both sides say so - a line before the call and one with
+        // the count after it - so a run attributes the wait from its log rather than by inference.
+        // Every caller of this function runs on the control thread today, which is why that thread
+        // must not be the one to ask; a staging call that blocks it stops commands, events, metrics
+        // and the watchdog together.
+        tracing::info!("asking the Program Server for its installed programs");
         let mut client = self
             .programs
             .lock()
             .map_err(|_| "the Program Server client was poisoned".to_owned())?;
-        client
+        let listing = client
             .list()
-            .map_err(|error| format!("reading the Program Server's store: {error}"))
+            .map_err(|error| format!("reading the Program Server's store: {error}"))?;
+        tracing::info!(
+            packages = listing.packages.len(),
+            "the Program Server's listing answered"
+        );
+        Ok(listing)
     }
 
     /// The programs this host has built, one per operator, for a precopy that names none.
@@ -1691,6 +1718,28 @@ impl MainProcess {
             operators = chosen.len(),
             "resolved this host's built programs for a precopy that named none"
         );
+        // What this host's store supplies, against what this build implements: the difference is
+        // the fact an operator needs, because it names the package nobody built (an operator whose
+        // module has no package cannot be supplied by the deployment either), and it is bounded -
+        // an operator the deployment never launches may be in it, which is why the line states the
+        // count rather than claiming these are needed.
+        let supplied: std::collections::BTreeSet<&str> = chosen
+            .keys()
+            .filter_map(|op| ops::operator_name(op))
+            .collect();
+        let missing: Vec<&str> = ops::operators()
+            .iter()
+            .copied()
+            .filter(|operator| !supplied.contains(operator))
+            .collect();
+        if !missing.is_empty() {
+            tracing::warn!(
+                supplied = supplied.len(),
+                implemented = ops::operators().len(),
+                missing = ?missing,
+                "this host's store supplies fewer operators than the build implements"
+            );
+        }
         let mut programs = Programs::new();
         let mut candidates = Candidates::new();
         for (op, ordered) in chosen {
@@ -2070,12 +2119,16 @@ impl MainProcess {
             tracing::warn!(
                 generation,
                 stage = entered,
-                waiting_on = %pending_work(&precopy.stage, &self.executors),
+                waiting_on = %pending_work(&precopy.stage, &self.executors, &precopy.policies),
                 waited_s = precopy.since.elapsed().as_secs(),
                 "the precopy has stood in this stage past the watchdog's stall bound and nothing \
                  has answered: the Program Server, a device or a scheduler is the one to look at"
             );
         }
+        // What the stage was waiting on, read before the stage is taken out: a bound that named
+        // `no stage` because the driver had already replaced it would say nothing at all, which is
+        // the opposite of what the line is for.
+        let pending = pending_work(&precopy.stage, &self.executors, &precopy.policies);
         let stage = std::mem::replace(&mut precopy.stage, PrecopyStage::Done);
 
         match stage {
@@ -2147,13 +2200,25 @@ impl MainProcess {
                 // that has stood past twice the watchdog's stall bound is failed here by name,
                 // saying what never answered. Serving keeps what it had; the update does not.
                 if precopy.since.elapsed() > self.watchdog.stall_bound() * 2 {
-                    let pending = pending_work(&precopy.stage, &self.executors);
+                    // The arm holds two waits, and naming the wrong one costs a run: a policy build
+                    // that never answers is not a device that never answered, and the previous
+                    // message said the device either way. The policy is the narrower of the two, so
+                    // it is asked first.
+                    let policy = matches!(
+                        poll_answers(&precopy.policies),
+                        Some(StageFailure::Pending)
+                    );
+                    let cause = if policy {
+                        "a scheduler's policy build never answered"
+                    } else {
+                        "this node's devices never answered their preparation"
+                    };
                     return self.abandon_precopy(
                         generation,
                         UpdateFailure::Precopy {
                             reason: format!(
-                                "this node's device never answered its preparation after {}s \
-                                 ({pending}): the device thread is the one to look at",
+                                "{cause} after {}s ({pending}): the wait named there is the one \
+                                 to look at",
                                 precopy.since.elapsed().as_secs()
                             ),
                         },
@@ -4089,6 +4154,7 @@ impl HostAction for Install {
             })?;
 
         let mut entries = Vec::new();
+        let mut asked: Vec<(String, usize)> = Vec::with_capacity(prepared.programs.len());
         for chosen in &prepared.programs {
             let operator = ops::operator_name(&chosen.slot.op).ok_or_else(|| {
                 executor::Error::Invalid(format!(
@@ -4103,6 +4169,7 @@ impl HostAction for Install {
                 .filter(|descriptor| descriptor.op == chosen.slot.op)
                 .flat_map(|descriptor| descriptor.keys.iter().cloned())
                 .collect();
+            asked.push((format!("{}/{}", chosen.slot.op, chosen.program.backend), keys.len()));
             for key in keys {
                 let module = client
                     .resolve(
@@ -4137,6 +4204,27 @@ impl HostAction for Install {
                     entries.push(entry);
                 }
             }
+        }
+        // A prepare that answered and produced nothing is a failure of the store's build, not a
+        // generation with fewer kernels: the walk would then find every operator missing and the
+        // update would stand in its device stage until a bound ended it. The key counts are what
+        // separates the two causes - a program given no descriptor key at all was never asked for
+        // a module, and one given keys whose build answered nothing is the store's own refusal.
+        if entries.is_empty() && !prepared.programs.is_empty() {
+            let asked = asked
+                .iter()
+                .map(|(program, keys)| format!("{program} with {keys} key(s)"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            tracing::warn!(
+                target = %self.target,
+                "the Program Server prepared this generation's programs and this device installed                  no module of any of them"
+            );
+            return Err(executor::Error::Invalid(format!(
+                "the Program Server prepared {} program(s) for target {} and this device installed                  no module of any of them ({asked}): a program given no key was never asked for a                  module, and one given keys built nothing",
+                prepared.programs.len(),
+                self.target
+            )));
         }
         tracing::info!(
             modules = entries.len(),
@@ -4318,41 +4406,70 @@ enum StageFailure {
 /// lane holds one task per device, the executor stage one submission per device, and the shadow
 /// stage one step per scheduler. The stall line prints the counts so a run names the wait that
 /// never answered without a second run built for the purpose.
-fn pending_work(stage: &PrecopyStage, executors: &[Arc<Executor>]) -> String {
+/// What a device stage is waiting on: each unanswered device's own account, and each scheduler's
+/// answer to the policy it was asked to build.
+///
+/// The two waits live in one stage, and a report that names only the devices says "the device thread
+/// is the one to look at" while the device has answered and a policy build is what never came back -
+/// which is a wrong name, worse than none. The policy figure is stated first for that reason: it is
+/// the wait the devices' own account cannot show.
+fn device_work(
+    submissions: &[Submission],
+    executors: &[Arc<Executor>],
+    policies: &[crossbeam_channel::Receiver<std::result::Result<(), String>>],
+) -> String {
+    // The label alone says which stage stood; the device thread's own account says whether it is
+    // working (a capture in progress, a bucket being recaptured) or waiting on something outside it.
+    // A capture is open or it is not, and the two look identical from the control thread without it.
+    let mut pending = Vec::new();
+    for (rank, submission) in submissions.iter().enumerate() {
+        if submission.outcome().is_some() {
+            continue;
+        }
+        let Some(executor) = executors.get(rank) else {
+            pending.push(format!("rank {rank}: no executor"));
+            continue;
+        };
+        let performing = executor
+            .performing()
+            .unwrap_or_else(|| "nothing".to_owned());
+        pending.push(format!(
+            "rank {rank}: {performing}, {} open capture(s)",
+            executor.capturing()
+        ));
+    }
+    let answered = submissions.len() - pending.len();
+    let devices = format!(
+        "{answered} of {} device preparation(s) answered ({})",
+        submissions.len(),
+        pending.join("; ")
+    );
+    let policies: String = if policies.is_empty() {
+        "no policy build was asked for".to_owned()
+    } else {
+        let answered = policies
+            .iter()
+            .filter(|answer| !answer.is_empty())
+            .count();
+        format!(
+            "{answered} of {} policy build(s) answered",
+            policies.len()
+        )
+    };
+    format!("{devices}; {policies}")
+}
+
+fn pending_work(
+    stage: &PrecopyStage,
+    executors: &[Arc<Executor>],
+    policies: &[crossbeam_channel::Receiver<std::result::Result<(), String>>],
+) -> String {
     match stage {
         PrecopyStage::Modules(tasks) => {
             let answered = tasks.iter().filter(|task| task.outcome().is_some()).count();
             format!("{answered} of {} kernel load(s) answered", tasks.len())
         }
-        PrecopyStage::Executors(submissions) => {
-            // The label alone says which stage stood; the device thread's own account says whether
-            // it is working (a capture in progress, a bucket being recaptured) or waiting on
-            // something outside it. A capture is open or it is not, and the two look identical
-            // from the control thread without this.
-            let mut pending = Vec::new();
-            for (rank, submission) in submissions.iter().enumerate() {
-                if submission.outcome().is_some() {
-                    continue;
-                }
-                let Some(executor) = executors.get(rank) else {
-                    pending.push(format!("rank {rank}: no executor"));
-                    continue;
-                };
-                let performing = executor
-                    .performing()
-                    .unwrap_or_else(|| "nothing".to_owned());
-                pending.push(format!(
-                    "rank {rank}: {performing}, {} open capture(s)",
-                    executor.capturing()
-                ));
-            }
-            format!(
-                "{} of {} device preparation(s) answered ({})",
-                submissions.len() - pending.len(),
-                submissions.len(),
-                pending.join("; ")
-            )
-        }
+        PrecopyStage::Executors(submissions) => device_work(submissions, executors, policies),
         PrecopyStage::Shadow(answers) => {
             let answered = answers.iter().filter(|answer| !answer.is_empty()).count();
             format!("{answered} of {} shadow step(s) answered", answers.len())
@@ -4414,9 +4531,18 @@ fn select_programs(
             .iter()
             .any(|module| targets.contains(&module.target))
         {
-            tracing::debug!(
+            // A store built for another device is the one store-side defect a run cannot name from
+            // the outside: the package is there, the operator exists, and nothing installs. Both
+            // sets are printed, because the difference between them is the fix.
+            tracing::info!(
                 op = %package.op,
                 backend = %package.backend,
+                held = ?package
+                    .modules
+                    .iter()
+                    .map(|module| module.target.to_string())
+                    .collect::<Vec<_>>(),
+                wanted = ?targets.iter().map(ToString::to_string).collect::<Vec<_>>(),
                 "the store holds this operator for another target: not installed"
             );
             continue;

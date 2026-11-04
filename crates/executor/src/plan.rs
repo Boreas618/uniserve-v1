@@ -967,6 +967,29 @@ mod tests {
         }
     }
 
+    /// One capture per bucket, and a bucket per (size, computation) pair the plan admits: the
+    /// first generation's capture set is the bucket set, so its size follows from the configured
+    /// sizes and nothing else.
+    ///
+    /// The figure matters because the first generation has no serving generation to compare
+    /// against - every operator of every bucket is new - so this count is the work it does before it
+    /// serves a request, and one executable per capture is not booked by any pool.
+    #[test]
+    fn the_capture_set_is_the_bucket_set() {
+        // The e2e deployment's own sizes: 4 decode sizes and one prefill size, sampling on.
+        let buckets = Buckets::for_batch(Some(&[1, 2, 4, 8]), Some(&[512]), 256, 40960, true)
+            .expect("the deployment's sizes");
+        // 4 sizes x (greedy + sampled) decode, and 4 sizes x 1 token count x (write + output)
+        // prefill: a prefill bucket is captured per row size, because rows bound the packing.
+        assert_eq!(buckets.len(), 16, "16 buckets, so 16 captures");
+
+        // The catalogues are the default when a deployment names no size, and the plan is their
+        // cross product: 44 decode sizes and 110 prefill token counts give 44 x (2 + 220).
+        let catalog = Buckets::for_batch(None, None, u32::MAX, u32::MAX, true)
+            .expect("the catalogues");
+        assert_eq!(catalog.len(), 44 * (2 + 110 * 2), "the catalog's cross product");
+    }
+
     /// The catalog is clamped to what the batch plan admits, so nothing is captured that no batch
     /// can fill, and a batch of the bound's own shape is still served.
     #[test]
