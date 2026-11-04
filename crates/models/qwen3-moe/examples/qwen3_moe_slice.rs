@@ -9,8 +9,17 @@
 //! --stage weights     no device: every parameter maps to a tensor of the config's shape and dtype
 //! --stage embedding   one operator on a GPU: the vocabulary table's rows, against the checkpoint
 //! --stage block       one decoder layer end to end (`--layer <n>`), against the same rows
+//!                     (`--substage <cut>` stops inside the layer at one operator)
 //! --stage decode      the whole model's decode step, against notes/reference/qwen3-reference.json
 //! ```
+//!
+//! `--reference <dir>` reads a reference stack's `hidden_NN.npy` files one stage at a time as the
+//! walk reaches them and prints each stage's `rms/scale` against the reference's own scale, the
+//! increment over the stage before it, and at the end the two readings that name a defect: the
+//! first stage past [`RELATIVE_BUDGET`] (where we stop agreeing) and the largest increment (where we
+//! start being wrong). They are not the same stage in general - smooth growth is bf16 accumulation
+//! and a jump is structure - so both are printed. A cut inside a layer prints the prefix's error
+//! beside it, because the cut inherits whatever the prefix already lost.
 //!
 //! All but `weights` need a program store: `--store <path>` or `UNISERVE_STORE`, holding the
 //! packages the fixture `notes/programs/qwen3-moe-keys.txt` names. Nothing here hard-codes a store
@@ -30,7 +39,7 @@ use nn::{
     Shape, TensorView, WeightKey, WeightLoader,
 };
 use ops::{Generation, KernelEntry};
-use qwen3_moe::{Config, LoadOptions, Partition};
+use qwen3_moe::{Config, LoadOptions, Partition, Substage};
 
 /// The checkpoint the reference was captured from, when `--checkpoint` does not name another.
 const DEFAULT_CHECKPOINT: &str = "/opt/uv/models/Qwen3-30B-A3B";
@@ -98,6 +107,14 @@ struct Args {
     layer: usize,
     tokens: String,
     resident: u64,
+    /// Where the decode stage writes its hidden rows and logits as `.npy`, when asked.
+    dump: Option<PathBuf>,
+    /// A reference stack's `hidden_NN.npy` directory: its files are read one stage at a time as the
+    /// decode stage walks the model, and the first stage past [`RELATIVE_BUDGET`] is named.
+    reference: Option<PathBuf>,
+    /// A cut inside `--layer`, named by the reference tensor that answers it: `normalized`,
+    /// `attended` or `mlp_out`.
+    substage: Option<Substage>,
 }
 
 /// The four stages of the run.
@@ -118,6 +135,9 @@ impl Args {
         let mut layer = 0;
         let mut tokens = String::new();
         let mut resident = 0;
+        let mut dump = None;
+        let mut reference = None;
+        let mut substage = None;
         let mut words = std::env::args().skip(1);
         while let Some(word) = words.next() {
             let mut value = |name: &str| -> Result<String> {
@@ -155,6 +175,17 @@ impl Args {
                     })?;
                 }
                 "--tokens" => tokens = value("--tokens")?,
+                "--dump" => dump = Some(PathBuf::from(value("--dump")?)),
+                "--reference" => reference = Some(PathBuf::from(value("--reference")?)),
+                "--substage" => {
+                    let name = value("--substage")?;
+                    substage = Some(Substage::parse(&name).ok_or_else(|| {
+                        Failure::message(format!(
+                            "--substage {name:?} names no cut; the cuts are {}",
+                            Substage::NAMES.join(", ")
+                        ))
+                    })?);
+                }
                 "--resident" => {
                     let gib = value("--resident")?;
                     let size: u64 = gib.parse().map_err(|_| {
@@ -165,16 +196,22 @@ impl Args {
                 "--help" | "-h" => {
                     return Err(Failure::message(
                         "qwen3_moe_slice --stage weights|embedding|block|decode \
-                         [--checkpoint PATH] [--store PATH] [--device N] [--layer N]",
+                         [--checkpoint PATH] [--store PATH] [--device N] [--layer N] \
+                         [--tokens ID,ID,...] [--dump DIR] [--reference DIR]",
                     ));
                 }
                 other => {
                     return Err(Failure::message(format!(
                         "unknown argument `{other}`; expected --stage, --checkpoint, --store, \
-                         --device or --layer"
+                         --device, --layer, --tokens, --dump or --reference"
                     )));
                 }
             }
+        }
+        if substage.is_some() && stage != Stage::Block {
+            return Err(Failure::message(
+                "--substage cuts inside one layer, so it belongs to --stage block",
+            ));
         }
         Ok(Self {
             stage,
@@ -184,6 +221,9 @@ impl Args {
             layer,
             tokens,
             resident,
+            dump,
+            reference,
+            substage,
         })
     }
 }
@@ -434,26 +474,50 @@ fn stage_embedding(args: &Args) -> Result<()> {
 ///
 /// There is no reset between layers -- the model allocates each layer's temporaries from one arena
 /// and nothing returns the cursor -- so this is sized for the whole stack, not one layer.
-fn decode_arena_bytes(plan: &qwen3_moe::Plan, tokens: u64, config: &Config) -> u64 {
-    let hidden = plan.hidden.saturating_mul(4).saturating_mul(tokens);
-    let logits = u64::try_from(config.vocab_size)
-        .unwrap_or(u64::MAX)
-        .saturating_mul(4);
+/// The arena the decode stage reserves: the KV planes and their flags, the batch's metadata, the
+/// model's own row buffer, and one forward's plan.
+///
+/// The forward releases a layer's scratch as the layer ends, so the plan is one layer deep and this
+/// is the whole requirement rather than a bound with room to spare. The constant is what the small
+/// metadata uploads lose against the arena's alignment.
+fn decode_arena_bytes(
+    plan: &qwen3_moe::Plan,
+    tokens: u64,
+    config: &Config,
+    page_size: u64,
+    pages: u64,
+) -> qwen3_moe::Result<u64> {
     let layers = u64::try_from(config.num_hidden_layers).unwrap_or(0);
-    let plane_row = 64_u64
-        .saturating_mul(u64::try_from(config.num_key_value_heads).unwrap_or(0))
-        .saturating_mul(u64::try_from(config.head_dim).unwrap_or(0))
+    let kv_heads = u64::try_from(config.num_key_value_heads).unwrap_or(0);
+    let head_dim = u64::try_from(config.head_dim).unwrap_or(0);
+    // BF16 planes: one key and one value per layer, over the pages this batch touches.
+    let plane = pages
+        .saturating_mul(page_size)
+        .saturating_mul(kv_heads)
+        .saturating_mul(head_dim)
         .saturating_mul(2);
-    let cache = layers
+    let planes = layers.saturating_mul(2).saturating_mul(plane);
+    let flags = layers
         .saturating_mul(2)
-        .saturating_mul(plane_row)
-        .saturating_mul(4)
-        .max(1 << 20);
-    plan.workspace
-        .saturating_add(hidden)
-        .saturating_add(logits)
-        .saturating_add(cache)
-        .saturating_add(1 << 30)
+        .saturating_mul(pages)
+        .saturating_mul(4);
+    let rows = tokens.saturating_mul(plan.hidden).saturating_mul(2);
+    // The batch's i32 metadata: positions, slots, sequence lengths, the two offsets and the logits
+    // rows are seven per token; the page table is `[sequences, pages]` and this batch is one
+    // sequence, so its rows are `pages` and not a fixed count — a prompt long enough to need more
+    // pages than the slack reserved would otherwise fault at the first attention launch.
+    let metadata = tokens
+        .saturating_mul(7)
+        .saturating_add(pages)
+        .saturating_add(64)
+        .saturating_mul(4);
+    let mut total = 0_u64;
+    for bytes in [planes, flags, rows, metadata, plan.bytes(DType::BF16)?] {
+        total = total
+            .saturating_add(bytes.next_multiple_of(256))
+            .saturating_add(256);
+    }
+    Ok(total)
 }
 
 /// The stack over one prompt: `last = Some(layer)` stops after that layer and digests its output,
@@ -482,6 +546,14 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     }
     let count = u64::try_from(tokens.len()).unwrap_or(0);
 
+    // A reference stack is one prompt's activations, so comparing another prompt against it would
+    // report the prompt and not the model. The reference's own `meta.json` records the ids it ran,
+    // and a run that names different ones is refused before the first launch rather than after
+    // forty-eight stages of disagreement.
+    if let Some(dir) = args.reference.as_deref() {
+        check_reference_prompt(dir, &tokens)?;
+    }
+
     let checkpoint = Checkpoint::open(&args.checkpoint)?;
     let config = Config::read(&args.checkpoint)?;
     let device =
@@ -505,7 +577,9 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
 
     // The arena, from the plan and the config's own cache geometry.
     let plan = model.plan(count)?;
-    let bytes = decode_arena_bytes(&plan, count, &config);
+    let page_size = 64_u64;
+    let pages = count.div_ceil(page_size).max(1);
+    let bytes = decode_arena_bytes(&plan, count, &config, page_size, pages)?;
     let allocator = weights.allocator();
     let reserve = usize::try_from(bytes).unwrap_or(usize::MAX);
     allocator.reserve(platform::PoolKind::Graph, reserve)?;
@@ -514,8 +588,6 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     let forward = Forward::new(&stream, &generation, &arena);
 
     // The batch of one sequence: every prompt token is one query row, the last asks for logits.
-    let page_size = 64_u64;
-    let pages = count.div_ceil(page_size).max(1);
     let positions: Vec<i32> = (0..count)
         .map(|at| i32::try_from(at).unwrap_or(0))
         .collect();
@@ -621,9 +693,155 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
                 digests[0], digests[1]
             )));
         }
+        // One layer against the reference, without walking the stack: the same comparison the
+        // decode stage makes, at a hundredth of the cost, for when a stage has already been named and
+        // the question is what one layer does. `--substage` cuts inside the layer, and the cut is
+        // read against the prefix that produced it: a clean cut at layer 30 means the layer adds
+        // nothing to a prefix already off by that much, never that layers 0..29 are right.
+        if args.reference.is_some() || args.dump.is_some() || args.substage.is_some() {
+            let rows = tokens_usize(&batch);
+            let width = usize::try_from(plan.hidden).unwrap_or(0);
+            let mut table = Table::default();
+            if let Some(cut) = args.substage {
+                if layer == 0 {
+                    println!("prefix: layer 0 has none - it is handed the embedding itself");
+                } else {
+                    let prefix =
+                        model.forward_through(&forward, &batch, &cache, hidden, layer - 1)?;
+                    stream.synchronize()?;
+                    let values = download_bf16(&stream, prefix, rows, width)?;
+                    let file = format!("hidden_{layer:02}.npy");
+                    let stage = Walked {
+                        file: &file,
+                        label: &stage_name(layer),
+                        index: layer,
+                        rows,
+                        width,
+                    };
+                    let error = report_stage(args, stage, &values, &mut table)?;
+                    if let Some(error) = error {
+                        println!(
+                            "prefix: layers 0..{} are at rms/scale {error:.3e} - the cut below adds \
+                             to that error and cannot be read as better than it",
+                            layer - 1
+                        );
+                    }
+                }
+                let out = model.forward_substage(&forward, &batch, &cache, hidden, layer, cut)?;
+                stream.synchronize()?;
+                let values = download_bf16(&stream, out, rows, width)?;
+                let file = format!("hidden_{:02}_{}.npy", layer + 1, cut.name());
+                let label = format!("layer {layer}'s `{}` cut", cut.name());
+                let stage = Walked {
+                    file: &file,
+                    label: &label,
+                    index: layer + 1,
+                    rows,
+                    width,
+                };
+                dump_stage(args, stage, &values)?;
+                // The reference tensor that answers this cut exists only if the caller's hooks
+                // dumped it; without it the cut is our own number and says where in the layer a
+                // number changes, not that the reference agrees.
+                match args.reference.as_deref() {
+                    Some(dir) if dir.join(&file).exists() => {
+                        report_stage(args, stage, &values, &mut table)?;
+                    }
+                    _ => println!(
+                        "substage: {label}, rms {:.4e} - no `{file}` in the reference directory, \
+                         so it is not compared; the file comes from a post-hook on {}",
+                        rms(&values),
+                        cut_hook(cut)
+                    ),
+                }
+                return Ok(());
+            }
+            let out = model.forward_through(&forward, &batch, &cache, hidden, layer)?;
+            stream.synchronize()?;
+            let values = download_bf16(&stream, out, rows, width)?;
+            let file = format!("hidden_{:02}.npy", layer + 1);
+            let stage = Walked {
+                file: &file,
+                label: &stage_name(layer + 1),
+                index: layer + 1,
+                rows,
+                width,
+            };
+            report_stage(args, stage, &values, &mut table)?;
+            summarize(&table, config.num_hidden_layers);
+        }
         return Ok(());
     }
+    // With `--dump`, every stage's output is written as float32 `.npy` for a comparison against a
+    // reference stack: the embedding's rows first, then one file per layer, then the logits. The
+    // stack is walked one layer at a time rather than all at once, because the only way to see a
+    // layer's output is to stop there - `forward_through` runs layers `0..=layer` and releases each
+    // layer's scratch as it ends, so the arena pays for one layer and not the stack.
+    let width = usize::try_from(plan.hidden).unwrap_or(0);
+    // One table for the whole walk: an increment is measured against the stage before it, the last
+    // stage included, and that stage is the full run's output rather than a layer's.
+    let mut table = Table::default();
+    if args.dump.is_some() || args.reference.is_some() {
+        if let Some(dir) = args.dump.as_deref() {
+            std::fs::create_dir_all(dir)
+                .map_err(|error| Failure::message(format!("--dump {}: {error}", dir.display())))?;
+        }
+        let rows = tokens_usize(&batch);
+        let embedded = download_bf16(&stream, hidden, rows, width)?;
+        let stage = Walked {
+            file: "hidden_00.npy",
+            label: &stage_name(0),
+            index: 0,
+            rows,
+            width,
+        };
+        report_stage(args, stage, &embedded, &mut table)?;
+        // Every call reserves a step's scratch, and nothing returns it: the arena is sized for one
+        // forward and not for forty-eight, so each layer's rows are read back to the host and the
+        // arena is then released to the mark taken before the first call. Without the release the
+        // walk would stop a few layers in, with the arena exhausted.
+        // The layer walk ends one short of the stack: the reference's last file is the output of
+        // the whole run, after the final norm, and a layer's own output is the state before it. The
+        // walk covers `hidden_01..hidden_{L-1}` and the full run below answers `hidden_L`.
+        let mark = arena.mark();
+        for layer in 0..config.num_hidden_layers.saturating_sub(1) {
+            let out = model.forward_through(&forward, &batch, &cache, hidden, layer)?;
+            stream.synchronize()?;
+            let values = download_bf16(&stream, out, rows, width)?;
+            let index = layer + 1;
+            let file = format!("hidden_{index:02}.npy");
+            let stage = Walked {
+                file: &file,
+                label: &stage_name(index),
+                index,
+                rows,
+                width,
+            };
+            report_stage(args, stage, &values, &mut table)?;
+            arena.release(mark);
+        }
+    }
+
     model.forward(&forward, &batch, &cache, hidden)?;
+    // The run's output norm writes into `hidden`, so this is the state a reference's last file
+    // holds: the output after the final norm, which no layer's own output is.
+    if args.dump.is_some() || args.reference.is_some() {
+        stream.synchronize()?;
+        let rows = tokens_usize(&batch);
+        let width = usize::try_from(plan.hidden).unwrap_or(0);
+        let values = download_bf16(&stream, hidden, rows, width)?;
+        let index = config.num_hidden_layers;
+        let file = format!("hidden_{index:02}.npy");
+        let stage = Walked {
+            file: &file,
+            label: &describe(index, config.num_hidden_layers),
+            index,
+            rows,
+            width,
+        };
+        report_stage(args, stage, &values, &mut table)?;
+    }
+    summarize(&table, config.num_hidden_layers);
     let logits = arena.tensor(
         DType::F32,
         Shape::new(&[1, u64::try_from(config.vocab_size).unwrap_or(0)]),
@@ -639,6 +857,10 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     // The last row's log-softmax, on the host, and its ten best tokens.
     let vocabulary = config.vocab_size;
     let values = download_f32(&stream, logits, vocabulary)?;
+    if let Some(dir) = args.dump.as_deref() {
+        write_npy(&dir.join("logits.npy"), &values, 1, vocabulary)?;
+        println!("dump: logits.npy is the last row, 1 x {vocabulary} f32");
+    }
     let best = top_logprobs(&values, 10);
     println!(
         "decode: {count} prompt tokens, {} layers, {} experts; last row's top-10",
@@ -653,6 +875,348 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
 /// The batch's token count, as a `usize`, for the host-side readbacks.
 fn tokens_usize(batch: &TokenBatch) -> usize {
     usize::try_from(batch.num_tokens).unwrap_or(0)
+}
+
+/// Refuse a reference stack that was captured from other prompt ids than the run's.
+///
+/// `meta.json` beside the `.npy` files records `"ids": [...]`. A stack without one is read as is -
+/// the caller may have built the arrays elsewhere - but a stack that names a prompt and does not
+/// match is a comparison that cannot say anything about the model, so it stops here.
+fn check_reference_prompt(dir: &std::path::Path, tokens: &[i32]) -> Result<()> {
+    let path = dir.join("meta.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(());
+    };
+    let Some(ids_at) = text.find("\"ids\"") else {
+        return Ok(());
+    };
+    let Some(list_at) = text[ids_at..].find('[').map(|at| at + ids_at) else {
+        return Ok(());
+    };
+    let Some(list_end) = text[list_at..].find(']').map(|at| at + list_at) else {
+        return Ok(());
+    };
+    let theirs: Vec<i32> = text[list_at + 1..list_end]
+        .split(',')
+        .filter_map(|part| part.trim().parse().ok())
+        .collect();
+    if theirs.is_empty() || theirs == tokens {
+        return Ok(());
+    }
+    let shown = |ids: &[i32]| {
+        ids.iter()
+            .take(16)
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    Err(Failure::message(format!(
+        "{} holds a stack for {} tokens ({}), and this run names {} ({}): a different prompt would \
+         disagree at every stage and say nothing about the model",
+        path.display(),
+        theirs.len(),
+        shown(&theirs),
+        tokens.len(),
+        shown(tokens)
+    )))
+}
+
+/// The relative distance a stage is allowed from the reference before it is a divergence.
+///
+/// The reference is a bf16 run of the same prompt, so the per-element floor is `2**-8` and a row of
+/// `hidden` values averages it down; five percent is two orders above that floor and still far below
+/// what a wrong computation produces, which is what makes it a line worth printing.
+const RELATIVE_BUDGET: f64 = 0.05;
+
+/// `hidden_NN`'s stage: the embedding's output at zero, then one layer per file.
+fn stage_name(index: usize) -> String {
+    match index {
+        0 => "the embedding's output".to_owned(),
+        other => format!("after layer {}", other - 1),
+    }
+}
+
+/// A stage's name for a summary line: the run's own output is not a layer's output.
+fn describe(index: usize, layers: usize) -> String {
+    if index == layers {
+        format!("the output after the final norm (hidden_{index:02})")
+    } else {
+        stage_name(index)
+    }
+}
+
+/// Write one stage's rows when `--dump` asked, and compare them against the reference when
+/// `--reference` did, recording the first stage that passes [`RELATIVE_BUDGET`].
+/// The reading of the walk as it accumulates: which stage first crossed the budget tripwire, the
+/// error the stage before printed (a stage's increment is measured against it), and the largest
+/// increment seen.
+///
+/// The increment is what names a defect: smooth growth is accumulation and a jump is structure, and
+/// the first crossing and the largest increment are not the same stage in general.
+#[derive(Default)]
+struct Table {
+    first_above: Option<usize>,
+    previous: Option<f64>,
+    largest: Option<(usize, f64)>,
+    /// How many stages were compared: one stage has no increment to print.
+    stages: usize,
+}
+
+impl Table {
+    /// Fold one stage's relative error in, answering the increment it makes over the stage before.
+    fn push(&mut self, index: usize, relative: f64) -> Option<f64> {
+        let increment = self.previous.map(|previous| relative - previous);
+        self.stages += 1;
+        if let Some(step) = increment {
+            let larger = self.largest.is_none_or(|(_, largest)| step > largest);
+            if larger {
+                self.largest = Some((index, step));
+            }
+        }
+        self.previous = Some(relative);
+        if relative > RELATIVE_BUDGET && self.first_above.is_none() {
+            self.first_above = Some(index);
+        }
+        increment
+    }
+}
+
+/// One stage of the walk: which file it is, what it follows, and the shape of its rows.
+#[derive(Clone, Copy)]
+struct Walked<'a> {
+    file: &'a str,
+    label: &'a str,
+    index: usize,
+    rows: usize,
+    width: usize,
+}
+
+fn report_stage(
+    args: &Args,
+    stage: Walked<'_>,
+    values: &[f32],
+    table: &mut Table,
+) -> Result<Option<f64>> {
+    let Walked {
+        file: name,
+        label,
+        index,
+        rows,
+        width,
+    } = stage;
+    dump_stage(args, stage, values)?;
+    let Some(dir) = args.reference.as_deref() else {
+        return Ok(None);
+    };
+    let path = dir.join(name);
+    let (theirs, their_rows, their_width) = read_npy(&path)?;
+    if their_rows != rows || their_width != width {
+        return Err(Failure::message(format!(
+            "{} is {their_rows} x {their_width}, the stage is {rows} x {width}",
+            path.display()
+        )));
+    }
+    let (relative, worst, scale, ours) = distance(values, &theirs);
+    let increment = table.push(index, relative);
+    let marker = if relative > RELATIVE_BUDGET {
+        "  <-- past the tripwire"
+    } else {
+        ""
+    };
+    // The increment is printed beside the error: a stage whose error grew by much more than its
+    // predecessor's is the one to open, and one that crossed the tripwire by creeping up is not.
+    match increment {
+        Some(step) => println!(
+            "reference: {name}, {label}, rms {ours:.4e} against the reference's {scale:.4e} \
+             — rms/scale {relative:.3e} (step {step:+.2e}), max |diff| {worst:.3e}{marker}"
+        ),
+        None => println!(
+            "reference: {name}, {label}, rms {ours:.4e} against the reference's {scale:.4e} \
+             — rms/scale {relative:.3e} (the first stage), max |diff| {worst:.3e}{marker}"
+        ),
+    }
+    Ok(Some(relative))
+}
+
+/// Write one stage into the `--dump` directory, when one was asked for.
+fn dump_stage(args: &Args, stage: Walked<'_>, values: &[f32]) -> Result<()> {
+    let Some(dir) = args.dump.as_deref() else {
+        return Ok(());
+    };
+    write_npy(&dir.join(stage.file), values, stage.rows, stage.width)?;
+    println!("dump: {} is {}", stage.file, stage.label);
+    Ok(())
+}
+
+/// A stage's root-mean-square, for a cut that has no reference file to be measured against.
+fn rms(values: &[f32]) -> f64 {
+    let count = values.len().max(1) as f64;
+    let squared: f64 = values.iter().map(|value| f64::from(*value).powi(2)).sum();
+    (squared / count).sqrt()
+}
+
+/// The reference module whose hook answer a cut, so a missing file says which hook to run.
+fn cut_hook(cut: Substage) -> &'static str {
+    match cut {
+        Substage::Normalized => "`input_layernorm`",
+        Substage::Attended => "`self_attn`",
+        Substage::MlpOut => "`mlp`",
+    }
+}
+
+/// The two readings the table gives, said as the decisions they are: where we stop agreeing and
+/// where we start being wrong.
+fn summarize(table: &Table, layers: usize) {
+    if table.previous.is_none() {
+        return;
+    }
+    match table.first_above {
+        Some(index) => println!(
+            "reference: the first stage past {:.0}% is hidden_{index:02}, {}",
+            RELATIVE_BUDGET * 100.0,
+            describe(index, layers)
+        ),
+        None => println!(
+            "reference: every stage is within {:.0}% of the reference, hidden_00 to hidden_{layers:02}",
+            RELATIVE_BUDGET * 100.0
+        ),
+    }
+    if table.stages < 2 {
+        return;
+    }
+    match table.largest {
+        // A step that is not above zero means no stage added anything: nothing here names a defect.
+        Some((index, step)) if step > 0.0 => println!(
+            "reference: the largest step is at hidden_{index:02} ({step:+.2e}), {} - the stage to open",
+            describe(index, layers)
+        ),
+        _ => println!("reference: no stage's error grew over the one before it"),
+    }
+}
+
+/// A stage's root-mean-square distance from the reference, relative to the reference's own scale,
+/// with the largest absolute difference and that scale beside it.
+///
+/// The root-mean-square is the measure, not the largest element: a bf16 reference differs from a
+/// bf16 computation by about `2**-8` per element and the maximum of a row says more about one
+/// rounding than about the two rows' agreement.
+fn distance(values: &[f32], reference: &[f32]) -> (f64, f64, f64, f64) {
+    let count = values.len().min(reference.len()).max(1) as f64;
+    let mut squared = 0.0_f64;
+    let mut ours = 0.0_f64;
+    let mut theirs = 0.0_f64;
+    let mut worst = 0.0_f64;
+    for (mine, other) in values.iter().zip(reference.iter()) {
+        let difference = f64::from(*mine) - f64::from(*other);
+        squared += difference * difference;
+        ours += f64::from(*mine) * f64::from(*mine);
+        theirs += f64::from(*other) * f64::from(*other);
+        worst = worst.max(difference.abs());
+    }
+    let scale = (theirs / count).sqrt();
+    let relative = if scale > 0.0 {
+        (squared / count).sqrt() / scale
+    } else {
+        f64::INFINITY
+    };
+    // Our own rms goes beside the reference's: a stage whose scale has collapsed disagrees in a way
+    // the ratio alone hides, and the reference's growth is the shape the stack has to reproduce.
+    (relative, worst, scale, (ours / count).sqrt())
+}
+
+/// Read a C-ordered `f32` `.npy` file: the magic, one version, a header dict this reads for the
+/// shape, then the little-endian data.
+///
+/// It is as narrow as the writer beside it on purpose: the reference dumps are `'<f4'` and
+/// C-ordered, and a file that is not is refused rather than read into the wrong shape.
+fn read_npy(path: &std::path::Path) -> Result<(Vec<f32>, usize, usize)> {
+    let bytes = std::fs::read(path)
+        .map_err(|error| Failure::message(format!("{}: {error}", path.display())))?;
+    let refuse = |what: &str| Failure::message(format!("{}: {what}", path.display()));
+    if bytes.len() < 10 || &bytes[..6] != b"\x93NUMPY" {
+        return Err(refuse("not a .npy file"));
+    }
+    let (header_at, header_len): (usize, usize) = match bytes[6] {
+        1 => (10, usize::from(u16::from_le_bytes([bytes[8], bytes[9]]))),
+        2 | 3 => (
+            12,
+            usize::try_from(u32::from_le_bytes([
+                bytes[8], bytes[9], bytes[10], bytes[11],
+            ]))
+            .unwrap_or(usize::MAX),
+        ),
+        other => return Err(refuse(&format!("a .npy version of {other}"))),
+    };
+    let header = std::str::from_utf8(&bytes[header_at..header_at.saturating_add(header_len)])
+        .map_err(|_| refuse("a header that is not UTF-8"))?;
+    if !header.contains("'<f4'") || header.contains("'fortran_order': True") {
+        return Err(refuse("not a C-ordered float32 array"));
+    }
+    let shape_at = header
+        .find("'shape': (")
+        .ok_or_else(|| refuse("a header with no shape"))?
+        + "'shape': (".len();
+    let shape_end = header[shape_at..]
+        .find(')')
+        .ok_or_else(|| refuse("a header with an unterminated shape"))?
+        + shape_at;
+    let extents: Vec<usize> = header[shape_at..shape_end]
+        .split(',')
+        .filter_map(|part| part.trim().parse().ok())
+        .collect();
+    let (rows, columns) = match extents.as_slice() {
+        [rows, columns] => (*rows, *columns),
+        _ => return Err(refuse("an array that is not two-dimensional")),
+    };
+    let data_at = header_at + header_len;
+    let wanted = rows.saturating_mul(columns);
+    let available = bytes.len().saturating_sub(data_at) / 4;
+    if available < wanted {
+        return Err(refuse(&format!(
+            "{available} values for a {rows} x {columns} array"
+        )));
+    }
+    let mut values = Vec::with_capacity(wanted);
+    for at in (data_at..data_at + wanted * 4).step_by(4) {
+        values.push(f32::from_le_bytes([
+            bytes[at],
+            bytes[at + 1],
+            bytes[at + 2],
+            bytes[at + 3],
+        ]));
+    }
+    Ok((values, rows, columns))
+}
+
+/// Write `values` as a C-ordered `f32` `.npy` file of `rows` x `columns`.
+///
+/// The format is the small end of `numpy.save`'s: the magic, one version, a header dict padded so
+/// that the header's length is a multiple of 64, then the little-endian data. It is written by hand
+/// because the readback is four lines of header and no dependency the example does not already
+/// have - and a reference comparison wants the array a `numpy.load` returns, nothing else.
+fn write_npy(path: &std::path::Path, values: &[f32], rows: usize, columns: usize) -> Result<()> {
+    let mut header =
+        format!("{{'descr': '<f4', 'fortran_order': False, 'shape': ({rows}, {columns}), }}");
+    // The format's header ends with a newline and starts after a ten-byte preamble, and the whole
+    // preamble is padded to a multiple of 64 bytes with spaces.
+    let unpadded = 10 + header.len() + 1;
+    let padding = (64 - unpadded % 64) % 64;
+    header.push_str(&" ".repeat(padding));
+    header.push('\n');
+    let mut bytes = Vec::with_capacity(10 + header.len() + values.len() * 4);
+    bytes.extend_from_slice(&[0x93, b'N', b'U', b'M', b'P', b'Y']);
+    bytes.extend_from_slice(&[1, 0]);
+    bytes.extend_from_slice(
+        &u16::try_from(header.len())
+            .map_err(|_| Failure::message("a .npy header above 65535 bytes"))?
+            .to_le_bytes(),
+    );
+    bytes.extend_from_slice(header.as_bytes());
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    std::fs::write(path, &bytes)
+        .map_err(|error| Failure::message(format!("{}: {error}", path.display())))
 }
 
 /// A cheap digest of a block's output: its sum and its largest magnitude, both rounded so that a

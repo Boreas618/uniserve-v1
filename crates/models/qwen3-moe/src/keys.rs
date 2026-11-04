@@ -158,9 +158,13 @@ impl Qwen3Moe {
         // tensor-parallel degree. The model states both, so the key follows the deployment's rank
         // count and never a guess.
         let gathered = self.head().padded() * self.partition().tensor_parallel as u32;
+        // The sampler's candidate buffer is FP32 by design, so the unpadding widens the head's
+        // product once into it: the two element types are the model's dtype and FP32.
         push(
             "vocab_unpad",
-            self.head().unpad_descriptor(dtype, gathered).to_string(),
+            self.head()
+                .unpad_descriptor(dtype, DType::F32, gathered)
+                .to_string(),
         );
 
         // The expert exchange, when this deployment splits the experts: at one rank every expert
