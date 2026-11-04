@@ -28,6 +28,7 @@
 
 use std::fmt;
 
+use ops::fp4::ScaleLayout;
 use ops::{DType, Shape, TensorView};
 
 use crate::checkpoint::{Checkpoint, FileIdentity};
@@ -50,6 +51,15 @@ impl WeightLayout {
 
     /// A routed expert's second projection: `[experts, hidden, intermediate]`.
     pub const DOWN: Self = Self("down");
+
+    /// A calibrated NVFP4 matrix's packed E2M1 values: `[rows, columns / 2]` U8, one byte per pair.
+    pub const NVFP4_VALUES: Self = Self("nvfp4_values");
+
+    /// A calibrated NVFP4 matrix's E4M3 block scales in the linear layout: `[rows, columns / 16]`.
+    pub const NVFP4_SCALES_LINEAR: Self = Self("nvfp4_scales_linear");
+
+    /// The same scales in the swizzled 128x4 layout the cuDNN product reads.
+    pub const NVFP4_SCALES_SWIZZLED: Self = Self("nvfp4_scales_swizzled_128x4");
 
     /// The layout named `name`.
     pub const fn named(name: &'static str) -> Self {
@@ -285,6 +295,22 @@ pub trait RetainedWeights {
     ) -> Result<Backing>;
 }
 
+/// A calibrated NVFP4 matrix, as the `nvfp4_gemm` operator reads it.
+///
+/// The two weights are the encoded fields of the checkpoint, retained like any other weight; the
+/// global scale is a plain value because it enters a kernel as a launch scalar.
+#[derive(Clone, Copy, Debug)]
+pub struct QuantizedWeight {
+    /// `[rows, columns / 2]` U8: two E2M1 codes a byte, packed along the contraction.
+    pub packed: Weight,
+    /// `ScaleLayout::shape(rows, columns)` U8: one E4M3 block scale per sixteen elements.
+    pub scales: Weight,
+    /// The reciprocal of the checkpoint's FP32 tensor scale.
+    pub global_scale: f32,
+    /// The layout the block scales are stored in.
+    pub layout: ScaleLayout,
+}
+
 /// A weight a layer reads: its view and the region that keeps the bytes alive.
 #[derive(Clone, Copy, Debug)]
 pub struct Weight {
@@ -516,6 +542,82 @@ impl<'a> WeightLoader<'a> {
         })
     }
 
+    /// Load a calibrated NVFP4 matrix: its packed E2M1 values, its block scales and its tensor
+    /// scale.
+    ///
+    /// A calibrated checkpoint already holds the encoded fields (`values`, `block_scale`,
+    /// `tensor_scale`, `uniserve/quantization/quantizer.py`), so nothing is quantized here: the
+    /// three are published through retained storage under keys naming the scale layout, and a
+    /// deployment that asks to quantize a BF16 checkpoint at load does it with the
+    /// `nvfp4_quantize` operator on the device, which is where the reference encodes too.
+    ///
+    /// `values` is `[rows, columns / 2]` U8 (two E2M1 codes a byte), `scales` holds the block
+    /// scales in the layout `ops::fp4::ScaleLayout::shape(rows, columns)` names — U8, as every
+    /// program reads them — and `global_scale` is the reciprocal of the checkpoint's FP32 tensor
+    /// scale, the scalar `nvfp4_quantize` takes. The product op's `alpha` is the two tensor
+    /// scales' product, which the runner copies into one device scalar once at load.
+    pub fn nvfp4(
+        &mut self,
+        values: &WeightRequest,
+        scales: &WeightRequest,
+        layout: ScaleLayout,
+        global_scale: f32,
+    ) -> Result<QuantizedWeight> {
+        if !(global_scale.is_finite() && global_scale > 0.0) {
+            return Err(Error::weight(
+                &values.tensor,
+                format!("a global scale of {global_scale} is not a positive number"),
+            ));
+        }
+        if values.shape.last() == 0 {
+            return Err(Error::weight(
+                &values.tensor,
+                "a packed NVFP4 matrix has a contraction axis".to_owned(),
+            ));
+        }
+        let rows = values.shape.numel() / values.shape.last();
+        let columns = values.shape.last() * 2;
+        let expected = layout.shape(rows, columns);
+        if scales.shape != expected {
+            return Err(Error::weight(
+                &scales.tensor,
+                format!(
+                    "the {layout} block scales of a [{rows}, {columns}] matrix are {:?}, not {:?}",
+                    expected.dims(),
+                    scales.shape.dims()
+                ),
+            ));
+        }
+        let scale_layout = match layout {
+            ScaleLayout::Linear => WeightLayout::NVFP4_SCALES_LINEAR,
+            ScaleLayout::Swizzled128X4 => WeightLayout::NVFP4_SCALES_SWIZZLED,
+        };
+        let mut values_request = values.clone().with_layout(WeightLayout::NVFP4_VALUES);
+        let mut scales_request = scales.clone().with_layout(scale_layout);
+        values_request.shape = Shape::new(&[rows, columns / 2]);
+        scales_request.shape = expected;
+        let packed = self.load(&values_request)?;
+        if packed.dtype() != DType::U8 {
+            return Err(Error::weight(
+                &values_request.tensor,
+                format!("packed E2M1 values are U8 bytes, not {}", packed.dtype()),
+            ));
+        }
+        let scales = self.load(&scales_request)?;
+        if scales.dtype() != DType::U8 {
+            return Err(Error::weight(
+                &scales_request.tensor,
+                format!("block scales are U8 bytes, not {}", scales.dtype()),
+            ));
+        }
+        Ok(QuantizedWeight {
+            packed,
+            scales,
+            global_scale,
+            layout,
+        })
+    }
+
     /// Publish host-computed bytes as a weight, without a checkpoint tensor behind them.
     ///
     /// The rotary frequency table is the first such weight: `inv_freq` is computed once at loading
@@ -611,6 +713,11 @@ impl<'a> WeightLoader<'a> {
     fn target_dtype(&self, names: &[String]) -> Result<DType> {
         let checkpoint = self.checkpoint_dtype(names)?;
         let dtype = self.dtype.unwrap_or(checkpoint);
+        // A representation that is not converted (BF16 kept as BF16, a packed NVFP4 field of
+        // bytes kept as bytes) is read as it is; only a stated change goes through `convert`.
+        if dtype == checkpoint {
+            return Ok(dtype);
+        }
         if !dtype.is_float() || !checkpoint.is_float() {
             return Err(Error::weight(
                 names.first().map(String::as_str).unwrap_or(""),
@@ -765,6 +872,11 @@ fn check_layout(tensor: &str, source: &WeightSource, layout: WeightLayout) -> Re
                 ),
             )),
         },
+        // The NVFP4 fields are byte buffers: a packed matrix, a fused stack of packed experts or
+        // the strided rows of either are all the same bytes to the product.
+        WeightLayout::NVFP4_VALUES
+        | WeightLayout::NVFP4_SCALES_LINEAR
+        | WeightLayout::NVFP4_SCALES_SWIZZLED => Ok(()),
         other => Err(Error::weight(
             tensor,
             format!("layout `{other}` is not one this loader produces"),
