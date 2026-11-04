@@ -25,8 +25,10 @@
 //!   (`:51-56`). [`Tile::above`] and [`Tile::left`] name those reads, and the driver keeps a second
 //!   raster for them.
 
-use crate::encoding::{Grid, SPATIAL_RATIO};
+use crate::encoding::{Grid, SPATIAL_RATIO, VideoEncoder};
 use crate::{Error, Result};
+use nn::layers::CrossFade;
+use nn::{DType, Forward, Shape, Strides, TensorView};
 
 /// One tile of a tiled encoding: the latent block it writes and the seams it fades over.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,24 +93,49 @@ impl Plan {
     }
 }
 
+/// The device views one tiled encoding reads and writes, as the caller uploaded and reserved them.
+///
+/// The raster is of the **run** - `Plan::extent` rows - and FP32, the type the video encoder computes
+/// in. The caller keeps the rows `Plan::crop` names, shifted back by `Plan::origin`.
+#[derive(Clone, Copy, Debug)]
+pub struct Scene<'a> {
+    /// Tile `i`'s pixels, `[1, in_channels, frames, tile_height, tile_width]`, in plan order.
+    pub pixels: &'a [TensorView],
+    /// The run's stitched latents, `[channels, frames, run_rows, latent_columns]`.
+    pub blended: TensorView,
+}
+
 /// The tiled encoding of one raster: the tile grid, and the band arithmetic over it.
 ///
 /// The raster's extents are input pixels and must be multiples of the spatial compression, which is
 /// what [`Grid::of`] checks; the latents are the raster divided by it.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone)]
 pub struct ClipEncoder {
     grid: Grid,
     latent: (u32, u32),
+    /// One compiled blend per seam width and axis, as `(extent, axis, layer)`.
+    blends: Vec<(u32, u32, CrossFade)>,
 }
 
 impl ClipEncoder {
     /// The tiled encoding of a `height` by `width` raster, in input pixels.
     pub fn new(height: u32, width: u32) -> Result<Self> {
         let grid = Grid::of(height, width)?;
-        Ok(Self {
+        let encoder = Self {
             grid,
             latent: (height / SPATIAL_RATIO, width / SPATIAL_RATIO),
-        })
+            blends: Vec::new(),
+        };
+        let blends = encoder
+            .blend_extents()
+            .into_iter()
+            .map(|(extent, axis)| {
+                CrossFade::new(DType::F32, extent, axis)
+                    .map(|layer| (extent, axis, layer))
+                    .map_err(Error::from)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { blends, ..encoder })
     }
 
     /// The latent raster one whole encoding produces, `(rows, columns)`.
@@ -137,6 +164,187 @@ impl ClipEncoder {
         }
         extents.sort_unstable();
         extents
+    }
+
+    /// Encode one run of the raster: every tile of `plan`, stitched into `scene.blended`.
+    ///
+    /// The tiles are written in [`Plan::tiles`] order, because a seam blend reads the block above it
+    /// and the block to its left, and both must be read **as decoded** rather than as already faded:
+    /// that is what makes the overlap where two seams cross follow the same arithmetic as the seams
+    /// themselves (`uniserve/nn/vae/tiled.py:51-56`). `nn::layers::CrossFade` reads its two sources as
+    /// contiguous blocks and writes its destination through the destination's strides, so the driver
+    /// keeps the decoded tiles in a ring of contiguous buffers and blends from there into the raster.
+    ///
+    /// Two buffers per tile column, one row of a two-row ring: row `r` reads row `r - 1`'s blocks and
+    /// overwrites row `r - 2`'s, which nothing reads again. One more block holds a tile whose fade is
+    /// both ways, because the second fade reads the first's result. A run's first tile row has nothing
+    /// above it, so its tiles blend only to the left; a run's first tile has nothing at all to blend
+    /// against, and its block reaches the raster through a blend of `extent` 1, whose only position
+    /// has weight `0 / 1` in the element type and so reproduces the block exactly.
+    pub fn encode(
+        &self,
+        f: &Forward,
+        encoder: &VideoEncoder,
+        plan: &Plan,
+        scene: Scene<'_>,
+    ) -> Result<()> {
+        let Scene { pixels, blended } = scene;
+        if blended.shape.rank() != 4 {
+            return Err(Error::config(format!(
+                "the raster is {:?}, not [channels, frames, rows, columns]",
+                blended.shape.dims()
+            )));
+        }
+        if blended.dtype != DType::F32 {
+            return Err(Error::config(format!(
+                "the raster is {}, not the encoder's F32",
+                blended.dtype
+            )));
+        }
+        if pixels.len() != plan.tiles.len() {
+            return Err(Error::config(format!(
+                "{} pixel views for {} tiles",
+                pixels.len(),
+                plan.tiles.len()
+            )));
+        }
+        let (origin, end) = plan.extent();
+        let rows = u64::from(end - origin);
+        let columns = u64::from(self.latent.1);
+        if blended.shape.dim(2) < rows || blended.shape.dim(3) < columns {
+            return Err(Error::config(format!(
+                "a run of {rows} by {columns} latent rows does not fit {:?}",
+                blended.shape.dims()
+            )));
+        }
+        let tile_rows = plan.tiles.first().map(|tile| tile.rows.1).unwrap_or(0);
+        let tile_columns = plan.tiles.first().map(|tile| tile.columns.1).unwrap_or(0);
+        if tile_rows == 0 || tile_columns == 0 {
+            return Err(Error::config("a tiled encoding without a tile".to_owned()));
+        }
+
+        let block = Shape::new(&[
+            blended.shape.dim(0),
+            blended.shape.dim(1),
+            u64::from(tile_rows),
+            u64::from(tile_columns),
+        ]);
+        // The two decoded rows of the ring, and the block a two-way fade hands to its second blend.
+        let mut ring = Vec::with_capacity(2);
+        for _ in 0..2 {
+            let mut row = Vec::with_capacity(self.grid.columns.len());
+            for _ in 0..self.grid.columns.len() {
+                row.push(f.arena().tensor(DType::F32, block)?);
+            }
+            ring.push(row);
+        }
+        let handed = f.arena().tensor(DType::F32, block)?;
+
+        // A blend of one position whose weight is `0 / 1`: the block passes through unchanged.
+        let place = CrossFade::new(DType::F32, 1, 2).map_err(Error::from)?;
+
+        for (index, tile) in plan.tiles.iter().enumerate() {
+            if tile.rows.1 != tile_rows || tile.columns.1 != tile_columns {
+                return Err(Error::config(format!(
+                    "tile {index} is {} by {} latents, not the run's {tile_rows} by {tile_columns}",
+                    tile.rows.1, tile.columns.1
+                )));
+            }
+            let decoded = ring[tile.row % 2][tile.column];
+            // The encoder reads `[1, channels, frames, rows, columns]`; the block is that, batched by
+            // one.
+            let strides = decoded.strides.as_slice();
+            let out = TensorView::with_strides(
+                decoded.element(&[0, 0, 0, 0]),
+                DType::F32,
+                Shape::new(&[
+                    1,
+                    block.dim(0),
+                    block.dim(1),
+                    u64::from(tile_rows),
+                    u64::from(tile_columns),
+                ]),
+                Strides::new(&[strides[0], strides[0], strides[1], strides[2], strides[3]]),
+            );
+            encoder.encode(f, pixels[index], out)?;
+
+            let placed = self.place_in(blended, plan, tile, block)?;
+            let above = match tile.fades_above() {
+                true => Some(ring[(tile.row + 1) % 2][tile.column]),
+                false => None,
+            };
+            let left = match tile.fades_left() {
+                true => Some(ring[tile.row % 2][tile.column - 1]),
+                false => None,
+            };
+            match (above, left) {
+                (Some(above), Some(left)) => {
+                    self.blend(tile.above, 2)?
+                        .forward(f, Some(above), decoded, handed)?;
+                    self.blend(tile.left, 3)?
+                        .forward(f, Some(left), handed, placed)?;
+                }
+                (Some(above), None) => {
+                    self.blend(tile.above, 2)?
+                        .forward(f, Some(above), decoded, placed)?;
+                }
+                (None, Some(left)) => {
+                    self.blend(tile.left, 3)?
+                        .forward(f, Some(left), decoded, placed)?;
+                }
+                (None, None) => {
+                    place.forward(f, Some(decoded), decoded, placed)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A view of `raster` holding one tile's block, at the tile's place in the run.
+    ///
+    /// The view keeps the raster's own strides, so a blend writes through them.
+    fn place_in(
+        &self,
+        raster: TensorView,
+        plan: &Plan,
+        tile: &Tile,
+        block: Shape,
+    ) -> Result<TensorView> {
+        let rows = u64::from(tile.rows.0) - u64::from(plan.origin);
+        let columns = u64::from(tile.columns.0);
+        if rows + block.dim(2) > raster.shape.dim(2) || columns + block.dim(3) > raster.shape.dim(3)
+        {
+            return Err(Error::config(format!(
+                "the block at ({rows}, {columns}) of {} by {} does not fit {:?}",
+                block.dim(2),
+                block.dim(3),
+                raster.shape.dims()
+            )));
+        }
+        Ok(TensorView::with_strides(
+            raster.element(&[0, 0, rows, columns]),
+            raster.dtype,
+            Shape::new(&[
+                raster.shape.dim(0),
+                raster.shape.dim(1),
+                block.dim(2),
+                block.dim(3),
+            ]),
+            raster.strides,
+        ))
+    }
+
+    /// The blend layer of `extent` along `axis`, compiled once with the encoder.
+    fn blend(&self, extent: u32, axis: u32) -> Result<CrossFade> {
+        self.blends
+            .iter()
+            .find(|(width, side, _)| *width == extent && *side == axis)
+            .map(|(_, _, layer)| *layer)
+            .ok_or_else(|| {
+                Error::config(format!(
+                    "the tiled encoder compiled no {extent}-position blend along axis {axis}"
+                ))
+            })
     }
 
     /// Every tile of the whole raster, in row-major order, and the identity crop.
@@ -241,9 +449,20 @@ mod tests {
             canvas().blend_extents(),
             vec![(4, 3), (5, 2), (5, 3), (6, 2)]
         );
+        // The encoder compiles exactly those blends, once each, so a driver finds every seam it
+        // meets and the run pays for four programs rather than one per seam.
+        let encoder = canvas();
+        let compiled: Vec<(u32, u32)> = encoder
+            .blends
+            .iter()
+            .map(|(extent, axis, _)| (*extent, *axis))
+            .collect();
+        assert_eq!(compiled, encoder.blend_extents());
+        assert_eq!(compiled.len(), 4);
         // A raster inside one tile has no seam at all.
         let small = ClipEncoder::new(256, 256).expect("one tile");
         assert!(small.blend_extents().is_empty());
+        assert!(small.blends.is_empty());
     }
 
     #[test]
