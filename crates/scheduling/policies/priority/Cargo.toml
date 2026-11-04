@@ -1,0 +1,17 @@
+[package]
+name = "scheduling-policy-priority"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "The scheduling policy that admits and batches by the request's own priority, then by arrival."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+scheduling-guest.workspace = true
+
+[lints]
+workspace = true

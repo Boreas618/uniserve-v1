@@ -1,0 +1,21 @@
+[package]
+name = "scheduling-policy-fcfs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "The default scheduling policy: first come, first served, reproducing the rules the current scheduler applies."
+
+[lib]
+# A policy package is compiled to `wasm32-unknown-unknown` and loaded as a
+# WASM module by the mechanism (design §4.4, §5.2). The library form is what
+# `cargo check` and the guest's own checks read.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The types, the events, the decisions and the helpers every policy shares.
+scheduling-guest.workspace = true
+
+[lints]
+workspace = true
