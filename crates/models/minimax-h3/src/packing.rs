@@ -314,6 +314,32 @@ pub fn tiled_rows(grid: (u32, u32, u32), shape: (u32, u32, u32), tiles: u32) -> 
     rows
 }
 
+/// The packed row of each latent voxel a clip's decoder reads, in clip-then-raster order.
+///
+/// The video VAE decodes one 25-frame clip at a time from [`CLIP_DECODE_LATENTS`] latent frames:
+/// clip `k` reads latent frames `[5k, 5k + 7)`, five that advance the timeline and two the next
+/// clip reads again, so a video's clips partition its latent frames and the last clip's input ends
+/// exactly at the last latent frame. Under dense attention the raster and packed orders agree; a
+/// sparse layout orders the rows tile-major, so each clip's rows are the packed position of every
+/// raster row it reads (the inverse of [`video_order`]).
+pub fn clip_rows(attention: AttentionKind, num_frames: u32, canvas: &Canvas) -> Result<Vec<u32>> {
+    let raster = latent_raster(canvas)?;
+    let order = video_order(attention, num_frames, canvas)?;
+    let mut packed_of_raster = vec![0_u32; order.len()];
+    for (packed, raster_row) in order.iter().enumerate() {
+        packed_of_raster[*raster_row as usize] = packed as u32;
+    }
+    let tokens = raster.patch_rows();
+    let clips = (num_frames - CLIP_LATENTS) / CLIP_FRAMES;
+    let mut rows = Vec::with_capacity((clips * CLIP_DECODE_LATENTS * tokens) as usize);
+    for clip in 0..clips {
+        let start = clip * CLIP_LATENTS * tokens;
+        let stop = start + CLIP_DECODE_LATENTS * tokens;
+        rows.extend_from_slice(&packed_of_raster[start as usize..stop as usize]);
+    }
+    Ok(rows)
+}
+
 /// The raster row of each generated video row, in packed order.
 ///
 /// Dense packing keeps the raster order; a sparse layout orders the rows tile-major, which depends
@@ -337,6 +363,10 @@ const ROPE_FRAMES_PER_LATENT: [u32; 5] = [1, 4, 4, 4, 4];
 
 /// Scale of the spatial rotary axes.
 const ROPE_SPATIAL_SCALE: f64 = 32.0;
+
+/// Latent frames one clip's decoder input covers: its five advancing frames and the two the next
+/// clip also reads (`uniserve/models/minimax_h3/decoding.py::VideoDecoder.clip_input`).
+const CLIP_DECODE_LATENTS: u32 = 7;
 
 /// The rotary coordinates of the patches along one spatial axis.
 ///
@@ -2099,5 +2129,43 @@ mod tests {
             audio_samples: 0,
         };
         assert!(condition_segments(&[off_canvas], &target).is_err());
+    }
+
+    #[test]
+    fn a_clips_rows_are_the_packed_position_of_every_latent_voxel_it_decodes() {
+        let canvas = canvas();
+        let tokens = latent_raster(&canvas).expect("raster").patch_rows();
+        // 124 frames give 37 latent frames and seven clips of seven latent frames.
+        let clips = 7;
+        assert_eq!(clips * CLIP_LATENTS * tokens + 2 * tokens, 37 * tokens);
+
+        // Dense packing keeps the raster order, so each clip's rows are its own range.
+        let dense = clip_rows(AttentionKind::Dense, 124, &canvas).expect("a plan");
+        assert_eq!(dense.len() as u32, clips * CLIP_DECODE_LATENTS * tokens);
+        assert_eq!(dense[0], 0);
+        assert_eq!(dense[7 * tokens as usize], CLIP_LATENTS * tokens);
+        assert!(dense.windows(2).all(|pair| pair[1] == pair[0] + 1));
+
+        // A sparse layout permutes the rows, and the clips still cover every row once.
+        let attention = AttentionKind::sparse(64, 0.8, None).expect("sparse");
+        let order = video_order(attention, 124, &canvas).expect("a plan");
+        let sparse = clip_rows(attention, 124, &canvas).expect("a plan");
+        assert_eq!(sparse.len() as u32, clips * CLIP_DECODE_LATENTS * tokens);
+        let mut every = sparse.clone();
+        every.sort_unstable();
+        assert_eq!(every, (0..37 * tokens).collect::<Vec<_>>());
+        // Every row a clip decodes reads one of that clip's own latent frames.
+        for (index, packed) in sparse.iter().enumerate() {
+            let clip = index as u32 / (CLIP_DECODE_LATENTS * tokens);
+            let raster_row = order[*packed as usize];
+            assert!(
+                raster_row >= clip * CLIP_LATENTS * tokens
+                    && raster_row < (clip * CLIP_LATENTS + CLIP_DECODE_LATENTS) * tokens,
+                "clip {clip} reads raster row {raster_row}"
+            );
+        }
+
+        // A frame count off the clip rule is refused by the latent arithmetic.
+        assert!(clip_rows(AttentionKind::Dense, 100, &canvas).is_err());
     }
 }
