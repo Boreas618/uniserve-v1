@@ -54,10 +54,10 @@
 
 use ops::norm::{Softmax, SoftmaxArgs, SoftmaxDescriptor};
 use ops::sampler::{
-    ArgMax, ArgMaxArgs, ArgMaxDescriptor, FilterArgs, FilterCandidates, FilterDescriptor,
-    InverseCdf, InverseCdfArgs, InverseCdfDescriptor, LogSoftmax, LogSoftmaxArgs,
-    LogSoftmaxDescriptor, LogitsShape, LogprobArgs, LogprobDescriptor, LogprobGather,
-    PARAMETER_COLUMNS, ShapeArgs, ShapeDescriptor, TopK, TopKArgs, TopKDescriptor,
+    ArgMax, ArgMaxArgs, ArgMaxDescriptor, CandidateOrder, FilterArgs, FilterCandidates,
+    FilterDescriptor, InverseCdf, InverseCdfArgs, InverseCdfDescriptor, LogSoftmax, LogSoftmaxArgs,
+    LogSoftmaxDescriptor, LogitsShape, LogprobArgs, LogprobDescriptor, LogprobGather, OrderArgs,
+    OrderDescriptor, PARAMETER_COLUMNS, ShapeArgs, ShapeDescriptor, TopK, TopKArgs, TopKDescriptor,
 };
 use ops::{DType, Op, Shape, TensorView};
 
@@ -451,6 +451,36 @@ impl Sampler {
         }
 
         Ok(rows)
+    }
+
+    /// Put each row's candidates in ascending token id order, ready for the draw.
+    ///
+    /// `values` and `ids` are `[rows, width]` and are left untouched; the two ordered views receive
+    /// the permutation. This is the step between filtering and the draw: `inverse_cdf` inverts a
+    /// cumulative distribution in the order it is given, and the reference orders candidates by token
+    /// id first so that a draw does not depend on the order the top-k program produced
+    /// (`uniserve/sampling/top_k.py:307-314`).
+    pub fn order_candidates(
+        &self,
+        f: &Forward,
+        values: TensorView,
+        ids: TensorView,
+        ordered_values: TensorView,
+        ordered_ids: TensorView,
+    ) -> Result<()> {
+        let descriptor = OrderDescriptor {
+            values: DType::F32,
+            ids: ids.dtype,
+            pdl: launch::PDL,
+        };
+        let args = OrderArgs {
+            values,
+            ids,
+            ordered_values,
+            ordered_ids,
+        };
+
+        f.operate::<CandidateOrder>(&descriptor, args)
     }
 
     /// Take each row's largest shaped logit as its token, and report its log-probability when
