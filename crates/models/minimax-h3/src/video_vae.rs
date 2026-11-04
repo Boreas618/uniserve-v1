@@ -1235,7 +1235,9 @@ pub(crate) mod tests {
         // The layout's own extents: the canvas over the spatial compression, and the latent frame count
         // the request's frames encode to.
         let raster = crate::packing::latent_raster(&canvas).expect("raster");
-        let latent_frames = crate::packing::video_latent_frames(1).expect("frames");
+        // One generated clip: 22 frames is the shortest count of the form 17n + 5, and it encodes to
+        // five latent frames plus the two that the next clip repeats.
+        let latent_frames = crate::packing::video_latent_frames(22).expect("frames");
         // One entry per latent voxel of one clip, and the values are the packed rows of the patches
         // those voxels lie in - not the voxel indices, which is the factor of the patch area apart.
         let rows = voxel_rows(

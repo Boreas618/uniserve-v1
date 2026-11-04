@@ -371,18 +371,20 @@ impl ClipDecoder {
             * u64::from(spatial)
             * u64::from(spatial);
         // The grid spreads its slack over the seams, so the overlaps are not all equal: a seam is at
-        // least `MINIMUM_OVERLAP` pixels and grows by an alignment step as the slack is spread, and it
-        // always fits its tile. One compiled blend serves every seam of one width, so the table is
-        // built for every width a grid of this tile size can produce, in latent positions - a seam is
-        // only ever as wide as the tile allows. Building it once, at load, is what lets one decoder
-        // block serve every canvas: the grid itself is arithmetic and is recomputed per request.
-        let minimum = crate::video_vae::MINIMUM_OVERLAP / spatial;
-        let widest = crate::video_vae::TILE_PIXELS / spatial - 1;
+        // least `MINIMUM_OVERLAP` **output pixels** wide - the raster the blend writes is in pixels, so
+        // that is the extent `cross_fade` is given - and it grows by an alignment step as the slack is
+        // spread, always inside its tile. One compiled blend serves every seam of one width, so the
+        // table is built for every width a grid of the checkpoint's tile size can produce, on both
+        // axes. Building it once, at load, is what lets one decoder block serve every canvas: the grid
+        // itself is arithmetic and is recomputed per request.
+        let alignment = spatial;
         let mut blends = Vec::new();
-        for extent in minimum..=widest {
+        let mut extent = crate::video_vae::MINIMUM_OVERLAP;
+        while extent < crate::video_vae::TILE_PIXELS {
             for axis in [2, 3] {
                 blends.push((extent, axis, CrossFade::new(DType::F16, extent, axis)?));
             }
+            extent += alignment;
         }
         Ok(Self {
             unpatchify,
