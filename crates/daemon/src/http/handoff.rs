@@ -44,8 +44,11 @@ pub(crate) fn now_ns() -> u64 {
     // SAFETY: `CLOCK_MONOTONIC` is a valid clock and `time` a valid pointer.
     let started = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) };
     assert_eq!(started, 0, "CLOCK_MONOTONIC is always readable");
-    u64::try_from(time.tv_sec).expect("a positive monotonic clock") * 1_000_000_000
-        + u64::try_from(time.tv_nsec).expect("nanoseconds below a second")
+    // `CLOCK_MONOTONIC` starts at the boot and both fields are non-negative;
+    // the default keeps the conversion total without a panic in the handoff
+    // path, which must not abort a stream.
+    u64::try_from(time.tv_sec).unwrap_or_default() * 1_000_000_000
+        + u64::try_from(time.tv_nsec).unwrap_or_default()
 }
 
 /// What a restart decides about one frozen response.
