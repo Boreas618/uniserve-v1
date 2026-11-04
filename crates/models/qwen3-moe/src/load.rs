@@ -438,21 +438,41 @@ fn expert_block(
         .map_err(Error::from)?;
 
     let activation = activation(config.hidden_act)?;
-    Moe::new(
-        router,
-        up_gate,
-        down,
-        None,
-        // Expert parallelism above one routes through the exchange; the map from a route's logical
-        // id to the weight row is the expert-parallel layer's, and this boundary passes the
-        // colocated case (one rank, every expert, logical id = row).
-        as_u32(range.len(), "the local experts")?,
-        as_u32(config.num_experts_per_tok, "num_experts_per_tok")?,
-        activation,
-        config.norm_topk_prob,
-        None,
-    )
-    .map_err(Error::from)
+    let local = as_u32(range.len(), "the local experts")?;
+    let top = as_u32(config.num_experts_per_tok, "num_experts_per_tok")?;
+    if partition.expert_parallel == 1 {
+        Moe::new(
+            router,
+            up_gate,
+            down,
+            None,
+            local,
+            top,
+            activation,
+            config.norm_topk_prob,
+            None,
+        )
+        .map_err(Error::from)
+    } else {
+        // One rank holds a contiguous window of the vocabulary, so the block needs no expert map:
+        // `local_offset` is what tells the sort which routes are this rank's, and the router stays
+        // replicated over the whole vocabulary so every rank routes a token the same way.
+        let offset = as_u32(range.start, "the first local expert")?;
+        Moe::expert_parallel(
+            router,
+            up_gate,
+            down,
+            None,
+            as_u32(config.num_experts, "num_experts")?,
+            local,
+            offset,
+            top,
+            activation,
+            config.norm_topk_prob,
+            None,
+        )
+        .map_err(Error::from)
+    }
 }
 
 /// One dense layer's feed-forward block.
