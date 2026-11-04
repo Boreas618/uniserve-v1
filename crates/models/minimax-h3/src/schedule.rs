@@ -528,6 +528,42 @@ mod tests {
     }
 
     #[test]
+    fn a_block_grids_spans_tile_the_interval_grid() {
+        // `fuse_heads` picks a head's rows by the span's start and takes one weight per row, so the
+        // pair must be exactly the block's own intervals: the right weights over the wrong rows is a
+        // fused parameter that is close to the intended one and wrong for every distilled request,
+        // and no shape or type refuses it.
+        let schedule = blocks();
+        let ScheduleGrid::Blocks {
+            intervals, nodes, ..
+        } = &schedule.spec().grid
+        else {
+            panic!("the fixture is a block grid");
+        };
+        for modality in Modality::ALL {
+            let mut next = 0_u32;
+            for block in 0..(nodes.len() - 1) as u32 {
+                let (start, weights) = schedule
+                    .block_span(modality, block)
+                    .expect("a block's span");
+                assert_eq!(
+                    start, nodes[block as usize] as u32,
+                    "block {block} starts at its node"
+                );
+                assert_eq!(
+                    start, next,
+                    "block {block} continues where the last one ended"
+                );
+                next = start + weights.len() as u32;
+            }
+            assert_eq!(
+                next, *intervals,
+                "the blocks cover every fine interval once"
+            );
+        }
+    }
+
+    #[test]
     fn the_other_grids_have_no_block_weights() {
         assert!(base().block_weights(Modality::Video, 0).is_err());
         assert!(dmd().block_weights(Modality::Video, 0).is_err());
