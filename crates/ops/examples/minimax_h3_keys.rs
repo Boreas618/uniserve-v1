@@ -620,6 +620,23 @@ fn main() {
         }
         .to_string(),
     );
+    // **The widening**: `Transformer::wide` turns the stack's own BF16 rows into the FP32 the head's
+    // floor computes in - `target <- 1 * source + 0 * target`, so the target is never read and an
+    // uninitialised buffer is the right operand (`transformer.rs`, `denoise_arena`'s `*.wide`).
+    // Two widths, because it widens the patchified rows before the input projection (96 columns) and
+    // the hidden rows before the output projection (5376).
+    for columns in [96, HIDDEN] {
+        push(
+            "scaled_add",
+            ops::residual::ScaledAddDescriptor {
+                target: DType::F32,
+                source: DType::BF16,
+                columns,
+                block: 1024,
+            }
+            .to_string(),
+        );
+    }
     // The conditioner's anchoring mix runs over `[condition rows, video_channels * 4]`, which is
     // narrower than any hidden width, in the conditioner's own dtype and in the trace path's.
     for (target, source) in [(DType::F32, DType::F32), (DType::BF16, DType::BF16)] {
