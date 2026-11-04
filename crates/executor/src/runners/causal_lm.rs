@@ -1445,7 +1445,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let served = self.graphs.captured(bucket, current).ok_or_else(|| {
             Error::Invariant(format!("no graph of bucket {bucket} in generation {current}"))
         })?;
-        if !served.same_structure(&walked.nodes) {
+        if !served.same_structure(&walked.nodes)? {
             // The launch structure changed: the bucket is recaptured from the walk's template,
             // which already carries the new kernels and their arguments.
             let held = hold_kernels(&kernels, &walked.nodes)?;

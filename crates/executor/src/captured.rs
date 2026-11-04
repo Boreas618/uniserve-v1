@@ -182,15 +182,24 @@ impl Captured {
     /// kernel inside - is a structure change, and its bucket is recaptured instead of rebound.
     /// Descriptor keys are not compared: a new program under a new key of the same operator is
     /// exactly the rebind case, and the parameters are what the walk recomputes.
-    pub fn same_structure(&self, nodes: &Nodes) -> bool {
-        self.nodes.len() == nodes.len()
-            && self
-                .nodes
-                .iter()
-                .zip(nodes)
-                .all(|((operator, _, mine), (walked, _, theirs))| {
-                    operator == walked && mine.len() == theirs.len()
-                })
+    pub fn same_structure(&self, nodes: &Nodes) -> Result<bool> {
+        if self.nodes.len() != nodes.len() {
+            return Ok(false);
+        }
+        for ((operator, _, mine), (walked, _, theirs)) in self.nodes.iter().zip(nodes) {
+            if operator != walked || mine.len() != theirs.len() {
+                return Ok(false);
+            }
+            // The kinds matter as much as the count: a rebind carries each kernel node's
+            // parameters over to the live graph by position, so a launch whose nodes changed from
+            // kernel-then-empty to empty-then-kernel has the same length and a different meaning.
+            for (live, fresh) in mine.iter().zip(theirs) {
+                if live.kind()? != fresh.kind()? {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
     }
 
     /// How many launches of `operator` the capture recorded.
