@@ -17,7 +17,9 @@ pub(crate) fn image_digest(id: u64) -> [u8; 32] {
     digest
 }
 
-use engine::{Executor, PolicyProgram, Scheduler, SchedulerConfig, SimEngine, SpecialTokenIds};
+use engine::{
+    Executor, Parameters, PolicyProgram, Scheduler, SchedulerConfig, SimEngine, SpecialTokenIds,
+};
 use engine::{GenerationFeatures, GenerationLimits, ModelDtype};
 use ipc::{CallKind, ForwardMode, MediaCall};
 
@@ -72,7 +74,7 @@ pub(crate) fn scheduler_with(
         ModelDtype::BFloat16,
         limits,
     )?;
-    install_policy(&mut scheduler);
+    install_policy(&mut scheduler, engine::BatchCapacity::of(&info));
     Ok(scheduler)
 }
 
@@ -100,13 +102,29 @@ pub(crate) fn policy_module() -> Vec<u8> {
 }
 
 /// Installs the policy a test world serves with: the `fcfs` package, revision
-/// one, with the policy's own defaults for every argument it lets a deployment
-/// state.
-pub(crate) fn install_policy(scheduler: &mut Scheduler) {
+/// one, instantiated for the capacity this world's workers were built for.
+///
+/// A policy declares its own limits, and the mechanism refuses a declaration
+/// above the build config's ceilings - the calls and tokens the workers were
+/// started for (§4.4) - rather than clamping it. The declaration is the
+/// policy's argument, so a deployment states the capacity its policy serves:
+/// left at the package's defaults, `fcfs` declares the 128 calls a production
+/// deployment has, and every test world whose workers were built for fewer
+/// would have no policy at all.
+pub(crate) fn install_policy(scheduler: &mut Scheduler, capacity: engine::BatchCapacity) {
+    let ceilings = engine::ceilings_of(capacity);
     let program = PolicyProgram {
         backend: "fcfs".to_owned(),
         revision: 1,
-        arguments: Default::default(),
+        arguments: Parameters {
+            chunked_prefill_size: Some(ceilings.chunked_prefill_size),
+            max_queued_requests: ceilings.max_queued_requests,
+            max_batch: Some(ceilings.max_batch),
+            max_num_batched_tokens: Some(ceilings.max_num_batched_tokens),
+            prefetch_min_tokens: Some(ceilings.prefetch_min_tokens),
+            timeout: Some(ceilings.timeout),
+            ..Default::default()
+        },
         stated: Default::default(),
     };
     let source = engine::PolicyBytes::new(policy_module());
