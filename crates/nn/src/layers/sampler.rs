@@ -592,6 +592,11 @@ mod tests {
         TensorView::new(DevicePtr::new(0x1000), DType::F32, Shape::new(shape))
     }
 
+    /// The state's own rows — the slot counts, the slot ids and the extra tokens — are integers.
+    fn ints(shape: &[u64]) -> TensorView {
+        TensorView::new(DevicePtr::new(0x1000), DType::I32, Shape::new(shape))
+    }
+
     #[test]
     fn a_step_is_built_for_a_vocabulary_and_a_candidate_width() {
         let sampler = Sampler::new(151_936, 8, 256, 0).unwrap();
@@ -663,10 +668,10 @@ mod tests {
     fn a_step_refuses_the_state_it_cannot_read() {
         let sampler = Sampler::new(1_024, 4, 64, 2).unwrap();
         let state = |extras: bool| SamplerState {
-            counts: view(&[4, 1_024]),
+            counts: ints(&[4, 1_024]),
             parameters: view(&[2, u64::from(PARAMETER_COLUMNS)]),
-            slots: view(&[2]),
-            extras: extras.then(|| view(&[2, 2])),
+            slots: ints(&[2]),
+            extras: extras.then(|| ints(&[2, 2])),
         };
         let samples = Samples {
             tokens: TensorView::new(DevicePtr::new(0x2000), DType::I32, Shape::new(&[2])),
@@ -676,11 +681,9 @@ mod tests {
                 Shape::new(&[2]),
             )),
         };
-        assert!(
-            sampler
-                .check(view(&[2, 1_024]), &state(true), &samples)
-                .is_ok()
-        );
+        sampler
+            .check(view(&[2, 1_024]), &state(true), &samples)
+            .expect("a step whose state is its own");
 
         // A row of the wrong width, a step with no rows, and a logit type the shaper cannot read.
         for (logits, named) in [
@@ -701,17 +704,17 @@ mod tests {
         // The request state: a row of parameters too narrow, counts that are not one row per slot,
         // and the two ways the extra columns and the sampler's declaration can disagree.
         let narrow = SamplerState {
-            counts: view(&[4, 1_024]),
+            counts: ints(&[4, 1_024]),
             parameters: view(&[2, 4]),
-            slots: view(&[2]),
-            extras: Some(view(&[2, 2])),
+            slots: ints(&[2]),
+            extras: Some(ints(&[2, 2])),
         };
         assert!(sampler.check(view(&[2, 1_024]), &narrow, &samples).is_err());
         let miscounted = SamplerState {
-            counts: view(&[3, 1_024]),
+            counts: ints(&[3, 1_024]),
             parameters: view(&[2, u64::from(PARAMETER_COLUMNS)]),
-            slots: view(&[2]),
-            extras: Some(view(&[2, 2])),
+            slots: ints(&[2]),
+            extras: Some(ints(&[2, 2])),
         };
         let text = format!(
             "{}",
@@ -746,9 +749,9 @@ mod tests {
     fn a_greedy_step_needs_no_draws_to_be_a_valid_step() {
         let sampler = Sampler::new(1_024, 4, 64, 0).unwrap();
         let state = SamplerState {
-            counts: view(&[4, 1_024]),
+            counts: ints(&[4, 1_024]),
             parameters: view(&[2, u64::from(PARAMETER_COLUMNS)]),
-            slots: view(&[2]),
+            slots: ints(&[2]),
             extras: None,
         };
         let samples = Samples {
