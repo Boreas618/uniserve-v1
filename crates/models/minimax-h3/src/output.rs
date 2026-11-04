@@ -25,6 +25,7 @@
 //! weights `i / 5`, and emits those five blended frames before the successor's body; the first blended
 //! frame is entirely the predecessor's and the fifth one fifth the successor's.
 
+use crate::programs::Programs;
 use nn::Shape;
 use nn::capability::StateTable;
 use nn::layers::{RgbBytes, ScaledAdd};
@@ -230,6 +231,25 @@ impl VideoPostprocessor {
             bytes: RgbBytes::new(dtype, Rgb::CHANNELS, mean, std)?,
             dtype,
         })
+    }
+
+    /// The programs a post-processor of `dtype` launches for rasters of these pixel extents.
+    ///
+    /// The byte packing is one program whatever the raster: the constants are weights and the extents
+    /// are launch values. The seam blend's rows are per pixel count, so the sizes the deployment
+    /// serves are the caller's, as with every other row program.
+    pub fn programs(dtype: DType, rasters: &[(u32, u32)]) -> Vec<(String, String)> {
+        use ops::residual::ScaledAdd as ScaledAddOp;
+
+        let mut programs = Programs::default();
+        programs.launch::<ops::rgb::RgbBytes>(&RgbBytes::descriptor_of(dtype, Rgb::CHANNELS));
+        for (height, width) in rasters {
+            let pixels = u64::from(*height) * u64::from(*width);
+            if let Ok(descriptor) = ScaledAdd.descriptor(dtype, dtype, pixels) {
+                programs.launch::<ScaledAddOp>(&descriptor);
+            }
+        }
+        programs.finish()
     }
 
     /// The element type of the clip raster this reads.
@@ -993,5 +1013,39 @@ mod tests {
         let (start, stop) = Splice::LAST.overlap;
         assert!(Splice::LAST.body.1 < start && stop - start == OVERLAP_FRAMES);
         assert!(timeline_frames(&[]).is_err());
+    }
+
+    /// The post-processor's programs follow from the raster sizes alone: the byte packing is one
+    /// program whatever the extents (its constants are weights), and the seam blend's row program
+    /// carries its pixel count, so two rasters of one size share one and two of different sizes do not.
+    #[test]
+    fn the_postprocessor_states_its_programs_from_the_raster_sizes() {
+        let rasters = [(480_u32, 832_u32), (720, 1280), (480, 832)];
+        let programs = VideoPostprocessor::programs(DType::F16, &rasters);
+
+        let count = |operator: &str| {
+            programs
+                .iter()
+                .filter(|(name, _)| name == operator)
+                .count()
+        };
+        assert_eq!(count("rgb_bytes"), 1);
+        assert_eq!(count("scaled_add"), 2, "{programs:?}");
+        assert!(
+            programs
+                .iter()
+                .any(|(_, key)| key.contains("dtype_f16_channels_3")),
+            "the packing states its element type and channel count: {programs:?}"
+        );
+        for (height, width) in [(480_u64, 832_u64), (720, 1280)] {
+            let pixels = height * width;
+            assert!(
+                programs
+                    .iter()
+                    .any(|(operator, key)| operator == "scaled_add"
+                        && key.contains(&format!("columns_{pixels}_"))),
+                "a row program per pixel count: {programs:?}"
+            );
+        }
     }
 }
