@@ -39,8 +39,8 @@ use crate::Validators;
 use crate::core::SchedulerHandle;
 use crate::handle::EventRx;
 use crate::scheduler::{
-    Arrival, BatchCapacity, Candidate, PolicyProgram, PolicyReverted, PolicySource, RoutePolicy,
-    RouteTrial, SchedulerStatsReporter, TrialState, arrival_view, ceilings_of,
+    Arrival, BatchCapacity, Candidate, PolicyProgram, PolicyReverted, PolicySource, PolicyUsage,
+    RoutePolicy, RouteTrial, SchedulerStatsReporter, TrialState, arrival_view, ceilings_of,
 };
 use scheduling::PolicyError;
 use scheduling::guest::event::{End, Event as PolicyEvent};
@@ -345,6 +345,36 @@ impl Routing {
         if let Some(policy) = crate::lock(&self.route).instance.as_mut() {
             policy.purge();
         }
+    }
+
+    /// §12's cost counters for the epoch's policy: every scheduler's, and the
+    /// control thread's own route instance.
+    ///
+    /// [`PolicyUsage`] is what `Metrics.policy_fuel`/`policy_calls` carry; the
+    /// frame states the world's other counters and is not this thread's to
+    /// send yet.
+    #[expect(
+        dead_code,
+        reason = "the Metrics frame that carries these counters is not sent yet"
+    )]
+    fn policy_usage(&self) -> PolicyUsage {
+        let mut usage = PolicyUsage::default();
+        for slot in &self.slots {
+            if let Ok(Some(scheduler)) = slot
+                .handle
+                .policy_usage()
+                .recv_timeout(std::time::Duration::from_millis(200))
+            {
+                usage.calls += scheduler.calls;
+                usage.fuel += scheduler.fuel;
+            }
+        }
+        if let Some(route) = crate::lock(&self.route).instance.as_ref() {
+            let route = route.usage();
+            usage.calls += route.calls;
+            usage.fuel += route.fuel;
+        }
+        usage
     }
 
     /// The policy failures the daemons must be told of (§7.3), in the order

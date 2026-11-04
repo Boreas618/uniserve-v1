@@ -168,6 +168,10 @@ impl Scheduler {
             Command::TakePolicyReport(answer) => {
                 let _ = answer.send(self.take_policy_report());
             }
+            Command::PolicyUsage { answer } => {
+                let usage = self.policy.as_ref().map(policy::PolicySlot::usage);
+                let _ = answer.send(usage);
+            }
             Command::DescribePolicyState { ranks, answer } => {
                 // No policy, no state a policy is instantiated with: the epoch
                 // waits for its first switchover (lead's ruling).

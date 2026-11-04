@@ -388,6 +388,63 @@ pub struct Candidate {
     program: PolicyProgram,
     module: PolicyModule,
     instance: PolicyInstance,
+    /// The guest calls the trial made, which the counters carry once the
+    /// candidate is adopted.
+    calls: u64,
+}
+
+/// What an epoch's policy has cost so far, in the two counters `Metrics`
+/// carries for it (design §12's deterministic proxy for per-step cost).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PolicyUsage {
+    /// Guest calls made since the epoch's policy first served, a precopy's
+    /// trial included.
+    pub calls: u64,
+    /// Fuel those calls consumed, summed over every instance the epoch's policy
+    /// has had: a switchover carries its predecessor's total forward, so the
+    /// counters only ever grow.
+    pub fuel: u64,
+}
+
+/// The running cost of the instance a slot serves, and of the ones it replaced.
+#[derive(Debug, Default)]
+struct Cost {
+    calls: u64,
+    /// Fuel of the instances that stopped serving, and of the trials whose
+    /// candidates were adopted.
+    spent: u64,
+}
+
+impl Cost {
+    /// Counts one call into `instance` around `call`.
+    fn call<T>(
+        &mut self,
+        instance: &mut PolicyInstance,
+        call: impl FnOnce(&mut PolicyInstance) -> Result<T, PolicyError>,
+    ) -> Result<T, PolicyError> {
+        self.calls += 1;
+        call(instance)
+    }
+
+    /// The counters as they stand, the serving instance's fuel included.
+    fn usage(&self, instance: &PolicyInstance) -> PolicyUsage {
+        PolicyUsage {
+            calls: self.calls,
+            fuel: self.spent + instance.fuel_consumed(),
+        }
+    }
+
+    /// An instance stops serving: its fuel stays in the total.
+    fn replace(&mut self, instance: &PolicyInstance) {
+        self.spent += instance.fuel_consumed();
+    }
+
+    /// A trial's calls are counted when its candidate is adopted: they are
+    /// calls the epoch's policy made, whether or not it goes on serving under
+    /// that program. Its fuel is already inside the instance's own total.
+    fn trial(&mut self, calls: u64) {
+        self.calls += calls;
+    }
 }
 
 impl Candidate {
@@ -527,6 +584,8 @@ pub struct PolicySlot {
     candidate: Option<(PolicyProgram, PolicyModule, PolicyInstance)>,
     /// The stage asked for and not yet applied, applied at the next boundary.
     pending: Option<Stage>,
+    /// What this scheduler's policy has cost (§12).
+    cost: Cost,
 }
 
 impl PolicySlot {
@@ -543,6 +602,7 @@ impl PolicySlot {
             previous: None,
             candidate: None,
             pending: None,
+            cost: Cost::default(),
         }
     }
 
@@ -571,6 +631,7 @@ impl PolicySlot {
             previous: None,
             candidate: None,
             pending: None,
+            cost: Cost::default(),
         })
     }
 
@@ -585,25 +646,22 @@ impl PolicySlot {
         self.instance.limits()
     }
 
-    /// Fuel every call into the serving instance has consumed, which is §12's
-    /// per-step policy cost when the mechanism takes it around a step.
-    pub fn fuel_consumed(&self) -> u64 {
-        self.instance.fuel_consumed()
-    }
-
     /// `observe`: every event since the previous step, in order (§4.4).
     pub fn observe(&mut self, events: &[Event]) -> Result<(), PolicyError> {
-        self.instance.observe(events)
+        let (instance, cost) = (&mut self.instance, &mut self.cost);
+        cost.call(instance, |instance| instance.observe(events))
     }
 
     /// `dispatch`: this step's plan (§4.4).
     pub fn dispatch(&mut self, room: &Room) -> Result<Plan, PolicyError> {
-        self.instance.dispatch(room)
+        let (instance, cost) = (&mut self.instance, &mut self.cost);
+        cost.call(instance, |instance| instance.dispatch(room))
     }
 
     /// `reclaim`: which objects to free, in order, for a shortage (§4.4).
     pub fn reclaim(&mut self, shortage: &Shortage) -> Result<Vec<Victim>, PolicyError> {
-        self.instance.reclaim(shortage)
+        let (instance, cost) = (&mut self.instance, &mut self.cost);
+        cost.call(instance, |instance| instance.reclaim(shortage))
     }
 
     /// `place`: which replica runs a request's first call on a block (§4.4).
@@ -612,17 +670,26 @@ impl PolicySlot {
         call: &CallView,
         replicas: &[ReplicaView],
     ) -> Result<usize, PolicyError> {
-        self.instance.place(call, replicas)
+        let (instance, cost) = (&mut self.instance, &mut self.cost);
+        cost.call(instance, |instance| instance.place(call, replicas))
     }
 
     /// `warm`: which pages to warm, in order, during an epoch's precopy (§4.4).
     pub fn warm(&mut self, room: &Room) -> Result<Vec<PageId>, PolicyError> {
-        self.instance.warm(room)
+        let (instance, cost) = (&mut self.instance, &mut self.cost);
+        cost.call(instance, |instance| instance.warm(room))
     }
 
     /// `experts`: the placement of experts on ranks (§4.4).
     pub fn experts(&mut self, load: &ExpertLoad) -> Result<ExpertOrder, PolicyError> {
-        self.instance.experts(load)
+        let (instance, cost) = (&mut self.instance, &mut self.cost);
+        cost.call(instance, |instance| instance.experts(load))
+    }
+
+    /// The calls this scheduler's policy has made and the fuel they consumed
+    /// (§12's cost counters, for `Metrics.policy_fuel`/`policy_calls`).
+    pub fn usage(&self) -> PolicyUsage {
+        self.cost.usage(&self.instance)
     }
 
     /// §7.3 step 2: instantiate `program` on `state` and ask it every decision
@@ -662,25 +729,33 @@ impl PolicySlot {
         let mut instance = module.instantiate(&init.state, &init.parameters, ceilings)?;
 
         // Every decision of §4.4's table once, on the state that exists now and
-        // without executing any of it.
+        // without executing any of it. The calls are the trial's cost, counted
+        // once the candidate is adopted.
+        let mut calls = 0;
         let plan = instance.dispatch(&room)?;
+        calls += 1;
         validators.plan(&plan)?;
         if let Some(shortage) = &shortage {
             let victims = instance.reclaim(shortage)?;
+            calls += 1;
             validators.victims(shortage, &victims)?;
         }
         if let Some((request, ranks)) = &arrival {
             let index = instance.route(request, ranks)?;
+            calls += 1;
             validators.route(request, ranks, index)?;
         }
         if let Some((call, replicas)) = &call {
             let index = instance.place(call, replicas)?;
+            calls += 1;
             validators.place(call, replicas, index)?;
         }
         let pages = instance.warm(&room)?;
+        calls += 1;
         validators.warm(&pages)?;
         if let Some(load) = &expert_load {
             let order = instance.experts(load)?;
+            calls += 1;
             validators.experts(load, &order)?;
         }
 
@@ -688,6 +763,7 @@ impl PolicySlot {
             program,
             module,
             instance,
+            calls,
         })
     }
 
@@ -697,6 +773,7 @@ impl PolicySlot {
     /// switchover: only a later precopy's result can be the one the daemon's
     /// switchover means.
     pub fn adopt(&mut self, candidate: Candidate) {
+        self.cost.trial(candidate.calls);
         self.candidate = Some((candidate.program, candidate.module, candidate.instance));
     }
 
@@ -782,7 +859,8 @@ impl PolicySlot {
         };
         let replaced_program = std::mem::replace(&mut self.program, program);
         let replaced_module = std::mem::replace(&mut self.module, module);
-        let _ = std::mem::replace(&mut self.instance, instance);
+        let replaced = std::mem::replace(&mut self.instance, instance);
+        self.cost.replace(&replaced);
         // §7.3 step 5: the replaced module stays until the next precopy, which
         // replaces it; committing therefore keeps it, and a revert finds it.
         self.previous = Some((replaced_program, replaced_module));
@@ -810,7 +888,8 @@ impl PolicySlot {
         let instance = module.instantiate(&init.state, &init.parameters, &self.ceilings)?;
         let _ = std::mem::replace(&mut self.program, program);
         let _ = std::mem::replace(&mut self.module, module);
-        let _ = std::mem::replace(&mut self.instance, instance);
+        let replaced = std::mem::replace(&mut self.instance, instance);
+        self.cost.replace(&replaced);
         Ok(())
     }
 
@@ -912,6 +991,8 @@ pub struct RoutePolicy {
     instance: PolicyInstance,
     previous: Option<(PolicyProgram, PolicyModule)>,
     candidate: Option<(PolicyProgram, PolicyModule, PolicyInstance)>,
+    /// What the control thread's policy has cost (§12).
+    cost: Cost,
 }
 
 impl RoutePolicy {
@@ -935,6 +1016,7 @@ impl RoutePolicy {
             instance,
             previous: None,
             candidate: None,
+            cost: Cost::default(),
         })
     }
 
@@ -949,6 +1031,7 @@ impl RoutePolicy {
             instance: candidate.instance,
             previous: None,
             candidate: None,
+            cost: Cost::default(),
         }
     }
 
@@ -963,7 +1046,8 @@ impl RoutePolicy {
         if events.is_empty() {
             return Ok(());
         }
-        self.instance.observe(events)
+        let (instance, cost) = (&mut self.instance, &mut self.cost);
+        cost.call(instance, |instance| instance.observe(events))
     }
 
     /// `route`: the index in `ranks` of the rank that serves a new request.
@@ -972,7 +1056,14 @@ impl RoutePolicy {
         request: &RequestView,
         ranks: &[RankView],
     ) -> Result<usize, PolicyError> {
-        self.instance.route(request, ranks)
+        let (instance, cost) = (&mut self.instance, &mut self.cost);
+        cost.call(instance, |instance| instance.route(request, ranks))
+    }
+
+    /// The calls this instance has made and the fuel they consumed (§12's cost
+    /// counters, for `Metrics.policy_fuel`/`policy_calls`).
+    pub fn usage(&self) -> PolicyUsage {
+        self.cost.usage(&self.instance)
     }
 
     /// §7.3 step 2 for the control thread's instance: instantiate `program` on
@@ -995,19 +1086,23 @@ impl RoutePolicy {
         let init = init_of(&program, state);
         let module = PolicyModule::load(engine, &source.bytes(&program)?)?;
         let mut instance = module.instantiate(&init.state, &init.parameters, ceilings)?;
+        let mut calls = 0;
         if let Some((request, ranks)) = &state.arrival {
             let index = instance.route(request, ranks)?;
+            calls += 1;
             validators.route(request, ranks, index)?;
         }
         Ok(Candidate {
             program,
             module,
             instance,
+            calls,
         })
     }
 
     /// Keeps a candidate a precopy prepared, for the switchover to put in.
     pub fn adopt(&mut self, candidate: Candidate) {
+        self.cost.trial(candidate.calls);
         self.candidate = Some((candidate.program, candidate.module, candidate.instance));
     }
 
@@ -1039,7 +1134,8 @@ impl RoutePolicy {
         };
         let replaced_program = std::mem::replace(&mut self.program, program);
         let replaced_module = std::mem::replace(&mut self.module, module);
-        let _ = std::mem::replace(&mut self.instance, instance);
+        let replaced = std::mem::replace(&mut self.instance, instance);
+        self.cost.replace(&replaced);
         self.previous = Some((replaced_program, replaced_module));
     }
 
@@ -1061,7 +1157,8 @@ impl RoutePolicy {
         let instance = module.instantiate(&init.state, &init.parameters, &self.ceilings)?;
         let _ = std::mem::replace(&mut self.program, program);
         let _ = std::mem::replace(&mut self.module, module);
-        let _ = std::mem::replace(&mut self.instance, instance);
+        let replaced = std::mem::replace(&mut self.instance, instance);
+        self.cost.replace(&replaced);
         Ok(())
     }
 
