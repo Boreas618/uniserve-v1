@@ -47,6 +47,18 @@ pub trait WeightStorage: Send + Sync {
     fn store(&self, key: &[u8; 32], bytes: &[u8]) -> Result<Backing>;
 }
 
+/// A shared storage, as two owners of one rank's client use it: the store itself and whatever else
+/// the rank maps weights through.
+impl<S: WeightStorage + ?Sized> WeightStorage for std::sync::Arc<S> {
+    fn fetch(&self, key: &[u8; 32]) -> Result<Option<Backing>> {
+        (**self).fetch(key)
+    }
+
+    fn store(&self, key: &[u8; 32], bytes: &[u8]) -> Result<Backing> {
+        (**self).store(key, bytes)
+    }
+}
+
 /// The storage key of `weight`, as §8 derives it from the model and its representation.
 ///
 /// The digest covers [`nn::WeightKey`]'s canonical text, which is every file's identity, the
