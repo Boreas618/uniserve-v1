@@ -1,20 +1,22 @@
 //! Command-line parsing for the `uniserve` binary.
 //!
-//! One executable runs every UniServe process, each as a command: `serve`
-//! (a node's daemon, and on the leader the API server), `engine` (the engine
-//! process a leader daemon starts), `worker` (one worker) and `storage` (a
-//! node's Storage Server). The binary's own options, its log
-//! levels, are global; each command declares its own. `serve` takes the
-//! serving command line (`daemon::options::ServeArgs`), which resolves one
-//! serving configuration from a `--config` file, a few flags and `--set`
-//! assignments. `worker` hands its arguments to the worker library
-//! unparsed.
+//! One executable runs every UniServe process, each as a command: `serve` (a
+//! node's daemon, and on the leader the application), `frontend` (the
+//! deployment's application process), `engine` (a node's main process for one
+//! epoch), `storage` (a host's Storage Server), `program-server` (a host's
+//! Program Server) and `worker` (one worker of the Python runtime the daemon
+//! still starts). The binary's own options, its log levels, are global; each
+//! command declares its own. `serve` and `frontend` take the serving command
+//! line (`daemon::options::ServeArgs`), which resolves one configuration from
+//! a `--config` file, a few flags and `--set` assignments. `worker` hands its
+//! arguments to the worker library unparsed.
 
 use std::ffi::OsString;
 
 use clap::{Args, Parser, Subcommand};
 use daemon::options::ServeArgs;
 
+use crate::engine::EngineArgs;
 use crate::storage::StorageArgs;
 
 /// Top-level parser for the `uniserve` binary.
@@ -28,21 +30,6 @@ pub(crate) struct Cli {
     pub log: LogLevels,
     #[command(subcommand)]
     pub command: Command,
-}
-
-/// Where an engine process reaches the daemon that started it.
-#[derive(Debug, Clone, Args)]
-pub(crate) struct EngineArgs {
-    /// The leader daemon's request socket, `unix:<path>` or `host:port`.
-    #[arg(long)]
-    pub requests: String,
-    /// The leader daemon's process socket, `unix:<path>` or `host:port`, through which the
-    /// engine starts its workers.
-    #[arg(long)]
-    pub processes: String,
-    /// The identity the daemon started the engine under.
-    #[arg(long)]
-    pub engine: u64,
 }
 
 /// The process's log levels, which every subcommand takes.
@@ -69,8 +56,16 @@ pub(crate) enum Command {
         override_usage = "uniserve serve [MODEL] [OPTIONS] [--config FILE] [--set PATH=VALUE]..."
     )]
     Serve(Box<ServeArgs>),
-    /// Run the engine process the leader daemon starts: its schedulers and
-    /// the request interface.
+    /// Run the deployment's application process: the HTTP and OpenAI API,
+    /// input and output processing, facts and migration, on the leader node.
+    /// The node's daemon starts it with the deployment's configuration.
+    #[command(
+        hide = true,
+        override_usage = "uniserve frontend [MODEL] [OPTIONS] [--config FILE] [--set PATH=VALUE]..."
+    )]
+    Frontend(Box<ServeArgs>),
+    /// Run the main process of this node and epoch: its schedulers and the
+    /// request interface.
     #[command(hide = true)]
     Engine(EngineArgs),
     /// Run one worker: the process a node's daemon starts for each worker
@@ -88,6 +83,11 @@ pub(crate) enum Command {
     /// The Storage Server of this host and the operator's commands against
     /// it.
     Storage(Box<StorageArgs>),
+    /// A command whose parser belongs to another crate, such as the Program
+    /// Server's: the executable hands the arguments to that parser instead of
+    /// restating its surface here.
+    #[command(hide = true, external_subcommand)]
+    External(Vec<OsString>),
 }
 
 #[cfg(test)]
@@ -110,5 +110,30 @@ mod tests {
             levels(&["uniserve", "serve", "m", "--log-level-http", "warn"]),
             (None, Some("warn".into()))
         );
+    }
+
+    /// Every process of a deployment is one of this binary's commands, and
+    /// the commands that the daemon starts are not in the help.
+    #[test]
+    fn each_process_is_a_command() {
+        for (args, expected) in [
+            (vec!["uniserve", "serve", "model"], "serve"),
+            (vec!["uniserve", "frontend", "model"], "frontend"),
+            (vec!["uniserve", "storage", "list"], "storage"),
+            (vec!["uniserve", "program-server"], "program-server"),
+        ] {
+            let cli = Cli::try_parse_from(args).expect("parses");
+            let name = match cli.command {
+                Command::Serve(_) => "serve",
+                Command::Frontend(_) => "frontend",
+                Command::Storage(_) => "storage",
+                Command::External(arguments) => match arguments.first().and_then(|name| name.to_str()) {
+                    Some("program-server") => "program-server",
+                    _ => "other",
+                },
+                Command::Engine(_) | Command::Worker { .. } => "other",
+            };
+            assert_eq!(name, expected);
+        }
     }
 }

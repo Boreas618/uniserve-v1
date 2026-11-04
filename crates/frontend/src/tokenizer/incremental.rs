@@ -10,6 +10,7 @@
 //! bytes so a matched stop string can still be truncated by `flush`.
 
 use std::mem::take;
+use std::sync::Arc;
 
 use crate::tokenizer::{HuggingFaceTokenizer, Result};
 
@@ -18,8 +19,11 @@ use crate::tokenizer::{HuggingFaceTokenizer, Result};
 /// One decoder serves one generation stream: `push_token` for every generated
 /// token, `next_chunk` for streamed text, and `flush` once at the end of the
 /// stream or at a stop-string match.
-pub struct IncrementalDecoder<'a> {
-    tokenizer: &'a HuggingFaceTokenizer,
+pub struct IncrementalDecoder {
+    /// The tokenizer the stream decodes with; owned, so a decoder (and the
+    /// stream state it carries) outlives the borrow of whoever started it and
+    /// can cross to a successor process.
+    tokenizer: Arc<HuggingFaceTokenizer>,
     skip_special_tokens: bool,
     min_bytes_to_buffer: usize,
     /// Token window decoded on every push. It starts as the prompt, which
@@ -53,13 +57,13 @@ pub struct IncrementalDecoder<'a> {
     pending_since_emit: usize,
 }
 
-impl<'a> IncrementalDecoder<'a> {
+impl IncrementalDecoder {
     /// Creates an incremental decoder for one generation stream.
     ///
     /// Construction does not decode. The prompt is seeded as decode context on
     /// the first `push_token`, which reports any decode error from seeding.
-    pub(crate) fn new(
-        tokenizer: &'a HuggingFaceTokenizer,
+    pub fn new(
+        tokenizer: Arc<HuggingFaceTokenizer>,
         prompt_token_ids: &[u32],
         skip_special_tokens: bool,
         min_bytes_to_buffer: usize,
@@ -99,7 +103,7 @@ const SAFE_SUFFIX_MAX: usize = 6;
 /// nothing and only slides the window.
 const MAX_PENDING_TOKENS: usize = 32;
 
-impl IncrementalDecoder<'_> {
+impl IncrementalDecoder {
     /// Seeds `self.prefix` from the shortest trailing suffix whose decoded text
     /// has no U+FFFD.
     ///
@@ -144,7 +148,7 @@ impl IncrementalDecoder<'_> {
     }
 }
 
-impl IncrementalDecoder<'_> {
+impl IncrementalDecoder {
     /// Pushes one generated token and returns how many bytes it appended to
     /// `output`.
     ///
@@ -250,6 +254,76 @@ impl IncrementalDecoder<'_> {
     pub fn output(&self) -> &str {
         &self.cumulative_output
     }
+
+    /// Returns the stream's place, so that another process continues this
+    /// request's decoding where this one stopped (design §7.5.1).
+    ///
+    /// Every value here is the decoder's own state: the decode window, the
+    /// text it has emitted, the offsets already returned, and the two
+    /// buffering settings the stream was started with. The tokenizer is not
+    /// part of it; [`IncrementalDecoder::resume`] takes the one the state was
+    /// taken on.
+    pub fn state(&self) -> IncrementalDecodeState {
+        IncrementalDecodeState {
+            ids: self.ids.clone(),
+            prefix: self.prefix.clone(),
+            prefix_index: self.prefix_index,
+            cumulative_output: self.cumulative_output.clone(),
+            output_index: self.output_index,
+            prompt_seeded: self.prompt_seeded,
+            pending_since_emit: self.pending_since_emit,
+            skip_special_tokens: self.skip_special_tokens,
+            min_bytes_to_buffer: self.min_bytes_to_buffer,
+        }
+    }
+
+    /// Continues the stream `state` stopped, on `tokenizer`, which is the one
+    /// the state was taken on.
+    pub fn resume(state: IncrementalDecodeState, tokenizer: Arc<HuggingFaceTokenizer>) -> Self {
+        Self {
+            tokenizer,
+            skip_special_tokens: state.skip_special_tokens,
+            min_bytes_to_buffer: state.min_bytes_to_buffer,
+            ids: state.ids,
+            prefix: state.prefix,
+            prefix_index: state.prefix_index,
+            cumulative_output: state.cumulative_output,
+            output_index: state.output_index,
+            prompt_seeded: state.prompt_seeded,
+            pending_since_emit: state.pending_since_emit,
+        }
+    }
+}
+
+/// One incremental decoder's place in a generation stream (design §7.5.1).
+///
+/// A request's response is produced by one decoder; when the process serving it
+/// hands the stream to a successor at an event boundary, this state moves with
+/// it, so the successor's text continues exactly where the predecessor's
+/// stopped. It is plain data: the handoff encodes it in its own append-only
+/// message.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IncrementalDecodeState {
+    /// The token window the next decode uses as context.
+    pub ids: Vec<u32>,
+    /// Decode of the window at the last emit or seed.
+    pub prefix: String,
+    /// Number of leading window tokens the next emit drops.
+    pub prefix_index: usize,
+    /// All text the stream has emitted, including bytes `next_chunk`
+    /// withholds.
+    pub cumulative_output: String,
+    /// Byte offset in `cumulative_output` up to which `next_chunk` has
+    /// returned text.
+    pub output_index: usize,
+    /// Whether the prompt seed has run.
+    pub prompt_seeded: bool,
+    /// Consecutive pushes that emitted nothing.
+    pub pending_since_emit: usize,
+    /// Whether special tokens are removed from the decoded text.
+    pub skip_special_tokens: bool,
+    /// Trailing output bytes `next_chunk` withholds.
+    pub min_bytes_to_buffer: usize,
 }
 
 #[cfg(test)]
