@@ -197,7 +197,7 @@ impl Scheduler {
         // Runtime state remains single-owner; executors receive immutable batch
         // inputs assembled from these queues and request records.
         Ok(Self {
-            executor,
+            executor: submission::Submissions::new(executor),
             inflight: inflight::Inflight::new(),
             placement: placement::Placement::default(),
             storage: allocation::Storage {
