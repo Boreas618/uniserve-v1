@@ -39,10 +39,17 @@ kind = "wasm"
 files = ["src/build.py"]
 script = "src/build.py"
 
+# The policy's own arguments, as the guest's `Parameters` type reads them
+# (`crates/scheduling/guest/src/limits.rs`): a number where the field is a
+# number, and **absence** where the field is an option - an absent
+# `max_queued_requests` is a queue without bound, which is what this package
+# asks for. `timeout` is `Nanos`, a count of nanoseconds, so thirty seconds is
+# stated as a number rather than as "30s": a string is refused by the guest's
+# parser, and a refused argument fails the precopy of every epoch that selects
+# this package.
 [parameters]
 chunked_prefill_size = 8192
-max_queued_requests = "unbounded"
 max_batch = 128
 max_num_batched_tokens = 8192
 prefetch_min_tokens = 256
-timeout = "30s"
+timeout = 30000000000
