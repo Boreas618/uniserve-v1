@@ -74,8 +74,8 @@ pub(super) struct PendingBatch {
     /// Worker execution time accumulated across partial results, in
     /// microseconds.
     pub(super) worker_exec_us: u64,
-    /// Whether the batch carries a `BatchKind::Prefill` call; such batches
-    /// count against `PREFILL_WINDOW_CREDITS`.
+    /// Whether the batch carries a `BatchKind::Prefill` call, which the room
+    /// reports as a prefill batch in flight.
     pub(super) prefill: bool,
     /// The kind of step the batch's worker time measures, if any.
     pub(super) measured: Option<speculation::MeasuredStep>,

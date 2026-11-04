@@ -9,6 +9,10 @@ members = [
     "crates/models",
     "crates/nixl",
     "crates/proto",
+    "crates/scheduling",
+    "crates/scheduling/guest",
+    "crates/scheduling/policies/fcfs",
+    "crates/scheduling/policies/priority",
     "crates/storage",
     "crates/storage-server",
     "crates/uniserve",
@@ -30,6 +34,10 @@ ipc = { path = "crates/ipc" }
 models = { path = "crates/models" }
 nixl = { path = "crates/nixl" }
 proto = { path = "crates/proto" }
+scheduling = { path = "crates/scheduling" }
+scheduling-guest = { path = "crates/scheduling/guest" }
+scheduling-policy-fcfs = { path = "crates/scheduling/policies/fcfs" }
+scheduling-policy-priority = { path = "crates/scheduling/policies/priority" }
 storage = { path = "crates/storage" }
 storage-server = { path = "crates/storage-server" }
 worker = { path = "crates/worker" }
