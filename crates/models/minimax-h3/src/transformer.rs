@@ -906,10 +906,18 @@ impl Transformer {
         let arena = f.arena();
         let entries = arena.tensor(nn::DType::I32, Shape::new(&[1, u64::from(groups.count())]))?;
         adaln.entries_of(f, step, entries)?;
+        // **The gather's own arrangement: one row per entry, the whole 18-vector table across the
+        // columns** (`gather_rows` derives its output from the table's columns and the index count,
+        // so a buffer of the same bytes in another shape is refused by name:
+        // `out is [12, 32256], [4, 96768] expected`). The block cuts three intervals per group out
+        // of it, and that is a view of the same flat order - group `g`'s row holds its three
+        // intervals' six vectors each, in order - so the block reads `[3 · groups, 6 · width]` over
+        // these bytes and nothing is copied.
         let modulation = arena.tensor(
             hidden.dtype,
-            Shape::new(&[u64::from(groups.count()) * 3, 6 * width]),
+            Shape::new(&[u64::from(groups.count()), adaln.layer_width()]),
         )?;
+        let per_layer = modulation.reshape(Shape::new(&[u64::from(groups.count()) * 3, 6 * width]));
         if let Some(trace) = trace {
             trace.check(self.layers.len(), tokens, width, hidden.dtype)?;
         }
@@ -919,7 +927,7 @@ impl Transformer {
         for (index, layer) in self.layers.iter().enumerate() {
             adaln.layer(f, index, entries, modulation)?;
             layer.forward(
-                f, current, alternate, modulation, rows, factors, visible, segments, &scratch,
+                f, current, alternate, per_layer, rows, factors, visible, segments, &scratch,
             )?;
             std::mem::swap(&mut current, &mut alternate);
             // A diagnosis reads the layer's packed output as it stands: the same rows the next
