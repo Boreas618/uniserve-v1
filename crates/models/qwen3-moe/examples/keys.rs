@@ -124,7 +124,7 @@ fn run(root: &Path, deployment: &Deployment) -> Result<(), String> {
             .map_err(|error| format!("loading {}: {error}", root.display()))?
     };
     let keys = model
-        .keys(deployment.cache, deployment.capacity)
+        .keys(deployment.cache, deployment.capacity, &[])
         .map_err(|error| format!("enumerating keys: {error}"))?;
     if keys.is_empty() {
         return Err("the model enumerated no programs".to_owned());

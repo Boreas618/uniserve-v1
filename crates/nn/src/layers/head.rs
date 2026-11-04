@@ -183,8 +183,14 @@ impl ParallelLMHead {
         input: DType,
         output: DType,
     ) -> Result<ops::gemm::Descriptor> {
-        let linear = Linear::new(self.weight, None, ops::gemm::WeightOrder::NxK)?;
-        Ok(linear.descriptor(input, output))
+        Ok(Linear::descriptor_of(
+            self.weight.shape().last() as u32,
+            self.weight.dtype(),
+            ops::gemm::WeightOrder::NxK,
+            false,
+            input,
+            output,
+        ))
     }
 
     /// The descriptor the vocabulary unpad launches with, for a gathered matrix of `gathered_width`
@@ -207,6 +213,27 @@ impl ParallelLMHead {
             dtype,
             output,
             vocabulary: self.vocabulary,
+            padded: gathered_width,
+            block: 1024,
+            pdl: crate::layers::launch::PDL,
+        }
+    }
+
+    /// The unpad's descriptor, from the vocabulary's size alone.
+    ///
+    /// The gathered width is `padded × ranks` — a launch value that follows the deployment's rank
+    /// count — so it is an argument; the vocabulary and the block are the checkpoint's and the
+    /// program's.
+    pub fn unpad_descriptor_of(
+        vocabulary: u32,
+        dtype: DType,
+        output: DType,
+        gathered_width: u32,
+    ) -> UnpadDescriptor {
+        UnpadDescriptor {
+            dtype,
+            output,
+            vocabulary,
             padded: gathered_width,
             block: 1024,
             pdl: crate::layers::launch::PDL,

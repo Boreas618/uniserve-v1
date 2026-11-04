@@ -748,7 +748,7 @@ fn dense_block(
 }
 
 /// The operator's name for the checkpoint's activation.
-fn activation(activation: Activation) -> Result<MoeActivation> {
+pub(crate) fn activation(activation: Activation) -> Result<MoeActivation> {
     match activation {
         Activation::Silu => Ok(MoeActivation::Silu),
         Activation::GeluTanh => Ok(MoeActivation::GeluTanh),
