@@ -291,6 +291,11 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             Dit::Base => "transformer_ref",
             Dit::Reference => "transformer",
         };
+        let placed_directories = component_bytes
+            .iter()
+            .filter(|(directory, _)| directory.as_str() != unplaced)
+            .map(|(directory, _)| directory.as_str())
+            .collect::<Vec<_>>();
         let all: u64 = component_bytes
             .iter()
             .filter(|(directory, _)| directory.as_str() != unplaced)
@@ -309,7 +314,8 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
         println!(
-            "weights {deployment}: table {table} MiB, under the {all} MiB its own components hold"
+            "weights {deployment}: table {table} MiB, under the {all} MiB that {} hold",
+            placed_directories.join(", ")
         );
     }
 
