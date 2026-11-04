@@ -302,6 +302,13 @@ impl<K: Order> Arrival<K> {
     }
 
     /// The pages a shortage of `kind` may take, least recently used first.
+    ///
+    /// A device page a resident request still continues from frees no device
+    /// units the mechanism may take (`validate_victims`: "page N is still
+    /// continued from and cannot be freed"), and a refused answer is a failed
+    /// policy - so naming one would stop the epoch at the first shortage
+    /// instead of freeing what is free. A host page is the host cache's to
+    /// take: the mechanism asks only that it is on the host.
     fn page_victims(&self, want_host: bool, need: u64) -> Vec<Victim> {
         let mut victims = Vec::new();
         let mut taken = 0u64;
@@ -310,6 +317,9 @@ impl<K: Order> Arrival<K> {
                 break;
             }
             if self.on_host.get(&page).copied().unwrap_or(false) != want_host {
+                continue;
+            }
+            if !want_host && !self.evictable.get(&page).copied().unwrap_or(false) {
                 continue;
             }
             victims.push(Victim::Page(page));
@@ -719,8 +729,8 @@ mod tests {
     use super::*;
     use crate::decision::Warming;
     use crate::ids::{ComponentId, PhaseId};
-    use crate::time::{Duration, Nanos};
     use crate::policy::Instantiation;
+    use crate::time::{Duration, Nanos};
     use crate::view::{EncodingView, PageView, PhaseView, RankView, ReplicaView, Snapshot};
 
     /// Drives an `Arrival` the way the mechanism does: construct it from the
@@ -931,6 +941,51 @@ mod tests {
             need: 1,
         });
         assert_eq!(victims, vec![Victim::Page(PageId(2))]);
+    }
+
+    #[test]
+    fn a_device_shortage_takes_only_pages_no_request_continues_from() {
+        let mut fcfs = policy();
+        fcfs.observe(&[
+            Event::Cached {
+                page: PageView {
+                    id: PageId(1),
+                    tokens: 16,
+                    last_used: Nanos(1),
+                    on_host: false,
+                    evictable: false,
+                },
+            },
+            Event::Cached {
+                page: PageView {
+                    id: PageId(2),
+                    tokens: 16,
+                    last_used: Nanos(2),
+                    on_host: false,
+                    evictable: true,
+                },
+            },
+        ]);
+        // The mechanism refuses a page a resident still reads, so the older
+        // one is not an offer it can accept: the free page is the victim and
+        // the answer stays valid.
+        let victims = fcfs.reclaim(&Shortage {
+            kind: Storage::KvUnits,
+            need: 1,
+        });
+        assert_eq!(victims, vec![Victim::Page(PageId(2))]);
+        // Nothing free: no page is named, which is a valid answer (the work
+        // waits), rather than one the mechanism has to refuse.
+        fcfs.observe(&[Event::Hit { page: PageId(2) }]);
+        let victims = fcfs.reclaim(&Shortage {
+            kind: Storage::KvUnits,
+            need: 1,
+        });
+        assert!(
+            victims
+                .iter()
+                .all(|victim| *victim != Victim::Page(PageId(1)))
+        );
     }
 
     #[test]

@@ -62,15 +62,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use scheduling::PolicyError;
 
-use crate::scheduler::policy::{PolicyReverted, PolicySlot, TrialState, Validators};
+use crate::scheduler::policy::Validators;
 use crate::scheduler::views::{Recorded, RecordedTable};
 use scheduling::guest::decision::{Plan, Room, Shortage, Storage, Victim, Work};
 use scheduling::guest::event::Event;
 use scheduling::guest::wire::Call;
 use scheduling::guest::{
-    CallView, EncodingId, EncodingView, ExpertLoad, ExpertOrder, Limits, Nanos, PageId, PageView,
-    PhaseId, PhaseKind, PhaseView, RankView, ReplicaView, RequestId, RequestState, RequestView,
-    Snapshot,
+    CallView, EncodingId, EncodingView, ExpertLoad, ExpertOrder, Nanos, PageId, PageView, PhaseId,
+    PhaseKind, PhaseView, RankView, ReplicaView, RequestId, RequestState, RequestView, Snapshot,
 };
 
 /// The mechanism's validators, against the state at one moment (`policy.rs`'s
@@ -96,7 +95,18 @@ impl Validators for Checked<'_> {
     }
 
     fn victims(&self, shortage: &Shortage, victims: &[Victim]) -> Result<(), PolicyError> {
-        validate_victims(shortage, victims, self.live)
+        // A trial runs on the mechanism's own state at this moment, so a
+        // victim cannot have vanished under it: the door maps that arm to a
+        // malformed answer rather than inventing a second failure kind for a
+        // case the trial cannot see.
+        match validate_victims(shortage, victims, self.live) {
+            Ok(()) => Ok(()),
+            Err(VictimError::Invalid(error)) => Err(error),
+            Err(VictimError::Vanished(message)) => Err(PolicyError::Malformed {
+                call: Call::Reclaim,
+                message,
+            }),
+        }
     }
 
     fn route(
@@ -149,6 +159,18 @@ pub(crate) struct Live<'a> {
     pub encodings: BTreeMap<EncodingId, EncodingView>,
     /// Every phase of this epoch, by id.
     pub phases: BTreeMap<PhaseId, PhaseView>,
+    /// The page identities the policy was told about and has not been told are
+    /// gone: the `Snapshot` it was instantiated with, plus every `Cached` since.
+    ///
+    /// A victim is judged against this, not against `pages`: the policy answers
+    /// about the state it was shown, so an identity it was shown and the
+    /// mechanism has since freed is *already freed*, while an identity it was
+    /// never shown is a decision about something that does not exist.
+    pub told_pages: std::borrow::Cow<'a, BTreeSet<PageId>>,
+    /// The encoder entries the policy was told about, on the same rule.
+    pub told_encodings: std::borrow::Cow<'a, BTreeSet<EncodingId>>,
+    /// The requests the policy was told about, on the same rule.
+    pub told_requests: std::borrow::Cow<'a, BTreeSet<RequestId>>,
 }
 
 impl Default for Live<'_> {
@@ -159,6 +181,9 @@ impl Default for Live<'_> {
             pages: std::borrow::Cow::Owned(BTreeMap::new()),
             encodings: BTreeMap::new(),
             phases: BTreeMap::new(),
+            told_pages: std::borrow::Cow::Owned(BTreeSet::new()),
+            told_encodings: std::borrow::Cow::Owned(BTreeSet::new()),
+            told_requests: std::borrow::Cow::Owned(BTreeSet::new()),
         }
     }
 }
@@ -182,9 +207,15 @@ impl Live<'static> {
         for phase in &snapshot.phases {
             live.phases.insert(phase.id, phase.clone());
         }
+        // The snapshot is what the policy was told at instantiation: every
+        // identity in it is one it may name, and nothing else is.
+        live.told_pages = std::borrow::Cow::Owned(snapshot.pages.iter().map(|p| p.id).collect());
+        live.told_encodings =
+            std::borrow::Cow::Owned(snapshot.encodings.iter().map(|e| e.id).collect());
+        live.told_requests =
+            std::borrow::Cow::Owned(snapshot.requests.iter().map(|request| request.id).collect());
         live
     }
-
 }
 
 impl Live<'_> {
@@ -237,6 +268,22 @@ fn decodes(kind: PhaseKind) -> bool {
 /// policy failure.
 pub(crate) fn validate_plan(plan: &Plan, room: &Room, live: &Live<'_>) -> Result<(), PolicyError> {
     validate_admission(plan, live)?;
+    validate_after_admission(plan, room, live)
+}
+
+/// Checks the plan's work and its retirement against the state the mechanism
+/// holds once the plan's admission has been applied.
+///
+/// A step applies a plan's admission before it checks the rest, so that one
+/// plan can both admit a request and run it (§4.4); the work then names a
+/// resident request and nothing else. The admission itself is checked against
+/// the queue the policy was given, before it is applied — see
+/// [`validate_admission`].
+pub(crate) fn validate_after_admission(
+    plan: &Plan,
+    room: &Room,
+    live: &Live<'_>,
+) -> Result<(), PolicyError> {
     validate_work(plan, room, live)?;
     validate_release(plan, live)?;
     Ok(())
@@ -249,7 +296,12 @@ pub(crate) fn validate_plan(plan: &Plan, room: &Room, live: &Live<'_>) -> Result
 /// stops at the first request its hard limits refuse, which is how `fcfs`
 /// reproduces first-come-first-served while a policy that reorders the queue
 /// gets its own order. Membership is all that is validated here.
-fn validate_admission(plan: &Plan, live: &Live<'_>) -> Result<(), PolicyError> {
+/// Checks a plan's admission against the queue the policy was dispatched on.
+///
+/// Applying admission removes the named requests from the queue, so this is the
+/// one check that must run before it: a plan read against the state after its
+/// own admission would name requests the mechanism no longer queues.
+pub(crate) fn validate_admission(plan: &Plan, live: &Live<'_>) -> Result<(), PolicyError> {
     let mut admitted = BTreeSet::new();
     for id in &plan.admit {
         if !live.queued(*id) {
@@ -537,71 +589,112 @@ pub(crate) fn validate_victims(
     shortage: &Shortage,
     victims: &[Victim],
     live: &Live<'_>,
-) -> Result<(), PolicyError> {
-    // Freeing nothing is a legal answer: the work that did not fit waits for
-    // the next step, and the watchdog bounds a resident request that then never
-    // advances (§4.4).
+) -> Result<(), VictimError> {
+    // Three cases, and they are the whole of §4.4's rule for this decision:
+    //
+    // 1. An object the policy **was told** about and the mechanism no longer
+    //    holds: the mechanism let go of it between the observation the policy
+    //    answered from and this call. Nothing of the step can do that today -
+    //    `admit_plan` is the only thing that changes storage between `observe`
+    //    and `reclaim`, and it frees nothing - so the case is unreachable, and
+    //    its path exists to catch the mechanism, not the policy: a free it made
+    //    without recording it is a broken invariant, and the epoch stops naming
+    //    that, never as a policy's wrong decision.
+    // 2. An object the policy was **never told** is an invalid decision: a
+    //    policy naming what it was never shown is confused or guessing, and
+    //    §4.4 makes that a failed policy. This is what keeps case 1 honest -
+    //    without it, a name that never existed would read as already freed.
+    // 3. The semantic refusals stay refusals throughout, as a policy's failure:
+    //    a page on the host frees no device units, a page a resident request
+    //    still continues from cannot be freed, an encoder entry no request
+    //    holds is not a cache entry, and a request that is not resident and
+    //    migratable cannot be ended.
+    //
+    // An empty answer stays legal: a policy may leave the shortfall to natural
+    // completion or to the next step, and only a resident request starved past
+    // `limits().timeout` is a failure (§4.4).
     let mut seen: Vec<Victim> = Vec::new();
     for victim in victims {
         if seen.contains(victim) {
-            return Err(invalid(Call::Reclaim, format!("{victim:?} is freed twice")));
+            return Err(invalid(Call::Reclaim, format!("{victim:?} is freed twice")).into());
         }
         seen.push(*victim);
         match (shortage.kind, victim) {
             (Storage::KvUnits, Victim::Page(page)) => {
-                let page = live.page(*page)?;
-                if page.on_host {
+                let Some(view) = told_page(live, *page, Storage::KvUnits)? else {
+                    continue;
+                };
+                if view.on_host {
                     return Err(invalid(
                         Call::Reclaim,
                         format!(
                             "page {} is on the host, it frees no device units",
-                            page.id.0
+                            view.id.0
                         ),
-                    ));
+                    )
+                    .into());
                 }
-                if !page.evictable {
+                if !view.evictable {
                     return Err(invalid(
                         Call::Reclaim,
                         format!(
                             "page {} is still continued from and cannot be freed",
-                            page.id.0
+                            view.id.0
                         ),
-                    ));
+                    )
+                    .into());
                 }
             }
             (Storage::KvUnits, Victim::Request(request)) => {
-                let request = live.request(*request)?;
-                if request.state != RequestState::Resident || !request.migratable {
+                let Some(view) = told_request(live, *request, Storage::KvUnits)? else {
+                    continue;
+                };
+                if view.state != RequestState::Resident || !view.migratable {
                     return Err(invalid(
                         Call::Reclaim,
                         format!(
                             "{} cannot be ended as migratable: it is {} and {} migratable",
-                            request.id.0,
-                            if request.state == RequestState::Resident {
+                            view.id.0,
+                            if view.state == RequestState::Resident {
                                 "resident"
                             } else {
                                 "not resident"
                             },
-                            if request.migratable { "" } else { "not" }
+                            if view.migratable { "" } else { "not" }
                         ),
-                    ));
+                    )
+                    .into());
                 }
             }
             (Storage::HostPages, Victim::Page(page)) => {
-                let page = live.page(*page)?;
-                if !page.on_host {
+                let Some(view) = told_page(live, *page, Storage::HostPages)? else {
+                    continue;
+                };
+                if !view.on_host {
                     return Err(invalid(
                         Call::Reclaim,
-                        format!("page {} is not on the host", page.id.0),
-                    ));
+                        format!("page {} is not on the host", view.id.0),
+                    )
+                    .into());
                 }
             }
             (Storage::EncoderEntries, Victim::Encoding(entry)) => {
-                if !live.encodings.contains_key(entry) {
+                if !live.told_encodings.contains(entry) {
                     return Err(invalid(
                         Call::Reclaim,
-                        format!("encoder entry {} does not exist", entry.0),
-                    ));
+                        format!(
+                            "encoder entry {} was never shown to the policy, so evicting it is \
+                             not a decision it was given the state for",
+                            entry.0
+                        ),
+                    )
+                    .into());
+                }
+                if !live.encodings.contains_key(entry) {
+                    return Err(VictimError::Vanished(format!(
+                        "encoder entry {} was shown to the policy and is gone before the reclaim",
+                        entry.0
+                    )));
                 }
             }
             (Storage::Other, _) => {}
@@ -609,11 +702,102 @@ pub(crate) fn validate_victims(
                 return Err(invalid(
                     Call::Reclaim,
                     format!("{victim:?} frees nothing of a {kind:?} shortage"),
-                ));
+                )
+                .into());
             }
         }
     }
     Ok(())
+}
+
+/// The page a victim names, when it is one the policy was told about and the
+/// mechanism still holds.
+///
+/// `Ok(None)` is the unreachable case above - told, and already gone - which is
+/// free to skip because nothing lives there any more; its path is `Vanished`
+/// only for the entry that has no other way to be gone.
+fn told_page(
+    live: &Live<'_>,
+    page: PageId,
+    kind: Storage,
+) -> Result<Option<PageView>, VictimError> {
+    if !live.told_pages.contains(&page) {
+        return Err(invalid(
+            Call::Reclaim,
+            format!(
+                "page {} was never shown to the policy, so freeing it is not a decision it was \
+                 given the state for",
+                page.0
+            ),
+        )
+        .into());
+    }
+    let Some(view) = live.pages.get(&page) else {
+        return Err(VictimError::Vanished(format!(
+            "page {} was shown to the policy for a {kind:?} shortage and is gone before the \
+             reclaim, which the mechanism did not record",
+            page.0
+        )));
+    };
+    Ok(Some(view.clone()))
+}
+
+/// The request a victim names, on the same rule as [`told_page`].
+fn told_request(
+    live: &Live<'_>,
+    request: RequestId,
+    kind: Storage,
+) -> Result<Option<RequestView>, VictimError> {
+    if !live.told_requests.contains(&request) {
+        return Err(invalid(
+            Call::Reclaim,
+            format!(
+                "request {} was never shown to the policy, so ending it is not a decision it \
+                 was given the state for",
+                request.0
+            ),
+        )
+        .into());
+    }
+    let Some(view) = live.requests.get(&request) else {
+        return Err(VictimError::Vanished(format!(
+            "request {} was shown to the policy for a {kind:?} shortage and is gone before the \
+             reclaim, which the mechanism did not record",
+            request.0
+        )));
+    };
+    Ok(Some(view.clone()))
+}
+
+/// Why the mechanism refused a victim list.
+///
+/// The two are kept apart because only one of them is the policy's: a
+/// [`VictimError::Vanished`] is the mechanism's own bookkeeping broken (§4.4's
+/// failure taxonomy has no place for it), and the epoch must stop naming that
+/// rather than blame the policy for answering about the view it was given.
+#[derive(Debug)]
+pub(crate) enum VictimError {
+    /// The policy's decision is invalid: it names an object it was never
+    /// shown, or one the mechanism's rules forbid taking.
+    Invalid(PolicyError),
+    /// An object the policy was told about is gone before the reclaim: the
+    /// mechanism freed it without recording that it did.
+    Vanished(String),
+}
+
+impl From<PolicyError> for VictimError {
+    fn from(error: PolicyError) -> Self {
+        Self::Invalid(error)
+    }
+}
+
+impl std::fmt::Display for VictimError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(error) => error.fmt(formatter),
+            Self::Vanished(message) => formatter.write_str(message),
+        }
+    }
 }
 
 /// Checks a routing decision: the rank exists, is alive, and is the scheduler
@@ -803,6 +987,18 @@ pub(crate) struct Recorder {
     recorded: RecordedTable,
     /// Requests the policy was told had ended and has not been told of since.
     finished: BTreeSet<RequestId>,
+    /// The page identities the policy was told about: the snapshot's, plus every
+    /// `Cached` it has since recorded, less every `Freed`.
+    ///
+    /// Kept because a victim is judged against what the policy was *shown*
+    /// (design §4.4): an identity in here that the mechanism has since freed is
+    /// already freed, and one that never was here is a decision about something
+    /// the policy was never given.
+    announced_pages: BTreeSet<PageId>,
+    /// The encoder entries the policy was told about, on the same rule.
+    announced_encodings: BTreeSet<EncodingId>,
+    /// The requests the policy was told about.
+    announced_requests: BTreeSet<RequestId>,
 }
 
 impl Recorder {
@@ -837,7 +1033,26 @@ impl Recorder {
             touched: BTreeMap::new(),
             recorded,
             finished: BTreeSet::new(),
+            announced_pages: snapshot.pages.iter().map(|page| page.id).collect(),
+            announced_encodings: snapshot.encodings.iter().map(|entry| entry.id).collect(),
+            announced_requests: snapshot.requests.iter().map(|request| request.id).collect(),
         }
+    }
+
+    /// The page identities the policy has been told about: what a `reclaim` is
+    /// judged against.
+    pub(crate) fn announced_pages(&self) -> &BTreeSet<PageId> {
+        &self.announced_pages
+    }
+
+    /// The encoder entries the policy has been told about.
+    pub(crate) fn announced_encodings(&self) -> &BTreeSet<EncodingId> {
+        &self.announced_encodings
+    }
+
+    /// The requests the policy has been told about.
+    pub(crate) fn announced_requests(&self) -> &BTreeSet<RequestId> {
+        &self.announced_requests
     }
 
     /// Records one state change.
@@ -854,9 +1069,28 @@ impl Recorder {
     }
 
     pub(crate) fn record(&mut self, event: Event) {
+        // What the policy is told of the cache, kept as it is told: the `reclaim`
+        // validators judge a victim against this and not against the mechanism's
+        // table, which may have moved on since.
+        match &event {
+            Event::Cached { page } => {
+                self.announced_pages.insert(page.id);
+            }
+            Event::Hit { page } => {
+                self.announced_pages.insert(*page);
+            }
+            Event::Freed { page } => {
+                self.announced_pages.remove(page);
+            }
+            Event::Encoded { entry } => {
+                self.announced_encodings.insert(entry.id);
+            }
+            _ => {}
+        }
         match &event {
             Event::Arrived { request } => {
                 self.finished.remove(&request.id);
+                self.announced_requests.insert(request.id);
                 self.told.insert(request.id, request.clone());
                 self.recorded.insert(
                     ipc::RequestId(request.id.0),
@@ -1057,6 +1291,7 @@ impl Watchdog {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::scheduler::policy::{PolicyReverted, TrialState};
     use scheduling::guest::{ComponentId, RequestClass, Room, Storage, Warming};
 
     fn request(id: u64, state: RequestState) -> RequestView {
@@ -1086,25 +1321,32 @@ mod tests {
     }
 
     fn live(requests: Vec<RequestView>, queue: Vec<RequestId>, kinds: &[(u32, PhaseKind)]) -> Live {
-        Live {
+        let mut live = Live {
             requests: requests.into_iter().map(|r| (r.id, r)).collect(),
             queue,
             pages: std::borrow::Cow::Owned(BTreeMap::new()),
             encodings: BTreeMap::new(),
             phases: kinds
                 .iter()
-                .map(|(id, kind)| {
+                .map(|(index, kind)| {
                     (
-                        PhaseId(*id),
+                        PhaseId(*index),
                         PhaseView {
-                            id: PhaseId(*id),
+                            id: PhaseId(*index),
                             kind: *kind,
-                            block: ComponentId(*id),
+                            block: ComponentId(*index),
                         },
                     )
                 })
                 .collect(),
-        }
+            ..Live::default()
+        };
+        // The validators judge a victim against what the policy was told, so a
+        // fixture's live state is also what it was told: every identity in it.
+        live.told_pages = std::borrow::Cow::Owned(live.pages.keys().copied().collect());
+        live.told_encodings = std::borrow::Cow::Owned(live.encodings.keys().copied().collect());
+        live.told_requests = std::borrow::Cow::Owned(live.requests.keys().copied().collect());
+        live
     }
 
     fn room() -> Room {
@@ -1539,6 +1781,53 @@ mod tests {
             need: 1,
         };
         validate_victims(&entries, &[Victim::Encoding(EncodingId(7))], &live).expect("an entry");
+    }
+
+    #[test]
+    fn a_victim_the_policy_was_never_shown_is_a_policy_failure() {
+        let mut live = live(Vec::new(), Vec::new(), &[]);
+        live.pages.to_mut().insert(
+            PageId(1),
+            PageView {
+                id: PageId(1),
+                tokens: 16,
+                last_used: Nanos(1),
+                on_host: false,
+                evictable: true,
+            },
+        );
+        live.told_pages.to_mut().clear();
+        let units = Shortage {
+            kind: Storage::KvUnits,
+            need: 1,
+        };
+        match validate_victims(&units, &[Victim::Page(PageId(1))], &live) {
+            Err(VictimError::Invalid(error)) => {
+                assert!(format!("{error}").contains("never shown"));
+            }
+            other => panic!("a page the policy was never shown is its own decision: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_victim_the_policy_was_shown_and_is_gone_is_the_mechanisms_defect() {
+        // Nothing of a step frees a page between the observation the policy
+        // answered from and the reclaim, so this state means the mechanism let
+        // go of a told object without recording it: an invariant of its own,
+        // named as such and never as the policy's wrong decision.
+        let live = live(Vec::new(), Vec::new(), &[]);
+        let mut live = live;
+        live.told_pages.to_mut().insert(PageId(1));
+        let units = Shortage {
+            kind: Storage::KvUnits,
+            need: 1,
+        };
+        match validate_victims(&units, &[Victim::Page(PageId(1))], &live) {
+            Err(VictimError::Vanished(message)) => {
+                assert!(message.contains("page 1"), "the reason names it: {message}");
+            }
+            other => panic!("a told page that is gone is the mechanism's defect: {other:?}"),
+        }
     }
 
     #[test]

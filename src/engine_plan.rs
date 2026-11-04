@@ -66,6 +66,10 @@ pub(crate) struct EpochPlan {
     world_size: usize,
     /// Batches the rank's schedulers keep in flight, which the capacity plan relays through.
     queue_depth: usize,
+    /// This rank's worker group, which the rank facts name as its identity.
+    group: String,
+    /// The watchdog the launch file states apart from the build config (§2.4), when it states one.
+    watchdog_override: Option<Duration>,
     /// This rank's part of the epoch's parallel shape (§4.3, §5.1), resolved with the plan.
     placement: Placement,
 }
@@ -141,27 +145,10 @@ impl EpochPlan {
             world: launch.world,
             world_size: launch.world_size as usize,
             queue_depth: launch.queue_depth as usize,
+            group: launch.group.clone(),
+            watchdog_override: launch.watchdog_timeout_s.map(Duration::from_secs),
             placement,
         })
-    }
-
-    /// The epoch's build config, for an accessor that needs another of its fields.
-    pub(crate) fn build(&self) -> &daemon::epoch::BuildConfig {
-        &self.build
-    }
-
-    /// The checkpoint this rank serves.
-    pub(crate) fn checkpoint(&self) -> &Path {
-        &self.checkpoint
-    }
-
-    /// The bucket catalog every device captures, built once from `cuda_graph`.
-    ///
-    /// A catalog is a property of the epoch, not of a device, so `graph` and `runners` share it
-    /// rather than each building one: two catalogs of one epoch would be two answers to what a
-    /// batch may be, and a batch that fits one but not the other would have no graph to replay.
-    pub(crate) fn buckets(&self) -> &Buckets {
-        &self.buckets
     }
 
     /// The blocking pools' admission bounds, one lane per kind (§2.4).
@@ -250,9 +237,79 @@ impl EpochPlan {
         })
     }
 
-    /// How long a job may run without rank progress before it is reported `Stalled` (§2.4).
+    /// How long a job may run without rank progress before it is reported `Stalled` (§2.4): the
+    /// launch file's when it states one apart from the build config, and the build config's else.
     pub(crate) fn watchdog_timeout(&self) -> Duration {
-        self.build.worker.watchdog_timeout
+        self.watchdog_override
+            .unwrap_or(self.build.worker.watchdog_timeout)
+    }
+
+    /// The launch-file and build-config facts a scheduler derives an epoch's configuration from.
+    ///
+    /// Every fact this process can state is read from the source that owns it: the launch file the
+    /// daemon wrote (`group`, `rank`, `world`, `world_size`, `devices`, the watchdog), the epoch's
+    /// build config (`dtype`, `max_running_requests`, `max_model_len`, the host cache), the captured
+    /// catalog (`max_batch`, `max_num_batched_tokens`, `graph_tiers`; a batch larger than the
+    /// largest bucket is refused before a kernel runs, so the catalog is the admission bound), and,
+    /// for the page size and the cache dtype, what was opened rather than what was asked for.
+    ///
+    /// The facts no source states stay `None`, and that is the answer rather than a gap to fill
+    /// with a guess: `hosts` is the deployment's hosts in rank order, which the launch file does not
+    /// carry (`Launch::peers` is this node's peer addresses), and `bos`, `eos`, `end_of_image` and
+    /// `generation_limits` are the checkpoint's tokenizer and generation facts, which neither the
+    /// launch file nor the model's configuration states. `engine::EngineConfig::of` refuses each of
+    /// them by name, so a deployment that needs one fails with the fact it is missing.
+    pub(crate) fn rank_facts(
+        &self,
+        memory: &Memory,
+        model: &qwen3_moe::Qwen3Moe,
+    ) -> Result<engine::RankFacts> {
+        let (rows, tokens) = self.buckets.bounds();
+        // The graph sizes this rank captures, which is the tier a plan's batch must fit (§4.5).
+        let graph_tiers = self
+            .buckets
+            .iter()
+            .map(|bucket| bucket.tokens)
+            .collect::<std::collections::BTreeSet<u32>>()
+            .into_iter()
+            .collect();
+        Ok(engine::RankFacts {
+            model: Some(self.checkpoint.display().to_string()),
+            dtype: Some(self.build.dtype.clone()),
+            world: Some(self.world),
+            group: Some(self.group.clone()),
+            rank: Some(self.rank as usize),
+            world_size: Some(self.world_size),
+            devices: Some(
+                self.devices
+                    .iter()
+                    .map(|device| device.0.to_string())
+                    .collect(),
+            ),
+            hosts: None,
+            peers: None,
+            max_running_requests: Some(self.build.max_running_requests.get()),
+            max_batch: Some(rows as usize),
+            max_num_batched_tokens: Some(tokens as usize),
+            block_size: Some(cache_page_size(memory, model)?),
+            kv_cache_dtype: Some(cache_dtype(model, self.build.kv_cache.dtype)?),
+            host_cache: match (self.build.kv_cache.host_ratio, self.build.kv_cache.host_gib) {
+                // A deployment that states neither keeps no host tier of its own, which is what a
+                // storage grant of `None` means.
+                (None, None) => None,
+                (ratio, gib) => Some(engine::HostCacheSize::new(
+                    ratio,
+                    gib.map(|gib| gib.get() << 30),
+                )?),
+            },
+            graph_tiers: Some(graph_tiers),
+            bos: None,
+            eos: None,
+            end_of_image: None,
+            generation_limits: None,
+            max_model_len: self.build.max_model_len.map(|length| length.get()),
+            watchdog_timeout: Some(self.watchdog_timeout()),
+        })
     }
 
     /// The Program Server's targets this rank resolves a module for (§5.3).

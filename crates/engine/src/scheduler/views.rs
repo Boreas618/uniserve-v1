@@ -1375,7 +1375,34 @@ pub(crate) fn queued(scheduler: &Scheduler) -> Vec<ViewRequestId> {
 /// The validators read a `Plan`'s names against it, so it is built at the step
 /// the plan belongs to and rebuilt after `reclaim` changes the state.
 pub(crate) fn live(scheduler: &Scheduler, step: u64, recorded: &RecordedTable) -> Live<'static> {
-    Live::of(&snapshot(scheduler, step, recorded), queued(scheduler))
+    let mut live = Live::of(&snapshot(scheduler, step, recorded), queued(scheduler));
+    // The told sets are the recorder's, owned here because this state outlives
+    // the borrow of the scheduler: the switch hands it over to a candidate.
+    live.told_pages = std::borrow::Cow::Owned(
+        scheduler
+            .recorder
+            .announced_pages()
+            .iter()
+            .copied()
+            .collect(),
+    );
+    live.told_encodings = std::borrow::Cow::Owned(
+        scheduler
+            .recorder
+            .announced_encodings()
+            .iter()
+            .copied()
+            .collect(),
+    );
+    live.told_requests = std::borrow::Cow::Owned(
+        scheduler
+            .recorder
+            .announced_requests()
+            .iter()
+            .copied()
+            .collect(),
+    );
+    live
 }
 
 /// The live state a step's starvation rule reads: the views of the requests the
