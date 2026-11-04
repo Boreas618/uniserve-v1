@@ -96,7 +96,6 @@ const HIDDEN: u32 = 5376;
 const ROPE_FREQ_DIM: u32 = 16;
 const ROPE_AXES: u32 = 3;
 const ROTATED: u32 = ROPE_FREQ_DIM * ROPE_AXES * 2;
-const ROPE_THETA: f32 = 10_000.0;
 
 /// Elements one `rotary_factors` program handles (`launch::ROTARY_BLOCK`).
 const ROTARY_BLOCK: u32 = 256;
@@ -301,7 +300,9 @@ fn main() {
             positions: DType::I32,
             columns: ROTATED / 2,
             block: ROTARY_BLOCK,
-            scale: ops::Float::from(ROPE_THETA),
+            // The layer's scale, not the rope base: every H3 `Rotary` is built with 1.0 and the
+            // 1e4 base lives in the frequencies table the host fills.
+            scale: ops::Float::from(1.0_f32),
             pdl: PDL,
             axes: ROPE_AXES,
             sections: {

@@ -222,8 +222,10 @@ fn main() {
             positions: DType::I32,
             columns: HEAD_DIM / 2,
             block: ROTARY_BLOCK,
-            // Qwen3's rope theta is 1e6, from the checkpoint's configuration.
-            scale: Float::from(1_000_000.0_f32),
+            // The layer's scale, not the rope base: `Rotary` multiplies every angle by 1.0 and the
+            // frequencies table carries Qwen3's 1e6 base, so a key that named the base would compile
+            // the same program under a name no layer asks for.
+            scale: Float::from(1.0_f32),
             pdl: PDL,
             // One-dimensional positions: Qwen3 is text only, so no section is cut.
             axes: 1,
