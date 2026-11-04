@@ -640,14 +640,15 @@ impl fmt::Display for GatherGemmNvfp4Descriptor {
 /// The arguments of one encoded FC1 launch.
 #[derive(Clone, Copy)]
 pub struct GatherGemmNvfp4Args {
-    /// `[routes, hidden/2]` U8: the gathered activations, encoded — two E2M1 codes a byte along the
-    /// contraction, exactly what `nvfp4_quantize` produces. The design's NVFP4 expert product reads
-    /// encoded activations (specs/worker.md's NVFP4 row: the FP4 GEMM, the *activation encoding* and
-    /// the FP4 expert GEMM are three kernel programs), and every kernel in the artifact that takes an
-    /// E2M1 weight takes an E2M1 activation as well.
+    /// `[tokens, hidden/2]` U8: the activations, encoded — two E2M1 codes a byte along the
+    /// contraction, exactly what `nvfp4_quantize` produces. **Token-major**: the product gathers its
+    /// rows itself, through the route map the cta maps and `permuted_to_expanded` describe, which is
+    /// what every kernel in the artifact with an E2M1 weight and a BF16 output does (their routing
+    /// implementation is `Ldgsts` or `Tma`, never `NoRoute`). A route-major buffer here would be
+    /// read as tokens and gathered a second time.
     pub hidden: TensorView,
-    /// The activations' block scales, one per sixteen elements of the contraction, of the
-    /// descriptor's `scale` type in its `layout`.
+    /// `[tokens, hidden/16]` the activations' block scales, one per sixteen elements of the
+    /// contraction, of the descriptor's `scale` type in its `layout`.
     pub hidden_scale: TensorView,
     /// `[experts, 2·intermediate, hidden/2]` U8: two E2M1 codes a byte along the contraction.
     pub weights: TensorView,
@@ -712,7 +713,7 @@ fn check_workspace(operator: &'static str, workspace: TensorView) -> Result<()> 
 /// scale layout — travel as well, since the entry checks the call against the module it was built as
 /// and refuses a mismatch by name rather than launching a kernel with another tactic's assumptions.
 pub struct GatherNvfp4Call {
-    /// `[routes, hidden/2]` U8: the gathered activations, two E2M1 codes a byte.
+    /// `[tokens, hidden/2]` U8: the activations, two E2M1 codes a byte, token-major.
     pub hidden: *const c_void,
     /// The activations' block scales.
     pub hidden_scale: *const c_void,
@@ -893,6 +894,8 @@ impl GatherGemmNvfp4 {
         let experts = u64::from(descriptor.experts);
         let top = u64::from(descriptor.top);
         let routes = args.out.rows();
+        // The activation operands are token-major: the product gathers its rows itself.
+        let tokens = args.hidden.rows();
 
         if args.out.shape.dims().last().copied().unwrap_or(0) != intermediate {
             return Err(Error::argument(
@@ -909,7 +912,7 @@ impl GatherGemmNvfp4 {
         // contraction. A BF16 row here would be read as packed codes and produce a product of half
         // the contraction, so the operand's width is the encoding's and is refused when it is not.
         args.hidden
-            .require_shape(Self::NAME, Shape::new(&[routes, hidden / 2]))?;
+            .require_shape(Self::NAME, Shape::new(&[tokens, hidden / 2]))?;
         if args.hidden.dtype != DType::U8 {
             return Err(Error::argument(
                 Self::NAME,
@@ -929,15 +932,15 @@ impl GatherGemmNvfp4 {
                 ),
             ));
         }
-        // The scales cover the contraction in blocks of sixteen, one per gathered row. A table that
-        // covers fewer rows than the product reads would scale another row's block.
+        // The scales cover the contraction in blocks of sixteen, one per *token*: the product gathers
+        // rows, so the table is indexed by the same token rows the activations are.
         let activation_blocks = hidden.div_ceil(u64::from(crate::fp4::BLOCK_ELEMENTS));
         let covered: u64 = args.hidden_scale.shape.dims().iter().product();
-        if covered < routes * activation_blocks {
+        if covered < tokens * activation_blocks {
             return Err(Error::argument(
                 Self::NAME,
                 format!(
-                    "{covered} activation block scales cover fewer than {routes} rows of \
+                    "{covered} activation block scales cover fewer than {tokens} rows of \
                      {activation_blocks} blocks"
                 ),
             ));
