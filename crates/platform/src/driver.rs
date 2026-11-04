@@ -514,3 +514,88 @@ pub(crate) fn in_context<T>(
     let scope = ContextScope::enter(context)?;
     operation(scope.driver)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every driver constant this crate passes is compared with `cuda.h`: a
+    /// wrong one is a refused call or, worse, an attribute the driver reads as
+    /// a different attribute.
+    #[test]
+    fn the_driver_constants_are_the_headers() {
+        crate::header::assert_constants(
+            "cuda.h",
+            &[
+                ("CUDA_SUCCESS", CUDA_SUCCESS as i64),
+                ("CUDA_ERROR_INVALID_VALUE", CUDA_ERROR_INVALID_VALUE as i64),
+                ("CUDA_ERROR_NOT_READY", CUDA_ERROR_NOT_READY as i64),
+                (
+                    "CU_MEM_LOCATION_TYPE_DEVICE",
+                    CU_MEM_LOCATION_TYPE_DEVICE as i64,
+                ),
+                (
+                    "CU_MEM_ALLOCATION_TYPE_PINNED",
+                    CU_MEM_ALLOCATION_TYPE_PINNED as i64,
+                ),
+                (
+                    "CU_MEM_ACCESS_FLAGS_PROT_READ",
+                    CU_MEM_ACCESS_FLAGS_PROT_READ as i64,
+                ),
+                (
+                    "CU_MEM_ACCESS_FLAGS_PROT_READWRITE",
+                    CU_MEM_ACCESS_FLAGS_PROT_READWRITE as i64,
+                ),
+                (
+                    "CU_MEMCPY_OPERAND_TYPE_POINTER",
+                    CU_MEMCPY_OPERAND_TYPE_POINTER as i64,
+                ),
+                (
+                    "CU_LAUNCH_ATTRIBUTE_COOPERATIVE",
+                    CU_LAUNCH_ATTRIBUTE_COOPERATIVE as i64,
+                ),
+                (
+                    "CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION",
+                    CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION as i64,
+                ),
+                (
+                    "CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE",
+                    CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE as i64,
+                ),
+                (
+                    "CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION",
+                    CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION as i64,
+                ),
+            ],
+        );
+    }
+
+    /// The structures this crate hands the driver are sized from the headers
+    /// too, where the header declares them in a form the scanner reads.
+    ///
+    /// The rest — the launch configuration, the node parameters, the attribute
+    /// union, the allocation property — carry unions and multi-line
+    /// documentation that the scanner does not read, so their layouts are the
+    /// device tests' business: a field in the wrong place there produces a
+    /// refused launch or a wrong grid, which the GPU tests see.
+    #[test]
+    fn the_driver_structures_are_sized_by_the_headers() {
+        use crate::header::struct_size;
+        for (name, size) in [
+            ("CUipcEventHandle", std::mem::size_of::<RawIpcEventHandle>()),
+            ("CUmemLocation", std::mem::size_of::<MemLocation>()),
+            ("CUmemAccessDesc", std::mem::size_of::<MemAccessDesc>()),
+            ("CUtensorMap", std::mem::size_of::<TensorMap>()),
+        ] {
+            match struct_size("cuda.h", name) {
+                Some(header) => assert_eq!(
+                    header, size,
+                    "{name}: cuda.h lays it out in {header} bytes, this crate in {size}"
+                ),
+                None => eprintln!(
+                    "skipped: cuda.h does not declare {name} in a form this scanner reads"
+                ),
+            }
+        }
+    }
+}

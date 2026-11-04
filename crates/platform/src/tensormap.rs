@@ -14,6 +14,13 @@ use crate::{DataType, Device, Error, Result};
 
 /// The largest tensor rank a tensor map describes.
 const MAX_RANK: usize = 5;
+/// The smallest tensor rank this platform's driver encodes. The CUDA
+/// documentation allows rank one, and the driver on this platform refuses
+/// every rank-one description it was given — with no stride array, with a
+/// valid one, and at three box and dimension sizes — while rank two encodes.
+/// The API takes what the driver takes; a one-dimensional tensor is described
+/// as rank two with a trailing dimension of one.
+const MIN_RANK: usize = 2;
 
 /// A tensor map (`CUtensorMap`), 64-byte aligned as the driver requires, and
 /// filled by [`TensorMap::encode_tiled`].
@@ -38,7 +45,8 @@ impl TensorMap {
     ///
     /// # Errors
     ///
-    /// Fails when the rank is not 1 to 5, when a per-dimension array does not
+    /// Fails when the rank is not 2 to 5 (the driver refuses a rank-one map;
+    /// see [`TensorMapSpec::check`]), when a per-dimension array does not
     /// match the rank, or with the driver's status when it rejects the
     /// description (alignment, box size against the swizzle, and so on).
     pub fn encode_tiled(device: &Device, spec: &TensorMapSpec<'_>) -> Result<Self> {
@@ -122,13 +130,20 @@ impl TensorMapSpec<'_> {
     /// Checks the description against the driver's requirements that can be
     /// checked without a device, and answers its rank.
     ///
+    /// A rank-one description is refused: the CUDA documentation allows it,
+    /// and this platform's driver encodes none of the rank-one maps it was
+    /// given, while rank two encodes. A one-dimensional tensor is therefore
+    /// described as rank two with a trailing dimension of one.
+    ///
     /// `encode_tiled` calls it before the driver sees the description; a
     /// caller may call it earlier, at the point the description is built.
     pub fn check(&self) -> Result<usize> {
         let rank = self.global_dim.len();
-        if rank == 0 || rank > MAX_RANK {
+        if !(MIN_RANK..=MAX_RANK).contains(&rank) {
             return Err(Error::invalid(format!(
-                "a tensor map has rank 1 to {MAX_RANK}, got {rank}"
+                "a tensor map has rank {MIN_RANK} to {MAX_RANK}, got {rank}; \
+                 the driver refuses a rank-one map, so a one-dimensional tensor is \
+                 described as rank two with a trailing dimension of one"
             )));
         }
         // The driver takes one stride per dimension but the innermost, and one
@@ -266,6 +281,116 @@ pub enum OobFill {
 mod tests {
     use super::*;
 
+    /// The discriminants of the description's enums are `cuda.h`'s
+    /// `CUtensorMap*` codes, passed to the driver unchanged: a wrong one is a
+    /// refused encode or a differently swizzled read, never a compile error.
+    #[test]
+    fn the_description_codes_are_the_headers() {
+        crate::header::assert_constants(
+            "cuda.h",
+            &[
+                (
+                    "CU_TENSOR_MAP_DATA_TYPE_UINT8",
+                    TensorDataType::Uint8 as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_DATA_TYPE_UINT16",
+                    TensorDataType::Uint16 as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_DATA_TYPE_UINT32",
+                    TensorDataType::Uint32 as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_DATA_TYPE_INT32",
+                    TensorDataType::Int32 as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_DATA_TYPE_UINT64",
+                    TensorDataType::Uint64 as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_DATA_TYPE_INT64",
+                    TensorDataType::Int64 as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_DATA_TYPE_FLOAT16",
+                    TensorDataType::Float16 as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_DATA_TYPE_FLOAT32",
+                    TensorDataType::Float32 as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_DATA_TYPE_FLOAT64",
+                    TensorDataType::Float64 as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_DATA_TYPE_BFLOAT16",
+                    TensorDataType::BFloat16 as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_DATA_TYPE_FLOAT32_FTZ",
+                    TensorDataType::Float32Ftz as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_DATA_TYPE_TFLOAT32",
+                    TensorDataType::TFloat32 as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_DATA_TYPE_TFLOAT32_FTZ",
+                    TensorDataType::TFloat32Ftz as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+                    TensorDataType::Uint4Align8 as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B",
+                    TensorDataType::Uint4Align16 as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_DATA_TYPE_16U6_ALIGN16B",
+                    TensorDataType::Uint6Align16 as i64,
+                ),
+                ("CU_TENSOR_MAP_INTERLEAVE_NONE", Interleave::None as i64),
+                ("CU_TENSOR_MAP_INTERLEAVE_16B", Interleave::B16 as i64),
+                ("CU_TENSOR_MAP_INTERLEAVE_32B", Interleave::B32 as i64),
+                ("CU_TENSOR_MAP_SWIZZLE_NONE", Swizzle::None as i64),
+                ("CU_TENSOR_MAP_SWIZZLE_32B", Swizzle::B32 as i64),
+                ("CU_TENSOR_MAP_SWIZZLE_64B", Swizzle::B64 as i64),
+                ("CU_TENSOR_MAP_SWIZZLE_128B", Swizzle::B128 as i64),
+                (
+                    "CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B",
+                    Swizzle::B128Atom32 as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B_FLIP_8B",
+                    Swizzle::B128Atom32Flip8 as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_SWIZZLE_128B_ATOM_64B",
+                    Swizzle::B128Atom64 as i64,
+                ),
+                ("CU_TENSOR_MAP_L2_PROMOTION_NONE", L2Promotion::None as i64),
+                ("CU_TENSOR_MAP_L2_PROMOTION_L2_64B", L2Promotion::B64 as i64),
+                (
+                    "CU_TENSOR_MAP_L2_PROMOTION_L2_128B",
+                    L2Promotion::B128 as i64,
+                ),
+                (
+                    "CU_TENSOR_MAP_L2_PROMOTION_L2_256B",
+                    L2Promotion::B256 as i64,
+                ),
+                ("CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE", OobFill::None as i64),
+                (
+                    "CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA",
+                    OobFill::NanRequestZeroFma as i64,
+                ),
+            ],
+        );
+    }
+
     /// A description whose arrays do not match its rank is the caller's
     /// mistake, named before the driver sees it; the checks below therefore
     /// need no device.
@@ -292,6 +417,15 @@ mod tests {
         for spec in [
             TensorMapSpec {
                 global_dim: &[16, 16, 16, 16, 16, 16],
+                ..valid
+            },
+            // The documentation allows a rank-one tensor map and the driver on
+            // this platform encodes none, so the description is refused here.
+            TensorMapSpec {
+                global_dim: &[64],
+                global_strides: &[],
+                box_dim: &[4],
+                element_strides: &[1],
                 ..valid
             },
             TensorMapSpec {
