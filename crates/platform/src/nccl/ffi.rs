@@ -33,6 +33,10 @@ pub(super) struct Api {
     pub(super) get_unique_id: unsafe extern "C" fn(*mut RawUniqueId) -> NcclResult,
     pub(super) comm_init_rank:
         unsafe extern "C" fn(*mut Handle, i32, RawUniqueId, i32) -> NcclResult,
+    /// `ncclCommSplit(comm, color, key, newcomm, config)`, an entry point of
+    /// newer releases (2.18); a NULL config takes the defaults.
+    pub(super) comm_split:
+        Result<unsafe extern "C" fn(Handle, i32, i32, *mut Handle, *mut c_void) -> NcclResult>,
     pub(super) comm_destroy: unsafe extern "C" fn(Handle) -> NcclResult,
     pub(super) comm_abort: unsafe extern "C" fn(Handle) -> NcclResult,
     pub(super) all_reduce: Reduction,
@@ -82,6 +86,7 @@ pub(super) fn api() -> Result<&'static Api> {
                 error_string: symbol(&library, "ncclGetErrorString")?,
                 get_unique_id: symbol(&library, "ncclGetUniqueId")?,
                 comm_init_rank: symbol(&library, "ncclCommInitRank")?,
+                comm_split: symbol(&library, "ncclCommSplit"),
                 comm_destroy: symbol(&library, "ncclCommDestroy")?,
                 comm_abort: symbol(&library, "ncclCommAbort")?,
                 all_reduce: symbol(&library, "ncclAllReduce")?,

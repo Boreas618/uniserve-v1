@@ -1,0 +1,18 @@
+[package]
+name = "media"
+description = "H.264/AAC encoding, MP4 muxing, condition media reading and host resampling"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+image.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[build-dependencies]
+cc = "1.2"
+
+[lints]
+workspace = true

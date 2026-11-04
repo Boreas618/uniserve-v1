@@ -11,9 +11,15 @@ members = [
     "crates/frontend",
     "crates/ipc",
     "crates/manager",
+    "crates/media",
     "crates/models",
     "crates/nixl",
+    "crates/program-server",
     "crates/proto",
+    "crates/scheduling",
+    "crates/scheduling/guest",
+    "crates/scheduling/policies/fcfs",
+    "crates/scheduling/policies/priority",
     "crates/storage",
     "crates/storage-server",
     "crates/worker",
@@ -63,9 +69,15 @@ daemon = { path = "crates/daemon" }
 engine = { path = "crates/engine" }
 frontend = { path = "crates/frontend" }
 ipc = { path = "crates/ipc" }
+media = { path = "crates/media" }
 models = { path = "crates/models" }
 nixl = { path = "crates/nixl" }
+program-server = { path = "crates/program-server" }
 proto = { path = "crates/proto" }
+scheduling = { path = "crates/scheduling" }
+scheduling-guest = { path = "crates/scheduling/guest" }
+scheduling-policy-fcfs = { path = "crates/scheduling/policies/fcfs" }
+scheduling-policy-priority = { path = "crates/scheduling/policies/priority" }
 storage = { path = "crates/storage" }
 storage-server = { path = "crates/storage-server" }
 worker = { path = "crates/worker" }
