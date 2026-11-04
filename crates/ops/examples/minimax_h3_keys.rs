@@ -101,7 +101,7 @@ const ROPE_THETA: f32 = 10_000.0;
 /// Elements one `rotary_factors` program handles (`launch::ROTARY_BLOCK`).
 const ROTARY_BLOCK: u32 = 256;
 
-/// Elements one `rows` program places (`nn::layers::rows::BLOCK`).
+/// Elements one `rows` program places: the layer's own `BLOCK` in `crates/nn/src/layers/rows.rs`.
 const ROWS_BLOCK: u32 = 1024;
 
 /// The video VAE decoder's token width: `decoder_num_attention_heads · decoder_attention_head_dim`.
@@ -138,6 +138,10 @@ const AUDIO_LATENT_DIM: u32 = 2048;
 
 /// The audio VAE's latent channels (`latent_channels`): the encoder's narrow width.
 const AUDIO_LATENT_CHANNELS: u32 = 32;
+
+/// The modulation table's chunks per row: shift, scale and gate for each of the two sublayers
+/// (`transformer.rs`'s `chunks` refuses a table wider or narrower than `6 · width`).
+const MODULATION_CHUNKS: u32 = 6;
 
 /// The transformer's normalizer epsilon (`norm_eps`, `qk_norm_eps`).
 const NORM_EPSILON: f32 = 1e-5;
@@ -354,6 +358,21 @@ fn main() {
             scale_stride: u64::from(HIDDEN),
             update: true,
             retain: false,
+        }
+        .to_string(),
+    );
+    // The gated residual that closes each block: `hidden + gate[i] · update`. The block's
+    // modulation table is `[rows, 6 · hidden]` and the gate is the sixth chunk of a row
+    // (`transformer.rs`'s `chunks(modulation, width, 3)`, which takes the last of the three MLP
+    // chunks), so the gate's rows sit `6 · hidden` elements apart. The row count is the launch's,
+    // not the key's: it changes with the clip length.
+    push(
+        "gated_residual",
+        ops::modulation::GatedResidualDescriptor {
+            dtype: DType::BF16,
+            indices: DType::I32,
+            width: HIDDEN,
+            gate_stride: u64::from(MODULATION_CHUNKS) * u64::from(HIDDEN),
         }
         .to_string(),
     );
@@ -1059,7 +1078,7 @@ fn main() {
 
     // Placing the rows a tower contributes into the sequence that reserved them. Four call sites
     // exist and each is in a layer of `crates/models/minimax-h3`, all of them at the layer crate's
-    // one element block (`nn::layers::rows::BLOCK`, 1024) and none on a dependent launch:
+    // one element block (its `rows.rs`'s `BLOCK`, 1024) and none on a dependent launch:
     //
     // - the text encoder's prompt reserves placeholder rows for its images and the tower's vision
     //   rows *replace* them (`text_encoder.rs`, `Rows::replace`), at the language width;
@@ -1094,16 +1113,19 @@ fn main() {
         );
     }
 
-    // Gaps this file does not fill, named rather than invented:
-    // - `bias_add`: the channel list per call site follows the stage widths above, but the call sites
-    //   are the decoder's and the video VAE's own composition, which is h3's to state.
-    // - `conv3d`: the video VAE's per-stage geometry (kernels 3, spatial strides from
-    //   `spatial_downsample_factors [2,2,2,2,1,1]`, temporal 1 or 2) is a construction inside
-    //   `diffusers`' `AutoencoderKLMiniMaxH3`, not a number in a config.
-    // - `embedding`, `act_and_mul`: the text encoder's shard rows and its gate/value strides are the
-    //   layer's layout choices, not the config's.
-    // - the five VSA operators, `gated_residual`, `frame_pad`/`frame_moments`/`frame_norm_pad`,
-    //   `position_interpolate`, `rope_apply`, `paged_attention`: h3's packing and processor.
+    // Gaps this file does not fill, named rather than invented. Each is a number the deployment
+    // owns, not one this file could read off a config:
+    // - `bias_add`: the decoder's and the video VAE's channel list per call site is a construction
+    //   inside `crates/models/minimax-h3`, so the row arrives with the layer that calls it.
+    // - `paged_attention`: the decode attention is trtllm-gen, and its key follows the executor's
+    //   page geometry (page size, pages per sequence), which is scheduling and not the model's.
+    // - `vsa_select_tiles`: the number of key tiles one query tile may select is the deployment's
+    //   sparsity choice; `vsa_prepare_tiles`, `vsa_scores`, `vsa_add_gated_tiles`,
+    //   `vsa_zero_padding` and `vsa_compose_gated_rows` are above, because their geometry is the
+    //   checkpoint's.
+    // - `softmax`, `swiglu`, `scaled_residual_rms_norm`, `scaled_residual_layer_norm`: declared and
+    //   unused by this model — the layers that call them are the Qwen3 slice's and the sampler's,
+    //   whose widths live in the other fixture.
 
     // One key per line, the same key once: a variant two layers launch is packaged once.
     lines.sort();

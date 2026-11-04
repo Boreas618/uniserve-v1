@@ -386,20 +386,21 @@ fn modulation_keys_separate_every_compiled_variant() {
         assert_ne!(key, changed, "changing {name} must select another variant");
     }
 
+    // The gated residual's row count is a launch value, so it is in no key: what selects a variant
+    // is the geometry the kernel is compiled against, and the gate's row stride is the last of them.
     let residual = GatedResidualDescriptor {
         dtype: DType::BF16,
         indices: DType::I32,
         width: 3072,
-        elements: 3072 * 64,
         gate_stride: 3072,
     };
     assert_ne!(
         ops::descriptor::key(&residual),
         ops::descriptor::key(&GatedResidualDescriptor {
-            elements: 3072 * 65,
+            gate_stride: 6144,
             ..residual
         }),
-        "the walked element count is part of the compiled variant"
+        "the gate's row stride is part of the compiled variant"
     );
 }
 
