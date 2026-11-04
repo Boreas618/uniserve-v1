@@ -41,10 +41,6 @@ pub(crate) struct Launch {
     /// The leader daemon's request interface, `unix:<path>` or
     /// `<host>:<port>`.
     pub requests: String,
-    /// The daemon's process interface, `unix:<path>` or `<host>:<port>`: the
-    /// supervision frames this process claims its storage with and reports to,
-    /// and the one place a program-layer command can reach it.
-    pub processes: String,
     /// The identity the daemon started this process under: the engine number,
     /// or the launch generation in the epoch-switch path, where that is the
     /// only allocator.
@@ -174,7 +170,6 @@ mod tests {
             build_config: PathBuf::from("/run/uniserve/build-config-12.json"),
             model: PathBuf::from("/models/qwen3"),
             requests: "unix:/run/uniserve/requests.sock".to_owned(),
-            processes: "unix:/run/uniserve/processes.sock".to_owned(),
             engine: 7,
             program_server: "/run/uniserve/programs.sock".to_owned(),
             devices: vec![0, 1],
@@ -224,7 +219,6 @@ mod tests {
             "build_config",
             "model",
             "requests",
-            "processes",
             "engine",
             "program_server",
             "devices",
@@ -243,10 +237,6 @@ mod tests {
         .map(str::to_owned)
         .collect::<BTreeSet<_>>();
         assert_eq!(keys, expected);
-        assert_eq!(
-            value["processes"],
-            json!("unix:/run/uniserve/processes.sock")
-        );
         assert_eq!(value["engine"], json!(7));
         assert_eq!(value["world"], json!(12));
         assert_eq!(value["devices"], json!([0, 1]));
