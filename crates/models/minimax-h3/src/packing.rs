@@ -847,13 +847,18 @@ pub fn condition_segments(conditions: &[Condition], canvas: &Canvas) -> Result<V
                 let raster = latent_raster(&frame.canvas)?;
                 // A still is one frame and one latent frame, with no repeat to the clip count: the
                 // reference returns 1 for `num_frames == 1` and its causal front padding agrees.
-                // A clip of any other length rounds **up**, because the reference repeats its last
-                // frame to the clip alignment rather than refusing the media - a 30-frame reference
-                // encodes as a 39-frame one.
+                //
+                // A clip of any other length is the encoder's rule, not this one's: the reference
+                // counts `ceil(frames / 17) * 5 - token_drop` latent frames
+                // (`encoding.py:105-110`, and `encoding::Stack::condition_latent_frames` states it
+                // here). That rule needs the checkpoint's `token_drop`, which a packing of a canvas
+                // does not hold, so this refuses an unaligned count rather than guessing one: a
+                // 30-frame reference is 7 latent frames by the reference's rule and 12 by the
+                // generated rule, and the two must not be confused.
                 let frames = if frame.num_frames == 1 {
                     1
                 } else {
-                    video_latent_frames(align_num_frames(frame.num_frames))?
+                    video_latent_frames(frame.num_frames)?
                 };
                 Some(Visual { frames, raster })
             }
@@ -2281,9 +2286,11 @@ mod tests {
     }
 
     #[test]
-    fn a_reference_clip_of_any_length_rounds_up_to_the_clip_alignment() {
-        // The reference repeats a clip's last frame to the alignment rather than refusing the media,
-        // so a 30-frame reference encodes as a 39-frame one: two clips, twelve latent frames.
+    fn a_reference_clip_of_an_unaligned_length_is_refused_rather_than_rounded() {
+        // The encoder's rule counts `ceil(frames / 17) * 5 - token_drop` latent frames, which needs
+        // the checkpoint's `token_drop`; a 30-frame reference is 7 by that rule and 12 by the
+        // generated one, so rounding here would be a silent five-frame lie. Until the drop is
+        // threaded, an unaligned count is refused by name.
         let target = canvas();
         let clip = Condition {
             role: Role::Reference,
@@ -2293,16 +2300,12 @@ mod tests {
             }),
             audio_samples: 0,
         };
-        let segments = condition_segments(&[clip], &target).expect("a short reference clip");
-        let visual = segments[0].visual.expect("pixels");
-        let aligned = align_num_frames(30);
-        assert_eq!(aligned % CLIP_FRAMES, CLIP_LATENTS);
-        assert!(aligned >= 30);
-        assert_eq!(
-            visual.frames,
-            video_latent_frames(aligned).expect("aligned")
+        let error = condition_segments(&[clip], &target).expect_err("an unaligned clip");
+        let message = format!("{error}");
+        assert!(
+            message.contains("17") && message.contains("5"),
+            "the refusal names the frame rule: {message}"
         );
-        assert_eq!(visual.frames, 12);
     }
 
     #[test]
