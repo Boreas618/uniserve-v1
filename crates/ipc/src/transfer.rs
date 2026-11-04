@@ -287,29 +287,30 @@ pub struct StateTransfer {
     pub rows: u32,
     /// Bytes one block holds: the pool's plane bytes.
     pub width: u64,
-    /// The raw rows, `[rows, width]`, as one published tensor.
-    pub data: TensorTransfer,
+    /// The key the snapshot is retained under, as `keys::state_key` derives it:
+    /// the identity a reader fetches the bytes by and verifies the shape
+    /// against.
+    pub key: Vec<u8>,
 }
 
 impl StateTransfer {
-    /// Validates the row geometry and the published tensor's shape against it.
+    /// Validates the row geometry and the key's width.
     fn validate(&self) -> ValidationResult<()> {
         let Self {
             rank: _,
             first_row,
             rows,
             width,
-            data,
+            key,
         } = self;
         ensure_valid!(
-            *rows > 0 && *width > 0 && data.shape == [u64::from(*rows), *width],
+            *rows > 0 && *width > 0 && key.len() == 32,
             "cache state transfer geometry is invalid"
         );
         ensure_valid!(
             first_row.checked_add(*rows).is_some(),
             "cache state transfer rows overflow their page"
         );
-        data.validate()?;
         Ok(())
     }
 }
@@ -478,19 +479,13 @@ impl CacheTransfer {
     /// Iterates over every published tensor: the groups' in group order, then
     /// the state page's when the transfer carries one.
     pub fn tensors(&self) -> impl Iterator<Item = &TensorTransfer> {
-        self.groups
-            .iter()
-            .flat_map(|group| &group.tensors)
-            .chain(self.state.iter().map(|state| &state.data))
+        self.groups.iter().flat_map(|group| &group.tensors)
     }
 
     /// Iterates mutably over every published tensor, in the same order, for
     /// rebinding or pruning their locators.
     pub fn tensors_mut(&mut self) -> impl Iterator<Item = &mut TensorTransfer> {
-        self.groups
-            .iter_mut()
-            .flat_map(|group| &mut group.tensors)
-            .chain(self.state.iter_mut().map(|state| &mut state.data))
+        self.groups.iter_mut().flat_map(|group| &mut group.tensors)
     }
 
     /// Merge reports for one immutable export without exposing a partial update.

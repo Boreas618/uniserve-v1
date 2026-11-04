@@ -207,6 +207,70 @@ pub(crate) fn page_cells(
     Ok(by_field)
 }
 
+/// The blocks of every unit of `pages` pages starting at `first_page`, per storage field, in the
+/// page's own order.
+///
+/// This is the layout of a state page in either direction: an export gathers these cells into
+/// its rows, an import scatters the same rows back into them, and the block copy of one page is
+/// the same list. `table` is the slot's block table of the state group, so the units are the
+/// destination's own; `num_units` is the pool's, which the cell indices are strided by.
+///
+/// # Errors
+///
+/// [`Error::Invalid`] when a page is past the table, and whatever [`page_cells`] refuses.
+pub(crate) fn page_runs(
+    plan: &crate::memory::CachePlan,
+    group: &CacheGroupPlan,
+    table: &crate::memory::prefix_cache::block_tables::GroupTable,
+    num_units: u32,
+    first_page: u32,
+    pages: u32,
+) -> Result<(u32, Runs)> {
+    let mut runs: Vec<(usize, Vec<i64>)> = Vec::new();
+    let mut rows = 0u32;
+    for page in first_page..first_page.saturating_add(pages) {
+        let position = usize::try_from(page.saturating_sub(table.start_page))
+            .map_err(|_| Error::Invalid("a state page is past its block table".to_owned()))?;
+        if position >= table.units.len() / table.shape.units_per_page as usize {
+            return Err(Error::Invalid(format!(
+                "a state page of {pages} pages from {first_page} is past its block table"
+            )));
+        }
+        let units = table.row(position);
+        for checkpoint in &plan.checkpoints {
+            for (field, cells) in page_cells(group, plan.columns, num_units, checkpoint, &units)? {
+                rows = rows.checked_add(cells.len() as u32).ok_or_else(|| {
+                    Error::Invalid("a state page holds too many blocks".to_owned())
+                })?;
+                match runs.last_mut() {
+                    Some((held, run)) if *held == field => run.extend(cells),
+                    _ => runs.push((field, cells)),
+                }
+            }
+        }
+    }
+    Ok((rows, runs))
+}
+
+/// The cells of one storage field, in row order.
+pub(crate) type Runs = Vec<(usize, Vec<i64>)>;
+
+/// A page's blocks as a destination writes them: the rows a transfer states and the cells of this
+/// rank's own units they land in.
+///
+/// It is what both directions of an import compare: the transfer states `rows` and `width`, this
+/// states the same two figures from the destination's own units of the same pages, and the
+/// scatter writes the rows into `runs` once they agree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatePage {
+    /// Blocks the page holds.
+    pub rows: u32,
+    /// Bytes one block holds.
+    pub width: u64,
+    /// The cells of the destination's units, per storage field, in row order.
+    pub runs: Vec<(usize, Vec<i64>)>,
+}
+
 /// The two copies' arguments, in one place so a caller states them once.
 pub(crate) fn snapshot_args(
     field: TensorView,

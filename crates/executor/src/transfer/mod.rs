@@ -8,7 +8,7 @@
 
 pub(crate) mod backing;
 pub(crate) mod cache_export;
-pub use cache_export::CacheExport;
+pub use cache_export::{CacheExport, StateIdentity};
 mod cache_import;
 mod capacity;
 mod channel;

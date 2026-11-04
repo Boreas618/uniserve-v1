@@ -286,6 +286,22 @@ pub fn kv_page_key(
     digest.finish()
 }
 
+/// The key of one page of the state a model keeps per unit (design 4.5).
+///
+/// It is [`kv_page_key`] with the region of the state group's own checkpoint layers, which is what
+/// keeps a state page from colliding with a KV page of the same prefix: the region names the
+/// layers the bytes belong to. Export and import both call this, so a snapshot this build writes
+/// is readable by it, and a snapshot whose shape disagrees is refused by name rather than
+/// misread.
+pub fn state_key(
+    prefix: TokenPrefix,
+    representation: &Representation<'_>,
+    split: Split,
+    group: &Region,
+) -> Key {
+    kv_page_key(prefix, representation, split, group)
+}
+
 /// The hash of input media (an image or audio track a block encoded).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MediaHash(pub [u8; 32]);
