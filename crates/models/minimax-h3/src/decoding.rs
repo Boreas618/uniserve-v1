@@ -23,7 +23,14 @@
 //! and *which* samples go where: the clip splice, the overlap the predecessor lends, and the halo a
 //! decoded audio window carries.
 
-use crate::{Error, Result, config::CLIP_FRAMES, config::CLIP_LATENTS};
+use crate::config::VideoVaeConfig;
+use crate::video_vae::{Canvas, Tile, Tiles};
+use crate::{
+    Error, Result,
+    config::{CLIP_FRAMES, CLIP_LATENTS},
+};
+use nn::layers::{CrossFade, UnpatchifyVideo};
+use nn::{DType, Forward, Shape, TensorView};
 
 /// The frames one decoded clip holds: a 17-frame body, three padding frames and a five-frame tail.
 pub const CLIP_OUTPUT_FRAMES: u32 = 25;
@@ -256,6 +263,150 @@ pub fn video_arena(
     ])
 }
 
+/// The video decoder's tiled output path: one tile's tokens become its pixels in the clip's raster.
+///
+/// The decoder decodes overlapping tiles one after another and blends each into the raster as it
+/// lands, which is the reference's stitch (`uniserve/nn/vae/tiled.py:46-81`): a tile is written where
+/// it belongs, then blended with the tile above it over the rows they share, then with the tile to
+/// its left over the columns they share. The first tile row and column have no predecessor, so they
+/// are written and nothing is blended.
+///
+/// The raster is `[channels, frames, rows, columns]` in the decoder's element type, one clip's
+/// decoded frames; the caller sizes it and hands the same buffer to every tile. A tile's placement is
+/// a view into it, so no copy and no separate placement operator is needed.
+pub struct ClipDecoder {
+    unpatchify: UnpatchifyVideo,
+    /// One blend layer for each overlap the tile grid has, by extent and axis.
+    blends: Vec<(u32, u32, CrossFade)>,
+    /// Pixels per latent position, the ratio a tile's latent origin scales by.
+    ratio: u32,
+    /// The raster's frames: a latent frame decodes to `temporal` of them, and every tile spans them
+    /// all.
+    frames: u32,
+}
+
+impl ClipDecoder {
+    /// The output path of `canvas`, whose tiles the caller decodes in [`Tile`] order.
+    pub fn new(config: &VideoVaeConfig, canvas: &Canvas) -> Result<Self> {
+        let tiles = Tiles::of(config, canvas)?;
+        let spatial = config.spatial_compression();
+        let unpatchify = UnpatchifyVideo::new(
+            DType::F16,
+            u64::from(config.out_channels),
+            config.temporal_compression(),
+            spatial,
+        )?;
+        // The grid spreads its slack over the seams, so the overlaps are not all equal; one compiled
+        // blend serves every seam of the same width, and a decoder fades both ways needs both axes.
+        let mut extents: Vec<u32> = tiles
+            .rows
+            .overlaps
+            .iter()
+            .chain(tiles.columns.overlaps.iter())
+            .copied()
+            .filter(|extent| *extent != 0)
+            .collect();
+        extents.sort_unstable();
+        extents.dedup();
+        let mut blends = Vec::with_capacity(2 * extents.len());
+        for extent in extents {
+            for axis in [2, 3] {
+                blends.push((extent, axis, CrossFade::new(DType::F16, extent, axis)?));
+            }
+        }
+        Ok(Self {
+            unpatchify,
+            blends,
+            ratio: spatial,
+            frames: canvas.frames_out(config),
+        })
+    }
+
+    /// The blend layer of `extent` along `axis`.
+    fn blend(&self, extent: u32, axis: u32) -> Result<CrossFade> {
+        self.blends
+            .iter()
+            .find(|(width, side, _)| *width == extent && *side == axis)
+            .map(|(_, _, layer)| *layer)
+            .ok_or_else(|| {
+                Error::config(format!(
+                    "the clip decoder has no {extent}-pixel blend along axis {axis}"
+                ))
+            })
+    }
+
+    /// Write one decoded tile into the clip's raster and blend it with its neighbours.
+    ///
+    /// `tokens` is what [`crate::video_vae::VideoDecoder::decode`] wrote for this tile,
+    /// `[rows, out_channels · temporal · spatial²]`, its voxel rows first; `dest` is the whole clip's
+    /// raster. The caller decodes the tiles in [`Tile`] order, because a blend reads what the tile
+    /// above and the tile to the left have already written.
+    pub fn write_tile(
+        &self,
+        f: &Forward,
+        tile: &Tile,
+        tokens: TensorView,
+        dest: TensorView,
+    ) -> Result<()> {
+        let shape = dest.shape;
+        if shape.rank() != 4 || shape.dim(0) != u64::from(self.unpatchify.channels()) {
+            return Err(Error::config(format!(
+                "{:?} is not a [channels, frames, rows, columns] raster",
+                shape.dims()
+            )));
+        }
+        let ratio = u64::from(self.ratio);
+        let first_row = u64::from(tile.latent_rows.0) * ratio;
+        let first_column = u64::from(tile.latent_columns.0) * ratio;
+        let view = self.placement(dest, tile, first_row, first_column, 0, 0)?;
+        self.unpatchify.forward(f, tokens, view)?;
+        if tile.above != 0 {
+            let previous = self.placement(dest, tile, first_row, first_column, tile.above, 0)?;
+            self.blend(tile.above, 2)?
+                .forward(f, previous, view, view)?;
+        }
+        if tile.left != 0 {
+            let previous = self.placement(dest, tile, first_row, first_column, 0, tile.left)?;
+            self.blend(tile.left, 3)?.forward(f, previous, view, view)?;
+        }
+        Ok(())
+    }
+
+    /// A view of `dest` holding one tile's pixel block, shifted back by `up` rows and `left` columns.
+    ///
+    /// The shift reads the region a blend's predecessor occupies, which the tile grid has already
+    /// written; the view keeps the raster's own strides, so the operator writes through them.
+    fn placement(
+        &self,
+        dest: TensorView,
+        tile: &Tile,
+        first_row: u64,
+        first_column: u64,
+        up: u32,
+        left: u32,
+    ) -> Result<TensorView> {
+        let ratio = u64::from(self.ratio);
+        let rows = first_row
+            .checked_sub(u64::from(up))
+            .ok_or_else(|| Error::config("a blend starts above the raster".to_owned()))?;
+        let columns = first_column
+            .checked_sub(u64::from(left))
+            .ok_or_else(|| Error::config("a blend starts left of the raster".to_owned()))?;
+        let shape = Shape::new(&[
+            dest.shape.dim(0),
+            u64::from(self.frames),
+            u64::from(tile.canvas.height) * ratio,
+            u64::from(tile.canvas.width) * ratio,
+        ]);
+        Ok(TensorView::with_strides(
+            dest.element(&[0, 0, rows, columns]),
+            dest.dtype,
+            shape,
+            dest.strides,
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,5 +559,63 @@ mod tests {
         names.dedup();
         assert_eq!(names.len(), count);
         assert!(arena.iter().all(|buffer| buffer.elements > 0));
+    }
+
+    #[test]
+    fn a_tiles_placement_is_a_view_of_the_raster_and_its_blends_read_the_neighbour() {
+        // 768x1280 pixels: 48x80 latent positions, so the checkpoint's 256-pixel tiles and 64-pixel
+        // minimum overlap give a grid of four columns and seven rows, each tile 16x16 latent.
+        let config = crate::video_vae::tests::video_config();
+        let canvas = Canvas::clip(&config, 48, 80);
+        let clip = ClipDecoder::new(&config, &canvas).expect("the output path");
+        let tiles = Tiles::of(&config, &canvas)
+            .expect("the grid")
+            .tiles(&config, &canvas);
+        assert_eq!(tiles.len(), 28);
+        let frames = canvas.frames_out(&config);
+        let dest = TensorView::new(
+            ops::DevicePtr::new(0x1000),
+            DType::F16,
+            Shape::new(&[3, u64::from(frames), 768, 1280]),
+        );
+        let ratio = 16;
+        let mut above_seams = 0;
+        let mut left_seams = 0;
+        for tile in &tiles {
+            let first_row = u64::from(tile.latent_rows.0) * ratio;
+            let first_column = u64::from(tile.latent_columns.0) * ratio;
+            let view = clip
+                .placement(dest, tile, first_row, first_column, 0, 0)
+                .expect("the placement");
+            // The block is the tile's canvas in pixels, and it sits where the seam table says.
+            assert_eq!(view.shape.dims(), &[3, u64::from(frames), 256, 256]);
+            let origin = (first_row * 1280 + first_column) * 2;
+            assert_eq!(view.ptr.address(), 0x1000 + origin);
+            if tile.above != 0 {
+                let previous = clip
+                    .placement(dest, tile, first_row, first_column, tile.above, 0)
+                    .expect("the row neighbour");
+                assert_eq!(
+                    previous.ptr.address(),
+                    0x1000 + origin - u64::from(tile.above) * 1280 * 2
+                );
+                assert!(clip.blend(tile.above, 2).is_ok());
+                above_seams += 1;
+            }
+            if tile.left != 0 {
+                let previous = clip
+                    .placement(dest, tile, first_row, first_column, 0, tile.left)
+                    .expect("the column neighbour");
+                assert_eq!(
+                    previous.ptr.address(),
+                    0x1000 + origin - u64::from(tile.left) * 2
+                );
+                assert!(clip.blend(tile.left, 3).is_ok());
+                left_seams += 1;
+            }
+        }
+        // Every tile but the first row blends upwards, every tile but the first column blends left.
+        assert_eq!(above_seams, 28 - 4);
+        assert_eq!(left_seams, 28 - 7);
     }
 }
