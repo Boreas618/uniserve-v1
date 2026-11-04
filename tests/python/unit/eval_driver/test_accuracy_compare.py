@@ -265,10 +265,25 @@ def test_a_run_must_score_every_selected_row(tmp_path: Path) -> None:
     """The binomial denominator is the selected sample size."""
     reference = _BundleWriter(tmp_path / "reference").write()
     candidate = _BundleWriter(tmp_path / "candidate").write(
-        selected_count=1319, total=1000
+        correct=950, selected_count=1319, total=1000
     )
 
-    with pytest.raises(ValueError, match="rows"):
+    with pytest.raises(ValueError, match="scored 1000 rows"):
+        compare_runs(reference, candidate)
+
+
+def test_a_pair_at_another_sample_size_is_not_comparable(
+    tmp_path: Path,
+) -> None:
+    """The acceptance interval is defined at the protocol's 1319 rows."""
+    reference = _BundleWriter(tmp_path / "reference").write(
+        correct=95, total=100, selected_count=100
+    )
+    candidate = _BundleWriter(tmp_path / "candidate").write(
+        correct=96, total=100, selected_count=100
+    )
+
+    with pytest.raises(ValueError, match="1319"):
         compare_runs(reference, candidate)
 
 
