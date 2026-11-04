@@ -12,16 +12,13 @@ backend = "fcfs"
 # wasm32 module for the host CPU with this wasmtime, and only an artifact from
 # the same engine configuration loads in the main process (design §5.1, §6.2).
 [toolchain]
-name = "wasm32"
-target = "wasm32-unknown-unknown"
-rust-version = "1.96"
-wasmtime = "50.0.1"
+kind = "wasm"
+version = "50.0.1"
 
 # The module form: a wasm32 binary the Program Server precompiles
 # (`WasmSource`, design §6.2) and the scheduler thread instantiates.
 [module]
-form = "wasm32"
-precompiled = true
+form = "wasm"
 
 # The program's arguments and their defaults. Each is a field of
 # `scheduling_guest::Parameters`; a deployment that states none gets these,
@@ -52,5 +49,9 @@ description = "Longest a resident request may go without progressing before the 
 
 # `fcfs` is the first-come-first-served policy: it has no tuning data and no
 # GPU resources; its whole behaviour is the source below.
+# The package's build script: it compiles the crate to wasm32 and writes the raw
+# module the Program Server precompiles (design §5.2, §6.2).
 [source]
-files = ["Cargo.toml", "src/lib.rs"]
+kind = "wasm"
+files = ["Cargo.toml", "src/lib.rs", "src/build.py"]
+script = "src/build.py"
