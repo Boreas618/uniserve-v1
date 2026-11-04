@@ -660,6 +660,44 @@ fn rows(deployment: DType) -> Vec<(String, String)> {
             .to_string(),
         );
     }
+    // The video decoder's per-head normalization fused with its rotation - **no learned gain**, which
+    // is what `affine_false` states and what makes this a different program from the DiT's row.
+    //
+    // Every number here is the export's, and none is a convention of this crate: `vae/config.json`
+    // gives the decoder 32 heads of 64 elements (`decoder_num_attention_heads`,
+    // `decoder_attention_head_dim`) with `decoder_rope_dim_ratio 0.75`, so **48 of the 64 columns
+    // rotate**, split-half; and `decoder_norm_eps 1e-5` is the RMS floor. `VideoDecoder::load` builds
+    // its `Rotary` with the identity gain because the checkpoint stores no normalization weight for
+    // that attention (`vae/` has no `decoder.*.attn.norm.*`), and `ops::rope` states a gainless
+    // normalization as the `_affine_false` key.
+    //
+    // Two rows, because the VAE's element type is the export's: F16 for a checkpoint that stores it
+    // half, F32 for one that stores it whole. Without them the store holds no cell for the first
+    // operator a decode launches past its input projection, and stage 2 would stop on this row as if
+    // it were a new defect - which is the class this list has now had three times in one night.
+    for vae in VAES {
+        push(
+            "qk_norm_rope",
+            ops::rope::QkNormRopeDescriptor {
+                dtype: vae,
+                output: vae,
+                head_dim: 64,
+                q_heads: 32,
+                k_heads: 32,
+                rotation: SPLIT_HALF,
+                // `f32` on purpose: the config's epsilon reaches the descriptor as a 32-bit float,
+                // and a 64-bit literal would name a different key.
+                epsilon: ops::Float::from(1.0e-5_f32),
+                rotated: 48,
+                rows: QK_NORM_TOKENS,
+                // `head_dim.next_power_of_two().min(1024)` - the row tile `nn`'s `Rotary` builds.
+                block: 64,
+                affine: false,
+                pdl: PDL,
+            }
+            .to_string(),
+        );
+    }
     // The latent reorder: the video decoder writes channel-first and the media stage reads
     // channel-last, so one strided copy moves the block. Two rows, because the two consumers work in
     // different precisions — the VAE's latent is FP32 (its native precision) and the VSA compose's
