@@ -1010,6 +1010,10 @@ pub struct CausalLmRunner<M: CausalLm> {
     pools: Option<Arc<std::sync::Mutex<Pools>>>,
     /// The device's counters, when the executor handed them over (7.3's metrics).
     counters: Option<Arc<crate::device::SharedCounters>>,
+    /// The device's record of the operators an update could not compare, each with its reason
+    /// (7.3 step 2). The control thread reports it when the precopy finishes, so an update that
+    /// has no evidence for an operator says so rather than leaving it to the log.
+    uncompared: Option<Arc<std::sync::Mutex<Vec<String>>>>,
     /// The host columns of the batch being staged.
     staging: Staging,
     /// The device the runner computes on.
@@ -1137,6 +1141,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             graphs: Graphs::new(),
             pools: None,
             counters: None,
+            uncompared: None,
             staging,
             device,
             stream,
@@ -1194,6 +1199,32 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// Installs the shadow harness, sized for the largest bucket's shadow set.
     pub fn set_shadow(&mut self, shadow: crate::shadow::Shadow) {
         self.shadow = Some(shadow);
+    }
+
+    /// Records that a program-layer update could not compare `entry` (7.3 step 2), once.
+    ///
+    /// The same operator is shadowed once per bucket the update's requests occupy, so the record
+    /// keeps the first statement of each fact and drops its repeats.
+    fn note_uncompared(&self, entry: String) {
+        let Some(sink) = &self.uncompared else {
+            return;
+        };
+        let mut sink = sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !sink.contains(&entry) {
+            sink.push(entry);
+        }
+    }
+
+    /// Starts a new update's record of what it could not compare.
+    fn clear_uncompared(&self) {
+        let Some(sink) = &self.uncompared else {
+            return;
+        };
+        sink.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 
     /// The shape of the bucket a batch is served from.
@@ -1281,6 +1312,20 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 generation: batch.generation,
             });
         }
+        // An operator the prepared generation *adds* has no program in the serving generation to
+        // be compared against: the update's evidence does not cover it, and saying so is the
+        // difference between an update that was measured and one that merely ran.
+        for (operator, key, _) in next.iter() {
+            if self.generation.keys(operator).next().is_some() {
+                continue;
+            }
+            self.note_uncompared(format!(
+                "operator {operator} is new in generation {}: the serving generation holds no \
+                 program of it, so there is nothing to compare it against (its {key} program is \
+                 unmeasured)",
+                batch.generation
+            ));
+        }
         Ok(Jobs::new(jobs))
     }
 
@@ -1302,6 +1347,9 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
     }
 
     fn precopy(&mut self, next: &Arc<Generation>) -> Result<Jobs> {
+        // One update's evidence: a new precopy starts its record empty, so an operator this
+        // update compares is never reported from the one before it.
+        self.clear_uncompared();
         // One update at a time: a second generation prepared while the first is still waiting for
         // its switchover would leave the first one's graphs unreachable and unaccounted for. The
         // daemon discards an update before starting the next, so this is a disagreement, not a
@@ -1482,6 +1530,10 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
 
     fn attach_counters(&mut self, counters: Arc<crate::device::SharedCounters>) {
         self.counters = Some(counters);
+    }
+
+    fn attach_uncompared(&mut self, sink: Arc<std::sync::Mutex<Vec<String>>>) {
+        self.uncompared = Some(sink);
     }
 
     fn discard(&mut self, generation: u64) -> Result<()> {
@@ -1853,6 +1905,25 @@ impl<M: CausalLm> CausalLmRunner<M> {
         // which the calling device command reports.
         harness.reset();
         self.shadow = Some(harness);
+        // A pair the two programs could not be compared over, and a forward that carved no twin at
+        // all, are both statements of what this update has no evidence for: the operator is named
+        // in the update's answer rather than left to the log (7.3 step 2).
+        if let Ok(summary) = &compared {
+            for entry in &summary.incomparable {
+                self.note_uncompared(format!(
+                    "operator {operator} {key} of generation {generation} in the bucket of {} \
+                     tokens and {} rows: {entry}",
+                    bucket.tokens, bucket.rows
+                ));
+            }
+            if summary.pairs == 0 {
+                self.note_uncompared(format!(
+                    "operator {operator} of generation {generation} was shadowed in the bucket of \
+                     {} tokens and {} rows and its launch carved no twin, so nothing was compared",
+                    bucket.tokens, bucket.rows
+                ));
+            }
+        }
         compared.map(|_| ())
     }
 

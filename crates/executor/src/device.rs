@@ -38,6 +38,11 @@ pub struct Executor {
     pools: Arc<std::sync::Mutex<Pools>>,
     /// What the device has done since it started, for the metrics report (7.3).
     counters: Arc<SharedCounters>,
+    /// The operators the last program-layer update could not compare, each with its reason
+    /// (7.3 step 2): the runners on this device write it as they prepare and shadow a generation,
+    /// and the control thread reports it when the precopy finishes. Empty is a fact - every
+    /// operator the update replaced was compared.
+    uncompared: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 /// What a device has done since it started: the metrics report's counters (7.3).
@@ -146,6 +151,7 @@ impl Executor {
         scratch: u64,
     ) -> Result<Self> {
         let counters = Arc::new(SharedCounters::default());
+        let uncompared = Arc::new(std::sync::Mutex::new(Vec::new()));
         let phases: Vec<ipc::PhaseId> = runners
             .iter()
             .flat_map(|named| named.phases.iter().copied())
@@ -153,6 +159,7 @@ impl Executor {
         for named in &mut runners {
             named.runner.attach_pools(Arc::clone(&pools));
             named.runner.attach_counters(Arc::clone(&counters));
+            named.runner.attach_uncompared(Arc::clone(&uncompared));
         }
         let queue = JobQueue::new(device, Arc::clone(&events));
         let state = Device {
@@ -181,7 +188,20 @@ impl Executor {
             thread: Some(thread),
             pools,
             counters,
+            uncompared,
         })
+    }
+
+    /// The operators the last program-layer update could not compare, each with its reason (7.3
+    /// step 2), in the order the device's runners recorded them.
+    ///
+    /// Read by the control thread when a precopy finishes, so the update's answer states what it
+    /// has no evidence for instead of leaving that to a log line.
+    pub fn uncompared(&self) -> Vec<String> {
+        self.uncompared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// The device this executor drives.

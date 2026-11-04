@@ -1843,6 +1843,24 @@ impl MainProcess {
             .report("this node's warmup", generation, bound, now);
     }
 
+    /// The operators this node's devices could not compare, each with its reason, in device order
+    /// and without repeats (7.3 step 2).
+    ///
+    /// It is carried by the precopy's answer so an update that has no evidence for an operator says
+    /// so in the record the daemon reads, not only in this process's log: empty is the statement
+    /// that every operator the update replaced was compared.
+    fn uncompared(&self) -> Vec<String> {
+        let mut entries: Vec<String> = Vec::new();
+        for executor in &self.executors {
+            for entry in executor.uncompared() {
+                if !entries.contains(&entry) {
+                    entries.push(entry);
+                }
+            }
+        }
+        entries
+    }
+
     /// §7.3 step 2, second half: advances the precopy at most one stage. It
     /// never waits on a job: a stage that has not finished leaves the precopy
     /// as it is, and the next serve pass looks again.
@@ -2064,7 +2082,13 @@ impl MainProcess {
                 // serving generation and a revert has nothing to undo.
                 self.prepared = std::mem::take(&mut precopy.next);
                 self.update.precopied(generation)?;
-                self.answer(precopy.reply, ProgramStatus::Precopied { generation });
+                self.answer(
+                    precopy.reply,
+                    ProgramStatus::Precopied {
+                        generation,
+                        uncompared: self.uncompared(),
+                    },
+                );
                 Ok(())
             }
             PrecopyStage::Done => Ok(()),
@@ -3350,8 +3374,12 @@ fn report_of(status: &ProgramStatus) -> Option<proto::process::Report> {
     use proto::process::report::Kind;
 
     let kind = match status {
-        ProgramStatus::Precopied { generation } => Kind::Precopied(proto::process::Precopied {
+        ProgramStatus::Precopied {
+            generation,
+            uncompared,
+        } => Kind::Precopied(proto::process::Precopied {
             generation: *generation,
+            uncompared: uncompared.clone(),
         }),
         ProgramStatus::PrecopyFailed { failure, .. } => {
             Kind::PrecopyFailed(proto::process::PrecopyFailed {

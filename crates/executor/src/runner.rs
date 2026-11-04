@@ -43,6 +43,16 @@ pub trait Runner: Send {
     /// Serves one batch: stage its inputs, choose its bucket, and return the device work.
     fn submit(&mut self, batch: Batch) -> Result<Jobs>;
 
+    /// Hands the runner the device's record of the operators a program-layer update could not
+    /// compare (7.3 step 2).
+    ///
+    /// The record lives on the device executor because the control thread reports it when a
+    /// precopy finishes, and the runners themselves run on the device thread. A runner that
+    /// compares nothing ignores it.
+    fn attach_uncompared(&mut self, sink: std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let _ = sink;
+    }
+
     /// Turns one shadow batch of the scheduler's `shadow` pass into the paired forwards it needs
     /// (7.3 step 2).
     ///

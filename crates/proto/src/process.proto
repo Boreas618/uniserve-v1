@@ -518,6 +518,13 @@ message Report {
 
 message Precopied {
   uint64 generation = 1;
+  // The operators this update could not compare, each with the reason it could
+  // not be compared (a changed output shape or element type, a launch that
+  // carved no twin). Empty states every operator the update replaced was
+  // compared: the absence carries information, so no "all fine" entry is ever
+  // listed. A pass where every replaced operator is uncompared lists every one
+  // of them, because that update has no shadow evidence at all.
+  repeated string uncompared = 2;
 }
 
 // A parked standby's readiness (§2.5): its generation is the one it was
