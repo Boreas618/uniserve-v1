@@ -24,6 +24,10 @@
 //!
 //! With fewer than two devices it prints why and returns, so it is safe on a CPU-only host.
 
+#![allow(
+    clippy::expect_used,
+    reason = "a probe's prerequisite failure must fail the test, not be handled"
+)]
 use std::sync::{Arc, Barrier};
 
 use platform::nccl::ReduceOp;
@@ -42,7 +46,10 @@ impl platform::Budget for Unbounded {
 #[derive(Debug)]
 struct RankReport {
     rank: i32,
-    #[allow(dead_code, reason = "printed with the rank's readings when the probe reports")]
+    #[allow(
+        dead_code,
+        reason = "printed with the rank's readings when the probe reports"
+    )]
     device: DeviceId,
     /// The four f32 the buffer held after one uncaptured collective.
     eager: [f32; 4],
