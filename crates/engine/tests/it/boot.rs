@@ -104,9 +104,15 @@ fn facts() -> RankFacts {
         devices: Some(vec!["cpu".to_owned()]),
         hosts: Some(vec!["localhost".to_owned()]),
         max_running_requests: Some(4),
-        max_batch: Some(8),
-        max_num_batched_tokens: Some(128),
-        graph_tiers: Some(Vec::new()),
+        // The budgets the pool below is built for, stated rather than left to a
+        // default: a plan may not exceed what the epoch was built for, so a
+        // budget tighter than the pool's would refuse the very batch a request
+        // needs and read as "the policy served nothing".
+        max_batch: Some(16),
+        max_num_batched_tokens: Some(512),
+        block_size: Some(64),
+        kv_cache_dtype: Some(ipc::PrefixCacheDtype::BFloat16),
+        graph_tiers: Some(vec![1, 8]),
         bos: Some(0),
         eos: Some(vec![151645]),
         end_of_image: Some(0),
