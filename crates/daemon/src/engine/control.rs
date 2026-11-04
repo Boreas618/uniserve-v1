@@ -846,6 +846,9 @@ impl<'a> ProgramSwitch<'a> {
         programs: &BTreeMap<crate::epoch::KernelKey, crate::epoch::Program>,
         policy: &crate::epoch::Program,
     ) -> Result<(), crate::epoch::Failure> {
+        // A precopy names no generation: the main process numbers its program
+        // generations and reports the one it prepared, and this daemon names
+        // that number back in the switchover and the purge (§7.3).
         let command = process::Command {
             kind: Some(command::Kind::Precopy(process::Precopy {
                 kernels: programs
@@ -861,13 +864,13 @@ impl<'a> ProgramSwitch<'a> {
             update,
             generations,
         } = self;
-        // Every process's own number, in the processes' order: a switchover
-        // names the generation each one prepared.
         generations.clear();
         for process in processes.iter() {
             send(commands, process, command.clone())?;
             let prepared = await_report(commands, process, update, PRECOPY_TIMEOUT, |report| {
                 match report.kind.as_ref() {
+                    // The number is the main process's, and the switchover and
+                    // the purge name it back to this same process.
                     Some(report::Kind::Precopied(precopied)) => Some(Ok(precopied.generation)),
                     Some(report::Kind::PrecopyFailed(failed)) => {
                         Some(Err(crate::epoch::Failure {

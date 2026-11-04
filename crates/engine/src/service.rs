@@ -3103,7 +3103,6 @@ mod tests {
         proto::process::Command {
             kind: Some(proto::process::command::Kind::Precopy(
                 proto::process::Precopy {
-                    generation,
                     kernels,
                     policy: Some(program()),
                     ..Default::default()
@@ -3200,7 +3199,6 @@ mod tests {
         let next = proto::process::Command {
             kind: Some(proto::process::command::Kind::Precopy(
                 proto::process::Precopy {
-                    generation: 2,
                     kernels: Vec::new(),
                     policy: Some(proto::process::Program {
                         backend: "fcfs".to_owned(),
