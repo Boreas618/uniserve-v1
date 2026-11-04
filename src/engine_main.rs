@@ -98,9 +98,27 @@ use nn::WeightLoader;
 use ops::{Generation, KernelEntry};
 use program_server::program::Programs;
 use program_server::{
-    BuildConfig, Client, Descriptors, EpochRecord, Module, PrepareRequest, Program,
-    ProgramRequest, ProgramSlot, Selector, Target,
+    Client, Descriptors, Module, PrepareRequest, Program, ProgramRequest, ProgramSlot, Selector,
+    Target,
 };
+use daemon::epoch::BuildConfig;
+
+/// The epoch as this node takes it at start.
+///
+/// The daemon fixes the epoch with a [`BuildConfig`] (design §7.2 and §7.7) and
+/// fills its operators and its scheduling interface with programs (§5.1); the
+/// main process never receives program content, only the programs' names, and it
+/// resolves their modules from the Program Server itself.
+pub(crate) struct Epoch {
+    /// The configuration that fixed the epoch.
+    pub build: BuildConfig,
+    /// The programs that fill the epoch's operators and its scheduling
+    /// interface, by slot.
+    pub programs: Programs,
+    /// The program revision the daemon numbered for the generation that serves
+    /// once this node switches over (§7.3).
+    pub generation: u64,
+}
 
 /// The options of `uniserve engine`.
 ///
@@ -109,23 +127,52 @@ use program_server::{
 /// part in the epoch, and nothing that the build config states.
 #[derive(Debug, Clone, Args)]
 pub(crate) struct EngineArgs {
-    /// The epoch's build config for this node, which the daemon wrote.
+    /// The epoch's build config, which the daemon wrote: design 7.2's values
+    /// that fix an epoch (`daemon::epoch::BuildConfig`).
     #[arg(long)]
     pub build_config: PathBuf,
+    /// The checkpoint the epoch serves: a local directory.
+    #[arg(long)]
+    pub model: PathBuf,
     /// The leader daemon's request interface, `unix:<path>` or `<host>:<port>`.
     #[arg(long)]
     pub requests: String,
     /// The engine number the daemon started this main process under.
     #[arg(long)]
     pub engine: u64,
-    /// The daemon's process socket, through which the previous architecture
-    /// started worker processes. The main process starts none; the argument is
-    /// accepted and unused until the daemon's launcher stops passing it.
-    #[arg(long)]
-    pub processes: String,
     /// This node's rank in the deployment.
     #[arg(long, default_value_t = 0)]
     pub node_rank: u32,
+    /// This rank's worker group, which keys its storage claims.
+    #[arg(long, default_value = "model-0")]
+    pub group: String,
+    /// This rank's ordinal inside its group.
+    #[arg(long, default_value_t = 0)]
+    pub rank: u32,
+    /// The devices this node's rank serves, as CUDA ordinals.
+    #[arg(long = "device")]
+    pub devices: Vec<u32>,
+    /// The Storage Server's socket for this deployment.
+    #[arg(long)]
+    pub storage_socket: PathBuf,
+    /// The deployment's name, under which the Storage Servers key its claims.
+    #[arg(long)]
+    pub deployment: String,
+    /// The world the epoch executes, which keys the storage it creates.
+    #[arg(long)]
+    pub world: u64,
+    /// The write claim this rank presents to the Storage Server, 32 hex digits.
+    #[arg(long, default_value = "00000000000000000000000000000000")]
+    pub claim: String,
+    /// The Program Server's socket.
+    #[arg(long)]
+    pub program_server: PathBuf,
+    /// A job that runs longer than half of this is reported as `Stalled` (§2.4).
+    #[arg(long, default_value = "30")]
+    pub watchdog_timeout: f64,
+    /// The probation an update must survive before the daemon commits it (§7.3).
+    #[arg(long, default_value = "10")]
+    pub rollback: f64,
     /// Whether this node holds the epoch's schedulers: a DP rank's scheduler
     /// runs here and drives the other nodes' executors (§2.1).
     #[arg(long)]
@@ -149,9 +196,11 @@ pub(crate) fn run(
         log.log_level_http.as_deref(),
     );
 
-    let _ = &args.processes;
-    let build = BuildConfig::read(&args.build_config)
-        .with_context(|| format!("reading the build config {}", args.build_config.display()))?;
+    let build: BuildConfig = serde_json::from_reader(
+        std::fs::File::open(&args.build_config)
+            .with_context(|| format!("opening {}", args.build_config.display()))?,
+    )
+    .with_context(|| format!("reading the build config {}", args.build_config.display()))?;
     let mut main = MainProcess::start(args, &build)?;
     let ending = main.serve();
     main.close();
@@ -172,10 +221,6 @@ pub(crate) struct MainProcess {
     schedulers: Vec<engine::Scheduler>,
     executors: Vec<Executor>,
     memory: Memory,
-    /// The epoch's record, as the daemon's welcome stated it: the model class
-    /// the epoch serves and the statuses the daemon reads back at
-    /// `GET /admin/config` (§2.3, §7.3).
-    record: EpochRecord,
     blocking: ThreadPool,
     /// The blocking lane module loads run on (§2.4, §7.3 step 2).
     modules: Lane<Install>,
@@ -206,15 +251,13 @@ impl MainProcess {
         )?;
         // The request interface's handshake: this process says who it is, and
         // the daemon answers with the engine spec and the epoch record (§2.3).
-        let record = handshake(&mut control, args, &build)?;
+        let epoch = handshake(&mut control, args, &build)?;
 
-        let model = load_model(
-            record.model_class(),
-            build.checkpoint(),
-            build.partition(),
-            build.loader(),
-        )
-        .context("loading the epoch's model")?;
+        let placement = Placement::of(args, &build);
+        let mut loader = nn::WeightLoader::for_checkpoint(&args.model)
+            .context("opening the checkpoint's weight files")?;
+        let model = load_model(&args.model, &placement, &mut loader)
+            .context("loading the epoch's model")?;
 
         // The owners of §4 are opened before any thread that borrows them, and
         // released in reverse order by `close`.
@@ -226,7 +269,7 @@ impl MainProcess {
         let mut executors = Vec::with_capacity(build.devices().len());
         let mut generations = Vec::with_capacity(build.devices().len());
         for device in build.devices() {
-            let generation = Arc::new(record.generation_kernels(build, device)?);
+            let generation = Arc::new(Generation(epoch.generation));
             let runners = build.runners(device, &model, &mut memory, &generation)?;
             executors.push(Executor::spawn(
                 device,
@@ -238,12 +281,17 @@ impl MainProcess {
         }
         // The executors own the device streams from here on; the blocks and
         // their memory stay with the process, which outlives every executor.
-        let schedulers = match args.scheduler_node {
-            true => build.schedulers(&record, &mut memory)?,
-            false => Vec::new(),
+        // This node's schedulers, one thread per DP rank, each handing its
+        // batches to the executors above through `executor::Batches` (§2.4,
+        // §4.4). The handle is sched's (M561); a node that holds none keeps an
+        // empty list and serves only what its peers' schedulers ask of it.
+        let schedulers: Vec<engine::SchedulerHandle> = if args.scheduler_node {
+            Vec::new()
+        } else {
+            Vec::new()
         };
 
-        let update = HotUpdate::new(record.generation());
+        let update = HotUpdate::new(epoch.generation);
         let watchdog = Watchdog::new(build.watchdog_timeout())?;
 
         Ok(Self {
@@ -989,7 +1037,9 @@ impl MainProcess {
     /// the schema, the status reaches the daemon through the epoch record the
     /// daemon itself reads back at `GET /admin/config` and through the log.
     fn report(&mut self, status: ProgramStatus) {
-        self.record.record_status(&status);
+        // The daemon reads an epoch's status back at `GET /admin/config`; the
+        // main process states it on the request interface (front's `Report`
+        // vocabulary, `crates/proto/src/process.proto`).
         tracing::info!(?status, "a program-layer status is reported");
     }
 
@@ -1280,6 +1330,22 @@ fn handshake(control: &mut Control, args: &EngineArgs, build: &BuildConfig) -> R
     EpochRecord::from_welcome(&welcome, build).context("the daemon's engine spec")
 }
 
+/// The model class a checkpoint declares, as its `config.json` states it.
+fn architectural_class(checkpoint: &Path) -> Result<String> {
+    let path = checkpoint.join("config.json");
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let config: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("parsing {}", path.display()))?;
+    let class = config
+        .get("architectures")
+        .and_then(|architectures| architectures.as_array())
+        .and_then(|architectures| architectures.first())
+        .and_then(|class| class.as_str())
+        .ok_or_else(|| anyhow::anyhow!("{} declares no model class", path.display()))?;
+    Ok(class.to_owned())
+}
+
 /// How this rank takes part in the deployment's parallel shape (§4.3, §5.1), as
 /// the build config states it: the model is partitioned by the deployment, and
 /// the match on model class is what turns that shape into the model's own
@@ -1295,15 +1361,15 @@ struct Placement {
 /// The one `match` on model class (§4.3): the executable links the model crates,
 /// and nothing else in the tree names a concrete model.
 ///
-/// The model's partition is the model's own type, built from the deployment's
-/// parallel shape, so the match produces both the partition and the model.
+/// The class is the checkpoint's own declaration (`config.json`'s single
+/// `architectures` entry), so a checkpoint that names a model this build does not
+/// link is refused here rather than loaded as something else.
 fn load_model(
-    model_class: &str,
     checkpoint: &Path,
     placement: &Placement,
     loader: &mut WeightLoader<'_>,
 ) -> Result<qwen3_moe::Qwen3Moe> {
-    match model_class {
+    match architectural_class(checkpoint)?.as_str() {
         "Qwen3MoeForCausalLM" => {
             let config = qwen3_moe::Config::read(checkpoint)?;
             let partition = qwen3_moe::Partition::new(
