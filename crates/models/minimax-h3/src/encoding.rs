@@ -112,9 +112,33 @@ pub struct Stack {
     pub blocks: u32,
     /// Latent channels.
     pub latent_channels: u32,
+    /// Frames one clip of the encoder's raster is: the frame count the network reads at once.
+    pub clip_frames: u32,
+    /// Latent frames one complete clip yields.
+    pub clip_latents: u32,
+    /// Latent frames the last clip of a condition drops: the clip's trailing frames a later clip
+    /// overlaps, which a condition's timeline does not keep.
+    pub token_drop: u32,
 }
 
 impl Stack {
+    /// The latent frames a **condition** of `frames` frames encodes to.
+    ///
+    /// Clips of [`Self::clip_frames`] frames, each [`Self::clip_latents`] latent frames, less the last
+    /// clip's trailing [`Self::token_drop`]; a single frame is a still of one latent frame.
+    pub fn condition_latent_frames(&self, frames: u32) -> Result<u32> {
+        if frames == 0 {
+            return Err(Error::config(
+                "a video condition of no frame encodes nothing".to_owned(),
+            ));
+        }
+        if frames == 1 {
+            return Ok(1);
+        }
+        let clips = frames.div_ceil(self.clip_frames);
+        Ok(clips * self.clip_latents - self.token_drop)
+    }
+
     /// The stack the config states.
     pub fn of(config: &VideoVaeConfig) -> Result<Self> {
         let stages = config.block_out_channels.len();
@@ -165,6 +189,9 @@ impl Stack {
             spatial_strides: config.spatial_downsample_factors.clone(),
             blocks: config.layers_per_block,
             latent_channels: config.latent_channels,
+            clip_frames: config.clip_length,
+            clip_latents: config.clip_latents(),
+            token_drop: config.token_drop,
         })
     }
 
@@ -972,13 +999,15 @@ impl EncoderScratch {
     }
 }
 
-/// One tile extent's buffers: the input pad, the input convolution's output, a set per level and the
-/// moments convolution's output.
+/// One tile extent's buffers: the input pad, the input convolution's output and a set per level.
+///
+/// The moment convolution writes the caller's `out`, so no buffer is held for it: the tile's result is
+/// the moments, and the one-by-one projection that follows runs once, on the stitched raster
+/// ([`VideoEncoder::project`]).
 struct EncoderSet {
     padded: TensorView,
     stream: TensorView,
     levels: Vec<LevelSet>,
-    moments: TensorView,
 }
 
 /// One level's buffers: the pair its blocks alternate between, one working buffer the block reads back,
@@ -1100,13 +1129,10 @@ impl VideoEncoder {
                 },
             });
         }
-        let latent = extents.last().copied().unwrap_or(raster);
-        let moments = buffer(2 * u64::from(self.stack.latent_channels), &latent)?;
         Ok(EncoderSet {
             padded,
             stream,
             levels,
-            moments,
         })
     }
 
@@ -1137,10 +1163,10 @@ impl VideoEncoder {
                 self.stack.input_channels
             )));
         }
-        if frames < u64::from(crate::config::CLIP_FRAMES) {
+        if frames != 1 && frames != u64::from(self.stack.clip_frames) {
             return Err(Error::config(format!(
-                "a {frames}-frame raster is shorter than the {}-frame clip",
-                crate::config::CLIP_FRAMES
+                "a video encoder reads one still (one frame) or one {}-frame clip, not {frames}",
+                self.stack.clip_frames
             )));
         }
         let raster = Extent {
@@ -1181,10 +1207,43 @@ impl VideoEncoder {
             }
         }
 
-        // The moment convolution writes `2 · latent_channels`; the one-by-one projection after it
-        // narrows that to the latent's own channels, which is the posterior the caller reads.
-        self.output.run(f, source, set.moments)?;
-        Ok(self.moments.forward(f, set.moments, out)?)
+        // The moment convolution writes `2 · latent_channels` into the caller's view. The one-by-one
+        // projection that follows it runs **once for the whole raster**, after the tiles are stitched
+        // (`project`), because that is the reference's order: the tiles produce moments, the tiler
+        // blends them, and the projection reads the stitched result.
+        self.output.run(f, source, out)
+    }
+
+    /// The latent frames a **condition** of `frames` frames encodes to.
+    ///
+    /// A condition is cut into clips of [`Stack::clip_frames`] frames, each yielding
+    /// [`Stack::clip_latents`] latent frames, and the last clip's trailing [`Stack::token_drop`] latent
+    /// frames are dropped - so 17 frames are 2 latent frames and 22 are 7. A single frame is a still and
+    /// yields one (`encoding.py:104-111`; the network's causal front padding makes one frame one latent
+    /// frame, `video_vae.py:1105-1113`).
+    ///
+    /// This is a **different statement** from the generated timeline's `packing::video_latent_frames`
+    /// (`17n + 5` frames to `5n + 2` latents). The two agree on the counts a generation uses and this
+    /// one alone accepts the counts a condition may be - 17, 30, any length - because a condition is
+    /// cut and padded, not generated.
+    pub fn latent_frames(&self, frames: u32) -> Result<u32> {
+        self.stack.condition_latent_frames(frames)
+    }
+
+    /// Project the stitched moments to the posterior's two fields: one call, after the stitch.
+    ///
+    /// The reference's `Encoder` wraps the tiled network and runs `quant_conv` on the stitched
+    /// moments, so a tile's own output is not yet projected. A one-by-one convolution commutes with the
+    /// blend in real arithmetic - the blend's weights do not depend on the channel - so projecting per
+    /// tile would be the same value for more work; it is written this way because it is also the order
+    /// the posterior is sampled in, which does depend on it: the sample reads a mean and a log-variance
+    /// of the same position, and a per-tile projection would entangle two tiles' roundings before they
+    /// were blended.
+    ///
+    /// `moments` is a tile's or the whole run's `[2 · latent_channels, frames, rows, columns]`; `out` is
+    /// the same shape. Nothing is reserved: the projection reads and writes the caller's views.
+    pub fn project(&self, f: &Forward, moments: TensorView, out: TensorView) -> Result<()> {
+        self.moments.forward(f, moments, out).map_err(Error::from)
     }
 
     /// One residual block: two normalized convolutions, added to the input or its projection.
@@ -1643,11 +1702,6 @@ pub fn video_encoder_tile_arena(
             push(format!("level{index}.strided"), width * pixels(next));
         }
     }
-    let latent = extents.last().copied().unwrap_or(raster);
-    push(
-        "moments".to_owned(),
-        2 * u64::from(stack.latent_channels) * pixels(&latent),
-    );
     Ok(plan)
 }
 
@@ -1952,6 +2006,51 @@ mod tests {
     use super::*;
     use crate::video_vae::tests::video_config;
 
+    /// A video encoder over the fixture's config: the stack is all `latent_frames` needs, so no
+    /// weights are loaded.
+    fn encoder_stack() -> Stack {
+        Stack::of(&video_config()).expect("the fixture's stack")
+    }
+
+    #[test]
+    fn a_condition_is_counted_by_its_own_rule() {
+        // The reference counts a condition in clips: every clip of `clip_length` frames yields
+        // `clip_latents` latent frames and the last clip's trailing `token_drop` are dropped, so the
+        // canonical 22 frames (`clip_length + 5`) are two clips less three.
+        let stack = encoder_stack();
+        assert_eq!(stack.condition_latent_frames(1).expect("a still"), 1);
+        assert_eq!(
+            stack
+                .condition_latent_frames(stack.clip_frames)
+                .expect("one clip"),
+            stack.clip_latents - stack.token_drop
+        );
+        let tail = stack.clip_frames + crate::config::CLIP_LATENTS;
+        assert_eq!(
+            stack
+                .condition_latent_frames(tail)
+                .expect("a clip and a tail"),
+            2 * stack.clip_latents - stack.token_drop
+        );
+        // A length no generation produces is a condition all the same: two clips and a short tail.
+        assert_eq!(
+            stack
+                .condition_latent_frames(2 * stack.clip_frames - 4)
+                .expect("a short last clip"),
+            2 * stack.clip_latents - stack.token_drop
+        );
+        assert!(stack.condition_latent_frames(0).is_err());
+
+        // The generated timeline's rule agrees on the canonical count, which is why the two must be
+        // stated separately rather than one standing in for the other.
+        assert_eq!(
+            stack
+                .condition_latent_frames(tail)
+                .expect("a clip and a tail"),
+            crate::packing::video_latent_frames(tail).expect("the generated rule")
+        );
+    }
+
     #[test]
     fn a_run_reserves_one_set_per_distinct_tile_extent() {
         let tile = |height: u32, width: u32| Extent {
@@ -2001,7 +2100,9 @@ mod tests {
         let widening = (1..levels)
             .filter(|index| stack.widths[index - 1] != stack.widths[*index])
             .count();
-        assert_eq!(plan.len(), 2 + levels * 3 + widening + downsamplers * 2 + 1);
+        // No moments buffer: the moment convolution writes the caller's view, and the projection that
+        // follows reads the stitched raster.
+        assert_eq!(plan.len(), 2 + levels * 3 + widening + downsamplers * 2);
         // Level 0 runs at the tile's pixels and the encoder's first width, and it is the entry a tiled
         // driver multiplies by its tile count.
         let first = plan
