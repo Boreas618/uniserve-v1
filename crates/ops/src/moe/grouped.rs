@@ -105,6 +105,45 @@ impl fmt::Display for GatherGemmDescriptor {
     }
 }
 
+/// One compilation of `route_gemm`.
+///
+/// The same fields as [`GatherGemmDescriptor`] less the activation: FC2 has none (FC1 applies it
+/// inside its gated product), and a descriptor carries only what its operator reads.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct RouteGemmDescriptor {
+    /// Hidden elements of a token: FC2's output width.
+    pub hidden: u32,
+    /// Expert width: FC2's contraction length.
+    pub intermediate: u32,
+    /// Experts the weight stacks.
+    pub experts: u32,
+    /// Routes per token.
+    pub top: u32,
+    /// Element type of the rows, the weights and the output.
+    pub dtype: DType,
+    /// The MMA tile the package compiled for: rows by columns.
+    pub tile: (u32, u32),
+    /// The cluster shape the package compiled for: rows by columns.
+    pub cluster: (u32, u32),
+}
+
+impl fmt::Display for RouteGemmDescriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Key::new()
+            .field("hidden", self.hidden)
+            .field("intermediate", self.intermediate)
+            .field("experts", self.experts)
+            .field("top", self.top)
+            .field("dtype", self.dtype)
+            .field("tile", format_args!("{}x{}", self.tile.0, self.tile.1))
+            .field(
+                "cluster",
+                format_args!("{}x{}", self.cluster.0, self.cluster.1),
+            )
+            .finish(formatter)
+    }
+}
+
 /// The arguments of one FC1 launch.
 pub struct GatherGemmArgs {
     /// `[tokens, hidden]` hidden states, row-major.
@@ -228,14 +267,14 @@ impl Op for GatherGemm {
 
         args.hidden
             .require_shape(Self::NAME, Shape::new(&[tokens, hidden]))?;
-        args.hidden.require_row(Self::NAME, descriptor.dtype, hidden)?;
-        args.weights.require_shape(
-            Self::NAME,
-            Shape::new(&[experts, 2 * intermediate, hidden]),
-        )?;
+        args.hidden
+            .require_row(Self::NAME, descriptor.dtype, hidden)?;
+        args.weights
+            .require_shape(Self::NAME, Shape::new(&[experts, 2 * intermediate, hidden]))?;
         args.weights
             .require_row(Self::NAME, descriptor.dtype, hidden)?;
-        args.ids.require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
+        args.ids
+            .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
         if args.ids.dtype != DType::I32 {
             return Err(Error::argument(
                 Self::NAME,
@@ -316,8 +355,8 @@ impl Op for GatherGemm {
         let reduction = u64::from(descriptor.hidden);
         let accumulate = DType::F32;
         let gamma = crate::tolerance::gamma(reduction, accumulate);
-        let atol = (2.0 * gamma * f64::from(ACTIVATION_ENVELOPE * ACTIVATION_ENVELOPE * 2.0))
-            as f32;
+        let atol =
+            (2.0 * gamma * f64::from(ACTIVATION_ENVELOPE * ACTIVATION_ENVELOPE * 2.0)) as f32;
         Tolerance::dot(reduction, accumulate, descriptor.dtype).with_atol(atol)
     }
 }
@@ -328,7 +367,7 @@ pub struct RouteGemm;
 impl Op for RouteGemm {
     const NAME: &'static str = "route_gemm";
 
-    type Descriptor = GatherGemmDescriptor;
+    type Descriptor = RouteGemmDescriptor;
     type Args<'a> = RouteGemmArgs;
 
     fn launch(
@@ -353,7 +392,8 @@ impl Op for RouteGemm {
             .require_shape(Self::NAME, Shape::new(&[experts, hidden, intermediate]))?;
         args.weights
             .require_row(Self::NAME, descriptor.dtype, intermediate)?;
-        args.ids.require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
+        args.ids
+            .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
         if args.ids.dtype != DType::I32 {
             return Err(Error::argument(
                 Self::NAME,

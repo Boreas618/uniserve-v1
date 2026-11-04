@@ -104,6 +104,8 @@ pub struct Descriptor {
     pub experts: u32,
     /// Rows one rank may hold, the transport's capacity.
     pub max_tokens: u32,
+    /// Ranks of the expert group whose transport this module drives.
+    pub ranks: u32,
     /// Element type of the states.
     pub dtype: DType,
 }
@@ -116,6 +118,7 @@ impl fmt::Display for Descriptor {
             .field("top", self.top)
             .field("experts", self.experts)
             .field("max_tokens", self.max_tokens)
+            .field("ranks", self.ranks)
             .field("dtype", self.dtype)
             .finish(formatter)
     }
@@ -259,6 +262,17 @@ impl Op for ExpertExchange {
         let max_tokens = u64::from(descriptor.max_tokens);
         let ranks = u64::from(args.ranks);
 
+        // The transport a module drives is built for one group size; a launch over another group
+        // would read and write peer workspace the transport does not have.
+        if descriptor.ranks != args.ranks {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the module is compiled for {} ranks, the launch passes {}",
+                    descriptor.ranks, args.ranks
+                ),
+            ));
+        }
         args.counts
             .require_shape(Self::NAME, Shape::new(&[ranks]))?;
         if args.counts.dtype != DType::I32 {
@@ -285,7 +299,8 @@ impl Op for ExpertExchange {
                 }
                 args.state
                     .require_shape(Self::NAME, Shape::new(&[tokens, hidden]))?;
-                args.state.require_row(Self::NAME, descriptor.dtype, hidden)?;
+                args.state
+                    .require_row(Self::NAME, descriptor.dtype, hidden)?;
                 args.ids
                     .require_shape(Self::NAME, Shape::new(&[tokens, top]))?;
                 args.weights
@@ -320,7 +335,8 @@ impl Op for ExpertExchange {
                 let tokens = u64::from(args.tokens);
                 args.state
                     .require_shape(Self::NAME, Shape::new(&[max_tokens, hidden]))?;
-                args.state.require_row(Self::NAME, descriptor.dtype, hidden)?;
+                args.state
+                    .require_row(Self::NAME, descriptor.dtype, hidden)?;
                 args.out
                     .require_shape(Self::NAME, Shape::new(&[tokens, hidden]))?;
                 args.out.require_row(Self::NAME, descriptor.dtype, hidden)?;
@@ -361,15 +377,13 @@ impl Op for ExpertExchange {
 
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
         match descriptor.mode {
+            // A dispatch only moves rows: two implementations agree bit for bit.
             Mode::Dispatch => Tolerance::exact(),
-            // The combine's reduction length is the number of ranks that hold a route; the
-            // descriptor does not carry the group size, so the bound is taken at the largest group
-            // the expert vocabulary can be split over, which bounds every launch.
-            Mode::Combine => Tolerance::dot(
-                u64::from(descriptor.experts),
-                DType::F32,
-                descriptor.dtype,
-            ),
+            // A token's partial expert sums arrive from the ranks that hold its experts, so the
+            // combine's reduction length is the group size.
+            Mode::Combine => {
+                Tolerance::dot(u64::from(descriptor.ranks), DType::F32, descriptor.dtype)
+            }
         }
     }
 }
@@ -398,6 +412,7 @@ mod tests {
             top: 8,
             experts: 128,
             max_tokens: 8192,
+            ranks: 4,
             dtype: DType::BF16,
         };
         assert_eq!(
@@ -409,6 +424,29 @@ mod tests {
             mode: Mode::Combine,
             ..dispatch
         };
-        assert!(ExpertExchange::tolerance(&combine).rtol > 0.0);
+        assert_eq!(
+            ExpertExchange::tolerance(&combine),
+            Tolerance::dot(4, DType::F32, DType::BF16),
+            "the combine sums one term per rank of the group"
+        );
+    }
+
+    #[test]
+    fn the_group_size_is_part_of_the_module_key() {
+        let combine = Descriptor {
+            mode: Mode::Combine,
+            hidden: 2048,
+            top: 8,
+            experts: 128,
+            max_tokens: 8192,
+            ranks: 4,
+            dtype: DType::BF16,
+        };
+        assert_eq!(
+            combine.to_string(),
+            "mode_combine_hidden_2048_top_8_experts_128_max_tokens_8192_ranks_4_dtype_bf16"
+        );
+        let wider = Descriptor { ranks: 8, ..combine };
+        assert_ne!(wider.to_string(), combine.to_string());
     }
 }
