@@ -1167,3 +1167,44 @@ fn a_calibrated_stack_names_its_fields_with_its_exports_suffixes() {
     assert!(text.contains("experts.0.up_proj.weight"), "{text}");
     assert!(text.contains("vLLM ModelOpt"), "{text}");
 }
+
+/// A host store answers the weights a model needs with no device, so a loading audit — which
+/// programs a request space names, which keys the layers build — costs no GPU time.
+#[test]
+fn a_host_store_retains_weights_and_answers_the_first_region() {
+    let mut store = nn::HostStore::new();
+    assert!(store.is_empty());
+    let key = |tensor: &str| WeightKey {
+        files: Vec::new(),
+        dtype: DType::BF16,
+        layout: WeightLayout::ROW_MAJOR,
+        region: nn::weights::WeightRegion {
+            tensors: vec![tensor.to_owned()],
+            start: 0,
+            shape: Shape::new(&[4, 32]),
+            stride: None,
+        },
+    };
+    let bytes: Vec<u8> = (0..256).map(|byte| byte as u8).collect();
+    let first = store
+        .publish(&key("w"), DType::BF16, Shape::new(&[4, 32]), &bytes)
+        .expect("a host store publishes");
+    assert_eq!(first.bytes(), 256);
+    // A view carved from it names the bytes the store kept.
+    let view = nn::TensorView::new(first.address(), DType::BF16, Shape::new(&[4, 32]));
+    assert_eq!(view.rows(), 4);
+    // The same key again answers the first region rather than a second buffer.
+    let again = store
+        .publish(&key("w"), DType::BF16, Shape::new(&[4, 32]), &bytes)
+        .expect("a repeated publish answers the first region");
+    assert_eq!(again.address(), first.address());
+    assert_eq!(store.len(), 1);
+    assert_eq!(
+        store
+            .retained(&key("w"))
+            .unwrap()
+            .map(|held| held.address()),
+        Some(first.address())
+    );
+    assert!(store.retained(&key("other")).unwrap().is_none());
+}

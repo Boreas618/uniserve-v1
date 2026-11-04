@@ -33,7 +33,7 @@ use ops::{DType, Shape, TensorView};
 
 use crate::checkpoint::{Checkpoint, FileIdentity};
 use crate::error::{Error, Result};
-use crate::tensor::Backing;
+use crate::tensor::{Backing, DevicePtr};
 
 /// The suffix one export spells each field of a calibrated NVFP4 projection with (specs/worker.md
 /// 8, 9).
@@ -376,6 +376,101 @@ pub trait RetainedWeights {
         shape: Shape,
         bytes: &[u8],
     ) -> Result<Backing>;
+}
+
+/// A retained store in host memory: a model loaded, and asked for what it would launch, with no
+/// device.
+///
+/// A loading audit — which programs a model's request space needs, which keys its layers build, what
+/// a checkpoint's mapping produces — is a question about shapes, dtypes and layouts. None of it needs
+/// a device: the checkpoint is host-mapped, `WeightLoader` converts on the host, and a store that
+/// keeps the bytes in host memory is enough to build every layer and ask each for its descriptor.
+///
+/// The addresses it answers are **host** addresses, which is why the type is named for the host and
+/// not for storage in general: a view carved from one is a shape and an element type, and a call that
+/// launches it would hand a host pointer to a device. A model built over this store is for
+/// enumeration, never for execution.
+pub struct HostStore {
+    /// One buffer per published region, eight-byte aligned so any element type can be read from it.
+    buffers: Vec<Vec<u64>>,
+    /// The regions, in publication order, with the key each was published under.
+    published: Vec<(WeightKey, Backing)>,
+}
+
+impl HostStore {
+    /// An empty store.
+    pub fn new() -> Self {
+        Self {
+            buffers: Vec::new(),
+            published: Vec::new(),
+        }
+    }
+
+    /// How many regions the store holds.
+    pub fn len(&self) -> usize {
+        self.published.len()
+    }
+
+    /// Whether the store holds nothing.
+    pub fn is_empty(&self) -> bool {
+        self.published.is_empty()
+    }
+
+    /// The keys of every published region, in publication order.
+    pub fn keys(&self) -> impl Iterator<Item = &WeightKey> {
+        self.published.iter().map(|(key, _)| key)
+    }
+}
+
+impl Default for HostStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RetainedWeights for HostStore {
+    fn retained(&mut self, key: &WeightKey) -> Result<Option<Backing>> {
+        Ok(self
+            .published
+            .iter()
+            .find(|(published, _)| published == key)
+            .map(|(_, backing)| *backing))
+    }
+
+    fn publish(
+        &mut self,
+        key: &WeightKey,
+        _dtype: DType,
+        _shape: Shape,
+        bytes: &[u8],
+    ) -> Result<Backing> {
+        // Publishing the same key twice answers the first region: a store that replaced it would
+        // hand two layers two buffers for one weight, and the second load would silently win.
+        if let Some((_, backing)) = self
+            .published
+            .iter()
+            .find(|(published, _)| published == key)
+        {
+            return Ok(*backing);
+        }
+        let words = bytes.len().div_ceil(8);
+        let mut buffer = vec![0_u64; words];
+        // SAFETY: the buffer has been sized to hold `bytes.len()` bytes rounded up to whole words,
+        // and both pointers are valid for that many bytes with no overlap: the source is the
+        // caller's slice and the destination is a buffer this function owns.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                buffer.as_mut_ptr().cast::<u8>(),
+                bytes.len(),
+            );
+        }
+        let address = DevicePtr::new(buffer.as_ptr() as u64);
+        let backing = Backing::new(address, bytes.len() as u64);
+        self.buffers.push(buffer);
+        self.published.push((key.clone(), backing));
+        Ok(backing)
+    }
 }
 
 /// A calibrated NVFP4 matrix, as the `nvfp4_gemm` operator reads it.
