@@ -542,7 +542,6 @@ impl EngineControl {
             build_config,
             model: PathBuf::from(&spec.model),
             requests: self.request_address.clone(),
-            processes: self.processes.clone(),
             engine,
             program_server: program_server.display().to_string(),
             devices: placement.devices.clone(),
