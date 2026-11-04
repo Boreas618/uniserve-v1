@@ -30,10 +30,15 @@ use ipc::{
 };
 
 /// How long a command answer may take.
-const ANSWER: Duration = Duration::from_secs(10);
+///
+/// Generous because the first one is the whole boot of a policy: the precopy
+/// compiles the `fcfs` module inside a debug build, on a machine that runs this
+/// suite's tests in parallel. The bound is the harness's, not the mechanism's;
+/// a mechanism that stopped answering would still fail here, only later.
+const ANSWER: Duration = Duration::from_secs(60);
 
 /// How long a request may take to emit its first token.
-const FIRST_TOKEN: Duration = Duration::from_secs(20);
+const FIRST_TOKEN: Duration = Duration::from_secs(60);
 
 /// The token this pool samples for the `index`th call of every batch.
 const SAMPLED: u32 = 1000;
