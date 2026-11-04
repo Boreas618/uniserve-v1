@@ -1552,12 +1552,59 @@ impl MainProcess {
     /// again resumes it in place instead of reading its pages back. Weights and storage stay mapped
     /// and the threads stay up - a drain is not an exit, and the daemon's `Serve` is what ends it.
     fn drain(&mut self, epoch: u64) -> Result<()> {
+        // An update cannot cross the drain: its switchover takes effect at a batch boundary and a
+        // drained epoch reaches none, so what the precopy built is given back now rather than left
+        // prepared for a boundary that cannot come.
+        self.drop_prepared("the epoch drained before its switchover")?;
         self.park_schedulers("draining the epoch")?;
         self.send_report(proto::process::Report {
             kind: Some(proto::process::report::Kind::Drained(
                 proto::process::Drained { epoch },
             )),
         });
+        Ok(())
+    }
+
+    /// Gives back what an in-flight update prepared, by name.
+    ///
+    /// A precopy still running is abandoned through its own path, which discards the captures on
+    /// every device, reinstates the serving policy and answers the peer or the daemon that asked.
+    /// A generation already prepared is discarded the same way: the device queue orders the discard
+    /// after the walk that captured it, and the generation that serves keeps its plans.
+    fn drop_prepared(&mut self, reason: &str) -> Result<()> {
+        if let Some(precopy) = self.precopy.take() {
+            let generation = precopy.generation;
+            let reply = precopy.reply;
+            self.precopy = Some(precopy);
+            return self.abandon_precopy(
+                generation,
+                UpdateFailure::Precopy {
+                    reason: reason.to_owned(),
+                },
+                reply,
+            );
+        }
+        let Some(generation) = self.prepared.first().map(|built| built.number()) else {
+            return Ok(());
+        };
+        self.discard_policy();
+        for executor in &self.executors {
+            match executor.discard(generation) {
+                Ok(submission) => {
+                    if let Err(error) =
+                        device_command(&self.watchdog, executor.device(), "discard", submission)
+                    {
+                        // The generation never serves: a discard that did not finish holds storage
+                        // until the purge, and the epoch that drained is not made to fail for it.
+                        tracing::warn!(%error, generation, "discarding a prepared generation failed");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, generation, "queueing a prepared generation's discard failed");
+                }
+            }
+        }
+        self.prepared.clear();
         Ok(())
     }
 
