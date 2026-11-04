@@ -898,8 +898,14 @@ static int mux_stream(UsvMuxer *muxer, AVFormatContext *input, int index,
             av_packet_unref(packet);
             continue;
         }
+        /* The reference drops a packet without a decode timestamp, which is
+         * the demuxer's flush packet: it has no timeline position to shift. */
+        if (packet->dts == AV_NOPTS_VALUE) {
+            av_packet_unref(packet);
+            continue;
+        }
         packet->pts = (packet->pts == AV_NOPTS_VALUE ? 0 : packet->pts) + offset;
-        packet->dts = (packet->dts == AV_NOPTS_VALUE ? 0 : packet->dts) + offset;
+        packet->dts = packet->dts + offset;
         packet->stream_index = target->index;
         if (last) {
             int64_t duration = packet->duration ? packet->duration : 1;
