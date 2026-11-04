@@ -138,7 +138,7 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
             .filter(|bucket| bucket.variant.media())
             .copied()
             .collect();
-        buckets.sort_by(|left, right| right.tokens.cmp(&left.tokens));
+        buckets.sort_by_key(|bucket| std::cmp::Reverse(bucket.tokens));
         buckets
     }
 
