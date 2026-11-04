@@ -434,7 +434,7 @@ pub fn sources(config: &AudioVaeConfig) -> Result<Vec<Source>> {
 pub const BLOCKS_PER_STAGE: usize = 3;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The checkpoint's audio VAE config (`audio_vae/config.json`).
