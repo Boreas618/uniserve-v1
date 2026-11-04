@@ -537,8 +537,13 @@ mod tests {
             .expect("the batch is queued");
 
         // The device loop, as the executor performs it: one job of a multi-job command per turn.
+        // The turns are counted rather than looped to `None`: `next` waits until an entry arrives
+        // or the queue closes, so an idle queue is not an end and a `while let` over it would spin.
         let mut order = Vec::new();
-        while let Some(entry) = queue.next(Some(Duration::from_millis(5))) {
+        for _ in 0..4 {
+            let entry = queue
+                .next(Some(Duration::from_secs(1)))
+                .expect("a queued command within a second");
             // The job list is taken out of the command the loop owns; the entry stays whole for
             // the completion call below.
             let command = entry.command.clone();
@@ -605,16 +610,24 @@ mod tests {
             )
             .expect("queued");
 
-        let mut turns = 0;
-        while let Some(entry) = queue.next(Some(Duration::from_millis(5))) {
-            turns += 1;
-            if turns == 1 {
-                queue.complete(entry, Err(Error::State("the shadow comparison failed".into())), None);
-            } else {
-                panic!("the rest of the command was performed after a failure");
-            }
-        }
+        let entry = queue
+            .next(Some(Duration::from_secs(1)))
+            .expect("the first step of the command");
+        queue.complete(
+            entry,
+            Err(Error::State("the shadow comparison failed".into())),
+            None,
+        );
         assert!(matches!(precopy.outcome(), Some(Outcome::Failed(_))));
+
+        // Nothing of the command survives the failure: the queue holds no further step, which is
+        // what closing then reading it says. A `while let` over `next` cannot say it - `next` waits
+        // for an entry or the close, so an idle queue never ends the loop.
+        queue.close();
+        assert!(
+            queue.next(Some(Duration::from_millis(10))).is_none(),
+            "the rest of the command was performed after a failure"
+        );
     }
 
     /// A deferred-release wait is a command of its own, after everything submitted before it.

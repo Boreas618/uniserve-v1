@@ -2235,13 +2235,26 @@ pub fn calls_output(
         .zip(states)
         .map(|(call, state)| CallOutput::completed(*call, Vec::new(), *state))
         .collect();
-    for (index, row) in sampling_rows.iter().copied().enumerate() {
-        // `logits_rows` names the token row that feeds `logits`; a negative entry is a row that
-        // samples nothing (a padded row, or a prefill chunk that ends no prompt).
-        if row < 0 {
+    for (index, logits_row) in sampling_rows.iter().copied().enumerate() {
+        // `logits_rows` names, for the batch row at `index`, the token row whose logits it samples
+        // from; a negative entry is a row that samples nothing (a padded row, or a prefill chunk
+        // that ends no prompt). The sample belongs to the **batch row**, which is the position -
+        // attributing it to the row it read its logits from would hand one request another
+        // request's token as soon as a batch's logits layout is not the identity.
+        if logits_row < 0 {
             continue;
         }
-        let row = row as u32;
+        let logits_row = logits_row as u32;
+        if !rows
+            .calls
+            .iter()
+            .any(|call| call.rows.contains(&logits_row))
+        {
+            return Err(Error::Invariant(format!(
+                "sampling row {logits_row} names a token row the batch does not hold"
+            )));
+        }
+        let row = index as u32;
         let (position, _) = rows
             .calls
             .iter()
@@ -2407,9 +2420,12 @@ mod tests {
             assert_eq!(descriptor.vocab, 1_024);
             assert_eq!(descriptor.index, DType::I32);
         }
-        // A catalog whose rows are all small needs one key.
-        let small = Buckets::causal_lm(&[1, 3], &[4], false);
-        assert_eq!(commit_descriptors(&small, 1_024).len(), 1);
+        // One key per block a catalog's rows fall into: rows 1 and 3 land in blocks 1 and 4, and a
+        // catalog whose rows share one block needs one key.
+        let two_blocks = Buckets::causal_lm(&[1, 3], &[4], false);
+        assert_eq!(commit_descriptors(&two_blocks, 1_024).len(), 2);
+        let one_block = Buckets::causal_lm(&[3], &[4], false);
+        assert_eq!(commit_descriptors(&one_block, 1_024).len(), 1);
     }
 
     /// A warm pose's commit table is inert and complete: every column is present, no row names a

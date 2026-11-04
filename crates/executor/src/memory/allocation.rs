@@ -1247,19 +1247,19 @@ mod element_type_tests {
 
     /// The eight element types the kernel ABI describes, and the six storage
     /// carries that no kernel operand names.
-    const KERNEL: [ElementType; 7] = [
+    const KERNEL: [ElementType; 8] = [
         ElementType::U8,
         ElementType::I32,
         ElementType::I64,
+        ElementType::I16,
         ElementType::F16,
         ElementType::BF16,
         ElementType::F32,
         ElementType::F8E4M3,
     ];
-    const STORAGE_ONLY: [ElementType; 6] = [
+    const STORAGE_ONLY: [ElementType; 5] = [
         ElementType::Bool,
         ElementType::I8,
-        ElementType::I16,
         ElementType::U32,
         ElementType::F64,
         ElementType::F8E5M2,

@@ -205,6 +205,18 @@ pub(crate) struct Launch {
     /// Required, not defaulted: a world of one on a multi-node deployment sizes this rank's storage
     /// claim for one rank, and the second node's claim would collide with it.
     pub world_size: u32,
+    /// Whether this process was started as the standby of the epoch that serves: it maps its
+    /// scope's storage, loads the epoch's weights, opens its pools and captures its graphs, and
+    /// then parks - executing nothing and admitting nothing - and reports `Parked`. The daemon
+    /// promotes it in place (`Promote`, answered `Promoted`) and only then does the frontend
+    /// submit to it (§2.5, §7.4).
+    ///
+    /// Defaulted rather than required, so that a launch file written before this field existed
+    /// still reads: an initial process is not a standby, and `false` says exactly that. A standby
+    /// that claimed its storage writable would give its scope two writers, which is why the role
+    /// is the launcher's statement rather than the process's guess.
+    #[serde(default)]
+    pub standby: bool,
 }
 
 impl Launch {
@@ -656,7 +668,7 @@ impl MainProcess {
         // and holds none would accept requests and dispatch nothing, which is refused by name.
         let schedulers = schedulers(&plan, launch, &memory, &model, &executors)?;
 
-        Ok(Self {
+        let mut process = Self {
             control,
             schedulers,
             executors,
@@ -675,13 +687,38 @@ impl MainProcess {
             process,
             stopping: false,
             streams: Vec::new(),
-            // The epoch serves from the end of `start` until the daemon drains it; a process the
-            // daemon spawned as a standby parks itself at the end of `start` instead, and the
-            // `Promote` that follows resumes it (2.5).
-            serving: true,
+            // The epoch serves from the end of `start` until the daemon drains it, unless the
+            // launcher started it as a standby: that one parks itself here, before it can admit
+            // anything, and the `Promote` that follows resumes it (2.5, 7.4).
+            serving: !launch.standby,
             parked: None,
             paused: false,
-        })
+        };
+        if launch.standby {
+            process.park_standby()?;
+        }
+        Ok(process)
+    }
+
+    /// §2.5: a standby that has prepared announces itself and executes nothing until promoted.
+    ///
+    /// Its schedulers hold no request and have served no world, so parking them would ask for a
+    /// cache handover that belongs to a drained epoch; what makes this a park is that nothing is
+    /// admitted. `Promote` is the command that ends it.
+    ///
+    /// The report means exactly "prepared and admitted nothing", which is what the daemon gates
+    /// its promotion on: it is sent after `start` has mapped the weights, opened the memory and
+    /// started the runners, and *before* the epoch's first generation has been warmed - a warmup
+    /// belongs to the first switchover, and a standby's own generation reaches it when the daemon
+    /// sends the epoch's programs.
+    fn park_standby(&mut self) -> Result<()> {
+        self.serving = false;
+        self.send_report(proto::process::Report {
+            kind: Some(proto::process::report::Kind::Parked(proto::process::Parked {
+                generation: self.update.current(),
+            })),
+        });
+        Ok(())
     }
 
     /// Serves until the daemon closes the process or a failure ends it.
@@ -982,6 +1019,14 @@ impl MainProcess {
         command: proto::process::Command,
     ) -> Result<Option<UpdateFailure>> {
         let current = self.update.current();
+        // A revert carries the daemon's own account of why, which `ipc::ProgramCommand` does not
+        // keep: read it here so the report repeats the operator's reason rather than inventing one.
+        let reverted_by = match &command.kind {
+            Some(proto::process::command::Kind::Revert(revert)) => {
+                Some(revert.reason.clone()).filter(|reason| !reason.is_empty())
+            }
+            _ => None,
+        };
         let Some(program) = ProgramCommand::from_command(command.clone(), current)? else {
             // The rest are this process's own lifecycle, and no scheduler's: sched's handle
             // answers every one of them with exactly that (a park, promote, drain, serve or pause
@@ -1022,7 +1067,7 @@ impl MainProcess {
             }
             return Ok(None);
         };
-        match self.program(program, None)? {
+        match self.program_with(program, None, reverted_by)? {
             // A precopy answers when its installs finish, from `advance_precopy`.
             None => Ok(None),
             Some(status) => {
@@ -1060,6 +1105,20 @@ impl MainProcess {
         command: ProgramCommand,
         reply: Option<u32>,
     ) -> Result<Option<ProgramStatus>> {
+        self.program_with(command, reply, None)
+    }
+
+    /// §7.3: one program-layer command, with the daemon's own reason when it stated one.
+    ///
+    /// A revert's reason is the daemon's account of why an operator ended the probation; it is
+    /// carried into the epoch's record instead of a reason this process makes up. A peer's command
+    /// states none, and the epoch's own failures state their own.
+    fn program_with(
+        &mut self,
+        command: ProgramCommand,
+        reply: Option<u32>,
+        reverted_by: Option<String>,
+    ) -> Result<Option<ProgramStatus>> {
         let status = match command {
             ProgramCommand::Precopy {
                 generation,
@@ -1071,10 +1130,14 @@ impl MainProcess {
             }
             ProgramCommand::Switchover { generation, step } => self.switchover(generation, step)?,
             ProgramCommand::Commit { generation } => self.commit(generation)?,
+            // The operator's rollback is the daemon's decision, and its reason - when the
+            // daemon states one - is what the record keeps. It is not a policy failure: nothing
+            // about the scheduling policy failed, and saying it did would put a policy error in
+            // the epoch's record and in the daemon's account of why the update ended.
             ProgramCommand::Revert { generation } => self.revert(
                 generation,
-                UpdateFailure::Policy {
-                    error: "the daemon reverted the update".into(),
+                UpdateFailure::Threshold {
+                    reason: reverted_by.unwrap_or_else(|| "the daemon reverted the update".into()),
                 },
             )?,
             ProgramCommand::Purge { generation } => self.purge(generation)?,
@@ -1774,14 +1837,141 @@ impl MainProcess {
         &mut self,
         command: proto::request::wire::EngineCommand,
     ) -> Result<Option<UpdateFailure>> {
-        // The request connection carries the epoch's own lifecycle commands. `Shutdown` ends the
-        // epoch: every request finishes as aborted, the workers close and the process exits, which
-        // is what `close` does in the order the owners need (§2.3). The rest are the routing's and
-        // the daemon's successor machinery's - they apply to connections this node does not hold -
-        // while the epoch layer's Park, Promote, Serve, Drain and Pause arrive on the process
-        // connection, where the schedulers take them.
-        if let Some(proto::request::wire::engine_command::Kind::Shutdown(_)) = command.kind {
-            self.stopping = true;
+        // §2.3: the epoch's lifecycle - Park, Promote, Serve, Drain, Pause, the program layer's
+        // stages - arrives on the process connection and is applied by the driver. On this
+        // connection the epoch owns exactly one command, `Shutdown`: every request finishes as
+        // aborted and the owners close in the order they need (`close`).
+        //
+        // The rest are the engine surface of the worker era, and the daemon's migration, expert
+        // and admin paths still send them here. Each is answered with what it needs instead of
+        // being dropped: a command a process does not serve is otherwise a caller waiting for a
+        // reply that never comes, which is a hang with no name in it.
+        let refused = match command.kind {
+            Some(proto::request::wire::engine_command::Kind::Shutdown(_)) => {
+                self.stopping = true;
+                return Ok(None);
+            }
+            Some(proto::request::wire::engine_command::Kind::Hook(hook)) => Some(
+                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
+                    id: hook.id,
+                    results: Vec::new(),
+                    error: WORKER_ERA.to_owned(),
+                }),
+            ),
+            Some(proto::request::wire::engine_command::Kind::ResizeCache(resize)) => {
+                Some(proto::request::wire::from_engine::Kind::Hooked(
+                    proto::request::wire::Hooked {
+                        id: resize.id,
+                        results: Vec::new(),
+                        error: WORKER_ERA.to_owned(),
+                    },
+                ))
+            }
+            Some(proto::request::wire::engine_command::Kind::UpdateWeights(update)) => Some(
+                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
+                    id: update.id,
+                    results: Vec::new(),
+                    error: WORKER_ERA.to_owned(),
+                }),
+            ),
+            Some(proto::request::wire::engine_command::Kind::CommitExperts(commit)) => Some(
+                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
+                    id: commit.id,
+                    results: Vec::new(),
+                    error: WORKER_ERA.to_owned(),
+                }),
+            ),
+            Some(proto::request::wire::engine_command::Kind::CacheWarm(warm)) => Some(
+                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
+                    id: warm.id,
+                    results: Vec::new(),
+                    error: WORKER_ERA.to_owned(),
+                }),
+            ),
+            // The worker era's park, resume and trial commit move a worker world between
+            // processes. The epoch parks, resumes and commits through the process connection, in
+            // front of the frontend rather than behind it (§2.5, §7.4).
+            Some(proto::request::wire::engine_command::Kind::Park(park)) => Some(
+                proto::request::wire::from_engine::Kind::Parked(proto::request::wire::Parked {
+                    id: park.id,
+                    error: EPOCH_LIFECYCLE.to_owned(),
+                    index: Vec::new(),
+                }),
+            ),
+            Some(proto::request::wire::engine_command::Kind::Resume(resume)) => Some(
+                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
+                    id: resume.id,
+                    results: Vec::new(),
+                    error: EPOCH_LIFECYCLE.to_owned(),
+                }),
+            ),
+            Some(proto::request::wire::engine_command::Kind::Commit(commit)) => Some(
+                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
+                    id: commit.id,
+                    results: Vec::new(),
+                    error: EPOCH_LIFECYCLE.to_owned(),
+                }),
+            ),
+            // The scheduling limits are the schedulers', applied at their next step through the
+            // policy slot the process connection names (§4.4).
+            Some(proto::request::wire::engine_command::Kind::Configure(configure)) => Some(
+                proto::request::wire::from_engine::Kind::Configured(
+                    proto::request::wire::Configured {
+                        id: configure.id,
+                        error: EPOCH_LIFECYCLE.to_owned(),
+                    },
+                ),
+            ),
+            // The storage ledgers and the transfer budgets are each node's daemon's, read over
+            // its claim (§8); an epoch's main process holds no claim of the deployment's.
+            Some(proto::request::wire::engine_command::Kind::DescribeStorage(describe)) => Some(
+                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
+                    id: describe.id,
+                    results: Vec::new(),
+                    error: LEDGERS.to_owned(),
+                }),
+            ),
+            Some(proto::request::wire::engine_command::Kind::ThrottleTransfers(throttle)) => Some(
+                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
+                    id: throttle.id,
+                    results: Vec::new(),
+                    error: LEDGERS.to_owned(),
+                }),
+            ),
+            // What the prefix cache holds is the schedulers' answer, and they are asked through
+            // the process connection.
+            Some(proto::request::wire::engine_command::Kind::DescribeCache(describe)) => Some(
+                proto::request::wire::from_engine::Kind::CacheDescribed(
+                    proto::request::wire::CacheDescribed {
+                        id: describe.id,
+                        error: EPOCH_LIFECYCLE.to_owned(),
+                        segments: Vec::new(),
+                    },
+                ),
+            ),
+            Some(proto::request::wire::engine_command::Kind::DescribeRequests(describe)) => Some(
+                proto::request::wire::from_engine::Kind::RequestsDescribed(
+                    proto::request::wire::RequestsDescribed {
+                        id: describe.id,
+                        error: EPOCH_LIFECYCLE.to_owned(),
+                        requests: Vec::new(),
+                    },
+                ),
+            ),
+            // Promote, FlushCache and Attach state no id and are answered with a state this
+            // process does not own: there is nothing to answer on, and a log line is what is
+            // left.
+            Some(other) => {
+                tracing::warn!(
+                    "the daemon sent an engine command this epoch does not serve: {}",
+                    engine_command_name(&other)
+                );
+                None
+            }
+            None => None,
+        };
+        if let Some(kind) = refused {
+            self.send_event(kind);
         }
         Ok(None)
     }
@@ -1997,6 +2187,9 @@ impl MainProcess {
         for error in self.blocking.close() {
             tracing::warn!(%error, "closing a blocking lane failed");
         }
+        // The caches a park handed back name segments of the pools below: they go before the
+        // resident owners close, so nothing the memory releases is still described as parked.
+        self.parked = None;
         if let Some(memory) = self.memory.take() {
             if let Err(error) = memory.close() {
                 tracing::warn!(%error, "closing the resident owners failed");
@@ -2188,6 +2381,48 @@ fn answer(
         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
             bail!("{what} lost its scheduler")
         }
+    }
+}
+
+/// What the engine answers a command of the worker era's surface: the operation named a worker
+/// world of its own, and this epoch executes batches itself (§2.4).
+const WORKER_ERA: &str =
+    "this epoch has no worker of that kind: the command names a worker-era engine, and the epoch's \
+     executors are the process's own";
+
+/// What the engine answers a command whose owner is the epoch layer: the same operation exists,
+/// and it is asked for through the process connection, where the driver applies it (§2.5, §7.4).
+const EPOCH_LIFECYCLE: &str =
+    "this command is the epoch layer's, applied through the process connection rather than the \
+     request connection";
+
+/// What the engine answers a command over the deployment's storage ledgers or transfer budgets:
+/// each node's daemon reads them over the claim it holds, not through an epoch's main process (§8).
+const LEDGERS: &str =
+    "the storage ledgers and transfer budgets are read by each node's daemon over its claim, not \
+     by an epoch's main process";
+
+/// The name of an engine command, for a log line about one this epoch does not serve.
+fn engine_command_name(kind: &proto::request::wire::engine_command::Kind) -> &'static str {
+    use proto::request::wire::engine_command::Kind;
+    match kind {
+        Kind::Shutdown(_) => "shutdown",
+        Kind::Promote(_) => "promote",
+        Kind::FlushCache(_) => "flush_cache",
+        Kind::Hook(_) => "hook",
+        Kind::Configure(_) => "configure",
+        Kind::Attach(_) => "attach",
+        Kind::ResizeCache(_) => "resize_cache",
+        Kind::UpdateWeights(_) => "update_weights",
+        Kind::Park(_) => "park",
+        Kind::Resume(_) => "resume",
+        Kind::Commit(_) => "commit",
+        Kind::DescribeCache(_) => "describe_cache",
+        Kind::DescribeStorage(_) => "describe_storage",
+        Kind::ThrottleTransfers(_) => "throttle_transfers",
+        Kind::DescribeRequests(_) => "describe_requests",
+        Kind::CacheWarm(_) => "cache_warm",
+        Kind::CommitExperts(_) => "commit_experts",
     }
 }
 
