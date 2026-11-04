@@ -1028,17 +1028,21 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         self.staging.stage(&batch.columns, &batch.calls, &shape, bucket)?;
         // The operators whose kernel differs between the serving generation and the one the batch
         // names are the ones the paired forwards compare (7.3 step 2).
+        let next = self.generation_named(batch.generation)?;
         let mut jobs = Vec::new();
         for (operator, key, kernel) in self.generation.iter() {
-            let same = self
-                .generation_named(batch.generation)
-                .map(|next| {
-                    next.kernel(operator, key)
-                        .map(|candidate| Arc::ptr_eq(candidate, kernel))
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
-            if same {
+            let Ok(candidate) = next.kernel(operator, key) else {
+                // The new generation has no program under this key: its program for the operator
+                // is a different descriptor, whose kernel output cannot be paired with this one.
+                // The precopy's walk recaptures such a bucket; there is nothing to compare here.
+                tracing::debug!(
+                    operator,
+                    key,
+                    "the prepared generation has no program under this key; no paired forward"
+                );
+                continue;
+            };
+            if Arc::ptr_eq(candidate, kernel) {
                 continue;
             }
             jobs.push(Job::Shadow {
