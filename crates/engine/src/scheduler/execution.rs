@@ -172,12 +172,13 @@ impl Scheduler {
     /// Returns whether the loop made progress or handled an executor outcome.
     #[cfg(feature = "testing")]
     pub fn step(&mut self, commands: &Receiver<Command>) -> bool {
-        if self.drain_commands(commands) {
+        let (stop, handled) = self.drain_commands(commands);
+        if stop {
             self.abort_all_requests();
             let _ = self.executor.close();
             return false;
         }
-        let progressed = self.step_nonblocking();
+        let progressed = self.step_nonblocking() || handled;
         if progressed || self.inflight.pending_batches.is_empty() {
             return progressed;
         }

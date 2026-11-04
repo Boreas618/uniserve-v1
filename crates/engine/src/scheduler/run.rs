@@ -731,19 +731,23 @@ impl Scheduler {
 
     /// All drivers consume the same command ingress before scheduling work.
     ///
-    /// Applies every queued command without blocking. Returns `true` when the
-    /// engine must stop: a `Shutdown` command arrived or every sender has
-    /// disconnected.
-    pub(super) fn drain_commands(&mut self, commands: &Receiver<Command>) -> bool {
+    /// Applies every queued command without blocking. Answers whether the
+    /// engine must stop — a `Shutdown` command arrived or every sender has
+    /// disconnected — and whether any command was applied, which is progress a
+    /// tick made even when it formed no batch: a submission that only queues a
+    /// request still changed the world a step is planned from.
+    pub(super) fn drain_commands(&mut self, commands: &Receiver<Command>) -> (bool, bool) {
+        let mut handled = false;
         loop {
             match commands.try_recv() {
                 Ok(command) => {
+                    handled = true;
                     if self.handle_command(command) {
-                        return true;
+                        return (true, handled);
                     }
                 }
-                Err(crossbeam_channel::TryRecvError::Empty) => return false,
-                Err(crossbeam_channel::TryRecvError::Disconnected) => return true,
+                Err(crossbeam_channel::TryRecvError::Empty) => return (false, handled),
+                Err(crossbeam_channel::TryRecvError::Disconnected) => return (true, handled),
             }
         }
     }
@@ -758,11 +762,12 @@ impl Scheduler {
     /// returning.
     pub fn run(mut self, rx: Receiver<Command>) -> bool {
         loop {
-            if self.drain_commands(&rx) {
+            let (stop, handled) = self.drain_commands(&rx);
+            if stop {
                 break;
             }
 
-            let progressed = self.step_nonblocking();
+            let progressed = self.step_nonblocking() || handled;
             // An update's shadow pass is answered once the step that ran it has
             // ended (§7.3 step 2): the answer never claims a comparison the
             // step has not finished.
