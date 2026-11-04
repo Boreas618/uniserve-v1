@@ -1390,7 +1390,7 @@ mod tests {
     /// (§7.3 steps 4-6).
     #[test]
     fn a_program_update_serves_from_the_generation_it_switched_to_until_it_is_committed() {
-        use crate::engine::stand_in::{main_processes, process, Answer, Seen};
+        use crate::engine::stand_in::{Answer, Seen, main_processes, process};
 
         let (commands, seen) =
             main_processes(vec![(7, Answer::Serves(11)), (8, Answer::Serves(12))]);
@@ -1494,7 +1494,11 @@ mod tests {
             .insert("max_batch".to_owned(), toml::Value::Integer(8));
         target.programs = programs.clone();
         epochs
-            .apply_programs(Update::new(1, target.clone()), vec![process("rank-0", 7)], false)
+            .apply_programs(
+                Update::new(1, target.clone()),
+                vec![process("rank-0", 7)],
+                false,
+            )
             .expect("the update switches over");
         assert!(epochs.program_in_flight());
 
@@ -1516,7 +1520,10 @@ mod tests {
         assert!(record.previous_policy.is_none());
         assert!(epochs.program_update().is_none());
         assert_eq!(
-            epochs.update().expect("the update is recorded").first_failure,
+            epochs
+                .update()
+                .expect("the update is recorded")
+                .first_failure,
             Some(failure.clone())
         );
         assert_eq!(epochs.unavailable(&target), Some(failure));
