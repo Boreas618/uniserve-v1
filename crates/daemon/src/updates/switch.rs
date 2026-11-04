@@ -143,6 +143,44 @@ pub(crate) trait Roster {
     fn events(&mut self) -> Vec<Event>;
 }
 
+/// A boxed roster commands exactly as the roster inside it, so the daemon can
+/// hold one trait object for the adapter it constructs once.
+impl<T: Roster + ?Sized> Roster for Box<T> {
+    fn claim(
+        &mut self,
+        host: &str,
+        world: u64,
+        scopes: &[process::Scope],
+        retire: &[u64],
+    ) -> Result<(), String> {
+        (**self).claim(host, world, scopes, retire)
+    }
+
+    fn spawn(&mut self, spawn: Spawn) -> Result<u32, String> {
+        (**self).spawn(spawn)
+    }
+
+    fn stop(&mut self, host: &str, group: &str, generation: Option<u64>) {
+        (**self).stop(host, group, generation)
+    }
+
+    fn command(&mut self, host: &str, generation: u64, command: process::Command) {
+        (**self).command(host, generation, command)
+    }
+
+    fn serve(&mut self, epoch: u64, requests: &str) {
+        (**self).serve(epoch, requests)
+    }
+
+    fn resume(&mut self, host: &str, generation: u64, reason: &str) {
+        (**self).resume(host, generation, reason)
+    }
+
+    fn events(&mut self) -> Vec<Event> {
+        (**self).events()
+    }
+}
+
 /// Where a switch is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
