@@ -964,6 +964,23 @@ impl<'a> WeightLoader<'a> {
         })
     }
 
+    /// The same checkpoint and store read under another element-type policy.
+    ///
+    /// A model whose components need different element types builds one loader per policy over the
+    /// same store: a component that pins its own type (the AdaLN projections' tables are FP32 at
+    /// every deployment, because our `gemm` has one element type for both operands) reads through
+    /// this rather than converting its activations to whatever the checkpoint happens to hold.
+    pub fn with_precision<'b>(&'b mut self, dtype: Option<DType>) -> Result<WeightLoader<'b>> {
+        let loader = WeightLoader {
+            checkpoint: self.checkpoint,
+            store: self.store,
+            dtype,
+            quantization: self.quantization,
+        };
+        loader.check_policy(self.checkpoint)?;
+        Ok(loader)
+    }
+
     /// Whether this loader's policy describes `checkpoint`'s weights.
     fn check_policy(&self, checkpoint: &Checkpoint) -> Result<()> {
         let held = checkpoint.dtypes();
