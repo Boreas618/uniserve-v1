@@ -232,6 +232,9 @@ pub(crate) struct Switch {
     committed: BTreeSet<String>,
     /// Hosts whose target main process acknowledged its revert.
     target_reverted: BTreeSet<String>,
+    /// Hosts whose target main process exited: they cannot be commanded, and
+    /// their failure is what started the return.
+    target_dead: BTreeSet<String>,
     failure: Option<Failure>,
     /// Where the switchover began and how long its pause took: from its first
     /// promote to the last drained epoch.
@@ -291,6 +294,7 @@ impl Switch {
             pending_restore: None,
             committed: BTreeSet::new(),
             target_reverted: BTreeSet::new(),
+            target_dead: BTreeSet::new(),
             failure: None,
             switchover_started: None,
             pause: None,
@@ -568,19 +572,30 @@ impl Switch {
     /// serves: the previous epoch admits again, the frontend serves it, and
     /// the target is stopped and retired.
     /// Starts the return to the previous epoch after the target died or
-    /// faulted while serving: every host returns the parked previous epoch to
-    /// serving (§7.4), and the frontend is served it only once every host
-    /// says it serves.
+    /// faulted while serving: every target that still runs is reverted, so no
+    /// host keeps serving the trial, and then every host returns the parked
+    /// previous epoch to serving (§7.4). The frontend is served it only once
+    /// every host says it serves.
     fn restore(&mut self, roster: &mut impl Roster, failure: Failure) {
         self.update.fail(failure.clone());
+        let reason = failure.reason.clone();
         self.failure = Some(failure.clone());
         self.pending_restore = Some(failure);
         self.phase = Phase::Reverting;
-        let reason = self
-            .failure
-            .as_ref()
-            .map(|failure| failure.reason.clone())
-            .unwrap_or_default();
+        let generation = self.target_generation();
+        for node in &self.nodes {
+            // A dead target is not commanded: its exit is the failure.
+            if self.target_dead.contains(&node.host) {
+                continue;
+            }
+            roster.command(
+                &node.host,
+                generation,
+                command(process::command::Kind::Revert(process::Revert {
+                    reason: reason.clone(),
+                })),
+            );
+        }
         self.resume(roster, &reason);
     }
 
@@ -712,6 +727,7 @@ impl Switch {
                 _ => {}
             }
         } else if self.is_target(generation) {
+            self.target_dead.insert(host.clone());
             match self.phase {
                 Phase::Preparing | Phase::Promoting => self.failed(roster, failure),
                 Phase::Serving => self.restore(roster, failure),
@@ -1497,6 +1513,41 @@ mod tests {
                 .unavailable()
                 .map(|failure| failure.kind.as_str()),
             Some("process_exit")
+        );
+    }
+
+    /// A target that dies while its sibling still serves ends the sibling's
+    /// trial too: the survivor is reverted, and only the dead host is left
+    /// uncommanded.
+    #[test]
+    fn a_dead_target_reverts_the_sibling_that_still_runs() {
+        let (_epochs, mut switch) = setup();
+        let mut roster = Fake::default();
+        serve_target(&mut roster, &mut switch);
+        roster.commands.clear();
+        roster.serves.clear();
+
+        roster.scripted = vec![exit_event("n0", 6)];
+        switch.advance(&mut roster);
+
+        assert_eq!(switch.phase(), Phase::Reverting);
+        assert_eq!(
+            roster.commands_of(6, |kind| matches!(kind, process::command::Kind::Revert(_))),
+            1,
+            "the dead target is not commanded; its sibling is"
+        );
+        assert!(roster.commands.iter().all(|(host, _, _)| host == "n1"));
+        assert!(
+            roster.serves.is_empty(),
+            "the frontend waits until a previous epoch serves"
+        );
+
+        switch.serving(&mut roster, "n0", 7);
+        switch.serving(&mut roster, "n1", 7);
+        assert_eq!(switch.phase(), Phase::Abandoned);
+        assert_eq!(
+            roster.serves,
+            vec![(11, "unix:/run/requests.sock".to_owned())]
         );
     }
 
