@@ -11,8 +11,8 @@
 
 use scheduling::guest::wire::{self, Call};
 use scheduling::guest::{
-    CallView, ExpertLoad, ExpertOrder, Init, Limits, Nanos, PageId, PhaseId, PhaseKind, Plan,
-    RequestClass, RequestId, RequestState, RequestView, Room, Shortage, Storage, Victim, Work,
+    CallView, ExpertLoad, ExpertOrder, Init, Limits, Nanos, PageId, PhaseId, Plan, RequestId,
+    RequestView, Room, Shortage, Storage, Victim, Work,
 };
 use scheduling::{Engine, PolicyError, PolicyInstance, PolicyModule};
 
@@ -196,24 +196,18 @@ fn engine() -> Engine {
 }
 
 /// A queued token request, as the mechanism views one.
+///
+/// Built from the encoding rather than from a struct literal: a view is an
+/// append-only list, so the fields this test does not name are the defaults the
+/// interface gives them, and a field added to `RequestView` later does not
+/// touch this test.
 fn request() -> RequestView {
-    RequestView {
-        id: RequestId(1),
-        state: RequestState::Queued,
-        phase: None,
-        priority: 0,
-        arrived_at: Nanos(0),
-        admitted_at: None,
-        prompt_tokens: 0,
-        generated_tokens: 0,
-        cached_prefix_tokens: 0,
-        cached_pages: 0,
-        last_emitted_at: None,
-        class: RequestClass::Token,
-        waiting_transfer: false,
-        prefilled_tokens: 0,
-        cache_rank: None,
-    }
+    wire::decode(br#"{"id":1,"state":{"state":"queued"},"class":{"class":"token"}}"#).unwrap()
+}
+
+/// A request's first call on a block.
+fn call() -> CallView {
+    wire::decode(br#"{"request":1,"phase":1,"kind":{"kind":"prefill"}}"#).unwrap()
 }
 
 /// Loads and instantiates `toy` against the default limits.
@@ -267,12 +261,7 @@ fn every_decision_reaches_its_export_and_answers() {
     );
     assert_eq!(policy.route(&request(), &[]).unwrap(), 2);
 
-    let call = CallView {
-        request: RequestId(1),
-        phase: PhaseId(1),
-        kind: PhaseKind::Prefill,
-    };
-    assert_eq!(policy.place(&call, &[]).unwrap(), 1);
+    assert_eq!(policy.place(&call(), &[]).unwrap(), 1);
     policy.observe(&[]).unwrap();
     assert_eq!(policy.failure(), None);
 }
