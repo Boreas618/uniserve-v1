@@ -93,6 +93,7 @@ pub mod phase;
 pub mod platform;
 pub mod rope;
 pub mod sampler;
+pub mod segments;
 pub mod tensor;
 pub mod tolerance;
 pub mod twins;
