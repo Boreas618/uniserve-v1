@@ -62,6 +62,10 @@ pub enum ModuleForm {
     /// is a flat byte blob, not a kernel, so it has neither launch metadata
     /// nor a C entry.
     Wasm,
+    /// An executable program the main process runs as its own process, rather
+    /// than loading into itself. It is stored as it is, so it has neither
+    /// launch metadata nor a C entry.
+    Executable,
 }
 
 /// A kind of source: what compiles a package's files into a module.
@@ -91,11 +95,16 @@ pub enum SourceKind {
 pub enum ToolchainKind {
     /// nvcc, the CUDA toolkit's compiler.
     Nvcc,
-    /// The Program Server's own Python environment, with Triton and CuTe DSL.
-    Python,
-    /// The WebAssembly toolchain: a wasm32 build, then `wasmtime`'s
-    /// precompilation for this host's CPU.
+    /// Triton, from the Program Server's own Python environment.
+    Triton,
+    /// CuTe DSL (the `cutlass-dsl` distribution), from the same environment.
+    CuteDsl,
+    /// The WebAssembly toolchain: a wasm32 build, then the scheduling
+    /// precompiler's wasmtime for this host's CPU.
     Wasm,
+    /// Nothing: a source that compiles nothing, such as a vendor cubin or an
+    /// executable, has no toolchain version to match.
+    None,
 }
 
 impl std::fmt::Display for ToolchainKind {
@@ -108,8 +117,10 @@ impl ToolchainKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Nvcc => "nvcc",
-            Self::Python => "python",
+            Self::Triton => "triton",
+            Self::CuteDsl => "cute_dsl",
             Self::Wasm => "wasm",
+            Self::None => "none",
         }
     }
 }
@@ -157,6 +168,13 @@ pub struct ModuleSpec {
     /// transport workspace around a launch.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub entries: BTreeMap<String, String>,
+    /// A file the package's compile script writes into the build's output:
+    /// a JSON object of role to symbol, which overrides [`Self::entries`] for
+    /// the module this descriptor builds. A package whose modules each launch
+    /// through their own C entry, such as an expert exchange dispatching on
+    /// its mode, names it; `[module.entries]` stays the package's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entries_file: Option<String>,
 }
 
 /// The entry role every native module has: the one that launches the kernel.
@@ -403,7 +421,14 @@ impl Manifest {
                     )));
                 }
             }
-            ModuleForm::Cubin | ModuleForm::Wasm => {
+            ModuleForm::Cubin | ModuleForm::Wasm | ModuleForm::Executable => {
+                if self.module.entries_file.is_some() {
+                    return Err(ManifestError::Invalid(
+                        "only a native module has C entries; a cubin or wasm module has none, and \
+                         no entries file"
+                            .into(),
+                    ));
+                }
                 if !self.module.entries.is_empty() {
                     return Err(ManifestError::Invalid(
                         "only a native module has C entries; a cubin or wasm module has none"

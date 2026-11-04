@@ -204,6 +204,8 @@ impl From<PhaseKind> for wire::ProgramPhase {
         match phase {
             PhaseKind::Prefill => wire::ProgramPhase::Prefill,
             PhaseKind::Decode => wire::ProgramPhase::Decode,
+            PhaseKind::Encode => wire::ProgramPhase::Encode,
+            PhaseKind::Denoise => wire::ProgramPhase::Denoise,
         }
     }
 }
@@ -216,6 +218,8 @@ impl TryFrom<wire::ProgramPhase> for Option<PhaseKind> {
             wire::ProgramPhase::All => None,
             wire::ProgramPhase::Prefill => Some(PhaseKind::Prefill),
             wire::ProgramPhase::Decode => Some(PhaseKind::Decode),
+            wire::ProgramPhase::Encode => Some(PhaseKind::Encode),
+            wire::ProgramPhase::Denoise => Some(PhaseKind::Denoise),
         })
     }
 }
@@ -226,6 +230,7 @@ impl From<ModuleForm> for wire::ModuleForm {
             ModuleForm::Cubin => wire::ModuleForm::Cubin,
             ModuleForm::Native => wire::ModuleForm::Native,
             ModuleForm::Wasm => wire::ModuleForm::Wasm,
+            ModuleForm::Executable => wire::ModuleForm::Executable,
         }
     }
 }
@@ -238,6 +243,7 @@ impl TryFrom<wire::ModuleForm> for ModuleForm {
             wire::ModuleForm::Cubin => Ok(ModuleForm::Cubin),
             wire::ModuleForm::Native => Ok(ModuleForm::Native),
             wire::ModuleForm::Wasm => Ok(ModuleForm::Wasm),
+            wire::ModuleForm::Executable => Ok(ModuleForm::Executable),
             wire::ModuleForm::Unspecified => Err(Error::Protocol("a module has no form".into())),
         }
     }
@@ -689,20 +695,17 @@ impl Client {
         }
     }
 
-    /// The next frame that is not a progress report, with the descriptors
-    /// that rode on it held for the answer it belongs to.
+    /// The next frame, with the descriptors that rode on it held for the
+    /// answer it belongs to.
+    ///
+    /// Progress reports are frames like any other: the requests that report
+    /// builds read them in their own loop, so dropping them here would lose
+    /// every report a caller asked for.
     fn answer(&mut self) -> Result<wire::server_message::Message> {
-        loop {
-            let (message, descriptors) = self.connection.receive::<wire::ServerMessage>()?;
-            match message.message {
-                Some(wire::server_message::Message::Progress(_)) => continue,
-                Some(answer) => {
-                    self.connection.hold(descriptors);
-                    return Ok(answer);
-                }
-                None => return Err(unexpected(None)),
-            }
-        }
+        let (message, descriptors) = self.connection.receive::<wire::ServerMessage>()?;
+        let answer = message.message.ok_or_else(|| unexpected(None))?;
+        self.connection.hold(descriptors);
+        Ok(answer)
     }
 }
 

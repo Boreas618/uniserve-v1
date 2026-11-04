@@ -4,6 +4,7 @@
 
 #![cfg(test)]
 
+mod build;
 mod builder;
 mod manifest;
 mod packages;

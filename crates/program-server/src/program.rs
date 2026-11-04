@@ -31,6 +31,10 @@ pub enum PhaseKind {
     Prefill,
     /// The phase that produces one token per request per step.
     Decode,
+    /// The encoding phase of a diffusion computation: inputs become latents.
+    Encode,
+    /// The denoising phase of a diffusion computation: latents become outputs.
+    Denoise,
 }
 
 impl PhaseKind {
@@ -39,6 +43,8 @@ impl PhaseKind {
         match self {
             Self::Prefill => "prefill",
             Self::Decode => "decode",
+            Self::Encode => "encode",
+            Self::Denoise => "denoise",
         }
     }
 }

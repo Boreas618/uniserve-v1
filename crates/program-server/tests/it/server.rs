@@ -18,7 +18,7 @@ op = "rms_norm"
 backend = "triton"
 
 [toolchain]
-kind = "python"
+kind = "triton"
 version = "3.7.1"
 
 [module]
@@ -62,7 +62,7 @@ fn config(temporary: &Path, upstream: Option<&Path>) -> ServerConfig {
         toolchains: ToolchainConfig {
             nvcc: None,
             python: PathBuf::from("/python/bin/python"),
-            wasmtime: None,
+            wasm: None,
             max_jobs: 1,
         },
         devices: vec![Device {

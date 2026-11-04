@@ -49,6 +49,11 @@ enum ProgramPhase {
   PROGRAM_PHASE_ALL = 0;
   PROGRAM_PHASE_PREFILL = 1;
   PROGRAM_PHASE_DECODE = 2;
+  // The phases of a diffusion computation: the encoding pass that turns
+  // inputs into latents, and the denoising loop that turns latents into
+  // outputs (design section 5.1: a program fills one phase of an operator).
+  PROGRAM_PHASE_ENCODE = 3;
+  PROGRAM_PHASE_DENOISE = 4;
 }
 
 // A program named by its backend and arguments: the server selects the
@@ -127,6 +132,9 @@ enum ModuleForm {
   // a scheduling policy (design section 5.3). A flat blob, with neither
   // launch metadata nor a C entry.
   MODULE_FORM_WASM = 3;
+  // An executable program, stored as it is and run as its own process: it is
+  // not loaded into the main process (design section 5.1).
+  MODULE_FORM_EXECUTABLE = 4;
 }
 
 // The state of one module's build.
