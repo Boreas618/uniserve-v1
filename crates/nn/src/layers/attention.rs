@@ -815,14 +815,31 @@ impl Attention {
     }
 }
 
-/// The per-page scale a plane's call carries: exactly one when the plane is FP8.
+/// The per-page scale a plane's call carries: a table with **one entry per page** when the plane is
+/// FP8, and absent otherwise.
 ///
-/// An FP8 plane without its scale would be read unnormalized and a scaled plane of another type
-/// would multiply a scale the cache never divided by, so both mismatches are refused here rather
-/// than at the launch.
+/// An FP8 plane without its scale would be read unnormalized, a scaled plane of another type would
+/// multiply a scale the cache never divided by, and a *scalar* where the page table belongs would
+/// scale every page of the sequence by one number — the last is the quiet one, since it type-checks,
+/// launches, and answers a plausible tensor. The write divides each page by the page's own FP32
+/// scale, so the reader's operand is a table of the same length: the pages of the plane in F32.
 fn page_scale(plane: TensorView, scale: Option<TensorView>) -> Result<Option<TensorView>> {
     match (plane.dtype == ops::DType::F8E4M3, scale) {
-        (true, Some(scale)) => Ok(Some(scale)),
+        (true, Some(scale)) => {
+            let pages = plane.shape.dim(0);
+            if scale.dtype != ops::DType::F32 || scale.shape.numel() != pages {
+                return Err(Error::shape(
+                    "Attention::attend",
+                    format!(
+                        "an FP8 plane of {pages} pages carries {pages} F32 page scales; the operand \
+                         is {} of {} element(s)",
+                        scale.dtype,
+                        scale.shape.numel()
+                    ),
+                ));
+            }
+            Ok(Some(scale))
+        }
         (true, None) => Err(Error::shape(
             "Attention::attend",
             "an FP8 cache plane needs its per-page scale".to_owned(),
@@ -849,6 +866,44 @@ mod tests {
     use ops::{DType, DevicePtr, Shape};
 
     use super::*;
+
+    /// The reader's scale operand is a page table, not a number: the write divides each page by its
+    /// own scale, so a reader holding one scalar would scale the whole sequence by it — a wrong
+    /// answer that type-checks and launches.
+    #[test]
+    fn a_page_scale_table_has_one_entry_per_page() {
+        let pages = 16_u64;
+        let plane = |dtype| {
+            TensorView::new(
+                DevicePtr::new(0x1_0000),
+                dtype,
+                Shape::new(&[pages, 64, 8, 128]),
+            )
+        };
+        let scale = |elements: u64, dtype| {
+            TensorView::new(DevicePtr::new(0x2_0000), dtype, Shape::new(&[elements]))
+        };
+
+        assert!(page_scale(plane(DType::F8E4M3), Some(scale(pages, DType::F32))).is_ok());
+        assert!(page_scale(plane(DType::F8E4M3), None).is_err(), "no scale at all");
+        assert!(
+            page_scale(plane(DType::F8E4M3), Some(scale(1, DType::F32))).is_err(),
+            "one scalar where a page table belongs"
+        );
+        assert!(
+            page_scale(plane(DType::F8E4M3), Some(scale(pages - 1, DType::F32))).is_err(),
+            "a table short of the plane's pages"
+        );
+        assert!(
+            page_scale(plane(DType::F8E4M3), Some(scale(pages, DType::BF16))).is_err(),
+            "page scales are FP32"
+        );
+        assert!(
+            page_scale(plane(DType::BF16), Some(scale(pages, DType::F32))).is_err(),
+            "a plane of the projection's own type carries no scale"
+        );
+        assert!(page_scale(plane(DType::BF16), None).is_ok());
+    }
 
     #[test]
     fn a_paged_layer_pins_the_page_geometry() {
