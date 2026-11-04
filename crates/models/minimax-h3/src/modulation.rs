@@ -213,6 +213,58 @@ impl AdaLnCache {
     }
 }
 
+
+/// The distinct noise levels the cache holds and the entry each step's group reads.
+///
+/// The cache is indexed by *value*, not by step: the generated video and audio have their own
+/// noise level per step, the visual condition's level is the video's floored at the clean level the
+/// reference anchors it at (`uniserve/models/minimax_h3/denoiser.py`, the modulation table), and an
+/// audio reference is clean at the top of the schedule. Steps whose levels coincide share one entry,
+/// which is where the cache's saving comes from - the schedule's points repeat across the two
+/// modalities and the condition groups.
+///
+/// The result is `(times, entries)`: one FP32 network time per entry, and one entry index per
+/// `(step, group)` in step-major order, ready to be published as the `[steps, groups]` table.
+pub fn entries(
+    video: &[f32],
+    audio: &[f32],
+    groups: Groups,
+) -> Result<(Vec<f32>, Vec<i32>)> {
+    if video.is_empty() || video.len() != audio.len() {
+        return Err(Error::checkpoint(format!(
+            "{} video and {} audio noise levels are not one schedule's",
+            video.len(),
+            audio.len()
+        )));
+    }
+    /// The clean level a visual condition is anchored at: the last sigma point of the schedule.
+    const CLEAN: f32 = 0.999;
+    let mut times: Vec<f32> = Vec::new();
+    let mut table = Vec::with_capacity(video.len() * groups.count() as usize);
+    for (video, audio) in video.iter().zip(audio) {
+        let mut levels = vec![*video, *audio];
+        if groups == Groups::Conditioned {
+            // A visual condition sits at the generated video's level until that level is cleaner
+            // than its anchor, and an audio reference is always clean.
+            levels.push(video.max(CLEAN));
+            levels.push(1.0);
+        }
+        for level in levels {
+            let position = match times.iter().position(|other| other.to_bits() == level.to_bits()) {
+                Some(position) => position,
+                None => {
+                    times.push(level);
+                    times.len() - 1
+                }
+            };
+            table.push(i32::try_from(position).map_err(|_| {
+                Error::checkpoint("an AdaLN cache of more than i32::MAX entries".to_owned())
+            })?);
+        }
+    }
+    Ok((times, table))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,6 +281,32 @@ mod tests {
         // groups holds twelve rows of six vectors.
         assert_eq!(VECTORS, 6);
         assert_eq!(Groups::Conditioned.count() * TAGS, 12);
+    }
+
+
+    #[test]
+    fn the_entries_are_the_distinct_noise_levels() {
+        // Two steps, one modality pair, the generated groups only: four levels, no sharing.
+        let (times, table) = entries(&[0.9, 0.5], &[0.8, 0.4], Groups::Generated).unwrap();
+        assert_eq!(times, vec![0.9, 0.8, 0.5, 0.4]);
+        assert_eq!(table, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn a_shared_level_is_one_entry() {
+        // The same pair of levels in both steps, as the last step of a schedule: two entries.
+        let (times, table) = entries(&[1.0, 1.0], &[1.0, 1.0], Groups::Generated).unwrap();
+        assert_eq!(times, vec![1.0]);
+        assert_eq!(table, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_conditioned_step_reads_four_levels() {
+        // The visual condition is the video's level floored at the clean anchor, and the audio
+        // reference is clean: at the first step both are 1.0, at the second they separate.
+        let (times, table) = entries(&[1.0, 0.5], &[1.0, 0.5], Groups::Conditioned).unwrap();
+        assert_eq!(times, vec![1.0, 0.5, 0.999]);
+        assert_eq!(table, vec![0, 0, 0, 0, 1, 1, 2, 0]);
     }
 
     #[test]
