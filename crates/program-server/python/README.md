@@ -40,3 +40,32 @@ The Program Server runs `<interpreter> <package>/<source.script>` with the packa
 | `MAX_JOBS` | the compile queue's limit on parallel compilers |
 
 The script reads the descriptor's parameter values out of its own manifest, so the keys a package accepts are exactly the descriptor range its `[kernel.descriptors]` declares.
+
+## The trtllm-gen artifact
+
+The attention package that launches TensorRT-LLM's FMHA kernels (design section 9, the native decode attention) compiles against a generated header and loads cubins that no Python distribution carries: FlashInfer pins them as a directory in NVIDIA's kernel artifact repository (`flashinfer.artifacts.ArtifactPath.TRTLLM_GEN_FMHA`, `CheckSumHash.TRTLLM_GEN_FMHA`). `uniserve_program_server.trtllm_gen` fetches that artifact, verifies it and caches it:
+
+```text
+.venv/bin/python -m uniserve_program_server.trtllm_gen --out DIR [--all | --cubin NAME] [--offline] [--verify]
+```
+
+- The pin's identity is the sha256 of its `checksums.txt` (`d79b5c51…`); the manifest is verified against that hash, and every file against the manifest.
+- The cache is content-addressed: `~/.cache/uniserve/program-server/artifacts/<sha256>/`, or `$UNISERVE_ARTIFACT_CACHE`. It works offline for what it holds, and a file that does not verify is fetched again.
+- `--out DIR` stages the generated header (`include/flashInferMetaInfo.h`) and the checksums into `DIR` as symbolic links; `--all` stages all 35 324 cubins, `--cubin NAME` one of them. The command prints a JSON description: the cache, the include directory, every cubin's name, what it staged.
+- A package's build script runs this against `$UNISERVE_OUT` to get the harness it compiles against, and copies the cubins its launch code needs into `$UNISERVE_OUT` so they are published with the module.
+
+Compiling the launch code against the artifact was proved on this host with nvcc 13.0.48, no GPU:
+
+```text
+nvcc -c -std=c++20 -arch=sm_100a \
+  -DTLLM_GEN_FMHA_CUBIN_PATH='"2d6a5a029eefcc388ec0ceb87efb55d8bcce5c3c/fmha/trtllm-gen/"' \
+  -DTLLM_GEN_FMHA_METAINFO_HASH='"d79b5c51fc8597fac57dae0da4afa114fb2014575e4ec3df099ad856d97cabc3"' \
+  -I <flashinfer>/data/include -I <staged>/include \
+  -I <flashinfer>/data/cutlass/include \
+  -I <flashinfer>/data/cccl/libcudacxx/include \
+  -I <flashinfer>/data/cccl/cub -I <flashinfer>/data/cccl/thrust \
+  -o probe.o probe.cu
+```
+
+The two `-D` macros are required (`fmhaKernels.cuh` static-asserts on them). The cubins are loaded at run time through `flashinfer::trtllm_cubin_loader::getCubin`, which the module implements: FlashInfer's `cubin_loader.h` provides the C callback mechanism (`FlashInferSetCubinCallback`/`FlashInferSetCurrentCubin`), and the module decides where the cubins are.
+
