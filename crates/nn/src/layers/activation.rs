@@ -507,6 +507,17 @@ impl Snake {
 pub struct Silu;
 
 impl Silu {
+    /// The descriptor one SiLU launch takes: the element type and the row's column count, which is the
+    /// width the timestep embedding activates.
+    pub fn descriptor_of(dtype: ops::DType, columns: u32) -> ops::activation::SiluDescriptor {
+        ops::activation::SiluDescriptor {
+            dtype,
+            columns,
+            block: BLOCK,
+            pdl: PDL,
+        }
+    }
+
     /// `out = silu(x)` over the rows.
     pub fn forward(&self, f: &Forward, x: TensorView, out: TensorView) -> Result<()> {
         if x.shape.rank() != 2 || x.shape != out.shape {
@@ -517,12 +528,7 @@ impl Silu {
         }
         let columns = u32::try_from(x.shape.last())
             .map_err(|_| Error::shape("Silu", "more columns than a descriptor holds".to_owned()))?;
-        let descriptor = ops::activation::SiluDescriptor {
-            dtype: x.dtype,
-            columns,
-            block: BLOCK,
-            pdl: PDL,
-        };
+        let descriptor = Self::descriptor_of(x.dtype, columns);
         f.operate::<ops::activation::Silu>(&descriptor, ops::activation::SiluArgs { x, out })
     }
 }
