@@ -182,13 +182,22 @@ impl CacheDescription {
         };
         let row_bytes = u64::from(kv_heads) * u64::from(head_dim) * element;
         let plane_bytes = row_bytes * u64::from(block_size);
+        // One column per layer: every layer writes its own column's planes, so
+        // a unit spans EVERY column - its key and value plane and its two
+        // initialized flags - and `CachePlanes` addresses a cell as
+        // `column * num_units + unit` with `columns * num_units` planes per
+        // field. A unit's bytes therefore grow with the layer count, and the
+        // flag bytes are per column too (`2 * columns`), because each field's
+        // flag plane has one byte per cell.
+        let columns = layers.max(1);
+        let per_column = 2 * plane_bytes + 2;
         Self {
-            // One column per layer: every layer writes its own column's unit,
-            // so a page holds one unit whatever the layer count.
-            columns: layers.max(1),
+            columns,
             plane_bytes,
             quantized: false,
-            unit_bytes: 2 * plane_bytes + 2,
+            // The initialized flags live here and nowhere else: `fit_cache`'s
+            // `unit_overhead` is the unit index columns, a different cost.
+            unit_bytes: u64::from(columns) * per_column,
             dtype,
             groups: vec![CacheGroupPlan {
                 window: None,
@@ -467,6 +476,31 @@ fn gcd(left: u32, right: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A dense pool of a model with many layers per group plans, and a unit spans every column.
+    ///
+    /// The geometry was written for a one-column pool and the pools have been per-layer since R8:
+    /// a unit holds each column's key and value plane and its two flags, which `CachePlanes`
+    /// addresses as `column * num_units + unit`. A one-column figure made `CachePlan::new` refuse
+    /// every model with more than two layers, which is every model.
+    #[test]
+    fn a_dense_pool_spans_every_column_in_its_unit() -> Result<()> {
+        let layers = 48;
+        let block_size = 16;
+        let kv_heads = 4;
+        let head_dim = 128;
+        let plan = CachePlan::new(CacheDescription::dense(
+            block_size,
+            layers,
+            kv_heads,
+            head_dim,
+            PrefixCacheDtype::BFloat16,
+        ))?;
+        let column = u64::from(kv_heads) * u64::from(head_dim) * 2 * u64::from(block_size);
+        assert_eq!(plan.columns, layers);
+        assert_eq!(plan.unit_bytes, u64::from(layers) * (2 * column + 2));
+        Ok(())
+    }
 
     /// A plan's request state fields read as the fields of device banks.
     #[test]
