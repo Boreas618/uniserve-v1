@@ -752,7 +752,12 @@ async fn program_update(
                 "update": update.number,
             })))
         }
-        Ok(None) => Ok(None),
+        Ok(None) => Err((
+            StatusCode::CONFLICT,
+            "the program-layer change moved nothing after it was planned: the \
+             deployment changed while this operation ran"
+                .to_owned(),
+        )),
         Err(error) => Err(refused_precopy(admin, &epochs, number, &error)),
     }
 }
