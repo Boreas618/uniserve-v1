@@ -104,6 +104,8 @@ mod parallel;
 mod request;
 mod tensor;
 mod transfer;
+/// The scheduler's name for one phase (§4.5).
+pub mod phase;
 /// The vocabulary of a program-layer update (§7.3).
 pub mod update;
 
@@ -131,4 +133,5 @@ pub use proto::request::{
 pub use request::*;
 pub use tensor::*;
 pub use transfer::*;
+pub use phase::PhaseId;
 pub use update::{ProgramStatus, UpdateFailure};
