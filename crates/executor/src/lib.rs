@@ -16,6 +16,22 @@
 //!   makes them writable again at the same addresses, so captured graphs stay
 //!   valid (§8).
 
+// The runner half of the design: the mechanism-to-executor crossing, captured
+// graphs and their buckets, the graph pools, the device executor and its job
+// queue, the shadow harness, and the runner of a causal language model
+// (§4.4, §4.5, §7.3, §2.4).
+pub mod arena;
+pub mod batch;
+pub mod captured;
+pub mod device;
+pub mod graph;
+pub mod job;
+pub mod plan;
+pub mod profiling;
+pub mod runner;
+pub mod runners;
+pub mod shadow;
+
 pub mod blocking;
 pub mod completion;
 pub mod config;

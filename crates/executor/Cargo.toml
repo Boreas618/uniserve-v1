@@ -16,6 +16,7 @@ indexmap.workspace = true
 ipc.workspace = true
 libc.workspace = true
 libloading.workspace = true
+nvtx.workspace = true
 proto.workspace = true
 rustix = { workspace = true, features = ["fs", "pipe", "system"] }
 serde.workspace = true
