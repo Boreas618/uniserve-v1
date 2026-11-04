@@ -1402,7 +1402,7 @@ impl Scheduler {
                 // continuing another world's state reads none: the host's
                 // pages are keyed by the world that serves.
                 let mut host_tokens = 0;
-                match host_prefix(&mut self.kv_offload, head, &target, cached_tokens, n) {
+                match host_prefix(&mut self.kv_offload, head, &target, cached_tokens, n, 0) {
                     HostHit::Serving(boundary) => host_tokens = boundary - cached_tokens,
                     // The host is looking up this request's pages: the head
                     // waits for the pins.
@@ -1770,6 +1770,7 @@ pub(super) fn host_prefix(
     target: &(crate::WorkerGroupId, String),
     device_hit: usize,
     limit: usize,
+    min_deepening: usize,
 ) -> HostHit {
     let Some(kv_offload) = kv_offload.as_mut() else {
         return HostHit::Nothing;
@@ -1793,7 +1794,14 @@ pub(super) fn host_prefix(
         state.req.cache.isolation_key,
         limit,
     );
-    match kv_offload.admission(state.req.request_id, &target.0, &keys, device_hit, limit) {
+    match kv_offload.admission(
+        state.req.request_id,
+        &target.0,
+        &keys,
+        device_hit,
+        limit,
+        min_deepening,
+    ) {
         Some(boundary) => HostHit::Serving(boundary),
         None => HostHit::Pending,
     }
