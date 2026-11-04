@@ -759,12 +759,24 @@ impl Transformer {
             .map(|index| Layer::load(kind, index, config, rows, tile_bound, partition, loader))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            proj_in: projection_with_bias(loader, "proj_in", hidden, video_in)?,
+            // **The four end projections are FP32 parameters at every preset**, because they are what
+            // touches the trajectory: `precision.py:106-117` pins `video_input`, `audio_input`,
+            // `video_output` and `audio_output` at FP32 whatever the attention, MLP and VAE tiers
+            // are. So the widening `wide` performs meets an FP32 weight and the product is FP32 on
+            // both sides, which is what makes the released BF16 stack run a FP32 sample at all.
+            proj_in: projection_with_bias(
+                loader,
+                "proj_in",
+                hidden,
+                video_in,
+                Some(nn::DType::F32),
+            )?,
             audio_proj_in: Some(projection_with_bias(
                 loader,
                 "audio_proj_in",
                 hidden,
                 audio_in,
+                Some(nn::DType::F32),
             )?),
             layers,
             norm_out: RmsNorm::new(
@@ -775,7 +787,13 @@ impl Transformer {
             // read only when the partition has one head.
             video_out: match heads {
                 Some(_) => None,
-                None => Some(projection_with_bias(loader, "proj_out", video_in, hidden)?),
+                None => Some(projection_with_bias(
+                    loader,
+                    "proj_out",
+                    video_in,
+                    hidden,
+                    Some(nn::DType::F32),
+                )?),
             },
             audio_out: match heads {
                 Some(_) => None,
@@ -784,6 +802,7 @@ impl Transformer {
                     "audio_proj_out",
                     audio_in,
                     hidden,
+                    Some(nn::DType::F32),
                 )?),
             },
             heads,
@@ -982,13 +1001,19 @@ fn projection_with_bias(
     name: &str,
     rows: u64,
     columns: u64,
+    dtype: Option<nn::DType>,
 ) -> Result<Linear> {
-    let weight = loader.load(&WeightRequest::region(
-        format!("{name}.weight"),
-        0,
-        Shape::new(&[rows, columns]),
-    ))?;
-    let bias = gain(loader, &format!("{name}.bias"), rows)?;
+    let mut request =
+        WeightRequest::region(format!("{name}.weight"), 0, Shape::new(&[rows, columns]));
+    if let Some(dtype) = dtype {
+        request = request.pinned(dtype);
+    }
+    let weight = loader.load(&request)?;
+    let mut request = WeightRequest::region(format!("{name}.bias"), 0, Shape::new(&[rows]));
+    if let Some(dtype) = dtype {
+        request = request.pinned(dtype);
+    }
+    let bias = loader.load(&request)?;
     Ok(Linear::new(weight, Some(bias), WeightOrder::NxK)?)
 }
 
