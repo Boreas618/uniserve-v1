@@ -789,22 +789,6 @@ impl Transformer {
         Ok(self.proj_in.forward(f, wide, out)?)
     }
 
-    /// Project one modality's hidden rows back to its velocity at one evaluation.
-    ///
-    /// `step` is the executor's `[1]` int32 step view: a student's head is chosen by it on the
-    /// device, so the same graph serves every evaluation.
-    pub fn predict(
-        &self,
-        f: &Forward,
-        hidden: TensorView,
-        modality: Modality,
-        block: u32,
-        step: TensorView,
-        out: TensorView,
-    ) -> Result<()> {
-        self.project_head(f, hidden, modality, block, step, out)
-    }
-
     /// The output projection of `hidden` at one evaluation, for either form of the heads.
     fn project_head(
         &self,
