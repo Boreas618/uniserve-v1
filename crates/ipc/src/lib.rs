@@ -104,6 +104,8 @@ mod parallel;
 mod request;
 mod tensor;
 mod transfer;
+/// The vocabulary of a program-layer update (§7.3).
+pub mod update;
 
 pub use batch::*;
 pub use cache::*;
@@ -129,3 +131,4 @@ pub use proto::request::{
 pub use request::*;
 pub use tensor::*;
 pub use transfer::*;
+pub use update::{ProgramStatus, UpdateFailure};
