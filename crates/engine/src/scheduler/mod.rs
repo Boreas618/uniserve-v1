@@ -77,6 +77,7 @@ mod policy;
 mod preemption;
 mod run;
 mod speculation;
+mod submission;
 pub(crate) mod views;
 mod warming;
 mod world;
@@ -443,7 +444,7 @@ struct PendingMedia {
 
 /// Single-threaded owner of scheduling, storage, execution, and request state.
 pub struct Scheduler {
-    executor: Box<dyn Executor>,
+    executor: submission::Submissions,
     inflight: inflight::Inflight,
     /// Resident resource ownership and reservation accounting.
     storage: allocation::Storage,
