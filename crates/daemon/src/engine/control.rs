@@ -34,6 +34,21 @@ const DAEMON_TIMEOUT: Duration = Duration::from_secs(90);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Starts the engine processes of one deployment.
+/// Whether `executable` is this process's own binary, by canonical path: a
+/// bare name is looked up by the operating system, not by us, and counts as
+/// another executable.
+fn own_executable(executable: &str) -> bool {
+    let path = std::path::Path::new(executable);
+    if !path.is_absolute() {
+        return false;
+    }
+    let Ok(own) = std::env::current_exe() else {
+        return false;
+    };
+    let own = std::fs::canonicalize(&own).unwrap_or(own);
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()) == own
+}
+
 pub struct EngineControl {
     /// The request socket engine processes connect back to.
     requests: Listener,
@@ -443,6 +458,48 @@ impl EngineControl {
         Ok(())
     }
 
+    /// The arguments of an engine process of `generation`, after its program
+    /// name: one builder for the engine the deployment serves with and every
+    /// epoch a switch starts (`specs/worker.md` §5.3, §7.3, §7.4). The engine
+    /// resolves an epoch's policy modules through this node's Program Server,
+    /// so that socket travels with the rest of what starts it.
+    fn arguments(&self, generation: u64) -> Vec<String> {
+        let mut arguments = vec![
+            "engine".to_owned(),
+            "--requests".to_owned(),
+            self.request_address.clone(),
+            "--processes".to_owned(),
+            self.processes.clone(),
+            "--engine".to_owned(),
+            generation.to_string(),
+        ];
+        if let Some(program_server) = &self.program_server {
+            arguments.push("--program-server".to_owned());
+            arguments.push(program_server.display().to_string());
+        }
+        arguments
+    }
+
+    /// What the epoch layer starts one epoch's main process with: the
+    /// executable the target names, at `generation`, and the arguments every
+    /// engine process of this daemon gets (`specs/worker.md` §7.4).
+    ///
+    /// The build is named only when `executable` is this daemon's own binary.
+    /// Another executable's children vouch for themselves: the first one's
+    /// `Hello` fixes the identity every other child of the epoch must report.
+    pub(crate) fn epoch_start(
+        &self,
+        executable: &str,
+        generation: u64,
+    ) -> crate::updates::switch::Start {
+        crate::updates::switch::Start {
+            executable: executable.to_owned(),
+            build: own_executable(executable).then(|| proto::BUILD.to_owned()),
+            arguments: self.arguments(generation),
+            environment: std::collections::HashMap::new(),
+        }
+    }
+
     fn spawn(&self, engine: u64, executable: &str, host: &str) -> anyhow::Result<Connection> {
         let (mut control, nodes) = self.connect()?;
         anyhow::ensure!(
@@ -455,22 +512,7 @@ impl EngineControl {
         );
 
         let executable = executable.to_owned();
-        // The engine resolves an epoch's policy modules through this node's
-        // Program Server, so the socket travels with the rest of what starts
-        // it (§5.3, §7.3).
-        let mut arguments = vec![
-            "engine".to_owned(),
-            "--requests".to_owned(),
-            self.request_address.clone(),
-            "--processes".to_owned(),
-            self.processes.clone(),
-            "--engine".to_owned(),
-            engine.to_string(),
-        ];
-        if let Some(program_server) = &self.program_server {
-            arguments.push("--program-server".to_owned());
-            arguments.push(program_server.display().to_string());
-        }
+        let arguments = self.arguments(engine);
         control.send(&process::Upstream {
             kind: Some(upstream::Kind::Request(process::Request {
                 id: 1,
