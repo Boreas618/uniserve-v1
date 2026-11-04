@@ -13,8 +13,9 @@ members = [
     "crates/ipc",
     "crates/manager",
     "crates/media",
-    "crates/models",
+    "crates/models/rules",
     "crates/models/qwen3-moe",
+    "crates/models/minimax-h3",
     "crates/nixl",
     "crates/nn",
     "crates/ops",
@@ -23,6 +24,7 @@ members = [
     "crates/scheduling",
     "crates/scheduling/guest",
     "crates/scheduling/policies/fcfs",
+    "crates/scheduling/policies/fixture",
     "crates/scheduling/policies/priority",
     "crates/storage",
     "crates/storage-server",
@@ -83,10 +85,11 @@ executor = { path = "crates/executor" }
 frontend = { path = "crates/frontend" }
 ipc = { path = "crates/ipc" }
 media = { path = "crates/media" }
-models = { path = "crates/models" }
+models = { path = "crates/models/rules" }
 nn = { path = "crates/nn" }
 ops = { path = "crates/ops" }
 qwen3-moe = { path = "crates/models/qwen3-moe" }
+minimax-h3 = { path = "crates/models/minimax-h3" }
 nixl = { path = "crates/nixl" }
 program-server = { path = "crates/program-server" }
 proto = { path = "crates/proto" }

@@ -726,6 +726,7 @@ impl Scheduler {
                                 &self.info,
                                 RequestKey::new(self.engine_id, id, state.request_epoch),
                                 kind,
+                                &placement::Choice::Existing,
                             )
                             .is_some()
                     })
