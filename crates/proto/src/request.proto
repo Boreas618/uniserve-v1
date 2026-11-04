@@ -79,11 +79,33 @@ message Metrics {
   uint64 policy_fuel = 7;
   // The number of those policy calls.
   uint64 policy_calls = 8;
+  // The devices' allocators, for the invariant design §4.1 and §8 state:
+  // a device never maps more physical memory than its budget allows.
+  repeated DeviceMemory memory = 9;
 }
 
 message QueueDepth {
   uint32 rank = 1;
   uint32 depth = 2;
+}
+
+// One device's allocator as the main process reports it.
+message DeviceMemory {
+  uint32 device = 1;
+  // The bytes the device's budget allows this epoch (design §8): the share
+  // of the device's memory, `mem_fraction_static`, that the deployment's
+  // epochs and transfers account against.
+  uint64 budget = 2;
+  // The allocator's pools (`crates/platform`'s `Allocator`, design §4.1).
+  repeated PoolMemory pools = 3;
+}
+
+// One pool of a device's allocator.
+message PoolMemory {
+  // The pool: `graph`, `scratch` or `resident` (design §4.1).
+  string pool = 1;
+  // The bytes of physical memory the pool has mapped now.
+  uint64 mapped = 2;
 }
 
 // What travels to the engine process after the welcome.
@@ -237,6 +259,13 @@ message Command {
     // its consumer took, so a slow consumer holds its request's output
     // back in the engine, whose scheduler then stalls the request.
     Consumed consumed = 6;
+    // The connection this command arrives on takes the request's event
+    // stream over from a position: a hot restart of the daemon hands the
+    // response to a successor (design 7.5.1 step 4). The request keeps
+    // generating in the engine that serves it; it is neither cancelled nor
+    // submitted again, and the engine sends this connection again the events
+    // after the position the previous consumer reached.
+    Takeover takeover = 7;
   }
 }
 
@@ -249,6 +278,15 @@ message Abort {}
 message Consumed {
   uint64 events = 1;
 }
+// One request's event stream taken over by another connection (a hot
+// restart's successor daemon). The command's `request` names the request.
+message Takeover {
+  // The events the response's previous consumer took in all: the engine
+  // sends the new consumer the events after this position, then the ones
+  // the request goes on producing.
+  uint64 events = 1;
+}
+
 // A command for the whole engine.
 message EngineCommand {
   reserved 2;
