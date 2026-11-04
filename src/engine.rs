@@ -75,9 +75,10 @@
 //! `crates/executor` and are used as they are written there.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context as _, Result};
 use clap::Args;
@@ -91,12 +92,14 @@ use executor::host::{HostAction, HostTask, Lane};
 use executor::hot_update::{Action, HotUpdate};
 use executor::memory::Memory;
 use executor::watchdog::{Running, Watchdog};
+use engine::{PolicyProgram, PolicySlot, PolicySource, Scheduler, Stage};
 use ipc::{ProgramCommand, ProgramStatus, UpdateFailure};
-use nn::{Checkpoint, Model, Partition, WeightLoader};
+use nn::WeightLoader;
 use ops::{Generation, KernelEntry};
+use program_server::program::Programs;
 use program_server::{
-    BuildConfig, Client, Descriptors, EpochRecord, PrepareRequest, Program, ProgramRequest,
-    ProgramSlot, Programs, Selector, Target,
+    BuildConfig, Client, Descriptors, EpochRecord, Module, PrepareRequest, Program,
+    ProgramRequest, ProgramSlot, Selector, Target,
 };
 
 /// The options of `uniserve engine`.
@@ -1050,11 +1053,11 @@ struct Install {
 impl HostAction for Install {
     type Output = Vec<KernelEntry>;
 
-    fn run(&self) -> Result<Self::Output> {
+    fn run(&self) -> executor::Result<Self::Output> {
         let mut client = self
             .programs
             .lock()
-            .map_err(|_| anyhow::anyhow!("the Program Server client was poisoned"))?;
+            .map_err(|_| executor::Error::State("the Program Server client was poisoned".into()))?;
         let prepared = client.prepare(&self.request, &mut |progress| {
             tracing::debug!(
                 path = %progress.path,
@@ -1066,10 +1069,10 @@ impl HostAction for Install {
         let mut entries = Vec::new();
         for chosen in &prepared.programs {
             let operator = ops::operator_name(&chosen.slot.op).ok_or_else(|| {
-                anyhow::anyhow!(
+                executor::Error::Invalid(format!(
                     "operator {} has no implementation in this build",
                     chosen.slot.op
-                )
+                ))
             })?;
             let keys: Vec<String> = self
                 .request
@@ -1100,7 +1103,7 @@ impl HostAction for Install {
         Ok(entries)
     }
 
-    fn release(&self) -> Result<()> {
+    fn release(&self) -> executor::Result<()> {
         Ok(())
     }
 
@@ -1240,17 +1243,46 @@ fn handshake(control: &mut Control, args: &EngineArgs, build: &BuildConfig) -> R
     EpochRecord::from_welcome(&welcome, build).context("the daemon's engine spec")
 }
 
+/// How this rank takes part in the deployment's parallel shape (§4.3, §5.1), as
+/// the build config states it: the model is partitioned by the deployment, and
+/// the match on model class is what turns that shape into the model's own
+/// partition type.
+struct Placement {
+    tensor_parallel: u32,
+    tensor_rank: u32,
+    expert_parallel: u32,
+    expert_rank: u32,
+    load_options: qwen3_moe::LoadOptions,
+}
+
 /// The one `match` on model class (§4.3): the executable links the model crates,
 /// and nothing else in the tree names a concrete model.
+///
+/// The model's partition is the model's own type, built from the deployment's
+/// parallel shape, so the match produces both the partition and the model.
 fn load_model(
     model_class: &str,
-    checkpoint: &Checkpoint,
-    partition: &Partition,
-    loader: &mut WeightLoader,
-) -> Result<Model> {
+    checkpoint: &Path,
+    placement: &Placement,
+    loader: &mut WeightLoader<'_>,
+) -> Result<qwen3_moe::Qwen3Moe> {
     match model_class {
-        "Qwen3MoeForCausalLM" => qwen3_moe::load(checkpoint, partition, loader),
-        "MiniMaxH3ModularPipeline" => minimax_h3::load(checkpoint, partition, loader),
+        "Qwen3MoeForCausalLM" => {
+            let config = qwen3_moe::Config::read(checkpoint)?;
+            let partition = qwen3_moe::Partition::new(
+                &config,
+                placement.tensor_parallel as usize,
+                placement.tensor_rank as usize,
+                placement.expert_parallel as usize,
+                placement.expert_rank as usize,
+            )?;
+            Ok(qwen3_moe::load(
+                checkpoint,
+                partition,
+                loader,
+                placement.load_options,
+            )?)
+        }
         other => bail!("unsupported model class {other}"),
     }
 }
