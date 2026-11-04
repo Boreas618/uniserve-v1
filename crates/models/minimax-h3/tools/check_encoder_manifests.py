@@ -41,6 +41,57 @@ import sys
 
 from check_manifests import DIMENSIONS
 
+# The complete field set each operator's key carries, in the order the operator's `Display` writes
+# them. A call that carries all of them names one key exactly; `--keys` emits the fixture's lines
+# from those and names the calls it cannot complete rather than printing a partial key.
+KEY_FIELDS: dict[str, tuple[str, ...]] = {
+    "dense_attention/fa4": (
+        "dtype",
+        "kv",
+        "out",
+        "head_dim",
+        "q_heads",
+        "kv_heads",
+        "mask",
+        "window",
+    ),
+    "qk_norm_rope/triton": (
+        "dtype",
+        "output",
+        "head_dim",
+        "q_heads",
+        "k_heads",
+        "rotation",
+        "epsilon",
+        "rows",
+        "block",
+        "pdl",
+    ),
+    "rotary_factors/triton": (
+        "dtype",
+        "positions",
+        "columns",
+        "block",
+        "scale",
+        "pdl",
+        "axes",
+        "sections",
+        "interleaved",
+    ),
+    "act_and_mul/triton": (
+        "dtype",
+        "width",
+        "block",
+        "activation",
+        "gate_stride",
+        "value_stride",
+        "wide",
+        "pdl",
+        "stepwise",
+    ),
+    "layer_norm/triton": ("dtype", "columns", "tile", "bias", "pdl"),
+}
+
 # One call: the package, the fields its descriptor carries, and why it carries them.
 Call = tuple[str, dict[str, str], str]
 
@@ -100,12 +151,16 @@ def text_calls(text: dict) -> list[Call]:
             (
                 "qk_norm_rope/triton",
                 {
+                    "dtype": "bf16",
+                    "output": "bf16",
                     "head_dim": str(head_dim),
                     "q_heads": str(heads // degree),
                     "k_heads": str(kv_heads // degree),
-                    "rotated": str(head_dim),
                     "rotation": "half",
-                    "block": "128",
+                    "epsilon": f"0x{_f32_bits(epsilon):08x}",
+                    "rows": "1",
+                    "block": _head_block(head_dim),
+                    "pdl": "false",
                 },
                 f"rope.rs: the qk-norm rotation, full width over {degree} rank(s)",
             )
@@ -118,6 +173,9 @@ def text_calls(text: dict) -> list[Call]:
                 "dtype": "f32",
                 "positions": "i32",
                 "columns": str(head_dim // 2),
+                "block": "256",
+                "scale": "0x3f800000",
+                "pdl": "false",
                 "axes": str(len(sections)),
                 "sections": rotated_sections,
                 "interleaved": "true",
@@ -138,21 +196,15 @@ def text_calls(text: dict) -> list[Call]:
             {
                 "dtype": "bf16",
                 "width": str(ffn),
+                "block": "1024",
                 "gate_stride": str(2 * ffn),
                 "value_stride": str(2 * ffn),
                 "activation": "silu",
                 "wide": "false",
+                "pdl": "false",
                 "stepwise": "false",
             },
             "text_encoder.rs: the gated MLP's activation",
-        )
-    )
-    # The norms' epsilon is a descriptor value in this package, encoded as an f32 bit pattern.
-    calls.append(
-        (
-            "qk_norm_rope/triton",
-            {"epsilon": f"0x{_f32_bits(epsilon):08x}"},
-            "text_encoder.rs: the qk norm's epsilon",
         )
     )
     return calls
@@ -167,7 +219,13 @@ def tower_calls(vision: dict) -> list[Call]:
     calls: list[Call] = [
         (
             "layer_norm/triton",
-            {"dtype": "bf16", "columns": str(hidden), "bias": "true"},
+            {
+                "dtype": "bf16",
+                "columns": str(hidden),
+                "tile": _row_tile(hidden),
+                "bias": "true",
+                "pdl": "false",
+            },
             "vision.rs: a block's norms",
         ),
         (
@@ -212,7 +270,13 @@ def vae_calls(vae: dict) -> list[Call]:
         calls.append(
             (
                 "layer_norm/triton",
-                {"dtype": "f32", "columns": str(width), "bias": "true"},
+                {
+                    "dtype": "f32",
+                    "columns": str(width),
+                    "tile": _row_tile(width),
+                    "bias": "true",
+                    "pdl": "false",
+                },
                 f"encoding.rs: a residual block's norm at {width} channels",
             )
         )
@@ -252,6 +316,48 @@ def _f32_bits(value: float) -> int:
     return struct.unpack("<I", struct.pack("<f", value))[0]
 
 
+def _head_block(head_dim: int) -> str:
+    """The head tile a rotation loads at a time: the head's own power of two, capped at 1024.
+
+    `crates/nn/src/layers/rope.rs` rounds the head width rather than taking a constant, so a
+    128-wide head compiles a 128-lane tile and a 256-wide one a 256-lane tile.
+    """
+    return str(min(1 << (head_dim - 1).bit_length(), 1024))
+
+
+def _row_tile(columns: int) -> str:
+    """The lane tile a row of `columns` takes: its own power of two (`nn::layers::row_tile`)."""
+    return str(1 << (columns - 1).bit_length())
+
+
+def keys(calls: list[Call]) -> int:
+    """Print the fixture's lines: each completed call's operator name and its exact key.
+
+    A call that does not carry every field its operator's `Display` writes names no key, and is
+    reported as such rather than printed short: a partial key in the store's fixture would be a
+    line that compiles nothing.
+    """
+    printed = 0
+    for package, fields, reason in calls:
+        order = KEY_FIELDS.get(package)
+        if order is None:
+            print(
+                f"  NOT EMITTED {package}: this tool does not model its field set [{reason}]"
+            )
+            continue
+        missing = [field for field in order if field not in fields]
+        if missing:
+            print(
+                f"  NOT EMITTED {package}: the call omits {', '.join(missing)} [{reason}]"
+            )
+            continue
+        operator = package.split("/")[0]
+        key = "_".join(f"{field}_{fields[field]}" for field in order)
+        print(f"{operator}\t{key}")
+        printed += 1
+    return printed
+
+
 def report(name: str, calls: list[Call], kernels: pathlib.Path) -> int:
     """Print `name`'s calls that no single manifest block declares, and answer how many."""
     print(name)
@@ -282,6 +388,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default="/opt/uv/models/MiniMax-H3")
     parser.add_argument("--kernels", default="crates/ops/kernels")
+    parser.add_argument(
+        "--keys",
+        action="store_true",
+        help=(
+            "print the operators' keys in the fixture's format "
+            "(`notes/programs/minimax-h3-keys.txt`) instead of checking the manifests"
+        ),
+    )
     arguments = parser.parse_args()
 
     root = pathlib.Path(arguments.root)
@@ -299,6 +413,12 @@ def main() -> int:
         ("vision tower", tower_calls(text_config["vision_config"])),
         ("video VAE encoder", vae_calls(json.loads(vae_path.read_text()))),
     ]
+
+    if arguments.keys:
+        emitted = sum(keys(calls) for _, calls in sections)
+        print()
+        print(f"{emitted} keys emitted")
+        return 0
 
     total = 0
     checked = 0
