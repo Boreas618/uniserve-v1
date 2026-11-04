@@ -33,14 +33,16 @@ def _monotone(values):
     negative = (bits >> 31) == 1
     # Negatives invert and positives flip their sign bit, which is the standard
     # order-preserving map of IEEE floats onto unsigned integers.
-    return tl.where(negative, ~bits, bits | 0x80000000)
+    # `bits ^ 0xFFFFFFFF` rather than `~bits`: the interpreter `~` turns a uint32 into the Python
+    # integer -1 and refuses it, and the XOR is the same value on both.
+    return tl.where(negative, bits ^ 0xFFFFFFFF, bits | 0x80000000)
 
 
 @triton.jit
 def _value_of(keys):
     """Map order-preserving unsigned keys back to FP32 values."""
     sign = (keys >> 31) == 1
-    bits = tl.where(sign, keys ^ 0x80000000, ~keys)
+    bits = tl.where(sign, keys ^ 0x80000000, keys ^ 0xFFFFFFFF)
     return bits.to(tl.float32, bitcast=True)
 
 
@@ -55,14 +57,21 @@ def _top_k_kernel(
     WIDTH: tl.constexpr,
     STEP: tl.constexpr,
 ):
-    """Keep the ``WIDTH`` largest logits of one row, sorted, with their ids.
+    """Keep the ``width`` largest logits of one row, sorted, with their ids.
 
-    ``logits`` is ``[rows, vocabulary]``, ``values`` ``[rows, WIDTH]`` and ``ids``
-    ``[rows, WIDTH]`` in the descriptor's id dtype. Grid: (rows,).
+    ``logits`` is ``[rows, vocabulary]``, ``values`` and ``ids`` are ``[rows, width]`` in the
+    descriptor's id dtype. Grid: (rows,).
+
+    ``WIDTH`` is the **padded** candidate count - the power of two the final sort runs over - and
+    ``width`` is the live one: the row's stride in the buffers is ``width``, and every emitted lane
+    at or past it is masked out. A sort needs a power-of-two network; a deployment's candidate count
+    (a vocabulary, 151936) is not one, so the network is widened and the buffers are not.
     """
     row = tl.program_id(0).to(tl.int64)
     base = row * vocabulary
     taken = width.to(tl.int32)
+    # The buffers' row stride is the live candidate count, not the sort's padded width.
+    stride = width.to(tl.int64)
     columns = tl.arange(0, STEP)
 
     # Four radix passes: after each one the top byte of `prefix` is fixed and
@@ -110,33 +119,39 @@ def _top_k_kernel(
         gt = (keys > prefix) & live
         eq = (keys == prefix) & live
         slot_gt = filled + tl.cumsum(gt.to(tl.int32), axis=0) - 1
-        keep_gt = gt & (slot_gt < WIDTH)
-        tl.store(values_ptr + row * WIDTH + slot_gt, values, mask=keep_gt)
-        tl.store(ids_ptr + row * WIDTH + slot_gt, lanes.to(tl.int32), mask=keep_gt)
+        keep_gt = gt & (slot_gt < taken)
+        tl.store(values_ptr + row * stride + slot_gt, values, mask=keep_gt)
+        tl.store(ids_ptr + row * stride + slot_gt, lanes.to(tl.int32), mask=keep_gt)
         slot_eq = above + equal_count + tl.cumsum(eq.to(tl.int32), axis=0) - 1
-        keep_eq = eq & (slot_eq < WIDTH)
-        tl.store(values_ptr + row * WIDTH + slot_eq, values, mask=keep_eq)
-        tl.store(ids_ptr + row * WIDTH + slot_eq, lanes.to(tl.int32), mask=keep_eq)
+        keep_eq = eq & (slot_eq < taken)
+        tl.store(values_ptr + row * stride + slot_eq, values, mask=keep_eq)
+        tl.store(ids_ptr + row * stride + slot_eq, lanes.to(tl.int32), mask=keep_eq)
         filled += tl.sum(gt.to(tl.int32), axis=0)
         equal_count += tl.sum(eq.to(tl.int32), axis=0)
 
-    # Slots the row did not fill keep a sentinel that sorts last.
+    # Slots the row did not fill keep a sentinel that sorts last: the lanes it did not fill inside
+    # the live width, and - through the load's `other` below - the padding lanes of the network.
     tl.debug_barrier()
     slots = tl.arange(0, WIDTH)
-    empty = slots >= tl.minimum(tl.maximum(filled, above + equal_count), WIDTH)
-    tl.store(values_ptr + row * WIDTH + slots, -float("inf"), mask=empty)
-    tl.store(ids_ptr + row * WIDTH + slots, 0, mask=empty)
+    filled_slots = tl.minimum(tl.maximum(filled, above + equal_count), taken)
+    empty = (slots >= filled_slots) & (slots < taken)
+    tl.store(values_ptr + row * stride + slots, -float("inf"), mask=empty)
+    tl.store(ids_ptr + row * stride + slots, 0, mask=empty)
 
     # Sort the emitted pairs: the key above the id makes a descending integer
-    # sort descending in value, and the id's complement ascending among equals.
+    # sort descending in value, and the id's complement ascending among equals. The network is
+    # `WIDTH` lanes wide; the lanes past the live width read a sentinel that sorts last and are
+    # never stored, so the padded network touches nothing outside the row.
     tl.debug_barrier()
-    pairs = tl.load(values_ptr + row * WIDTH + slots)
-    identities = tl.load(ids_ptr + row * WIDTH + slots).to(tl.int64)
+    in_row = slots < taken
+    pairs = tl.load(values_ptr + row * stride + slots, mask=in_row, other=-float("inf"))
+    identities = tl.load(ids_ptr + row * stride + slots, mask=in_row, other=0).to(tl.int64)
     packed = (_monotone(pairs).to(tl.int64) << 32) | (0xFFFFFFFF - identities)
     ordered = tl.sort(packed, dim=0, descending=True)
     keys = (ordered >> 32).to(tl.uint32)
-    tl.store(values_ptr + row * WIDTH + slots, _value_of(keys))
+    tl.store(values_ptr + row * stride + slots, _value_of(keys), mask=in_row)
     tl.store(
-        ids_ptr + row * WIDTH + slots,
+        ids_ptr + row * stride + slots,
         (0xFFFFFFFF - (ordered & 0xFFFFFFFF)).to(tl.int32),
+        mask=in_row,
     )

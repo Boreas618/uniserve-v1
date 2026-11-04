@@ -98,9 +98,12 @@ const ENCODE_CHUNK: u32 = 1024;
 /// block with no scale to name it.
 const _: () = assert!(ENCODE_CHUNK.is_multiple_of(BLOCK_ELEMENTS));
 
-/// The geometry one encoded expert step's buffers are sized from.
+/// The geometry one expert step's buffers are sized from.
+///
+/// Both paths route, sort and combine identically, so both are sized from these five numbers; the
+/// encoded path adds the activation planes on top.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct EncodedGeometry {
+pub struct MoeGeometry {
     /// The hidden width.
     pub hidden: u64,
     /// One half of the gated product's width.
@@ -124,22 +127,23 @@ pub struct EncodedGeometry {
 /// reach when every expert owns a single route — for the slice's own 15-token batch that is 15360
 /// rows against 120 expanded routes. The host cannot know the tile count (it is device data the sort
 /// produces), so the buffers are sized for the worst case and a replay over the same plan finds the
-/// same addresses, which is the price of a captured graph. The dense pair does not pay it because
-/// its down product writes only the live rows, and that asymmetry is the honest cost of the encoded
-/// path rather than a defect to hide.
+/// same addresses, which is the price of a captured graph. **Both paths pay it**: the combine indexes
+/// its input in the permuted row space, so the gated rows and the products are permuted-height
+/// whether the experts are dense or encoded, and the encoded path's extra cost is its activation
+/// planes rather than the row height.
 ///
 /// `layout` is the activation encoding's block-scale layout: a field of the products' descriptors,
 /// not of the weights, whose scales have their own layout.
 pub fn encoded_bytes(
     tokens: u64,
-    geometry: EncodedGeometry,
+    geometry: MoeGeometry,
     layout: ScaleLayout,
     dtype: DType,
 ) -> Result<u64> {
     let width_bytes = dtype
         .bytes()
         .ok_or_else(|| Error::shape("Moe", format!("{dtype} has no byte size")))?;
-    let EncodedGeometry {
+    let MoeGeometry {
         hidden,
         intermediate,
         top,
@@ -168,6 +172,80 @@ pub fn encoded_bytes(
         total = total.saturating_add(bytes.next_multiple_of(ALIGNMENT));
     }
     Ok(total)
+}
+
+/// The bytes the routing prefix reserves for `tokens` rows: the scores, the kept ids and weights,
+/// the expert-mapped ids, and the sort's four metadata arrays and their two counters.
+///
+/// Every path through this block starts here, so a plan that covers the expert step but not the
+/// prefix leaves the first launch of every routed layer writing past its region.
+pub fn routing_bytes(tokens: u64, geometry: MoeGeometry, dtype: DType) -> Result<u64> {
+    let MoeGeometry {
+        top, experts, tile, ..
+    } = geometry;
+    let width_bytes = dtype
+        .bytes()
+        .ok_or_else(|| Error::shape("Moe", format!("{dtype} has no byte size")))?;
+    let tiles = ops::moe::max_tiles(tokens, top, experts, tile);
+    let routes = ops::moe::max_permuted_rows(tokens, top, experts, tile);
+    let mut total: u64 = 0;
+    for bytes in [
+        tokens * experts * width_bytes, // the router's scores
+        tokens * top * 4,               // its kept ids, i32
+        tokens * top * 4,               // the route weights, f32
+        tokens * top * 4,               // the expert-mapped ids, i32
+        tiles * 4,                      // each tile's expert
+        tiles * 4,                      // each tile's live rows
+        tokens * top * 4,               // the permuted row of each expanded route
+        routes * 4,                     // the expanded row of each permuted position
+        4,                              // the padded row count
+        4,                              // the non-empty tile count
+    ] {
+        total = total.saturating_add(bytes.next_multiple_of(ALIGNMENT));
+    }
+    Ok(total)
+}
+
+/// The bytes the expert products reserve for `tokens` rows: the gated rows and the permuted
+/// products, both at the permutation's height, in the activation's element type.
+pub fn dense_bytes(tokens: u64, geometry: MoeGeometry, dtype: DType) -> Result<u64> {
+    let MoeGeometry {
+        hidden,
+        intermediate,
+        top,
+        experts,
+        tile,
+    } = geometry;
+    let width_bytes = dtype
+        .bytes()
+        .ok_or_else(|| Error::shape("Moe", format!("{dtype} has no byte size")))?;
+    let routes = ops::moe::max_permuted_rows(tokens, top, experts, tile);
+    let mut total: u64 = 0;
+    for bytes in [
+        routes * intermediate * width_bytes, // FC1's gated rows
+        routes * hidden * width_bytes,       // FC2's permuted products
+    ] {
+        total = total.saturating_add(bytes.next_multiple_of(ALIGNMENT));
+    }
+    Ok(total)
+}
+
+/// The bytes one routed layer's whole expert step reserves for `tokens` rows: the routing prefix,
+/// then the products — dense or encoded — as `encoded` says.
+pub fn step_bytes(
+    tokens: u64,
+    geometry: MoeGeometry,
+    layout: ScaleLayout,
+    dtype: DType,
+    encoded: bool,
+) -> Result<u64> {
+    let routing = routing_bytes(tokens, geometry, dtype)?;
+    let expert = if encoded {
+        encoded_bytes(tokens, geometry, layout, dtype)?
+    } else {
+        dense_bytes(tokens, geometry, dtype)?
+    };
+    Ok(routing.saturating_add(expert))
 }
 
 /// The expert stacks a block multiplies.
@@ -565,6 +643,32 @@ impl Moe {
         self.experts
     }
 
+    /// Whether this block's experts are the checkpoint's encoded stacks.
+    ///
+    /// What the block launches depends on it: a dense block runs one grouped product per projection,
+    /// an encoded one encodes each operand first and multiplies packed codes. A caller that
+    /// enumerates programs — a key walk, a store's shopping list — asks this rather than the loading
+    /// options, so the two cannot disagree about what the block will launch.
+    pub const fn is_encoded(&self) -> bool {
+        matches!(self.stacks, ExpertStacks::Encoded { .. })
+    }
+
+    /// The element type of the encoded stacks' block scales, or `None` for a dense block.
+    pub fn scale_dtype(&self) -> Option<DType> {
+        match &self.stacks {
+            ExpertStacks::Dense { .. } => None,
+            ExpertStacks::Encoded { up_gate, .. } => Some(up_gate.scales.dtype()),
+        }
+    }
+
+    /// The layout the encoded stacks' block scales are stored in, or `None` for a dense block.
+    pub fn scale_layout(&self) -> Option<ScaleLayout> {
+        match &self.stacks {
+            ExpertStacks::Dense { .. } => None,
+            ExpertStacks::Encoded { up_gate, .. } => Some(up_gate.layout),
+        }
+    }
+
     /// The routing prefix: the router, its top-k, the expert map, and the sort that groups the
     /// routes into the tiles a grouped product reads.
     ///
@@ -675,8 +779,6 @@ impl Moe {
             // An encoded stack runs the packed products instead; the routing above is the same.
             return self.forward_encoded(f, hidden, out);
         };
-        let tokens = hidden.rows();
-        let top = u64::from(self.top);
         let intermediate = u64::from(self.intermediate);
         let arena = f.arena();
 
@@ -690,6 +792,9 @@ impl Moe {
             hidden,
             weights: up_gate.view(),
             ids: routes.local_ids,
+            // The map the product's reader uses, not the product's own lookup: FC1 writes row `p` at
+            // the sort's permuted row `p`, and this is how a route is found again afterwards.
+            expanded_to_permuted: routes.expanded_to_permuted,
             tile_to_expert: routes.tile_to_expert,
             tile_to_limit: routes.tile_to_limit,
             permuted_to_expanded: routes.permuted_to_expanded,
@@ -699,7 +804,10 @@ impl Moe {
 
         f.operate::<GatherGemm>(&first, args)?;
 
-        let products = arena.tensor(hidden.dtype, Shape::new(&[tokens * top, hidden_width]))?;
+        // The combine indexes this buffer in the **permuted** row space, so it is permuted-height on
+        // every path however few rows are live: FC2 writes only the rows it has, but it writes them
+        // where the map says they are, not packed from zero.
+        let products = arena.tensor(hidden.dtype, Shape::new(&[routes.rows, hidden_width]))?;
         let second = self.route_descriptor(hidden.dtype);
         let args = RouteGemmArgs {
             rows: gated,
@@ -801,14 +909,15 @@ impl Moe {
         first.max(second)
     }
 
-    /// The bytes one forward's encoded step reserves from the arena, for `tokens` rows.
+    /// The bytes one routed layer's whole expert step reserves from the arena, for `tokens` rows —
+    /// the routing prefix included.
     ///
-    /// [`encoded_bytes`] states the extents; this answers them for this block's geometry, which is
-    /// what a deployment asks when it sizes the arena from its plan.
-    pub fn encoded_bytes(&self, tokens: u64, layout: ScaleLayout, dtype: DType) -> Result<u64> {
-        encoded_bytes(
+    /// [`step_bytes`] states the extents; this answers them for this block's geometry, which is what
+    /// a deployment asks when it sizes the arena from its plan.
+    pub fn step_bytes(&self, tokens: u64, layout: ScaleLayout, dtype: DType) -> Result<u64> {
+        step_bytes(
             tokens,
-            EncodedGeometry {
+            MoeGeometry {
                 hidden: u64::from(self.hidden),
                 intermediate: u64::from(self.intermediate),
                 top: u64::from(self.top),
@@ -817,6 +926,7 @@ impl Moe {
             },
             layout,
             dtype,
+            matches!(self.stacks, ExpertStacks::Encoded { .. }),
         )
     }
 
@@ -883,8 +993,13 @@ impl Moe {
     }
 
     /// The combine's descriptor: the routes summed in FP32 and rounded once to `output`.
+    ///
+    /// The routes arrive in **permuted** rows, which is the convention `route_gemm` writes and the
+    /// one the combine's module is compiled for; it is a descriptor field so a chain that ever
+    /// writes expanded rows names its own module instead of reading this one's buffer wrongly.
     pub fn combine_descriptor(&self, product: DType, output: DType) -> combine::Descriptor {
         combine::Descriptor {
+            layout: combine::Layout::Permuted,
             hidden: self.hidden,
             top: self.top,
             experts: self.experts,
@@ -1239,6 +1354,7 @@ impl Moe {
             hidden: exchange.states,
             weights: up_gate.view(),
             ids: exchange.ids,
+            expanded_to_permuted,
             tile_to_expert,
             tile_to_limit,
             permuted_to_expanded,
@@ -1248,7 +1364,9 @@ impl Moe {
 
         f.operate::<GatherGemm>(&first, args)?;
 
-        let products = arena.tensor(hidden.dtype, Shape::new(&[received * top, hidden_width]))?;
+        // Permuted-height for the reason the dense path's is: the combine below indexes it through
+        // `expanded_to_permuted`.
+        let products = arena.tensor(hidden.dtype, Shape::new(&[rows, hidden_width]))?;
         let second = RouteGemmDescriptor {
             hidden: self.hidden,
             intermediate: self.intermediate,
@@ -1274,6 +1392,7 @@ impl Moe {
         // 6. Each received row's routes summed with their FP32 weights, in receive order.
         let combined = arena.tensor(hidden.dtype, Shape::new(&[received, hidden_width]))?;
         let combine_descriptor = combine::Descriptor {
+            layout: combine::Layout::Permuted,
             hidden: self.hidden,
             top: self.top,
             experts: self.experts,
@@ -1317,6 +1436,7 @@ impl Moe {
             ExpertStacks::Encoded { .. } => DType::BF16,
         };
         MoeUnpermute::tolerance(&combine::Descriptor {
+            layout: combine::Layout::Permuted,
             hidden: self.hidden,
             top: self.top,
             experts: self.experts,
@@ -1566,6 +1686,7 @@ pub(super) mod tests {
         assert_eq!(
             block.tolerance(),
             MoeUnpermute::tolerance(&combine::Descriptor {
+                layout: combine::Layout::Permuted,
                 hidden: 2048,
                 top: 8,
                 experts: 128,

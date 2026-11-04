@@ -434,26 +434,47 @@ fn stage_embedding(args: &Args) -> Result<()> {
 ///
 /// There is no reset between layers -- the model allocates each layer's temporaries from one arena
 /// and nothing returns the cursor -- so this is sized for the whole stack, not one layer.
-fn decode_arena_bytes(plan: &qwen3_moe::Plan, tokens: u64, config: &Config) -> u64 {
-    let hidden = plan.hidden.saturating_mul(4).saturating_mul(tokens);
-    let logits = u64::try_from(config.vocab_size)
-        .unwrap_or(u64::MAX)
-        .saturating_mul(4);
+/// The arena the decode stage reserves: the KV planes and their flags, the batch's metadata, the
+/// model's own row buffer, and one forward's plan.
+///
+/// The forward releases a layer's scratch as the layer ends, so the plan is one layer deep and this
+/// is the whole requirement rather than a bound with room to spare. The constant is what the small
+/// metadata uploads lose against the arena's alignment.
+fn decode_arena_bytes(
+    plan: &qwen3_moe::Plan,
+    tokens: u64,
+    config: &Config,
+    page_size: u64,
+    pages: u64,
+) -> qwen3_moe::Result<u64> {
     let layers = u64::try_from(config.num_hidden_layers).unwrap_or(0);
-    let plane_row = 64_u64
-        .saturating_mul(u64::try_from(config.num_key_value_heads).unwrap_or(0))
-        .saturating_mul(u64::try_from(config.head_dim).unwrap_or(0))
+    let kv_heads = u64::try_from(config.num_key_value_heads).unwrap_or(0);
+    let head_dim = u64::try_from(config.head_dim).unwrap_or(0);
+    // BF16 planes: one key and one value per layer, over the pages this batch touches.
+    let plane = pages
+        .saturating_mul(page_size)
+        .saturating_mul(kv_heads)
+        .saturating_mul(head_dim)
         .saturating_mul(2);
-    let cache = layers
+    let planes = layers.saturating_mul(2).saturating_mul(plane);
+    let flags = layers
         .saturating_mul(2)
-        .saturating_mul(plane_row)
-        .saturating_mul(4)
-        .max(1 << 20);
-    plan.workspace
-        .saturating_add(hidden)
-        .saturating_add(logits)
-        .saturating_add(cache)
-        .saturating_add(1 << 30)
+        .saturating_mul(pages)
+        .saturating_mul(4);
+    let rows = tokens.saturating_mul(plan.hidden).saturating_mul(2);
+    // The batch's i32 metadata: positions, slots, sequence lengths, the two offsets, the logits
+    // rows and the page table.
+    let metadata = tokens
+        .saturating_mul(7)
+        .saturating_add(64)
+        .saturating_mul(4);
+    let mut total = 0_u64;
+    for bytes in [planes, flags, rows, metadata, plan.bytes(DType::BF16)?] {
+        total = total
+            .saturating_add(bytes.next_multiple_of(256))
+            .saturating_add(256);
+    }
+    Ok(total)
 }
 
 /// The stack over one prompt: `last = Some(layer)` stops after that layer and digests its output,
@@ -505,7 +526,9 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
 
     // The arena, from the plan and the config's own cache geometry.
     let plan = model.plan(count)?;
-    let bytes = decode_arena_bytes(&plan, count, &config);
+    let page_size = 64_u64;
+    let pages = count.div_ceil(page_size).max(1);
+    let bytes = decode_arena_bytes(&plan, count, &config, page_size, pages)?;
     let allocator = weights.allocator();
     let reserve = usize::try_from(bytes).unwrap_or(usize::MAX);
     allocator.reserve(platform::PoolKind::Graph, reserve)?;
@@ -514,8 +537,6 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     let forward = Forward::new(&stream, &generation, &arena);
 
     // The batch of one sequence: every prompt token is one query row, the last asks for logits.
-    let page_size = 64_u64;
-    let pages = count.div_ceil(page_size).max(1);
     let positions: Vec<i32> = (0..count)
         .map(|at| i32::try_from(at).unwrap_or(0))
         .collect();

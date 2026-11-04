@@ -44,7 +44,18 @@ pub fn load(
     loader: &mut WeightLoader<'_>,
     options: LoadOptions,
 ) -> Result<Qwen3Moe> {
-    load_with(root, partition, loader, options, Quantization::Bf16)
+    // The experts' encoding is a property of this entry point, not of the caller's options: `load`
+    // reads dense stacks, so the plan reserves no encoded step whatever the options said.
+    load_with(
+        root,
+        partition,
+        loader,
+        LoadOptions {
+            experts_encoded: false,
+            ..options
+        },
+        Quantization::Bf16,
+    )
 }
 
 /// Load a model whose expert stacks are stored encoded (NVFP4).
@@ -60,11 +71,17 @@ pub fn load_encoded(
     options: LoadOptions,
     layout: ScaleLayout,
 ) -> Result<Qwen3Moe> {
+    // Likewise for the encoded stacks: this entry point is the one that reads them, so the plan's
+    // reservation follows from the call rather than from a second statement the caller could get
+    // wrong.
     load_with(
         root,
         partition,
         loader,
-        options,
+        LoadOptions {
+            experts_encoded: true,
+            ..options
+        },
         Quantization::Nvfp4(layout),
     )
 }
