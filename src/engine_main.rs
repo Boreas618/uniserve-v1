@@ -119,13 +119,9 @@ use program_server::{Client, Descriptors, Module, PrepareRequest, Program, Progr
 /// main process never receives program content, only the programs' names, and it
 /// resolves their modules from the Program Server itself.
 pub(crate) struct Epoch {
-    /// The configuration that fixed the epoch.
-    pub build: BuildConfig,
-    /// The programs that fill the epoch's operators and its scheduling
-    /// interface, by slot.
-    pub programs: Programs,
     /// The program revision the daemon numbered for the generation that serves
-    /// once this node switches over (§7.3).
+    /// once this node switches over (§7.3). Zero until the daemon's first `Precopy` names the
+    /// number it prepares: the number is the daemon's and this process never invents one.
     pub generation: u64,
     /// The host identity of the node this process runs on, which the daemon knows and which the
     /// Storage Server's claim states.
@@ -513,7 +509,21 @@ impl MainProcess {
         )?;
         // The request interface's handshake: this process says who it is, and the
         // daemon answers with the epoch this node serves (§2.3).
-        let epoch = handshake(&mut control, launch, build)?;
+        // The world this rank belongs to is the daemon's, and both of its facts decide the storage
+        // this process claims and the peers it exchanges products with. A zero world names no
+        // world, and a peer list on a world of one is a second node this epoch does not have: each
+        // is refused here, by name, rather than at the claim or the first transfer.
+        if launch.world == 0 {
+            bail!("the launch file states world 0, which names no world for this rank to serve");
+        }
+        if launch.world_size == 1 && !launch.peers.is_empty() {
+            bail!(
+                "the launch file states a world of one rank and {} peer address(es): a peer is \
+                 another main process of the same world, and this epoch has no other",
+                launch.peers.len()
+            );
+        }
+        let epoch = handshake(&mut control, launch)?;
         // The daemon's two interfaces are two sockets: the epoch's requests and metrics travel on
         // the request connection above, and everything the daemon asks of this process - the claim,
         // the reports of §7.3, and every command of the program layer - travels on this one.
@@ -532,20 +542,19 @@ impl MainProcess {
             .first()
             .context("this rank serves no device to map its weights on")?;
         let mut weights = WeightStore::new(Arc::clone(&client), weight_device);
-        let placement = Placement::of(launch, build)?;
         // One model per rank: every device's runner reads the same weights, so a second device costs
-        // one `Arc` and not a second load.
-        let model = Arc::new(
-            load_model(&launch.model, &placement, &mut weights)
-                .context("loading the epoch's model")?,
-        );
+        // one `Arc` and not a second load. The load and the capacity plan are one call because the
+        // order between them is the plan's: the weights are mapped first, so what the plan measures
+        // is what is left of the device rather than what was there before the model.
+        let (model, mut memory) = plan
+            .load_and_open(&mut weights, &mut &*client)
+            .context("loading the epoch's model")?;
 
         // The owners of §4 are opened before any thread that borrows them, and
         // released in reverse order by `close`. The weights are mapped before the capacity plan
         // measures, so the plan sees a device with the model already in it - the figure it computes
         // is what is left, not what was there before the load. Pools sized first and weights after
         // would over-commit the device by exactly the model's size.
-        let mut memory = plan.open_memory(&model, &mut &*client)?;
         let blocking = ThreadPool::new(plan.blocking_limits());
         let modules = blocking.lane::<Install>(BlockingKind::ModuleLoad)?;
         let programs = Arc::new(Mutex::new(Client::connect(plan.program_server())?));
@@ -1821,9 +1830,6 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Server for the node is the slow part, and it is the daemon's to do.
 const CLAIM_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The program slot that holds the epoch's scheduling policy (§4.4, §5.1).
-const SCHEDULING: &str = "scheduling";
-
 /// One device's half of §7.3 step 2, on the module-load lane: the Program
 /// Server compiles and caches what the generation's descriptors need, each
 /// module is resolved for this node's target, and each is loaded into this
@@ -2158,13 +2164,12 @@ fn device_command(
 /// The handshake with the daemon, which answers with the epoch this node serves
 /// (`specs/worker.md` §2.3).
 ///
-/// The daemon states three things: that this build may serve the epoch, the
-/// programs that fill the epoch's operators and its scheduling interface (their
-/// names and arguments, never their content, §5.1), and the program revision the
-/// daemon numbered for the generation that serves once this node switches over
-/// (§7.3). The build config is the one the daemon wrote for this node, read
-/// before the handshake; the welcome confirms it is the same epoch.
-fn handshake(control: &mut Control, launch: &Launch, build: &BuildConfig) -> Result<Epoch> {
+/// The daemon states that this build may serve the epoch, this node's host identity, and, later,
+/// the program revision of the generation it prepares (§7.3). The programs themselves never come
+/// through this interface: the daemon names them and this process resolves their modules from the
+/// Program Server (§5.1). The build config is the one the daemon wrote for this node, which `run`
+/// reads before the handshake.
+fn handshake(control: &mut Control, launch: &Launch) -> Result<Epoch> {
     control.daemon_mut().send(&proto::request::wire::Hello {
         engine: launch.engine,
         build: proto::BUILD.to_owned(),
@@ -2193,67 +2198,11 @@ fn handshake(control: &mut Control, launch: &Launch, build: &BuildConfig) -> Res
         );
     }
     Ok(Epoch {
-        build: build.clone(),
-        programs: Programs::new(),
         generation: 0,
         host: spec.host,
     })
 }
 
-/// The model class a checkpoint declares, as its `config.json` states it.
-fn architectural_class(checkpoint: &Path) -> Result<String> {
-    let path = checkpoint.join("config.json");
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let config: serde_json::Value = serde_json::from_str(&text)
-        .with_context(|| format!("parsing {}", path.display()))?;
-    let class = config
-        .get("architectures")
-        .and_then(|architectures| architectures.as_array())
-        .and_then(|architectures| architectures.first())
-        .and_then(|class| class.as_str())
-        .ok_or_else(|| anyhow::anyhow!("{} declares no model class", path.display()))?;
-    Ok(class.to_owned())
-}
-
-/// How this rank takes part in the deployment's parallel shape (§4.3, §5.1), as
-/// the build config fixes it and the daemon's launch places it.
-struct Placement {
-    tensor_parallel: u32,
-    tensor_rank: u32,
-    expert_parallel: u32,
-    expert_rank: u32,
-    load_options: qwen3_moe::LoadOptions,
-}
-
-impl Placement {
-    /// This rank's part of the epoch's parallel shape.
-    ///
-    /// Tensor parallelism splits every layer of the group's ranks; expert parallelism splits the
-    /// routed experts of the deployment's schedulers. A rank's ordinal places it in both: its
-    /// tensor rank is its position inside its scheduler's group, and its expert rank is which
-    /// scheduler's share of the experts it keeps.
-    fn of(launch: &Launch, build: &BuildConfig) -> Result<Self> {
-        let tensor_parallel = u32::try_from(build.tensor_parallel_size.get())
-            .context("a tensor-parallel degree larger than u32::MAX")?;
-        if tensor_parallel == 0 {
-            bail!("a tensor-parallel degree of zero splits nothing");
-        }
-        let data_parallel = u32::try_from(build.data_parallel_size.get())
-            .context("a data-parallel degree larger than u32::MAX")?;
-        let expert_parallel = if build.expert_parallel { data_parallel } else { 1 };
-        Ok(Self {
-            tensor_parallel,
-            tensor_rank: launch.rank % tensor_parallel,
-            expert_parallel,
-            expert_rank: (launch.rank / tensor_parallel) % expert_parallel,
-            // The deployment's page size is the cache's (`kv_cache_config.block_size`), and the
-            // attention program's workspace is the load config's; neither is ours to guess, so the
-            // model's own defaults stand until the loader takes them from the build config.
-            load_options: qwen3_moe::LoadOptions::default(),
-        })
-    }
-}
 
 /// The captured bucket set the epoch's runners are bound to (§4.5), and the same sizes as the
 /// capacity plan needs them.
@@ -2353,39 +2302,3 @@ impl GraphPlan {
     }
 }
 
-/// The one `match` on model class (§4.3): the executable links the model crates,
-/// and nothing else in the tree names a concrete model.
-///
-/// The class is the checkpoint's own declaration (`config.json`'s single
-/// `architectures` entry), so a checkpoint that names a model this build does not
-/// link is refused here rather than loaded as something else.
-fn load_model(
-    checkpoint: &Path,
-    placement: &Placement,
-    weights: &mut dyn nn::RetainedWeights,
-) -> Result<qwen3_moe::Qwen3Moe> {
-    match architectural_class(checkpoint)?.as_str() {
-        "Qwen3MoeForCausalLM" => {
-            // §8: a weight converted once is published to retained storage and mapped read-only
-            // afterwards; the checkpoint's own representation stands unless the deployment fixed
-            // another, which is the build config's `dtype` and `quantization`.
-            let opened = nn::Checkpoint::open(checkpoint)?;
-            let mut loader = nn::WeightLoader::new(&opened, weights, None, None);
-            let config = qwen3_moe::Config::read(checkpoint)?;
-            let partition = qwen3_moe::Partition::new(
-                &config,
-                placement.tensor_parallel as usize,
-                placement.tensor_rank as usize,
-                placement.expert_parallel as usize,
-                placement.expert_rank as usize,
-            )?;
-            Ok(qwen3_moe::load(
-                checkpoint,
-                partition,
-                &mut loader,
-                placement.load_options,
-            )?)
-        }
-        other => bail!("unsupported model class {other}"),
-    }
-}
