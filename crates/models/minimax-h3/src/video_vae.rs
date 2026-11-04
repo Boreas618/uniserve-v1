@@ -285,6 +285,69 @@ pub const TILE_PIXELS: u32 = 256;
 /// The minimum overlap between two adjacent tiles, in output pixels.
 pub const MINIMUM_OVERLAP: u32 = 64;
 
+/// Every parameter of the decoder, with its checkpoint key.
+///
+/// The decoder is the post-quantization projection, the input projection, the register table, 36
+/// transformer layers of twelve parameters each, and the final LayerNorm and output projection read
+/// from the checkpoint's name-translated keys (`decoder.proj_in`, `decoder.transformer_blocks.<i>`,
+/// `decoder.norm_out`, `decoder.proj_out`, `post_quant_conv`). The feed-forward projection is one
+/// packed tensor, value rows first, which is what the value-first SwiGLU reads: the reference splits
+/// it into two views only for its quantized fused path, and the dense decoder never does.
+///
+/// The vocabulary is [`crate::audio_vae::Source`]'s: a logical parameter named once, and the
+/// checkpoint tensor that fills it.
+pub fn sources(config: &VideoVaeConfig) -> crate::Result<Vec<crate::audio_vae::Source>> {
+    use crate::audio_vae::{Source, Tensor};
+
+    let mut sources = Vec::new();
+    let region = |parameter: &str, tensor: String| Source {
+        parameter: parameter.to_owned(),
+        tensor: Tensor::Region(tensor),
+    };
+
+    for (parameter, tensor) in [
+        ("post_quant.weight", "post_quant_conv.weight".to_owned()),
+        ("post_quant.bias", "post_quant_conv.bias".to_owned()),
+        ("input.weight", "decoder.proj_in.weight".to_owned()),
+        ("input.bias", "decoder.proj_in.bias".to_owned()),
+        ("registers", "decoder.register_tokens".to_owned()),
+    ] {
+        sources.push(region(parameter, tensor));
+    }
+    for index in 0..config.decoder_num_layers {
+        let at = |name: &str| format!("decoder.transformer_blocks.{index}.{name}");
+        for (parameter, tensor) in [
+            ("norm1.weight", at("norm1.weight")),
+            ("norm2.weight", at("norm2.weight")),
+            ("scale1", at("scale1")),
+            ("scale2", at("scale2")),
+            ("query.weight", at("attn.to_q.weight")),
+            ("query.bias", at("attn.to_q.bias")),
+            ("key.weight", at("attn.to_k.weight")),
+            ("key.bias", at("attn.to_k.bias")),
+            ("value.weight", at("attn.to_v.weight")),
+            ("value.bias", at("attn.to_v.bias")),
+            ("output.weight", at("attn.to_out.0.weight")),
+            ("output.bias", at("attn.to_out.0.bias")),
+            ("gate_up.weight", at("ff.net.0.proj.weight")),
+            ("gate_up.bias", at("ff.net.0.proj.bias")),
+            ("down.weight", at("ff.net.2.weight")),
+            ("down.bias", at("ff.net.2.bias")),
+        ] {
+            sources.push(region(&format!("layers.{index}.{parameter}"), tensor));
+        }
+    }
+    for (parameter, tensor) in [
+        ("norm.weight", "decoder.norm_out.weight".to_owned()),
+        ("norm.bias", "decoder.norm_out.bias".to_owned()),
+        ("output.weight", "decoder.proj_out.weight".to_owned()),
+        ("output.bias", "decoder.proj_out.bias".to_owned()),
+    ] {
+        sources.push(region(parameter, tensor));
+    }
+    Ok(sources)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,6 +454,42 @@ mod tests {
                     + u64::from(tile.canvas.registers)
                     + u64::from(tile.canvas.tail)
             );
+        }
+    }
+
+    #[test]
+    fn the_weight_table_names_every_parameter_of_the_checkpoint() {
+        let table = sources(&video_config()).expect("the decoder's parameters");
+        // 36 layers of sixteen parameters, plus the post-quantization pair, the input pair, the
+        // register table, and the head's four.
+        assert_eq!(table.len(), 36 * 16 + 5 + 4);
+        let names: Vec<&str> = table
+            .iter()
+            .map(|source| source.parameter.as_str())
+            .collect();
+        assert!(names.contains(&"post_quant.weight"));
+        assert!(names.contains(&"registers"));
+        assert!(names.contains(&"layers.0.norm1.weight"));
+        assert!(names.contains(&"layers.35.gate_up.bias"));
+        assert!(names.contains(&"norm.weight"));
+        assert!(names.contains(&"output.weight"));
+        let checkpoint: Vec<String> = table
+            .iter()
+            .map(|source| match &source.tensor {
+                crate::audio_vae::Tensor::Region(tensor) => tensor.clone(),
+                crate::audio_vae::Tensor::Normalized { .. } => {
+                    panic!("the video decoder folds no weight norm")
+                }
+            })
+            .collect();
+        assert!(checkpoint.contains(&"decoder.transformer_blocks.35.ff.net.0.proj.weight".to_owned()));
+        assert!(checkpoint.contains(&"decoder.proj_out.bias".to_owned()));
+        // No parameter and no checkpoint tensor is named twice.
+        for list in [names, checkpoint.iter().map(String::as_str).collect()] {
+            let mut unique = list.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(unique.len(), list.len());
         }
     }
 
