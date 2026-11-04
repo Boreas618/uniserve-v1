@@ -118,6 +118,7 @@ pub(crate) async fn adopt(
     http: proto::handoff::Http,
     mut body: crate::http::stream::ResponseStream,
     app: Router,
+    finished: impl FnOnce(),
 ) -> anyhow::Result<()> {
     let io = socket_of(descriptor).context("taking over a handed connection")?;
     let mut connection = Connection::new(io, app, CancellationToken::new());
@@ -132,6 +133,10 @@ pub(crate) async fn adopt(
     if http.chunked {
         connection.write(b"0\r\n\r\n", None).await?;
     }
+    // The response ends here, not when the connection closes: a kept-alive
+    // connection serves the next request from `run`, and the handoff's record
+    // names this response, not the connection (design §7.5.1).
+    finished();
     if !http.keep_alive {
         let _ = connection.io.shutdown().await;
         return Ok(());
@@ -1790,7 +1795,11 @@ mod tests {
             chunked: true,
             content_length: None,
         };
-        let adopted = tokio::spawn(adopt(descriptor, http, body, app()));
+        let ended = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&ended);
+        let adopted = tokio::spawn(adopt(descriptor, http, body, app(), move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
 
         let response = client.read_response().await;
         assert_eq!(response.status, 200);
@@ -1798,6 +1807,11 @@ mod tests {
         // The client sends nothing: these bytes came from the predecessor.
         let ahead = client.read_response().await;
         assert_eq!(ahead.body, "hello");
+        assert_eq!(
+            ended.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the adopted response ended before its connection went on to the next one"
+        );
         drop(client);
         adopted
             .await
@@ -1844,7 +1858,7 @@ mod tests {
             chunked: true,
             content_length: None,
         };
-        let adopted = tokio::spawn(adopt(descriptor, http, body, app()));
+        let adopted = tokio::spawn(adopt(descriptor, http, body, app(), || {}));
 
         let response = client.read_response().await;
         assert_eq!(response.body, "data: a\n\n");
@@ -1986,7 +2000,7 @@ mod tests {
             chunked: true,
             content_length: None,
         };
-        let adopted = tokio::spawn(adopt(descriptor, http, body, app()));
+        let adopted = tokio::spawn(adopt(descriptor, http, body, app(), || {}));
         frames.send(Bytes::from_static(b"data: c\n\n")).unwrap();
         drop(frames);
 
