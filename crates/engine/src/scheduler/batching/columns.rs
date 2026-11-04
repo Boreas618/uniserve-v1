@@ -1030,11 +1030,12 @@ mod tests {
         assert_eq!(columns.calls(), 1, "one call evaluates three rows");
         assert_eq!(columns.slots.len(), 3);
         assert_eq!(columns.commit.len(), commit::COMMIT_FIELDS);
+        // A verification is served from a decode bucket: one token per row,
+        // three candidate rows, and the sampler graph because they draw.
         columns
-            .check(&executor::plan::Shape::prefill(
+            .check(&executor::plan::Shape::decode(
                 3,
-                3,
-                executor::plan::Variant::PrefillWrite,
+                executor::plan::Variant::DecodeSampled,
             ))
             .expect("the fill satisfies the executor's check for a multi-row call");
     }
