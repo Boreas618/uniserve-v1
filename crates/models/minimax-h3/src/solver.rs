@@ -122,16 +122,13 @@ impl Solver {
         evaluation: u32,
     ) -> Result<()> {
         let track = self.track(modality);
-        let scaled = track
-            .steps
-            .get(evaluation as usize)
-            .ok_or_else(|| {
-                Error::checkpoint(format!(
-                    "H3 {} evaluation {evaluation} is outside the {} the schedule has",
-                    modality.as_str(),
-                    track.steps.len()
-                ))
-            })?;
+        let scaled = track.steps.get(evaluation as usize).ok_or_else(|| {
+            Error::checkpoint(format!(
+                "H3 {} evaluation {evaluation} is outside the {} the schedule has",
+                modality.as_str(),
+                track.steps.len()
+            ))
+        })?;
         let (sample, velocity) = self.check(sample, velocity, modality)?;
         scaled.forward(f, sample, velocity).map_err(Error::from)
     }
@@ -255,8 +252,8 @@ fn element(table: &Weight, index: usize) -> Weight {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Shifts;
     use crate::config::ScheduleSpec;
+    use crate::config::Shifts;
 
     fn base() -> Schedule {
         let spec = ScheduleSpec::uniform(
@@ -337,11 +334,7 @@ mod tests {
 
     #[test]
     fn a_latent_view_is_one_element_per_row() {
-        let view = TensorView::new(
-            DevicePtr::new(0),
-            DType::BF16,
-            Shape::new(&[24, 5, 8, 8]),
-        );
+        let view = TensorView::new(DevicePtr::new(0), DType::BF16, Shape::new(&[24, 5, 8, 8]));
         let elements = elements(view).expect("a contiguous latent tensor");
         assert_eq!(elements.shape.dims(), &[24 * 5 * 8 * 8, 1]);
     }
