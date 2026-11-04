@@ -32,7 +32,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::{Error, Result};
+use crate::{Config, Error, Result};
 
 /// The declaration's own file, when the export writes one beside `config.json`.
 const DECLARATION_FILE: &str = "hf_quant_config.json";
@@ -139,6 +139,52 @@ impl Representation {
             ))),
         }
     }
+}
+
+/// Every parameter this model reads, with the role that decides how it may be stored.
+///
+/// The list is the boundary's own statement of what the model consumes: one entry per checkpoint
+/// tensor, in the names the checkpoint uses. It is built from the configuration rather than from a
+/// shard's contents, because a checkpoint's *shard* is a bag of tensors while the model's set is a
+/// fact of its architecture — and the difference is what lets a declaration be checked before a
+/// tensor is opened.
+///
+/// The router appears only on a layer that routes, and the dense MLP's three projections only on a
+/// layer that does not, which is the checkpoint's own `mlp_only_layers` rule.
+pub fn parameters(config: &Config) -> Vec<(String, Role)> {
+    let mut parameters: Vec<(String, Role)> = vec![
+        ("model.embed_tokens.weight".to_owned(), Role::Embedding),
+        ("lm_head.weight".to_owned(), Role::Head),
+        ("model.norm.weight".to_owned(), Role::Norm),
+    ];
+    for layer in 0..config.num_hidden_layers {
+        let base = format!("model.layers.{layer}");
+        for projection in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+            parameters.push((format!("{base}.self_attn.{projection}.weight"), Role::Projection));
+        }
+        for norm in ["input_layernorm", "post_attention_layernorm"] {
+            parameters.push((format!("{base}.{norm}.weight"), Role::Norm));
+        }
+        for norm in ["q_norm", "k_norm"] {
+            parameters.push((format!("{base}.self_attn.{norm}.weight"), Role::Norm));
+        }
+        if config.sparse(layer) {
+            parameters.push((format!("{base}.mlp.gate.weight"), Role::Router));
+            for expert in 0..config.num_experts {
+                for projection in ["gate_proj", "up_proj", "down_proj"] {
+                    parameters.push((
+                        format!("{base}.mlp.experts.{expert}.{projection}.weight"),
+                        Role::Projection,
+                    ));
+                }
+            }
+        } else {
+            for projection in ["gate_proj", "up_proj", "down_proj"] {
+                parameters.push((format!("{base}.mlp.{projection}.weight"), Role::Projection));
+            }
+        }
+    }
+    parameters
 }
 
 /// A parameter's role, which decides whether a quantized form of it is served.

@@ -32,7 +32,7 @@ use ops::moe::grouped::Activation as MoeActivation;
 use ops::rope::Rotation;
 
 use crate::model::{AttentionLayer, DecoderLayer, DenseMlp, LoadOptions, Mlp, Qwen3Moe};
-use crate::representation::{Adopted, Representation, Role};
+use crate::representation::{self, Adopted, Representation};
 use crate::{Activation, Config, Error, Partition, Result};
 
 /// Load a `Qwen3MoeForCausalLM` checkpoint from `root`.
@@ -127,37 +127,8 @@ fn refuse_dense_parameters(root: &Path, representation: &Representation) -> Resu
         return Ok(());
     }
     let config = Config::read(root)?;
-    let mut parameters: Vec<(&str, Role)> = vec![
-        ("model.embed_tokens.weight", Role::Embedding),
-        ("lm_head.weight", Role::Head),
-        ("model.norm.weight", Role::Norm),
-    ];
-    // The per-layer names, built once per layer rather than once per parameter: a layer contributes
-    // seven projections, two norms, two Q/K norms, the router and (when it is dense) three more.
-    let mut names: Vec<(String, Role)> = Vec::new();
-    for layer in 0..config.num_hidden_layers {
-        let base = format!("model.layers.{layer}");
-        for projection in ["q_proj", "k_proj", "v_proj", "o_proj"] {
-            names.push((format!("{base}.self_attn.{projection}.weight"), Role::Projection));
-        }
-        for norm in ["input_layernorm", "post_attention_layernorm"] {
-            names.push((format!("{base}.{norm}.weight"), Role::Norm));
-        }
-        for norm in ["q_norm", "k_norm"] {
-            names.push((format!("{base}.self_attn.{norm}.weight"), Role::Norm));
-        }
-        if config.sparse(layer) {
-            names.push((format!("{base}.mlp.gate.weight"), Role::Router));
-        } else {
-            for projection in ["gate_proj", "up_proj", "down_proj"] {
-                names.push((format!("{base}.mlp.{projection}.weight"), Role::Projection));
-            }
-        }
-    }
-    for (name, role) in names.iter().map(|(name, role)| (name.as_str(), *role)) {
-        parameters.push((name, role));
-    }
-    for (parameter, role) in parameters {
+    for (parameter, role) in representation::parameters(&config) {
+        let parameter = parameter.as_str();
         // A *quantized projection* is the one shape this entry point cannot serve yet: its packed
         // product is keyed by the row count, which `keys()` has no input for. The refusal says so
         // rather than reading the parameter as dense.
