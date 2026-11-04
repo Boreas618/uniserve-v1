@@ -276,10 +276,10 @@ impl VideoPostprocessor {
             }
             None => clip,
         };
-        self.bytes.forward(f, raster.body(source, splice), out)?;
+        self.bytes.forward(f, raster.body(source, splice)?, out)?;
         if splice.last {
             self.bytes
-                .forward(f, raster.written(source, splice.overlap), out)?;
+                .forward(f, raster.written(source, splice.overlap)?, out)?;
         }
         Ok(())
     }
@@ -321,11 +321,17 @@ impl Raster {
 
     /// The view of `range` frames of `raster`, as `[channels, frames, rows, columns]`.
     ///
-    /// The clip is contiguous and channels-first, so a frame range is a column-block of every channel:
-    /// the view keeps the channel stride and narrows the frames axis, which every operator here reads
-    /// through the view's strides rather than by flattening.
-    fn written(&self, raster: TensorView, range: (u32, u32)) -> TensorView {
+    /// A frame range is a column-block of every channel: the view keeps the clip's own strides and
+    /// narrows the frames axis, so a clip that is a sub-block of a larger raster stays on the frames it
+    /// names. The operators on this path read through the view's strides rather than by flattening.
+    fn written(&self, raster: TensorView, range: (u32, u32)) -> Result<TensorView> {
         let (start, stop) = range;
+        if start >= stop || stop > self.frames {
+            return Err(Error::config(format!(
+                "a clip's frames {start}..{stop} lie outside its {} decoded frames",
+                self.frames
+            )));
+        }
         let element = raster.element(&[0, u64::from(start), 0, 0]);
         let shape = Shape::new(&[
             u64::from(Rgb::CHANNELS),
@@ -333,17 +339,19 @@ impl Raster {
             u64::from(self.height),
             u64::from(self.width),
         ]);
-        let strides = nn::Strides::new(&[
-            u64::from(self.frames) * u64::from(self.height) * u64::from(self.width),
-            u64::from(self.height) * u64::from(self.width),
-            u64::from(self.width),
-            1,
-        ]);
-        TensorView::with_strides(element, raster.dtype, shape, strides)
+        // The frame range's strides are the clip's own, so a clip that is a sub-block of a larger
+        // raster keeps reading the right frames; only the frames extent narrows.
+        let strides = nn::Strides::new(raster.strides.as_slice());
+        Ok(TensorView::with_strides(
+            element,
+            raster.dtype,
+            shape,
+            strides,
+        ))
     }
 
     /// The body view of one clip: what the timeline keeps before the tail.
-    fn body(&self, raster: TensorView, splice: &Splice) -> TensorView {
+    fn body(&self, raster: TensorView, splice: &Splice) -> Result<TensorView> {
         self.written(raster, splice.body)
     }
 
@@ -492,7 +500,7 @@ mod tests {
         let per_channel = u64::from(CLIP_OUTPUT_FRAMES) * per_frame;
         // The body is the clip's first frames of every channel: the channel stride stays the whole
         // clip's, so the second channel is one channel into the block, not one body into it.
-        let body = raster.body(clip, &Splice::CLIP);
+        let body = raster.body(clip, &Splice::CLIP).expect("a body");
         assert_eq!(
             body.shape.dims(),
             [
@@ -509,7 +517,7 @@ mod tests {
         assert_eq!(body.element(&[1, 0, 0, 0]), clip.element(&[1, 0, 0, 0]));
         // The tail's first frame is the frame after the three padding frames, with the same channel
         // stride - the offset that a wrong range would take from the padding instead.
-        let tail = raster.written(clip, Splice::LAST.overlap);
+        let tail = raster.written(clip, Splice::LAST.overlap).expect("a tail");
         assert_eq!(tail.shape.dim(1), u64::from(OVERLAP_FRAMES));
         assert_eq!(tail.strides.as_slice(), body.strides.as_slice());
         assert_eq!(
@@ -523,6 +531,39 @@ mod tests {
             body_last,
             clip.element(&[0, u64::from(CLIP_FRAMES) - 1, 0, 0])
         );
+    }
+
+    #[test]
+    fn a_strided_clip_keeps_its_own_frames_and_a_range_outside_it_is_refused() {
+        let (height, width) = (4_u32, 6_u32);
+        let per_frame = u64::from(height) * u64::from(width);
+        let per_channel = u64::from(CLIP_OUTPUT_FRAMES) * per_frame;
+        // A clip that is a sub-block of a wider raster: one frame padding between frames, so the
+        // frame stride is the block's own and not the contiguous one.
+        let padded = TensorView::with_strides(
+            nn::DevicePtr::new(0),
+            nn::DType::F16,
+            Shape::new(&[
+                3,
+                u64::from(CLIP_OUTPUT_FRAMES),
+                u64::from(height),
+                u64::from(width),
+            ]),
+            nn::Strides::new(&[per_channel + per_frame, per_frame * 2, u64::from(width), 1]),
+        );
+        let raster = Raster::of(padded).expect("a clip raster");
+        let body = raster.body(padded, &Splice::CLIP).expect("a body");
+        // The view keeps the clip's strides; only the frames extent narrows.
+        assert_eq!(body.strides.as_slice(), padded.strides.as_slice());
+        assert_eq!(body.element(&[0, 1, 0, 0]), padded.element(&[0, 1, 0, 0]));
+        assert_eq!(body.element(&[1, 0, 0, 0]), padded.element(&[1, 0, 0, 0]));
+        // A range that leaves the clip is refused rather than read past it.
+        assert!(
+            raster
+                .written(padded, (CLIP_FRAMES, CLIP_OUTPUT_FRAMES + 1))
+                .is_err()
+        );
+        assert!(raster.written(padded, (CLIP_FRAMES, CLIP_FRAMES)).is_err());
     }
 
     #[test]
