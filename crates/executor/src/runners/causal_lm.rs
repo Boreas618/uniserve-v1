@@ -768,6 +768,23 @@ struct Sampled {
     logits: Option<TensorView>,
 }
 
+/// The largest candidate of one row: a greedy request's token.
+///
+/// The first finite value wins ties (the lowest token id, which is what `torch.max` answers for a
+/// row of distinct logits and what keeps two runs alike for a tied one), and a row whose values are
+/// all non-finite answers candidate zero rather than an arbitrary index. This is the same rule the
+/// captured `argmax` operator applies on the device, and it is here in one place so the host path
+/// and its test cannot disagree about it.
+fn argmax(values: &[f32]) -> usize {
+    let mut best = 0_usize;
+    for (index, value) in values.iter().enumerate() {
+        if value.is_finite() && (*value > values[best] || !values[best].is_finite()) {
+            best = index;
+        }
+    }
+    best
+}
+
 /// The sampling step's own device state: the slot histories its penalties read.
 struct Sampling {
     sampler: nn::Sampler,
@@ -1979,16 +1996,12 @@ impl<M: CausalLm> CausalLmRunner<M> {
             self.stream.synchronize()?;
             // SAFETY: the copy above filled `width` f32 in the pinned row buffer, and the token
             // buffer holds one i32 per row of this bucket.
+            // SAFETY: the copy above filled `width` f32 in the pinned row buffer.
             let best = unsafe {
-                let values =
-                    std::slice::from_raw_parts(self.columns.logits_row.as_ptr().cast::<f32>(), width as usize);
-                let mut best = 0_usize;
-                for (index, value) in values.iter().enumerate() {
-                    if value.is_finite() && (*value > values[best] || !values[best].is_finite()) {
-                        best = index;
-                    }
-                }
-                best
+                argmax(std::slice::from_raw_parts(
+                    self.columns.logits_row.as_ptr().cast::<f32>(),
+                    width as usize,
+                ))
             };
             // SAFETY: the readback buffer holds `rows` i32 and `row` is inside it.
             unsafe {
@@ -2711,6 +2724,27 @@ mod tests {
             error.to_string().contains("never copied"),
             "the refusal does not say what would go wrong: {error}"
         );
+    }
+
+    /// The host argmax of a greedy row is the same rule the captured `argmax` operator applies: the
+    /// largest finite value, ties to the lowest index, and a row of non-finite values answering
+    /// candidate zero rather than an arbitrary index.
+    ///
+    /// The end-to-end proof - a greedy request whose prompt spans several prefill chunks taking the
+    /// argmax of that chunk's row - belongs to the caller's run, which must compare against a
+    /// recomputed argmax and not merely against a rerun of this code: a drawn token is just as
+    /// deterministic.
+    #[test]
+    fn the_host_argmax_is_the_largest_finite_candidate_and_ties_go_to_the_lowest() {
+        assert_eq!(argmax(&[1.0, 3.0, 2.0]), 1);
+        assert_eq!(argmax(&[3.0, 1.0, 1.0]), 0);
+        // Two equal maxima: the first wins, so two runs and two implementations agree.
+        assert_eq!(argmax(&[0.5, 2.0, 2.0]), 1);
+        // A non-finite value is never a candidate, at the head or in the middle.
+        assert_eq!(argmax(&[f32::NAN, 1.5, 1.0]), 1);
+        assert_eq!(argmax(&[1.0, f32::INFINITY, 2.0]), 2);
+        // Every value non-finite: answer zero rather than an index that came from nowhere.
+        assert_eq!(argmax(&[f32::NAN, f32::NAN]), 0);
     }
 
     /// A provider that holds no cache refuses a slot row by name, because the gather would otherwise
