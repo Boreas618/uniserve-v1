@@ -501,6 +501,21 @@ fn main() {
         }
         .to_string(),
     );
+    // The latent reorder: the video decoder writes channel-first and the media stage reads
+    // channel-last, so one strided copy moves the block. Two rows, because the two consumers work in
+    // different precisions — the VAE's latent is FP32 (its native precision) and the VSA compose's
+    // pooled block is BF16 — and the key names the element type and nothing else: the strides are
+    // launch values, so one program serves every clip geometry.
+    for dtype in [DType::F32, DType::BF16] {
+        push(
+            "copy_block",
+            ops::copy_block::Descriptor {
+                source: dtype,
+                out: dtype,
+            }
+            .to_string(),
+        );
+    }
     // The audio decoder's fused BigVGAN block, at the decoder's own rate and taps.
     push(
         "audio_activation",

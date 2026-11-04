@@ -82,6 +82,7 @@ pub mod block_copy;
 pub mod capture;
 pub mod commit;
 pub mod conv;
+pub mod copy_block;
 pub mod cross_fade;
 pub mod descriptor;
 pub mod embedding;
