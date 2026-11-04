@@ -64,6 +64,19 @@ pairwise-versus-sequential sum of the rotary time series. What a correct report 
 the dumper must be run for a *recorded* run (in a full environment, without stubbing imports), is in
 `notes/h3/numeric-diagnosis.md`.
 
+The same example compares **block tensors** in a second mode, file by file between two dump
+directories - one from the reference implementation's shadow pass and one from this crate's traced
+views:
+
+```text
+cargo run -p minimax-h3 --example compare_blocks -- --reference /tmp/ref --candidate /tmp/ours
+```
+
+Integer tensors are compared exactly, floats by their largest absolute and relative difference, and
+half-precision tensors are read in the dtype they were computed in (`4` bf16, `5` f16 - the reader
+widens, so a trace is not doubled on disk). Nothing here is a gate: a report states what the two
+sides computed, and a difference is diagnosed before it is fixed.
+
 ## What is not built here yet
 
 - The video decoder, the audio decoder and the condition encoders are not yet capability blocks, so
