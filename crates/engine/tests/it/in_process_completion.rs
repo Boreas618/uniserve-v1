@@ -153,12 +153,13 @@ impl Serving {
     }
 
     /// The batch's calls, each answered as a completed call that sampled
-    /// [`SAMPLED`] and stands one token past the cache extent the mechanism
-    /// wrote into the batch's own rows.
+    /// [`SAMPLED`] and leaves the cache extent its row was stated with.
     ///
-    /// The positions are the columns', not invented: a real executor reports
-    /// the slot's state after the commit, and the mechanism's next call reads
-    /// them to know what a successor may read.
+    /// The extents are the columns', not invented: `seq_lens` is a row's
+    /// attention length, cached prefix plus its own query, which is exactly the
+    /// cache the call leaves behind - so a prefill of eight prompt tokens
+    /// leaves eight, and a decode of one token on top leaves nine. The
+    /// mechanism's next call reads them to know what a successor may read.
     fn serve(&self, batch: Batch) -> Submission {
         let calls = batch
             .calls
@@ -177,9 +178,11 @@ impl Serving {
                     *call,
                     vec![SAMPLED + index as u32],
                     RowState {
-                        step_index: seen + 1,
-                        cache_computed_len: seen + 1,
-                        cache_visible_len: seen + 1,
+                        // Text carries no denoising trajectory: the step index
+                        // is a media row's, and this pool serves forwards.
+                        step_index: 0,
+                        cache_computed_len: seen,
+                        cache_visible_len: seen,
                     },
                 )
             })
