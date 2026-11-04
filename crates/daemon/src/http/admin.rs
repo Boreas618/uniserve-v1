@@ -118,6 +118,16 @@ impl Admin {
     /// An admin whose shutdown cancels `shutdown` and, when asked to, sets
     /// `retire`.
     pub(crate) fn new(shutdown: CancellationToken, retire: Arc<AtomicBool>) -> Arc<Self> {
+        Self::with_epochs(shutdown, retire, Arc::new(crate::epoch::Epochs::new()))
+    }
+
+    /// As [`Admin::new`], over records the epoch layer already holds: the
+    /// admin reports the same epochs the switch moves.
+    pub(crate) fn with_epochs(
+        shutdown: CancellationToken,
+        retire: Arc<AtomicBool>,
+        epochs: Arc<crate::epoch::Epochs>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             events: Mutex::new(VecDeque::with_capacity(EVENT_CAPACITY)),
             next_event: AtomicU64::new(1),
@@ -588,6 +598,7 @@ fn applied_result(
         Ok(Applied::InPlace(plan)) => Ok(json!({ "change": "in_place", "plan": plan })),
         Ok(Applied::Planned(plan)) => Ok(json!({ "change": "planned", "plan": plan })),
         Ok(Applied::World(report)) => Ok(json!({ "change": "world", "world": report })),
+        Ok(Applied::Epoch(report)) => Ok(json!({ "change": "epoch", "epoch": report })),
         Ok(Applied::Daemon { .. }) => Err((
             StatusCode::CONFLICT,
             "the daemon's own options changed again after its hot restart".to_owned(),
@@ -647,8 +658,20 @@ async fn commit(State(state): State<AdminState>) -> Response {
             let number = program.update.number;
             match leader.commit_programs(number).await {
                 Ok(true) => {
-                    program_phase(&admin, &epochs, Phase::Committed, program.epoch, &program.update);
-                    program_phase(&admin, &epochs, Phase::Purged, program.epoch, &program.update);
+                    program_phase(
+                        &admin,
+                        &epochs,
+                        Phase::Committed,
+                        program.epoch,
+                        &program.update,
+                    );
+                    program_phase(
+                        &admin,
+                        &epochs,
+                        Phase::Purged,
+                        program.epoch,
+                        &program.update,
+                    );
                     return Ok(json!({
                         "change": "program",
                         "epoch": program.epoch,
@@ -714,7 +737,12 @@ async fn program_update(
         Ok(Some(update)) => {
             // The main processes prepared, switched to and now serve the new
             // generation; the probation decides it (§7.3 steps 2-4).
-            for phase in [Phase::Precopied, Phase::Switchover, Phase::Switched, Phase::Probation] {
+            for phase in [
+                Phase::Precopied,
+                Phase::Switchover,
+                Phase::Switched,
+                Phase::Probation,
+            ] {
                 program_phase(admin, &epochs, phase, epoch, &update);
             }
             Ok(Some(json!({
@@ -743,15 +771,9 @@ fn refused_precopy(
         number,
         Phase::PrecopyFailed,
         epoch,
-        [
-            ("change", json!("program")),
-            ("reason", json!(reason)),
-        ],
+        [("change", json!("program")), ("reason", json!(reason))],
     );
-    (
-        update_status(error),
-        format!("precopy failed: {reason}"),
-    )
+    (update_status(error), format!("precopy failed: {reason}"))
 }
 
 /// Reports one phase of a program-layer update on the event log: the phase,
@@ -840,8 +862,20 @@ async fn rollback(State(state): State<AdminState>, body: axum::body::Bytes) -> R
             let number = program.update.number;
             match leader.rollback_programs(number, &reason).await {
                 Ok(true) => {
-                    program_phase(&admin, &epochs, Phase::Reverted, program.epoch, &program.update);
-                    program_phase(&admin, &epochs, Phase::Purged, program.epoch, &program.update);
+                    program_phase(
+                        &admin,
+                        &epochs,
+                        Phase::Reverted,
+                        program.epoch,
+                        &program.update,
+                    );
+                    program_phase(
+                        &admin,
+                        &epochs,
+                        Phase::Purged,
+                        program.epoch,
+                        &program.update,
+                    );
                     return Ok(json!({
                         "change": "program",
                         "epoch": program.epoch,
