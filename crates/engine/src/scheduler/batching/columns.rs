@@ -45,7 +45,7 @@
 
 use std::ops::Range;
 
-use executor::batch::{commit, BatchColumns};
+use executor::batch::{BatchColumns, commit};
 use ipc::{Call, CallKind, ForwardMode};
 use nn::{BatchRow, BatchRows, RowKind};
 use proto::request::SamplingParams;
@@ -175,7 +175,8 @@ pub(crate) fn columns(
         }
 
         let first = u32::try_from(call.coordinates.logical_position).ok()?;
-        rows.positions.extend(slots::positions_of(first, tokens_of_call)?);
+        rows.positions
+            .extend(slots::positions_of(first, tokens_of_call)?);
 
         // One `-1` per token whose row writes no cache page: the write decision
         // is per row, so it expands over the row's tokens here and nowhere else.
@@ -441,9 +442,10 @@ mod tests {
     }
 
     /// One cell of the commit table, which is column-major over the batch's
-    /// rows.
+    /// calls: a call states once how the step advances its slot, however many
+    /// rows it evaluated.
     fn commit_cell(columns: &BatchColumns, column: usize, row: usize) -> i64 {
-        columns.commit[column * columns.rows() + row]
+        columns.commit[column * columns.calls() + row]
     }
 
     fn decode() -> CallKind {
@@ -653,29 +655,33 @@ mod tests {
         let mut unsampled_decode = call(decode(), 12, &[1]);
         unsampled_decode.token_output = None;
         unsampled_decode.coordinates.cache_visible_len = 12;
-        assert!(columns(
-            &[(unsampled_decode, placement(1, &[1], &[true]))],
-            &[vec![1]],
-            &[&sampling()],
-            &[0],
-            page(),
-            2048,
-        )
-        .is_none());
+        assert!(
+            columns(
+                &[(unsampled_decode, placement(1, &[1], &[true]))],
+                &[vec![1]],
+                &[&sampling()],
+                &[0],
+                page(),
+                2048,
+            )
+            .is_none()
+        );
 
         // A prefill writing past the extent its block table covers is a
         // planning fault, not a clamped extent.
         let mut overlong = call(prefill(), 18, &[4]);
         overlong.coordinates.cache_visible_len = 18;
-        assert!(columns(
-            &[(overlong, placement(1, &[4], &[true]))],
-            &[vec![1, 2, 3, 4]],
-            &[&sampling()],
-            &[0],
-            page(),
-            2048,
-        )
-        .is_none());
+        assert!(
+            columns(
+                &[(overlong, placement(1, &[4], &[true]))],
+                &[vec![1, 2, 3, 4]],
+                &[&sampling()],
+                &[0],
+                page(),
+                2048,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -693,17 +699,19 @@ mod tests {
         // Call A: 4 tokens at position 8 (page 2, unit 7); call B: 2 tokens at
         // position 12 (page 3, unit 9).
         let requests = vec![
-            (
-                call(prefill(), 8, &[4]),
-                placement(1, &[4], &[true]),
-            ),
-            (
-                call(prefill(), 12, &[2]),
-                placement(2, &[2], &[true]),
-            ),
+            (call(prefill(), 8, &[4]), placement(1, &[4], &[true])),
+            (call(prefill(), 12, &[2]), placement(2, &[2], &[true])),
         ];
         let inputs = vec![vec![11, 12, 13, 14], vec![21, 22]];
-        let columns = columns(&requests, &inputs, &[&sampling(), &sampling()], &[0, 0], page(), 2048).expect("a prefill batch");
+        let columns = columns(
+            &requests,
+            &inputs,
+            &[&sampling(), &sampling()],
+            &[0, 0],
+            page(),
+            2048,
+        )
+        .expect("a prefill batch");
 
         assert_eq!(columns.rows(), 2, "one row per call");
         assert_eq!(columns.tokens(), 6);
@@ -742,12 +750,16 @@ mod tests {
 
     #[test]
     fn a_filled_batch_states_one_sampler_row_per_row_and_passes_the_executors_check() {
-        let requests = vec![(
-            call(prefill(), 8, &[4]),
-            placement(1, &[4], &[true]),
-        )];
-        let columns = columns(&requests, &[vec![1, 2, 3, 4]], &[&sampling()], &[0], page(), 2048)
-            .expect("a prefill batch");
+        let requests = vec![(call(prefill(), 8, &[4]), placement(1, &[4], &[true]))];
+        let columns = columns(
+            &requests,
+            &[vec![1, 2, 3, 4]],
+            &[&sampling()],
+            &[0],
+            page(),
+            2048,
+        )
+        .expect("a prefill batch");
         assert_eq!(columns.parameters.len(), SAMPLER_PARAMETERS);
         assert_eq!(
             &columns.parameters[..7],
@@ -766,11 +778,9 @@ mod tests {
 
     #[test]
     fn a_row_that_writes_nothing_states_minus_one_for_its_tokens() {
-        let requests = vec![(
-            call(prefill(), 8, &[2]),
-            placement(1, &[2], &[false]),
-        )];
-        let columns = columns(&requests, &[vec![1, 2]], &[&sampling()], &[0], page(), 64).expect("a prefill batch");
+        let requests = vec![(call(prefill(), 8, &[2]), placement(1, &[2], &[false]))];
+        let columns = columns(&requests, &[vec![1, 2]], &[&sampling()], &[0], page(), 64)
+            .expect("a prefill batch");
         assert_eq!(columns.rows.slot_mapping, vec![-1, -1]);
     }
 
@@ -781,7 +791,15 @@ mod tests {
             call(verify(), 9, &[1, 1, 1]),
             placement(1, &[1, 1, 1], &[true, true, true]),
         )];
-        let columns = columns(&requests, &[vec![7, 8, 9]], &[&sampling()], &[0], page(), 64).expect("a verify batch");
+        let columns = columns(
+            &requests,
+            &[vec![7, 8, 9]],
+            &[&sampling()],
+            &[0],
+            page(),
+            64,
+        )
+        .expect("a verify batch");
         assert_eq!(columns.rows(), 3);
         assert_eq!(columns.tokens(), 3);
         assert_eq!(columns.rows.positions, vec![9, 10, 11]);
@@ -796,14 +814,33 @@ mod tests {
             0..3,
             "one call owns all three rows"
         );
+        // The batch's two row counts stay distinct: the sampler's slots and
+        // parameters are per row, the commit table's are per call.
+        assert_eq!(columns.calls(), 1, "one call evaluates three rows");
+        assert_eq!(columns.slots.len(), 3);
+        assert_eq!(columns.commit.len(), commit::COMMIT_FIELDS);
+        columns
+            .check(&executor::plan::Shape::prefill(
+                3,
+                3,
+                executor::plan::Variant::PrefillWrite,
+            ))
+            .expect("the fill satisfies the executor's check for a multi-row call");
     }
 
     #[test]
     fn a_media_call_is_not_a_token_batch() {
         let media = call(ipc::CallKind::Media(ipc::MediaCall::Denoising), 0, &[1]);
         assert!(
-            columns(&[(media, placement(1, &[1], &[true]))], &[vec![0]], &[&sampling()], &[0], page(), 64)
-                .is_none(),
+            columns(
+                &[(media, placement(1, &[1], &[true]))],
+                &[vec![0]],
+                &[&sampling()],
+                &[0],
+                page(),
+                64
+            )
+            .is_none(),
             "a media call has no token row"
         );
     }
@@ -816,18 +853,22 @@ mod tests {
         let mut decode = decode;
         decode.input_token_ids.clear();
         assert!(
-            columns(&[(decode, placement(1, &[1], &[true]))], &[Vec::new()], &[&sampling()], &[0], page(), 64)
-                .is_none()
+            columns(
+                &[(decode, placement(1, &[1], &[true]))],
+                &[Vec::new()],
+                &[&sampling()],
+                &[0],
+                page(),
+                64
+            )
+            .is_none()
         );
     }
 
     #[test]
     fn a_token_outside_its_table_is_a_fault_not_a_clamp() {
         // A call at position 20 lies past the table's last covered page.
-        let requests = vec![(
-            call(prefill(), 20, &[1]),
-            placement(1, &[1], &[true]),
-        )];
+        let requests = vec![(call(prefill(), 20, &[1]), placement(1, &[1], &[true]))];
         assert!(columns(&requests, &[vec![1]], &[&sampling()], &[0], page(), 64).is_none());
     }
 
@@ -841,15 +882,29 @@ mod tests {
 
     #[test]
     fn the_inputs_must_name_one_token_per_token_the_rows_embed() {
-        let requests = vec![(
-            call(prefill(), 8, &[2]),
-            placement(1, &[2], &[true]),
-        )];
+        let requests = vec![(call(prefill(), 8, &[2]), placement(1, &[2], &[true]))];
         assert!(columns(&requests, &[vec![1]], &[&sampling()], &[0], page(), 64).is_none());
-        assert!(columns(&requests, &[vec![1, 2, 3]], &[&sampling()], &[0], page(), 64).is_none());
         assert!(
-            columns(&requests, &[vec![1, 2], vec![3]], &[&sampling(), &sampling()], &[0, 0], page(), 64)
-                .is_none(),
+            columns(
+                &requests,
+                &[vec![1, 2, 3]],
+                &[&sampling()],
+                &[0],
+                page(),
+                64
+            )
+            .is_none()
+        );
+        assert!(
+            columns(
+                &requests,
+                &[vec![1, 2], vec![3]],
+                &[&sampling(), &sampling()],
+                &[0, 0],
+                page(),
+                64
+            )
+            .is_none(),
             "an input list per call, not one more than there are calls"
         );
     }
