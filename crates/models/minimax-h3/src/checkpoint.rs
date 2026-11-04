@@ -583,15 +583,13 @@ mod tests {
         // `MiniMax-H3/FL2VA/model_index.json`: the pipeline class a task export states, with its
         // `video_vae` directory rather than the modular pipeline's `vae`.
         write(
-            &root.path(),
+            root.path(),
             "model_index.json",
             r#"{"_class_name": "MiniMaxH3Pipeline", "transformer": ["diffusers", "Model"]}"#,
         );
-        write(&root.path(), "transformer/config.json", "{}");
-        write(&root.path(), "video_vae/config.json", "{}");
-        let error = Layout::detect(root.path())
-            .err()
-            .expect("a task export is refused");
+        write(root.path(), "transformer/config.json", "{}");
+        write(root.path(), "video_vae/config.json", "{}");
+        let error = Layout::detect(root.path()).expect_err("a task export is refused");
         assert!(
             matches!(error, Error::Checkpoint(ref problem)
                 if problem.contains("MiniMaxH3Pipeline") && problem.contains("pipeline root")),
@@ -601,7 +599,7 @@ mod tests {
         // The modular pipeline's own class name is taken, and an index that states none is not
         // refused for it: a hand-built export need not name one.
         write(
-            &root.path(),
+            root.path(),
             "model_index.json",
             &format!(
                 r#"{{"_class_name": "{PIPELINE_CLASS}", "transformer": ["diffusers", "Model"]}}"#
@@ -614,13 +612,13 @@ mod tests {
     fn a_base_release_lists_the_dits_its_index_names_and_its_root_holds() {
         let root = tempfile::tempdir().expect("tempdir");
         write(
-            &root.path(),
+            root.path(),
             "model_index.json",
             &base_index(&["transformer", "transformer_ref"]),
         );
         for dit in Dit::ALL {
             write(
-                &root.path(),
+                root.path(),
                 &format!("{}/config.json", dit.directory()),
                 "{}",
             );
@@ -647,17 +645,17 @@ mod tests {
     fn a_dit_the_index_names_but_the_root_lacks_is_not_a_layout() {
         let root = tempfile::tempdir().expect("tempdir");
         write(
-            &root.path(),
+            root.path(),
             "model_index.json",
             &base_index(&["transformer", "transformer_ref"]),
         );
-        write(&root.path(), "transformer/config.json", "{}");
+        write(root.path(), "transformer/config.json", "{}");
         let layout = Layout::detect(root.path()).expect("the base DiT is present");
         assert_eq!(layout.dits.len(), 1);
 
         let empty = tempfile::tempdir().expect("tempdir");
         write(
-            &empty.path(),
+            empty.path(),
             "model_index.json",
             &base_index(&["transformer"]),
         );
@@ -681,7 +679,7 @@ mod tests {
     fn a_dmd_export_states_its_rungs_and_serves_its_partitions_tasks() {
         let root = tempfile::tempdir().expect("tempdir");
         write(
-            &root.path(),
+            root.path(),
             "fastvideo_inference.json",
             r#"{
                 "task": "t2av",
@@ -727,7 +725,7 @@ mod tests {
     fn an_omniref_export_states_its_block_grid_its_keep_rate_and_its_base_revision() {
         let root = tempfile::tempdir().expect("tempdir");
         write(
-            &root.path(),
+            root.path(),
             "fastvideo_inference.json",
             r#"{
                 "model_type": "ref2va",
@@ -766,7 +764,7 @@ mod tests {
     fn a_contract_is_refused_when_it_states_no_supported_task() {
         let root = tempfile::tempdir().expect("tempdir");
         write(
-            &root.path(),
+            root.path(),
             "fastvideo_inference.json",
             r#"{"task": "t2v", "video_scheduler_shift": 1.0, "audio_scheduler_shift": 1.0,
                 "dmd_denoising_steps": [10], "vsa_tile_size": 64, "vsa_sparsity": 0.0}"#,
@@ -782,7 +780,7 @@ mod tests {
     fn a_contract_states_exactly_one_schedule() {
         let root = tempfile::tempdir().expect("tempdir");
         write(
-            &root.path(),
+            root.path(),
             "fastvideo_inference.json",
             r#"{"task": "t2av", "video_scheduler_shift": 1.0, "audio_scheduler_shift": 1.0,
                 "vsa_tile_size": 64, "vsa_sparsity": 0.0}"#,
@@ -806,10 +804,10 @@ mod tests {
             ("scheduler/scheduler_config.json", r#"{"shift": 12.0}"#),
             ("audio_scheduler/scheduler_config.json", r#"{"shift": 3.0}"#),
         ] {
-            write(&base.path(), relative, body);
+            write(base.path(), relative, body);
         }
         write(
-            &export.path(),
+            export.path(),
             "transformer/config.json",
             r#"{"num_layers": 50}"#,
         );
@@ -824,9 +822,12 @@ mod tests {
         assert_eq!(sidecars.dits[&Dit::Base]["num_layers"], 50);
         assert!(sidecars.video_processor.is_none());
 
-        let error = Sidecars::read(export.path(), None, &layout)
-            .err()
-            .expect("without the base the text encoder is missing");
+        // Without the base the export holds no text encoder: the reader says which sidecar it
+        // looked for. `Sidecars` is not `Debug`, so the error is matched rather than unwrapped.
+        let error = match Sidecars::read(export.path(), None, &layout) {
+            Ok(_) => panic!("without the base the text encoder is missing"),
+            Err(error) => error,
+        };
         assert!(
             matches!(error, Error::Checkpoint(ref problem) if problem.contains("text_encoder/config.json")),
             "{error}"

@@ -602,8 +602,10 @@ impl Layouts {
             &segments,
             // The prompt's vision rows arrive with `VideoRequest`'s condition shapes.
             &[],
-            sparsity,
-            reference_keep,
+            packing::Sparsity {
+                sparsity,
+                reference_keep,
+            },
         )?;
         let rows = tables.groups.len();
         if rows != packing.extent.padded_tokens as usize {
