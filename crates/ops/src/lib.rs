@@ -106,6 +106,7 @@ pub mod replicate_pad;
 pub mod residual;
 pub mod resize;
 pub mod rope;
+pub mod rows;
 pub mod sampler;
 pub mod segments;
 pub mod snake;

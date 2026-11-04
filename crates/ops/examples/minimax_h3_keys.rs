@@ -362,8 +362,10 @@ fn main() {
         NoiseDescriptor {
             dtype: DType::BF16,
             block: ops::noise::NOISE_BLOCK,
-            // The initial latent noise: one standard normal sample per element.
+            // The initial latent noise: one standard normal sample per element, its stream keyed by
+            // the request's seed as a launch scalar (the model has no key view to upload).
             kind: ops::noise::NoiseKind::Normal,
+            source: ops::noise::KeySource::Scalar,
         }
         .to_string(),
     );
