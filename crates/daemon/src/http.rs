@@ -8,12 +8,12 @@
 //! `middleware`.
 
 pub(crate) mod admin;
+pub(crate) mod conn;
 pub(crate) mod handoff;
 pub(crate) mod listener;
-pub(crate) mod conn;
-pub(crate) mod stream;
 mod middleware;
 mod node;
+pub(crate) mod stream;
 
 pub use node::node;
 
@@ -92,7 +92,7 @@ pub async fn serve(config: ServeConfig, stated: Stated, shutdown: CancellationTo
     // The leader's start waits for the other nodes to join, which blocks.
     let options = config.daemon_options();
     let starting = tokio::task::spawn_blocking(move || Daemon::start(options));
-    let daemon = tokio::select! {
+    let mut daemon = tokio::select! {
         daemon = starting => daemon
             .context("the daemon's start did not complete")?
             .context("failed to start this node's daemon")?,
@@ -102,6 +102,12 @@ pub async fn serve(config: ServeConfig, stated: Stated, shutdown: CancellationTo
     // once its processes are down.
     let retire = Arc::new(AtomicBool::new(false));
     let address = daemon.address().map(str::to_owned);
+    // The epoch records the admin reports and the epoch layer moves are one.
+    let epoch_records = Arc::new(crate::epoch::Epochs::new());
+    let updates = daemon.updates(
+        Arc::clone(&epoch_records),
+        config.served_model_name().to_owned(),
+    );
     let daemon = Arc::new(std::sync::Mutex::new(Some(daemon)));
     let Some(address) = address else {
         info!(node_rank = config.node_rank, host = %config.host_identity, "serving this node's processes for the leader");
@@ -118,8 +124,22 @@ pub async fn serve(config: ServeConfig, stated: Stated, shutdown: CancellationTo
         }
         return stop_daemon(daemon).await;
     };
+    let Some((updates, awake)) = updates else {
+        anyhow::bail!("the leader's daemon serves no epoch layer");
+    };
+    Daemon::advance_epochs(Arc::clone(&updates), awake)
+        .context("starting the epoch layer's thread")?;
+    // The daemon's channel down to the main processes, which the epoch's
+    // first program switch commands through.
+    let commands = daemon
+        .lock()
+        .map_err(|_| anyhow::anyhow!("the daemon's lock is poisoned"))?
+        .as_ref()
+        .and_then(Daemon::commands);
     let engine = tokio::select! {
-        engine = Leader::start(&config, &stated, address) => engine.map(Arc::new),
+        engine = Leader::start(&config, &stated, address, commands.as_ref(), updates) => {
+            engine.map(Arc::new)
+        }
         () = shutdown.cancelled() => return stop_daemon(daemon).await,
     };
     let engine = match engine {
@@ -131,7 +151,11 @@ pub async fn serve(config: ServeConfig, stated: Stated, shutdown: CancellationTo
             return Err(error);
         }
     };
-    let admin = admin::Admin::new(shutdown.clone(), Arc::clone(&retire));
+    let admin = admin::Admin::with_epochs(
+        shutdown.clone(),
+        Arc::clone(&retire),
+        Arc::clone(&epoch_records),
+    );
     admin.record(
         "deployment",
         format!("serving {}", engine.served_model_name()),
@@ -317,6 +341,24 @@ async fn serve_on(
     );
     info!(%bind_address, model = engine.served_model_name(), "starting HTTP server");
 
+    // The responses the daemon this one replaced handed over go on here: each
+    // connection writes the bytes the predecessor did not write and then goes
+    // on with the resumed body (design §7.5.1 step 4).
+    for stream in crate::restart::streams::take_adopted() {
+        let app = app.clone();
+        tokio::spawn(async move {
+            crate::restart::streams::adopted(std::slice::from_ref(&stream));
+            let request_id = stream.request_id.clone();
+            let error = conn::adopt(stream.descriptor, stream.http, stream.body, app)
+                .await
+                .err();
+            if let Some(error) = error {
+                tracing::warn!(%request_id, %error, "a handed-over connection ended");
+            }
+            crate::restart::streams::finished(&request_id);
+        });
+    }
+
     let serving = conn::serve(listener, app, accepting.clone());
     let drain = async {
         serving.await.context("HTTP server failed")?;
@@ -410,6 +452,7 @@ pub(crate) fn router(
                     Arc::clone(&engine),
                     Arc::clone(&jobs),
                     video_body_limit,
+                    Arc::clone(&handoff),
                 ));
             }
             Task::Readout => {

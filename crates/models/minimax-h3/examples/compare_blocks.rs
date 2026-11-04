@@ -137,8 +137,10 @@ fn run() -> Result<String, String> {
                 case.num_text_tokens,
                 &segments,
                 &spans,
-                sparsity,
-                reference_keep,
+                packing::Sparsity {
+                    sparsity,
+                    reference_keep,
+                },
             )
             .map_err(problem)?;
             let extent: &SegmentExtent = &plan.extent;

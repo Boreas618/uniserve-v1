@@ -5,3 +5,10 @@
 pub mod client;
 pub mod control;
 pub mod hold;
+pub(crate) mod launch;
+
+/// Stand-in main processes over the daemon's command channel, for the tests
+/// of the program layer: no engine runs, and every command is answered as
+/// the protocol says.
+#[cfg(test)]
+pub(crate) mod stand_in;
