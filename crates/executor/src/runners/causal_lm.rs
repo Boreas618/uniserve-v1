@@ -1752,38 +1752,13 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 ),
             )
         };
-        // The completion names one row per call, and the state it reports is the call's own: the
-        // commit table is per call and the sampler's slot view is per row, so a multi-row call
-        // reads the slot its rows share through its first row.
-        let row_slots = self.staging.slots(rows);
-        let calls = self.staging.calls();
-        let mut states = Vec::with_capacity(calls.len());
-        for index in 0..calls.len() {
-            let row = self
-                .staging
-                .batch_rows()
-                .calls
-                .get(index)
-                .map(|call| call.rows.start as usize)
-                .unwrap_or(0);
-            // A call whose slot is below zero states nothing about the row it would advance; every
-            // other call reads its own row of the commit table, which is indexed by call and not by
-            // the slot the call writes to.
-            let slot = row_slots.get(row).copied().unwrap_or(-1);
-            states.push(if slot < 0 {
-                RowState::default()
-            } else {
-                let at = index;
-                RowState {
-                    // For text the slot's trajectory position is the number of tokens it has
-                    // committed, which the table keeps in the sampling column; a latent
-                    // trajectory advances the same column one step at a time.
-                    step_index: length_at(sampling, at),
-                    cache_computed_len: length_at(logical, at),
-                    cache_visible_len: length_at(sampling, at),
-                }
-            });
-        }
+        let states = states_of(
+            self.staging.slots(rows),
+            self.staging.batch_rows(),
+            self.staging.calls().len(),
+            logical,
+            sampling,
+        );
         let calls = calls_output(
             ids,
             self.staging.logits_rows(),
@@ -2233,6 +2208,42 @@ impl ops::capture::Sink for Recording {
 
 /// The non-negative length a per-slot table column holds for `slot`, or zero when the table has no
 /// such slot: a length is never negative, and a padded row names no slot at all.
+/// The state each call of a staged batch reports, from the commit table's readback.
+///
+/// The completion names one row per call and the state it carries is the call's **own row of the
+/// commit table**: the table is per call, while the sampler's `slots` column is per row, so a
+/// multi-row call reads the slot its rows share through the first row it owns. A call whose slot is
+/// below zero names no state at all and reports the default.
+fn states_of(
+    slots: &[i32],
+    rows: &nn::BatchRows,
+    calls: usize,
+    logical: &[i32],
+    sampling: &[i32],
+) -> Vec<RowState> {
+    let mut states = Vec::with_capacity(calls);
+    for index in 0..calls {
+        let row = rows
+            .calls
+            .get(index)
+            .map(|call| call.rows.start as usize)
+            .unwrap_or(0);
+        states.push(if slots.get(row).copied().unwrap_or(-1) < 0 {
+            RowState::default()
+        } else {
+            RowState {
+                // For text the call's trajectory position is the number of tokens it has committed,
+                // which the table keeps in the sampling column; a latent trajectory advances the
+                // same column one step at a time.
+                step_index: length_at(sampling, index),
+                cache_computed_len: length_at(logical, index),
+                cache_visible_len: length_at(sampling, index),
+            }
+        });
+    }
+    states
+}
+
 /// One row of a commit table column: the call at `row`, whose lengths a completion reports.
 ///
 /// A row the table does not hold reads as zero rather than as a neighbour's value, so a batch that
@@ -2537,6 +2548,82 @@ mod tests {
         assert_eq!(&staging.input_ids(2), &[7, 8]);
         assert_eq!(staging.input_ids(4).len(), 4);
         Ok(())
+    }
+
+    /// A completion reports the commit table's row of its own call. The slot a call writes to is a
+    /// state slot, not a row of the table: a batch whose slots are numbered past its calls must not
+    /// read another call's lengths, nor a row the table does not hold.
+    #[test]
+    fn a_completion_reads_its_own_row_of_the_commit_table() {
+        let rows = nn::BatchRows {
+            positions: vec![1, 2],
+            slot_mapping: vec![0, 1],
+            seq_lens: vec![2, 3],
+            query_offsets: vec![0, 1, 2],
+            logits_rows: vec![0, 1],
+            calls: vec![
+                nn::BatchRow {
+                    request: 0,
+                    kind: nn::RowKind::Decode,
+                    cache_group: 0,
+                    rows: 0..1,
+                },
+                nn::BatchRow {
+                    request: 1,
+                    kind: nn::RowKind::Decode,
+                    cache_group: 0,
+                    rows: 1..2,
+                },
+            ],
+        };
+        // Slots 9 and 4 write state nine and four: neither is a row of the two-call table.
+        let states = states_of(&[9, 4], &rows, 2, &[3, 5], &[3, 6]);
+        assert_eq!(
+            states,
+            vec![
+                RowState {
+                    step_index: 3,
+                    cache_computed_len: 3,
+                    cache_visible_len: 3
+                },
+                RowState {
+                    step_index: 6,
+                    cache_computed_len: 5,
+                    cache_visible_len: 6
+                },
+            ]
+        );
+    }
+
+    /// A call that evaluates several rows reports one state, the one the commit table wrote for the
+    /// call, and a call whose slot names no state reports nothing.
+    #[test]
+    fn a_multi_row_call_reports_one_state_and_no_slot_reports_none() {
+        let rows = nn::BatchRows {
+            positions: vec![9, 10, 11],
+            slot_mapping: vec![0, 1, 2],
+            seq_lens: vec![1, 1, 1],
+            query_offsets: vec![0, 1, 2, 3],
+            logits_rows: vec![0, 1, 2],
+            calls: vec![nn::BatchRow {
+                request: 0,
+                kind: nn::RowKind::Verify,
+                cache_group: 0,
+                rows: 0..3,
+            }],
+        };
+        assert_eq!(
+            states_of(&[2, 2, 2], &rows, 1, &[7], &[11]),
+            vec![RowState {
+                step_index: 11,
+                cache_computed_len: 7,
+                cache_visible_len: 11
+            }]
+        );
+        assert_eq!(
+            states_of(&[-1], &rows, 1, &[7], &[11]),
+            vec![RowState::default()]
+        );
     }
 
     /// A batch larger than the bucket it planned is refused before any staging or launch.
