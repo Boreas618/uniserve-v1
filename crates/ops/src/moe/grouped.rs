@@ -663,19 +663,21 @@ pub struct GatherGemmNvfp4Args {
     pub num_non_exiting_tiles: TensorView,
     /// `[routes, intermediate]` the gated product.
     pub out: TensorView,
-    /// `[bytes]` U8: scratch for the program's own bookkeeping. A hint rather than a requirement: the
-    /// program computes the size its tactic needs and grows it itself when this view is short, because
-    /// the size is the artifact's and not something `ops` can restate.
+    /// `[bytes]` U8: scratch the program needs for its own bookkeeping. The size its tactic needs is
+    /// the artifact's plan, not something `ops` can restate; a view shorter than the plan is refused
+    /// by name at the point of use, never grown — a step that allocates is a host allocation inside a
+    /// captured graph, and the address the pool baked is the wrong one the moment the step grows.
     pub workspace: TensorView,
 }
 
 /// Check the scratch view both encoded products carry.
 ///
-/// A workspace is bytes the program uses for its own bookkeeping. It is a *hint*: the program knows
-/// the size its tactic needs and allocates its own when this view is short, because that size belongs
-/// to the artifact rather than to `ops`. What this refuses is a view that is not plain bytes, or one
-/// of no bytes at all — an empty scratch would make every launch pay for an allocation that a caller
-/// could have sized once.
+/// A workspace is bytes the program uses for its own bookkeeping, and the size the tactic needs is the
+/// artifact's plan rather than anything `ops` can restate — so this checks only what is a property of
+/// the operand itself: plain bytes, and at least one of them. The floor is the *plan's*, checked at
+/// the point of use by the entry, where a short buffer is a named refusal; it is never grown, because
+/// the step runs inside a captured graph and an allocation there lands at an address the pool did not
+/// bake into the capture.
 fn check_workspace(operator: &'static str, workspace: TensorView) -> Result<()> {
     workspace.require_rank(operator, 1)?;
     if workspace.dtype != DType::U8 {
@@ -687,7 +689,7 @@ fn check_workspace(operator: &'static str, workspace: TensorView) -> Result<()> 
     if workspace.numel() == 0 {
         return Err(Error::argument(
             operator,
-            "a workspace of no bytes: the program would allocate its own on every launch",
+            "a workspace of no bytes: the plan's size is a caller's to provide",
         ));
     }
     Ok(())
@@ -1248,8 +1250,8 @@ pub struct RouteGemmNvfp4Args {
     /// `[routes, hidden]` the contracted rows, one per route: the `top` repeats are combined by
     /// `moe_unpermute`, not here.
     pub out: TensorView,
-    /// `[bytes]` U8: scratch for the program's own bookkeeping, as FC1's is — a hint the program grows
-    /// itself when it is short.
+    /// `[bytes]` U8: scratch for the program's own bookkeeping, as FC1's is: the plan's size or more,
+    /// refused at the point of use when it is short.
     pub workspace: TensorView,
 }
 
