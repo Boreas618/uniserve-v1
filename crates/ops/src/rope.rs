@@ -58,18 +58,56 @@ pub struct FactorsDescriptor {
     pub scale: Float,
     /// Launch with programmatic dependent launch.
     pub pdl: bool,
+    /// How many position axes the factors read: 1 for one-dimensional positions.
+    ///
+    /// A multimodal transformer's positions are one coordinate per axis (time, height, width), and
+    /// the head's columns are cut into one section per axis, so column `j` rotates by the
+    /// coordinate of the axis its section belongs to (M-RoPE).
+    pub axes: u32,
+    /// Rotated elements each axis owns, in axis order; only the first `axes` entries are read.
+    pub sections: [u32; MAX_AXES],
+}
+
+/// The most position axes a sectioned rotation reads.
+///
+/// Qwen2.5-VL's M-RoPE cuts the head into three (time, height, width); a fourth is room for a
+/// model that adds a modality axis, and the kernels' per-column search is a scan over four entries.
+pub const MAX_AXES: usize = 4;
+
+/// `widths` as a key value: `64` or `16-24-24`.
+struct Sections<'a>(&'a [u32]);
+
+impl fmt::Display for Sections<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, width) in self.0.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str("-")?;
+            }
+            write!(formatter, "{width}")?;
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Display for FactorsDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        Key::new()
+        let mut key = Key::new()
             .field("dtype", self.dtype)
             .field("positions", self.positions)
             .field("columns", self.columns)
             .field("block", self.block)
             .field("scale", self.scale)
-            .field("pdl", self.pdl)
-            .finish(formatter)
+            .field("pdl", self.pdl);
+        // A one-dimensional descriptor's key is the one it always had: `axes` and `sections`
+        // appear only when there is more than one axis, because one axis compiles the same
+        // program as no axis at all.
+        if self.axes > 1 {
+            let axes = self.axes as usize;
+            key = key
+                .field("axes", self.axes)
+                .field("sections", Sections(&self.sections[..axes.min(MAX_AXES)]));
+        }
+        key.finish(formatter)
     }
 }
 
@@ -77,6 +115,9 @@ impl fmt::Display for FactorsDescriptor {
 #[derive(Clone, Copy)]
 pub struct FactorsArgs {
     /// `[…, tokens]` positions, in any leading shape; every element is one token's position.
+    ///
+    /// A sectioned rotation's positions are `[axes, tokens]` (or `[axes, …, tokens]`): one
+    /// coordinate per axis per token, contiguous, so axis `a`'s coordinates start at `a * tokens`.
     pub positions: TensorView,
     /// `[columns]`, the angle per rotated dimension, in radians per position unit.
     pub frequencies: TensorView,
@@ -113,7 +154,40 @@ impl Op for RotaryFactors {
         let columns = u64::from(descriptor.columns);
         args.frequencies
             .require_shape(Self::NAME, Shape::new(&[columns]))?;
-        let tokens = args.positions.numel();
+        let axes = u64::from(descriptor.axes.max(1));
+        if args.positions.numel() % axes != 0 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "{} position coordinates do not divide into {axes} axes",
+                    args.positions.numel()
+                ),
+            ));
+        }
+        if descriptor.axes > 1 {
+            let sections: u64 = descriptor
+                .sections
+                .iter()
+                .take(descriptor.axes as usize)
+                .map(|width| u64::from(*width))
+                .sum();
+            if sections != columns * 2 {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!(
+                        "sections cover {sections} elements of a {} element head",
+                        columns * 2
+                    ),
+                ));
+            }
+            if descriptor.axes as usize > MAX_AXES {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!("{} axes, at most {MAX_AXES}", descriptor.axes),
+                ));
+            }
+        }
+        let tokens = args.positions.numel() / axes;
         args.cosine
             .require_row(Self::NAME, descriptor.dtype, columns)?;
         args.sine
@@ -139,6 +213,15 @@ impl Op for RotaryFactors {
             .u64(total)
             .u32(descriptor.columns)
             .f32(f32::from_bits(descriptor.scale.0 as u32));
+        // A sectioned rotation's program takes one more pair: how many axes the positions carry
+        // and the rotated width each one owns. A one-dimensional program's arguments end at
+        // `scale`, so its existing packages stay valid.
+        if descriptor.axes > 1 {
+            arguments.u32(descriptor.axes);
+            for width in descriptor.sections.iter().take(MAX_AXES) {
+                arguments.u32(*width);
+            }
+        }
         kernel.launch(
             LaunchGrid::covering(total, u64::from(descriptor.block))?,
             &mut arguments,

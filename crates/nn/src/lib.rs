@@ -64,7 +64,7 @@ pub use layers::{
     Embedding, FrameMoments, FrameNormPad, FramePad, GatedActivation, LayerNorm, Linear,
     ModulatedRmsNorm, Moe, Noise, PackedSwiGlu, ParallelLMHead, RmsNorm, Rotary, Rotation, Sampler,
     SamplerState, Samples, ScaledResidual, ScaledResidualLayerNorm, ScaledResidualRmsNorm, SwiGlu,
-    TRTLLM_WORKSPACE_BYTES, UlyssesExchange, WeightedRmsNorm, gather_rows,
+    TRTLLM_WORKSPACE_BYTES, UlyssesExchange, VsaTiles, WeightedRmsNorm, gather_rows,
 };
 pub use model::{Block, BlockName, Model, PhaseId};
 pub use ops::PhaseKind;
