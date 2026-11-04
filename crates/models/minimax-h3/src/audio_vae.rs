@@ -1127,9 +1127,7 @@ impl<'a, 'b> Binder<'a, 'b> {
                     .load(&WeightRequest::region(tensor, 0, Shape::new(shape)))?)
             }
             other => Err(Error::checkpoint(format!(
-                "{}: {}",
-                parameter.to_owned(),
-                format!("the parameter is not one tensor: {other:?}")
+                "{parameter}: the parameter is not one tensor: {other:?}"
             ))),
         }
     }
