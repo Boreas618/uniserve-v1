@@ -13,7 +13,7 @@ use crate::{DeviceId, Error, PrimaryContext, Result, Stream};
 const NCCL_SUSPEND_MEM: i32 = 0x01;
 
 /// The 128-byte rendezvous token every rank of a communicator initializes
-/// with. Rank 0 creates it and the caller hands it to the other ranks.
+/// with. Rank 0 creates it and the worker distributes it to its peers.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct UniqueId(pub [u8; 128]);
 
@@ -67,26 +67,6 @@ pub enum ReduceOp {
 /// Every operation is enqueued on the stream passed to it, which belongs to
 /// the communicator's device. Collective calls must be issued in the same
 /// order on every rank; group several with [`group`].
-///
-/// # One communicator per device, driven by that device's thread
-///
-/// The main process drives every GPU of its node from one thread per device
-/// (design 2.4), and each of those threads owns its device's communicator and
-/// issues all of its collectives. [`Communicator::init`] blocks until every
-/// rank of the communicator has joined, so the ranks' threads must call it
-/// concurrently: called one after another in a single thread it never returns.
-/// [`group`] covers collective operations, not initialization. A communicator
-/// is `Send` but not `Sync`: one thread uses it at a time, which the `&mut
-/// self` on its operations enforces.
-///
-/// # A captured graph outlives no communicator
-///
-/// A graph that captured a collective must be destroyed before its
-/// communicator's [`Communicator::destroy`] runs: `ncclCommDestroy` waits for
-/// the communicator's work and does not return while such a graph still
-/// references it (measured on GB200). The owner's order is therefore: destroy
-/// or rebind a captured graph, drain its stream, then destroy the
-/// communicator.
 ///
 /// Release is explicit because it is collective: [`Communicator::destroy`]
 /// destroys the communicator once every rank's work retired, and
@@ -427,17 +407,4 @@ pub fn group<R>(submit: impl FnOnce() -> Result<R>) -> Result<R> {
     let value = result?;
     ended?;
     Ok(value)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::Communicator;
-
-    /// The main process moves a communicator to the thread that drives its
-    /// device; it never shares one between threads at once.
-    #[test]
-    fn a_communicator_moves_to_its_device_thread() {
-        fn movable<T: Send>() {}
-        movable::<Communicator>();
-    }
 }

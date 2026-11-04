@@ -52,8 +52,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use platform::{
-    Capture, CaptureMode, Device, DeviceAllocation, DeviceId, Function, LaunchConfig, Library,
-    PinnedBuffer, Stream,
+    Device, DeviceAllocation, DeviceId, Function, LaunchConfig, Library, PinnedBuffer, Stream,
 };
 use ipc::FenceHistogram;
 
@@ -1138,8 +1137,8 @@ mod device_tests {
         stream: &Stream,
         issue: impl FnOnce(&Stream) -> Result<()>,
     ) -> Result<platform::GraphExec> {
-        let mut capture = Capture::begin(stream, CaptureMode::Global)?;
+        let capture = platform::Capture::begin(stream, platform::CaptureMode::Global)?;
         issue(stream)?;
-        capture.end()?.instantiate()
+        Ok(capture.end()?.instantiate()?)
     }
 }
