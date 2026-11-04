@@ -1494,6 +1494,12 @@ pub struct UnitColumn {
 
 impl UnitColumn {
     /// Bind the resets of `planes` to `stream` (`None` for a host pool).
+    /// Bytes one column of `num_units` unit indices occupies: one `i64` per
+    /// unit.
+    pub(crate) fn bytes(num_units: u32) -> u64 {
+        u64::from(num_units) * ElementType::I64.bytes() as u64
+    }
+
     pub(crate) fn bind(planes: &Arc<CachePlanes>, stream: Option<&Stream>) -> Result<Self> {
         if planes.device.is_some() != stream.is_some() {
             return Err(Error::Invalid(
