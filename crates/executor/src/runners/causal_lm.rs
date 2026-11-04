@@ -2575,12 +2575,13 @@ mod sampled_output_tests {
         );
     }
 
-    /// A call whose rows sample nothing still completes: it advanced, it just ended no prompt. A
-    /// bucket with no sampling row states no call and measures nothing.
+    /// A call whose rows sample nothing still completes: it advanced, it just ended no prompt. The
+    /// readback still holds a token per bucket row - the sampler writes one whatever the row is -
+    /// and the row's `-1` is what discards it, so no call ever receives it.
     #[test]
     fn a_call_that_samples_nothing_still_completes() {
         let output = calls_output(
-            &[],
+            &[0],
             &[-1],
             &rows(&[(0, 0..4)]),
             &[CallId(1)],
