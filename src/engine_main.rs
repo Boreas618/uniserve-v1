@@ -791,7 +791,11 @@ impl MainProcess {
             }
             Action::Revert => {
                 let generation = self.update.phase().generation().unwrap_or_default();
-                self.revert(generation, failure);
+                let reason = failure.reason();
+                self.revert(generation, failure)?;
+                // The revert answers the daemon itself; the failure that caused it is what the
+                // revert's own report carries.
+                tracing::info!(generation, %reason, "an update on probation was reverted");
                 Ok(None)
             }
             Action::Epoch => {
@@ -1011,7 +1015,7 @@ impl MainProcess {
                 UpdateFailure::Policy {
                     error: "the daemon reverted the update".into(),
                 },
-            ),
+            )?,
             ProgramCommand::Purge { generation } => self.purge(generation)?,
         };
         Ok(Some(status))
@@ -1409,7 +1413,7 @@ impl MainProcess {
                     error: error.to_string(),
                     batch: None,
                 };
-                return Ok(self.revert(generation, failure));
+                return self.revert(generation, failure);
             }
         }
         // §4.5: the first request served on a generation must not pay for a capture, so every
@@ -1429,7 +1433,7 @@ impl MainProcess {
                     error: error.to_string(),
                     batch: None,
                 };
-                return Ok(self.revert(generation, failure));
+                return self.revert(generation, failure);
             }
         }
 
@@ -1458,13 +1462,13 @@ impl MainProcess {
     /// §7.3 step 4: revert to the generation serving before the update. The old
     /// generation and its nodes stayed through probation, so the revert is the
     /// reverse switchover and nothing has to be prepared again.
-    fn revert(&mut self, generation: u64, failure: UpdateFailure) -> ProgramStatus {
+    fn revert(&mut self, generation: u64, failure: UpdateFailure) -> Result<ProgramStatus> {
         if let Err(error) = self.update.revert(generation, failure.clone()) {
             tracing::error!(%error, "reverting a program-layer update failed");
-            return ProgramStatus::Failed {
+            return Ok(ProgramStatus::Failed {
                 generation,
                 failure,
-            };
+            });
         }
         self.revert_policy(generation);
         // The generation that served before the update serves again, and the one built for the
@@ -1480,21 +1484,19 @@ impl MainProcess {
             // that runs it: a `switchover` back to the kept generation would find nothing prepared
             // (the cut-over took `next`) and refuse by name - the current generation would be left
             // serving with no kernels and no graphs.
-            match executor.revert(current) {
-                Ok(submission) => {
-                    if let Err(error) = device_command(&self.watchdog, device, "revert", submission) {
-                        tracing::error!(%error, "reverting a device's generation failed");
-                    }
-                }
-                Err(error) => {
-                    tracing::error!(%error, "queueing a device's revert failed");
-                }
-            }
+            // A device that cannot go back to the generation that served is a device with no
+            // generation at all: the update's kernels are the ones its graphs were rebound to, and a
+            // revert that half happened leaves the epoch serving from neither. So a failed revert
+            // ends the epoch by name instead of leaving it to fail on a batch that finds no graph.
+            let submission = executor.revert(current).with_context(|| {
+                format!("queueing device {}'s revert to generation {current}", device.0)
+            })?;
+            device_command(&self.watchdog, device, "revert", submission)?;
         }
-        ProgramStatus::Reverted {
+        Ok(ProgramStatus::Reverted {
             generation,
             reason: failure.reason(),
-        }
+        })
     }
 
     /// §7.3 step 6: release the generation before the serving one, once its last
