@@ -858,6 +858,14 @@ def run_trajectory(
             f"the prefix source is {tuple(table.shape)} and the layout's text segment is"
             f" {(layout.num_text_tokens, width)}"
         )
+    # The case states the prefix's height too, and it is a second computation of one number: the
+    # harness's `text_rows + condition_rows + 1` against the layout's. They agree only at the layout
+    # the device runs, so a case written at another layout is refused rather than compared.
+    if "prefix_rows" in case and int(case["prefix_rows"]) != rows:
+        raise SystemExit(
+            f"the case states a prefix of {case['prefix_rows']} rows and the layout's is {rows}"
+            f" ({layout.num_text_tokens} text + {layout.condition_rows} condition + 1)"
+        )
     prefix = torch.zeros((rows, width), dtype=table.dtype, device=device)
     prefix[: layout.num_text_tokens] = table.to(device=device)
     print(f"prefix  {rows} rows: {layout.num_text_tokens} text, one zero row")
