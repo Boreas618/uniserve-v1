@@ -1,0 +1,53 @@
+# The conv3d operator's cudnn backend: design 5.2's program package.
+#
+# One native module per descriptor. The module is the convolution itself, through
+# cuDNN 9's backend API: an engine per shape, chosen once (`tuning/engines.json`
+# when a tuning pass has run, cuDNN's first proposal until then) and executed on
+# the caller's stream, workspace from the stream's pool so a captured graph
+# records it.
+#
+# The descriptor carries the element types and the geometry, so a descriptor is
+# one compilation: the script passes the types, the geometry is validated at
+# launch. The key is the operator crate's: `input_f32_weight_f32_output_f32_`
+# `geometry_kernel_3x3x3_stride_1x1x1_padding_1x1x1_dilation_1x1x1_groups_1_`
+# `bias_true_tf32_true_rank_3_transposed_false`.
+#
+# `tf32` describes FP32 inputs only: cuDNN 9's backend API chooses the engine's
+# arithmetic and exposes no math-type knob, so an FP32 convolution runs the engine
+# cuDNN proposes and a half-precision one has no such choice. A descriptor whose
+# `tf32` disagrees with its input type is refused at launch rather than run.
+#
+# The video VAE's spatial convolutions are FP32 with TF32 allowed; the cube's
+# filter is 3x3x3, stride one, padding one, one group, no bias.
+
+op = "conv3d"
+backend = "cudnn"
+
+[toolchain]
+kind = "nvcc"
+version = "13.0.48"
+packages = []
+
+[module]
+form = "native"
+
+[module.entries]
+launch = "uniserve_conv3d"
+
+[source]
+kind = "cuda"
+files = [
+    "include/uniserve_conv.h",
+    "src/conv.cu",
+    "src/build.py",
+]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_100f"]
+
+[kernel.descriptors]
+dimensions = { input = ["f32", "bf16"], weight = ["f32", "bf16"], output = ["f32", "bf16"], geometry_kernel = ["3x3x3", "1x1x1"], stride = ["1x1x1", "2x2x2"], padding = ["1x1x1", "0x0x0"], dilation = ["1x1x1"], groups = ["1"], bias = ["true", "false"], tf32 = ["true", "false"], rank = ["3"], transposed = ["false"] }
+
+[parameters]
