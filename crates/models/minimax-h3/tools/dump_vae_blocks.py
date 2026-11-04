@@ -20,7 +20,13 @@ One probe per invocation, so a failure costs one tensor and not the batch:
         --out artifacts/diagnosis/vae-blocks/ref
 
 The plan is printed before anything is loaded, so a wrong module path or a missing weight shard is
-visible in the first screen. A probe is a module path, relative to the component's root module, and the
+visible in the first screen. A **stage** probe (`--probe decode_out`) is the other half: it has no
+fixed input, and runs the reference's module on the input a candidate's stage wrote, so the
+comparison is about the reference's arithmetic and not about who drew the clip's latents.
+
+    .venv/bin/python crates/models/minimax-h3/tools/dump_vae_blocks.py --probe decode_out \\
+        --stack artifacts/h3-stage2/video_decoder --checkpoint /opt/uv/models/MiniMax-H3 \\
+        --out artifacts/h3-stage2-ref --device cuda A probe is a module path, relative to the component's root module, and the
 value written is that module's output for a fixed input the options below make reproducible.
 
 Run it from the repository root with the repository's environment and the repository importable
@@ -34,6 +40,7 @@ This is a **diagnosis, never an acceptance gate** (`specs/worker.md` 10).
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -132,6 +139,22 @@ CATALOGUE = {
         ("decoder.network.conv_post", "the last convolution, before the clamp"),
     ),
 }
+
+
+# A stage probe runs a component the candidate has already run, on the candidate's own input. The
+# value written is the component's output for that input, under the name the candidate's tree gives it,
+# so the two trees line up by name and a difference is arithmetic rather than a second draw.
+STAGES = {
+    "decode_out": (
+        "video_decoder",
+        "run host: the reference's video decoder on the candidate's latents, one clip",
+    ),
+}
+
+# The precision the deployment declares per component, which is the default a stage runs in: the video
+# decoder is FP16 and every transformer block is BF16 (design section 1). A stage passes this as the
+# module's compute dtype, so a comparison in another dtype would measure the conversion.
+STAGE_DTYPES = {"decode_out": "torch.float16"}
 
 
 def plan(probe: str) -> tuple[str, str, str]:
@@ -254,6 +277,148 @@ def dump(out: Path, name: str, values) -> None:
     write(out, name, values)
 
 
+def dtype_of(options, default: str):
+    """The compute dtype a probe loads its parameters in, named as the option spells it."""
+    name = options.dtype or default
+    dtype = DTYPES.get(name)
+    if dtype is None:
+        raise SystemExit(f"--dtype takes one of {sorted(DTYPES)}")
+    return dtype
+
+
+def read_tensor(path: Path) -> torch.Tensor:
+    """Read one H3D1 tensor: the container this directory writes and the Rust comparator reads."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from dump_tables import load
+
+    try:
+        return load(path)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+
+
+def read_sidecars(checkpoint: Path):
+    """The checkpoint's typed configs, through the reference's own loading boundary."""
+    try:
+        from uniserve.models.minimax_h3 import config as h3_config
+    except ImportError as error:
+        print(f"IMPORT FAILED: {type(error).__name__}: {error}")
+        print("  the reference's compiled extensions are not built in this environment")
+        raise SystemExit(1) from error
+    try:
+        return h3_config.read_config(checkpoint, io=None, sources=())
+    except Exception as error:  # noqa: BLE001 - the first line of a bad checkpoint path
+        print(f"CONFIG FAILED: {type(error).__name__}: {error}")
+        raise SystemExit(1) from error
+
+
+def run_stage(options) -> int:
+    """Run a component on the candidate's own input and write its output under the candidate's name.
+
+    The candidate's tree is the contract: this reads the tensor the candidate's stage read and the
+    `case.json` beside it, so both sides compute over the same bytes. Nothing here draws an input,
+    which is why a stage probe has no fixed input in the catalogue.
+    """
+    component, description = STAGES[options.probe]
+    stack = options.stack
+    if stack is None:
+        raise SystemExit(
+            f"--probe {options.probe} reads the candidate's tree: --stack <out>/{component}"
+        )
+    case_path, input_path = stack / "case.json", stack / "latents.h3t"
+    for path in (case_path, input_path):
+        if not path.is_file():
+            raise SystemExit(
+                f"{path} is missing; a decode stage writes `case.json` and `latents.h3t` under its"
+                f" own directory"
+            )
+    case = json.loads(case_path.read_text())
+    latents = read_tensor(input_path)
+    print(f"probe   {options.probe} ({description})")
+    print(f"stack   {stack}")
+    print(
+        f"case    canvas {case.get('canvas')},"
+        f" {case.get('latent_frames')} latent frames,"
+        f" latent dtype {case.get('latent_dtype')},"
+        f" {case.get('tiles')} tile(s),"
+        f" {case.get('position_rows')} position rows"
+    )
+    # The candidate's case says where its latents came from. It changes nothing about the
+    # comparison - this reads the candidate's own bytes, so both sides read the same numbers
+    # either way - but a generated input is a sawtooth and not a request, and a page that does not
+    # say so invites the wrong conclusion about what the stage proves.
+    print(f"latents {case.get('latents')}; the input both sides read")
+    print(f"input   {tuple(latents.shape)} {latents.dtype}")
+    if latents.ndim != 5:
+        raise SystemExit(
+            f"{input_path} holds {tuple(latents.shape)};"
+            f" a decode reads [1, C, T, h, w] latents"
+        )
+
+    sidecars = read_sidecars(options.checkpoint)
+    module = load_module(component, build(component, sidecars), options)
+    dtype = dtype_of(options, STAGE_DTYPES[options.probe])
+    print(f"dtype   {dtype} parameters on {options.device}")
+    device = torch.device(options.device)
+    with torch.no_grad():
+        decoded = module(latents.to(device=device))
+    # NCTHW in and out: one batch row, one clip, the decoded precision. The stage's tree is one
+    # clip as `[frames, height, width, 3]` channels last, which is the layout the checkpoint's
+    # output path and the crate's decoder both state.
+    if decoded.ndim != 5 or decoded.shape[0] != 1 or decoded.shape[1] != 3:
+        raise SystemExit(
+            f"the module returned {tuple(decoded.shape)}; a clip decodes to [1, 3, T, H, W]"
+        )
+    raster = decoded[0].permute(1, 2, 3, 0).contiguous()
+    print(f"got     {tuple(raster.shape)} {raster.dtype} channels last")
+    name = f"{component}/raster"
+    (options.out / component).mkdir(parents=True, exist_ok=True)
+    dump(options.out, name, raster)
+    (options.out / component / "case.json").write_text(case_path.read_text())
+    print(f"wrote   {options.out / (name + '.h3t')}")
+    # Same convention as the stack producer: the root the comparator is given is the one holding
+    # the component directories, so both trees keep the same names and a file on one side only is
+    # listed rather than counted as a difference.
+    candidate = stack.parent if stack.name == component else stack
+    print(
+        "compare cargo run -p minimax-h3 --example compare_blocks --"
+        f" --reference {options.out}"
+        f" --candidate {candidate}"
+        f" --out {options.out}-compare.txt"
+    )
+    return 0
+
+
+def load_module(component: str, module: nn.Module, options):
+    """Load the checkpoint's own tensors into a built component, at the probe's dtype."""
+    from uniserve.loading import loader, weights as weight_options
+
+    source = component_source(component, options.checkpoint)
+    print(f"load    {source.name} from {source.root} ({len(source.files)} file(s))")
+    dtype = dtype_of(options, "torch.bfloat16")
+    try:
+        reports = loader.load_weights(
+            module,
+            (source,),
+            mapping=lambda root: (mapping(component, root),),
+            device=options.device,
+            weights=weight_options.Config(dtype=dtype),
+        )
+    except Exception as error:  # noqa: BLE001 - the lead's first-line rule
+        print(f"LOAD FAILED: {type(error).__name__}: {error}")
+        raise SystemExit(1) from error
+    for report in reports:
+        print(
+            f"loaded  {len(report.loaded)} parameter(s); missing {len(report.missing)}, "
+            f"unexpected {len(report.unexpected)}, incomplete {len(report.incomplete)}"
+        )
+        for name in sorted(report.missing)[:8]:
+            print(f"missing  {name}")
+        for name in sorted(report.unexpected)[:8]:
+            print(f"unexpected  {name}")
+    return module
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--list", action="store_true", help="print the probe catalogue and exit")
@@ -261,9 +426,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--checkpoint", type=Path, help="the MiniMax-H3 checkpoint directory")
     parser.add_argument("--out", type=Path, help="where to write the dump")
     parser.add_argument(
+        "--stack",
+        type=Path,
+        help=(
+            "the candidate's stage directory, holding `latents.h3t` and"
+            " `case.json` (`--probe decode_out`)"
+        ),
+    )
+    parser.add_argument(
+        "--device",
+        default="cpu",
+        help="the device the module runs on (default: cpu)",
+    )
+    parser.add_argument(
         "--dtype",
-        default="torch.bfloat16",
-        help="the compute dtype the module's parameters load in (default: the checkpoint's)",
+        default=None,
+        help=(
+            "the compute dtype the module's parameters load in; the default is the"
+            " deployment's own - bfloat16 for a transformer block, float16 for the"
+            " video decoder"
+        ),
     )
     options = parser.parse_args(argv)
 
@@ -271,9 +453,13 @@ def main(argv: list[str] | None = None) -> int:
         for component, probes in CATALOGUE.items():
             for path, description in probes:
                 print(f"{component}:{path}\t{description}")
+        for stage, (component, description) in STAGES.items():
+            print(f"{stage}\t{description} (component {component})")
         return 0
     if not (options.probe and options.checkpoint and options.out):
         parser.error("--probe, --checkpoint and --out are required unless --list")
+    if options.probe in STAGES:
+        return run_stage(options)
 
     component, path, description = plan(options.probe)
     print(f"probe   {component}:{path}")
@@ -309,37 +495,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"probe   resolves to {type(module.get_submodule(path)).__name__}")
     print(f"expect  {component} output of one fixed input, shape set by {shape}")
 
-    try:
-        from uniserve.loading import loader, weights as weight_options
-    except ImportError as error:
-        print(f"IMPORT FAILED: {type(error).__name__}: {error}")
-        return 1
-
-    source = component_source(component, options.checkpoint)
-    print(f"load    {source.name} from {source.root} ({len(source.files)} file(s))")
-    dtype = DTYPES.get(options.dtype)
-    if dtype is None:
-        parser.error(f"--dtype takes one of {sorted(DTYPES)}")
-    try:
-        reports = loader.load_weights(
-            module,
-            (source,),
-            mapping=lambda root: (mapping(component, root),),
-            device="cpu",
-            weights=weight_options.Config(dtype=dtype),
-        )
-    except Exception as error:  # noqa: BLE001 - the lead's first-line rule
-        print(f"LOAD FAILED: {type(error).__name__}: {error}")
-        return 1
-    for report in reports:
-        print(
-            f"loaded  {len(report.loaded)} parameter(s); missing {len(report.missing)}, "
-            f"unexpected {len(report.unexpected)}, incomplete {len(report.incomplete)}"
-        )
-        for name in sorted(report.missing)[:8]:
-            print(f"missing  {name}")
-        for name in sorted(report.unexpected)[:8]:
-            print(f"unexpected  {name}")
+    load_module(component, module, options)
 
     captured = capture(module, path)
     generator = torch.Generator().manual_seed(SEED)
