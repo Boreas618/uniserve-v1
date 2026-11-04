@@ -116,6 +116,24 @@ impl ClipEncoder {
         &self.grid
     }
 
+    /// The seams a run of this raster blends over, as `(extent, axis)` pairs.
+    ///
+    /// One compiled blend serves every seam of the same width, so a driver compiles these and no
+    /// more: the rows axis is `2` and the columns axis `3`, as [`nn::layers::CrossFade`] numbers
+    /// them, and a raster inside one tile has none.
+    pub fn blend_extents(&self) -> Vec<(u32, u32)> {
+        let mut extents = Vec::new();
+        for (axis, seams) in [(2, &self.grid.rows), (3, &self.grid.columns)] {
+            for extent in Grid::blends(seams) {
+                if extent != 0 && !extents.contains(&(extent, axis)) {
+                    extents.push((extent, axis));
+                }
+            }
+        }
+        extents.sort_unstable();
+        extents
+    }
+
     /// Every tile of the whole raster, in row-major order, and the identity crop.
     pub fn plan(&self) -> Plan {
         self.plan_of(
@@ -200,6 +218,19 @@ mod tests {
         assert_eq!(tile.columns, (0, 16));
         assert!(!tile.fades_above() && !tile.fades_left());
         assert_eq!(plan.crop, (0, 16));
+    }
+
+    #[test]
+    fn a_raster_needs_one_compiled_blend_for_each_seam_width_it_has() {
+        // 1344 by 768 has three seams of two widths along the rows and six of two along the columns:
+        // four compiled blends serve the whole raster, not ten.
+        assert_eq!(
+            canvas().blend_extents(),
+            vec![(4, 3), (5, 2), (5, 3), (6, 2)]
+        );
+        // A raster inside one tile has no seam at all.
+        let small = ClipEncoder::new(256, 256).expect("one tile");
+        assert!(small.blend_extents().is_empty());
     }
 
     #[test]
