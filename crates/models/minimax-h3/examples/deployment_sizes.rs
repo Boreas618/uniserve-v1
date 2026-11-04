@@ -27,29 +27,29 @@ const STAGES: &[Stage] = &[
     Stage { deployment: "t2va dense", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
     Stage { deployment: "t2va dense", stage: "denoiser (base DiT + refiner)", weights: 41953, constants: 1946, arena: 1470, tables: 12 },
     Stage { deployment: "t2va dense", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
-    Stage { deployment: "t2va dense", stage: "audio_decoder", weights: 123, constants: 0, arena: 1612, tables: 0 },
+    Stage { deployment: "t2va dense", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "t2va dense", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
     Stage { deployment: "fl2va dense", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
     Stage { deployment: "fl2va dense", stage: "denoiser (base DiT + refiner)", weights: 41953, constants: 1946, arena: 1470, tables: 12 },
     Stage { deployment: "fl2va dense", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
-    Stage { deployment: "fl2va dense", stage: "audio_decoder", weights: 123, constants: 0, arena: 1612, tables: 0 },
+    Stage { deployment: "fl2va dense", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "fl2va dense", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
     Stage { deployment: "fl2va dense", stage: "latent_encoder", weights: 512, constants: 0, arena: 0, tables: 0 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "denoiser (OmniRef DiT + refiner)", weights: 41953, constants: 1946, arena: 1550, tables: 14 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
-    Stage { deployment: "ref2va dense (tile 128)", stage: "audio_decoder", weights: 123, constants: 0, arena: 1612, tables: 0 },
+    Stage { deployment: "ref2va dense (tile 128)", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
     Stage { deployment: "ref2va dense (tile 128)", stage: "latent_encoder", weights: 512, constants: 0, arena: 0, tables: 0 },
     Stage { deployment: "t2va + DMD student", stage: "text_encoder", weights: 49121, constants: 0, arena: 2, tables: 7 },
     Stage { deployment: "t2va + DMD student", stage: "denoiser (student + refiner)", weights: 41953, constants: 343, arena: 1470, tables: 12 },
     Stage { deployment: "t2va + DMD student", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
-    Stage { deployment: "t2va + DMD student", stage: "audio_decoder", weights: 123, constants: 0, arena: 1612, tables: 0 },
+    Stage { deployment: "t2va + DMD student", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "t2va + DMD student", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
     Stage { deployment: "t2va dense, TP2", stage: "text_encoder", weights: 25129, constants: 0, arena: 1, tables: 7 },
     Stage { deployment: "t2va dense, TP2", stage: "denoiser (base DiT + refiner)", weights: 21299, constants: 1946, arena: 735, tables: 12 },
     Stage { deployment: "t2va dense, TP2", stage: "video_decoder", weights: 4618, constants: 0, arena: 7591, tables: 1 },
-    Stage { deployment: "t2va dense, TP2", stage: "audio_decoder", weights: 123, constants: 0, arena: 1612, tables: 0 },
+    Stage { deployment: "t2va dense, TP2", stage: "audio_decoder", weights: 123, constants: 0, arena: 1178, tables: 0 },
     Stage { deployment: "t2va dense, TP2", stage: "video_postprocessor (splice)", weights: 0, constants: 0, arena: 148, tables: 0 },
 ];
 
@@ -187,17 +187,32 @@ fn derived(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     for frames in [124_u32, 362] {
-        let plan = minimax_h3::audio_vae::audio_arena(&config.audio_vae, frames)?;
+        // `audio_arena` takes audio latent steps, not video frames: one latent step is 800 samples and
+        // the request's frame count reaches them through the packing rule.
+        let plan = minimax_h3::audio_vae::audio_arena(
+            &config.audio_vae,
+            minimax_h3::packing::audio_latent_frames(frames),
+        )?;
         let bytes: u64 = plan
             .iter()
             .map(|buffer| buffer.elements * if buffer.element == "f16" { 2 } else { 4 })
             .sum();
         println!(
-            "audio plan {frames} frames: {} buffers, {} bytes = {} MiB",
+            "audio plan {frames} frames ({} latent steps): {} buffers, {} bytes = {} MiB",
+            minimax_h3::packing::audio_latent_frames(frames),
             plan.len(),
             bytes,
             bytes / (1 << 20)
         );
+        if std::env::var("H3_PLAN_BUFFERS").is_ok() && frames == 124 {
+            for buffer in &plan {
+                let size = buffer.elements * if buffer.element == "f16" { 2 } else { 4 };
+                println!(
+                    "    {:32} {} {:>12} elements {:>10} B",
+                    buffer.name, buffer.element, buffer.elements, size
+                );
+            }
+        }
     }
     let tile = minimax_h3::video_vae::Canvas::clip(&config.video_vae, 16, 16);
     let one: u64 = minimax_h3::decoding::video_arena(&config.video_vae, &tile)?
